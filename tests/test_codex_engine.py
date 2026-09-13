@@ -1,10 +1,11 @@
 import json
 from pathlib import Path
+import shutil
 import sys
 
 import pytest
 from openswap.codex.engine import CodexEngine, CodexAuthError, CodexSwitchError
-from openswap.exceptions import ValidationError
+from openswap.exceptions import ConfigError, ValidationError
 from openswap.engine.protocol import AccountEngine
 from openswap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from tests.test_codex_auth import _auth
@@ -368,6 +369,61 @@ def test_swap_missing_auth_json_is_empty_slot_not_abort(tmp_path):
     assert data["accounts"]["2"]["email"] == "a@x.com"
     assert (eng.slots_dir / "1" / "auth.json").exists()
     assert not (eng.slots_dir / "2" / "auth.json").exists()
+
+
+@pytest.mark.parametrize("keep_slot", ("1", "2", "both"))
+def test_swap_refuses_leftover_staging_even_if_one_slot_missing(tmp_path, keep_slot):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a")
+    eng.add_account()
+    _login(home, email="b@x.com", account_id="acc-b")
+    eng.add_account()
+    a_text = (eng.slots_dir / "1" / "auth.json").read_text()
+    b_text = (eng.slots_dir / "2" / "auth.json").read_text()
+    leftover = eng.slots_dir / ".swapping-1"
+    leftover.mkdir()
+    (leftover / "auth.json").write_text("stranded-a")
+    if keep_slot != "both":
+        gone = "2" if keep_slot == "1" else "1"
+        shutil.rmtree(eng.slots_dir / gone)
+
+    with pytest.raises(ConfigError, match="leftover slot swap staging"):
+        eng.swap_accounts("1", "2")
+
+    data = eng._read_roster()
+    assert data["accounts"]["1"]["email"] == "a@x.com"
+    assert data["accounts"]["2"]["email"] == "b@x.com"
+    assert (leftover / "auth.json").read_text() == "stranded-a"
+    if keep_slot in ("1", "both"):
+        assert (eng.slots_dir / "1" / "auth.json").read_text() == a_text
+    else:
+        assert not (eng.slots_dir / "1").exists()
+    if keep_slot in ("2", "both"):
+        assert (eng.slots_dir / "2" / "auth.json").read_text() == b_text
+    else:
+        assert not (eng.slots_dir / "2").exists()
+
+
+def test_swap_crash_after_first_replace_refuses_mismatched_retry(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a")
+    eng.add_account()
+    _login(home, email="b@x.com", account_id="acc-b")
+    eng.add_account()
+    a_text = (eng.slots_dir / "1" / "auth.json").read_text()
+    b_text = (eng.slots_dir / "2" / "auth.json").read_text()
+    # Crash after dir_a → .swapping-1; dir_b is still at slots/2.
+    (eng.slots_dir / "1").rename(eng.slots_dir / ".swapping-1")
+
+    with pytest.raises(ConfigError, match="leftover slot swap staging"):
+        eng.swap_accounts("1", "2")
+
+    data = eng._read_roster()
+    assert data["accounts"]["1"]["email"] == "a@x.com"
+    assert data["accounts"]["2"]["email"] == "b@x.com"
+    assert (eng.slots_dir / ".swapping-1" / "auth.json").read_text() == a_text
+    assert (eng.slots_dir / "2" / "auth.json").read_text() == b_text
+    assert not (eng.slots_dir / "1").exists()
 
 
 def test_move_to_empty_frees_old_slot(tmp_path):

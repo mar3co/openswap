@@ -461,22 +461,36 @@ class CodexEngine:
         dir_a = self._slot_dir(num_a)
         dir_b = self._slot_dir(num_b)
         self.slots_dir.mkdir(parents=True, exist_ok=True)
+        leftovers = sorted(self.slots_dir.glob(".swapping-*"))
+        if leftovers:
+            raise ConfigError(
+                f"Found leftover slot swap staging: {leftovers[0]}. "
+                "Verify both accounts, then delete the directory and retry."
+            )
         a_exists = dir_a.exists()
         b_exists = dir_b.exists()
-        if a_exists and b_exists:
-            staging = self.slots_dir / f".swapping-{num_a}"
-            if staging.exists():
-                raise ConfigError(
-                    f"Found leftover slot swap staging: {staging}. "
-                    "Verify both accounts, then delete the directory and retry."
-                )
-            os.replace(dir_a, staging)
-            os.replace(dir_b, dir_a)
-            os.replace(staging, dir_b)
-        elif a_exists:
-            os.replace(dir_a, dir_b)
-        elif b_exists:
-            os.replace(dir_b, dir_a)
+        staging = None
+        try:
+            if a_exists and b_exists:
+                staging = self.slots_dir / f".swapping-{num_a}"
+                os.replace(dir_a, staging)
+                os.replace(dir_b, dir_a)
+                os.replace(staging, dir_b)
+                staging = None
+            elif a_exists:
+                os.replace(dir_a, dir_b)
+            elif b_exists:
+                os.replace(dir_b, dir_a)
+        finally:
+            if staging is not None and staging.exists():
+                try:
+                    if not dir_a.exists():
+                        os.replace(staging, dir_a)
+                    elif not dir_b.exists():
+                        os.replace(dir_a, dir_b)
+                        os.replace(staging, dir_a)
+                except OSError:
+                    pass
 
     def _move_slot_dir(self, src: str, dest: str) -> None:
         src_dir = self._slot_dir(src)
