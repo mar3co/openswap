@@ -345,7 +345,7 @@ Examples:
 
 
 def _codex_command(argv: list[str]) -> int:
-    """Handle ``openswap codex add|list|switch|remove|disable|enable|alias``."""
+    """Handle ``openswap codex add|list|switch|remove|disable|enable|alias|export|import``."""
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} codex",
         description="Manage Codex CLI accounts as a second provider beside Claude.",
@@ -382,6 +382,22 @@ def _codex_command(argv: list[str]) -> int:
     al.add_argument("target", metavar="NUM|EMAIL|ALIAS")
     al.add_argument("name", nargs="?", metavar="NAME")
     al.add_argument("--unset", action="store_true", help="Remove the alias")
+
+    ex = sub.add_parser("export", help="Export Codex accounts to a JSON envelope")
+    ex.add_argument("path", metavar="PATH", help="File path, or '-' for stdout")
+    ex.add_argument(
+        "--account",
+        metavar="NUM|EMAIL|ALIAS",
+        help="Limit export to one account",
+    )
+
+    im = sub.add_parser("import", help="Import Codex accounts from a JSON envelope")
+    im.add_argument("path", metavar="PATH", help="File path, or '-' for stdin")
+    im.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing matching slots",
+    )
 
     args = parser.parse_args(argv)
     from openswap.codex.engine import CodexEngine
@@ -435,6 +451,14 @@ def _codex_command(argv: list[str]) -> int:
                     parser.error("NAME is required (or pass --unset)")
                 num, normalized = eng.set_alias(args.target, args.name)
                 print(f"Set alias '{normalized}' for Codex account {num}")
+            return 0
+        if args.verb == "export":
+            from openswap.codex.transfer import export_accounts
+            export_accounts(eng, args.path, account=args.account)
+            return 0
+        if args.verb == "import":
+            from openswap.codex.transfer import import_accounts
+            import_accounts(eng, args.path, force=args.force)
             return 0
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
@@ -1123,7 +1147,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
-  %(prog)s codex add|list|switch|remove  Codex CLI accounts (second provider)
+  %(prog)s codex add|list|switch|remove|export|import  Codex CLI accounts
   %(prog)s config [set KEY VALUE]     show or change shared policy (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
