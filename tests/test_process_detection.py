@@ -12,12 +12,17 @@ import pytest
 
 from openswap.process_detection import (
     ClaudeSession,
+    CodexProcess,
     IdeInstance,
+    classify_codex_argv,
     get_claude_dir,
+    get_running_codex_instances,
     get_running_instances,
+    is_codex_comm,
     is_pid_alive,
     list_ide_instances,
     list_sessions,
+    parse_process_table,
 )
 from openswap.printer import abbreviate_path, entrypoint_label, format_age
 
@@ -377,3 +382,110 @@ class TestFormatAge:
     def test_days(self):
         ms = int((time.time() - 172800) * 1000)  # 2 days ago
         assert format_age(ms) == "2d ago"
+
+
+# --- Codex SCAN (process table; never real ps) ---
+
+
+class TestIsCodexComm:
+    def test_basename_codex_and_exe_only(self):
+        assert is_codex_comm("codex") is True
+        assert is_codex_comm("codex.exe") is True
+        assert is_codex_comm("/usr/local/bin/codex") is True
+        assert is_codex_comm("C:\\Tools\\codex.exe") is True
+        assert is_codex_comm("CODEX.EXE") is True
+        assert is_codex_comm("codex-cli") is False
+        assert is_codex_comm("node") is False
+        assert is_codex_comm("claude") is False
+        assert is_codex_comm("") is False
+
+
+class TestClassifyCodexArgv:
+    def test_tui_bare_resume_fork(self):
+        assert classify_codex_argv(["codex"]) == "tui"
+        assert classify_codex_argv(["/opt/homebrew/bin/codex"]) == "tui"
+        assert classify_codex_argv(["codex", "resume"]) == "tui"
+        assert classify_codex_argv(["codex", "resume", "sess-1"]) == "tui"
+        assert classify_codex_argv(["codex", "fork"]) == "tui"
+        assert classify_codex_argv(["codex", "--sandbox", "resume"]) == "tui"
+
+    def test_exec(self):
+        assert classify_codex_argv(["codex", "exec", "hi"]) == "exec"
+        assert classify_codex_argv(["codex", "e", "hi"]) == "exec"
+        assert classify_codex_argv(["/usr/bin/codex", "exec"]) == "exec"
+
+    def test_app_server(self):
+        assert classify_codex_argv(["codex", "app-server"]) == "app-server"
+        assert classify_codex_argv(["codex", "app-server", "--listen"]) == "app-server"
+
+    def test_app(self):
+        assert classify_codex_argv(["codex", "app"]) == "app"
+
+    def test_other(self):
+        assert classify_codex_argv(["codex", "login"]) == "other"
+        assert classify_codex_argv(["codex", "mcp"]) == "other"
+        assert classify_codex_argv(["codex", "exec-not"]) == "other"
+
+
+class TestParseProcessTable:
+    def test_filters_non_codex(self):
+        rows = [
+            (10, "node", ["node", "server"]),
+            (11, "codex", ["codex", "exec", "hi"]),
+            (12, "claude", ["claude"]),
+            (13, "codex-cli", ["codex-cli"]),
+        ]
+        got = parse_process_table(rows)
+        assert [p.pid for p in got] == [11]
+        assert got[0].kind == "exec"
+        assert got[0].argv == ["codex", "exec", "hi"]
+        assert isinstance(got[0], CodexProcess)
+
+    def test_pid_zero_and_one_dropped(self):
+        rows = [
+            (0, "codex", ["codex"]),
+            (1, "codex", ["codex"]),
+            (2, "codex", ["codex"]),
+        ]
+        got = parse_process_table(rows)
+        assert [p.pid for p in got] == [2]
+
+
+class TestGetRunningCodexInstances:
+    def test_tui_only(self):
+        rows = [
+            (100, "codex", ["codex"]),
+            (101, "codex", ["codex", "resume", "abc"]),
+            (102, "codex", ["codex", "fork"]),
+            (103, "codex", ["codex", "exec", "hi"]),
+            (104, "codex", ["codex", "e", "hi"]),
+            (105, "codex", ["codex", "app-server"]),
+            (106, "codex", ["codex", "app"]),
+            (107, "codex", ["codex", "login"]),
+            (108, "node", ["node", "foo"]),
+        ]
+        got = get_running_codex_instances(ps=lambda: rows)
+        assert [p.pid for p in got] == [100, 101, 102]
+        assert all(p.kind == "tui" for p in got)
+
+    def test_empty(self):
+        assert get_running_codex_instances(ps=lambda: []) == []
+
+    def test_injected_ps_never_calls_real_ps(self):
+        with patch("openswap.process_detection.subprocess.run") as run:
+            got = get_running_codex_instances(
+                ps=lambda: [(9, "codex", ["codex", "resume"])]
+            )
+        run.assert_not_called()
+        assert len(got) == 1
+        assert got[0].pid == 9
+        assert got[0].kind == "tui"
+
+    def test_pid_zero_and_one_dropped(self):
+        rows = [
+            (0, "codex", ["codex"]),
+            (1, "codex", ["codex"]),
+            (42, "codex", ["codex"]),
+        ]
+        got = get_running_codex_instances(ps=lambda: rows)
+        assert [p.pid for p in got] == [42]

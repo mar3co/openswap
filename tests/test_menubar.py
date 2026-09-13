@@ -2002,6 +2002,59 @@ def test_codex_restart_hint():
     assert menubar.codex_restart_hint() == "Restart Codex to apply."
 
 
+def test_format_codex_running_line_empty_is_none():
+    assert menubar.format_codex_running_line([]) is None
+    assert menubar.format_codex_running_line(None) is None
+
+
+def test_format_codex_running_line_one_without_cwd():
+    proc = SimpleNamespace(pid=424242, cwd="", kind="tui")
+    line = menubar.format_codex_running_line([proc])
+    assert line == "Codex is running."
+    assert "424242" not in line
+    assert "pid" not in line.lower()
+
+
+def test_format_codex_running_line_one_with_cwd():
+    proc = SimpleNamespace(pid=424242, cwd="/Users/x/proj", kind="tui")
+    line = menubar.format_codex_running_line([proc])
+    assert line == "Codex is running in x/proj."
+    assert "424242" not in line
+    assert "pid" not in line.lower()
+
+
+def test_format_codex_running_line_multiple_sessions():
+    procs = [
+        SimpleNamespace(pid=11111, cwd="/a/one", kind="tui"),
+        SimpleNamespace(pid=22222, cwd="/b/two", kind="tui"),
+    ]
+    line = menubar.format_codex_running_line(procs)
+    assert line == "Codex is running (2 sessions)."
+    assert "11111" not in line
+    assert "22222" not in line
+
+
+def test_switch_codex_restart_hint():
+    assert menubar.switch_codex_restart_hint(True) == "Restart Codex to apply."
+    assert menubar.switch_codex_restart_hint(False) == ""
+    assert menubar.codex_restart_hint() == menubar.switch_codex_restart_hint(True)
+
+
+def test_manual_switch_omits_restart_codex_when_not_running():
+    off = menubar.notification_copy_for_manual_switch(
+        "work", running=False, provider="codex"
+    )
+    assert "Restart Codex" not in off.body
+    assert "Claude Code" not in off.body
+    on = menubar.notification_copy_for_manual_switch(
+        "work", running=True, provider="codex"
+    )
+    assert on.body == "Restart Codex to apply."
+    assert "Claude Code" not in on.body
+    default = menubar.notification_copy_for_manual_switch("work", provider="codex")
+    assert "Restart Codex to apply." in default.body
+
+
 def test_hold_cache_ignores_codex_events():
     held = NoSwitchEvent(reason="cooldown")
     codex_sw = SwitchEvent(
@@ -2023,6 +2076,25 @@ def test_codex_switch_event_toast_says_restart_codex():
     assert copy.title == "Switched to b"
     assert "Restart Codex to apply." in copy.body
     assert "Claude Code" not in copy.body
+
+
+def test_codex_switch_event_respects_running():
+    ev = SwitchEvent(
+        trigger="proactive",
+        from_ref={"number": 1, "email": "a@x.com"},
+        to_ref={"number": 2, "email": "b@x.com"},
+        provider="codex",
+    )
+    off = menubar.notification_copy_for_event(ev, running=False)
+    assert off is not None
+    assert "Restart Codex" not in off.body
+    assert "Claude Code" not in off.body
+    on = menubar.notification_copy_for_event(ev, running=True)
+    assert "Restart Codex to apply." in on.body
+    assert "Claude Code" not in on.body
+    default = menubar.notification_copy_for_event(ev)
+    assert "Restart Codex to apply." in default.body
+    assert "Claude Code" not in default.body
 
 
 def test_codex_quarantine_toast_says_sign_in_with_codex():
@@ -2102,3 +2174,38 @@ def test_codex_snapshot_retries_codex_autoswitch_start():
     start = src.index("def _worker")
     end = src.index("def _log_usage")
     assert "_ensure_codex_engine" in src[start:end]
+
+
+def test_worker_scans_codex_running_and_keeps_hint_on_error():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[src.index("def _worker") : src.index("def _log_usage")]
+    assert "get_running_codex_instances" in body
+    assert 'snap["codex_running"] = True' in body
+    assert "codex_running_line" in body
+    assert "format_codex_running_line" in body
+
+
+def test_notify_switched_gates_codex_restart_on_running():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[src.index("def _notify_switched") : src.index("def _switch_from_widget")]
+    assert "codex_running" in body
+    assert "provider=\"codex\"" in body or "provider=provider" in body
+
+
+def test_drain_engine_events_uses_codex_running():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[
+        src.index("def _drain_engine_events") : src.index("def _threshold")
+    ]
+    assert "codex_running" in body
+
+
+def test_panel_draws_codex_running_line():
+    text = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
+        encoding="utf-8"
+    )
+    assert "codex_running_line" in text
+    assert "RUNNING_LINE_H" in text

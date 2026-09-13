@@ -171,6 +171,16 @@ def run(switcher, codex=None) -> int:
                 else:
                     snap["running_line"] = format_running_line(sessions, ides)
                     snap["claude_running"] = bool(sessions or ides)
+                try:
+                    from openswap.process_detection import get_running_codex_instances
+
+                    codex_procs = get_running_codex_instances()
+                except Exception:
+                    snap["codex_running_line"] = None
+                    snap["codex_running"] = True
+                else:
+                    snap["codex_running_line"] = format_codex_running_line(codex_procs)
+                    snap["codex_running"] = bool(codex_procs)
                 self.snapshot = snap
                 self._snapshot_at = now
                 self._dirty = True  # picked up by on_sync_tick on the main thread
@@ -435,8 +445,14 @@ def run(switcher, codex=None) -> int:
             with self._event_lock:
                 events, self._engine_events = self._engine_events, []
             aliases = self._alias_map()
-            running = bool(self.snapshot.get("claude_running", True))
+            claude_running = bool(self.snapshot.get("claude_running", True))
+            codex_running = bool(self.snapshot.get("codex_running", True))
             for ev in events:
+                running = (
+                    codex_running
+                    if getattr(ev, "provider", "claude") == "codex"
+                    else claude_running
+                )
                 copy = notification_copy_for_event(ev, aliases, running=running)
                 if copy is not None:
                     self._notify(copy)
@@ -756,11 +772,14 @@ def run(switcher, codex=None) -> int:
 
         def _notify_switched(self, dest_name: str, *, provider: str = "claude"):
             if provider == "codex":
-                copy = notification_copy_for_manual_switch(dest_name, running=False)
-                self._notify(NotificationCopy(title=copy.title, body=codex_restart_hint()))
-                return
-            running = bool(self.snapshot.get("claude_running", True))
-            self._notify(notification_copy_for_manual_switch(dest_name, running=running))
+                running = bool(self.snapshot.get("codex_running", True))
+            else:
+                running = bool(self.snapshot.get("claude_running", True))
+            self._notify(
+                notification_copy_for_manual_switch(
+                    dest_name, running=running, provider=provider
+                )
+            )
 
         def _switch_from_widget(self, num):
             self._on_account_click(num, close_panel=False)

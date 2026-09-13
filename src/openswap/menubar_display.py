@@ -483,10 +483,37 @@ def format_running_line(sessions, ides) -> str | None:
     return None
 
 
+def format_codex_running_line(procs) -> str | None:
+    """None when empty.
+
+    One without cwd: ``Codex is running.``
+    One with cwd: ``Codex is running in {last two path parts}.``
+    Multiple: ``Codex is running ({n} sessions).``
+    Never include pid numbers in the string.
+    """
+    n = len(procs or ())
+    if n == 1:
+        cwd = str(getattr(procs[0], "cwd", "") or "")
+        place = _abbrev_cwd(cwd) if cwd else ""
+        if place:
+            return f"Codex is running in {place}."
+        return "Codex is running."
+    if n > 1:
+        return f"Codex is running ({n} sessions)."
+    return None
+
+
 def switch_restart_hint(running: bool) -> str:
     """Restart sentence when Claude Code is live; otherwise empty."""
     if running:
         return "Restart Claude Code to apply now, or wait about 30 seconds."
+    return ""
+
+
+def switch_codex_restart_hint(running: bool) -> str:
+    """Restart sentence when a Codex TUI is live; otherwise empty."""
+    if running:
+        return "Restart Codex to apply."
     return ""
 
 
@@ -499,7 +526,7 @@ def notification_copy_for_event(
     alias-or-short-name, never ``Account-N (email)``. Trigger jargon is not the
     headline. Exhausted reset times are local-clock, not ISO-Z. Recovery is not
     a CLI command. Switch toasts include the restart sentence only when
-    ``running`` is true (a live Claude Code session or IDE lock).
+    ``running`` is true (a live Claude Code session/IDE lock, or a Codex TUI).
     """
     kind = getattr(event, "kind", None)
     provider = getattr(event, "provider", "claude")
@@ -517,7 +544,7 @@ def notification_copy_for_event(
         if src:
             parts.append(f"Was {src}.")
         if provider == "codex":
-            hint = codex_restart_hint()
+            hint = switch_codex_restart_hint(running)
         else:
             hint = switch_restart_hint(running)
         if hint:
@@ -553,12 +580,16 @@ def notification_copy_for_event(
 
 
 def notification_copy_for_manual_switch(
-    dest_name: str, *, running: bool = True
+    dest_name: str, *, running: bool = True, provider: str = "claude"
 ) -> NotificationCopy:
     """Copy after a user-initiated switch; the title names the destination."""
+    if provider == "codex":
+        body = switch_codex_restart_hint(running)
+    else:
+        body = switch_restart_hint(running)
     return NotificationCopy(
         title=f"Switched to {dest_name}",
-        body=switch_restart_hint(running),
+        body=body,
     )
 
 
@@ -1536,6 +1567,6 @@ def codex_live_slot_changed(snapshot: dict, live_num: str | int | None) -> bool:
 
 
 def codex_restart_hint() -> str:
-    return "Restart Codex to apply."
+    return switch_codex_restart_hint(True)
 
 

@@ -876,6 +876,7 @@ class MenuBarPanel:
         if not self._auto_enabled():
             hold_line = ""
         running_line = snap.get("running_line") or ""
+        codex_running_line = snap.get("codex_running_line") or ""
         pal = _colors()
 
         body_h = 0.0
@@ -889,7 +890,8 @@ class MenuBarPanel:
                 body_h += SECTION_H
 
         hold_h = HOLD_LINE_H if hold_line else 0.0
-        running_h = RUNNING_LINE_H if running_line else 0.0
+        n_running = (1 if running_line else 0) + (1 if codex_running_line else 0)
+        running_h = RUNNING_LINE_H * n_running
         height = PAD + HEADER_H + hold_h + 4 + body_h + PAD + running_h + FOOTER_H
         root = _RootView.alloc().initWithHover_(self._on_hover)
         root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, height))
@@ -1074,10 +1076,20 @@ class MenuBarPanel:
 
         # Footer
         fy = height - FOOTER_H
+        extra = RUNNING_LINE_H if (running_line and codex_running_line) else 0.0
         if running_line:
             root.addSubview_(
                 _label(
                     running_line,
+                    font_small,
+                    pal["muted"],
+                    NSMakeRect(PAD, fy - RUNNING_LINE_H - extra, inner_w, RUNNING_LINE_H),
+                )
+            )
+        if codex_running_line:
+            root.addSubview_(
+                _label(
+                    codex_running_line,
                     font_small,
                     pal["muted"],
                     NSMakeRect(PAD, fy - RUNNING_LINE_H, inner_w, RUNNING_LINE_H),
