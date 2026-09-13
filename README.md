@@ -65,6 +65,8 @@ The `cswap` command still works as an alias during the rename.
 | `openswap codex remove` | Remove a stored Codex account |
 | `openswap codex export` | Export Codex auth.json envelopes |
 | `openswap codex import` | Import Codex auth.json envelopes |
+| `openswap codex swap` | Exchange two Codex slot numbers |
+| `openswap codex move` | Assign a Codex account to a slot |
 | `openswap config` | Shared settings (`autoswitch.*`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |

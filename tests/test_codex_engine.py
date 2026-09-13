@@ -4,6 +4,7 @@ import sys
 
 import pytest
 from openswap.codex.engine import CodexEngine, CodexAuthError, CodexSwitchError
+from openswap.exceptions import ValidationError
 from openswap.engine.protocol import AccountEngine
 from openswap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from tests.test_codex_auth import _auth
@@ -323,3 +324,89 @@ def test_switch_does_not_capture_outgoing_over_newer_slot(tmp_path):
     )
     eng.switch_to("1", json_output=True)
     assert "rt-b2" in (eng.slots_dir / "2" / "auth.json").read_text()
+
+
+def test_swap_exchanges_slot_dirs_and_roster_emails(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a")
+    eng.add_account()
+    _login(home, email="b@x.com", account_id="acc-b")
+    eng.add_account()
+    a_text = (eng.slots_dir / "1" / "auth.json").read_text()
+    b_text = (eng.slots_dir / "2" / "auth.json").read_text()
+    num_a, num_b = eng.swap_accounts("1", "2")
+    assert (num_a, num_b) == ("1", "2")
+    data = eng._read_roster()
+    assert data["accounts"]["1"]["email"] == "b@x.com"
+    assert data["accounts"]["2"]["email"] == "a@x.com"
+    assert (eng.slots_dir / "1" / "auth.json").read_text() == b_text
+    assert (eng.slots_dir / "2" / "auth.json").read_text() == a_text
+    assert data["sequence"] == [1, 2]
+
+
+def test_swap_updates_active_account_number(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a")
+    eng.add_account()
+    _login(home, email="b@x.com", account_id="acc-b")
+    eng.add_account()
+    assert str(eng._read_roster()["activeAccountNumber"]) == "2"
+    eng.swap_accounts("1", "2")
+    assert str(eng._read_roster()["activeAccountNumber"]) == "1"
+
+
+def test_swap_missing_auth_json_is_empty_slot_not_abort(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a")
+    eng.add_account()
+    _login(home, email="b@x.com", account_id="acc-b")
+    eng.add_account()
+    (eng.slots_dir / "1" / "auth.json").unlink()
+    eng.swap_accounts("1", "2")
+    data = eng._read_roster()
+    assert data["accounts"]["1"]["email"] == "b@x.com"
+    assert data["accounts"]["2"]["email"] == "a@x.com"
+    assert (eng.slots_dir / "1" / "auth.json").exists()
+    assert not (eng.slots_dir / "2" / "auth.json").exists()
+
+
+def test_move_to_empty_frees_old_slot(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a")
+    eng.add_account()
+    _login(home, email="b@x.com", account_id="acc-b")
+    eng.add_account()
+    src, dest, swapped = eng.move_account("2", "5")
+    assert (src, dest, swapped) == ("2", "5", False)
+    data = eng._read_roster()
+    assert "2" not in data["accounts"]
+    assert data["accounts"]["5"]["email"] == "b@x.com"
+    assert data["accounts"]["1"]["email"] == "a@x.com"
+    assert data["sequence"] == [1, 5]
+    assert not (eng.slots_dir / "2").exists()
+    assert (eng.slots_dir / "5" / "auth.json").exists()
+    assert str(data["activeAccountNumber"]) == "5"
+
+
+def test_move_to_occupied_is_swap(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a")
+    eng.add_account()
+    _login(home, email="b@x.com", account_id="acc-b")
+    eng.add_account()
+    src, dest, swapped = eng.move_account("1", "2")
+    assert (src, dest, swapped) == ("1", "2", True)
+    data = eng._read_roster()
+    assert data["accounts"]["1"]["email"] == "b@x.com"
+    assert data["accounts"]["2"]["email"] == "a@x.com"
+
+
+def test_move_cap_rejects_huge_slot(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a")
+    eng.add_account()
+    with pytest.raises(ValidationError, match="out of range"):
+        eng.move_account("1", "100")
+    data = eng._read_roster()
+    assert "1" in data["accounts"]
+    assert "100" not in data["accounts"]

@@ -103,3 +103,17 @@ def test_codex_export_import_roundtrip(temp_home, capsys, monkeypatch):
     assert run_cli(["codex", "import", str(out), "--force"]) == 0
     slot = paths.get_backup_root() / "codex" / "slots" / "1" / "auth.json"
     assert "rt-a" in slot.read_text()
+
+
+def test_codex_swap_and_move_roundtrip(temp_home, capsys, monkeypatch):
+    _two_codex_accounts(temp_home, monkeypatch)
+    capsys.readouterr()
+    assert run_cli(["codex", "swap", "1", "2"]) == 0
+    seq = json.loads((paths.get_backup_root() / "codex" / "sequence.json").read_text())
+    assert seq["accounts"]["1"]["email"] == "b@x.com"
+    assert seq["accounts"]["2"]["email"] == "a@x.com"
+    assert run_cli(["codex", "move", "1", "5"]) == 0
+    seq = json.loads((paths.get_backup_root() / "codex" / "sequence.json").read_text())
+    assert seq["accounts"]["5"]["email"] == "b@x.com"
+    assert "1" not in seq["accounts"]
+    assert seq["sequence"] == [2, 5]

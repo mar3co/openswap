@@ -437,6 +437,159 @@ class CodexEngine:
                 shutil.rmtree(slot_dir)
         print(f"{accent('Removed')} Account-{num} ({email})")
 
+    def _map_sequence(self, data: dict, mapping: dict[str, str]) -> None:
+        seq: list = []
+        seen: set[str] = set()
+        for n in data.get("sequence") or []:
+            text = mapping.get(str(n), str(n))
+            if text in seen:
+                continue
+            seen.add(text)
+            seq.append(int(text) if text.isdigit() else text)
+        seq.sort(key=lambda n: n if isinstance(n, int) else 0)
+        data["sequence"] = seq
+
+    def _map_active(self, data: dict, mapping: dict[str, str]) -> None:
+        active = data.get("activeAccountNumber")
+        if active is None:
+            return
+        key = str(active)
+        if key in mapping:
+            data["activeAccountNumber"] = mapping[key]
+
+    def _swap_slot_dirs(self, num_a: str, num_b: str) -> None:
+        dir_a = self._slot_dir(num_a)
+        dir_b = self._slot_dir(num_b)
+        self.slots_dir.mkdir(parents=True, exist_ok=True)
+        a_exists = dir_a.exists()
+        b_exists = dir_b.exists()
+        if a_exists and b_exists:
+            staging = self.slots_dir / f".swapping-{num_a}"
+            if staging.exists():
+                raise ConfigError(
+                    f"Found leftover slot swap staging: {staging}. "
+                    "Verify both accounts, then delete the directory and retry."
+                )
+            os.replace(dir_a, staging)
+            os.replace(dir_b, dir_a)
+            os.replace(staging, dir_b)
+        elif a_exists:
+            os.replace(dir_a, dir_b)
+        elif b_exists:
+            os.replace(dir_b, dir_a)
+
+    def _move_slot_dir(self, src: str, dest: str) -> None:
+        src_dir = self._slot_dir(src)
+        dest_dir = self._slot_dir(dest)
+        self.slots_dir.mkdir(parents=True, exist_ok=True)
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir)
+        if src_dir.exists():
+            os.replace(src_dir, dest_dir)
+
+    def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
+        """Exchange two Codex accounts' slot numbers under the roster lock."""
+        with self._lock():
+            return self._swap_accounts_locked(first, second)
+
+    def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
+        num_a, email_a, _acc_a = self.resolve_account(first)
+        num_b, email_b, _acc_b = self.resolve_account(second)
+        if num_a == num_b:
+            raise ValidationError("Cannot swap an account with itself")
+        data = dict(self._read_roster())
+        accounts = dict(data.get("accounts") or {})
+        record_a = accounts.get(str(num_a))
+        record_b = accounts.get(str(num_b))
+        if not record_a:
+            raise AccountNotFoundError(f"Account-{num_a} does not exist")
+        if not record_b:
+            raise AccountNotFoundError(f"Account-{num_b} does not exist")
+        dirs_swapped = False
+        try:
+            self._swap_slot_dirs(num_a, num_b)
+            dirs_swapped = True
+            accounts[str(num_a)], accounts[str(num_b)] = record_b, record_a
+            data["accounts"] = accounts
+            mapping = {str(num_a): str(num_b), str(num_b): str(num_a)}
+            self._map_sequence(data, mapping)
+            self._map_active(data, mapping)
+            self._write_roster(data)
+        except BaseException:
+            if dirs_swapped:
+                try:
+                    self._swap_slot_dirs(num_a, num_b)
+                except Exception:
+                    pass
+            raise
+        self._logger.info(
+            "Swapped Codex slots: %s (%s) <-> %s (%s)", num_a, email_a, num_b, email_b
+        )
+        return num_a, num_b
+
+    def move_account(self, account: str, slot: str) -> tuple[str, str, bool]:
+        """Assign ``account`` to slot ``slot``; occupied target swaps."""
+        target = str(slot).strip()
+        if not target.isdigit() or int(target) < 1:
+            raise ValidationError(
+                f"Target slot must be a positive slot number, got: {target!r} "
+                "(use `swap` to trade two accounts by identifier)"
+            )
+        target = str(int(target))
+        with self._lock():
+            num_src, _email, _acc = self.resolve_account(account)
+            data = self._read_roster()
+            accounts = data.get("accounts") or {}
+            if not accounts.get(num_src):
+                raise AccountNotFoundError(f"Account-{num_src} does not exist")
+            max_slot = max(
+                (int(n) for n in accounts if str(n).isdigit()), default=0
+            )
+            cap = max(99, max_slot)
+            if int(target) > cap:
+                raise ValidationError(
+                    f"Target slot {target} is out of range (1-{cap}): new accounts "
+                    "are numbered from the highest slot, so a large target would "
+                    "inflate future account numbers"
+                )
+            if num_src == target:
+                return num_src, target, False
+            if accounts.get(target):
+                self._swap_accounts_locked(num_src, target)
+                return num_src, target, True
+            self._relocate_locked(num_src, target)
+            return num_src, target, False
+
+    def _relocate_locked(self, num_src: str, target: str) -> None:
+        data = dict(self._read_roster())
+        accounts = dict(data.get("accounts") or {})
+        record = accounts.get(str(num_src))
+        if not record:
+            raise AccountNotFoundError(f"Account-{num_src} does not exist")
+        if accounts.get(str(target)):
+            raise ValidationError(
+                f"Slot {target} is already occupied — retry the move"
+            )
+        email = record.get("email", "")
+        dirs_moved = False
+        try:
+            self._move_slot_dir(num_src, target)
+            dirs_moved = True
+            accounts[str(target)] = record
+            del accounts[str(num_src)]
+            data["accounts"] = accounts
+            self._map_sequence(data, {str(num_src): str(target)})
+            self._map_active(data, {str(num_src): str(target)})
+            self._write_roster(data)
+        except BaseException:
+            if dirs_moved:
+                try:
+                    self._move_slot_dir(target, num_src)
+                except Exception:
+                    pass
+            raise
+        self._logger.info("Moved Codex slot: %s (%s) -> %s", num_src, email, target)
+
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False
     ) -> dict | None:
