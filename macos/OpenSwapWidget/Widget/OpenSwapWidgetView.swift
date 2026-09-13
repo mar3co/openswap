@@ -364,6 +364,11 @@ private struct AccountBlock: View {
                     .foregroundStyle(Palette.fg)
                     .lineLimit(1)
                 Spacer(minLength: 4)
+                if account.provider == "codex" || account.num.hasPrefix("codex:") {
+                    Text("Codex")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Palette.muted)
+                }
                 if account.active {
                     Text("active")
                         .font(.system(size: 10, weight: .medium))
