@@ -647,7 +647,7 @@ Codex rotation runs alongside; its outcome is logged, not returned.
 
         codex = CodexEngine(debug=args.debug)
         codex_engine = None
-        if codex.switchable_account_numbers():
+        if settings.codex_enabled and codex.switchable_account_numbers():
             codex_engine = AutoSwitchEngine(
                 codex, settings, _prefixed(emit, "codex"), dry_run=args.dry_run,
                 state_path=codex.state_dir / "autoswitch_state.json",

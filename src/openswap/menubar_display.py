@@ -207,7 +207,12 @@ class MenuBarSettings:
 
 
 def settings_page_rows(
-    settings: MenuBarSettings, *, strategy: str, threshold: float
+    settings: MenuBarSettings,
+    *,
+    strategy: str,
+    threshold: float,
+    has_codex: bool = False,
+    codex_enabled: bool = True,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
 
@@ -215,6 +220,7 @@ def settings_page_rows(
     Choice and popup rows include ``options`` ``(value, label)`` and the current
     ``value``. Toggles include a bool ``value``. Child rows are omitted while
     their parent is off (title_scoped, auto-switch policy, kickoff time).
+    ``codex_enabled`` is shown only when master auto is on and ``has_codex``.
     """
     rows = [
         {
@@ -288,6 +294,15 @@ def settings_page_rows(
                 },
             ]
         )
+        if has_codex:
+            rows.append(
+                {
+                    "kind": "toggle",
+                    "id": "codex_enabled",
+                    "label": "Auto-switch Codex accounts",
+                    "value": bool(codex_enabled),
+                }
+            )
     rows.append(
         {
             "kind": "toggle",

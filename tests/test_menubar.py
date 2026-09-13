@@ -292,6 +292,90 @@ def test_settings_page_hides_autoswitch_policy_when_disabled():
     assert ids_on.index("strategy") < ids_on.index("strategy_hint")
     assert ids_on.index("strategy_hint") < ids_on.index("kickoff_enabled")
     assert "strategy_hint" not in ids_off
+    assert "codex_enabled" not in ids_off
+    assert "codex_enabled" not in ids_on
+
+
+def test_settings_page_shows_codex_enabled_when_auto_on_and_has_codex():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=True),
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        codex_enabled=True,
+    )
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["codex_enabled"]["kind"] == "toggle"
+    assert by_id["codex_enabled"]["label"] == "Auto-switch Codex accounts"
+    assert by_id["codex_enabled"]["value"] is True
+    ids = [row["id"] for row in rows]
+    assert ids.index("auto_switch_enabled") < ids.index("codex_enabled")
+    assert ids.index("strategy_hint") < ids.index("codex_enabled")
+    assert ids.index("codex_enabled") < ids.index("kickoff_enabled")
+
+    off_value = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=True),
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        codex_enabled=False,
+    )
+    assert {row["id"]: row for row in off_value}["codex_enabled"]["value"] is False
+
+
+def test_settings_page_hides_codex_enabled_when_auto_off():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=False),
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        codex_enabled=True,
+    )
+    ids = [row["id"] for row in rows]
+    assert "auto_switch_enabled" in ids
+    assert "codex_enabled" not in ids
+
+
+def test_settings_page_hides_codex_enabled_without_codex():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=True),
+        strategy="best",
+        threshold=90,
+    )
+    assert "codex_enabled" not in [row["id"] for row in rows]
+
+
+def test_on_setting_handles_codex_enabled():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    body = text[text.index("def _on_setting") : text.index("def _popup_overflow")]
+    assert 'row_id == "codex_enabled"' in body
+    assert "autoswitch.codexEnabled" in body
+    assert "set_setting" in body
+    assert "_codex_engine" in body
+    assert "_ensure_codex_engine" in body
+    assert "_stop_engine" not in body
+
+
+def test_ensure_codex_engine_honors_codex_enabled():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[src.index("def _ensure_codex_engine") : src.index("def _start_engine")]
+    assert "codex_enabled" in body
+    assert "load_settings" in body
+
+
+def test_panel_settings_pass_has_codex_and_codex_enabled():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    attach = text[text.index("def _attach_panel_once") : text.index("def _on_setting")]
+    assert "has_codex" in attach
+    assert "codex_enabled" in attach
+    panel = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
+        encoding="utf-8"
+    )
+    build = panel[panel.index("def _build_settings") :]
+    assert "has_codex" in build
+    assert "codex_enabled" in build
+    assert "settings_page_rows" in build
 
 
 def test_settings_page_hides_kickoff_time_when_disabled():

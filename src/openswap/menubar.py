@@ -287,11 +287,14 @@ def run(switcher, codex=None) -> int:
                 return
             if self.codex is None or not self.codex.switchable_account_numbers():
                 return
+            settings = load_settings(self.switcher.backup_dir)
+            if not settings.codex_enabled:
+                return
             try:
                 from openswap.autoswitch import STATE_FILENAME
                 ceng = AutoSwitchEngine(
                     self.codex,
-                    load_settings(self.switcher.backup_dir),
+                    settings,
                     self._on_engine_event,
                     dry_run=False,
                     state_path=self.codex.state_dir / STATE_FILENAME,
@@ -351,6 +354,13 @@ def run(switcher, codex=None) -> int:
                 and getattr(panel, "_page", None) == MAIN_PAGE
             ):
                 panel.reload()
+
+        def _stop_codex_engine(self):
+            with self._event_lock:
+                codex_engine = self._codex_engine
+                self._codex_engine = None
+            if codex_engine is not None:
+                codex_engine.stop()
 
         def _stop_engine(self):
             with self._event_lock:
@@ -473,6 +483,20 @@ def run(switcher, codex=None) -> int:
             except Exception:
                 return "best"
 
+        def _codex_enabled(self) -> bool:
+            try:
+                return bool(load_settings(self.switcher.backup_dir).codex_enabled)
+            except Exception:
+                return True
+
+        def _has_codex(self) -> bool:
+            if self.codex is None:
+                return False
+            try:
+                return bool(self.codex.switchable_account_numbers())
+            except Exception:
+                return False
+
         # ---- menu construction -----------------------------------------------
         def _attach_panel_once(self, timer):
             timer.stop()
@@ -506,6 +530,8 @@ def run(switcher, codex=None) -> int:
                 on_setting=self._on_setting,
                 settings=lambda: self.settings,
                 strategy=self._strategy,
+                has_codex=self._has_codex,
+                codex_enabled=self._codex_enabled,
             )
             self._panel.attach(nsitem)
 
@@ -526,6 +552,24 @@ def run(switcher, codex=None) -> int:
                 self._make_threshold(int(value))(None)
             elif row_id == "strategy":
                 self._make_strategy(value)(None)
+            elif row_id == "codex_enabled":
+                try:
+                    current = load_settings(self.switcher.backup_dir).codex_enabled
+                    set_setting(
+                        self.switcher.backup_dir,
+                        "autoswitch.codexEnabled",
+                        "false" if current else "true",
+                    )
+                except Exception as e:
+                    rumps.alert(
+                        title="openswap",
+                        message=f"Couldn't set Codex auto-switch: {e}",
+                    )
+                    return
+                if current:
+                    self._stop_codex_engine()
+                else:
+                    self._ensure_codex_engine()
             elif row_id == "kickoff_enabled":
                 self.on_toggle_kickoff(None)
             elif row_id == "kickoff_time":

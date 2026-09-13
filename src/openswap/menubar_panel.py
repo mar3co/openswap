@@ -540,6 +540,8 @@ class MenuBarPanel:
         on_setting=None,
         settings=None,
         strategy=None,
+        has_codex=None,
+        codex_enabled=None,
     ):
         self._on_switch = on_switch
         self._on_rotate = on_rotate
@@ -552,6 +554,8 @@ class MenuBarPanel:
         self._threshold = threshold
         self._settings = settings
         self._strategy = strategy
+        self._has_codex = has_codex
+        self._codex_enabled = codex_enabled
         self._page = MAIN_PAGE
         self._item = None
         self._popover = None
@@ -1134,7 +1138,23 @@ class MenuBarPanel:
             threshold = float(self._threshold())
         except Exception:
             threshold = 0.0
-        rows = settings_page_rows(settings, strategy=strategy, threshold=threshold)
+        try:
+            has_codex = bool(self._has_codex()) if callable(self._has_codex) else False
+        except Exception:
+            has_codex = False
+        try:
+            codex_enabled = (
+                bool(self._codex_enabled()) if callable(self._codex_enabled) else True
+            )
+        except Exception:
+            codex_enabled = True
+        rows = settings_page_rows(
+            settings,
+            strategy=strategy,
+            threshold=threshold,
+            has_codex=has_codex,
+            codex_enabled=codex_enabled,
+        )
 
         def _choice_lines(row):
             lines = []
