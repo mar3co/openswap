@@ -953,12 +953,16 @@ def _statusline_command(argv: list[str]) -> int:
 
     Pre-dispatched so paint never constructs the engine. Always exit 0 on
     paint: a crashed status line is worse than a missing name.
+
+    ``--codex`` is paint-only (live auth.json + codex/sequence.json). Codex
+    TUI has no command hook; this path never writes config.toml.
     """
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} statusline",
         description=(
             "Opt-in Claude Code status line. Wraps your existing status line "
-            "and appends the OpenSwap account name next to the percentages."
+            "and appends the OpenSwap account name next to the percentages. "
+            "With --codex, prints the live Codex account label (paint-only)."
         ),
     )
     group = parser.add_mutually_exclusive_group()
@@ -971,6 +975,11 @@ def _statusline_command(argv: list[str]) -> int:
         "--uninstall",
         action="store_true",
         help="Restore the previous statusLine, or remove one we created",
+    )
+    group.add_argument(
+        "--codex",
+        action="store_true",
+        help="Print the live Codex account label (paint-only; Codex TUI has no command hook)",
     )
     args = parser.parse_args(argv)
 
@@ -1017,6 +1026,20 @@ def _statusline_command(argv: list[str]) -> int:
             print("Claude Code status line restored.")
         else:
             print("OpenSwap was not wrapping the Claude Code status line.")
+        return 0
+
+    if args.codex:
+        try:
+            from openswap.codex.auth import auth_path, codex_home
+
+            sys.stdout.write(
+                sl.paint_codex(
+                    auth_file=auth_path(codex_home()),
+                    sequence_path=backup / "codex" / "sequence.json",
+                )
+            )
+        except Exception:
+            pass
         return 0
 
     try:

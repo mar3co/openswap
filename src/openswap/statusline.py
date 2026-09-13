@@ -2,6 +2,9 @@
 
 Paint is store-only (live ``~/.claude.json`` + roster). It does not construct
 the engine, hit the network, or write the default Claude login.
+
+``--codex`` is paint-only: live ``auth.json`` + ``codex/sequence.json``. Codex
+TUI has no command hook, so this module never writes ``config.toml``.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from openswap.codex.auth import parse_auth
 from openswap.exceptions import ConfigError
 from openswap.fsutil import replace_with_retry
 from openswap.settings import SETTINGS_SCHEMA_VERSION, atomic_write_json, settings_path
@@ -143,6 +147,40 @@ def current_account_label(config_path: Path, sequence_path: Path) -> str:
     return account_label(email, managed=False)
 
 
+def current_codex_account_label(auth_file: Path, sequence_path: Path) -> str:
+    """Live Codex ``auth.json`` identity matched against ``codex/sequence.json``.
+
+    Match is email + accountId. Label rule is ``account_label``: alias, else
+    planType, else personal when managed; unmanaged uses the email local-part.
+    """
+    try:
+        text = auth_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    ident = parse_auth(text)
+    if ident is None:
+        return ""
+    email = ident.email or ""
+    account_id = ident.account_id or ""
+    accounts = _read_json(sequence_path).get("accounts") or {}
+    if not isinstance(accounts, dict):
+        return account_label(email, managed=False)
+    for rec in accounts.values():
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("email") or "") != email:
+            continue
+        if (rec.get("accountId") or "") != account_id:
+            continue
+        return account_label(
+            email,
+            alias=rec.get("alias") or "",
+            org_name=rec.get("planType") or "",
+            managed=True,
+        )
+    return account_label(email, managed=False)
+
+
 def _cwd_from_stdin(stdin: str) -> str | None:
     try:
         data = json.loads(stdin) if stdin else {}
@@ -192,6 +230,17 @@ def paint(
     if out and not out.endswith("\n"):
         out += "\n"
     return out
+
+
+def paint_codex(*, auth_file: Path, sequence_path: Path) -> str:
+    """Print the live Codex account label. No inner command, no Engine."""
+    try:
+        label = current_codex_account_label(auth_file, sequence_path)
+    except Exception:
+        label = ""
+    if label and not label.endswith("\n"):
+        label += "\n"
+    return label
 
 
 def load_wrap(backup_root: Path) -> dict:
