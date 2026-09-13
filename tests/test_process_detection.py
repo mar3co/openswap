@@ -407,16 +407,29 @@ class TestClassifyCodexArgv:
         assert classify_codex_argv(["codex", "resume"]) == "tui"
         assert classify_codex_argv(["codex", "resume", "sess-1"]) == "tui"
         assert classify_codex_argv(["codex", "fork"]) == "tui"
+        # --sandbox takes a MODE; resume after the mode is still TUI.
+        assert classify_codex_argv(
+            ["codex", "--sandbox", "workspace-write", "resume"]
+        ) == "tui"
+
+    def test_tui_skips_value_taking_flags(self):
+        assert classify_codex_argv(["codex", "-m", "o3"]) == "tui"
+        assert classify_codex_argv(["codex", "--sandbox", "workspace-write"]) == "tui"
+        assert classify_codex_argv(["codex", "-C", "/tmp"]) == "tui"
+        assert classify_codex_argv(["codex", "--model=o3"]) == "tui"
+        # Value skipped, then no subcommand remains (resume was the MODE).
         assert classify_codex_argv(["codex", "--sandbox", "resume"]) == "tui"
 
     def test_exec(self):
         assert classify_codex_argv(["codex", "exec", "hi"]) == "exec"
         assert classify_codex_argv(["codex", "e", "hi"]) == "exec"
         assert classify_codex_argv(["/usr/bin/codex", "exec"]) == "exec"
+        assert classify_codex_argv(["codex", "-m", "o3", "exec", "hi"]) == "exec"
 
     def test_app_server(self):
         assert classify_codex_argv(["codex", "app-server"]) == "app-server"
         assert classify_codex_argv(["codex", "app-server", "--listen"]) == "app-server"
+        assert classify_codex_argv(["codex", "-m", "o3", "app-server"]) == "app-server"
 
     def test_app(self):
         assert classify_codex_argv(["codex", "app"]) == "app"

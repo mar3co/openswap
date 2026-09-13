@@ -216,6 +216,22 @@ class CodexProcess:
 
 _TUI_SUBCOMMANDS = {"resume", "fork"}
 _EXEC_SUBCOMMANDS = {"exec", "e"}
+# Codex global options that consume the following token (from `codex --help`).
+_CODEX_VALUE_OPTIONS = frozenset(
+    {
+        "-m",
+        "--model",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+        "-c",
+        "--config",
+        "--enable",
+        "-p",
+        "--profile",
+    }
+)
 
 
 def is_codex_comm(comm: str) -> bool:
@@ -236,10 +252,18 @@ def _codex_subcommand(argv: list[str]) -> str | None:
         if tok == "--":
             i += 1
             break
-        if tok.startswith("-"):
-            i += 1
+        if not tok.startswith("-"):
+            break
+        i += 1
+        name, eq, _ = tok.partition("=")
+        if eq:
             continue
-        break
+        if (
+            name in _CODEX_VALUE_OPTIONS
+            and i < len(tokens)
+            and not tokens[i].startswith("-")
+        ):
+            i += 1
     if i >= len(tokens):
         return None
     return tokens[i]
