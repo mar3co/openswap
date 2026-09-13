@@ -534,9 +534,13 @@ def notification_copy_for_event(
             ),
             getattr(event, "number", None),
         )
+        if provider == "codex":
+            body = "Sign in with this account in Codex, then click it in the extra."
+        else:
+            body = "Sign in with this account in Claude Code, then click it in the extra."
         return NotificationCopy(
             title=f"{name} was paused",
-            body="Sign in with this account in Claude Code, then click it in the extra.",
+            body=body,
         )
     if kind == "all-exhausted":
         reset = format_local_reset(getattr(event, "earliest_reset_at", None))

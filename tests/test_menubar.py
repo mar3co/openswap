@@ -2025,6 +2025,22 @@ def test_codex_switch_event_toast_says_restart_codex():
     assert "Claude Code" not in copy.body
 
 
+def test_codex_quarantine_toast_says_sign_in_with_codex():
+    ev = QuarantineEvent(
+        number="1",
+        email="a@x.com",
+        reason="invalid_grant",
+        provider="codex",
+    )
+    copy = menubar.notification_copy_for_event(ev)
+    assert copy is not None
+    assert (
+        "Sign in with this account in Codex, then click it in the extra."
+        in copy.body
+    )
+    assert "Claude Code" not in copy.body
+
+
 def test_codex_switch_toast_does_not_use_claude_slot_alias():
     ev = SwitchEvent(
         trigger="proactive",
