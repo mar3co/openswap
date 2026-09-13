@@ -1,12 +1,14 @@
 # Architecture
 
 ```
-                    ┌─────────────┐
-                    │ Claude Code │  default login in ~/.claude
-                    └──────▲──────┘
-                           │ engine writes credentials
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
+        ┌─────────────┐                 ┌───────────────┐
+        │ Claude Code │                 │   Codex CLI   │
+        │  ~/.claude  │                 │ ~/.codex/     │
+        └──────▲──────┘                 │  auth.json    │
+               │                        └──────▲────────┘
+               │ engine writes credentials     │
+        ┌──────┼───────────────────────────────┼──────┐
+        │      │                               │      │
    openswap CLI         AutoSwitchEngine    rumps extra
    (cli.py)          (autoswitch.py)     (menubar.py)
         │                  │                  │
