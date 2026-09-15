@@ -702,10 +702,28 @@ def run(switcher, codex=None) -> int:
             self.settings.save(settings_path)
             self.rebuild_menu()
 
-        def _show_error(self, message: str):
+        def _dialog(self, fn):
+            """Run a modal dialog in front of everything.
+
+            The popover floats at menu level, above a modal alert, so it is
+            closed first or the dialog opens underneath it. A menu-bar
+            (accessory) app is not the active app either, so a modal can
+            render blank until the app is brought forward.
+            """
+            if self._panel is not None and self._panel.is_shown():
+                self._panel.close()
             import AppKit
             AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-            rumps.alert(title="openswap", message=message)
+            return fn()
+
+        def _alert(self, **kwargs) -> int:
+            return self._dialog(lambda: rumps.alert(**kwargs))
+
+        def _prompt(self, **kwargs):
+            return self._dialog(lambda: rumps.Window(**kwargs).run())
+
+        def _show_error(self, message: str):
+            self._alert(title="openswap", message=message)
 
         def _guard(self, fn):
             """Run a switcher action, surfacing ClaudeSwitchError via an alert."""
@@ -852,12 +870,10 @@ def run(switcher, codex=None) -> int:
             else:
                 app = "Claude Code"
                 live_name = self._name_for_identity(self.switcher.live_identity())
-            import AppKit
-            AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             title, message = switch_confirm_copy(
                 self._name_for_num(num), live_name=live_name, app=app
             )
-            return rumps.alert(title=title, message=message, ok="Switch", cancel="Cancel") == 1
+            return self._alert(title=title, message=message, ok="Switch", cancel="Cancel") == 1
 
         def _live_is_active(self, num) -> bool:
             # A consent gate must not trust the cached snapshot, which a
@@ -875,12 +891,10 @@ def run(switcher, codex=None) -> int:
         def _confirm_strategy_switch(self, strategy) -> bool:
             if not self.settings.confirm_switch:
                 return True
-            import AppKit
-            AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             title, message = strategy_confirm_copy(
                 strategy, live_name=self._name_for_identity(self.switcher.live_identity())
             )
-            return rumps.alert(title=title, message=message, ok="Switch", cancel="Cancel") == 1
+            return self._alert(title=title, message=message, ok="Switch", cancel="Cancel") == 1
 
         def _repair_relogin(self, num, *, close_panel):
             slot = self._slot_identity(num)
@@ -896,16 +910,13 @@ def run(switcher, codex=None) -> int:
             if plan.kind == "capture":
                 self._capture_relogin(num, close_panel=close_panel)
                 return
-            if plan.kind == "confirm_open_login":
-                import AppKit
-                AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-                if rumps.alert(
-                    title=relogin_wrong_account_title(plan),
-                    message=relogin_wrong_account_message(plan),
-                    ok="Open login",
-                    cancel="Cancel",
-                ) != 1:
-                    return
+            if plan.kind == "confirm_open_login" and self._alert(
+                title=relogin_wrong_account_title(plan),
+                message=relogin_wrong_account_message(plan),
+                ok="Open login",
+                cancel="Cancel",
+            ) != 1:
+                return
             self._open_claude_login(plan)
 
         def _capture_relogin(self, num, *, close_panel):
@@ -920,7 +931,7 @@ def run(switcher, codex=None) -> int:
             try:
                 self.switcher.add_account(slot=None)
             except CredentialReadError:
-                rumps.alert(
+                self._alert(
                     title="openswap",
                     message="Couldn't read the active credential. If the menu bar is running "
                             "as a background/login agent, macOS blocks its Keychain access — "
@@ -1008,14 +1019,12 @@ def run(switcher, codex=None) -> int:
 
         def _make_rename(self, num, email, current):
             def cb(_sender):
-                import AppKit
-                AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-                resp = rumps.Window(
+                resp = self._prompt(
                     title="Rename account",
                     message=f"Short name for {email} (leave blank to remove it):",
                     default_text=current or "",
                     ok="Save", cancel="Cancel", dimensions=(320, 24),
-                ).run()
+                )
                 if resp.clicked != 1:
                     return
                 action, value = alias_edit(resp.text, current or None)
@@ -1034,7 +1043,7 @@ def run(switcher, codex=None) -> int:
 
         def _make_remove(self, num):
             def cb(_sender):
-                if rumps.alert(
+                if self._alert(
                     title="Remove account",
                     message=f"Remove account {num}?",
                     ok="Remove",
@@ -1085,26 +1094,19 @@ def run(switcher, codex=None) -> int:
                     self._ensure_codex_engine()
 
         def on_add_token(self, _sender):
-            # A menu-bar (accessory) app isn't the active app, so a modal
-            # rumps.Window can render black/blank until we bring the app
-            # forward. Activate before showing the input dialogs.
-            import AppKit
-            AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-            email_win = rumps.Window(
+            email_resp = self._prompt(
                 title="Add account from token",
                 message="Email label (optional; leave blank to auto-name):",
                 ok="Next", cancel="Cancel", dimensions=(320, 24),
             )
-            email_resp = email_win.run()
             if email_resp.clicked != 1:
                 return
             email = email_resp.text.strip() or None
-            token_win = rumps.Window(
+            token_resp = self._prompt(
                 title="Add account from token",
                 message="API key (sk-ant-api…) or setup token (sk-ant-oat01-…):",
                 ok="Add", cancel="Cancel", dimensions=(320, 24),
             )
-            token_resp = token_win.run()
             if token_resp.clicked != 1 or not token_resp.text.strip():
                 return
             if self._guard(lambda: self.switcher.add_account_from_token(
@@ -1120,7 +1122,7 @@ def run(switcher, codex=None) -> int:
 
         def on_refresh_creds(self, _sender):
             if self.switcher.live_identity() is None:
-                rumps.alert(title="openswap",
+                self._alert(title="openswap",
                             message="No active Claude Code login detected. Log in first.")
                 return
             try:
@@ -1129,7 +1131,7 @@ def run(switcher, codex=None) -> int:
                 # Almost always a launchd/login-agent Keychain block: the active
                 # credential lives in the macOS Keychain, which a background agent
                 # can't read (the security call times out). Point at the fix.
-                rumps.alert(
+                self._alert(
                     title="openswap",
                     message="Couldn't read the active credential. If the menu bar is running "
                             "as a background/login agent, macOS blocks its Keychain access — "
@@ -1137,7 +1139,7 @@ def run(switcher, codex=None) -> int:
                 )
                 return
             except ClaudeSwitchError as e:
-                rumps.alert(title="openswap", message=str(e))
+                self._alert(title="openswap", message=str(e))
                 return
             self.refresh_async()
 
@@ -1334,7 +1336,7 @@ def run(switcher, codex=None) -> int:
                 try:
                     set_setting(self.switcher.backup_dir, "autoswitch.threshold", str(pct))
                 except Exception as e:
-                    rumps.alert(title="openswap", message=f"Couldn't set threshold: {e}")
+                    self._alert(title="openswap", message=f"Couldn't set threshold: {e}")
                     return
                 self._restart_engine()  # apply immediately if running
                 self.rebuild_menu()
@@ -1347,7 +1349,7 @@ def run(switcher, codex=None) -> int:
                         self.switcher.backup_dir, "autoswitch.strategy", strategy
                     )
                 except Exception as e:
-                    rumps.alert(title="openswap", message=f"Couldn't set strategy: {e}")
+                    self._alert(title="openswap", message=f"Couldn't set strategy: {e}")
                     return
                 self._restart_engine()
                 self.rebuild_menu()

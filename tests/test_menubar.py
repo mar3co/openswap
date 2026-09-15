@@ -2327,3 +2327,15 @@ def test_window_suffix_prefers_the_reset_countdown(win, stale, expected):
 def test_card_rows_use_window_suffix():
     panel_path = Path(menubar.__file__).with_name("menubar_panel.py")
     assert "window_suffix(win, stale=stale)" in panel_path.read_text(encoding="utf-8")
+
+
+def test_every_dialog_goes_through_the_popover_closing_helper():
+    # The popover floats above a modal alert, so a dialog opened while it is
+    # shown lands underneath it. _dialog closes the popover first.
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    helper = text[text.index("def _dialog") : text.index("def _alert")]
+    assert "self._panel.close()" in helper and "activateIgnoringOtherApps_" in helper
+    body = text[text.index("def _alert") :]
+    assert "rumps.alert(" not in body[body.index("def _show_error") :]
+    assert "rumps.Window(" not in body[body.index("def _show_error") :]
+    assert "activateIgnoringOtherApps_" not in body[body.index("def _show_error") :]
