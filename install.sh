@@ -8,7 +8,8 @@
 # saves the Claude account you are logged into, and starts the menu bar extra.
 # Safe to re-run: ~/.openswap is pulled instead of cloned.
 #
-# Everything lives in main() so a download that stops halfway runs nothing.
+# Everything lives in main(), invoked inside a group whose closing brace is
+# the last token, so a download that stops anywhere short of that runs nothing.
 set -euo pipefail
 
 REPO_URL="${OPENSWAP_REPO:-https://github.com/mar3co/openswap.git}"
@@ -90,4 +91,7 @@ main() {
   return "$status"
 }
 
-main "$@"
+{
+  main "$@"
+  exit
+}

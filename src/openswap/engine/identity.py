@@ -106,7 +106,16 @@ class IdentityMixin:
         data = self._read_json(config_path, strict=strict)
         if not data:
             return None
-        oauth_account = data.get("oauthAccount", {})
+        oauth_account = data.get("oauthAccount")
+        if oauth_account is None:
+            return None
+        if not isinstance(oauth_account, dict):
+            if strict:
+                raise ConfigError(
+                    f"{config_path} has a malformed oauthAccount entry. "
+                    "Repair or move it, then retry."
+                )
+            return None
         email = oauth_account.get("emailAddress", "")
         if not email:
             return None

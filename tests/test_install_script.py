@@ -76,6 +76,7 @@ def run_installer(
     uv: bool = True,
     bin_on_path: bool = True,
     env: dict[str, str] | None = None,
+    script_text: str | None = None,
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
@@ -109,8 +110,10 @@ def run_installer(
         "STUB_DIR": str(stubs),
         **(env or {}),
     }
+    # File mode is the documented `bash install.sh`; stdin mode is `curl | bash`.
     proc = subprocess.run(
-        ["bash", str(SCRIPT)],
+        ["bash", str(SCRIPT)] if script_text is None else ["bash"],
+        input=script_text,
         env=run_env,
         capture_output=True,
         text=True,
@@ -232,6 +235,25 @@ class TestInstallScript:
         assert proc.returncode == 3
         assert "openswap setup" in calls
         assert "new terminal" in proc.stdout
+
+    @pytest.mark.parametrize("cut_before", ['\n{\n  main "$@"', "\n  exit\n}"])
+    def test_truncated_download_runs_nothing(self, tmp_path, cut_before):
+        """bash executes a piped script as it parses, so every prefix must be inert.
+
+        Cut just before the brace group (a complete, do-nothing script) and
+        just before its closing brace (an unfinished group). The bare
+        ``main "$@"`` the second cut leaves is exactly what a call outside a
+        group would have executed.
+        """
+        text = SCRIPT.read_text()
+        head = text[: text.rindex(cut_before)]
+        _, calls = run_installer(tmp_path, script_text=head)
+        assert calls == []
+
+    def test_piped_script_installs_like_the_file(self, tmp_path):
+        proc, calls = run_installer(tmp_path, script_text=SCRIPT.read_text())
+        assert proc.returncode == 0, proc.stderr
+        assert "openswap setup" in calls
 
     def test_refuses_root(self, tmp_path):
         proc, calls = run_installer(tmp_path, env={"FAKE_UID": "0"})

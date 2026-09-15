@@ -485,11 +485,25 @@ class SwitchMixin:
         except PermissionError:
             raise ConfigError("Permission denied reading Claude config")
 
-        # Get account UUID and org fields
-        config_data = self._read_json(config_path) or {}
-        oauth_data = config_data.get("oauthAccount", {})
-        account_uuid = oauth_data.get("accountUuid", "") or ""
-        organization_uuid = oauth_data.get("organizationUuid", "") or ""
+        # The UUIDs come from the verified identity, not from a second read
+        # that a logout/login race could blank. Only the org name is new, and
+        # it is parsed from the same bytes that become the backup, so the
+        # backup and the metadata cannot disagree.
+        try:
+            config_data = json.loads(current_config)
+        except json.JSONDecodeError as e:
+            raise ConfigError(
+                f"{config_path} could not be parsed ({e}). Retry once Claude Code "
+                "has finished writing it."
+            ) from e
+        oauth_data = config_data.get("oauthAccount") if isinstance(config_data, dict) else None
+        if not isinstance(oauth_data, dict) or not oauth_data:
+            raise ConfigError(
+                f"{config_path} has no oauthAccount to capture; the login changed "
+                "while it was being captured. Retry."
+            )
+        account_uuid = current_account_uuid
+        organization_uuid = current_org_uuid
         organization_name = oauth_data.get("organizationName", "") or ""
 
         self._reject_identity_drift_since_verify(identity)
