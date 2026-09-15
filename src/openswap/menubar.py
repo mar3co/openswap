@@ -869,12 +869,16 @@ def run(switcher, codex=None) -> int:
                 self.settings.confirm_switch, is_active=self._live_is_active(num)
             ):
                 return True
-            from openswap.codex import split_provider_num
+            from openswap.codex import CODEX_NUM_PREFIX, split_provider_num
             provider, _n = split_provider_num(num)
             if provider == "codex":
                 app = "Codex CLI"
-                ident = self.codex.live_identity()
-                live_name = account_short_name(ident[0]) if ident else None
+                live = self.codex.current_account_number()
+                if live:
+                    live_name = self._name_for_num(f"{CODEX_NUM_PREFIX}{live}")
+                else:
+                    ident = self.codex.live_identity()
+                    live_name = account_short_name(ident[0]) if ident and ident[0] else None
             else:
                 app = "Claude Code"
                 live_name = self._name_for_identity(self.switcher.live_identity())
@@ -1029,7 +1033,10 @@ def run(switcher, codex=None) -> int:
             def cb(_sender):
                 resp = self._prompt(
                     title="Rename account",
-                    message=f"Short name for {email} (leave blank to remove it):",
+                    message=(
+                        f"Short name for {account_short_name(email, None, num)} "
+                        "(leave blank to remove it):"
+                    ),
                     default_text=current or "",
                     ok="Save", cancel="Cancel", dimensions=(320, 24),
                 )

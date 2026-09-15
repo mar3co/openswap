@@ -1332,8 +1332,9 @@ def store_roster_changed(paths, seen: dict) -> bool:
     differs from the last call.
 
     ``seen`` maps path to ``(stamp, digest)`` and is updated in place, where
-    stamp is (mtime_ns, size) so a rewrite inside one coarse timestamp tick
-    is still noticed. The first call only primes it, so startup does not
+    stamp is (mtime_ns, size, inode): the writers replace the file
+    atomically, so a rewrite inside one coarse timestamp tick still changes
+    the inode. The first call only primes it, so startup does not
     trigger a refresh. The file is parsed only when its stamp moved. Switches
     rewrite the index too,
     but only its volatile keys, which the digest ignores: the active-slot
@@ -1346,7 +1347,7 @@ def store_roster_changed(paths, seen: dict) -> bool:
         key = str(path)
         try:
             st = path.stat()
-            stamp: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+            stamp: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, st.st_ino)
         except OSError:
             stamp = None
         previous = seen.get(key)

@@ -2193,8 +2193,10 @@ def test_should_confirm_switch_only_for_a_real_switch_with_the_setting_on(enable
 def test_confirm_switch_names_the_provider_and_reads_the_live_slot():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     body = text[text.index("def _confirm_switch") : text.index("def _live_is_active")]
-    # Both branches name the live login from a live read, never the snapshot.
-    assert "self.codex.live_identity()" in body and "Codex CLI" in body
+    # Both branches name the live login from a live read, never the snapshot;
+    # a managed Codex slot goes through the roster so its alias is used.
+    assert "self.codex.current_account_number()" in body and "Codex CLI" in body
+    assert "self.codex.live_identity()" in body
     assert "_name_for_identity(self.switcher.live_identity())" in body
     assert "snapshot" not in body
     # The gate must not trust the cached snapshot: a stale one could call a
@@ -2277,16 +2279,18 @@ def test_store_roster_changed_ignores_switch_and_timestamp_only_rewrites(tmp_pat
     assert menubar.store_roster_changed([index], seen) is False
 
 
-def test_store_roster_changed_sees_a_different_size_rewrite_within_the_same_timestamp(tmp_path: Path):
-    # Coarse-timestamp filesystems can give two writes one mtime; size is the
-    # second cheap key. A same-size rewrite in the same tick is an accepted
-    # miss that the next refresh covers.
+def test_store_roster_changed_sees_a_same_size_atomic_rewrite_within_the_same_timestamp(tmp_path: Path):
+    # Coarse-timestamp filesystems can give two writes one mtime, and a
+    # rename such as work -> home keeps the size; the writers replace the
+    # file atomically, so the inode still moves.
     index = tmp_path / "sequence.json"
-    _write_index(index)
+    _write_index(index, alias="work")
     seen: dict = {}
     menubar.store_roster_changed([index], seen)
     stamp = index.stat().st_mtime
-    _write_index(index, alias="longer-alias-name")
+    fresh = tmp_path / "sequence.json.tmp"
+    _write_index(fresh, alias="home")
+    os.replace(fresh, index)
     os.utime(index, (stamp, stamp))
     assert menubar.store_roster_changed([index], seen) is True
 
