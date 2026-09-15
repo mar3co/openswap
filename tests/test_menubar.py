@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import plistlib
 import sys
 from pathlib import Path
@@ -863,9 +864,10 @@ def test_format_title_both_windows_with_name():
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "loc · 42% · 18%"
 
 
-def test_format_title_empty_when_name_and_pct_off():
+def test_format_title_falls_back_to_icon_when_name_and_pct_off():
+    # An empty title is indistinguishable from a crashed extra.
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == ""
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == menubar.STATUS_ICON
     assert "%" not in menubar.format_title(
         "loc@papaya.asia", {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}, s
     )
@@ -894,12 +896,12 @@ def test_format_title_scoped_off_by_default():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
     assert not s.title_scoped
-    assert menubar.format_title("loc@papaya.asia", usage, s) == ""
+    assert menubar.format_title("loc@papaya.asia", usage, s) == menubar.STATUS_ICON
 
 
-def test_format_title_empty_when_no_active_account():
+def test_format_title_falls_back_to_icon_when_no_active_account():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
-    assert menubar.format_title(None, None, s) == ""
+    assert menubar.format_title(None, None, s) == menubar.STATUS_ICON
 
 
 def test_format_title_icon_when_no_active_account():
@@ -907,6 +909,11 @@ def test_format_title_icon_when_no_active_account():
         show_account_name=True, title_pct="both", show_icon=True
     )
     assert menubar.format_title(None, None, s) == menubar.STATUS_ICON
+
+
+def test_format_title_does_not_double_the_icon_fallback():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off", show_icon=True)
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == menubar.STATUS_ICON
 
 
 def test_kickoff_settings_round_trip(tmp_path: Path):
@@ -1259,7 +1266,7 @@ def test_format_title_truncates_long_local_part():
 
 def test_format_title_both_drops_unavailable_windows():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@x.com", "no credentials", s) == ""
+    assert menubar.format_title("loc@x.com", "no credentials", s) == menubar.STATUS_ICON
 
 
 def test_format_title_both_keeps_available_window():
@@ -2086,3 +2093,257 @@ def test_codex_snapshot_retries_codex_autoswitch_start():
     start = src.index("def _worker")
     end = src.index("def _log_usage")
     assert "_ensure_codex_engine" in src[start:end]
+
+
+# --- confirm before switching -----------------------------------------------
+
+
+def test_settings_page_has_confirm_switch_toggle_defaulting_on():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(), strategy="best", threshold=90
+    )
+    row = next(r for r in rows if r["id"] == "confirm_switch")
+    assert row["kind"] == "toggle" and row["value"] is True
+    ids = [r["id"] for r in rows]
+    assert ids.index("confirm_switch") < ids.index("refresh_interval")
+
+
+def test_confirm_switch_setting_round_trips_and_defaults_on(tmp_path: Path):
+    path = tmp_path / "menubar_settings.json"
+    assert menubar.MenuBarSettings.load(path).confirm_switch is True
+    menubar.MenuBarSettings(confirm_switch=False).save(path)
+    assert menubar.MenuBarSettings.load(path).confirm_switch is False
+
+
+def test_account_click_confirms_before_switching_for_both_providers():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    click = text[text.index("def _on_account_click") : text.index("def _repair_relogin")]
+    codex_branch = click[: click.index("_slot_needs_relogin")]
+    claude_branch = click[click.index("_slot_needs_relogin") :]
+    assert "_confirm_switch(" in codex_branch
+    assert "_confirm_switch(" in claude_branch
+    # The re-login repair path has its own dialogs; it must not be gated twice.
+    assert claude_branch.index("_repair_relogin(") < claude_branch.index("_confirm_switch(")
+
+
+# --- store index watch -------------------------------------------------------
+
+
+def test_sync_tick_refreshes_when_a_store_index_changes():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    sync = text[text.index("def on_sync_tick") : text.index("def _consume_widget_command")]
+    assert "_detect_store_change" in sync
+    detect = text[text.index("def _detect_store_change") : text.index("def _detect_active_change")]
+    assert "store_roster_changed" in detect and "refresh_async" in detect
+
+
+# --- rename from the extra ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, current, expected",
+    [
+        ("work", None, ("set", "work")),
+        ("  work ", None, ("set", "work")),
+        ("work", "home", ("set", "work")),
+        ("home", "home", ("noop", None)),
+        ("", "home", ("clear", None)),
+        ("   ", "home", ("clear", None)),
+        ("", None, ("noop", None)),
+    ],
+)
+def test_alias_edit_decides_set_clear_or_noop(text, current, expected):
+    assert menubar.alias_edit(text, current) == expected
+
+
+def test_overflow_menu_has_rename_beside_remove_and_disable():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    rebuild = text[text.index("def rebuild_menu") : text.index("def _add_menu")]
+    assert "_rename_menu(rumps)" in rebuild
+    rename = text[text.index("def _rename_menu") : text.index("def _remove_menu")]
+    assert "Rename account" in rename
+    make = text[text.index("def _make_rename") : text.index("def _make_remove")]
+    assert "alias_edit(" in make and "set_alias(" in make and "unset_alias(" in make
+
+
+
+
+def test_switch_confirm_copy_names_both_ends_and_the_app():
+    title, message = menubar.switch_confirm_copy("work", live_name="personal")
+    assert title == "Switch to work?"
+    assert message == "Claude Code is signed in as personal. Switch it to work?"
+    _, codex = menubar.switch_confirm_copy("work", live_name="personal", app="Codex CLI")
+    assert codex.startswith("Codex CLI is signed in as personal.")
+
+
+def test_switch_confirm_copy_without_a_live_account():
+    title, message = menubar.switch_confirm_copy("work", live_name=None)
+    assert title == "Switch to work?"
+    assert message == "Sign Claude Code in as work?"
+
+
+@pytest.mark.parametrize(
+    "enabled, is_active, expected",
+    [(True, False, True), (True, True, False), (False, False, False), (False, True, False)],
+)
+def test_should_confirm_switch_only_for_a_real_switch_with_the_setting_on(enabled, is_active, expected):
+    assert menubar.should_confirm_switch(enabled, is_active=is_active) is expected
+
+
+def test_confirm_switch_names_the_provider_and_reads_the_live_slot():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    body = text[text.index("def _confirm_switch") : text.index("def _live_is_active")]
+    # Both branches name the live login from a live read, never the snapshot;
+    # a managed Codex slot goes through the roster so its alias is used.
+    assert "self.codex.current_account_number()" in body and "Codex CLI" in body
+    assert "self.codex.live_identity()" in body
+    assert "_name_for_identity(self.switcher.live_identity())" in body
+    assert "snapshot" not in body
+    # The gate must not trust the cached snapshot: a stale one could call a
+    # card active and skip the dialog on a real switch.
+    assert "_is_active_row" not in body
+    live = text[text.index("def _live_is_active") : text.index("def _repair_relogin")]
+    assert "current_account_number()" in live
+
+
+@pytest.mark.parametrize(
+    "strategy, expected",
+    [
+        (None, "Rotate to the next account?"),
+        ("best", "Switch to the account with the most headroom?"),
+        ("next-available", "Switch to the next available account?"),
+    ],
+)
+def test_strategy_confirm_copy_names_the_action(strategy, expected):
+    title, message = menubar.strategy_confirm_copy(strategy, live_name="work")
+    assert title == expected
+    assert message == "Claude Code is signed in as work."
+    assert menubar.strategy_confirm_copy(strategy, live_name=None)[1] == ""
+
+
+def test_rotate_and_best_confirm_too():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    body = text[text.index("def _switch(self, strategy)") : text.index("def _make_rename")]
+    assert "_confirm_strategy_switch(strategy)" in body
+
+
+def test_every_settings_row_is_dispatched():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    body = text[text.index("def _on_setting") : text.index("def _popup_overflow")]
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=True, kickoff_enabled=True),
+        strategy="best",
+        threshold=90,
+    )
+    for row in rows:
+        if row["kind"] == "group":
+            continue
+        assert f'"{row["id"]}"' in body, row["id"]
+
+
+# --- store roster watch ------------------------------------------------------
+
+
+def _write_index(path: Path, *, alias: str | None = None, stamp: str = "t1", active=1):
+    accounts = {"1": {"email": "a@x.com"}, "2": {"email": "b@x.com"}}
+    if alias:
+        accounts["2"]["alias"] = alias
+    path.write_text(json.dumps({
+        "activeAccountNumber": active, "lastUpdated": stamp,
+        "sequence": [1, 2], "accounts": accounts,
+    }))
+    os.utime(path, None)
+
+
+def test_store_roster_changed_primes_silently_then_reports_roster_edits(tmp_path: Path):
+    index = tmp_path / "sequence.json"
+    _write_index(index)
+    seen: dict = {}
+    assert menubar.store_roster_changed([index], seen) is False
+    assert menubar.store_roster_changed([index], seen) is False
+    _write_index(index, alias="work", stamp="t2")
+    os.utime(index, (5, 5))
+    assert menubar.store_roster_changed([index], seen) is True
+    assert menubar.store_roster_changed([index], seen) is False
+
+
+def test_store_roster_changed_ignores_switch_and_timestamp_only_rewrites(tmp_path: Path):
+    # A switch rewrites activeAccountNumber and lastUpdated; the active-slot
+    # watcher already covers that, and the app refreshed itself for it.
+    index = tmp_path / "sequence.json"
+    _write_index(index, active=1, stamp="t1")
+    seen: dict = {}
+    menubar.store_roster_changed([index], seen)
+    _write_index(index, active=2, stamp="t2")
+    os.utime(index, (5, 5))
+    assert menubar.store_roster_changed([index], seen) is False
+
+
+def test_store_roster_changed_sees_a_same_size_atomic_rewrite_within_the_same_timestamp(tmp_path: Path):
+    # Coarse-timestamp filesystems can give two writes one mtime, and a
+    # rename such as work -> home keeps the size; the writers replace the
+    # file atomically, so the inode still moves.
+    index = tmp_path / "sequence.json"
+    _write_index(index, alias="work")
+    seen: dict = {}
+    menubar.store_roster_changed([index], seen)
+    stamp = index.stat().st_mtime
+    fresh = tmp_path / "sequence.json.tmp"
+    _write_index(fresh, alias="home")
+    os.replace(fresh, index)
+    os.utime(index, (stamp, stamp))
+    assert menubar.store_roster_changed([index], seen) is True
+
+
+def test_store_roster_changed_treats_appearing_vanishing_and_corrupt_as_changes(tmp_path: Path):
+    index = tmp_path / "sequence.json"
+    seen: dict = {}
+    assert menubar.store_roster_changed([index], seen) is False
+    _write_index(index)
+    assert menubar.store_roster_changed([index], seen) is True
+    index.write_text("{not json")
+    os.utime(index, (5, 5))
+    assert menubar.store_roster_changed([index], seen) is True
+    index.unlink()
+    assert menubar.store_roster_changed([index], seen) is True
+    assert menubar.store_roster_changed([index], seen) is False
+
+
+# --- card row suffix ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "win, stale, expected",
+    [
+        ({"countdown": "4d 17h", "maxed": True, "ahead": False}, False, "4d 17h"),
+        ({"countdown": "", "maxed": True, "ahead": False}, False, "max"),
+        ({"countdown": "", "maxed": False, "ahead": True}, False, "ahead"),
+        ({"countdown": "2h", "maxed": False, "ahead": True}, False, "2h"),
+        ({"countdown": "", "maxed": True, "ahead": True}, True, ""),
+        ({"countdown": "2h", "maxed": True, "ahead": True}, True, "2h"),
+        ({}, False, ""),
+    ],
+)
+def test_window_suffix_prefers_the_reset_countdown(win, stale, expected):
+    assert menubar.window_suffix(win, stale=stale) == expected
+
+
+def test_card_rows_use_window_suffix():
+    panel_path = Path(menubar.__file__).with_name("menubar_panel.py")
+    assert "window_suffix(win, stale=stale)" in panel_path.read_text(encoding="utf-8")
+
+
+def test_every_dialog_goes_through_the_above_popover_helper():
+    # The popover floats above a modal alert, so a dialog opened while it is
+    # shown lands underneath it. _dialog lowers the popover for the dialog's
+    # lifetime instead of closing it, so Cancel leaves the user in place.
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    helper = text[text.index("def _dialog") : text.index("def _alert")]
+    assert "popover_window()" in helper and "NSNormalWindowLevel" in helper
+    assert "finally:" in helper and "setLevel_(level)" in helper
+    assert "activateIgnoringOtherApps_" in helper
+    assert ".close()" not in helper
+    rest = text[: text.index("def _dialog")] + text[text.index("def _show_error") :]
+    assert "rumps.alert(" not in rest
+    assert "rumps.Window(" not in rest
+    assert "activateIgnoringOtherApps_" not in rest
