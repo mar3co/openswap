@@ -702,19 +702,27 @@ def run(switcher, codex=None) -> int:
             self.settings.save(settings_path)
             self.rebuild_menu()
 
-        def _dialog(self, fn):
-            """Run a modal dialog in front of everything.
+        def _dialog(self, run):
+            """Run a modal dialog in front of the popover without closing it.
 
-            The popover floats at menu level, above a modal alert, so it is
-            closed first or the dialog opens underneath it. A menu-bar
-            (accessory) app is not the active app either, so a modal can
-            render blank until the app is brought forward.
+            The popover floats at menu level, above a modal alert, and the
+            modal runner pins the alert's own level, so the popover's window
+            is lowered for the dialog's lifetime instead; Cancel then leaves
+            the user where they were. A menu-bar (accessory) app is not the
+            active app either, so it is brought forward or the modal can
+            render blank.
             """
-            if self._panel is not None and self._panel.is_shown():
-                self._panel.close()
             import AppKit
             AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-            return fn()
+            popover = self._panel.popover_window() if self._panel is not None else None
+            if popover is None:
+                return run()
+            level = popover.level()
+            popover.setLevel_(AppKit.NSNormalWindowLevel)
+            try:
+                return run()
+            finally:
+                popover.setLevel_(level)
 
         def _alert(self, **kwargs) -> int:
             return self._dialog(lambda: rumps.alert(**kwargs))

@@ -2329,13 +2329,17 @@ def test_card_rows_use_window_suffix():
     assert "window_suffix(win, stale=stale)" in panel_path.read_text(encoding="utf-8")
 
 
-def test_every_dialog_goes_through_the_popover_closing_helper():
+def test_every_dialog_goes_through_the_above_popover_helper():
     # The popover floats above a modal alert, so a dialog opened while it is
-    # shown lands underneath it. _dialog closes the popover first.
+    # shown lands underneath it. _dialog lowers the popover for the dialog's
+    # lifetime instead of closing it, so Cancel leaves the user in place.
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     helper = text[text.index("def _dialog") : text.index("def _alert")]
-    assert "self._panel.close()" in helper and "activateIgnoringOtherApps_" in helper
-    body = text[text.index("def _alert") :]
-    assert "rumps.alert(" not in body[body.index("def _show_error") :]
-    assert "rumps.Window(" not in body[body.index("def _show_error") :]
-    assert "activateIgnoringOtherApps_" not in body[body.index("def _show_error") :]
+    assert "popover_window()" in helper and "NSNormalWindowLevel" in helper
+    assert "finally:" in helper and "setLevel_(level)" in helper
+    assert "activateIgnoringOtherApps_" in helper
+    assert ".close()" not in helper
+    rest = text[: text.index("def _dialog")] + text[text.index("def _show_error") :]
+    assert "rumps.alert(" not in rest
+    assert "rumps.Window(" not in rest
+    assert "activateIgnoringOtherApps_" not in rest

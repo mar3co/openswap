@@ -631,6 +631,15 @@ class MenuBarPanel:
     def is_shown(self) -> bool:
         return bool(self._popover is not None and self._popover.isShown())
 
+    def popover_window(self):
+        """The popover's window while shown, else None."""
+        if not self.is_shown():
+            return None
+        try:
+            return self._popover.contentViewController().view().window()
+        except AttributeError:  # no controller or view yet
+            return None
+
     def close(self) -> None:
         self._page = MAIN_PAGE
         self._clear_dismiss_watchers()
