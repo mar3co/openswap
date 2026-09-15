@@ -303,7 +303,7 @@ class SwitchMixin:
 
         identity = self._get_current_identity_triple()
         if identity is None:
-            raise ConfigError("No active Claude account found. Please log in first.")
+            raise NotLoggedInError("No active Claude account found. Please log in first.")
         current_email, current_org_uuid, current_account_uuid = identity
 
         # When no slot specified and account already exists, refresh credentials in place

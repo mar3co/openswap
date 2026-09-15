@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from openswap.update_check import check_for_update, run_self_upgrade
+from openswap.update_check import INSTALL_COMMAND, check_for_update, run_self_upgrade
 
 
 class TestNoPypi:
@@ -47,7 +47,7 @@ class TestNoPypi:
             mock_run.assert_not_called()
         err = capsys.readouterr().err
         assert "not published to PyPI" in err
-        assert "uv tool install --force --editable" in err
+        assert INSTALL_COMMAND in err
 
     def test_run_self_upgrade_gone_checkout_path(self, tmp_path, monkeypatch, capsys):
         missing = tmp_path / "moved-openswap"
