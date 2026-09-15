@@ -152,6 +152,8 @@ class TestRestartWidgetAgent:
 
         monkeypatch.setattr("openswap.launch_agent.is_loaded", lambda label, *a, **k: label in loaded)
         monkeypatch.setattr("openswap.launch_agent._launchctl", fake_launchctl)
+        # service_target calls os.getuid, which Windows lacks; the test farm runs there too.
+        monkeypatch.setattr("openswap.launch_agent.service_target", lambda label, uid=None: f"gui/501/{label}")
         return calls
 
     def test_kickstarts_loaded_widget_and_returns_none(self, monkeypatch):
