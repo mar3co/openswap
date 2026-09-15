@@ -1496,7 +1496,7 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
 class TestSetupCommand:
     """``openswap setup``: capture the live login, then start the extra."""
 
-    def _harness(self, monkeypatch, argv, *, add_raises=None, install_raises=None):
+    def _harness(self, monkeypatch, argv, *, add_raises=None, install_raises=None, widget_detail=None):
         seen: dict = {"add": 0, "install": 0, "widget": 0}
 
         class FakeSwitcher:
@@ -1525,6 +1525,7 @@ class TestSetupCommand:
 
         def fake_widget_restart():
             seen["widget"] += 1
+            return widget_detail
 
         monkeypatch.setattr(cli, "ClaudeAccountSwitcher", FakeSwitcher)
         monkeypatch.setattr("openswap.launch_agent.install", fake_install)
@@ -1591,6 +1592,14 @@ class TestSetupCommand:
         tail = out.strip().splitlines()[-2:]
         assert message in tail[0]
         assert "openswap add" in tail[1]
+
+    def test_widget_restart_failure_is_a_warning_with_its_own_fix(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"], widget_detail="kickstart exit 113")
+        assert self._run() == 0
+        out = capsys.readouterr().out
+        assert "Menu bar extra started" in out
+        assert "kickstart exit 113" in out
+        assert out.count("openswap widget --install") == 1
 
     def test_service_failure_after_failed_capture_reports_both(self, monkeypatch, capsys):
         from openswap.exceptions import ClaudeSwitchError, CredentialReadError

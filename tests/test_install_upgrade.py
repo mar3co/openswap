@@ -140,3 +140,64 @@ class TestNoPypi:
         err = capsys.readouterr().err
         assert "bootstrap failed" in err
         assert "menubar --install-service" in err
+
+
+class TestRestartWidgetAgent:
+    def _arm(self, monkeypatch, returncode, *, loaded):
+        calls: list[tuple[str, ...]] = []
+
+        def fake_launchctl(*args):
+            calls.append(args)
+            return MagicMock(returncode=returncode, stderr="Could not find service", stdout="")
+
+        monkeypatch.setattr("openswap.launch_agent.is_loaded", lambda label, *a, **k: label in loaded)
+        monkeypatch.setattr("openswap.launch_agent._launchctl", fake_launchctl)
+        return calls
+
+    def test_kickstarts_loaded_widget_and_returns_none(self, monkeypatch):
+        from openswap.update_check import restart_widget_agent
+        from openswap.widget_install import LABEL
+
+        calls = self._arm(monkeypatch, 0, loaded={LABEL})
+        assert restart_widget_agent() is None
+        assert len(calls) == 1
+        assert calls[0][:2] == ("kickstart", "-k")
+        assert calls[0][2].endswith(LABEL)
+
+    def test_returns_detail_when_kickstart_fails(self, monkeypatch):
+        from openswap.update_check import restart_widget_agent
+        from openswap.widget_install import LABEL
+
+        self._arm(monkeypatch, 113, loaded={LABEL})
+        detail = restart_widget_agent()
+        assert detail is not None
+        assert "113" in detail
+        assert "Could not find service" in detail
+
+    def test_stale_plist_without_a_loaded_job_is_not_a_widget(self, tmp_path, monkeypatch):
+        from openswap import widget_install
+        from openswap.update_check import restart_widget_agent
+
+        plist = widget_install.plist_path(widget_install.LEGACY_LABEL, tmp_path)
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_bytes(b"")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        calls = self._arm(monkeypatch, 113, loaded=set())
+        assert restart_widget_agent() is None
+        assert calls == []
+
+    def test_upgrade_warns_but_succeeds_when_widget_does_not_restart(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        repo = tmp_path / "openswap"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        monkeypatch.setattr("openswap.update_check._checkout_root", lambda: repo)
+        monkeypatch.setattr("openswap.update_check.sys.platform", "darwin")
+        monkeypatch.setattr("openswap.update_check.subprocess.run", lambda *a, **k: MagicMock(returncode=0))
+        monkeypatch.setattr("openswap.launch_agent.is_loaded", lambda *a, **k: False)
+        monkeypatch.setattr("openswap.update_check.restart_widget_agent", lambda: "kickstart exit 113")
+        assert run_self_upgrade() == 0
+        err = capsys.readouterr().err
+        assert "kickstart exit 113" in err
+        assert "openswap widget --install" in err

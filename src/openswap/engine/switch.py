@@ -301,7 +301,7 @@ class SwitchMixin:
             self._init_sequence_file()
             self._migrate_org_fields()
 
-        identity = self._get_current_identity_triple()
+        identity = self._get_current_identity_triple(strict=True)
         if identity is None:
             raise NotLoggedInError("No active Claude account found. Please log in first.")
         current_email, current_org_uuid, current_account_uuid = identity
@@ -486,7 +486,7 @@ class SwitchMixin:
             raise ConfigError("Permission denied reading Claude config")
 
         # Get account UUID and org fields
-        config_data = self._read_json(config_path)
+        config_data = self._read_json(config_path) or {}
         oauth_data = config_data.get("oauthAccount", {})
         account_uuid = oauth_data.get("accountUuid", "") or ""
         organization_uuid = oauth_data.get("organizationUuid", "") or ""

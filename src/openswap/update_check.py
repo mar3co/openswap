@@ -129,24 +129,34 @@ def _refresh_launch_agents() -> None:
         )
     if menubar_present:
         launch_agent.install()
-    restart_widget_agent()
+    detail = restart_widget_agent()
+    if detail:
+        from openswap.printer import error
+
+        error(f"Widget host did not restart: {detail}\nRun: openswap widget --install")
 
 
-def restart_widget_agent() -> None:
-    """Kick an installed widget host so it stops running a replaced virtualenv."""
+def restart_widget_agent() -> str | None:
+    """Kick an installed widget host so it stops running a replaced virtualenv.
+
+    Returns launchctl's failure detail, or None when it restarted or there is
+    no widget host to restart.
+    """
     from openswap import launch_agent
     from openswap import widget_install
 
-    widget_plist = widget_install.plist_path(widget_install.LABEL)
-    legacy_widget = widget_install.plist_path(widget_install.LEGACY_LABEL)
-    if widget_plist.exists() and launch_agent.is_loaded(widget_install.LABEL):
-        launch_agent._launchctl(
-            "kickstart", "-k", launch_agent.service_target(widget_install.LABEL)
-        )
-    elif legacy_widget.exists() or launch_agent.is_loaded(widget_install.LEGACY_LABEL):
-        launch_agent._launchctl(
-            "kickstart", "-k", launch_agent.service_target(widget_install.LEGACY_LABEL)
-        )
+    # Only a loaded job can be kickstarted; a leftover plist alone is not a widget.
+    if launch_agent.is_loaded(widget_install.LABEL):
+        label = widget_install.LABEL
+    elif launch_agent.is_loaded(widget_install.LEGACY_LABEL):
+        label = widget_install.LEGACY_LABEL
+    else:
+        return None
+    kicked = launch_agent._launchctl("kickstart", "-k", launch_agent.service_target(label))
+    if kicked.returncode == 0:
+        return None
+    output = (kicked.stderr or kicked.stdout or "").strip()
+    return f"launchctl kickstart exit {kicked.returncode}" + (f": {output}" if output else "")
 
 
 def run_self_upgrade() -> int:

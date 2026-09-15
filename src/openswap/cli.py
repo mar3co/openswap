@@ -940,7 +940,7 @@ def _setup_command(argv: list[str]) -> int:
         except ClaudeSwitchError as e:
             not_saved = (str(e), "When that is fixed, run: openswap add", 1)
         result = launch_agent.install()
-        restart_widget_agent()
+        widget_detail = restart_widget_agent()
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         if saved:
@@ -955,7 +955,11 @@ def _setup_command(argv: list[str]) -> int:
 
     print(f"Menu bar extra started ({result['label']}). Look for openswap in the menu bar.")
     print(dimmed(f"  log: {result['stderr_log']}"))
-    print(dimmed("Desktop widget (needs Xcode): openswap widget --install"))
+    if widget_detail:
+        warning(f"Widget host did not restart: {widget_detail}")
+        print(dimmed("Run: openswap widget --install"))
+    else:
+        print(dimmed("Desktop widget (needs Xcode): openswap widget --install"))
     if not_saved is None:
         print(dimmed("Log into another Claude account, then run: openswap add"))
         return 0

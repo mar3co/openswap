@@ -22,7 +22,7 @@ from unittest.mock import patch
 import pytest
 
 from openswap.switcher import ClaudeAccountSwitcher
-from openswap.exceptions import ConfigError, ValidationError
+from openswap.exceptions import ConfigError, NotLoggedInError, ValidationError
 
 CREDS = json.dumps({"claudeAiOauth": {
     "accessToken": "sk-ant-oat01-THEIRS", "refreshToken": "rt-theirs",
@@ -702,7 +702,7 @@ def test_the_guard_receives_the_triple_THAT_WAS_READ_not_a_rebuild(
         type(s), "_reject_identity_drift_since_verify",
         lambda self, verified: got.append(verified),
     )
-    monkeypatch.setattr(type(s), "_get_current_identity_triple", lambda self: read)
+    monkeypatch.setattr(type(s), "_get_current_identity_triple", lambda self, **kw: read)
     with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
          patch("openswap.oauth.fetch_oauth_profile",
                return_value={"uuid": read[2], "email": read[0],
@@ -718,3 +718,31 @@ def test_the_guard_receives_the_triple_THAT_WAS_READ_not_a_rebuild(
         "_get_current_identity_triple returned, or a sibling change that "
         "overwrites one of the unpacked names silently poisons it"
     )
+
+
+def test_add_with_no_config_is_not_logged_in(temp_home: Path, mock_claude_config: Path):
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s._get_claude_config_path().unlink()
+    with pytest.raises(NotLoggedInError):
+        s.add_account()
+
+
+def test_add_with_config_lacking_an_account_is_not_logged_in(
+    temp_home: Path, mock_claude_config: Path,
+):
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s._get_claude_config_path().write_text("{}", encoding="utf-8")
+    with pytest.raises(NotLoggedInError):
+        s.add_account()
+
+
+def test_add_with_malformed_config_is_a_config_error_not_a_login_problem(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """A torn or corrupt .claude.json must not be reported as "log in first"."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s._get_claude_config_path().write_text("{not json", encoding="utf-8")
+    with pytest.raises(ConfigError) as e:
+        s.add_account()
+    assert not isinstance(e.value, NotLoggedInError)
+    assert "could not be parsed" in str(e.value)
