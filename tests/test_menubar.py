@@ -315,26 +315,17 @@ def test_settings_page_hides_kickoff_time_when_disabled():
     assert ids_on.index("kickoff_time") < ids_on.index("group_advanced")
 
 
-def test_settings_page_hides_scoped_title_when_pct_is_off():
-    off = menubar.settings_page_rows(
-        menubar.MenuBarSettings(title_pct="off", title_scoped=True),
+@pytest.mark.parametrize("title_pct", ["off", "both"])
+def test_settings_page_keeps_scoped_title_regardless_of_pct(title_pct):
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(title_pct=title_pct, title_scoped=True),
         strategy="best",
         threshold=90,
     )
-    ids_off = [row["id"] for row in off]
-    assert "title_pct_5h" in ids_off
-    assert "title_pct_7d" in ids_off
-    assert "title_scoped" not in ids_off
-
-    on = menubar.settings_page_rows(
-        menubar.MenuBarSettings(title_pct="both", title_scoped=True),
-        strategy="best",
-        threshold=90,
-    )
-    ids_on = [row["id"] for row in on]
-    assert ids_on.index("title_pct_5h") < ids_on.index("title_scoped")
-    assert ids_on.index("title_pct_7d") < ids_on.index("title_scoped")
-    assert ids_on.index("title_scoped") < ids_on.index("refresh_interval")
+    ids = [row["id"] for row in rows]
+    assert ids.index("title_pct_5h") < ids.index("title_scoped")
+    assert ids.index("title_pct_7d") < ids.index("title_scoped")
+    assert ids.index("title_scoped") < ids.index("refresh_interval")
 
 
 def test_combine_title_pct_round_trips_the_two_toggles():
