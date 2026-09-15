@@ -1496,7 +1496,9 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
 class TestSetupCommand:
     """``openswap setup``: capture the live login, then start the extra."""
 
-    def _harness(self, monkeypatch, argv, *, add_raises=None, install_raises=None, widget_detail=None):
+    def _harness(
+        self, monkeypatch, argv, *, add_raises=None, install_raises=None, widget_detail=None, pid=4242
+    ):
         seen: dict = {"add": 0, "install": 0, "widget": 0}
 
         class FakeSwitcher:
@@ -1529,6 +1531,11 @@ class TestSetupCommand:
 
         monkeypatch.setattr(cli, "ClaudeAccountSwitcher", FakeSwitcher)
         monkeypatch.setattr("openswap.launch_agent.install", fake_install)
+        monkeypatch.setattr(
+            "openswap.launch_agent.status",
+            lambda label=None, *a, **k: {"installed": True, "loaded": True, "state": "running", "pid": pid},
+        )
+        monkeypatch.setattr(cli, "_wait_for_pid", lambda agent, label, timeout=3.0: agent.status(label)["pid"])
         monkeypatch.setattr("openswap.update_check.restart_widget_agent", fake_widget_restart)
         monkeypatch.setattr(sys, "argv", argv)
         return seen
@@ -1548,7 +1555,7 @@ class TestSetupCommand:
         assert self._run() == 0
         assert seen == {"add": 1, "install": 1, "widget": 1}
         out = capsys.readouterr().out
-        assert "Menu bar extra started" in out
+        assert "Menu bar extra running (pid 4242)" in out
         assert "/tmp/e.log" in out
         assert "Log into another Claude account, then run: openswap add" in out
 
@@ -1563,41 +1570,79 @@ class TestSetupCommand:
         assert self._run() == 0
         assert seen == {"add": 1, "install": 1, "widget": 1}
         out = capsys.readouterr().out
-        assert "Menu bar extra started" in out
+        assert "Menu bar extra running (pid 4242)" in out
         assert "another Claude account" not in out
         tail = out.strip().splitlines()[-2:]
         assert "No active Claude account" in tail[0]
         assert "Log into Claude Code, then run: openswap add" in tail[1]
 
     @pytest.mark.parametrize(
-        "exc_name, message",
+        "exc, message",
         [
             ("CredentialReadError", "Keychain access denied"),
             ("ConfigError", "Permission denied reading Claude config"),
+            (OSError, "[Errno 30] Read-only file system"),
         ],
     )
-    def test_other_capture_failures_are_not_login_problems(self, monkeypatch, capsys, exc_name, message):
+    def test_other_capture_failures_are_not_login_problems(self, monkeypatch, capsys, exc, message):
         from openswap import exceptions
 
+        exc_type = getattr(exceptions, exc) if isinstance(exc, str) else exc
         seen = self._harness(
             monkeypatch,
             ["openswap", "setup"],
-            add_raises=getattr(exceptions, exc_name)(message),
+            add_raises=exc_type(message),
         )
         assert self._run() == 1
         assert seen == {"add": 1, "install": 1, "widget": 1}
         out = capsys.readouterr().out
-        assert "Menu bar extra started" in out
+        assert "Menu bar extra running (pid 4242)" in out
         assert "Log into Claude Code" not in out
         tail = out.strip().splitlines()[-2:]
         assert message in tail[0]
         assert "openswap add" in tail[1]
 
+    def test_extra_that_did_not_come_up_is_not_called_running(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"], pid=None)
+        assert self._run() == 0
+        out = capsys.readouterr().out
+        assert "Menu bar extra running" not in out
+        assert "not running yet" in out
+        assert "/tmp/e.log" in out
+
+    def test_ctrl_c_after_capture_says_the_account_was_saved(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"], install_raises=KeyboardInterrupt())
+        assert self._run() == 130
+        assert "account was saved" in capsys.readouterr().out
+
+    def test_wait_for_pid_returns_pid_once_launchd_spawned_it(self):
+        answers = iter([None, None, 77])
+        agent = type("A", (), {"status": staticmethod(lambda label: {"pid": next(answers)})})
+        assert cli._wait_for_pid(agent, "x", timeout=5.0) == 77
+
+    def test_wait_for_pid_gives_up_at_the_deadline(self):
+        agent = type("A", (), {"status": staticmethod(lambda label: {"pid": None})})
+        assert cli._wait_for_pid(agent, "x", timeout=0.0) is None
+
+    def test_ctrl_c_after_failed_capture_reports_the_reason(self, monkeypatch, capsys):
+        from openswap.exceptions import CredentialReadError
+
+        self._harness(
+            monkeypatch,
+            ["openswap", "setup"],
+            add_raises=CredentialReadError("Keychain access denied"),
+            install_raises=KeyboardInterrupt(),
+        )
+        assert self._run() == 130
+        out = capsys.readouterr().out
+        assert "Keychain access denied" in out
+        assert "openswap add" in out
+
     def test_widget_restart_failure_is_a_warning_with_its_own_fix(self, monkeypatch, capsys):
         self._harness(monkeypatch, ["openswap", "setup"], widget_detail="kickstart exit 113")
         assert self._run() == 0
         out = capsys.readouterr().out
-        assert "Menu bar extra started" in out
+        assert "Menu bar extra running (pid 4242)" in out
         assert "kickstart exit 113" in out
         assert out.count("openswap widget --install") == 1
 
@@ -1613,6 +1658,7 @@ class TestSetupCommand:
         assert self._run() == 1
         err = capsys.readouterr().err
         assert "Keychain access denied" in err
+        assert "When that is fixed, run: openswap add" in err
         assert "launchctl bootstrap failed" in err
 
     def test_service_failure_exits_nonzero_with_retry_and_account_state(self, monkeypatch, capsys):

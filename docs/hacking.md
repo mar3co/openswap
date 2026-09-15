@@ -13,7 +13,7 @@ uv tool install --editable '.[menubar]'
 uv sync   # dev extras: pytest, etc.
 ```
 
-`OPENSWAP_DIR=$PWD bash install.sh` installs the tool from an existing checkout without pulling it, then runs `openswap setup`. It does not run `uv sync`.
+`OPENSWAP_DIR=$PWD bash install.sh` installs the tool from an existing checkout without pulling it, then runs `openswap setup`. It does not run `uv sync`. If the path does not exist, the installer clones there.
 
 OpenSwap is not on PyPI. `openswap upgrade` runs `git pull` in this checkout, then `uv tool install --force --editable '.[menubar]'`, then refreshes installed LaunchAgents. If you moved the clone, reinstall from the new path.
 

@@ -903,6 +903,20 @@ The menu bar extra must be running so the widget has live usage numbers.
         return 1
 
 
+def _wait_for_pid(launch_agent, label: str, timeout: float = 3.0) -> int | None:
+    """The extra's pid once launchd has spawned it, or None if it has not by
+    ``timeout``. bootstrap returns before the process exists, so a plain
+    status read right after it would report a healthy job as absent."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        pid = launch_agent.status(label)["pid"]
+        if pid or time.monotonic() >= deadline:
+            return pid
+        time.sleep(0.2)
+
+
 def _setup_command(argv: list[str]) -> int:
     """Handle ``openswap setup``: save the live Claude login, start the extra.
 
@@ -937,23 +951,35 @@ def _setup_command(argv: list[str]) -> int:
             saved = True
         except NotLoggedInError as e:
             not_saved = (str(e), "Log into Claude Code, then run: openswap add", 0)
-        except ClaudeSwitchError as e:
+        except (ClaudeSwitchError, OSError) as e:
+            # OSError: the backup store itself is unwritable. The extra is
+            # still worth installing; the store problem is the user's fix.
             not_saved = (str(e), "When that is fixed, run: openswap add", 1)
         result = launch_agent.install()
         widget_detail = restart_widget_agent()
+        pid = _wait_for_pid(launch_agent, result["label"])
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         if saved:
             error("Your Claude account was saved.")
         elif not_saved is not None:
             error(f"Claude account not saved: {not_saved[0]}")
+            error(not_saved[1])
         error("Retry the extra with: openswap menubar --install-service")
         return 1
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
+        if saved:
+            print(dimmed("Your Claude account was saved."))
+        elif not_saved is not None:
+            print(dimmed(f"Claude account not saved: {not_saved[0]}"))
+            print(dimmed(not_saved[1]))
         return 130
 
-    print(f"Menu bar extra started ({result['label']}). Look for openswap in the menu bar.")
+    if pid:
+        print(f"Menu bar extra running (pid {pid}). Look for openswap in the menu bar.")
+    else:
+        warning("Menu bar extra was installed but is not running yet.")
     print(dimmed(f"  log: {result['stderr_log']}"))
     if widget_detail:
         warning(f"Widget host did not restart: {widget_detail}")

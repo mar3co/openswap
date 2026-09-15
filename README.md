@@ -15,7 +15,7 @@ One command. Needs a Mac with [Claude Code](https://docs.anthropic.com/en/docs/c
 curl -fsSL https://raw.githubusercontent.com/mar3co/openswap/main/install.sh | bash
 ```
 
-It installs [uv](https://docs.astral.sh/uv/) if you do not have it (uv brings its own Python), clones OpenSwap to `~/.openswap`, saves the Claude account you are logged into, and puts the extra in your menu bar. On a brand-new Mac, macOS first asks to install its Command Line Tools; run the command again once that finishes. Re-run it any time to update; it pulls instead of cloning. `openswap upgrade` updates from the terminal. Homebrew cask comes later. OpenSwap is not on PyPI.
+It installs [uv](https://docs.astral.sh/uv/) if you do not have it (uv brings its own Python), clones OpenSwap to `~/.openswap`, saves the Claude account you are logged into, and puts the extra in your menu bar. On a brand-new Mac, macOS first asks to install its Command Line Tools; run the command again once that finishes. Re-run it any time to update; it pulls instead of cloning, then saves the current login and starts the extra again. `openswap upgrade` updates from the terminal. Homebrew cask comes later. OpenSwap is not on PyPI.
 
 Already have a checkout? `OPENSWAP_DIR=/path/to/openswap bash install.sh` installs from it.
 

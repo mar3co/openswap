@@ -127,13 +127,20 @@ def _refresh_launch_agents() -> None:
             launch_agent.plist_path(old).exists() or launch_agent.is_loaded(old)
             for old in launch_agent.LEGACY_LABELS
         )
+    from openswap.exceptions import ClaudeSwitchError
+
     if menubar_present:
-        launch_agent.install()
+        try:
+            launch_agent.install()
+        except ClaudeSwitchError as exc:
+            raise ClaudeSwitchError(
+                f"Menu bar extra: {exc}\nRun: openswap menubar --install-service"
+            ) from exc
     detail = restart_widget_agent()
     if detail:
-        from openswap.printer import error
-
-        error(f"Widget host did not restart: {detail}\nRun: openswap widget --install")
+        raise ClaudeSwitchError(
+            f"Widget host did not restart: {detail}\nRun: openswap widget --install"
+        )
 
 
 def restart_widget_agent() -> str | None:
@@ -173,7 +180,8 @@ def run_self_upgrade() -> int:
             f"The git checkout at {root} is gone (moved?).\n"
             "From the new location run "
             "`uv tool install --force --editable '.[menubar]'` then "
-            f"`openswap setup`, or reinstall with:\n  {INSTALL_COMMAND}"
+            "`openswap menubar --install-service` (and `openswap widget --install` "
+            f"if you use the widget), or reinstall with:\n  {INSTALL_COMMAND}"
         )
         return 1
 
@@ -195,9 +203,6 @@ def run_self_upgrade() -> int:
     try:
         _refresh_launch_agents()
     except ClaudeSwitchError as exc:
-        error(
-            f"Tool upgraded, but the menu bar service did not reload: {exc}\n"
-            "Run: openswap menubar --install-service"
-        )
+        error(f"Tool upgraded, but a login item did not reload: {exc}")
         return 1
     return 0

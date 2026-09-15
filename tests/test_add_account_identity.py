@@ -745,7 +745,8 @@ def test_add_with_malformed_config_is_a_config_error_not_a_login_problem(
     with pytest.raises(ConfigError) as e:
         s.add_account()
     assert not isinstance(e.value, NotLoggedInError)
-    assert "could not be parsed" in str(e.value)
+    assert "Retry once Claude Code has finished writing it" in str(e.value)
+    assert "move it" not in str(e.value)
 
 
 @pytest.mark.parametrize("value", ['"corrupt"', "[]", '""', "0"])
@@ -762,21 +763,28 @@ def test_add_with_non_object_oauth_account_is_a_config_error(
     assert "oauthAccount" in str(e.value)
 
 
+OTHER_LOGIN = json.dumps({"oauthAccount": {
+    "emailAddress": "bx@example.com", "organizationUuid": "org-2",
+    "accountUuid": "acct-2", "organizationName": "Bee Corp"}})
+
+
 @pytest.mark.parametrize(
     "torn, expect",
     [
         ("{not json", "could not be parsed"),
-        ("{}", "no oauthAccount"),
-        ('{"oauthAccount": {"emailAddress": "ax@example.com"}}', None),
+        ("{}", "login changed"),
+        ('{"oauthAccount": {"emailAddress": "ax@example.com"}}', "login changed"),
+        (OTHER_LOGIN, "login changed"),
     ],
 )
 def test_add_never_commits_from_a_config_that_changed_mid_capture(
-    temp_home: Path, mock_claude_config: Path, torn: str, expect: str | None,
+    temp_home: Path, mock_claude_config: Path, torn: str, expect: str,
 ):
     """Between the verified read and the commit read the file is torn,
-    empty, or blank-UUID, and settles back before the drift guard runs.
-    Unparseable or account-less content must refuse; a settled-back file
-    with blank UUIDs must commit the VERIFIED UUIDs, never the blanks."""
+    empty, blank-UUID, or another account's login, and settles back before
+    the drift guard runs. Every one must refuse: the guard re-reads the
+    settled file and cannot tell, so the captured bytes themselves are
+    checked against the verified identity."""
     s = _switcher(temp_home, mock_claude_config, "ax@example.com", org="org-1")
     cfg = s._get_claude_config_path()
     good = cfg.read_text(encoding="utf-8")
@@ -799,15 +807,45 @@ def test_add_never_commits_from_a_config_that_changed_mid_capture(
          patch("openswap.oauth.fetch_oauth_profile",
                return_value={"uuid": "acct-1", "email": "ax@example.com",
                              "organizationUuid": "org-1"}):
-        if expect is None:
+        with pytest.raises(ConfigError, match=expect):
             s.add_account(slot=7, assume_yes=True)
-        else:
-            with pytest.raises(ConfigError, match=expect):
-                s.add_account(slot=7, assume_yes=True)
 
-    record = s._get_sequence_data().get("accounts", {}).get("7")
-    if expect is None:
-        assert record["uuid"] == "acct-1"
-        assert record["organizationUuid"] == "org-1"
-    else:
-        assert record is None
+    assert "7" not in s._get_sequence_data().get("accounts", {})
+    assert not list(s.configs_dir.glob(".claude-config-7-*"))
+
+
+TORN_UTF8 = '{"oauthAccount": {"emailAddress": "ax@example.com", "organizationName": "Caf\xc3'
+
+
+@pytest.mark.parametrize("torn", ["{not json", "{}", OTHER_LOGIN, TORN_UTF8])
+def test_refresh_in_place_never_backs_up_a_config_that_changed_mid_capture(
+    temp_home: Path, mock_claude_config: Path, torn: str,
+):
+    """Re-running setup refreshes an existing slot; the same tear must refuse
+    there too, leaving the slot's backup config untouched."""
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com", org="org-1")
+    cfg = s._get_claude_config_path()
+    good = cfg.read_text(encoding="utf-8")
+    profile = {"uuid": "acct-1", "email": "ax@example.com", "organizationUuid": "org-1"}
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("openswap.oauth.fetch_oauth_profile", return_value=profile):
+        s.add_account(slot=7, assume_yes=True)
+    backup = s.configs_dir / ".claude-config-7-ax@example.com.json"
+    assert json.loads(backup.read_text(encoding="utf-8"))["oauthAccount"]["emailAddress"] == "ax@example.com"
+    real_guard = s._reject_identity_drift_since_verify
+
+    def tear_after_verify():
+        cfg.write_bytes(torn.encode("latin-1"))
+        return CREDS
+
+    def settle_then_guard(identity):
+        cfg.write_text(good, encoding="utf-8")
+        return real_guard(identity)
+
+    with patch.object(s, "_read_capture_credentials", side_effect=tear_after_verify), \
+         patch.object(s, "_reject_identity_drift_since_verify", side_effect=settle_then_guard), \
+         patch("openswap.oauth.fetch_oauth_profile", return_value=profile):
+        with pytest.raises(ConfigError):
+            s.add_account()
+
+    assert json.loads(backup.read_text(encoding="utf-8"))["oauthAccount"]["emailAddress"] == "ax@example.com"

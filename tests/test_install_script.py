@@ -49,6 +49,7 @@ cat "$STUB_DIR/uv-installer.sh"
 '''
 
 UV_INSTALLER = r'''#!/bin/sh
+[ -n "${FAIL_UV_INSTALLER:-}" ] && exit 1
 [ -n "${UV_INSTALLER_NOOP:-}" ] && exit 0
 mkdir -p "$HOME/.local/bin"
 cp "$STUB_DIR/uv.stub" "$HOME/.local/bin/uv"
@@ -163,7 +164,8 @@ class TestInstallScript:
         _fake_checkout(tmp_path / "home" / ".openswap")
         proc, calls = run_installer(tmp_path, env={"FAIL_PULL": "1"})
         assert proc.returncode == 0, proc.stderr
-        assert "Could not update" in proc.stdout
+        # Once when it happens, once more as the last word after setup's output.
+        assert proc.stderr.count("NOT updated") == 2
         assert "uv tool install --force --editable .[menubar]" in calls
         assert "openswap setup" in calls
 
@@ -223,12 +225,21 @@ class TestInstallScript:
         proc, calls = run_installer(tmp_path, env={"FAIL_UV_INSTALL": "1"})
         assert proc.returncode == 1
         assert "openswap setup" not in calls
+        assert "Installing the openswap tool failed" in proc.stderr
+
+    def test_failed_uv_installer_is_reported(self, tmp_path):
+        proc, calls = run_installer(tmp_path, uv=False, bin_on_path=False, env={"FAIL_UV_INSTALLER": "1"})
+        assert proc.returncode == 1
+        assert "uv installer failed" in proc.stderr
+        assert not any(c.startswith("git") for c in calls)
 
     def test_shell_config_failure_does_not_block_setup(self, tmp_path):
         proc, calls = run_installer(tmp_path, bin_on_path=False, env={"FAIL_UPDATE_SHELL": "1"})
         assert proc.returncode == 0, proc.stderr
-        assert "Could not update your shell config" in proc.stdout
         assert "openswap setup" in calls
+        last = proc.stdout.strip().splitlines()[-1]
+        assert "Add" in last and "PATH" in last
+        assert "new terminal" not in proc.stdout
 
     def test_setup_failure_is_the_exit_status_but_path_hint_still_prints(self, tmp_path):
         proc, calls = run_installer(tmp_path, bin_on_path=False, env={"FAIL_SETUP": "3"})

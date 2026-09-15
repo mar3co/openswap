@@ -289,6 +289,48 @@ class SwitchMixin:
 
         self._commit_add_account(slot, assume_yes, alias)
 
+    def _read_capture_config(self, verified: tuple[str, str, str]) -> tuple[str, dict]:
+        """The bytes to back up and their ``oauthAccount``, from ONE read.
+
+        The bytes must still describe ``verified``: the drift guard re-reads
+        the file later and cannot see a login that landed and settled back in
+        between, so the check has to be on the bytes themselves. Unparseable
+        or account-less content refuses too.
+        """
+        config_path = self._get_claude_config_path()
+        try:
+            text = read_text_with_retry(config_path)
+        except FileNotFoundError:
+            raise ConfigError("Claude config file not found")
+        except PermissionError:
+            raise ConfigError("Permission denied reading Claude config")
+        except UnicodeDecodeError as e:
+            raise ConfigError(
+                f"{config_path} could not be decoded ({e}). Retry once Claude Code "
+                "has finished writing it."
+            ) from e
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ConfigError(
+                f"{config_path} could not be parsed ({e}). Retry once Claude Code "
+                "has finished writing it."
+            ) from e
+        oauth = data.get("oauthAccount") if isinstance(data, dict) else None
+        if not isinstance(oauth, dict):
+            oauth = {}
+        found = (
+            oauth.get("emailAddress", "") or "",
+            oauth.get("organizationUuid", "") or "",
+            oauth.get("accountUuid", "") or "",
+        )
+        if found != verified:
+            raise ConfigError(
+                f"The active Claude login changed while {verified[0]} was being "
+                "captured; nothing was stored. Retry."
+            )
+        return text, oauth
+
     def _commit_add_account(
         self,
         slot: int | None,
@@ -301,7 +343,18 @@ class SwitchMixin:
             self._init_sequence_file()
             self._migrate_org_fields()
 
-        identity = self._get_current_identity_triple(strict=True)
+        try:
+            identity = self._get_current_identity_triple(strict=True)
+        except ConfigError as e:
+            # The strict reader's generic "repair or move it" is wrong for a
+            # file Claude Code is mid-write on; a parse error here wants a
+            # retry, not surgery. An OSError keeps its own accurate advice.
+            if isinstance(e.__cause__, (json.JSONDecodeError, UnicodeDecodeError)):
+                raise ConfigError(
+                    f"Could not read {self._get_claude_config_path()}: "
+                    f"{e.__cause__}. Retry once Claude Code has finished writing it."
+                ) from e
+            raise
         if identity is None:
             raise NotLoggedInError("No active Claude account found. Please log in first.")
         current_email, current_org_uuid, current_account_uuid = identity
@@ -331,13 +384,7 @@ class SwitchMixin:
             )
             self._reject_credential_drift_since_verify(current_creds)
 
-            config_path = self._get_claude_config_path()
-            try:
-                current_config = config_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                raise ConfigError("Claude config file not found")
-            except PermissionError:
-                raise ConfigError("Permission denied reading Claude config")
+            current_config, _ = self._read_capture_config(identity)
 
             # AFTER the read, because it licenses those bytes. Ahead of it, a
             # `/login` landing between the check and the read stores a config
@@ -477,31 +524,7 @@ class SwitchMixin:
         )
         self._reject_credential_drift_since_verify(current_creds)
 
-        config_path = self._get_claude_config_path()
-        try:
-            current_config = config_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            raise ConfigError("Claude config file not found")
-        except PermissionError:
-            raise ConfigError("Permission denied reading Claude config")
-
-        # The UUIDs come from the verified identity, not from a second read
-        # that a logout/login race could blank. Only the org name is new, and
-        # it is parsed from the same bytes that become the backup, so the
-        # backup and the metadata cannot disagree.
-        try:
-            config_data = json.loads(current_config)
-        except json.JSONDecodeError as e:
-            raise ConfigError(
-                f"{config_path} could not be parsed ({e}). Retry once Claude Code "
-                "has finished writing it."
-            ) from e
-        oauth_data = config_data.get("oauthAccount") if isinstance(config_data, dict) else None
-        if not isinstance(oauth_data, dict) or not oauth_data:
-            raise ConfigError(
-                f"{config_path} has no oauthAccount to capture; the login changed "
-                "while it was being captured. Retry."
-            )
+        current_config, oauth_data = self._read_capture_config(identity)
         account_uuid = current_account_uuid
         organization_uuid = current_org_uuid
         organization_name = oauth_data.get("organizationName", "") or ""
