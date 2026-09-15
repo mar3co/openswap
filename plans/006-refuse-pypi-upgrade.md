@@ -43,7 +43,7 @@ at the mar3co repo.
   sources.
 
 This machine: `uv tool install --editable '.[menubar]'` so
-`openswap.__file__` is under `/Users/yohan/GitHub/openswap` which has
+`openswap.__file__` is under the git checkout, which has
 `.git`. Detection must use the **package file path**, not `sys.prefix`
 (prefix is still `uv/tools`).
 
