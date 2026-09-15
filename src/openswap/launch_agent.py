@@ -237,9 +237,12 @@ def install(
     target_plist = plist_path(label, home)
     out_log, err_log = log_paths(label, home)
 
-    target_plist.parent.mkdir(parents=True, exist_ok=True)
-    out_log.parent.mkdir(parents=True, exist_ok=True)
-    target_plist.write_bytes(build_plist(program, label, home))
+    try:
+        target_plist.parent.mkdir(parents=True, exist_ok=True)
+        out_log.parent.mkdir(parents=True, exist_ok=True)
+        target_plist.write_bytes(build_plist(program, label, home))
+    except OSError as e:
+        raise ClaudeSwitchError(f"Could not write the launch agent: {e}") from e
 
     settled = True
     if is_loaded(label, uid):
@@ -289,7 +292,9 @@ def uninstall(
             )
 
     existed = target_plist.exists()
-    if existed:
-        target_plist.unlink()
+    try:
+        target_plist.unlink(missing_ok=True)
+    except OSError as e:
+        raise ClaudeSwitchError(f"Could not remove the launch agent: {e}") from e
 
     return {"label": label, "was_loaded": was_loaded, "removed_plist": existed}

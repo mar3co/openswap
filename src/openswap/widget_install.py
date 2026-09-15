@@ -187,16 +187,20 @@ def install_launch_agent(app: Path, home: Path | None = None, uid: int | None = 
         raise ClaudeSwitchError(f"Widget host binary missing in {app}")
     target = plist_path(LABEL, home)
     out_log, err_log = log_paths(LABEL, home)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    out_log.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(build_host_plist(app, home))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        out_log.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(build_host_plist(app, home))
+    except OSError as e:
+        raise ClaudeSwitchError(f"Could not write the launch agent: {e}") from e
 
     if is_loaded(LEGACY_LABEL, uid):
         _launchctl("bootout", service_target(LEGACY_LABEL, uid))
         _wait_until_unloaded(LEGACY_LABEL, uid)
-        legacy_plist = plist_path(LEGACY_LABEL, home)
-        if legacy_plist.exists():
-            legacy_plist.unlink()
+        try:
+            plist_path(LEGACY_LABEL, home).unlink(missing_ok=True)
+        except OSError as e:
+            raise ClaudeSwitchError(f"Could not remove the old widget launch agent: {e}") from e
 
     settled = True
     if is_loaded(LABEL, uid):
@@ -231,10 +235,13 @@ def _copy_built_app(derived: Path, dest: Path) -> Path:
     built = derived / "Build" / "Products" / "Release" / f"{HOST_PRODUCT}.app"
     if not built.is_dir():
         raise ClaudeSwitchError(f"xcodebuild produced no app at {built}")
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(built, dest)
+    try:
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(built, dest)
+    except OSError as e:
+        raise ClaudeSwitchError(f"Could not install the widget app: {e}") from e
     return dest
 
 
@@ -249,8 +256,12 @@ def install_widget(
     src = project_dir()
     team = team or detect_development_team()
     derived = derived or (Path.home() / "Library" / "Caches" / "openswap-widget")
-    derived.mkdir(parents=True, exist_ok=True)
     log_file = derived / "xcodebuild.log"
+    try:
+        derived.mkdir(parents=True, exist_ok=True)
+        handle = log_file.open("w", encoding="utf-8")
+    except OSError as e:
+        raise ClaudeSwitchError(f"Could not write the build log: {e}") from e
     cmd = [
         _xcodebuild(),
         "-project",
@@ -268,7 +279,7 @@ def install_widget(
         "-allowProvisioningUpdates",
         "build",
     ]
-    with log_file.open("w", encoding="utf-8") as handle:
+    with handle:
         proc = subprocess.run(cmd, stdout=handle, stderr=subprocess.STDOUT, check=False)
     if proc.returncode != 0:
         tail = ""
@@ -307,10 +318,14 @@ def uninstall_widget(home: Path | None = None, uid: int | None = None) -> dict:
     _require_macos()
     agent = uninstall_launch_agent(home=home, uid=uid)
     app = widget_app_path(home)
-    removed_app = False
-    if app.exists():
-        shutil.rmtree(app)
-        removed_app = True
+    removed_app = app.exists()
+    if removed_app:
+        try:
+            shutil.rmtree(app)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise ClaudeSwitchError(f"Could not remove the widget app: {e}") from e
     return {**agent, "removed_app": removed_app, "app": str(app)}
 
 
