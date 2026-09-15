@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from openswap.update_check import check_for_update, run_self_upgrade
+from openswap.update_check import INSTALL_COMMAND, check_for_update, run_self_upgrade
 
 
 class TestNoPypi:
@@ -47,7 +47,7 @@ class TestNoPypi:
             mock_run.assert_not_called()
         err = capsys.readouterr().err
         assert "not published to PyPI" in err
-        assert "uv tool install --force --editable" in err
+        assert INSTALL_COMMAND in err
 
     def test_run_self_upgrade_gone_checkout_path(self, tmp_path, monkeypatch, capsys):
         missing = tmp_path / "moved-openswap"
@@ -132,11 +132,74 @@ class TestNoPypi:
             "openswap.update_check.subprocess.run",
             lambda *a, **k: MagicMock(returncode=0),
         )
-        def boom():
+        def boom(**kwargs):
             raise ClaudeSwitchError("bootstrap failed")
 
-        monkeypatch.setattr("openswap.update_check._refresh_launch_agents", boom)
+        plist = tmp_path / "Library" / "LaunchAgents" / "com.opensoft.openswap.menubar.plist"
+        plist.parent.mkdir(parents=True)
+        plist.write_bytes(b"")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("openswap.update_check.sys.platform", "darwin")
+        monkeypatch.setattr("openswap.launch_agent.is_loaded", lambda *a, **k: False)
+        monkeypatch.setattr("openswap.launch_agent.install", boom)
         assert run_self_upgrade() == 1
         err = capsys.readouterr().err
         assert "bootstrap failed" in err
         assert "menubar --install-service" in err
+
+
+class TestRestartWidgetAgent:
+    def _arm(self, monkeypatch, returncode, *, loaded):
+        calls: list[tuple[str, ...]] = []
+
+        def fake_launchctl(*args):
+            calls.append(args)
+            return MagicMock(returncode=returncode, stderr="Could not find service", stdout="")
+
+        monkeypatch.setattr("openswap.launch_agent.is_loaded", lambda label, *a, **k: label in loaded)
+        monkeypatch.setattr("openswap.launch_agent._launchctl", fake_launchctl)
+        # service_target calls os.getuid, which Windows lacks; the test farm runs there too.
+        monkeypatch.setattr("openswap.launch_agent.service_target", lambda label, uid=None: f"gui/501/{label}")
+        return calls
+
+    def test_kickstarts_loaded_widget_and_returns_none(self, monkeypatch):
+        from openswap.update_check import restart_widget_agent
+        from openswap.widget_install import LABEL
+
+        calls = self._arm(monkeypatch, 0, loaded={LABEL})
+        assert restart_widget_agent() is None
+        assert len(calls) == 1
+        assert calls[0][:2] == ("kickstart", "-k")
+        assert calls[0][2].endswith(LABEL)
+
+    def test_returns_detail_when_kickstart_fails(self, monkeypatch):
+        from openswap.update_check import restart_widget_agent
+        from openswap.widget_install import LABEL
+
+        self._arm(monkeypatch, 113, loaded={LABEL})
+        detail = restart_widget_agent()
+        assert detail is not None
+        assert "113" in detail
+        assert "Could not find service" in detail
+
+    def test_no_loaded_widget_job_means_nothing_to_restart(self, monkeypatch):
+        from openswap.update_check import restart_widget_agent
+
+        calls = self._arm(monkeypatch, 113, loaded=set())
+        assert restart_widget_agent() is None
+        assert calls == []
+
+    def test_upgrade_fails_when_widget_does_not_restart(self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "openswap"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        monkeypatch.setattr("openswap.update_check._checkout_root", lambda: repo)
+        monkeypatch.setattr("openswap.update_check.sys.platform", "darwin")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("openswap.update_check.subprocess.run", lambda *a, **k: MagicMock(returncode=0))
+        monkeypatch.setattr("openswap.launch_agent.is_loaded", lambda *a, **k: False)
+        monkeypatch.setattr("openswap.update_check.restart_widget_agent", lambda: "kickstart exit 113")
+        assert run_self_upgrade() == 1
+        err = capsys.readouterr().err
+        assert "kickstart exit 113" in err
+        assert "openswap widget --install" in err

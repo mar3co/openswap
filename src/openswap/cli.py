@@ -18,6 +18,7 @@ from openswap.printer import (
     error,
     force_utf8_output,
     muted,
+    warning,
 )
 from openswap.settings import load_ui_settings
 from openswap.engine import Engine
@@ -902,6 +903,98 @@ The menu bar extra must be running so the widget has live usage numbers.
         return 1
 
 
+def _wait_for_pid(launch_agent, label: str, timeout: float = 3.0) -> int | None:
+    """The extra's pid once launchd has spawned it, or None if it has not by
+    ``timeout``. bootstrap returns before the process exists, so a plain
+    status read right after it would report a healthy job as absent."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        pid = launch_agent.status(label)["pid"]
+        if pid or time.monotonic() >= deadline:
+            return pid
+        time.sleep(0.2)
+
+
+def _setup_command(argv: list[str]) -> int:
+    """Handle ``openswap setup``: save the live Claude login, start the extra.
+
+    The install script ends here so a fresh Mac goes from one command to an
+    icon in the menu bar. Re-runnable: add_account refreshes an account that
+    is already stored, and launch_agent.install re-bootstraps the service.
+    No Claude login is a warning and exit 0: the extra still installs and can
+    capture the account later. Any other capture failure (Keychain denied,
+    lock timeout, ...) still installs the extra but exits 1, because "log in"
+    is the wrong advice for it. A failed capture is reported after the extra
+    so its hint is the last thing the user reads.
+    """
+    parser = argparse.ArgumentParser(
+        prog="openswap setup",
+        description=(
+            "Save the Claude account you are logged into and start the "
+            "menu bar extra (now, and at every login)."
+        ),
+    )
+    parser.parse_args(argv)
+    from openswap import launch_agent
+    from openswap.exceptions import NotLoggedInError
+    from openswap.update_check import restart_widget_agent
+
+    saved = False
+    not_saved: tuple[str, str, int] | None = None  # (reason, hint, exit code)
+    try:
+        switcher = ClaudeAccountSwitcher()
+        _guard_root(switcher)
+        try:
+            switcher.add_account()
+            saved = True
+        except NotLoggedInError as e:
+            not_saved = (str(e), "Log into Claude Code, then run: openswap add", 0)
+        except (ClaudeSwitchError, OSError) as e:
+            # OSError: the backup store itself is unwritable. The extra is
+            # still worth installing; the store problem is the user's fix.
+            not_saved = (str(e), "When that is fixed, run: openswap add", 1)
+        result = launch_agent.install()
+        widget_detail = restart_widget_agent()
+        pid = _wait_for_pid(launch_agent, result["label"])
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        if saved:
+            error("Your Claude account was saved.")
+        elif not_saved is not None:
+            error(f"Claude account not saved: {not_saved[0]}")
+            error(not_saved[1])
+        error("Retry the extra with: openswap menubar --install-service")
+        return 1
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        if saved:
+            print(dimmed("Your Claude account was saved."))
+        elif not_saved is not None:
+            print(dimmed(f"Claude account not saved: {not_saved[0]}"))
+            print(dimmed(not_saved[1]))
+        return 130
+
+    if pid:
+        print(f"Menu bar extra running (pid {pid}). Look for openswap in the menu bar.")
+    else:
+        warning("Menu bar extra was installed but is not running yet.")
+    print(dimmed(f"  log: {result['stderr_log']}"))
+    if widget_detail:
+        warning(f"Widget host did not restart: {widget_detail}")
+        print(dimmed("Run: openswap widget --install"))
+    else:
+        print(dimmed("Desktop widget (needs Xcode): openswap widget --install"))
+    if not_saved is None:
+        print(dimmed("Log into another Claude account, then run: openswap add"))
+        return 0
+    reason, hint, code = not_saved
+    warning(f"Claude account not saved: {reason}")
+    print(dimmed(hint))
+    return code
+
+
 def _statusline_command(argv: list[str]) -> int:
     """Handle ``openswap statusline`` (paint) and ``--install`` / ``--uninstall``.
 
@@ -1059,6 +1152,8 @@ def main() -> None:
         sys.exit(_widget_command(argv[1:]))
     if argv and argv[0] == "statusline":
         sys.exit(_statusline_command(argv[1:]))
+    if argv and argv[0] == "setup":
+        sys.exit(_setup_command(argv[1:]))
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1108,6 +1203,7 @@ def main() -> None:
 
 Commands:
   %(prog)s help                       show this help
+  %(prog)s setup                      save the current login and start the menu bar extra
   %(prog)s list                       list managed accounts
   %(prog)s status                     show current account
   %(prog)s switch                     rotate to the next account

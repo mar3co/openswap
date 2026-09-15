@@ -10,6 +10,10 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
+INSTALL_COMMAND = (
+    "curl -fsSL https://raw.githubusercontent.com/mar3co/openswap/main/install.sh | bash"
+)
+
 
 def _looks_like_openswap_checkout(root: Path) -> bool:
     """True when ``root`` is this project's tree, not some other git repo."""
@@ -116,7 +120,6 @@ def _refresh_launch_agents() -> None:
     if sys.platform != "darwin":
         return
     from openswap import launch_agent
-    from openswap import widget_install
 
     menubar_present = launch_agent.plist_path().exists()
     if not menubar_present:
@@ -124,18 +127,43 @@ def _refresh_launch_agents() -> None:
             launch_agent.plist_path(old).exists() or launch_agent.is_loaded(old)
             for old in launch_agent.LEGACY_LABELS
         )
+    from openswap.exceptions import ClaudeSwitchError
+
     if menubar_present:
-        launch_agent.install()
-    widget_plist = widget_install.plist_path(widget_install.LABEL)
-    legacy_widget = widget_install.plist_path(widget_install.LEGACY_LABEL)
-    if widget_plist.exists() and launch_agent.is_loaded(widget_install.LABEL):
-        launch_agent._launchctl(
-            "kickstart", "-k", launch_agent.service_target(widget_install.LABEL)
+        try:
+            launch_agent.install()
+        except ClaudeSwitchError as exc:
+            raise ClaudeSwitchError(
+                f"Menu bar extra: {exc}\nRun: openswap menubar --install-service"
+            ) from exc
+    detail = restart_widget_agent()
+    if detail:
+        raise ClaudeSwitchError(
+            f"Widget host did not restart: {detail}\nRun: openswap widget --install"
         )
-    elif legacy_widget.exists() or launch_agent.is_loaded(widget_install.LEGACY_LABEL):
-        launch_agent._launchctl(
-            "kickstart", "-k", launch_agent.service_target(widget_install.LEGACY_LABEL)
-        )
+
+
+def restart_widget_agent() -> str | None:
+    """Kick an installed widget host so it stops running a replaced virtualenv.
+
+    Returns launchctl's failure detail, or None when it restarted or there is
+    no widget host to restart.
+    """
+    from openswap import launch_agent
+    from openswap import widget_install
+
+    # Only a loaded job can be kickstarted; a leftover plist alone is not a widget.
+    if launch_agent.is_loaded(widget_install.LABEL):
+        label = widget_install.LABEL
+    elif launch_agent.is_loaded(widget_install.LEGACY_LABEL):
+        label = widget_install.LEGACY_LABEL
+    else:
+        return None
+    kicked = launch_agent._launchctl("kickstart", "-k", launch_agent.service_target(label))
+    if kicked.returncode == 0:
+        return None
+    output = (kicked.stderr or kicked.stdout or "").strip()
+    return f"launchctl kickstart exit {kicked.returncode}" + (f": {output}" if output else "")
 
 
 def run_self_upgrade() -> int:
@@ -145,18 +173,15 @@ def run_self_upgrade() -> int:
 
     root = _checkout_root()
     if root is None:
-        error(
-            "OpenSwap is not published to PyPI.\n"
-            "Clone https://github.com/mar3co/openswap.git then "
-            "`uv tool install --force --editable '.[menubar]'`."
-        )
+        error(f"OpenSwap is not published to PyPI. Install it with:\n  {INSTALL_COMMAND}")
         return 1
     if not root.exists():
         error(
             f"The git checkout at {root} is gone (moved?).\n"
             "From the new location run "
-            "`uv tool install --force --editable '.[menubar]'`, "
-            "then `openswap menubar --install-service`."
+            "`uv tool install --force --editable '.[menubar]'` then "
+            "`openswap menubar --install-service` (and `openswap widget --install` "
+            f"if you use the widget), or reinstall with:\n  {INSTALL_COMMAND}"
         )
         return 1
 
@@ -171,20 +196,13 @@ def run_self_upgrade() -> int:
         )
     except FileNotFoundError as exc:
         missing = getattr(exc, "filename", None) or "git or uv"
-        error(
-            f"`{missing}` is not on PATH. Install uv from https://docs.astral.sh/uv/ "
-            "then retry, or from the checkout run "
-            "`uv tool install --force --editable '.[menubar]'`."
-        )
+        error(f"`{missing}` is not on PATH. Re-run the installer:\n  {INSTALL_COMMAND}")
         return 1
     if inst.returncode != 0:
         return inst.returncode
     try:
         _refresh_launch_agents()
     except ClaudeSwitchError as exc:
-        error(
-            f"Tool upgraded, but the menu bar service did not reload: {exc}\n"
-            "Run: openswap menubar --install-service"
-        )
+        error(f"Tool upgraded, but a login item did not reload: {exc}")
         return 1
     return 0

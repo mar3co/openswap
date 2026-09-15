@@ -2,7 +2,9 @@
 
 ## Clone and install
 
-The extra and widget expect an **editable** install so Python loads `src/openswap` from this tree (the widget builder also walks parents looking for `macos/OpenSwapWidget`).
+Users run `install.sh` (see the README): it installs uv, clones to `~/.openswap`, runs `uv tool install --force --editable '.[menubar]'`, then `openswap setup` (save the live login, install the menu bar LaunchAgent). Its branches are covered by `tests/test_install_script.py` with stub tools on `PATH`.
+
+For hacking, clone wherever you like and install from there. The extra and widget expect an **editable** install so Python loads `src/openswap` from this tree (the widget builder also walks parents looking for `macos/OpenSwapWidget`).
 
 ```bash
 git clone https://github.com/mar3co/openswap.git
@@ -10,6 +12,8 @@ cd openswap
 uv tool install --editable '.[menubar]'
 uv sync   # dev extras: pytest, etc.
 ```
+
+`OPENSWAP_DIR=$PWD bash install.sh` installs the tool from an existing checkout without pulling it, then runs `openswap setup`. It does not run `uv sync`. If the path does not exist, the installer clones there.
 
 OpenSwap is not on PyPI. `openswap upgrade` runs `git pull` in this checkout, then `uv tool install --force --editable '.[menubar]'`, then refreshes installed LaunchAgents. If you moved the clone, reinstall from the new path.
 

@@ -1491,3 +1491,192 @@ def test_importing_the_module_allocates_no_temp_dir(tmp_path, tmp_path_factory):
     home = Path(_subprocess_env()["HOME"])
     assert home.is_dir(), f"the isolated HOME is not a real directory: {home}"
     assert home.is_relative_to(tmp_path_factory.getbasetemp()), f"{home} escapes basetemp"
+
+
+class TestSetupCommand:
+    """``openswap setup``: capture the live login, then start the extra."""
+
+    def _harness(
+        self, monkeypatch, argv, *, add_raises=None, install_raises=None, widget_detail=None, pid=4242
+    ):
+        seen: dict = {"add": 0, "install": 0, "widget": 0}
+
+        class FakeSwitcher:
+            def __init__(self, debug=False):
+                pass
+
+            def _is_running_in_container(self):
+                return True  # keep _guard_root quiet if the suite runs as root
+
+            def add_account(self, slot=None, assume_yes=False, alias=None):
+                seen["add"] += 1
+                if add_raises is not None:
+                    raise add_raises
+
+        def fake_install():
+            seen["install"] += 1
+            if install_raises is not None:
+                raise install_raises
+            return {
+                "label": "com.opensoft.openswap.menubar",
+                "plist": "/tmp/p.plist",
+                "program": ["/tmp/openswap", "menubar"],
+                "stdout_log": "/tmp/o.log",
+                "stderr_log": "/tmp/e.log",
+            }
+
+        def fake_widget_restart():
+            seen["widget"] += 1
+            return widget_detail
+
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", FakeSwitcher)
+        monkeypatch.setattr("openswap.launch_agent.install", fake_install)
+        monkeypatch.setattr(
+            "openswap.launch_agent.status",
+            lambda label=None, *a, **k: {"installed": True, "loaded": True, "state": "running", "pid": pid},
+        )
+        monkeypatch.setattr(cli, "_wait_for_pid", lambda agent, label, timeout=3.0: agent.status(label)["pid"])
+        monkeypatch.setattr("openswap.update_check.restart_widget_agent", fake_widget_restart)
+        monkeypatch.setattr(sys, "argv", argv)
+        return seen
+
+    def _run(self):
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        return exc.value.code
+
+    def test_help(self, capsys):
+        with patch.object(sys, "argv", ["openswap", "setup", "--help"]):
+            assert self._run() == 0
+        assert "usage: openswap setup" in capsys.readouterr().out
+
+    def test_saves_login_and_installs_service(self, monkeypatch, capsys):
+        seen = self._harness(monkeypatch, ["openswap", "setup"])
+        assert self._run() == 0
+        assert seen == {"add": 1, "install": 1, "widget": 1}
+        out = capsys.readouterr().out
+        assert "Menu bar extra running (pid 4242)" in out
+        assert "/tmp/e.log" in out
+        assert "Log into another Claude account, then run: openswap add" in out
+
+    def test_not_logged_in_still_installs_service_and_says_so_last(self, monkeypatch, capsys):
+        from openswap.exceptions import NotLoggedInError
+
+        seen = self._harness(
+            monkeypatch,
+            ["openswap", "setup"],
+            add_raises=NotLoggedInError("No active Claude account found. Please log in first."),
+        )
+        assert self._run() == 0
+        assert seen == {"add": 1, "install": 1, "widget": 1}
+        out = capsys.readouterr().out
+        assert "Menu bar extra running (pid 4242)" in out
+        assert "another Claude account" not in out
+        tail = out.strip().splitlines()[-2:]
+        assert "No active Claude account" in tail[0]
+        assert "Log into Claude Code, then run: openswap add" in tail[1]
+
+    @pytest.mark.parametrize(
+        "exc, message",
+        [
+            ("CredentialReadError", "Keychain access denied"),
+            ("ConfigError", "Permission denied reading Claude config"),
+            (OSError, "[Errno 30] Read-only file system"),
+        ],
+    )
+    def test_other_capture_failures_are_not_login_problems(self, monkeypatch, capsys, exc, message):
+        from openswap import exceptions
+
+        exc_type = getattr(exceptions, exc) if isinstance(exc, str) else exc
+        seen = self._harness(
+            monkeypatch,
+            ["openswap", "setup"],
+            add_raises=exc_type(message),
+        )
+        assert self._run() == 1
+        assert seen == {"add": 1, "install": 1, "widget": 1}
+        out = capsys.readouterr().out
+        assert "Menu bar extra running (pid 4242)" in out
+        assert "Log into Claude Code" not in out
+        tail = out.strip().splitlines()[-2:]
+        assert message in tail[0]
+        assert "openswap add" in tail[1]
+
+    def test_extra_that_did_not_come_up_is_not_called_running(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"], pid=None)
+        assert self._run() == 0
+        out = capsys.readouterr().out
+        assert "Menu bar extra running" not in out
+        assert "not running yet" in out
+        assert "/tmp/e.log" in out
+
+    def test_ctrl_c_after_capture_says_the_account_was_saved(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"], install_raises=KeyboardInterrupt())
+        assert self._run() == 130
+        assert "account was saved" in capsys.readouterr().out
+
+    def test_wait_for_pid_returns_pid_once_launchd_spawned_it(self):
+        answers = iter([None, None, 77])
+        agent = type("A", (), {"status": staticmethod(lambda label: {"pid": next(answers)})})
+        assert cli._wait_for_pid(agent, "x", timeout=5.0) == 77
+
+    def test_wait_for_pid_gives_up_at_the_deadline(self):
+        agent = type("A", (), {"status": staticmethod(lambda label: {"pid": None})})
+        assert cli._wait_for_pid(agent, "x", timeout=0.0) is None
+
+    def test_ctrl_c_after_failed_capture_reports_the_reason(self, monkeypatch, capsys):
+        from openswap.exceptions import CredentialReadError
+
+        self._harness(
+            monkeypatch,
+            ["openswap", "setup"],
+            add_raises=CredentialReadError("Keychain access denied"),
+            install_raises=KeyboardInterrupt(),
+        )
+        assert self._run() == 130
+        out = capsys.readouterr().out
+        assert "Keychain access denied" in out
+        assert "openswap add" in out
+
+    def test_widget_restart_failure_is_a_warning_with_its_own_fix(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"], widget_detail="kickstart exit 113")
+        assert self._run() == 0
+        out = capsys.readouterr().out
+        assert "Menu bar extra running (pid 4242)" in out
+        assert "kickstart exit 113" in out
+        assert out.count("openswap widget --install") == 1
+
+    def test_service_failure_after_failed_capture_reports_both(self, monkeypatch, capsys):
+        from openswap.exceptions import ClaudeSwitchError, CredentialReadError
+
+        self._harness(
+            monkeypatch,
+            ["openswap", "setup"],
+            add_raises=CredentialReadError("Keychain access denied"),
+            install_raises=ClaudeSwitchError("launchctl bootstrap failed (exit 5)"),
+        )
+        assert self._run() == 1
+        err = capsys.readouterr().err
+        assert "Keychain access denied" in err
+        assert "When that is fixed, run: openswap add" in err
+        assert "launchctl bootstrap failed" in err
+
+    def test_service_failure_exits_nonzero_with_retry_and_account_state(self, monkeypatch, capsys):
+        from openswap.exceptions import ClaudeSwitchError
+
+        seen = self._harness(
+            monkeypatch,
+            ["openswap", "setup"],
+            install_raises=ClaudeSwitchError("launchctl bootstrap failed (exit 5)"),
+        )
+        assert self._run() == 1
+        assert seen == {"add": 1, "install": 1, "widget": 0}
+        err = capsys.readouterr().err
+        assert "launchctl bootstrap failed" in err
+        assert "account was saved" in err
+        assert "openswap menubar --install-service" in err
+
+    def test_ctrl_c_exits_130(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"], add_raises=KeyboardInterrupt())
+        assert self._run() == 130
+        assert "cancelled" in capsys.readouterr().out.lower()

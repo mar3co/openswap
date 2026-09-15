@@ -31,6 +31,12 @@ class ConfigError(ClaudeSwitchError):
     pass
 
 
+class NotLoggedInError(ConfigError):
+    """Claude Code has no active login to capture."""
+
+    pass
+
+
 class SwitchError(ClaudeSwitchError):
     """Error during account switch operation."""
 
