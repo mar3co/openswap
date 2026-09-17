@@ -265,7 +265,7 @@ class DesktopSwitcher:
                 or not all(len(data.get(k, "")) == 64 and all(
                     char in "0123456789abcdef" for char in data[k]
                 ) for k in digest_keys)
-                or not all(data[k].isdigit() and int(data[k]) > 0
+                or not all(data[k].isascii() and data[k].isdigit() and int(data[k]) > 0
                            and str(int(data[k])) == data[k]
                            for k in ("number", "fromNumber"))
                 or _digest(data["sourceLive"]) != data["sourceFingerprint"]

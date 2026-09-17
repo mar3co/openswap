@@ -296,15 +296,6 @@ def test_quit_timeout_does_not_write_target(tmp_path):
     assert engine._live_text() == original
 
 
-def test_rejects_api_key_and_unsupported_store(tmp_path):
-    engine = setup_engine(tmp_path)
-    (engine.home / "config.toml").write_text(
-        'cli_auth_credentials_store = "keyring"\n', encoding="utf-8"
-    )
-    with pytest.raises(DesktopSwitchError, match="only.*file"):
-        DesktopSwitcher(engine, FakeApp()).preflight("1")
-
-
 def test_allows_ordinary_model_options_but_rejects_custom_provider(tmp_path):
     engine = setup_engine(tmp_path)
     config = engine.home / "config.toml"
@@ -321,15 +312,18 @@ def test_allows_ordinary_model_options_but_rejects_custom_provider(tmp_path):
         DesktopSwitcher(engine, FakeApp()).preflight("1")
 
 
-def test_rejects_auto_and_ephemeral_stores_and_api_key_target(tmp_path):
+@pytest.mark.parametrize("mode", ["keyring", "auto", "ephemeral"])
+def test_rejects_non_file_credential_store(tmp_path, mode):
     engine = setup_engine(tmp_path)
-    for mode in ("auto", "ephemeral"):
-        (engine.home / "config.toml").write_text(
-            f'cli_auth_credentials_store = "{mode}"\n', encoding="utf-8"
-        )
-        with pytest.raises(DesktopSwitchError, match="only.*file"):
-            DesktopSwitcher(engine, FakeApp()).preflight("1")
-    (engine.home / "config.toml").unlink()
+    (engine.home / "config.toml").write_text(
+        f'cli_auth_credentials_store = "{mode}"\n', encoding="utf-8"
+    )
+    with pytest.raises(DesktopSwitchError, match="only.*file"):
+        DesktopSwitcher(engine, FakeApp()).preflight("1")
+
+
+def test_rejects_api_key_target(tmp_path):
+    engine = setup_engine(tmp_path)
     engine._write_slot("1", json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-test"}))
     roster = engine._read_roster()
     roster["accounts"]["1"]["kind"] = "api_key"
@@ -409,6 +403,8 @@ def test_launch_failure_running_and_unstoppable_keeps_recovery(tmp_path):
 
     class UnstoppableApp(FakeApp):
         def launch(self, home, timeout=20):
+            # The launch marker drives the conditional quit failure below.
+            self.calls.append(("launch", home, timeout))
             self.running = True
             raise DesktopAppError("launch uncertain")
 
@@ -418,12 +414,6 @@ def test_launch_failure_running_and_unstoppable_keeps_recovery(tmp_path):
             super().quit(timeout)
 
     app = UnstoppableApp()
-    # Preserve a launch marker for the conditional quit failure above.
-    def launch(home, timeout=20):
-        app.calls.append(("launch", home, timeout))
-        app.running = True
-        raise DesktopAppError("launch uncertain")
-    app.launch = launch
     with pytest.raises(DesktopSwitchError, match="may still be running"):
         DesktopSwitcher(engine, app).switch("1", confirm_restart=True, confirm_idle=True)
     assert DesktopSwitcher(engine, app).recovery_file.exists()
@@ -481,31 +471,54 @@ def test_rejects_managed_requirements_and_profile_auth_override(tmp_path):
         DesktopSwitcher(engine, FakeApp()).preflight("1")
 
 
-def test_recovery_status_is_sanitized_and_recover_is_explicit(tmp_path):
-    engine = setup_engine(tmp_path)
-    switcher = DesktopSwitcher(engine, FakeApp())
+def _journal(engine, switcher, **overrides):
+    """Leave a 2 -> 1 switch interrupted after both writes; return its journal."""
     source = engine._live_text()
     target = engine._slot_text("1")
     roster_before = engine.sequence_file.read_text(encoding="utf-8")
     roster = engine._read_roster()
     roster["activeAccountNumber"] = "1"
     roster_written = json.dumps(roster, indent=2)
-    from openswap.codex.desktop import _atomic_text, _digest
     journal = {
         "schemaVersion": 2,
         "number": "1",
         "fromNumber": "2",
         "sourceLive": source,
-        "sourceFingerprint": _digest(source),
-        "targetFingerprint": _digest(target),
+        "sourceFingerprint": desktop._digest(source),
+        "targetFingerprint": desktop._digest(target),
         "rosterBefore": roster_before,
-        "rosterBeforeFingerprint": _digest(roster_before),
+        "rosterBeforeFingerprint": desktop._digest(roster_before),
         "rosterWritten": roster_written,
-        "rosterWrittenFingerprint": _digest(roster_written),
+        "rosterWrittenFingerprint": desktop._digest(roster_written),
+        **overrides,
     }
-    _atomic_text(switcher.recovery_file, json.dumps(journal))
-    _atomic_text(engine.home / "auth.json", target)
-    _atomic_text(engine.sequence_file, roster_written)
+    desktop._atomic_text(switcher.recovery_file, json.dumps(journal))
+    desktop._atomic_text(engine.home / "auth.json", target)
+    desktop._atomic_text(engine.sequence_file, roster_written)
+    return journal
+
+
+def _recovery_state(engine, switcher):
+    return (
+        engine._live_text(),
+        engine.sequence_file.read_text(encoding="utf-8"),
+        switcher.recovery_file.read_text(encoding="utf-8"),
+    )
+
+
+def _assert_recover_refused(engine, switcher, match):
+    """A refused recovery leaves live auth, roster, and journal untouched."""
+    before = _recovery_state(engine, switcher)
+    with pytest.raises(DesktopSwitchError, match=match):
+        switcher.recover(confirm_restart=True, confirm_idle=True)
+    assert _recovery_state(engine, switcher) == before
+    assert not any(call[0] == "launch" for call in switcher.app.calls)
+
+
+def test_recovery_status_is_sanitized_and_recover_is_explicit(tmp_path):
+    engine = setup_engine(tmp_path)
+    switcher = DesktopSwitcher(engine, FakeApp())
+    journal = _journal(engine, switcher)
     status = switcher.recovery_status()
     assert status["pending"] is True
     assert "rt-" not in json.dumps(status)
@@ -513,8 +526,146 @@ def test_recovery_status_is_sanitized_and_recover_is_explicit(tmp_path):
         switcher.recover()
     result = switcher.recover(confirm_restart=True, confirm_idle=True)
     assert result["status"] == "recovered_awaiting_verification"
-    assert engine._live_text() == source
-    assert engine.sequence_file.read_text(encoding="utf-8") == roster_before
+    assert engine._live_text() == journal["sourceLive"]
+    assert engine.sequence_file.read_text(encoding="utf-8") == journal["rosterBefore"]
     assert switcher.recovery_status() == {
         "status": "none", "pending": False, "experimental": True
     }
+
+
+_FOREIGN_SOURCE = _auth(email="a@x.com", account_id="acc-a", refresh="rt-foreign")
+
+
+@pytest.mark.parametrize("overrides, match", [
+    ({"schemaVersion": 1}, "integrity validation"),
+    ({"number": "01"}, "integrity validation"),
+    ({"number": "\u00b2"}, "integrity validation"),
+    ({"targetFingerprint": "not-a-digest"}, "integrity validation"),
+    ({"sourceLive": "{}"}, "integrity validation"),
+    ({"rosterBefore": "{}"}, "integrity validation"),
+    ({"rosterWritten": "{}"}, "integrity validation"),
+    # Re-fingerprinted credentials of an account the transaction never left.
+    ({"sourceLive": _FOREIGN_SOURCE,
+      "sourceFingerprint": desktop._digest(_FOREIGN_SOURCE)}, "identities are inconsistent"),
+])
+def test_recover_refuses_tampered_journal_before_lifecycle(tmp_path, overrides, match):
+    engine = setup_engine(tmp_path)
+    switcher = DesktopSwitcher(engine, FakeApp())
+    _journal(engine, switcher, **overrides)
+    with pytest.raises(DesktopSwitchError, match=match):
+        switcher.recovery_status()
+    _assert_recover_refused(engine, switcher, match)
+    assert switcher.app.calls == []
+
+
+def test_recover_refuses_malformed_journal_before_lifecycle(tmp_path):
+    engine = setup_engine(tmp_path)
+    switcher = DesktopSwitcher(engine, FakeApp())
+    _journal(engine, switcher)
+    switcher.recovery_file.write_text("{truncated", encoding="utf-8")
+    _assert_recover_refused(engine, switcher, "recovery record is malformed")
+    assert switcher.app.calls == []
+
+
+@pytest.mark.parametrize("live, match", [
+    (_auth(email="c@x.com", account_id="acc-c", refresh="rt-c"), "unrelated to this recovery"),
+    (_auth(email="b@x.com", account_id="acc-b", refresh="rt-b-old",
+           last_refresh="2026-09-09T00:00:00Z"), "cannot be proven newer"),
+    (_auth(email="b@x.com", account_id="acc-b", refresh="rt-b-undated",
+           last_refresh=None), "cannot be proven newer"),
+], ids=["unrelated", "older", "undated"])
+def test_recover_never_overwrites_unproven_live_login(tmp_path, live, match):
+    engine = setup_engine(tmp_path)
+    switcher = DesktopSwitcher(engine, FakeApp())
+    _journal(engine, switcher)
+    engine._write_live(live)
+    _assert_recover_refused(engine, switcher, match)
+    assert not switcher.app.running
+
+
+def test_recover_keeps_newer_generation_of_source_login(tmp_path):
+    engine = setup_engine(tmp_path)
+    switcher = DesktopSwitcher(engine, FakeApp())
+    journal = _journal(engine, switcher)
+    refreshed = _auth(
+        email="b@x.com", account_id="acc-b", refresh="rt-b-new",
+        last_refresh="2026-09-12T00:00:00Z",
+    )
+    engine._write_live(refreshed)
+    switcher.recover(confirm_restart=True, confirm_idle=True)
+    assert engine._live_text() == refreshed
+    assert engine.sequence_file.read_text(encoding="utf-8") == journal["rosterBefore"]
+    assert not switcher.recovery_file.exists()
+
+
+def test_recover_preserves_roster_changed_outside_transaction(tmp_path):
+    engine = setup_engine(tmp_path)
+    switcher = DesktopSwitcher(engine, FakeApp())
+    _journal(engine, switcher)
+    roster = engine._read_roster()
+    roster["accounts"]["2"]["alias"] = "concurrent"
+    engine._write_roster(roster)
+    _assert_recover_refused(engine, switcher, "roster changed outside")
+    assert not switcher.app.running
+
+
+def test_recover_relaunch_failure_keeps_journal_for_retry(tmp_path):
+    engine = setup_engine(tmp_path)
+    switcher = DesktopSwitcher(engine, FakeApp(launch_error=DesktopAppError("launch failed")))
+    journal = _journal(engine, switcher)
+    journal_text = switcher.recovery_file.read_text(encoding="utf-8")
+    with pytest.raises(DesktopSwitchError, match="relaunch failed. The app is stopped"):
+        switcher.recover(confirm_restart=True, confirm_idle=True)
+    restored = (journal["sourceLive"], journal["rosterBefore"], journal_text)
+    assert _recovery_state(engine, switcher) == restored
+    assert not switcher.app.running
+
+    switcher.app.launch_error = None
+    result = switcher.recover(confirm_restart=True, confirm_idle=True)
+    assert result["status"] == "recovered_awaiting_verification"
+    assert not switcher.recovery_file.exists()
+    assert engine._live_text() == journal["sourceLive"]
+    assert engine.sequence_file.read_text(encoding="utf-8") == journal["rosterBefore"]
+
+
+def test_recover_relaunch_failure_with_unstoppable_app_keeps_journal(tmp_path):
+    engine = setup_engine(tmp_path)
+
+    def cannot_stop():
+        raise DesktopAppError("cannot stop")
+
+    app = FakeApp(running=False, quit_hook=cannot_stop,
+                  launch_error=DesktopAppError("launch uncertain"))
+    app.launch_hook = lambda: setattr(app, "running", True)
+    switcher = DesktopSwitcher(engine, app)
+    journal = _journal(engine, switcher)
+    with pytest.raises(DesktopSwitchError, match="may still be running"):
+        switcher.recover(confirm_restart=True, confirm_idle=True)
+    assert engine._live_text() == journal["sourceLive"]
+    assert switcher.recovery_status()["pending"] is True
+
+
+@pytest.mark.parametrize("roster_written", [False, True])
+def test_recover_does_not_rewrite_live_already_equal_to_source(
+    tmp_path, monkeypatch, roster_written
+):
+    engine = setup_engine(tmp_path)
+    switcher = DesktopSwitcher(engine, FakeApp())
+    journal = _journal(engine, switcher)
+    engine._write_live(journal["sourceLive"])
+    if not roster_written:
+        engine.sequence_file.write_text(journal["rosterBefore"], encoding="utf-8")
+    atomic_text = desktop._atomic_text
+    written = []
+
+    def record_write(path, text):
+        written.append(path)
+        atomic_text(path, text)
+
+    monkeypatch.setattr(desktop, "_atomic_text", record_write)
+    result = switcher.recover(confirm_restart=True, confirm_idle=True)
+    assert result["status"] == "recovered_awaiting_verification"
+    assert written == ([engine.sequence_file] if roster_written else [])
+    assert engine._live_text() == journal["sourceLive"]
+    assert engine.sequence_file.read_text(encoding="utf-8") == journal["rosterBefore"]
+    assert not switcher.recovery_file.exists()
