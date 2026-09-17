@@ -96,6 +96,7 @@ def test_settings_defaults_when_file_missing(tmp_path: Path):
     assert s.title_pct == "both"
     assert s.refresh_interval == 60
     assert s.auto_switch_enabled is False
+    assert s.chatgpt_auto_enabled is False
     assert s.show_icon is False
     assert s.kickoff_enabled is False
 
@@ -107,6 +108,7 @@ def test_settings_round_trip(tmp_path: Path):
         title_pct="5h",
         refresh_interval=300,
         auto_switch_enabled=True,
+        chatgpt_auto_enabled=True,
     )
     original.save(path)
     loaded = menubar.MenuBarSettings.load(path)
@@ -202,6 +204,51 @@ def test_auto_strategy_choices_match_core_settings():
 def test_settings_page_constants():
     assert menubar.SETTINGS_PAGE == "settings"
     assert menubar.MAIN_PAGE == "main"
+    assert menubar.SETTINGS_SECTIONS == (
+        ("general", "General"),
+        ("automation", "Automation"),
+    )
+
+
+def test_settings_page_sections_separate_display_from_provider_automation():
+    settings = menubar.MenuBarSettings(
+        auto_switch_enabled=True,
+        chatgpt_auto_enabled=False,
+    )
+    general = menubar.settings_page_rows(
+        settings,
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        section=menubar.SETTINGS_SECTION_GENERAL,
+    )
+    automation = menubar.settings_page_rows(
+        settings,
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        section=menubar.SETTINGS_SECTION_AUTOMATION,
+    )
+
+    general_ids = {row["id"] for row in general}
+    automation_by_id = {row["id"]: row for row in automation}
+    assert "show_account_name" in general_ids
+    assert "auto_switch_enabled" not in general_ids
+    assert automation_by_id["auto_switch_enabled"]["label"] == (
+        "Auto-switch Claude accounts"
+    )
+    assert automation_by_id["chatgpt_auto_enabled"]["label"] == (
+        "Suggest ChatGPT account switches"
+    )
+    assert automation_by_id["codex_enabled"]["label"] == (
+        "Auto-switch Codex CLI accounts"
+    )
+    assert automation_by_id["group_policy"]["label"] == "Shared rotation policy"
+    assert all(row["section"] == menubar.SETTINGS_SECTION_GENERAL for row in general)
+    assert all(
+        row["section"] == menubar.SETTINGS_SECTION_AUTOMATION
+        for row in automation
+    )
 
 
 def test_settings_page_rows_include_required_ids_and_values():
@@ -297,6 +344,22 @@ def test_settings_page_hides_autoswitch_policy_when_disabled():
     assert "codex_enabled" not in ids_on
 
 
+def test_chatgpt_auto_is_persisted_independently_and_exposes_policy():
+    settings = menubar.MenuBarSettings(
+        auto_switch_enabled=False, chatgpt_auto_enabled=True
+    )
+    rows = menubar.settings_page_rows(
+        settings, strategy="best", threshold=90, has_codex=True,
+        codex_enabled=False,
+    )
+    ids = [row["id"] for row in rows]
+    assert settings.auto_switch_enabled is False
+    assert settings.chatgpt_auto_enabled is True
+    assert "threshold" in ids
+    assert "strategy" in ids
+    assert "codex_enabled" not in ids
+
+
 def test_settings_page_shows_codex_enabled_when_auto_on_and_has_codex():
     rows = menubar.settings_page_rows(
         menubar.MenuBarSettings(auto_switch_enabled=True),
@@ -307,7 +370,7 @@ def test_settings_page_shows_codex_enabled_when_auto_on_and_has_codex():
     )
     by_id = {row["id"]: row for row in rows}
     assert by_id["codex_enabled"]["kind"] == "toggle"
-    assert by_id["codex_enabled"]["label"] == "Auto-switch Codex accounts"
+    assert by_id["codex_enabled"]["label"] == "Auto-switch Codex CLI accounts"
     assert by_id["codex_enabled"]["value"] is True
     ids = [row["id"] for row in rows]
     assert ids.index("auto_switch_enabled") < ids.index("codex_enabled")
@@ -396,7 +459,7 @@ def test_settings_page_hides_kickoff_time_when_disabled():
     )
     ids_on = [row["id"] for row in on]
     assert ids_on.index("kickoff_enabled") < ids_on.index("kickoff_time")
-    assert ids_on.index("kickoff_time") < ids_on.index("group_advanced")
+    assert ids_on.index("group_schedule") < ids_on.index("kickoff_enabled")
 
 
 @pytest.mark.parametrize("title_pct", ["off", "both"])
@@ -1290,7 +1353,8 @@ def test_kickoff_is_wired_from_menubar_sync_tick():
     assert "self._maybe_kickoff()" in text
     assert "self._drain_kickoff_results()" in text
     assert any(
-        row["id"] == "kickoff_enabled" and "Start 5-hour window" in row["label"]
+        row["id"] == "kickoff_enabled"
+        and "Start Claude 5-hour window" in row["label"]
         for row in menubar.settings_page_rows(
             menubar.MenuBarSettings(), strategy="best", threshold=90
         )
@@ -2070,6 +2134,43 @@ def test_panel_accounts_prefixes_codex_title_and_sets_provider():
     assert cards[0]["provider"] == "claude"
     assert cards[1]["provider"] == "codex" and cards[1]["title"] == "Codex · plus"
     assert cards[1]["num"] == "codex:1"
+
+
+def test_provider_cards_filters_and_transforms_shared_codex_without_mutating():
+    cards = [
+        {"provider": "claude", "title": "personal", "num": "1"},
+        {"provider": "codex", "title": "Codex · plus", "num": "codex:1"},
+    ]
+    original = [dict(card) for card in cards]
+    assert [card["num"] for card in menubar.provider_cards(cards, "claude")] == ["1"]
+    chatgpt = menubar.provider_cards(cards, "chatgpt")
+    assert chatgpt == [{"provider": "chatgpt", "title": "plus", "num": "codex:1"}]
+    assert cards == original
+    assert menubar.provider_cards(cards, "other") == []
+
+
+@pytest.mark.parametrize("marker", ["kinds", "display"])
+def test_panel_accounts_marks_codex_api_key_cli_only_from_either_marker(marker):
+    row = ("codex:1", "api@x.com", True, _USAGE, _USAGE, "", "plus", False, None)
+    snapshot = {"accounts": [row]}
+    if marker == "kinds":
+        snapshot["kinds"] = {"codex:1": "api_key"}
+    else:
+        snapshot["accounts"] = [(*row[:3], menubar.USAGE_API_KEY, *row[4:])]
+    raw_cards = menubar.panel_accounts(snapshot)
+    assert not raw_cards[0]["disabled"]  # Widget/CLI semantics are unchanged.
+    card = menubar.provider_cards(raw_cards, "chatgpt")[0]
+    assert card["api_key"] is True
+    assert card["disabled"] is True
+    assert "CLI-only" in card["note"]
+
+
+def test_panel_accounts_keeps_normal_disabled_row_distinct_from_api_key():
+    row = ("codex:1", "a@x.com", False, _USAGE, _USAGE, "", "plus", True, None)
+    card = menubar.panel_accounts({"accounts": [row]})[0]
+    assert card["disabled"] is True
+    assert card["api_key"] is False
+    assert "CLI-only" not in (card["note"] or "")
 
 
 def test_codex_live_slot_changed():

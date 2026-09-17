@@ -1,0 +1,227 @@
+"""Exercise panel navigation without requiring AppKit on CI."""
+
+import ast
+from pathlib import Path
+import threading
+from unittest.mock import Mock
+
+import pytest
+
+from openswap import menubar
+
+
+def _panel():
+    source = Path(menubar.__file__).with_name("menubar_panel.py").read_text()
+    tree = ast.parse(source)
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+               and node.name == "MenuBarPanel")
+    methods = {
+        "__init__", "_select_provider", "_show_settings", "_show_main",
+        "_select_settings_section", "close",
+    }
+    cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef)
+                and node.name in methods]
+    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
+    namespace = {
+        "MAIN_PAGE": "main",
+        "SETTINGS_PAGE": "settings",
+        "SETTINGS_SECTION_GENERAL": "general",
+        "SETTINGS_SECTION_AUTOMATION": "automation",
+        "SETTINGS_SECTIONS": (("general", "General"), ("automation", "Automation")),
+    }
+    exec(compile(module, "<panel-navigation-test>", "exec"), namespace)
+    actions = {key: Mock() for key in (
+        "on_switch", "on_rotate", "on_best", "on_toggle_auto", "on_more"
+    )}
+    panel = namespace["MenuBarPanel"](
+        **actions, auto_enabled=lambda: False, snapshot=lambda: {}, threshold=lambda: 90
+    )
+    panel.is_shown = Mock(return_value=True)
+    panel.reload = Mock()
+    panel._clear_dismiss_watchers = Mock()
+    return panel, actions
+
+
+def test_provider_navigation_never_calls_account_or_policy_actions():
+    panel, actions = _panel()
+    assert panel._selected_provider == "claude"
+    panel._select_provider("chatgpt")
+    assert panel._selected_provider == "chatgpt"
+    panel.reload.assert_called_once()
+    for action in actions.values():
+        action.assert_not_called()
+
+
+def test_selected_provider_survives_close_and_settings():
+    panel, _ = _panel()
+    panel._select_provider("chatgpt")
+    panel._show_settings()
+    assert panel._page == "settings"
+    assert panel._settings_section == "automation"
+    panel._show_main()
+    assert panel._page == "main"
+    assert panel._selected_provider == "chatgpt"
+    panel.close()
+    assert panel._selected_provider == "chatgpt"
+
+
+def test_settings_sections_are_navigation_only():
+    panel, actions = _panel()
+    panel._show_settings()
+    assert panel._settings_section == "general"
+    panel.reload.reset_mock()
+
+    panel._select_settings_section("automation")
+
+    assert panel._settings_section == "automation"
+    panel.reload.assert_called_once()
+    for action in actions.values():
+        action.assert_not_called()
+
+
+def test_unknown_provider_does_not_change_view_or_reload():
+    panel, _ = _panel()
+    panel._select_provider("unknown")
+    assert panel._selected_provider == "claude"
+    panel.reload.assert_not_called()
+
+
+def test_hidden_panel_selection_does_not_rebuild_native_views():
+    panel, _ = _panel()
+    panel.is_shown.return_value = False
+    panel._select_provider("chatgpt")
+    assert panel._selected_provider == "chatgpt"
+    panel.reload.assert_not_called()
+
+
+@pytest.mark.parametrize("provider,name", [("claude", "Claude"), ("chatgpt", "ChatGPT")])
+def test_empty_state_gives_provider_specific_add_guidance(provider, name):
+    state = menubar.provider_empty_state(provider)
+    assert name in state["title"]
+    if provider == "chatgpt":
+        assert state["body"] == "Add an account without signing out."
+        assert state["action"] == "start"
+        assert state["button"] == "Sign in with ChatGPT"
+        assert state["secondary_action"] == "capture"
+        assert state["secondary_button"] == "Save current login"
+    else:
+        assert "Sign in" in state["body"]
+        assert state["action"] == "add"
+        assert state["button"] == "Add current login"
+        assert "Does not switch" in state["hint"]
+
+
+@pytest.mark.parametrize("stage", ["starting", "waiting", "ready", "error", "saving", "cancelling", "saved"])
+def test_login_panel_state_is_concise_and_safe(stage):
+    state = menubar.login_panel_state({
+        "stage": stage,
+        "email": "person@example.com",
+        "plan": "Plus",
+        "has_url": True,
+        "message": "Try https://example.test and auth_secret_value",
+        "device_code": "ABCD-1234",
+    })
+    assert state["stage"] == stage
+    assert "https://" not in state["message"]
+    assert "auth_secret" not in state["message"]
+    if stage == "waiting":
+        assert "cancel" in state["actions"]
+        assert "copy_link" in state["actions"]
+        assert "device" in state["actions"]
+    if stage in ("saving", "cancelling"):
+        assert state["actions"] == []
+    if stage == "saved":
+        assert state["actions"] == ["dismiss"]
+        assert state["body"] == "Ready to use."
+        assert state["hint"] == ""
+
+
+@pytest.mark.parametrize("provider", ["claude", "chatgpt"])
+@pytest.mark.parametrize("status", ["loading", "error", "unavailable"])
+def test_empty_load_states_never_offer_account_import(provider, status):
+    state = menubar.provider_empty_state(provider, status)
+    assert state["action"] == ("retry" if status == "error" else None)
+    assert "first" not in state["title"]
+
+
+def test_waiting_only_offers_available_login_actions():
+    assert menubar.login_panel_state({"stage": "waiting"})["actions"] == ["cancel", "device"]
+    device = menubar.login_panel_state({"stage": "waiting", "mode": "device"})
+    assert device["actions"] == ["cancel"]
+    assert device["body"] == "Preparing your code…"
+    device = menubar.login_panel_state({
+        "stage": "waiting", "mode": "device", "has_url": True, "device_code": "ABCD-EFGH"
+    })
+    assert device["actions"] == ["open_browser", "cancel", "copy_code", "copy_link"]
+
+
+def test_empty_action_callback_routes_provider_without_switching():
+    tree = ast.parse(Path(menubar.__file__).read_text())
+    method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                  and node.name == "_on_empty_action")
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    scope = {}
+    exec(compile(module, "<empty-action-test>", "exec"), scope)
+    app = Mock(_desktop_switching=False, _refreshing=False)
+    action = scope["_on_empty_action"]
+    action(app, "claude", "add")
+    app.on_add_login.assert_called_once_with(None)
+    app.on_add_codex_login.assert_not_called()
+    action(app, "chatgpt", "add")
+    app._on_login_action.assert_called_once_with("start")
+    action(app, "chatgpt", "capture")
+    app.on_add_codex_login.assert_called_once_with(None)
+    action(app, "chatgpt", "retry")
+    app.refresh_async.assert_called_once_with()
+    app._make_desktop_switch.assert_not_called()
+    app._on_account_click.assert_not_called()
+    app.reset_mock()
+    app._desktop_switching = True
+    action(app, "claude", "add")
+    app.on_add_login.assert_not_called()
+
+
+def test_snapshot_failure_is_an_error_not_an_empty_roster():
+    tree = ast.parse(Path(menubar.__file__).read_text())
+    method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                  and node.name == "_worker")
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    scope = {}
+    exec(compile(module, "<empty-worker-test>", "exec"), scope)
+    app = Mock()
+    app._account_states = {"claude": "loading", "chatgpt": "loading"}
+    app.snapshot = {"accounts": []}
+    app._snapshot_source.take.side_effect = RuntimeError("synthetic read failure")
+    scope["_worker"](app, False)
+    assert app._account_states == {"claude": "error", "chatgpt": "error"}
+    assert app._refreshing is False
+    assert app._hold_reload_pending is True
+
+
+@pytest.mark.parametrize("codex_fails", [False, True])
+def test_worker_resolves_loading_states_per_provider(monkeypatch, codex_fails):
+    from openswap import process_detection, widget_snapshot
+    monkeypatch.setattr(process_detection, "get_running_instances", lambda: ([], []))
+    monkeypatch.setattr(process_detection, "get_running_codex_instances", lambda: [])
+    monkeypatch.setattr(widget_snapshot, "publish_widget_snapshot", Mock())
+    tree = ast.parse(Path(menubar.__file__).read_text())
+    method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                  and node.name == "_worker")
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    scope = dict(vars(menubar))
+    scope["_adapt_snapshot"] = lambda *_: {"accounts": []}
+    exec(compile(module, "<empty-worker-test>", "exec"), scope)
+    app = Mock()
+    app._account_states = {"claude": "loading", "chatgpt": "loading"}
+    app.snapshot = {"accounts": []}
+    app._engine = None
+    app._event_lock = threading.Lock()
+    app._pending_relogin_notifies = set()
+    app._relogin_notified = set()
+    app._hold_line_for.return_value = None
+    if codex_fails:
+        app._codex_source.take.side_effect = RuntimeError("synthetic failure")
+    scope["_worker"](app, False)
+    assert app._account_states == {"claude": "ready", "chatgpt": "error" if codex_fails else "ready"}
+    assert app._refreshing is False
+    assert app._hold_reload_pending is True

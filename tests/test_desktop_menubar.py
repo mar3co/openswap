@@ -28,6 +28,23 @@ def test_desktop_choices_exclude_claude_disabled_and_api_keys():
     assert menubar.desktop_switch_choices(snapshot) == [("1", "1  Work (person@example.test)")]
 
 
+def test_desktop_choices_reject_api_key_kind_even_with_cached_usage():
+    snapshot = {"accounts": [_row(f"{CODEX_NUM_PREFIX}1", display={})],
+                "kinds": {f"{CODEX_NUM_PREFIX}1": "api_key"}}
+    assert menubar.desktop_switch_choices(snapshot) == []
+
+
+def test_changed_suggestion_during_confirmation_never_launches_switch(app):
+    expected = ("1", ("one@example.test", "a"), "2", ("two@example.test", "b"))
+    app._pending_chatgpt_switch = expected
+    app._validate_pending_chatgpt_switch = Mock(
+        side_effect=lambda: setattr(app, "_pending_chatgpt_switch", None)
+    )
+    app._make_desktop_switch("2", "Work", expected_pending=expected)(None)
+    app._test_thread.assert_not_called()
+    app._show_error.assert_called_once()
+
+
 def test_desktop_consent_explicitly_covers_restart_idle_and_verification():
     title, body = menubar.desktop_switch_confirm_copy("Work")
     assert "Restart ChatGPT" in title
@@ -35,11 +52,19 @@ def test_desktop_consent_explicitly_covers_restart_idle_and_verification():
         assert text in body
 
 
+def test_desktop_consent_explains_persistent_pause_only_when_needed():
+    _, body = menubar.desktop_switch_confirm_copy("Work", pause_auto=True)
+    assert "all OpenSwap instances" in body
+    assert "Claude rotation is unchanged" in body
+    assert "until you re-enable" in body
+    assert "also pauses" not in menubar.desktop_switch_confirm_copy("Work")[1]
+
+
 @pytest.fixture
 def app(monkeypatch):
     tree = ast.parse(Path(menubar.__file__).read_text())
     cls = next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "MenuBarApp")
-    wanted = {"_make_desktop_switch", "_desktop_worker", "_drain_desktop_result", "_pause_codex_for_desktop"}
+    wanted = {"_make_desktop_switch", "_desktop_worker", "_drain_desktop_result", "_pause_codex_for_desktop", "_on_panel_account_click"}
     cls.bases = []
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
@@ -48,6 +73,7 @@ def app(monkeypatch):
     setting = Mock(return_value=None)
     namespace = {
         "desktop_switch_confirm_copy": menubar.desktop_switch_confirm_copy,
+        "desktop_switch_choices": menubar.desktop_switch_choices,
         "ClaudeSwitchError": ClaudeSwitchError,
         "threading": Mock(Thread=thread),
         "record_manual_switch": record,
@@ -59,12 +85,17 @@ def app(monkeypatch):
     instance.switcher = Mock()
     instance._guard = lambda fn: (fn(), True)[1]
     instance._desktop_switching = False
+    instance._login_session = None
     instance._desktop_result = None
+    instance._desktop_status = "Experimental"
+    instance.snapshot = {"accounts": [_row(f"{CODEX_NUM_PREFIX}2")]}
+    instance._on_account_click = Mock()
     instance._refreshing = False
     instance._kickoff_running = False
     instance._event_lock = threading.Lock()
     instance._panel = Mock()
-    for name in ("_show_error", "_stop_codex_engine", "rebuild_menu", "refresh_async"):
+    for name in ("_show_error", "_stop_codex_engine", "_stop_chatgpt_auto_monitor",
+                 "_start_chatgpt_auto_monitor", "rebuild_menu", "refresh_async"):
         setattr(instance, name, Mock())
     instance._alert = Mock(return_value=1)
     instance._codex_enabled = Mock(return_value=False)
@@ -74,7 +105,7 @@ def app(monkeypatch):
     return instance
 
 
-@pytest.mark.parametrize("guard", ["cancel", "refresh", "kickoff", "auto", "busy"])
+@pytest.mark.parametrize("guard", ["cancel", "refresh", "kickoff", "busy"])
 def test_menu_refusals_do_not_start_a_switch(app, guard):
     if guard == "cancel":
         app._alert.return_value = 0
@@ -82,13 +113,65 @@ def test_menu_refusals_do_not_start_a_switch(app, guard):
         app._refreshing = True
     elif guard == "kickoff":
         app._kickoff_running = True
-    elif guard == "auto":
-        app._codex_enabled.return_value = True
     else:
         app._desktop_switching = True
     app._make_desktop_switch("2", "Work")(None)
     app._test_thread.assert_not_called()
     app._stop_codex_engine.assert_not_called()
+
+
+def test_switch_can_pause_auto_in_same_explicit_confirmation(app):
+    app._codex_enabled.return_value = True
+    app._make_desktop_switch("2", "Work")(None)
+    assert "also pauses" in app._alert.call_args.kwargs["message"]
+    app._test_setting.assert_called_once_with(
+        app.switcher.backup_dir, "autoswitch.codexEnabled", "false"
+    )
+    app._test_thread.return_value.start.assert_called_once()
+
+
+def test_cancel_does_not_pause_auto(app):
+    app._codex_enabled.return_value = True
+    app._alert.return_value = 0
+    app._make_desktop_switch("2", "Work")(None)
+    app._test_setting.assert_not_called()
+    app._test_thread.assert_not_called()
+
+
+def test_pause_setting_failure_does_not_start_worker(app):
+    app._codex_enabled.return_value = True
+    app._guard = Mock(return_value=False)
+    app._make_desktop_switch("2", "Work")(None)
+    app._test_thread.assert_not_called()
+
+
+def test_auto_enabled_during_consent_requires_new_consent(app):
+    app._codex_enabled.side_effect = [False, True]
+    app._make_desktop_switch("2", "Work")(None)
+    app._test_setting.assert_not_called()
+    app._test_thread.assert_not_called()
+
+
+def test_chatgpt_card_uses_desktop_flow_not_cli_only_switch(app):
+    app._on_panel_account_click(f"{CODEX_NUM_PREFIX}2")
+    app._test_thread.return_value.start.assert_called_once()
+    app._on_account_click.assert_not_called()
+    app.codex.switch_to.assert_not_called()
+
+
+@pytest.mark.parametrize("row", [_row(f"{CODEX_NUM_PREFIX}2", disabled=True),
+                                 _row(f"{CODEX_NUM_PREFIX}2", display=USAGE_API_KEY)])
+def test_chatgpt_card_refuses_ineligible_rows(app, row):
+    app.snapshot = {"accounts": [row]}
+    app._on_panel_account_click(f"{CODEX_NUM_PREFIX}2")
+    app._test_thread.assert_not_called()
+    app._show_error.assert_called_once()
+
+
+def test_claude_card_keeps_normal_switch_action(app):
+    app._on_panel_account_click("1")
+    app._on_account_click.assert_called_once_with("1", close_panel=True)
+    app._test_thread.assert_not_called()
 
 
 def test_confirmed_switch_starts_background_worker_not_normal_switch(app):
@@ -134,6 +217,8 @@ def test_worker_uses_both_confirmations_and_main_thread_completion(app, monkeypa
     app._desktop_switching = True
     app._drain_desktop_result()
     assert not app._desktop_switching
+    assert "Verification needed" in app._desktop_status
+    assert app._hold_reload_pending is True
     assert "not yet verified" in app._alert.call_args.kwargs["message"]
     app.refresh_async.assert_called_once()
 
@@ -144,6 +229,7 @@ def test_worker_unexpected_error_does_not_leak_protocol_or_credentials(app, monk
     app._desktop_worker("2")
     app._drain_desktop_result()
     assert "secret-token" not in app._show_error.call_args.args[0]
+    assert "Switch failed" in app._desktop_status
     app._test_record.assert_not_called()
 
 
@@ -199,6 +285,9 @@ def test_real_run_wires_submenu_and_completion_timer(tmp_path, monkeypatch):
     submenu = next(item for item in live_app.menu if item and item.title == "Switch ChatGPT app (experimental)")
     assert len(submenu.items) == 1
     assert callable(submenu.items[0].callback)
+    live_app._panel = Mock()
+    live_app.rebuild_menu()
+    assert not any(item and item.title == "Switch ChatGPT app (experimental)" for item in live_app.menu)
     callbacks = [call.args[0].__name__ for call in fake_rumps.Timer.call_args_list]
     assert "on_sync_tick" in callbacks
 

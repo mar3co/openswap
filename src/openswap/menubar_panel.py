@@ -6,6 +6,8 @@ status item stays a short title; this panel is what opens on click.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import objc
 from AppKit import (
     NSApp,
@@ -15,6 +17,7 @@ from AppKit import (
     NSApplication,
     NSBezierPath,
     NSButton,
+    NSButtonTypePushOnPushOff,
     NSButtonTypeSwitch,
     NSColor,
     NSControlSizeSmall,
@@ -26,7 +29,11 @@ from AppKit import (
     NSFontWeightRegular,
     NSFontWeightSemibold,
     NSGraphicsContext,
+    NSImage,
+    NSImageScaleProportionallyUpOrDown,
+    NSImageView,
     NSLineBreakByTruncatingTail,
+    NSLineBreakByWordWrapping,
     NSNoImage,
     NSPopUpButton,
     NSPopover,
@@ -64,7 +71,14 @@ from openswap.menubar import (
     POPOVER_AUTO_CLOSE_S,
     SETTINGS_PAGE,
     SETTINGS_POPUP_W,
+    SETTINGS_SECTION_AUTOMATION,
+    SETTINGS_SECTION_GENERAL,
+    SETTINGS_SECTIONS,
     panel_accounts,
+    provider_cards,
+    provider_empty_state,
+    login_panel_state,
+    provider_shared_copy,
     resolve_popover_theme,
     settings_header_frames,
     settings_page_rows,
@@ -142,7 +156,6 @@ HEADER_H = 36.0
 HOLD_LINE_H = 16.0
 RUNNING_LINE_H = 16.0
 FOOTER_H = 38.0
-SECTION_H = 18.0
 SETTINGS_TOGGLE_H = 30.0
 SETTINGS_GROUP_H = 22.0
 SETTINGS_CHOICE_LABEL_H = 16.0
@@ -153,6 +166,7 @@ SETTINGS_ROW_GAP = 6.0
 SETTINGS_POPUP_H = 24.0
 SETTINGS_BACK_W = 64.0
 SETTINGS_BACK_H = 22.0
+SETTINGS_TABS_H = 40.0
 CARD_GAP = 8.0
 CARD_PAD = 11.0
 CARD_RADIUS = 10.0
@@ -165,6 +179,9 @@ LABEL_W = 44.0
 PCT_W = 48.0
 COUNT_W = 60.0
 COL_GAP = 8.0
+TAB_H = 40.0
+TAB_GAP = 6.0
+INFO_LINE_H = 16.0
 
 
 def _card_height(card) -> float:
@@ -186,6 +203,7 @@ def _hex(color: str, alpha: float = 1.0):
 # rooted so the GC cannot collect a provider the catalog still calls.
 _DYNAMIC_PROVIDERS: list = []
 _PALETTE = None
+_BRAND_IMAGE = None
 
 
 def _dynamic(light_hex, dark_hex, light_alpha=1.0, dark_alpha=1.0, *, name=None):
@@ -225,6 +243,26 @@ def _colors() -> dict:
             ),
         }
     return _PALETTE
+
+
+def _brand_mark(frame, tint):
+    """OpenSoft monogram from the packaged brand asset, tinted like text."""
+    global _BRAND_IMAGE
+    if _BRAND_IMAGE is None:
+        path = Path(__file__).with_name("assets") / "opensoft-symbol-64.png"
+        _BRAND_IMAGE = NSImage.alloc().initWithContentsOfFile_(str(path))
+        if _BRAND_IMAGE is not None:
+            _BRAND_IMAGE.setTemplate_(True)
+    if _BRAND_IMAGE is None:
+        return None
+    view = NSImageView.alloc().initWithFrame_(frame)
+    view.setImage_(_BRAND_IMAGE)
+    view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+    try:
+        view.setContentTintColor_(tint)
+    except Exception:
+        pass
+    return view
 
 
 def _system_popover_appearance():
@@ -549,16 +587,27 @@ class MenuBarPanel:
         auto_enabled,
         snapshot,
         threshold,
+        on_toggle_chatgpt_auto=None,
+        on_review_chatgpt_switch=None,
+        chatgpt_switch_pending=None,
         on_setting=None,
         settings=None,
         strategy=None,
         has_codex=None,
         codex_enabled=None,
+        desktop_status=None,
+        account_state=None,
+        on_empty_action=None,
+        login_state=None,
+        on_login_action=None,
     ):
         self._on_switch = on_switch
         self._on_rotate = on_rotate
         self._on_best = on_best
         self._on_toggle_auto = on_toggle_auto
+        self._on_toggle_chatgpt_auto = on_toggle_chatgpt_auto
+        self._on_review_chatgpt_switch = on_review_chatgpt_switch
+        self._chatgpt_switch_pending = chatgpt_switch_pending or (lambda: False)
         self._on_more = on_more
         self._on_setting = on_setting
         self._auto_enabled = auto_enabled
@@ -568,6 +617,17 @@ class MenuBarPanel:
         self._strategy = strategy
         self._has_codex = has_codex
         self._codex_enabled = codex_enabled
+        self._desktop_status = desktop_status or (lambda: "Experimental · Switching reopens ChatGPT")
+        self._account_state = account_state or (lambda _provider: "ready")
+        self._on_empty_action = on_empty_action
+        self._login_state = login_state or (lambda: {"stage": "idle"})
+        self._on_login_action = on_login_action
+        self._login_alias = ""
+        self._login_alias_field = None
+        # Deliberately kept outside close()/reload(): users can inspect a
+        # second provider without losing their place when the popover closes.
+        self._selected_provider = "claude"
+        self._settings_section = SETTINGS_SECTION_GENERAL
         self._page = MAIN_PAGE
         self._item = None
         self._popover = None
@@ -812,18 +872,64 @@ class MenuBarPanel:
         finally:
             self._hold_overflow(False)
 
+    def _select_provider(self, provider: str) -> None:
+        if provider not in ("claude", "chatgpt"):
+            return
+        self._selected_provider = provider
+        if self.is_shown():
+            self.reload()
+
+    def show_login(self) -> None:
+        """Open the ChatGPT onboarding surface in the current popover."""
+        self._selected_provider = "chatgpt"
+        self._page = MAIN_PAGE
+        self.reload()
+
+    def _login_action(self, action: str, alias: str | None = None) -> None:
+        if self._on_login_action is not None:
+            self._on_login_action(action, alias=alias)
+
+    def _save_login(self, field) -> None:
+        try:
+            self._login_alias = field.stringValue().strip()
+        except Exception:
+            self._login_alias = ""
+        self._login_action("save", self._login_alias or None)
+
+    def _login_state_model(self) -> dict:
+        try:
+            return login_panel_state(self._login_state())
+        except Exception:
+            return login_panel_state({"stage": "error", "message": "Sign-in is unavailable."})
+
+    def _empty_action(self, provider, action):
+        if self._on_empty_action is not None:
+            self._on_empty_action(provider, action)
+
     def _tramp(self, fn) -> _Trampoline:
         t = _Trampoline.alloc().initWithCallback_(fn)
         self._tramps.append(t)
         return t
 
     def _show_settings(self, _sender=None):
+        self._settings_section = (
+            SETTINGS_SECTION_AUTOMATION
+            if self._selected_provider == "chatgpt"
+            else SETTINGS_SECTION_GENERAL
+        )
         self._page = SETTINGS_PAGE
         self.reload()
 
     def _show_main(self, _sender=None):
         self._page = MAIN_PAGE
         self.reload()
+
+    def _select_settings_section(self, section: str) -> None:
+        if section not in {value for value, _label in SETTINGS_SECTIONS}:
+            return
+        self._settings_section = section
+        if self.is_shown():
+            self.reload()
 
     def _emit_setting(self, row_id, value):
         cb = self._on_setting
@@ -896,28 +1002,50 @@ class MenuBarPanel:
         if self._page == SETTINGS_PAGE:
             return self._build_settings()
         snap = self._snapshot()
-        cards = panel_accounts(snap)
+        all_cards = panel_accounts(snap)
+        provider = self._selected_provider
+        cards = provider_cards(all_cards, provider)
+        current_login_model = self._login_state_model()
+        login_model = current_login_model if provider == "chatgpt" else login_panel_state(None)
+        login_view = provider == "chatgpt" and login_model["stage"] != "idle"
+        if current_login_model["stage"] == "ready" and self._login_alias_field is not None:
+            try:
+                self._login_alias = self._login_alias_field.stringValue().strip()
+            except Exception:
+                pass
+        elif current_login_model["stage"] != "ready":
+            self._login_alias = ""
+        self._login_alias_field = None
+        empty = provider_empty_state(provider, self._account_state(provider)) if not cards else None
+        if login_view:
+            empty = None
+        shared_copy = provider_shared_copy(provider)
         hold_line = snap.get("hold_line") or ""
-        if not self._auto_enabled():
+        if provider != "claude" or not self._auto_enabled():
             hold_line = ""
-        running_line = snap.get("running_line") or ""
-        codex_running_line = snap.get("codex_running_line") or ""
+        running_line = (snap.get("running_line") or "") if provider == "claude" else ""
+        codex_running_line = (snap.get("codex_running_line") or "") if provider == "chatgpt" else ""
+        desktop_status = str(self._desktop_status() or "") if provider == "chatgpt" else ""
+        if empty or login_view:
+            shared_copy = hold_line = running_line = codex_running_line = desktop_status = ""
         pal = _colors()
 
         body_h = 0.0
-        if not cards:
-            body_h = 48.0
+        if login_view:
+            body_h = 220.0 if login_model["stage"] == "ready" else (230.0 if len(login_model.get("actions") or []) > 2 else 184.0)
+        elif not cards:
+            body_h = 184.0
         else:
             for card in cards:
                 body_h += _card_height(card)
             body_h += CARD_GAP * (len(cards) - 1)
-            if any(card.get("provider") == "codex" for card in cards):
-                body_h += SECTION_H
 
         hold_h = HOLD_LINE_H if hold_line else 0.0
+        info_h = INFO_LINE_H if shared_copy else 0.0
         n_running = (1 if running_line else 0) + (1 if codex_running_line else 0)
         running_h = RUNNING_LINE_H * n_running
-        height = PAD + HEADER_H + hold_h + 4 + body_h + PAD + running_h + FOOTER_H
+        status_h = RUNNING_LINE_H if desktop_status else 0.0
+        height = PAD + HEADER_H + TAB_H + hold_h + info_h + 4 + body_h + PAD + running_h + status_h + FOOTER_H
         root = _RootView.alloc().initWithHover_(self._on_hover)
         root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, height))
         root.setMaterial_(NSVisualEffectMaterialMenu)
@@ -930,9 +1058,18 @@ class MenuBarPanel:
         font_digits = NSFont.monospacedDigitSystemFontOfSize_weight_(11, NSFontWeightMedium)
         font_label = NSFont.monospacedDigitSystemFontOfSize_weight_(11, NSFontWeightRegular)
 
-        # Header: title on the left, auto-switch hugging the top-right.
+        # Header: OpenSoft mark + product name on the left, provider-specific
+        # automation switch hugging the top-right.
+        mark = _brand_mark(NSMakeRect(PAD, PAD + 1, 18, 18), pal["fg"])
+        if mark is not None:
+            root.addSubview_(mark)
         root.addSubview_(
-            _label("openswap", font_title, pal["fg"], NSMakeRect(PAD, PAD, 80, 20))
+            _label(
+                "OpenSwap",
+                font_title,
+                pal["fg"],
+                NSMakeRect(PAD + (24 if mark is not None else 0), PAD, 86, 20),
+            )
         )
         auto_label = _label(
             "Auto-switch",
@@ -942,18 +1079,45 @@ class MenuBarPanel:
         )
         auto_label.sizeToFit()
         ls = auto_label.frame().size
-        auto = self._alloc_switch(bool(self._auto_enabled()), self._on_toggle_auto)
+        chatgpt_auto = bool(
+            getattr(self._settings() if callable(self._settings) else None,
+                    "chatgpt_auto_enabled", False)
+        )
+        auto = self._alloc_switch(
+            chatgpt_auto if provider == "chatgpt" else bool(self._auto_enabled()),
+            self._on_toggle_chatgpt_auto if provider == "chatgpt" else self._on_toggle_auto,
+        )
         cs = auto.frame().size
         lab_f, ctl_f = trailing_header_frames(
             PANEL_WIDTH, PAD, (ls.width, ls.height), (cs.width, cs.height)
         )
         auto_label.setFrame_(NSMakeRect(*lab_f))
         auto.setFrame_(NSMakeRect(*ctl_f))
-        root.addSubview_(auto_label)
-        root.addSubview_(auto)
+        if ((provider == "claude" and cards) or
+                (provider == "chatgpt" and self._on_toggle_chatgpt_auto is not None)):
+            root.addSubview_(auto_label)
+            root.addSubview_(auto)
 
         inner_w = PANEL_WIDTH - PAD * 2
         y = PAD + HEADER_H
+        tab_w = (inner_w - TAB_GAP) / 2.0
+        for index, (tab_provider, title) in enumerate((("claude", "Claude"), ("chatgpt", "ChatGPT"))):
+            tab = self._add_button(
+                root,
+                title,
+                NSMakeRect(PAD + index * (tab_w + TAB_GAP), y, tab_w, TAB_H),
+                lambda _sender, p=tab_provider: self._select_provider(p),
+                font_small,
+            )
+            if tab_provider == provider:
+                tab.setButtonType_(NSButtonTypePushOnPushOff)
+                tab.setState_(1)
+                tab.setFont_(font_title)
+            else:
+                tab.setButtonType_(NSButtonTypePushOnPushOff)
+                tab.setState_(0)
+                tab.setAlphaValue_(0.68)
+        y += TAB_H
         if hold_line:
             root.addSubview_(
                 _label(
@@ -964,31 +1128,103 @@ class MenuBarPanel:
                 )
             )
             y += HOLD_LINE_H
+        if shared_copy:
+            root.addSubview_(_label(shared_copy, font_small, pal["muted"], NSMakeRect(PAD, y, inner_w, INFO_LINE_H)))
+            y += INFO_LINE_H
         y += 4
 
-        if not cards:
+        if login_view:
+            # Login state is intentionally a compact, replace-in-place panel:
+            # the roster never appears alongside an in-flight attempt.
+            root.addSubview_(_label(login_model["title"], font_title, pal["fg"], NSMakeRect(PAD + 12, y + 14, inner_w - 24, 22)))
+            body = login_model.get("body") or ""
+            body_height = 70 if login_model["stage"] == "error" else 34
+            if body:
+                label = _label(body, font_body, pal["muted"], NSMakeRect(PAD + 12, y + 44, inner_w - 24, body_height))
+                label.cell().setUsesSingleLineMode_(False)
+                label.cell().setScrollable_(False)
+                label.cell().setWraps_(True)
+                label.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
+                root.addSubview_(label)
+            row_y = y + (44 + body_height if body else 48)
+            if login_model.get("email"):
+                root.addSubview_(_label(login_model["email"], font_body, pal["fg"], NSMakeRect(PAD + 12, row_y, inner_w - 24, 20)))
+                row_y += 22
+            if login_model.get("plan"):
+                root.addSubview_(_label(login_model["plan"], font_small, pal["muted"], NSMakeRect(PAD + 12, row_y, inner_w - 24, 18)))
+                row_y += 24
+            workspace_id = login_model.get("workspace_id") or login_model.get("account_id")
+            if workspace_id:
+                workspace = _label(f"Workspace · {workspace_id}", font_small, pal["muted"], NSMakeRect(PAD + 12, row_y, inner_w - 24, 18))
+                workspace.setToolTip_("Workspace identifier")
+                root.addSubview_(workspace)
+                row_y += 22
+            if login_model["stage"] == "ready":
+                alias_field = NSTextField.alloc().initWithFrame_(NSMakeRect(PAD + 12, row_y, inner_w - 24, 28))
+                alias_field.setPlaceholderString_("Nickname (optional)")
+                alias_field.setStringValue_(self._login_alias)
+                alias_field.setFont_(font_body)
+                alias_field.cell().setUsesSingleLineMode_(True)
+                alias_field.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+                root.addSubview_(alias_field)
+                self._login_alias_field = alias_field
+                row_y += 36
+                button_w = (inner_w - 24 - 6) / 2
+                save = self._add_button(root, "Save account", NSMakeRect(PAD + 12, row_y, button_w, 40), lambda _s, f=alias_field: self._save_login(f), font_body)
+                save.setEnabled_(self._on_login_action is not None)
+                cancel = self._add_button(root, "Cancel", NSMakeRect(PAD + 12 + button_w + 6, row_y, button_w, 40), lambda _s: self._login_action("cancel"), font_body)
+                cancel.setEnabled_(self._on_login_action is not None)
+            else:
+                if login_model.get("device_code"):
+                    code = _label(login_model["device_code"], font_digits, pal["fg"], NSMakeRect(PAD + 12, row_y, inner_w - 24, 24), align="center")
+                    root.addSubview_(code)
+                    row_y += 30
+                actions = login_model.get("actions") or []
+                labels = {"cancel": "Cancel", "copy_link": "Copy link", "retry": "Try again", "device": "Use a code", "open_browser": "Open browser", "copy_code": "Copy code", "start": "Sign in with ChatGPT", "dismiss": "Done"}
+                enabled_actions = [a for a in actions if a in labels]
+                for index, action in enumerate(enabled_actions):
+                    width = (inner_w - 24 - 6) / 2 if len(enabled_actions) > 1 else inner_w - 24
+                    x = PAD + 12 + (width + 6) * (index % 2)
+                    yy = row_y + (46 * (index // 2))
+                    btn = self._add_button(root, labels[action], NSMakeRect(x, yy, width, 40), lambda _s, a=action: self._login_action(a), font_body)
+                    if action == "copy_link":
+                        btn.setToolTip_("Open this link in another browser profile to use a different account.")
+                    elif action == "device":
+                        btn.setToolTip_("Device sign-in must be enabled by your account or workspace.")
+                    btn.setEnabled_(self._on_login_action is not None)
+                if login_model.get("hint"):
+                    root.addSubview_(_label(login_model["hint"], font_small, pal["muted"], NSMakeRect(PAD + 12, y + body_h - 22, inner_w - 24, 18)))
+        elif not cards:
             root.addSubview_(
                 _label(
-                    "No managed accounts",
-                    font_body,
-                    pal["muted"],
-                    NSMakeRect(PAD, y, inner_w, 20),
+                    empty["title"], font_title, pal["fg"],
+                    NSMakeRect(PAD + 12, y + 14, inner_w - 24, 22),
                 )
             )
-        else:
-            sectioned = False
-            for card in cards:
-                if card.get("provider") == "codex" and not sectioned:
-                    root.addSubview_(
-                        _label(
-                            "Codex",
-                            font_small,
-                            pal["muted"],
-                            NSMakeRect(PAD, y, inner_w, SECTION_H),
-                        )
+            for text, offset, h, font in ((empty["body"], 42, 54, font_body),
+                                          (empty["hint"], 144, 32, font_small)):
+                label = _label(text, font, pal["muted"], NSMakeRect(PAD + 12, y + offset, inner_w - 24, h))
+                label.cell().setUsesSingleLineMode_(False)
+                label.cell().setScrollable_(False)
+                label.cell().setWraps_(True)
+                label.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
+                root.addSubview_(label)
+            if empty["action"]:
+                button = self._add_button(
+                    root, empty["button"], NSMakeRect(PAD + 12, y + 98, inner_w - 24, 40),
+                    lambda _sender, p=provider, a=empty["action"]: self._empty_action(p, a), font_body,
+                )
+                button.setEnabled_(self._on_empty_action is not None)
+                secondary = empty.get("secondary_action")
+                if secondary:
+                    secondary_btn = self._add_button(
+                        root, empty.get("secondary_button", "Save current login"),
+                        NSMakeRect(PAD + 12, y + 144, inner_w - 24, 40),
+                        lambda _sender, p=provider, a=secondary: self._empty_action(p, a), font_body,
                     )
-                    y += SECTION_H
-                    sectioned = True
+                    secondary_btn.setEnabled_(self._on_empty_action is not None)
+        else:
+            for card in cards:
                 card_h = _card_height(card)
                 card_view = _CardView.alloc().initWithCard_onSwitch_(
                     card, self._on_switch
@@ -999,23 +1235,36 @@ class MenuBarPanel:
 
                 title = card["title"]
                 if card.get("disabled"):
-                    title = f"{title}  (disabled)"
+                    title = (
+                        f"{title}  (CLI only)"
+                        if card.get("api_key")
+                        else f"{title}  ({'paused' if provider == 'chatgpt' else 'disabled'})"
+                    )
+                badge_w = 58 if provider == "chatgpt" else 48
+                title_w = inner_w - CARD_PAD * 2 - 8
+                if card.get("active"):
+                    title_w -= badge_w + 8
                 card_view.addSubview_(
                     _label(
                         title,
                         font_title,
                         pal["fg"],
-                        NSMakeRect(CARD_PAD + 6, CARD_PAD, inner_w - CARD_PAD * 2 - 52, TITLE_H),
+                        NSMakeRect(CARD_PAD + 6, CARD_PAD, title_w, TITLE_H),
                     )
                 )
                 if card.get("active"):
+                    badge_text = "selected" if provider == "chatgpt" else "active"
                     badge = _label(
-                        "active",
+                        badge_text,
                         font_small,
                         pal["accent"],
-                        NSMakeRect(inner_w - CARD_PAD - 48, CARD_PAD + 1, 48, TITLE_H),
+                        NSMakeRect(inner_w - CARD_PAD - badge_w, CARD_PAD + 1, badge_w, TITLE_H),
                         align="right",
                     )
+                    if provider == "chatgpt":
+                        badge.setToolTip_(
+                            "Selected in the shared credential file. Verify the account in ChatGPT after switching."
+                        )
                     card_view.addSubview_(badge)
 
                 subtitle = card.get("subtitle") or ""
@@ -1119,16 +1368,24 @@ class MenuBarPanel:
         hairline.setFrame_(NSMakeRect(PAD, fy, inner_w, 1))
         root.addSubview_(hairline)
 
+        if provider == "claude" and cards:
+            self._add_button(
+                root, "Rotate", NSMakeRect(PAD, fy + 8, 62, 22), self._on_rotate, font_small
+            )
+            self._add_button(
+                root, "Best", NSMakeRect(PAD + 70, fy + 8, 54, 22), self._on_best, font_small
+            )
+        else:
+            if desktop_status:
+                root.addSubview_(_label(desktop_status, font_small, pal["muted"], NSMakeRect(PAD, fy - running_h - RUNNING_LINE_H, inner_w, RUNNING_LINE_H)))
+            if provider == "chatgpt" and cards:
+                add = self._add_button(root, "Add account", NSMakeRect(PAD, fy + 8, 90, 22), lambda _s: self._login_action("start"), font_small)
+                add.setEnabled_(self._on_login_action is not None)
+                if self._on_review_chatgpt_switch is not None and self._chatgpt_switch_pending():
+                    self._add_button(root, "Review switch", NSMakeRect(PAD + 96, fy + 8, 100, 22), self._on_review_chatgpt_switch, font_small)
         self._add_button(
-            root, "Rotate", NSMakeRect(PAD, fy + 8, 62, 22), self._on_rotate, font_small
-        )
-        self._add_button(
-            root, "Best", NSMakeRect(PAD + 70, fy + 8, 54, 22), self._on_best, font_small
-        )
-        self._add_button(
-            root,
-            "Settings",
-            NSMakeRect(PAD + 134, fy + 8, 72, 22),
+            root, "Settings",
+            NSMakeRect(PAD + (134 if provider == "claude" and cards else (202 if provider == "chatgpt" and cards and self._chatgpt_switch_pending() else (96 if provider == "chatgpt" and cards else 0))), fy + 8, 72, 22),
             self._show_settings,
             font_small,
         )
@@ -1147,6 +1404,7 @@ class MenuBarPanel:
         font_title = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
         font_body = NSFont.systemFontOfSize_weight_(12, NSFontWeightRegular)
         font_small = NSFont.systemFontOfSize_weight_(11, NSFontWeightRegular)
+        font_group = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold)
         inner_w = PANEL_WIDTH - PAD * 2
         settings = self._settings() if callable(self._settings) else MenuBarSettings()
         strategy = self._strategy() if callable(self._strategy) else "best"
@@ -1170,6 +1428,7 @@ class MenuBarPanel:
             threshold=threshold,
             has_codex=has_codex,
             codex_enabled=codex_enabled,
+            section=self._settings_section,
         )
 
         def _choice_lines(row):
@@ -1193,7 +1452,7 @@ class MenuBarPanel:
         def _row_height(row) -> float:
             kind = row.get("kind")
             if kind == "group":
-                return SETTINGS_GROUP_H
+                return 34.0 if row.get("style") == "hint" else SETTINGS_GROUP_H
             if kind == "toggle":
                 return SETTINGS_TOGGLE_H
             if kind == "popup":
@@ -1206,7 +1465,7 @@ class MenuBarPanel:
         body_h = 0.0
         for row in rows:
             body_h += _row_height(row) + SETTINGS_ROW_GAP
-        height = PAD + HEADER_H + body_h + PAD
+        height = PAD + HEADER_H + SETTINGS_TABS_H + body_h + PAD
         root = _RootView.alloc().initWithHover_(self._on_hover)
         root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, height))
         root.setMaterial_(NSVisualEffectMaterialMenu)
@@ -1227,18 +1486,41 @@ class MenuBarPanel:
         root.addSubview_(hairline)
 
         y = PAD + HEADER_H
+        tab_w = (inner_w - TAB_GAP) / len(SETTINGS_SECTIONS)
+        for index, (section, label) in enumerate(SETTINGS_SECTIONS):
+            tab = self._add_button(
+                root,
+                label,
+                NSMakeRect(PAD + index * (tab_w + TAB_GAP), y, tab_w, SETTINGS_TABS_H),
+                lambda _sender, value=section: self._select_settings_section(value),
+                font_small,
+            )
+            tab.setButtonType_(NSButtonTypePushOnPushOff)
+            selected = section == self._settings_section
+            tab.setState_(1 if selected else 0)
+            if selected:
+                tab.setFont_(font_group)
+            else:
+                tab.setAlphaValue_(0.68)
+        y += SETTINGS_TABS_H
+
         for row in rows:
             kind = row.get("kind")
             h = _row_height(row)
             if kind == "group":
-                root.addSubview_(
-                    _label(
-                        row.get("label") or "",
-                        font_small,
-                        pal["muted"],
-                        NSMakeRect(PAD, y + 4, inner_w, SETTINGS_GROUP_H - 4),
-                    )
+                is_hint = row.get("style") == "hint"
+                label = _label(
+                    row.get("label") or "",
+                    font_small if is_hint else font_group,
+                    pal["muted"] if is_hint else pal["fg"],
+                    NSMakeRect(PAD, y + (2 if is_hint else 4), inner_w, h - 4),
                 )
+                if is_hint:
+                    label.cell().setUsesSingleLineMode_(False)
+                    label.cell().setScrollable_(False)
+                    label.cell().setWraps_(True)
+                    label.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
+                root.addSubview_(label)
             elif kind == "toggle":
                 root.addSubview_(
                     _label(
@@ -1252,6 +1534,7 @@ class MenuBarPanel:
                     bool(row.get("value")),
                     lambda _s, rid=row["id"]: self._emit_setting(rid, None),
                 )
+                sw.setEnabled_(not bool(row.get("disabled")))
                 cs = sw.frame().size
                 sw.setFrame_(
                     NSMakeRect(

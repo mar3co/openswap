@@ -45,6 +45,10 @@ class CodexAuthError(ClaudeSwitchError):
     """No live Codex login, or the login is already a managed slot."""
 
 
+class DuplicateAccountError(CodexAuthError):
+    """An OAuth identity is already present in the managed roster."""
+
+
 class CodexSwitchError(ClaudeSwitchError):
     """Switch refused (unmanaged live login, missing target, …)."""
 
@@ -356,6 +360,106 @@ class CodexEngine:
             self._write_roster(data)
             return num
 
+    def add_oauth_account(self, text: str, alias: str | None = None) -> str:
+        """Import a validated OAuth blob as a new, enabled account.
+
+        Unlike :meth:`add_account`, this never reads or changes the live Codex
+        login and deliberately leaves the active marker alone.
+        """
+        # Local import avoids the desktop module's engine import cycle.
+        from openswap.codex.desktop import DesktopSwitchError, _credential_identity
+
+        try:
+            ident = _credential_identity(text, label="The new login")
+        except DesktopSwitchError as exc:
+            raise CodexAuthError(str(exc)) from exc
+        try:
+            normalized_alias = normalize_alias(alias) if alias else None
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
+        with self._lock():
+            if self.sequence_file.exists():
+                try:
+                    data = json.loads(self.sequence_file.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise ConfigError(
+                        "The Codex account roster is unreadable; repair it before adding an account."
+                    ) from exc
+                accounts_value = data.get("accounts", {}) if isinstance(data, dict) else None
+                sequence_value = data.get("sequence", []) if isinstance(data, dict) else None
+                valid_sequence = (
+                    isinstance(sequence_value, list) and
+                    all(isinstance(item, (str, int)) and not isinstance(item, bool)
+                        for item in sequence_value)
+                )
+                if (not isinstance(data, dict) or not isinstance(accounts_value, dict) or
+                        not all(isinstance(rec, dict) for rec in accounts_value.values()) or
+                        not valid_sequence):
+                    raise ConfigError(
+                        "The Codex account roster is malformed; repair it before adding an account."
+                    )
+            else:
+                data = self._read_roster()
+            accounts = dict(data.get("accounts") or {})
+            for existing, rec in accounts.items():
+                if (rec.get("email") == ident.email and
+                        rec.get("accountId") == ident.account_id):
+                    raise DuplicateAccountError(
+                        f"This ChatGPT account is already saved as account {existing}."
+                    )
+            if normalized_alias:
+                for existing, rec in accounts.items():
+                    if rec.get("alias") == normalized_alias:
+                        raise ConfigError(
+                            f"Alias '{normalized_alias}' is already used by account {existing}"
+                        )
+
+            num = self._next_free_number(data)
+            # Never adopt or overwrite an untracked directory. It may be an
+            # interrupted older operation, and cleanup below must remove only
+            # the exact slot created by this call.
+            while os.path.lexists(self._slot_dir(num)):
+                taken = {int(n) for n in self._seq_nums(data) if str(n).isdigit()}
+                taken.add(int(num))
+                candidate = 1
+                while candidate in taken or os.path.lexists(self._slot_dir(str(candidate))):
+                    candidate += 1
+                num = str(candidate)
+            slot_path = self._slot_auth_path(num)
+            wrote_slot = False
+            try:
+                self._write_slot(num, text)
+                wrote_slot = True
+                rec = {
+                    "email": ident.email,
+                    "accountId": ident.account_id,
+                    "planType": ident.plan_type,
+                    "kind": "oauth",
+                    "added": get_timestamp(),
+                    "disabled": False,
+                }
+                if normalized_alias:
+                    rec["alias"] = normalized_alias
+                accounts[num] = rec
+                sequence = list(data.get("sequence") or [])
+                sequence.append(int(num) if num.isdigit() else num)
+                data["accounts"] = accounts
+                data["sequence"] = sequence
+                self._write_roster(data)
+            except BaseException:
+                if wrote_slot:
+                    try:
+                        committed = self._read_roster()
+                        referenced = num in (committed.get("accounts") or {})
+                        if not referenced:
+                            slot_path.unlink(missing_ok=True)
+                            slot_path.parent.rmdir()
+                    except OSError:
+                        pass
+                raise
+            return num
+
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         with self._lock():
             num, _email, _acc = self.resolve_account(identifier)
@@ -620,6 +724,14 @@ class CodexEngine:
                         "reason": "codex-auto-disabled", "warnings": [],
                     }
             num, email, _acc = self.resolve_account(identifier)
+            if automatic:
+                data = self._read_roster()
+                if self._record(data, num).get("disabled"):
+                    return {
+                        "switched": False, "from": None,
+                        "to": self._ref(str(num), email),
+                        "reason": "account-disabled", "warnings": [],
+                    }
             target_text = self._slot_text(num)
             if parse_auth(target_text) is None:
                 raise CodexSwitchError(f"Account {num} has no usable Codex login.")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import struct
 from unittest.mock import patch
 
 import pytest
@@ -42,6 +43,34 @@ def test_project_dir_finds_checkout_sources():
     found = wi.project_dir()
     assert found == expected
     assert (found / "OpenSwapWidget.xcodeproj").is_dir()
+
+
+def test_widget_app_icons_use_the_opensoft_mark_at_every_declared_size():
+    root = Path(__file__).resolve().parents[1]
+    icon_dir = (
+        root / "macos" / "OpenSwapWidget" / "Host" / "Assets.xcassets"
+        / "AppIcon.appiconset"
+    )
+    for size in (16, 32, 64, 128, 256, 512, 1024):
+        data = (icon_dir / f"icon_{size}.png").read_bytes()
+        assert data.startswith(b"\x89PNG\r\n\x1a\n")
+        assert struct.unpack(">II", data[16:24]) == (size, size)
+
+    source = (root / "assets" / "opensoft-app-icon.svg").read_text()
+    assert 'aria-label="OpenSoft"' in source
+    assert '<rect width="32" height="32" rx="6" fill="#0a0a0a"/>' in source
+
+
+def test_popover_packages_the_opensoft_symbol():
+    package_dir = Path(__file__).resolve().parents[1] / "src" / "openswap"
+    svg = (package_dir / "assets" / "opensoft-symbol.svg").read_text()
+    png = package_dir / "assets" / "opensoft-symbol-64.png"
+    panel = (package_dir / "menubar_panel.py").read_text()
+
+    assert 'aria-label="OpenSoft"' in svg
+    assert struct.unpack(">II", png.read_bytes()[16:24]) == (64, 64)
+    assert "def _brand_mark" in panel
+    assert '"OpenSwap"' in panel
 
 
 def test_require_macos_refuses_other_platforms(monkeypatch):
