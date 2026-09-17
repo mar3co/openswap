@@ -114,9 +114,17 @@ def kickoff_account_eligible(
 
     A 5h window is open only while its ``resets_at`` is still in the future.
     Stale last-good rows from yesterday (pct > 0, reset already passed) are
-    idle again and must be pinged.
+    idle again and must be pinged. The account must report a numeric
+    ``five_hour`` window first: missing usage is unsupported/unknown, never
+    permission to spend quota on a probe.
     """
     if is_api_key:
+        return False
+    window = usage.get("five_hour") if isinstance(usage, dict) else None
+    if not (
+        isinstance(window, dict)
+        and isinstance(window.get("pct"), (int, float))
+    ):
         return False
     resets_at = _five_hour_resets_at_ts(usage)
     if resets_at is not None and resets_at > _as_posix(now):
@@ -242,6 +250,7 @@ def invoke_kickoff(
         argv,
         env=env,
         cwd=cwd,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -250,7 +259,10 @@ def invoke_kickoff(
 
 
 def build_codex_kickoff_argv(codex_bin: str) -> list[str]:
-    return [codex_bin, "exec", KICKOFF_PROMPT]
+    # A kickoff is intentionally projectless: it sends a trivial prompt only
+    # to open the account's reported 5h window. CODEX_HOME is not a Git repo,
+    # so make that explicit instead of letting the CLI fail its repo guard.
+    return [codex_bin, "exec", "--skip-git-repo-check", KICKOFF_PROMPT]
 
 
 def build_codex_kickoff_env(home, environ=None) -> dict[str, str]:
@@ -291,6 +303,9 @@ def invoke_codex_kickoff(
         argv,
         env=env,
         cwd=cwd,
+        # A GUI app can inherit a pipe on stdin. Close it so Codex does not
+        # append unrelated input or emit "Reading additional input from stdin".
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         timeout=timeout,
