@@ -6,6 +6,7 @@ status item stays a short title; this panel is what opens on click.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import objc
@@ -49,6 +50,7 @@ from AppKit import (
     NSVisualEffectMaterialMenu,
     NSVisualEffectStateActive,
     NSVisualEffectView,
+    NSWorkspace,
 )
 try:
     from AppKit import NSSwitch
@@ -64,6 +66,11 @@ from Foundation import (
     NSUserDefaults,
 )
 
+from openswap.brand_motion import (
+    BRAND_MOTION_DURATION,
+    brand_mark_centers,
+    brand_motion_progress,
+)
 from openswap.menubar import (
     MAIN_PAGE,
     MenuBarSettings,
@@ -182,6 +189,8 @@ COL_GAP = 8.0
 TAB_H = 40.0
 TAB_GAP = 6.0
 INFO_LINE_H = 16.0
+LOGIN_BRAND_SIZE = 56.0
+LOGIN_BRAND_SPACE = 68.0
 
 
 def _card_height(card) -> float:
@@ -408,6 +417,107 @@ class _FillView(NSView):
         NSBezierPath.bezierPathWithRect_(self.bounds()).fill()
 
 
+class _BrandMotionView(NSView):
+    """One-shot native rendering of the OpenSoft ring-to-mark motion."""
+
+    def initWithFrame_tint_elapsed_(self, frame, tint, elapsed):
+        self = objc.super(_BrandMotionView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._tint = tint
+        self._elapsed = max(0.0, float(elapsed))
+        self._started_at = None
+        self._timer = None
+        fraction = min(self._elapsed / BRAND_MOTION_DURATION, 1.0)
+        self._progress = brand_motion_progress(fraction)
+        try:
+            self.setAccessibilityElement_(False)
+        except Exception:
+            pass
+        return self
+
+    def isFlipped(self):
+        return True
+
+    def _reduce_motion(self) -> bool:
+        try:
+            return bool(
+                NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+            )
+        except Exception:
+            return False
+
+    def _stop_timer(self) -> None:
+        timer = self._timer
+        self._timer = None
+        if timer is not None:
+            timer.invalidate()
+
+    def viewDidMoveToWindow(self):
+        objc.super(_BrandMotionView, self).viewDidMoveToWindow()
+        if self.window() is None:
+            self._stop_timer()
+            return
+        if self._reduce_motion() or self._elapsed >= BRAND_MOTION_DURATION:
+            self._progress = 1.0
+            self.setNeedsDisplay_(True)
+            return
+        if self._timer is None:
+            self._started_at = time.monotonic() - self._elapsed
+            self._timer = (
+                NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    1.0 / 60.0, self, "tick:", None, True
+                )
+            )
+
+    def tick_(self, _timer):
+        elapsed = time.monotonic() - self._started_at
+        fraction = min(elapsed / BRAND_MOTION_DURATION, 1.0)
+        self._progress = brand_motion_progress(fraction)
+        if fraction >= 1.0:
+            self._progress = 1.0
+            self._stop_timer()
+        self.setNeedsDisplay_(True)
+
+    def viewDidChangeEffectiveAppearance(self):
+        objc.super(_BrandMotionView, self).viewDidChangeEffectiveAppearance()
+        self.setNeedsDisplay_(True)
+
+    def _half_path(self, center_y: float, *, right: bool):
+        bounds = self.bounds()
+        side = min(bounds.size.width, bounds.size.height)
+        scale = side / 32.0
+        origin_x = (bounds.size.width - side) / 2.0
+        origin_y = (bounds.size.height - side) / 2.0
+
+        def point(x, y):
+            return (origin_x + x * scale, origin_y + y * scale)
+
+        radius = 8.0
+        control = radius * 0.5522847498
+        direction = 1.0 if right else -1.0
+        path = NSBezierPath.bezierPath()
+        path.moveToPoint_(point(16.0, center_y - radius))
+        path.curveToPoint_controlPoint1_controlPoint2_(
+            point(16.0 + direction * radius, center_y),
+            point(16.0 + direction * control, center_y - radius),
+            point(16.0 + direction * radius, center_y - control),
+        )
+        path.curveToPoint_controlPoint1_controlPoint2_(
+            point(16.0, center_y + radius),
+            point(16.0 + direction * radius, center_y + control),
+            point(16.0 + direction * control, center_y + radius),
+        )
+        path.setLineWidth_(4.0 * scale)
+        return path
+
+    def drawRect_(self, _rect):
+        left_y, right_y = brand_mark_centers(self._progress)
+        self._tint.setStroke()
+        self._half_path(left_y, right=False).stroke()
+        self._half_path(right_y, right=True).stroke()
+
+
 class _BarView(NSView):
     def initWithPct_threshold_stale_(self, pct, threshold, stale):
         self = objc.super(_BarView, self).initWithFrame_(NSMakeRect(0, 0, 100, BAR_H))
@@ -624,6 +734,7 @@ class MenuBarPanel:
         self._on_login_action = on_login_action
         self._login_alias = ""
         self._login_alias_field = None
+        self._login_brand_started_at = None
         # Deliberately kept outside close()/reload(): users can inspect a
         # second provider without losing their place when the popover closes.
         self._selected_provider = "claude"
@@ -902,6 +1013,15 @@ class MenuBarPanel:
         except Exception:
             return login_panel_state({"stage": "error", "message": "Sign-in is unavailable."})
 
+    def _login_brand_elapsed(self, stage: str) -> float:
+        if stage not in {"starting", "waiting"}:
+            self._login_brand_started_at = None
+            return 0.0
+        now = time.monotonic()
+        if self._login_brand_started_at is None:
+            self._login_brand_started_at = now
+        return max(0.0, now - self._login_brand_started_at)
+
     def _empty_action(self, provider, action):
         if self._on_empty_action is not None:
             self._on_empty_action(provider, action)
@@ -1008,6 +1128,8 @@ class MenuBarPanel:
         current_login_model = self._login_state_model()
         login_model = current_login_model if provider == "chatgpt" else login_panel_state(None)
         login_view = provider == "chatgpt" and login_model["stage"] != "idle"
+        branded_login = login_view and login_model["stage"] in {"starting", "waiting"}
+        brand_elapsed = self._login_brand_elapsed(current_login_model["stage"])
         if current_login_model["stage"] == "ready" and self._login_alias_field is not None:
             try:
                 self._login_alias = self._login_alias_field.stringValue().strip()
@@ -1033,6 +1155,8 @@ class MenuBarPanel:
         body_h = 0.0
         if login_view:
             body_h = 220.0 if login_model["stage"] == "ready" else (230.0 if len(login_model.get("actions") or []) > 2 else 184.0)
+            if branded_login:
+                body_h += LOGIN_BRAND_SPACE
         elif not cards:
             body_h = 184.0
         else:
@@ -1136,17 +1260,49 @@ class MenuBarPanel:
         if login_view:
             # Login state is intentionally a compact, replace-in-place panel:
             # the roster never appears alongside an in-flight attempt.
-            root.addSubview_(_label(login_model["title"], font_title, pal["fg"], NSMakeRect(PAD + 12, y + 14, inner_w - 24, 22)))
+            title_y = y + 14
+            body_y = y + 44
+            title_align = "left"
+            if branded_login:
+                brand = _BrandMotionView.alloc().initWithFrame_tint_elapsed_(
+                    NSMakeRect(
+                        PAD + (inner_w - LOGIN_BRAND_SIZE) / 2.0,
+                        y + 10,
+                        LOGIN_BRAND_SIZE,
+                        LOGIN_BRAND_SIZE,
+                    ),
+                    pal["fg"],
+                    brand_elapsed,
+                )
+                root.addSubview_(brand)
+                title_y = y + 76
+                body_y = y + 104
+                title_align = "center"
+            root.addSubview_(
+                _label(
+                    login_model["title"],
+                    font_title,
+                    pal["fg"],
+                    NSMakeRect(PAD + 12, title_y, inner_w - 24, 22),
+                    align=title_align,
+                )
+            )
             body = login_model.get("body") or ""
             body_height = 70 if login_model["stage"] == "error" else 34
             if body:
-                label = _label(body, font_body, pal["muted"], NSMakeRect(PAD + 12, y + 44, inner_w - 24, body_height))
+                label = _label(
+                    body,
+                    font_body,
+                    pal["muted"],
+                    NSMakeRect(PAD + 12, body_y, inner_w - 24, body_height),
+                    align="center" if branded_login else "left",
+                )
                 label.cell().setUsesSingleLineMode_(False)
                 label.cell().setScrollable_(False)
                 label.cell().setWraps_(True)
                 label.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
                 root.addSubview_(label)
-            row_y = y + (44 + body_height if body else 48)
+            row_y = body_y + body_height if body else (y + 104 if branded_login else y + 48)
             if login_model.get("email"):
                 root.addSubview_(_label(login_model["email"], font_body, pal["fg"], NSMakeRect(PAD + 12, row_y, inner_w - 24, 20)))
                 row_y += 22
