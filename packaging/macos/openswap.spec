@@ -6,6 +6,7 @@ a = Analysis(
     ["entry.py"],
     pathex=["../../src"],
     hiddenimports=["rumps", "AppKit", "Foundation", "objc", "truststore"],
+    datas=[("../../src/openswap/assets", "openswap/assets")],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

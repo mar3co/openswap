@@ -10,8 +10,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 WIDGET="$ROOT/macos/OpenSwapWidget"
-DERIVED="${HOME}/Library/Caches/openswap-spike"
-APP="$HERE/dist/OpenSwap.app"
+DERIVED="${OPENSWAP_DERIVED_DIR:-${HOME}/Library/Caches/openswap-spike}"
+DIST="${OPENSWAP_DIST_DIR:-$HERE/dist}"
+WORK="${OPENSWAP_BUILD_DIR:-$HERE/build}"
+APP="$DIST/OpenSwap.app"
 IDENTITY="${OPENSWAP_SIGN_IDENTITY:-}"
 
 cd "$WIDGET"
@@ -29,7 +31,7 @@ cd "$HERE"
 # Local extra from the repo root (.[menubar]). The plan's '../..[menubar]'
 # string is missing the slash after the path.
 uv run --directory "$ROOT" --with pyinstaller --with '.[menubar]' \
-  pyinstaller --noconfirm --clean --distpath "$HERE/dist" --workpath "$HERE/build" \
+  pyinstaller --noconfirm --clean --distpath "$DIST" --workpath "$WORK" \
   "$HERE/openswap.spec"
 
 RELEASE="$DERIVED/Build/Products/Release"
@@ -54,7 +56,7 @@ ICNS="$RELEASE/OpenSwap.app/Contents/Resources/AppIcon.icns"
 if [[ -f "$ICNS" ]]; then
   cp "$ICNS" "$APP/Contents/Resources/AppIcon.icns"
 else
-  ICONSET="$HERE/build/AppIcon.iconset"
+  ICONSET="$WORK/AppIcon.iconset"
   rm -rf "$ICONSET"
   mkdir -p "$ICONSET"
   SRC="$WIDGET/Host/Assets.xcassets/AppIcon.appiconset"
@@ -106,7 +108,7 @@ if [[ "${OPENSWAP_SKIP_NOTARY:-}" == "1" ]]; then
   exit 0
 fi
 
-ZIP="$HERE/dist/OpenSwap.zip"
+ZIP="$DIST/OpenSwap.zip"
 ditto -c -k --keepParent "$APP" "$ZIP"
 
 if [[ -n "${OPENSWAP_NOTARY_KEY_PATH:-}" ]]; then

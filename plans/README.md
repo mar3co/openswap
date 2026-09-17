@@ -23,8 +23,16 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 008  | Ship the single app: cask, install/upgrade rewiring, release CI | P1 | L | 007 verdict | NOT WRITTEN |
 | 009  | Codex CLI accounts: provider seam, CodexEngine, CLI, auto, kickoff, extra, widget | P2 | L | — | DONE |
 | 010  | Codex parity follow-ups (badge, knob, transfer, swap, sessions) | P2 | L | 009 | IN PROGRESS |
+| 011  | ChatGPT desktop switching: research and validation gates | P2 | M | 009, 010 | IN PROGRESS |
+| 015  | Desktop recovery and quiet completion feedback | P1 | M | — | DONE; profile detection still blocked |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED
+
+010's implementation and review fixes merged in PR #36 on 2026-09-17 UTC;
+the deferred manual UI verification keeps its overall status IN PROGRESS.
+011 now includes the user-requested experimental restart-and-switch action;
+real two-account desktop validation remains open. It is not automatic or
+verified production desktop support.
 
 007 was added 2026-09-09 (planned at `92722b1`). Freeze and assemble are
 proved on this Mac; local Developer ID signing was skipped (operator:
@@ -38,7 +46,9 @@ and/or widget; run them only after 001 is merged into the executor’s base.
 009 was added 2026-09-10 (planned at `b00dce8`) from a feasibility spike:
 Codex CLI is a good second provider (plain `auth.json`, `CODEX_HOME`
 isolation, `codex app-server` rate limits without spending quota); the
-ChatGPT desktop app is not a rotation target. It is independent of 007/008
+ChatGPT desktop app was excluded from that plan, not proven impossible. Plan
+011 reopens its feasibility with version-specific evidence and a manual
+validation gate. Plan 009 is independent of 007/008
 but touches `menubar.py`, so do not run it concurrently with 008's
 install/upgrade rewiring. Three phases with a green-suite gate between them.
 

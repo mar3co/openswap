@@ -43,7 +43,7 @@ openswap setup                        # save the current login, start the extra 
 openswap widget --install             # Desktop / Notification Center (this checkout + Xcode)
 ```
 
-Click the extra for usage bars, then a card to switch. Auto-switch waits five minutes before it can move you again. Settings (in the popover): auto-switch, burn weekly first, burn 5-hour first, 5-hour kickoff. Add the widget from Edit Widgets (search **OpenSwap**). Right-click it to choose all accounts, combined remaining, or one account.
+Click the extra for usage bars, then a card to switch. Auto-switch waits five minutes before it can move you again. Popover Settings separates **General** display controls from **Automation** for Claude, ChatGPT, and Codex, with one shared quota policy and a Claude 5-hour kickoff schedule. Add the widget from Edit Widgets (search **OpenSwap**). The popover header and widget host use the OpenSoft mark. Right-click the widget to choose all accounts, combined remaining, or one account.
 
 [Menu bar](https://github.com/mar3co/openswap/wiki/Menu-Bar) · [Widget](https://github.com/mar3co/openswap/wiki/Desktop-Widget) · [Kickoff](https://github.com/mar3co/openswap/wiki/Five-Hour-Kickoff)
 
@@ -68,6 +68,7 @@ The `cswap` command still works as an alias during the rename.
 | `openswap codex import` | Import Codex auth.json envelopes |
 | `openswap codex swap` | Exchange two Codex slot numbers |
 | `openswap codex move` | Assign a Codex account to a slot |
+| `openswap codex desktop` | Experimental, confirmed ChatGPT quit/switch/relaunch and recovery |
 | `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |
@@ -76,3 +77,20 @@ The `cswap` command still works as an alias during the rename.
 | `openswap statusline --codex` | Paint the live Codex account label (no config.toml wrap) |
 
 `openswap help` lists everything. [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
+
+The menu-bar popover has **Claude | ChatGPT** tabs. The ChatGPT tab shows the
+shared ChatGPT/Codex accounts; clicking an OAuth account starts the experimental
+desktop switch with mandatory restart confirmation. Its usage bars measure
+**Codex usage**, not ChatGPT message limits. Read the
+[test and recovery guide](docs/chatgpt-desktop-testing.md) first. The ChatGPT
+**Auto-switch** toggle automatically chooses a replacement, then offers
+**Review switch**: you still confirm before ChatGPT restarts. Unattended desktop
+rotation and authenticated UI verification are not implemented.
+
+To add another account, choose **ChatGPT → Add account** (or **Sign in with
+ChatGPT** on an empty tab). Sign in through your browser, review the account,
+then **Save account**. OpenSwap uses a separate login session: it does not log
+out or replace your current login. New accounts are enabled immediately and
+eligible for automatic rotation if it is on. **Copy link** lets you use another browser profile; **Use a code** offers
+device sign-in where enabled. **Save current login** remains available for
+capturing an existing login.

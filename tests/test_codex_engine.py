@@ -89,6 +89,19 @@ def test_switch_to_same_slot_is_already_active(tmp_path):
     _login(home); eng.add_account()
     assert eng.switch_to("1", json_output=True)["reason"] == "already-active"
 
+
+def test_automatic_commit_rechecks_disabled_setting_but_manual_switch_still_works(tmp_path):
+    from openswap.settings import set_setting
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a"); eng.add_account()
+    _login(home, email="b@x.com", account_id="acc-b"); eng.add_account()
+    before = eng._live_text()
+    set_setting(eng.backup_dir, "autoswitch.codexEnabled", "false")
+    result = eng.switch_to("1", json_output=True, automatic=True)
+    assert not result["switched"] and result["reason"] == "codex-auto-disabled"
+    assert eng._live_text() == before
+    assert eng.switch_to("1", json_output=True)["switched"]
+
 def test_switch_refuses_unmanaged_live_login_unless_forced(tmp_path):
     eng, home = _engine(tmp_path)
     _login(home, email="a@x.com", account_id="acc-a"); eng.add_account()

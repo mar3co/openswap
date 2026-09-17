@@ -345,8 +345,26 @@ Examples:
         sys.exit(130)
 
 
+def _desktop_account_number(value: str) -> str:
+    if not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError("account NUMBER must be a positive integer")
+    return str(int(value))
+
+
+def _desktop_json_payload(
+    result: dict, keys: tuple[str, ...], ref_keys: tuple[str, ...]
+) -> dict:
+    """Copy only the allow-listed keys, reducing each account ref to its number."""
+    payload = {key: result[key] for key in keys if key in result}
+    for key in ref_keys:
+        ref = result.get(key)
+        if isinstance(ref, dict) and "number" in ref:
+            payload[key] = {"number": str(ref["number"])}
+    return payload
+
+
 def _codex_command(argv: list[str]) -> int:
-    """Handle ``openswap codex add|list|switch|remove|disable|enable|alias|export|import|swap|move``."""
+    """Handle Codex account and experimental desktop commands."""
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} codex",
         description="Manage Codex CLI accounts as a second provider beside Claude.",
@@ -407,6 +425,68 @@ def _codex_command(argv: list[str]) -> int:
     mv = sub.add_parser("move", help="Assign a Codex account to a slot number")
     mv.add_argument("account", metavar="NUM|EMAIL|ALIAS")
     mv.add_argument("slot", metavar="SLOT")
+
+    desktop = sub.add_parser(
+        "desktop",
+        help="Experimental macOS ChatGPT desktop preflight and switch",
+        description=(
+            "Experimental macOS support for a ChatGPT desktop app that shares "
+            "Codex authentication. Save and finish all local and remote work "
+            "before switching. A switch quits and relaunches ChatGPT; manually "
+            "verify the account in Chat, Work, and Codex afterwards."
+        ),
+    )
+    desktop_sub = desktop.add_subparsers(dest="desktop_verb", required=True)
+    desktop_status = desktop_sub.add_parser(
+        "status", help="Check whether a desktop switch is safe to attempt"
+    )
+    desktop_status.add_argument(
+        "target", type=_desktop_account_number, metavar="NUMBER"
+    )
+    desktop_status.add_argument("--json", action="store_true", help="Emit JSON")
+    desktop_switch = desktop_sub.add_parser(
+        "switch", help="Quit ChatGPT, switch shared auth, and relaunch"
+    )
+    desktop_switch.add_argument(
+        "target", type=_desktop_account_number, metavar="NUMBER"
+    )
+    desktop_switch.add_argument(
+        "--confirm-restart",
+        action="store_true",
+        required=True,
+        help="Confirm that ChatGPT may be quit and relaunched",
+    )
+    desktop_switch.add_argument(
+        "--confirm-idle",
+        action="store_true",
+        required=True,
+        help="Confirm all local and remote work is saved and finished",
+    )
+    desktop_switch.add_argument("--json", action="store_true", help="Emit JSON")
+    desktop_recovery_status = desktop_sub.add_parser(
+        "recovery-status",
+        help="Report sanitized pending desktop recovery state",
+    )
+    desktop_recovery_status.add_argument(
+        "--json", action="store_true", help="Emit JSON"
+    )
+    desktop_recover = desktop_sub.add_parser(
+        "recover",
+        help="Restore a pending desktop credential transaction",
+    )
+    desktop_recover.add_argument(
+        "--confirm-restart",
+        action="store_true",
+        required=True,
+        help="Confirm that ChatGPT may be quit and may remain stopped",
+    )
+    desktop_recover.add_argument(
+        "--confirm-idle",
+        action="store_true",
+        required=True,
+        help="Confirm all local and remote work is saved and finished",
+    )
+    desktop_recover.add_argument("--json", action="store_true", help="Emit JSON")
 
     args = parser.parse_args(argv)
     from openswap.codex.engine import CodexEngine
@@ -482,6 +562,95 @@ def _codex_command(argv: list[str]) -> int:
             else:
                 email = eng.account_email(num_target)
                 print(f"{accent('Moved')} {email} to slot {num_target}")
+            return 0
+        if args.verb == "desktop":
+            from openswap.codex.desktop import DesktopSwitcher
+
+            desktop_switcher = DesktopSwitcher(eng)
+            if args.desktop_verb == "recovery-status":
+                result = desktop_switcher.recovery_status()
+                if args.json:
+                    payload = _desktop_json_payload(
+                        result,
+                        ("status", "pending", "experimental", "warning"),
+                        ("from", "to"),
+                    )
+                    print(json.dumps(payload, indent=2))
+                else:
+                    state = result.get("status") or (
+                        "pending" if result.get("pending") else "none"
+                    )
+                    print(f"Experimental desktop recovery status: {state}")
+                    warning_text = result.get("warning")
+                    if warning_text:
+                        print(dimmed(str(warning_text)))
+                return 0
+
+            if args.desktop_verb == "recover":
+                result = desktop_switcher.recover(
+                    confirm_restart=args.confirm_restart,
+                    confirm_idle=args.confirm_idle,
+                )
+                if args.json:
+                    payload = _desktop_json_payload(
+                        result,
+                        ("status", "experimental", "app", "warning"),
+                        ("restored",),
+                    )
+                    print(json.dumps(payload, indent=2))
+                else:
+                    state = result.get("status") or "unknown"
+                    print(f"Experimental desktop recovery result: {state}")
+                    warning_text = result.get("warning")
+                    if warning_text:
+                        print(dimmed(str(warning_text)))
+                    print(
+                        dimmed(
+                            "Recovery does not verify a desktop account. ChatGPT "
+                            "may remain stopped; follow the recovery guidance above."
+                        )
+                    )
+                return 0
+
+            if args.desktop_verb == "status":
+                result = desktop_switcher.preflight(args.target)
+                if args.json:
+                    print(json.dumps(result, indent=2))
+                else:
+                    print("Experimental ChatGPT desktop preflight completed.")
+                    target = result.get("target") or {}
+                    target_name = target.get("email") or (
+                        f"Account {target.get('number', args.target)}"
+                    )
+                    print(f"Target: {target_name}")
+                    print(
+                        "ChatGPT: running"
+                        if result.get("running")
+                        else "ChatGPT: not running"
+                    )
+                    print(
+                        dimmed(
+                            "Before switching, save and finish all local and remote "
+                            "work. ChatGPT will be quit and relaunched."
+                        )
+                    )
+                return 0
+
+            result = desktop_switcher.switch(
+                args.target,
+                confirm_restart=args.confirm_restart,
+                confirm_idle=args.confirm_idle,
+            )
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                print("Experimental ChatGPT desktop switch is awaiting verification.")
+                print(
+                    dimmed(
+                        "Open ChatGPT and manually verify the intended account in "
+                        "Chat, Work, and Codex."
+                    )
+                )
             return 0
     except ClaudeSwitchError as e:
         error(f"Error: {e}")

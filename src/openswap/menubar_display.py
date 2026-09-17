@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import plistlib
 import re
@@ -18,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +57,7 @@ _HOLD_WINDOW = {
     "soonest-5h": "5-hour",
 }
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
+MENU_BAR_PROVIDER_CHOICES: tuple[str, ...] = ("claude", "chatgpt", "both", "logo")
 MENUBAR_SETTINGS_FILENAME = "menubar_settings.json"
 
 
@@ -86,6 +86,12 @@ def combine_title_pct(show_5h: bool, show_7d: bool) -> str:
 REFRESH_LABELS: dict[int, str] = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
 SETTINGS_PAGE = "settings"
 MAIN_PAGE = "main"
+SETTINGS_SECTION_GENERAL = "general"
+SETTINGS_SECTION_AUTOMATION = "automation"
+SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = (
+    (SETTINGS_SECTION_GENERAL, "General"),
+    (SETTINGS_SECTION_AUTOMATION, "Automation"),
+)
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.opensoft.openswap.menubar"
 RELOGIN_CARD_NOTE = "Signed out. Log in with Claude Code, then click this card."
@@ -162,12 +168,14 @@ class MenuBarSettings:
     Engine cooldown / last switch / quarantine live in ``autoswitch_state.json``.
     """
 
+    menu_bar_provider: str = "claude"
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
-    show_icon: bool = False  # optional ✻ in the status-item title; off by default
+    # Separate from Claude's live rotation: this only proposes desktop targets.
+    chatgpt_auto_enabled: bool = False
     confirm_switch: bool = True  # ask before a card click swaps the live login
     kickoff_enabled: bool = False
     kickoff_hour: int = 7
@@ -199,6 +207,8 @@ class MenuBarSettings:
                 continue
             if f.name == "title_pct" and value not in TITLE_PCT_CHOICES:
                 continue
+            if f.name == "menu_bar_provider" and value not in MENU_BAR_PROVIDER_CHOICES:
+                continue
             kwargs[f.name] = value
         return cls(**kwargs)
 
@@ -214,79 +224,181 @@ def settings_page_rows(
     threshold: float,
     has_codex: bool = False,
     codex_enabled: bool = True,
+    section: str | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
 
     Each dict: ``{"kind": "toggle"|"choice"|"group"|"popup", "id": str, "label": str, ...}``.
     Choice and popup rows include ``options`` ``(value, label)`` and the current
     ``value``. Toggles include a bool ``value``. Child rows are omitted while
-    their parent is off (auto-switch policy, kickoff time).
-    ``codex_enabled`` is shown only when master auto is on and ``has_codex``.
+    their parent is off (shared automation policy, kickoff time). Every row is
+    tagged with a settings section so AppKit can keep the page compact; callers
+    that omit ``section`` receive the complete model for compatibility.
+
+    Claude, ChatGPT desktop selection, and Codex CLI rotation are named
+    independently. ChatGPT suggestions and live Codex rotation are mutually
+    exclusive in the controller; the model makes that relationship visible.
     """
-    rows = [
+    general = [
+        {
+            "kind": "group",
+            "style": "section",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "group_menu_bar",
+            "label": "Menu bar",
+        },
+        {
+            "kind": "popup",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "menu_bar_provider",
+            "label": "Show",
+            "options": [
+                ("claude", "Claude"), ("chatgpt", "ChatGPT"),
+                ("both", "Both"), ("logo", "Logo only"),
+            ],
+            "value": settings.menu_bar_provider,
+        },
         {
             "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
             "id": "show_account_name",
-            "label": "Show account name in menu bar",
+            "label": "Account name",
             "value": bool(settings.show_account_name),
         },
         {
             "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
             "id": "title_pct_5h",
-            "label": "Show 5-hour % in menu bar",
+            "label": "5-hour usage",
             "value": title_shows_5h(settings.title_pct),
         },
         {
             "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
             "id": "title_pct_7d",
-            "label": "Show 7-day % in menu bar",
+            "label": "7-day usage",
             "value": title_shows_7d(settings.title_pct),
         },
         {
             "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
             "id": "title_scoped",
-            "label": "Show model limits in title",
+            "label": "Claude model limits",
             "value": bool(settings.title_scoped),
         },
         {
+            "kind": "group",
+            "style": "section",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "group_behavior",
+            "label": "Behavior",
+        },
+        {
             "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
             "id": "confirm_switch",
             "label": "Confirm before switching",
             "value": bool(settings.confirm_switch),
         },
         {
             "kind": "choice",
+            "section": SETTINGS_SECTION_GENERAL,
             "id": "refresh_interval",
             "label": "Refresh interval",
             "options": [(secs, REFRESH_LABELS[secs]) for secs in REFRESH_CHOICES],
             "value": settings.refresh_interval,
         },
+    ]
+    title_controls = {"show_account_name", "title_pct_5h", "title_pct_7d", "title_scoped"}
+    if settings.menu_bar_provider == "logo":
+        general = [row for row in general if row["id"] not in title_controls]
+    elif settings.menu_bar_provider == "chatgpt":
+        general = [row for row in general if row["id"] != "title_scoped"]
+    if settings.menu_bar_provider in ("chatgpt", "both"):
+        hint_at = next(i for i, row in enumerate(general) if row["id"] == "group_behavior")
+        general.insert(hint_at, {
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "menu_bar_chatgpt_hint",
+            "label": (
+                "ChatGPT: shared Codex login and usage. App sign-in is unverified; "
+                "these aren’t ChatGPT message limits."
+            ),
+        })
+
+    automation = [
+        {
+            "kind": "group",
+            "style": "section",
+            "section": SETTINGS_SECTION_AUTOMATION,
+            "id": "group_claude",
+            "label": "Claude Code",
+        },
         {
             "kind": "toggle",
+            "section": SETTINGS_SECTION_AUTOMATION,
             "id": "auto_switch_enabled",
-            "label": "Auto-switch accounts",
+            "label": "Auto-switch Claude accounts",
             "value": bool(settings.auto_switch_enabled),
         },
     ]
-    if settings.auto_switch_enabled:
-        rows.extend(
+    if has_codex or settings.chatgpt_auto_enabled:
+        automation.extend(
             [
                 {
+                    "kind": "group",
+                    "style": "section",
+                    "section": SETTINGS_SECTION_AUTOMATION,
+                    "id": "group_chatgpt",
+                    "label": "ChatGPT",
+                },
+                {
+                    "kind": "toggle",
+                    "section": SETTINGS_SECTION_AUTOMATION,
+                    "id": "chatgpt_auto_enabled",
+                    "label": "Suggest ChatGPT account switches",
+                    "value": bool(settings.chatgpt_auto_enabled),
+                },
+                {
+                    "kind": "group",
+                    "style": "hint",
+                    "section": SETTINGS_SECTION_AUTOMATION,
+                    "id": "chatgpt_auto_hint",
+                    "label": "Uses Codex quota. You approve every ChatGPT restart.",
+                },
+            ]
+        )
+    if settings.auto_switch_enabled or settings.chatgpt_auto_enabled:
+        automation.extend(
+            [
+                {
+                    "kind": "group",
+                    "style": "section",
+                    "section": SETTINGS_SECTION_AUTOMATION,
+                    "id": "group_policy",
+                    "label": "Shared rotation policy",
+                },
+                {
                     "kind": "choice",
+                    "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "threshold",
-                    "label": "Auto-switch threshold",
+                    "label": "Switch at",
                     "options": [(pct, f"{pct}%") for pct in AUTO_THRESHOLD_CHOICES],
                     "value": int(threshold),
                 },
                 {
                     "kind": "choice",
+                    "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "strategy",
-                    "label": "Auto-switch strategy",
+                    "label": "Choose the next account by",
                     "options": list(AUTO_STRATEGY_CHOICES),
                     "value": strategy,
                 },
                 {
                     "kind": "group",
+                    "style": "hint",
+                    "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "strategy_hint",
                     "label": AUTO_STRATEGY_HINTS.get(
                         strategy, AUTO_STRATEGY_HINTS["best"]
@@ -294,27 +406,61 @@ def settings_page_rows(
                 },
             ]
         )
-        if has_codex:
-            rows.append(
-                {
-                    "kind": "toggle",
-                    "id": "codex_enabled",
-                    "label": "Auto-switch Codex accounts",
-                    "value": bool(codex_enabled),
-                }
+        if has_codex and settings.auto_switch_enabled:
+            automation.extend(
+                [
+                    {
+                        "kind": "group",
+                        "style": "section",
+                        "section": SETTINGS_SECTION_AUTOMATION,
+                        "id": "group_codex",
+                        "label": "Codex CLI",
+                    },
+                    {
+                        "kind": "toggle",
+                        "section": SETTINGS_SECTION_AUTOMATION,
+                        "id": "codex_enabled",
+                        "label": "Auto-switch Codex CLI accounts",
+                        "value": bool(codex_enabled),
+                        "disabled": bool(settings.chatgpt_auto_enabled),
+                    },
+                    {
+                        "kind": "group",
+                        "style": "hint",
+                        "section": SETTINGS_SECTION_AUTOMATION,
+                        "id": "codex_auto_hint",
+                        "label": (
+                            "Turn off ChatGPT suggestions to use live Codex rotation."
+                            if settings.chatgpt_auto_enabled
+                            else "Runs alongside Claude auto-switch using the shared policy."
+                        ),
+                    },
+                ]
             )
-    rows.append(
-        {
-            "kind": "toggle",
-            "id": "kickoff_enabled",
-            "label": "Start 5-hour window",
-            "value": bool(settings.kickoff_enabled),
-        }
+
+    automation.extend(
+        [
+            {
+                "kind": "group",
+                "style": "section",
+                "section": SETTINGS_SECTION_AUTOMATION,
+                "id": "group_schedule",
+                "label": "Claude schedule",
+            },
+            {
+                "kind": "toggle",
+                "section": SETTINGS_SECTION_AUTOMATION,
+                "id": "kickoff_enabled",
+                "label": "Start Claude 5-hour window",
+                "value": bool(settings.kickoff_enabled),
+            },
+        ]
     )
     if settings.kickoff_enabled:
-        rows.append(
+        automation.append(
             {
                 "kind": "popup",
+                "section": SETTINGS_SECTION_AUTOMATION,
                 "id": "kickoff_time",
                 "label": "Time",
                 "options": kickoff_time_options(
@@ -325,30 +471,15 @@ def settings_page_rows(
                 ),
             }
         )
-    rows.extend(
-        [
-            {
-                "kind": "group",
-                "id": "group_advanced",
-                "label": "Advanced",
-            },
-            {
-                "kind": "toggle",
-                "id": "show_icon",
-                "label": "Show asterisk in menu bar",
-                "value": bool(settings.show_icon),
-            },
-        ]
-    )
+    rows = general + automation
+    if section is not None:
+        valid_sections = {value for value, _label in SETTINGS_SECTIONS}
+        if section not in valid_sections:
+            section = SETTINGS_SECTION_GENERAL
+        rows = [row for row in rows if row["section"] == section]
     return rows
 
 
-STATUS_ICON = "✻"
-# AppKit's default title extra is ~10pt per side. With no leading icon that
-# empty inset is just gap; compact width keeps ~3pt per side so the hover
-# pill still clears the first glyph.
-STATUS_ITEM_COMPACT_PAD = 6.0
-NS_VARIABLE_STATUS_ITEM_LENGTH = -1.0
 # After the pointer leaves the popover (not on open). Click-outside still
 # dismisses immediately.
 POPOVER_AUTO_CLOSE_S = 12.0
@@ -369,6 +500,7 @@ class NotificationCopy:
     title: str
     subtitle: str = ""
     body: str = ""
+    sound: bool | None = None
 
     def rumps_args(self) -> tuple[str, str, str]:
         return (self.title, self.subtitle, self.body)
@@ -605,6 +737,15 @@ def notification_copy_for_manual_switch(
     return NotificationCopy(
         title=f"Switched to {dest_name}",
         body=body,
+    )
+
+
+def notification_copy_for_desktop_switch() -> NotificationCopy:
+    """Quiet completion feedback; selected credentials are not UI verification."""
+    return NotificationCopy(
+        title="ChatGPT reopened",
+        body="Check the selected account in ChatGPT.",
+        sound=False,
     )
 
 
@@ -1104,6 +1245,10 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 {**win, "countdown": None, "resets_at_ts": None}
                 for win in windows
             ]
+        is_api_key = (
+            (snapshot.get("kinds") or {}).get(str(num)) == "api_key"
+            or display == USAGE_API_KEY
+        )
         cards.append(
             {
                 "num": num,
@@ -1111,6 +1256,7 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 "subtitle": subtitle,
                 "active": bool(is_active),
                 "disabled": bool(disabled),
+                "api_key": is_api_key,
                 "note": note,
                 "needs_relogin": needs_relogin,
                 "fetched_at": fetched_at,
@@ -1119,6 +1265,135 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
             }
         )
     return cards
+
+
+def provider_cards(cards: list[dict], provider: str) -> list[dict]:
+    """Filter popover cards by UI provider tab.
+
+    The ChatGPT tab intentionally reuses the Codex roster: those credentials
+    are shared, while the visible copy makes that relationship explicit.
+    """
+    if provider not in ("claude", "chatgpt"):
+        return []
+    if provider == "claude":
+        return [card for card in cards if card.get("provider", "claude") == "claude"]
+    result = []
+    for card in cards:
+        if card.get("provider") != "codex":
+            continue
+        shown = dict(card)
+        if str(shown.get("title", "")).startswith("Codex · "):
+            shown["title"] = str(shown["title"])[len("Codex · ") :]
+        shown["provider"] = "chatgpt"
+        # Desktop-only restrictions must not change widget/CLI behavior.
+        if shown.get("api_key"):
+            shown["disabled"] = True
+            shown["note"] = "CLI-only · Switch API-key accounts with Codex CLI."
+        result.append(shown)
+    return result
+
+
+def provider_empty_state(provider: str, state: str = "ready") -> dict:
+    """Actionable empty copy; never mistake a failed read for an empty roster."""
+    name = "ChatGPT" if provider == "chatgpt" else "Claude"
+    if state == "loading":
+        return {"title": f"Loading {name} accounts…",
+                "body": "Checking your saved logins. This may take a moment.",
+                "action": None, "button": "", "hint": "Your current login stays unchanged."}
+    if state == "error":
+        return {"title": f"Couldn’t load {name} accounts",
+                "body": "OpenSwap couldn’t read the account list. Try again; OpenSwap hasn’t changed your saved logins.",
+                "action": "retry", "button": "Try again", "hint": "Retrying does not switch accounts."}
+    if state == "unavailable":
+        return {"title": f"{name} accounts unavailable",
+                "body": "The shared Codex account store isn’t available in this session. Restart OpenSwap to reconnect it.",
+                "action": None, "button": "", "hint": "Your current login stays unchanged."}
+    if provider == "chatgpt":
+        return {
+            "title": "Add a ChatGPT account",
+            "body": "Add an account without signing out.",
+            "action": "start",
+            "button": "Sign in with ChatGPT",
+            "secondary_action": "capture",
+            "secondary_button": "Save current login",
+            "hint": "",
+        }
+    body = "Sign in to Claude Code, then save your login."
+    return {"title": f"Add your first {name} account", "body": body,
+            "action": "add", "button": "Add current login",
+            "hint": "Saves the login to OpenSwap. Does not switch accounts."}
+
+
+def provider_shared_copy(provider: str) -> str:
+    if provider == "chatgpt":
+        return "Shared with Codex · Codex usage"
+    return ""
+
+
+def login_panel_state(state: dict | None) -> dict:
+    """Return safe, concise native-view data for the browser login lifecycle.
+
+    This deliberately accepts backend-shaped dictionaries but only exposes
+    display-safe fields. In particular, URLs are represented by ``has_url``;
+    the URL itself never becomes public UI state.
+    """
+    raw = state if isinstance(state, dict) else {}
+    stage = str(raw.get("stage") or "idle").lower()
+    if stage not in {"idle", "starting", "waiting", "ready", "error", "cancelled", "saving", "cancelling", "saved"}:
+        stage = "error"
+    email = str(raw.get("email") or "").strip()
+    plan = str(raw.get("plan") or "").strip()
+    account_id = str(raw.get("account_id") or "").strip()
+    workspace_id = str(raw.get("workspace_id") or "").strip()
+    message = str(raw.get("message") or "").strip().replace("\n", " ")
+    message = re.sub(r"https?://\S+|\b(?:sk|auth)_[A-Za-z0-9_-]+", "", message).strip()
+    message = re.sub(r"\s{2,}", " ", message)[:180]
+    code = str(raw.get("device_code") or "").strip()
+    mode = str(raw.get("mode") or "browser").lower()
+    result = {
+        "stage": stage,
+        "email": email,
+        "plan": plan,
+        "account_id": account_id,
+        "workspace_id": workspace_id,
+        "message": message,
+        "has_url": bool(raw.get("has_url")),
+        "device_code": code[:64],
+        "mode": mode,
+        "hint": "",
+        "title": "",
+        "body": "",
+        "actions": [],
+    }
+    if stage == "starting":
+        result.update(title="Preparing sign-in", body="", actions=["cancel"])
+    elif stage == "waiting":
+        if mode == "device":
+            actions = (["open_browser"] if result["has_url"] else []) + ["cancel"]
+            if code:
+                actions.append("copy_code")
+            if result["has_url"]:
+                actions.append("copy_link")
+            result.update(title="Waiting for sign-in…", body="Enter this code in your browser." if code else "Preparing your code…", actions=actions)
+        else:
+            actions = (["open_browser"] if result["has_url"] else []) + ["cancel"]
+            if result["has_url"]:
+                actions.append("copy_link")
+            actions.append("device")
+            result.update(title="Waiting for sign-in…", body="Finish in your browser.", actions=actions)
+    elif stage == "ready":
+        result.update(title="Save this account?", body="", actions=["save", "cancel"])
+    elif stage == "error":
+        result.update(title="Sign-in didn’t finish", body=message or "Try again.", actions=["retry", "cancel"] + ([] if mode == "device" else ["device"]))
+    elif stage == "cancelled":
+        result.update(title="Sign-in cancelled", body="", actions=["start", "dismiss"])
+    elif stage == "saved":
+        result.update(title="Account saved", body="Ready to use.", actions=["dismiss"])
+    elif stage == "saving":
+        result.update(title="Saving account…", body="", actions=[])
+    elif stage == "cancelling":
+        result.update(title="Cancelling sign-in…", body="", actions=[])
+    return result
 
 
 def hold_event_update(current, event):
@@ -1284,14 +1559,15 @@ def format_title(
     now: float | None = None,
     alias: str | None = None,
     org_name: str | None = None,
+    *,
+    label_windows: bool = False,
 ) -> str:
     """Build the menu-bar title from the active account and settings.
 
-    Never empty: an unmanaged live login, or every title toggle off, shows the
-    icon, because a blank status item is indistinguishable from a crashed one.
+    Text is optional: the native status item always displays the OpenSoft logo.
     """
     if active_email is None:
-        return STATUS_ICON
+        return ""
     if now is None:
         now = time.time()
     segments: list[str] = []
@@ -1301,13 +1577,13 @@ def format_title(
     if title_shows_5h(settings.title_pct):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"{'5h ' if label_windows else ''}{p:.0f}%")
     if title_shows_7d(settings.title_pct):
         seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
         seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"{'7d ' if label_windows else ''}{p:.0f}%")
     if settings.title_scoped and isinstance(active_usage, dict):
         # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
         # dropdown rows; named so multiple scoped models stay distinguishable.
@@ -1315,10 +1591,67 @@ def format_title(
             window = _rolled_weekly_window(window, now)
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
-    text = " · ".join(segments)
-    if settings.show_icon and text:
-        return f"{STATUS_ICON} {text}"
-    return text or STATUS_ICON
+    return " · ".join(segments)
+
+
+def format_menu_bar_title(
+    snapshot: dict, settings: MenuBarSettings, now: float | None = None
+) -> str:
+    """Provider-labelled status text, independent of the popover's selected tab.
+
+    ChatGPT shares the selected Codex credential, but its desktop session is not
+    verified by that file. Name that limitation instead of presenting the CLI's
+    identity or quota as a verified ChatGPT session or message limit.
+    """
+    provider = settings.menu_bar_provider
+    if provider == "logo":
+        return ""
+    if now is None:
+        now = time.time()
+    titles = []
+    if provider in ("claude", "both"):
+        if snapshot.get("active_email"):
+            detail = format_title(
+                snapshot["active_email"], title_usage(snapshot), settings,
+                now=title_clock(snapshot, now), alias=snapshot.get("active_alias"),
+                org_name=snapshot.get("active_org"), label_windows=True,
+            )
+            titles.append("Claude" + (f" · {detail}" if detail else ""))
+        else:
+            titles.append("Claude · No account")
+    if provider in ("chatgpt", "both"):
+        number = snapshot.get("codex_active_num")
+        active = next(
+            (row for row in snapshot.get("accounts") or []
+             if number is not None and str(row[0]) == f"codex:{number}"
+             and (snapshot.get("kinds") or {}).get(str(row[0])) != "api_key"
+             and row[3] != USAGE_API_KEY),
+            None,
+        )
+        if active is None:
+            titles.append("ChatGPT · No shared account")
+        else:
+            _num, email, _active, usage, last_good, alias, org, _disabled, fetched_at = active
+            shared = {
+                "active_usage": usage, "active_last_good": last_good,
+                "active_fetched_at": fetched_at,
+            }
+            name = format_title(
+                email, None, replace(settings, title_pct="off", title_scoped=False),
+                alias=alias, org_name=org,
+            )
+            quota = format_title(
+                email, title_usage(shared),
+                replace(settings, show_account_name=False, title_scoped=False),
+                now=title_clock(shared, now), label_windows=True,
+            )
+            parts = ["ChatGPT (unverified)"]
+            if name:
+                parts.append(name)
+            if quota:
+                parts.append(f"Codex {quota}")
+            titles.append(" · ".join(parts))
+    return "  |  ".join(titles)
 
 
 def should_confirm_switch(enabled: bool, *, is_active: bool) -> bool:
@@ -1427,13 +1760,6 @@ def alias_edit(text: str, current: str | None) -> tuple[str, str | None]:
     if value == current:
         return ("noop", None)
     return ("set", value)
-
-
-def status_item_length(title_width: float, *, compact: bool) -> float:
-    """Width for the status extra. Compact (icon off) drops the ~10pt insets."""
-    if not compact or title_width <= 0:
-        return NS_VARIABLE_STATUS_ITEM_LENGTH
-    return float(math.ceil(title_width + STATUS_ITEM_COMPACT_PAD))
 
 
 def trailing_header_frames(
