@@ -420,6 +420,32 @@ class TestClassifyCodexArgv:
         # Value skipped, then no subcommand remains (resume was the MODE).
         assert classify_codex_argv(["codex", "--sandbox", "resume"]) == "tui"
 
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "--add-dir",
+            "--disable",
+            "--remote",
+            "--remote-auth-token-env",
+            "-i",
+            "--image",
+            "--local-provider",
+            "-a",
+            "--ask-for-approval",
+        ],
+    )
+    def test_tui_skips_all_other_value_taking_global_flags(self, flag):
+        assert classify_codex_argv(["codex", flag, "value"]) == "tui"
+        assert classify_codex_argv(["codex", flag, "value", "fix tests"]) == "tui"
+
+    def test_positional_prompt_is_tui(self):
+        assert classify_codex_argv(["codex", "fix tests"]) == "tui"
+        assert classify_codex_argv(["codex", "please", "fix", "tests"]) == "tui"
+
+    def test_option_delimiter_forces_positional_prompt(self):
+        assert classify_codex_argv(["codex", "--", "exec"]) == "tui"
+        assert classify_codex_argv(["codex", "-m", "o3", "--", "app-server"]) == "tui"
+
     def test_exec(self):
         assert classify_codex_argv(["codex", "exec", "hi"]) == "exec"
         assert classify_codex_argv(["codex", "e", "hi"]) == "exec"
@@ -437,7 +463,12 @@ class TestClassifyCodexArgv:
     def test_other(self):
         assert classify_codex_argv(["codex", "login"]) == "other"
         assert classify_codex_argv(["codex", "mcp"]) == "other"
-        assert classify_codex_argv(["codex", "exec-not"]) == "other"
+        assert classify_codex_argv(["codex", "review"]) == "other"
+        assert classify_codex_argv(["codex", "apply"]) == "other"
+        assert classify_codex_argv(["codex", "a"]) == "other"
+
+    def test_unknown_positional_is_a_prompt(self):
+        assert classify_codex_argv(["codex", "exec-not"]) == "tui"
 
 
 class TestParseProcessTable:
@@ -476,9 +507,11 @@ class TestGetRunningCodexInstances:
             (106, "codex", ["codex", "app"]),
             (107, "codex", ["codex", "login"]),
             (108, "node", ["node", "foo"]),
+            (109, "codex", ["codex", "fix tests"]),
+            (110, "codex", ["codex", "--", "exec"]),
         ]
         got = get_running_codex_instances(ps=lambda: rows)
-        assert [p.pid for p in got] == [100, 101, 102]
+        assert [p.pid for p in got] == [100, 101, 102, 109, 110]
         assert all(p.kind == "tui" for p in got)
 
     def test_empty(self):

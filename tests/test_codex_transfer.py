@@ -23,6 +23,20 @@ def _two_oauth_slots(tmp_path):
     return eng, home
 
 
+def _add_api_key(eng, key, alias=None):
+    eng.home.mkdir(parents=True, exist_ok=True)
+    (eng.home / "auth.json").write_text(json.dumps({
+        "auth_mode": "apiKey",
+        "OPENAI_API_KEY": key,
+        "tokens": None,
+    }))
+    return eng.add_account(alias=alias)
+
+
+def _api_key_for_slot(eng, number):
+    return json.loads(eng._slot_text(str(number)))["OPENAI_API_KEY"]
+
+
 def test_export_import_round_trip_two_oauth_slots(tmp_path):
     src, _home = _two_oauth_slots(tmp_path)
     out = tmp_path / "codex.openswap"
@@ -52,6 +66,125 @@ def test_export_import_round_trip_two_oauth_slots(tmp_path):
     assert json.loads(dst._slot_text("1"))["tokens"]["refresh_token"] == "rt-a"
     assert json.loads(dst._slot_text("2"))["tokens"]["refresh_token"] == "rt-b"
     assert not (dst_home / "auth.json").exists()
+
+
+def test_export_import_round_trip_multiple_api_keys(tmp_path):
+    src, _home = _engine(tmp_path)
+    _add_api_key(src, "sk-first", alias="first")
+    _add_api_key(src, "sk-second", alias="second")
+    out = tmp_path / "keys.openswap"
+    export_accounts(src, str(out))
+
+    dst, _dst_home = _engine(tmp_path / "dst")
+    import_accounts(dst, str(out))
+
+    roster = dst._read_roster()
+    assert set(roster["accounts"]) == {"1", "2"}
+    assert _api_key_for_slot(dst, "1") == "sk-first"
+    assert _api_key_for_slot(dst, "2") == "sk-second"
+    assert roster["accounts"]["1"]["kind"] == "api_key"
+    assert roster["accounts"]["2"]["kind"] == "api_key"
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_different_api_key_does_not_replace_existing_slot(tmp_path, force):
+    src, _home = _engine(tmp_path / "src")
+    _add_api_key(src, "sk-imported")
+    out = tmp_path / "key.openswap"
+    export_accounts(src, str(out))
+
+    dst, _dst_home = _engine(tmp_path / "dst")
+    _add_api_key(dst, "sk-local")
+    import_accounts(dst, str(out), force=force)
+
+    assert set(dst._read_roster()["accounts"]) == {"1", "2"}
+    assert _api_key_for_slot(dst, "1") == "sk-local"
+    assert _api_key_for_slot(dst, "2") == "sk-imported"
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_same_api_key_matches_existing_despite_json_formatting(tmp_path, force):
+    src, _home = _engine(tmp_path / "src")
+    _add_api_key(src, "sk-same")
+    out = tmp_path / "key.openswap"
+    export_accounts(src, str(out))
+
+    dst, _dst_home = _engine(tmp_path / "dst")
+    _add_api_key(dst, "sk-same")
+    # Change stored bytes without changing the semantic credential.
+    dst._write_slot("1", '{\n  "tokens": null, "OPENAI_API_KEY": "sk-same", "auth_mode": "apiKey"\n}')
+    before = dst._slot_text("1")
+    import_accounts(dst, str(out), force=force)
+
+    assert set(dst._read_roster()["accounts"]) == {"1"}
+    if force:
+        assert json.loads(dst._slot_text("1"))["OPENAI_API_KEY"] == "sk-same"
+    else:
+        assert dst._slot_text("1") == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("email", "forged@example.com"),
+        ("accountId", "forged-account"),
+        ("kind", "oauth"),
+    ],
+)
+def test_reject_metadata_mismatch_before_mutation(tmp_path, field, value):
+    src, _home = _engine(tmp_path / "src")
+    _add_api_key(src, "sk-imported")
+    out = tmp_path / "key.openswap"
+    export_accounts(src, str(out))
+    envelope = json.loads(out.read_text())
+    envelope["accounts"][0][field] = value
+    out.write_text(json.dumps(envelope))
+
+    dst, _dst_home = _engine(tmp_path / "dst")
+    _add_api_key(dst, "sk-local")
+    roster_before = dst._read_roster()
+    slot_before = dst._slot_text("1")
+    with pytest.raises(TransferError, match="does not match auth"):
+        import_accounts(dst, str(out), force=True)
+
+    assert dst._read_roster() == roster_before
+    assert dst._slot_text("1") == slot_before
+
+
+def test_import_derives_optional_metadata_and_accepts_stale_plan(tmp_path):
+    src, _home = _two_oauth_slots(tmp_path / "src")
+    out = tmp_path / "oauth.openswap"
+    export_accounts(src, str(out), account="1")
+    envelope = json.loads(out.read_text())
+    account = envelope["accounts"][0]
+    account.pop("accountId")
+    account.pop("kind")
+    account["planType"] = "stale-plan"
+    out.write_text(json.dumps(envelope))
+
+    dst, _dst_home = _engine(tmp_path / "dst")
+    import_accounts(dst, str(out))
+
+    record = dst._read_roster()["accounts"]["1"]
+    assert record["accountId"] == "acc-1"
+    assert record["kind"] == "oauth"
+    assert record["planType"] == "plus"
+
+
+def test_different_api_key_with_existing_alias_drops_imported_alias(tmp_path, capsys):
+    src, _home = _engine(tmp_path / "src")
+    _add_api_key(src, "sk-imported", alias="work")
+    out = tmp_path / "key.openswap"
+    export_accounts(src, str(out))
+
+    dst, _dst_home = _engine(tmp_path / "dst")
+    _add_api_key(dst, "sk-local", alias="work")
+    import_accounts(dst, str(out))
+
+    assert "dropping the imported alias" in capsys.readouterr().err
+    roster = dst._read_roster()
+    assert roster["accounts"]["1"]["alias"] == "work"
+    assert "alias" not in roster["accounts"]["2"]
 
 
 def test_active_slot_export_uses_live_bytes_when_live_is_newer(tmp_path):

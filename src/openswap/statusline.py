@@ -150,8 +150,10 @@ def current_account_label(config_path: Path, sequence_path: Path) -> str:
 def current_codex_account_label(auth_file: Path, sequence_path: Path) -> str:
     """Live Codex ``auth.json`` identity matched against ``codex/sequence.json``.
 
-    Match is email + accountId. Label rule is ``account_label``: alias, else
-    planType, else personal when managed; unmanaged uses the email local-part.
+    OAuth matches by email + accountId. API-key logins match the actual key in
+    each stored slot auth file, since their parsed email and accountId are both
+    empty. Label rule is ``account_label``: alias, else planType, else personal
+    when managed; unmanaged OAuth uses the email local-part.
     """
     try:
         text = auth_file.read_text(encoding="utf-8")
@@ -165,6 +167,29 @@ def current_codex_account_label(auth_file: Path, sequence_path: Path) -> str:
     accounts = _read_json(sequence_path).get("accounts") or {}
     if not isinstance(accounts, dict):
         return account_label(email, managed=False)
+    if ident.kind == "api_key":
+        live_key = _codex_api_key(text)
+        if not live_key:
+            return ""
+        slots_dir = sequence_path.parent / "slots"
+        for num, rec in accounts.items():
+            if not isinstance(rec, dict) or rec.get("kind") != "api_key":
+                continue
+            try:
+                stored_text = (slots_dir / str(num) / "auth.json").read_text(
+                    encoding="utf-8"
+                )
+            except (OSError, UnicodeDecodeError):
+                continue
+            if _codex_api_key(stored_text) != live_key:
+                continue
+            return account_label(
+                rec.get("email") or "",
+                alias=rec.get("alias") or "",
+                org_name=rec.get("planType") or "",
+                managed=True,
+            )
+        return ""
     for rec in accounts.values():
         if not isinstance(rec, dict):
             continue
@@ -179,6 +204,18 @@ def current_codex_account_label(auth_file: Path, sequence_path: Path) -> str:
             managed=True,
         )
     return account_label(email, managed=False)
+
+
+def _codex_api_key(text: str) -> str:
+    """Return the API key represented by a Codex auth document, if any."""
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    key = data.get("OPENAI_API_KEY")
+    return key if isinstance(key, str) and key else ""
 
 
 def _cwd_from_stdin(stdin: str) -> str | None:

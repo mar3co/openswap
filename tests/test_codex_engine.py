@@ -54,6 +54,20 @@ def test_add_refuses_missing_and_duplicate(tmp_path):
     with pytest.raises(CodexAuthError, match="already"):
         eng.add_account()
 
+
+def test_relogin_then_switch_recaptures_existing_slot(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a", refresh="rt-old")
+    num = eng.add_account()
+    _login(home, email="a@x.com", account_id="acc-a", refresh="rt-new")
+    live = eng._live_text()
+
+    result = eng.switch_to(num)
+
+    assert result["reason"] == "already-active"
+    assert eng._slot_text(num) == live
+    assert eng._live_text() == live
+
 def test_switch_to_writes_live_and_captures_outgoing(tmp_path):
     eng, home = _engine(tmp_path)
     _login(home, email="a@x.com", account_id="acc-a", refresh="rt-a1")

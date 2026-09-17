@@ -216,6 +216,37 @@ class CodexProcess:
 
 _TUI_SUBCOMMANDS = {"resume", "fork"}
 _EXEC_SUBCOMMANDS = {"exec", "e"}
+# Every other command listed by ``codex --help`` is non-interactive.  Keeping
+# this explicit is important: an arbitrary first positional argument is the
+# optional TUI prompt, not an unknown subcommand.
+_NON_TUI_SUBCOMMANDS = frozenset(
+    {
+        "agents",
+        "review",
+        "login",
+        "logout",
+        "mcp",
+        "plugin",
+        "mcp-server",
+        "remote-control",
+        "completion",
+        "update",
+        "doctor",
+        "sandbox",
+        "debug",
+        "apply",
+        "a",
+        "queue",
+        "archive",
+        "delete",
+        "migrate-rollouts",
+        "unarchive",
+        "cloud",
+        "exec-server",
+        "features",
+        "help",
+    }
+)
 # Codex global options that consume the following token (from `codex --help`).
 _CODEX_VALUE_OPTIONS = frozenset(
     {
@@ -228,8 +259,17 @@ _CODEX_VALUE_OPTIONS = frozenset(
         "-c",
         "--config",
         "--enable",
+        "--disable",
+        "--remote",
+        "--remote-auth-token-env",
+        "-i",
+        "--image",
+        "--local-provider",
         "-p",
         "--profile",
+        "--add-dir",
+        "-a",
+        "--ask-for-approval",
     }
 )
 
@@ -250,19 +290,17 @@ def _codex_subcommand(argv: list[str]) -> str | None:
     while i < len(tokens):
         tok = tokens[i]
         if tok == "--":
-            i += 1
-            break
+            # Everything after the option delimiter is positional input.  At
+            # the top level that means the optional interactive prompt, even
+            # when its text happens to match a command name such as ``exec``.
+            return None
         if not tok.startswith("-"):
             break
         i += 1
         name, eq, _ = tok.partition("=")
         if eq:
             continue
-        if (
-            name in _CODEX_VALUE_OPTIONS
-            and i < len(tokens)
-            and not tokens[i].startswith("-")
-        ):
+        if name in _CODEX_VALUE_OPTIONS and i < len(tokens):
             i += 1
     if i >= len(tokens):
         return None
@@ -270,7 +308,7 @@ def _codex_subcommand(argv: list[str]) -> str | None:
 
 
 def classify_codex_argv(argv: list[str]) -> str:
-    """bare / resume / fork → tui; exec / e → exec; app-server; app; else other."""
+    """Classify known commands while treating a positional prompt as TUI."""
     cmd = _codex_subcommand(argv)
     if cmd is None or cmd in _TUI_SUBCOMMANDS:
         return "tui"
@@ -280,7 +318,9 @@ def classify_codex_argv(argv: list[str]) -> str:
         return "app-server"
     if cmd == "app":
         return "app"
-    return "other"
+    if cmd in _NON_TUI_SUBCOMMANDS:
+        return "other"
+    return "tui"
 
 
 def parse_process_table(rows: list[tuple[int, str, list[str]]]) -> list[CodexProcess]:

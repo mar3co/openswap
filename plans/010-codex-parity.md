@@ -44,7 +44,8 @@ leftover copy/docs from 009:
 else keep the Claude Code sentence.
 
 **CLI** (`QuarantineEvent._human`): if `self.provider == "codex"`, recovery
-is `openswap codex add`, not `openswap --add-account --slot N`.
+is `openswap codex switch N` after signing in again, so the refreshed live
+credentials are captured into the existing slot.
 
 **Docs**: architecture ASCII shows Codex CLI (`~/.codex/auth.json`) beside
 Claude Code, both feeding CLI / AutoSwitchEngine / extra. Mark 009 DONE
@@ -54,7 +55,7 @@ comments in `tests/test_codex_cli.py` if present.
 TDD tests first:
 
 - `test_codex_quarantine_toast_says_sign_in_with_codex` in `test_menubar.py`
-- `test_codex_quarantine_human_says_codex_add` in `test_autoswitch.py`
+- `test_codex_quarantine_human_says_codex_switch` in `test_autoswitch.py`
 
 ### Task 2 — Swift Codex badge
 

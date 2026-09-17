@@ -398,7 +398,7 @@ class QuarantineEvent(AutoSwitchEvent):
 
     def _human(self) -> str:
         if self.provider == "codex":
-            recovery = "openswap codex add"
+            recovery = f"openswap codex switch {self.number}"
         else:
             recovery = f"openswap --add-account --slot {self.number}"
         return (

@@ -7112,14 +7112,13 @@ def test_codex_unmanaged_live_does_not_switch(tmp_path, monkeypatch):
     assert "rt-s" in (home / "auth.json").read_text()
 
 
-def test_codex_quarantine_human_says_codex_add():
+def test_codex_quarantine_human_says_codex_switch():
     line = QuarantineEvent(
         number="1", email="c@x.com", reason="invalid_grant", provider="codex"
     ).human()
-    assert "openswap codex add" in line
+    assert "openswap codex switch 1" in line
     assert "--add-account" not in line
     claude = QuarantineEvent(
         number="1", email="c@x.com", reason="invalid_grant"
     ).human()
     assert "--add-account" in claude
-

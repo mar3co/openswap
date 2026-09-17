@@ -576,6 +576,97 @@ class TestCodexAccountLabel:
             _backup_root(temp_home) / "codex" / "sequence.json",
         ) == ""
 
+    @staticmethod
+    def _write_api_key_roster(home: Path) -> Path:
+        sequence = _backup_root(home) / "codex" / "sequence.json"
+        sequence.parent.mkdir(parents=True, exist_ok=True)
+        sequence.write_text(
+            json.dumps(
+                {
+                    "accounts": {
+                        "1": {
+                            "email": "",
+                            "accountId": "",
+                            "planType": "",
+                            "kind": "api_key",
+                            "alias": "first",
+                        },
+                        "2": {
+                            "email": "",
+                            "accountId": "",
+                            "planType": "",
+                            "kind": "api_key",
+                            "alias": "second",
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return sequence
+
+    @staticmethod
+    def _write_slot_auth(sequence: Path, num: str, text: str) -> None:
+        slot = sequence.parent / "slots" / num
+        slot.mkdir(parents=True, exist_ok=True)
+        (slot / "auth.json").write_text(text, encoding="utf-8")
+
+    def test_api_key_matches_second_slot_by_actual_key(self, temp_home: Path):
+        auth = temp_home / ".codex" / "auth.json"
+        auth.parent.mkdir()
+        auth.write_text(
+            json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-second"}),
+            encoding="utf-8",
+        )
+        sequence = self._write_api_key_roster(temp_home)
+        self._write_slot_auth(
+            sequence, "1", json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-first"})
+        )
+        self._write_slot_auth(
+            sequence, "2", json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-second"})
+        )
+
+        assert sl.current_codex_account_label(auth, sequence) == "second"
+
+    def test_unmanaged_api_key_has_no_label(self, temp_home: Path):
+        auth = temp_home / ".codex" / "auth.json"
+        auth.parent.mkdir()
+        auth.write_text(
+            json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-unmanaged"}),
+            encoding="utf-8",
+        )
+        sequence = self._write_api_key_roster(temp_home)
+        self._write_slot_auth(
+            sequence, "1", json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-first"})
+        )
+
+        assert sl.current_codex_account_label(auth, sequence) == ""
+
+    def test_api_key_match_ignores_json_formatting(self, temp_home: Path):
+        auth = temp_home / ".codex" / "auth.json"
+        auth.parent.mkdir()
+        auth.write_text(
+            '{\n  "OPENAI_API_KEY": "sk-second",\n  "auth_mode": "apiKey"\n}\n',
+            encoding="utf-8",
+        )
+        sequence = self._write_api_key_roster(temp_home)
+        self._write_slot_auth(
+            sequence, "2", '{"auth_mode":"apiKey","OPENAI_API_KEY":"sk-second"}'
+        )
+
+        assert sl.current_codex_account_label(auth, sequence) == "second"
+
+    def test_api_key_missing_slot_file_does_not_match(self, temp_home: Path):
+        auth = temp_home / ".codex" / "auth.json"
+        auth.parent.mkdir()
+        auth.write_text(
+            json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-first"}),
+            encoding="utf-8",
+        )
+        sequence = self._write_api_key_roster(temp_home)
+
+        assert sl.current_codex_account_label(auth, sequence) == ""
+
 
 class TestCodexCLI:
     def test_live_auth_and_roster_alias_prints_alias(self, temp_home: Path):

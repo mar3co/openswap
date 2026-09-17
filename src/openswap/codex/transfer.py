@@ -73,7 +73,17 @@ def _atomic_write_file(path: Path, content: str) -> None:
         raise
 
 
-def _validate_imported_account(account: dict) -> tuple[str, str]:
+def _credential_identity(auth: dict, parsed_auth: Any) -> tuple[str, ...]:
+    """Return the semantic login identity, independent of JSON serialization."""
+    if parsed_auth.kind == "api_key":
+        api_key = auth.get("OPENAI_API_KEY")
+        if not isinstance(api_key, str) or not api_key:
+            raise TransferError("API-key auth is missing OPENAI_API_KEY")
+        return ("api_key", api_key)
+    return ("oauth", parsed_auth.email, parsed_auth.account_id)
+
+
+def _validate_imported_account(account: dict) -> tuple[str, str, tuple[str, ...], Any]:
     if not isinstance(account, dict):
         raise TransferError("account entry must be a JSON object")
 
@@ -104,15 +114,54 @@ def _validate_imported_account(account: dict) -> tuple[str, str]:
     auth = account.get("auth")
     if not isinstance(auth, dict):
         raise TransferError(f"auth for {email} must be a JSON object")
-    if parse_auth(json.dumps(auth)) is None:
+    parsed_auth = parse_auth(json.dumps(auth))
+    if parsed_auth is None:
         raise TransferError(f"auth for {email} is not a usable Codex login")
 
-    return email, str(raw_number)
+    metadata_checks = {
+        "email": parsed_auth.email,
+        "accountId": parsed_auth.account_id,
+        "kind": parsed_auth.kind,
+    }
+    for field, parsed_value in metadata_checks.items():
+        if field in account and (account.get(field) or "") != parsed_value:
+            raise TransferError(
+                f"{field} for imported account {email or raw_number} does not match auth"
+            )
+
+    return (
+        parsed_auth.email,
+        str(raw_number),
+        _credential_identity(auth, parsed_auth),
+        parsed_auth,
+    )
 
 
-def _find_existing_slot(data: dict, email: str, account_id: str) -> str | None:
+def _find_existing_slot(
+    engine: CodexEngine,
+    data: dict,
+    email: str,
+    account_id: str,
+    credential_identity: tuple[str, ...],
+) -> str | None:
     for num, rec in (data.get("accounts") or {}).items():
-        if rec.get("email") == email and (rec.get("accountId") or "") == account_id:
+        if credential_identity[0] == "oauth":
+            matches = (
+                rec.get("email") == email
+                and (rec.get("accountId") or "") == account_id
+            )
+        else:
+            slot_text = engine._slot_text(str(num))
+            parsed = parse_auth(slot_text) if slot_text else None
+            if parsed is None or parsed.kind != "api_key":
+                matches = False
+            else:
+                try:
+                    auth = _parse_payload(slot_text, f"auth.json for slot {num}")
+                    matches = _credential_identity(auth, parsed) == credential_identity
+                except TransferError:
+                    matches = False
+        if matches:
             return str(num)
     return None
 
@@ -275,22 +324,35 @@ def import_accounts(
         raise TransferError("export file has no accounts to import")
 
     local_data = engine._read_roster()
-    local_aliases: dict[str, tuple[str, str]] = {
-        (acc.get("alias") or "").lower(): (
-            acc.get("email", ""), acc.get("accountId", "") or "",
+    local_aliases: dict[str, tuple[str, ...]] = {}
+    for num, acc in (local_data.get("accounts") or {}).items():
+        alias = acc.get("alias")
+        if not alias:
+            continue
+        owner: tuple[str, ...] = (
+            "oauth",
+            acc.get("email", ""),
+            acc.get("accountId", "") or "",
         )
-        for acc in (local_data.get("accounts") or {}).values()
-        if acc.get("alias")
-    }
+        slot_text = engine._slot_text(str(num))
+        parsed = parse_auth(slot_text) if slot_text else None
+        if parsed is not None:
+            try:
+                owner = _credential_identity(
+                    _parse_payload(slot_text, f"auth.json for slot {num}"), parsed
+                )
+            except TransferError:
+                pass
+        local_aliases[alias.lower()] = owner
     normalized: list[dict[str, Any]] = []
-    seen_keys: set[tuple[str, str]] = set()
+    seen_keys: set[tuple[str, ...]] = set()
     seen_aliases: set[str] = set()
     for raw in accounts:
-        email, exported_num = _validate_imported_account(raw)
-        account_id = raw.get("accountId", "") or ""
-        if not isinstance(account_id, str):
-            account_id = ""
-        key = (email, account_id)
+        email, exported_num, credential_identity, parsed_auth = (
+            _validate_imported_account(raw)
+        )
+        account_id = parsed_auth.account_id
+        key = credential_identity
         if key in seen_keys:
             raise TransferError(
                 f"duplicate account in export: {email} (accountId={account_id or 'none'})"
@@ -304,7 +366,7 @@ def import_accounts(
                 raise TransferError(f"duplicate alias in export: {alias_key}")
             seen_aliases.add(alias_key)
             owner = local_aliases.get(alias_key)
-            if owner is not None and owner != (email, account_id):
+            if owner is not None and owner != credential_identity:
                 _eprint(
                     f"Warning: alias '{alias_key}' for {email} already used by an "
                     "existing account, dropping the imported alias"
@@ -318,12 +380,13 @@ def import_accounts(
                 "email": email,
                 "exported_num": exported_num,
                 "account_id": account_id,
-                "plan_type": raw.get("planType", "") or "",
-                "kind": raw.get("kind", "") or "oauth",
+                "plan_type": parsed_auth.plan_type,
+                "kind": parsed_auth.kind,
                 "added": raw.get("added") or get_timestamp(),
                 "alias": alias,
                 "disabled": bool(raw.get("disabled")),
                 "auth_text": json.dumps(raw["auth"]),
+                "credential_identity": credential_identity,
             }
         )
 
@@ -349,7 +412,11 @@ def import_accounts(
                     and entry["exported_num"] == envelope_active_str
                 )
                 existing_slot = _find_existing_slot(
-                    data, entry["email"], entry["account_id"]
+                    engine,
+                    data,
+                    entry["email"],
+                    entry["account_id"],
+                    entry["credential_identity"],
                 )
                 if existing_slot is not None:
                     if not force:
