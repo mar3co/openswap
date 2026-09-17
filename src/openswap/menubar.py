@@ -1346,10 +1346,22 @@ def run(switcher, codex=None) -> int:
                 popover.setLevel_(level)
 
         def _alert(self, **kwargs) -> int:
-            return self._dialog(lambda: rumps.alert(**kwargs))
+            from openswap.menubar_panel import make_dialog_alert
+
+            alert = make_dialog_alert(**kwargs)
+            return self._dialog(alert.runModal)
 
         def _prompt(self, **kwargs):
-            return self._dialog(lambda: rumps.Window(**kwargs).run())
+            from openswap.menubar_panel import (
+                DIALOG_CONTENT_WIDTH,
+                DIALOG_INPUT_HEIGHT,
+                style_dialog_alert,
+            )
+
+            kwargs["dimensions"] = (DIALOG_CONTENT_WIDTH, DIALOG_INPUT_HEIGHT)
+            window = rumps.Window(**kwargs)
+            style_dialog_alert(window._alert)
+            return self._dialog(window.run)
 
         def _show_error(self, message: str):
             self._alert(title="openswap", message=message)
@@ -1677,7 +1689,7 @@ def run(switcher, codex=None) -> int:
                         "(leave blank to remove it):"
                     ),
                     default_text=current or "",
-                    ok="Save", cancel="Cancel", dimensions=(320, 24),
+                    ok="Save", cancel="Cancel",
                 )
                 if resp.clicked != 1:
                     return
@@ -1751,7 +1763,7 @@ def run(switcher, codex=None) -> int:
             email_resp = self._prompt(
                 title="Add account from token",
                 message="Email label (optional; leave blank to auto-name):",
-                ok="Next", cancel="Cancel", dimensions=(320, 24),
+                ok="Next", cancel="Cancel",
             )
             if email_resp.clicked != 1:
                 return
@@ -1759,7 +1771,7 @@ def run(switcher, codex=None) -> int:
             token_resp = self._prompt(
                 title="Add account from token",
                 message="API key (sk-ant-api…) or setup token (sk-ant-oat01-…):",
-                ok="Add", cancel="Cancel", dimensions=(320, 24),
+                ok="Add", cancel="Cancel",
             )
             if token_resp.clicked != 1 or not token_resp.text.strip():
                 return

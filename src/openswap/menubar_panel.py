@@ -12,6 +12,7 @@ from pathlib import Path
 import objc
 from AppKit import (
     NSApp,
+    NSAlert,
     NSAppearance,
     NSAppearanceNameAqua,
     NSAppearanceNameDarkAqua,
@@ -191,6 +192,8 @@ TAB_GAP = 6.0
 INFO_LINE_H = 16.0
 LOGIN_BRAND_SIZE = 56.0
 LOGIN_BRAND_SPACE = 68.0
+DIALOG_CONTENT_WIDTH = 360.0
+DIALOG_INPUT_HEIGHT = 24.0
 
 
 def _card_height(card) -> float:
@@ -213,6 +216,7 @@ def _hex(color: str, alpha: float = 1.0):
 _DYNAMIC_PROVIDERS: list = []
 _PALETTE = None
 _BRAND_IMAGE = None
+_DIALOG_BRAND_IMAGE = None
 
 
 def _dynamic(light_hex, dark_hex, light_alpha=1.0, dark_alpha=1.0, *, name=None):
@@ -272,6 +276,56 @@ def _brand_mark(frame, tint):
     except Exception:
         pass
     return view
+
+
+def _dialog_brand_image():
+    """A template copy sized for the standard macOS alert icon well."""
+    global _DIALOG_BRAND_IMAGE
+    if _DIALOG_BRAND_IMAGE is None:
+        path = Path(__file__).with_name("assets") / "opensoft-symbol-64.png"
+        _DIALOG_BRAND_IMAGE = NSImage.alloc().initWithContentsOfFile_(str(path))
+        if _DIALOG_BRAND_IMAGE is not None:
+            _DIALOG_BRAND_IMAGE.setTemplate_(True)
+            _DIALOG_BRAND_IMAGE.setSize_((64, 64))
+    return _DIALOG_BRAND_IMAGE.copy() if _DIALOG_BRAND_IMAGE is not None else None
+
+
+def style_dialog_alert(alert):
+    """Apply the shared OpenSwap icon and content width to an ``NSAlert``."""
+    icon = _dialog_brand_image()
+    if icon is not None:
+        alert.setIcon_(icon)
+    accessory = alert.accessoryView()
+    if accessory is None:
+        accessory = NSView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, DIALOG_CONTENT_WIDTH, 1)
+        )
+        alert.setAccessoryView_(accessory)
+    else:
+        height = max(float(accessory.frame().size.height), 1.0)
+        accessory.setFrameSize_((DIALOG_CONTENT_WIDTH, height))
+    try:
+        alert.layout()
+    except Exception:
+        pass
+    return alert
+
+
+def make_dialog_alert(*, title=None, message="", ok=None, cancel=None, other=None):
+    """Build a branded alert while preserving rumps' 1/0 button contract."""
+    shown_title = str(title or "OpenSwap")
+    if shown_title.casefold() == "openswap":
+        shown_title = "OpenSwap"
+    shown_message = str(message or "").replace("%", "%%")
+    if not isinstance(cancel, str):
+        cancel = "Cancel" if cancel else None
+    factory = (
+        NSAlert
+        .alertWithMessageText_defaultButton_alternateButton_otherButton_informativeTextWithFormat_
+    )
+    alert = factory(shown_title, ok, cancel, other, shown_message)
+    alert.setAlertStyle_(0)
+    return style_dialog_alert(alert)
 
 
 def _system_popover_appearance():
