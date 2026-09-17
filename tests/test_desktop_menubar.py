@@ -66,7 +66,7 @@ def test_desktop_consent_explains_persistent_pause_only_when_needed():
 
 @pytest.fixture
 def app(monkeypatch):
-    tree = ast.parse(Path(menubar.__file__).read_text())
+    tree = ast.parse(Path(menubar.__file__).read_text(encoding="utf-8"))
     cls = next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "MenuBarApp")
     wanted = {"_make_desktop_switch", "_desktop_worker", "_drain_desktop_result", "_pause_codex_for_desktop", "_on_panel_account_click", "_notify"}
     cls.bases = []
