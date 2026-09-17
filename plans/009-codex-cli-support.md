@@ -27,6 +27,10 @@
 - **Spike**: chat findings 2026-09-10 (Codex CLI feasible; ChatGPT desktop app
   is not a rotation target and is out of scope here)
 
+2026-09-17 clarification: desktop exclusion above describes this plan's scope,
+not a demonstrated technical impossibility. See
+[plan 011](011-chatgpt-desktop-feasibility.md) for the new investigation.
+
 ## Why this matters
 
 OpenSwap rotates Claude Code accounts. Codex CLI users have the same problem
