@@ -254,6 +254,16 @@ def test_install_raises_with_launchctl_detail_when_bootstrap_fails(tmp_path):
             launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
 
 
+@pytest.mark.parametrize("op", ["mkdir", "write_bytes"])
+def test_install_reports_an_unwritable_launch_agents_directory(tmp_path, op):
+    with patch.object(launch_agent.subprocess, "run") as run, patch.object(
+        Path, op, side_effect=PermissionError(13, "Permission denied")
+    ):
+        run.side_effect = _router({"print": _completed(1)})
+        with pytest.raises(ClaudeSwitchError, match="Could not write the launch agent.*Permission denied"):
+            launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+
+
 def test_install_refuses_off_macos(tmp_path):
     with patch.object(launch_agent.sys, "platform", "linux"):
         with pytest.raises(ClaudeSwitchError, match="only available on macOS"):
@@ -294,6 +304,38 @@ def test_uninstall_removes_a_plist_that_was_never_bootstrapped(tmp_path):
         run.side_effect = _router({"print": _completed(1)})
         result = launch_agent.uninstall(home=tmp_path, uid=UID)
     assert result["removed_plist"] is True and not target.exists()
+
+
+def test_uninstall_reports_a_plist_it_cannot_remove(tmp_path):
+    plist = launch_agent.plist_path(home=tmp_path)
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(b"")
+    with patch.object(launch_agent.subprocess, "run") as run, patch.object(
+        Path, "unlink", side_effect=PermissionError(13, "Permission denied")
+    ):
+        run.side_effect = _router({"print": _completed(1)})
+        with pytest.raises(ClaudeSwitchError, match="Could not remove the launch agent.*Permission denied"):
+            launch_agent.uninstall(home=tmp_path, uid=UID)
+
+
+def test_uninstall_tolerates_a_plist_that_vanished_after_the_existence_check(tmp_path):
+    plist = launch_agent.plist_path(home=tmp_path)
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(b"")
+    real_exists = Path.exists
+
+    def exists_then_vanish(self, *a, **k):
+        present = real_exists(self, *a, **k)
+        if self == plist and present:
+            plist.unlink()
+        return present
+
+    with patch.object(launch_agent.subprocess, "run") as run, patch.object(
+        Path, "exists", exists_then_vanish
+    ):
+        run.side_effect = _router({"print": _completed(1)})
+        result = launch_agent.uninstall(home=tmp_path, uid=UID)
+    assert result["removed_plist"] is True
 
 
 def test_uninstall_raises_when_bootout_fails_and_the_service_stays_loaded(tmp_path):

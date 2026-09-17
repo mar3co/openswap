@@ -86,6 +86,11 @@ def run(switcher, codex=None) -> int:
             from openswap.codex.auth import auth_path
             self._codex_auth_path = auth_path(codex.home) if codex is not None else None
             self._codex_auth_mtime = 0.0
+            self._store_paths = [switcher.sequence_file]
+            if codex is not None:
+                self._store_paths.append(codex.sequence_file)
+            self._store_seen: dict = {}
+            store_roster_changed(self._store_paths, self._store_seen)
             self._last_usage_log: dict = {}  # account num -> last-logged (5h, 7d) key
             # Auto-switch engine (the same one `openswap auto` runs), hosted in a
             # background thread while enabled.
@@ -226,6 +231,7 @@ def run(switcher, codex=None) -> int:
                 # Hold copy is applied below and reloads the open main page
                 # only when it changes, deferred while the left button is down.
             self._detect_active_change()
+            self._detect_store_change()
             self._drain_engine_events()
             self._apply_hold_line()
             self._drain_relogin_notifies()
@@ -240,6 +246,18 @@ def run(switcher, codex=None) -> int:
             num = consume_switch_command()
             if num is not None:
                 self._switch_from_widget(num)
+
+        def _detect_store_change(self):
+            # CLI add / remove / alias / disable write only OpenSwap's own
+            # index, never Claude's config, so _detect_active_change cannot
+            # see them. Skipped while a worker is in flight so a change that
+            # landed after it started is still caught next tick. The extra's
+            # own roster edits therefore cost one redundant pass a tick later;
+            # re-priming after the worker would lose writes it raced.
+            if self._refreshing:
+                return
+            if store_roster_changed(self._store_paths, self._store_seen):
+                self.refresh_async()
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto engine)
@@ -544,6 +562,8 @@ def run(switcher, codex=None) -> int:
                 self.on_toggle_title_7d(None)
             elif row_id == "title_scoped":
                 self.on_toggle_scoped(None)
+            elif row_id == "confirm_switch":
+                self.on_toggle_confirm_switch(None)
             elif row_id == "refresh_interval":
                 self._make_interval(int(value))(None)
             elif row_id == "auto_switch_enabled":
@@ -561,10 +581,7 @@ def run(switcher, codex=None) -> int:
                         "false" if current else "true",
                     )
                 except Exception as e:
-                    rumps.alert(
-                        title="openswap",
-                        message=f"Couldn't set Codex auto-switch: {e}",
-                    )
+                    self._show_error(f"Couldn't set Codex auto-switch: {e}")
                     return
                 if current:
                     self._stop_codex_engine()
@@ -656,6 +673,7 @@ def run(switcher, codex=None) -> int:
                 rumps.MenuItem("Next available", callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
+                self._rename_menu(rumps),
                 self._disable_menu(rumps),
                 self._remove_menu(rumps),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
@@ -682,6 +700,16 @@ def run(switcher, codex=None) -> int:
                 ))
             if hasattr(self.switcher, "add_account_from_token"):
                 menu.add(rumps.MenuItem("From API key or setup token…", callback=self.on_add_token))
+            return menu
+
+        def _rename_menu(self, rumps):
+            menu = rumps.MenuItem("Rename account")
+            accounts = self.snapshot["accounts"]
+            if not accounts:
+                menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            for num, email, _is_active, _display, _last_good, alias, _org, _disabled, _fetched_at in accounts:
+                label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
+                menu.add(rumps.MenuItem(label, callback=self._make_rename(num, email, alias)))
             return menu
 
         def _remove_menu(self, rumps):
@@ -731,10 +759,36 @@ def run(switcher, codex=None) -> int:
             self.settings.save(settings_path)
             self.rebuild_menu()
 
-        def _show_error(self, message: str):
+        def _dialog(self, run):
+            """Run a modal dialog in front of the popover without closing it.
+
+            The popover floats at menu level, above a modal alert, and the
+            modal runner pins the alert's own level, so the popover's window
+            is lowered for the dialog's lifetime instead; Cancel then leaves
+            the user where they were. A menu-bar (accessory) app is not the
+            active app either, so it is brought forward or the modal can
+            render blank.
+            """
             import AppKit
             AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-            rumps.alert(title="openswap", message=message)
+            popover = self._panel.popover_window() if self._panel is not None else None
+            if popover is None:
+                return run()
+            level = popover.level()
+            popover.setLevel_(AppKit.NSNormalWindowLevel)
+            try:
+                return run()
+            finally:
+                popover.setLevel_(level)
+
+        def _alert(self, **kwargs) -> int:
+            return self._dialog(lambda: rumps.alert(**kwargs))
+
+        def _prompt(self, **kwargs):
+            return self._dialog(lambda: rumps.Window(**kwargs).run())
+
+        def _show_error(self, message: str):
+            self._alert(title="openswap", message=message)
 
         def _guard(self, fn):
             """Run a switcher action, surfacing ClaudeSwitchError via an alert."""
@@ -847,7 +901,7 @@ def run(switcher, codex=None) -> int:
             from openswap.codex import split_provider_num
             provider, n = split_provider_num(num)
             if provider == "codex":
-                if self.codex is None:
+                if self.codex is None or not self._confirm_switch(num):
                     return
                 result = self._run_switch(
                     lambda: self.codex.switch_to(n, json_output=True)
@@ -860,12 +914,59 @@ def run(switcher, codex=None) -> int:
             if self._slot_needs_relogin(num):
                 self._repair_relogin(num, close_panel=close_panel)
                 return
+            if not self._confirm_switch(num):
+                return
             result = self._run_switch(
                 lambda: self.switcher.switch_to(str(num), json_output=True)
             )
             self._finish_manual_switch(
                 result, self._name_for_num(num), close_panel=close_panel
             )
+
+        def _confirm_switch(self, num) -> bool:
+            """Ask before a card or widget tap swaps the live login."""
+            if not should_confirm_switch(
+                self.settings.confirm_switch, is_active=self._live_is_active(num)
+            ):
+                return True
+            from openswap.codex import CODEX_NUM_PREFIX, split_provider_num
+            provider, _n = split_provider_num(num)
+            if provider == "codex":
+                app = "Codex CLI"
+                live = self.codex.current_account_number()
+                if live:
+                    live_name = self._name_for_num(f"{CODEX_NUM_PREFIX}{live}")
+                else:
+                    ident = self.codex.live_identity()
+                    live_name = account_short_name(ident[0]) if ident and ident[0] else None
+            else:
+                app = "Claude Code"
+                live_name = self._name_for_identity(self.switcher.live_identity())
+            title, message = switch_confirm_copy(
+                self._name_for_num(num), live_name=live_name, app=app
+            )
+            return self._alert(title=title, message=message, ok="Switch", cancel="Cancel") == 1
+
+        def _live_is_active(self, num) -> bool:
+            # A consent gate must not trust the cached snapshot, which a
+            # failing worker keeps stale on purpose; read the live slot and
+            # treat any doubt as "not active" so the dialog shows.
+            from openswap.codex import split_provider_num
+            provider, n = split_provider_num(num)
+            engine = self.codex if provider == "codex" else self.switcher
+            try:
+                live = engine.current_account_number() if engine is not None else None
+            except (ClaudeSwitchError, OSError):
+                return False
+            return live is not None and str(live) == str(n)
+
+        def _confirm_strategy_switch(self, strategy) -> bool:
+            if not self.settings.confirm_switch:
+                return True
+            title, message = strategy_confirm_copy(
+                strategy, live_name=self._name_for_identity(self.switcher.live_identity())
+            )
+            return self._alert(title=title, message=message, ok="Switch", cancel="Cancel") == 1
 
         def _repair_relogin(self, num, *, close_panel):
             slot = self._slot_identity(num)
@@ -881,16 +982,13 @@ def run(switcher, codex=None) -> int:
             if plan.kind == "capture":
                 self._capture_relogin(num, close_panel=close_panel)
                 return
-            if plan.kind == "confirm_open_login":
-                import AppKit
-                AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-                if rumps.alert(
-                    title=relogin_wrong_account_title(plan),
-                    message=relogin_wrong_account_message(plan),
-                    ok="Open login",
-                    cancel="Cancel",
-                ) != 1:
-                    return
+            if plan.kind == "confirm_open_login" and self._alert(
+                title=relogin_wrong_account_title(plan),
+                message=relogin_wrong_account_message(plan),
+                ok="Open login",
+                cancel="Cancel",
+            ) != 1:
+                return
             self._open_claude_login(plan)
 
         def _capture_relogin(self, num, *, close_panel):
@@ -905,7 +1003,7 @@ def run(switcher, codex=None) -> int:
             try:
                 self.switcher.add_account(slot=None)
             except CredentialReadError:
-                rumps.alert(
+                self._alert(
                     title="openswap",
                     message="Couldn't read the active credential. If the menu bar is running "
                             "as a background/login agent, macOS blocks its Keychain access — "
@@ -981,6 +1079,8 @@ def run(switcher, codex=None) -> int:
 
         def _switch(self, strategy):
             def cb(_sender):
+                if not self._confirm_strategy_switch(strategy):
+                    return
                 result = self._run_switch(
                     lambda: self.switcher.switch(strategy=strategy, json_output=True)
                 )
@@ -989,9 +1089,36 @@ def run(switcher, codex=None) -> int:
                 )
             return cb
 
+        def _make_rename(self, num, email, current):
+            def cb(_sender):
+                resp = self._prompt(
+                    title="Rename account",
+                    message=(
+                        f"Short name for {account_short_name(email, None, num)} "
+                        "(leave blank to remove it):"
+                    ),
+                    default_text=current or "",
+                    ok="Save", cancel="Cancel", dimensions=(320, 24),
+                )
+                if resp.clicked != 1:
+                    return
+                action, value = alias_edit(resp.text, current or None)
+                if action == "noop":
+                    return
+                from openswap.codex import split_provider_num
+                provider, n = split_provider_num(num)
+                engine = self.codex if provider == "codex" else self.switcher
+                if action == "set":
+                    ok = self._guard(lambda: engine.set_alias(n, value))
+                else:
+                    ok = self._guard(lambda: engine.unset_alias(n))
+                if ok:
+                    self.refresh_async()
+            return cb
+
         def _make_remove(self, num):
             def cb(_sender):
-                if rumps.alert(
+                if self._alert(
                     title="Remove account",
                     message=f"Remove account {num}?",
                     ok="Remove",
@@ -1042,26 +1169,19 @@ def run(switcher, codex=None) -> int:
                     self._ensure_codex_engine()
 
         def on_add_token(self, _sender):
-            # A menu-bar (accessory) app isn't the active app, so a modal
-            # rumps.Window can render black/blank until we bring the app
-            # forward. Activate before showing the input dialogs.
-            import AppKit
-            AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-            email_win = rumps.Window(
+            email_resp = self._prompt(
                 title="Add account from token",
                 message="Email label (optional; leave blank to auto-name):",
                 ok="Next", cancel="Cancel", dimensions=(320, 24),
             )
-            email_resp = email_win.run()
             if email_resp.clicked != 1:
                 return
             email = email_resp.text.strip() or None
-            token_win = rumps.Window(
+            token_resp = self._prompt(
                 title="Add account from token",
                 message="API key (sk-ant-api…) or setup token (sk-ant-oat01-…):",
                 ok="Add", cancel="Cancel", dimensions=(320, 24),
             )
-            token_resp = token_win.run()
             if token_resp.clicked != 1 or not token_resp.text.strip():
                 return
             if self._guard(lambda: self.switcher.add_account_from_token(
@@ -1077,7 +1197,7 @@ def run(switcher, codex=None) -> int:
 
         def on_refresh_creds(self, _sender):
             if self.switcher.live_identity() is None:
-                rumps.alert(title="openswap",
+                self._alert(title="openswap",
                             message="No active Claude Code login detected. Log in first.")
                 return
             try:
@@ -1086,7 +1206,7 @@ def run(switcher, codex=None) -> int:
                 # Almost always a launchd/login-agent Keychain block: the active
                 # credential lives in the macOS Keychain, which a background agent
                 # can't read (the security call times out). Point at the fix.
-                rumps.alert(
+                self._alert(
                     title="openswap",
                     message="Couldn't read the active credential. If the menu bar is running "
                             "as a background/login agent, macOS blocks its Keychain access — "
@@ -1094,7 +1214,7 @@ def run(switcher, codex=None) -> int:
                 )
                 return
             except ClaudeSwitchError as e:
-                rumps.alert(title="openswap", message=str(e))
+                self._alert(title="openswap", message=str(e))
                 return
             self.refresh_async()
 
@@ -1107,6 +1227,10 @@ def run(switcher, codex=None) -> int:
 
         def on_toggle_name(self, _sender):
             self.settings.show_account_name = not self.settings.show_account_name
+            self._save_and_rebuild()
+
+        def on_toggle_confirm_switch(self, _sender):
+            self.settings.confirm_switch = not self.settings.confirm_switch
             self._save_and_rebuild()
 
         def on_toggle_scoped(self, _sender):
@@ -1287,7 +1411,7 @@ def run(switcher, codex=None) -> int:
                 try:
                     set_setting(self.switcher.backup_dir, "autoswitch.threshold", str(pct))
                 except Exception as e:
-                    rumps.alert(title="openswap", message=f"Couldn't set threshold: {e}")
+                    self._alert(title="openswap", message=f"Couldn't set threshold: {e}")
                     return
                 self._restart_engine()  # apply immediately if running
                 self.rebuild_menu()
@@ -1300,7 +1424,7 @@ def run(switcher, codex=None) -> int:
                         self.switcher.backup_dir, "autoswitch.strategy", strategy
                     )
                 except Exception as e:
-                    rumps.alert(title="openswap", message=f"Couldn't set strategy: {e}")
+                    self._alert(title="openswap", message=f"Couldn't set strategy: {e}")
                     return
                 self._restart_engine()
                 self.rebuild_menu()

@@ -68,6 +68,7 @@ from openswap.menubar import (
     resolve_popover_theme,
     settings_header_frames,
     settings_page_rows,
+    window_suffix,
     status_item_length,
     trailing_header_frames,
 )
@@ -249,6 +250,17 @@ def _sev(pct: float, pal: dict):
     if pct >= WARN_PCT:
         return pal["warn"]
     return pal["ok"]
+
+
+def _button_width(title, font) -> float:
+    """Width a rounded small button needs to show ``title`` untruncated."""
+    btn = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 0, SETTINGS_BTN_H))
+    btn.setTitle_(title)
+    btn.setBezelStyle_(1)
+    btn.setControlSize_(1)
+    btn.setFont_(font)
+    btn.sizeToFit()
+    return btn.frame().size.width
 
 
 def _measure_text(text, font) -> float:
@@ -622,6 +634,15 @@ class MenuBarPanel:
 
     def is_shown(self) -> bool:
         return bool(self._popover is not None and self._popover.isShown())
+
+    def popover_window(self):
+        """The popover's window while shown, else None."""
+        if not self.is_shown():
+            return None
+        try:
+            return self._popover.contentViewController().view().window()
+        except AttributeError:  # no controller or view yet
+            return None
 
     def close(self) -> None:
         self._page = MAIN_PAGE
@@ -1047,12 +1068,7 @@ class MenuBarPanel:
                                 align="right",
                             )
                         )
-                        suffix = win.get("countdown") or ""
-                        if not stale:
-                            if win.get("maxed"):
-                                suffix = "max"
-                            elif win.get("ahead") and not suffix:
-                                suffix = "ahead"
+                        suffix = window_suffix(win, stale=stale)
                         card_view.addSubview_(
                             _label(
                                 suffix,
@@ -1163,7 +1179,7 @@ class MenuBarPanel:
             current = row.get("value")
             for value, lab in row.get("options") or []:
                 title = f"✓ {lab}" if value == current else lab
-                w = min(inner_w, max(52.0, _measure_text(title, font_small) + 16.0))
+                w = min(inner_w, max(52.0, _button_width(title, font_small)))
                 if line and x + w > inner_w:
                     lines.append(line)
                     line = []

@@ -9,21 +9,21 @@ OpenSwap is a standalone MIT descendant of [claude-swap](https://github.com/real
 
 ## Install
 
-Needs macOS, Python 3.12+, [uv](https://docs.astral.sh/uv/), and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) already logged in. Homebrew cask comes later.
+One command. Needs a Mac with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) logged in.
 
 ```bash
-git clone https://github.com/mar3co/openswap.git
-cd openswap
-uv tool install --editable '.[menubar]'
+curl -fsSL https://raw.githubusercontent.com/mar3co/openswap/main/install.sh | bash
 ```
 
-Update with `openswap upgrade` (pull this checkout, reinstall the tool, refresh the extra and widget if installed). OpenSwap is not on PyPI.
+It installs [uv](https://docs.astral.sh/uv/) if you do not have it (uv brings its own Python), clones OpenSwap to `~/.openswap`, saves the Claude account you are logged into, and puts the extra in your menu bar. On a brand-new Mac, macOS first asks to install its Command Line Tools; run the command again once that finishes. Re-run it any time to update; it pulls instead of cloning, then saves the current login and starts the extra again. `openswap upgrade` updates from the terminal. Homebrew cask comes later. OpenSwap is not on PyPI.
+
+Already have a checkout? `OPENSWAP_DIR=/path/to/openswap bash install.sh` installs from it.
 
 ## Quick start
 
+The installer saved your first account. Log into another Claude account, then:
+
 ```bash
-openswap add              # save the OAuth account you are logged into
-# log into another Claude account, then:
 openswap add
 openswap add-token sk-ant-api03-...   # API key slot (switch only, no usage bars)
 openswap list             # 5h / 7d usage for every account
@@ -39,7 +39,7 @@ Walkthrough: [Getting started](https://github.com/mar3co/openswap/wiki/Getting-S
 ## macOS extras
 
 ```bash
-openswap menubar --install-service    # extra at login
+openswap setup                        # save the current login, start the extra at login (the installer ran this)
 openswap widget --install             # Desktop / Notification Center (this checkout + Xcode)
 ```
 
@@ -53,6 +53,7 @@ The `cswap` command still works as an alias during the rename.
 
 | Command | What it does |
 | --- | --- |
+| `openswap setup` | Save the current login and start the menu bar extra |
 | `openswap list` | Accounts with 5h / 7d usage |
 | `openswap switch` / `openswap switch 2` | Rotate, or jump to a slot |
 | `openswap add` | Save the current OAuth login |
@@ -70,7 +71,7 @@ The `cswap` command still works as an alias during the rename.
 | `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |
-| `openswap upgrade` | Pull this checkout and reinstall |
+| `openswap upgrade` | Pull the checkout and reinstall |
 | `openswap statusline --install` | Opt-in: wrap Claude Code status line |
 | `openswap statusline --codex` | Paint the live Codex account label (no config.toml wrap) |
 

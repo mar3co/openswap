@@ -86,8 +86,13 @@ class IdentityMixin:
             return None
         return email, acc.get("organizationUuid") or ""
 
-    def _get_current_identity_triple(self) -> tuple[str, str, str] | None:
+    def _get_current_identity_triple(
+        self, *, strict: bool = False
+    ) -> tuple[str, str, str] | None:
         """``(email, org_uuid, account_uuid)`` from ONE read of ``.claude.json``.
+
+        None means no login to capture. With ``strict=True`` an unreadable or
+        malformed config raises ``ConfigError`` instead of looking logged out.
 
         ``add_account`` used to read the config for its identity and again
         near the write. A ``/login`` landing in between pairs one account's
@@ -98,10 +103,19 @@ class IdentityMixin:
         config_path = self._get_claude_config_path()
         if not config_path.exists():
             return None
-        data = self._read_json(config_path)
+        data = self._read_json(config_path, strict=strict)
         if not data:
             return None
-        oauth_account = data.get("oauthAccount", {})
+        oauth_account = data.get("oauthAccount")
+        if oauth_account is None:
+            return None
+        if not isinstance(oauth_account, dict):
+            if strict:
+                raise ConfigError(
+                    f"{config_path} has a malformed oauthAccount entry. "
+                    "Repair or move it, then retry."
+                )
+            return None
         email = oauth_account.get("emailAddress", "")
         if not email:
             return None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -53,3 +54,26 @@ def test_widget_app_path_is_under_home_applications(tmp_path: Path):
     from openswap.widget_snapshot import widget_app_path
 
     assert widget_app_path(tmp_path) == tmp_path / "Applications" / "OpenSwap.app"
+
+
+def test_install_launch_agent_reports_an_unwritable_launch_agents_directory(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(wi.sys, "platform", "darwin")
+    app = tmp_path / "Host.app"
+    binary = wi._host_binary(app)
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"")
+    with patch.object(Path, "mkdir", side_effect=PermissionError(13, "Permission denied")):
+        with pytest.raises(ClaudeSwitchError, match="Could not write the launch agent.*Permission denied"):
+            wi.install_launch_agent(app, home=tmp_path, uid=501)
+
+
+def test_copy_built_app_reports_a_copy_it_cannot_make(tmp_path: Path):
+    built = tmp_path / "Build" / "Products" / "Release" / f"{wi.HOST_PRODUCT}.app"
+    built.mkdir(parents=True)
+    with patch.object(
+        wi.shutil, "copytree", side_effect=PermissionError(13, "Permission denied")
+    ):
+        with pytest.raises(ClaudeSwitchError, match="Could not install the widget app.*Permission denied"):
+            wi._copy_built_app(tmp_path, tmp_path / "Applications" / "Host.app")

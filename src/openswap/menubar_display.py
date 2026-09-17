@@ -168,6 +168,7 @@ class MenuBarSettings:
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
     show_icon: bool = False  # optional ✻ in the status-item title; off by default
+    confirm_switch: bool = True  # ask before a card click swaps the live login
     kickoff_enabled: bool = False
     kickoff_hour: int = 7
     kickoff_minute: int = 0
@@ -219,7 +220,7 @@ def settings_page_rows(
     Each dict: ``{"kind": "toggle"|"choice"|"group"|"popup", "id": str, "label": str, ...}``.
     Choice and popup rows include ``options`` ``(value, label)`` and the current
     ``value``. Toggles include a bool ``value``. Child rows are omitted while
-    their parent is off (title_scoped, auto-switch policy, kickoff time).
+    their parent is off (auto-switch policy, kickoff time).
     ``codex_enabled`` is shown only when master auto is on and ``has_codex``.
     """
     rows = [
@@ -241,33 +242,32 @@ def settings_page_rows(
             "label": "Show 7-day % in menu bar",
             "value": title_shows_7d(settings.title_pct),
         },
+        {
+            "kind": "toggle",
+            "id": "title_scoped",
+            "label": "Show model limits in title",
+            "value": bool(settings.title_scoped),
+        },
+        {
+            "kind": "toggle",
+            "id": "confirm_switch",
+            "label": "Confirm before switching",
+            "value": bool(settings.confirm_switch),
+        },
+        {
+            "kind": "choice",
+            "id": "refresh_interval",
+            "label": "Refresh interval",
+            "options": [(secs, REFRESH_LABELS[secs]) for secs in REFRESH_CHOICES],
+            "value": settings.refresh_interval,
+        },
+        {
+            "kind": "toggle",
+            "id": "auto_switch_enabled",
+            "label": "Auto-switch accounts",
+            "value": bool(settings.auto_switch_enabled),
+        },
     ]
-    if settings.title_pct != "off":
-        rows.append(
-            {
-                "kind": "toggle",
-                "id": "title_scoped",
-                "label": "Show model limits in title",
-                "value": bool(settings.title_scoped),
-            }
-        )
-    rows.extend(
-        [
-            {
-                "kind": "choice",
-                "id": "refresh_interval",
-                "label": "Refresh interval",
-                "options": [(secs, REFRESH_LABELS[secs]) for secs in REFRESH_CHOICES],
-                "value": settings.refresh_interval,
-            },
-            {
-                "kind": "toggle",
-                "id": "auto_switch_enabled",
-                "label": "Auto-switch accounts",
-                "value": bool(settings.auto_switch_enabled),
-            },
-        ]
-    )
     if settings.auto_switch_enabled:
         rows.extend(
             [
@@ -1285,9 +1285,13 @@ def format_title(
     alias: str | None = None,
     org_name: str | None = None,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
+    """Build the menu-bar title from the active account and settings.
+
+    Never empty: an unmanaged live login, or every title toggle off, shows the
+    icon, because a blank status item is indistinguishable from a crashed one.
+    """
     if active_email is None:
-        return STATUS_ICON if settings.show_icon else ""
+        return STATUS_ICON
     if now is None:
         now = time.time()
     segments: list[str] = []
@@ -1312,9 +1316,117 @@ def format_title(
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
     text = " · ".join(segments)
-    if settings.show_icon:
-        return f"{STATUS_ICON} {text}" if text else STATUS_ICON
-    return text
+    if settings.show_icon and text:
+        return f"{STATUS_ICON} {text}"
+    return text or STATUS_ICON
+
+
+def should_confirm_switch(enabled: bool, *, is_active: bool) -> bool:
+    """A click on the already-active card is a no-op and needs no dialog."""
+    return bool(enabled) and not is_active
+
+
+def switch_confirm_copy(
+    dest_name: str, *, live_name: str | None, app: str = "Claude Code"
+) -> tuple[str, str]:
+    """Title and body for the dialog shown before a card click switches."""
+    title = f"Switch to {dest_name}?"
+    if live_name:
+        body = f"{app} is signed in as {live_name}. Switch it to {dest_name}?"
+    else:
+        body = f"Sign {app} in as {dest_name}?"
+    return title, body
+
+
+STRATEGY_CONFIRM_TITLES = {
+    None: "Rotate to the next account?",
+    "best": "Switch to the account with the most headroom?",
+    "next-available": "Switch to the next available account?",
+}
+
+
+def strategy_confirm_copy(
+    strategy: str | None, *, live_name: str | None, app: str = "Claude Code"
+) -> tuple[str, str]:
+    """Dialog for Rotate / Best / Next available, whose destination is only
+    known after the switch runs."""
+    title = STRATEGY_CONFIRM_TITLES.get(strategy, "Switch accounts?")
+    body = f"{app} is signed in as {live_name}." if live_name else ""
+    return title, body
+
+
+_ROSTER_VOLATILE_KEYS = ("activeAccountNumber", "lastUpdated")
+
+
+def _roster_digest(path) -> str | None:
+    """The index file's content minus the keys every switch rewrites."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    stable = {k: v for k, v in data.items() if k not in _ROSTER_VOLATILE_KEYS}
+    return json.dumps(stable, sort_keys=True)
+
+
+def store_roster_changed(paths, seen: dict) -> bool:
+    """True when a store index file's roster (slots, aliases, disabled flags)
+    differs from the last call.
+
+    ``seen`` maps path to ``(stamp, digest)`` and is updated in place, where
+    stamp is (mtime_ns, size, inode): the writers replace the file
+    atomically, so a rewrite inside one coarse timestamp tick still changes
+    the inode. The first call only primes it, so startup does not
+    trigger a refresh. The file is parsed only when its stamp moved. Switches
+    rewrite the index too,
+    but only its volatile keys, which the digest ignores: the active-slot
+    watcher already covers those and the app refreshes itself after its own
+    actions. A file appearing, vanishing, or turning unparseable counts as a
+    change.
+    """
+    changed = False
+    for path in paths:
+        key = str(path)
+        try:
+            st = path.stat()
+            stamp: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            stamp = None
+        previous = seen.get(key)
+        if previous is not None and previous[0] == stamp:
+            continue
+        digest = _roster_digest(path) if stamp is not None else None
+        if previous is not None and (
+            previous[1] != digest or (previous[0] is None) != (stamp is None)
+        ):
+            changed = True
+        seen[key] = (stamp, digest)
+    return changed
+
+
+def window_suffix(win: dict, *, stale: bool) -> str:
+    """Right-hand note on a card row: the reset countdown when there is one,
+    else "max" or "ahead" for a live measurement. The red 100% already says
+    maxed, so the countdown wins."""
+    suffix = win.get("countdown") or ""
+    if suffix or stale:
+        return suffix
+    if win.get("maxed"):
+        return "max"
+    if win.get("ahead"):
+        return "ahead"
+    return ""
+
+
+def alias_edit(text: str, current: str | None) -> tuple[str, str | None]:
+    """Decide what a rename prompt's answer means: set, clear, or noop."""
+    value = text.strip()
+    if not value:
+        return ("clear", None) if current else ("noop", None)
+    if value == current:
+        return ("noop", None)
+    return ("set", value)
 
 
 def status_item_length(title_width: float, *, compact: bool) -> float:
@@ -1583,5 +1695,3 @@ def codex_live_slot_changed(snapshot: dict, live_num: str | int | None) -> bool:
 
 def codex_restart_hint() -> str:
     return switch_codex_restart_hint(True)
-
-
