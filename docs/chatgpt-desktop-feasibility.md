@@ -87,6 +87,33 @@ Additional lifecycle findings from the archive:
 
 ## Isolated backend experiment
 
+### Follow-up: automatic identity verification (2026-09-17)
+
+Read-only inspection of the running installed app confirmed that its main
+process owns a bundled `codex app-server` child. That child's standard input
+and output are connected directly to the desktop process. It had no named
+Unix listener or TCP listening socket for an independent `account/read`
+client. This is a live observation for this run, not a claim about every
+desktop version or configuration.
+
+The current official App Server documentation describes `account/read` with
+`refreshToken: false`, and stdio, Unix-socket, and WebSocket transports. Merely
+starting another listener would inspect a different backend and would not
+verify the app's existing session. We did not start a new backend, intercept
+the existing stdio connection, or enable debugging/remote access.
+
+The app process also has private IPC sockets. Their existence is not evidence
+of a supported external identity-verification API; they were not queried.
+The computer-use tool explicitly blocked inspection of `com.openai.codex` for
+safety reasons, so the Accessibility/profile-menu proposal could not be
+validated in this environment. No alternate UI-inspection mechanism was used.
+
+Automatic desktop-profile verification remains unimplemented and unproven.
+Any user-confirmed fallback must be labeled **manually checked**, not
+automatically verified, and must expire on app restart, account change, or
+loss of the evidence it was tied to. A fresh backend account read alone would
+still not prove that Chat, Work, and Codex all adopted the same session.
+
 Run the committed probe without touching a real login:
 
 ```sh
@@ -158,3 +185,11 @@ do not promote it to supported desktop behavior until this matrix passes.
 Keep automatic quota rotation separate: it needs its own active-task policy,
 usage semantics, and recovery guarantees. A process-table scan currently used
 for display is not a sufficient shutdown or mutation guard.
+
+Static inspection found an internal renderer `readAccountInfo` path that derives
+account and user IDs, email, and plan from the desktop connection's cached auth
+token. No supported external attachment to that reader has been established;
+private IPC was not queried. UI automation restrictions also prevented an
+independent profile-menu inspection in this pass, which is not evidence that a
+separately permissioned integration is impossible. Automatic running-profile
+verification remains blocked on an accessible, independent identity source.

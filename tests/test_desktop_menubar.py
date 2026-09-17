@@ -48,34 +48,42 @@ def test_changed_suggestion_during_confirmation_never_launches_switch(app):
 def test_desktop_consent_explicitly_covers_restart_idle_and_verification():
     title, body = menubar.desktop_switch_confirm_copy("Work")
     assert "Restart ChatGPT" in title
-    for text in ("Experimental", "local and remote", "all work is stopped", "verify", "auto-switching off"):
+    for text in ("Experimental", "Work", "entire app", "shared Codex login",
+                 "Save and stop all local/remote work", "close other Codex clients before continuing",
+                 "check the account in Chat, Work, and Codex", "auto-switching off"):
         assert text in body
+    assert len(body.split()) < 65
 
 
 def test_desktop_consent_explains_persistent_pause_only_when_needed():
     _, body = menubar.desktop_switch_confirm_copy("Work", pause_auto=True)
     assert "all OpenSwap instances" in body
-    assert "Claude rotation is unchanged" in body
-    assert "until you re-enable" in body
-    assert "also pauses" not in menubar.desktop_switch_confirm_copy("Work")[1]
+    assert "Claude is unchanged" in body
+    assert "until re-enabled" in body
+    assert "turns off" not in menubar.desktop_switch_confirm_copy("Work")[1]
+    assert len(body.split()) < 80
 
 
 @pytest.fixture
 def app(monkeypatch):
     tree = ast.parse(Path(menubar.__file__).read_text())
     cls = next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "MenuBarApp")
-    wanted = {"_make_desktop_switch", "_desktop_worker", "_drain_desktop_result", "_pause_codex_for_desktop", "_on_panel_account_click"}
+    wanted = {"_make_desktop_switch", "_desktop_worker", "_drain_desktop_result", "_pause_codex_for_desktop", "_on_panel_account_click", "_notify"}
     cls.bases = []
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     thread = Mock()
     record = Mock()
     setting = Mock(return_value=None)
+    notification = Mock()
     namespace = {
         "desktop_switch_confirm_copy": menubar.desktop_switch_confirm_copy,
         "desktop_switch_choices": menubar.desktop_switch_choices,
+        "notification_copy_for_desktop_switch": menubar.notification_copy_for_desktop_switch,
+        "NotificationCopy": menubar.NotificationCopy,
         "ClaudeSwitchError": ClaudeSwitchError,
         "threading": Mock(Thread=thread),
+        "rumps": SimpleNamespace(notification=notification),
         "record_manual_switch": record,
         "set_setting": setting,
     }
@@ -102,6 +110,7 @@ def app(monkeypatch):
     instance._test_thread = thread
     instance._test_record = record
     instance._test_setting = setting
+    instance._test_notification = notification
     return instance
 
 
@@ -123,7 +132,7 @@ def test_menu_refusals_do_not_start_a_switch(app, guard):
 def test_switch_can_pause_auto_in_same_explicit_confirmation(app):
     app._codex_enabled.return_value = True
     app._make_desktop_switch("2", "Work")(None)
-    assert "also pauses" in app._alert.call_args.kwargs["message"]
+    assert "Codex auto-switching turns off" in app._alert.call_args.kwargs["message"]
     app._test_setting.assert_called_once_with(
         app.switcher.backup_dir, "autoswitch.codexEnabled", "false"
     )
@@ -217,9 +226,27 @@ def test_worker_uses_both_confirmations_and_main_thread_completion(app, monkeypa
     app._desktop_switching = True
     app._drain_desktop_result()
     assert not app._desktop_switching
-    assert "Verification needed" in app._desktop_status
+    assert app._desktop_status == "ChatGPT reopened · Check the profile"
     assert app._hold_reload_pending is True
-    assert "not yet verified" in app._alert.call_args.kwargs["message"]
+    app._alert.assert_not_called()
+    app._test_notification.assert_called_once_with(
+        "ChatGPT reopened", "", "Check the selected account in ChatGPT.", sound=False
+    )
+    app.refresh_async.assert_called_once()
+
+
+def test_notification_failure_keeps_desktop_status_and_refresh(app, monkeypatch):
+    from openswap.codex import desktop
+    backend = Mock()
+    backend.switch.return_value = {"status": "awaiting_verification"}
+    monkeypatch.setattr(desktop, "DesktopSwitcher", Mock(return_value=backend))
+    app._desktop_worker("2")
+    app._test_notification.side_effect = RuntimeError("notifications unavailable")
+
+    app._drain_desktop_result()
+
+    assert app._desktop_status == "ChatGPT reopened · Check the profile"
+    app._alert.assert_not_called()
     app.refresh_async.assert_called_once()
 
 

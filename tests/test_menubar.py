@@ -93,11 +93,11 @@ def test_notification_identity_is_noop_when_frozen(tmp_path: Path, monkeypatch):
 def test_settings_defaults_when_file_missing(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "nope.json")
     assert s.show_account_name is True
+    assert s.menu_bar_provider == "claude"
     assert s.title_pct == "both"
     assert s.refresh_interval == 60
     assert s.auto_switch_enabled is False
     assert s.chatgpt_auto_enabled is False
-    assert s.show_icon is False
     assert s.kickoff_enabled is False
 
 
@@ -109,6 +109,7 @@ def test_settings_round_trip(tmp_path: Path):
         refresh_interval=300,
         auto_switch_enabled=True,
         chatgpt_auto_enabled=True,
+        menu_bar_provider="both",
     )
     original.save(path)
     loaded = menubar.MenuBarSettings.load(path)
@@ -145,10 +146,51 @@ def test_settings_ignores_unknown_and_bad_types(tmp_path: Path):
 
 def test_settings_invalid_title_pct_falls_back_to_default(tmp_path: Path):
     path = menubar.menubar_settings_path(tmp_path)
-    path.write_text(json.dumps({"title_pct": "nope", "show_icon": True}), encoding="utf-8")
+    path.write_text(json.dumps({"title_pct": "nope", "confirm_switch": False}), encoding="utf-8")
     s = menubar.MenuBarSettings.load(path)
     assert s.title_pct == "both"
-    assert s.show_icon is True
+    assert s.confirm_switch is False
+
+
+@pytest.mark.parametrize("provider", ["claude", "chatgpt", "both", "logo", "unknown", True])
+def test_menu_bar_provider_settings_validation(tmp_path: Path, provider):
+    path = tmp_path / "menubar_settings.json"
+    path.write_text(json.dumps({"menu_bar_provider": provider}), encoding="utf-8")
+    loaded = menubar.MenuBarSettings.load(path)
+    assert loaded.menu_bar_provider == (
+        provider if provider in ("claude", "chatgpt", "both", "logo") else "claude"
+    )
+
+
+@pytest.mark.parametrize("provider", ["claude", "chatgpt", "both", "logo"])
+def test_menu_bar_display_controls_follow_provider(provider):
+    settings = menubar.MenuBarSettings(menu_bar_provider=provider, title_scoped=True)
+    rows = menubar.settings_page_rows(
+        settings, strategy="best", threshold=90, section="general"
+    )
+    by_id = {row["id"]: row for row in rows}
+    picker = by_id["menu_bar_provider"]
+    assert picker["label"] == "Show"
+    assert picker["kind"] == "popup"
+    assert picker["value"] == provider
+    assert picker["options"] == [
+        ("claude", "Claude"), ("chatgpt", "ChatGPT"),
+        ("both", "Both"), ("logo", "Logo only"),
+    ]
+    assert ("title_scoped" in by_id) == (provider in ("claude", "both"))
+    for rid, label in [
+        ("show_account_name", "Account name"),
+        ("title_pct_5h", "5-hour usage"),
+        ("title_pct_7d", "7-day usage"),
+    ]:
+        assert (rid in by_id) == (provider != "logo")
+        if rid in by_id:
+            assert by_id[rid]["label"] == label
+    hints = " ".join(row["label"] for row in rows if row.get("style") == "hint")
+    if provider in ("chatgpt", "both"):
+        assert "Codex" in hints and "message limits" in hints and "unverified" in hints
+    # Hiding a control must not erase the user's choice.
+    assert settings.title_scoped is True
 
 
 def test_menubar_settings_path_constant(tmp_path: Path):
@@ -169,15 +211,15 @@ def test_settings_save_writes_through_symlink(tmp_path: Path):
     repo.mkdir()
     live.mkdir()
     tracked = repo / "menubar_settings.json"
-    tracked.write_text(json.dumps({"show_icon": False}), encoding="utf-8")
+    tracked.write_text(json.dumps({"show_account_name": True}), encoding="utf-8")
     link = live / "menubar_settings.json"
     link.symlink_to(tracked)
 
-    menubar.MenuBarSettings(show_icon=True, title_pct="5h").save(link)
+    menubar.MenuBarSettings(show_account_name=False, title_pct="5h").save(link)
 
     assert link.is_symlink()
     loaded = menubar.MenuBarSettings.load(tracked)
-    assert loaded.show_icon is True
+    assert loaded.show_account_name is False
     assert loaded.title_pct == "5h"
 
 
@@ -260,7 +302,6 @@ def test_settings_page_rows_include_required_ids_and_values():
         title_scoped=True,
         refresh_interval=30,
         auto_switch_enabled=True,
-        show_icon=True,
         kickoff_enabled=True,
         kickoff_hour=19,
         kickoff_minute=30,
@@ -279,7 +320,6 @@ def test_settings_page_rows_include_required_ids_and_values():
         "strategy_hint",
         "kickoff_enabled",
         "kickoff_time",
-        "show_icon",
     )
     for rid in required:
         assert rid in by_id
@@ -290,7 +330,8 @@ def test_settings_page_rows_include_required_ids_and_values():
     assert by_id["title_scoped"]["value"] is True
     assert by_id["auto_switch_enabled"]["value"] is True
     assert by_id["kickoff_enabled"]["value"] is True
-    assert by_id["show_icon"]["value"] is True
+    assert "show_icon" not in by_id
+    assert "group_advanced" not in by_id
 
     assert by_id["title_pct_5h"]["kind"] == "toggle"
     assert by_id["title_pct_5h"]["value"] is True
@@ -1002,10 +1043,10 @@ def test_format_title_both_windows_with_name():
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "loc · 42% · 18%"
 
 
-def test_format_title_falls_back_to_icon_when_name_and_pct_off():
-    # An empty title is indistinguishable from a crashed extra.
+def test_format_title_leaves_logo_only_when_name_and_pct_off():
+    # The native image stays visible even when there is no title text.
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == menubar.STATUS_ICON
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == ""
     assert "%" not in menubar.format_title(
         "loc@papaya.asia", {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}, s
     )
@@ -1034,24 +1075,12 @@ def test_format_title_scoped_off_by_default():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
     assert not s.title_scoped
-    assert menubar.format_title("loc@papaya.asia", usage, s) == menubar.STATUS_ICON
+    assert menubar.format_title("loc@papaya.asia", usage, s) == ""
 
 
-def test_format_title_falls_back_to_icon_when_no_active_account():
+def test_format_title_leaves_logo_only_when_no_active_account():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
-    assert menubar.format_title(None, None, s) == menubar.STATUS_ICON
-
-
-def test_format_title_icon_when_no_active_account():
-    s = menubar.MenuBarSettings(
-        show_account_name=True, title_pct="both", show_icon=True
-    )
-    assert menubar.format_title(None, None, s) == menubar.STATUS_ICON
-
-
-def test_format_title_does_not_double_the_icon_fallback():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off", show_icon=True)
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == menubar.STATUS_ICON
+    assert menubar.format_title(None, None, s) == ""
 
 
 def test_kickoff_settings_round_trip(tmp_path: Path):
@@ -1070,35 +1099,15 @@ def test_kickoff_settings_round_trip(tmp_path: Path):
     assert loaded.kickoff_last_date == "2026-09-05"
 
 
-def test_show_icon_round_trip_true(tmp_path: Path):
+@pytest.mark.parametrize("legacy_value", [True, False])
+def test_settings_drop_legacy_show_icon(tmp_path: Path, legacy_value):
     path = tmp_path / "menubar_settings.json"
-    original = menubar.MenuBarSettings(show_icon=True)
-    original.save(path)
+    path.write_text(json.dumps({"show_icon": legacy_value, "title_pct": "5h"}), encoding="utf-8")
     loaded = menubar.MenuBarSettings.load(path)
-    assert loaded.show_icon is True
-    assert loaded.show_icon is not menubar.MenuBarSettings().show_icon
-
-
-def test_format_title_includes_asterisk_iff_icon_on():
-    on = menubar.MenuBarSettings(show_account_name=True, title_pct="off", show_icon=True)
-    off = menubar.MenuBarSettings(show_account_name=True, title_pct="off", show_icon=False)
-    assert menubar.format_title("loc@papaya.asia", _USAGE, on) == f"{menubar.STATUS_ICON} loc"
-    assert menubar.STATUS_ICON not in menubar.format_title("loc@papaya.asia", _USAGE, off)
-
-
-def test_format_title_icon_only_when_name_and_pct_off():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off", show_icon=True)
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == menubar.STATUS_ICON
-
-
-def test_show_icon_control_is_nested_under_advanced_not_settings_root():
-    rows = menubar.settings_page_rows(
-        menubar.MenuBarSettings(), strategy="best", threshold=90
-    )
-    ids = [row["id"] for row in rows]
-    assert ids.index("group_advanced") < ids.index("show_icon")
-    assert ids[0] != "show_icon"
-    assert any(row["id"] == "show_icon" and "asterisk" in row["label"] for row in rows)
+    assert loaded.title_pct == "5h"
+    assert not hasattr(loaded, "show_icon")
+    loaded.save(path)
+    assert "show_icon" not in json.loads(path.read_text(encoding="utf-8"))
 
 
 def test_trailing_header_frames_hug_the_right_edge():
@@ -1179,7 +1188,6 @@ def test_on_setting_reloads_settings_page_not_rebuild_menu():
         "_make_strategy",
         "on_toggle_kickoff",
         "on_kickoff_time",
-        "on_toggle_icon",
     ):
         assert name in body
     assert "SETTINGS_PAGE" in body
@@ -1201,7 +1209,7 @@ def test_kickoff_popup_holds_overflow_like_more():
     setting = Path(menubar.__file__).read_text(encoding="utf-8")
     body = setting[setting.index("def _on_setting") : setting.index("def _popup_overflow")]
     kickoff = body[body.index("kickoff_time") :]
-    assert "return" in kickoff[: kickoff.index("show_icon")]
+    assert "return" in kickoff[: kickoff.index("else:")]
 
 
 def test_panel_settings_page_does_not_set_menu_open():
@@ -1329,23 +1337,17 @@ def test_live_slot_changed_sees_org_switch_with_the_same_email():
     assert menubar.live_slot_changed({"active_num": None}, None) is False
 
 
-def test_status_item_length_compacts_only_when_icon_is_off():
-    assert menubar.status_item_length(58.06, compact=False) == menubar.NS_VARIABLE_STATUS_ITEM_LENGTH
-    assert menubar.status_item_length(0, compact=True) == menubar.NS_VARIABLE_STATUS_ITEM_LENGTH
-    compact = menubar.status_item_length(58.06, compact=True)
-    assert compact == 65.0  # ceil(58.06 + 6pt total pad)
-    assert compact < 58.06 + 20  # AppKit's default is ~10pt per side
-
-
-def test_rebuild_menu_fits_status_item_from_show_icon():
+def test_rebuild_menu_fits_status_item_with_permanent_logo():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
-    assert "title_usage(self.snapshot)" in text
+    assert "format_menu_bar_title(self.snapshot, self.settings)" in text
     assert "self._fit_status_item(title)" in text
-    assert "compact=not self.settings.show_icon" in text
+    assert "show_icon" not in text
     panel = Path(menubar.__file__).resolve().parent / "menubar_panel.py"
     body = panel.read_text(encoding="utf-8")
     assert "def fit_status_item" in body
     assert "button.setTitle_" in body
+    assert "button.setImage_(icon)" in body
+    assert "NSImageLeft if shown else NSImageOnly" in body
 
 
 def test_kickoff_is_wired_from_menubar_sync_tick():
@@ -1405,7 +1407,7 @@ def test_format_title_truncates_long_local_part():
 
 def test_format_title_both_drops_unavailable_windows():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@x.com", "no credentials", s) == menubar.STATUS_ICON
+    assert menubar.format_title("loc@x.com", "no credentials", s) == ""
 
 
 def test_format_title_both_keeps_available_window():
@@ -1565,11 +1567,11 @@ def test_title_usage_falls_back_to_last_good_on_sentinel():
     }
     assert menubar.title_usage(snap) == lg
     s = menubar.MenuBarSettings(
-        show_account_name=True, title_pct="5h", title_scoped=True, show_icon=True
+        show_account_name=True, title_pct="5h", title_scoped=True
     )
     assert menubar.format_title(
         snap["active_email"], menubar.title_usage(snap), s, alias="adsonline"
-    ) == f"{menubar.STATUS_ICON} adsonline · 13% · Fable 23%"
+    ) == "adsonline · 13% · Fable 23%"
     assert menubar.title_usage({"active_usage": lg}) == lg
     assert menubar.title_usage(menubar.EMPTY_SNAPSHOT) is None
 

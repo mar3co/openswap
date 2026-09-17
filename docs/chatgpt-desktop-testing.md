@@ -107,7 +107,10 @@ Claude tab; the overflow menu labels its Claude actions explicitly.
 When ChatGPT reopens, check its profile menu and start a new Chat conversation,
 a new Work task, and a new Codex task to confirm the selected identity. Check
 account-scoped history and projects too. Switching files and launching a
-process alone are not proof that every surface authenticated correctly.
+process alone are not proof that every surface authenticated correctly. A
+silent **ChatGPT reopened** notification and the inline **ChatGPT reopened ·
+Check the profile** status prompt this check without blocking on a success
+dialog; errors still use a dialog.
 
 Repeat A → B → A and record app version, selected slot, visible identity, and
 result for each surface. Do not record or share tokens or auth-file contents.
@@ -172,7 +175,7 @@ Widget behavior is unchanged.
 | Claude strategy actions beside Codex cards | Rotate/Best shown only on Claude; overflow actions explicitly label Claude |
 | No desktop restart consent | Mandatory dialog explaining whole-app restart, idle acknowledgement, and shared auth |
 | No desktop operation state | Background worker with a busy menu and duplicate-action guard |
-| No desktop completion state | Manual-verification dialog and persistent in-process status, or sanitized failure/recovery guidance |
+| No desktop completion state | Silent completion notification and persistent in-process status, or sanitized failure/recovery guidance |
 | Bare empty-list label | Provider-specific guidance: browser sign-in for ChatGPT, current-login capture for Claude |
 | Loading/read failures look like no accounts | Separate loading, unavailable, and retryable error states |
 | Empty tabs show irrelevant controls | Auto-switch, Rotate/Best, usage captions, and running/restart status hidden until accounts are present |
@@ -188,6 +191,12 @@ Widget behavior is unchanged.
 | Crowded account footer | Wider Add account and Review switch buttons without truncated labels |
 
 ## Validation recorded for this test build
+
+Desktop hardening follow-up on 2026-09-17: one operator-observed switch changed
+the visible ChatGPT profile. That observation did not test a new Chat
+conversation, Work task, Codex task, or the A → B → A round trip, so those
+remain release gates. Completion now uses a silent notification and inline
+status; it still requires the operator to inspect the profile.
 
 ChatGPT Auto-switch follow-up on 2026-09-17: 2,699 tests passed, 3 skipped.
 Fifteen dedicated monitor lifecycle tests and a selection-only Codex-engine test

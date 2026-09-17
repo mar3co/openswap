@@ -1,7 +1,10 @@
 import json
+import os
+import stat
 
 import pytest
 
+from openswap.codex import desktop
 from openswap.codex.desktop import DesktopSwitchError, DesktopSwitcher
 from openswap.codex.desktop_app import DesktopAppError
 from openswap.codex.engine import CodexEngine
@@ -155,6 +158,127 @@ def test_failed_launch_does_not_clobber_concurrent_refresh(tmp_path):
         DesktopSwitcher(engine, app).switch("1", confirm_restart=True, confirm_idle=True)
     assert engine._live_text() == concurrent
     assert not app.running
+
+
+@pytest.mark.parametrize("failed_path", ["auth", "roster"])
+def test_post_replace_durability_failure_rolls_back_exact_writes(
+    tmp_path, monkeypatch, failed_path
+):
+    engine = setup_engine(tmp_path)
+    original_live = engine._live_text()
+    original_roster = engine.sequence_file.read_text(encoding="utf-8")
+    switcher = DesktopSwitcher(engine, FakeApp())
+    atomic_text = desktop._atomic_text
+    failed = False
+
+    def fail_after_replace(path, text):
+        nonlocal failed
+        atomic_text(path, text)
+        if (not failed and (
+                (failed_path == "auth" and path == engine.home / "auth.json")
+                or (failed_path == "roster" and path == engine.sequence_file))):
+            failed = True
+            raise OSError("synthetic directory fsync failure")
+
+    monkeypatch.setattr(desktop, "_atomic_text", fail_after_replace)
+    with pytest.raises(DesktopSwitchError, match="Original credentials were restored"):
+        switcher.switch("1", confirm_restart=True, confirm_idle=True)
+
+    assert engine._live_text() == original_live
+    assert engine.sequence_file.read_text(encoding="utf-8") == original_roster
+    assert not switcher.recovery_file.exists()
+
+
+def test_failure_before_auth_replace_leaves_credentials_unchanged(tmp_path, monkeypatch):
+    engine = setup_engine(tmp_path)
+    original_live = engine._live_text()
+    original_roster = engine.sequence_file.read_text(encoding="utf-8")
+    switcher = DesktopSwitcher(engine, FakeApp())
+    atomic_text = desktop._atomic_text
+
+    def fail_before_replace(path, text):
+        if path == engine.home / "auth.json":
+            raise OSError("synthetic pre-replace failure")
+        atomic_text(path, text)
+
+    monkeypatch.setattr(desktop, "_atomic_text", fail_before_replace)
+    with pytest.raises(DesktopSwitchError, match="Credentials were not changed"):
+        switcher.switch("1", confirm_restart=True, confirm_idle=True)
+
+    assert engine._live_text() == original_live
+    assert engine.sequence_file.read_text(encoding="utf-8") == original_roster
+    assert not switcher.recovery_file.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory fsync is POSIX-only")
+def test_real_directory_fsync_failure_after_auth_replace_is_reconciled(
+    tmp_path, monkeypatch
+):
+    engine = setup_engine(tmp_path)
+    original_live = engine._live_text()
+    switcher = DesktopSwitcher(engine, FakeApp())
+    fsync = os.fsync
+    directory_fsyncs = 0
+
+    def fail_auth_directory_fsync(fd):
+        nonlocal directory_fsyncs
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_fsyncs += 1
+            if directory_fsyncs == 2:
+                raise OSError("synthetic auth directory fsync failure")
+        return fsync(fd)
+
+    monkeypatch.setattr(desktop.os, "fsync", fail_auth_directory_fsync)
+    with pytest.raises(DesktopSwitchError, match="Original credentials were restored"):
+        switcher.switch("1", confirm_restart=True, confirm_idle=True)
+
+    assert engine._live_text() == original_live
+    assert engine.current_account_number() == "2"
+    assert not switcher.recovery_file.exists()
+
+
+def test_recovery_journal_durability_failure_retains_actionable_record(
+    tmp_path, monkeypatch
+):
+    engine = setup_engine(tmp_path)
+    original_live = engine._live_text()
+    switcher = DesktopSwitcher(engine, FakeApp())
+    atomic_text = desktop._atomic_text
+
+    def fail_after_journal_replace(path, text):
+        atomic_text(path, text)
+        if path == switcher.recovery_file:
+            raise OSError("synthetic recovery directory fsync failure")
+
+    monkeypatch.setattr(desktop, "_atomic_text", fail_after_journal_replace)
+    with pytest.raises(DesktopSwitchError, match="recovery-status"):
+        switcher.switch("1", confirm_restart=True, confirm_idle=True)
+
+    assert engine._live_text() == original_live
+    assert switcher.recovery_file.exists()
+    assert switcher.recovery_status()["pending"] is True
+
+
+def test_post_replace_auth_failure_preserves_concurrent_login_and_recovery(
+    tmp_path, monkeypatch
+):
+    engine = setup_engine(tmp_path)
+    concurrent = _auth(email="a@x.com", account_id="acc-a", refresh="rt-concurrent")
+    switcher = DesktopSwitcher(engine, FakeApp())
+    atomic_text = desktop._atomic_text
+
+    def race_after_replace(path, text):
+        atomic_text(path, text)
+        if path == engine.home / "auth.json":
+            engine._write_live(concurrent)
+            raise OSError("synthetic directory fsync failure")
+
+    monkeypatch.setattr(desktop, "_atomic_text", race_after_replace)
+    with pytest.raises(DesktopSwitchError, match="rollback was withheld"):
+        switcher.switch("1", confirm_restart=True, confirm_idle=True)
+
+    assert engine._live_text() == concurrent
+    assert switcher.recovery_file.exists()
 
 
 def test_quit_timeout_does_not_write_target(tmp_path):

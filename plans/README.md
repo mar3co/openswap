@@ -24,6 +24,7 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 009  | Codex CLI accounts: provider seam, CodexEngine, CLI, auto, kickoff, extra, widget | P2 | L | — | DONE |
 | 010  | Codex parity follow-ups (badge, knob, transfer, swap, sessions) | P2 | L | 009 | IN PROGRESS |
 | 011  | ChatGPT desktop switching: research and validation gates | P2 | M | 009, 010 | IN PROGRESS |
+| 015  | Desktop recovery and quiet completion feedback | P1 | M | — | DONE; profile detection still blocked |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED
 
