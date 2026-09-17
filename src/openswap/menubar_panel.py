@@ -552,6 +552,8 @@ class MenuBarPanel:
         on_setting=None,
         settings=None,
         strategy=None,
+        has_codex=None,
+        codex_enabled=None,
     ):
         self._on_switch = on_switch
         self._on_rotate = on_rotate
@@ -564,6 +566,8 @@ class MenuBarPanel:
         self._threshold = threshold
         self._settings = settings
         self._strategy = strategy
+        self._has_codex = has_codex
+        self._codex_enabled = codex_enabled
         self._page = MAIN_PAGE
         self._item = None
         self._popover = None
@@ -897,6 +901,7 @@ class MenuBarPanel:
         if not self._auto_enabled():
             hold_line = ""
         running_line = snap.get("running_line") or ""
+        codex_running_line = snap.get("codex_running_line") or ""
         pal = _colors()
 
         body_h = 0.0
@@ -910,7 +915,8 @@ class MenuBarPanel:
                 body_h += SECTION_H
 
         hold_h = HOLD_LINE_H if hold_line else 0.0
-        running_h = RUNNING_LINE_H if running_line else 0.0
+        n_running = (1 if running_line else 0) + (1 if codex_running_line else 0)
+        running_h = RUNNING_LINE_H * n_running
         height = PAD + HEADER_H + hold_h + 4 + body_h + PAD + running_h + FOOTER_H
         root = _RootView.alloc().initWithHover_(self._on_hover)
         root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, height))
@@ -1090,10 +1096,20 @@ class MenuBarPanel:
 
         # Footer
         fy = height - FOOTER_H
+        extra = RUNNING_LINE_H if (running_line and codex_running_line) else 0.0
         if running_line:
             root.addSubview_(
                 _label(
                     running_line,
+                    font_small,
+                    pal["muted"],
+                    NSMakeRect(PAD, fy - RUNNING_LINE_H - extra, inner_w, RUNNING_LINE_H),
+                )
+            )
+        if codex_running_line:
+            root.addSubview_(
+                _label(
+                    codex_running_line,
                     font_small,
                     pal["muted"],
                     NSMakeRect(PAD, fy - RUNNING_LINE_H, inner_w, RUNNING_LINE_H),
@@ -1138,7 +1154,23 @@ class MenuBarPanel:
             threshold = float(self._threshold())
         except Exception:
             threshold = 0.0
-        rows = settings_page_rows(settings, strategy=strategy, threshold=threshold)
+        try:
+            has_codex = bool(self._has_codex()) if callable(self._has_codex) else False
+        except Exception:
+            has_codex = False
+        try:
+            codex_enabled = (
+                bool(self._codex_enabled()) if callable(self._codex_enabled) else True
+            )
+        except Exception:
+            codex_enabled = True
+        rows = settings_page_rows(
+            settings,
+            strategy=strategy,
+            threshold=threshold,
+            has_codex=has_codex,
+            codex_enabled=codex_enabled,
+        )
 
         def _choice_lines(row):
             lines = []

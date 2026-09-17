@@ -293,6 +293,90 @@ def test_settings_page_hides_autoswitch_policy_when_disabled():
     assert ids_on.index("strategy") < ids_on.index("strategy_hint")
     assert ids_on.index("strategy_hint") < ids_on.index("kickoff_enabled")
     assert "strategy_hint" not in ids_off
+    assert "codex_enabled" not in ids_off
+    assert "codex_enabled" not in ids_on
+
+
+def test_settings_page_shows_codex_enabled_when_auto_on_and_has_codex():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=True),
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        codex_enabled=True,
+    )
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["codex_enabled"]["kind"] == "toggle"
+    assert by_id["codex_enabled"]["label"] == "Auto-switch Codex accounts"
+    assert by_id["codex_enabled"]["value"] is True
+    ids = [row["id"] for row in rows]
+    assert ids.index("auto_switch_enabled") < ids.index("codex_enabled")
+    assert ids.index("strategy_hint") < ids.index("codex_enabled")
+    assert ids.index("codex_enabled") < ids.index("kickoff_enabled")
+
+    off_value = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=True),
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        codex_enabled=False,
+    )
+    assert {row["id"]: row for row in off_value}["codex_enabled"]["value"] is False
+
+
+def test_settings_page_hides_codex_enabled_when_auto_off():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=False),
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        codex_enabled=True,
+    )
+    ids = [row["id"] for row in rows]
+    assert "auto_switch_enabled" in ids
+    assert "codex_enabled" not in ids
+
+
+def test_settings_page_hides_codex_enabled_without_codex():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=True),
+        strategy="best",
+        threshold=90,
+    )
+    assert "codex_enabled" not in [row["id"] for row in rows]
+
+
+def test_on_setting_handles_codex_enabled():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    body = text[text.index("def _on_setting") : text.index("def _popup_overflow")]
+    assert 'row_id == "codex_enabled"' in body
+    assert "autoswitch.codexEnabled" in body
+    assert "set_setting" in body
+    assert "_codex_engine" in body
+    assert "_ensure_codex_engine" in body
+    assert "_stop_engine" not in body
+
+
+def test_ensure_codex_engine_honors_codex_enabled():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[src.index("def _ensure_codex_engine") : src.index("def _start_engine")]
+    assert "codex_enabled" in body
+    assert "load_settings" in body
+
+
+def test_panel_settings_pass_has_codex_and_codex_enabled():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    attach = text[text.index("def _attach_panel_once") : text.index("def _on_setting")]
+    assert "has_codex" in attach
+    assert "codex_enabled" in attach
+    panel = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
+        encoding="utf-8"
+    )
+    build = panel[panel.index("def _build_settings") :]
+    assert "has_codex" in build
+    assert "codex_enabled" in build
+    assert "settings_page_rows" in build
 
 
 def test_settings_page_hides_kickoff_time_when_disabled():
@@ -2000,6 +2084,59 @@ def test_codex_restart_hint():
     assert menubar.codex_restart_hint() == "Restart Codex to apply."
 
 
+def test_format_codex_running_line_empty_is_none():
+    assert menubar.format_codex_running_line([]) is None
+    assert menubar.format_codex_running_line(None) is None
+
+
+def test_format_codex_running_line_one_without_cwd():
+    proc = SimpleNamespace(pid=424242, cwd="", kind="tui")
+    line = menubar.format_codex_running_line([proc])
+    assert line == "Codex is running."
+    assert "424242" not in line
+    assert "pid" not in line.lower()
+
+
+def test_format_codex_running_line_one_with_cwd():
+    proc = SimpleNamespace(pid=424242, cwd="/Users/x/proj", kind="tui")
+    line = menubar.format_codex_running_line([proc])
+    assert line == "Codex is running in x/proj."
+    assert "424242" not in line
+    assert "pid" not in line.lower()
+
+
+def test_format_codex_running_line_multiple_sessions():
+    procs = [
+        SimpleNamespace(pid=11111, cwd="/a/one", kind="tui"),
+        SimpleNamespace(pid=22222, cwd="/b/two", kind="tui"),
+    ]
+    line = menubar.format_codex_running_line(procs)
+    assert line == "Codex is running (2 sessions)."
+    assert "11111" not in line
+    assert "22222" not in line
+
+
+def test_switch_codex_restart_hint():
+    assert menubar.switch_codex_restart_hint(True) == "Restart Codex to apply."
+    assert menubar.switch_codex_restart_hint(False) == ""
+    assert menubar.codex_restart_hint() == menubar.switch_codex_restart_hint(True)
+
+
+def test_manual_switch_omits_restart_codex_when_not_running():
+    off = menubar.notification_copy_for_manual_switch(
+        "work", running=False, provider="codex"
+    )
+    assert "Restart Codex" not in off.body
+    assert "Claude Code" not in off.body
+    on = menubar.notification_copy_for_manual_switch(
+        "work", running=True, provider="codex"
+    )
+    assert on.body == "Restart Codex to apply."
+    assert "Claude Code" not in on.body
+    default = menubar.notification_copy_for_manual_switch("work", provider="codex")
+    assert "Restart Codex to apply." in default.body
+
+
 def test_hold_cache_ignores_codex_events():
     held = NoSwitchEvent(reason="cooldown")
     codex_sw = SwitchEvent(
@@ -2020,6 +2157,41 @@ def test_codex_switch_event_toast_says_restart_codex():
     assert copy is not None
     assert copy.title == "Switched to b"
     assert "Restart Codex to apply." in copy.body
+    assert "Claude Code" not in copy.body
+
+
+def test_codex_switch_event_respects_running():
+    ev = SwitchEvent(
+        trigger="proactive",
+        from_ref={"number": 1, "email": "a@x.com"},
+        to_ref={"number": 2, "email": "b@x.com"},
+        provider="codex",
+    )
+    off = menubar.notification_copy_for_event(ev, running=False)
+    assert off is not None
+    assert "Restart Codex" not in off.body
+    assert "Claude Code" not in off.body
+    on = menubar.notification_copy_for_event(ev, running=True)
+    assert "Restart Codex to apply." in on.body
+    assert "Claude Code" not in on.body
+    default = menubar.notification_copy_for_event(ev)
+    assert "Restart Codex to apply." in default.body
+    assert "Claude Code" not in default.body
+
+
+def test_codex_quarantine_toast_says_sign_in_with_codex():
+    ev = QuarantineEvent(
+        number="1",
+        email="a@x.com",
+        reason="invalid_grant",
+        provider="codex",
+    )
+    copy = menubar.notification_copy_for_event(ev)
+    assert copy is not None
+    assert (
+        "Sign in with this account in Codex, then click it in the extra."
+        in copy.body
+    )
     assert "Claude Code" not in copy.body
 
 
@@ -2084,6 +2256,41 @@ def test_codex_snapshot_retries_codex_autoswitch_start():
     start = src.index("def _worker")
     end = src.index("def _log_usage")
     assert "_ensure_codex_engine" in src[start:end]
+
+
+def test_worker_scans_codex_running_and_keeps_hint_on_error():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[src.index("def _worker") : src.index("def _log_usage")]
+    assert "get_running_codex_instances" in body
+    assert 'snap["codex_running"] = True' in body
+    assert "codex_running_line" in body
+    assert "format_codex_running_line" in body
+
+
+def test_notify_switched_gates_codex_restart_on_running():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[src.index("def _notify_switched") : src.index("def _switch_from_widget")]
+    assert "codex_running" in body
+    assert "provider=\"codex\"" in body or "provider=provider" in body
+
+
+def test_drain_engine_events_uses_codex_running():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[
+        src.index("def _drain_engine_events") : src.index("def _threshold")
+    ]
+    assert "codex_running" in body
+
+
+def test_panel_draws_codex_running_line():
+    text = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
+        encoding="utf-8"
+    )
+    assert "codex_running_line" in text
+    assert "RUNNING_LINE_H" in text
 
 
 # --- confirm before switching -----------------------------------------------

@@ -21,7 +21,8 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 005  | Widget tap-to-switch and accessory families | P2 | M | 001 | DONE |
 | 007  | Spike: single notarized OpenSwap.app (PyInstaller + WidgetKit) | P1 | M | — | IN PROGRESS |
 | 008  | Ship the single app: cask, install/upgrade rewiring, release CI | P1 | L | 007 verdict | NOT WRITTEN |
-| 009  | Codex CLI accounts: provider seam, CodexEngine, CLI, auto, kickoff, extra, widget | P2 | L | — | TODO |
+| 009  | Codex CLI accounts: provider seam, CodexEngine, CLI, auto, kickoff, extra, widget | P2 | L | — | DONE |
+| 010  | Codex parity follow-ups (badge, knob, transfer, swap, sessions) | P2 | L | 009 | IN PROGRESS |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED
 

@@ -64,10 +64,15 @@ The `cswap` command still works as an alias during the rename.
 | `openswap codex list` | Codex accounts with 5h / 7d usage |
 | `openswap codex switch` | Rotate or jump to a Codex slot |
 | `openswap codex remove` | Remove a stored Codex account |
-| `openswap config` | Shared settings (`autoswitch.*`) |
+| `openswap codex export` | Export Codex auth.json envelopes |
+| `openswap codex import` | Import Codex auth.json envelopes |
+| `openswap codex swap` | Exchange two Codex slot numbers |
+| `openswap codex move` | Assign a Codex account to a slot |
+| `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |
 | `openswap upgrade` | Pull the checkout and reinstall |
 | `openswap statusline --install` | Opt-in: wrap Claude Code status line |
+| `openswap statusline --codex` | Paint the live Codex account label (no config.toml wrap) |
 
 `openswap help` lists everything. [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).

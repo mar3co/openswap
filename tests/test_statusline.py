@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from openswap import statusline as sl
 from openswap.exceptions import ConfigError
 from openswap.models import Platform
+from tests.test_codex_auth import _auth
 
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
 
@@ -31,7 +34,44 @@ def _env(home: Path) -> dict[str, str]:
     env["PYTHONPATH"] = _SRC_DIR + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("CLAUDE_CONFIG_DIR", None)
     env.pop("XDG_DATA_HOME", None)
+    env.pop("CODEX_HOME", None)
     return env
+
+
+def _write_codex_live(home: Path, *, email: str, account_id: str) -> Path:
+    codex = home / ".codex"
+    codex.mkdir(exist_ok=True)
+    path = codex / "auth.json"
+    path.write_text(_auth(email=email, account_id=account_id), encoding="utf-8")
+    return path
+
+
+def _write_codex_roster(
+    home: Path,
+    *,
+    email: str,
+    account_id: str,
+    alias: str = "",
+    plan_type: str = "plus",
+) -> Path:
+    sequence = _backup_root(home) / "codex" / "sequence.json"
+    sequence.parent.mkdir(parents=True, exist_ok=True)
+    sequence.write_text(
+        json.dumps(
+            {
+                "accounts": {
+                    "1": {
+                        "email": email,
+                        "accountId": account_id,
+                        "planType": plan_type,
+                        "alias": alias,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return sequence
 
 
 class TestAppendLabel:
@@ -496,3 +536,200 @@ class TestCLI:
         )
         assert result.returncode == 0
         assert result.stdout == "home\n"
+
+
+class TestCodexAccountLabel:
+    def test_live_auth_and_roster_alias(self, temp_home: Path):
+        auth = _write_codex_live(temp_home, email="user@example.com", account_id="acc-a")
+        sequence = _write_codex_roster(
+            temp_home,
+            email="user@example.com",
+            account_id="acc-a",
+            alias="work",
+        )
+        assert sl.current_codex_account_label(auth, sequence) == "work"
+
+    def test_unmanaged_uses_email_local_part(self, temp_home: Path):
+        auth = _write_codex_live(temp_home, email="user@example.com", account_id="acc-live")
+        sequence = _write_codex_roster(
+            temp_home,
+            email="other@example.com",
+            account_id="acc-other",
+            alias="work",
+        )
+        assert sl.current_codex_account_label(auth, sequence) == "user"
+
+    def test_plan_type_when_no_alias(self, temp_home: Path):
+        auth = _write_codex_live(temp_home, email="user@example.com", account_id="acc-a")
+        sequence = _write_codex_roster(
+            temp_home,
+            email="user@example.com",
+            account_id="acc-a",
+            alias="",
+            plan_type="plus",
+        )
+        assert sl.current_codex_account_label(auth, sequence) == "plus"
+
+    def test_missing_files_are_empty(self, temp_home: Path):
+        assert sl.current_codex_account_label(
+            temp_home / ".codex" / "auth.json",
+            _backup_root(temp_home) / "codex" / "sequence.json",
+        ) == ""
+
+    @staticmethod
+    def _write_api_key_roster(home: Path) -> Path:
+        sequence = _backup_root(home) / "codex" / "sequence.json"
+        sequence.parent.mkdir(parents=True, exist_ok=True)
+        sequence.write_text(
+            json.dumps(
+                {
+                    "accounts": {
+                        "1": {
+                            "email": "",
+                            "accountId": "",
+                            "planType": "",
+                            "kind": "api_key",
+                            "alias": "first",
+                        },
+                        "2": {
+                            "email": "",
+                            "accountId": "",
+                            "planType": "",
+                            "kind": "api_key",
+                            "alias": "second",
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return sequence
+
+    @staticmethod
+    def _write_slot_auth(sequence: Path, num: str, text: str) -> None:
+        slot = sequence.parent / "slots" / num
+        slot.mkdir(parents=True, exist_ok=True)
+        (slot / "auth.json").write_text(text, encoding="utf-8")
+
+    def test_api_key_matches_second_slot_by_actual_key(self, temp_home: Path):
+        auth = temp_home / ".codex" / "auth.json"
+        auth.parent.mkdir()
+        auth.write_text(
+            json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-second"}),
+            encoding="utf-8",
+        )
+        sequence = self._write_api_key_roster(temp_home)
+        self._write_slot_auth(
+            sequence, "1", json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-first"})
+        )
+        self._write_slot_auth(
+            sequence, "2", json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-second"})
+        )
+
+        assert sl.current_codex_account_label(auth, sequence) == "second"
+
+    def test_unmanaged_api_key_has_no_label(self, temp_home: Path):
+        auth = temp_home / ".codex" / "auth.json"
+        auth.parent.mkdir()
+        auth.write_text(
+            json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-unmanaged"}),
+            encoding="utf-8",
+        )
+        sequence = self._write_api_key_roster(temp_home)
+        self._write_slot_auth(
+            sequence, "1", json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-first"})
+        )
+
+        assert sl.current_codex_account_label(auth, sequence) == ""
+
+    def test_api_key_match_ignores_json_formatting(self, temp_home: Path):
+        auth = temp_home / ".codex" / "auth.json"
+        auth.parent.mkdir()
+        auth.write_text(
+            '{\n  "OPENAI_API_KEY": "sk-second",\n  "auth_mode": "apiKey"\n}\n',
+            encoding="utf-8",
+        )
+        sequence = self._write_api_key_roster(temp_home)
+        self._write_slot_auth(
+            sequence, "2", '{"auth_mode":"apiKey","OPENAI_API_KEY":"sk-second"}'
+        )
+
+        assert sl.current_codex_account_label(auth, sequence) == "second"
+
+    def test_api_key_missing_slot_file_does_not_match(self, temp_home: Path):
+        auth = temp_home / ".codex" / "auth.json"
+        auth.parent.mkdir()
+        auth.write_text(
+            json.dumps({"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-first"}),
+            encoding="utf-8",
+        )
+        sequence = self._write_api_key_roster(temp_home)
+
+        assert sl.current_codex_account_label(auth, sequence) == ""
+
+
+class TestCodexCLI:
+    def test_live_auth_and_roster_alias_prints_alias(self, temp_home: Path):
+        _write_codex_live(temp_home, email="user@example.com", account_id="acc-a")
+        _write_codex_roster(
+            temp_home,
+            email="user@example.com",
+            account_id="acc-a",
+            alias="work",
+        )
+        result = subprocess.run(
+            [sys.executable, "-m", "openswap", "statusline", "--codex"],
+            capture_output=True,
+            text=True,
+            env=_env(temp_home),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "work\n"
+
+    def test_unmanaged_prints_email_local_part(self, temp_home: Path):
+        _write_codex_live(temp_home, email="user@example.com", account_id="acc-live")
+        result = subprocess.run(
+            [sys.executable, "-m", "openswap", "statusline", "--codex"],
+            capture_output=True,
+            text=True,
+            env=_env(temp_home),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "user\n"
+
+    def test_codex_does_not_construct_engine(self, temp_home: Path, monkeypatch, capsys):
+        _write_codex_live(temp_home, email="user@example.com", account_id="acc-a")
+        _write_codex_roster(
+            temp_home,
+            email="user@example.com",
+            account_id="acc-a",
+            alias="work",
+        )
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        from openswap.cli import _statusline_command
+
+        with (
+            patch("openswap.cli.ClaudeAccountSwitcher") as claude_cls,
+            patch("openswap.cli.Engine") as engine_cls,
+            patch("openswap.codex.engine.CodexEngine") as codex_cls,
+        ):
+            assert _statusline_command(["--codex"]) == 0
+            claude_cls.assert_not_called()
+            engine_cls.assert_not_called()
+            codex_cls.assert_not_called()
+        assert capsys.readouterr().out == "work\n"
+
+    def test_install_help_mentions_claude_settings_not_config_toml(self, temp_home: Path):
+        result = subprocess.run(
+            [sys.executable, "-m", "openswap", "statusline", "--help"],
+            capture_output=True,
+            text=True,
+            env=_env(temp_home),
+        )
+        assert result.returncode == 0
+        help_text = result.stdout
+        assert "--install" in help_text
+        assert "Claude" in help_text
+        assert "settings.json" in help_text
+        assert "config.toml" not in help_text.lower()
+        assert "--codex" in help_text

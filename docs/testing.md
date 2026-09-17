@@ -18,6 +18,8 @@ The suite describes the product we ship: engine, extra, widget, kickoff, and adv
 | `tests/test_widget_install.py` | No (paths, team parsing, plist). |
 | `tests/test_autoswitch.py` | No. |
 | `tests/test_codex_*.py` | No. |
+| `tests/test_process_detection.py` | No. |
+| `tests/test_statusline.py` | No. |
 
 Live AppKit probes (status item padding, appearance) are one-off scripts, not CI.
 

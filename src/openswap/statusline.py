@@ -2,6 +2,9 @@
 
 Paint is store-only (live ``~/.claude.json`` + roster). It does not construct
 the engine, hit the network, or write the default Claude login.
+
+``--codex`` is paint-only: live ``auth.json`` + ``codex/sequence.json``. Codex
+TUI has no command hook, so this module never writes ``config.toml``.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from openswap.codex.auth import parse_auth
 from openswap.exceptions import ConfigError
 from openswap.fsutil import replace_with_retry
 from openswap.settings import SETTINGS_SCHEMA_VERSION, atomic_write_json, settings_path
@@ -143,6 +147,77 @@ def current_account_label(config_path: Path, sequence_path: Path) -> str:
     return account_label(email, managed=False)
 
 
+def current_codex_account_label(auth_file: Path, sequence_path: Path) -> str:
+    """Live Codex ``auth.json`` identity matched against ``codex/sequence.json``.
+
+    OAuth matches by email + accountId. API-key logins match the actual key in
+    each stored slot auth file, since their parsed email and accountId are both
+    empty. Label rule is ``account_label``: alias, else planType, else personal
+    when managed; unmanaged OAuth uses the email local-part.
+    """
+    try:
+        text = auth_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    ident = parse_auth(text)
+    if ident is None:
+        return ""
+    email = ident.email or ""
+    account_id = ident.account_id or ""
+    accounts = _read_json(sequence_path).get("accounts") or {}
+    if not isinstance(accounts, dict):
+        return account_label(email, managed=False)
+    if ident.kind == "api_key":
+        live_key = _codex_api_key(text)
+        if not live_key:
+            return ""
+        slots_dir = sequence_path.parent / "slots"
+        for num, rec in accounts.items():
+            if not isinstance(rec, dict) or rec.get("kind") != "api_key":
+                continue
+            try:
+                stored_text = (slots_dir / str(num) / "auth.json").read_text(
+                    encoding="utf-8"
+                )
+            except (OSError, UnicodeDecodeError):
+                continue
+            if _codex_api_key(stored_text) != live_key:
+                continue
+            return account_label(
+                rec.get("email") or "",
+                alias=rec.get("alias") or "",
+                org_name=rec.get("planType") or "",
+                managed=True,
+            )
+        return ""
+    for rec in accounts.values():
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("email") or "") != email:
+            continue
+        if (rec.get("accountId") or "") != account_id:
+            continue
+        return account_label(
+            email,
+            alias=rec.get("alias") or "",
+            org_name=rec.get("planType") or "",
+            managed=True,
+        )
+    return account_label(email, managed=False)
+
+
+def _codex_api_key(text: str) -> str:
+    """Return the API key represented by a Codex auth document, if any."""
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    key = data.get("OPENAI_API_KEY")
+    return key if isinstance(key, str) and key else ""
+
+
 def _cwd_from_stdin(stdin: str) -> str | None:
     try:
         data = json.loads(stdin) if stdin else {}
@@ -192,6 +267,17 @@ def paint(
     if out and not out.endswith("\n"):
         out += "\n"
     return out
+
+
+def paint_codex(*, auth_file: Path, sequence_path: Path) -> str:
+    """Print the live Codex account label. No inner command, no Engine."""
+    try:
+        label = current_codex_account_label(auth_file, sequence_path)
+    except Exception:
+        label = ""
+    if label and not label.endswith("\n"):
+        label += "\n"
+    return label
 
 
 def load_wrap(backup_root: Path) -> dict:

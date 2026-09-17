@@ -346,7 +346,7 @@ Examples:
 
 
 def _codex_command(argv: list[str]) -> int:
-    """Handle ``openswap codex add|list|switch|remove|disable|enable|alias``."""
+    """Handle ``openswap codex add|list|switch|remove|disable|enable|alias|export|import|swap|move``."""
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} codex",
         description="Manage Codex CLI accounts as a second provider beside Claude.",
@@ -383,6 +383,30 @@ def _codex_command(argv: list[str]) -> int:
     al.add_argument("target", metavar="NUM|EMAIL|ALIAS")
     al.add_argument("name", nargs="?", metavar="NAME")
     al.add_argument("--unset", action="store_true", help="Remove the alias")
+
+    ex = sub.add_parser("export", help="Export Codex accounts to a JSON envelope")
+    ex.add_argument("path", metavar="PATH", help="File path, or '-' for stdout")
+    ex.add_argument(
+        "--account",
+        metavar="NUM|EMAIL|ALIAS",
+        help="Limit export to one account",
+    )
+
+    im = sub.add_parser("import", help="Import Codex accounts from a JSON envelope")
+    im.add_argument("path", metavar="PATH", help="File path, or '-' for stdin")
+    im.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing matching slots",
+    )
+
+    swp = sub.add_parser("swap", help="Exchange two Codex accounts' slot numbers")
+    swp.add_argument("first", metavar="NUM|EMAIL|ALIAS")
+    swp.add_argument("second", metavar="NUM|EMAIL|ALIAS")
+
+    mv = sub.add_parser("move", help="Assign a Codex account to a slot number")
+    mv.add_argument("account", metavar="NUM|EMAIL|ALIAS")
+    mv.add_argument("slot", metavar="SLOT")
 
     args = parser.parse_args(argv)
     from openswap.codex.engine import CodexEngine
@@ -436,6 +460,28 @@ def _codex_command(argv: list[str]) -> int:
                     parser.error("NAME is required (or pass --unset)")
                 num, normalized = eng.set_alias(args.target, args.name)
                 print(f"Set alias '{normalized}' for Codex account {num}")
+            return 0
+        if args.verb == "export":
+            from openswap.codex.transfer import export_accounts
+            export_accounts(eng, args.path, account=args.account)
+            return 0
+        if args.verb == "import":
+            from openswap.codex.transfer import import_accounts
+            import_accounts(eng, args.path, force=args.force)
+            return 0
+        if args.verb == "swap":
+            num_a, num_b = eng.swap_accounts(args.first, args.second)
+            print(f"{accent('Swapped')} Codex accounts {num_a} and {num_b}")
+            return 0
+        if args.verb == "move":
+            num_src, num_target, swapped = eng.move_account(args.account, args.slot)
+            if num_src == num_target:
+                print(f"{dimmed('Already in')} slot {num_target}")
+            elif swapped:
+                print(f"{accent('Swapped')} Codex accounts {num_src} and {num_target}")
+            else:
+                email = eng.account_email(num_target)
+                print(f"{accent('Moved')} {email} to slot {num_target}")
             return 0
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
@@ -602,7 +648,7 @@ Codex rotation runs alongside; its outcome is logged, not returned.
 
         codex = CodexEngine(debug=args.debug)
         codex_engine = None
-        if codex.switchable_account_numbers():
+        if settings.codex_enabled and codex.switchable_account_numbers():
             codex_engine = AutoSwitchEngine(
                 codex, settings, _prefixed(emit, "codex"), dry_run=args.dry_run,
                 state_path=codex.state_dir / "autoswitch_state.json",
@@ -1000,12 +1046,16 @@ def _statusline_command(argv: list[str]) -> int:
 
     Pre-dispatched so paint never constructs the engine. Always exit 0 on
     paint: a crashed status line is worse than a missing name.
+
+    ``--codex`` is paint-only (live auth.json + codex/sequence.json). Codex
+    TUI has no command hook; this path never writes config.toml.
     """
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} statusline",
         description=(
             "Opt-in Claude Code status line. Wraps your existing status line "
-            "and appends the OpenSwap account name next to the percentages."
+            "and appends the OpenSwap account name next to the percentages. "
+            "With --codex, prints the live Codex account label (paint-only)."
         ),
     )
     group = parser.add_mutually_exclusive_group()
@@ -1018,6 +1068,11 @@ def _statusline_command(argv: list[str]) -> int:
         "--uninstall",
         action="store_true",
         help="Restore the previous statusLine, or remove one we created",
+    )
+    group.add_argument(
+        "--codex",
+        action="store_true",
+        help="Print the live Codex account label (paint-only; Codex TUI has no command hook)",
     )
     args = parser.parse_args(argv)
 
@@ -1064,6 +1119,20 @@ def _statusline_command(argv: list[str]) -> int:
             print("Claude Code status line restored.")
         else:
             print("OpenSwap was not wrapping the Claude Code status line.")
+        return 0
+
+    if args.codex:
+        try:
+            from openswap.codex.auth import auth_path, codex_home
+
+            sys.stdout.write(
+                sl.paint_codex(
+                    auth_file=auth_path(codex_home()),
+                    sequence_path=backup / "codex" / "sequence.json",
+                )
+            )
+        except Exception:
+            pass
         return 0
 
     try:
@@ -1219,7 +1288,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
-  %(prog)s codex add|list|switch|remove  Codex CLI accounts (second provider)
+  %(prog)s codex add|list|switch|remove|export|import|swap|move  Codex CLI accounts
   %(prog)s config [set KEY VALUE]     show or change shared policy (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
