@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from openswap.codex.desktop_app import DesktopApp, DesktopAppError
+from openswap.codex.desktop_app import DesktopApp, DesktopAppError, _argv0
 from openswap.exceptions import ClaudeSwitchError
 
 
@@ -45,6 +45,11 @@ def _ps(stdout: str):
 
 def test_error_is_a_handled_openswap_error():
     assert issubclass(DesktopAppError, ClaudeSwitchError)
+
+
+def test_argv0_preserves_quoted_windows_paths():
+    executable = r"C:\Program Files\ChatGPT\codex-code-mode-host"
+    assert _argv0(f'"{executable}" --flag') == executable
 
 
 def test_preflight_returns_only_sanitized_metadata(desktop, tmp_path, monkeypatch):

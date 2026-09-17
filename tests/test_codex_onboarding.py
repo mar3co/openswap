@@ -135,7 +135,7 @@ def test_session_keeps_url_private_sanitizes_environment_and_saves(tmp_path, mon
         made.append(proc)
         return proc
 
-    session = LoginSession(engine, codex_bin="/bin/echo", popen=popen)
+    session = LoginSession(engine, codex_bin=sys.executable, popen=popen)
     session.run()
 
     public = session.state()
@@ -180,7 +180,7 @@ def test_cancelled_session_has_no_secret_and_removes_temp_home(tmp_path, monkeyp
 
     # Avoid signalling the synthetic PID while still exercising ownership and cleanup.
     monkeypatch.setattr(LoginSession, "_terminate", lambda _self, proc: setattr(proc, "returncode", -15))
-    session = LoginSession(engine, codex_bin="/bin/echo", popen=popen, timeout=10)
+    session = LoginSession(engine, codex_bin=sys.executable, popen=popen, timeout=10)
     thread = threading.Thread(target=session.run)
     thread.start()
     deadline = time.time() + 2

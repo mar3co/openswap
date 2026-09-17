@@ -103,11 +103,15 @@ def _processes() -> list[_Process]:
 
 
 def _argv0(args: str) -> str:
+    # POSIX shlex treats backslashes in drive-letter paths as escapes. Preserve
+    # them when process snapshots are analyzed by cross-platform tooling.
+    probe = args.lstrip().lstrip('"')
+    windows_path = len(probe) >= 3 and probe[1] == ":" and probe[2] in {"\\", "/"}
     try:
-        parts = shlex.split(args, posix=True)
+        parts = shlex.split(args, posix=not windows_path)
     except ValueError:
         return ""
-    return parts[0] if parts else ""
+    return parts[0].strip('"') if parts else ""
 
 
 def _descendants(rows: list[_Process], roots: set[int]) -> set[int]:
