@@ -1293,12 +1293,6 @@ def provider_cards(cards: list[dict], provider: str) -> list[dict]:
     return result
 
 
-def provider_empty_copy(provider: str) -> str:
-    if provider == "chatgpt":
-        return "No shared ChatGPT / Codex accounts"
-    return "No managed Claude accounts"
-
-
 def provider_empty_state(provider: str, state: str = "ready") -> dict:
     """Actionable empty copy; never mistake a failed read for an empty roster."""
     name = "ChatGPT" if provider == "chatgpt" else "Claude"
@@ -1400,10 +1394,6 @@ def login_panel_state(state: dict | None) -> dict:
     elif stage == "cancelling":
         result.update(title="Cancelling sign-in…", body="", actions=[])
     return result
-
-
-# Descriptive alias for callers that prefer the model's role to its layout.
-login_state_panel = login_panel_state
 
 
 def hold_event_update(current, event):

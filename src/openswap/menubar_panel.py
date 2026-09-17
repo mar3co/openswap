@@ -339,6 +339,14 @@ def _label(text, font, color, frame, align="left"):
     return field
 
 
+def _wrap(label):
+    cell = label.cell()
+    cell.setUsesSingleLineMode_(False)
+    cell.setScrollable_(False)
+    cell.setWraps_(True)
+    cell.setLineBreakMode_(NSLineBreakByWordWrapping)
+
+
 class _PopupButton(NSPopUpButton):
     """Time popup whose menu keeps the popover from auto-closing."""
 
@@ -1299,10 +1307,7 @@ class MenuBarPanel:
                     NSMakeRect(PAD + 12, body_y, inner_w - 24, body_height),
                     align="center" if branded_login else "left",
                 )
-                label.cell().setUsesSingleLineMode_(False)
-                label.cell().setScrollable_(False)
-                label.cell().setWraps_(True)
-                label.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
+                _wrap(label)
                 root.addSubview_(label)
             row_y = body_y + body_height if body else (y + 104 if branded_login else y + 48)
             if login_model.get("email"):
@@ -1362,10 +1367,7 @@ class MenuBarPanel:
             for text, offset, h, font in ((empty["body"], 42, 54, font_body),
                                           (empty["hint"], 144, 32, font_small)):
                 label = _label(text, font, pal["muted"], NSMakeRect(PAD + 12, y + offset, inner_w - 24, h))
-                label.cell().setUsesSingleLineMode_(False)
-                label.cell().setScrollable_(False)
-                label.cell().setWraps_(True)
-                label.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
+                _wrap(label)
                 root.addSubview_(label)
             if empty["action"]:
                 button = self._add_button(
@@ -1526,6 +1528,7 @@ class MenuBarPanel:
         hairline.setFrame_(NSMakeRect(PAD, fy, inner_w, 1))
         root.addSubview_(hairline)
 
+        settings_x = PAD
         if provider == "claude" and cards:
             self._add_button(
                 root, "Rotate", NSMakeRect(PAD, fy + 8, 62, 22), self._on_rotate, font_small
@@ -1533,17 +1536,21 @@ class MenuBarPanel:
             self._add_button(
                 root, "Best", NSMakeRect(PAD + 70, fy + 8, 54, 22), self._on_best, font_small
             )
+            settings_x = PAD + 134
         else:
             if desktop_status:
                 root.addSubview_(_label(desktop_status, font_small, pal["muted"], NSMakeRect(PAD, fy - running_h - RUNNING_LINE_H, inner_w, RUNNING_LINE_H)))
             if provider == "chatgpt" and cards:
                 add = self._add_button(root, "Add account", NSMakeRect(PAD, fy + 8, 90, 22), lambda _s: self._login_action("start"), font_small)
                 add.setEnabled_(self._on_login_action is not None)
-                if self._on_review_chatgpt_switch is not None and self._chatgpt_switch_pending():
-                    self._add_button(root, "Review switch", NSMakeRect(PAD + 96, fy + 8, 100, 22), self._on_review_chatgpt_switch, font_small)
+                settings_x = PAD + 96
+                if self._chatgpt_switch_pending():
+                    settings_x = PAD + 202
+                    if self._on_review_chatgpt_switch is not None:
+                        self._add_button(root, "Review switch", NSMakeRect(PAD + 96, fy + 8, 100, 22), self._on_review_chatgpt_switch, font_small)
         self._add_button(
             root, "Settings",
-            NSMakeRect(PAD + (134 if provider == "claude" and cards else (202 if provider == "chatgpt" and cards and self._chatgpt_switch_pending() else (96 if provider == "chatgpt" and cards else 0))), fy + 8, 72, 22),
+            NSMakeRect(settings_x, fy + 8, 72, 22),
             self._show_settings,
             font_small,
         )
@@ -1674,10 +1681,7 @@ class MenuBarPanel:
                     NSMakeRect(PAD, y + (2 if is_hint else 4), inner_w, h - 4),
                 )
                 if is_hint:
-                    label.cell().setUsesSingleLineMode_(False)
-                    label.cell().setScrollable_(False)
-                    label.cell().setWraps_(True)
-                    label.cell().setLineBreakMode_(NSLineBreakByWordWrapping)
+                    _wrap(label)
                 root.addSubview_(label)
             elif kind == "toggle":
                 root.addSubview_(

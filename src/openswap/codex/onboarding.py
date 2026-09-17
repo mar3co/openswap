@@ -34,14 +34,6 @@ _DEVICE_RE = re.compile(
     re.IGNORECASE,
 )
 _OFFICIAL_HOSTS = {"auth.openai.com", "login.openai.com", "auth0.openai.com", "chatgpt.com"}
-_ENV_DENY = {
-    "OPENAI_API_KEY", "CODEX_API_KEY", "CHATGPT_API_KEY",
-    "OPENAI_ACCESS_TOKEN", "CODEX_ACCESS_TOKEN", "CHATGPT_ACCESS_TOKEN",
-    "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "CODEX_CLI_PATH", "CODEX_COMMAND",
-    "CODEX_EXECUTABLE", "CODEX_APP_SERVER_COMMAND", "CODEX_BASE_URL",
-    "OPENAI_BASE_URL", "OPENAI_API_BASE", "BROWSER", "CODEX_HOME",
-    "ELECTRON_RUN_AS_NODE", "CODEX_PROFILE", "CODEX_CONFIG", "CODEX_WORKSPACE",
-}
 _ENV_ALLOW = {
     "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
     "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -341,8 +333,8 @@ class LoginSession:
 
     @staticmethod
     def _environment(home: Path) -> dict[str, str]:
-        env = {key: value for key, value in os.environ.items()
-               if key in _ENV_ALLOW and key not in _ENV_DENY}
+        # Allowlist only: API keys, base URLs and CODEX_* overrides never reach the child.
+        env = {key: value for key, value in os.environ.items() if key in _ENV_ALLOW}
         env["CODEX_HOME"] = str(home)
         return env
 

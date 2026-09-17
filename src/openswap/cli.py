@@ -345,6 +345,24 @@ Examples:
         sys.exit(130)
 
 
+def _desktop_account_number(value: str) -> str:
+    if not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError("account NUMBER must be a positive integer")
+    return str(int(value))
+
+
+def _desktop_json_payload(
+    result: dict, keys: tuple[str, ...], ref_keys: tuple[str, ...]
+) -> dict:
+    """Copy only the allow-listed keys, reducing each account ref to its number."""
+    payload = {key: result[key] for key in keys if key in result}
+    for key in ref_keys:
+        ref = result.get(key)
+        if isinstance(ref, dict) and "number" in ref:
+            payload[key] = {"number": str(ref["number"])}
+    return payload
+
+
 def _codex_command(argv: list[str]) -> int:
     """Handle Codex account and experimental desktop commands."""
     parser = argparse.ArgumentParser(
@@ -422,20 +440,15 @@ def _codex_command(argv: list[str]) -> int:
     desktop_status = desktop_sub.add_parser(
         "status", help="Check whether a desktop switch is safe to attempt"
     )
-    def desktop_account_number(value: str) -> str:
-        if not value.isdigit() or int(value) < 1:
-            raise argparse.ArgumentTypeError("account NUMBER must be a positive integer")
-        return str(int(value))
-
     desktop_status.add_argument(
-        "target", type=desktop_account_number, metavar="NUMBER"
+        "target", type=_desktop_account_number, metavar="NUMBER"
     )
     desktop_status.add_argument("--json", action="store_true", help="Emit JSON")
     desktop_switch = desktop_sub.add_parser(
         "switch", help="Quit ChatGPT, switch shared auth, and relaunch"
     )
     desktop_switch.add_argument(
-        "target", type=desktop_account_number, metavar="NUMBER"
+        "target", type=_desktop_account_number, metavar="NUMBER"
     )
     desktop_switch.add_argument(
         "--confirm-restart",
@@ -557,15 +570,11 @@ def _codex_command(argv: list[str]) -> int:
             if args.desktop_verb == "recovery-status":
                 result = desktop_switcher.recovery_status()
                 if args.json:
-                    payload = {
-                        key: result[key]
-                        for key in ("status", "pending", "experimental", "warning")
-                        if key in result
-                    }
-                    for key in ("from", "to"):
-                        ref = result.get(key)
-                        if isinstance(ref, dict) and "number" in ref:
-                            payload[key] = {"number": str(ref["number"])}
+                    payload = _desktop_json_payload(
+                        result,
+                        ("status", "pending", "experimental", "warning"),
+                        ("from", "to"),
+                    )
                     print(json.dumps(payload, indent=2))
                 else:
                     state = result.get("status") or (
@@ -583,16 +592,11 @@ def _codex_command(argv: list[str]) -> int:
                     confirm_idle=args.confirm_idle,
                 )
                 if args.json:
-                    payload = {
-                        key: result[key]
-                        for key in (
-                            "status", "experimental", "app", "warning"
-                        )
-                        if key in result
-                    }
-                    restored = result.get("restored")
-                    if isinstance(restored, dict) and "number" in restored:
-                        payload["restored"] = {"number": str(restored["number"])}
+                    payload = _desktop_json_payload(
+                        result,
+                        ("status", "experimental", "app", "warning"),
+                        ("restored",),
+                    )
                     print(json.dumps(payload, indent=2))
                 else:
                     state = result.get("status") or "unknown"

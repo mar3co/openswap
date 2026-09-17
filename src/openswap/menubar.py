@@ -37,14 +37,17 @@ def desktop_switch_choices(snapshot):
     from openswap.codex import split_provider_num
     from openswap.json_output import USAGE_API_KEY
 
+    kinds = snapshot.get("kinds") or {}
     choices = []
     for row in snapshot.get("accounts") or []:
         num, email, _active, display, _usage, alias, _org, disabled, _at = row
         provider, slot = split_provider_num(num)
-        is_api_key = display == USAGE_API_KEY or (snapshot.get("kinds") or {}).get(str(num)) == "api_key"
-        if provider == "codex" and not disabled and not is_api_key:
-            label = f"{slot}  {alias} ({email})" if alias else f"{slot}  {email}"
-            choices.append((slot, label))
+        if provider != "codex" or disabled:
+            continue
+        if display == USAGE_API_KEY or kinds.get(str(num)) == "api_key":
+            continue
+        label = f"{slot}  {alias} ({email})" if alias else f"{slot}  {email}"
+        choices.append((slot, label))
     return choices
 
 
@@ -191,8 +194,12 @@ def run(switcher, codex=None) -> int:
                 for row in self.snapshot.get("accounts", [])
             }
             next_states = {
-                provider: "loading" if state != "unavailable" and
-                (state == "error" or provider not in populated) else state
+                provider: (
+                    "loading"
+                    if state != "unavailable"
+                    and (state == "error" or provider not in populated)
+                    else state
+                )
                 for provider, state in self._account_states.items()
             }
             if next_states != self._account_states:
@@ -389,9 +396,7 @@ def run(switcher, codex=None) -> int:
 
         # ---- auto-switch engine ----------------------------------------------
         def _ensure_codex_engine(self):
-            if self._desktop_switching:
-                return
-            if self.settings.chatgpt_auto_enabled:
+            if self._desktop_switching or self.settings.chatgpt_auto_enabled:
                 return
             if self._codex_engine is not None or self._engine is None:
                 return
@@ -564,7 +569,7 @@ def run(switcher, codex=None) -> int:
                 self._start_chatgpt_auto_monitor()
 
         def _chatgpt_desktop_status(self):
-            if self._desktop_status.startswith(("Switch failed", "Verification needed", "Switching account")):
+            if self._desktop_status.startswith(("Switch failed", "Switching account")):
                 return self._desktop_status
             if self._chatgpt_monitor_notice:
                 return self._chatgpt_monitor_notice
@@ -639,10 +644,11 @@ def run(switcher, codex=None) -> int:
                     ok="Turn On", cancel="Cancel",
                 ) != 1:
                     return
-                if self._codex_enabled() and not self._guard(lambda: set_setting(
-                    self.switcher.backup_dir, "autoswitch.codexEnabled", "false"
-                )):
-                    return
+                if self._codex_enabled():
+                    if not self._guard(lambda: set_setting(
+                        self.switcher.backup_dir, "autoswitch.codexEnabled", "false"
+                    )):
+                        return
                 self._stop_codex_engine()
             self.settings.chatgpt_auto_enabled = enabling
             try:
@@ -954,7 +960,7 @@ def run(switcher, codex=None) -> int:
                 self._hold_reload_pending = True
                 self._start_chatgpt_auto_monitor()
             if result is not None and result[0] is self._login_session:
-                _session, number, error = result
+                _session, _number, error = result
                 if error:
                     self._login_ui_state = {"stage": "error", "message": error}
                 else:
