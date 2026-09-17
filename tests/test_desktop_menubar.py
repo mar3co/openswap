@@ -1,7 +1,5 @@
 """Exercise the native menu callbacks without importing AppKit or rumps."""
 
-import ast
-from pathlib import Path
 import threading
 import sys
 from types import SimpleNamespace
@@ -13,6 +11,7 @@ from openswap import menubar
 from openswap.codex import CODEX_NUM_PREFIX
 from openswap.exceptions import ClaudeSwitchError
 from openswap.json_output import USAGE_API_KEY
+from tests.menubar_harness import extract_class
 
 
 def _row(num, display=None, disabled=False):
@@ -66,12 +65,7 @@ def test_desktop_consent_explains_persistent_pause_only_when_needed():
 
 @pytest.fixture
 def app(monkeypatch):
-    tree = ast.parse(Path(menubar.__file__).read_text(encoding="utf-8"))
-    cls = next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "MenuBarApp")
     wanted = {"_make_desktop_switch", "_desktop_worker", "_drain_desktop_result", "_pause_codex_for_desktop", "_on_panel_account_click", "_notify"}
-    cls.bases = []
-    cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
-    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     thread = Mock()
     record = Mock()
     setting = Mock(return_value=None)
@@ -87,8 +81,7 @@ def app(monkeypatch):
         "record_manual_switch": record,
         "set_setting": setting,
     }
-    exec(compile(module, "<desktop-menu-test>", "exec"), namespace)
-    instance = namespace["MenuBarApp"]()
+    instance = extract_class(menubar.__file__, "MenuBarApp", wanted, namespace)()
     instance.codex = Mock()
     instance.switcher = Mock()
     instance._guard = lambda fn: (fn(), True)[1]

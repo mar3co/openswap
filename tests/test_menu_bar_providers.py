@@ -1,13 +1,12 @@
 """Provider selection and honest source labels for the native status title."""
 
-import ast
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from openswap import menubar
+from tests.menubar_harness import extract_class
 
 
 @pytest.fixture
@@ -108,22 +107,18 @@ def test_chatgpt_stale_weekly_usage_uses_its_own_fetch_clock(snapshot):
 
 
 def test_provider_setting_persists_and_rebuilds_without_switching_accounts(tmp_path):
-    tree = ast.parse(Path(menubar.__file__).read_text(encoding="utf-8"))
-    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "MenuBarApp")
-    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {"_on_setting", "_save_and_rebuild"}]
-    module = ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[]))
     scope = dict(vars(menubar))
     scope["settings_path"] = tmp_path / "menubar_settings.json"
-    exec(compile(module, "<menu-provider-setting>", "exec"), scope)
+    methods = extract_class(menubar.__file__, "MenuBarApp", {"_on_setting", "_save_and_rebuild"}, scope)
     app = SimpleNamespace(
         settings=menubar.MenuBarSettings(), _panel=None,
         rebuild_menu=Mock(),
     )
-    app._save_and_rebuild = lambda: scope["_save_and_rebuild"](app)
+    app._save_and_rebuild = lambda: methods._save_and_rebuild(app)
     # Exercise only the provider branch, with no switcher/auth APIs available.
-    scope["_on_setting"](app, "menu_bar_provider", "both")
+    methods._on_setting(app, "menu_bar_provider", "both")
     assert app.settings.menu_bar_provider == "both"
     app.rebuild_menu.assert_called_once()
     assert menubar.MenuBarSettings.load(scope["settings_path"]).menu_bar_provider == "both"
-    scope["_on_setting"](app, "menu_bar_provider", "bad-value")
+    methods._on_setting(app, "menu_bar_provider", "bad-value")
     assert app.settings.menu_bar_provider == "both"

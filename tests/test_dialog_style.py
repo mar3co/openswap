@@ -1,11 +1,15 @@
 """Native layout and interaction checks (requires the macOS menu bar extra)."""
 
+import os
 import sys
 
 import pytest
 
 if sys.platform != "darwin":
     pytest.skip("macOS dialogs", allow_module_level=True)
+# These open real windows: each xdist worker gets a Dock icon and steals focus.
+if os.environ.get("OPENSWAP_NATIVE_UI_TESTS") != "1":
+    pytest.skip("set OPENSWAP_NATIVE_UI_TESTS=1 to run native dialog tests", allow_module_level=True)
 AppKit = pytest.importorskip("AppKit")
 from Foundation import NSObject, NSRunLoop, NSTimer
 

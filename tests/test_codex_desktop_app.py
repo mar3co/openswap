@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from openswap.codex.desktop_app import DesktopApp, DesktopAppError, _argv0
+from openswap.codex.desktop_app import DesktopApp, DesktopAppError, _Process, _argv0
 from openswap.exceptions import ClaudeSwitchError
 
 
@@ -152,14 +152,13 @@ def test_signature_rejects_wrong_team(tmp_path, monkeypatch):
 def test_is_running_matches_exact_executable_not_name(desktop, monkeypatch):
     exe = desktop.app_path / "Contents/MacOS/ChatGPT"
     monkeypatch.setattr("openswap.codex.desktop_app._processes", lambda: [
-        __import__("openswap.codex.desktop_app", fromlist=["_Process"])._Process(2, 1, "/other/ChatGPT", "/other/ChatGPT"),
-        __import__("openswap.codex.desktop_app", fromlist=["_Process"])._Process(3, 1, str(exe), str(exe)),
+        _Process(2, 1, "/other/ChatGPT", "/other/ChatGPT"),
+        _Process(3, 1, str(exe), str(exe)),
     ])
     assert desktop.is_running()
 
 
 def test_assert_stopped_refuses_external_codex_without_exposing_args(desktop, monkeypatch):
-    from openswap.codex.desktop_app import _Process
     monkeypatch.setattr("openswap.codex.desktop_app._processes", lambda: [
         _Process(90, 1, "/usr/local/bin/codex", "codex --some-private-value secret")
     ])
@@ -169,7 +168,6 @@ def test_assert_stopped_refuses_external_codex_without_exposing_args(desktop, mo
 
 
 def test_assert_stopped_recognizes_only_known_helpers_inside_bundle(desktop, monkeypatch):
-    from openswap.codex.desktop_app import _Process
     inside = desktop.app_path / "Contents/Resources/codex-code-mode-host"
     monkeypatch.setattr("openswap.codex.desktop_app._processes", lambda: [
         _Process(91, 1, "codex-code-mode-host", str(inside)),
@@ -183,7 +181,6 @@ def test_assert_stopped_recognizes_only_known_helpers_inside_bundle(desktop, mon
 
 
 def test_quit_uses_graceful_request_and_waits_for_descendants(desktop, monkeypatch):
-    from openswap.codex.desktop_app import _Process
     exe = str(desktop.app_path / "Contents/MacOS/ChatGPT")
     snapshots = iter([
         [_Process(10, 1, exe, exe), _Process(11, 10, str(desktop._bundled_cli), str(desktop._bundled_cli))],
@@ -199,7 +196,6 @@ def test_quit_uses_graceful_request_and_waits_for_descendants(desktop, monkeypat
 
 
 def test_quit_timeout_never_force_kills(desktop, monkeypatch):
-    from openswap.codex.desktop_app import _Process
     exe = str(desktop.app_path / "Contents/MacOS/ChatGPT")
     monkeypatch.setattr("openswap.codex.desktop_app._processes", lambda: [_Process(10, 1, exe, exe)])
     monkeypatch.setattr(desktop, "_request_terminate", lambda _pids, _executable: None)

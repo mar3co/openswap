@@ -216,13 +216,15 @@ def test_device_output_strips_ansi_and_parses_one_time_code(tmp_path):
 
 
 def test_streaming_reader_surfaces_short_flushed_url_before_child_exits(tmp_path):
-    session = LoginSession(_engine(tmp_path), codex_bin="/bin/echo", timeout=5)
+    # The child and session outlive the generous poll deadline below (loaded CI
+    # runners start Python slowly); cancel() ends both at once when the URL shows.
+    session = LoginSession(_engine(tmp_path), codex_bin="/bin/echo", timeout=30)
     session._public = {"stage": "waiting", "has_url": False}
     proc = subprocess.Popen(
         [sys.executable, "-c", (
             "import sys,time; "
             "print('https://auth.openai.com/oauth/authorize?state=private', flush=True); "
-            "time.sleep(5)"
+            "time.sleep(30)"
         )],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -231,11 +233,13 @@ def test_streaming_reader_surfaces_short_flushed_url_before_child_exits(tmp_path
     session._process = proc
     thread = threading.Thread(target=session._wait, args=(proc,))
     thread.start()
-    deadline = time.time() + 2
+    deadline = time.time() + 10
     while not session.state()["has_url"] and time.time() < deadline:
         time.sleep(0.01)
-    assert session.state()["has_url"] is True
-    assert proc.poll() is None
-    session.cancel()
-    thread.join(timeout=2)
+    try:
+        assert session.state()["has_url"] is True
+        assert proc.poll() is None
+    finally:  # never leave the long-lived child behind, even on failure
+        session.cancel()
+        thread.join(timeout=10)
     assert not thread.is_alive()

@@ -1,21 +1,11 @@
 from __future__ import annotations
 
 import json
-import sys
 from unittest.mock import Mock
 
 import pytest
 
-from openswap.cli import main
-
-
-def run_cli(args: list[str]) -> int:
-    sys.argv = ["openswap", *args]
-    try:
-        main()
-    except SystemExit as exc:
-        return int(exc.code or 0)
-    return 0
+from tests.test_codex_cli import run_cli
 
 
 @pytest.fixture

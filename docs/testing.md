@@ -23,6 +23,8 @@ The suite describes the product we ship: engine, extra, widget, kickoff, and adv
 
 Live AppKit probes (status item padding, appearance) are one-off scripts, not CI.
 
+`tests/test_dialog_style.py` is the one exception: it opens real AppKit dialogs, so it is skipped unless `OPENSWAP_NATIVE_UI_TESTS=1` is set. Run it that way after touching `menubar_dialog.py`.
+
 ## Conventions already in the suite
 
 - Do not hit the real account store or Keychain. `conftest.py` isolates HOME / backup dirs.

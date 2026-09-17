@@ -1,9 +1,7 @@
 """Native app orchestration with authentication and UI boundaries stubbed."""
 
-import ast
 import sys
 import threading
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,21 +9,16 @@ import pytest
 
 from openswap import menubar
 from openswap.exceptions import ClaudeSwitchError
+from tests.menubar_harness import extract_class
 
 
 @pytest.fixture
 def app(monkeypatch):
-    tree = ast.parse(Path(menubar.__file__).read_text())
-    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "MenuBarApp")
     names = {"_on_login_action", "_login_run_worker", "_login_cancel_worker",
-             "_login_save_worker", "_poll_login", "_enable_codex_account"}
-    cls.bases = []
-    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
-    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
+             "_login_save_worker", "_poll_login"}
     thread = Mock()
     scope = {"threading": SimpleNamespace(Thread=thread), "ClaudeSwitchError": ClaudeSwitchError}
-    exec(compile(module, "<onboarding-menu>", "exec"), scope)
-    instance = scope["MenuBarApp"]()
+    instance = extract_class(menubar.__file__, "MenuBarApp", names, scope)()
     instance.codex = Mock()
     instance._desktop_switching = False
     instance._login_session = None

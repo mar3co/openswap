@@ -1,6 +1,5 @@
 """Exercise panel navigation without requiring AppKit on CI."""
 
-import ast
 from pathlib import Path
 import threading
 from unittest.mock import Mock
@@ -8,20 +7,14 @@ from unittest.mock import Mock
 import pytest
 
 from openswap import menubar
+from tests.menubar_harness import extract_class
 
 
 def _panel():
-    source = Path(menubar.__file__).with_name("menubar_panel.py").read_text()
-    tree = ast.parse(source)
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
-               and node.name == "MenuBarPanel")
     methods = {
         "__init__", "_select_provider", "_show_settings", "_show_main",
         "_select_settings_section", "close",
     }
-    cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef)
-                and node.name in methods]
-    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     namespace = {
         "MAIN_PAGE": "main",
         "SETTINGS_PAGE": "settings",
@@ -29,11 +22,13 @@ def _panel():
         "SETTINGS_SECTION_AUTOMATION": "automation",
         "SETTINGS_SECTIONS": (("general", "General"), ("automation", "Automation")),
     }
-    exec(compile(module, "<panel-navigation-test>", "exec"), namespace)
+    panel_type = extract_class(
+        Path(menubar.__file__).with_name("menubar_panel.py"), "MenuBarPanel", methods, namespace
+    )
     actions = {key: Mock() for key in (
         "on_switch", "on_rotate", "on_best", "on_toggle_auto", "on_more"
     )}
-    panel = namespace["MenuBarPanel"](
+    panel = panel_type(
         **actions, auto_enabled=lambda: False, snapshot=lambda: {}, threshold=lambda: 90
     )
     panel.is_shown = Mock(return_value=True)
@@ -156,14 +151,8 @@ def test_waiting_only_offers_available_login_actions():
 
 
 def test_empty_action_callback_routes_provider_without_switching():
-    tree = ast.parse(Path(menubar.__file__).read_text())
-    method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
-                  and node.name == "_on_empty_action")
-    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
-    scope = {}
-    exec(compile(module, "<empty-action-test>", "exec"), scope)
+    action = extract_class(menubar.__file__, "MenuBarApp", {"_on_empty_action"}, {})._on_empty_action
     app = Mock(_desktop_switching=False, _refreshing=False)
-    action = scope["_on_empty_action"]
     action(app, "claude", "add")
     app.on_add_login.assert_called_once_with(None)
     app.on_add_codex_login.assert_not_called()
@@ -182,17 +171,12 @@ def test_empty_action_callback_routes_provider_without_switching():
 
 
 def test_snapshot_failure_is_an_error_not_an_empty_roster():
-    tree = ast.parse(Path(menubar.__file__).read_text())
-    method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
-                  and node.name == "_worker")
-    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
-    scope = {}
-    exec(compile(module, "<empty-worker-test>", "exec"), scope)
+    worker = extract_class(menubar.__file__, "MenuBarApp", {"_worker"}, {})._worker
     app = Mock()
     app._account_states = {"claude": "loading", "chatgpt": "loading"}
     app.snapshot = {"accounts": []}
     app._snapshot_source.take.side_effect = RuntimeError("synthetic read failure")
-    scope["_worker"](app, False)
+    worker(app, False)
     assert app._account_states == {"claude": "error", "chatgpt": "error"}
     assert app._refreshing is False
     assert app._hold_reload_pending is True
@@ -204,13 +188,9 @@ def test_worker_resolves_loading_states_per_provider(monkeypatch, codex_fails):
     monkeypatch.setattr(process_detection, "get_running_instances", lambda: ([], []))
     monkeypatch.setattr(process_detection, "get_running_codex_instances", lambda: [])
     monkeypatch.setattr(widget_snapshot, "publish_widget_snapshot", Mock())
-    tree = ast.parse(Path(menubar.__file__).read_text())
-    method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
-                  and node.name == "_worker")
-    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
     scope = dict(vars(menubar))
     scope["_adapt_snapshot"] = lambda *_: {"accounts": []}
-    exec(compile(module, "<empty-worker-test>", "exec"), scope)
+    worker = extract_class(menubar.__file__, "MenuBarApp", {"_worker"}, scope)._worker
     app = Mock()
     app._account_states = {"claude": "loading", "chatgpt": "loading"}
     app.snapshot = {"accounts": []}
@@ -221,7 +201,7 @@ def test_worker_resolves_loading_states_per_provider(monkeypatch, codex_fails):
     app._hold_line_for.return_value = None
     if codex_fails:
         app._codex_source.take.side_effect = RuntimeError("synthetic failure")
-    scope["_worker"](app, False)
+    worker(app, False)
     assert app._account_states == {"claude": "ready", "chatgpt": "error" if codex_fails else "ready"}
     assert app._refreshing is False
     assert app._hold_reload_pending is True

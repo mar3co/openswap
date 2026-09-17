@@ -1,13 +1,12 @@
 """Focused safety/lifecycle tests for deferred ChatGPT auto-switching."""
 
-import ast
-from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 from openswap import menubar
+from tests.menubar_harness import extract_class
 
 
 METHODS = {
@@ -15,7 +14,6 @@ METHODS = {
     "_start_chatgpt_auto_monitor",
     "_stop_chatgpt_auto_monitor",
     "_run_chatgpt_auto_engine",
-    "_restart_chatgpt_auto_monitor",
     "_reconcile_chatgpt_auto_mode",
     "_on_chatgpt_auto_event",
     "_validate_pending_chatgpt_switch",
@@ -25,12 +23,6 @@ METHODS = {
 
 
 def _app(monkeypatch, tmp_path):
-    tree = ast.parse(Path(menubar.__file__).read_text(encoding="utf-8"))
-    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "MenuBarApp")
-    cls.bases = []
-    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in METHODS]
-    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
-
     engine_type = Mock()
     load = Mock(return_value=SimpleNamespace(codex_enabled=False))
     set_setting = Mock()
@@ -44,8 +36,7 @@ def _app(monkeypatch, tmp_path):
         "threading": SimpleNamespace(Thread=thread_type),
         "time": time,
     }
-    exec(compile(module, "<chatgpt-auto-menu>", "exec"), scope)
-    app = scope["MenuBarApp"]()
+    app = extract_class(menubar.__file__, "MenuBarApp", METHODS, scope)()
     app.settings = menubar.MenuBarSettings(chatgpt_auto_enabled=True)
     app.switcher = Mock(backup_dir=tmp_path, _logger=Mock())
     app.codex = Mock(state_dir=tmp_path)
