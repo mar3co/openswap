@@ -10,7 +10,10 @@ The installed unified ChatGPT app has account-change handling and uses Codex
 app-server authentication. This is evidence for feasibility, not a verified
 OpenSwap desktop switch implementation.
 
-This study does not add a production switch command. In particular, neither
+The initial research commit did not add a switch command. The follow-up now
+includes an explicitly experimental, user-confirmed restart-and-switch action;
+see [the testing guide](chatgpt-desktop-testing.md). This is not verified
+production desktop support. In particular, neither
 replacing a file nor restarting an Electron window proves that Chat, Work, and
 Codex now use the same intended account. A real two-account desktop test is
 still required before advertising support.
@@ -150,7 +153,8 @@ decoded JWT or OpenSwap's active-slot bookkeeping is not proof that the desktop
 has authenticated as the intended user. Keyring-backed logins need separate
 support rather than silently falling back to a file.
 
-Only after that evidence should OpenSwap expose an explicit desktop action.
+The experimental action exists solely to gather that evidence with an operator;
+do not promote it to supported desktop behavior until this matrix passes.
 Keep automatic quota rotation separate: it needs its own active-task policy,
 usage semantics, and recovery guarantees. A process-table scan currently used
 for display is not a sufficient shutdown or mutation guard.

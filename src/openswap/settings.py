@@ -58,7 +58,7 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
-    # Gate Codex AutoSwitchEngine construction only (the engine stays unaware).
+    # Gate Codex AutoSwitchEngine construction and recheck before its auth commit.
     codex_enabled: bool = True
 
 

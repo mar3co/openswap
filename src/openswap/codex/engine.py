@@ -605,9 +605,20 @@ class CodexEngine:
         self._logger.info("Moved Codex slot: %s (%s) -> %s", num_src, email, target)
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self, identifier: str, json_output: bool = False, force: bool = False,
+        *, automatic: bool = False,
     ) -> dict | None:
         with self._lock():
+            # Recheck under the same lock as desktop switching: an auto tick
+            # already in flight must not overwrite the operator's selection
+            # after they disable rotation for an experimental desktop test.
+            if automatic:
+                from openswap.settings import load_settings
+                if not load_settings(self.backup_dir).codex_enabled:
+                    return {
+                        "switched": False, "from": None, "to": None,
+                        "reason": "codex-auto-disabled", "warnings": [],
+                    }
             num, email, _acc = self.resolve_account(identifier)
             target_text = self._slot_text(num)
             if parse_auth(target_text) is None:

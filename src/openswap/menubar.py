@@ -31,6 +31,36 @@ from openswap.menubar_display import (  # noqa: F401  tests poke these
     codex_restart_hint,
 )
 
+
+def desktop_switch_choices(snapshot):
+    """Only offer managed Codex OAuth rows in the experimental submenu."""
+    from openswap.codex import split_provider_num
+    from openswap.json_output import USAGE_API_KEY
+
+    choices = []
+    for row in snapshot.get("accounts") or []:
+        num, email, _active, display, _usage, alias, _org, disabled, _at = row
+        provider, slot = split_provider_num(num)
+        if provider == "codex" and not disabled and display != USAGE_API_KEY:
+            label = f"{slot}  {alias} ({email})" if alias else f"{slot}  {email}"
+            choices.append((slot, label))
+    return choices
+
+
+def desktop_switch_confirm_copy(name):
+    return (
+        "Restart ChatGPT to switch accounts?",
+        f"Experimental: select {name} for ChatGPT and the shared Codex login. "
+        "This will quit and relaunch the entire ChatGPT app, including this "
+        "conversation if it is open there.\n\n"
+        "Save and finish all local and remote work first. Close other Codex "
+        "clients. Continuing confirms that all work is stopped and you agree "
+        "to the restart.\n\n"
+        "After relaunch, verify the account in Chat, Work, and Codex. "
+        "Keep Codex auto-switching off during testing.",
+    )
+
+
 def run(switcher, codex=None) -> int:
     """Entry point for ``openswap menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -104,6 +134,8 @@ def run(switcher, codex=None) -> int:
             self._event_lock = threading.Lock()
             self._panel = None
             self._kickoff_running = False
+            self._desktop_switching = False
+            self._desktop_result = None
             self._kickoff_results = None
             self._kickoff_retry_after: float | None = None
             self._kickoff_succeeded_nums: set[str] = set()
@@ -132,7 +164,7 @@ def run(switcher, codex=None) -> int:
 
         # ---- display refresh plumbing ----------------------------------------
         def refresh_async(self, full=False):
-            if self._refreshing:
+            if self._refreshing or self._desktop_switching:
                 return  # in-flight guard: one worker at a time (SnapshotSource
                         # pacing state is only touched by this single worker)
             self._refreshing = True
@@ -222,6 +254,9 @@ def run(switcher, codex=None) -> int:
             self.refresh_async()
 
         def on_sync_tick(self, _timer):
+            self._drain_desktop_result()
+            if self._desktop_switching:
+                return
             self._consume_widget_command()
             if self._dirty:
                 self._dirty = False
@@ -301,6 +336,8 @@ def run(switcher, codex=None) -> int:
 
         # ---- auto-switch engine ----------------------------------------------
         def _ensure_codex_engine(self):
+            if self._desktop_switching:
+                return
             if self._codex_engine is not None or self._engine is None:
                 return
             if self.codex is None or not self.codex.switchable_account_numbers():
@@ -665,6 +702,9 @@ def run(switcher, codex=None) -> int:
                             _purge(_sub)
                 _purge(self.menu._menu)
             self.menu.clear()
+            if self._desktop_switching:
+                self.menu = [rumps.MenuItem("Restarting ChatGPT…", callback=None)]
+                return
             # Overflow menu (popover More…): account switching and settings live
             # in the popover, so this list is management only.
             self.menu = [
@@ -673,6 +713,7 @@ def run(switcher, codex=None) -> int:
                 rumps.MenuItem("Next available", callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
+                self._desktop_menu(rumps),
                 self._rename_menu(rumps),
                 self._disable_menu(rumps),
                 self._remove_menu(rumps),
@@ -711,6 +752,108 @@ def run(switcher, codex=None) -> int:
                 label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
                 menu.add(rumps.MenuItem(label, callback=self._make_rename(num, email, alias)))
             return menu
+
+        def _desktop_menu(self, rumps):
+            menu = rumps.MenuItem("Switch ChatGPT app (experimental)")
+            if self.codex is not None and self._codex_enabled():
+                menu.add(rumps.MenuItem(
+                    "Pause Codex auto-switching for testing…",
+                    callback=self._pause_codex_for_desktop,
+                ))
+                menu.add(None)
+            choices = desktop_switch_choices(self.snapshot) if self.codex else []
+            if not choices:
+                menu.add(rumps.MenuItem("Add a ChatGPT login via Codex first", callback=None))
+            for num, label in choices:
+                menu.add(rumps.MenuItem(label, callback=self._make_desktop_switch(num, label)))
+            return menu
+
+        def _pause_codex_for_desktop(self, _sender):
+            if self._desktop_switching:
+                return
+            if self._alert(
+                title="Pause Codex auto-switching?",
+                message=(
+                    "This turns off automatic Codex account rotation for all OpenSwap "
+                    "instances using this account store. Claude rotation is unchanged. "
+                    "It stays off until you re-enable it in Settings or with the CLI."
+                ),
+                ok="Pause Codex", cancel="Cancel",
+            ) != 1:
+                return
+            if self._guard(lambda: set_setting(
+                self.switcher.backup_dir, "autoswitch.codexEnabled", "false"
+            )):
+                self._stop_codex_engine()
+                self.rebuild_menu()
+
+        def _make_desktop_switch(self, num, label):
+            def cb(_sender):
+                if self.codex is None or self._desktop_switching:
+                    return
+                if self._refreshing or self._kickoff_running:
+                    self._show_error("Wait for the current refresh or kickoff to finish, then try again.")
+                    return
+                if self._codex_enabled():
+                    self._show_error(
+                        "Choose 'Pause Codex auto-switching for testing…' in this menu "
+                        "before switching ChatGPT. Keep it off while you verify the account."
+                    )
+                    return
+                title, message = desktop_switch_confirm_copy(label)
+                if self._alert(title=title, message=message, ok="Restart ChatGPT", cancel="Cancel") != 1:
+                    return
+                # A native modal dialog can pump the timer run loop. Recheck
+                # activity that may have started while consent was visible.
+                if self._refreshing or self._kickoff_running:
+                    self._show_error("A refresh or kickoff started. Wait for it to finish, then try again.")
+                    return
+                self._stop_codex_engine()
+                self._desktop_switching = True
+                self.rebuild_menu()
+                if self._panel is not None:
+                    self._panel.close()
+                threading.Thread(target=self._desktop_worker, args=(num,), daemon=True).start()
+            return cb
+
+        def _desktop_worker(self, num):
+            try:
+                from openswap.codex.desktop import DesktopSwitcher
+                result = DesktopSwitcher(self.codex).switch(
+                    num, confirm_restart=True, confirm_idle=True
+                )
+                outcome = (result, None)
+            except ClaudeSwitchError as exc:
+                outcome = (None, str(exc))
+            except Exception:
+                # Never surface arbitrary credential/protocol details.
+                outcome = (None, "The experimental desktop switch failed. Check the selected account before retrying.")
+            with self._event_lock:
+                self._desktop_result = outcome
+
+        def _drain_desktop_result(self):
+            with self._event_lock:
+                pending = self._desktop_result
+                self._desktop_result = None
+            if pending is None:
+                return
+            self._desktop_switching = False
+            self.rebuild_menu()
+            result, error = pending
+            if error:
+                self._show_error(error)
+            elif result is not None:
+                record_manual_switch(self.codex.state_dir)
+                self._alert(
+                    title="ChatGPT reopened — verify the account",
+                    message=(
+                        "The selected credentials were installed and ChatGPT was relaunched. "
+                        "Desktop authentication is not yet verified. Check the profile menu "
+                        "and new Chat, Work, and Codex tasks before continuing. "
+                        "Keep Codex auto-switching off during this test."
+                    ),
+                )
+            self.refresh_async()
 
         def _remove_menu(self, rumps):
             menu = rumps.MenuItem("Remove account")
@@ -898,6 +1041,8 @@ def run(switcher, codex=None) -> int:
                 return None
 
         def _on_account_click(self, num, *, close_panel):
+            if self._desktop_switching:
+                return
             from openswap.codex import split_provider_num
             provider, n = split_provider_num(num)
             if provider == "codex":
@@ -1297,7 +1442,7 @@ def run(switcher, codex=None) -> int:
             self._save_and_rebuild()
 
         def _maybe_kickoff(self):
-            if self._kickoff_running or self._kickoff_results is not None:
+            if self._desktop_switching or self._kickoff_running or self._kickoff_results is not None:
                 return
             now = datetime.now()
             today = now.date().isoformat()

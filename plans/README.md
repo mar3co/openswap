@@ -29,8 +29,9 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED
 
 010's implementation and review fixes merged in PR #36 on 2026-09-17 UTC;
 the deferred manual UI verification keeps its overall status IN PROGRESS.
-011's static/isolated research is complete; real two-account desktop validation
-remains open. No desktop switch command is shipped by that research.
+011 now includes the user-requested experimental restart-and-switch action;
+real two-account desktop validation remains open. It is not automatic or
+verified production desktop support.
 
 007 was added 2026-09-09 (planned at `92722b1`). Freeze and assemble are
 proved on this Mac; local Developer ID signing was skipped (operator:

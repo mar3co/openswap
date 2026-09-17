@@ -68,6 +68,7 @@ The `cswap` command still works as an alias during the rename.
 | `openswap codex import` | Import Codex auth.json envelopes |
 | `openswap codex swap` | Exchange two Codex slot numbers |
 | `openswap codex move` | Assign a Codex account to a slot |
+| `openswap codex desktop` | Experimental, confirmed ChatGPT quit/switch/relaunch and recovery |
 | `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |
@@ -76,3 +77,8 @@ The `cswap` command still works as an alias during the rename.
 | `openswap statusline --codex` | Paint the live Codex account label (no config.toml wrap) |
 
 `openswap help` lists everything. [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
+
+The experimental ChatGPT desktop action is also available under the menu bar's
+**More… → Switch ChatGPT app (experimental)**. Read the
+[test and recovery guide](docs/chatgpt-desktop-testing.md) first; automatic
+desktop rotation and authenticated UI verification are not implemented.
