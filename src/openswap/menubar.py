@@ -1346,22 +1346,16 @@ def run(switcher, codex=None) -> int:
                 popover.setLevel_(level)
 
         def _alert(self, **kwargs) -> int:
-            from openswap.menubar_panel import make_dialog_alert
+            from openswap.menubar_dialog import make_dialog_alert
 
             alert = make_dialog_alert(**kwargs)
             return self._dialog(alert.runModal)
 
         def _prompt(self, **kwargs):
-            from openswap.menubar_panel import (
-                DIALOG_CONTENT_WIDTH,
-                DIALOG_INPUT_HEIGHT,
-                style_dialog_alert,
-            )
+            from openswap.menubar_dialog import make_dialog_prompt
 
-            kwargs["dimensions"] = (DIALOG_CONTENT_WIDTH, DIALOG_INPUT_HEIGHT)
-            window = rumps.Window(**kwargs)
-            style_dialog_alert(window._alert)
-            return self._dialog(window.run)
+            prompt = make_dialog_prompt(**kwargs)
+            return self._dialog(prompt.run)
 
         def _show_error(self, message: str):
             self._alert(title="openswap", message=message)
@@ -1714,6 +1708,7 @@ def run(switcher, codex=None) -> int:
                     message=f"Remove account {num}?",
                     ok="Remove",
                     cancel="Cancel",
+                    destructive=True,
                 ) == 1:  # 1 == OK
                     from openswap.codex import split_provider_num
                     provider, n = split_provider_num(num)
