@@ -1905,6 +1905,8 @@ def run(switcher, codex=None) -> int:
         def _run_kickoff(self):
             results: list[tuple[str, bool, str]] = []
             try:
+                from openswap.codex import split_provider_num
+                from openswap.kickoff import invoke_codex_kickoff
                 from openswap.session import SessionManager
 
                 mgr = SessionManager(self.switcher)
@@ -1913,6 +1915,7 @@ def run(switcher, codex=None) -> int:
                 ) in self.snapshot["accounts"]:
                     if str(num) in self._kickoff_succeeded_nums:
                         continue
+                    provider, slot_n = split_provider_num(num)
                     try:
                         is_api = (
                             (self.snapshot.get("kinds") or {}).get(str(num))
@@ -1930,9 +1933,6 @@ def run(switcher, codex=None) -> int:
                         continue
                     name = account_short_name(email, alias or None, num)
                     try:
-                        from openswap.codex import split_provider_num
-                        from openswap.kickoff import invoke_codex_kickoff
-                        provider, slot_n = split_provider_num(num)
                         if provider == "codex":
                             if self.codex is None:
                                 continue

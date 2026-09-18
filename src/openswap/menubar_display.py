@@ -445,14 +445,21 @@ def settings_page_rows(
                 "style": "section",
                 "section": SETTINGS_SECTION_AUTOMATION,
                 "id": "group_schedule",
-                "label": "Claude schedule",
+                "label": "Window kickoff",
             },
             {
                 "kind": "toggle",
                 "section": SETTINGS_SECTION_AUTOMATION,
                 "id": "kickoff_enabled",
-                "label": "Start Claude 5-hour window",
+                "label": "Start available 5-hour windows",
                 "value": bool(settings.kickoff_enabled),
+            },
+            {
+                "kind": "group",
+                "style": "hint",
+                "section": SETTINGS_SECTION_AUTOMATION,
+                "id": "kickoff_hint",
+                "label": "Only accounts that report a 5-hour limit are included.",
             },
         ]
     )
@@ -771,14 +778,25 @@ def notification_copy_for_kickoff(
             title = "Started 5-hour windows"
         body = "Pinged " + ", ".join(ok) + "."
     elif ok and bad:
-        title = "Started some 5-hour windows"
+        title = "Some 5-hour windows didn't start"
         failed = ", ".join(name for name, _err in bad)
-        body = f"Started {', '.join(ok)}. Couldn't reach {failed}."
+        body = f"Started: {', '.join(ok)}. Couldn't start: {failed}."
     else:
-        title = "Couldn't start 5-hour windows"
-        body = "; ".join(
-            f"{name}: {err}" if err else name for name, err in bad
-        )[:240]
+        if len(bad) == 1:
+            name, err = bad[0]
+            title = f"Couldn't start {name}'s 5-hour window"
+            lines = [line.strip() for line in str(err).splitlines() if line.strip()]
+            lines = [
+                line
+                for line in lines
+                if not line.lower().startswith(
+                    "reading additional input from stdin"
+                )
+            ]
+            body = (lines[-1] if lines else "The account could not be reached.")[:200]
+        else:
+            title = "Couldn't start 5-hour windows"
+            body = "Couldn't start: " + ", ".join(name for name, _err in bad) + "."
     return NotificationCopy(title=title, body=body)
 
 

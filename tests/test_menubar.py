@@ -491,7 +491,14 @@ def test_settings_page_hides_kickoff_time_when_disabled():
     )
     ids_off = [row["id"] for row in off]
     assert "kickoff_enabled" in ids_off
+    assert "kickoff_hint" in ids_off
     assert "kickoff_time" not in ids_off
+    off_by_id = {row["id"]: row for row in off}
+    assert off_by_id["group_schedule"]["label"] == "Window kickoff"
+    assert off_by_id["kickoff_enabled"]["label"] == (
+        "Start available 5-hour windows"
+    )
+    assert "report a 5-hour limit" in off_by_id["kickoff_hint"]["label"]
 
     on = menubar.settings_page_rows(
         menubar.MenuBarSettings(kickoff_enabled=True),
@@ -701,6 +708,11 @@ def test_panel_windows_includes_scoped_maxed():
 def test_panel_windows_sentinel_or_missing_is_empty():
     assert menubar.panel_windows("no credentials") == []
     assert menubar.panel_windows(None) == []
+
+
+def test_panel_windows_omits_five_hour_when_plan_reports_weekly_only():
+    rows = menubar.panel_windows({"seven_day": {"pct": 46.0}})
+    assert [row["label"] for row in rows] == ["7d"]
 
 
 def test_panel_accounts_prefers_alias_and_keeps_note():
@@ -1356,7 +1368,7 @@ def test_kickoff_is_wired_from_menubar_sync_tick():
     assert "self._drain_kickoff_results()" in text
     assert any(
         row["id"] == "kickoff_enabled"
-        and "Start Claude 5-hour window" in row["label"]
+        and "Start available 5-hour windows" in row["label"]
         for row in menubar.settings_page_rows(
             menubar.MenuBarSettings(), strategy="best", threshold=90
         )
@@ -1397,6 +1409,7 @@ def test_codex_active_kickoff_pings_engine_home():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     run = text[text.index("def _run_kickoff") : text.index("def _drain_kickoff_results")]
     assert "invoke_codex_kickoff(self.codex.home)" in run
+    assert "kickoff_account_eligible" in run
 
 
 def test_format_title_truncates_long_local_part():
@@ -1855,6 +1868,23 @@ def test_kickoff_notification_names_accounts_not_slots():
     assert "adsonline" in text
     assert "Account-" not in text
     assert "openswap --add-account" not in text
+
+
+def test_kickoff_notification_drops_noisy_stdin_preamble():
+    copy = menubar.notification_copy_for_kickoff(
+        [
+            (
+                "personal",
+                False,
+                "Reading additional input from stdin...\n"
+                "Not inside a trusted directory and --skip-git-repo-check was not specified.",
+            )
+        ]
+    )
+    assert copy is not None
+    assert copy.title == "Couldn't start personal's 5-hour window"
+    assert "stdin" not in copy.body
+    assert "trusted directory" in copy.body
 
 
 # --- signed-out repair (extra) ------------------------------------------------

@@ -20,6 +20,22 @@ def test_rate_limits_to_usage_tolerates_missing_secondary():
     usage = rate_limits_to_usage({"primary": {"usedPercent": 5, "windowDurationMins": 300}, "secondary": None}, _NOW)
     assert usage == {"five_hour": {"pct": 5.0}}
 
+def test_rate_limits_to_usage_weekly_only_does_not_invent_five_hour():
+    usage = rate_limits_to_usage(
+        {
+            "primary": {
+                "usedPercent": 46,
+                "windowDurationMins": 10080,
+                "resetsAt": 1790216227,
+            },
+            "secondary": None,
+        },
+        _NOW,
+    )
+    assert usage is not None
+    assert "five_hour" not in usage
+    assert usage["seven_day"]["pct"] == 46.0
+
 def test_rate_limits_to_usage_none_when_empty():
     assert rate_limits_to_usage({}, _NOW) is None
     assert rate_limits_to_usage({"primary": None, "secondary": None}, _NOW) is None

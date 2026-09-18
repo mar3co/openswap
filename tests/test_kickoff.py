@@ -102,14 +102,23 @@ def _five_hour(pct: float, delta_s: float | None) -> dict:
     return {"five_hour": window}
 
 
-def test_eligibility_skips_api_key_and_includes_idle_oauth():
+def test_eligibility_skips_api_key_and_requires_a_reported_window():
     assert not kickoff_account_eligible(is_api_key=True, usage=None, now=_ELIG_NOW)
     assert not kickoff_account_eligible(
         is_api_key=True, usage=_five_hour(0.0, -3600), now=_ELIG_NOW
     )
-    assert kickoff_account_eligible(is_api_key=False, usage=None, now=_ELIG_NOW)
+    assert not kickoff_account_eligible(is_api_key=False, usage=None, now=_ELIG_NOW)
     assert kickoff_account_eligible(
         is_api_key=False, usage=_five_hour(0.0, None), now=_ELIG_NOW
+    )
+
+
+def test_eligibility_rejects_a_weekly_only_plan():
+    weekly_only = {"seven_day": {"pct": 46.0}}
+    assert not kickoff_account_eligible(
+        is_api_key=False,
+        usage=weekly_only,
+        now=_ELIG_NOW,
     )
 
 
@@ -174,9 +183,12 @@ def test_invoke_codex_kickoff_exec_argv_and_home(tmp_path):
         captured["argv"] = list(argv); captured["kw"] = kw
         return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
     invoke_codex_kickoff(tmp_path, which=fake_which, run=fake_run, environ={"PATH": "/usr/bin", "OPENAI_API_KEY": "sk"})
-    assert captured["argv"] == ["/opt/fake/codex", "exec", KICKOFF_PROMPT]
+    assert captured["argv"] == [
+        "/opt/fake/codex", "exec", "--skip-git-repo-check", KICKOFF_PROMPT
+    ]
     assert captured["kw"]["env"]["CODEX_HOME"] == str(tmp_path)
     assert "OPENAI_API_KEY" not in captured["kw"]["env"]
+    assert captured["kw"]["stdin"] is subprocess.DEVNULL
 
 def test_invoke_codex_kickoff_live_login_has_no_codex_home():
     captured = {}
