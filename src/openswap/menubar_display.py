@@ -483,6 +483,176 @@ def format_running_line(sessions, ides) -> str | None:
     return None
 
 
+# A switch and a login each write the config and the credential as two steps;
+# a drift has to outlive this before it is one and not the middle of either.
+IDENTITY_SETTLE_S = 10.0
+IDENTITY_RETRY_S = 300.0
+# Every pass is charged, clean ones included: each costs a Keychain read per
+# slot, and an external writer flipping the identity is what would drive them.
+IDENTITY_ATTEMPTS_PER_HOUR = 12
+
+
+class IdentityDriftWatch:
+    """When the extra runs ``Engine.identity_drift``, and what it reports (#46).
+
+    Armed at startup and whenever the live identity differs from the one the
+    last pass saw (the identity, not its slot: every unmanaged login is slot
+    None). A drift is reported once, on a second sighting a settle window
+    after the first, with the evidence gathered at the FIRST: that is the
+    moment closest to the write, and a short-lived writer may be gone by the
+    second. Passes that could not tell retry on a backoff, and every pass
+    draws on an hourly budget. A spent budget only postpones: the states that
+    spend it (Keychain locked, offline, a flapping writer) end on their own.
+
+    Not locked. ``slot_seen``/``ready`` run on the main-thread tick, the rest
+    on the refresh worker, and the tick skips both while ``_refreshing`` is
+    set, which spans the worker's whole life. A caller that breaks that (a
+    pass started from another thread, or outside ``_worker``) needs a lock.
+    """
+
+    def __init__(self) -> None:
+        self._due = True
+        self._retry_at = 0.0
+        self._seen: tuple | None = None
+        self._checked: tuple | None = None
+        self._pending: tuple | None = None
+        self._pending_since = 0.0
+        self._pending_line: str | None = None
+        self._attempts: list[float] = []
+        self._warned_exhausted = False
+        self._indeterminate_logged = False
+
+    def _budget_floor(self, now: float) -> float:
+        """Earliest time another attempt fits the hourly budget (0: now)."""
+        self._attempts = [t for t in self._attempts if now - t < 3600]
+        if len(self._attempts) < IDENTITY_ATTEMPTS_PER_HOUR:
+            return 0.0
+        return min(self._attempts) + 3600
+
+    def slot_seen(self, live: tuple | None, now: float) -> bool:
+        """Arm when the live identity is not the one the last pass saw."""
+        self._seen = live
+        if live == self._checked:
+            return False
+        self._due = True
+        self._retry_at = max(self._retry_at, self._budget_floor(now))
+        return True
+
+    def ready(self, now: float) -> bool:
+        """Side-effect-free ``begin``, for the tick that only kicks a pass."""
+        return self._due and now >= self._retry_at
+
+    def begin(self, now: float) -> str:
+        """``"run"``, ``"wait"``, or (once per spent budget) ``"exhausted"``."""
+        if not self._due:
+            return "wait"
+        floor = self._budget_floor(now)
+        if floor > now:
+            self._retry_at = max(self._retry_at, floor)
+            if self._warned_exhausted:
+                return "wait"
+            self._warned_exhausted = True
+            return "exhausted"
+        if now < self._retry_at:
+            return "wait"
+        self._warned_exhausted = False
+        self._attempts.append(now)
+        return "run"
+
+    def record(
+        self, now: float, live: tuple | None, drift, line: str | None
+    ) -> str | None:
+        """Take a pass's result and its log line; returns the line to log."""
+        self._checked = live
+        if drift is None:
+            self._due = False
+            self._pending = None
+            self._indeterminate_logged = False
+            return None
+        if drift.outcome != "observed":
+            # Not evidence either way, so a pending drift survives it.
+            self._due = True
+            self._retry_at = now + IDENTITY_RETRY_S
+            if drift.outcome != "indeterminate" or self._indeterminate_logged:
+                return None
+            self._indeterminate_logged = True
+            return line
+        key = (drift.config_identity, drift.owner_slot)
+        if self._pending != key:
+            self._pending, self._pending_since, self._pending_line = key, now, line
+        if now - self._pending_since < IDENTITY_SETTLE_S:
+            self._due = True
+            self._retry_at = self._pending_since + IDENTITY_SETTLE_S
+            return None
+        # Reported, and the incident is over as far as the watch goes: nothing
+        # re-arms it while the identity stays put, and if the same drift comes
+        # back after the identity moved, that is a new incident with new
+        # evidence.
+        self._due = False
+        self._indeterminate_logged = False
+        reported, self._pending, self._pending_line = self._pending_line, None, None
+        return reported
+
+    def failed(self, now: float) -> None:
+        """A pass raised. Backed off, and pinned to the identity the tick last
+        saw, so the config writes Claude Code makes all day cannot re-arm a
+        pass that will only raise again."""
+        self._checked = self._seen
+        self._due = True
+        self._retry_at = now + IDENTITY_RETRY_S
+
+
+def _local_iso_or_unknown(epoch_s) -> str:
+    try:
+        return datetime.fromtimestamp(epoch_s).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "unknown"
+
+
+def format_identity_drift_log(
+    drift, sessions, unreadable: int, config_mtime: float | None
+) -> str:
+    """Log line for an identity rewritten outside a switch (#46).
+
+    Carries what it takes to name the writer: when the config was last
+    written and every Claude Code session alive at that moment, with its
+    entrypoint (``claude-desktop`` vs ``cli``) and start time. ``sessions`` is
+    None when they could not be enumerated, which must never read as "none
+    were running".
+    """
+    if drift.outcome == "indeterminate":
+        what = (
+            "could not be checked for a change made outside openswap (the "
+            "Keychain or a stored backup is unreadable)"
+        )
+    else:
+        named = (
+            f"Account-{drift.config_slot}"
+            if drift.config_slot is not None
+            else "an unmanaged account"
+        )
+        what = (
+            f"changed outside openswap: config names {named} but the live "
+            f"credential is Account-{drift.owner_slot}'s"
+        )
+    if sessions is None:
+        running = "could not enumerate"
+    else:
+        running = ", ".join(
+            f"pid {s.pid} {s.entrypoint} {s.kind} since "
+            + (
+                _local_iso_or_unknown(s.started_at / 1000)
+                if isinstance(s.started_at, (int, float)) and s.started_at
+                else "unknown"
+            )
+            for s in sessions
+        ) or "none"
+        if unreadable:
+            running += f" (+{unreadable} unreadable)"
+    written = _local_iso_or_unknown(config_mtime) if config_mtime else "unknown"
+    return f"Active account {what}. Config written {written}; running: {running}"
+
+
 def switch_restart_hint(running: bool) -> str:
     """Restart sentence when Claude Code is live; otherwise empty."""
     if running:

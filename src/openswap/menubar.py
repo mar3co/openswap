@@ -83,6 +83,7 @@ def run(switcher, codex=None) -> int:
             self._refreshing = False
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
+            self._identity_watch = IdentityDriftWatch()
             from openswap.codex.auth import auth_path
             self._codex_auth_path = auth_path(codex.home) if codex is not None else None
             self._codex_auth_mtime = 0.0
@@ -143,6 +144,7 @@ def run(switcher, codex=None) -> int:
             # CPython); the main-thread sync tick reads them. While the engine
             # runs it already paces all fetching, so the display reads store-only.
             try:
+                self._check_identity_drift()
                 try:
                     raw = self._snapshot_source.take(
                         full=full, store_only=self._engine is not None
@@ -191,6 +193,46 @@ def run(switcher, codex=None) -> int:
                 self._ensure_codex_engine()
             finally:
                 self._refreshing = False
+
+        def _check_identity_drift(self):
+            watch = self._identity_watch
+            log = self.switcher._logger
+            now = time.time()
+            state = watch.begin(now)
+            if state == "exhausted":
+                log.warning(
+                    "Identity check budget for this hour is spent; next check "
+                    "when it rolls over (#46)"
+                )
+            if state != "run":
+                return
+            try:
+                drift = self.switcher.identity_drift()
+                line = None
+                if drift is not None and drift.outcome != "unattributed":
+                    try:
+                        config_mtime = self._config_path.stat().st_mtime
+                    except OSError:
+                        config_mtime = None
+                    try:
+                        from openswap.process_detection import scan_sessions
+
+                        sessions, unreadable = scan_sessions()
+                    except OSError:
+                        sessions, unreadable = None, 0
+                    line = format_identity_drift_log(
+                        drift, sessions, unreadable, config_mtime
+                    )
+                report = watch.record(
+                    time.time(), self.switcher.live_identity(), drift, line
+                )
+                if report:
+                    log.warning(report)
+            except Exception:
+                # KeychainError is a plain Exception; nothing here may take
+                # out the refresh pass this runs at the head of.
+                watch.failed(time.time())
+                log.warning("identity drift check failed", exc_info=True)
 
         def _log_usage(self, snap):
             """Log each account's session/weekly limits when they change.
@@ -267,8 +309,14 @@ def run(switcher, codex=None) -> int:
                 mtime = None
             if mtime is not None and mtime != self._config_mtime:
                 self._config_mtime = mtime
-                if live_slot_changed(
-                    self.snapshot, self.switcher.current_account_number()
+                live_num = self.switcher.current_account_number()
+                if live_slot_changed(self.snapshot, live_num):
+                    changed = True
+                # The watch compares against the identity ITS last pass saw,
+                # not the snapshot: a worker already in flight can absorb an
+                # external rewrite into the snapshot before this tick runs.
+                if self._identity_watch.slot_seen(
+                    self.switcher.live_identity(), time.time()
                 ):
                     changed = True
             if self.codex is not None and self._codex_auth_path is not None:
@@ -283,6 +331,8 @@ def run(switcher, codex=None) -> int:
                             self.snapshot, self.codex.current_account_number()
                         ):
                             changed = True
+            if self._identity_watch.ready(time.time()):
+                changed = True
             if changed:
                 # Do not clear the hold cache here: the engine may already have
                 # recorded a reason for the new slot. Display is gated by
