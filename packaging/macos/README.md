@@ -18,6 +18,12 @@ From the repo root:
 Needs Xcode, xcodegen, and uv. Output: `packaging/macos/dist/OpenSwap.app`
 (gitignored). Bundle size on this spike Mac: 26M.
 
+For an isolated experimental build without replacing the ordinary dist app,
+set absolute `OPENSWAP_DIST_DIR`, `OPENSWAP_BUILD_DIR`, and
+`OPENSWAP_DERIVED_DIR` paths. See
+[desktop testing](../../docs/chatgpt-desktop-testing.md) for the experimental
+ChatGPT restart-and-switch action. Building does not install or launch the app.
+
 To sign locally as well, export `OPENSWAP_SIGN_IDENTITY` (the quoted
 codesigning identity) and `OPENSWAP_NOTARY_PROFILE=openswap-notary` after
 `xcrun notarytool store-credentials openswap-notary`. CI does this from

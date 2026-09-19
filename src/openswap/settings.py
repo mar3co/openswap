@@ -58,6 +58,8 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Gate Codex AutoSwitchEngine construction and recheck before its auth commit.
+    codex_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "codexEnabled", "codex_enabled", "bool",
+            help="Rotate Codex CLI accounts alongside Claude",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

@@ -1119,6 +1119,44 @@ class TestAutoCommand:
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
 
+    def _fake_codex(self, temp_home):
+        class FakeCodex:
+            def __init__(self, *a, **k):
+                self.state_dir = Path(temp_home) / "codex-state"
+                self.state_dir.mkdir(parents=True, exist_ok=True)
+
+            def switchable_account_numbers(self):
+                return ["1", "2"]
+
+        return FakeCodex
+
+    def test_codex_enabled_false_skips_codex_autoswitch_engine(self, temp_home):
+        from openswap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"codexEnabled": False},
+        }))
+        with patch("openswap.codex.engine.CodexEngine", self._fake_codex(temp_home)):
+            self._run(["--once"], temp_home)
+        assert len(self.FakeEngine.instances) == 1
+        assert type(self.FakeEngine.instances[0].switcher).__name__ != "FakeCodex"
+
+    def test_codex_enabled_true_starts_codex_autoswitch_engine(self, temp_home):
+        with patch("openswap.codex.engine.CodexEngine", self._fake_codex(temp_home)):
+            self._run(["--once"], temp_home)
+        assert len(self.FakeEngine.instances) == 2
+        assert type(self.FakeEngine.instances[1].switcher).__name__ == "FakeCodex"
+
+    def test_auto_command_gates_codex_engine_on_codex_enabled(self):
+        import inspect
+
+        src = inspect.getsource(cli._auto_command)
+        assert "codex_enabled" in src
+        assert "switchable_account_numbers" in src
+
     def test_json_stdout_is_pure_jsonl(self, temp_home, capsys):
         from openswap.autoswitch import NoSwitchEvent, TickOutcome
 

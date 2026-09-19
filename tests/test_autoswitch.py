@@ -7085,6 +7085,19 @@ def test_codex_engine_switches_when_over_threshold(tmp_path, monkeypatch):
     assert [e.kind for e in events if e.kind == "switch"] and all(e.provider == "codex" for e in events)
 
 
+def test_codex_running_auto_engine_cannot_switch_after_setting_disabled(tmp_path, monkeypatch):
+    from openswap.settings import set_setting
+    clock = FakeClock(); events = []
+    eng, home = codex_harness(tmp_path, clock)
+    entries = {"1": _entry_for(_usage(95.0), clock()), "2": _entry_for(_usage(10.0), clock())}
+    monkeypatch.setattr(eng, "usage_entries_by_account", lambda fetch=None, *, scheduled=False: entries)
+    auto = _codex_auto(eng, clock, events)
+    set_setting(eng.backup_dir, "autoswitch.codexEnabled", "false")
+    assert auto.tick() is TickOutcome.NO_ACTION
+    assert eng.current_account_number() == "1"
+    assert not [event for event in events if event.kind == "switch"]
+
+
 def test_codex_slot_is_never_quarantined_for_missing_claude_oauth(tmp_path, monkeypatch):
     clock = FakeClock(); events = []
     eng, home = codex_harness(tmp_path, clock)
@@ -7111,3 +7124,14 @@ def test_codex_unmanaged_live_does_not_switch(tmp_path, monkeypatch):
     )
     assert "rt-s" in (home / "auth.json").read_text()
 
+
+def test_codex_quarantine_human_says_codex_switch():
+    line = QuarantineEvent(
+        number="1", email="c@x.com", reason="invalid_grant", provider="codex"
+    ).human()
+    assert "openswap codex switch 1" in line
+    assert "--add-account" not in line
+    claude = QuarantineEvent(
+        number="1", email="c@x.com", reason="invalid_grant"
+    ).human()
+    assert "--add-account" in claude

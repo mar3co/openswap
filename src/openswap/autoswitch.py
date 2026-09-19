@@ -397,9 +397,13 @@ class QuarantineEvent(AutoSwitchEvent):
         return {"number": self.number, "email": self.email, "reason": self.reason}
 
     def _human(self) -> str:
+        if self.provider == "codex":
+            recovery = f"openswap codex switch {self.number}"
+        else:
+            recovery = f"openswap --add-account --slot {self.number}"
         return (
             f"Account-{self.number} ({self.email}) quarantined: {self.reason}. "
-            f"Log in with it and run 'openswap --add-account --slot {self.number}' "
+            f"Log in with it and run '{recovery}' "
             "to recover."
         )
 
@@ -2055,7 +2059,12 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            if getattr(self.switcher, "provider", None) == "codex":
+                result = self.switcher.switch_to(
+                    number, json_output=True, automatic=True
+                )
+            else:
+                result = self.switcher.switch_to(number, json_output=True)
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(

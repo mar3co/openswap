@@ -1,8 +1,8 @@
-"""Detect running Claude Code instances.
+"""Detect running Claude Code and Codex instances.
 
-Reads session PID files (~/.claude/sessions/{pid}.json) and IDE lockfiles
-(~/.claude/ide/{port}.lock) to determine which Claude Code instances are
-currently running. Uses the same mechanism Claude Code itself uses internally.
+Claude: session PID files (~/.claude/sessions/{pid}.json) and IDE lockfiles
+(~/.claude/ide/{port}.lock). Codex has no session files — SCAN an injected
+process table (or macOS/Linux ``ps``) and keep only TUI processes.
 """
 
 from __future__ import annotations
@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -199,3 +201,194 @@ def get_running_instances(
     """Return all running Claude Code sessions and IDE instances."""
     resolved = claude_dir or get_claude_dir()
     return list_sessions(resolved), list_ide_instances(resolved)
+
+
+# --- Codex SCAN (process table; display only, never a destructive guard) ---
+
+
+@dataclass
+class CodexProcess:
+    pid: int
+    argv: list[str]
+    kind: str  # tui | exec | app-server | app | other
+    cwd: str = ""
+
+
+_TUI_SUBCOMMANDS = {"resume", "fork"}
+_EXEC_SUBCOMMANDS = {"exec", "e"}
+# Every other command listed by ``codex --help`` is non-interactive.  Keeping
+# this explicit is important: an arbitrary first positional argument is the
+# optional TUI prompt, not an unknown subcommand.
+_NON_TUI_SUBCOMMANDS = frozenset(
+    {
+        "agents",
+        "review",
+        "login",
+        "logout",
+        "mcp",
+        "plugin",
+        "mcp-server",
+        "remote-control",
+        "completion",
+        "update",
+        "doctor",
+        "sandbox",
+        "debug",
+        "apply",
+        "a",
+        "queue",
+        "archive",
+        "delete",
+        "migrate-rollouts",
+        "unarchive",
+        "cloud",
+        "exec-server",
+        "features",
+        "help",
+    }
+)
+# Codex global options that consume the following token (from `codex --help`).
+_CODEX_VALUE_OPTIONS = frozenset(
+    {
+        "-m",
+        "--model",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "--remote",
+        "--remote-auth-token-env",
+        "-i",
+        "--image",
+        "--local-provider",
+        "-p",
+        "--profile",
+        "--add-dir",
+        "-a",
+        "--ask-for-approval",
+    }
+)
+
+
+def is_codex_comm(comm: str) -> bool:
+    """True when the process comm basename is ``codex`` or ``codex.exe``."""
+    if not comm:
+        return False
+    name = Path(str(comm).replace("\\", "/")).name.lower()
+    return name in {"codex", "codex.exe"}
+
+
+def _codex_subcommand(argv: list[str]) -> str | None:
+    tokens = [str(t) for t in (argv or ())]
+    if tokens and is_codex_comm(tokens[0]):
+        tokens = tokens[1:]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":
+            # Everything after the option delimiter is positional input.  At
+            # the top level that means the optional interactive prompt, even
+            # when its text happens to match a command name such as ``exec``.
+            return None
+        if not tok.startswith("-"):
+            break
+        i += 1
+        name, eq, _ = tok.partition("=")
+        if eq:
+            continue
+        if name in _CODEX_VALUE_OPTIONS and i < len(tokens):
+            i += 1
+    if i >= len(tokens):
+        return None
+    return tokens[i]
+
+
+def classify_codex_argv(argv: list[str]) -> str:
+    """Classify known commands while treating a positional prompt as TUI."""
+    cmd = _codex_subcommand(argv)
+    if cmd is None or cmd in _TUI_SUBCOMMANDS:
+        return "tui"
+    if cmd in _EXEC_SUBCOMMANDS:
+        return "exec"
+    if cmd == "app-server":
+        return "app-server"
+    if cmd == "app":
+        return "app"
+    if cmd in _NON_TUI_SUBCOMMANDS:
+        return "other"
+    return "tui"
+
+
+def parse_process_table(rows: list[tuple[int, str, list[str]]]) -> list[CodexProcess]:
+    """Keep basename-codex rows; drop pid ≤ 1."""
+    out: list[CodexProcess] = []
+    for row in rows:
+        try:
+            pid, comm, argv = row
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 1:
+            continue
+        if not is_codex_comm(str(comm)):
+            continue
+        argv_list = [str(a) for a in (argv or ())]
+        out.append(
+            CodexProcess(
+                pid=pid,
+                argv=argv_list,
+                kind=classify_codex_argv(argv_list),
+            )
+        )
+    return out
+
+
+def _parse_ps_text(text: str) -> list[tuple[int, str, list[str]]]:
+    rows: list[tuple[int, str, list[str]]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        comm = parts[1]
+        args = parts[2] if len(parts) > 2 else comm
+        try:
+            argv = shlex.split(args, posix=True)
+        except ValueError:
+            argv = args.split()
+        if not argv:
+            argv = [comm]
+        rows.append((pid, comm, argv))
+    return rows
+
+
+def _read_process_table() -> list[tuple[int, str, list[str]]]:
+    if sys.platform == "win32":
+        return []
+    completed = subprocess.run(
+        ["ps", "-ax", "-o", "pid=,comm=,args="],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise OSError(completed.stderr or "ps failed")
+    return _parse_ps_text(completed.stdout)
+
+
+def get_running_codex_instances(*, ps=None) -> list[CodexProcess]:
+    """SCAN for display: kind == tui only."""
+    reader = _read_process_table if ps is None else ps
+    rows = reader()
+    return [p for p in parse_process_table(rows) if p.kind == "tui"]

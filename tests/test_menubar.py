@@ -93,10 +93,11 @@ def test_notification_identity_is_noop_when_frozen(tmp_path: Path, monkeypatch):
 def test_settings_defaults_when_file_missing(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "nope.json")
     assert s.show_account_name is True
+    assert s.menu_bar_provider == "claude"
     assert s.title_pct == "both"
     assert s.refresh_interval == 60
     assert s.auto_switch_enabled is False
-    assert s.show_icon is False
+    assert s.chatgpt_auto_enabled is False
     assert s.kickoff_enabled is False
 
 
@@ -107,6 +108,8 @@ def test_settings_round_trip(tmp_path: Path):
         title_pct="5h",
         refresh_interval=300,
         auto_switch_enabled=True,
+        chatgpt_auto_enabled=True,
+        menu_bar_provider="both",
     )
     original.save(path)
     loaded = menubar.MenuBarSettings.load(path)
@@ -143,10 +146,51 @@ def test_settings_ignores_unknown_and_bad_types(tmp_path: Path):
 
 def test_settings_invalid_title_pct_falls_back_to_default(tmp_path: Path):
     path = menubar.menubar_settings_path(tmp_path)
-    path.write_text(json.dumps({"title_pct": "nope", "show_icon": True}), encoding="utf-8")
+    path.write_text(json.dumps({"title_pct": "nope", "confirm_switch": False}), encoding="utf-8")
     s = menubar.MenuBarSettings.load(path)
     assert s.title_pct == "both"
-    assert s.show_icon is True
+    assert s.confirm_switch is False
+
+
+@pytest.mark.parametrize("provider", ["claude", "chatgpt", "both", "logo", "unknown", True])
+def test_menu_bar_provider_settings_validation(tmp_path: Path, provider):
+    path = tmp_path / "menubar_settings.json"
+    path.write_text(json.dumps({"menu_bar_provider": provider}), encoding="utf-8")
+    loaded = menubar.MenuBarSettings.load(path)
+    assert loaded.menu_bar_provider == (
+        provider if provider in ("claude", "chatgpt", "both", "logo") else "claude"
+    )
+
+
+@pytest.mark.parametrize("provider", ["claude", "chatgpt", "both", "logo"])
+def test_menu_bar_display_controls_follow_provider(provider):
+    settings = menubar.MenuBarSettings(menu_bar_provider=provider, title_scoped=True)
+    rows = menubar.settings_page_rows(
+        settings, strategy="best", threshold=90, section="general"
+    )
+    by_id = {row["id"]: row for row in rows}
+    picker = by_id["menu_bar_provider"]
+    assert picker["label"] == "Show"
+    assert picker["kind"] == "popup"
+    assert picker["value"] == provider
+    assert picker["options"] == [
+        ("claude", "Claude"), ("chatgpt", "ChatGPT"),
+        ("both", "Both"), ("logo", "Logo only"),
+    ]
+    assert ("title_scoped" in by_id) == (provider in ("claude", "both"))
+    for rid, label in [
+        ("show_account_name", "Account name"),
+        ("title_pct_5h", "5-hour usage"),
+        ("title_pct_7d", "7-day usage"),
+    ]:
+        assert (rid in by_id) == (provider != "logo")
+        if rid in by_id:
+            assert by_id[rid]["label"] == label
+    hints = " ".join(row["label"] for row in rows if row.get("style") == "hint")
+    if provider in ("chatgpt", "both"):
+        assert "Codex" in hints and "message limits" in hints and "unverified" in hints
+    # Hiding a control must not erase the user's choice.
+    assert settings.title_scoped is True
 
 
 def test_menubar_settings_path_constant(tmp_path: Path):
@@ -167,15 +211,15 @@ def test_settings_save_writes_through_symlink(tmp_path: Path):
     repo.mkdir()
     live.mkdir()
     tracked = repo / "menubar_settings.json"
-    tracked.write_text(json.dumps({"show_icon": False}), encoding="utf-8")
+    tracked.write_text(json.dumps({"show_account_name": True}), encoding="utf-8")
     link = live / "menubar_settings.json"
     link.symlink_to(tracked)
 
-    menubar.MenuBarSettings(show_icon=True, title_pct="5h").save(link)
+    menubar.MenuBarSettings(show_account_name=False, title_pct="5h").save(link)
 
     assert link.is_symlink()
     loaded = menubar.MenuBarSettings.load(tracked)
-    assert loaded.show_icon is True
+    assert loaded.show_account_name is False
     assert loaded.title_pct == "5h"
 
 
@@ -202,6 +246,51 @@ def test_auto_strategy_choices_match_core_settings():
 def test_settings_page_constants():
     assert menubar.SETTINGS_PAGE == "settings"
     assert menubar.MAIN_PAGE == "main"
+    assert menubar.SETTINGS_SECTIONS == (
+        ("general", "General"),
+        ("automation", "Automation"),
+    )
+
+
+def test_settings_page_sections_separate_display_from_provider_automation():
+    settings = menubar.MenuBarSettings(
+        auto_switch_enabled=True,
+        chatgpt_auto_enabled=False,
+    )
+    general = menubar.settings_page_rows(
+        settings,
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        section=menubar.SETTINGS_SECTION_GENERAL,
+    )
+    automation = menubar.settings_page_rows(
+        settings,
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        section=menubar.SETTINGS_SECTION_AUTOMATION,
+    )
+
+    general_ids = {row["id"] for row in general}
+    automation_by_id = {row["id"]: row for row in automation}
+    assert "show_account_name" in general_ids
+    assert "auto_switch_enabled" not in general_ids
+    assert automation_by_id["auto_switch_enabled"]["label"] == (
+        "Auto-switch Claude accounts"
+    )
+    assert automation_by_id["chatgpt_auto_enabled"]["label"] == (
+        "Suggest ChatGPT account switches"
+    )
+    assert automation_by_id["codex_enabled"]["label"] == (
+        "Auto-switch Codex CLI accounts"
+    )
+    assert automation_by_id["group_policy"]["label"] == "Shared rotation policy"
+    assert all(row["section"] == menubar.SETTINGS_SECTION_GENERAL for row in general)
+    assert all(
+        row["section"] == menubar.SETTINGS_SECTION_AUTOMATION
+        for row in automation
+    )
 
 
 def test_settings_page_rows_include_required_ids_and_values():
@@ -213,7 +302,6 @@ def test_settings_page_rows_include_required_ids_and_values():
         title_scoped=True,
         refresh_interval=30,
         auto_switch_enabled=True,
-        show_icon=True,
         kickoff_enabled=True,
         kickoff_hour=19,
         kickoff_minute=30,
@@ -232,7 +320,6 @@ def test_settings_page_rows_include_required_ids_and_values():
         "strategy_hint",
         "kickoff_enabled",
         "kickoff_time",
-        "show_icon",
     )
     for rid in required:
         assert rid in by_id
@@ -243,7 +330,8 @@ def test_settings_page_rows_include_required_ids_and_values():
     assert by_id["title_scoped"]["value"] is True
     assert by_id["auto_switch_enabled"]["value"] is True
     assert by_id["kickoff_enabled"]["value"] is True
-    assert by_id["show_icon"]["value"] is True
+    assert "show_icon" not in by_id
+    assert "group_advanced" not in by_id
 
     assert by_id["title_pct_5h"]["kind"] == "toggle"
     assert by_id["title_pct_5h"]["value"] is True
@@ -293,6 +381,106 @@ def test_settings_page_hides_autoswitch_policy_when_disabled():
     assert ids_on.index("strategy") < ids_on.index("strategy_hint")
     assert ids_on.index("strategy_hint") < ids_on.index("kickoff_enabled")
     assert "strategy_hint" not in ids_off
+    assert "codex_enabled" not in ids_off
+    assert "codex_enabled" not in ids_on
+
+
+def test_chatgpt_auto_is_persisted_independently_and_exposes_policy():
+    settings = menubar.MenuBarSettings(
+        auto_switch_enabled=False, chatgpt_auto_enabled=True
+    )
+    rows = menubar.settings_page_rows(
+        settings, strategy="best", threshold=90, has_codex=True,
+        codex_enabled=False,
+    )
+    ids = [row["id"] for row in rows]
+    assert settings.auto_switch_enabled is False
+    assert settings.chatgpt_auto_enabled is True
+    assert "threshold" in ids
+    assert "strategy" in ids
+    assert "codex_enabled" not in ids
+
+
+def test_settings_page_shows_codex_enabled_when_auto_on_and_has_codex():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=True),
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        codex_enabled=True,
+    )
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["codex_enabled"]["kind"] == "toggle"
+    assert by_id["codex_enabled"]["label"] == "Auto-switch Codex CLI accounts"
+    assert by_id["codex_enabled"]["value"] is True
+    ids = [row["id"] for row in rows]
+    assert ids.index("auto_switch_enabled") < ids.index("codex_enabled")
+    assert ids.index("strategy_hint") < ids.index("codex_enabled")
+    assert ids.index("codex_enabled") < ids.index("kickoff_enabled")
+
+    off_value = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=True),
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        codex_enabled=False,
+    )
+    assert {row["id"]: row for row in off_value}["codex_enabled"]["value"] is False
+
+
+def test_settings_page_hides_codex_enabled_when_auto_off():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=False),
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        codex_enabled=True,
+    )
+    ids = [row["id"] for row in rows]
+    assert "auto_switch_enabled" in ids
+    assert "codex_enabled" not in ids
+
+
+def test_settings_page_hides_codex_enabled_without_codex():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(auto_switch_enabled=True),
+        strategy="best",
+        threshold=90,
+    )
+    assert "codex_enabled" not in [row["id"] for row in rows]
+
+
+def test_on_setting_handles_codex_enabled():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    body = text[text.index("def _on_setting") : text.index("def _popup_overflow")]
+    assert 'row_id == "codex_enabled"' in body
+    assert "autoswitch.codexEnabled" in body
+    assert "set_setting" in body
+    assert "_codex_engine" in body
+    assert "_ensure_codex_engine" in body
+    assert "_stop_engine" not in body
+
+
+def test_ensure_codex_engine_honors_codex_enabled():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[src.index("def _ensure_codex_engine") : src.index("def _start_engine")]
+    assert "codex_enabled" in body
+    assert "load_settings" in body
+
+
+def test_panel_settings_pass_has_codex_and_codex_enabled():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    attach = text[text.index("def _attach_panel_once") : text.index("def _on_setting")]
+    assert "has_codex" in attach
+    assert "codex_enabled" in attach
+    panel = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
+        encoding="utf-8"
+    )
+    build = panel[panel.index("def _build_settings") :]
+    assert "has_codex" in build
+    assert "codex_enabled" in build
+    assert "settings_page_rows" in build
 
 
 def test_settings_page_hides_kickoff_time_when_disabled():
@@ -303,7 +491,14 @@ def test_settings_page_hides_kickoff_time_when_disabled():
     )
     ids_off = [row["id"] for row in off]
     assert "kickoff_enabled" in ids_off
+    assert "kickoff_hint" in ids_off
     assert "kickoff_time" not in ids_off
+    off_by_id = {row["id"]: row for row in off}
+    assert off_by_id["group_schedule"]["label"] == "Window kickoff"
+    assert off_by_id["kickoff_enabled"]["label"] == (
+        "Start available 5-hour windows"
+    )
+    assert "report a 5-hour limit" in off_by_id["kickoff_hint"]["label"]
 
     on = menubar.settings_page_rows(
         menubar.MenuBarSettings(kickoff_enabled=True),
@@ -312,7 +507,7 @@ def test_settings_page_hides_kickoff_time_when_disabled():
     )
     ids_on = [row["id"] for row in on]
     assert ids_on.index("kickoff_enabled") < ids_on.index("kickoff_time")
-    assert ids_on.index("kickoff_time") < ids_on.index("group_advanced")
+    assert ids_on.index("group_schedule") < ids_on.index("kickoff_enabled")
 
 
 @pytest.mark.parametrize("title_pct", ["off", "both"])
@@ -513,6 +708,11 @@ def test_panel_windows_includes_scoped_maxed():
 def test_panel_windows_sentinel_or_missing_is_empty():
     assert menubar.panel_windows("no credentials") == []
     assert menubar.panel_windows(None) == []
+
+
+def test_panel_windows_omits_five_hour_when_plan_reports_weekly_only():
+    rows = menubar.panel_windows({"seven_day": {"pct": 46.0}})
+    assert [row["label"] for row in rows] == ["7d"]
 
 
 def test_panel_accounts_prefers_alias_and_keeps_note():
@@ -855,10 +1055,10 @@ def test_format_title_both_windows_with_name():
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "loc · 42% · 18%"
 
 
-def test_format_title_falls_back_to_icon_when_name_and_pct_off():
-    # An empty title is indistinguishable from a crashed extra.
+def test_format_title_leaves_logo_only_when_name_and_pct_off():
+    # The native image stays visible even when there is no title text.
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == menubar.STATUS_ICON
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == ""
     assert "%" not in menubar.format_title(
         "loc@papaya.asia", {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0}}, s
     )
@@ -887,24 +1087,12 @@ def test_format_title_scoped_off_by_default():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
     assert not s.title_scoped
-    assert menubar.format_title("loc@papaya.asia", usage, s) == menubar.STATUS_ICON
+    assert menubar.format_title("loc@papaya.asia", usage, s) == ""
 
 
-def test_format_title_falls_back_to_icon_when_no_active_account():
+def test_format_title_leaves_logo_only_when_no_active_account():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
-    assert menubar.format_title(None, None, s) == menubar.STATUS_ICON
-
-
-def test_format_title_icon_when_no_active_account():
-    s = menubar.MenuBarSettings(
-        show_account_name=True, title_pct="both", show_icon=True
-    )
-    assert menubar.format_title(None, None, s) == menubar.STATUS_ICON
-
-
-def test_format_title_does_not_double_the_icon_fallback():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off", show_icon=True)
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == menubar.STATUS_ICON
+    assert menubar.format_title(None, None, s) == ""
 
 
 def test_kickoff_settings_round_trip(tmp_path: Path):
@@ -923,35 +1111,15 @@ def test_kickoff_settings_round_trip(tmp_path: Path):
     assert loaded.kickoff_last_date == "2026-09-05"
 
 
-def test_show_icon_round_trip_true(tmp_path: Path):
+@pytest.mark.parametrize("legacy_value", [True, False])
+def test_settings_drop_legacy_show_icon(tmp_path: Path, legacy_value):
     path = tmp_path / "menubar_settings.json"
-    original = menubar.MenuBarSettings(show_icon=True)
-    original.save(path)
+    path.write_text(json.dumps({"show_icon": legacy_value, "title_pct": "5h"}), encoding="utf-8")
     loaded = menubar.MenuBarSettings.load(path)
-    assert loaded.show_icon is True
-    assert loaded.show_icon is not menubar.MenuBarSettings().show_icon
-
-
-def test_format_title_includes_asterisk_iff_icon_on():
-    on = menubar.MenuBarSettings(show_account_name=True, title_pct="off", show_icon=True)
-    off = menubar.MenuBarSettings(show_account_name=True, title_pct="off", show_icon=False)
-    assert menubar.format_title("loc@papaya.asia", _USAGE, on) == f"{menubar.STATUS_ICON} loc"
-    assert menubar.STATUS_ICON not in menubar.format_title("loc@papaya.asia", _USAGE, off)
-
-
-def test_format_title_icon_only_when_name_and_pct_off():
-    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off", show_icon=True)
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == menubar.STATUS_ICON
-
-
-def test_show_icon_control_is_nested_under_advanced_not_settings_root():
-    rows = menubar.settings_page_rows(
-        menubar.MenuBarSettings(), strategy="best", threshold=90
-    )
-    ids = [row["id"] for row in rows]
-    assert ids.index("group_advanced") < ids.index("show_icon")
-    assert ids[0] != "show_icon"
-    assert any(row["id"] == "show_icon" and "asterisk" in row["label"] for row in rows)
+    assert loaded.title_pct == "5h"
+    assert not hasattr(loaded, "show_icon")
+    loaded.save(path)
+    assert "show_icon" not in json.loads(path.read_text(encoding="utf-8"))
 
 
 def test_trailing_header_frames_hug_the_right_edge():
@@ -1032,7 +1200,6 @@ def test_on_setting_reloads_settings_page_not_rebuild_menu():
         "_make_strategy",
         "on_toggle_kickoff",
         "on_kickoff_time",
-        "on_toggle_icon",
     ):
         assert name in body
     assert "SETTINGS_PAGE" in body
@@ -1054,7 +1221,7 @@ def test_kickoff_popup_holds_overflow_like_more():
     setting = Path(menubar.__file__).read_text(encoding="utf-8")
     body = setting[setting.index("def _on_setting") : setting.index("def _popup_overflow")]
     kickoff = body[body.index("kickoff_time") :]
-    assert "return" in kickoff[: kickoff.index("show_icon")]
+    assert "return" in kickoff[: kickoff.index("else:")]
 
 
 def test_panel_settings_page_does_not_set_menu_open():
@@ -1182,23 +1349,17 @@ def test_live_slot_changed_sees_org_switch_with_the_same_email():
     assert menubar.live_slot_changed({"active_num": None}, None) is False
 
 
-def test_status_item_length_compacts_only_when_icon_is_off():
-    assert menubar.status_item_length(58.06, compact=False) == menubar.NS_VARIABLE_STATUS_ITEM_LENGTH
-    assert menubar.status_item_length(0, compact=True) == menubar.NS_VARIABLE_STATUS_ITEM_LENGTH
-    compact = menubar.status_item_length(58.06, compact=True)
-    assert compact == 65.0  # ceil(58.06 + 6pt total pad)
-    assert compact < 58.06 + 20  # AppKit's default is ~10pt per side
-
-
-def test_rebuild_menu_fits_status_item_from_show_icon():
+def test_rebuild_menu_fits_status_item_with_permanent_logo():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
-    assert "title_usage(self.snapshot)" in text
+    assert "format_menu_bar_title(self.snapshot, self.settings)" in text
     assert "self._fit_status_item(title)" in text
-    assert "compact=not self.settings.show_icon" in text
+    assert "show_icon" not in text
     panel = Path(menubar.__file__).resolve().parent / "menubar_panel.py"
     body = panel.read_text(encoding="utf-8")
     assert "def fit_status_item" in body
     assert "button.setTitle_" in body
+    assert "button.setImage_(icon)" in body
+    assert "NSImageLeft if shown else NSImageOnly" in body
 
 
 def test_kickoff_is_wired_from_menubar_sync_tick():
@@ -1206,7 +1367,8 @@ def test_kickoff_is_wired_from_menubar_sync_tick():
     assert "self._maybe_kickoff()" in text
     assert "self._drain_kickoff_results()" in text
     assert any(
-        row["id"] == "kickoff_enabled" and "Start 5-hour window" in row["label"]
+        row["id"] == "kickoff_enabled"
+        and "Start available 5-hour windows" in row["label"]
         for row in menubar.settings_page_rows(
             menubar.MenuBarSettings(), strategy="best", threshold=90
         )
@@ -1247,6 +1409,7 @@ def test_codex_active_kickoff_pings_engine_home():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     run = text[text.index("def _run_kickoff") : text.index("def _drain_kickoff_results")]
     assert "invoke_codex_kickoff(self.codex.home)" in run
+    assert "kickoff_account_eligible" in run
 
 
 def test_format_title_truncates_long_local_part():
@@ -1257,7 +1420,7 @@ def test_format_title_truncates_long_local_part():
 
 def test_format_title_both_drops_unavailable_windows():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@x.com", "no credentials", s) == menubar.STATUS_ICON
+    assert menubar.format_title("loc@x.com", "no credentials", s) == ""
 
 
 def test_format_title_both_keeps_available_window():
@@ -1417,11 +1580,11 @@ def test_title_usage_falls_back_to_last_good_on_sentinel():
     }
     assert menubar.title_usage(snap) == lg
     s = menubar.MenuBarSettings(
-        show_account_name=True, title_pct="5h", title_scoped=True, show_icon=True
+        show_account_name=True, title_pct="5h", title_scoped=True
     )
     assert menubar.format_title(
         snap["active_email"], menubar.title_usage(snap), s, alias="adsonline"
-    ) == f"{menubar.STATUS_ICON} adsonline · 13% · Fable 23%"
+    ) == "adsonline · 13% · Fable 23%"
     assert menubar.title_usage({"active_usage": lg}) == lg
     assert menubar.title_usage(menubar.EMPTY_SNAPSHOT) is None
 
@@ -1707,6 +1870,23 @@ def test_kickoff_notification_names_accounts_not_slots():
     assert "openswap --add-account" not in text
 
 
+def test_kickoff_notification_drops_noisy_stdin_preamble():
+    copy = menubar.notification_copy_for_kickoff(
+        [
+            (
+                "personal",
+                False,
+                "Reading additional input from stdin...\n"
+                "Not inside a trusted directory and --skip-git-repo-check was not specified.",
+            )
+        ]
+    )
+    assert copy is not None
+    assert copy.title == "Couldn't start personal's 5-hour window"
+    assert "stdin" not in copy.body
+    assert "trusted directory" in copy.body
+
+
 # --- signed-out repair (extra) ------------------------------------------------
 
 def test_panel_accounts_relogin_keeps_windows_and_uses_extra_copy():
@@ -1988,6 +2168,43 @@ def test_panel_accounts_prefixes_codex_title_and_sets_provider():
     assert cards[1]["num"] == "codex:1"
 
 
+def test_provider_cards_filters_and_transforms_shared_codex_without_mutating():
+    cards = [
+        {"provider": "claude", "title": "personal", "num": "1"},
+        {"provider": "codex", "title": "Codex · plus", "num": "codex:1"},
+    ]
+    original = [dict(card) for card in cards]
+    assert [card["num"] for card in menubar.provider_cards(cards, "claude")] == ["1"]
+    chatgpt = menubar.provider_cards(cards, "chatgpt")
+    assert chatgpt == [{"provider": "chatgpt", "title": "plus", "num": "codex:1"}]
+    assert cards == original
+    assert menubar.provider_cards(cards, "other") == []
+
+
+@pytest.mark.parametrize("marker", ["kinds", "display"])
+def test_panel_accounts_marks_codex_api_key_cli_only_from_either_marker(marker):
+    row = ("codex:1", "api@x.com", True, _USAGE, _USAGE, "", "plus", False, None)
+    snapshot = {"accounts": [row]}
+    if marker == "kinds":
+        snapshot["kinds"] = {"codex:1": "api_key"}
+    else:
+        snapshot["accounts"] = [(*row[:3], menubar.USAGE_API_KEY, *row[4:])]
+    raw_cards = menubar.panel_accounts(snapshot)
+    assert not raw_cards[0]["disabled"]  # Widget/CLI semantics are unchanged.
+    card = menubar.provider_cards(raw_cards, "chatgpt")[0]
+    assert card["api_key"] is True
+    assert card["disabled"] is True
+    assert "CLI-only" in card["note"]
+
+
+def test_panel_accounts_keeps_normal_disabled_row_distinct_from_api_key():
+    row = ("codex:1", "a@x.com", False, _USAGE, _USAGE, "", "plus", True, None)
+    card = menubar.panel_accounts({"accounts": [row]})[0]
+    assert card["disabled"] is True
+    assert card["api_key"] is False
+    assert "CLI-only" not in (card["note"] or "")
+
+
 def test_codex_live_slot_changed():
     snap = {"codex_active_num": "1"}
     assert menubar.codex_live_slot_changed(snap, "2") is True
@@ -1998,6 +2215,59 @@ def test_codex_live_slot_changed():
 
 def test_codex_restart_hint():
     assert menubar.codex_restart_hint() == "Restart Codex to apply."
+
+
+def test_format_codex_running_line_empty_is_none():
+    assert menubar.format_codex_running_line([]) is None
+    assert menubar.format_codex_running_line(None) is None
+
+
+def test_format_codex_running_line_one_without_cwd():
+    proc = SimpleNamespace(pid=424242, cwd="", kind="tui")
+    line = menubar.format_codex_running_line([proc])
+    assert line == "Codex is running."
+    assert "424242" not in line
+    assert "pid" not in line.lower()
+
+
+def test_format_codex_running_line_one_with_cwd():
+    proc = SimpleNamespace(pid=424242, cwd="/Users/x/proj", kind="tui")
+    line = menubar.format_codex_running_line([proc])
+    assert line == "Codex is running in x/proj."
+    assert "424242" not in line
+    assert "pid" not in line.lower()
+
+
+def test_format_codex_running_line_multiple_sessions():
+    procs = [
+        SimpleNamespace(pid=11111, cwd="/a/one", kind="tui"),
+        SimpleNamespace(pid=22222, cwd="/b/two", kind="tui"),
+    ]
+    line = menubar.format_codex_running_line(procs)
+    assert line == "Codex is running (2 sessions)."
+    assert "11111" not in line
+    assert "22222" not in line
+
+
+def test_switch_codex_restart_hint():
+    assert menubar.switch_codex_restart_hint(True) == "Restart Codex to apply."
+    assert menubar.switch_codex_restart_hint(False) == ""
+    assert menubar.codex_restart_hint() == menubar.switch_codex_restart_hint(True)
+
+
+def test_manual_switch_omits_restart_codex_when_not_running():
+    off = menubar.notification_copy_for_manual_switch(
+        "work", running=False, provider="codex"
+    )
+    assert "Restart Codex" not in off.body
+    assert "Claude Code" not in off.body
+    on = menubar.notification_copy_for_manual_switch(
+        "work", running=True, provider="codex"
+    )
+    assert on.body == "Restart Codex to apply."
+    assert "Claude Code" not in on.body
+    default = menubar.notification_copy_for_manual_switch("work", provider="codex")
+    assert "Restart Codex to apply." in default.body
 
 
 def test_hold_cache_ignores_codex_events():
@@ -2020,6 +2290,41 @@ def test_codex_switch_event_toast_says_restart_codex():
     assert copy is not None
     assert copy.title == "Switched to b"
     assert "Restart Codex to apply." in copy.body
+    assert "Claude Code" not in copy.body
+
+
+def test_codex_switch_event_respects_running():
+    ev = SwitchEvent(
+        trigger="proactive",
+        from_ref={"number": 1, "email": "a@x.com"},
+        to_ref={"number": 2, "email": "b@x.com"},
+        provider="codex",
+    )
+    off = menubar.notification_copy_for_event(ev, running=False)
+    assert off is not None
+    assert "Restart Codex" not in off.body
+    assert "Claude Code" not in off.body
+    on = menubar.notification_copy_for_event(ev, running=True)
+    assert "Restart Codex to apply." in on.body
+    assert "Claude Code" not in on.body
+    default = menubar.notification_copy_for_event(ev)
+    assert "Restart Codex to apply." in default.body
+    assert "Claude Code" not in default.body
+
+
+def test_codex_quarantine_toast_says_sign_in_with_codex():
+    ev = QuarantineEvent(
+        number="1",
+        email="a@x.com",
+        reason="invalid_grant",
+        provider="codex",
+    )
+    copy = menubar.notification_copy_for_event(ev)
+    assert copy is not None
+    assert (
+        "Sign in with this account in Codex, then click it in the extra."
+        in copy.body
+    )
     assert "Claude Code" not in copy.body
 
 
@@ -2084,6 +2389,41 @@ def test_codex_snapshot_retries_codex_autoswitch_start():
     start = src.index("def _worker")
     end = src.index("def _log_usage")
     assert "_ensure_codex_engine" in src[start:end]
+
+
+def test_worker_scans_codex_running_and_keeps_hint_on_error():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[src.index("def _worker") : src.index("def _log_usage")]
+    assert "get_running_codex_instances" in body
+    assert 'snap["codex_running"] = True' in body
+    assert "codex_running_line" in body
+    assert "format_codex_running_line" in body
+
+
+def test_notify_switched_gates_codex_restart_on_running():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[src.index("def _notify_switched") : src.index("def _switch_from_widget")]
+    assert "codex_running" in body
+    assert "provider=\"codex\"" in body or "provider=provider" in body
+
+
+def test_drain_engine_events_uses_codex_running():
+    import inspect
+    src = inspect.getsource(menubar.run)
+    body = src[
+        src.index("def _drain_engine_events") : src.index("def _threshold")
+    ]
+    assert "codex_running" in body
+
+
+def test_panel_draws_codex_running_line():
+    text = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
+        encoding="utf-8"
+    )
+    assert "codex_running_line" in text
+    assert "RUNNING_LINE_H" in text
 
 
 # --- confirm before switching -----------------------------------------------

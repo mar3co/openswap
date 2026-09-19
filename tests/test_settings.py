@@ -108,6 +108,21 @@ class TestLoadSettings:
         set_setting(tmp_path, "autoswitch.strategy", "soonest-5h")
         assert load_settings(tmp_path).strategy == "soonest-5h"
 
+    def test_missing_file_codex_enabled_defaults_true(self, tmp_path: Path):
+        assert AutoSwitchSettings().codex_enabled is True
+        assert load_settings(tmp_path).codex_enabled is True
+
+    def test_set_codex_enabled_false_round_trips(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.codexEnabled", "false") is False
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["autoswitch"]["codexEnabled"] is False
+        assert "codex" not in raw["autoswitch"]
+        assert load_settings(tmp_path).codex_enabled is False
+
+    def test_set_codex_enabled_accepts_FALSE(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.codexEnabled", "FALSE") is False
+        assert load_settings(tmp_path).codex_enabled is False
+
 
 class TestSaveSettings:
     def test_roundtrip(self, tmp_path: Path):

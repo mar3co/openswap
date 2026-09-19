@@ -45,6 +45,7 @@ struct AccountCard: Codable, Identifiable {
     var note: String?
     var needsRelogin: Bool?
     var windows: [UsageWindow]
+    var provider: String? = nil
     var id: String { num }
 }
 

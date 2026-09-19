@@ -45,6 +45,10 @@ class CodexAuthError(ClaudeSwitchError):
     """No live Codex login, or the login is already a managed slot."""
 
 
+class DuplicateAccountError(CodexAuthError):
+    """An OAuth identity is already present in the managed roster."""
+
+
 class CodexSwitchError(ClaudeSwitchError):
     """Switch refused (unmanaged live login, missing target, …)."""
 
@@ -356,6 +360,106 @@ class CodexEngine:
             self._write_roster(data)
             return num
 
+    def add_oauth_account(self, text: str, alias: str | None = None) -> str:
+        """Import a validated OAuth blob as a new, enabled account.
+
+        Unlike :meth:`add_account`, this never reads or changes the live Codex
+        login and deliberately leaves the active marker alone.
+        """
+        # Local import avoids the desktop module's engine import cycle.
+        from openswap.codex.desktop import DesktopSwitchError, _credential_identity
+
+        try:
+            ident = _credential_identity(text, label="The new login")
+        except DesktopSwitchError as exc:
+            raise CodexAuthError(str(exc)) from exc
+        try:
+            normalized_alias = normalize_alias(alias) if alias else None
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
+        with self._lock():
+            if self.sequence_file.exists():
+                try:
+                    data = json.loads(self.sequence_file.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise ConfigError(
+                        "The Codex account roster is unreadable; repair it before adding an account."
+                    ) from exc
+                accounts_value = data.get("accounts", {}) if isinstance(data, dict) else None
+                sequence_value = data.get("sequence", []) if isinstance(data, dict) else None
+                valid_sequence = (
+                    isinstance(sequence_value, list) and
+                    all(isinstance(item, (str, int)) and not isinstance(item, bool)
+                        for item in sequence_value)
+                )
+                if (not isinstance(data, dict) or not isinstance(accounts_value, dict) or
+                        not all(isinstance(rec, dict) for rec in accounts_value.values()) or
+                        not valid_sequence):
+                    raise ConfigError(
+                        "The Codex account roster is malformed; repair it before adding an account."
+                    )
+            else:
+                data = self._read_roster()
+            accounts = dict(data.get("accounts") or {})
+            for existing, rec in accounts.items():
+                if (rec.get("email") == ident.email and
+                        rec.get("accountId") == ident.account_id):
+                    raise DuplicateAccountError(
+                        f"This ChatGPT account is already saved as account {existing}."
+                    )
+            if normalized_alias:
+                for existing, rec in accounts.items():
+                    if rec.get("alias") == normalized_alias:
+                        raise ConfigError(
+                            f"Alias '{normalized_alias}' is already used by account {existing}"
+                        )
+
+            num = self._next_free_number(data)
+            # Never adopt or overwrite an untracked directory. It may be an
+            # interrupted older operation, and cleanup below must remove only
+            # the exact slot created by this call.
+            while os.path.lexists(self._slot_dir(num)):
+                taken = {int(n) for n in self._seq_nums(data) if str(n).isdigit()}
+                taken.add(int(num))
+                candidate = 1
+                while candidate in taken or os.path.lexists(self._slot_dir(str(candidate))):
+                    candidate += 1
+                num = str(candidate)
+            slot_path = self._slot_auth_path(num)
+            wrote_slot = False
+            try:
+                self._write_slot(num, text)
+                wrote_slot = True
+                rec = {
+                    "email": ident.email,
+                    "accountId": ident.account_id,
+                    "planType": ident.plan_type,
+                    "kind": "oauth",
+                    "added": get_timestamp(),
+                    "disabled": False,
+                }
+                if normalized_alias:
+                    rec["alias"] = normalized_alias
+                accounts[num] = rec
+                sequence = list(data.get("sequence") or [])
+                sequence.append(int(num) if num.isdigit() else num)
+                data["accounts"] = accounts
+                data["sequence"] = sequence
+                self._write_roster(data)
+            except BaseException:
+                if wrote_slot:
+                    try:
+                        committed = self._read_roster()
+                        referenced = num in (committed.get("accounts") or {})
+                        if not referenced:
+                            slot_path.unlink(missing_ok=True)
+                            slot_path.parent.rmdir()
+                    except OSError:
+                        pass
+                raise
+            return num
+
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         with self._lock():
             num, _email, _acc = self.resolve_account(identifier)
@@ -437,11 +541,197 @@ class CodexEngine:
                 shutil.rmtree(slot_dir)
         print(f"{accent('Removed')} Account-{num} ({email})")
 
+    def _map_sequence(self, data: dict, mapping: dict[str, str]) -> None:
+        seq: list = []
+        seen: set[str] = set()
+        for n in data.get("sequence") or []:
+            text = mapping.get(str(n), str(n))
+            if text in seen:
+                continue
+            seen.add(text)
+            seq.append(int(text) if text.isdigit() else text)
+        seq.sort(key=lambda n: n if isinstance(n, int) else 0)
+        data["sequence"] = seq
+
+    def _map_active(self, data: dict, mapping: dict[str, str]) -> None:
+        active = data.get("activeAccountNumber")
+        if active is None:
+            return
+        key = str(active)
+        if key in mapping:
+            data["activeAccountNumber"] = mapping[key]
+
+    def _swap_slot_dirs(self, num_a: str, num_b: str) -> None:
+        dir_a = self._slot_dir(num_a)
+        dir_b = self._slot_dir(num_b)
+        self.slots_dir.mkdir(parents=True, exist_ok=True)
+        leftovers = sorted(self.slots_dir.glob(".swapping-*"))
+        if leftovers:
+            raise ConfigError(
+                f"Found leftover slot swap staging: {leftovers[0]}. "
+                "Verify both accounts, then delete the directory and retry."
+            )
+        a_exists = dir_a.exists()
+        b_exists = dir_b.exists()
+        staging = None
+        try:
+            if a_exists and b_exists:
+                staging = self.slots_dir / f".swapping-{num_a}"
+                os.replace(dir_a, staging)
+                os.replace(dir_b, dir_a)
+                os.replace(staging, dir_b)
+                staging = None
+            elif a_exists:
+                os.replace(dir_a, dir_b)
+            elif b_exists:
+                os.replace(dir_b, dir_a)
+        finally:
+            if staging is not None and staging.exists():
+                try:
+                    if not dir_a.exists():
+                        os.replace(staging, dir_a)
+                    elif not dir_b.exists():
+                        os.replace(dir_a, dir_b)
+                        os.replace(staging, dir_a)
+                except OSError:
+                    pass
+
+    def _move_slot_dir(self, src: str, dest: str) -> None:
+        src_dir = self._slot_dir(src)
+        dest_dir = self._slot_dir(dest)
+        self.slots_dir.mkdir(parents=True, exist_ok=True)
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir)
+        if src_dir.exists():
+            os.replace(src_dir, dest_dir)
+
+    def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
+        """Exchange two Codex accounts' slot numbers under the roster lock."""
+        with self._lock():
+            return self._swap_accounts_locked(first, second)
+
+    def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
+        num_a, email_a, _acc_a = self.resolve_account(first)
+        num_b, email_b, _acc_b = self.resolve_account(second)
+        if num_a == num_b:
+            raise ValidationError("Cannot swap an account with itself")
+        data = dict(self._read_roster())
+        accounts = dict(data.get("accounts") or {})
+        record_a = accounts.get(str(num_a))
+        record_b = accounts.get(str(num_b))
+        if not record_a:
+            raise AccountNotFoundError(f"Account-{num_a} does not exist")
+        if not record_b:
+            raise AccountNotFoundError(f"Account-{num_b} does not exist")
+        dirs_swapped = False
+        try:
+            self._swap_slot_dirs(num_a, num_b)
+            dirs_swapped = True
+            accounts[str(num_a)], accounts[str(num_b)] = record_b, record_a
+            data["accounts"] = accounts
+            mapping = {str(num_a): str(num_b), str(num_b): str(num_a)}
+            self._map_sequence(data, mapping)
+            self._map_active(data, mapping)
+            self._write_roster(data)
+        except BaseException:
+            if dirs_swapped:
+                try:
+                    self._swap_slot_dirs(num_a, num_b)
+                except Exception:
+                    pass
+            raise
+        self._logger.info(
+            "Swapped Codex slots: %s (%s) <-> %s (%s)", num_a, email_a, num_b, email_b
+        )
+        return num_a, num_b
+
+    def move_account(self, account: str, slot: str) -> tuple[str, str, bool]:
+        """Assign ``account`` to slot ``slot``; occupied target swaps."""
+        target = str(slot).strip()
+        if not target.isdigit() or int(target) < 1:
+            raise ValidationError(
+                f"Target slot must be a positive slot number, got: {target!r} "
+                "(use `swap` to trade two accounts by identifier)"
+            )
+        target = str(int(target))
+        with self._lock():
+            num_src, _email, _acc = self.resolve_account(account)
+            data = self._read_roster()
+            accounts = data.get("accounts") or {}
+            if not accounts.get(num_src):
+                raise AccountNotFoundError(f"Account-{num_src} does not exist")
+            max_slot = max(
+                (int(n) for n in accounts if str(n).isdigit()), default=0
+            )
+            cap = max(99, max_slot)
+            if int(target) > cap:
+                raise ValidationError(
+                    f"Target slot {target} is out of range (1-{cap}): new accounts "
+                    "are numbered from the highest slot, so a large target would "
+                    "inflate future account numbers"
+                )
+            if num_src == target:
+                return num_src, target, False
+            if accounts.get(target):
+                self._swap_accounts_locked(num_src, target)
+                return num_src, target, True
+            self._relocate_locked(num_src, target)
+            return num_src, target, False
+
+    def _relocate_locked(self, num_src: str, target: str) -> None:
+        data = dict(self._read_roster())
+        accounts = dict(data.get("accounts") or {})
+        record = accounts.get(str(num_src))
+        if not record:
+            raise AccountNotFoundError(f"Account-{num_src} does not exist")
+        if accounts.get(str(target)):
+            raise ValidationError(
+                f"Slot {target} is already occupied — retry the move"
+            )
+        email = record.get("email", "")
+        dirs_moved = False
+        try:
+            self._move_slot_dir(num_src, target)
+            dirs_moved = True
+            accounts[str(target)] = record
+            del accounts[str(num_src)]
+            data["accounts"] = accounts
+            self._map_sequence(data, {str(num_src): str(target)})
+            self._map_active(data, {str(num_src): str(target)})
+            self._write_roster(data)
+        except BaseException:
+            if dirs_moved:
+                try:
+                    self._move_slot_dir(target, num_src)
+                except Exception:
+                    pass
+            raise
+        self._logger.info("Moved Codex slot: %s (%s) -> %s", num_src, email, target)
+
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self, identifier: str, json_output: bool = False, force: bool = False,
+        *, automatic: bool = False,
     ) -> dict | None:
         with self._lock():
+            # Recheck under the same lock as desktop switching: an auto tick
+            # already in flight must not overwrite the operator's selection
+            # after they disable rotation for an experimental desktop test.
+            if automatic:
+                from openswap.settings import load_settings
+                if not load_settings(self.backup_dir).codex_enabled:
+                    return {
+                        "switched": False, "from": None, "to": None,
+                        "reason": "codex-auto-disabled", "warnings": [],
+                    }
             num, email, _acc = self.resolve_account(identifier)
+            if automatic:
+                data = self._read_roster()
+                if self._record(data, num).get("disabled"):
+                    return {
+                        "switched": False, "from": None,
+                        "to": self._ref(str(num), email),
+                        "reason": "account-disabled", "warnings": [],
+                    }
             target_text = self._slot_text(num)
             if parse_auth(target_text) is None:
                 raise CodexSwitchError(f"Account {num} has no usable Codex login.")

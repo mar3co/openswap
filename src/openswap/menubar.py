@@ -31,6 +31,42 @@ from openswap.menubar_display import (  # noqa: F401  tests poke these
     codex_restart_hint,
 )
 
+
+def desktop_switch_choices(snapshot):
+    """Only offer managed Codex OAuth rows in the experimental submenu."""
+    from openswap.codex import split_provider_num
+    from openswap.json_output import USAGE_API_KEY
+
+    kinds = snapshot.get("kinds") or {}
+    choices = []
+    for row in snapshot.get("accounts") or []:
+        num, email, _active, display, _usage, alias, _org, disabled, _at = row
+        provider, slot = split_provider_num(num)
+        if provider != "codex" or disabled:
+            continue
+        if display == USAGE_API_KEY or kinds.get(str(num)) == "api_key":
+            continue
+        label = f"{slot}  {alias} ({email})" if alias else f"{slot}  {email}"
+        choices.append((slot, label))
+    return choices
+
+
+def desktop_switch_confirm_copy(name, *, pause_auto=False):
+    pause_copy = (
+        "Codex auto-switching turns off for all OpenSwap instances using this "
+        "store until re-enabled. Claude is unchanged."
+        if pause_auto else "Keep Codex auto-switching off during desktop switching."
+    )
+    return (
+        "Restart ChatGPT?",
+        f"Experimental switch to {name}.\n\n"
+        "Restarts the entire app and changes the shared Codex login. "
+        "Save and stop all local/remote work; close other Codex clients before continuing.\n\n"
+        "After restart, check the account in Chat, Work, and Codex.\n\n"
+        + pause_copy,
+    )
+
+
 def run(switcher, codex=None) -> int:
     """Entry point for ``openswap menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -78,6 +114,9 @@ def run(switcher, codex=None) -> int:
             self._snapshot_source = SnapshotSource(switcher)
             self._codex_source = SnapshotSource(codex) if codex is not None else None
             self.snapshot = dict(EMPTY_SNAPSHOT)
+            self._account_states = {
+                "claude": "loading", "chatgpt": "loading" if codex is not None else "unavailable"
+            }
             self._dirty = False
             self._snapshot_at = 0.0
             self._refreshing = False
@@ -97,6 +136,11 @@ def run(switcher, codex=None) -> int:
             # background thread while enabled.
             self._engine = None
             self._codex_engine = None
+            self._chatgpt_auto_engine = None
+            self._chatgpt_auto_generation = 0
+            self._pending_chatgpt_switch = None
+            self._chatgpt_monitor_notice = ""
+            self._chatgpt_auto_retry_at = 0.0
             self._engine_events: list = []
             self._hold_event = None
             self._hold_slot = None
@@ -105,6 +149,13 @@ def run(switcher, codex=None) -> int:
             self._event_lock = threading.Lock()
             self._panel = None
             self._kickoff_running = False
+            self._desktop_switching = False
+            self._desktop_result = None
+            self._desktop_status = "Experimental · Switching reopens ChatGPT"
+            self._login_session = None
+            self._login_ui_state = {"stage": "idle"}
+            self._login_save_result = None
+            self._login_cancelled_session = None
             self._kickoff_results = None
             self._kickoff_retry_after: float | None = None
             self._kickoff_succeeded_nums: set[str] = set()
@@ -130,19 +181,39 @@ def run(switcher, codex=None) -> int:
             wake_widget_host()
             if self.settings.auto_switch_enabled:
                 self._start_engine()
+            if self.settings.chatgpt_auto_enabled:
+                self._start_chatgpt_auto_monitor()
 
         # ---- display refresh plumbing ----------------------------------------
         def refresh_async(self, full=False):
-            if self._refreshing:
+            if self._refreshing or self._desktop_switching:
                 return  # in-flight guard: one worker at a time (SnapshotSource
                         # pacing state is only touched by this single worker)
             self._refreshing = True
+            populated = {
+                "chatgpt" if str(row[0]).startswith("codex:") else "claude"
+                for row in self.snapshot.get("accounts", [])
+            }
+            next_states = {
+                provider: (
+                    "loading"
+                    if state != "unavailable"
+                    and (state == "error" or provider not in populated)
+                    else state
+                )
+                for provider, state in self._account_states.items()
+            }
+            if next_states != self._account_states:
+                self._account_states = next_states
+                self._hold_reload_pending = True
             threading.Thread(target=self._worker, args=(full,), daemon=True).start()
 
         def _worker(self, full):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
             # CPython); the main-thread sync tick reads them. While the engine
             # runs it already paces all fetching, so the display reads store-only.
+            previous_states = self._account_states
+            previous_slots = tuple(row[0] for row in self.snapshot.get("accounts", []))
             try:
                 self._check_identity_drift()
                 try:
@@ -152,12 +223,16 @@ def run(switcher, codex=None) -> int:
                 except Exception:
                     # Keep the last good snapshot rather than blanking the menu.
                     self.switcher._logger.debug("menubar snapshot failed", exc_info=True)
+                    self._account_states = {
+                        "claude": "error", "chatgpt": "error" if self.codex is not None else "unavailable"
+                    }
                     return
                 codex_raw = None
                 if self._codex_source is not None:
                     try:
                         codex_raw = self._codex_source.take(
-                            full=full, store_only=self._codex_engine is not None
+                            full=full, store_only=(self._codex_engine is not None or
+                                                   self._chatgpt_auto_engine is not None)
                         )
                     except Exception:
                         self.switcher._logger.debug(
@@ -178,7 +253,22 @@ def run(switcher, codex=None) -> int:
                 else:
                     snap["running_line"] = format_running_line(sessions, ides)
                     snap["claude_running"] = bool(sessions or ides)
+                try:
+                    from openswap.process_detection import get_running_codex_instances
+
+                    codex_procs = get_running_codex_instances()
+                except Exception:
+                    snap["codex_running_line"] = None
+                    snap["codex_running"] = True
+                else:
+                    snap["codex_running_line"] = format_codex_running_line(codex_procs)
+                    snap["codex_running"] = bool(codex_procs)
                 self.snapshot = snap
+                self._account_states = {
+                    "claude": "ready",
+                    "chatgpt": ("ready" if codex_raw is not None else "error")
+                    if self._codex_source is not None else "unavailable",
+                }
                 self._snapshot_at = now
                 self._dirty = True  # picked up by on_sync_tick on the main thread
                 curr_relogin = relogin_slot_nums(snap)
@@ -191,8 +281,17 @@ def run(switcher, codex=None) -> int:
                 from openswap.widget_snapshot import publish_widget_snapshot
                 publish_widget_snapshot(snap, now=self._snapshot_at)
                 self._ensure_codex_engine()
+            except Exception:
+                self.switcher._logger.debug("account display refresh failed", exc_info=True)
+                self._account_states = {
+                    provider: "error" if state == "loading" else state
+                    for provider, state in self._account_states.items()
+                }
             finally:
                 self._refreshing = False
+                if (previous_states != self._account_states or
+                        previous_slots != tuple(row[0] for row in self.snapshot.get("accounts", []))):
+                    self._hold_reload_pending = True
 
         def _check_identity_drift(self):
             watch = self._identity_watch
@@ -254,6 +353,10 @@ def run(switcher, codex=None) -> int:
             self.refresh_async()
 
         def on_sync_tick(self, _timer):
+            self._poll_login()
+            self._drain_desktop_result()
+            if self._desktop_switching:
+                return
             self._consume_widget_command()
             if self._dirty:
                 self._dirty = False
@@ -263,6 +366,8 @@ def run(switcher, codex=None) -> int:
                 # Hold copy is applied below and reloads the open main page
                 # only when it changes, deferred while the left button is down.
             self._detect_active_change()
+            self._reconcile_chatgpt_auto_mode()
+            self._validate_pending_chatgpt_switch()
             self._detect_store_change()
             self._drain_engine_events()
             self._apply_hold_line()
@@ -341,15 +446,20 @@ def run(switcher, codex=None) -> int:
 
         # ---- auto-switch engine ----------------------------------------------
         def _ensure_codex_engine(self):
+            if self._desktop_switching or self.settings.chatgpt_auto_enabled:
+                return
             if self._codex_engine is not None or self._engine is None:
                 return
             if self.codex is None or not self.codex.switchable_account_numbers():
+                return
+            settings = load_settings(self.switcher.backup_dir)
+            if not settings.codex_enabled:
                 return
             try:
                 from openswap.autoswitch import STATE_FILENAME
                 ceng = AutoSwitchEngine(
                     self.codex,
-                    load_settings(self.switcher.backup_dir),
+                    settings,
                     self._on_engine_event,
                     dry_run=False,
                     state_path=self.codex.state_dir / STATE_FILENAME,
@@ -409,6 +519,201 @@ def run(switcher, codex=None) -> int:
                 and getattr(panel, "_page", None) == MAIN_PAGE
             ):
                 panel.reload()
+
+        def _stop_codex_engine(self):
+            with self._event_lock:
+                codex_engine = self._codex_engine
+                self._codex_engine = None
+            if codex_engine is not None:
+                codex_engine.stop()
+
+        def _chatgpt_target_identity(self, number):
+            try:
+                return self.codex.slot_identity(str(number)) if self.codex else None
+            except Exception:
+                return None
+
+        def _start_chatgpt_auto_monitor(self):
+            """Start the dry-run candidate monitor; it can never switch credentials."""
+            if (not self.settings.chatgpt_auto_enabled or self.codex is None or
+                    self._chatgpt_auto_engine is not None or self._desktop_switching or
+                    self._login_session is not None):
+                return
+            if time.monotonic() < self._chatgpt_auto_retry_at:
+                return
+            if self._codex_enabled():
+                self._chatgpt_monitor_notice = "Auto-switch paused · Live Codex rotation is on"
+                self._hold_reload_pending = True
+                return
+            try:
+                from openswap.autoswitch import STATE_FILENAME
+                engine = AutoSwitchEngine(
+                    self.codex, load_settings(self.switcher.backup_dir),
+                    lambda _event: None, dry_run=True,
+                    # Read the same cooldown recorded by a confirmed desktop
+                    # switch. Dry-run never writes this policy state.
+                    state_path=self.codex.state_dir / STATE_FILENAME,
+                )
+                self._chatgpt_auto_generation += 1
+                generation = self._chatgpt_auto_generation
+                engine.on_event = lambda event, e=engine, g=generation: self._on_chatgpt_auto_event(event, e, g)
+                self._chatgpt_auto_engine = engine
+                self._chatgpt_monitor_notice = ""
+                threading.Thread(target=self._run_chatgpt_auto_engine, args=(engine, generation), daemon=True).start()
+            except Exception:
+                self._chatgpt_auto_engine = None
+                self._chatgpt_monitor_notice = "Auto-switch paused · Monitor unavailable"
+                self._chatgpt_auto_retry_at = time.monotonic() + 60
+                self._hold_reload_pending = True
+                self.switcher._logger.debug("ChatGPT candidate monitor failed to start")
+
+        def _stop_chatgpt_auto_monitor(self, *, clear_pending=True):
+            with self._event_lock:
+                engine = self._chatgpt_auto_engine
+                self._chatgpt_auto_engine = None
+                self._chatgpt_auto_generation += 1
+                if clear_pending:
+                    self._pending_chatgpt_switch = None
+                self._chatgpt_monitor_notice = ""
+                self._hold_reload_pending = True
+            if engine is not None:
+                engine.stop()
+
+        def _run_chatgpt_auto_engine(self, engine, generation):
+            try:
+                engine.run_loop()
+            except Exception:
+                self.switcher._logger.debug("ChatGPT candidate monitor stopped unexpectedly")
+            finally:
+                with self._event_lock:
+                    if (engine is self._chatgpt_auto_engine and
+                            generation == self._chatgpt_auto_generation):
+                        self._chatgpt_auto_engine = None
+                        self._pending_chatgpt_switch = None
+                        self._chatgpt_monitor_notice = "Auto-switch paused · Monitor unavailable"
+                        self._chatgpt_auto_retry_at = time.monotonic() + 60
+                        self._dirty = True
+                        self._hold_reload_pending = True
+
+        def _restart_chatgpt_auto_monitor(self):
+            if self.settings.chatgpt_auto_enabled:
+                self._stop_chatgpt_auto_monitor(clear_pending=True)
+                self._chatgpt_auto_retry_at = 0.0
+                self._start_chatgpt_auto_monitor()
+
+        def _reconcile_chatgpt_auto_mode(self):
+            if not self.settings.chatgpt_auto_enabled:
+                if self._chatgpt_auto_engine is not None or self._pending_chatgpt_switch is not None:
+                    self._stop_chatgpt_auto_monitor(clear_pending=True)
+                return
+            if self._codex_enabled():
+                if self._chatgpt_auto_engine is not None or self._pending_chatgpt_switch is not None:
+                    self._stop_chatgpt_auto_monitor(clear_pending=True)
+                notice = "Auto-switch paused · Live Codex rotation is on"
+                if self._chatgpt_monitor_notice != notice:
+                    self._chatgpt_monitor_notice = notice
+                    self._hold_reload_pending = True
+                return
+            if (self._chatgpt_auto_engine is None and not self._desktop_switching and
+                    self._login_session is None):
+                self._start_chatgpt_auto_monitor()
+
+        def _chatgpt_desktop_status(self):
+            if self._desktop_status.startswith(("Switch failed", "Switching account")):
+                return self._desktop_status
+            if self._chatgpt_monitor_notice:
+                return self._chatgpt_monitor_notice
+            if self._pending_chatgpt_switch is not None:
+                return "Switch ready · Confirms before restart"
+            if self.settings.chatgpt_auto_enabled:
+                return "Confirms before restart"
+            return self._desktop_status
+
+        def _on_chatgpt_auto_event(self, event, engine, generation):
+            with self._event_lock:
+                if (engine is not self._chatgpt_auto_engine or
+                        generation != self._chatgpt_auto_generation):
+                    return
+                if event.kind == "switch" and getattr(event, "dry_run", False):
+                    number = str(((getattr(event, "to_ref", None) or {}).get("number") or ""))
+                    from_number = str(((getattr(event, "from_ref", None) or {}).get("number") or ""))
+                    target_identity = self._chatgpt_target_identity(number)
+                    source_identity = self._chatgpt_target_identity(from_number)
+                    self._pending_chatgpt_switch = (
+                        (from_number, source_identity, number, target_identity)
+                        if number and target_identity and from_number and source_identity else None
+                    )
+                    self._chatgpt_monitor_notice = ""
+                elif event.kind in ("no-switch", "all-exhausted", "error"):
+                    self._pending_chatgpt_switch = None
+                    self._chatgpt_monitor_notice = (
+                        "Auto-switch paused · Couldn’t check accounts" if event.kind == "error" else ""
+                    )
+            self._dirty = True
+            self._hold_reload_pending = True
+
+        def _validate_pending_chatgpt_switch(self):
+            with self._event_lock:
+                pending = self._pending_chatgpt_switch
+            if pending is None:
+                return
+            from_number, source_identity, target, target_identity = pending
+            try:
+                active = self.codex.current_account_number() if self.codex else None
+                live_identity = self.codex.live_identity() if self.codex else None
+                switchable = set(self.codex.switchable_account_numbers()) if self.codex else set()
+            except Exception:
+                active, live_identity, switchable = None, None, set()
+            if (not self.settings.chatgpt_auto_enabled or self._codex_enabled() or
+                    target not in switchable or self._chatgpt_target_identity(target) != target_identity or
+                    str(active or "") != from_number or live_identity != source_identity or
+                    self._desktop_switching or
+                    self._login_session is not None):
+                with self._event_lock:
+                    if self._pending_chatgpt_switch == pending:
+                        self._pending_chatgpt_switch = None
+                self._dirty = True
+                self._hold_reload_pending = True
+
+        def _review_chatgpt_switch(self, _sender=None):
+            self._validate_pending_chatgpt_switch()
+            with self._event_lock:
+                pending = self._pending_chatgpt_switch
+            choices = dict(desktop_switch_choices(self.snapshot))
+            if pending is None or pending[2] not in choices:
+                self._show_error("That suggested account is no longer available.")
+                return
+            self._make_desktop_switch(pending[2], choices[pending[2]], expected_pending=pending)(None)
+
+        def on_toggle_chatgpt_auto(self, _sender):
+            enabling = not self.settings.chatgpt_auto_enabled
+            if enabling:
+                if self._alert(
+                    title="Turn on ChatGPT Auto-switch?",
+                    message="Finds the next account automatically. You confirm before ChatGPT restarts.\n\nThis disables live Codex rotation to prevent conflicting account changes.",
+                    ok="Turn On", cancel="Cancel",
+                ) != 1:
+                    return
+                if self._codex_enabled():
+                    if not self._guard(lambda: set_setting(
+                        self.switcher.backup_dir, "autoswitch.codexEnabled", "false"
+                    )):
+                        return
+                self._stop_codex_engine()
+            self.settings.chatgpt_auto_enabled = enabling
+            try:
+                self.settings.save(settings_path)
+            except Exception:
+                self.settings.chatgpt_auto_enabled = not enabling
+                self._show_error("Couldn’t save Auto-switch settings. Try again.")
+                return
+            self._chatgpt_auto_retry_at = 0.0
+            if enabling:
+                self._start_chatgpt_auto_monitor()
+            else:
+                self._stop_chatgpt_auto_monitor(clear_pending=True)
+            self.rebuild_menu()
+            self._reload_main_panel_if_shown()
 
         def _stop_engine(self):
             with self._event_lock:
@@ -503,8 +808,14 @@ def run(switcher, codex=None) -> int:
             with self._event_lock:
                 events, self._engine_events = self._engine_events, []
             aliases = self._alias_map()
-            running = bool(self.snapshot.get("claude_running", True))
+            claude_running = bool(self.snapshot.get("claude_running", True))
+            codex_running = bool(self.snapshot.get("codex_running", True))
             for ev in events:
+                running = (
+                    codex_running
+                    if getattr(ev, "provider", "claude") == "codex"
+                    else claude_running
+                )
                 copy = notification_copy_for_event(ev, aliases, running=running)
                 if copy is not None:
                     self._notify(copy)
@@ -525,6 +836,18 @@ def run(switcher, codex=None) -> int:
             except Exception:
                 return "best"
 
+        def _codex_enabled(self) -> bool:
+            try:
+                return bool(load_settings(self.switcher.backup_dir).codex_enabled)
+            except Exception:
+                return True
+
+        def _has_codex(self) -> bool:
+            # Settings describe the installed integration, not the current
+            # roster. Keep ChatGPT/Codex controls discoverable before the first
+            # OpenAI account is added.
+            return self.codex is not None
+
         # ---- menu construction -----------------------------------------------
         def _attach_panel_once(self, timer):
             timer.stop()
@@ -543,14 +866,17 @@ def run(switcher, codex=None) -> int:
             except Exception:
                 self.switcher._logger.debug("status item autosave failed", exc_info=True)
             try:
-                fit_status_item(nsitem, compact=not self.settings.show_icon)
+                fit_status_item(nsitem)
             except Exception:
                 self.switcher._logger.debug("status item fit failed", exc_info=True)
             self._panel = MenuBarPanel(
-                on_switch=lambda num: self._on_account_click(num, close_panel=True),
+                on_switch=self._on_panel_account_click,
                 on_rotate=lambda *_a: self._switch(None)(None),
                 on_best=lambda *_a: self._switch("best")(None),
                 on_toggle_auto=lambda *_a: self.on_toggle_autoswitch(None),
+                on_toggle_chatgpt_auto=lambda *_a: self.on_toggle_chatgpt_auto(None),
+                on_review_chatgpt_switch=self._review_chatgpt_switch,
+                chatgpt_switch_pending=lambda: self._pending_chatgpt_switch is not None,
                 on_more=self._popup_overflow,
                 auto_enabled=lambda: self.settings.auto_switch_enabled,
                 snapshot=lambda: self.snapshot,
@@ -558,11 +884,165 @@ def run(switcher, codex=None) -> int:
                 on_setting=self._on_setting,
                 settings=lambda: self.settings,
                 strategy=self._strategy,
+                has_codex=self._has_codex,
+                codex_enabled=self._codex_enabled,
+                desktop_status=self._chatgpt_desktop_status,
+                account_state=lambda provider: self._account_states.get(provider, "error"),
+                on_empty_action=self._on_empty_action,
+                login_state=lambda: dict(self._login_ui_state),
+                on_login_action=self._on_login_action,
             )
             self._panel.attach(nsitem)
 
+        def _on_empty_action(self, provider, action):
+            if self._desktop_switching or self._refreshing:
+                return
+            if provider not in ("claude", "chatgpt"):
+                return
+            if action == "retry":
+                self.refresh_async()
+            elif action in ("add", "start"):
+                if provider == "chatgpt":
+                    self._on_login_action("start")
+                else:
+                    self.on_add_login(None)
+            elif action == "capture" and provider == "chatgpt":
+                self.on_add_codex_login(None)
+
+        def _show_login_panel(self):
+            if self._panel is not None:
+                self._panel.show_login()
+                if not self._panel.is_shown():
+                    self._panel.toggle()
+
+        def _on_login_action(self, action, alias=None):
+            if self._desktop_switching:
+                return
+            if self._login_ui_state.get("stage") in ("saving", "cancelling"):
+                return
+            session = self._login_session
+            if action in ("start", "retry", "device"):
+                if self.codex is None:
+                    return
+                if self._panel is None:
+                    self._show_error("Sign-in needs the account panel. Restart OpenSwap and try again.")
+                    return
+                if action == "start" and session is not None and session.state().get("stage") != "cancelled":
+                    self._show_login_panel()
+                    return
+                from openswap.codex.onboarding import LoginSession
+                try:
+                    new_session = LoginSession(self.codex, mode="device" if action == "device" else "browser")
+                except Exception:
+                    self._login_ui_state = {"stage": "error", "message": "Couldn’t start sign-in. Try again."}
+                    self._show_login_panel()
+                    return
+                self._stop_chatgpt_auto_monitor(clear_pending=True)
+                self._login_session = new_session
+                self._login_ui_state = {"stage": "starting"}
+                self._show_login_panel()
+                threading.Thread(target=self._login_run_worker, args=(session, new_session), daemon=True).start()
+            elif action == "capture":
+                if session is None:
+                    self.on_add_codex_login(None)
+            elif action == "cancel":
+                self._hold_reload_pending = True
+                if session is None:
+                    self._login_ui_state = {"stage": "idle"}
+                else:
+                    self._login_ui_state = {"stage": "cancelling"}
+                    threading.Thread(target=self._login_cancel_worker, args=(session,), daemon=True).start()
+            elif action == "save" and session is not None:
+                if session.state().get("stage") != "ready":
+                    return
+                self._login_ui_state = {**self._login_ui_state, "stage": "saving"}
+                self._hold_reload_pending = True
+                threading.Thread(target=self._login_save_worker, args=(session, alias), daemon=True).start()
+            elif action == "dismiss":
+                if self._login_ui_state.get("stage") in ("saved", "cancelled"):
+                    self._login_session = None
+                    self._login_ui_state = {"stage": "idle"}
+                    self._hold_reload_pending = True
+                    self._start_chatgpt_auto_monitor()
+            elif action in ("copy_link", "open_browser", "copy_code") and session is not None:
+                value = (session.state().get("device_code") if action == "copy_code" else session.login_url())
+                if not value:
+                    return
+                if action == "open_browser":
+                    import webbrowser
+                    webbrowser.open(value)
+                else:
+                    from AppKit import NSPasteboard, NSPasteboardTypeString
+                    clipboard = NSPasteboard.generalPasteboard()
+                    clipboard.clearContents()
+                    clipboard.setString_forType_(value, NSPasteboardTypeString)
+
+        def _login_run_worker(self, previous, session):
+            if previous is not None:
+                previous.cancel()
+            session.run()
+
+        def _login_cancel_worker(self, session):
+            session.cancel()
+            with self._event_lock:
+                self._login_cancelled_session = session
+
+        def _login_save_worker(self, session, alias):
+            try:
+                number = session.save(alias=alias or None)
+                outcome = (session, number, None)
+            except ClaudeSwitchError as exc:
+                outcome = (session, None, str(exc))
+            except Exception:
+                outcome = (session, None, "Couldn’t save the account. Try again.")
+            with self._event_lock:
+                self._login_save_result = outcome
+
+        def _poll_login(self):
+            with self._event_lock:
+                cancelled = self._login_cancelled_session
+                self._login_cancelled_session = None
+                result = self._login_save_result
+                self._login_save_result = None
+            if cancelled is self._login_session and cancelled is not None:
+                self._login_session = None
+                self._login_ui_state = {"stage": "idle"}
+                self._hold_reload_pending = True
+                self._start_chatgpt_auto_monitor()
+            if result is not None and result[0] is self._login_session:
+                _session, _number, error = result
+                if error:
+                    self._login_ui_state = {"stage": "error", "message": error}
+                else:
+                    self._login_ui_state = {"stage": "saved"}
+                    self.refresh_async()
+                self._hold_reload_pending = True
+                return
+            if self._login_session is None or self._login_ui_state.get("stage") in ("saving", "cancelling", "saved"):
+                return
+            state = self._login_session.state()
+            # Keep save errors visible until the user chooses Retry or Cancel.
+            if self._login_ui_state.get("stage") == "error" and state.get("stage") == "ready":
+                return
+            if state != self._login_ui_state:
+                self._login_ui_state = state
+                self._hold_reload_pending = True
+
+        def _enable_codex_account(self, number):
+            if self.codex is None:
+                return False
+            if self._alert(title="Enable account?", message="This account can be used by automatic rotation when it’s on.",
+                           ok="Enable", cancel="Cancel") != 1:
+                return False
+            return self._guard(lambda: self.codex.set_account_disabled(number, False))
+
         def _on_setting(self, row_id, value):
-            if row_id == "show_account_name":
+            if row_id == "menu_bar_provider":
+                if value not in MENU_BAR_PROVIDER_CHOICES:
+                    return
+                self.settings.menu_bar_provider = value
+                self._save_and_rebuild()
+            elif row_id == "show_account_name":
                 self.on_toggle_name(None)
             elif row_id == "title_pct_5h":
                 self.on_toggle_title_5h(None)
@@ -576,10 +1056,30 @@ def run(switcher, codex=None) -> int:
                 self._make_interval(int(value))(None)
             elif row_id == "auto_switch_enabled":
                 self.on_toggle_autoswitch(None)
+            elif row_id == "chatgpt_auto_enabled":
+                self.on_toggle_chatgpt_auto(None)
             elif row_id == "threshold":
                 self._make_threshold(int(value))(None)
             elif row_id == "strategy":
                 self._make_strategy(value)(None)
+            elif row_id == "codex_enabled":
+                if (not self._codex_enabled()) and self.settings.chatgpt_auto_enabled:
+                    self._show_error("Turn off ChatGPT Auto-switch before enabling live Codex rotation.")
+                    return
+                try:
+                    current = load_settings(self.switcher.backup_dir).codex_enabled
+                    set_setting(
+                        self.switcher.backup_dir,
+                        "autoswitch.codexEnabled",
+                        "false" if current else "true",
+                    )
+                except Exception as e:
+                    self._show_error(f"Couldn't set Codex auto-switch: {e}")
+                    return
+                if current:
+                    self._stop_codex_engine()
+                else:
+                    self._ensure_codex_engine()
             elif row_id == "kickoff_enabled":
                 self.on_toggle_kickoff(None)
             elif row_id == "kickoff_time":
@@ -587,8 +1087,6 @@ def run(switcher, codex=None) -> int:
                 # The popup already shows the pick; do not rebuild the page
                 # under the open menu.
                 return
-            elif row_id == "show_icon":
-                self.on_toggle_icon(None)
             else:
                 return
             panel = self._panel
@@ -621,21 +1119,13 @@ def run(switcher, codex=None) -> int:
 
                 fit_status_item(
                     nsitem,
-                    compact=not self.settings.show_icon,
                     title=title,
                 )
             except Exception:
                 self.switcher._logger.debug("status item fit failed", exc_info=True)
 
         def rebuild_menu(self):
-            title = format_title(
-                self.snapshot["active_email"],
-                title_usage(self.snapshot),
-                self.settings,
-                now=title_clock(self.snapshot),
-                alias=self.snapshot.get("active_alias"),
-                org_name=self.snapshot.get("active_org"),
-            )
+            title = format_menu_bar_title(self.snapshot, self.settings)
             self.title = title
             self._fit_status_item(title)
             # Stop a rumps memory leak: rumps registers each menu item's callback
@@ -658,14 +1148,18 @@ def run(switcher, codex=None) -> int:
                             _purge(_sub)
                 _purge(self.menu._menu)
             self.menu.clear()
+            if self._desktop_switching:
+                self.menu = [rumps.MenuItem("Restarting ChatGPT…", callback=None)]
+                return
             # Overflow menu (popover More…): account switching and settings live
             # in the popover, so this list is management only.
             self.menu = [
-                rumps.MenuItem("Rotate to next", callback=self._switch(None)),
-                rumps.MenuItem("Switch to best", callback=self._switch("best")),
-                rumps.MenuItem("Next available", callback=self._switch("next-available")),
+                rumps.MenuItem("Claude: rotate to next", callback=self._switch(None)),
+                rumps.MenuItem("Claude: switch to best", callback=self._switch("best")),
+                rumps.MenuItem("Claude: next available", callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
+                *([self._desktop_menu(rumps)] if self._panel is None else []),
                 self._rename_menu(rumps),
                 self._disable_menu(rumps),
                 self._remove_menu(rumps),
@@ -688,8 +1182,9 @@ def run(switcher, codex=None) -> int:
             menu = rumps.MenuItem("Add account")
             menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
             if self.codex is not None:
+                menu.add(rumps.MenuItem("Sign in with ChatGPT…", callback=lambda _sender: self._on_login_action("start")))
                 menu.add(rumps.MenuItem(
-                    "From current Codex login", callback=self.on_add_codex_login
+                    "Save current ChatGPT login", callback=self.on_add_codex_login
                 ))
             if hasattr(self.switcher, "add_account_from_token"):
                 menu.add(rumps.MenuItem("From API key or setup token…", callback=self.on_add_token))
@@ -704,6 +1199,125 @@ def run(switcher, codex=None) -> int:
                 label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
                 menu.add(rumps.MenuItem(label, callback=self._make_rename(num, email, alias)))
             return menu
+
+        def _desktop_menu(self, rumps):
+            menu = rumps.MenuItem("Switch ChatGPT app (experimental)")
+            if self.codex is not None and self._codex_enabled():
+                menu.add(rumps.MenuItem(
+                    "Pause Codex auto-switching for testing…",
+                    callback=self._pause_codex_for_desktop,
+                ))
+                menu.add(None)
+            choices = desktop_switch_choices(self.snapshot) if self.codex else []
+            if not choices:
+                menu.add(rumps.MenuItem("Add a ChatGPT login via Codex first", callback=None))
+            for num, label in choices:
+                menu.add(rumps.MenuItem(label, callback=self._make_desktop_switch(num, label)))
+            return menu
+
+        def _pause_codex_for_desktop(self, _sender):
+            if self._desktop_switching:
+                return
+            if self._alert(
+                title="Pause Codex auto-switching?",
+                message=(
+                    "This turns off automatic Codex account rotation for all OpenSwap "
+                    "instances using this account store. Claude rotation is unchanged. "
+                    "It stays off until you re-enable it in Settings or with the CLI."
+                ),
+                ok="Pause Codex", cancel="Cancel",
+            ) != 1:
+                return
+            if self._guard(lambda: set_setting(
+                self.switcher.backup_dir, "autoswitch.codexEnabled", "false"
+            )):
+                self._stop_codex_engine()
+                self.rebuild_menu()
+
+        def _make_desktop_switch(self, num, label, *, expected_pending=None):
+            def cb(_sender):
+                if self.codex is None or self._desktop_switching:
+                    return
+                if self._login_session is not None:
+                    self._show_error("Finish or cancel adding the account first.")
+                    return
+                if self._refreshing or self._kickoff_running:
+                    self._show_error("Wait for the current refresh or kickoff to finish, then try again.")
+                    return
+                pause_auto = self._codex_enabled()
+                title, message = desktop_switch_confirm_copy(label, pause_auto=pause_auto)
+                if self._alert(title=title, message=message, ok="Restart ChatGPT", cancel="Cancel") != 1:
+                    return
+                if expected_pending is not None:
+                    self._validate_pending_chatgpt_switch()
+                    if self._pending_chatgpt_switch != expected_pending:
+                        self._show_error("The suggested account changed. Review the latest suggestion.")
+                        return
+                # A native modal dialog can pump the timer run loop. Recheck
+                # activity that may have started while consent was visible.
+                if self._refreshing or self._kickoff_running:
+                    self._show_error("A refresh or kickoff started. Wait for it to finish, then try again.")
+                    return
+                if pause_auto:
+                    if not self._guard(lambda: set_setting(
+                        self.switcher.backup_dir, "autoswitch.codexEnabled", "false"
+                    )):
+                        return
+                elif self._codex_enabled():
+                    self._show_error("Codex auto-switching was enabled while confirming. Try again to confirm pausing it.")
+                    return
+                self._stop_codex_engine()
+                self._stop_chatgpt_auto_monitor(clear_pending=True)
+                self._desktop_switching = True
+                self._desktop_status = "Switching account · Reopening ChatGPT…"
+                self.rebuild_menu()
+                if self._panel is not None:
+                    self._panel.close()
+                threading.Thread(target=self._desktop_worker, args=(num,), daemon=True).start()
+            return cb
+
+        def _desktop_worker(self, num):
+            try:
+                from openswap.codex.desktop import DesktopSwitcher
+                result = DesktopSwitcher(self.codex).switch(
+                    num, confirm_restart=True, confirm_idle=True
+                )
+                outcome = (result, None)
+            except ClaudeSwitchError as exc:
+                outcome = (None, str(exc))
+            except Exception:
+                # Never surface arbitrary credential/protocol details.
+                outcome = (None, "The desktop switch failed. Check the selected account before retrying.")
+            with self._event_lock:
+                self._desktop_result = outcome
+
+        def _drain_desktop_result(self):
+            with self._event_lock:
+                pending = self._desktop_result
+                self._desktop_result = None
+            if pending is None:
+                return
+            self._desktop_switching = False
+            self._start_chatgpt_auto_monitor()
+            result, error = pending
+            self._desktop_status = (
+                "Switch failed · Check ChatGPT before retrying" if error else
+                "ChatGPT reopened · Check the profile"
+            )
+            # The panel may have been reopened during the background work.
+            # Reuse the existing mouse-up-safe main-panel refresh queue.
+            self._hold_reload_pending = True
+            self.rebuild_menu()
+            if error:
+                self._show_error(error)
+            elif result is not None:
+                record_manual_switch(self.codex.state_dir)
+                try:
+                    self._notify(notification_copy_for_desktop_switch())
+                except Exception:
+                    # Inline status and refresh are the durable fallback.
+                    pass
+            self.refresh_async()
 
         def _remove_menu(self, rumps):
             menu = rumps.MenuItem("Remove account")
@@ -775,10 +1389,16 @@ def run(switcher, codex=None) -> int:
                 popover.setLevel_(level)
 
         def _alert(self, **kwargs) -> int:
-            return self._dialog(lambda: rumps.alert(**kwargs))
+            from openswap.menubar_dialog import make_dialog_alert
+
+            alert = make_dialog_alert(**kwargs)
+            return self._dialog(alert.runModal)
 
         def _prompt(self, **kwargs):
-            return self._dialog(lambda: rumps.Window(**kwargs).run())
+            from openswap.menubar_dialog import make_dialog_prompt
+
+            prompt = make_dialog_prompt(**kwargs)
+            return self._dialog(prompt.run)
 
         def _show_error(self, message: str):
             self._alert(title="openswap", message=message)
@@ -825,7 +1445,8 @@ def run(switcher, codex=None) -> int:
         def _notify(self, copy: NotificationCopy | None):
             if copy is None:
                 return
-            rumps.notification(*copy.rumps_args())
+            kwargs = {} if copy.sound is None else {"sound": copy.sound}
+            rumps.notification(*copy.rumps_args(), **kwargs)
 
         def _alias_map(self) -> dict[str, str]:
             aliases: dict[str, str] = {}
@@ -863,14 +1484,30 @@ def run(switcher, codex=None) -> int:
 
         def _notify_switched(self, dest_name: str, *, provider: str = "claude"):
             if provider == "codex":
-                copy = notification_copy_for_manual_switch(dest_name, running=False)
-                self._notify(NotificationCopy(title=copy.title, body=codex_restart_hint()))
-                return
-            running = bool(self.snapshot.get("claude_running", True))
-            self._notify(notification_copy_for_manual_switch(dest_name, running=running))
+                running = bool(self.snapshot.get("codex_running", True))
+            else:
+                running = bool(self.snapshot.get("claude_running", True))
+            self._notify(
+                notification_copy_for_manual_switch(
+                    dest_name, running=running, provider=provider
+                )
+            )
 
         def _switch_from_widget(self, num):
             self._on_account_click(num, close_panel=False)
+
+        def _on_panel_account_click(self, num):
+            """The ChatGPT tab has one guarded desktop/shared-login action."""
+            from openswap.codex import split_provider_num
+            provider, slot = split_provider_num(num)
+            if provider != "codex":
+                self._on_account_click(num, close_panel=True)
+                return
+            choices = dict(desktop_switch_choices(self.snapshot))
+            if slot not in choices:
+                self._show_error("Choose an enabled ChatGPT OAuth account. API keys are only supported by the Codex CLI.")
+                return
+            self._make_desktop_switch(slot, choices[slot])(None)
 
         def _slot_needs_relogin(self, num) -> bool:
             for row in self.snapshot.get("accounts") or []:
@@ -888,6 +1525,8 @@ def run(switcher, codex=None) -> int:
                 return None
 
         def _on_account_click(self, num, *, close_panel):
+            if self._desktop_switching:
+                return
             from openswap.codex import split_provider_num
             provider, n = split_provider_num(num)
             if provider == "codex":
@@ -1088,7 +1727,7 @@ def run(switcher, codex=None) -> int:
                         "(leave blank to remove it):"
                     ),
                     default_text=current or "",
-                    ok="Save", cancel="Cancel", dimensions=(320, 24),
+                    ok="Save", cancel="Cancel",
                 )
                 if resp.clicked != 1:
                     return
@@ -1113,6 +1752,7 @@ def run(switcher, codex=None) -> int:
                     message=f"Remove account {num}?",
                     ok="Remove",
                     cancel="Cancel",
+                    destructive=True,
                 ) == 1:  # 1 == OK
                     from openswap.codex import split_provider_num
                     provider, n = split_provider_num(num)
@@ -1135,9 +1775,9 @@ def run(switcher, codex=None) -> int:
                 from openswap.codex import split_provider_num
                 provider, n = split_provider_num(num)
                 if provider == "codex" and self.codex is not None:
-                    ok = self._guard(
-                        lambda: self.codex.set_account_disabled(n, target)
-                    )
+                    ok = (self._enable_codex_account(n) if not target else self._guard(
+                        lambda: self.codex.set_account_disabled(n, True)
+                    ))
                 else:
                     ok = self._guard(
                         lambda: self.switcher.set_account_disabled(str(num), target)
@@ -1162,7 +1802,7 @@ def run(switcher, codex=None) -> int:
             email_resp = self._prompt(
                 title="Add account from token",
                 message="Email label (optional; leave blank to auto-name):",
-                ok="Next", cancel="Cancel", dimensions=(320, 24),
+                ok="Next", cancel="Cancel",
             )
             if email_resp.clicked != 1:
                 return
@@ -1170,7 +1810,7 @@ def run(switcher, codex=None) -> int:
             token_resp = self._prompt(
                 title="Add account from token",
                 message="API key (sk-ant-api…) or setup token (sk-ant-oat01-…):",
-                ok="Add", cancel="Cancel", dimensions=(320, 24),
+                ok="Add", cancel="Cancel",
             )
             if token_resp.clicked != 1 or not token_resp.text.strip():
                 return
@@ -1212,6 +1852,9 @@ def run(switcher, codex=None) -> int:
             self.refresh_async(full=True)  # explicit user refresh → full pass
 
         def on_quit(self, _sender):
+            if self._login_session is not None:
+                self._login_session.cancel()
+            self._stop_chatgpt_auto_monitor(clear_pending=True)
             self._stop_engine()
             rumps.quit_application()
 
@@ -1264,10 +1907,6 @@ def run(switcher, codex=None) -> int:
             self.rebuild_menu()
             self._reload_main_panel_if_shown()
 
-        def on_toggle_icon(self, _sender):
-            self.settings.show_icon = not self.settings.show_icon
-            self._save_and_rebuild()
-
         def on_toggle_kickoff(self, _sender):
             self.settings.kickoff_enabled = not self.settings.kickoff_enabled
             self._save_and_rebuild()
@@ -1287,7 +1926,7 @@ def run(switcher, codex=None) -> int:
             self._save_and_rebuild()
 
         def _maybe_kickoff(self):
-            if self._kickoff_running or self._kickoff_results is not None:
+            if self._desktop_switching or self._kickoff_running or self._kickoff_results is not None:
                 return
             now = datetime.now()
             today = now.date().isoformat()
@@ -1316,6 +1955,8 @@ def run(switcher, codex=None) -> int:
         def _run_kickoff(self):
             results: list[tuple[str, bool, str]] = []
             try:
+                from openswap.codex import split_provider_num
+                from openswap.kickoff import invoke_codex_kickoff
                 from openswap.session import SessionManager
 
                 mgr = SessionManager(self.switcher)
@@ -1324,6 +1965,7 @@ def run(switcher, codex=None) -> int:
                 ) in self.snapshot["accounts"]:
                     if str(num) in self._kickoff_succeeded_nums:
                         continue
+                    provider, slot_n = split_provider_num(num)
                     try:
                         is_api = (
                             (self.snapshot.get("kinds") or {}).get(str(num))
@@ -1341,9 +1983,6 @@ def run(switcher, codex=None) -> int:
                         continue
                     name = account_short_name(email, alias or None, num)
                     try:
-                        from openswap.codex import split_provider_num
-                        from openswap.kickoff import invoke_codex_kickoff
-                        provider, slot_n = split_provider_num(num)
                         if provider == "codex":
                             if self.codex is None:
                                 continue
@@ -1404,6 +2043,7 @@ def run(switcher, codex=None) -> int:
                     self._alert(title="openswap", message=f"Couldn't set threshold: {e}")
                     return
                 self._restart_engine()  # apply immediately if running
+                self._restart_chatgpt_auto_monitor()
                 self.rebuild_menu()
             return cb
 
@@ -1417,6 +2057,7 @@ def run(switcher, codex=None) -> int:
                     self._alert(title="openswap", message=f"Couldn't set strategy: {e}")
                     return
                 self._restart_engine()
+                self._restart_chatgpt_auto_monitor()
                 self.rebuild_menu()
             return cb
 

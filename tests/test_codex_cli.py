@@ -73,3 +73,47 @@ def test_codex_remove_cancel_does_not_claim_success(temp_home, capsys, monkeypat
     assert "Cancelled" in out
     assert "Removed" not in out
     assert (paths.get_backup_root() / "codex" / "slots" / "1" / "auth.json").exists()
+
+
+def _two_codex_accounts(temp_home, monkeypatch):
+    home = temp_home / ".codex"
+    home.mkdir()
+    (home / "auth.json").write_text(_auth(email="a@x.com", account_id="acc-a", refresh="rt-a"))
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setattr(
+        "openswap.codex.engine.read_rate_limits",
+        lambda *a, **k: {"primary": {"usedPercent": 3, "windowDurationMins": 300}},
+    )
+    monkeypatch.setattr("shutil.which", lambda name: "/opt/codex" if name == "codex" else None)
+    assert run_cli(["codex", "add", "--alias", "work"]) == 0
+    (home / "auth.json").write_text(_auth(email="b@x.com", account_id="acc-b", refresh="rt-b"))
+    assert run_cli(["codex", "add"]) == 0
+    return home
+
+
+def test_codex_export_import_roundtrip(temp_home, capsys, monkeypatch):
+    _two_codex_accounts(temp_home, monkeypatch)
+    capsys.readouterr()
+    out = temp_home / "codex.openswap"
+    assert run_cli(["codex", "export", str(out)]) == 0
+    envelope = json.loads(out.read_text())
+    assert envelope["provider"] == "codex"
+    assert {a["email"] for a in envelope["accounts"]} == {"a@x.com", "b@x.com"}
+    assert run_cli(["codex", "import", str(out)]) == 0
+    assert run_cli(["codex", "import", str(out), "--force"]) == 0
+    slot = paths.get_backup_root() / "codex" / "slots" / "1" / "auth.json"
+    assert "rt-a" in slot.read_text()
+
+
+def test_codex_swap_and_move_roundtrip(temp_home, capsys, monkeypatch):
+    _two_codex_accounts(temp_home, monkeypatch)
+    capsys.readouterr()
+    assert run_cli(["codex", "swap", "1", "2"]) == 0
+    seq = json.loads((paths.get_backup_root() / "codex" / "sequence.json").read_text())
+    assert seq["accounts"]["1"]["email"] == "b@x.com"
+    assert seq["accounts"]["2"]["email"] == "a@x.com"
+    assert run_cli(["codex", "move", "1", "5"]) == 0
+    seq = json.loads((paths.get_backup_root() / "codex" / "sequence.json").read_text())
+    assert seq["accounts"]["5"]["email"] == "b@x.com"
+    assert "1" not in seq["accounts"]
+    assert seq["sequence"] == [2, 5]
