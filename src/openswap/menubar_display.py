@@ -1102,12 +1102,16 @@ def extra_note_for_display(display, *, provider: str = "claude") -> str | None:
     return None
 
 
-def relogin_slot_nums(snapshot: dict) -> set[str]:
-    return {
-        str(row[0])
-        for row in snapshot.get("accounts") or []
-        if display_needs_relogin(row[3])
-    }
+def relogin_slot_nums(snapshot: dict, *, provider: str | None = None) -> set[str]:
+    result = set()
+    for row in snapshot.get("accounts") or []:
+        num = str(row[0])
+        row_provider = "codex" if num.startswith("codex:") else "claude"
+        if provider is not None and row_provider != provider:
+            continue
+        if display_needs_relogin(row[3]):
+            result.add(num)
+    return result
 
 
 def newly_relogin_slots(prev: set[str], curr: set[str]) -> set[str]:

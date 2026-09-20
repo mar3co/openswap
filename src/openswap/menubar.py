@@ -242,19 +242,6 @@ def run(switcher, codex=None) -> int:
                         )
                         codex_raw = None
                 snap = _adapt_snapshot(raw, codex_raw)
-                with self._event_lock:
-                    # A fresh healthy measurement taken after the kickoff
-                    # failure proves the user repaired that account. Cached
-                    # last-good usage must not clear the warning early.
-                    self._kickoff_action_required = (
-                        reconcile_kickoff_action_required(
-                            self._kickoff_action_required,
-                            snap.get("accounts") or [],
-                        )
-                    )
-                    snap["kickoff_action_required"] = sorted(
-                        self._kickoff_action_required
-                    )
                 self._log_usage(snap)
                 now = time.time()
                 snap["hold_line"] = self._hold_line_for(snap)
@@ -278,7 +265,20 @@ def run(switcher, codex=None) -> int:
                 else:
                     snap["codex_running_line"] = format_codex_running_line(codex_procs)
                     snap["codex_running"] = bool(codex_procs)
-                self.snapshot = snap
+                # Keep reconciliation and publication under the same lock as
+                # kickoff result draining. Otherwise a snapshot built just
+                # before an OAuth failure can overwrite the new warning.
+                with self._event_lock:
+                    self._kickoff_action_required = (
+                        reconcile_kickoff_action_required(
+                            self._kickoff_action_required,
+                            snap.get("accounts") or [],
+                        )
+                    )
+                    snap["kickoff_action_required"] = sorted(
+                        self._kickoff_action_required
+                    )
+                    self.snapshot = snap
                 self._account_states = {
                     "claude": "ready",
                     "chatgpt": ("ready" if codex_raw is not None else "error")
@@ -1722,7 +1722,9 @@ def run(switcher, codex=None) -> int:
         def _maybe_auto_capture_relogin(self):
             if self._refreshing or self._auto_capturing:
                 return
-            nums = relogin_slot_nums(self.snapshot)
+            # Claude auto-capture must never adopt a Codex/ChatGPT credential;
+            # the two providers use different identity and storage formats.
+            nums = relogin_slot_nums(self.snapshot, provider="claude")
             self._auto_captured_nums &= nums
             if not nums:
                 self._auto_capture_failed_for = None

@@ -2085,6 +2085,29 @@ def test_matching_relogin_slot_requires_org_uuid():
     assert menubar.matching_relogin_slot(live, identities, set()) is None
 
 
+def test_relogin_slot_filter_keeps_provider_credentials_separate():
+    relogin = menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
+    snapshot = {
+        "accounts": [
+            ("1", "claude@x.com", False, relogin, None, "", "", False, None),
+            (
+                "codex:1",
+                "codex@x.com",
+                False,
+                relogin,
+                None,
+                "",
+                "",
+                False,
+                None,
+            ),
+        ]
+    }
+    assert menubar.relogin_slot_nums(snapshot) == {"1", "codex:1"}
+    assert menubar.relogin_slot_nums(snapshot, provider="claude") == {"1"}
+    assert menubar.relogin_slot_nums(snapshot, provider="codex") == {"codex:1"}
+
+
 def test_newly_relogin_slots_only_the_new_ones():
     assert menubar.newly_relogin_slots({"1"}, {"1", "2"}) == {"2"}
     assert menubar.newly_relogin_slots(set(), {"1"}) == {"1"}
