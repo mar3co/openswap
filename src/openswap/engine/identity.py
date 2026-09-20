@@ -4,6 +4,51 @@ from __future__ import annotations
 
 from openswap.engine.notes import *  # noqa: F403
 
+
+@dataclasses.dataclass(frozen=True)
+class IdentityDrift:
+    """``~/.claude.json`` names ``config_slot`` while the live credential is
+    ``owner_slot``'s: something other than a switch rewrote the identity.
+
+    ``outcome``:
+
+    - ``"observed"``: the live credential is attributed to ``owner_slot``
+      (display text; several slots when backups share its lineage) and the config
+      names something else: another slot, or an unmanaged login
+      (``config_slot`` None).
+    - ``"unattributed"``: the credential is absent, or (under a managed
+      config) matches no backup: rotated since the last resync, or a login in
+      progress. Neither a drift nor consistent yet; ``owner_slot`` is None.
+    - ``"indeterminate"``: a degraded live read, or an unreadable backup or
+      config, left nothing established (both slots None).
+    """
+
+    config_slot: str | None
+    owner_slot: str | None
+    outcome: str
+    # The exact ``(email, organizationUuid)`` the config named. ``config_slot``
+    # is None for EVERY unmanaged login, so the slot alone cannot tell one
+    # observed identity from a different login that replaced it.
+    config_identity: tuple[str, str] | None = dataclasses.field(
+        default=None, compare=False
+    )
+
+
+def credential_owner_slots(
+    live_fp: str | None, backup_fps: dict[str, str | None]
+) -> list[str]:
+    """Slots whose stored backup shares the live credential's lineage.
+
+    None (a fresh ``/login``, or a rotation no collect pass has resynced yet)
+    and several (one account captured into two slots) are different states:
+    only the first can be a login openswap does not manage, and the second
+    still says whether the config names one of them.
+    """
+    if not live_fp:
+        return []
+    return [num for num, fp in backup_fps.items() if fp == live_fp]
+
+
 class IdentityMixin:
     """(email, organizationUuid) matching and identifier resolution."""
 
@@ -55,6 +100,66 @@ class IdentityMixin:
         data = self._get_sequence_data() or {}
         email, org_uuid = identity
         return self._find_account_slot(data, email, org_uuid)
+
+    def identity_drift(self) -> IdentityDrift | None:
+        """Whether the config identity and the live credential disagree.
+
+        Called by the extra. Other Claude surfaces rewrite ``oauthAccount``
+        without touching the credential (#46), which reads everywhere else
+        here as an account change nobody made. Read-only, and takes no lock,
+        so a single ``"observed"`` can be the middle of a switch or a login
+        (each writes the config and the credential as two steps): callers
+        must see it persist before believing it.
+
+        None means nothing to report: consistent, logged out, or a login
+        openswap does not manage running on its own credential. A degraded live read may be
+        a superseded generation (on macOS Claude Code rotates keychain-only, so
+        the plaintext fallback lags), an unreadable backup could be the second
+        owner that makes the match ambiguous, and a credential no backup
+        attributes says nothing about whose it is. None of those is evidence
+        either way, so none of them may read as "no drift". Nor may a config
+        caught mid-write: Claude Code rewrites it constantly, and a torn read
+        taken for "logged out" would disarm the caller over a drift that is
+        still there.
+        """
+        try:
+            triple = self._get_current_identity_triple(strict=True)
+            if triple is None:
+                return None
+            roster = self._get_sequence_data() or {}
+        except ConfigError:
+            return IdentityDrift(None, None, "indeterminate")
+        config_identity = triple[:2]
+        active = self._read_active_credentials()
+        if active.degraded or active.value is None:
+            return IdentityDrift(None, None, "indeterminate")
+        backup_fps: dict[str, str | None] = {}
+        for num, acc in (roster.get("accounts") or {}).items():
+            backup, unreadable = self._read_account_credentials_ex(
+                num, acc.get("email") or ""
+            )
+            if unreadable:
+                return IdentityDrift(None, None, "indeterminate")
+            backup_fps[num] = oauth.credential_fingerprint(backup)
+        live_fp = oauth.credential_fingerprint(active.value)
+        owners = credential_owner_slots(live_fp, backup_fps)
+        config_slot = self._find_account_slot(roster, *config_identity)
+        if owners:
+            if config_slot in owners:
+                return None
+            return IdentityDrift(
+                config_slot,
+                "'s or Account-".join(sorted(owners)),
+                "observed",
+                config_identity,
+            )
+        if live_fp and config_slot is None:
+            # A login openswap does not manage, running on its own credential.
+            # A managed slot's credential that rotated since its last resync
+            # looks the same under an unmanaged config, and is missed here:
+            # retrying that would retry every genuine unmanaged login forever.
+            return None
+        return IdentityDrift(config_slot, None, "unattributed", config_identity)
 
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
