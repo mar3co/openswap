@@ -293,6 +293,12 @@ def run(switcher, codex=None) -> int:
                         previous_slots != tuple(row[0] for row in self.snapshot.get("accounts", []))):
                     self._hold_reload_pending = True
 
+        def _config_mtime_or_none(self):
+            try:
+                return self._config_path.stat().st_mtime
+            except OSError:
+                return None
+
         def _check_identity_drift(self):
             watch = self._identity_watch
             log = self.switcher._logger
@@ -306,13 +312,16 @@ def run(switcher, codex=None) -> int:
             if state != "run":
                 return
             try:
+                # Both sampled BEFORE the check reads the config. A rewrite
+                # landing during its Keychain reads then leaves the watch
+                # holding the OLD identity, so the next tick re-arms it;
+                # sampled after, the new identity would be marked checked
+                # without ever having been looked at.
+                sampled = self.switcher.live_identity()
+                config_mtime = self._config_mtime_or_none()
                 drift = self.switcher.identity_drift()
                 line = None
                 if drift is not None and drift.outcome != "unattributed":
-                    try:
-                        config_mtime = self._config_path.stat().st_mtime
-                    except OSError:
-                        config_mtime = None
                     try:
                         from openswap.process_detection import scan_sessions
 
@@ -320,11 +329,21 @@ def run(switcher, codex=None) -> int:
                     except OSError:
                         sessions, unreadable = None, 0
                     line = format_identity_drift_log(
-                        drift, sessions, unreadable, config_mtime
+                        drift,
+                        sessions,
+                        unreadable,
+                        config_mtime,
+                        self._config_mtime_or_none(),
                     )
-                report = watch.record(
-                    time.time(), self.switcher.live_identity(), drift, line
+                # The identity the check actually judged, when it says; the
+                # earlier sample only stands in for a clean pass, where being
+                # older can over-arm but never miss.
+                checked = (
+                    drift.config_identity
+                    if drift is not None and drift.config_identity is not None
+                    else sampled
                 )
+                report = watch.record(time.time(), checked, drift, line)
                 if report:
                     log.warning(report)
             except Exception:

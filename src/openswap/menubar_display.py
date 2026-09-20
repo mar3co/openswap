@@ -660,7 +660,9 @@ def format_codex_running_line(procs) -> str | None:
 # A switch and a login each write the config and the credential as two steps;
 # a drift has to outlive this before it is one and not the middle of either.
 IDENTITY_SETTLE_S = 10.0
-IDENTITY_RETRY_S = 300.0
+# Half the hourly budget at most: a state that retries for hours (offline, no
+# credential) must leave room for a real incident's two passes.
+IDENTITY_RETRY_S = 600.0
 # Every pass is charged, clean ones included: each costs a Keychain read per
 # slot, and an external writer flipping the identity is what would drive them.
 IDENTITY_ATTEMPTS_PER_HOUR = 12
@@ -708,8 +710,11 @@ class IdentityDriftWatch:
         self._seen = live
         if live == self._checked:
             return False
+        # A move is news: the backoff it would wait out belongs to the state
+        # it just replaced, and the evidence is freshest now. The budget, which
+        # every pass draws on, is what bounds a writer that keeps moving it.
         self._due = True
-        self._retry_at = max(self._retry_at, self._budget_floor(now))
+        self._retry_at = self._budget_floor(now)
         return True
 
     def ready(self, now: float) -> bool:
@@ -784,7 +789,11 @@ def _local_iso_or_unknown(epoch_s) -> str:
 
 
 def format_identity_drift_log(
-    drift, sessions, unreadable: int, config_mtime: float | None
+    drift,
+    sessions,
+    unreadable: int,
+    config_mtime: float | None,
+    config_mtime_after: float | None = None,
 ) -> str:
     """Log line for an identity rewritten outside a switch (#46).
 
@@ -792,12 +801,15 @@ def format_identity_drift_log(
     written and every Claude Code session alive at that moment, with its
     entrypoint (``claude-desktop`` vs ``cli``) and start time. ``sessions`` is
     None when they could not be enumerated, which must never read as "none
-    were running".
+    were running". ``config_mtime`` is sampled just before the check read the
+    identity and ``config_mtime_after`` once it finished: when they differ
+    the config was written again meanwhile, and the line says so rather than
+    pairing the identity with a write that may not be the one that set it.
     """
     if drift.outcome == "indeterminate":
         what = (
             "could not be checked for a change made outside openswap (the "
-            "Keychain or a stored backup is unreadable)"
+            "Keychain, a stored backup or the config is unreadable)"
         )
     else:
         named = (
@@ -824,6 +836,11 @@ def format_identity_drift_log(
         if unreadable:
             running += f" (+{unreadable} unreadable)"
     written = _local_iso_or_unknown(config_mtime) if config_mtime else "unknown"
+    if config_mtime_after and config_mtime_after != config_mtime:
+        written += (
+            f" (and again at {_local_iso_or_unknown(config_mtime_after)}, "
+            "during the check)"
+        )
     return f"Active account {what}. Config written {written}; running: {running}"
 
 

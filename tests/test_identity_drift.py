@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from openswap.credentials import ActiveCredentials
-from openswap.engine.identity import IdentityDrift, credential_owner_slot
+from openswap.engine.identity import IdentityDrift, credential_owner_slots
 from openswap.menubar_display import (
     IDENTITY_ATTEMPTS_PER_HOUR,
     IDENTITY_RETRY_S,
@@ -29,15 +29,14 @@ UNATTRIBUTED = IdentityDrift("1", None, "unattributed", (EMAIL, PERSONAL_ORG))
 @pytest.mark.parametrize(
     ("live_fp", "backup_fps", "expected"),
     [
-        ("fp-2", {"1": "fp-1", "2": "fp-2"}, "2"),
-        ("fp-9", {"1": "fp-1", "2": "fp-2"}, None),
-        ("fp-1", {"1": "fp-1", "2": "fp-1"}, None),
-        (None, {"1": None, "2": "fp-2"}, None),
-        ("fp-2", {}, None),
+        ("fp-2", {"1": "fp-1", "2": "fp-2"}, ["2"]),
+        ("fp-9", {"1": "fp-1", "2": "fp-2"}, []),
+        ("fp-1", {"1": "fp-1", "2": "fp-1"}, ["1", "2"]),
+        (None, {"1": None, "2": "fp-2"}, []),
     ],
 )
-def test_credential_owner_slot(live_fp, backup_fps, expected) -> None:
-    assert credential_owner_slot(live_fp, backup_fps) == expected
+def test_credential_owner_slots(live_fp, backup_fps, expected) -> None:
+    assert credential_owner_slots(live_fp, backup_fps) == expected
 
 
 def _set_live_credential(temp_home: Path, refresh_token: str) -> None:
@@ -101,6 +100,65 @@ def test_unmanaged_login_with_its_own_credential_is_no_drift(temp_home: Path) ->
         json.dumps({"oauthAccount": {"emailAddress": "y@example.com"}}),
         encoding="utf-8",
     )
+
+    assert s.identity_drift() is None
+
+
+def _unmanaged_config(temp_home: Path) -> None:
+    (temp_home / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "y@example.com"}}),
+        encoding="utf-8",
+    )
+
+
+def test_unmanaged_login_with_no_credential_is_not_consistent(temp_home: Path) -> None:
+    s = _two_org_engine(temp_home)
+    _unmanaged_config(temp_home)
+    (temp_home / ".claude" / ".credentials.json").unlink()
+
+    assert s.identity_drift() == IdentityDrift(None, None, "unattributed")
+
+
+def _share_slot_2_lineage_with_slot_1(s) -> None:
+    s._write_account_credentials("1", EMAIL, s._read_account_credentials("2", EMAIL))
+
+
+def test_config_naming_one_of_several_owners_is_consistent(temp_home: Path) -> None:
+    s = _two_org_engine(temp_home)
+    _share_slot_2_lineage_with_slot_1(s)
+    _set_live_credential(temp_home, "rt-2")
+
+    assert s.identity_drift() is None
+
+
+def test_config_naming_none_of_several_owners_is_a_drift(temp_home: Path) -> None:
+    s = _two_org_engine(temp_home)
+    _unmanaged_config(temp_home)
+    _share_slot_2_lineage_with_slot_1(s)
+    _set_live_credential(temp_home, "rt-2")
+
+    assert s.identity_drift() == IdentityDrift(None, "1's or Account-2", "observed")
+
+
+def test_torn_config_is_indeterminate_not_logged_out(temp_home: Path) -> None:
+    s = _two_org_engine(temp_home)
+    _set_live_credential(temp_home, "rt-2")
+    (temp_home / ".claude.json").write_text('{"oauthAccount": {"emai', encoding="utf-8")
+
+    assert s.identity_drift() == INDETERMINATE
+
+
+def test_torn_roster_is_indeterminate(temp_home: Path) -> None:
+    s = _two_org_engine(temp_home)
+    _set_live_credential(temp_home, "rt-2")
+    s.sequence_file.write_text('{"accounts": {"1"', encoding="utf-8")
+
+    assert s.identity_drift() == INDETERMINATE
+
+
+def test_absent_config_is_no_drift(temp_home: Path) -> None:
+    s = _two_org_engine(temp_home)
+    (temp_home / ".claude.json").unlink()
 
     assert s.identity_drift() is None
 
@@ -190,6 +248,18 @@ def test_watch_keeps_a_pending_drift_through_an_unattributable_pass() -> None:
     )
 
 
+def test_steady_retries_leave_budget_for_a_real_incident() -> None:
+    watch = IdentityDriftWatch()
+    now = 0.0
+    while now < 2 * 3600:
+        assert watch.begin(now) == "run"
+        watch.record(now, A, UNATTRIBUTED, None)
+        now += IDENTITY_RETRY_S
+
+    assert watch.slot_seen(B, now - 1) is True
+    assert watch.begin(now) == "run"
+
+
 def test_watch_disarms_until_the_live_identity_moves() -> None:
     watch = IdentityDriftWatch()
     watch.record(0.0, A, None, None)
@@ -216,14 +286,13 @@ def test_watch_charges_every_pass_and_resumes_when_the_window_rolls() -> None:
     assert watch.begin(3600.0) == "run"
 
 
-def test_watch_arming_cannot_cut_a_backoff_short() -> None:
+def test_an_identity_move_does_not_wait_out_an_older_backoff() -> None:
     watch = IdentityDriftWatch()
-    assert watch.record(0.0, A, INDETERMINATE, "could not check") == "could not check"
-    assert watch.record(IDENTITY_RETRY_S, A, INDETERMINATE, "again") is None
+    watch.record(0.0, A, INDETERMINATE, "could not check")
+    assert watch.ready(1.0) is False
 
-    assert watch.slot_seen(B, IDENTITY_RETRY_S + 1) is True
-    assert watch.ready(IDENTITY_RETRY_S + 2) is False
-    assert watch.ready(2 * IDENTITY_RETRY_S) is True
+    assert watch.slot_seen(B, 2.0) is True
+    assert watch.begin(2.0) == "run"
 
 
 def test_watch_says_it_cannot_check_again_after_a_report() -> None:
@@ -277,4 +346,21 @@ def test_drift_log_never_reports_unknown_as_none() -> None:
     assert "Config written unknown" in line
     assert "could not be checked" in format_identity_drift_log(
         INDETERMINATE, [], 0, None
+    )
+
+
+def test_drift_log_says_when_the_config_was_rewritten_during_the_check() -> None:
+    before = datetime(2026, 9, 19, 6, 30, 16).timestamp()
+    after = datetime(2026, 9, 19, 6, 30, 19).timestamp()
+
+    steady = format_identity_drift_log(OBSERVED, [], 0, before, before)
+    moved = format_identity_drift_log(OBSERVED, [], 0, before, after)
+
+    assert "during the check" not in steady
+    assert "Config written unknown (and again at 2026-09-19T06:30:19" in (
+        format_identity_drift_log(OBSERVED, [], 0, None, after)
+    )
+    assert (
+        "Config written 2026-09-19T06:30:16 (and again at 2026-09-19T06:30:19, "
+        "during the check)" in moved
     )
