@@ -25,6 +25,7 @@ from openswap import pace
 from openswap.exceptions import ClaudeSwitchError, CredentialReadError
 from openswap.kickoff import (
     KICKOFF_RETRY_BACKOFF_S,
+    KickoffResult,
     invoke_kickoff,
     kickoff_account_eligible,
     kickoff_backoff_active,
@@ -97,7 +98,12 @@ SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = (
 )
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.opensoft.openswap.menubar"
-RELOGIN_CARD_NOTE = "Signed out. Log in with Claude Code, then click this card."
+RELOGIN_CARD_NOTE = (
+    "Action required · OAuth expired. Sign in again with Claude Code."
+)
+CODEX_RELOGIN_CARD_NOTE = (
+    "Action required · OAuth expired. Sign in again with Codex."
+)
 _CLAUDE_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 
 
@@ -954,31 +960,51 @@ def notification_copy_for_engine_start_failure(message: str) -> NotificationCopy
 
 
 def notification_copy_for_kickoff(
-    results: list[tuple[str, bool, str]],
+    results: list[KickoffResult],
 ) -> NotificationCopy | None:
     """Copy after a scheduled 5h kickoff pass. None when nothing was attempted."""
     if not results:
         return None
-    ok = [name for name, success, _err in results if success]
-    bad = [(name, err) for name, success, err in results if not success]
+
+    def provider_name(result: KickoffResult) -> str:
+        return {
+            "claude": "Claude",
+            "codex": "ChatGPT",
+            "openswap": "OpenSwap",
+        }.get(result.provider, str(result.provider).title())
+
+    def full_name(result: KickoffResult) -> str:
+        return f"{provider_name(result)} · {result.name}"
+
+    ok = [result for result in results if result.success]
+    bad = [result for result in results if not result.success]
     if ok and not bad:
         if len(ok) == 1:
-            title = f"Started {ok[0]}'s 5-hour window"
+            title = f"Started {provider_name(ok[0])} 5-hour window"
         else:
             title = "Started 5-hour windows"
-        body = "Pinged " + ", ".join(ok) + "."
+        body = "Pinged " + ", ".join(full_name(result) for result in ok) + "."
     elif ok and bad:
         title = "Some 5-hour windows didn't start"
-        failed = ", ".join(name for name, _err in bad)
-        body = f"Started: {', '.join(ok)}. Couldn't start: {failed}."
+        started = ", ".join(full_name(result) for result in ok)
+        failed = ", ".join(full_name(result) for result in bad)
+        body = f"Started: {started}. Couldn't start: {failed}."
     else:
         if len(bad) == 1:
-            name, err = bad[0]
-            title = f"Couldn't start {name}'s 5-hour window"
-            if kickoff_failure_requires_relogin(err):
-                body = "The OAuth session expired. Sign in again; OpenSwap will retry later."
+            result = bad[0]
+            title = f"Couldn't start {provider_name(result)} 5-hour window"
+            if kickoff_failure_requires_relogin(result.error):
+                app = "Codex" if result.provider == "codex" else "Claude Code"
+                body = (
+                    f"{result.name}: OAuth expired. Sign in again with {app}; "
+                    "OpenSwap will retry later."
+                )
             else:
-                lines = [line.strip() for line in str(err).splitlines() if line.strip()]
+                lines = [
+                    line.strip()
+                    for line in str(result.error).splitlines()
+                    if line.strip()
+                ]
                 lines = [
                     line
                     for line in lines
@@ -986,17 +1012,63 @@ def notification_copy_for_kickoff(
                         "reading additional input from stdin"
                     )
                 ]
-                body = (lines[-1] if lines else "The account could not be reached.")[:200]
+                error = lines[-1] if lines else "The account could not be reached."
+                body = f"{result.name}: {error}"[:200]
         else:
             title = "Couldn't start 5-hour windows"
-            body = "Couldn't start: " + ", ".join(name for name, _err in bad) + "."
+            body = "Couldn't start: " + ", ".join(
+                full_name(result) for result in bad
+            ) + "."
     return NotificationCopy(title=title, body=body)
 
 
-def notification_copy_for_relogin(name: str) -> NotificationCopy:
+def kickoff_action_required_after_results(
+    current: dict[str, float],
+    results: list[KickoffResult],
+    *,
+    now: float,
+) -> dict[str, float]:
+    """Apply provider/account kickoff outcomes to the popover warning state."""
+    updated = dict(current)
+    for result in results:
+        if not result.account_num:
+            continue
+        if result.success:
+            updated.pop(result.account_num, None)
+        elif kickoff_failure_requires_relogin(result.error):
+            updated[result.account_num] = now
+    return updated
+
+
+def reconcile_kickoff_action_required(
+    current: dict[str, float], accounts: list | tuple
+) -> dict[str, float]:
+    """Clear warnings only after a newer healthy usage read proves recovery."""
+    updated = dict(current)
+    for row in accounts:
+        num, _email, _active, display, _last, _alias, _org, _dis, fetched_at = row
+        failed_at = updated.get(str(num))
+        if (
+            failed_at is not None
+            and isinstance(display, dict)
+            and isinstance(fetched_at, (int, float))
+            and fetched_at > failed_at
+        ):
+            updated.pop(str(num), None)
+    return updated
+
+
+def notification_copy_for_relogin(
+    name: str, *, provider: str = "claude"
+) -> NotificationCopy:
+    provider_name = "ChatGPT" if provider == "codex" else "Claude"
+    if provider == "codex":
+        body = "OAuth expired. Sign in again with Codex; OpenSwap will detect it."
+    else:
+        body = "OAuth expired. Sign in with Claude Code, then click that account."
     return NotificationCopy(
-        title=f"{name} signed out",
-        body="Log in with Claude Code, then click that account in the extra.",
+        title=f"{provider_name} · {name} signed out",
+        body=body,
     )
 
 
@@ -1021,21 +1093,25 @@ def display_needs_relogin(display) -> bool:
     return display == SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
 
 
-def extra_note_for_display(display) -> str | None:
+def extra_note_for_display(display, *, provider: str = "claude") -> str | None:
     """Popover note: extra copy for signed-out, otherwise the sentinel string."""
     if display_needs_relogin(display):
-        return RELOGIN_CARD_NOTE
+        return CODEX_RELOGIN_CARD_NOTE if provider == "codex" else RELOGIN_CARD_NOTE
     if isinstance(display, str):
         return display
     return None
 
 
-def relogin_slot_nums(snapshot: dict) -> set[str]:
-    return {
-        str(row[0])
-        for row in snapshot.get("accounts") or []
-        if display_needs_relogin(row[3])
-    }
+def relogin_slot_nums(snapshot: dict, *, provider: str | None = None) -> set[str]:
+    result = set()
+    for row in snapshot.get("accounts") or []:
+        num = str(row[0])
+        row_provider = "codex" if num.startswith("codex:") else "claude"
+        if provider is not None and row_provider != provider:
+            continue
+        if display_needs_relogin(row[3]):
+            result.add(num)
+    return result
 
 
 def newly_relogin_slots(prev: set[str], curr: set[str]) -> set[str]:
@@ -1433,13 +1509,26 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
     if now is None:
         now = time.time()
     cards = []
+    kickoff_action_required = {
+        str(num) for num in snapshot.get("kickoff_action_required") or []
+    }
     for row in snapshot.get("accounts") or []:
         num, email, is_active, display, last_good, alias, org_name, disabled, fetched_at = row
-        needs_relogin = display_needs_relogin(display)
-        note = extra_note_for_display(display)
+        is_codex = str(num).startswith("codex:")
+        provider = "codex" if is_codex else "claude"
+        needs_relogin = (
+            display_needs_relogin(display) or str(num) in kickoff_action_required
+        )
+        if needs_relogin:
+            note = (
+                CODEX_RELOGIN_CARD_NOTE
+                if provider == "codex"
+                else RELOGIN_CARD_NOTE
+            )
+        else:
+            note = extra_note_for_display(display, provider=provider)
         usage = display if isinstance(display, dict) else last_good
         title, subtitle = account_card_names(email, alias, org_name)
-        is_codex = str(num).startswith("codex:")
         if is_codex:
             title = f"Codex · {title}"
         as_of = now
@@ -1470,9 +1559,10 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 "api_key": is_api_key,
                 "note": note,
                 "needs_relogin": needs_relogin,
+                "action_required": needs_relogin,
                 "fetched_at": fetched_at,
                 "windows": windows,
-                "provider": "codex" if is_codex else "claude",
+                "provider": provider,
             }
         )
     return cards
@@ -1502,6 +1592,14 @@ def provider_cards(cards: list[dict], provider: str) -> list[dict]:
             shown["note"] = "CLI-only · Switch API-key accounts with Codex CLI."
         result.append(shown)
     return result
+
+
+def provider_tab_title(cards: list[dict], provider: str) -> str:
+    """Provider tab copy that keeps hidden action-required accounts visible."""
+    name = "ChatGPT" if provider == "chatgpt" else "Claude"
+    if any(card.get("action_required") for card in provider_cards(cards, provider)):
+        return f"{name} · Sign in"
+    return name
 
 
 def provider_empty_state(provider: str, state: str = "ready") -> dict:

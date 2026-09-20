@@ -91,6 +91,7 @@ def app(monkeypatch):
     instance._desktop_status = "Experimental"
     instance.snapshot = {"accounts": [_row(f"{CODEX_NUM_PREFIX}2")]}
     instance._on_account_click = Mock()
+    instance._slot_needs_relogin = Mock(return_value=False)
     instance._refreshing = False
     instance._kickoff_running = False
     instance._event_lock = threading.Lock()
@@ -159,6 +160,16 @@ def test_chatgpt_card_uses_desktop_flow_not_cli_only_switch(app):
     app._test_thread.return_value.start.assert_called_once()
     app._on_account_click.assert_not_called()
     app.codex.switch_to.assert_not_called()
+
+
+def test_chatgpt_expired_oauth_card_explains_required_sign_in(app):
+    app._slot_needs_relogin.return_value = True
+    app._on_panel_account_click(f"{CODEX_NUM_PREFIX}2")
+    app._test_thread.assert_not_called()
+    app._show_error.assert_called_once()
+    message = app._show_error.call_args.args[0]
+    assert "ChatGPT OAuth session expired" in message
+    assert "Codex" in message
 
 
 @pytest.mark.parametrize("row", [_row(f"{CODEX_NUM_PREFIX}2", disabled=True),

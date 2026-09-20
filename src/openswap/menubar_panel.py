@@ -89,6 +89,7 @@ from openswap.menubar import (
     provider_empty_state,
     login_panel_state,
     provider_shared_copy,
+    provider_tab_title,
     resolve_popover_theme,
     settings_header_frames,
     settings_page_rows,
@@ -602,7 +603,7 @@ class _CardView(NSView):
         pal = _colors()
         if self._hover:
             color = pal["card_hover"]
-        elif self.card.get("active"):
+        elif self.card.get("active") or self.card.get("action_required"):
             color = pal["card_active"]
         else:
             color = pal["card"]
@@ -612,10 +613,11 @@ class _CardView(NSView):
         )
         color.setFill()
         path.fill()
-        if self.card.get("active"):
+        if self.card.get("active") or self.card.get("action_required"):
             NSGraphicsContext.saveGraphicsState()
             path.addClip()
-            pal["accent"].setFill()
+            stripe = pal["warn"] if self.card.get("action_required") else pal["accent"]
+            stripe.setFill()
             NSBezierPath.bezierPathWithRect_(
                 NSMakeRect(0, 0, 3, bounds.size.height)
             ).fill()
@@ -1235,7 +1237,8 @@ class MenuBarPanel:
         inner_w = PANEL_WIDTH - PAD * 2
         y = PAD + HEADER_H
         tab_w = (inner_w - TAB_GAP) / 2.0
-        for index, (tab_provider, title) in enumerate((("claude", "Claude"), ("chatgpt", "ChatGPT"))):
+        for index, tab_provider in enumerate(("claude", "chatgpt")):
+            title = provider_tab_title(all_cards, tab_provider)
             tab = self._add_button(
                 root,
                 title,
@@ -1251,6 +1254,8 @@ class MenuBarPanel:
                 tab.setButtonType_(NSButtonTypePushOnPushOff)
                 tab.setState_(0)
                 tab.setAlphaValue_(0.68)
+            if title.endswith(" · Sign in"):
+                tab.setToolTip_("OAuth sign-in required for this provider.")
         y += TAB_H
         if hold_line:
             root.addSubview_(
@@ -1400,9 +1405,12 @@ class MenuBarPanel:
                         if card.get("api_key")
                         else f"{title}  ({'paused' if provider == 'chatgpt' else 'disabled'})"
                     )
-                badge_w = 58 if provider == "chatgpt" else 48
+                action_required = bool(card.get("action_required"))
+                badge_w = (
+                    86 if action_required else (58 if provider == "chatgpt" else 48)
+                )
                 title_w = inner_w - CARD_PAD * 2 - 8
-                if card.get("active"):
+                if card.get("active") or action_required:
                     title_w -= badge_w + 8
                 card_view.addSubview_(
                     _label(
@@ -1412,16 +1420,22 @@ class MenuBarPanel:
                         NSMakeRect(CARD_PAD + 6, CARD_PAD, title_w, TITLE_H),
                     )
                 )
-                if card.get("active"):
-                    badge_text = "selected" if provider == "chatgpt" else "active"
+                if card.get("active") or action_required:
+                    badge_text = (
+                        "sign in needed"
+                        if action_required
+                        else ("selected" if provider == "chatgpt" else "active")
+                    )
                     badge = _label(
                         badge_text,
                         font_small,
-                        pal["accent"],
+                        pal["warn"] if action_required else pal["accent"],
                         NSMakeRect(inner_w - CARD_PAD - badge_w, CARD_PAD + 1, badge_w, TITLE_H),
                         align="right",
                     )
-                    if provider == "chatgpt":
+                    if action_required:
+                        badge.setToolTip_(card.get("note") or "OAuth sign-in required.")
+                    elif provider == "chatgpt":
                         badge.setToolTip_(
                             "Selected in the shared credential file. Verify the account in ChatGPT after switching."
                         )

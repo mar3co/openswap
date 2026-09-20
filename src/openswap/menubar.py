@@ -159,6 +159,7 @@ def run(switcher, codex=None) -> int:
             self._kickoff_results = None
             self._kickoff_retry_after: float | None = None
             self._kickoff_notified_failure = None
+            self._kickoff_action_required: dict[str, float] = {}
             self._kickoff_succeeded_nums: set[str] = set()
             self._kickoff_success_date = ""
             self._relogin_notified: set[str] = set()
@@ -264,7 +265,20 @@ def run(switcher, codex=None) -> int:
                 else:
                     snap["codex_running_line"] = format_codex_running_line(codex_procs)
                     snap["codex_running"] = bool(codex_procs)
-                self.snapshot = snap
+                # Keep reconciliation and publication under the same lock as
+                # kickoff result draining. Otherwise a snapshot built just
+                # before an OAuth failure can overwrite the new warning.
+                with self._event_lock:
+                    self._kickoff_action_required = (
+                        reconcile_kickoff_action_required(
+                            self._kickoff_action_required,
+                            snap.get("accounts") or [],
+                        )
+                    )
+                    snap["kickoff_action_required"] = sorted(
+                        self._kickoff_action_required
+                    )
+                    self.snapshot = snap
                 self._account_states = {
                     "claude": "ready",
                     "chatgpt": ("ready" if codex_raw is not None else "error")
@@ -1523,6 +1537,12 @@ def run(switcher, codex=None) -> int:
             if provider != "codex":
                 self._on_account_click(num, close_panel=True)
                 return
+            if self._slot_needs_relogin(num):
+                self._show_error(
+                    "This ChatGPT OAuth session expired. Sign in again with "
+                    "Codex, then try again."
+                )
+                return
             choices = dict(desktop_switch_choices(self.snapshot))
             if slot not in choices:
                 self._show_error("Choose an enabled ChatGPT OAuth account. API keys are only supported by the Codex CLI.")
@@ -1530,6 +1550,11 @@ def run(switcher, codex=None) -> int:
             self._make_desktop_switch(slot, choices[slot])(None)
 
         def _slot_needs_relogin(self, num) -> bool:
+            if str(num) in {
+                str(value)
+                for value in self.snapshot.get("kickoff_action_required") or []
+            }:
+                return True
             for row in self.snapshot.get("accounts") or []:
                 if str(row[0]) == str(num):
                     return display_needs_relogin(row[3])
@@ -1685,12 +1710,21 @@ def run(switcher, codex=None) -> int:
             with self._event_lock:
                 pending, self._pending_relogin_notifies = self._pending_relogin_notifies, set()
             for num in sorted(pending):
-                self._notify(notification_copy_for_relogin(self._name_for_num(num)))
+                from openswap.codex import split_provider_num
+
+                provider, _slot = split_provider_num(num)
+                self._notify(
+                    notification_copy_for_relogin(
+                        self._name_for_num(num), provider=provider
+                    )
+                )
 
         def _maybe_auto_capture_relogin(self):
             if self._refreshing or self._auto_capturing:
                 return
-            nums = relogin_slot_nums(self.snapshot)
+            # Claude auto-capture must never adopt a Codex/ChatGPT credential;
+            # the two providers use different identity and storage formats.
+            nums = relogin_slot_nums(self.snapshot, provider="claude")
             self._auto_captured_nums &= nums
             if not nums:
                 self._auto_capture_failed_for = None
@@ -1973,7 +2007,7 @@ def run(switcher, codex=None) -> int:
             threading.Thread(target=self._run_kickoff, daemon=True).start()
 
         def _run_kickoff(self):
-            results: list[tuple[str, bool, str]] = []
+            results: list[KickoffResult] = []
             try:
                 from openswap.codex import split_provider_num
                 from openswap.kickoff import invoke_codex_kickoff
@@ -2020,7 +2054,9 @@ def run(switcher, codex=None) -> int:
                             )
                             proc = invoke_kickoff(session_dir)
                         if proc.returncode == 0:
-                            results.append((name, True, ""))
+                            results.append(
+                                KickoffResult(provider, str(num), name, True)
+                            )
                             self._kickoff_succeeded_nums.add(str(num))
                         else:
                             fallback = (
@@ -2029,11 +2065,19 @@ def run(switcher, codex=None) -> int:
                                 else "claude exited with an error"
                             )
                             err = (proc.stderr or proc.stdout or fallback).strip()
-                            results.append((name, False, err[:200]))
+                            results.append(
+                                KickoffResult(
+                                    provider, str(num), name, False, err[:200]
+                                )
+                            )
                     except Exception as e:
-                        results.append((name, False, str(e)))
+                        results.append(
+                            KickoffResult(provider, str(num), name, False, str(e))
+                        )
             except Exception as e:
-                results.append(("kickoff", False, str(e)))
+                results.append(
+                    KickoffResult("openswap", "", "kickoff", False, str(e))
+                )
             finally:
                 with self._event_lock:
                     self._kickoff_results = results
@@ -2045,6 +2089,16 @@ def run(switcher, codex=None) -> int:
                 self._kickoff_results = None
             if results is None:
                 return
+            now = time.time()
+            with self._event_lock:
+                self._kickoff_action_required = (
+                    kickoff_action_required_after_results(
+                        self._kickoff_action_required, results, now=now
+                    )
+                )
+                action_required = sorted(self._kickoff_action_required)
+            self.snapshot["kickoff_action_required"] = action_required
+            self._hold_reload_pending = True
             if kickoff_pass_complete(results):
                 self.settings.kickoff_last_date = datetime.now().date().isoformat()
                 self.settings.save(settings_path)
@@ -2053,7 +2107,7 @@ def run(switcher, codex=None) -> int:
                 self._kickoff_notified_failure = None
                 self._notify(notification_copy_for_kickoff(results))
             else:
-                self._kickoff_retry_after = time.time() + kickoff_retry_backoff(results)
+                self._kickoff_retry_after = now + kickoff_retry_backoff(results)
                 failure = kickoff_failure_signature(results)
                 if failure != self._kickoff_notified_failure:
                     self._notify(notification_copy_for_kickoff(results))
