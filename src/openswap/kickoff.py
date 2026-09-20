@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +27,17 @@ KICKOFF_PROMPT = "ok"
 KICKOFF_TIMEOUT_S = 90.0
 KICKOFF_RETRY_BACKOFF_S = 300.0
 KICKOFF_RELOGIN_RETRY_BACKOFF_S = 3600.0
+
+
+@dataclass(frozen=True)
+class KickoffResult:
+    """One provider/account outcome from a scheduled kickoff pass."""
+
+    provider: str
+    account_num: str
+    name: str
+    success: bool
+    error: str = ""
 
 
 def kickoff_failure_requires_relogin(message: str) -> bool:
@@ -49,27 +61,28 @@ def kickoff_failure_requires_relogin(message: str) -> bool:
     )
 
 
-def kickoff_retry_backoff(results: list[tuple[str, bool, str]]) -> float:
+def kickoff_retry_backoff(results: list[KickoffResult]) -> float:
     """Choose a retry delay appropriate for the failure mode.
 
     A dead OAuth session cannot improve through rapid retries, so check it at
     most hourly. Other failures retain the short retry used for transient
     process and network errors.
     """
-    failures = [err for _name, ok, err in results if not ok]
+    failures = [result.error for result in results if not result.success]
     if failures and all(kickoff_failure_requires_relogin(err) for err in failures):
         return KICKOFF_RELOGIN_RETRY_BACKOFF_S
     return KICKOFF_RETRY_BACKOFF_S
 
 
 def kickoff_failure_signature(
-    results: list[tuple[str, bool, str]],
-) -> tuple[tuple[str, str], ...] | None:
+    results: list[KickoffResult],
+) -> tuple[tuple[str, str, str], ...] | None:
     """Stable identity for failed kickoff state, used to dedupe notices."""
-    failures: list[tuple[str, str]] = []
-    for name, ok, err in results:
-        if ok:
+    failures: list[tuple[str, str, str]] = []
+    for result in results:
+        if result.success:
             continue
+        err = result.error
         if kickoff_failure_requires_relogin(err):
             category = "relogin"
         else:
@@ -89,7 +102,7 @@ def kickoff_failure_signature(
                 category = "network"
             else:
                 category = text[:120] or "unknown"
-        failures.append((str(name), category))
+        failures.append((result.provider, result.account_num, category))
     return tuple(failures) or None
 
 
@@ -121,13 +134,13 @@ def kickoff_is_due(
     return now >= scheduled
 
 
-def kickoff_pass_complete(results: list[tuple[str, bool, str]]) -> bool:
+def kickoff_pass_complete(results: list[KickoffResult]) -> bool:
     """True when this pass should mark the local day done.
 
     An empty pass (nothing eligible) is complete. Any failed ping keeps the
     day open so a later tick can retry.
     """
-    return all(ok for _name, ok, _err in results)
+    return all(result.success for result in results)
 
 
 def kickoff_backoff_active(*, now: float, retry_after: float | None) -> bool:

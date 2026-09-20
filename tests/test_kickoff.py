@@ -14,6 +14,7 @@ from openswap.kickoff import (
     KICKOFF_PROMPT,
     KICKOFF_RELOGIN_RETRY_BACKOFF_S,
     KICKOFF_RETRY_BACKOFF_S,
+    KickoffResult,
     build_kickoff_argv,
     build_kickoff_env,
     format_kickoff_time,
@@ -73,11 +74,21 @@ def test_kickoff_custom_minute_is_respected():
 def test_kickoff_pass_complete_only_when_nothing_failed():
     """Persist last_date after an empty or all-ok pass, never after a failure."""
     assert kickoff_pass_complete([]) is True
-    assert kickoff_pass_complete([("personal", True, "")]) is True
-    assert kickoff_pass_complete([("a", True, ""), ("b", True, "")]) is True
-    assert kickoff_pass_complete([("personal", False, "auth failed")]) is False
+    assert kickoff_pass_complete([KickoffResult("claude", "1", "personal", True)]) is True
     assert kickoff_pass_complete(
-        [("personal", True, ""), ("adsonline", False, "timeout")]
+        [
+            KickoffResult("claude", "1", "personal", True),
+            KickoffResult("codex", "codex:1", "work", True),
+        ]
+    ) is True
+    assert kickoff_pass_complete(
+        [KickoffResult("claude", "1", "personal", False, "auth failed")]
+    ) is False
+    assert kickoff_pass_complete(
+        [
+            KickoffResult("claude", "1", "personal", True),
+            KickoffResult("codex", "codex:1", "adsonline", False, "timeout"),
+        ]
     ) is False
 
 
@@ -90,27 +101,35 @@ def test_kickoff_backoff_active_until_retry_after():
 
 def test_expired_oauth_uses_slow_retry_and_stable_notification_signature():
     first = [
-        (
+        KickoffResult(
+            "codex",
+            "codex:1",
             "personal",
             False,
             "Failed to authenticate: OAuth session expired and could not be refreshed",
         )
     ]
     repeated = [
-        (
+        KickoffResult(
+            "codex",
+            "codex:1",
             "personal",
             False,
             "FAILED TO AUTHENTICATE: OAuth session expired and could not be refreshed",
         )
     ]
-    assert kickoff_failure_requires_relogin(first[0][2]) is True
+    assert kickoff_failure_requires_relogin(first[0].error) is True
     assert kickoff_retry_backoff(first) == KICKOFF_RELOGIN_RETRY_BACKOFF_S
     assert kickoff_failure_signature(first) == kickoff_failure_signature(repeated)
 
 
 def test_transient_kickoff_failure_keeps_short_retry():
-    results = [("personal", False, "service temporarily unavailable")]
-    assert kickoff_failure_requires_relogin(results[0][2]) is False
+    results = [
+        KickoffResult(
+            "claude", "1", "personal", False, "service temporarily unavailable"
+        )
+    ]
+    assert kickoff_failure_requires_relogin(results[0].error) is False
     assert kickoff_retry_backoff(results) == KICKOFF_RETRY_BACKOFF_S
 
 

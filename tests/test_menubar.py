@@ -1860,12 +1860,19 @@ def test_engine_start_failure_notification_names_the_event():
 
 def test_kickoff_notification_names_accounts_not_slots():
     copy = menubar.notification_copy_for_kickoff(
-        [("personal", True, ""), ("adsonline", False, "auth failed")]
+        [
+            menubar.KickoffResult("claude", "1", "personal", True),
+            menubar.KickoffResult(
+                "codex", "codex:2", "adsonline", False, "auth failed"
+            ),
+        ]
     )
     assert copy is not None
     text = _combined(copy)
     assert "personal" in text
     assert "adsonline" in text
+    assert "Claude" in text
+    assert "ChatGPT" in text
     assert "Account-" not in text
     assert "openswap --add-account" not in text
 
@@ -1873,7 +1880,9 @@ def test_kickoff_notification_names_accounts_not_slots():
 def test_kickoff_notification_drops_noisy_stdin_preamble():
     copy = menubar.notification_copy_for_kickoff(
         [
-            (
+            menubar.KickoffResult(
+                "codex",
+                "codex:1",
                 "personal",
                 False,
                 "Reading additional input from stdin...\n"
@@ -1882,7 +1891,7 @@ def test_kickoff_notification_drops_noisy_stdin_preamble():
         ]
     )
     assert copy is not None
-    assert copy.title == "Couldn't start personal's 5-hour window"
+    assert copy.title == "Couldn't start ChatGPT 5-hour window"
     assert "stdin" not in copy.body
     assert "trusted directory" in copy.body
 
@@ -1890,7 +1899,9 @@ def test_kickoff_notification_drops_noisy_stdin_preamble():
 def test_kickoff_expired_oauth_notification_is_actionable():
     copy = menubar.notification_copy_for_kickoff(
         [
-            (
+            menubar.KickoffResult(
+                "codex",
+                "codex:1",
                 "personal",
                 False,
                 "Failed to authenticate: OAuth session expired and could not be refreshed",
@@ -1898,9 +1909,41 @@ def test_kickoff_expired_oauth_notification_is_actionable():
         ]
     )
     assert copy is not None
-    assert copy.title == "Couldn't start personal's 5-hour window"
+    assert copy.title == "Couldn't start ChatGPT 5-hour window"
+    assert copy.body.startswith("personal:")
     assert "Sign in again" in copy.body
+    assert "Codex" in copy.body
     assert "could not be refreshed" not in copy.body
+
+
+def test_kickoff_action_warning_persists_until_newer_healthy_usage():
+    failure = menubar.KickoffResult(
+        "codex",
+        "codex:1",
+        "personal",
+        False,
+        "OAuth session expired and could not be refreshed",
+    )
+    warnings = menubar.kickoff_action_required_after_results(
+        {}, [failure], now=100.0
+    )
+    assert warnings == {"codex:1": 100.0}
+
+    cached = (
+        "codex:1", "a@x.com", True, _USAGE, _USAGE, "personal", "", False, 99.0
+    )
+    assert menubar.reconcile_kickoff_action_required(warnings, [cached]) == warnings
+
+    healthy = (*cached[:8], 101.0)
+    assert menubar.reconcile_kickoff_action_required(warnings, [healthy]) == {}
+
+
+def test_successful_kickoff_clears_action_warning_for_only_that_account():
+    current = {"1": 90.0, "codex:1": 91.0}
+    success = menubar.KickoffResult("codex", "codex:1", "personal", True)
+    assert menubar.kickoff_action_required_after_results(
+        current, [success], now=100.0
+    ) == {"1": 90.0}
 
 
 # --- signed-out repair (extra) ------------------------------------------------
@@ -1923,7 +1966,10 @@ def test_panel_accounts_relogin_keeps_windows_and_uses_extra_copy():
     }
     cards = menubar.panel_accounts(snap)
     assert cards[0]["needs_relogin"] is True
+    assert cards[0]["action_required"] is True
     assert cards[0]["note"] == menubar.RELOGIN_CARD_NOTE
+    assert "Action required" in cards[0]["note"]
+    assert "OAuth expired" in cards[0]["note"]
     assert "openswap" not in cards[0]["note"]
     assert [w["label"] for w in cards[0]["windows"]] == ["5h", "7d"]
     assert cards[0]["windows"][0]["pct"] == 42.0
@@ -2071,9 +2117,13 @@ def test_slot_identity_from_sequence_uses_org_uuid():
 
 def test_notification_copy_for_relogin_has_no_cli():
     copy = menubar.notification_copy_for_relogin("personal")
-    assert copy.title == "personal signed out"
+    assert copy.title == "Claude · personal signed out"
     assert "openswap" not in copy.body.lower()
     assert "click" in copy.body.lower()
+    codex = menubar.notification_copy_for_relogin("work", provider="codex")
+    assert codex.title == "ChatGPT · work signed out"
+    assert "Codex" in codex.body
+    assert "Claude Code" not in codex.body
     captured = menubar.notification_copy_for_relogin_captured("personal")
     assert "personal" in captured.title
     assert "openswap" not in captured.body.lower()
@@ -2182,6 +2232,55 @@ def test_panel_accounts_prefixes_codex_title_and_sets_provider():
     assert cards[0]["provider"] == "claude"
     assert cards[1]["provider"] == "codex" and cards[1]["title"] == "Codex · plus"
     assert cards[1]["num"] == "codex:1"
+
+
+def test_codex_expired_oauth_uses_provider_specific_action_copy():
+    snapshot = {
+        "accounts": [
+            (
+                "codex:1",
+                "c@x.com",
+                True,
+                menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED],
+                _USAGE,
+                "work",
+                "plus",
+                False,
+                None,
+            )
+        ]
+    }
+    card = menubar.provider_cards(menubar.panel_accounts(snapshot), "chatgpt")[0]
+    assert card["action_required"] is True
+    assert card["note"] == menubar.CODEX_RELOGIN_CARD_NOTE
+    assert "Action required" in card["note"]
+    assert "Codex" in card["note"]
+    assert "Claude Code" not in card["note"]
+
+
+def test_kickoff_oauth_failure_marks_card_and_provider_tab_for_action():
+    snapshot = {
+        "accounts": [
+            (
+                "codex:1",
+                "c@x.com",
+                True,
+                _USAGE,
+                _USAGE,
+                "work",
+                "plus",
+                False,
+                _NOW - 60,
+            )
+        ],
+        "kickoff_action_required": ["codex:1"],
+    }
+    cards = menubar.panel_accounts(snapshot, now=_NOW)
+    assert cards[0]["needs_relogin"] is True
+    assert cards[0]["action_required"] is True
+    assert "OAuth expired" in cards[0]["note"]
+    assert menubar.provider_tab_title(cards, "chatgpt") == "ChatGPT · Sign in"
+    assert menubar.provider_tab_title(cards, "claude") == "Claude"
 
 
 def test_provider_cards_filters_and_transforms_shared_codex_without_mutating():

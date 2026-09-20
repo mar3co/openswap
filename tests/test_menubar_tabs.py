@@ -196,6 +196,7 @@ def test_worker_resolves_loading_states_per_provider(monkeypatch, codex_fails):
     app.snapshot = {"accounts": []}
     app._engine = None
     app._event_lock = threading.Lock()
+    app._kickoff_action_required = {}
     app._pending_relogin_notifies = set()
     app._relogin_notified = set()
     app._hold_line_for.return_value = None
