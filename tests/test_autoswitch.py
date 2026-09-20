@@ -334,6 +334,45 @@ class TestDecisionTable:
             "no-active-account"
         ]
 
+    def test_tick_emits_poll_before_hold_or_switch(self, harness, temp_home):
+        def assert_poll_first(events):
+            kinds = [e.kind for e in events]
+            assert "poll" in kinds
+            poll = kinds.index("poll")
+            later = [
+                i
+                for i, kind in enumerate(kinds)
+                if kind in ("no-switch", "all-exhausted", "switch")
+            ]
+            assert later
+            assert poll < min(later)
+
+        harness.events.clear()
+        harness.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(10)})
+        assert_poll_first(harness.events)
+
+        empty = EngineHarness(temp_home)
+        empty.engine.tick()
+        assert_poll_first(empty.events)
+
+        harness.events.clear()
+        harness.tick_with_usage({
+            "1": _usage(100, "2026-07-03T12:00:00Z"),
+            "2": _usage(100, "2026-07-03T10:30:00Z"),
+            "3": _usage(100, "2026-07-03T11:00:00Z"),
+        })
+        assert_poll_first(harness.events)
+
+        switched = EngineHarness(temp_home)
+        switched.seed(1, "a@example.com")
+        switched.seed(2, "b@example.com")
+        switched.seed(3, "c@example.com")
+        switched.make_live("a@example.com", 1)
+        switched.tick_with_usage({
+            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+        })
+        assert_poll_first(switched.events)
+
     def test_hysteresis_margin_blocks_marginal_candidates(self, harness):
         # threshold 90, hysteresis 10 → a candidate must beat the active
         # account's utilization by >= 10 points; 95→86 is only 9 better.

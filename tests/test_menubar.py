@@ -21,6 +21,7 @@ from openswap import menubar
 from openswap.autoswitch import (
     AllExhaustedEvent,
     ConfigWarningEvent,
+    ErrorEvent,
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
@@ -616,6 +617,37 @@ def test_hold_cache_after_event_poll_then_hold_keeps_tick_slot():
     assert tick is None
 
 
+def test_hold_cache_later_poll_does_not_rebind_or_clear_hold():
+    poll = PollEvent(
+        active={"number": 1, "email": "a@x.com"},
+        headroom={},
+        threshold=90.0,
+    )
+    held = NoSwitchEvent(reason="cooldown")
+    ev, slot, tick = menubar.hold_cache_after_event(None, None, None, poll)
+    ev, slot, tick = menubar.hold_cache_after_event(ev, slot, tick, held)
+    later = PollEvent(
+        active={"number": 2, "email": "b@x.com"},
+        headroom={},
+        threshold=90.0,
+    )
+    ev, slot, tick = menubar.hold_cache_after_event(ev, slot, tick, later)
+    assert ev is held
+    assert slot == "1"
+    assert tick == "2"
+    assert menubar.hold_event_for_snapshot(
+        ev, hold_slot=slot, active_num="1"
+    ) is held
+    assert menubar.hold_event_for_snapshot(
+        ev, hold_slot=slot, active_num="2"
+    ) is None
+    err = ErrorEvent(message="could not freshen any candidate (network?)", transient=True)
+    ev, slot, tick = menubar.hold_cache_after_event(ev, slot, tick, err)
+    assert ev is held
+    assert slot == "1"
+    assert tick == "2"
+
+
 def test_extra_hold_line_none_when_auto_off_or_no_event():
     ev = NoSwitchEvent(reason="cooldown")
     assert menubar.extra_hold_line(
@@ -934,6 +966,10 @@ def test_panel_wires_trailing_autoswitch_and_auto_close():
     more = text[text.index("def _more") : text.index("def _tramp")]
     assert "self.close()" not in more
     assert "self._on_more(sender)" in more
+    build = text[text.index("def _build") :]
+    hold = build[build.index('hold_line = snap.get("hold_line")') : build.index("running_line")]
+    assert "if not self._auto_enabled():" in hold
+    assert 'hold_line = ""' in hold
 
 
 def test_card_view_accepts_the_first_click():
@@ -1065,6 +1101,50 @@ def test_apply_hold_line_reloads_open_main_panel_only_when_copy_changes():
     assert "SETTINGS_PAGE" not in reload_fn
     assert "is_shown()" in reload_fn
     assert "panel.reload()" in reload_fn
+
+
+def test_engine_callback_wires_hold_cache_and_ignores_dying_engine():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    start = text[text.index("def _start_engine") : text.index("def _run_engine")]
+    assert "e=engine: self._on_engine_event(event, e)" in start
+    on_event = text[text.index("def _on_engine_event") : text.index("def _hold_line_for")]
+    assert "if self._engine is None:" in on_event
+    assert "engine is not self._engine" in on_event
+    assert on_event.index("if self._engine is None:") < on_event.index(
+        "hold_cache_after_event"
+    )
+    assert on_event.index("engine is not self._engine") < on_event.index(
+        "hold_cache_after_event"
+    )
+    assert "self._hold_event, self._hold_slot, self._tick_slot" in on_event
+    assert "hold_cache_after_event" in on_event
+    hold_for = text[text.index("def _hold_line_for") : text.index("def _apply_hold_line")]
+    assert "hold_event_for_snapshot" in hold_for
+    assert "hold_slot=self._hold_slot" in hold_for
+    assert 'active_num=snap.get("active_num")' in hold_for
+    assert "engine_on = self._engine is not None" in hold_for
+    assert "auto_enabled=engine_on" in hold_for
+
+
+def test_detect_active_change_does_not_clear_hold():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    detect = text[
+        text.index("def _detect_active_change") : text.index("def _start_engine")
+    ]
+    assert "_clear_hold_event" not in detect
+    assert "_hold_event = None" not in detect
+
+
+def test_toggle_autoswitch_applies_hold_and_reloads_main():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    toggle = text[
+        text.index("def on_toggle_autoswitch") : text.index("def on_toggle_icon")
+    ]
+    assert "_stop_engine" in toggle
+    assert "_apply_hold_line" in toggle
+    assert "_reload_main_panel_if_shown" in toggle
+    assert toggle.index("_stop_engine") < toggle.index("_apply_hold_line")
+    assert toggle.index("_apply_hold_line") < toggle.index("_reload_main_panel_if_shown")
 
 
 def test_manual_switch_uses_json_stamps_cooldown_and_alerts_in_front():
