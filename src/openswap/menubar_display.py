@@ -28,8 +28,11 @@ from openswap.kickoff import (
     invoke_kickoff,
     kickoff_account_eligible,
     kickoff_backoff_active,
+    kickoff_failure_requires_relogin,
+    kickoff_failure_signature,
     kickoff_is_due,
     kickoff_pass_complete,
+    kickoff_retry_backoff,
     kickoff_time_options,
     kickoff_time_value,
     kickoff_uses_default_login,
@@ -972,15 +975,18 @@ def notification_copy_for_kickoff(
         if len(bad) == 1:
             name, err = bad[0]
             title = f"Couldn't start {name}'s 5-hour window"
-            lines = [line.strip() for line in str(err).splitlines() if line.strip()]
-            lines = [
-                line
-                for line in lines
-                if not line.lower().startswith(
-                    "reading additional input from stdin"
-                )
-            ]
-            body = (lines[-1] if lines else "The account could not be reached.")[:200]
+            if kickoff_failure_requires_relogin(err):
+                body = "The OAuth session expired. Sign in again; OpenSwap will retry later."
+            else:
+                lines = [line.strip() for line in str(err).splitlines() if line.strip()]
+                lines = [
+                    line
+                    for line in lines
+                    if not line.lower().startswith(
+                        "reading additional input from stdin"
+                    )
+                ]
+                body = (lines[-1] if lines else "The account could not be reached.")[:200]
         else:
             title = "Couldn't start 5-hour windows"
             body = "Couldn't start: " + ", ".join(name for name, _err in bad) + "."
