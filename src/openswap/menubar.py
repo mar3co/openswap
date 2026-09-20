@@ -158,6 +158,7 @@ def run(switcher, codex=None) -> int:
             self._login_cancelled_session = None
             self._kickoff_results = None
             self._kickoff_retry_after: float | None = None
+            self._kickoff_notified_failure = None
             self._kickoff_succeeded_nums: set[str] = set()
             self._kickoff_success_date = ""
             self._relogin_notified: set[str] = set()
@@ -2049,9 +2050,14 @@ def run(switcher, codex=None) -> int:
                 self.settings.save(settings_path)
                 self._kickoff_retry_after = None
                 self._kickoff_succeeded_nums.clear()
+                self._kickoff_notified_failure = None
+                self._notify(notification_copy_for_kickoff(results))
             else:
-                self._kickoff_retry_after = time.time() + KICKOFF_RETRY_BACKOFF_S
-            self._notify(notification_copy_for_kickoff(results))
+                self._kickoff_retry_after = time.time() + kickoff_retry_backoff(results)
+                failure = kickoff_failure_signature(results)
+                if failure != self._kickoff_notified_failure:
+                    self._notify(notification_copy_for_kickoff(results))
+                    self._kickoff_notified_failure = failure
             self.refresh_async()
 
         def _make_threshold(self, pct):

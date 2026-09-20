@@ -12,6 +12,8 @@ import pytest
 from openswap.exceptions import SessionError
 from openswap.kickoff import (
     KICKOFF_PROMPT,
+    KICKOFF_RELOGIN_RETRY_BACKOFF_S,
+    KICKOFF_RETRY_BACKOFF_S,
     build_kickoff_argv,
     build_kickoff_env,
     format_kickoff_time,
@@ -19,8 +21,11 @@ from openswap.kickoff import (
     invoke_kickoff,
     kickoff_account_eligible,
     kickoff_backoff_active,
+    kickoff_failure_requires_relogin,
+    kickoff_failure_signature,
     kickoff_is_due,
     kickoff_pass_complete,
+    kickoff_retry_backoff,
     kickoff_time_options,
     kickoff_time_value,
     kickoff_uses_default_login,
@@ -81,6 +86,32 @@ def test_kickoff_backoff_active_until_retry_after():
     assert kickoff_backoff_active(now=150.0, retry_after=150.0) is False
     assert kickoff_backoff_active(now=151.0, retry_after=150.0) is False
     assert kickoff_backoff_active(now=100.0, retry_after=None) is False
+
+
+def test_expired_oauth_uses_slow_retry_and_stable_notification_signature():
+    first = [
+        (
+            "personal",
+            False,
+            "Failed to authenticate: OAuth session expired and could not be refreshed",
+        )
+    ]
+    repeated = [
+        (
+            "personal",
+            False,
+            "FAILED TO AUTHENTICATE: OAuth session expired and could not be refreshed",
+        )
+    ]
+    assert kickoff_failure_requires_relogin(first[0][2]) is True
+    assert kickoff_retry_backoff(first) == KICKOFF_RELOGIN_RETRY_BACKOFF_S
+    assert kickoff_failure_signature(first) == kickoff_failure_signature(repeated)
+
+
+def test_transient_kickoff_failure_keeps_short_retry():
+    results = [("personal", False, "service temporarily unavailable")]
+    assert kickoff_failure_requires_relogin(results[0][2]) is False
+    assert kickoff_retry_backoff(results) == KICKOFF_RETRY_BACKOFF_S
 
 
 def test_kickoff_uses_default_login_only_for_the_active_slot():

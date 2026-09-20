@@ -1887,6 +1887,22 @@ def test_kickoff_notification_drops_noisy_stdin_preamble():
     assert "trusted directory" in copy.body
 
 
+def test_kickoff_expired_oauth_notification_is_actionable():
+    copy = menubar.notification_copy_for_kickoff(
+        [
+            (
+                "personal",
+                False,
+                "Failed to authenticate: OAuth session expired and could not be refreshed",
+            )
+        ]
+    )
+    assert copy is not None
+    assert copy.title == "Couldn't start personal's 5-hour window"
+    assert "Sign in again" in copy.body
+    assert "could not be refreshed" not in copy.body
+
+
 # --- signed-out repair (extra) ------------------------------------------------
 
 def test_panel_accounts_relogin_keeps_windows_and_uses_extra_copy():

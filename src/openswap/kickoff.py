@@ -25,6 +25,72 @@ from openswap.session import AUTH_OVERRIDE_ENV_VARS
 KICKOFF_PROMPT = "ok"
 KICKOFF_TIMEOUT_S = 90.0
 KICKOFF_RETRY_BACKOFF_S = 300.0
+KICKOFF_RELOGIN_RETRY_BACKOFF_S = 3600.0
+
+
+def kickoff_failure_requires_relogin(message: str) -> bool:
+    """True when another unattended retry cannot repair the login.
+
+    Keep this deliberately narrow. Generic authentication failures can be
+    caused by a temporary service/network problem, while these messages mean
+    the locally stored OAuth grant itself needs user action.
+    """
+    text = " ".join(str(message or "").casefold().split())
+    return any(
+        marker in text
+        for marker in (
+            "oauth session expired and could not be refreshed",
+            "refresh token dead",
+            "invalid_grant",
+            "run codex login",
+            "please login to codex",
+            "please log in to codex",
+        )
+    )
+
+
+def kickoff_retry_backoff(results: list[tuple[str, bool, str]]) -> float:
+    """Choose a retry delay appropriate for the failure mode.
+
+    A dead OAuth session cannot improve through rapid retries, so check it at
+    most hourly. Other failures retain the short retry used for transient
+    process and network errors.
+    """
+    failures = [err for _name, ok, err in results if not ok]
+    if failures and all(kickoff_failure_requires_relogin(err) for err in failures):
+        return KICKOFF_RELOGIN_RETRY_BACKOFF_S
+    return KICKOFF_RETRY_BACKOFF_S
+
+
+def kickoff_failure_signature(
+    results: list[tuple[str, bool, str]],
+) -> tuple[tuple[str, str], ...] | None:
+    """Stable identity for failed kickoff state, used to dedupe notices."""
+    failures: list[tuple[str, str]] = []
+    for name, ok, err in results:
+        if ok:
+            continue
+        if kickoff_failure_requires_relogin(err):
+            category = "relogin"
+        else:
+            text = " ".join(str(err or "").casefold().split())
+            if "timed out" in text or "timeout" in text:
+                category = "timeout"
+            elif any(
+                marker in text
+                for marker in (
+                    "network",
+                    "connection",
+                    "temporarily unavailable",
+                    "name resolution",
+                    "dns",
+                )
+            ):
+                category = "network"
+            else:
+                category = text[:120] or "unknown"
+        failures.append((str(name), category))
+    return tuple(failures) or None
 
 
 def kickoff_is_due(
