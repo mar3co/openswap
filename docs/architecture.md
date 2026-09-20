@@ -86,4 +86,4 @@ Claude Code and Codex CLI are independent rotations: one live Claude login and o
 - Do not change the user’s default `~/.claude` login except via `switcher` (kickoff pings the live login **in place**). Status line install writes only `~/.claude/settings.json` `statusLine`, never `.claude.json`.
 - Do not `os.exec*` the extra process (`kickoff` uses returning `subprocess.run`).
 - Do not put WidgetKit inside the Python extra (impossible); snapshot + Darwin notification + host `.app` is the split.
-- Do not default `show_icon` on. Compact the extra when the asterisk is off ([Menu bar](menubar.md)).
+- Keep the OpenSoft logo visible in the extra, including when account and usage text are off ([Menu bar](menubar.md)).

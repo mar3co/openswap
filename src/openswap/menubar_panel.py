@@ -12,6 +12,7 @@ from pathlib import Path
 import objc
 from AppKit import (
     NSApp,
+    NSAlert,
     NSAppearance,
     NSAppearanceNameAqua,
     NSAppearanceNameDarkAqua,
@@ -31,6 +32,8 @@ from AppKit import (
     NSFontWeightSemibold,
     NSGraphicsContext,
     NSImage,
+    NSImageLeft,
+    NSImageOnly,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
     NSLineBreakByTruncatingTail,
@@ -46,6 +49,7 @@ from AppKit import (
     NSTrackingMouseEnteredAndExited,
     NSView,
     NSViewController,
+    NSVariableStatusItemLength,
     NSVisualEffectBlendingModeBehindWindow,
     NSVisualEffectMaterialMenu,
     NSVisualEffectStateActive,
@@ -90,7 +94,6 @@ from openswap.menubar import (
     settings_header_frames,
     settings_page_rows,
     window_suffix,
-    status_item_length,
     trailing_header_frames,
 )
 from openswap.theme import (
@@ -124,38 +127,32 @@ def pin_status_item(nsstatusitem) -> None:
     nsstatusitem.setAutosaveName_(STATUS_AUTOSAVE_NAME)
 
 
-def fit_status_item(nsstatusitem, *, compact: bool, title: str | None = None) -> None:
-    """Put the title on the button and size the extra.
+def fit_status_item(nsstatusitem, *, title: str | None = None) -> None:
+    """Keep the brand visible, with optional account text sized by AppKit.
 
     rumps writes ``NSStatusItem.setTitle_`` (deprecated). The visible extra
-    is the button, so we set that too. The extra is text (optional ✻ in the
-    string), so the image is always cleared. Compact (icon off) uses a tight
-    length; otherwise the extra is variable-width.
+    is the button, so we set that too. A separate image keeps logo-only states
+    visible without adding a text glyph or a display preference.
     """
     button = nsstatusitem.button()
     if button is None:
         return
-    if title is not None:
-        try:
-            button.setTitle_(title)
-        except Exception:
-            pass
-    try:
+    shown = str(button.title() or "") if title is None else title
+    button.setTitle_(shown)
+    brand = _brand_image()
+    if brand is not None:
+        # Copy so sizing the menu-bar image does not change the header asset.
+        icon = brand.copy()
+        icon.setSize_((16, 16))
+        button.setImage_(icon)
+        button.setImagePosition_(NSImageLeft if shown else NSImageOnly)
+    else:
         button.setImage_(None)
         button.setImagePosition_(NSNoImage)
-    except Exception:
-        pass
-    shown = str(button.title() or title or "")
-    width = 0.0
-    if shown:
-        font = button.font() or NSFont.menuBarFontOfSize_(0)
-        width = (
-            NSAttributedString.alloc()
-            .initWithString_attributes_(shown, {NSFontAttributeName: font})
-            .size()
-            .width
-        )
-    nsstatusitem.setLength_(status_item_length(width, compact=compact))
+        shown = shown or "OpenSwap"
+        button.setTitle_(shown)
+    button.setAccessibilityLabel_(f"OpenSwap, {shown}" if shown else "OpenSwap")
+    nsstatusitem.setLength_(NSVariableStatusItemLength)
 
 
 PAD = 12.0
@@ -191,6 +188,8 @@ TAB_GAP = 6.0
 INFO_LINE_H = 16.0
 LOGIN_BRAND_SIZE = 56.0
 LOGIN_BRAND_SPACE = 68.0
+DIALOG_CONTENT_WIDTH = 360.0
+DIALOG_INPUT_HEIGHT = 24.0
 
 
 def _card_height(card) -> float:
@@ -213,6 +212,7 @@ def _hex(color: str, alpha: float = 1.0):
 _DYNAMIC_PROVIDERS: list = []
 _PALETTE = None
 _BRAND_IMAGE = None
+_DIALOG_BRAND_IMAGE = None
 
 
 def _dynamic(light_hex, dark_hex, light_alpha=1.0, dark_alpha=1.0, *, name=None):
@@ -254,24 +254,80 @@ def _colors() -> dict:
     return _PALETTE
 
 
-def _brand_mark(frame, tint):
-    """OpenSoft monogram from the packaged brand asset, tinted like text."""
+def _brand_image():
+    """Shared template image; callers must copy before changing its size."""
     global _BRAND_IMAGE
     if _BRAND_IMAGE is None:
         path = Path(__file__).with_name("assets") / "opensoft-symbol-64.png"
         _BRAND_IMAGE = NSImage.alloc().initWithContentsOfFile_(str(path))
         if _BRAND_IMAGE is not None:
             _BRAND_IMAGE.setTemplate_(True)
-    if _BRAND_IMAGE is None:
+    return _BRAND_IMAGE
+
+
+def _brand_mark(frame, tint):
+    """OpenSoft monogram from the packaged brand asset, tinted like text."""
+    brand = _brand_image()
+    if brand is None:
         return None
     view = NSImageView.alloc().initWithFrame_(frame)
-    view.setImage_(_BRAND_IMAGE)
+    view.setImage_(brand)
     view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
     try:
         view.setContentTintColor_(tint)
     except Exception:
         pass
     return view
+
+
+def _dialog_brand_image():
+    """A template copy sized for the standard macOS alert icon well."""
+    global _DIALOG_BRAND_IMAGE
+    if _DIALOG_BRAND_IMAGE is None:
+        path = Path(__file__).with_name("assets") / "opensoft-symbol-64.png"
+        _DIALOG_BRAND_IMAGE = NSImage.alloc().initWithContentsOfFile_(str(path))
+        if _DIALOG_BRAND_IMAGE is not None:
+            _DIALOG_BRAND_IMAGE.setTemplate_(True)
+            _DIALOG_BRAND_IMAGE.setSize_((64, 64))
+    return _DIALOG_BRAND_IMAGE.copy() if _DIALOG_BRAND_IMAGE is not None else None
+
+
+def style_dialog_alert(alert):
+    """Apply the shared OpenSwap icon and content width to an ``NSAlert``."""
+    icon = _dialog_brand_image()
+    if icon is not None:
+        alert.setIcon_(icon)
+    accessory = alert.accessoryView()
+    if accessory is None:
+        accessory = NSView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, DIALOG_CONTENT_WIDTH, 1)
+        )
+        alert.setAccessoryView_(accessory)
+    else:
+        height = max(float(accessory.frame().size.height), 1.0)
+        accessory.setFrameSize_((DIALOG_CONTENT_WIDTH, height))
+    try:
+        alert.layout()
+    except Exception:
+        pass
+    return alert
+
+
+def make_dialog_alert(*, title=None, message="", ok=None, cancel=None, other=None):
+    """Build a branded alert while preserving rumps' 1/0 button contract."""
+    shown_title = str(title or "OpenSwap")
+    if shown_title.casefold() == "openswap":
+        shown_title = "OpenSwap"
+    shown_message = str(message or "").replace("%", "%%")
+    if not isinstance(cancel, str):
+        cancel = "Cancel" if cancel else None
+    factory = (
+        NSAlert
+        .alertWithMessageText_defaultButton_alternateButton_otherButton_informativeTextWithFormat_
+    )
+    alert = factory(shown_title, ok, cancel, other, shown_message)
+    alert.setAlertStyle_(0)
+    return style_dialog_alert(alert)
 
 
 def _system_popover_appearance():

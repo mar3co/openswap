@@ -10,7 +10,7 @@ After `rumps` attaches the status item, a short timer steals the click for the p
 
 ## Split: pure vs AppKit
 
-`menubar_display.py` holds import-safe helpers (`format_title`, `status_item_length`, `MenuBarSettings`, notification copy, panel snapshot adapters). `menubar.py` is the rumps app and re-exports those helpers. Tests in `tests/test_menubar.py` import `openswap.menubar` and never import AppKit.
+`menubar_display.py` holds import-safe helpers (`format_title`, `MenuBarSettings`, notification copy, panel snapshot adapters). `menubar.py` is the rumps app and re-exports those helpers. Tests in `tests/test_menubar.py` import `openswap.menubar` and never import AppKit.
 
 `menubar_panel.py` is AppKit-only: popover, bars, Dark Mode colors, `fit_status_item`. The header loads the packaged OpenSoft symbol from `openswap/assets`; the same OpenSoft app icon source is rendered into the widget host's AppIcon catalog.
 
@@ -18,9 +18,15 @@ The header pins the OpenSoft mark and **OpenSwap** name on the left and an **Aut
 
 Card title is the alias or org tag (`personal` when the org name is empty); email is the subtitle. Sentinel notes (signed-out, foreign credential, …) render even when last-good bars are present. Account-row clicks call `switch_to(..., json_output=True)` unless the slot is `USAGE_RELOGIN_REQUIRED`. Signed-out clicks never switch a dead backup: capture only when the live Claude login matches that slot’s email **and** org uuid; otherwise the extra opens `claude auth login --email` in Terminal (after confirming if another managed account is signed in). After a matching login, the extra auto-captures on the 1s tick. A real switch toasts, stamps `autoswitch_state.json` `lastSwitchAt` (engine cooldown, default 5 minutes), and closes. Already-active closes with no toast. A `ClaudeSwitchError` leaves the popover open and brings the extra forward before `rumps.alert`. Cards implement `acceptsFirstMouse_` so the first click on a non-key popover switches. `rebuild_menu` does not reload an open popover (that replaced the view tree mid-click). `_detect_active_change` compares slot number, not email, so two orgs that share an address still refresh.
 
-## Title width
+## Menu-bar display
 
-AppKit’s default text extra is ~10pt inset per side. With the asterisk off that left inset is empty. `fit_status_item(..., compact=not show_icon, title=...)` writes the title on the status-item **button** (rumps still uses the deprecated `NSStatusItem.setTitle_`), clears the image, and sets length to measured title plus `STATUS_ITEM_COMPACT_PAD` (6pt total) when compact. Call it after every title rebuild and on popover attach. A sentinel on the active slot still titles from `last_good` (`title_usage`), frozen at `fetched_at` so a passed weekly reset does not paint as a fresh 0%.
+Settings → General → Menu bar → **Show** selects **Claude**, **ChatGPT**, **Both**, or **Logo only**, independently of the popover tab. Existing settings default to Claude. **Account name**, **5-hour usage**, and **7-day usage** apply to the selected providers; **Claude model limits** appears only when Claude is included. Logo only hides these controls without resetting their saved choices.
+
+`format_menu_bar_title` prefixes each provider and labels quota windows (5h / 7d). Both joins the two provider summaries. ChatGPT uses the selected shared Codex credential, labels its quota **Codex**, and explicitly marks the app identity **unverified**: shared credentials do not prove which account the ChatGPT desktop session is using. Missing shared credentials (including API-key authentication) show **No shared account**, never another saved account. Claude's empty state is **No account**. ChatGPT message limits are not available here.
+
+### Title width
+
+`fit_status_item(..., title=...)` writes the optional title on the status-item **button** (rumps still uses the deprecated `NSStatusItem.setTitle_`) and always displays the packaged OpenSoft template image at 16pt. AppKit sizes the image and text together; **Logo only** leaves the logo visible by itself. There is no asterisk preference; legacy `show_icon` values are ignored. Call it after every title rebuild and on popover attach. A sentinel on either provider's active slot still titles from `last_good` (`title_usage`), frozen at that provider's `fetched_at` so a passed weekly reset does not paint as a fresh 0%.
 
 ## Appearance
 
@@ -43,6 +49,12 @@ Settings-page strategies: **Most quota left** (`best`), **Burn weekly first** (`
 ## Notifications
 
 `rumps.notification` needs a bundle id. `ensure_notification_identity` writes a tiny `Info.plist` next to the uv interpreter (`com.opensoft.openswap.menubar`) if missing.
+
+After an experimental ChatGPT desktop switch completes, the extra sends a
+silent **ChatGPT reopened** notification asking the operator to check the
+selected account. The inline **ChatGPT reopened · Check the profile** status
+remains the fallback if notification delivery fails. Consent and error feedback
+remain dialogs; completion does not claim that the running profile is verified.
 
 A switch toast includes “Restart Claude Code to apply now, or wait about 30 seconds.” only when a Claude Code session or IDE lock is live (`claude_running`). Otherwise the restart sentence is omitted. Codex switches include “Restart Codex to apply.” only when a Codex TUI is live (`codex_running`).
 

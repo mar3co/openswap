@@ -498,9 +498,14 @@ class DesktopSwitcher:
                 )
             app_info = self.app.preflight(self.engine.home)
             was_running = bool(self.app.is_running())
-            wrote = ""
-            roster_written: str | None = None
+            live_after = live_before
+            target: str | None = None
+            roster_planned: str | None = None
+            recovery_write_attempted = False
+            auth_write_attempted = False
+            roster_write_attempted = False
             lifecycle_stopped = False
+            launch_attempted = False
             try:
                 if was_running:
                     self.app.quit(timeout=20)
@@ -580,16 +585,22 @@ class DesktopSwitcher:
                     "rosterWritten": roster_planned,
                     "rosterWrittenFingerprint": _digest(roster_planned),
                 }
+                recovery_write_attempted = True
                 _atomic_text(self.recovery_file, json.dumps(recovery, sort_keys=True))
+                # Mark the write before entering _atomic_text: replacement can
+                # succeed even when the following directory fsync fails.
+                auth_write_attempted = True
                 _atomic_text(auth_path(self.engine.home), target)
-                wrote = target
+                roster_write_attempted = True
                 _atomic_text(roster_path, roster_planned)
-                roster_written = _optional_text(roster_path)
+                launch_attempted = True
                 self.app.launch(self.engine.home, timeout=20)
             except BaseException as exc:
-                # Roll back only while the live file is still exactly our write;
-                # never clobber a login or refresh produced concurrently.
-                if wrote:
+                # Reconcile exact contents after every attempted replacement.
+                # _atomic_text may have replaced a file before directory fsync
+                # reports failure, so its return value cannot establish whether
+                # the write became visible.
+                if auth_write_attempted or roster_write_attempted:
                     try:
                         if self.app.is_running():
                             self.app.quit(timeout=20)
@@ -600,36 +611,71 @@ class DesktopSwitcher:
                             "was attempted; stop it, run 'openswap codex desktop recovery-status', "
                             "then use the explicit desktop recover command."
                         ) from stop_exc
-                    if self.engine._live_text() != wrote:
+
+                    live_current = self.engine._live_text()
+                    auth_replaced = live_current == target and live_current != live_after
+                    if live_current == target:
+                        try:
+                            if live_current != live_after:
+                                _atomic_text(auth_path(self.engine.home), live_after)
+                        except Exception as restore_exc:
+                            raise DesktopSwitchError(
+                                "Desktop switch failed and the stopped app's auth could not be "
+                                "restored; use the explicit desktop recover command."
+                            ) from restore_exc
+                    elif live_current != live_after:
                         raise DesktopSwitchError(
-                            "Desktop launch failed and auth changed after OpenSwap wrote it. "
+                            "Desktop switch failed and auth changed after OpenSwap attempted it. "
                             "The app is stopped, but rollback was withheld to avoid clobbering "
                             "a refreshed login; use the explicit desktop recover command."
                         ) from exc
-                    try:
-                        _atomic_text(auth_path(self.engine.home), live_after)
-                    except Exception as restore_exc:
-                        raise DesktopSwitchError(
-                            "Desktop switch failed and the stopped app's auth could not be "
-                            "restored; use the explicit desktop recover command."
-                        ) from restore_exc
+
                     roster_current = _optional_text(roster_path)
-                    if roster_current != roster_written:
+                    roster_replaced = roster_current == roster_planned and roster_current != (
+                        roster_before or None
+                    )
+                    if roster_current == roster_planned:
+                        try:
+                            if roster_before:
+                                _atomic_text(roster_path, roster_before)
+                            else:
+                                _unlink_durable(roster_path)
+                        except Exception as restore_exc:
+                            raise DesktopSwitchError(
+                                "Desktop auth was restored, but roster rollback was incomplete; "
+                                "use the explicit desktop recover command."
+                            ) from restore_exc
+                    elif roster_current != (roster_before or None):
                         raise DesktopSwitchError(
                             "Desktop auth was restored, but the roster changed concurrently. "
                             "The concurrent roster was preserved; run desktop recovery-status."
                         ) from exc
                     try:
-                        if roster_before:
-                            _atomic_text(roster_path, roster_before)
-                        else:
-                            roster_path.unlink(missing_ok=True)
                         _unlink_durable(self.recovery_file)
                     except Exception as restore_exc:
                         raise DesktopSwitchError(
-                            "Desktop auth was restored, but roster rollback was incomplete; "
+                            "Desktop files were restored, but recovery cleanup was incomplete; "
                             "use the explicit desktop recover command."
                         ) from restore_exc
+                    if isinstance(exc, ClaudeSwitchError):
+                        raise
+                    state = "is stopped" if lifecycle_stopped else "may still be running"
+                    phase = "during launch" if launch_attempted else "before launch"
+                    outcome = (
+                        "Original credentials were restored."
+                        if auth_replaced or roster_replaced
+                        else "Credentials were not changed."
+                    )
+                    raise DesktopSwitchError(
+                        f"Desktop switch failed {phase}; the app {state}. {outcome}"
+                    ) from exc
+                if recovery_write_attempted and self.recovery_file.exists():
+                    raise DesktopSwitchError(
+                        "Desktop switch stopped before credentials were replaced, but its recovery "
+                        "record may have been written. Keep the app idle; run "
+                        "'openswap codex desktop recovery-status', then use the explicit desktop "
+                        "recover command."
+                    ) from exc
                 if isinstance(exc, ClaudeSwitchError):
                     raise
                 state = "is stopped" if lifecycle_stopped else "may still be running"

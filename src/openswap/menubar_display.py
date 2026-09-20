@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import plistlib
 import re
@@ -18,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +57,7 @@ _HOLD_WINDOW = {
     "soonest-5h": "5-hour",
 }
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
+MENU_BAR_PROVIDER_CHOICES: tuple[str, ...] = ("claude", "chatgpt", "both", "logo")
 MENUBAR_SETTINGS_FILENAME = "menubar_settings.json"
 
 
@@ -168,6 +168,7 @@ class MenuBarSettings:
     Engine cooldown / last switch / quarantine live in ``autoswitch_state.json``.
     """
 
+    menu_bar_provider: str = "claude"
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
@@ -175,7 +176,6 @@ class MenuBarSettings:
     auto_switch_enabled: bool = False
     # Separate from Claude's live rotation: this only proposes desktop targets.
     chatgpt_auto_enabled: bool = False
-    show_icon: bool = False  # optional ✻ in the status-item title; off by default
     confirm_switch: bool = True  # ask before a card click swaps the live login
     kickoff_enabled: bool = False
     kickoff_hour: int = 7
@@ -206,6 +206,8 @@ class MenuBarSettings:
             if not _json_matches_field(value, getattr(defaults, f.name)):
                 continue
             if f.name == "title_pct" and value not in TITLE_PCT_CHOICES:
+                continue
+            if f.name == "menu_bar_provider" and value not in MENU_BAR_PROVIDER_CHOICES:
                 continue
             kwargs[f.name] = value
         return cls(**kwargs)
@@ -246,31 +248,42 @@ def settings_page_rows(
             "label": "Menu bar",
         },
         {
+            "kind": "popup",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "menu_bar_provider",
+            "label": "Show",
+            "options": [
+                ("claude", "Claude"), ("chatgpt", "ChatGPT"),
+                ("both", "Both"), ("logo", "Logo only"),
+            ],
+            "value": settings.menu_bar_provider,
+        },
+        {
             "kind": "toggle",
             "section": SETTINGS_SECTION_GENERAL,
             "id": "show_account_name",
-            "label": "Show account name in menu bar",
+            "label": "Account name",
             "value": bool(settings.show_account_name),
         },
         {
             "kind": "toggle",
             "section": SETTINGS_SECTION_GENERAL,
             "id": "title_pct_5h",
-            "label": "Show 5-hour % in menu bar",
+            "label": "5-hour usage",
             "value": title_shows_5h(settings.title_pct),
         },
         {
             "kind": "toggle",
             "section": SETTINGS_SECTION_GENERAL,
             "id": "title_pct_7d",
-            "label": "Show 7-day % in menu bar",
+            "label": "7-day usage",
             "value": title_shows_7d(settings.title_pct),
         },
         {
             "kind": "toggle",
             "section": SETTINGS_SECTION_GENERAL,
             "id": "title_scoped",
-            "label": "Show model limits in title",
+            "label": "Claude model limits",
             "value": bool(settings.title_scoped),
         },
         {
@@ -295,21 +308,24 @@ def settings_page_rows(
             "options": [(secs, REFRESH_LABELS[secs]) for secs in REFRESH_CHOICES],
             "value": settings.refresh_interval,
         },
-        {
-            "kind": "group",
-            "style": "section",
-            "section": SETTINGS_SECTION_GENERAL,
-            "id": "group_advanced",
-            "label": "Advanced",
-        },
-        {
-            "kind": "toggle",
-            "section": SETTINGS_SECTION_GENERAL,
-            "id": "show_icon",
-            "label": "Show asterisk in menu bar",
-            "value": bool(settings.show_icon),
-        },
     ]
+    title_controls = {"show_account_name", "title_pct_5h", "title_pct_7d", "title_scoped"}
+    if settings.menu_bar_provider == "logo":
+        general = [row for row in general if row["id"] not in title_controls]
+    elif settings.menu_bar_provider == "chatgpt":
+        general = [row for row in general if row["id"] != "title_scoped"]
+    if settings.menu_bar_provider in ("chatgpt", "both"):
+        hint_at = next(i for i, row in enumerate(general) if row["id"] == "group_behavior")
+        general.insert(hint_at, {
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "menu_bar_chatgpt_hint",
+            "label": (
+                "ChatGPT: shared Codex login and usage. App sign-in is unverified; "
+                "these aren’t ChatGPT message limits."
+            ),
+        })
 
     automation = [
         {
@@ -464,12 +480,6 @@ def settings_page_rows(
     return rows
 
 
-STATUS_ICON = "✻"
-# AppKit's default title extra is ~10pt per side. With no leading icon that
-# empty inset is just gap; compact width keeps ~3pt per side so the hover
-# pill still clears the first glyph.
-STATUS_ITEM_COMPACT_PAD = 6.0
-NS_VARIABLE_STATUS_ITEM_LENGTH = -1.0
 # After the pointer leaves the popover (not on open). Click-outside still
 # dismisses immediately.
 POPOVER_AUTO_CLOSE_S = 12.0
@@ -490,6 +500,7 @@ class NotificationCopy:
     title: str
     subtitle: str = ""
     body: str = ""
+    sound: bool | None = None
 
     def rumps_args(self) -> tuple[str, str, str]:
         return (self.title, self.subtitle, self.body)
@@ -726,6 +737,15 @@ def notification_copy_for_manual_switch(
     return NotificationCopy(
         title=f"Switched to {dest_name}",
         body=body,
+    )
+
+
+def notification_copy_for_desktop_switch() -> NotificationCopy:
+    """Quiet completion feedback; selected credentials are not UI verification."""
+    return NotificationCopy(
+        title="ChatGPT reopened",
+        body="Check the selected account in ChatGPT.",
+        sound=False,
     )
 
 
@@ -1549,14 +1569,15 @@ def format_title(
     now: float | None = None,
     alias: str | None = None,
     org_name: str | None = None,
+    *,
+    label_windows: bool = False,
 ) -> str:
     """Build the menu-bar title from the active account and settings.
 
-    Never empty: an unmanaged live login, or every title toggle off, shows the
-    icon, because a blank status item is indistinguishable from a crashed one.
+    Text is optional: the native status item always displays the OpenSoft logo.
     """
     if active_email is None:
-        return STATUS_ICON
+        return ""
     if now is None:
         now = time.time()
     segments: list[str] = []
@@ -1566,13 +1587,13 @@ def format_title(
     if title_shows_5h(settings.title_pct):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"{'5h ' if label_windows else ''}{p:.0f}%")
     if title_shows_7d(settings.title_pct):
         seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
         seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"{'7d ' if label_windows else ''}{p:.0f}%")
     if settings.title_scoped and isinstance(active_usage, dict):
         # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
         # dropdown rows; named so multiple scoped models stay distinguishable.
@@ -1580,10 +1601,67 @@ def format_title(
             window = _rolled_weekly_window(window, now)
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
-    text = " · ".join(segments)
-    if settings.show_icon and text:
-        return f"{STATUS_ICON} {text}"
-    return text or STATUS_ICON
+    return " · ".join(segments)
+
+
+def format_menu_bar_title(
+    snapshot: dict, settings: MenuBarSettings, now: float | None = None
+) -> str:
+    """Provider-labelled status text, independent of the popover's selected tab.
+
+    ChatGPT shares the selected Codex credential, but its desktop session is not
+    verified by that file. Name that limitation instead of presenting the CLI's
+    identity or quota as a verified ChatGPT session or message limit.
+    """
+    provider = settings.menu_bar_provider
+    if provider == "logo":
+        return ""
+    if now is None:
+        now = time.time()
+    titles = []
+    if provider in ("claude", "both"):
+        if snapshot.get("active_email"):
+            detail = format_title(
+                snapshot["active_email"], title_usage(snapshot), settings,
+                now=title_clock(snapshot, now), alias=snapshot.get("active_alias"),
+                org_name=snapshot.get("active_org"), label_windows=True,
+            )
+            titles.append("Claude" + (f" · {detail}" if detail else ""))
+        else:
+            titles.append("Claude · No account")
+    if provider in ("chatgpt", "both"):
+        number = snapshot.get("codex_active_num")
+        active = next(
+            (row for row in snapshot.get("accounts") or []
+             if number is not None and str(row[0]) == f"codex:{number}"
+             and (snapshot.get("kinds") or {}).get(str(row[0])) != "api_key"
+             and row[3] != USAGE_API_KEY),
+            None,
+        )
+        if active is None:
+            titles.append("ChatGPT · No shared account")
+        else:
+            _num, email, _active, usage, last_good, alias, org, _disabled, fetched_at = active
+            shared = {
+                "active_usage": usage, "active_last_good": last_good,
+                "active_fetched_at": fetched_at,
+            }
+            name = format_title(
+                email, None, replace(settings, title_pct="off", title_scoped=False),
+                alias=alias, org_name=org,
+            )
+            quota = format_title(
+                email, title_usage(shared),
+                replace(settings, show_account_name=False, title_scoped=False),
+                now=title_clock(shared, now), label_windows=True,
+            )
+            parts = ["ChatGPT (unverified)"]
+            if name:
+                parts.append(name)
+            if quota:
+                parts.append(f"Codex {quota}")
+            titles.append(" · ".join(parts))
+    return "  |  ".join(titles)
 
 
 def should_confirm_switch(enabled: bool, *, is_active: bool) -> bool:
@@ -1692,13 +1770,6 @@ def alias_edit(text: str, current: str | None) -> tuple[str, str | None]:
     if value == current:
         return ("noop", None)
     return ("set", value)
-
-
-def status_item_length(title_width: float, *, compact: bool) -> float:
-    """Width for the status extra. Compact (icon off) drops the ~10pt insets."""
-    if not compact or title_width <= 0:
-        return NS_VARIABLE_STATUS_ITEM_LENGTH
-    return float(math.ceil(title_width + STATUS_ITEM_COMPACT_PAD))
 
 
 def trailing_header_frames(

@@ -50,21 +50,17 @@ def desktop_switch_choices(snapshot):
 
 def desktop_switch_confirm_copy(name, *, pause_auto=False):
     pause_copy = (
-        "\n\nThis also pauses Codex automatic account rotation for all OpenSwap "
-        "instances using this store. Claude rotation is unchanged. Codex rotation "
-        "stays off until you re-enable it in Settings or with the CLI."
-        if pause_auto else ""
+        "Codex auto-switching turns off for all OpenSwap instances using this "
+        "store until re-enabled. Claude is unchanged."
+        if pause_auto else "Keep Codex auto-switching off during desktop switching."
     )
     return (
-        "Restart ChatGPT to switch accounts?",
-        f"Experimental: select {name} for ChatGPT and the shared Codex login. "
-        "This will quit and relaunch the entire ChatGPT app, including this "
-        "conversation if it is open there.\n\n"
-        "Save and finish all local and remote work first. Close other Codex "
-        "clients. Continuing confirms that all work is stopped and you agree "
-        "to the restart.\n\n"
-        "After relaunch, verify the account in Chat, Work, and Codex. "
-        "Keep Codex auto-switching off during testing." + pause_copy,
+        "Restart ChatGPT?",
+        f"Experimental switch to {name}.\n\n"
+        "Restarts the entire app and changes the shared Codex login. "
+        "Save and stop all local/remote work; close other Codex clients before continuing.\n\n"
+        "After restart, check the account in Chat, Work, and Codex.\n\n"
+        + pause_copy,
     )
 
 
@@ -814,7 +810,7 @@ def run(switcher, codex=None) -> int:
             except Exception:
                 self.switcher._logger.debug("status item autosave failed", exc_info=True)
             try:
-                fit_status_item(nsitem, compact=not self.settings.show_icon)
+                fit_status_item(nsitem)
             except Exception:
                 self.switcher._logger.debug("status item fit failed", exc_info=True)
             self._panel = MenuBarPanel(
@@ -985,7 +981,12 @@ def run(switcher, codex=None) -> int:
             return self._guard(lambda: self.codex.set_account_disabled(number, False))
 
         def _on_setting(self, row_id, value):
-            if row_id == "show_account_name":
+            if row_id == "menu_bar_provider":
+                if value not in MENU_BAR_PROVIDER_CHOICES:
+                    return
+                self.settings.menu_bar_provider = value
+                self._save_and_rebuild()
+            elif row_id == "show_account_name":
                 self.on_toggle_name(None)
             elif row_id == "title_pct_5h":
                 self.on_toggle_title_5h(None)
@@ -1030,8 +1031,6 @@ def run(switcher, codex=None) -> int:
                 # The popup already shows the pick; do not rebuild the page
                 # under the open menu.
                 return
-            elif row_id == "show_icon":
-                self.on_toggle_icon(None)
             else:
                 return
             panel = self._panel
@@ -1064,21 +1063,13 @@ def run(switcher, codex=None) -> int:
 
                 fit_status_item(
                     nsitem,
-                    compact=not self.settings.show_icon,
                     title=title,
                 )
             except Exception:
                 self.switcher._logger.debug("status item fit failed", exc_info=True)
 
         def rebuild_menu(self):
-            title = format_title(
-                self.snapshot["active_email"],
-                title_usage(self.snapshot),
-                self.settings,
-                now=title_clock(self.snapshot),
-                alias=self.snapshot.get("active_alias"),
-                org_name=self.snapshot.get("active_org"),
-            )
+            title = format_menu_bar_title(self.snapshot, self.settings)
             self.title = title
             self._fit_status_item(title)
             # Stop a rumps memory leak: rumps registers each menu item's callback
@@ -1240,7 +1231,7 @@ def run(switcher, codex=None) -> int:
                 outcome = (None, str(exc))
             except Exception:
                 # Never surface arbitrary credential/protocol details.
-                outcome = (None, "The experimental desktop switch failed. Check the selected account before retrying.")
+                outcome = (None, "The desktop switch failed. Check the selected account before retrying.")
             with self._event_lock:
                 self._desktop_result = outcome
 
@@ -1255,7 +1246,7 @@ def run(switcher, codex=None) -> int:
             result, error = pending
             self._desktop_status = (
                 "Switch failed · Check ChatGPT before retrying" if error else
-                "Verification needed · Check the ChatGPT profile"
+                "ChatGPT reopened · Check the profile"
             )
             # The panel may have been reopened during the background work.
             # Reuse the existing mouse-up-safe main-panel refresh queue.
@@ -1265,15 +1256,11 @@ def run(switcher, codex=None) -> int:
                 self._show_error(error)
             elif result is not None:
                 record_manual_switch(self.codex.state_dir)
-                self._alert(
-                    title="ChatGPT reopened — verify the account",
-                    message=(
-                        "The selected credentials were installed and ChatGPT was relaunched. "
-                        "Desktop authentication is not yet verified. Check the profile menu "
-                        "and new Chat, Work, and Codex tasks before continuing. "
-                        "Keep Codex auto-switching off during this test."
-                    ),
-                )
+                try:
+                    self._notify(notification_copy_for_desktop_switch())
+                except Exception:
+                    # Inline status and refresh are the durable fallback.
+                    pass
             self.refresh_async()
 
         def _remove_menu(self, rumps):
@@ -1346,10 +1333,22 @@ def run(switcher, codex=None) -> int:
                 popover.setLevel_(level)
 
         def _alert(self, **kwargs) -> int:
-            return self._dialog(lambda: rumps.alert(**kwargs))
+            from openswap.menubar_panel import make_dialog_alert
+
+            alert = make_dialog_alert(**kwargs)
+            return self._dialog(alert.runModal)
 
         def _prompt(self, **kwargs):
-            return self._dialog(lambda: rumps.Window(**kwargs).run())
+            from openswap.menubar_panel import (
+                DIALOG_CONTENT_WIDTH,
+                DIALOG_INPUT_HEIGHT,
+                style_dialog_alert,
+            )
+
+            kwargs["dimensions"] = (DIALOG_CONTENT_WIDTH, DIALOG_INPUT_HEIGHT)
+            window = rumps.Window(**kwargs)
+            style_dialog_alert(window._alert)
+            return self._dialog(window.run)
 
         def _show_error(self, message: str):
             self._alert(title="openswap", message=message)
@@ -1396,7 +1395,8 @@ def run(switcher, codex=None) -> int:
         def _notify(self, copy: NotificationCopy | None):
             if copy is None:
                 return
-            rumps.notification(*copy.rumps_args())
+            kwargs = {} if copy.sound is None else {"sound": copy.sound}
+            rumps.notification(*copy.rumps_args(), **kwargs)
 
         def _alias_map(self) -> dict[str, str]:
             aliases: dict[str, str] = {}
@@ -1677,7 +1677,7 @@ def run(switcher, codex=None) -> int:
                         "(leave blank to remove it):"
                     ),
                     default_text=current or "",
-                    ok="Save", cancel="Cancel", dimensions=(320, 24),
+                    ok="Save", cancel="Cancel",
                 )
                 if resp.clicked != 1:
                     return
@@ -1751,7 +1751,7 @@ def run(switcher, codex=None) -> int:
             email_resp = self._prompt(
                 title="Add account from token",
                 message="Email label (optional; leave blank to auto-name):",
-                ok="Next", cancel="Cancel", dimensions=(320, 24),
+                ok="Next", cancel="Cancel",
             )
             if email_resp.clicked != 1:
                 return
@@ -1759,7 +1759,7 @@ def run(switcher, codex=None) -> int:
             token_resp = self._prompt(
                 title="Add account from token",
                 message="API key (sk-ant-api…) or setup token (sk-ant-oat01-…):",
-                ok="Add", cancel="Cancel", dimensions=(320, 24),
+                ok="Add", cancel="Cancel",
             )
             if token_resp.clicked != 1 or not token_resp.text.strip():
                 return
@@ -1855,10 +1855,6 @@ def run(switcher, codex=None) -> int:
             self._apply_hold_line()
             self.rebuild_menu()
             self._reload_main_panel_if_shown()
-
-        def on_toggle_icon(self, _sender):
-            self.settings.show_icon = not self.settings.show_icon
-            self._save_and_rebuild()
 
         def on_toggle_kickoff(self, _sender):
             self.settings.kickoff_enabled = not self.settings.kickoff_enabled
