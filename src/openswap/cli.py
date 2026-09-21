@@ -1457,7 +1457,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
-  %(prog)s codex add|list|switch|remove|export|import|swap|move  Codex CLI accounts
+  %(prog)s codex add|list|switch|remove|disable|enable|alias|export|import|swap|move|desktop  Codex CLI / ChatGPT desktop
   %(prog)s config [set KEY VALUE]     show or change shared policy (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

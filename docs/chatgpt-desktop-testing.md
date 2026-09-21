@@ -69,20 +69,23 @@ desktop authentication still requires manual verification after a switch.
 
 ## ChatGPT Auto-switch
 
-The ChatGPT tab has its own **Auto-switch** preference, independent of Claude.
-It automatically selects a replacement using Codex quota and the configured
-strategy. It does **not** use ChatGPT message limits or silently restart the app.
+Settings → Automation → **Enable ChatGPT switching** is the parent (default off).
+**Suggest ChatGPT account switches** is a separate stored preference; the ChatGPT
+tab Auto-switch is that child control. It stays disabled until the parent is on.
+Both must be on before the extra picks a replacement from Codex quota and the
+configured strategy. It does **not** use ChatGPT message limits or silently
+restart the app.
 
 When a replacement is ready, choose **Review switch**. Finish your work, then
 confirm the existing restart dialog. OpenSwap cannot reliably determine whether
 all Chat, Work and Codex tasks are idle, so every restart requires confirmation.
 Canceling leaves the active account unchanged.
 
-Enabling this mode explains the confirmation requirement and pauses legacy
+Enabling suggestions explains the confirmation requirement and pauses legacy
 Codex credential-only rotation with your consent. The modes cannot run together.
-Turn it off to discard the pending suggestion; onboarding and a desktop switch
-pause monitoring. New accounts remain enabled by default, but saving does not
-approve a restart. This is automatic selection with a confirmed switch, not
+Turn suggestions off to discard the pending candidate; onboarding and a desktop
+switch pause monitoring. New accounts remain enabled by default, but saving does
+not approve a restart. This is automatic selection with a confirmed switch, not
 unattended desktop rotation.
 
 ## Menu-bar test
@@ -91,15 +94,24 @@ Quit the existing **OpenSwap** menu-bar instance yourself, then open the test
 build. Do not run two OpenSwap menu-bar instances with the same account store.
 Building does not install, launch, or replace your normal app.
 
-Open the menu-bar popover, select **ChatGPT**, then click your target account.
-Changing tabs only changes the view, never credentials. The selected tab is
-remembered until OpenSwap restarts, including visits to Settings.
-Read the confirmation and choose **Restart ChatGPT** only after work is idle.
-This opens ChatGPT even if it was previously closed. The menu shows a busy
-state while the transaction runs. The Claude tab, widget, and ordinary CLI
-commands retain their existing behavior; only ChatGPT popover account clicks
-use the desktop flow. If the native popover cannot attach, the experimental
-submenu remains available in the fallback menu.
+Open Settings → Automation and turn on **Enable ChatGPT switching**. Open the
+popover, select **ChatGPT**, and wait for a capable observation. Changing tabs
+only changes the view, never credentials. The selected tab is remembered until
+OpenSwap restarts, including visits to Settings.
+
+If switching is off, a card click offers **Enable in Settings** and does not
+open the restart dialog. While the probe is in flight the extra shows
+**Checking ChatGPT…**. An incompatible build shows **This ChatGPT build isn’t
+compatible with switching.** A missing or unverifiable app is refused the same
+way. Only a fresh **stopped** or **running** observation enables activation.
+
+Then click your target account. A stopped app uses **Switch and open ChatGPT**;
+a running app uses **Restart ChatGPT**. Confirm only after work is idle. The
+stopped path opens ChatGPT if it was closed. The menu shows a busy state while
+the transaction runs. The Claude tab, widget, and ordinary CLI commands retain
+their existing behavior; only ChatGPT popover account clicks (and the fallback
+submenu if the popover cannot attach) use this gated desktop flow. The CLI is
+not gated by the extra’s parent toggle.
 
 ChatGPT and Codex share this account list. The usage bars show **Codex usage**,
 not ChatGPT message limits. “Selected” means the shared credential file matches
@@ -177,7 +189,7 @@ Widget behavior is unchanged.
 | Before | After |
 |--------|-------|
 | Mixed Claude/Codex list | Remembered Claude and ChatGPT tabs with provider-specific accounts and status |
-| Separate desktop submenu | One ChatGPT card action for the shared ChatGPT/Codex login; submenu only as a fallback |
+| Separate desktop submenu | One ChatGPT card action, gated by **Enable ChatGPT switching** (default off) and a worker capability probe; submenu only as a fallback |
 | Codex rotation control hidden when general auto is off | Explicit rotation-pause consent integrated into the switch confirmation |
 | Ambiguous usage and active labels | Codex usage caption, shared-file “selected” badge, and CLI-only API-key cards |
 | Claude strategy actions beside Codex cards | Rotate/Best shown only on Claude; overflow actions explicitly label Claude |
@@ -191,7 +203,7 @@ Widget behavior is unchanged.
 | No sign-in progress or identity review | Inline progress, cancel/retry, account review and optional nickname |
 | Browser-added accounts require Save, then Enable | Save enables the account immediately; the success screen offers only Done |
 | Sign-in competes with normal account captions | Focused sign-in view, aligned actions, wrapped errors, and nickname drafts preserved across navigation |
-| Auto-switch is visible only on Claude | Independent ChatGPT Auto-switch control in the same header position |
+| Auto-switch is visible only on Claude | ChatGPT header Auto-switch is the child suggestions toggle; it is disabled until **Enable ChatGPT switching** is on |
 | No desktop-safe automatic selection | Selection-only monitor with a concise confirmation-required caption |
 | Replacement choice requires manual inspection | Switch ready status and Review switch action; the existing restart confirmation still applies |
 | Policy controls depend only on Claude auto-switch | Threshold and strategy remain available when ChatGPT automatic selection is on |

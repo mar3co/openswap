@@ -9,19 +9,19 @@ OpenSwap is a standalone MIT descendant of [claude-swap](https://github.com/real
 
 ## Install
 
-One command. Needs a Mac with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) logged in.
+One command. Needs a Mac.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mar3co/openswap/main/install.sh | bash
 ```
 
-It installs [uv](https://docs.astral.sh/uv/) if you do not have it (uv brings its own Python), clones OpenSwap to `~/.openswap`, saves the Claude account you are logged into, and puts the extra in your menu bar. On a brand-new Mac, macOS first asks to install its Command Line Tools; run the command again once that finishes. Re-run it any time to update; it pulls instead of cloning, then saves the current login and starts the extra again. `openswap upgrade` updates from the terminal. Homebrew cask comes later. OpenSwap is not on PyPI.
+It installs [uv](https://docs.astral.sh/uv/) if you do not have it (uv brings its own Python), clones OpenSwap to `~/.openswap`, and starts the extra in your menu bar. If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) is logged in, setup saves that account; otherwise the extra still starts and you add accounts later. On a brand-new Mac, macOS first asks to install its Command Line Tools; run the command again once that finishes. Re-run it any time to update; it pulls instead of cloning, then runs setup again. `openswap upgrade` updates from the terminal. Homebrew cask comes later. OpenSwap is not on PyPI.
 
 Already have a checkout? `OPENSWAP_DIR=/path/to/openswap bash install.sh` installs from it.
 
 ## Quick start
 
-The installer saved your first account. Log into another Claude account, then:
+If Claude Code was logged in, the installer saved that account. Log into another Claude account, then:
 
 ```bash
 openswap add
@@ -68,7 +68,7 @@ The `cswap` command still works as an alias during the rename.
 | `openswap codex import` | Import Codex auth.json envelopes |
 | `openswap codex swap` | Exchange two Codex slot numbers |
 | `openswap codex move` | Assign a Codex account to a slot |
-| `openswap codex desktop` | Experimental, confirmed ChatGPT quit/switch/relaunch and recovery |
+| `openswap codex desktop` | Experimental ChatGPT preflight, switch, and recovery (`switch` and `recover` need `--confirm-restart --confirm-idle`) |
 | `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |
@@ -76,21 +76,33 @@ The `cswap` command still works as an alias during the rename.
 | `openswap statusline --install` | Opt-in: wrap Claude Code status line |
 | `openswap statusline --codex` | Paint the live Codex account label (no config.toml wrap) |
 
-`openswap help` lists everything. [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
+`openswap help` lists the main commands. Full list: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
 
-The menu-bar popover has **Claude | ChatGPT** tabs. The ChatGPT tab shows the
-shared ChatGPT/Codex accounts; clicking an OAuth account starts the experimental
-desktop switch with mandatory restart confirmation. Its usage bars measure
-**Codex usage**, not ChatGPT message limits. Read the
-[test and recovery guide](docs/chatgpt-desktop-testing.md) first. The ChatGPT
-**Auto-switch** toggle automatically chooses a replacement, then offers
-**Review switch**: you still confirm before ChatGPT restarts. Unattended desktop
-rotation and authenticated UI verification are not implemented.
+The menu-bar popover has **Claude | ChatGPT** tabs. The ChatGPT tab lists the
+shared ChatGPT/Codex accounts. Usage bars are **Codex usage**, not ChatGPT
+message limits. Desktop switching is experimental and **off by default**: turn on
+Settings → Automation → **Enable ChatGPT switching**, wait until the extra shows
+**Switch and open ChatGPT** or **Restart ChatGPT**, then click an OAuth account
+and confirm. While switching is off, a click offers **Enable in Settings**.
+Incompatible builds show **This ChatGPT build isn’t compatible with switching.**
+Relaunch does not prove which profile ChatGPT loaded. Read the
+[test and recovery guide](docs/chatgpt-desktop-testing.md) first.
+
+**Suggest ChatGPT account switches** (the ChatGPT tab Auto-switch) only runs
+when switching is on. It picks a replacement from Codex quota, then **Review
+switch**; you still confirm before ChatGPT restarts. That mode cannot run with
+live Codex CLI rotation. Unattended desktop rotation is not implemented.
 
 To add another account, choose **ChatGPT → Add account** (or **Sign in with
 ChatGPT** on an empty tab). Sign in through your browser, review the account,
-then **Save account**. OpenSwap uses a separate login session: it does not log
-out or replace your current login. New accounts are enabled immediately and
-eligible for automatic rotation if it is on. **Copy link** lets you use another browser profile; **Use a code** offers
-device sign-in where enabled. **Save current login** remains available for
-capturing an existing login.
+then **Save account**. That session is separate: it does not log out or replace
+your current login. New accounts are enabled when saved. They can be suggested
+for a confirmed ChatGPT restart, or used by Codex CLI auto-switch — not both at
+once. **Copy link** uses another browser profile; **Use a code** is device
+sign-in where enabled. **Save current login** captures an existing login.
+
+## JSON output for scripting
+
+`list`, `status`, and `switch` take `--json` (one object on stdout; notices on
+stderr). `openswap auto --json` is an event stream. Schema version 1; ignore
+unknown fields. Envelope details: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference#json).

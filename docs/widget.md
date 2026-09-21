@@ -6,7 +6,7 @@ Python cannot host WidgetKit. Split:
 2. Extra posts Darwin notification `com.opensoft.openswap.widget.reload`.
 3. `OpenSwap.app` (LSUIElement) listens and calls `WidgetCenter.shared.reloadAllTimelines()`.
 4. The appex reads the JSON (sandbox: home-relative read-write exception on `Library/Application Support/OpenSwap/` only + `getpwuid` for the real home; container `NSHomeDirectory()` is wrong).
-5. A tap writes `~/Library/Application Support/OpenSwap/widget-command.json` (`{"op":"switch","num":…}`). The extra consumes it on the 1s sync tick and handles it like a popover card click (switch, or signed-out repair). Combined remaining taps the slot with the most remaining on the primary window. The extra must be running; the widget cannot switch on its own. Disabled cards are not tappable. Sentinel notes render even when last-good bars are present.
+5. A tap writes `~/Library/Application Support/OpenSwap/widget-command.json` (`{"op":"switch","num":…}`). The extra consumes it on the 1s sync tick and calls CLI `switch_to` (Claude signed-out repair still applies). Widget taps do not take the ChatGPT popover’s gated desktop-restart path. Combined remaining taps the slot with the most remaining on the primary window. The extra must be running; the widget cannot switch on its own. Disabled cards are not tappable. Sentinel notes render even when last-good bars are present.
 
 The widget is `AppIntentConfiguration` (`OpenSwapWidgetIntent`). Right-click → Edit Widget sets layout (all accounts, combined remaining, one account), which windows (5h, 7d, both), and the account picker for one-account. Those choices live on the widget instance, not in extra Settings.
 
