@@ -428,6 +428,14 @@ def test_chatgpt_capability_freshness_and_activation_helpers():
     copy = menubar.desktop_capability_status_copy(missing)
     assert "ChatGPT" in copy
     assert "/" not in copy
+    incompatible = DesktopCapability(state="invalid", reason="incompatible_backend")
+    assert menubar.desktop_capability_status_copy(incompatible) == (
+        "This ChatGPT build isn’t compatible with switching."
+    )
+    retryable = DesktopCapability(state="invalid", reason="probe_failed", observed_at=now)
+    assert menubar.desktop_capability_status_copy(retryable) == (
+        "ChatGPT compatibility couldn’t be checked."
+    )
 
 
 def test_chatgpt_desktop_config_check_reuses_transaction_policy(tmp_path, monkeypatch):

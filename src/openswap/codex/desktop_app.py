@@ -7,13 +7,17 @@ can put a credential transaction between the two lifecycle operations.
 
 from __future__ import annotations
 
-import os
+import json
 import math
+import os
 import plistlib
+import signal
 import shlex
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from xml.parsers.expat import ExpatError
 from dataclasses import dataclass
@@ -86,9 +90,9 @@ def capability_is_fresh(capability: DesktopCapability, *, now: float) -> bool:
 _BUNDLE_ID = "com.openai.codex"
 _DEFAULT_APP = Path("/Applications/ChatGPT.app")
 _BUNDLED_CLI = Path("Contents/Resources/codex")
-_SUPPORTED_VERSION = "26.908.70816"
-_SUPPORTED_BUILD = "9275"
 _OPENAI_TEAM_ID = "2DC432GLL2"
+_TESTED_BASELINE_BUILDS = frozenset({("26.908.70816", "9275")})
+_BLOCKED_BUILDS: frozenset[tuple[str, str]] = frozenset()
 _KNOWN_BUNDLE_HELPERS = {"codex-code-mode-host", "codex-app-server", "app-server"}
 _UNSUPPORTED_OVERRIDES = (
     "CODEX_CLI_PATH",
@@ -112,6 +116,12 @@ _SECRET_ENV_NAMES = {
 }
 _SUBPROCESS_TIMEOUT = 3.0
 _CODESIGN_TIMEOUT = 15.0
+_COMPATIBILITY_TIMEOUT = 5.0
+_COMPATIBILITY_CLIENT_INFO = {
+    "name": "openswap_compatibility_probe",
+    "title": "OpenSwap Compatibility Probe",
+    "version": "1",
+}
 
 
 @dataclass(frozen=True)
@@ -196,8 +206,69 @@ def _is_codex_process(row: _Process, bundled_cli: Path, app_path: Path) -> bool:
     return inside_bundle and candidate.name in _KNOWN_BUNDLE_HELPERS
 
 
+def _stop_probe(proc: subprocess.Popen, force: bool) -> None:
+    """Stop only the isolated compatibility probe and any children it owns."""
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            proc.kill() if force else proc.terminate()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def _send_probe(proc: subprocess.Popen, message: dict) -> None:
+    if proc.stdin is None or proc.poll() is not None:
+        raise DesktopAppError(
+            "The bundled Codex compatibility probe exited unexpectedly.",
+            reason="probe_failed",
+        )
+    try:
+        proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
+    except (OSError, TypeError, ValueError) as exc:
+        raise DesktopAppError(
+            "The bundled Codex compatibility probe could not be completed.",
+            reason="probe_failed",
+        ) from exc
+
+
+def _await_probe(proc: subprocess.Popen, request_id: int) -> dict:
+    if proc.stdout is None:
+        raise DesktopAppError(
+            "The bundled Codex compatibility probe could not be completed.",
+            reason="probe_failed",
+        )
+    try:
+        for line in proc.stdout:
+            try:
+                message = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(message, dict) or message.get("id") != request_id:
+                continue
+            if "error" in message:
+                raise DesktopAppError(
+                    "The bundled Codex backend rejected the compatibility probe.",
+                    reason="incompatible_backend",
+                )
+            result = message.get("result")
+            return result if isinstance(result, dict) else {}
+    except (OSError, UnicodeError) as exc:
+        raise DesktopAppError(
+            "The bundled Codex compatibility probe could not be completed.",
+            reason="probe_failed",
+        ) from exc
+    raise DesktopAppError(
+        "The bundled Codex compatibility probe exited unexpectedly.",
+        reason="probe_failed",
+    )
+
+
 class DesktopApp:
-    """Lifecycle adapter for the exact installed OpenAI desktop bundle."""
+    """Lifecycle adapter for a compatible, publisher-verified ChatGPT bundle."""
 
     def __init__(self, app_path: Path = _DEFAULT_APP):
         self.app_path = Path(app_path)
@@ -210,6 +281,134 @@ class DesktopApp:
     @property
     def _bundled_cli(self) -> Path:
         return self.app_path / _BUNDLED_CLI
+
+    @staticmethod
+    def _build_key(info: dict) -> tuple[str, str]:
+        return (
+            str(info.get("CFBundleShortVersionString", "")),
+            str(info.get("CFBundleVersion", "")),
+        )
+
+    def _probe_bundled_cli(self) -> None:
+        """Verify the bundled backend's file-store contract in an isolated home.
+
+        The probe runs only after the application signature is accepted. It uses
+        a disposable home and a fabricated API key, never the operator's config,
+        credentials, network session, or account.
+        """
+        try:
+            with tempfile.TemporaryDirectory(prefix="openswap-desktop-compat-") as raw_root:
+                root = Path(raw_root)
+                codex_home = root / "codex"
+                home = root / "home"
+                tmp = root / "tmp"
+                for directory in (codex_home, home, tmp):
+                    directory.mkdir(mode=0o700)
+                auth_file = codex_home / "auth.json"
+                auth_file.write_text(
+                    json.dumps({"OPENAI_API_KEY": "sk-fabricated-openswap-compatibility"}),
+                    encoding="utf-8",
+                )
+                auth_file.chmod(0o600)
+                env = {
+                    "CODEX_HOME": str(codex_home),
+                    "HOME": str(home),
+                    "USERPROFILE": str(home),
+                    "XDG_CACHE_HOME": str(root / "xdg-cache"),
+                    "XDG_CONFIG_HOME": str(root / "xdg-config"),
+                    "XDG_DATA_HOME": str(root / "xdg-data"),
+                    "TMPDIR": str(tmp),
+                    "LANG": "C.UTF-8",
+                }
+                for name in ("XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+                    Path(env[name]).mkdir(mode=0o700)
+                proc = subprocess.Popen(
+                    [
+                        str(self._bundled_cli),
+                        "app-server",
+                        "--stdio",
+                        "--config",
+                        'cli_auth_credentials_store="file"',
+                    ],
+                    cwd=str(root),
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,
+                )
+                killer = threading.Timer(
+                    _COMPATIBILITY_TIMEOUT, _stop_probe, args=(proc, True)
+                )
+                killer.daemon = True
+                killer.start()
+                try:
+                    _send_probe(
+                        proc,
+                        {
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {"clientInfo": _COMPATIBILITY_CLIENT_INFO},
+                        },
+                    )
+                    initialized = _await_probe(proc, 1)
+                    reported_home = initialized.get("codexHome")
+                    if not isinstance(reported_home, str):
+                        raise DesktopAppError(
+                            "The bundled Codex backend did not report its credential home.",
+                            reason="incompatible_backend",
+                        )
+                    try:
+                        home_matches = Path(reported_home).resolve() == codex_home.resolve()
+                    except (OSError, RuntimeError, ValueError):
+                        home_matches = False
+                    if not home_matches:
+                        raise DesktopAppError(
+                            "The bundled Codex backend did not honor the isolated credential home.",
+                            reason="incompatible_backend",
+                        )
+                    _send_probe(proc, {"method": "initialized", "params": {}})
+                    _send_probe(
+                        proc,
+                        {
+                            "id": 2,
+                            "method": "account/read",
+                            "params": {"refreshToken": False},
+                        },
+                    )
+                    account = _await_probe(proc, 2).get("account")
+                    if not isinstance(account, dict) or account.get("type") != "apiKey":
+                        raise DesktopAppError(
+                            "The bundled Codex backend did not load file-backed credentials.",
+                            reason="incompatible_backend",
+                        )
+                finally:
+                    killer.cancel()
+                    _stop_probe(proc, False)
+                    try:
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        _stop_probe(proc, True)
+                        proc.wait(timeout=1.0)
+                    if proc.stdin is not None:
+                        try:
+                            proc.stdin.close()
+                        except OSError:
+                            pass
+                    if proc.stdout is not None:
+                        try:
+                            proc.stdout.close()
+                        except OSError:
+                            pass
+        except DesktopAppError:
+            raise
+        except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as exc:
+            raise DesktopAppError(
+                "The bundled Codex backend compatibility check could not be completed.",
+                reason="probe_failed",
+            ) from exc
 
     def _validate(self) -> tuple[dict, Path]:
         if sys.platform != "darwin":
@@ -240,13 +439,11 @@ class DesktopApp:
                 "The selected application is not the supported ChatGPT app.",
                 reason="wrong_bundle",
             )
-        if (
-            info.get("CFBundleShortVersionString") != _SUPPORTED_VERSION
-            or str(info.get("CFBundleVersion", "")) != _SUPPORTED_BUILD
-        ):
+        build_key = self._build_key(info)
+        if build_key in _BLOCKED_BUILDS:
             raise DesktopAppError(
-                "This ChatGPT desktop version has not been validated for account switching.",
-                reason="unvalidated_version",
+                "This ChatGPT desktop build is known to be incompatible with account switching.",
+                reason="known_incompatible_build",
             )
         executable_name = info.get("CFBundleExecutable")
         if not isinstance(executable_name, str) or not executable_name or Path(executable_name).name != executable_name:
@@ -281,7 +478,10 @@ class DesktopApp:
             ) from exc
         if self._validation_cache is not None and self._validation_cache[0] == stamp:
             return self._validation_cache[1], self._validation_cache[2]
+        # Never execute the bundled compatibility probe until the complete app
+        # and its nested code pass the publisher/signature check.
         self._verify_signature()
+        self._probe_bundled_cli()
         try:
             after_stats = [item.stat() for item in (self._plist_path, executable, self._bundled_cli)]
             after_stamp = tuple(
@@ -343,7 +543,7 @@ class DesktopApp:
             )
 
     def preflight(self, home: Path) -> dict:
-        """Validate the fixed app shape and return non-secret launch metadata."""
+        """Validate the app's trust/capability contract and return safe metadata."""
         info, executable = self._validate()
         self._reject_custom_backend()
         home = Path(home)
@@ -360,6 +560,12 @@ class DesktopApp:
             "bundle_id": _BUNDLE_ID,
             "version": str(info.get("CFBundleShortVersionString", "")),
             "build": str(info.get("CFBundleVersion", "")),
+            "compatibility": (
+                "tested_baseline"
+                if self._build_key(info) in _TESTED_BASELINE_BUILDS
+                else "compatible_unvalidated"
+            ),
+            "compatibility_basis": "publisher_signature_and_isolated_file_store_probe",
             "executable": str(executable),
             "bundled_cli": str(self._bundled_cli),
             "codex_home": str(home),
