@@ -65,6 +65,7 @@ def _app(monkeypatch, tmp_path):
     app._codex_enabled = Mock(return_value=False)
     app._run_engine = Mock()
     app._stop_codex_engine = Mock()
+    app._ensure_codex_engine = Mock()
     app._guard = lambda fn: (fn(), True)[1]
     app._alert = Mock(return_value=1)
     app._show_error = Mock()
@@ -243,6 +244,7 @@ def test_parent_off_stops_monitor_invalidates_and_clears_pending(monkeypatch, tm
     assert app._pending_chatgpt_switch is None
     assert app._chatgpt_auto_generation == 5
     engine.stop.assert_called_once()
+    app._ensure_codex_engine.assert_called_once()
     app.rebuild_menu.assert_called()
     app._reload_main_panel_if_shown.assert_called()
     stale = Mock()
@@ -330,6 +332,7 @@ def test_failed_codex_pause_rolls_back_suggestions(monkeypatch, tmp_path):
     ).chatgpt_auto_enabled is False
     app._stop_codex_engine.assert_not_called()
     app._start_chatgpt_auto_monitor.assert_not_called()
+    app._ensure_codex_engine.assert_called_once()
     app.rebuild_menu.assert_called_once()
     app._reload_main_panel_if_shown.assert_called_once()
 
@@ -363,6 +366,7 @@ def test_turning_off_stops_monitor_and_clears_pending(monkeypatch, tmp_path):
     assert app.settings.chatgpt_auto_enabled is False
     assert app._pending_chatgpt_switch is None
     engine.stop.assert_called_once()
+    app._ensure_codex_engine.assert_called_once()
 
 
 def test_external_live_rotation_conflict_holds_monitor(monkeypatch, tmp_path):

@@ -730,7 +730,10 @@ def run(switcher, codex=None) -> int:
                 with self._desktop_app_lock:
                     if self._desktop_switching:
                         return
-                    cap = self._desktop_app.observe_capability()
+                    if self.codex is None:
+                        cap = DesktopCapability("invalid", "codex_unavailable")
+                    else:
+                        cap = self._desktop_app.observe_capability(self.codex.home)
             except Exception:
                 cap = DesktopCapability(
                     "invalid", "probe_failed", observed_at=time.monotonic(),
@@ -844,6 +847,7 @@ def run(switcher, codex=None) -> int:
                 self._start_chatgpt_auto_monitor()
             else:
                 self._stop_chatgpt_auto_monitor(clear_pending=True)
+                self._ensure_codex_engine()
             self.rebuild_menu()
             self._reload_main_panel_if_shown()
 
@@ -883,6 +887,8 @@ def run(switcher, codex=None) -> int:
                             "Couldn’t restore Auto-switch settings. "
                             "Turn off ChatGPT suggestions and try again."
                         )
+                    else:
+                        self._ensure_codex_engine()
                     self.rebuild_menu()
                     self._reload_main_panel_if_shown()
                     return
@@ -890,6 +896,7 @@ def run(switcher, codex=None) -> int:
                 self._start_chatgpt_auto_monitor()
             else:
                 self._stop_chatgpt_auto_monitor(clear_pending=True)
+                self._ensure_codex_engine()
             self.rebuild_menu()
             self._reload_main_panel_if_shown()
 

@@ -547,6 +547,7 @@ def test_stale_capability_worker_cannot_update_current_ui(app):
     assert app._chatgpt_capability.state == "checking"
     app._chatgpt_capability_worker(9)
     assert app._chatgpt_capability.state == "running"
+    assert app._desktop_app.observe_capability.call_args.args == (app.codex.home,)
 
 
 def test_transaction_invalidates_capability_probes(app):

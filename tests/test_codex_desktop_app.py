@@ -303,14 +303,14 @@ def test_observe_capability_uses_reason_codes_not_exception_text(desktop, monkey
     from openswap.codex.desktop_app import DesktopCapability
 
     monkeypatch.setattr("openswap.codex.desktop_app.sys.platform", "linux")
-    cap = desktop.observe_capability(now=10.0)
+    cap = desktop.observe_capability(_home(), now=10.0)
     assert cap == DesktopCapability(state="unsupported", reason="unsupported_platform")
     assert "linux" not in cap.reason
     assert "exception" not in cap.reason
 
     monkeypatch.setattr("openswap.codex.desktop_app.sys.platform", "darwin")
     missing = DesktopApp(Path("/no/such/ChatGPT.app"))
-    cap = missing.observe_capability(now=11.0)
+    cap = missing.observe_capability(_home(), now=11.0)
     assert cap.state == "missing"
     assert cap.reason == "app_missing"
     assert "/" not in cap.reason
@@ -318,10 +318,24 @@ def test_observe_capability_uses_reason_codes_not_exception_text(desktop, monkey
 
     with desktop._plist_path.open("wb") as stream:
         plistlib.dump({"CFBundleIdentifier": "evil.app", "CFBundleExecutable": "ChatGPT"}, stream)
-    cap = desktop.observe_capability(now=12.0)
+    cap = desktop.observe_capability(_home(), now=12.0)
     assert cap.state == "invalid"
     assert cap.reason == "wrong_bundle"
     assert "evil.app" not in cap.reason
+
+
+def test_observe_capability_applies_transaction_policy(desktop, tmp_path, monkeypatch):
+    custom_home = tmp_path / "other-codex-home"
+    cap = desktop.observe_capability(custom_home, now=20.0)
+    assert cap.state == "invalid"
+    assert cap.reason == "custom_home"
+    assert cap.observed_at is None
+
+    monkeypatch.setenv("CODEX_CLI_PATH", "/custom/codex")
+    cap = desktop.observe_capability(_home(), now=21.0)
+    assert cap.state == "invalid"
+    assert cap.reason == "custom_backend"
+    assert cap.observed_at is None
 
 
 def test_observe_capability_classifies_by_reason_when_messages_collide(desktop, monkeypatch):
@@ -334,7 +348,7 @@ def test_observe_capability_classifies_by_reason_when_messages_collide(desktop, 
         )
 
     monkeypatch.setattr(DesktopApp, "_validate", boom)
-    cap = desktop.observe_capability()
+    cap = desktop.observe_capability(_home())
     assert cap == DesktopCapability(state="invalid", reason="app_invalid")
 
 
@@ -349,7 +363,7 @@ def test_transient_capability_failures_expire_for_retry(desktop, monkeypatch):
 
         monkeypatch.setattr(desktop, "is_running", fail_inspection)
         observed_at = 100.0 + index
-        cap = desktop.observe_capability(now=observed_at)
+        cap = desktop.observe_capability(_home(), now=observed_at)
 
         assert cap.state == "invalid"
         assert cap.reason == reason
@@ -360,13 +374,13 @@ def test_transient_capability_failures_expire_for_retry(desktop, monkeypatch):
 
 def test_observe_capability_reports_fresh_stopped_and_running(desktop, monkeypatch):
     monkeypatch.setattr(desktop, "is_running", lambda: False)
-    stopped = desktop.observe_capability(now=100.0)
+    stopped = desktop.observe_capability(_home(), now=100.0)
     assert stopped.state == "stopped"
     assert stopped.reason == "stopped"
     assert stopped.observed_at == 100.0
 
     monkeypatch.setattr(desktop, "is_running", lambda: True)
-    running = desktop.observe_capability(now=101.5)
+    running = desktop.observe_capability(_home(), now=101.5)
     assert running.state == "running"
     assert running.reason == "running"
     assert running.observed_at == 101.5
@@ -383,6 +397,6 @@ def test_observe_capability_timestamps_after_process_inspection(desktop, monkeyp
         return False
 
     monkeypatch.setattr(desktop, "is_running", slow_running)
-    cap = desktop.observe_capability()
+    cap = desktop.observe_capability(_home())
     assert cap.state == "stopped"
     assert cap.observed_at == 9.0

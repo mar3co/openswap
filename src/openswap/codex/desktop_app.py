@@ -393,9 +393,12 @@ class DesktopApp:
         """Drop the signature cache so the next validate re-runs codesign."""
         self._validation_cache = None
 
-    def observe_capability(self, *, now: float | None = None) -> DesktopCapability:
-        """Classify installation and process state without exposing internals."""
+    def observe_capability(
+        self, home: Path, *, now: float | None = None,
+    ) -> DesktopCapability:
+        """Classify transaction policy and process state without exposing internals."""
         try:
+            self.preflight(home)
             running = self.is_running()
         except DesktopAppError as exc:
             observed_at = time.monotonic() if now is None else now
