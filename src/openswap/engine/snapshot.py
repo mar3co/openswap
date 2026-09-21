@@ -169,32 +169,12 @@ class SnapshotMixin:
             is_active = str(num) == active_num
 
             if is_active:
-                active = self._read_active_credentials()
-                creds = active.value or ""
-                self._record_active_verdict(active)
-                # Claude Code can leave a syntactically present OAuth record
-                # with both tokens blank after an invalid_grant. For a real
-                # fetch pass, use this slot's saved credential so a wiped
-                # live store does not freeze the displayed statistics. The
-                # fetch worker may restore it only after an identity probe and
-                # locked drift checks. Store-only paints retain their
-                # no-backup-I/O guarantee.
                 may_load_active_backup = load_idle is True or (
                     isinstance(load_idle, set) and str(num) in load_idle
                 )
-                if (
-                    may_load_active_backup
-                    and not active.degraded
-                    and active.value is not None
-                    and not looks_like_api_key(creds)
-                    and not oauth.extract_access_token(creds)
-                ):
-                    backup, backup_unreadable = self._read_account_credentials_ex(
-                        str(num), email
-                    )
-                    if not backup_unreadable and oauth.extract_access_token(backup):
-                        creds = backup
-                        self._record_active_backup_fallback(True)
+                creds = self._active_usage_credentials(
+                    str(num), email, load_backup=may_load_active_backup
+                )
             elif load_idle is True or (
                 isinstance(load_idle, set) and str(num) in load_idle
             ):
@@ -204,6 +184,37 @@ class SnapshotMixin:
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
+
+    def _active_usage_credentials(
+        self, account_num: str, email: str, *, load_backup: bool
+    ) -> str:
+        """Prepare the active credential source for one usage collection.
+
+        Claude Code can leave a syntactically present OAuth record with both
+        tokens blank after an ``invalid_grant``. A network-capable collection
+        may then use this slot's saved credential; its worker attempts a live
+        restore only after identity verification and locked drift checks.
+        Store-only paints pass ``load_backup=False`` and retain their no-backup
+        I/O guarantee. Shared by full snapshots and active-only status.
+        """
+        self._record_active_backup_fallback(False)
+        active = self._read_active_credentials()
+        creds = active.value or ""
+        self._record_active_verdict(active)
+        if (
+            load_backup
+            and not active.degraded
+            and active.value is not None
+            and not looks_like_api_key(creds)
+            and not oauth.extract_access_token(creds)
+        ):
+            backup, backup_unreadable = self._read_account_credentials_ex(
+                account_num, email
+            )
+            if not backup_unreadable and oauth.extract_access_token(backup):
+                creds = backup
+                self._record_active_backup_fallback(True)
+        return creds
 
     def _fetch_active_usage(
         self, account_num: str, email: str, creds: str, org_uuid: str = ""
@@ -1770,9 +1781,9 @@ class SnapshotMixin:
         collector, so freshness/backoff/claim gating and the shared
         ``cache/usage.json`` table behave exactly as in ``--list``.
         """
-        active = self._read_active_credentials()
-        creds = active.value or ""
-        self._record_active_verdict(active)
+        creds = self._active_usage_credentials(
+            str(account_num), current_email, load_backup=True
+        )
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 

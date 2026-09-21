@@ -3886,6 +3886,102 @@ class TestSwitchToSelfSlotAndForce:
         assert data["activeAccountNumber"] == 1
         assert "Activated" in capsys.readouterr().out
 
+    def test_guarded_force_does_not_overwrite_credentials_that_appeared(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """A stale UI restore action must not clobber a login that landed
+        before the mutation acquired Claude's credential locks."""
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            result = switcher.switch_to(
+                "1",
+                json_output=True,
+                force=True,
+                force_if_live_missing=True,
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert live["creds"] == self.LIVE_1
+        assert creds[("1", "test@example.com")] == self.IMPORTED_1
+        assert result["switched"] is False
+        assert result["reason"] == "live-credential-present"
+        assert "not activated" in result["message"]
+
+    def test_guarded_force_restores_when_live_credentials_are_still_missing(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        live["creds"] = json.dumps({"claudeAiOauth": {
+            "accessToken": "", "refreshToken": "",
+        }})
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            with patch.object(
+                switcher,
+                "_read_active_credentials",
+                return_value=ActiveCredentials(live["creds"], False, False),
+            ):
+                result = switcher.switch_to(
+                    "1",
+                    json_output=True,
+                    force=True,
+                    force_if_live_missing=True,
+                )
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert live["creds"] == self.IMPORTED_1
+        assert result["switched"] is False
+        assert result["reason"] == "activated"
+
+    def test_guarded_force_refuses_an_unreadable_live_store(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            with patch.object(
+                switcher,
+                "_read_active_credentials",
+                return_value=ActiveCredentials(None, True, True),
+            ), pytest.raises(CredentialReadError, match="still missing"):
+                switcher.switch_to(
+                    "1",
+                    json_output=True,
+                    force=True,
+                    force_if_live_missing=True,
+                )
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert live["creds"] == self.LIVE_1
+        assert creds[("1", "test@example.com")] == self.IMPORTED_1
+
+    def test_guarded_force_requires_force(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        with pytest.raises(ValidationError, match="requires force=True"):
+            switcher.switch_to("1", force_if_live_missing=True)
+
     def test_force_cross_slot_skips_backup_of_current(
         self,
         temp_home: Path,
@@ -9376,6 +9472,43 @@ class TestMissingActiveCredentialUsageFallback:
         assert entry.sentinel is None
         assert s._active_backup_repaired() is True
         write_live.assert_called_once_with(backup)
+
+    def test_status_path_uses_saved_credential_and_auto_restores(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """Active-only status uses the same fallback/repair path as list."""
+        s = self._switcher(temp_home, monkeypatch)
+        backup = self._backup()
+        monkeypatch.setattr(
+            s, "_read_account_credentials_ex", lambda *_: (backup, False)
+        )
+        usage = {"five_hour": {"pct": 84.0}, "seven_day": {"pct": 21.0}}
+        profile = {
+            "uuid": "uuid-ads",
+            "email": "ads@example.com",
+            "organizationUuid": "org-ads",
+        }
+
+        with patch(
+            "openswap.oauth.fetch_oauth_profile", return_value=profile
+        ), patch.object(
+            s, "_read_credentials", return_value=""
+        ), patch.object(
+            s, "_write_credentials"
+        ) as write_live, patch(
+            "openswap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(usage=usage),
+        ) as fetch:
+            entry = s._active_account_usage("2", "ads@example.com", "org-ads")
+
+        assert entry.last_good == usage
+        assert entry.sentinel is None
+        assert s._active_backup_fallback() is True
+        assert s._active_backup_repaired() is True
+        write_live.assert_called_once_with(backup)
+        fetch.assert_called_once_with(
+            "2", "ads@example.com", backup, is_active=True,
+        )
 
     def test_store_only_paint_does_not_read_active_backup(
         self, temp_home: Path, monkeypatch,

@@ -2700,10 +2700,14 @@ def test_account_click_restores_saved_live_login_before_normal_confirmation():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     click = text[text.index("def _on_account_click") : text.index("def _repair_relogin")]
     start = click.index("_slot_needs_restore")
-    restore = click[start : click.index("_confirm_switch", start)]
+    restore = click[start:]
 
+    assert "has_live_credentials()" in restore
+    assert restore.index("has_live_credentials()") < restore.index("force=True")
     assert "switch_to(" in restore
     assert "force=True" in restore
+    assert "force_if_live_missing=True" in restore
+    assert "_confirm_switch(" in restore
 
 
 # --- store index watch -------------------------------------------------------

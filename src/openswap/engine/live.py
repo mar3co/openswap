@@ -162,6 +162,19 @@ class LiveMixin:
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
 
+    def has_live_credentials(self) -> bool:
+        """Whether Claude's active store currently has usable credentials.
+
+        Unlike :meth:`has_live_login`, this checks the credential bytes, not
+        merely the config identity. An unreadable store is never treated as
+        empty: callers must not overwrite state they could not inspect.
+        """
+        active = self._read_active_credentials()
+        if active.value is None or active.keychain_unavailable:
+            raise CredentialReadError("Cannot safely read live Claude credentials")
+        value = active.value or ""
+        return looks_like_api_key(value) or bool(oauth.extract_access_token(value))
+
     def _record_active_verdict(self, active) -> None:
         """Record THIS thread's active-read verdict (see `_active_verdict_tls`)."""
         self._active_verdict_tls.value = active

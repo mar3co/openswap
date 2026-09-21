@@ -1614,9 +1614,27 @@ def run(switcher, codex=None) -> int:
                 )
                 return
             if self._slot_needs_restore(num):
+                try:
+                    live_credentials_present = self.switcher.has_live_credentials()
+                except CredentialReadError as e:
+                    self._show_error(str(e))
+                    return
+                if live_credentials_present:
+                    if not self._confirm_switch(num):
+                        return
+                    result = self._run_switch(
+                        lambda: self.switcher.switch_to(
+                            str(num), json_output=True
+                        )
+                    )
+                    self._finish_manual_switch(
+                        result, self._name_for_num(num), close_panel=close_panel
+                    )
+                    return
                 result = self._run_switch(
                     lambda: self.switcher.switch_to(
-                        str(num), json_output=True, force=True
+                        str(num), json_output=True, force=True,
+                        force_if_live_missing=True,
                     )
                 )
                 self._finish_manual_switch(
