@@ -315,6 +315,25 @@ def test_failed_child_save_does_not_disable_codex_rotation(monkeypatch, tmp_path
     assert "/secret/path" not in message
 
 
+def test_failed_codex_pause_rolls_back_suggestions(monkeypatch, tmp_path):
+    app = _app(monkeypatch, tmp_path)
+    app.settings.chatgpt_auto_enabled = False
+    app._codex_enabled.return_value = True
+    app._guard = Mock(return_value=False)
+    app._start_chatgpt_auto_monitor = Mock()
+
+    app.on_toggle_chatgpt_auto(None)
+
+    assert app.settings.chatgpt_auto_enabled is False
+    assert menubar.MenuBarSettings.load(
+        tmp_path / "menubar_settings.json"
+    ).chatgpt_auto_enabled is False
+    app._stop_codex_engine.assert_not_called()
+    app._start_chatgpt_auto_monitor.assert_not_called()
+    app.rebuild_menu.assert_called_once()
+    app._reload_main_panel_if_shown.assert_called_once()
+
+
 def test_enable_disables_only_legacy_codex_rotation(monkeypatch, tmp_path):
     app = _app(monkeypatch, tmp_path)
     app.settings.chatgpt_auto_enabled = False

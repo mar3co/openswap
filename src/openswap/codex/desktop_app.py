@@ -42,9 +42,12 @@ class DesktopCapability:
 _CAPABILITY_TTL_S = 5.0
 _PROCESS_STATES = frozenset({"running", "stopped"})
 _TERMINAL_STATES = frozenset({"unsupported", "missing", "invalid"})
+_RETRYABLE_REASONS = frozenset({"process_inspect_failed", "probe_failed"})
 
 
-def capability_from_error(exc: DesktopAppError) -> DesktopCapability:
+def capability_from_error(
+    exc: DesktopAppError, *, observed_at: float | None = None,
+) -> DesktopCapability:
     """Map a structured desktop error to a UI-safe capability. Never reads ``str(exc)``."""
     reason = exc.reason if isinstance(getattr(exc, "reason", None), str) and exc.reason else "app_invalid"
     if reason == "unsupported_platform":
@@ -53,11 +56,18 @@ def capability_from_error(exc: DesktopAppError) -> DesktopCapability:
         state = "missing"
     else:
         state = "invalid"
-    return DesktopCapability(state=state, reason=reason)
+    return DesktopCapability(
+        state=state,
+        reason=reason,
+        observed_at=observed_at if reason in _RETRYABLE_REASONS else None,
+    )
 
 
 def capability_is_fresh(capability: DesktopCapability, *, now: float) -> bool:
-    """``running``/``stopped`` expire after five monotonic seconds; other terminals do not."""
+    """Process observations and retryable failures expire after five seconds."""
+    if capability.reason in _RETRYABLE_REASONS:
+        observed = capability.observed_at
+        return observed is not None and (now - observed) < _CAPABILITY_TTL_S
     if capability.state in _TERMINAL_STATES:
         return True
     if capability.state not in _PROCESS_STATES:
@@ -378,7 +388,8 @@ class DesktopApp:
         try:
             running = self.is_running()
         except DesktopAppError as exc:
-            return capability_from_error(exc)
+            observed_at = time.monotonic() if now is None else now
+            return capability_from_error(exc, observed_at=observed_at)
         observed_at = time.monotonic() if now is None else now
         state = "running" if running else "stopped"
         return DesktopCapability(state=state, reason=state, observed_at=observed_at)

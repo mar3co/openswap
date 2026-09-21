@@ -526,6 +526,17 @@ def test_stale_activation_does_not_queue_another_probe_while_inflight(app):
     app._show_error.assert_called()
 
 
+def test_transient_probe_failure_retries_after_ttl_without_restart(app):
+    app._chatgpt_capability = DesktopCapability(
+        "invalid", "process_inspect_failed", observed_at=time.monotonic() - 6,
+    )
+
+    app._on_chatgpt_view_active()
+
+    assert app._test_thread.call_args.kwargs["target"] == app._chatgpt_capability_worker
+    assert app._chatgpt_capability.state == "checking"
+
+
 def test_stale_capability_worker_cannot_update_current_ui(app):
     app._chatgpt_capability = DesktopCapability("checking", "checking")
     app._chatgpt_capability_generation = 9

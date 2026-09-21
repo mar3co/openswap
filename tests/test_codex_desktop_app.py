@@ -318,6 +318,25 @@ def test_observe_capability_classifies_by_reason_when_messages_collide(desktop, 
     assert cap == DesktopCapability(state="invalid", reason="app_invalid")
 
 
+def test_transient_process_inspection_failure_expires_for_retry(desktop, monkeypatch):
+    from openswap.codex.desktop_app import capability_is_fresh
+
+    def fail_inspection():
+        raise DesktopAppError(
+            "Could not safely inspect running desktop processes.",
+            reason="process_inspect_failed",
+        )
+
+    monkeypatch.setattr(desktop, "is_running", fail_inspection)
+    cap = desktop.observe_capability(now=100.0)
+
+    assert cap.state == "invalid"
+    assert cap.reason == "process_inspect_failed"
+    assert cap.observed_at == 100.0
+    assert capability_is_fresh(cap, now=104.9) is True
+    assert capability_is_fresh(cap, now=105.0) is False
+
+
 def test_observe_capability_reports_fresh_stopped_and_running(desktop, monkeypatch):
     monkeypatch.setattr(desktop, "is_running", lambda: False)
     stopped = desktop.observe_capability(now=100.0)
