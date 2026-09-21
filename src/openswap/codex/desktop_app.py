@@ -7,6 +7,7 @@ can put a credential transaction between the two lifecycle operations.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -122,6 +123,8 @@ _COMPATIBILITY_CLIENT_INFO = {
     "title": "OpenSwap Compatibility Probe",
     "version": "1",
 }
+_COMPATIBILITY_EMAIL = "openswap-compatibility@example.invalid"
+_COMPATIBILITY_ACCOUNT_ID = "openswap-compatibility-account"
 
 
 @dataclass(frozen=True)
@@ -208,15 +211,54 @@ def _is_codex_process(row: _Process, bundled_cli: Path, app_path: Path) -> bool:
 
 def _stop_probe(proc: subprocess.Popen, force: bool) -> None:
     """Stop only the isolated compatibility probe and any children it owns."""
-    if proc.poll() is not None:
-        return
     try:
         if os.name == "nt":
+            if proc.poll() is not None:
+                return
             proc.kill() if force else proc.terminate()
         else:
             os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
     except OSError:
         pass
+
+
+def _encode_probe_jwt(claims: dict) -> str:
+    """Return a parseable, deliberately unverifiable JWT for the isolated probe."""
+    def encode(value: dict) -> str:
+        payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+        return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+    return f"{encode({'alg': 'none', 'typ': 'JWT'})}.{encode(claims)}.invalid"
+
+
+def _probe_oauth_credentials() -> dict:
+    """Build non-secret OAuth-shaped credentials that cannot authorize requests."""
+    now = int(time.time())
+    id_token = _encode_probe_jwt({
+        "email": _COMPATIBILITY_EMAIL,
+        "exp": now + 3600,
+        "iat": now,
+        "sub": "openswap-compatibility-subject",
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": _COMPATIBILITY_ACCOUNT_ID,
+            "chatgpt_plan_type": "plus",
+        },
+    })
+    return {
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": None,
+        "email": _COMPATIBILITY_EMAIL,
+        "tokens": {
+            "id_token": id_token,
+            "access_token": "fabricated-openswap-compatibility-access-token",
+            "refresh_token": "fabricated-openswap-compatibility-refresh-token",
+            # A token-level account_id selects a workspace and makes newer
+            # backends perform network routing discovery. The isolated probe
+            # keeps the stable account claim in the ID token instead; this is
+            # also a credential shape accepted by DesktopSwitcher.
+        },
+        "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+    }
 
 
 def _send_probe(proc: subprocess.Popen, message: dict) -> None:
@@ -293,8 +335,8 @@ class DesktopApp:
         """Verify the bundled backend's file-store contract in an isolated home.
 
         The probe runs only after the application signature is accepted. It uses
-        a disposable home and a fabricated API key, never the operator's config,
-        credentials, network session, or account.
+        a disposable home and fabricated OAuth-shaped credentials, never the
+        operator's config, credentials, network session, or account.
         """
         try:
             with tempfile.TemporaryDirectory(prefix="openswap-desktop-compat-") as raw_root:
@@ -306,7 +348,7 @@ class DesktopApp:
                     directory.mkdir(mode=0o700)
                 auth_file = codex_home / "auth.json"
                 auth_file.write_text(
-                    json.dumps({"OPENAI_API_KEY": "sk-fabricated-openswap-compatibility"}),
+                    json.dumps(_probe_oauth_credentials()),
                     encoding="utf-8",
                 )
                 auth_file.chmod(0o600)
@@ -379,9 +421,9 @@ class DesktopApp:
                         },
                     )
                     account = _await_probe(proc, 2).get("account")
-                    if not isinstance(account, dict) or account.get("type") != "apiKey":
+                    if not isinstance(account, dict) or account.get("type") != "chatgpt":
                         raise DesktopAppError(
-                            "The bundled Codex backend did not load file-backed credentials.",
+                            "The bundled Codex backend did not load file-backed OAuth credentials.",
                             reason="incompatible_backend",
                         )
                 finally:
@@ -392,6 +434,10 @@ class DesktopApp:
                     except subprocess.TimeoutExpired:
                         _stop_probe(proc, True)
                         proc.wait(timeout=1.0)
+                    if os.name != "nt":
+                        # The leader can exit before descendants in its private
+                        # process group. Do not let them survive or retain stdio.
+                        _stop_probe(proc, True)
                     if proc.stdin is not None:
                         try:
                             proc.stdin.close()
@@ -565,7 +611,7 @@ class DesktopApp:
                 if self._build_key(info) in _TESTED_BASELINE_BUILDS
                 else "compatible_unvalidated"
             ),
-            "compatibility_basis": "publisher_signature_and_isolated_file_store_probe",
+            "compatibility_basis": "publisher_signature_and_isolated_oauth_file_store_probe",
             "executable": str(executable),
             "bundled_cli": str(self._bundled_cli),
             "codex_home": str(home),

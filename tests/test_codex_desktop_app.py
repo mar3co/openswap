@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import json
+import os
 import plistlib
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from openswap.codex.desktop_app import DesktopApp, DesktopAppError, _Process, _argv0
+from openswap.codex.desktop_app import (
+    DesktopApp,
+    DesktopAppError,
+    _Process,
+    _argv0,
+    _probe_oauth_credentials,
+    _stop_probe,
+)
 from openswap.exceptions import ClaudeSwitchError
 
 
@@ -60,7 +70,9 @@ def test_preflight_returns_only_sanitized_metadata(desktop, tmp_path, monkeypatc
     assert data["bundle_id"] == "com.openai.codex"
     assert data["version"] == "26.908.70816"
     assert data["compatibility"] == "tested_baseline"
-    assert data["compatibility_basis"] == "publisher_signature_and_isolated_file_store_probe"
+    assert data["compatibility_basis"] == (
+        "publisher_signature_and_isolated_oauth_file_store_probe"
+    )
     assert data["codex_home"] == str(_home())
     assert "secret" not in repr(data)
 
@@ -201,7 +213,53 @@ def test_signature_rejects_wrong_team(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="macOS compatibility executable")
-def test_bundled_cli_probe_uses_isolated_file_store(tmp_path):
+def test_bundled_cli_probe_uses_isolated_oauth_file_store(tmp_path):
+    app_path = _app(tmp_path)
+    cli = app_path / "Contents/Resources/codex"
+    cli.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("id") == 1:
+        print(json.dumps({{"id": 1, "result": {{"codexHome": os.environ["CODEX_HOME"]}}}}), flush=True)
+    elif message.get("id") == 2:
+        with open(os.path.join(os.environ["CODEX_HOME"], "auth.json"), encoding="utf-8") as stream:
+            auth = json.load(stream)
+        tokens = auth.get("tokens") or {{}}
+        valid = (
+            auth.get("auth_mode") == "chatgpt"
+            and auth.get("OPENAI_API_KEY") is None
+            and all(tokens.get(name) for name in ("id_token", "access_token", "refresh_token"))
+            and "account_id" not in tokens
+        )
+        account = {{"type": "chatgpt"}} if valid else None
+        print(json.dumps({{"id": 2, "result": {{"account": account}}}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    cli.chmod(0o700)
+    DesktopApp(app_path)._probe_bundled_cli()
+
+
+def test_probe_credentials_match_desktop_switch_oauth_contract():
+    from openswap.codex.desktop import _credential_identity
+
+    ident = _credential_identity(
+        json.dumps(_probe_oauth_credentials()),
+        label="Compatibility probe",
+    )
+
+    assert ident.kind == "oauth"
+    assert ident.email == "openswap-compatibility@example.invalid"
+    assert ident.account_id == "openswap-compatibility-account"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="macOS compatibility executable")
+def test_bundled_cli_probe_rejects_api_key_only_backend(tmp_path):
     app_path = _app(tmp_path)
     cli = app_path / "Contents/Resources/codex"
     cli.write_text(
@@ -220,32 +278,30 @@ for line in sys.stdin:
         encoding="utf-8",
     )
     cli.chmod(0o700)
-    DesktopApp(app_path)._probe_bundled_cli()
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="macOS compatibility executable")
-def test_bundled_cli_probe_rejects_incompatible_protocol(tmp_path):
-    app_path = _app(tmp_path)
-    cli = app_path / "Contents/Resources/codex"
-    cli.write_text(
-        f"""#!{sys.executable}
-import json
-import os
-import sys
-
-for line in sys.stdin:
-    message = json.loads(line)
-    if message.get("id") == 1:
-        print(json.dumps({{"id": 1, "result": {{"codexHome": os.environ["CODEX_HOME"]}}}}), flush=True)
-    elif message.get("id") == 2:
-        print(json.dumps({{"id": 2, "result": {{"account": None}}}}), flush=True)
-""",
-        encoding="utf-8",
-    )
-    cli.chmod(0o700)
-    with pytest.raises(DesktopAppError, match="did not load file-backed credentials") as exc:
+    with pytest.raises(DesktopAppError, match="did not load file-backed OAuth credentials") as exc:
         DesktopApp(app_path)._probe_bundled_cli()
     assert exc.value.reason == "incompatible_backend"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_stop_probe_signals_group_after_leader_exits(monkeypatch):
+    calls = []
+
+    class ExitedLeader:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return 0
+
+    monkeypatch.setattr(
+        "openswap.codex.desktop_app.os.killpg",
+        lambda pid, sig: calls.append((pid, sig)),
+    )
+
+    _stop_probe(ExitedLeader(), True)
+
+    assert calls == [(4321, signal.SIGKILL)]
 
 
 def test_signature_timeout_is_retryable_but_rejection_is_terminal(tmp_path, monkeypatch):

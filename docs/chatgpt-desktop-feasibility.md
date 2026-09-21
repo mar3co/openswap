@@ -28,10 +28,11 @@ Routine ChatGPT updates are evaluated by capability rather than an exact
 version/build equality check. OpenSwap still fails closed unless the app has
 the expected bundle identifier, a valid complete signature from the expected
 OpenAI team, the expected executable and bundled Codex backend, and a passing
-isolated backend probe. The probe uses a disposable home and fabricated API-key
-credentials to verify that the bundled backend honors `CODEX_HOME`, starts its
-app-server protocol, and reads a file-backed credential at startup. It never
-reads or changes the operator's credentials.
+isolated backend probe. The probe uses a disposable home and fabricated,
+non-authorizing OAuth-shaped credentials to verify that the bundled backend
+honors `CODEX_HOME`, starts its app-server protocol, and reads the same
+file-backed credential mode required by desktop switching. It never reads or
+changes the operator's credentials.
 
 A build that passes those checks but is not the historical tested baseline is
 reported as `compatible_unvalidated`; it is not described as authenticated or
