@@ -653,6 +653,29 @@ class _CardView(NSView):
         loc = self.convertPoint_fromView_(event.locationInWindow(), None)
         if not NSPointInRect(loc, self.bounds()):
             return
+        self._activate_card()
+
+    def keyDown_(self, event):
+        chars = str(event.characters() or "")
+        if chars in ("\r", "\n", " "):
+            self._activate_card()
+            return
+        objc.super(_CardView, self).keyDown_(event)
+
+    def isAccessibilityElement(self):
+        return True
+
+    def accessibilityRole(self):
+        return "AXButton"
+
+    def accessibilityLabel(self):
+        return str(self.card.get("title") or "Account")
+
+    def accessibilityPerformPress(self):
+        self._activate_card()
+        return True
+
+    def _activate_card(self):
         if self.on_switch and not self.card.get("disabled"):
             self.on_switch(self.card["num"])
 
@@ -718,6 +741,7 @@ class MenuBarPanel:
         has_codex=None,
         codex_enabled=None,
         desktop_status=None,
+        on_chatgpt_view_active=None,
         account_state=None,
         on_empty_action=None,
         login_state=None,
@@ -740,6 +764,7 @@ class MenuBarPanel:
         self._has_codex = has_codex
         self._codex_enabled = codex_enabled
         self._desktop_status = desktop_status or (lambda: "Experimental · Switching reopens ChatGPT")
+        self._on_chatgpt_view_active = on_chatgpt_view_active
         self._account_state = account_state or (lambda _provider: "ready")
         self._on_empty_action = on_empty_action
         self._login_state = login_state or (lambda: {"stage": "idle"})
@@ -841,6 +866,8 @@ class MenuBarPanel:
             return
         self._sync_popover_appearance()
         self.reload()
+        if self._selected_provider == "chatgpt" and self._on_chatgpt_view_active is not None:
+            self._on_chatgpt_view_active()
         button = self._item.button()
         if button is None:
             return
@@ -999,6 +1026,8 @@ class MenuBarPanel:
         if provider not in ("claude", "chatgpt"):
             return
         self._selected_provider = provider
+        if provider == "chatgpt" and self._on_chatgpt_view_active is not None:
+            self._on_chatgpt_view_active()
         if self.is_shown():
             self.reload()
 
@@ -1229,6 +1258,9 @@ class MenuBarPanel:
         )
         auto_label.setFrame_(NSMakeRect(*lab_f))
         auto.setFrame_(NSMakeRect(*ctl_f))
+        if provider == "chatgpt":
+            settings = self._settings() if callable(self._settings) else None
+            auto.setEnabled_(bool(getattr(settings, "chatgpt_switching_enabled", False)))
         if ((provider == "claude" and cards) or
                 (provider == "chatgpt" and self._on_toggle_chatgpt_auto is not None)):
             root.addSubview_(auto_label)

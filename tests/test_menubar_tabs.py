@@ -74,6 +74,24 @@ def test_settings_sections_are_navigation_only():
         action.assert_not_called()
 
 
+def test_chatgpt_tab_notifies_capability_probe_without_switching():
+    panel, actions = _panel()
+    panel._on_chatgpt_view_active = Mock()
+    panel._select_provider("chatgpt")
+    panel._on_chatgpt_view_active.assert_called_once()
+    actions["on_switch"].assert_not_called()
+
+
+def test_card_activation_paths_share_one_controller_entry():
+    source = Path(menubar.__file__).with_name("menubar_panel.py").read_text(encoding="utf-8")
+    assert "def _activate_card(self):" in source
+    assert "def accessibilityPerformPress(self):" in source
+    assert "def keyDown_(self, event):" in source
+    assert source.index("self._activate_card()") < source.index("def accessibilityPerformPress")
+    assert "accessibilityPerformPress" in source
+    assert "self.on_switch(self.card[\"num\"])" in source
+
+
 def test_unknown_provider_does_not_change_view_or_reload():
     panel, _ = _panel()
     panel._select_provider("unknown")

@@ -12,8 +12,12 @@ OpenSwap desktop switch implementation.
 
 The initial research commit did not add a switch command. The follow-up now
 includes an explicitly experimental, user-confirmed restart-and-switch action;
-see [the testing guide](chatgpt-desktop-testing.md). This is not verified
-production desktop support. In particular, neither
+see [the testing guide](chatgpt-desktop-testing.md). The menu bar extra now
+also gates that action behind **Enable ChatGPT switching** (default off) and a
+typed, worker-thread capability probe of the allowlisted app. Detecting that
+ChatGPT is installed, stopped, or running, selecting credentials, or
+relaunching the app still does not verify the profile ChatGPT actually loaded.
+This is not verified production desktop support. In particular, neither
 replacing a file nor restarting an Electron window proves that Chat, Work, and
 Codex now use the same intended account. A real two-account desktop test is
 still required before advertising support.

@@ -17,6 +17,7 @@ from datetime import datetime
 
 from openswap.exceptions import ClaudeSwitchError, CredentialReadError
 from openswap.menubar_display import *  # noqa: F403
+from openswap.codex.desktop_app import DesktopApp, DesktopCapability, capability_is_fresh
 from openswap.menubar_display import (  # noqa: F401  tests poke these
     EMPTY_SNAPSHOT,
     MenuBarSettings,
@@ -26,6 +27,9 @@ from openswap.menubar_display import (  # noqa: F401  tests poke these
     _resets_at_ts,
     _rolled_weekly_window,
     _usage_log_key,
+    chatgpt_manual_activation_allowed,
+    chatgpt_suggestions_effective,
+    desktop_capability_status_copy,
     ensure_notification_identity,
     codex_live_slot_changed,
     codex_restart_hint,
@@ -51,17 +55,29 @@ def desktop_switch_choices(snapshot):
     return choices
 
 
-def desktop_switch_confirm_copy(name, *, pause_auto=False):
+def desktop_switch_confirm_ok(process_state="running"):
+    if process_state == "stopped":
+        return "Switch and open ChatGPT"
+    return "Restart ChatGPT"
+
+
+def desktop_switch_confirm_copy(name, *, pause_auto=False, process_state="running"):
     pause_copy = (
         "Codex auto-switching turns off for all OpenSwap instances using this "
         "store until re-enabled. Claude is unchanged."
         if pause_auto else "Keep Codex auto-switching off during desktop switching."
     )
+    if process_state == "stopped":
+        title = "Switch and open ChatGPT?"
+        action = "Opens ChatGPT and changes the shared Codex login. "
+    else:
+        title = "Restart ChatGPT?"
+        action = "Restarts the entire app and changes the shared Codex login. "
     return (
-        "Restart ChatGPT?",
+        title,
         f"Experimental switch to {name}.\n\n"
-        "Restarts the entire app and changes the shared Codex login. "
-        "Save and stop all local/remote work; close other Codex clients before continuing.\n\n"
+        + action
+        + "Save and stop all local/remote work; close other Codex clients before continuing.\n\n"
         "After restart, check the account in Chat, Work, and Codex.\n\n"
         + pause_copy,
     )
@@ -152,6 +168,12 @@ def run(switcher, codex=None) -> int:
             self._desktop_switching = False
             self._desktop_result = None
             self._desktop_status = "Experimental · Switching reopens ChatGPT"
+            self._desktop_app = DesktopApp()
+            self._desktop_app_lock = threading.Lock()
+            self._chatgpt_capability = DesktopCapability("checking", "checking")
+            self._chatgpt_capability_generation = 0
+            self._chatgpt_probe_inflight = False
+            self._desktop_consent_generation = None
             self._login_session = None
             self._login_ui_state = {"stage": "idle"}
             self._login_save_result = None
@@ -183,7 +205,7 @@ def run(switcher, codex=None) -> int:
             wake_widget_host()
             if self.settings.auto_switch_enabled:
                 self._start_engine()
-            if self.settings.chatgpt_auto_enabled:
+            if self.settings.chatgpt_switching_enabled and self.settings.chatgpt_auto_enabled:
                 self._start_chatgpt_auto_monitor()
 
         # ---- display refresh plumbing ----------------------------------------
@@ -480,7 +502,7 @@ def run(switcher, codex=None) -> int:
 
         # ---- auto-switch engine ----------------------------------------------
         def _ensure_codex_engine(self):
-            if self._desktop_switching or self.settings.chatgpt_auto_enabled:
+            if self._desktop_switching or chatgpt_suggestions_effective(self.settings):
                 return
             if self._codex_engine is not None or self._engine is None:
                 return
@@ -552,6 +574,8 @@ def run(switcher, codex=None) -> int:
                 and panel.is_shown()
                 and getattr(panel, "_page", None) == MAIN_PAGE
             ):
+                if getattr(panel, "_selected_provider", None) == "chatgpt":
+                    self._on_chatgpt_view_active()
                 panel.reload()
 
         def _stop_codex_engine(self):
@@ -569,7 +593,8 @@ def run(switcher, codex=None) -> int:
 
         def _start_chatgpt_auto_monitor(self):
             """Start the dry-run candidate monitor; it can never switch credentials."""
-            if (not self.settings.chatgpt_auto_enabled or self.codex is None or
+            if (not self.settings.chatgpt_switching_enabled or
+                    not self.settings.chatgpt_auto_enabled or self.codex is None or
                     self._chatgpt_auto_engine is not None or self._desktop_switching or
                     self._login_session is not None):
                 return
@@ -630,13 +655,13 @@ def run(switcher, codex=None) -> int:
                         self._hold_reload_pending = True
 
         def _restart_chatgpt_auto_monitor(self):
-            if self.settings.chatgpt_auto_enabled:
+            if self.settings.chatgpt_switching_enabled and self.settings.chatgpt_auto_enabled:
                 self._stop_chatgpt_auto_monitor(clear_pending=True)
                 self._chatgpt_auto_retry_at = 0.0
                 self._start_chatgpt_auto_monitor()
 
         def _reconcile_chatgpt_auto_mode(self):
-            if not self.settings.chatgpt_auto_enabled:
+            if not (self.settings.chatgpt_switching_enabled and self.settings.chatgpt_auto_enabled):
                 if self._chatgpt_auto_engine is not None or self._pending_chatgpt_switch is not None:
                     self._stop_chatgpt_auto_monitor(clear_pending=True)
                 return
@@ -653,15 +678,97 @@ def run(switcher, codex=None) -> int:
                 self._start_chatgpt_auto_monitor()
 
         def _chatgpt_desktop_status(self):
-            if self._desktop_status.startswith(("Switch failed", "Switching account")):
+            if self._desktop_status.startswith(
+                ("Switch failed", "Switching account", "ChatGPT reopened")
+            ):
                 return self._desktop_status
+            if not self.settings.chatgpt_switching_enabled:
+                return "Enable ChatGPT switching in Settings"
+            cap = self._chatgpt_capability
+            now = time.monotonic()
+            if not capability_is_fresh(cap, now=now):
+                return "Checking ChatGPT…"
+            if cap.state not in ("running", "stopped"):
+                return desktop_capability_status_copy(cap)
             if self._chatgpt_monitor_notice:
                 return self._chatgpt_monitor_notice
             if self._pending_chatgpt_switch is not None:
                 return "Switch ready · Confirms before restart"
             if self.settings.chatgpt_auto_enabled:
                 return "Confirms before restart"
-            return self._desktop_status
+            return desktop_capability_status_copy(cap)
+
+        def _chatgpt_switching_persisted(self):
+            try:
+                return bool(MenuBarSettings.load(settings_path).chatgpt_switching_enabled)
+            except Exception:
+                return False
+
+        def _on_chatgpt_view_active(self):
+            if self._desktop_switching:
+                return
+            now = time.monotonic()
+            if capability_is_fresh(self._chatgpt_capability, now=now):
+                return
+            if self._chatgpt_probe_inflight:
+                return
+            self._request_chatgpt_capability()
+
+        def _request_chatgpt_capability(self):
+            if self._desktop_switching:
+                return
+            self._chatgpt_capability_generation += 1
+            generation = self._chatgpt_capability_generation
+            self._chatgpt_capability = DesktopCapability("checking", "checking")
+            self._chatgpt_probe_inflight = True
+            threading.Thread(
+                target=self._chatgpt_capability_worker, args=(generation,), daemon=True,
+            ).start()
+
+        def _chatgpt_capability_worker(self, generation):
+            try:
+                with self._desktop_app_lock:
+                    if self._desktop_switching:
+                        return
+                    cap = self._desktop_app.observe_capability()
+            except Exception:
+                cap = DesktopCapability("invalid", "app_invalid")
+            finally:
+                if generation == self._chatgpt_capability_generation:
+                    self._chatgpt_probe_inflight = False
+            with self._event_lock:
+                if generation != self._chatgpt_capability_generation or self._desktop_switching:
+                    return
+                self._chatgpt_capability = cap
+                if self._desktop_status.startswith("ChatGPT reopened"):
+                    self._desktop_status = "Experimental · Switching reopens ChatGPT"
+                self._hold_reload_pending = True
+
+        def _begin_desktop_transaction(self, *, consent_generation=None):
+            self._desktop_consent_generation = consent_generation
+            self._chatgpt_capability_generation += 1
+            self._chatgpt_probe_inflight = False
+            self._stop_codex_engine()
+            self._stop_chatgpt_auto_monitor(clear_pending=True)
+            self._desktop_switching = True
+            self._desktop_status = "Switching account · Reopening ChatGPT…"
+
+        def _offer_enable_chatgpt_switching(self):
+            if self._alert(
+                title="ChatGPT switching is off",
+                message=(
+                    "Turn on ChatGPT switching in Settings to change the shared "
+                    "login from this menu."
+                ),
+                ok="Enable in Settings", cancel="Cancel",
+            ) != 1:
+                return
+            panel = self._panel
+            if panel is None:
+                return
+            panel._select_provider("chatgpt")
+            panel._show_settings()
+            panel._select_settings_section(SETTINGS_SECTION_AUTOMATION)
 
         def _on_chatgpt_auto_event(self, event, engine, generation):
             with self._event_lock:
@@ -698,7 +805,8 @@ def run(switcher, codex=None) -> int:
                 switchable = set(self.codex.switchable_account_numbers()) if self.codex else set()
             except Exception:
                 active, live_identity, switchable = None, None, set()
-            if (not self.settings.chatgpt_auto_enabled or self._codex_enabled() or
+            if (not self.settings.chatgpt_switching_enabled or
+                    not self.settings.chatgpt_auto_enabled or self._codex_enabled() or
                     target not in switchable or self._chatgpt_target_identity(target) != target_identity or
                     str(active or "") != from_number or live_identity != source_identity or
                     self._desktop_switching or
@@ -719,7 +827,28 @@ def run(switcher, codex=None) -> int:
                 return
             self._make_desktop_switch(pending[2], choices[pending[2]], expected_pending=pending)(None)
 
+        def on_toggle_chatgpt_switching(self, _sender):
+            enabling = not self.settings.chatgpt_switching_enabled
+            previous = self.settings.chatgpt_switching_enabled
+            self.settings.chatgpt_switching_enabled = enabling
+            try:
+                self.settings.save(settings_path)
+            except Exception:
+                self.settings.chatgpt_switching_enabled = previous
+                self._show_error("Couldn’t save ChatGPT switching settings. Try again.")
+                return
+            self._chatgpt_auto_retry_at = 0.0
+            if enabling:
+                self._start_chatgpt_auto_monitor()
+            else:
+                self._stop_chatgpt_auto_monitor(clear_pending=True)
+            self.rebuild_menu()
+            self._reload_main_panel_if_shown()
+
         def on_toggle_chatgpt_auto(self, _sender):
+            if not self.settings.chatgpt_switching_enabled:
+                self._show_error("Turn on ChatGPT switching in Settings first.")
+                return
             enabling = not self.settings.chatgpt_auto_enabled
             if enabling:
                 if self._alert(
@@ -921,6 +1050,7 @@ def run(switcher, codex=None) -> int:
                 has_codex=self._has_codex,
                 codex_enabled=self._codex_enabled,
                 desktop_status=self._chatgpt_desktop_status,
+                on_chatgpt_view_active=self._on_chatgpt_view_active,
                 account_state=lambda provider: self._account_states.get(provider, "error"),
                 on_empty_action=self._on_empty_action,
                 login_state=lambda: dict(self._login_ui_state),
@@ -1090,6 +1220,8 @@ def run(switcher, codex=None) -> int:
                 self._make_interval(int(value))(None)
             elif row_id == "auto_switch_enabled":
                 self.on_toggle_autoswitch(None)
+            elif row_id == "chatgpt_switching_enabled":
+                self.on_toggle_chatgpt_switching(None)
             elif row_id == "chatgpt_auto_enabled":
                 self.on_toggle_chatgpt_auto(None)
             elif row_id == "threshold":
@@ -1097,7 +1229,7 @@ def run(switcher, codex=None) -> int:
             elif row_id == "strategy":
                 self._make_strategy(value)(None)
             elif row_id == "codex_enabled":
-                if (not self._codex_enabled()) and self.settings.chatgpt_auto_enabled:
+                if (not self._codex_enabled()) and chatgpt_suggestions_effective(self.settings):
                     self._show_error("Turn off ChatGPT Auto-switch before enabling live Codex rotation.")
                     return
                 try:
@@ -1278,9 +1410,34 @@ def run(switcher, codex=None) -> int:
                 if self._refreshing or self._kickoff_running:
                     self._show_error("Wait for the current refresh or kickoff to finish, then try again.")
                     return
+                generation = self._chatgpt_capability_generation
+                persisted = self._chatgpt_switching_persisted()
+                if not persisted or not self.settings.chatgpt_switching_enabled:
+                    self._offer_enable_chatgpt_switching()
+                    return
+                now = time.monotonic()
+                if not chatgpt_manual_activation_allowed(
+                    self.settings, self._chatgpt_capability, now=now
+                ):
+                    cap = self._chatgpt_capability
+                    self._show_error(
+                        desktop_capability_status_copy(
+                            DesktopCapability("checking", "checking")
+                            if not capability_is_fresh(cap, now=now)
+                            else cap
+                        )
+                    )
+                    self._request_chatgpt_capability()
+                    return
                 pause_auto = self._codex_enabled()
-                title, message = desktop_switch_confirm_copy(label, pause_auto=pause_auto)
-                if self._alert(title=title, message=message, ok="Restart ChatGPT", cancel="Cancel") != 1:
+                process_state = self._chatgpt_capability.state
+                title, message = desktop_switch_confirm_copy(
+                    label, pause_auto=pause_auto, process_state=process_state,
+                )
+                if self._alert(
+                    title=title, message=message,
+                    ok=desktop_switch_confirm_ok(process_state), cancel="Cancel",
+                ) != 1:
                     return
                 if expected_pending is not None:
                     self._validate_pending_chatgpt_switch()
@@ -1292,6 +1449,15 @@ def run(switcher, codex=None) -> int:
                 if self._refreshing or self._kickoff_running:
                     self._show_error("A refresh or kickoff started. Wait for it to finish, then try again.")
                     return
+                if (
+                    generation != self._chatgpt_capability_generation
+                    or not self._chatgpt_switching_persisted()
+                    or not self.settings.chatgpt_switching_enabled
+                    or self._chatgpt_capability.state != process_state
+                    or self._chatgpt_capability.state not in ("running", "stopped")
+                ):
+                    self._show_error("ChatGPT status changed. Try again.")
+                    return
                 if pause_auto:
                     if not self._guard(lambda: set_setting(
                         self.switcher.backup_dir, "autoswitch.codexEnabled", "false"
@@ -1300,23 +1466,32 @@ def run(switcher, codex=None) -> int:
                 elif self._codex_enabled():
                     self._show_error("Codex auto-switching was enabled while confirming. Try again to confirm pausing it.")
                     return
-                self._stop_codex_engine()
-                self._stop_chatgpt_auto_monitor(clear_pending=True)
-                self._desktop_switching = True
-                self._desktop_status = "Switching account · Reopening ChatGPT…"
+                self._begin_desktop_transaction(consent_generation=generation)
                 self.rebuild_menu()
                 if self._panel is not None:
                     self._panel.close()
-                threading.Thread(target=self._desktop_worker, args=(num,), daemon=True).start()
+                threading.Thread(
+                    target=self._desktop_worker, args=(num, generation), daemon=True,
+                ).start()
             return cb
 
-        def _desktop_worker(self, num):
+        def _desktop_worker(self, num, generation=None):
             try:
-                from openswap.codex.desktop import DesktopSwitcher
-                result = DesktopSwitcher(self.codex).switch(
-                    num, confirm_restart=True, confirm_idle=True
-                )
-                outcome = (result, None)
+                persisted = self._chatgpt_switching_persisted()
+                if not persisted:
+                    outcome = (None, "ChatGPT switching is off.")
+                elif (
+                    generation is not None
+                    and getattr(self, "_desktop_consent_generation", None) not in (None, generation)
+                ):
+                    outcome = (None, "ChatGPT status changed. Try again.")
+                else:
+                    from openswap.codex.desktop import DesktopSwitcher
+                    with self._desktop_app_lock:
+                        result = DesktopSwitcher(self.codex, app=self._desktop_app).switch(
+                            num, confirm_restart=True, confirm_idle=True
+                        )
+                    outcome = (result, None)
             except ClaudeSwitchError as exc:
                 outcome = (None, str(exc))
             except Exception:
@@ -1332,12 +1507,14 @@ def run(switcher, codex=None) -> int:
             if pending is None:
                 return
             self._desktop_switching = False
+            self._chatgpt_probe_inflight = False
             self._start_chatgpt_auto_monitor()
             result, error = pending
             self._desktop_status = (
                 "Switch failed · Check ChatGPT before retrying" if error else
                 "ChatGPT reopened · Check the profile"
             )
+            self._request_chatgpt_capability()
             # The panel may have been reopened during the background work.
             # Reuse the existing mouse-up-safe main-panel refresh queue.
             self._hold_reload_pending = True
@@ -1546,6 +1723,9 @@ def run(switcher, codex=None) -> int:
             choices = dict(desktop_switch_choices(self.snapshot))
             if slot not in choices:
                 self._show_error("Choose an enabled ChatGPT OAuth account. API keys are only supported by the Codex CLI.")
+                return
+            if not self.settings.chatgpt_switching_enabled or not self._chatgpt_switching_persisted():
+                self._offer_enable_chatgpt_switching()
                 return
             self._make_desktop_switch(slot, choices[slot])(None)
 

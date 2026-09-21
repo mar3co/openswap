@@ -39,6 +39,10 @@ from openswap.kickoff import (
     kickoff_uses_default_login,
     parse_kickoff_time,
 )
+from openswap.codex.desktop_app import (
+    DesktopCapability,
+    capability_is_fresh,
+)
 from openswap.autoswitch import record_manual_switch
 from openswap.paths import get_backup_root
 from openswap.settings import atomic_write_json
@@ -63,6 +67,48 @@ _HOLD_WINDOW = {
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 MENU_BAR_PROVIDER_CHOICES: tuple[str, ...] = ("claude", "chatgpt", "both", "logo")
 MENUBAR_SETTINGS_FILENAME = "menubar_settings.json"
+
+
+def chatgpt_suggestions_effective(settings: "MenuBarSettings") -> bool:
+    """True only when both stored ChatGPT toggles are on."""
+    return bool(getattr(settings, "chatgpt_switching_enabled", False)) and bool(
+        getattr(settings, "chatgpt_auto_enabled", False)
+    )
+
+
+def chatgpt_manual_activation_allowed(
+    settings: "MenuBarSettings",
+    capability: DesktopCapability,
+    *,
+    now: float,
+) -> bool:
+    """True only when the persisted parent is on and a fresh process observation exists."""
+    if not bool(getattr(settings, "chatgpt_switching_enabled", False)):
+        return False
+    if not capability_is_fresh(capability, now=now):
+        return False
+    return capability.state in ("running", "stopped")
+
+
+def desktop_capability_status_copy(capability: DesktopCapability) -> str:
+    """Operator-facing capability status. Never includes paths or exception text."""
+    if capability.state == "checking":
+        return "Checking ChatGPT…"
+    if capability.state == "unsupported":
+        return "ChatGPT switching isn’t available on this Mac."
+    if capability.state == "missing":
+        return "ChatGPT isn’t installed."
+    if capability.reason == "unvalidated_version":
+        return "This ChatGPT version isn’t supported for switching."
+    if capability.reason in ("signature_unverified", "unexpected_publisher"):
+        return "ChatGPT couldn’t be verified."
+    if capability.state == "invalid":
+        return "ChatGPT isn’t ready for switching."
+    if capability.state == "stopped":
+        return "Switch and open ChatGPT"
+    if capability.state == "running":
+        return "Restart ChatGPT"
+    return "Checking ChatGPT…"
 
 
 def menubar_settings_path(backup_root: Path) -> Path:
@@ -183,6 +229,7 @@ class MenuBarSettings:
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
+    chatgpt_switching_enabled: bool = False
     # Separate from Claude's live rotation: this only proposes desktop targets.
     chatgpt_auto_enabled: bool = False
     confirm_switch: bool = True  # ask before a card click swaps the live login
@@ -219,7 +266,12 @@ class MenuBarSettings:
             if f.name == "menu_bar_provider" and value not in MENU_BAR_PROVIDER_CHOICES:
                 continue
             kwargs[f.name] = value
-        return cls(**kwargs)
+        settings = cls(**kwargs)
+        # Legacy files that already suggested ChatGPT switches implied the
+        # parent was on. A present false always wins over that inference.
+        if "chatgpt_switching_enabled" not in raw and kwargs.get("chatgpt_auto_enabled") is True:
+            settings.chatgpt_switching_enabled = True
+        return settings
 
     def save(self, path: Path) -> None:
         """Atomically write settings (0600 file, 0700 parent, through a symlink)."""
@@ -352,7 +404,7 @@ def settings_page_rows(
             "value": bool(settings.auto_switch_enabled),
         },
     ]
-    if has_codex or settings.chatgpt_auto_enabled:
+    if has_codex or settings.chatgpt_auto_enabled or settings.chatgpt_switching_enabled:
         automation.extend(
             [
                 {
@@ -365,9 +417,17 @@ def settings_page_rows(
                 {
                     "kind": "toggle",
                     "section": SETTINGS_SECTION_AUTOMATION,
+                    "id": "chatgpt_switching_enabled",
+                    "label": "Enable ChatGPT switching",
+                    "value": bool(settings.chatgpt_switching_enabled),
+                },
+                {
+                    "kind": "toggle",
+                    "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "chatgpt_auto_enabled",
                     "label": "Suggest ChatGPT account switches",
                     "value": bool(settings.chatgpt_auto_enabled),
+                    "disabled": not bool(settings.chatgpt_switching_enabled),
                 },
                 {
                     "kind": "group",
@@ -431,7 +491,7 @@ def settings_page_rows(
                         "id": "codex_enabled",
                         "label": "Auto-switch Codex CLI accounts",
                         "value": bool(codex_enabled),
-                        "disabled": bool(settings.chatgpt_auto_enabled),
+                        "disabled": chatgpt_suggestions_effective(settings),
                     },
                     {
                         "kind": "group",
@@ -440,7 +500,7 @@ def settings_page_rows(
                         "id": "codex_auto_hint",
                         "label": (
                             "Turn off ChatGPT suggestions to use live Codex rotation."
-                            if settings.chatgpt_auto_enabled
+                            if chatgpt_suggestions_effective(settings)
                             else "Runs alongside Claude auto-switch using the shared policy."
                         ),
                     },
