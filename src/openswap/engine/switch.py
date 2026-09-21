@@ -1461,14 +1461,23 @@ class SwitchMixin:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        force_if_live_missing: bool = False,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+        ``force_if_live_missing`` narrows that recovery for stale UI actions:
+        the force is cancelled under the credential locks if usable live
+        credentials appeared after the card snapshot was taken.
         """
+        if force_if_live_missing and not force:
+            raise ValidationError("force_if_live_missing requires force=True")
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -1561,18 +1570,38 @@ class SwitchMixin:
                         message=f"Already on Account-{target_account} ({email})",
                     )
 
-        op = self._perform_switch(
-            target_account,
-            emit_output=not json_output,
-            force_activate=force,
-            provenance=provenance,
-        )
-        result = self._switch_result_from_op(op, "direct") if json_output else None
+        perform_kwargs = {
+            "emit_output": not json_output,
+            "force_activate": force,
+            "provenance": provenance,
+        }
+        if force_if_live_missing:
+            perform_kwargs["force_if_live_missing"] = True
+        op = self._perform_switch(target_account, **perform_kwargs)
+        if json_output and op.get("restoreSkipped"):
+            result = self._switch_noop(
+                strategy="direct",
+                reason="live-credential-present",
+                from_ref=op["from"],
+                to_ref=op["to"],
+                message=(
+                    "Live credentials appeared before restoration; "
+                    "the saved backup was not activated"
+                ),
+                warnings=op["warnings"],
+            )
+        else:
+            result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
         # A cross-slot force stays "switched": reason reports the outcome, not
         # the skipped-backup mechanism.
-        if result is not None and force and not result["switched"]:
+        if (
+            result is not None
+            and force
+            and not op.get("restoreSkipped")
+            and not result["switched"]
+        ):
             to = result["to"]
             result["reason"] = "activated"
             result["message"] = (
@@ -1878,6 +1907,7 @@ class SwitchMixin:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        force_if_live_missing: bool = False,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -1982,6 +2012,34 @@ class SwitchMixin:
                 current_account = self._find_account_slot(
                     data, current_email, current_org_uuid
                 )
+
+            if force_if_live_missing:
+                active_now = self._read_active_credentials()
+                if active_now.value is None or active_now.keychain_unavailable:
+                    raise CredentialReadError(
+                        "Cannot verify that live credentials are still missing"
+                    )
+                live_now = active_now.value or ""
+                if looks_like_api_key(live_now) or oauth.extract_access_token(
+                    live_now
+                ):
+                    if current_identity is None:
+                        current_ref = None
+                    elif current_account is None:
+                        current_ref = account_ref(None, current_identity[0])
+                    else:
+                        current_ref = account_ref(
+                            int(current_account), current_identity[0]
+                        )
+                    return {
+                        "from": current_ref,
+                        "to": current_ref,
+                        "restoreSkipped": True,
+                        "warnings": [
+                            "Live credentials appeared before restoration; "
+                            "the saved backup was not activated."
+                        ],
+                    }
 
             config_path = self._get_claude_config_path()
 

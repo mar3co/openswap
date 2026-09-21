@@ -275,6 +275,20 @@ def test_combined_window_empty_when_no_live_slots():
     assert ws.build_combined(accounts, _NOW) == {}
 
 
+def test_combined_window_excludes_stale_or_action_required_capacity():
+    accounts = [
+        _card(1, "live", 20),
+        {**_card(2, "stale", 0), "stale": True},
+        {**_card(3, "repair", 0), "action_required": True},
+    ]
+
+    combined = ws.combined_window(accounts, "5h", _NOW)
+
+    assert combined is not None
+    assert combined["total"] == 1
+    assert combined["switch_num"] == "1"
+
+
 def test_combined_window_ignores_passed_resets():
     accounts = [_card(1, "personal", 50, ts_5h=_NOW - 60)]
     five = ws.combined_window(accounts, "5h", _NOW)

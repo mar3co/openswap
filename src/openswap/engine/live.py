@@ -162,9 +162,42 @@ class LiveMixin:
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
 
+    def has_live_credentials(self) -> bool:
+        """Whether Claude's active store currently has usable credentials.
+
+        Unlike :meth:`has_live_login`, this checks the credential bytes, not
+        merely the config identity. An unreadable store is never treated as
+        empty: callers must not overwrite state they could not inspect.
+        """
+        active = self._read_active_credentials()
+        if active.value is None or active.keychain_unavailable:
+            raise CredentialReadError("Cannot safely read live Claude credentials")
+        value = active.value or ""
+        return looks_like_api_key(value) or bool(oauth.extract_access_token(value))
+
     def _record_active_verdict(self, active) -> None:
         """Record THIS thread's active-read verdict (see `_active_verdict_tls`)."""
         self._active_verdict_tls.value = active
+
+    def _record_active_backup_fallback(self, enabled: bool) -> None:
+        """Record that this pass is reading active usage from its backup."""
+        self._active_verdict_tls.backup_fallback = {
+            "enabled": bool(enabled),
+            "repaired": False,
+        }
+
+    def _active_backup_fallback(self) -> bool:
+        state = getattr(self._active_verdict_tls, "backup_fallback", None)
+        return bool(state and state.get("enabled"))
+
+    def _mark_active_backup_repaired(self) -> None:
+        state = getattr(self._active_verdict_tls, "backup_fallback", None)
+        if state is not None:
+            state["repaired"] = True
+
+    def _active_backup_repaired(self) -> bool:
+        state = getattr(self._active_verdict_tls, "backup_fallback", None)
+        return bool(state and state.get("repaired"))
 
     def _with_active_verdict(self, fn):
         """Wrap `fn` so a worker thread inherits THIS thread's verdict.
@@ -174,9 +207,16 @@ class LiveMixin:
         measured 30/30 verdicts lost, and the consume gate never fired.
         """
         verdict = self._active_verdict()
+        backup_fallback = getattr(
+            self._active_verdict_tls, "backup_fallback", None
+        )
 
         def _inherit(*args, **kwargs):
             self._record_active_verdict(verdict)
+            # Share this pass-local state object with the worker. The worker
+            # can mark a successful repair and the collector thread then sees
+            # it without leaking the verdict into a concurrent GUI lane.
+            self._active_verdict_tls.backup_fallback = backup_fallback
             return fn(*args, **kwargs)
 
         return _inherit

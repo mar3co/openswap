@@ -755,7 +755,8 @@ def test_panel_accounts_uses_last_good_when_display_is_a_sentinel():
         ]
     }
     cards = menubar.panel_accounts(snap)
-    assert cards[0]["note"] == menubar.SENTINEL_NOTES[USAGE_FOREIGN_CREDENTIAL]
+    assert cards[0]["note"] == menubar.RECONCILE_CARD_NOTE
+    assert cards[0]["action_required"] is True
     assert [w["label"] for w in cards[0]["windows"]] == ["5h", "7d"]
     assert cards[0]["windows"][0]["pct"] == 42.0
 
@@ -2027,7 +2028,107 @@ def test_panel_accounts_foreign_note_is_not_relogin():
     }
     cards = menubar.panel_accounts(snap)
     assert cards[0]["needs_relogin"] is False
-    assert cards[0]["note"] == menubar.SENTINEL_NOTES[USAGE_FOREIGN_CREDENTIAL]
+    assert cards[0]["needs_reconcile"] is True
+    assert cards[0]["action_required"] is True
+    assert cards[0]["note"] == menubar.RECONCILE_CARD_NOTE
+
+
+def test_panel_accounts_marks_old_fallback_stale_with_age():
+    fetched = _NOW - 3600
+    snap = {
+        "accounts": [(
+            2, "a@x.com", True,
+            menubar.SENTINEL_NOTES[USAGE_FOREIGN_CREDENTIAL],
+            _USAGE, "adsonline", "Ads Online", False, fetched,
+        )]
+    }
+
+    card = menubar.panel_accounts(snap, now=_NOW)[0]
+
+    assert card["stale"] is True
+    assert card["action_required"] is True
+    assert card["note"] == menubar.RECONCILE_CARD_NOTE
+    assert all(window["countdown"] is None for window in card["windows"])
+
+
+def test_panel_accounts_saved_login_is_current_and_actionable():
+    from openswap.json_output import USAGE_LIVE_CREDENTIAL_MISSING
+
+    fetched = _NOW - 30
+    snap = {
+        "accounts": [(
+            2, "a@x.com", True,
+            menubar.SENTINEL_NOTES[USAGE_LIVE_CREDENTIAL_MISSING],
+            _USAGE, "adsonline", "Ads Online", False, fetched,
+        )]
+    }
+
+    card = menubar.panel_accounts(snap, now=_NOW)[0]
+
+    assert card["needs_restore"] is True
+    assert card["action_required"] is True
+    assert card["stale"] is False
+    assert card["note"] == (
+        "Usage verified just now · Click to restore the saved Claude login."
+    )
+    assert menubar.provider_tab_title([card], "claude") == "Claude · Fix login"
+
+
+def test_store_only_missing_live_login_marks_cached_usage_stale_and_restorable():
+    from openswap.json_output import USAGE_NO_CREDENTIALS
+
+    fetched = _NOW - 3600
+    snap = {
+        "accounts": [(
+            2, "a@x.com", True,
+            menubar.SENTINEL_NOTES[USAGE_NO_CREDENTIALS],
+            _USAGE, "adsonline", "Ads Online", False, fetched,
+        )]
+    }
+
+    card = menubar.panel_accounts(snap, now=_NOW)[0]
+
+    assert card["needs_restore"] is True
+    assert card["action_required"] is True
+    assert card["stale"] is True
+    assert card["note"] == (
+        "Stale · last updated 1h ago · Click to restore the saved Claude login."
+    )
+
+
+def test_missing_saved_login_is_an_actionable_sign_in_state():
+    from openswap.json_output import USAGE_NO_CREDENTIALS
+
+    snap = {"accounts": [(
+        2, "a@x.com", False,
+        menubar.SENTINEL_NOTES[USAGE_NO_CREDENTIALS],
+        None, "adsonline", "Ads Online", False, None,
+    )]}
+
+    card = menubar.panel_accounts(snap, now=_NOW)[0]
+
+    assert card["action_required"] is True
+    assert card["needs_restore"] is False
+    assert card["note"] == menubar.MISSING_LOGIN_CARD_NOTE
+    assert menubar.provider_tab_title([card], "claude") == "Claude · Sign in"
+
+
+def test_saved_login_usage_becomes_visibly_stale_after_serve_ttl():
+    from openswap.json_output import USAGE_LIVE_CREDENTIAL_MISSING
+
+    fetched = _NOW - menubar.SERVE_TTL_S - 1
+    snap = {
+        "accounts": [(
+            2, "a@x.com", True,
+            menubar.SENTINEL_NOTES[USAGE_LIVE_CREDENTIAL_MISSING],
+            _USAGE, "adsonline", "Ads Online", False, fetched,
+        )]
+    }
+
+    card = menubar.panel_accounts(snap, now=_NOW)[0]
+
+    assert card["stale"] is True
+    assert card["note"].startswith("Stale · last updated 3m ago ·")
 
 
 def test_plan_relogin_click_captures_only_on_email_and_org_match():
@@ -2593,6 +2694,20 @@ def test_account_click_confirms_before_switching_for_both_providers():
     assert "_confirm_switch(" in claude_branch
     # The re-login repair path has its own dialogs; it must not be gated twice.
     assert claude_branch.index("_repair_relogin(") < claude_branch.index("_confirm_switch(")
+
+
+def test_account_click_restores_saved_live_login_before_normal_confirmation():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    click = text[text.index("def _on_account_click") : text.index("def _repair_relogin")]
+    start = click.index("_slot_needs_restore")
+    restore = click[start:]
+
+    assert "has_live_credentials()" in restore
+    assert restore.index("has_live_credentials()") < restore.index("force=True")
+    assert "switch_to(" in restore
+    assert "force=True" in restore
+    assert "force_if_live_missing=True" in restore
+    assert "_confirm_switch(" in restore
 
 
 # --- store index watch -------------------------------------------------------

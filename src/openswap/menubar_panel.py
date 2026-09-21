@@ -1422,7 +1422,11 @@ class MenuBarPanel:
                 )
                 if card.get("active") or action_required:
                     badge_text = (
-                        "sign in needed"
+                        (
+                            "repair login"
+                            if card.get("needs_restore") or card.get("needs_reconcile")
+                            else "sign in needed"
+                        )
                         if action_required
                         else ("selected" if provider == "chatgpt" else "active")
                     )
@@ -1457,7 +1461,7 @@ class MenuBarPanel:
                     row_y += SUBTITLE_H
                 row_y += 6
                 if card["windows"]:
-                    stale = bool(card.get("needs_relogin"))
+                    stale = bool(card.get("stale"))
                     label_x = CARD_PAD + 6
                     count_x = inner_w - CARD_PAD - COUNT_W
                     pct_x = count_x - COL_GAP - PCT_W
@@ -1503,7 +1507,9 @@ class MenuBarPanel:
                         )
                         row_y += ROW_H
                 if card.get("note"):
-                    note_color = pal["warn"] if card.get("needs_relogin") else pal["muted"]
+                    note_color = pal["warn"] if (
+                        card.get("action_required") or card.get("stale")
+                    ) else pal["muted"]
                     card_view.addSubview_(
                         _label(
                             card["note"],
