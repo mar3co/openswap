@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import json
+import os
 import plistlib
+import signal
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from openswap.codex.desktop_app import DesktopApp, DesktopAppError, _Process, _argv0
+from openswap.codex.desktop_app import (
+    DesktopApp,
+    DesktopAppError,
+    _Process,
+    _argv0,
+    _probe_oauth_credentials,
+    _stop_probe,
+)
 from openswap.exceptions import ClaudeSwitchError
 
 
@@ -32,6 +43,7 @@ def desktop(tmp_path, monkeypatch):
     monkeypatch.setattr("openswap.codex.desktop_app.sys.platform", "darwin")
     monkeypatch.setattr("openswap.codex.desktop_app.Path.home", lambda: tmp_path)
     monkeypatch.setattr("openswap.codex.desktop_app.DesktopApp._verify_signature", lambda self: None)
+    monkeypatch.setattr("openswap.codex.desktop_app.DesktopApp._probe_bundled_cli", lambda self: None)
     return DesktopApp(_app(tmp_path))
 
 
@@ -57,6 +69,10 @@ def test_preflight_returns_only_sanitized_metadata(desktop, tmp_path, monkeypatc
     data = desktop.preflight(_home())
     assert data["bundle_id"] == "com.openai.codex"
     assert data["version"] == "26.908.70816"
+    assert data["compatibility"] == "tested_baseline"
+    assert data["compatibility_basis"] == (
+        "publisher_signature_and_isolated_oauth_file_store_probe"
+    )
     assert data["codex_home"] == str(_home())
     assert "secret" not in repr(data)
 
@@ -91,7 +107,7 @@ def test_preflight_rejects_custom_home(desktop, tmp_path):
         desktop.preflight(tmp_path / "elsewhere")
 
 
-def test_preflight_rejects_unvalidated_version(desktop):
+def test_preflight_accepts_future_version_when_capabilities_pass(desktop):
     with desktop._plist_path.open("wb") as stream:
         plistlib.dump({
             "CFBundleIdentifier": "com.openai.codex",
@@ -99,8 +115,20 @@ def test_preflight_rejects_unvalidated_version(desktop):
             "CFBundleShortVersionString": "future",
             "CFBundleVersion": "9999",
         }, stream)
-    with pytest.raises(DesktopAppError, match="has not been validated"):
+    result = desktop.preflight(_home())
+    assert result["version"] == "future"
+    assert result["build"] == "9999"
+    assert result["compatibility"] == "compatible_unvalidated"
+
+
+def test_preflight_rejects_known_incompatible_build(desktop, monkeypatch):
+    monkeypatch.setattr(
+        "openswap.codex.desktop_app._BLOCKED_BUILDS",
+        frozenset({("26.908.70816", "9275")}),
+    )
+    with pytest.raises(DesktopAppError, match="known to be incompatible") as exc:
         desktop.preflight(_home())
+    assert exc.value.reason == "known_incompatible_build"
 
 
 def test_preflight_rejects_non_dictionary_plist(desktop):
@@ -121,20 +149,24 @@ def test_signature_verification_is_strict_and_cached(tmp_path, monkeypatch):
     monkeypatch.setattr("openswap.codex.desktop_app.Path.home", lambda: tmp_path)
     app = DesktopApp(_app(tmp_path))
     calls = []
+    probes = []
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
         stderr = "Identifier=com.openai.codex\nTeamIdentifier=2DC432GLL2\n" if "-d" in argv else ""
         return subprocess.CompletedProcess(argv, 0, "", stderr)
     monkeypatch.setattr("openswap.codex.desktop_app.subprocess.run", fake_run)
+    monkeypatch.setattr(app, "_probe_bundled_cli", lambda: probes.append(True))
     app.preflight(_home())
     app.preflight(_home())
     assert len(calls) == 2
+    assert len(probes) == 1
     assert calls[0][0][:5] == ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app.app_path)]
     assert all(call[1]["timeout"] == 15.0 for call in calls)
     app._bundled_cli.write_text("changed")
     app._bundled_cli.chmod(0o700)
     app.preflight(_home())
     assert len(calls) == 4
+    assert len(probes) == 2
 
 
 def test_invalidate_cache_rechecks_signature_after_secondary_bundle_change(tmp_path, monkeypatch):
@@ -142,6 +174,7 @@ def test_invalidate_cache_rechecks_signature_after_secondary_bundle_change(tmp_p
     monkeypatch.setattr("openswap.codex.desktop_app.Path.home", lambda: tmp_path)
     app = DesktopApp(_app(tmp_path))
     calls = []
+    probes = []
 
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
@@ -149,8 +182,10 @@ def test_invalidate_cache_rechecks_signature_after_secondary_bundle_change(tmp_p
         return subprocess.CompletedProcess(argv, 0, "", stderr)
 
     monkeypatch.setattr("openswap.codex.desktop_app.subprocess.run", fake_run)
+    monkeypatch.setattr(app, "_probe_bundled_cli", lambda: probes.append(True))
     app.preflight(_home())
     assert len(calls) == 2
+    assert len(probes) == 1
     helper = app.app_path / "Contents/MacOS" / "ChatGPT Helper"
     helper.write_text("other-signed-resource")
     helper.chmod(0o700)
@@ -159,18 +194,114 @@ def test_invalidate_cache_rechecks_signature_after_secondary_bundle_change(tmp_p
     app.invalidate_validation_cache()
     app.preflight(_home())
     assert len(calls) == 4
+    assert len(probes) == 2
 
 
 def test_signature_rejects_wrong_team(tmp_path, monkeypatch):
     monkeypatch.setattr("openswap.codex.desktop_app.sys.platform", "darwin")
     monkeypatch.setattr("openswap.codex.desktop_app.Path.home", lambda: tmp_path)
     app = DesktopApp(_app(tmp_path))
+    probes = []
     def fake_run(argv, **kwargs):
         stderr = "Identifier=com.openai.codex\nTeamIdentifier=NOT-OPENAI\n" if "-d" in argv else ""
         return subprocess.CompletedProcess(argv, 0, "", stderr)
     monkeypatch.setattr("openswap.codex.desktop_app.subprocess.run", fake_run)
+    monkeypatch.setattr(app, "_probe_bundled_cli", lambda: probes.append(True))
     with pytest.raises(DesktopAppError, match="expected publisher"):
         app.preflight(_home())
+    assert probes == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="macOS compatibility executable")
+def test_bundled_cli_probe_uses_isolated_oauth_file_store(tmp_path):
+    app_path = _app(tmp_path)
+    cli = app_path / "Contents/Resources/codex"
+    cli.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("id") == 1:
+        print(json.dumps({{"id": 1, "result": {{"codexHome": os.environ["CODEX_HOME"]}}}}), flush=True)
+    elif message.get("id") == 2:
+        with open(os.path.join(os.environ["CODEX_HOME"], "auth.json"), encoding="utf-8") as stream:
+            auth = json.load(stream)
+        tokens = auth.get("tokens") or {{}}
+        valid = (
+            auth.get("auth_mode") == "chatgpt"
+            and auth.get("OPENAI_API_KEY") is None
+            and all(tokens.get(name) for name in ("id_token", "access_token", "refresh_token"))
+            and "account_id" not in tokens
+        )
+        account = {{"type": "chatgpt"}} if valid else None
+        print(json.dumps({{"id": 2, "result": {{"account": account}}}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    cli.chmod(0o700)
+    DesktopApp(app_path)._probe_bundled_cli()
+
+
+def test_probe_credentials_match_desktop_switch_oauth_contract():
+    from openswap.codex.desktop import _credential_identity
+
+    ident = _credential_identity(
+        json.dumps(_probe_oauth_credentials()),
+        label="Compatibility probe",
+    )
+
+    assert ident.kind == "oauth"
+    assert ident.email == "openswap-compatibility@example.invalid"
+    assert ident.account_id == "openswap-compatibility-account"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="macOS compatibility executable")
+def test_bundled_cli_probe_rejects_api_key_only_backend(tmp_path):
+    app_path = _app(tmp_path)
+    cli = app_path / "Contents/Resources/codex"
+    cli.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("id") == 1:
+        print(json.dumps({{"id": 1, "result": {{"codexHome": os.environ["CODEX_HOME"]}}}}), flush=True)
+    elif message.get("id") == 2:
+        print(json.dumps({{"id": 2, "result": {{"account": {{"type": "apiKey"}}}}}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    cli.chmod(0o700)
+    with pytest.raises(DesktopAppError, match="did not load file-backed OAuth credentials") as exc:
+        DesktopApp(app_path)._probe_bundled_cli()
+    assert exc.value.reason == "incompatible_backend"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_stop_probe_signals_group_after_leader_exits(monkeypatch):
+    calls = []
+
+    class ExitedLeader:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return 0
+
+    monkeypatch.setattr(
+        "openswap.codex.desktop_app.os.killpg",
+        lambda pid, sig: calls.append((pid, sig)),
+    )
+
+    _stop_probe(ExitedLeader(), True)
+
+    assert calls == [(4321, signal.SIGKILL)]
 
 
 def test_signature_timeout_is_retryable_but_rejection_is_terminal(tmp_path, monkeypatch):
@@ -352,11 +483,16 @@ def test_observe_capability_classifies_by_reason_when_messages_collide(desktop, 
     assert cap == DesktopCapability(state="invalid", reason="app_invalid")
 
 
-def test_transient_capability_failures_expire_for_retry(desktop, monkeypatch):
+def test_retryable_capability_failures_expire_for_retry(desktop, monkeypatch):
     from openswap.codex.desktop_app import capability_is_fresh
 
     for index, reason in enumerate((
-        "process_inspect_failed", "app_changed", "signature_check_failed",
+        "process_inspect_failed",
+        "app_changed",
+        "signature_check_failed",
+        "probe_failed",
+        "incompatible_backend",
+        "known_incompatible_build",
     )):
         def fail_inspection(reason=reason):
             raise DesktopAppError("Operational probe failure.", reason=reason)

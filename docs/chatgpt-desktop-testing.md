@@ -8,9 +8,12 @@ You must verify the resulting account in Chat, Work, and Codex yourself.
 ## Supported first test
 
 - macOS with the unified `/Applications/ChatGPT.app` (`com.openai.codex`) and
-  its bundled Codex CLI. This first build checks the OpenAI signature and
-  supports app version `26.908.70816`, build `9275`; an updated version needs
-  another compatibility check. Older native ChatGPT apps are not supported.
+  its bundled Codex CLI. OpenSwap requires the official OpenAI signature and
+  publisher identity, then checks the installed bundle's executable layout and
+  runs its bundled Codex backend against a disposable file-backed credential
+  home. Routine signed updates do not require a new OpenSwap release when that
+  capability contract still passes. Known-incompatible builds can be blocked.
+  Older native ChatGPT apps are not supported.
 - Default `~/.codex` home and file-backed OAuth credentials. Keyring, auto,
   ephemeral storage, custom homes, and custom authentication/backend setups
   are refused. Ordinary model preferences do not select a different login.
@@ -131,6 +134,11 @@ openswap codex desktop switch 2 --confirm-restart --confirm-idle
 `status` is a preflight, not an authenticated desktop identity check. `--json`
 is available on both desktop commands. Successful switching returns
 `status: awaiting_verification`; it does not claim the desktop is authenticated.
+The JSON app metadata reports `tested_baseline` for the historical build used
+during implementation and `compatible_unvalidated` for another build accepted
+by the same signature and isolated capability checks. Neither state claims the
+desktop identity is verified; both require manual profile verification after
+every switch.
 
 ## Refusals and recovery
 

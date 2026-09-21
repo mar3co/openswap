@@ -14,13 +14,32 @@ The initial research commit did not add a switch command. The follow-up now
 includes an explicitly experimental, user-confirmed restart-and-switch action;
 see [the testing guide](chatgpt-desktop-testing.md). The menu bar extra now
 also gates that action behind **Enable ChatGPT switching** (default off) and a
-typed, worker-thread capability probe of the allowlisted app. Detecting that
-ChatGPT is installed, stopped, or running, selecting credentials, or
+typed, worker-thread capability probe of the publisher-verified app. Detecting
+that ChatGPT is installed, stopped, or running, selecting credentials, or
 relaunching the app still does not verify the profile ChatGPT actually loaded.
 This is not verified production desktop support. In particular, neither
 replacing a file nor restarting an Electron window proves that Chat, Work, and
 Codex now use the same intended account. A real two-account desktop test is
 still required before advertising support.
+
+## Compatibility policy
+
+Routine ChatGPT updates are evaluated by capability rather than an exact
+version/build equality check. OpenSwap still fails closed unless the app has
+the expected bundle identifier, a valid complete signature from the expected
+OpenAI team, the expected executable and bundled Codex backend, and a passing
+isolated backend probe. The probe uses a disposable home and fabricated,
+non-authorizing OAuth-shaped credentials to verify that the bundled backend
+honors `CODEX_HOME`, starts its app-server protocol, and reads the same
+file-backed credential mode required by desktop switching. It never reads or
+changes the operator's credentials.
+
+A build that passes those checks but is not the historical tested baseline is
+reported as `compatible_unvalidated`; it is not described as authenticated or
+UI-verified. A small denylist remains available for builds with a known
+behavioral regression. Signature, structure, protocol, storage, process,
+transaction, and post-switch manual-verification safeguards remain mandatory
+regardless of version.
 
 ## Official protocol evidence
 
@@ -46,8 +65,10 @@ Inspected application binaries and packaged JavaScript, not user credentials:
 - Bundled CLI: `0.154.0-alpha.6.2`.
 - Archive: `Contents/Resources/app.asar`.
 
-These findings apply to this version of the unified app. They do not establish
-support for older native ChatGPT apps, other platforms, or future builds.
+These findings are the historical tested baseline for that version of the
+unified app. They do not establish support for older native ChatGPT apps or
+other platforms. Future builds must pass the compatibility policy above and
+remain manually verified after a switch.
 
 In the archive's `.vite/build/main-DaMR-wdT.js`:
 

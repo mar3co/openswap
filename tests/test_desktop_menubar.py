@@ -559,9 +559,13 @@ def test_stale_activation_does_not_queue_another_probe_while_inflight(app):
     app._show_error.assert_called()
 
 
-def test_transient_probe_failure_retries_after_ttl_without_restart(app):
+@pytest.mark.parametrize(
+    "reason",
+    ("process_inspect_failed", "incompatible_backend", "known_incompatible_build"),
+)
+def test_retryable_probe_failure_retries_after_ttl_without_restart(app, reason):
     app._chatgpt_capability = DesktopCapability(
-        "invalid", "process_inspect_failed", observed_at=time.monotonic() - 6,
+        "invalid", reason, observed_at=time.monotonic() - 6,
     )
 
     app._on_chatgpt_view_active()
