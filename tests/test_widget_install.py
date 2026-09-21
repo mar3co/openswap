@@ -98,6 +98,27 @@ def test_install_launch_agent_reports_an_unwritable_launch_agents_directory(
             wi.install_launch_agent(app, home=tmp_path, uid=501)
 
 
+def test_install_launch_agent_removes_unloaded_legacy_plist(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(wi.sys, "platform", "darwin")
+    app = tmp_path / "OpenSwap.app"
+    binary = wi._host_binary(app)
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"")
+    legacy = wi.plist_path(wi.LEGACY_LABEL, tmp_path)
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"old")
+    monkeypatch.setattr(wi, "is_loaded", lambda *a, **k: False)
+    monkeypatch.setattr(
+        wi,
+        "_launchctl",
+        lambda *a, **k: type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
+    )
+
+    wi.install_launch_agent(app, home=tmp_path, uid=501)
+
+    assert not legacy.exists()
+
+
 def test_copy_built_app_reports_a_copy_it_cannot_make(tmp_path: Path):
     built = tmp_path / "Build" / "Products" / "Release" / f"{wi.HOST_PRODUCT}.app"
     built.mkdir(parents=True)

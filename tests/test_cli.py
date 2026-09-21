@@ -148,12 +148,15 @@ class TestCLI:
         assert "--add-account" not in options_section
 
     def test_stale_cswap_launcher_is_rejected(self, capsys):
-        with patch.object(sys, "argv", ["/usr/local/bin/cswap", "list"]):
+        with patch.object(sys, "argv", ["/usr/local/bin/cswap", "list"]), patch(
+            "openswap.cli._migrate_legacy_cswap_state"
+        ) as migrate:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
 
         assert excinfo.value.code == 2
         assert "Use 'openswap' instead" in capsys.readouterr().err
+        migrate.assert_called_once_with()
 
     def test_tui_and_watch_are_gone(self):
         for verb in ("tui", "watch"):

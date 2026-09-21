@@ -7,7 +7,6 @@
 	<key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
 	<array>
 		<string>/Library/Application Support/OpenSwap/</string>
-		<string>/Library/Application Support/cswap/</string>
 	</array>
 </dict>
 </plist>

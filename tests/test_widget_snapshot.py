@@ -134,6 +134,29 @@ def test_default_command_path_under_application_support(tmp_path: Path):
     )
 
 
+def test_cleanup_legacy_widget_support_removes_only_known_ipc_files(tmp_path: Path):
+    legacy = tmp_path / "Library" / "Application Support" / "cswap"
+    legacy.mkdir(parents=True)
+    (legacy / ws.SNAPSHOT_FILENAME).write_text("{}", encoding="utf-8")
+    (legacy / ws.COMMAND_FILENAME).write_text("{}", encoding="utf-8")
+    unrelated = legacy / "keep.txt"
+    unrelated.write_text("keep", encoding="utf-8")
+
+    assert ws.cleanup_legacy_widget_support(tmp_path) is True
+    assert unrelated.read_text(encoding="utf-8") == "keep"
+    assert not (legacy / ws.SNAPSHOT_FILENAME).exists()
+    assert not (legacy / ws.COMMAND_FILENAME).exists()
+
+
+def test_cleanup_legacy_widget_support_removes_empty_directory(tmp_path: Path):
+    legacy = tmp_path / "Library" / "Application Support" / "cswap"
+    legacy.mkdir(parents=True)
+    (legacy / ws.SNAPSHOT_FILENAME).write_text("{}", encoding="utf-8")
+
+    assert ws.cleanup_legacy_widget_support(tmp_path) is True
+    assert not legacy.exists()
+
+
 def test_parse_switch_command_happy_path():
     assert ws.parse_switch_command({"op": "switch", "num": "2"}) == "2"
     assert ws.parse_switch_command({"op": "switch", "num": 3}) == "3"

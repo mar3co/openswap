@@ -67,6 +67,27 @@ def _invoked_as_removed_cswap_command() -> bool:
     return name == "cswap"
 
 
+def _migrate_legacy_cswap_state() -> None:
+    """Best-effort migration before the removed launcher can strand hooks."""
+    try:
+        from openswap import statusline
+
+        statusline.migrate_legacy_command(
+            paths.get_claude_config_home(),
+            command=statusline.paint_command(),
+        )
+    except Exception:
+        pass  # Compatibility cleanup must never block the requested command.
+
+    if sys.platform == "darwin":
+        try:
+            from openswap.widget_snapshot import cleanup_legacy_widget_support
+
+            cleanup_legacy_widget_support()
+        except Exception:
+            pass
+
+
 # Memorable subcommand aliases → the long-standing flags they expand to. Lets
 # users type `openswap list`, `openswap status`, `openswap add`, etc. instead of `--list`
 # / `--status` / `--add-account`, which all still work. `switch` is special-cased
@@ -1378,6 +1399,7 @@ def _menubar_service(args) -> int:
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
+    _migrate_legacy_cswap_state()
     if _invoked_as_removed_cswap_command():
         error("The 'cswap' command has been removed. Use 'openswap' instead.")
         sys.exit(2)

@@ -24,6 +24,7 @@ from openswap.fsutil import replace_with_retry
 from openswap.settings import SETTINGS_SCHEMA_VERSION, atomic_write_json, settings_path
 
 PAINT_COMMAND = "openswap statusline"
+LEGACY_PAINT_COMMAND = "cswap statusline"
 INNER_TIMEOUT_S = 2.0
 
 
@@ -325,6 +326,24 @@ def is_our_command(command: str | None) -> bool:
     return False
 
 
+def _is_legacy_command(command: str | None) -> bool:
+    """Whether ``command`` is an obsolete OpenSwap status-line hook."""
+    if not command or not str(command).strip():
+        return False
+    s = str(command).strip()
+    if s == LEGACY_PAINT_COMMAND:
+        return True
+    try:
+        parts = shlex.split(s)
+    except ValueError:
+        return False
+    return (
+        len(parts) >= 2
+        and parts[-1] == "statusline"
+        and Path(parts[-2]).name == "cswap"
+    )
+
+
 def paint_command() -> str:
     argv0 = Path(sys.argv[0])
     if argv0.name == "openswap":
@@ -336,6 +355,28 @@ def paint_command() -> str:
     if found:
         return f"{shlex.quote(found)} statusline"
     return PAINT_COMMAND
+
+
+def migrate_legacy_command(
+    config_home: Path,
+    *,
+    command: str = PAINT_COMMAND,
+) -> bool:
+    """Rewrite an obsolete status-line hook without disturbing its wrap state."""
+    settings_file = config_home / "settings.json"
+    if not settings_file.exists():
+        return False
+    settings = _read_json_for_write(settings_file)
+    block = settings.get("statusLine")
+    if not isinstance(block, dict):
+        return False
+    current = block.get("command")
+    if not isinstance(current, str) or not _is_legacy_command(current):
+        return False
+    block["command"] = command
+    settings["statusLine"] = block
+    _write_json(settings_file, settings)
+    return True
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -369,6 +410,7 @@ def install(
     *,
     command: str = PAINT_COMMAND,
 ) -> dict:
+    migrated = migrate_legacy_command(config_home, command=command)
     settings_file = config_home / "settings.json"
     # Read both files before writing either: a torn OpenSwap settings.json
     # must not leave Claude already wrapped.
@@ -380,7 +422,7 @@ def install(
         raw_cmd = block.get("command")
         current = raw_cmd if isinstance(raw_cmd, str) else None
         if is_our_command(current):
-            return {"already": True, "created": False}
+            return {"already": True, "created": False, "migrated": migrated}
     created = not bool(current and current.strip())
     inner = None if created else current
     if not isinstance(block, dict):
@@ -392,7 +434,7 @@ def install(
     # and will not take the already-wrapped path that forgets it.
     save_wrap(backup_root, inner_command=inner, created=created)
     _write_json(settings_file, settings)
-    return {"already": False, "created": created}
+    return {"already": False, "created": created, "migrated": False}
 
 
 def uninstall(config_home: Path, backup_root: Path) -> dict:
@@ -405,7 +447,7 @@ def uninstall(config_home: Path, backup_root: Path) -> dict:
     if isinstance(block, dict):
         raw_cmd = block.get("command")
         command = raw_cmd if isinstance(raw_cmd, str) else None
-    if not is_our_command(command):
+    if not (is_our_command(command) or _is_legacy_command(command)):
         save_wrap(backup_root, inner_command=None, created=False)
         return {"restored": False}
     inner = wrap.get("innerCommand")

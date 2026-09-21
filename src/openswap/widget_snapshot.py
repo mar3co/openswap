@@ -43,6 +43,25 @@ def default_command_path(home: Path | None = None) -> Path:
     return _support_dir(home) / COMMAND_FILENAME
 
 
+def cleanup_legacy_widget_support(home: Path | None = None) -> bool:
+    """Remove obsolete widget IPC files, leaving any unrelated files alone."""
+    root = home if home is not None else Path.home()
+    legacy = root / "Library" / "Application Support" / LEGACY_SUPPORT_DIRNAME
+    removed = False
+    for filename in (SNAPSHOT_FILENAME, COMMAND_FILENAME):
+        path = legacy / filename
+        try:
+            path.unlink()
+            removed = True
+        except FileNotFoundError:
+            pass
+    try:
+        legacy.rmdir()
+    except (FileNotFoundError, OSError):
+        pass
+    return removed
+
+
 def parse_switch_command(raw: dict) -> str | None:
     """Return slot num if ``op=='switch'`` and ``num`` is a non-empty str/int.
 
