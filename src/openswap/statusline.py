@@ -314,20 +314,20 @@ def is_our_command(command: str | None) -> bool:
     if not command or not str(command).strip():
         return False
     s = str(command).strip()
-    if s in {PAINT_COMMAND, "cswap statusline"}:
+    if s == PAINT_COMMAND:
         return True
     try:
         parts = shlex.split(s)
     except ValueError:
         return False
     if len(parts) >= 2 and parts[-1] == "statusline":
-        return Path(parts[-2]).name in {"openswap", "cswap"}
+        return Path(parts[-2]).name == "openswap"
     return False
 
 
 def paint_command() -> str:
     argv0 = Path(sys.argv[0])
-    if argv0.name in {"openswap", "cswap"}:
+    if argv0.name == "openswap":
         try:
             return f"{shlex.quote(str(argv0.resolve()))} statusline"
         except OSError:

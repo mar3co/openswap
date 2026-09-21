@@ -44,8 +44,8 @@ def _prog_name() -> str:
     argparse otherwise defaults to ``os.path.basename(sys.argv[0])``, which for
     an installed entry-point shim renders as an ugly absolute path (e.g.
     ``python.exe C:\\Users\\me\\.local\\bin\\openswap``). We strip that down to the
-    bare command the user typed (``openswap`` / ``openswap``), falling back to
-    ``openswap`` for ``python -m openswap`` and odd launchers.
+    bare command the user typed, falling back to ``openswap`` for
+    ``python -m openswap`` and odd launchers.
     """
     name = os.path.basename(sys.argv[0] or "")
     for ext in (".exe", ".pyw", ".py"):
@@ -55,6 +55,16 @@ def _prog_name() -> str:
     if not name or name in {"__main__", "python", "python3", "py"}:
         return "openswap"
     return name
+
+
+def _invoked_as_removed_cswap_command() -> bool:
+    """Reject stale launchers left behind by an older installation."""
+    name = os.path.basename(sys.argv[0] or "").lower()
+    for ext in (".exe", ".pyw", ".py"):
+        if name.endswith(ext):
+            name = name[: -len(ext)]
+            break
+    return name == "cswap"
 
 
 # Memorable subcommand aliases → the long-standing flags they expand to. Lets
@@ -1368,6 +1378,9 @@ def _menubar_service(args) -> int:
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
+    if _invoked_as_removed_cswap_command():
+        error("The 'cswap' command has been removed. Use 'openswap' instead.")
+        sys.exit(2)
     _use_native_tls()
     argv = sys.argv[1:]
     try:

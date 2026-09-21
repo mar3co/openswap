@@ -47,7 +47,7 @@ Click the extra for usage bars, then a card to switch. Auto-switch waits five mi
 
 [Menu bar](https://github.com/mar3co/openswap/wiki/Menu-Bar) · [Widget](https://github.com/mar3co/openswap/wiki/Desktop-Widget) · [Kickoff](https://github.com/mar3co/openswap/wiki/Five-Hour-Kickoff)
 
-The `cswap` command still works as an alias during the rename.
+The command-line executable is `openswap`.
 
 ## Commands
 

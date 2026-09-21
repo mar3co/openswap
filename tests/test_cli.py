@@ -147,6 +147,14 @@ class TestCLI:
         options_section = result.stdout.split("Flags combine with subcommands:")[0]
         assert "--add-account" not in options_section
 
+    def test_stale_cswap_launcher_is_rejected(self, capsys):
+        with patch.object(sys, "argv", ["/usr/local/bin/cswap", "list"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "Use 'openswap' instead" in capsys.readouterr().err
+
     def test_tui_and_watch_are_gone(self):
         for verb in ("tui", "watch"):
             result = subprocess.run(

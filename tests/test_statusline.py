@@ -193,6 +193,12 @@ class TestCurrentAccountLabel:
 
 
 class TestInstallWrap:
+    def test_only_openswap_statusline_is_recognized_as_ours(self):
+        assert sl.is_our_command("openswap statusline") is True
+        assert sl.is_our_command("/usr/local/bin/openswap statusline") is True
+        assert sl.is_our_command("cswap statusline") is False
+        assert sl.is_our_command("/usr/local/bin/cswap statusline") is False
+
     def test_install_with_no_statusline_creates_ours(self, tmp_path: Path):
         claude = tmp_path / ".claude"
         claude.mkdir()

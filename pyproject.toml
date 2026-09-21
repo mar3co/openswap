@@ -39,7 +39,6 @@ Issues = "https://github.com/mar3co/openswap/issues"
 
 [project.scripts]
 openswap = "openswap.cli:main"
-cswap = "openswap.cli:main"
 
 [build-system]
 requires = ["hatchling"]
