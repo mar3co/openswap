@@ -24,6 +24,9 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 009  | Codex CLI accounts: provider seam, CodexEngine, CLI, auto, kickoff, extra, widget | P2 | L | — | DONE |
 | 010  | Codex parity follow-ups (badge, knob, transfer, swap, sessions) | P2 | L | 009 | IN PROGRESS |
 | 011  | ChatGPT desktop switching: research and validation gates | P2 | M | 009, 010 | IN PROGRESS |
+| 012  | Unified Claude/ChatGPT account tabs | P2 | M | 011 | DONE; real desktop validation still operator-owned |
+| 013  | Browser-led ChatGPT account onboarding | P2 | M | 012 | DONE; live OAuth acceptance still operator-owned |
+| 014  | ChatGPT auto-switch with confirmed restart | P2 | M | 012, 013 | DONE; unattended restarts remain unsupported |
 | 015  | Desktop recovery and quiet completion feedback | P1 | M | — | DONE; profile detection still blocked |
 | 016  | App-aware ChatGPT switching | P1 | M | 014, 015, PR #49 | DONE |
 

@@ -51,6 +51,7 @@
 | Widget build | `widget_install.py` | `xcodebuild` + LaunchAgent |
 | Claude Code status line | `statusline.py` | Opt-in wrap of `~/.claude/settings.json` `statusLine`. Paint reads live `.claude.json` + roster only (no Engine, no network). Wrap target lives in `settings.json` `statusline` (not a fourth file). `openswap statusline --codex` is paint-only (live `auth.json` + `codex/sequence.json`); Codex TUI has no command hook, so `config.toml` is never wrapped. |
 | Live process SCAN | `process_detection.py` | Claude: `~/.claude/sessions/{pid}.json` + IDE locks. Codex: injected process table, TUI only (`codex exec` / `app-server` do not count). |
+| ChatGPT desktop | `codex/desktop.py`, `codex/desktop_app.py` | Extra/CLI experimental quit → switch shared Codex `auth.json` → relaunch. Gated by `chatgpt_switching_enabled` (default off) and a worker capability probe. Routine signed updates stay available when the capability contract passes. Does not verify the profile ChatGPT loaded. |
 
 The extra is a thin shell. It must not re-implement quota math, ranking, or credential writes. It must not call `_get_current_account`, `_account_kind`, or `_get_sequence_data`; kind and live `(email, orgUuid)` are on the snapshot / `Engine.live_identity`.
 
@@ -80,6 +81,8 @@ OpenSwap ships for macOS (extra, widget, kickoff, Keychain). The engine still ha
 ### Two providers, two rotations
 
 Claude Code and Codex CLI are independent rotations: one live Claude login and one live Codex login. They never pool. Codex slots are namespaced as `"codex:<n>"` in the extra and widget. Combined remaining counts Claude cards only. `autoswitch.codexEnabled` (default true) gates the Codex rotation. `openswap codex export|import` moves `auth.json` envelopes; `swap`/`move` rename slot dirs. Codex has no `unclaimed` stash.
+
+The extra’s ChatGPT tab shows that same Codex roster. A card click there is a gated desktop restart (`codex/desktop.py`), not `Engine.switch_to`. Widget taps still call CLI `switch_to`.
 
 ## Constraints we keep
 
