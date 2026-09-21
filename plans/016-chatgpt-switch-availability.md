@@ -78,6 +78,9 @@ user’s real ChatGPT app.
   policy states do not use that TTL.
 - Serialize all access to the shared `DesktopApp` with one controller-owned
   lock. Pause or invalidate probes during desktop transactions.
+- After consent, re-observe ChatGPT on the transaction worker and require its
+  running/stopped state to match the copy the user approved before changing
+  credentials or app lifecycle state.
 - Pass that same `DesktopApp` instance into `DesktopSwitcher` so validation
   caching is shared. Transaction revalidation inside `switch()` stays
   authoritative.
@@ -142,13 +145,13 @@ or if a test fails twice without an understood cause.
 
 ## Validation record
 
-- Focused gate 1: 373 passed, 0 skipped, 0 warnings (`tests/test_menubar.py`
+- Focused gate 1: 374 passed, 0 skipped, 0 warnings (`tests/test_menubar.py`
   `tests/test_desktop_menubar.py` `tests/test_chatgpt_auto_menubar.py`
   `tests/test_codex_desktop_app.py` `tests/test_menubar_tabs.py`).
 - Safety gate 2: 49 passed, 0 skipped, 0 warnings
   (`tests/test_codex_desktop.py` `tests/test_chatgpt_auto_safety.py`).
-- Combined focused+safety: 422 passed.
-- Full suite: 2834 passed, 4 skipped, 3 existing pytest warnings.
+- Combined focused+safety: 423 passed.
+- Full suite: 2835 passed, 4 skipped, 3 existing pytest warnings.
 - `git diff --check`: passed (no whitespace errors).
 - Screenshots: synthetic AppKit PNGs were generated during implementation
   in a local scratch directory and are **not** in this checkout or the

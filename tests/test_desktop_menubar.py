@@ -226,7 +226,9 @@ def test_claude_card_keeps_normal_switch_action(app):
 
 def test_confirmed_switch_starts_background_worker_not_normal_switch(app):
     app._make_desktop_switch("2", "Work")(None)
-    app._test_thread.assert_called_once_with(target=app._desktop_worker, args=("2", 1), daemon=True)
+    app._test_thread.assert_called_once_with(
+        target=app._desktop_worker, args=("2", 1, "running"), daemon=True,
+    )
     app._test_thread.return_value.start.assert_called_once()
     app._stop_codex_engine.assert_called_once()
     app.codex.switch_to.assert_not_called()
@@ -395,7 +397,12 @@ def test_stale_running_observation_does_not_open_consent(app):
     assert app._show_error.call_args.args[0] == "Checking ChatGPT…"
 
 
-def test_consent_past_process_ttl_is_refused(app, monkeypatch):
+def test_consent_past_process_ttl_is_reobserved_by_worker(app, monkeypatch):
+    from openswap.codex import desktop
+
+    backend = Mock()
+    backend.switch.return_value = {"status": "awaiting_verification"}
+    monkeypatch.setattr(desktop, "DesktopSwitcher", Mock(return_value=backend))
     app._chatgpt_capability = DesktopCapability(
         "running", "running", observed_at=100.0,
     )
@@ -408,9 +415,33 @@ def test_consent_past_process_ttl_is_refused(app, monkeypatch):
 
     app._alert.side_effect = consent
     app._make_desktop_switch("2", "Work")(None)
-    app._test_thread.assert_not_called()
+    app._test_thread.assert_called_once_with(
+        target=app._desktop_worker, args=("2", 1, "running"), daemon=True,
+    )
+    app._desktop_app.observe_capability.return_value = DesktopCapability(
+        "running", "running", observed_at=clock["t"],
+    )
+    app._desktop_worker("2", 1, "running")
+    app._desktop_app.observe_capability.assert_called_once_with(app.codex.home)
+    backend.switch.assert_called_once_with(
+        "2", confirm_restart=True, confirm_idle=True,
+    )
+
+
+def test_worker_refuses_process_state_changed_while_consent_was_open(app, monkeypatch):
+    from openswap.codex import desktop
+
+    backend = Mock()
+    monkeypatch.setattr(desktop, "DesktopSwitcher", Mock(return_value=backend))
+    app._desktop_app.observe_capability.return_value = DesktopCapability(
+        "stopped", "stopped", observed_at=time.monotonic(),
+    )
+
+    app._desktop_worker("2", app._chatgpt_capability_generation, "running")
+    app._drain_desktop_result()
+
+    backend.switch.assert_not_called()
     app._show_error.assert_called_once_with("ChatGPT status changed. Try again.")
-    app._stop_codex_engine.assert_not_called()
 
 
 def test_chatgpt_reload_probes_when_running_observation_is_stale(app):

@@ -1489,9 +1489,6 @@ def run(switcher, codex=None) -> int:
                     generation != self._chatgpt_capability_generation
                     or not self._chatgpt_switching_persisted()
                     or not self.settings.chatgpt_switching_enabled
-                    or not capability_is_fresh(
-                        self._chatgpt_capability, now=time.monotonic()
-                    )
                     or self._chatgpt_capability.state != process_state
                     or self._chatgpt_capability.state not in ("running", "stopped")
                 ):
@@ -1510,11 +1507,13 @@ def run(switcher, codex=None) -> int:
                 if self._panel is not None:
                     self._panel.close()
                 threading.Thread(
-                    target=self._desktop_worker, args=(num, generation), daemon=True,
+                    target=self._desktop_worker,
+                    args=(num, generation, process_state),
+                    daemon=True,
                 ).start()
             return cb
 
-        def _desktop_worker(self, num, generation=None):
+        def _desktop_worker(self, num, generation=None, consent_state=None):
             try:
                 persisted = self._chatgpt_switching_persisted()
                 if not persisted:
@@ -1525,13 +1524,20 @@ def run(switcher, codex=None) -> int:
                 ):
                     outcome = (None, "ChatGPT status changed. Try again.")
                 else:
-                    from openswap.codex.desktop import DesktopSwitcher
                     with self._desktop_app_lock:
                         self._desktop_app.invalidate_validation_cache()
-                        result = DesktopSwitcher(self.codex, app=self._desktop_app).switch(
-                            num, confirm_restart=True, confirm_idle=True
+                        observed = (
+                            self._desktop_app.observe_capability(self.codex.home)
+                            if consent_state is not None else None
                         )
-                    outcome = (result, None)
+                        if observed is not None and observed.state != consent_state:
+                            outcome = (None, "ChatGPT status changed. Try again.")
+                        else:
+                            from openswap.codex.desktop import DesktopSwitcher
+                            result = DesktopSwitcher(self.codex, app=self._desktop_app).switch(
+                                num, confirm_restart=True, confirm_idle=True
+                            )
+                            outcome = (result, None)
             except ClaudeSwitchError as exc:
                 outcome = (None, str(exc))
             except Exception:
