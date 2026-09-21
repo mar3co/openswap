@@ -137,13 +137,13 @@ or if a test fails twice without an understood cause.
 
 ## Validation record
 
-- Focused gate 1: 368 passed, 0 skipped, 0 warnings (`tests/test_menubar.py`
+- Focused gate 1: 369 passed, 0 skipped, 0 warnings (`tests/test_menubar.py`
   `tests/test_desktop_menubar.py` `tests/test_chatgpt_auto_menubar.py`
   `tests/test_codex_desktop_app.py` `tests/test_menubar_tabs.py`).
 - Safety gate 2: 49 passed, 0 skipped, 0 warnings
   (`tests/test_codex_desktop.py` `tests/test_chatgpt_auto_safety.py`).
-- Combined focused+safety: 417 passed.
-- Full suite: 2829 passed, 4 skipped, 3 existing pytest warnings.
+- Combined focused+safety: 418 passed.
+- Full suite: 2830 passed, 4 skipped, 3 existing pytest warnings.
 - `git diff --check`: passed (no whitespace errors).
 - Screenshots: synthetic AppKit PNGs were generated during implementation
   in a local scratch directory and are **not** in this checkout or the

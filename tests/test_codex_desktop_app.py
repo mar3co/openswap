@@ -173,6 +173,26 @@ def test_signature_rejects_wrong_team(tmp_path, monkeypatch):
         app.preflight(_home())
 
 
+def test_signature_timeout_is_retryable_but_rejection_is_terminal(tmp_path, monkeypatch):
+    app = DesktopApp(_app(tmp_path))
+
+    def timeout_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr("openswap.codex.desktop_app.subprocess.run", timeout_run)
+    with pytest.raises(DesktopAppError) as timeout:
+        app._verify_signature()
+    assert timeout.value.reason == "signature_check_failed"
+
+    def reject_run(argv, **_kwargs):
+        raise subprocess.CalledProcessError(1, argv)
+
+    monkeypatch.setattr("openswap.codex.desktop_app.subprocess.run", reject_run)
+    with pytest.raises(DesktopAppError) as rejected:
+        app._verify_signature()
+    assert rejected.value.reason == "signature_unverified"
+
+
 def test_is_running_matches_exact_executable_not_name(desktop, monkeypatch):
     exe = desktop.app_path / "Contents/MacOS/ChatGPT"
     monkeypatch.setattr("openswap.codex.desktop_app._processes", lambda: [
@@ -318,23 +338,24 @@ def test_observe_capability_classifies_by_reason_when_messages_collide(desktop, 
     assert cap == DesktopCapability(state="invalid", reason="app_invalid")
 
 
-def test_transient_process_inspection_failure_expires_for_retry(desktop, monkeypatch):
+def test_transient_capability_failures_expire_for_retry(desktop, monkeypatch):
     from openswap.codex.desktop_app import capability_is_fresh
 
-    def fail_inspection():
-        raise DesktopAppError(
-            "Could not safely inspect running desktop processes.",
-            reason="process_inspect_failed",
-        )
+    for index, reason in enumerate((
+        "process_inspect_failed", "app_changed", "signature_check_failed",
+    )):
+        def fail_inspection(reason=reason):
+            raise DesktopAppError("Operational probe failure.", reason=reason)
 
-    monkeypatch.setattr(desktop, "is_running", fail_inspection)
-    cap = desktop.observe_capability(now=100.0)
+        monkeypatch.setattr(desktop, "is_running", fail_inspection)
+        observed_at = 100.0 + index
+        cap = desktop.observe_capability(now=observed_at)
 
-    assert cap.state == "invalid"
-    assert cap.reason == "process_inspect_failed"
-    assert cap.observed_at == 100.0
-    assert capability_is_fresh(cap, now=104.9) is True
-    assert capability_is_fresh(cap, now=105.0) is False
+        assert cap.state == "invalid"
+        assert cap.reason == reason
+        assert cap.observed_at == observed_at
+        assert capability_is_fresh(cap, now=observed_at + 4.9) is True
+        assert capability_is_fresh(cap, now=observed_at + 5.0) is False
 
 
 def test_observe_capability_reports_fresh_stopped_and_running(desktop, monkeypatch):

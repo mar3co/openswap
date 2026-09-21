@@ -42,7 +42,12 @@ class DesktopCapability:
 _CAPABILITY_TTL_S = 5.0
 _PROCESS_STATES = frozenset({"running", "stopped"})
 _TERMINAL_STATES = frozenset({"unsupported", "missing", "invalid"})
-_RETRYABLE_REASONS = frozenset({"process_inspect_failed", "probe_failed"})
+_RETRYABLE_REASONS = frozenset({
+    "app_changed",
+    "process_inspect_failed",
+    "probe_failed",
+    "signature_check_failed",
+})
 
 
 def capability_from_error(
@@ -306,7 +311,12 @@ class DesktopApp:
                 ["/usr/bin/codesign", "-d", "--verbose=4", str(self.app_path)],
                 check=True, capture_output=True, text=True, timeout=_CODESIGN_TIMEOUT,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DesktopAppError(
+                "The ChatGPT application signature could not be verified.",
+                reason="signature_check_failed",
+            ) from exc
+        except subprocess.SubprocessError as exc:
             raise DesktopAppError(
                 "The ChatGPT application signature could not be verified.",
                 reason="signature_unverified",

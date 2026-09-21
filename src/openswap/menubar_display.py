@@ -118,7 +118,9 @@ def desktop_capability_status_copy(capability: DesktopCapability) -> str:
         return "ChatGPT isn’t installed."
     if capability.reason == "unvalidated_version":
         return "This ChatGPT version isn’t supported for switching."
-    if capability.reason in ("signature_unverified", "unexpected_publisher"):
+    if capability.reason in (
+        "signature_check_failed", "signature_unverified", "unexpected_publisher",
+    ):
         return "ChatGPT couldn’t be verified."
     if capability.state == "invalid":
         return "ChatGPT isn’t ready for switching."
