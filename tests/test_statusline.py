@@ -377,6 +377,26 @@ class TestInstallWrap:
         assert not (claude / "settings.json").exists()
         assert (backup / "settings.json").read_text(encoding="utf-8") == "{nope"
 
+    def test_legacy_migration_waits_until_wrap_state_is_readable(self, tmp_path: Path):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        settings_file = claude / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {"statusLine": {"type": "command", "command": "cswap statusline"}}
+            ),
+            encoding="utf-8",
+        )
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        (backup / "settings.json").write_text("{nope", encoding="utf-8")
+
+        with pytest.raises(ConfigError, match="overwrite"):
+            sl.install(claude, backup, command="openswap statusline")
+
+        settings = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert settings["statusLine"]["command"] == "cswap statusline"
+
     def test_uninstall_refuses_torn_claude_settings(self, tmp_path: Path):
         claude = tmp_path / ".claude"
         claude.mkdir()

@@ -410,7 +410,6 @@ def install(
     *,
     command: str = PAINT_COMMAND,
 ) -> dict:
-    migrated = migrate_legacy_command(config_home, command=command)
     settings_file = config_home / "settings.json"
     # Read both files before writing either: a torn OpenSwap settings.json
     # must not leave Claude already wrapped.
@@ -422,7 +421,12 @@ def install(
         raw_cmd = block.get("command")
         current = raw_cmd if isinstance(raw_cmd, str) else None
         if is_our_command(current):
-            return {"already": True, "created": False, "migrated": migrated}
+            return {"already": True, "created": False, "migrated": False}
+        if _is_legacy_command(current):
+            block["command"] = command
+            settings["statusLine"] = block
+            _write_json(settings_file, settings)
+            return {"already": True, "created": False, "migrated": True}
     created = not bool(current and current.strip())
     inner = None if created else current
     if not isinstance(block, dict):
