@@ -94,7 +94,7 @@ def resolve_program() -> list[str]:
     into the plist — the very path this module avoids pinning, since a
     reinstall recreates the virtualenv while the symlink keeps its name.
     """
-    names = ("openswap", "cswap")
+    names = ("openswap",)
     candidate = sys.argv[0] if sys.argv and sys.argv[0] else None
     if candidate is not None:
         absolute = Path(os.path.abspath(candidate))

@@ -193,6 +193,61 @@ class TestCurrentAccountLabel:
 
 
 class TestInstallWrap:
+    def test_only_openswap_statusline_is_recognized_as_ours(self):
+        assert sl.is_our_command("openswap statusline") is True
+        assert sl.is_our_command("/usr/local/bin/openswap statusline") is True
+        assert sl.is_our_command("cswap statusline") is False
+        assert sl.is_our_command("/usr/local/bin/cswap statusline") is False
+        assert sl._is_legacy_command("cswap statusline") is True
+        assert sl._is_legacy_command("/usr/local/bin/cswap statusline") is True
+
+    def test_install_migrates_legacy_command_without_nesting_it(self, tmp_path: Path):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        (claude / "settings.json").write_text(
+            json.dumps(
+                {
+                    "statusLine": {
+                        "type": "command",
+                        "command": "/usr/local/bin/cswap statusline",
+                        "padding": 2,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        sl.save_wrap(backup, inner_command="~/original.sh", created=False)
+
+        result = sl.install(claude, backup, command="openswap statusline")
+
+        settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
+        assert settings["statusLine"] == {
+            "type": "command",
+            "command": "openswap statusline",
+            "padding": 2,
+        }
+        assert result == {"already": True, "created": False, "migrated": True}
+        assert sl.load_wrap(backup)["innerCommand"] == "~/original.sh"
+
+    def test_uninstall_cleans_up_legacy_command(self, tmp_path: Path):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        (claude / "settings.json").write_text(
+            json.dumps(
+                {"statusLine": {"type": "command", "command": "cswap statusline"}}
+            ),
+            encoding="utf-8",
+        )
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        sl.save_wrap(backup, inner_command="~/original.sh", created=False)
+
+        assert sl.uninstall(claude, backup)["restored"] is True
+        settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
+        assert settings["statusLine"]["command"] == "~/original.sh"
+
     def test_install_with_no_statusline_creates_ours(self, tmp_path: Path):
         claude = tmp_path / ".claude"
         claude.mkdir()
@@ -321,6 +376,26 @@ class TestInstallWrap:
             sl.install(claude, backup, command="openswap statusline")
         assert not (claude / "settings.json").exists()
         assert (backup / "settings.json").read_text(encoding="utf-8") == "{nope"
+
+    def test_legacy_migration_waits_until_wrap_state_is_readable(self, tmp_path: Path):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        settings_file = claude / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {"statusLine": {"type": "command", "command": "cswap statusline"}}
+            ),
+            encoding="utf-8",
+        )
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        (backup / "settings.json").write_text("{nope", encoding="utf-8")
+
+        with pytest.raises(ConfigError, match="overwrite"):
+            sl.install(claude, backup, command="openswap statusline")
+
+        settings = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert settings["statusLine"]["command"] == "cswap statusline"
 
     def test_uninstall_refuses_torn_claude_settings(self, tmp_path: Path):
         claude = tmp_path / ".claude"

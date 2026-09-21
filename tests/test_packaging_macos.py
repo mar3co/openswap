@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,17 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGING = ROOT / "packaging" / "macos"
 FORBIDDEN_IDENTITY = "Developer ID Application:"
+
+
+def test_project_publishes_only_the_openswap_command():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert project["project"]["scripts"] == {"openswap": "openswap.cli:main"}
+
+
+def test_widget_runtime_has_no_legacy_cswap_path_or_entitlement():
+    widget = ROOT / "macos" / "OpenSwapWidget" / "Widget"
+    for name in ("Snapshot.swift", "Widget.entitlements"):
+        assert "cswap" not in (widget / name).read_text(encoding="utf-8").lower()
 
 
 def _tracked_text_files(*dirs: Path) -> list[Path]:

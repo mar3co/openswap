@@ -151,12 +151,23 @@ def restart_widget_agent() -> str | None:
     """
     from openswap import launch_agent
     from openswap import widget_install
+    from openswap.exceptions import ClaudeSwitchError
 
-    # Only a loaded job can be kickstarted; a leftover plist alone is not a widget.
+    # Rewrite the old job instead of restarting it: its legacy label and plist
+    # should disappear as part of the upgrade.
+    legacy_loaded = launch_agent.is_loaded(widget_install.LEGACY_LABEL)
+    legacy_plist = launch_agent.plist_path(widget_install.LEGACY_LABEL).exists()
+    if legacy_loaded or legacy_plist:
+        try:
+            widget_install.install_launch_agent(widget_install.widget_app_path())
+        except (ClaudeSwitchError, OSError) as exc:
+            return f"legacy widget migration failed: {exc}"
+        return None
+
+    # Only a loaded current job can be kickstarted; a leftover plist alone is
+    # not a running widget.
     if launch_agent.is_loaded(widget_install.LABEL):
         label = widget_install.LABEL
-    elif launch_agent.is_loaded(widget_install.LEGACY_LABEL):
-        label = widget_install.LEGACY_LABEL
     else:
         return None
     kicked = launch_agent._launchctl("kickstart", "-k", launch_agent.service_target(label))

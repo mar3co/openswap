@@ -197,10 +197,10 @@ def install_launch_agent(app: Path, home: Path | None = None, uid: int | None = 
     if is_loaded(LEGACY_LABEL, uid):
         _launchctl("bootout", service_target(LEGACY_LABEL, uid))
         _wait_until_unloaded(LEGACY_LABEL, uid)
-        try:
-            plist_path(LEGACY_LABEL, home).unlink(missing_ok=True)
-        except OSError as e:
-            raise ClaudeSwitchError(f"Could not remove the old widget launch agent: {e}") from e
+    try:
+        plist_path(LEGACY_LABEL, home).unlink(missing_ok=True)
+    except OSError as e:
+        raise ClaudeSwitchError(f"Could not remove the old widget launch agent: {e}") from e
 
     settled = True
     if is_loaded(LABEL, uid):
@@ -228,7 +228,9 @@ def uninstall_launch_agent(home: Path | None = None, uid: int | None = None) -> 
     _require_macos()
     from openswap.launch_agent import uninstall as _uninstall
 
-    return _uninstall(label=LABEL, home=home, uid=uid)
+    result = _uninstall(label=LABEL, home=home, uid=uid)
+    _uninstall(label=LEGACY_LABEL, home=home, uid=uid)
+    return result
 
 
 def _copy_built_app(derived: Path, dest: Path) -> Path:

@@ -72,7 +72,7 @@ Files and their roles:
   signature. The bundle already has a real `Info.plist`, so this must be a
   no-op when frozen.
 - `src/openswap/launch_agent.py:95-108` — `resolve_program()` prefers
-  `sys.argv[0]` when its basename is `openswap` or `cswap`, else `which`, else
+  `sys.argv[0]` when its basename is `openswap`, else `which`, else
   `[sys.executable, "-m", "openswap"]`. The plist runs `[*program, "menubar"]`
   (line 140). In a bundle the executable basename is `OpenSwap`.
 - `src/openswap/widget_snapshot.py:94-97` — `widget_app_path()` is hard-coded

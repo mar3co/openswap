@@ -172,6 +172,37 @@ class TestRestartWidgetAgent:
         assert calls[0][:2] == ("kickstart", "-k")
         assert calls[0][2].endswith(LABEL)
 
+    def test_migrates_loaded_legacy_widget_instead_of_kickstarting_it(
+        self, monkeypatch
+    ):
+        from openswap.update_check import restart_widget_agent
+        from openswap.widget_install import LEGACY_LABEL
+
+        calls = self._arm(monkeypatch, 0, loaded={LEGACY_LABEL})
+        installed = []
+        monkeypatch.setattr(
+            "openswap.widget_install.install_launch_agent",
+            lambda app: installed.append(app) or {"label": "current"},
+        )
+
+        assert restart_widget_agent() is None
+        assert len(installed) == 1
+        assert installed[0].name == "OpenSwap.app"
+        assert calls == []
+
+    def test_reports_legacy_widget_migration_failure(self, monkeypatch):
+        from openswap.exceptions import ClaudeSwitchError
+        from openswap.update_check import restart_widget_agent
+        from openswap.widget_install import LEGACY_LABEL
+
+        self._arm(monkeypatch, 0, loaded={LEGACY_LABEL})
+
+        def fail(app):
+            raise ClaudeSwitchError("cannot migrate")
+
+        monkeypatch.setattr("openswap.widget_install.install_launch_agent", fail)
+        assert restart_widget_agent() == "legacy widget migration failed: cannot migrate"
+
     def test_returns_detail_when_kickstart_fails(self, monkeypatch):
         from openswap.update_check import restart_widget_agent
         from openswap.widget_install import LABEL

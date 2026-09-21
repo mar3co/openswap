@@ -152,7 +152,7 @@ def test_resolve_program_falls_back_to_the_interpreter_without_a_script(tmp_path
             assert launch_agent.resolve_program() == [sys.executable, "-m", "openswap"]
 
 
-def test_resolve_program_ignores_an_argv0_that_is_not_cswap(tmp_path):
+def test_resolve_program_ignores_an_argv0_that_is_not_openswap(tmp_path):
     # Running through pytest, argv[0] is the test runner — not a thing launchd
     # should be pointed at.
     other = tmp_path / "pytest"

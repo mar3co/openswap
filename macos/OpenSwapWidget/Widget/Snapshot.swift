@@ -65,21 +65,11 @@ enum SnapshotStore {
             .appendingPathComponent("Library/Application Support/OpenSwap/widget-snapshot.json")
     }
 
-    static var legacyFileURL: URL {
-        realHomeDirectory()
-            .appendingPathComponent("Library/Application Support/cswap/widget-snapshot.json")
-    }
-
     static func load() -> WidgetSnapshot? {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        for url in [fileURL, legacyFileURL] {
-            if let data = try? Data(contentsOf: url),
-               let snapshot = try? decoder.decode(WidgetSnapshot.self, from: data) {
-                return snapshot
-            }
-        }
-        return nil
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        return try? decoder.decode(WidgetSnapshot.self, from: data)
     }
 }
 
