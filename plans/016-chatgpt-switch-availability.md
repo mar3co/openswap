@@ -67,8 +67,9 @@ user’s real ChatGPT app.
 
 - Model `checking`, `unsupported`, `missing`, `invalid`, `stopped`, and
   `running` with stable reason codes on `DesktopAppError` / a frozen
-  observation type. Apply the same Codex-home and backend policy preflight as
-  the transaction. Never classify failures by matching exception text.
+  observation type. Apply the same Codex-home, backend, credential-store, and
+  managed-configuration policy preflight as the transaction. Never classify
+  failures by matching exception text.
 - Probe lazily on a worker when the ChatGPT view becomes active. Never run
   codesign or process inspection on the AppKit thread. Generation guards
   drop stale worker results. A `running`/`stopped` observation and a retryable
@@ -138,13 +139,13 @@ or if a test fails twice without an understood cause.
 
 ## Validation record
 
-- Focused gate 1: 370 passed, 0 skipped, 0 warnings (`tests/test_menubar.py`
+- Focused gate 1: 372 passed, 0 skipped, 0 warnings (`tests/test_menubar.py`
   `tests/test_desktop_menubar.py` `tests/test_chatgpt_auto_menubar.py`
   `tests/test_codex_desktop_app.py` `tests/test_menubar_tabs.py`).
 - Safety gate 2: 49 passed, 0 skipped, 0 warnings
   (`tests/test_codex_desktop.py` `tests/test_chatgpt_auto_safety.py`).
-- Combined focused+safety: 419 passed.
-- Full suite: 2831 passed, 4 skipped, 3 existing pytest warnings.
+- Combined focused+safety: 421 passed.
+- Full suite: 2833 passed, 4 skipped, 3 existing pytest warnings.
 - `git diff --check`: passed (no whitespace errors).
 - Screenshots: synthetic AppKit PNGs were generated during implementation
   in a local scratch directory and are **not** in this checkout or the

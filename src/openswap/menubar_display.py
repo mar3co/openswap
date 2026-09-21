@@ -97,7 +97,9 @@ def apply_chatgpt_activation(
     *,
     now: float,
 ) -> list[dict]:
-    """Copy ChatGPT cards and mark rows whose credential-changing activation must no-op."""
+    """Mark capability-blocked rows while preserving the parent-off Settings route."""
+    if not bool(getattr(settings, "chatgpt_switching_enabled", False)):
+        return cards
     if chatgpt_manual_activation_allowed(settings, capability, now=now):
         return cards
     marked = []
@@ -118,6 +120,8 @@ def desktop_capability_status_copy(capability: DesktopCapability) -> str:
         return "ChatGPT isn’t installed."
     if capability.reason == "unvalidated_version":
         return "This ChatGPT version isn’t supported for switching."
+    if capability.reason == "unsupported_config":
+        return "This Codex configuration isn’t supported for switching."
     if capability.reason in (
         "signature_check_failed", "signature_unverified", "unexpected_publisher",
     ):

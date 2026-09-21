@@ -55,6 +55,17 @@ def desktop_switch_choices(snapshot):
     return choices
 
 
+def chatgpt_desktop_config_check(home):
+    """Apply the desktop transaction's existing global configuration policy."""
+    from openswap.codex.desktop import _config_check
+
+    try:
+        _config_check(home)
+    except ClaudeSwitchError:
+        return False
+    return True
+
+
 def desktop_switch_confirm_ok(process_state="running"):
     if process_state == "stopped":
         return "Switch and open ChatGPT"
@@ -732,6 +743,8 @@ def run(switcher, codex=None) -> int:
                         return
                     if self.codex is None:
                         cap = DesktopCapability("invalid", "codex_unavailable")
+                    elif not chatgpt_desktop_config_check(self.codex.home):
+                        cap = DesktopCapability("invalid", "unsupported_config")
                     else:
                         cap = self._desktop_app.observe_capability(self.codex.home)
             except Exception:

@@ -411,10 +411,12 @@ def test_chatgpt_capability_freshness_and_activation_helpers():
     assert menubar.chatgpt_manual_activation_allowed(settings_on, expired, now=now) is False
     assert menubar.chatgpt_manual_activation_allowed(settings_on, stopped, now=now) is True
     cards = [{"num": "codex:1", "disabled": False, "title": "Work"}]
-    blocked = menubar.apply_chatgpt_activation(cards, settings_off, stopped, now=now)
+    parent_off = menubar.apply_chatgpt_activation(cards, settings_off, stopped, now=now)
+    assert parent_off[0].get("activation_disabled") is not True
+    assert "activation_disabled" not in cards[0]
+    blocked = menubar.apply_chatgpt_activation(cards, settings_on, missing, now=now)
     assert blocked[0]["activation_disabled"] is True
     assert blocked[0]["disabled"] is False
-    assert "activation_disabled" not in cards[0]
     allowed = menubar.apply_chatgpt_activation(cards, settings_on, stopped, now=now)
     assert allowed[0].get("activation_disabled") is not True
     title, _body = menubar.desktop_switch_confirm_copy("Work", process_state="stopped")
@@ -426,6 +428,21 @@ def test_chatgpt_capability_freshness_and_activation_helpers():
     copy = menubar.desktop_capability_status_copy(missing)
     assert "ChatGPT" in copy
     assert "/" not in copy
+
+
+def test_chatgpt_desktop_config_check_reuses_transaction_policy(tmp_path, monkeypatch):
+    from openswap.codex import desktop
+
+    seen = []
+    monkeypatch.setattr(desktop, "_config_check", lambda home: seen.append(home))
+    assert menubar.chatgpt_desktop_config_check(tmp_path) is True
+    assert seen == [tmp_path]
+
+    def reject(_home):
+        raise ClaudeSwitchError("secret policy detail")
+
+    monkeypatch.setattr(desktop, "_config_check", reject)
+    assert menubar.chatgpt_desktop_config_check(tmp_path) is False
 
 
 def test_chatgpt_auto_is_persisted_independently_and_exposes_policy():

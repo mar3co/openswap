@@ -107,6 +107,16 @@ def test_activate_card_noops_when_activation_is_disabled():
     view._activate_card()
     view.on_switch.assert_called_once_with("codex:1")
 
+    view.on_switch.reset_mock()
+    view.card = menubar.apply_chatgpt_activation(
+        [{"num": "codex:1", "disabled": False}],
+        menubar.MenuBarSettings(chatgpt_switching_enabled=False),
+        menubar.DesktopCapability("stopped", "stopped", observed_at=1.0),
+        now=1.0,
+    )[0]
+    view._activate_card()
+    view.on_switch.assert_called_once_with("codex:1")
+
 
 def test_unknown_provider_does_not_change_view_or_reload():
     panel, _ = _panel()

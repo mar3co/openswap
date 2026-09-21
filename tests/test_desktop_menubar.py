@@ -78,6 +78,7 @@ def app(monkeypatch, tmp_path):
     thread = Mock()
     record = Mock()
     setting = Mock(return_value=None)
+    config_check = Mock(return_value=True)
     notification = Mock()
     settings_path = tmp_path / "menubar_settings.json"
     namespace = {
@@ -86,6 +87,7 @@ def app(monkeypatch, tmp_path):
         "desktop_switch_choices": menubar.desktop_switch_choices,
         "desktop_capability_status_copy": menubar.desktop_capability_status_copy,
         "chatgpt_manual_activation_allowed": menubar.chatgpt_manual_activation_allowed,
+        "chatgpt_desktop_config_check": config_check,
         "notification_copy_for_desktop_switch": menubar.notification_copy_for_desktop_switch,
         "NotificationCopy": menubar.NotificationCopy,
         "MenuBarSettings": menubar.MenuBarSettings,
@@ -137,6 +139,7 @@ def app(monkeypatch, tmp_path):
     instance._test_thread = thread
     instance._test_record = record
     instance._test_setting = setting
+    instance._test_config_check = config_check
     instance._test_notification = notification
     instance._test_settings_path = settings_path
     return instance
@@ -537,6 +540,17 @@ def test_transient_probe_failure_retries_after_ttl_without_restart(app):
     assert app._chatgpt_capability.state == "checking"
 
 
+def test_capability_probe_rejects_unsupported_global_config(app):
+    app._test_config_check.return_value = False
+
+    app._chatgpt_capability_worker(app._chatgpt_capability_generation)
+
+    assert app._chatgpt_capability == DesktopCapability(
+        "invalid", "unsupported_config",
+    )
+    app._desktop_app.observe_capability.assert_not_called()
+
+
 def test_stale_capability_worker_cannot_update_current_ui(app):
     app._chatgpt_capability = DesktopCapability("checking", "checking")
     app._chatgpt_capability_generation = 9
@@ -547,6 +561,7 @@ def test_stale_capability_worker_cannot_update_current_ui(app):
     assert app._chatgpt_capability.state == "checking"
     app._chatgpt_capability_worker(9)
     assert app._chatgpt_capability.state == "running"
+    assert app._test_config_check.call_args.args == (app.codex.home,)
     assert app._desktop_app.observe_capability.call_args.args == (app.codex.home,)
 
 
