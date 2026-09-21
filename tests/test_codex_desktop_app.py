@@ -483,11 +483,16 @@ def test_observe_capability_classifies_by_reason_when_messages_collide(desktop, 
     assert cap == DesktopCapability(state="invalid", reason="app_invalid")
 
 
-def test_transient_capability_failures_expire_for_retry(desktop, monkeypatch):
+def test_retryable_capability_failures_expire_for_retry(desktop, monkeypatch):
     from openswap.codex.desktop_app import capability_is_fresh
 
     for index, reason in enumerate((
-        "process_inspect_failed", "app_changed", "signature_check_failed", "probe_failed",
+        "process_inspect_failed",
+        "app_changed",
+        "signature_check_failed",
+        "probe_failed",
+        "incompatible_backend",
+        "known_incompatible_build",
     )):
         def fail_inspection(reason=reason):
             raise DesktopAppError("Operational probe failure.", reason=reason)

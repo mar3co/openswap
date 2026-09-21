@@ -49,6 +49,8 @@ _PROCESS_STATES = frozenset({"running", "stopped"})
 _TERMINAL_STATES = frozenset({"unsupported", "missing", "invalid"})
 _RETRYABLE_REASONS = frozenset({
     "app_changed",
+    "incompatible_backend",
+    "known_incompatible_build",
     "process_inspect_failed",
     "probe_failed",
     "signature_check_failed",
