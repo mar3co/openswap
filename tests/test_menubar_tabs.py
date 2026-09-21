@@ -53,9 +53,11 @@ def test_selected_provider_survives_close_and_settings():
     panel._show_settings()
     assert panel._page == "settings"
     assert panel._settings_section == "automation"
+    panel._on_chatgpt_view_active = Mock()
     panel._show_main()
     assert panel._page == "main"
     assert panel._selected_provider == "chatgpt"
+    panel._on_chatgpt_view_active.assert_called_once()
     panel.close()
     assert panel._selected_provider == "chatgpt"
 
@@ -97,8 +99,15 @@ def test_card_activation_paths_share_one_controller_entry():
 
 def test_activate_card_noops_when_activation_is_disabled():
     panel_path = Path(menubar.__file__).with_name("menubar_panel.py")
-    view_type = extract_class(panel_path, "_CardView", {"_activate_card"}, {})
+    view_type = extract_class(
+        panel_path,
+        "_CardView",
+        {"_activate_card", "acceptsFirstResponder", "canBecomeKeyView"},
+        {},
+    )
     view = view_type()
+    assert view.acceptsFirstResponder() is True
+    assert view.canBecomeKeyView() is True
     view.on_switch = Mock()
     view.card = {"num": "codex:1", "disabled": False, "activation_disabled": True}
     view._activate_card()

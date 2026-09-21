@@ -539,6 +539,14 @@ def test_transient_probe_failure_retries_after_ttl_without_restart(app):
     assert app._chatgpt_capability.state == "checking"
 
 
+def test_parent_off_does_not_probe_chatgpt_capability(app):
+    app.settings.chatgpt_switching_enabled = False
+
+    app._on_chatgpt_view_active()
+
+    app._test_thread.assert_not_called()
+
+
 def test_capability_probe_rejects_unsupported_global_config(app):
     app._test_config_check.return_value = False
 

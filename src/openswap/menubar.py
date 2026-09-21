@@ -716,7 +716,7 @@ def run(switcher, codex=None) -> int:
                 return False
 
         def _on_chatgpt_view_active(self):
-            if self._desktop_switching:
+            if self._desktop_switching or not self.settings.chatgpt_switching_enabled:
                 return
             now = time.monotonic()
             if capability_is_fresh(self._chatgpt_capability, now=now):

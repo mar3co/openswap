@@ -70,11 +70,12 @@ user’s real ChatGPT app.
   observation type. Apply the same Codex-home, backend, credential-store, and
   managed-configuration policy preflight as the transaction. Never classify
   failures by matching exception text.
-- Probe lazily on a worker when the ChatGPT view becomes active. Never run
-  codesign or process inspection on the AppKit thread. Generation guards
-  drop stale worker results. A `running`/`stopped` observation and a retryable
-  operational failure expire after five seconds of monotonic time; stable
-  terminal installation and policy states do not use that TTL.
+- When the parent is enabled, probe lazily on a worker whenever navigation
+  makes the ChatGPT view active. Never run codesign or process inspection on
+  the AppKit thread. Generation guards drop stale worker results. A
+  `running`/`stopped` observation and a retryable operational failure expire
+  after five seconds of monotonic time; stable terminal installation and
+  policy states do not use that TTL.
 - Serialize all access to the shared `DesktopApp` with one controller-owned
   lock. Pause or invalidate probes during desktop transactions.
 - Pass that same `DesktopApp` instance into `DesktopSwitcher` so validation
@@ -87,7 +88,8 @@ user’s real ChatGPT app.
   switching is disabled. Disable only credential-changing account-row
   activation.
 - Reject activation through mouse, keyboard, accessibility, stale callbacks,
-  and direct callback invocation. Controller checks are authoritative.
+  and direct callback invocation. Card views participate in the keyboard
+  focus loop. Controller checks are authoritative.
 - Parent-off offers **Enable in Settings**.
 - Fresh stopped uses **Switch and open ChatGPT**; fresh running uses
   **Restart ChatGPT**.
@@ -140,13 +142,13 @@ or if a test fails twice without an understood cause.
 
 ## Validation record
 
-- Focused gate 1: 372 passed, 0 skipped, 0 warnings (`tests/test_menubar.py`
+- Focused gate 1: 373 passed, 0 skipped, 0 warnings (`tests/test_menubar.py`
   `tests/test_desktop_menubar.py` `tests/test_chatgpt_auto_menubar.py`
   `tests/test_codex_desktop_app.py` `tests/test_menubar_tabs.py`).
 - Safety gate 2: 49 passed, 0 skipped, 0 warnings
   (`tests/test_codex_desktop.py` `tests/test_chatgpt_auto_safety.py`).
-- Combined focused+safety: 421 passed.
-- Full suite: 2833 passed, 4 skipped, 3 existing pytest warnings.
+- Combined focused+safety: 422 passed.
+- Full suite: 2834 passed, 4 skipped, 3 existing pytest warnings.
 - `git diff --check`: passed (no whitespace errors).
 - Screenshots: synthetic AppKit PNGs were generated during implementation
   in a local scratch directory and are **not** in this checkout or the

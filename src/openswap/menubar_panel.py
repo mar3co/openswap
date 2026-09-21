@@ -597,6 +597,12 @@ class _CardView(NSView):
         # focuses the window and the second click actually switches.
         return True
 
+    def acceptsFirstResponder(self):
+        return True
+
+    def canBecomeKeyView(self):
+        return True
+
     def viewDidChangeEffectiveAppearance(self):
         objc.super(_CardView, self).viewDidChangeEffectiveAppearance()
         self.setNeedsDisplay_(True)
@@ -1091,6 +1097,8 @@ class MenuBarPanel:
 
     def _show_main(self, _sender=None):
         self._page = MAIN_PAGE
+        if self._selected_provider == "chatgpt" and self._on_chatgpt_view_active is not None:
+            self._on_chatgpt_view_active()
         self.reload()
 
     def _select_settings_section(self, section: str) -> None:
