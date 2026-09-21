@@ -137,6 +137,30 @@ def test_signature_verification_is_strict_and_cached(tmp_path, monkeypatch):
     assert len(calls) == 4
 
 
+def test_invalidate_cache_rechecks_signature_after_secondary_bundle_change(tmp_path, monkeypatch):
+    monkeypatch.setattr("openswap.codex.desktop_app.sys.platform", "darwin")
+    monkeypatch.setattr("openswap.codex.desktop_app.Path.home", lambda: tmp_path)
+    app = DesktopApp(_app(tmp_path))
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        stderr = "Identifier=com.openai.codex\nTeamIdentifier=2DC432GLL2\n" if "-d" in argv else ""
+        return subprocess.CompletedProcess(argv, 0, "", stderr)
+
+    monkeypatch.setattr("openswap.codex.desktop_app.subprocess.run", fake_run)
+    app.preflight(_home())
+    assert len(calls) == 2
+    helper = app.app_path / "Contents/MacOS" / "ChatGPT Helper"
+    helper.write_text("other-signed-resource")
+    helper.chmod(0o700)
+    app.preflight(_home())
+    assert len(calls) == 2
+    app.invalidate_validation_cache()
+    app.preflight(_home())
+    assert len(calls) == 4
+
+
 def test_signature_rejects_wrong_team(tmp_path, monkeypatch):
     monkeypatch.setattr("openswap.codex.desktop_app.sys.platform", "darwin")
     monkeypatch.setattr("openswap.codex.desktop_app.Path.home", lambda: tmp_path)
@@ -306,3 +330,19 @@ def test_observe_capability_reports_fresh_stopped_and_running(desktop, monkeypat
     assert running.state == "running"
     assert running.reason == "running"
     assert running.observed_at == 101.5
+
+
+def test_observe_capability_timestamps_after_process_inspection(desktop, monkeypatch):
+    import openswap.codex.desktop_app as desktop_app_mod
+
+    ticks = iter([1.0, 9.0])
+    monkeypatch.setattr(desktop_app_mod.time, "monotonic", lambda: next(ticks))
+
+    def slow_running():
+        desktop_app_mod.time.monotonic()
+        return False
+
+    monkeypatch.setattr(desktop, "is_running", slow_running)
+    cap = desktop.observe_capability()
+    assert cap.state == "stopped"
+    assert cap.observed_at == 9.0

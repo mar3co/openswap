@@ -410,6 +410,13 @@ def test_chatgpt_capability_freshness_and_activation_helpers():
     assert menubar.chatgpt_manual_activation_allowed(settings_off, stopped, now=now) is False
     assert menubar.chatgpt_manual_activation_allowed(settings_on, expired, now=now) is False
     assert menubar.chatgpt_manual_activation_allowed(settings_on, stopped, now=now) is True
+    cards = [{"num": "codex:1", "disabled": False, "title": "Work"}]
+    blocked = menubar.apply_chatgpt_activation(cards, settings_off, stopped, now=now)
+    assert blocked[0]["activation_disabled"] is True
+    assert blocked[0]["disabled"] is False
+    assert "activation_disabled" not in cards[0]
+    allowed = menubar.apply_chatgpt_activation(cards, settings_on, stopped, now=now)
+    assert allowed[0].get("activation_disabled") is not True
     title, _body = menubar.desktop_switch_confirm_copy("Work", process_state="stopped")
     assert title == "Switch and open ChatGPT?"
     assert menubar.desktop_switch_confirm_ok("stopped") == "Switch and open ChatGPT"

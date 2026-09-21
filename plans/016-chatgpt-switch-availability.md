@@ -118,7 +118,6 @@ user’s real ChatGPT app.
 ## Git workflow and verification
 
 Branch: `feat/chatgpt-switch-availability` from `origin/main` at `862ae85`.
-Do not push or merge.
 
 ```
 uv run pytest -q tests/test_menubar.py tests/test_desktop_menubar.py tests/test_chatgpt_auto_menubar.py tests/test_codex_desktop_app.py tests/test_menubar_tabs.py
@@ -137,27 +136,20 @@ or if a test fails twice without an understood cause.
 
 ## Validation record
 
-- Focused gate 1: 354 passed, 0 skipped, 0 warnings (`tests/test_menubar.py`
+- Focused gate 1: 365 passed, 0 skipped, 0 warnings (`tests/test_menubar.py`
   `tests/test_desktop_menubar.py` `tests/test_chatgpt_auto_menubar.py`
   `tests/test_codex_desktop_app.py` `tests/test_menubar_tabs.py`).
 - Safety gate 2: 49 passed, 0 skipped, 0 warnings
   (`tests/test_codex_desktop.py` `tests/test_chatgpt_auto_safety.py`).
-- Full suite run A: 2815 passed, 4 skipped, 3 existing pytest warnings.
-- Full suite run B: 2815 passed, 4 skipped, 3 existing pytest warnings.
-  Both full-suite runs agree.
+- Combined focused+safety: 414 passed.
+- Full suite: 2826 passed, 4 skipped, 3 existing pytest warnings.
 - `git diff --check`: passed (no whitespace errors).
-- Screenshots (synthetic AppKit, no real account switch or ChatGPT
-  quit/launch), under the implementer scratch dir `screenshots/`:
-  - `chatgpt-preference-off-light.png`
-  - `chatgpt-preference-off-dark.png`
-  - `chatgpt-missing-app-light.png`
-  - `chatgpt-missing-app-dark.png`
-  - `chatgpt-stopped-light.png`
-  - `chatgpt-stopped-dark.png`
-  - `chatgpt-running-light.png`
-  - `chatgpt-running-dark.png`
-  - `chatgpt-automation-settings-light.png`
-  - `chatgpt-automation-settings-dark.png`
+- Screenshots: synthetic AppKit PNGs were generated during implementation
+  in a local scratch directory and are **not** in this checkout or the
+  git tree. They are not a merge gate. A real two-account desktop proof
+  that ChatGPT loaded the intended profile remains out of scope.
 - `src/openswap/codex/desktop.py` was not modified: `DesktopSwitcher` already
   accepts a shared `DesktopApp` instance; the extra now passes the
-  controller-owned instance.
+  controller-owned instance. Transactions call
+  `DesktopApp.invalidate_validation_cache()` before `switch()` so a
+  secondary bundle change after a probe is re-signed.

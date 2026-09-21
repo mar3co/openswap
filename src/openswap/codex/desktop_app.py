@@ -369,13 +369,17 @@ class DesktopApp:
         _, app_pids, _ = self._snapshot(executable)
         return bool(app_pids)
 
+    def invalidate_validation_cache(self) -> None:
+        """Drop the signature cache so the next validate re-runs codesign."""
+        self._validation_cache = None
+
     def observe_capability(self, *, now: float | None = None) -> DesktopCapability:
         """Classify installation and process state without exposing internals."""
-        observed_at = time.monotonic() if now is None else now
         try:
             running = self.is_running()
         except DesktopAppError as exc:
             return capability_from_error(exc)
+        observed_at = time.monotonic() if now is None else now
         state = "running" if running else "stopped"
         return DesktopCapability(state=state, reason=state, observed_at=observed_at)
 

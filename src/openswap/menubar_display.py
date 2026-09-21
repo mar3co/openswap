@@ -90,6 +90,24 @@ def chatgpt_manual_activation_allowed(
     return capability.state in ("running", "stopped")
 
 
+def apply_chatgpt_activation(
+    cards: list[dict],
+    settings: "MenuBarSettings",
+    capability: DesktopCapability,
+    *,
+    now: float,
+) -> list[dict]:
+    """Copy ChatGPT cards and mark rows whose credential-changing activation must no-op."""
+    if chatgpt_manual_activation_allowed(settings, capability, now=now):
+        return cards
+    marked = []
+    for card in cards:
+        shown = dict(card)
+        shown["activation_disabled"] = True
+        marked.append(shown)
+    return marked
+
+
 def desktop_capability_status_copy(capability: DesktopCapability) -> str:
     """Operator-facing capability status. Never includes paths or exception text."""
     if capability.state == "checking":

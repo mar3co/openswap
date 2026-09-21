@@ -503,6 +503,27 @@ def test_worker_passes_shared_desktop_app_under_lock(app, monkeypatch):
     app._desktop_worker("2", app._chatgpt_capability_generation)
     constructor.assert_called_once_with(app.codex, app=app._desktop_app)
     backend.switch.assert_called_once_with("2", confirm_restart=True, confirm_idle=True)
+    app._desktop_app.invalidate_validation_cache.assert_called_once()
+
+
+def test_request_chatgpt_capability_coalesces_while_probe_inflight(app):
+    app._chatgpt_probe_inflight = True
+    app._chatgpt_capability_generation = 4
+    app._request_chatgpt_capability()
+    app._test_thread.assert_not_called()
+    assert app._chatgpt_capability_generation == 4
+
+
+def test_stale_activation_does_not_queue_another_probe_while_inflight(app):
+    app._chatgpt_probe_inflight = True
+    app._chatgpt_capability = DesktopCapability(
+        "running", "running", observed_at=time.monotonic() - 6,
+    )
+    app._chatgpt_capability_generation = 2
+    app._make_desktop_switch("2", "Work")(None)
+    app._test_thread.assert_not_called()
+    assert app._chatgpt_capability_generation == 2
+    app._show_error.assert_called()
 
 
 def test_stale_capability_worker_cannot_update_current_ui(app):

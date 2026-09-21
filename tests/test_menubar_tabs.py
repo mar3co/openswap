@@ -90,6 +90,22 @@ def test_card_activation_paths_share_one_controller_entry():
     assert source.index("self._activate_card()") < source.index("def accessibilityPerformPress")
     assert "accessibilityPerformPress" in source
     assert "self.on_switch(self.card[\"num\"])" in source
+    build = source[source.index("def _build") : source.index("def _build_settings")]
+    assert "apply_chatgpt_activation" in build
+    assert "activation_disabled" in build
+
+
+def test_activate_card_noops_when_activation_is_disabled():
+    panel_path = Path(menubar.__file__).with_name("menubar_panel.py")
+    view_type = extract_class(panel_path, "_CardView", {"_activate_card"}, {})
+    view = view_type()
+    view.on_switch = Mock()
+    view.card = {"num": "codex:1", "disabled": False, "activation_disabled": True}
+    view._activate_card()
+    view.on_switch.assert_not_called()
+    view.card["activation_disabled"] = False
+    view._activate_card()
+    view.on_switch.assert_called_once_with("codex:1")
 
 
 def test_unknown_provider_does_not_change_view_or_reload():

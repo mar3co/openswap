@@ -715,7 +715,7 @@ def run(switcher, codex=None) -> int:
             self._request_chatgpt_capability()
 
         def _request_chatgpt_capability(self):
-            if self._desktop_switching:
+            if self._desktop_switching or self._chatgpt_probe_inflight:
                 return
             self._chatgpt_capability_generation += 1
             generation = self._chatgpt_capability_generation
@@ -857,12 +857,6 @@ def run(switcher, codex=None) -> int:
                     ok="Turn On", cancel="Cancel",
                 ) != 1:
                     return
-                if self._codex_enabled():
-                    if not self._guard(lambda: set_setting(
-                        self.switcher.backup_dir, "autoswitch.codexEnabled", "false"
-                    )):
-                        return
-                self._stop_codex_engine()
             self.settings.chatgpt_auto_enabled = enabling
             try:
                 self.settings.save(settings_path)
@@ -872,6 +866,13 @@ def run(switcher, codex=None) -> int:
                 return
             self._chatgpt_auto_retry_at = 0.0
             if enabling:
+                paused_codex = True
+                if self._codex_enabled():
+                    paused_codex = self._guard(lambda: set_setting(
+                        self.switcher.backup_dir, "autoswitch.codexEnabled", "false"
+                    ))
+                if paused_codex:
+                    self._stop_codex_engine()
                 self._start_chatgpt_auto_monitor()
             else:
                 self._stop_chatgpt_auto_monitor(clear_pending=True)
@@ -1050,6 +1051,7 @@ def run(switcher, codex=None) -> int:
                 has_codex=self._has_codex,
                 codex_enabled=self._codex_enabled,
                 desktop_status=self._chatgpt_desktop_status,
+                chatgpt_capability=lambda: self._chatgpt_capability,
                 on_chatgpt_view_active=self._on_chatgpt_view_active,
                 account_state=lambda provider: self._account_states.get(provider, "error"),
                 on_empty_action=self._on_empty_action,
@@ -1488,6 +1490,7 @@ def run(switcher, codex=None) -> int:
                 else:
                     from openswap.codex.desktop import DesktopSwitcher
                     with self._desktop_app_lock:
+                        self._desktop_app.invalidate_validation_cache()
                         result = DesktopSwitcher(self.codex, app=self._desktop_app).switch(
                             num, confirm_restart=True, confirm_idle=True
                         )

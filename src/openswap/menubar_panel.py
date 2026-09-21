@@ -84,6 +84,8 @@ from openswap.menubar import (
     SETTINGS_SECTION_AUTOMATION,
     SETTINGS_SECTION_GENERAL,
     SETTINGS_SECTIONS,
+    apply_chatgpt_activation,
+    DesktopCapability,
     panel_accounts,
     provider_cards,
     provider_empty_state,
@@ -676,7 +678,11 @@ class _CardView(NSView):
         return True
 
     def _activate_card(self):
-        if self.on_switch and not self.card.get("disabled"):
+        if (
+            self.on_switch
+            and not self.card.get("disabled")
+            and not self.card.get("activation_disabled")
+        ):
             self.on_switch(self.card["num"])
 
 
@@ -741,6 +747,7 @@ class MenuBarPanel:
         has_codex=None,
         codex_enabled=None,
         desktop_status=None,
+        chatgpt_capability=None,
         on_chatgpt_view_active=None,
         account_state=None,
         on_empty_action=None,
@@ -764,6 +771,7 @@ class MenuBarPanel:
         self._has_codex = has_codex
         self._codex_enabled = codex_enabled
         self._desktop_status = desktop_status or (lambda: "Experimental · Switching reopens ChatGPT")
+        self._chatgpt_capability = chatgpt_capability
         self._on_chatgpt_view_active = on_chatgpt_view_active
         self._account_state = account_state or (lambda _provider: "ready")
         self._on_empty_action = on_empty_action
@@ -1166,6 +1174,16 @@ class MenuBarPanel:
         all_cards = panel_accounts(snap)
         provider = self._selected_provider
         cards = provider_cards(all_cards, provider)
+        if provider == "chatgpt":
+            settings = self._settings() if callable(self._settings) else None
+            cap = self._chatgpt_capability() if callable(self._chatgpt_capability) else None
+            if settings is None:
+                settings = MenuBarSettings()
+            if cap is None:
+                cap = DesktopCapability("checking", "checking")
+            cards = apply_chatgpt_activation(
+                cards, settings, cap, now=time.monotonic(),
+            )
         current_login_model = self._login_state_model()
         login_model = current_login_model if provider == "chatgpt" else login_panel_state(None)
         login_view = provider == "chatgpt" and login_model["stage"] != "idle"
@@ -1427,7 +1445,7 @@ class MenuBarPanel:
                     card, self._on_switch
                 )
                 card_view.setFrame_(NSMakeRect(PAD, y, inner_w, card_h))
-                if card.get("disabled"):
+                if card.get("disabled") or card.get("activation_disabled"):
                     card_view.setAlphaValue_(0.45)
 
                 title = card["title"]

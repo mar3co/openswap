@@ -299,6 +299,22 @@ def test_cancelled_enable_changes_nothing(monkeypatch, tmp_path):
     app._stop_codex_engine.assert_not_called()
 
 
+def test_failed_child_save_does_not_disable_codex_rotation(monkeypatch, tmp_path):
+    app = _app(monkeypatch, tmp_path)
+    app.settings.chatgpt_auto_enabled = False
+    app._codex_enabled.return_value = True
+    app.settings.save = Mock(side_effect=OSError("/secret/path"))
+
+    app.on_toggle_chatgpt_auto(None)
+
+    assert app.settings.chatgpt_auto_enabled is False
+    app._set_setting.assert_not_called()
+    app._stop_codex_engine.assert_not_called()
+    message = app._show_error.call_args.args[0]
+    assert "save" in message.lower()
+    assert "/secret/path" not in message
+
+
 def test_enable_disables_only_legacy_codex_rotation(monkeypatch, tmp_path):
     app = _app(monkeypatch, tmp_path)
     app.settings.chatgpt_auto_enabled = False
