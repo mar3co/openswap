@@ -92,7 +92,8 @@ user’s real ChatGPT app.
 - Fresh stopped uses **Switch and open ChatGPT**; fresh running uses
   **Restart ChatGPT**.
 - Recheck the persisted preference and capability generation before showing
-  consent, after consent, and at worker entry.
+  consent, and recheck both generation and freshness after consent. Recheck
+  persisted preference and generation again at worker entry.
 - Preserve `DesktopSwitcher` preflight, locking, credential-generation
   checks, recovery journal, and process-race handling.
 

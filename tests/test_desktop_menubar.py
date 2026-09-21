@@ -395,7 +395,7 @@ def test_stale_running_observation_does_not_open_consent(app):
     assert app._show_error.call_args.args[0] == "Checking ChatGPT…"
 
 
-def test_consent_past_process_ttl_still_starts_worker(app, monkeypatch):
+def test_consent_past_process_ttl_is_refused(app, monkeypatch):
     app._chatgpt_capability = DesktopCapability(
         "running", "running", observed_at=100.0,
     )
@@ -408,10 +408,9 @@ def test_consent_past_process_ttl_still_starts_worker(app, monkeypatch):
 
     app._alert.side_effect = consent
     app._make_desktop_switch("2", "Work")(None)
-    app._test_thread.assert_called_once_with(
-        target=app._desktop_worker, args=("2", 1), daemon=True,
-    )
-    app._show_error.assert_not_called()
+    app._test_thread.assert_not_called()
+    app._show_error.assert_called_once_with("ChatGPT status changed. Try again.")
+    app._stop_codex_engine.assert_not_called()
 
 
 def test_chatgpt_reload_probes_when_running_observation_is_stale(app):

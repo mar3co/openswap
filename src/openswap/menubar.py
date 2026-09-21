@@ -1489,6 +1489,9 @@ def run(switcher, codex=None) -> int:
                     generation != self._chatgpt_capability_generation
                     or not self._chatgpt_switching_persisted()
                     or not self.settings.chatgpt_switching_enabled
+                    or not capability_is_fresh(
+                        self._chatgpt_capability, now=time.monotonic()
+                    )
                     or self._chatgpt_capability.state != process_state
                     or self._chatgpt_capability.state not in ("running", "stopped")
                 ):
