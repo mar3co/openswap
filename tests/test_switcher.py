@@ -9278,6 +9278,155 @@ class TestBackupUnreadableDisplay:
         assert s._static_usage_sentinel(info_bad) == USAGE_KEYCHAIN_UNAVAILABLE
 
 
+class TestMissingActiveCredentialUsageFallback:
+    """A Claude-wiped live record must not freeze a healthy slot's stats."""
+
+    @staticmethod
+    def _backup() -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "saved-access",
+            "refreshToken": "saved-refresh",
+            "expiresAt": (time.time() + 3600) * 1000,
+        }})
+
+    @staticmethod
+    def _sequence() -> dict:
+        return {
+            "sequence": [2],
+            "accounts": {"2": {
+                "email": "ads@example.com",
+                "organizationUuid": "org-ads",
+                "alias": "adsonline",
+            }},
+        }
+
+    def _switcher(self, temp_home: Path, monkeypatch) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, self._sequence())
+        monkeypatch.setattr(s, "_get_sequence_data_migrated", self._sequence)
+        monkeypatch.setattr(
+            s, "_get_current_account", lambda: ("ads@example.com", "org-ads")
+        )
+        monkeypatch.setattr(
+            s, "_read_active_credentials",
+            lambda: ActiveCredentials("", False, False),
+        )
+        return s
+
+    def test_unverified_saved_credential_fetches_read_only_and_prompts(
+        self, temp_home: Path, monkeypatch,
+    ):
+        from openswap.json_output import USAGE_LIVE_CREDENTIAL_MISSING
+
+        s = self._switcher(temp_home, monkeypatch)
+        backup = self._backup()
+        monkeypatch.setattr(
+            s, "_read_account_credentials_ex", lambda *_: (backup, False)
+        )
+        info = s._build_accounts_info(load_idle={"2"})
+        assert info[0][5] == backup
+        assert s._active_backup_fallback() is True
+
+        usage = {"five_hour": {"pct": 84.0}, "seven_day": {"pct": 21.0}}
+        with patch("openswap.oauth.fetch_oauth_profile", return_value=None), \
+             patch.object(s, "_write_credentials") as write_live, \
+             patch(
+                 "openswap.oauth.try_fetch_usage_for_account",
+                 return_value=oauth.UsageOutcome(usage=usage),
+             ) as fetch:
+            entry = s._collect_usage_entries(info, fetch={"2"})["2"]
+
+        assert entry.last_good == usage
+        assert entry.sentinel == USAGE_LIVE_CREDENTIAL_MISSING
+        write_live.assert_not_called()
+        fetch.assert_called_once_with(
+            "2", "ads@example.com", backup, is_active=True,
+        )
+
+    def test_verified_saved_credential_auto_restores_live_login(
+        self, temp_home: Path, monkeypatch,
+    ):
+        s = self._switcher(temp_home, monkeypatch)
+        backup = self._backup()
+        monkeypatch.setattr(
+            s, "_read_account_credentials_ex", lambda *_: (backup, False)
+        )
+        info = s._build_accounts_info(load_idle={"2"})
+        usage = {"five_hour": {"pct": 84.0}, "seven_day": {"pct": 21.0}}
+        profile = {
+            "uuid": "uuid-ads",
+            "email": "ads@example.com",
+            "organizationUuid": "org-ads",
+        }
+
+        with patch(
+            "openswap.oauth.fetch_oauth_profile", return_value=profile
+        ), patch.object(
+            s, "_read_credentials", return_value=""
+        ), patch.object(
+            s, "_write_credentials"
+        ) as write_live, patch(
+            "openswap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(usage=usage),
+        ):
+            entry = s._collect_usage_entries(info, fetch={"2"})["2"]
+
+        assert entry.last_good == usage
+        assert entry.sentinel is None
+        assert s._active_backup_repaired() is True
+        write_live.assert_called_once_with(backup)
+
+    def test_store_only_paint_does_not_read_active_backup(
+        self, temp_home: Path, monkeypatch,
+    ):
+        from openswap.json_output import USAGE_NO_CREDENTIALS
+
+        s = self._switcher(temp_home, monkeypatch)
+        read_backup = MagicMock(return_value=(self._backup(), False))
+        monkeypatch.setattr(s, "_read_account_credentials_ex", read_backup)
+
+        info = s._build_accounts_info(load_idle=set())
+
+        read_backup.assert_not_called()
+        assert s._active_backup_fallback() is False
+        assert s._static_usage_sentinel(info[0]) == USAGE_NO_CREDENTIALS
+
+    def test_absent_saved_credential_stays_no_credentials(
+        self, temp_home: Path, monkeypatch,
+    ):
+        from openswap.json_output import USAGE_NO_CREDENTIALS
+
+        s = self._switcher(temp_home, monkeypatch)
+        monkeypatch.setattr(
+            s, "_read_account_credentials_ex", lambda *_: ("", False)
+        )
+
+        info = s._build_accounts_info(load_idle={"2"})
+
+        assert s._active_backup_fallback() is False
+        assert s._static_usage_sentinel(info[0]) == USAGE_NO_CREDENTIALS
+
+    def test_active_api_key_does_not_fall_back_to_saved_oauth(
+        self, temp_home: Path, monkeypatch,
+    ):
+        from openswap.json_output import USAGE_API_KEY
+
+        s = self._switcher(temp_home, monkeypatch)
+        monkeypatch.setattr(
+            s, "_read_active_credentials",
+            lambda: ActiveCredentials("sk-ant-api03-live", False, False),
+        )
+        read_backup = MagicMock(return_value=(self._backup(), False))
+        monkeypatch.setattr(s, "_read_account_credentials_ex", read_backup)
+
+        info = s._build_accounts_info(load_idle={"2"})
+
+        read_backup.assert_not_called()
+        assert s._active_backup_fallback() is False
+        assert s._static_usage_sentinel(info[0]) == USAGE_API_KEY
+
+
 class TestSwitchUnreadableBackup:
     """M1: switching to a slot whose backup is keychain-unreadable errors
     with 'keychain locked/unavailable', never the re-add instruction."""

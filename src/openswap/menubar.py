@@ -1560,6 +1560,24 @@ def run(switcher, codex=None) -> int:
                     return display_needs_relogin(row[3])
             return False
 
+        def _slot_needs_restore(self, num) -> bool:
+            for row in self.snapshot.get("accounts") or []:
+                if str(row[0]) == str(num):
+                    return display_needs_restore(row[3]) or (
+                        bool(row[2])
+                        and display_missing_credentials(row[3])
+                        and isinstance(row[4], dict)
+                    )
+            return False
+
+        def _slot_missing_login(self, num) -> bool:
+            for row in self.snapshot.get("accounts") or []:
+                if str(row[0]) == str(num):
+                    return display_missing_credentials(row[3]) and not (
+                        bool(row[2]) and isinstance(row[4], dict)
+                    )
+            return False
+
         def _slot_identity(self, num) -> tuple[str, str] | None:
             ident = (self.snapshot.get("identities") or {}).get(str(num))
             if ident is not None:
@@ -1586,7 +1604,24 @@ def run(switcher, codex=None) -> int:
                 )
                 return
             if self._slot_needs_relogin(num):
-                self._repair_relogin(num, close_panel=close_panel)
+                self._repair_relogin(
+                    num, close_panel=close_panel, force_login=True
+                )
+                return
+            if self._slot_missing_login(num):
+                self._repair_relogin(
+                    num, close_panel=close_panel, force_login=True
+                )
+                return
+            if self._slot_needs_restore(num):
+                result = self._run_switch(
+                    lambda: self.switcher.switch_to(
+                        str(num), json_output=True, force=True
+                    )
+                )
+                self._finish_manual_switch(
+                    result, self._name_for_num(num), close_panel=close_panel
+                )
                 return
             if not self._confirm_switch(num):
                 return
@@ -1642,7 +1677,7 @@ def run(switcher, codex=None) -> int:
             )
             return self._alert(title=title, message=message, ok="Switch", cancel="Cancel") == 1
 
-        def _repair_relogin(self, num, *, close_panel):
+        def _repair_relogin(self, num, *, close_panel, force_login=False):
             slot = self._slot_identity(num)
             slot_name = self._name_for_num(num)
             live = self.switcher.live_identity()
@@ -1653,6 +1688,10 @@ def run(switcher, codex=None) -> int:
             if plan is None:
                 self._show_error(f"Couldn't find {slot_name} in the account list.")
                 return
+            if force_login and plan.kind == "capture":
+                plan = ReloginClickPlan(
+                    "open_login", plan.slot_name, plan.login_email, plan.live_name
+                )
             if plan.kind == "capture":
                 self._capture_relogin(num, close_panel=close_panel)
                 return

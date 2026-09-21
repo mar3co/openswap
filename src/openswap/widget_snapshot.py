@@ -118,7 +118,12 @@ def combined_window(accounts: list[dict], label: str, now: float) -> dict | None
     """
     slices: list[dict] = []
     for card in accounts:
-        if card.get("disabled") or card.get("needs_relogin"):
+        if (
+            card.get("disabled")
+            or card.get("needs_relogin")
+            or card.get("action_required")
+            or card.get("stale")
+        ):
             continue
         window = _window_with_label(card, label)
         if not isinstance(window, dict) or not isinstance(window.get("pct"), (int, float)):
@@ -192,7 +197,12 @@ def snapshot_updated_at(accounts: list[dict], now: float) -> float:
             continue
         stamp = float(ts)
         any_fetch.append(stamp)
-        if not card.get("disabled") and not card.get("needs_relogin"):
+        if (
+            not card.get("disabled")
+            and not card.get("needs_relogin")
+            and not card.get("action_required")
+            and not card.get("stale")
+        ):
             live.append(stamp)
     if live:
         return max(live)

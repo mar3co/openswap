@@ -32,6 +32,7 @@ from openswap.json_output import (
     USAGE_API_KEY,
     USAGE_FOREIGN_CREDENTIAL,
     USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_LIVE_CREDENTIAL_MISSING,
     USAGE_NO_CREDENTIALS,
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
@@ -202,6 +203,8 @@ SENTINEL_NOTES = {
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: openswap add",
+    USAGE_LIVE_CREDENTIAL_MISSING: "live login missing — saved credential is available to restore",
+    USAGE_NO_CREDENTIALS: "no credentials — sign in with Claude Code",
 }
 
 
@@ -350,6 +353,7 @@ __all__ = [
     'USAGE_API_KEY',
     'USAGE_FOREIGN_CREDENTIAL',
     'USAGE_KEYCHAIN_UNAVAILABLE',
+    'USAGE_LIVE_CREDENTIAL_MISSING',
     'USAGE_NO_CREDENTIALS',
     'USAGE_RELOGIN_REQUIRED',
     'USAGE_TOKEN_EXPIRED',

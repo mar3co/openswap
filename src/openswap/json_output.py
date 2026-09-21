@@ -19,6 +19,10 @@ SCHEMA_VERSION = 1
 # of a usage dict. Kept here (the serialization hub) so the human renderer and the
 # JSON projection agree instead of scattering raw strings.
 USAGE_NO_CREDENTIALS = "no credentials"
+# The active Claude Code store is empty, but the managed slot still has a
+# readable saved OAuth credential. Usage can be checked read-only from that
+# copy, while restoring the live login remains an explicit user action.
+USAGE_LIVE_CREDENTIAL_MISSING = "live credential missing"
 USAGE_TOKEN_EXPIRED = "token expired"
 # API-key (``/login`` managed key) accounts have no subscription quota; usage is
 # reported as this sentinel instead of being fetched from the OAuth usage API.
@@ -160,6 +164,8 @@ def usage_fields(
         return "relogin_required", None
     if entry == USAGE_FOREIGN_CREDENTIAL:
         return "foreign_credential", None
+    if entry == USAGE_LIVE_CREDENTIAL_MISSING:
+        return "live_credential_missing", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None

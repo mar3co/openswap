@@ -42,7 +42,15 @@ from openswap.kickoff import (
 from openswap.autoswitch import record_manual_switch
 from openswap.paths import get_backup_root
 from openswap.settings import atomic_write_json
-from openswap.engine import SENTINEL_NOTES, USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
+from openswap.engine import (
+    SENTINEL_NOTES,
+    USAGE_API_KEY,
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_LIVE_CREDENTIAL_MISSING,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+)
+from openswap.poll_policy import SERVE_TTL_S
 
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
@@ -104,6 +112,9 @@ RELOGIN_CARD_NOTE = (
 CODEX_RELOGIN_CARD_NOTE = (
     "Action required · OAuth expired. Sign in again with Codex."
 )
+RESTORE_CARD_NOTE = "Click to restore the saved Claude login."
+MISSING_LOGIN_CARD_NOTE = "Action required · Sign in with Claude Code."
+RECONCILE_CARD_NOTE = "Action required · Login mismatch. Click to repair."
 _CLAUDE_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 
 
@@ -1093,6 +1104,21 @@ def display_needs_relogin(display) -> bool:
     return display == SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
 
 
+def display_needs_restore(display) -> bool:
+    return display == SENTINEL_NOTES[USAGE_LIVE_CREDENTIAL_MISSING]
+
+
+def display_missing_credentials(display) -> bool:
+    return display in (
+        USAGE_NO_CREDENTIALS,
+        SENTINEL_NOTES[USAGE_NO_CREDENTIALS],
+    )
+
+
+def display_needs_reconcile(display) -> bool:
+    return display == SENTINEL_NOTES[USAGE_FOREIGN_CREDENTIAL]
+
+
 def extra_note_for_display(display, *, provider: str = "claude") -> str | None:
     """Popover note: extra copy for signed-out, otherwise the sentinel string."""
     if display_needs_relogin(display):
@@ -1100,6 +1126,19 @@ def extra_note_for_display(display, *, provider: str = "claude") -> str | None:
     if isinstance(display, str):
         return display
     return None
+
+
+def _compact_measurement_age(fetched_at: object, now: float) -> str | None:
+    if not isinstance(fetched_at, (int, float)):
+        return None
+    seconds = max(0, int(now - float(fetched_at)))
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
 
 
 def relogin_slot_nums(snapshot: dict, *, provider: str | None = None) -> set[str]:
@@ -1519,25 +1558,63 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
         needs_relogin = (
             display_needs_relogin(display) or str(num) in kickoff_action_required
         )
+        missing_credentials = display_missing_credentials(display)
+        backup_usage_verified = display_needs_restore(display)
+        needs_restore = provider == "claude" and (
+            backup_usage_verified
+            or (
+                bool(is_active)
+                and missing_credentials
+                and isinstance(last_good, dict)
+            )
+        )
+        missing_login = (
+            provider == "claude"
+            and missing_credentials
+            and not needs_restore
+            and not bool(disabled)
+        )
+        needs_reconcile = provider == "claude" and display_needs_reconcile(display)
+        age = _compact_measurement_age(fetched_at, now)
+        fallback_usage = isinstance(display, str) and isinstance(last_good, dict)
+        fallback_is_current = (
+            backup_usage_verified
+            and isinstance(fetched_at, (int, float))
+            and now - float(fetched_at) <= SERVE_TTL_S
+        )
+        stale = fallback_usage and not fallback_is_current
         if needs_relogin:
             note = (
                 CODEX_RELOGIN_CARD_NOTE
                 if provider == "codex"
                 else RELOGIN_CARD_NOTE
             )
+        elif needs_restore:
+            if backup_usage_verified and not stale:
+                freshness = f"Usage verified {age}" if age else "Usage verified"
+                note = f"{freshness} · {RESTORE_CARD_NOTE}"
+            else:
+                freshness = f"Stale · last updated {age}" if age else "Stale"
+                note = f"{freshness} · {RESTORE_CARD_NOTE}"
+        elif missing_login:
+            note = MISSING_LOGIN_CARD_NOTE
+        elif needs_reconcile:
+            note = RECONCILE_CARD_NOTE
         else:
             note = extra_note_for_display(display, provider=provider)
+            if stale and age and note:
+                note = f"Stale · last updated {age} · {note}"
         usage = display if isinstance(display, dict) else last_good
         title, subtitle = account_card_names(email, alias, org_name)
         if is_codex:
             title = f"Codex · {title}"
         as_of = now
-        if needs_relogin and isinstance(fetched_at, (int, float)):
+        if stale and isinstance(fetched_at, (int, float)):
             as_of = float(fetched_at)
         windows = panel_windows(
             usage if isinstance(usage, dict) else None, as_of, fetched_at
         )
-        if needs_relogin:
+        if stale:
             # Last-good bars stay, but the reset clock is not live: ticking
             # countdown / wall-clock weekly roll would paint stale quota as
             # a fresh measurement (issue #4).
@@ -1559,7 +1636,12 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 "api_key": is_api_key,
                 "note": note,
                 "needs_relogin": needs_relogin,
-                "action_required": needs_relogin,
+                "needs_restore": needs_restore,
+                "needs_reconcile": needs_reconcile,
+                "stale": stale,
+                "action_required": (
+                    needs_relogin or needs_restore or missing_login or needs_reconcile
+                ),
                 "fetched_at": fetched_at,
                 "windows": windows,
                 "provider": provider,
@@ -1597,7 +1679,13 @@ def provider_cards(cards: list[dict], provider: str) -> list[dict]:
 def provider_tab_title(cards: list[dict], provider: str) -> str:
     """Provider tab copy that keeps hidden action-required accounts visible."""
     name = "ChatGPT" if provider == "chatgpt" else "Claude"
-    if any(card.get("action_required") for card in provider_cards(cards, provider)):
+    shown = provider_cards(cards, provider)
+    if any(
+        card.get("needs_restore") or card.get("needs_reconcile")
+        for card in shown
+    ):
+        return f"{name} · Fix login"
+    if any(card.get("action_required") for card in shown):
         return f"{name} · Sign in"
     return name
 

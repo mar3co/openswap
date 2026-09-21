@@ -159,6 +159,7 @@ class SnapshotMixin:
         # read failed with no fallback. Read by _static_usage_sentinel (main
         # thread writes it here before the fetch pool starts → no data race).
         self._record_active_verdict(None)
+        self._record_active_backup_fallback(False)
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -171,6 +172,29 @@ class SnapshotMixin:
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
+                # Claude Code can leave a syntactically present OAuth record
+                # with both tokens blank after an invalid_grant. For a real
+                # fetch pass, use this slot's saved credential so a wiped
+                # live store does not freeze the displayed statistics. The
+                # fetch worker may restore it only after an identity probe and
+                # locked drift checks. Store-only paints retain their
+                # no-backup-I/O guarantee.
+                may_load_active_backup = load_idle is True or (
+                    isinstance(load_idle, set) and str(num) in load_idle
+                )
+                if (
+                    may_load_active_backup
+                    and not active.degraded
+                    and active.value is not None
+                    and not looks_like_api_key(creds)
+                    and not oauth.extract_access_token(creds)
+                ):
+                    backup, backup_unreadable = self._read_account_credentials_ex(
+                        str(num), email
+                    )
+                    if not backup_unreadable and oauth.extract_access_token(backup):
+                        creds = backup
+                        self._record_active_backup_fallback(True)
             elif load_idle is True or (
                 isinstance(load_idle, set) and str(num) in load_idle
             ):
@@ -933,6 +957,20 @@ class SnapshotMixin:
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
         if is_active:
+            if self._active_backup_fallback():
+                repair = self._auto_restore_missing_active_credential(
+                    str(num), email, org_uuid, creds
+                )
+                if repair == "foreign":
+                    return FetchRecord(sentinel=USAGE_FOREIGN_CREDENTIAL)
+                outcome = oauth.try_fetch_usage_for_account(
+                    str(num), email, creds, is_active=True,
+                )
+                return FetchRecord(
+                    usage=outcome.usage,
+                    error=outcome.error,
+                    retry_after_s=outcome.retry_after_s,
+                )
             return self._fetch_active_usage(str(num), email, creds, org_uuid)
 
         from openswap.session import (
@@ -1012,6 +1050,80 @@ class SnapshotMixin:
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
         )
+
+    def _auto_restore_missing_active_credential(
+        self, account_num: str, email: str, org_uuid: str, backup: str
+    ) -> str:
+        """Restore a verified saved credential into an empty live store.
+
+        Returns ``"restored"``, ``"deferred"``, or ``"foreign"``. Identity
+        verification happens before the locks (network is forbidden while
+        held), then the live identity, credential, and backup generation are
+        all re-read under the same lock order as a normal switch. Any drift
+        defers to a later pass instead of overwriting it.
+        """
+        token = oauth.extract_access_token(backup)
+        fingerprint = oauth.credential_fingerprint(backup) or ""
+        if not token or not fingerprint:
+            return "deferred"
+
+        key = self._lineage_key(account_num, email, fingerprint)
+        verdict = self._probe_verdicts.get(key)
+        if verdict is None:
+            resolved = oauth.fetch_oauth_profile(token)
+            if not resolved:
+                return "deferred"
+            verdict = self._resolved_matches_slot_identity(account_num, resolved)
+            if verdict is not None:
+                self._probe_verdicts[key] = verdict
+        if verdict is False:
+            self._logger.warning(
+                "Saved credential for account %s belongs to another account; "
+                "automatic live-login repair refused.", account_num,
+            )
+            return "foreign"
+        if verdict is not True:
+            return "deferred"
+
+        try:
+            with (
+                FileLock(self.lock_file),
+                claude_credentials_lock(),
+                claude_config_lock(),
+            ):
+                if not self._live_identity_matches(email, org_uuid):
+                    return "deferred"
+                live = self._read_credentials()
+                if live is None:
+                    return "deferred"
+                if looks_like_api_key(live) or oauth.extract_access_token(live):
+                    return "deferred"
+                current_backup, unreadable = self._read_account_credentials_ex(
+                    account_num, email
+                )
+                if unreadable or (
+                    oauth.credential_fingerprint(current_backup) != fingerprint
+                ):
+                    return "deferred"
+                self._write_credentials(
+                    self._prepare_credentials_for_activation(current_backup, live)
+                )
+        except LockError:
+            return "deferred"
+        except Exception:
+            self._logger.warning(
+                "Automatic live-login repair for account %s failed; leaving "
+                "the saved credential untouched for manual recovery.",
+                account_num, exc_info=True,
+            )
+            return "deferred"
+
+        self._mark_active_backup_repaired()
+        self._logger.info(
+            "Restored account %s's verified saved credential into the empty "
+            "live Claude store.", account_num,
+        )
+        return "restored"
 
     def _run_usage_fetches(
         self, infos: list[tuple[int, str, str, str, bool, str, str]]
@@ -1160,6 +1272,17 @@ class SnapshotMixin:
                     entries[num], num, _i[1], _i[5], _i[4]
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
+
+        # A pass using the saved credential must not make the live Claude
+        # login look healthy. On success the store now has a current last-good
+        # measurement; on failure it keeps the older one. In either case the
+        # UI can offer a precise one-click restoration. A stronger sentinel
+        # produced by this pass (for example re-login-required) wins.
+        if self._active_backup_fallback() and not self._active_backup_repaired():
+            for num, info in info_by_num.items():
+                if info[4]:
+                    sentinels.setdefault(num, USAGE_LIVE_CREDENTIAL_MISSING)
+                    break
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
