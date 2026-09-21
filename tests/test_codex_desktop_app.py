@@ -137,6 +137,30 @@ def test_signature_verification_is_strict_and_cached(tmp_path, monkeypatch):
     assert len(calls) == 4
 
 
+def test_invalidate_cache_rechecks_signature_after_secondary_bundle_change(tmp_path, monkeypatch):
+    monkeypatch.setattr("openswap.codex.desktop_app.sys.platform", "darwin")
+    monkeypatch.setattr("openswap.codex.desktop_app.Path.home", lambda: tmp_path)
+    app = DesktopApp(_app(tmp_path))
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        stderr = "Identifier=com.openai.codex\nTeamIdentifier=2DC432GLL2\n" if "-d" in argv else ""
+        return subprocess.CompletedProcess(argv, 0, "", stderr)
+
+    monkeypatch.setattr("openswap.codex.desktop_app.subprocess.run", fake_run)
+    app.preflight(_home())
+    assert len(calls) == 2
+    helper = app.app_path / "Contents/MacOS" / "ChatGPT Helper"
+    helper.write_text("other-signed-resource")
+    helper.chmod(0o700)
+    app.preflight(_home())
+    assert len(calls) == 2
+    app.invalidate_validation_cache()
+    app.preflight(_home())
+    assert len(calls) == 4
+
+
 def test_signature_rejects_wrong_team(tmp_path, monkeypatch):
     monkeypatch.setattr("openswap.codex.desktop_app.sys.platform", "darwin")
     monkeypatch.setattr("openswap.codex.desktop_app.Path.home", lambda: tmp_path)
@@ -147,6 +171,26 @@ def test_signature_rejects_wrong_team(tmp_path, monkeypatch):
     monkeypatch.setattr("openswap.codex.desktop_app.subprocess.run", fake_run)
     with pytest.raises(DesktopAppError, match="expected publisher"):
         app.preflight(_home())
+
+
+def test_signature_timeout_is_retryable_but_rejection_is_terminal(tmp_path, monkeypatch):
+    app = DesktopApp(_app(tmp_path))
+
+    def timeout_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr("openswap.codex.desktop_app.subprocess.run", timeout_run)
+    with pytest.raises(DesktopAppError) as timeout:
+        app._verify_signature()
+    assert timeout.value.reason == "signature_check_failed"
+
+    def reject_run(argv, **_kwargs):
+        raise subprocess.CalledProcessError(1, argv)
+
+    monkeypatch.setattr("openswap.codex.desktop_app.subprocess.run", reject_run)
+    with pytest.raises(DesktopAppError) as rejected:
+        app._verify_signature()
+    assert rejected.value.reason == "signature_unverified"
 
 
 def test_is_running_matches_exact_executable_not_name(desktop, monkeypatch):
@@ -253,3 +297,106 @@ def test_process_scan_uses_fixed_ps_argv(monkeypatch):
     assert seen["calls"][0][0] == ["/bin/ps", "-ww", "-axo", "pid=,ppid=,comm="]
     assert seen["calls"][1][0] == ["/bin/ps", "-ww", "-axo", "pid=,args="]
     assert all(call[1]["timeout"] == 3.0 for call in seen["calls"])
+
+
+def test_observe_capability_uses_reason_codes_not_exception_text(desktop, monkeypatch):
+    from openswap.codex.desktop_app import DesktopCapability
+
+    monkeypatch.setattr("openswap.codex.desktop_app.sys.platform", "linux")
+    cap = desktop.observe_capability(_home(), now=10.0)
+    assert cap == DesktopCapability(state="unsupported", reason="unsupported_platform")
+    assert "linux" not in cap.reason
+    assert "exception" not in cap.reason
+
+    monkeypatch.setattr("openswap.codex.desktop_app.sys.platform", "darwin")
+    missing = DesktopApp(Path("/no/such/ChatGPT.app"))
+    cap = missing.observe_capability(_home(), now=11.0)
+    assert cap.state == "missing"
+    assert cap.reason == "app_missing"
+    assert "/" not in cap.reason
+    assert "ChatGPT.app" not in repr(cap)
+
+    with desktop._plist_path.open("wb") as stream:
+        plistlib.dump({"CFBundleIdentifier": "evil.app", "CFBundleExecutable": "ChatGPT"}, stream)
+    cap = desktop.observe_capability(_home(), now=12.0)
+    assert cap.state == "invalid"
+    assert cap.reason == "wrong_bundle"
+    assert "evil.app" not in cap.reason
+
+
+def test_observe_capability_applies_transaction_policy(desktop, tmp_path, monkeypatch):
+    custom_home = tmp_path / "other-codex-home"
+    cap = desktop.observe_capability(custom_home, now=20.0)
+    assert cap.state == "invalid"
+    assert cap.reason == "custom_home"
+    assert cap.observed_at is None
+
+    monkeypatch.setenv("CODEX_CLI_PATH", "/custom/codex")
+    cap = desktop.observe_capability(_home(), now=21.0)
+    assert cap.state == "invalid"
+    assert cap.reason == "custom_backend"
+    assert cap.observed_at is None
+
+
+def test_observe_capability_classifies_by_reason_when_messages_collide(desktop, monkeypatch):
+    from openswap.codex.desktop_app import DesktopCapability
+
+    def boom(self):
+        raise DesktopAppError(
+            "The ChatGPT application bundle is missing or invalid.",
+            reason="app_invalid",
+        )
+
+    monkeypatch.setattr(DesktopApp, "_validate", boom)
+    cap = desktop.observe_capability(_home())
+    assert cap == DesktopCapability(state="invalid", reason="app_invalid")
+
+
+def test_transient_capability_failures_expire_for_retry(desktop, monkeypatch):
+    from openswap.codex.desktop_app import capability_is_fresh
+
+    for index, reason in enumerate((
+        "process_inspect_failed", "app_changed", "signature_check_failed",
+    )):
+        def fail_inspection(reason=reason):
+            raise DesktopAppError("Operational probe failure.", reason=reason)
+
+        monkeypatch.setattr(desktop, "is_running", fail_inspection)
+        observed_at = 100.0 + index
+        cap = desktop.observe_capability(_home(), now=observed_at)
+
+        assert cap.state == "invalid"
+        assert cap.reason == reason
+        assert cap.observed_at == observed_at
+        assert capability_is_fresh(cap, now=observed_at + 4.9) is True
+        assert capability_is_fresh(cap, now=observed_at + 5.0) is False
+
+
+def test_observe_capability_reports_fresh_stopped_and_running(desktop, monkeypatch):
+    monkeypatch.setattr(desktop, "is_running", lambda: False)
+    stopped = desktop.observe_capability(_home(), now=100.0)
+    assert stopped.state == "stopped"
+    assert stopped.reason == "stopped"
+    assert stopped.observed_at == 100.0
+
+    monkeypatch.setattr(desktop, "is_running", lambda: True)
+    running = desktop.observe_capability(_home(), now=101.5)
+    assert running.state == "running"
+    assert running.reason == "running"
+    assert running.observed_at == 101.5
+
+
+def test_observe_capability_timestamps_after_process_inspection(desktop, monkeypatch):
+    import openswap.codex.desktop_app as desktop_app_mod
+
+    ticks = iter([1.0, 9.0])
+    monkeypatch.setattr(desktop_app_mod.time, "monotonic", lambda: next(ticks))
+
+    def slow_running():
+        desktop_app_mod.time.monotonic()
+        return False
+
+    monkeypatch.setattr(desktop, "is_running", slow_running)
+    cap = desktop.observe_capability(_home())
+    assert cap.state == "stopped"
+    assert cap.observed_at == 9.0

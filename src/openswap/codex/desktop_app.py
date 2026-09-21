@@ -25,6 +25,63 @@ from openswap.exceptions import ClaudeSwitchError
 class DesktopAppError(ClaudeSwitchError):
     """The desktop app cannot be controlled without risking another client."""
 
+    def __init__(self, message: str, *, reason: str = "app_invalid"):
+        super().__init__(message)
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class DesktopCapability:
+    """Typed installation/process observation. Never carries paths or stderr."""
+
+    state: str
+    reason: str
+    observed_at: float | None = None
+
+
+_CAPABILITY_TTL_S = 5.0
+_PROCESS_STATES = frozenset({"running", "stopped"})
+_TERMINAL_STATES = frozenset({"unsupported", "missing", "invalid"})
+_RETRYABLE_REASONS = frozenset({
+    "app_changed",
+    "process_inspect_failed",
+    "probe_failed",
+    "signature_check_failed",
+})
+
+
+def capability_from_error(
+    exc: DesktopAppError, *, observed_at: float | None = None,
+) -> DesktopCapability:
+    """Map a structured desktop error to a UI-safe capability. Never reads ``str(exc)``."""
+    reason = exc.reason if isinstance(getattr(exc, "reason", None), str) and exc.reason else "app_invalid"
+    if reason == "unsupported_platform":
+        state = "unsupported"
+    elif reason == "app_missing":
+        state = "missing"
+    else:
+        state = "invalid"
+    return DesktopCapability(
+        state=state,
+        reason=reason,
+        observed_at=observed_at if reason in _RETRYABLE_REASONS else None,
+    )
+
+
+def capability_is_fresh(capability: DesktopCapability, *, now: float) -> bool:
+    """Process observations and retryable failures expire after five seconds."""
+    if capability.reason in _RETRYABLE_REASONS:
+        observed = capability.observed_at
+        return observed is not None and (now - observed) < _CAPABILITY_TTL_S
+    if capability.state in _TERMINAL_STATES:
+        return True
+    if capability.state not in _PROCESS_STATES:
+        return False
+    observed = capability.observed_at
+    if observed is None:
+        return False
+    return (now - observed) < _CAPABILITY_TTL_S
+
 
 _BUNDLE_ID = "com.openai.codex"
 _DEFAULT_APP = Path("/Applications/ChatGPT.app")
@@ -77,7 +134,10 @@ def _processes() -> list[_Process]:
             capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise DesktopAppError("Could not safely inspect running desktop processes.") from exc
+        raise DesktopAppError(
+            "Could not safely inspect running desktop processes.",
+            reason="process_inspect_failed",
+        ) from exc
 
     args_by_pid: dict[int, str] = {}
     for line in arguments.stdout.splitlines():
@@ -153,34 +213,61 @@ class DesktopApp:
 
     def _validate(self) -> tuple[dict, Path]:
         if sys.platform != "darwin":
-            raise DesktopAppError("ChatGPT desktop switching is only supported on macOS.")
+            raise DesktopAppError(
+                "ChatGPT desktop switching is only supported on macOS.",
+                reason="unsupported_platform",
+            )
         try:
             with self._plist_path.open("rb") as stream:
                 info = plistlib.load(stream)
+        except FileNotFoundError as exc:
+            raise DesktopAppError(
+                "The ChatGPT application bundle is missing or invalid.",
+                reason="app_missing",
+            ) from exc
         except (OSError, ValueError, ExpatError, plistlib.InvalidFileException) as exc:
-            raise DesktopAppError("The ChatGPT application bundle is missing or invalid.") from exc
+            raise DesktopAppError(
+                "The ChatGPT application bundle is missing or invalid.",
+                reason="app_invalid",
+            ) from exc
         if not isinstance(info, dict):
-            raise DesktopAppError("The ChatGPT application bundle is missing or invalid.")
+            raise DesktopAppError(
+                "The ChatGPT application bundle is missing or invalid.",
+                reason="app_invalid",
+            )
         if info.get("CFBundleIdentifier") != _BUNDLE_ID:
-            raise DesktopAppError("The selected application is not the supported ChatGPT app.")
+            raise DesktopAppError(
+                "The selected application is not the supported ChatGPT app.",
+                reason="wrong_bundle",
+            )
         if (
             info.get("CFBundleShortVersionString") != _SUPPORTED_VERSION
             or str(info.get("CFBundleVersion", "")) != _SUPPORTED_BUILD
         ):
             raise DesktopAppError(
-                "This ChatGPT desktop version has not been validated for account switching."
+                "This ChatGPT desktop version has not been validated for account switching.",
+                reason="unvalidated_version",
             )
         executable_name = info.get("CFBundleExecutable")
         if not isinstance(executable_name, str) or not executable_name or Path(executable_name).name != executable_name:
-            raise DesktopAppError("The ChatGPT application has an invalid executable declaration.")
+            raise DesktopAppError(
+                "The ChatGPT application has an invalid executable declaration.",
+                reason="invalid_executable",
+            )
         executable = self.app_path / "Contents/MacOS" / executable_name
         for path, label in ((executable, "desktop executable"), (self._bundled_cli, "bundled Codex CLI")):
             try:
                 mode = path.stat().st_mode
             except OSError as exc:
-                raise DesktopAppError(f"The ChatGPT {label} is missing.") from exc
+                raise DesktopAppError(
+                    f"The ChatGPT {label} is missing.",
+                    reason="helper_missing",
+                ) from exc
             if not stat.S_ISREG(mode) or not os.access(path, os.X_OK):
-                raise DesktopAppError(f"The ChatGPT {label} is not executable.")
+                raise DesktopAppError(
+                    f"The ChatGPT {label} is not executable.",
+                    reason="helper_not_executable",
+                )
         try:
             stats = [item.stat() for item in (self._plist_path, executable, self._bundled_cli)]
             stamp = tuple(
@@ -188,7 +275,10 @@ class DesktopApp:
                 for value in stats
             )
         except OSError as exc:
-            raise DesktopAppError("The ChatGPT application changed during validation.") from exc
+            raise DesktopAppError(
+                "The ChatGPT application changed during validation.",
+                reason="app_changed",
+            ) from exc
         if self._validation_cache is not None and self._validation_cache[0] == stamp:
             return self._validation_cache[1], self._validation_cache[2]
         self._verify_signature()
@@ -199,9 +289,15 @@ class DesktopApp:
                 for value in after_stats
             )
         except OSError as exc:
-            raise DesktopAppError("The ChatGPT application changed during validation.") from exc
+            raise DesktopAppError(
+                "The ChatGPT application changed during validation.",
+                reason="app_changed",
+            ) from exc
         if after_stamp != stamp:
-            raise DesktopAppError("The ChatGPT application changed during validation.")
+            raise DesktopAppError(
+                "The ChatGPT application changed during validation.",
+                reason="app_changed",
+            )
         self._validation_cache = (stamp, info, executable)
         return info, executable
 
@@ -215,8 +311,16 @@ class DesktopApp:
                 ["/usr/bin/codesign", "-d", "--verbose=4", str(self.app_path)],
                 check=True, capture_output=True, text=True, timeout=_CODESIGN_TIMEOUT,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise DesktopAppError("The ChatGPT application signature could not be verified.") from exc
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DesktopAppError(
+                "The ChatGPT application signature could not be verified.",
+                reason="signature_check_failed",
+            ) from exc
+        except subprocess.SubprocessError as exc:
+            raise DesktopAppError(
+                "The ChatGPT application signature could not be verified.",
+                reason="signature_unverified",
+            ) from exc
         output = f"{details.stdout}\n{details.stderr}"
         values = {}
         for line in output.splitlines():
@@ -224,14 +328,18 @@ class DesktopApp:
                 key, value = line.strip().split("=", 1)
                 values[key] = value
         if values.get("Identifier") != _BUNDLE_ID or values.get("TeamIdentifier") != _OPENAI_TEAM_ID:
-            raise DesktopAppError("The ChatGPT application is not signed by the expected publisher.")
+            raise DesktopAppError(
+                "The ChatGPT application is not signed by the expected publisher.",
+                reason="unexpected_publisher",
+            )
 
     def _reject_custom_backend(self) -> None:
         present = [name for name in _UNSUPPORTED_OVERRIDES if os.environ.get(name)]
         if present:
             raise DesktopAppError(
                 "A custom Codex backend configuration is active; desktop switching is unsupported "
-                f"while {', '.join(present)} is set."
+                f"while {', '.join(present)} is set.",
+                reason="custom_backend",
             )
 
     def preflight(self, home: Path) -> dict:
@@ -240,11 +348,12 @@ class DesktopApp:
         self._reject_custom_backend()
         home = Path(home)
         if not home.is_absolute():
-            raise DesktopAppError("The Codex home must be an absolute path.")
+            raise DesktopAppError("The Codex home must be an absolute path.", reason="custom_home")
         supported_home = Path.home() / ".codex"
         if home != supported_home:
             raise DesktopAppError(
-                "A custom Codex home is not yet supported for ChatGPT desktop switching."
+                "A custom Codex home is not yet supported for ChatGPT desktop switching.",
+                reason="custom_home",
             )
         return {
             "app_path": str(self.app_path),
@@ -279,6 +388,24 @@ class DesktopApp:
         _, executable = self._validate()
         _, app_pids, _ = self._snapshot(executable)
         return bool(app_pids)
+
+    def invalidate_validation_cache(self) -> None:
+        """Drop the signature cache so the next validate re-runs codesign."""
+        self._validation_cache = None
+
+    def observe_capability(
+        self, home: Path, *, now: float | None = None,
+    ) -> DesktopCapability:
+        """Classify transaction policy and process state without exposing internals."""
+        try:
+            self.preflight(home)
+            running = self.is_running()
+        except DesktopAppError as exc:
+            observed_at = time.monotonic() if now is None else now
+            return capability_from_error(exc, observed_at=observed_at)
+        observed_at = time.monotonic() if now is None else now
+        state = "running" if running else "stopped"
+        return DesktopCapability(state=state, reason=state, observed_at=observed_at)
 
     def assert_stopped(self) -> None:
         _, executable = self._validate()

@@ -53,9 +53,11 @@ def test_selected_provider_survives_close_and_settings():
     panel._show_settings()
     assert panel._page == "settings"
     assert panel._settings_section == "automation"
+    panel._on_chatgpt_view_active = Mock()
     panel._show_main()
     assert panel._page == "main"
     assert panel._selected_provider == "chatgpt"
+    panel._on_chatgpt_view_active.assert_called_once()
     panel.close()
     assert panel._selected_provider == "chatgpt"
 
@@ -72,6 +74,57 @@ def test_settings_sections_are_navigation_only():
     panel.reload.assert_called_once()
     for action in actions.values():
         action.assert_not_called()
+
+
+def test_chatgpt_tab_notifies_capability_probe_without_switching():
+    panel, actions = _panel()
+    panel._on_chatgpt_view_active = Mock()
+    panel._select_provider("chatgpt")
+    panel._on_chatgpt_view_active.assert_called_once()
+    actions["on_switch"].assert_not_called()
+
+
+def test_card_activation_paths_share_one_controller_entry():
+    source = Path(menubar.__file__).with_name("menubar_panel.py").read_text(encoding="utf-8")
+    assert "def _activate_card(self):" in source
+    assert "def accessibilityPerformPress(self):" in source
+    assert "def keyDown_(self, event):" in source
+    assert source.index("self._activate_card()") < source.index("def accessibilityPerformPress")
+    assert "accessibilityPerformPress" in source
+    assert "self.on_switch(self.card[\"num\"])" in source
+    build = source[source.index("def _build") : source.index("def _build_settings")]
+    assert "apply_chatgpt_activation" in build
+    assert "activation_disabled" in build
+
+
+def test_activate_card_noops_when_activation_is_disabled():
+    panel_path = Path(menubar.__file__).with_name("menubar_panel.py")
+    view_type = extract_class(
+        panel_path,
+        "_CardView",
+        {"_activate_card", "acceptsFirstResponder", "canBecomeKeyView"},
+        {},
+    )
+    view = view_type()
+    assert view.acceptsFirstResponder() is True
+    assert view.canBecomeKeyView() is True
+    view.on_switch = Mock()
+    view.card = {"num": "codex:1", "disabled": False, "activation_disabled": True}
+    view._activate_card()
+    view.on_switch.assert_not_called()
+    view.card["activation_disabled"] = False
+    view._activate_card()
+    view.on_switch.assert_called_once_with("codex:1")
+
+    view.on_switch.reset_mock()
+    view.card = menubar.apply_chatgpt_activation(
+        [{"num": "codex:1", "disabled": False}],
+        menubar.MenuBarSettings(chatgpt_switching_enabled=False),
+        menubar.DesktopCapability("stopped", "stopped", observed_at=1.0),
+        now=1.0,
+    )[0]
+    view._activate_card()
+    view.on_switch.assert_called_once_with("codex:1")
 
 
 def test_unknown_provider_does_not_change_view_or_reload():

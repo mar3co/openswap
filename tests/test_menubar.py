@@ -98,6 +98,7 @@ def test_settings_defaults_when_file_missing(tmp_path: Path):
     assert s.refresh_interval == 60
     assert s.auto_switch_enabled is False
     assert s.chatgpt_auto_enabled is False
+    assert s.chatgpt_switching_enabled is False
     assert s.kickoff_enabled is False
 
 
@@ -109,6 +110,7 @@ def test_settings_round_trip(tmp_path: Path):
         refresh_interval=300,
         auto_switch_enabled=True,
         chatgpt_auto_enabled=True,
+        chatgpt_switching_enabled=True,
         menu_bar_provider="both",
     )
     original.save(path)
@@ -279,9 +281,15 @@ def test_settings_page_sections_separate_display_from_provider_automation():
     assert automation_by_id["auto_switch_enabled"]["label"] == (
         "Auto-switch Claude accounts"
     )
+    assert automation_by_id["chatgpt_switching_enabled"]["label"] == (
+        "Enable ChatGPT switching"
+    )
     assert automation_by_id["chatgpt_auto_enabled"]["label"] == (
         "Suggest ChatGPT account switches"
     )
+    assert automation_by_id["chatgpt_auto_enabled"]["disabled"] is True
+    ids = [row["id"] for row in automation]
+    assert ids.index("chatgpt_switching_enabled") < ids.index("chatgpt_auto_enabled")
     assert automation_by_id["codex_enabled"]["label"] == (
         "Auto-switch Codex CLI accounts"
     )
@@ -385,9 +393,63 @@ def test_settings_page_hides_autoswitch_policy_when_disabled():
     assert "codex_enabled" not in ids_on
 
 
+def test_chatgpt_capability_freshness_and_activation_helpers():
+    from openswap.codex.desktop_app import DesktopCapability, capability_is_fresh
+
+    now = 20.0
+    checking = DesktopCapability(state="checking", reason="checking")
+    missing = DesktopCapability(state="missing", reason="app_missing")
+    stopped = DesktopCapability(state="stopped", reason="stopped", observed_at=16.0)
+    expired = DesktopCapability(state="running", reason="running", observed_at=14.9)
+    assert capability_is_fresh(checking, now=now) is False
+    assert capability_is_fresh(missing, now=now) is True
+    assert capability_is_fresh(stopped, now=now) is True
+    assert capability_is_fresh(expired, now=now) is False
+    settings_off = menubar.MenuBarSettings()
+    settings_on = menubar.MenuBarSettings(chatgpt_switching_enabled=True)
+    assert menubar.chatgpt_manual_activation_allowed(settings_off, stopped, now=now) is False
+    assert menubar.chatgpt_manual_activation_allowed(settings_on, expired, now=now) is False
+    assert menubar.chatgpt_manual_activation_allowed(settings_on, stopped, now=now) is True
+    cards = [{"num": "codex:1", "disabled": False, "title": "Work"}]
+    parent_off = menubar.apply_chatgpt_activation(cards, settings_off, stopped, now=now)
+    assert parent_off[0].get("activation_disabled") is not True
+    assert "activation_disabled" not in cards[0]
+    blocked = menubar.apply_chatgpt_activation(cards, settings_on, missing, now=now)
+    assert blocked[0]["activation_disabled"] is True
+    assert blocked[0]["disabled"] is False
+    allowed = menubar.apply_chatgpt_activation(cards, settings_on, stopped, now=now)
+    assert allowed[0].get("activation_disabled") is not True
+    title, _body = menubar.desktop_switch_confirm_copy("Work", process_state="stopped")
+    assert title == "Switch and open ChatGPT?"
+    assert menubar.desktop_switch_confirm_ok("stopped") == "Switch and open ChatGPT"
+    title, _body = menubar.desktop_switch_confirm_copy("Work", process_state="running")
+    assert title == "Restart ChatGPT?"
+    assert menubar.desktop_switch_confirm_ok("running") == "Restart ChatGPT"
+    copy = menubar.desktop_capability_status_copy(missing)
+    assert "ChatGPT" in copy
+    assert "/" not in copy
+
+
+def test_chatgpt_desktop_config_check_reuses_transaction_policy(tmp_path, monkeypatch):
+    from openswap.codex import desktop
+
+    seen = []
+    monkeypatch.setattr(desktop, "_config_check", lambda home: seen.append(home))
+    assert menubar.chatgpt_desktop_config_check(tmp_path) is True
+    assert seen == [tmp_path]
+
+    def reject(_home):
+        raise ClaudeSwitchError("secret policy detail")
+
+    monkeypatch.setattr(desktop, "_config_check", reject)
+    assert menubar.chatgpt_desktop_config_check(tmp_path) is False
+
+
 def test_chatgpt_auto_is_persisted_independently_and_exposes_policy():
     settings = menubar.MenuBarSettings(
-        auto_switch_enabled=False, chatgpt_auto_enabled=True
+        auto_switch_enabled=False,
+        chatgpt_switching_enabled=True,
+        chatgpt_auto_enabled=True,
     )
     rows = menubar.settings_page_rows(
         settings, strategy="best", threshold=90, has_codex=True,
@@ -396,9 +458,78 @@ def test_chatgpt_auto_is_persisted_independently_and_exposes_policy():
     ids = [row["id"] for row in rows]
     assert settings.auto_switch_enabled is False
     assert settings.chatgpt_auto_enabled is True
+    assert settings.chatgpt_switching_enabled is True
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["chatgpt_auto_enabled"]["disabled"] is False
     assert "threshold" in ids
     assert "strategy" in ids
     assert "codex_enabled" not in ids
+
+
+def test_chatgpt_switching_parent_defaults_off_and_disables_suggestions_toggle():
+    settings = menubar.MenuBarSettings()
+    rows = menubar.settings_page_rows(
+        settings, strategy="best", threshold=90, has_codex=True,
+    )
+    ids = [row["id"] for row in rows]
+    by_id = {row["id"]: row for row in rows}
+    assert settings.chatgpt_switching_enabled is False
+    assert "chatgpt_switching_enabled" in ids
+    assert ids.index("chatgpt_switching_enabled") < ids.index("chatgpt_auto_enabled")
+    assert by_id["chatgpt_switching_enabled"]["value"] is False
+    assert by_id["chatgpt_auto_enabled"]["disabled"] is True
+    assert by_id["chatgpt_auto_enabled"]["value"] is False
+
+
+def test_legacy_chatgpt_auto_file_migrates_parent_switching_on(tmp_path: Path):
+    path = tmp_path / "menubar_settings.json"
+    path.write_text(json.dumps({"chatgpt_auto_enabled": True}), encoding="utf-8")
+    loaded = menubar.MenuBarSettings.load(path)
+    assert loaded.chatgpt_auto_enabled is True
+    assert loaded.chatgpt_switching_enabled is True
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert "chatgpt_switching_enabled" not in raw
+    loaded.save(path)
+    assert json.loads(path.read_text(encoding="utf-8"))["chatgpt_switching_enabled"] is True
+
+
+def test_present_chatgpt_switching_false_wins_over_legacy_auto(tmp_path: Path):
+    path = tmp_path / "menubar_settings.json"
+    path.write_text(
+        json.dumps({
+            "chatgpt_auto_enabled": True,
+            "chatgpt_switching_enabled": False,
+        }),
+        encoding="utf-8",
+    )
+    loaded = menubar.MenuBarSettings.load(path)
+    assert loaded.chatgpt_auto_enabled is True
+    assert loaded.chatgpt_switching_enabled is False
+
+
+def test_parent_off_does_not_block_codex_rotation_on_stored_child():
+    settings = menubar.MenuBarSettings(
+        auto_switch_enabled=True,
+        chatgpt_switching_enabled=False,
+        chatgpt_auto_enabled=True,
+    )
+    assert menubar.chatgpt_suggestions_effective(settings) is False
+    rows = menubar.settings_page_rows(
+        settings, strategy="best", threshold=90, has_codex=True, codex_enabled=False,
+    )
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["chatgpt_auto_enabled"]["disabled"] is True
+    assert by_id["codex_enabled"]["disabled"] is False
+    on = menubar.MenuBarSettings(
+        auto_switch_enabled=True,
+        chatgpt_switching_enabled=True,
+        chatgpt_auto_enabled=True,
+    )
+    assert menubar.chatgpt_suggestions_effective(on) is True
+    on_rows = menubar.settings_page_rows(
+        on, strategy="best", threshold=90, has_codex=True, codex_enabled=False,
+    )
+    assert {row["id"]: row for row in on_rows}["codex_enabled"]["disabled"] is True
 
 
 def test_settings_page_shows_codex_enabled_when_auto_on_and_has_codex():
@@ -466,6 +597,7 @@ def test_ensure_codex_engine_honors_codex_enabled():
     src = inspect.getsource(menubar.run)
     body = src[src.index("def _ensure_codex_engine") : src.index("def _start_engine")]
     assert "codex_enabled" in body
+    assert "chatgpt_suggestions_effective" in body
     assert "load_settings" in body
 
 

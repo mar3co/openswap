@@ -15,10 +15,12 @@ METHODS = {
     "_stop_chatgpt_auto_monitor",
     "_run_chatgpt_auto_engine",
     "_reconcile_chatgpt_auto_mode",
+    "_restart_chatgpt_auto_monitor",
     "_on_chatgpt_auto_event",
     "_validate_pending_chatgpt_switch",
     "_review_chatgpt_switch",
     "on_toggle_chatgpt_auto",
+    "on_toggle_chatgpt_switching",
 }
 
 
@@ -37,7 +39,9 @@ def _app(monkeypatch, tmp_path):
         "time": time,
     }
     app = extract_class(menubar.__file__, "MenuBarApp", METHODS, scope)()
-    app.settings = menubar.MenuBarSettings(chatgpt_auto_enabled=True)
+    app.settings = menubar.MenuBarSettings(
+        chatgpt_switching_enabled=True, chatgpt_auto_enabled=True,
+    )
     app.switcher = Mock(backup_dir=tmp_path, _logger=Mock())
     app.codex = Mock(state_dir=tmp_path)
     app.codex.slot_identity.side_effect = lambda n: {
@@ -61,6 +65,7 @@ def _app(monkeypatch, tmp_path):
     app._codex_enabled = Mock(return_value=False)
     app._run_engine = Mock()
     app._stop_codex_engine = Mock()
+    app._ensure_codex_engine = Mock()
     app._guard = lambda fn: (fn(), True)[1]
     app._alert = Mock(return_value=1)
     app._show_error = Mock()
@@ -214,6 +219,75 @@ def test_review_only_calls_existing_confirmed_desktop_path(monkeypatch, tmp_path
     app.codex.switch_to.assert_not_called()
 
 
+def test_suggestions_do_not_start_when_parent_switching_is_off(monkeypatch, tmp_path):
+    app = _app(monkeypatch, tmp_path)
+    app.settings.chatgpt_switching_enabled = False
+    app.settings.chatgpt_auto_enabled = True
+    app._start_chatgpt_auto_monitor()
+    app._engine_type.assert_not_called()
+    assert app._chatgpt_auto_engine is None
+
+
+def test_parent_off_stops_monitor_invalidates_and_clears_pending(monkeypatch, tmp_path):
+    app = _app(monkeypatch, tmp_path)
+    engine = Mock()
+    app._chatgpt_auto_engine = engine
+    app._chatgpt_auto_generation = 4
+    app._pending_chatgpt_switch = ("pending",)
+    app._hold_reload_pending = False
+
+    app.on_toggle_chatgpt_switching(None)
+
+    assert app.settings.chatgpt_switching_enabled is False
+    assert app.settings.chatgpt_auto_enabled is True
+    assert app._chatgpt_auto_engine is None
+    assert app._pending_chatgpt_switch is None
+    assert app._chatgpt_auto_generation == 5
+    engine.stop.assert_called_once()
+    app._ensure_codex_engine.assert_called_once()
+    app.rebuild_menu.assert_called()
+    app._reload_main_panel_if_shown.assert_called()
+    stale = Mock()
+    app._chatgpt_auto_engine = stale
+    app._on_chatgpt_auto_event(_switch_event(), engine, 4)
+    assert app._pending_chatgpt_switch is None
+
+
+def test_failed_parent_save_restores_prior_and_leaves_monitor(monkeypatch, tmp_path):
+    app = _app(monkeypatch, tmp_path)
+    engine = Mock()
+    app._chatgpt_auto_engine = engine
+    app._chatgpt_auto_generation = 2
+    app._pending_chatgpt_switch = ("pending",)
+    app.settings.save = Mock(side_effect=OSError("/secret/path"))
+
+    app.on_toggle_chatgpt_switching(None)
+
+    assert app.settings.chatgpt_switching_enabled is True
+    assert app._chatgpt_auto_engine is engine
+    assert app._pending_chatgpt_switch == ("pending",)
+    assert app._chatgpt_auto_generation == 2
+    engine.stop.assert_not_called()
+    app.rebuild_menu.assert_not_called()
+    message = app._show_error.call_args.args[0]
+    assert "save" in message.lower()
+    assert "/secret/path" not in message
+
+
+def test_child_toggle_refused_while_parent_off(monkeypatch, tmp_path):
+    app = _app(monkeypatch, tmp_path)
+    app.settings.chatgpt_switching_enabled = False
+    app.settings.chatgpt_auto_enabled = False
+    app._start_chatgpt_auto_monitor = Mock()
+
+    app.on_toggle_chatgpt_auto(None)
+
+    assert app.settings.chatgpt_auto_enabled is False
+    app._alert.assert_not_called()
+    app._start_chatgpt_auto_monitor.assert_not_called()
+    app._show_error.assert_called_once()
+
+
 def test_cancelled_enable_changes_nothing(monkeypatch, tmp_path):
     app = _app(monkeypatch, tmp_path)
     app.settings.chatgpt_auto_enabled = False
@@ -225,6 +299,42 @@ def test_cancelled_enable_changes_nothing(monkeypatch, tmp_path):
     assert app.settings.chatgpt_auto_enabled is False
     app._set_setting.assert_not_called()
     app._stop_codex_engine.assert_not_called()
+
+
+def test_failed_child_save_does_not_disable_codex_rotation(monkeypatch, tmp_path):
+    app = _app(monkeypatch, tmp_path)
+    app.settings.chatgpt_auto_enabled = False
+    app._codex_enabled.return_value = True
+    app.settings.save = Mock(side_effect=OSError("/secret/path"))
+
+    app.on_toggle_chatgpt_auto(None)
+
+    assert app.settings.chatgpt_auto_enabled is False
+    app._set_setting.assert_not_called()
+    app._stop_codex_engine.assert_not_called()
+    message = app._show_error.call_args.args[0]
+    assert "save" in message.lower()
+    assert "/secret/path" not in message
+
+
+def test_failed_codex_pause_rolls_back_suggestions(monkeypatch, tmp_path):
+    app = _app(monkeypatch, tmp_path)
+    app.settings.chatgpt_auto_enabled = False
+    app._codex_enabled.return_value = True
+    app._guard = Mock(return_value=False)
+    app._start_chatgpt_auto_monitor = Mock()
+
+    app.on_toggle_chatgpt_auto(None)
+
+    assert app.settings.chatgpt_auto_enabled is False
+    assert menubar.MenuBarSettings.load(
+        tmp_path / "menubar_settings.json"
+    ).chatgpt_auto_enabled is False
+    app._stop_codex_engine.assert_not_called()
+    app._start_chatgpt_auto_monitor.assert_not_called()
+    app._ensure_codex_engine.assert_called_once()
+    app.rebuild_menu.assert_called_once()
+    app._reload_main_panel_if_shown.assert_called_once()
 
 
 def test_enable_disables_only_legacy_codex_rotation(monkeypatch, tmp_path):
@@ -256,6 +366,7 @@ def test_turning_off_stops_monitor_and_clears_pending(monkeypatch, tmp_path):
     assert app.settings.chatgpt_auto_enabled is False
     assert app._pending_chatgpt_switch is None
     engine.stop.assert_called_once()
+    app._ensure_codex_engine.assert_called_once()
 
 
 def test_external_live_rotation_conflict_holds_monitor(monkeypatch, tmp_path):

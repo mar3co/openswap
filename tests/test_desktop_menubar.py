@@ -2,6 +2,7 @@
 
 import threading
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,6 +10,7 @@ import pytest
 
 from openswap import menubar
 from openswap.codex import CODEX_NUM_PREFIX
+from openswap.codex.desktop_app import DesktopCapability
 from openswap.exceptions import ClaudeSwitchError
 from openswap.json_output import USAGE_API_KEY
 from tests.menubar_harness import extract_class
@@ -64,22 +66,42 @@ def test_desktop_consent_explains_persistent_pause_only_when_needed():
 
 
 @pytest.fixture
-def app(monkeypatch):
-    wanted = {"_make_desktop_switch", "_desktop_worker", "_drain_desktop_result", "_pause_codex_for_desktop", "_on_panel_account_click", "_notify"}
+def app(monkeypatch, tmp_path):
+    wanted = {
+        "_make_desktop_switch", "_desktop_worker", "_drain_desktop_result",
+        "_pause_codex_for_desktop", "_on_panel_account_click", "_notify",
+        "_chatgpt_switching_persisted", "_offer_enable_chatgpt_switching",
+        "_request_chatgpt_capability", "_chatgpt_capability_worker",
+        "_on_chatgpt_view_active", "_begin_desktop_transaction",
+        "_chatgpt_desktop_status", "_reload_main_panel_if_shown",
+    }
     thread = Mock()
     record = Mock()
     setting = Mock(return_value=None)
+    config_check = Mock(return_value=True)
     notification = Mock()
+    settings_path = tmp_path / "menubar_settings.json"
     namespace = {
         "desktop_switch_confirm_copy": menubar.desktop_switch_confirm_copy,
+        "desktop_switch_confirm_ok": menubar.desktop_switch_confirm_ok,
         "desktop_switch_choices": menubar.desktop_switch_choices,
+        "desktop_capability_status_copy": menubar.desktop_capability_status_copy,
+        "chatgpt_manual_activation_allowed": menubar.chatgpt_manual_activation_allowed,
+        "chatgpt_desktop_config_check": config_check,
         "notification_copy_for_desktop_switch": menubar.notification_copy_for_desktop_switch,
         "NotificationCopy": menubar.NotificationCopy,
+        "MenuBarSettings": menubar.MenuBarSettings,
+        "DesktopCapability": DesktopCapability,
+        "capability_is_fresh": menubar.capability_is_fresh,
         "ClaudeSwitchError": ClaudeSwitchError,
         "threading": Mock(Thread=thread),
+        "time": time,
         "rumps": SimpleNamespace(notification=notification),
         "record_manual_switch": record,
         "set_setting": setting,
+        "settings_path": settings_path,
+        "SETTINGS_SECTION_AUTOMATION": "automation",
+        "MAIN_PAGE": "main",
     }
     instance = extract_class(menubar.__file__, "MenuBarApp", wanted, namespace)()
     instance.codex = Mock()
@@ -96,6 +118,19 @@ def app(monkeypatch):
     instance._kickoff_running = False
     instance._event_lock = threading.Lock()
     instance._panel = Mock()
+    instance.settings = menubar.MenuBarSettings(chatgpt_switching_enabled=True)
+    instance.settings.save(settings_path)
+    instance._chatgpt_capability = DesktopCapability(
+        "running", "running", observed_at=time.monotonic(),
+    )
+    instance._chatgpt_capability_generation = 1
+    instance._chatgpt_probe_inflight = False
+    instance._desktop_consent_generation = None
+    instance._chatgpt_monitor_notice = ""
+    instance._pending_chatgpt_switch = None
+    instance._desktop_app = Mock(name="shared_desktop_app")
+    instance._desktop_app_lock = threading.Lock()
+    instance._hold_reload_pending = False
     for name in ("_show_error", "_stop_codex_engine", "_stop_chatgpt_auto_monitor",
                  "_start_chatgpt_auto_monitor", "rebuild_menu", "refresh_async"):
         setattr(instance, name, Mock())
@@ -104,7 +139,9 @@ def app(monkeypatch):
     instance._test_thread = thread
     instance._test_record = record
     instance._test_setting = setting
+    instance._test_config_check = config_check
     instance._test_notification = notification
+    instance._test_settings_path = settings_path
     return instance
 
 
@@ -189,7 +226,9 @@ def test_claude_card_keeps_normal_switch_action(app):
 
 def test_confirmed_switch_starts_background_worker_not_normal_switch(app):
     app._make_desktop_switch("2", "Work")(None)
-    app._test_thread.assert_called_once_with(target=app._desktop_worker, args=("2",), daemon=True)
+    app._test_thread.assert_called_once_with(
+        target=app._desktop_worker, args=("2", 1, "running"), daemon=True,
+    )
     app._test_thread.return_value.start.assert_called_once()
     app._stop_codex_engine.assert_called_once()
     app.codex.switch_to.assert_not_called()
@@ -333,3 +372,244 @@ def test_real_run_wires_submenu_and_completion_timer(tmp_path, monkeypatch):
     live_app.on_sync_tick(None)
     live_app._show_error.assert_called_once_with("synthetic failure")
     assert not live_app._desktop_switching
+
+
+def test_parent_off_keeps_accounts_and_rejects_every_activation_path(app):
+    app.settings.chatgpt_switching_enabled = False
+    app.settings.save(app._test_settings_path)
+    app._on_panel_account_click(f"{CODEX_NUM_PREFIX}2")
+    app._test_thread.assert_not_called()
+    assert app._alert.call_args.kwargs["ok"] == "Enable in Settings"
+    app._panel._show_settings.assert_called()
+    app._make_desktop_switch("2", "Work")(None)
+    app._test_thread.assert_not_called()
+    app.codex.switch_to.assert_not_called()
+
+
+def test_stale_running_observation_does_not_open_consent(app):
+    app._chatgpt_capability = DesktopCapability(
+        "running", "running", observed_at=time.monotonic() - 6,
+    )
+    app._make_desktop_switch("2", "Work")(None)
+    app._alert.assert_not_called()
+    assert app._test_thread.call_args.kwargs["target"] == app._chatgpt_capability_worker
+    app._show_error.assert_called()
+    assert app._show_error.call_args.args[0] == "Checking ChatGPT…"
+
+
+def test_consent_past_process_ttl_is_reobserved_by_worker(app, monkeypatch):
+    from openswap.codex import desktop
+
+    backend = Mock()
+    backend.switch.return_value = {"status": "awaiting_verification"}
+    monkeypatch.setattr(desktop, "DesktopSwitcher", Mock(return_value=backend))
+    app._chatgpt_capability = DesktopCapability(
+        "running", "running", observed_at=100.0,
+    )
+    clock = {"t": 100.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+    def consent(**kwargs):
+        clock["t"] = 107.0
+        return 1
+
+    app._alert.side_effect = consent
+    app._make_desktop_switch("2", "Work")(None)
+    app._test_thread.assert_called_once_with(
+        target=app._desktop_worker, args=("2", 1, "running"), daemon=True,
+    )
+    app._desktop_app.observe_capability.return_value = DesktopCapability(
+        "running", "running", observed_at=clock["t"],
+    )
+    app._desktop_worker("2", 1, "running")
+    app._desktop_app.observe_capability.assert_called_once_with(app.codex.home)
+    backend.switch.assert_called_once_with(
+        "2", confirm_restart=True, confirm_idle=True,
+    )
+
+
+def test_worker_refuses_process_state_changed_while_consent_was_open(app, monkeypatch):
+    from openswap.codex import desktop
+
+    backend = Mock()
+    monkeypatch.setattr(desktop, "DesktopSwitcher", Mock(return_value=backend))
+    app._desktop_app.observe_capability.return_value = DesktopCapability(
+        "stopped", "stopped", observed_at=time.monotonic(),
+    )
+
+    app._desktop_worker("2", app._chatgpt_capability_generation, "running")
+    app._drain_desktop_result()
+
+    backend.switch.assert_not_called()
+    app._show_error.assert_called_once_with("ChatGPT status changed. Try again.")
+
+
+def test_chatgpt_reload_probes_when_running_observation_is_stale(app):
+    app._chatgpt_capability = DesktopCapability(
+        "running", "running", observed_at=time.monotonic() - 6,
+    )
+    app._panel = Mock()
+    app._panel.is_shown.return_value = True
+    app._panel._page = "main"
+    app._panel._selected_provider = "chatgpt"
+    app._reload_main_panel_if_shown()
+    app._panel.reload.assert_called_once()
+    assert app._test_thread.call_args.kwargs["target"] == app._chatgpt_capability_worker
+    assert app._chatgpt_capability.state == "checking"
+
+
+def test_post_switch_reminder_shown_until_next_probe_completes(app, monkeypatch):
+    from openswap.codex import desktop
+    backend = Mock()
+    backend.switch.return_value = {"status": "awaiting_verification"}
+    monkeypatch.setattr(desktop, "DesktopSwitcher", Mock(return_value=backend))
+    app._desktop_worker("2")
+    app._desktop_switching = True
+    app._drain_desktop_result()
+    assert app._chatgpt_desktop_status() == "ChatGPT reopened · Check the profile"
+    gen = app._chatgpt_capability_generation
+    app._desktop_app.observe_capability.return_value = DesktopCapability(
+        "running", "running", observed_at=time.monotonic(),
+    )
+    app._chatgpt_capability_worker(gen)
+    assert app._chatgpt_desktop_status() != "ChatGPT reopened · Check the profile"
+
+
+def test_transaction_clears_probe_inflight_so_stale_worker_cannot_pin_it(app):
+    app._chatgpt_probe_inflight = True
+    app._chatgpt_capability_generation = 3
+    app._begin_desktop_transaction()
+    assert app._chatgpt_probe_inflight is False
+    app._chatgpt_capability_worker(3)
+    assert app._chatgpt_probe_inflight is False
+
+
+def test_stopped_observation_uses_open_copy_and_running_uses_restart(app):
+    app._chatgpt_capability = DesktopCapability(
+        "stopped", "stopped", observed_at=time.monotonic(),
+    )
+    app._make_desktop_switch("2", "Work")(None)
+    assert app._alert.call_args.kwargs["title"] == "Switch and open ChatGPT?"
+    assert app._alert.call_args.kwargs["ok"] == "Switch and open ChatGPT"
+    app._desktop_switching = False
+    app._chatgpt_capability = DesktopCapability(
+        "running", "running", observed_at=time.monotonic(),
+    )
+    app._make_desktop_switch("2", "Work")(None)
+    assert app._alert.call_args.kwargs["title"] == "Restart ChatGPT?"
+    assert app._alert.call_args.kwargs["ok"] == "Restart ChatGPT"
+
+
+def test_preference_and_generation_rechecked_after_consent(app):
+    generation = app._chatgpt_capability_generation
+
+    def consent(**kwargs):
+        app.settings.chatgpt_switching_enabled = False
+        app.settings.save(app._test_settings_path)
+        app._chatgpt_capability_generation = generation + 1
+        return 1
+
+    app._alert.side_effect = consent
+    app._make_desktop_switch("2", "Work")(None)
+    app._test_thread.assert_not_called()
+
+
+def test_worker_rechecks_persisted_preference_and_generation(app, monkeypatch):
+    from openswap.codex import desktop
+    backend = Mock()
+    monkeypatch.setattr(desktop, "DesktopSwitcher", Mock(return_value=backend))
+    app.settings.chatgpt_switching_enabled = False
+    app.settings.save(app._test_settings_path)
+    app._desktop_worker("2", 1)
+    backend.switch.assert_not_called()
+    app._drain_desktop_result()
+    app._show_error.assert_called()
+    assert "off" in app._show_error.call_args.args[0].lower()
+
+
+def test_worker_passes_shared_desktop_app_under_lock(app, monkeypatch):
+    from openswap.codex import desktop
+    backend = Mock()
+    backend.switch.return_value = {"status": "awaiting_verification"}
+    constructor = Mock(return_value=backend)
+    monkeypatch.setattr(desktop, "DesktopSwitcher", constructor)
+    app._desktop_worker("2", app._chatgpt_capability_generation)
+    constructor.assert_called_once_with(app.codex, app=app._desktop_app)
+    backend.switch.assert_called_once_with("2", confirm_restart=True, confirm_idle=True)
+    app._desktop_app.invalidate_validation_cache.assert_called_once()
+
+
+def test_request_chatgpt_capability_coalesces_while_probe_inflight(app):
+    app._chatgpt_probe_inflight = True
+    app._chatgpt_capability_generation = 4
+    app._request_chatgpt_capability()
+    app._test_thread.assert_not_called()
+    assert app._chatgpt_capability_generation == 4
+
+
+def test_stale_activation_does_not_queue_another_probe_while_inflight(app):
+    app._chatgpt_probe_inflight = True
+    app._chatgpt_capability = DesktopCapability(
+        "running", "running", observed_at=time.monotonic() - 6,
+    )
+    app._chatgpt_capability_generation = 2
+    app._make_desktop_switch("2", "Work")(None)
+    app._test_thread.assert_not_called()
+    assert app._chatgpt_capability_generation == 2
+    app._show_error.assert_called()
+
+
+def test_transient_probe_failure_retries_after_ttl_without_restart(app):
+    app._chatgpt_capability = DesktopCapability(
+        "invalid", "process_inspect_failed", observed_at=time.monotonic() - 6,
+    )
+
+    app._on_chatgpt_view_active()
+
+    assert app._test_thread.call_args.kwargs["target"] == app._chatgpt_capability_worker
+    assert app._chatgpt_capability.state == "checking"
+
+
+def test_parent_off_does_not_probe_chatgpt_capability(app):
+    app.settings.chatgpt_switching_enabled = False
+
+    app._on_chatgpt_view_active()
+
+    app._test_thread.assert_not_called()
+
+
+def test_capability_probe_rejects_unsupported_global_config(app):
+    app._test_config_check.return_value = False
+
+    app._chatgpt_capability_worker(app._chatgpt_capability_generation)
+
+    assert app._chatgpt_capability == DesktopCapability(
+        "invalid", "unsupported_config",
+    )
+    app._desktop_app.observe_capability.assert_not_called()
+
+
+def test_stale_capability_worker_cannot_update_current_ui(app):
+    app._chatgpt_capability = DesktopCapability("checking", "checking")
+    app._chatgpt_capability_generation = 9
+    app._desktop_app.observe_capability.return_value = DesktopCapability(
+        "running", "running", observed_at=50.0,
+    )
+    app._chatgpt_capability_worker(8)
+    assert app._chatgpt_capability.state == "checking"
+    app._chatgpt_capability_worker(9)
+    assert app._chatgpt_capability.state == "running"
+    assert app._test_config_check.call_args.args == (app.codex.home,)
+    assert app._desktop_app.observe_capability.call_args.args == (app.codex.home,)
+
+
+def test_transaction_invalidates_capability_probes(app):
+    app._chatgpt_capability_generation = 3
+    app._begin_desktop_transaction()
+    assert app._desktop_switching is True
+    assert app._chatgpt_capability_generation == 4
+    app._desktop_app.observe_capability.return_value = DesktopCapability(
+        "running", "running", observed_at=1.0,
+    )
+    app._chatgpt_capability_worker(3)
+    assert app._chatgpt_capability.state != "running" or app._desktop_switching
