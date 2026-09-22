@@ -132,7 +132,7 @@ def app(monkeypatch, tmp_path):
     instance._desktop_app_lock = threading.Lock()
     instance._hold_reload_pending = False
     for name in ("_show_error", "_stop_codex_engine", "_stop_chatgpt_auto_monitor",
-                 "_start_chatgpt_auto_monitor", "rebuild_menu", "refresh_async"):
+                 "_start_chatgpt_auto_monitor", "rebuild_menu", "refresh_async", "_animate_swap"):
         setattr(instance, name, Mock())
     instance._alert = Mock(return_value=1)
     instance._codex_enabled = Mock(return_value=False)

@@ -26,6 +26,13 @@ Settings → General → Menu bar → **Show** selects **Claude**, **ChatGPT**, 
 
 ### Title width
 
+After a successful manual or automatic switch in the extra (including widget
+commands and ChatGPT desktop completion), the menu-bar mark's two halves
+exchange vertical positions, then flip horizontally back into the original
+logo. The sequence takes 1.05 seconds. Account text stays still. Cancelled, failed,
+already-active, and dry-run switches do not animate. The animation respects
+macOS Reduce Motion and coalesces switches that finish together.
+
 `fit_status_item(..., title=...)` writes the optional title on the status-item **button** (rumps still uses the deprecated `NSStatusItem.setTitle_`) and always displays the packaged OpenSoft template image at 16pt. AppKit sizes the image and text together; **Logo only** leaves the logo visible by itself. There is no asterisk preference; legacy `show_icon` values are ignored. Call it after every title rebuild and on popover attach. A sentinel on either provider's active slot still titles from `last_good` (`title_usage`), frozen at that provider's `fetched_at` so a passed weekly reset does not paint as a fresh 0%.
 
 ## Appearance
