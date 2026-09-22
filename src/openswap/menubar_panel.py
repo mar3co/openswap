@@ -7,6 +7,7 @@ status item stays a short title; this panel is what opens on click.
 from __future__ import annotations
 
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import objc
@@ -60,19 +61,25 @@ try:
 except ImportError:  # macOS 14 and older
     NSSwitch = None
 from Foundation import (
+    NSAffineTransform,
     NSAttributedString,
     NSDistributedNotificationCenter,
     NSMakeRect,
     NSObject,
     NSPointInRect,
+    NSRunLoop,
+    NSRunLoopCommonModes,
     NSTimer,
     NSUserDefaults,
 )
 
 from openswap.brand_motion import (
     BRAND_MOTION_DURATION,
+    SWAP_MOTION_DURATION,
     brand_mark_centers,
     brand_motion_progress,
+    swap_motion_separation,
+    swap_motion_width,
 )
 from openswap.menubar import (
     MAIN_PAGE,
@@ -262,6 +269,116 @@ def _brand_image():
         if _BRAND_IMAGE is not None:
             _BRAND_IMAGE.setTemplate_(True)
     return _BRAND_IMAGE
+
+
+def _brand_half_path(bounds, center_y: float, *, right: bool):
+    side = min(bounds.size.width, bounds.size.height)
+    scale = side / 32.0
+    origin_x = (bounds.size.width - side) / 2.0
+    origin_y = (bounds.size.height - side) / 2.0
+
+    def point(x, y):
+        return (origin_x + x * scale, origin_y + y * scale)
+
+    radius = 8.0
+    control = radius * 0.5522847498
+    direction = 1.0 if right else -1.0
+    path = NSBezierPath.bezierPath()
+    path.moveToPoint_(point(16.0, center_y - radius))
+    path.curveToPoint_controlPoint1_controlPoint2_(
+        point(16.0 + direction * radius, center_y),
+        point(16.0 + direction * control, center_y - radius),
+        point(16.0 + direction * radius, center_y - control),
+    )
+    path.curveToPoint_controlPoint1_controlPoint2_(
+        point(16.0, center_y + radius),
+        point(16.0 + direction * radius, center_y + control),
+        point(16.0 + direction * control, center_y + radius),
+    )
+    path.setLineWidth_(4.0 * scale)
+    return path
+
+
+_SWAP_FRAME_COUNT = round(SWAP_MOTION_DURATION * 60)
+
+
+@lru_cache(maxsize=_SWAP_FRAME_COUNT + 1)
+def _swap_icon_frame(frame: int):
+    fraction = frame / _SWAP_FRAME_COUNT
+    scale_x = swap_motion_width(fraction)
+    separation = swap_motion_separation(fraction)
+
+    def draw(bounds):
+        NSGraphicsContext.saveGraphicsState()
+        try:
+            transform = NSAffineTransform.transform()
+            transform.translateXBy_yBy_(bounds.size.width / 2, bounds.size.height / 2)
+            transform.scaleXBy_yBy_(scale_x, 1.0)
+            transform.translateXBy_yBy_(-bounds.size.width / 2, -bounds.size.height / 2)
+            transform.concat()
+            left_y, right_y = brand_mark_centers(separation)
+            NSColor.blackColor().setStroke()
+            _brand_half_path(bounds, left_y, right=False).stroke()
+            _brand_half_path(bounds, right_y, right=True).stroke()
+        finally:
+            NSGraphicsContext.restoreGraphicsState()
+        return True
+
+    icon = NSImage.imageWithSize_flipped_drawingHandler_((16, 16), True, draw)
+    icon.setTemplate_(True)
+    return icon
+
+
+class StatusIconAnimator:
+    """Main-thread, one-shot feedback that preserves the native status button."""
+
+    def __init__(self, nsstatusitem):
+        self._button = nsstatusitem.button()
+        self._timer = None
+        self._target = _Trampoline.alloc().initWithCallback_(self._tick)
+        self._image = None
+        self._resting_image = None
+
+    def play(self):
+        if self._button is None:
+            return
+        if NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion():
+            self.stop()
+            return
+        # Coalesce switches drained together; never stack timers or snap back
+        # to the first frame while a flip is already visible.
+        if self._timer is not None or self._button.image() is None:
+            return
+        self._resting_image = self._button.image()
+        self._started_at = time.monotonic()
+        self._timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0 / 60.0, self._target, "act:", None, True
+        )
+        # Continue animating while the user is tracking the overflow menu.
+        NSRunLoop.mainRunLoop().addTimer_forMode_(self._timer, NSRunLoopCommonModes)
+
+    def _tick(self, _timer):
+        fraction = (time.monotonic() - self._started_at) / SWAP_MOTION_DURATION
+        if fraction >= 1.0 or NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion():
+            self.stop()
+            return
+        self._image = _swap_icon_frame(round(max(0.0, fraction) * _SWAP_FRAME_COUNT))
+        self._button.setImage_(self._image)
+
+    def reapply(self):
+        """Keep a title refresh from replacing an animation frame with the logo."""
+        if self._timer is not None:
+            self._resting_image = self._button.image()
+            if self._image is not None:
+                self._button.setImage_(self._image)
+
+    def stop(self):
+        if self._timer is not None:
+            self._timer.invalidate()
+            self._timer = None
+            self._button.setImage_(self._resting_image)
+        self._image = None
+        self._resting_image = None
 
 
 def _brand_mark(frame, tint):
@@ -497,32 +614,7 @@ class _BrandMotionView(NSView):
         self.setNeedsDisplay_(True)
 
     def _half_path(self, center_y: float, *, right: bool):
-        bounds = self.bounds()
-        side = min(bounds.size.width, bounds.size.height)
-        scale = side / 32.0
-        origin_x = (bounds.size.width - side) / 2.0
-        origin_y = (bounds.size.height - side) / 2.0
-
-        def point(x, y):
-            return (origin_x + x * scale, origin_y + y * scale)
-
-        radius = 8.0
-        control = radius * 0.5522847498
-        direction = 1.0 if right else -1.0
-        path = NSBezierPath.bezierPath()
-        path.moveToPoint_(point(16.0, center_y - radius))
-        path.curveToPoint_controlPoint1_controlPoint2_(
-            point(16.0 + direction * radius, center_y),
-            point(16.0 + direction * control, center_y - radius),
-            point(16.0 + direction * radius, center_y - control),
-        )
-        path.curveToPoint_controlPoint1_controlPoint2_(
-            point(16.0, center_y + radius),
-            point(16.0 + direction * radius, center_y + control),
-            point(16.0 + direction * control, center_y + radius),
-        )
-        path.setLineWidth_(4.0 * scale)
-        return path
+        return _brand_half_path(self.bounds(), center_y, right=right)
 
     def drawRect_(self, _rect):
         left_y, right_y = brand_mark_centers(self._progress)

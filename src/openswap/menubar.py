@@ -175,6 +175,7 @@ def run(switcher, codex=None) -> int:
             self._hold_reload_pending = False
             self._event_lock = threading.Lock()
             self._panel = None
+            self._status_icon_animator = None
             self._kickoff_running = False
             self._desktop_switching = False
             self._desktop_result = None
@@ -1009,6 +1010,8 @@ def run(switcher, codex=None) -> int:
             claude_running = bool(self.snapshot.get("claude_running", True))
             codex_running = bool(self.snapshot.get("codex_running", True))
             for ev in events:
+                if ev.kind == "switch" and not getattr(ev, "dry_run", False):
+                    self._animate_swap()
                 running = (
                     codex_running
                     if getattr(ev, "provider", "claude") == "codex"
@@ -1323,8 +1326,25 @@ def run(switcher, codex=None) -> int:
                     nsitem,
                     title=title,
                 )
+                if self._status_icon_animator is not None:
+                    self._status_icon_animator.reapply()
             except Exception:
                 self.switcher._logger.debug("status item fit failed", exc_info=True)
+
+        def _animate_swap(self):
+            nsapp = getattr(self, "_nsapp", None)
+            nsitem = getattr(nsapp, "nsstatusitem", None) if nsapp is not None else None
+            if nsitem is None:
+                return
+            try:
+                from openswap.menubar_panel import StatusIconAnimator
+
+                if self._status_icon_animator is None:
+                    self._status_icon_animator = StatusIconAnimator(nsitem)
+                self._status_icon_animator.play()
+            except Exception:
+                # Visual feedback must never interfere with a completed swap.
+                self.switcher._logger.debug("status icon animation failed", exc_info=True)
 
         def rebuild_menu(self):
             title = format_menu_bar_title(self.snapshot, self.settings)
@@ -1568,6 +1588,7 @@ def run(switcher, codex=None) -> int:
             if error:
                 self._show_error(error)
             elif result is not None:
+                self._animate_swap()
                 record_manual_switch(self.codex.state_dir)
                 try:
                     self._notify(notification_copy_for_desktop_switch())
@@ -1680,6 +1701,7 @@ def run(switcher, codex=None) -> int:
             if result is None:
                 return
             if should_notify_manual_switch(result):
+                self._animate_swap()
                 self._clear_hold_event()
                 stamp_dir = (
                     self.codex.state_dir
@@ -2189,6 +2211,8 @@ def run(switcher, codex=None) -> int:
             self.refresh_async(full=True)  # explicit user refresh → full pass
 
         def on_quit(self, _sender):
+            if self._status_icon_animator is not None:
+                self._status_icon_animator.stop()
             if self._login_session is not None:
                 self._login_session.cancel()
             self._stop_chatgpt_auto_monitor(clear_pending=True)
