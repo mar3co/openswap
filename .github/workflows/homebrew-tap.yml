@@ -1,0 +1,59 @@
+name: Homebrew tap
+
+# When a person publishes a release (the macOS app workflow only drafts one),
+# copy its rendered cask into mar3co/homebrew-openswap so
+# `brew install --cask mar3co/openswap/openswap` picks it up.
+#
+# Needs repository secret HOMEBREW_TAP_TOKEN: a fine-grained token with
+# Contents read/write on mar3co/homebrew-openswap only. Without it the job
+# prints the manual steps and succeeds, so a release is never blocked on it.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag whose openswap.rb to publish (e.g. v0.2.0)"
+        required: true
+
+jobs:
+  update-cask:
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TAP_REPO: mar3co/homebrew-openswap
+      HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    steps:
+      - name: Download rendered cask
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern openswap.rb --dir .
+
+      - name: No tap token
+        if: ${{ env.HAS_TAP_TOKEN != 'true' }}
+        run: |
+          echo "::warning::HOMEBREW_TAP_TOKEN is not set; copy openswap.rb from release $TAG to $TAP_REPO/Casks/openswap.rb by hand."
+          cat openswap.rb
+
+      - name: Push cask to tap
+        if: ${{ env.HAS_TAP_TOKEN == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Casks
+          cp openswap.rb tap/Casks/openswap.rb
+          cd tap
+          if git diff --quiet -- Casks/openswap.rb && git ls-files --error-unmatch Casks/openswap.rb >/dev/null 2>&1; then
+            echo "Casks/openswap.rb already matches $TAG"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/openswap.rb
+          git commit -m "openswap ${TAG#v}"
+          git push origin HEAD

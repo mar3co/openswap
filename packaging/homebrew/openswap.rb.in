@@ -1,0 +1,52 @@
+cask "openswap" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "https://github.com/mar3co/openswap/releases/download/v#{version}/OpenSwap-#{version}.zip"
+  name "OpenSwap"
+  desc "Menu bar app for rotating Claude Code and Codex CLI accounts"
+  homepage "https://github.com/mar3co/openswap"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on macos: :sonoma
+
+  app "OpenSwap.app"
+  binary "#{appdir}/OpenSwap.app/Contents/MacOS/OpenSwap", target: "openswap"
+
+  # `openswap setup` writes the login LaunchAgent, not this cask. An
+  # `uninstall launchctl:` stanza also runs on every `brew upgrade` and would
+  # delete it, so upgrades restart the agent on the new app and only `zap`
+  # removes it.
+  postflight_steps do
+    run "/bin/sh",
+        args:         ["-c", "launchctl kickstart -k gui/$(id -u)/com.opensoft.openswap.menubar"],
+        must_succeed: false,
+        print_stderr: false
+  end
+
+  zap launchctl: [
+        "com.opensoft.openswap.menubar",
+        "com.opensoft.openswap.widget",
+      ],
+      trash:     [
+        "~/Library/Application Support/OpenSwap",
+        "~/Library/Containers/com.opensoft.openswap.widget.extension",
+        "~/Library/Logs/com.opensoft.openswap.menubar.err",
+        "~/Library/Logs/com.opensoft.openswap.menubar.log",
+        "~/Library/Logs/com.opensoft.openswap.widget.err",
+        "~/Library/Logs/com.opensoft.openswap.widget.log",
+      ]
+
+  caveats <<~EOS
+    Save your Claude login and start the menu bar extra at login:
+      openswap setup
+
+    Before `brew uninstall --cask openswap`, run
+      openswap menubar --uninstall-service
+    or uninstall with --zap, so launchd is not left pointing at a removed app.
+  EOS
+end
