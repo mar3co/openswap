@@ -20,7 +20,7 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 004  | Move Settings into the popover | P2 | M | 001, 003 | DONE |
 | 005  | Widget tap-to-switch and accessory families | P2 | M | 001 | DONE |
 | 007  | Spike: single notarized OpenSwap.app (PyInstaller + WidgetKit) | P1 | M | — | IN PROGRESS |
-| 008  | Ship the single app: cask, install/upgrade rewiring, release CI | P1 | L | 007 verdict | NOT WRITTEN |
+| 008  | Ship the single app: cask, install/upgrade rewiring, release CI | P1 | L | 007 verdict | TODO; release plumbing landed |
 | 009  | Codex CLI accounts: provider seam, CodexEngine, CLI, auto, kickoff, extra, widget | P2 | L | — | DONE |
 | 010  | Codex parity follow-ups (badge, knob, transfer, swap, sessions) | P2 | L | 009 | IN PROGRESS |
 | 011  | ChatGPT desktop switching: research and validation gates | P2 | M | 009, 010 | IN PROGRESS |
@@ -41,8 +41,10 @@ verified production desktop support.
 007 was added 2026-09-09 (planned at `92722b1`). Freeze and assemble are
 proved on this Mac; local Developer ID signing was skipped (operator:
 GitHub Actions `.github/workflows/macos-app.yml` signs once secrets exist).
-008 is only outlined in 007's maintenance notes; write it after a notarized
-CI artifact records `spctl` `source=Notarized Developer ID`.
+008 was written 2026-09-22 (planned at `6ec5c71`). Its release plumbing
+(versioned zip, draft release, rendered cask, tap workflow) landed with it
+because it needs no Apple credentials. The code rewiring still waits for a
+notarized CI artifact that records `spctl` `source=Notarized Developer ID`.
 
 001 and 006 share no files and may run in parallel. 002–005 all touch the extra
 and/or widget; run them only after 001 is merged into the executor’s base.
