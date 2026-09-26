@@ -7416,31 +7416,33 @@ class TestSelfSwitchProvenance:
         assert result["reason"] == "repaired"
 
     @pytest.mark.parametrize(
-        "live_tokens, profile, expected",
+        "live_tokens, profile, expected, degraded",
         [
             # Live is the slot's own backup: nothing to ask about.
-            (("sk-1", "rt-1"), None, {"state": "matches"}),
+            (("sk-1", "rt-1"), None, {"state": "matches"}, False),
+            # ...unless it's a fallback read while the Keychain failed.
+            (("sk-1", "rt-1"), None, {"state": "unknown"}, True),
             # Diverged and the probe failed.
-            (("sk-x", "rt-x"), None, {"state": "unknown"}),
+            (("sk-x", "rt-x"), None, {"state": "unknown"}, False),
             # No live login at all is not a match.
-            (None, None, {"state": "unknown"}),
+            (None, None, {"state": "unknown"}, False),
             # Rotated, but resolves to this slot by uuid.
             (("sk-x", "rt-x"), {"uuid": "uuid-1", "email": "test@example.com",
-                                "organizationUuid": ""}, {"state": "own"}),
+                                "organizationUuid": ""}, {"state": "own"}, False),
             # Another saved slot, matched by uuid.
             (("sk-x", "rt-x"), {"uuid": "uuid-2", "email": "account2@example.com",
                                 "organizationUuid": ""},
-             {"state": "other", "email": "account2@example.com", "slot": "2"}),
+             {"state": "other", "email": "account2@example.com", "slot": "2"}, False),
             # Same email and org as slot 1 but a new uuid: a recycled
             # address is another account, never this slot.
             (("sk-x", "rt-x"), {"uuid": "uuid-new", "email": "test@example.com",
                                 "organizationUuid": ""},
-             {"state": "other", "email": "test@example.com", "slot": None}),
+             {"state": "other", "email": "test@example.com", "slot": None}, False),
         ],
     )
     def test_live_credential_owner_states(
         self, temp_home, mock_claude_config, sample_sequence_data,
-        live_tokens, profile, expected,
+        live_tokens, profile, expected, degraded,
     ):
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
@@ -7448,14 +7450,18 @@ class TestSelfSwitchProvenance:
         creds_store[("1", "test@example.com")] = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-1", "refreshToken": "rt-1",
         }})
-        live_state = {"creds": live_tokens and json.dumps({"claudeAiOauth": {
+        live = live_tokens and json.dumps({"claudeAiOauth": {
             "accessToken": live_tokens[0], "refreshToken": live_tokens[1],
-        }})}
+        }})
         patches = self._install_store_patches(
-            switcher, creds_store, configs_store, live_state,
+            switcher, creds_store, configs_store, {"creds": live},
         )
         try:
-            with patch("openswap.oauth.fetch_oauth_profile", return_value=profile):
+            with patch("openswap.oauth.fetch_oauth_profile", return_value=profile), \
+                    patch.object(
+                        switcher, "_read_active_credentials",
+                        return_value=ActiveCredentials(live or "", False, degraded),
+                    ):
                 assert switcher.live_credential_owner(1) == expected
         finally:
             for p in patches:

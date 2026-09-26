@@ -266,11 +266,13 @@ class LiveMixin:
         num = str(num)
         email = (self.slot_identity(num) or ("",))[0]
         try:
-            live = self._read_credentials()
+            active = self._read_active_credentials()
         except Exception:
-            live = None
-        if not live:
-            # Missing or unreadable is not proof of a match.
+            return {"state": "unknown"}
+        live = active.value
+        if not live or active.degraded:
+            # Missing, unreadable, or a possibly stale fallback while the
+            # Keychain is unreadable: none of these proves a match.
             return {"state": "unknown"}
         backup = self._read_account_credentials(num, email)
         if backup and (
