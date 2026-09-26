@@ -7415,6 +7415,40 @@ class TestSelfSwitchProvenance:
         # Reported as a repair, not a silent already-active no-op.
         assert result["reason"] == "repaired"
 
+    def test_self_switch_not_reported_repaired_when_unresolved_under_lock(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Bytes moved after the pre-lock lookup: no claim of a repair."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-1", "refreshToken": "rt-1",
+        }})
+        configs_store[("1", "test@example.com")] = json.dumps({
+            "oauthAccount": {"emailAddress": "test@example.com", "accountUuid": "uuid-1"},
+        })
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-x", "refreshToken": "rt-x",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            with patch(
+                "openswap.oauth.fetch_oauth_profile",
+                return_value={"uuid": "uuid-2", "email": "account2@example.com",
+                              "organizationUuid": ""},
+            ), patch.object(
+                switcher, "_classify_outgoing_credential",
+                return_value=("unresolved", None),
+            ), patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("1", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+        assert result["reason"] != "repaired"
+
     @pytest.mark.parametrize(
         "live_tokens, profile, expected, degraded",
         [
