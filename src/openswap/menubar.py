@@ -1986,14 +1986,17 @@ def run(switcher, codex=None) -> int:
             owner_email = (owner or {}).get("email")
             if owner is not None and not owner_email:
                 owner_email = "an unknown account"
-            owner_name = None  # set only when the owner is a saved account
+            owner_num = None  # set only when the owner is a saved account
             if owner is not None:
                 owner_ident = (owner_email, owner.get("organizationUuid") or "")
                 for row in self.snapshot.get("accounts") or []:
                     if self._slot_identity(row[0]) == owner_ident:
-                        owner_name = self._name_for_num(row[0])
+                        owner_num = row[0]
                         break
-            if owner_name != name:
+            if str(owner_num) != str(num):
+                owner_name = (
+                    self._name_for_num(owner_num) if owner_num is not None else None
+                )
                 title, message, ok = reconcile_dialog_copy(
                     name, slot[0] if slot else "",
                     owner_email=owner_email, owner_name=owner_name,

@@ -2845,6 +2845,8 @@ def test_account_click_routes_login_mismatch_to_explained_repair():
     repair = text[text.index("def _repair_reconcile") : text.index("def _capture_relogin")]
     # Look up whose login is live and explain it before touching anything.
     assert "live_credential_owner()" in repair
+    # Identity is the slot number; short names can collide across accounts.
+    assert "str(owner_num) != str(num)" in repair
     assert "reconcile_dialog_copy(" in repair
     assert repair.index("self._alert(") < repair.index("switch_to(")
     # Unverifiable owner: offer a fresh sign-in instead of a blind restore.
