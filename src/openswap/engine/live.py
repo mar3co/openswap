@@ -253,6 +253,53 @@ class LiveMixin:
     def _active_read_degraded(self) -> bool:
         return self._active_verdict().degraded
 
+    def live_credential_owner(self, num: str | int) -> dict:
+        """Whose login the live credential is, relative to slot ``num``.
+
+        ``{"state": ...}`` where state is ``"matches"`` (the live bytes are
+        the slot's own backup lineage), ``"own"`` (rotated, but resolved to
+        this slot), ``"other"`` (another account: ``email`` and, when it is
+        a saved account, ``slot``) or ``"unknown"`` (couldn't be resolved).
+        Uuid-first matching, like the switch classifier. Makes a network
+        call; never call it while holding a lock.
+        """
+        num = str(num)
+        email = (self.slot_identity(num) or ("",))[0]
+        try:
+            active = self._read_active_credentials()
+        except Exception:
+            return {"state": "unknown"}
+        live = active.value
+        if not live or active.degraded:
+            # Missing, unreadable, or a possibly stale fallback while the
+            # Keychain is unreadable: none of these proves a match.
+            return {"state": "unknown"}
+        backup = self._read_account_credentials(num, email)
+        if backup and (
+            live == backup
+            or oauth.credential_fingerprint(live)
+            == oauth.credential_fingerprint(backup)
+        ):
+            return {"state": "matches"}
+        prefetch = self._prefetch_live_identity()
+        resolved = prefetch["resolved"]
+        if resolved is None or prefetch["live"] != live:
+            # Unresolved, or the profile is for bytes that changed since
+            # the read above.
+            return {"state": "unknown"}
+        accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+        verdicts = {
+            str(slot): self._resolved_matches_slot_identity(str(slot), resolved)
+            for slot in accounts
+        }
+        owner = next((slot for slot, v in verdicts.items() if v), None)
+        if owner is None and None in verdicts.values():
+            # A partial profile couldn't rule some slot in or out.
+            return {"state": "unknown"}
+        if owner == num:
+            return {"state": "own"}
+        return {"state": "other", "email": resolved.get("email"), "slot": owner}
+
     def _prefetch_live_identity(self) -> dict:
         """Resolve the live credential's owner BEFORE the locks are taken.
 

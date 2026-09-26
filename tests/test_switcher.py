@@ -7412,6 +7412,127 @@ class TestSelfSwitchProvenance:
         # The rotation was captured into the slot's backup.
         assert creds_store[("1", "test@example.com")] == rotated
         assert result["switched"] is False or result["to"]["number"] == 1
+        # Reported as a repair, not a silent already-active no-op.
+        assert result["reason"] == "repaired"
+
+    def test_self_switch_not_reported_repaired_when_unresolved_under_lock(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Bytes moved after the pre-lock lookup: no claim of a repair."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-1", "refreshToken": "rt-1",
+        }})
+        configs_store[("1", "test@example.com")] = json.dumps({
+            "oauthAccount": {"emailAddress": "test@example.com", "accountUuid": "uuid-1"},
+        })
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-x", "refreshToken": "rt-x",
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            with patch(
+                "openswap.oauth.fetch_oauth_profile",
+                return_value={"uuid": "uuid-2", "email": "account2@example.com",
+                              "organizationUuid": ""},
+            ), patch.object(
+                switcher, "_classify_outgoing_credential",
+                return_value=("unresolved", None),
+            ), patch.object(switcher, "list_accounts"):
+                result = switcher.switch_to("1", json_output=True)
+        finally:
+            for p in patches:
+                p.stop()
+        assert result["reason"] != "repaired"
+
+    @pytest.mark.parametrize(
+        "live_tokens, profile, expected, degraded",
+        [
+            # Live is the slot's own backup: nothing to ask about.
+            (("sk-1", "rt-1"), None, {"state": "matches"}, False),
+            # ...unless it's a fallback read while the Keychain failed.
+            (("sk-1", "rt-1"), None, {"state": "unknown"}, True),
+            # Diverged and the probe failed.
+            (("sk-x", "rt-x"), None, {"state": "unknown"}, False),
+            # No live login at all is not a match.
+            (None, None, {"state": "unknown"}, False),
+            # Rotated, but resolves to this slot by uuid.
+            (("sk-x", "rt-x"), {"uuid": "uuid-1", "email": "test@example.com",
+                                "organizationUuid": ""}, {"state": "own"}, False),
+            # Another saved slot, matched by uuid.
+            (("sk-x", "rt-x"), {"uuid": "uuid-2", "email": "account2@example.com",
+                                "organizationUuid": ""},
+             {"state": "other", "email": "account2@example.com", "slot": "2"}, False),
+            # Same email and org as slot 1 but a new uuid: a recycled
+            # address is another account, never this slot.
+            (("sk-x", "rt-x"), {"uuid": "uuid-new", "email": "test@example.com",
+                                "organizationUuid": ""},
+             {"state": "other", "email": "test@example.com", "slot": None}, False),
+        ],
+    )
+    def test_live_credential_owner_states(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+        live_tokens, profile, expected, degraded,
+    ):
+        assert self._owner_state(
+            temp_home, sample_sequence_data, live_tokens, profile, degraded,
+        ) == expected
+
+    def test_live_credential_owner_unknown_when_partial_profile_is_indeterminate(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A uuid-only profile vs a slot with no stored uuid proves nothing."""
+        sample_sequence_data["accounts"]["2"].pop("uuid")
+        assert self._owner_state(
+            temp_home, sample_sequence_data, ("sk-x", "rt-x"),
+            {"uuid": "uuid-9", "email": None, "organizationUuid": None},
+        ) == {"state": "unknown"}
+
+    def test_live_credential_owner_unknown_when_live_changes_mid_lookup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The profile must describe the bytes that were read, not newer ones."""
+        with patch(
+            "openswap.engine.live.LiveMixin._prefetch_live_identity",
+            return_value={"live": "other-bytes", "resolved": {
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "",
+            }},
+        ):
+            assert self._owner_state(
+                temp_home, sample_sequence_data, ("sk-x", "rt-x"), None,
+            ) == {"state": "unknown"}
+
+    def _owner_state(
+        self, temp_home, sample_sequence_data, live_tokens, profile,
+        degraded=False,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-1", "refreshToken": "rt-1",
+        }})
+        live = live_tokens and json.dumps({"claudeAiOauth": {
+            "accessToken": live_tokens[0], "refreshToken": live_tokens[1],
+        }})
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, {"creds": live},
+        )
+        try:
+            with patch("openswap.oauth.fetch_oauth_profile", return_value=profile), \
+                    patch.object(
+                        switcher, "_read_active_credentials",
+                        return_value=ActiveCredentials(live or "", False, degraded),
+                    ):
+                return switcher.live_credential_owner(1)
+        finally:
+            for p in patches:
+                p.stop()
 
 
 class TestDuplicateAccountDetection:
