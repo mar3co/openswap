@@ -7492,6 +7492,21 @@ class TestSelfSwitchProvenance:
             {"uuid": "uuid-9", "email": None, "organizationUuid": None},
         ) == {"state": "unknown"}
 
+    def test_live_credential_owner_unknown_when_live_changes_mid_lookup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The profile must describe the bytes that were read, not newer ones."""
+        with patch(
+            "openswap.engine.live.LiveMixin._prefetch_live_identity",
+            return_value={"live": "other-bytes", "resolved": {
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "",
+            }},
+        ):
+            assert self._owner_state(
+                temp_home, sample_sequence_data, ("sk-x", "rt-x"), None,
+            ) == {"state": "unknown"}
+
     def _owner_state(
         self, temp_home, sample_sequence_data, live_tokens, profile,
         degraded=False,

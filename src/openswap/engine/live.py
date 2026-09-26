@@ -281,8 +281,11 @@ class LiveMixin:
             == oauth.credential_fingerprint(backup)
         ):
             return {"state": "matches"}
-        resolved = self._prefetch_live_identity()["resolved"]
-        if resolved is None:
+        prefetch = self._prefetch_live_identity()
+        resolved = prefetch["resolved"]
+        if resolved is None or prefetch["live"] != live:
+            # Unresolved, or the profile is for bytes that changed since
+            # the read above.
             return {"state": "unknown"}
         accounts = (self._get_sequence_data() or {}).get("accounts") or {}
         verdicts = {
