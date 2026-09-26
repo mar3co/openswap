@@ -1981,7 +1981,9 @@ def run(switcher, codex=None) -> int:
 
         def _repair_reconcile(self, num, *, close_panel):
             name = self._name_for_num(num)
-            owner = self.switcher.live_credential_owner(num)
+            owner = self._run_switch(lambda: self.switcher.live_credential_owner(num))
+            if owner is None:
+                return
             if owner["state"] in ("matches", "own"):
                 # Already this account's login (fixed since the card was
                 # drawn, or just a token refresh): nothing to repair, and no
