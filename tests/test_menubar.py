@@ -2849,6 +2849,9 @@ def test_account_click_routes_login_mismatch_to_explained_repair():
     assert "_name_for_identity" not in repair
     # Already fixed since the card was drawn: refresh, don't prompt.
     assert repair.index('"matches"') < repair.index("self._alert(")
+    # Every restore goes through the dialog; no unconfirmed switch path.
+    assert '!= "own"' not in repair
+    assert repair.index("self._alert(") < repair.index("switch_to(")
     assert "reconcile_dialog_copy(" in repair
     assert repair.index("self._alert(") < repair.index("switch_to(")
     # Unverifiable owner: offer a fresh sign-in instead of a blind restore.

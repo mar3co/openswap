@@ -1982,8 +1982,10 @@ def run(switcher, codex=None) -> int:
         def _repair_reconcile(self, num, *, close_panel):
             name = self._name_for_num(num)
             owner = self.switcher.live_credential_owner(num)
-            if owner["state"] == "matches":
-                # Fixed since the card was drawn (e.g. by another window).
+            if owner["state"] in ("matches", "own"):
+                # Already this account's login (fixed since the card was
+                # drawn, or just a token refresh): nothing to repair, and no
+                # restore may run without the confirmation below.
                 self._notify(
                     NotificationCopy(
                         title=f"{name}'s login is already fixed",
@@ -1992,30 +1994,27 @@ def run(switcher, codex=None) -> int:
                 )
                 self.refresh_async()
                 return
-            if owner["state"] != "own":
-                slot = self._slot_identity(num)
-                owner_email = owner.get("email")
-                if owner["state"] == "other" and not owner_email:
-                    owner_email = "an unknown account"
-                title, message, ok = reconcile_dialog_copy(
-                    name, slot[0] if slot else "",
-                    owner_email=owner_email,
-                    owner_name=(
-                        self._name_for_num(owner["slot"])
-                        if owner.get("slot") else None
-                    ),
+            slot = self._slot_identity(num)
+            owner_email = owner.get("email")
+            if owner["state"] == "other" and not owner_email:
+                owner_email = "an unknown account"
+            title, message, ok = reconcile_dialog_copy(
+                name, slot[0] if slot else "",
+                owner_email=owner_email,
+                owner_name=(
+                    self._name_for_num(owner["slot"])
+                    if owner.get("slot") else None
+                ),
+            )
+            if self._alert(
+                title=title, message=message, ok=ok, cancel="Cancel"
+            ) != 1:
+                return
+            if owner["state"] == "unknown":
+                self._repair_relogin(
+                    num, close_panel=close_panel, force_login=True
                 )
-                if self._alert(
-                    title=title, message=message, ok=ok, cancel="Cancel"
-                ) != 1:
-                    return
-                if owner["state"] == "unknown":
-                    self._repair_relogin(
-                        num, close_panel=close_panel, force_login=True
-                    )
-                    return
-            # "own": this account's rotated token; the switch just re-syncs
-            # it, nothing to ask.
+                return
             result = self._run_switch(
                 lambda: self.switcher.switch_to(str(num), json_output=True)
             )
