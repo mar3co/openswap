@@ -285,13 +285,14 @@ class LiveMixin:
         if resolved is None:
             return {"state": "unknown"}
         accounts = (self._get_sequence_data() or {}).get("accounts") or {}
-        owner = next(
-            (
-                str(slot) for slot in accounts
-                if self._resolved_matches_slot_identity(str(slot), resolved)
-            ),
-            None,
-        )
+        verdicts = {
+            str(slot): self._resolved_matches_slot_identity(str(slot), resolved)
+            for slot in accounts
+        }
+        owner = next((slot for slot, v in verdicts.items() if v), None)
+        if owner is None and None in verdicts.values():
+            # A partial profile couldn't rule some slot in or out.
+            return {"state": "unknown"}
         if owner == num:
             return {"state": "own"}
         return {"state": "other", "email": resolved.get("email"), "slot": owner}

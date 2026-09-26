@@ -7478,6 +7478,24 @@ class TestSelfSwitchProvenance:
         self, temp_home, mock_claude_config, sample_sequence_data,
         live_tokens, profile, expected, degraded,
     ):
+        assert self._owner_state(
+            temp_home, sample_sequence_data, live_tokens, profile, degraded,
+        ) == expected
+
+    def test_live_credential_owner_unknown_when_partial_profile_is_indeterminate(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A uuid-only profile vs a slot with no stored uuid proves nothing."""
+        sample_sequence_data["accounts"]["2"].pop("uuid")
+        assert self._owner_state(
+            temp_home, sample_sequence_data, ("sk-x", "rt-x"),
+            {"uuid": "uuid-9", "email": None, "organizationUuid": None},
+        ) == {"state": "unknown"}
+
+    def _owner_state(
+        self, temp_home, sample_sequence_data, live_tokens, profile,
+        degraded=False,
+    ):
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7496,7 +7514,7 @@ class TestSelfSwitchProvenance:
                         switcher, "_read_active_credentials",
                         return_value=ActiveCredentials(live or "", False, degraded),
                     ):
-                assert switcher.live_credential_owner(1) == expected
+                return switcher.live_credential_owner(1)
         finally:
             for p in patches:
                 p.stop()
