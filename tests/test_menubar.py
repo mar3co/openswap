@@ -2847,7 +2847,9 @@ def test_account_click_routes_login_mismatch_to_explained_repair():
     # The engine decides ownership (uuid-first), never display names.
     assert "live_credential_owner(num)" in repair
     # Roster/config errors surface as an alert, like a failed switch.
-    assert "_run_switch(lambda: self.switcher.live_credential_owner(num))" in repair
+    assert "self.switcher.live_credential_owner(num)" in repair
+    assert repair.index("_run_switch(") < repair.index("live_credential_owner(num)")
+    assert "except OSError" in repair
     assert "_name_for_identity" not in repair
     # Already fixed since the card was drawn: refresh, don't prompt.
     assert repair.index('"matches"') < repair.index("self._alert(")

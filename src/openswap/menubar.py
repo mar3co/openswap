@@ -1981,7 +1981,14 @@ def run(switcher, codex=None) -> int:
 
         def _repair_reconcile(self, num, *, close_panel):
             name = self._name_for_num(num)
-            owner = self._run_switch(lambda: self.switcher.live_credential_owner(num))
+            try:
+                owner = self._run_switch(
+                    lambda: self.switcher.live_credential_owner(num)
+                )
+            except OSError as e:
+                # The lookup can record a verified uuid in the roster.
+                self._show_error(f"Couldn't update OpenSwap's account list: {e}")
+                return
             if owner is None:
                 return
             if owner["state"] in ("matches", "own"):
