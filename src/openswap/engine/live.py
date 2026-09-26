@@ -253,6 +253,13 @@ class LiveMixin:
     def _active_read_degraded(self) -> bool:
         return self._active_verdict().degraded
 
+    def live_credential_owner(self) -> dict | None:
+        """Who the live token belongs to when it diverged from the active
+        slot's backup: ``{"uuid", "email", "organizationUuid"}``, or None when
+        it matches the backup or could not be resolved. Makes a network call;
+        never call it while holding a lock."""
+        return self._prefetch_live_identity()["resolved"]
+
     def _prefetch_live_identity(self) -> dict:
         """Resolve the live credential's owner BEFORE the locks are taken.
 

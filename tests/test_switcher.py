@@ -7412,6 +7412,8 @@ class TestSelfSwitchProvenance:
         # The rotation was captured into the slot's backup.
         assert creds_store[("1", "test@example.com")] == rotated
         assert result["switched"] is False or result["to"]["number"] == 1
+        # Reported as a repair, not a silent already-active no-op.
+        assert result["reason"] == "repaired"
 
 
 class TestDuplicateAccountDetection:

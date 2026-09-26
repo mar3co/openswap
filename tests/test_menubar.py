@@ -2836,6 +2836,51 @@ def test_account_click_confirms_before_switching_for_both_providers():
     assert claude_branch.index("_repair_relogin(") < claude_branch.index("_confirm_switch(")
 
 
+def test_account_click_routes_login_mismatch_to_explained_repair():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    click = text[text.index("def _on_account_click") : text.index("def _repair_relogin")]
+    claude_branch = click[click.index("_slot_needs_relogin") :]
+    # A mismatch on the active card must not fall into the silent self-switch.
+    assert claude_branch.index("_repair_reconcile(") < claude_branch.index("_confirm_switch(")
+    repair = text[text.index("def _repair_reconcile") : text.index("def _capture_relogin")]
+    # Look up whose login is live and explain it before touching anything.
+    assert "live_credential_owner()" in repair
+    assert "reconcile_dialog_copy(" in repair
+    assert repair.index("self._alert(") < repair.index("switch_to(")
+    # Unverifiable owner: offer a fresh sign-in instead of a blind restore.
+    assert repair.index("force_login=True") < repair.index("switch_to(")
+    assert '"repaired"' in repair and "refresh_async()" in repair
+
+
+def test_reconcile_dialog_names_the_real_owner_and_both_choices():
+    title, body, ok = menubar.reconcile_dialog_copy(
+        "adsonline", "gomryo@gmail.com",
+        owner_email="yohan@virtualshield.com", owner_name="virtualshield",
+    )
+    assert ok == "Restore adsonline"
+    assert "adsonline (gomryo@gmail.com)" in body
+    assert "belongs to yohan@virtualshield.com" in body
+    assert "click virtualshield's card" in body
+    assert "Claude app" in body
+
+
+def test_reconcile_dialog_for_unsaved_owner_says_to_add_it():
+    _t, body, _ok = menubar.reconcile_dialog_copy(
+        "adsonline", "gomryo@gmail.com",
+        owner_email="someone@example.com", owner_name=None,
+    )
+    assert "add it as an account" in body
+
+
+def test_reconcile_dialog_when_owner_unknown_changes_nothing():
+    title, body, ok = menubar.reconcile_dialog_copy(
+        "adsonline", "gomryo@gmail.com", owner_email=None, owner_name=None,
+    )
+    assert title == "Couldn't check Claude Code's login"
+    assert "Nothing has been changed" in body
+    assert ok == "Sign in as adsonline"
+
+
 def test_account_click_restores_saved_live_login_before_normal_confirmation():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     click = text[text.index("def _on_account_click") : text.index("def _repair_relogin")]

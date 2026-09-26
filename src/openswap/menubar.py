@@ -1818,6 +1818,12 @@ def run(switcher, codex=None) -> int:
                     )
             return False
 
+        def _slot_needs_reconcile(self, num) -> bool:
+            for row in self.snapshot.get("accounts") or []:
+                if str(row[0]) == str(num):
+                    return display_needs_reconcile(row[3])
+            return False
+
         def _slot_missing_login(self, num) -> bool:
             for row in self.snapshot.get("accounts") or []:
                 if str(row[0]) == str(num):
@@ -1860,6 +1866,9 @@ def run(switcher, codex=None) -> int:
                 self._repair_relogin(
                     num, close_panel=close_panel, force_login=True
                 )
+                return
+            if self._slot_needs_reconcile(num):
+                self._repair_reconcile(num, close_panel=close_panel)
                 return
             if self._slot_needs_restore(num):
                 try:
@@ -1969,6 +1978,58 @@ def run(switcher, codex=None) -> int:
             ) != 1:
                 return
             self._open_claude_login(plan)
+
+        def _repair_reconcile(self, num, *, close_panel):
+            name = self._name_for_num(num)
+            slot = self._slot_identity(num)
+            owner = self.switcher.live_credential_owner()
+            owner_email = (owner or {}).get("email")
+            if owner is not None and not owner_email:
+                owner_email = "an unknown account"
+            owner_name = None  # set only when the owner is a saved account
+            if owner is not None:
+                owner_ident = (owner_email, owner.get("organizationUuid") or "")
+                for row in self.snapshot.get("accounts") or []:
+                    if self._slot_identity(row[0]) == owner_ident:
+                        owner_name = self._name_for_num(row[0])
+                        break
+            if owner_name != name:
+                title, message, ok = reconcile_dialog_copy(
+                    name, slot[0] if slot else "",
+                    owner_email=owner_email, owner_name=owner_name,
+                )
+                if self._alert(
+                    title=title, message=message, ok=ok, cancel="Cancel"
+                ) != 1:
+                    return
+                if owner_email is None:
+                    self._repair_relogin(
+                        num, close_panel=close_panel, force_login=True
+                    )
+                    return
+            # else: the live token is this account's own rotation; the
+            # switch just re-syncs it, nothing to ask.
+            result = self._run_switch(
+                lambda: self.switcher.switch_to(str(num), json_output=True)
+            )
+            if result is None:
+                return
+            if result.get("reason") == "repaired":
+                self._notify(
+                    NotificationCopy(
+                        title=f"{name}'s login restored",
+                        body="Claude Code is using the right account again.",
+                    )
+                )
+                self.refresh_async()
+            elif not result.get("switched"):
+                # The login changed again between the check and the repair.
+                self._show_error(
+                    f"Claude Code's login changed while checking. Click {name} "
+                    "again to see what it's using now."
+                )
+                return
+            self._finish_manual_switch(result, name, close_panel=close_panel)
 
         def _capture_relogin(self, num, *, close_panel):
             slot = self._slot_identity(num)

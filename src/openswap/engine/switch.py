@@ -1607,6 +1607,14 @@ class SwitchMixin:
             result["message"] = (
                 f"Activated Account-{to['number']} ({to['email']}) from stored backup"
             )
+        # Likewise a reconciled self-switch rewrote a diverged live login;
+        # the menu bar needs to tell that apart from a true no-op.
+        elif result is not None and provenance is not None and not result["switched"]:
+            to = result["to"]
+            result["reason"] = "repaired"
+            result["message"] = (
+                f"Repaired Account-{to['number']} ({to['email']}) live login"
+            )
         return result
 
     def _self_switch_action(self, slot: str, email: str) -> tuple[str, dict | None]:
