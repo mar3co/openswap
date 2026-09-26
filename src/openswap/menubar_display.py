@@ -1332,7 +1332,8 @@ def reconcile_dialog_copy(
     if owner_name:
         other = (
             f"To use {owner_name} instead: click Cancel, then click "
-            f"{owner_name}'s card."
+            f"{owner_name}'s card. That switches to {owner_name}'s saved "
+            "login; if it's out of date, you'll need to sign in again."
         )
     else:
         other = (

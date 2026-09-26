@@ -7422,6 +7422,8 @@ class TestSelfSwitchProvenance:
             (("sk-1", "rt-1"), None, {"state": "matches"}),
             # Diverged and the probe failed.
             (("sk-x", "rt-x"), None, {"state": "unknown"}),
+            # No live login at all is not a match.
+            (None, None, {"state": "unknown"}),
             # Rotated, but resolves to this slot by uuid.
             (("sk-x", "rt-x"), {"uuid": "uuid-1", "email": "test@example.com",
                                 "organizationUuid": ""}, {"state": "own"}),
@@ -7446,7 +7448,7 @@ class TestSelfSwitchProvenance:
         creds_store[("1", "test@example.com")] = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-1", "refreshToken": "rt-1",
         }})
-        live_state = {"creds": json.dumps({"claudeAiOauth": {
+        live_state = {"creds": live_tokens and json.dumps({"claudeAiOauth": {
             "accessToken": live_tokens[0], "refreshToken": live_tokens[1],
         }})}
         patches = self._install_store_patches(

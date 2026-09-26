@@ -2865,6 +2865,8 @@ def test_reconcile_dialog_names_the_real_owner_and_both_choices():
     assert "adsonline (gomryo@gmail.com)" in body
     assert "belongs to yohan@virtualshield.com" in body
     assert "click virtualshield's card" in body
+    # Switching uses the saved login, which may need a fresh sign-in.
+    assert "sign in again" in body
     assert "Claude app" in body
 
 

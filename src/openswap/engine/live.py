@@ -265,7 +265,19 @@ class LiveMixin:
         """
         num = str(num)
         email = (self.slot_identity(num) or ("",))[0]
-        if self._live_matches_slot_backup(num, email):
+        try:
+            live = self._read_credentials()
+        except Exception:
+            live = None
+        if not live:
+            # Missing or unreadable is not proof of a match.
+            return {"state": "unknown"}
+        backup = self._read_account_credentials(num, email)
+        if backup and (
+            live == backup
+            or oauth.credential_fingerprint(live)
+            == oauth.credential_fingerprint(backup)
+        ):
             return {"state": "matches"}
         resolved = self._prefetch_live_identity()["resolved"]
         if resolved is None:
