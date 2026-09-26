@@ -1981,37 +1981,41 @@ def run(switcher, codex=None) -> int:
 
         def _repair_reconcile(self, num, *, close_panel):
             name = self._name_for_num(num)
-            slot = self._slot_identity(num)
-            owner = self.switcher.live_credential_owner()
-            owner_email = (owner or {}).get("email")
-            if owner is not None and not owner_email:
-                owner_email = "an unknown account"
-            owner_num = None  # set only when the owner is a saved account
-            if owner is not None:
-                owner_ident = (owner_email, owner.get("organizationUuid") or "")
-                for row in self.snapshot.get("accounts") or []:
-                    if self._slot_identity(row[0]) == owner_ident:
-                        owner_num = row[0]
-                        break
-            if str(owner_num) != str(num):
-                owner_name = (
-                    self._name_for_num(owner_num) if owner_num is not None else None
+            owner = self.switcher.live_credential_owner(num)
+            if owner["state"] == "matches":
+                # Fixed since the card was drawn (e.g. by another window).
+                self._notify(
+                    NotificationCopy(
+                        title=f"{name}'s login is already fixed",
+                        body="Claude Code is using the right account.",
+                    )
                 )
+                self.refresh_async()
+                return
+            if owner["state"] != "own":
+                slot = self._slot_identity(num)
+                owner_email = owner.get("email")
+                if owner["state"] == "other" and not owner_email:
+                    owner_email = "an unknown account"
                 title, message, ok = reconcile_dialog_copy(
                     name, slot[0] if slot else "",
-                    owner_email=owner_email, owner_name=owner_name,
+                    owner_email=owner_email,
+                    owner_name=(
+                        self._name_for_num(owner["slot"])
+                        if owner.get("slot") else None
+                    ),
                 )
                 if self._alert(
                     title=title, message=message, ok=ok, cancel="Cancel"
                 ) != 1:
                     return
-                if owner_email is None:
+                if owner["state"] == "unknown":
                     self._repair_relogin(
                         num, close_panel=close_panel, force_login=True
                     )
                     return
-            # else: the live token is this account's own rotation; the
-            # switch just re-syncs it, nothing to ask.
+            # "own": this account's rotated token; the switch just re-syncs
+            # it, nothing to ask.
             result = self._run_switch(
                 lambda: self.switcher.switch_to(str(num), json_output=True)
             )

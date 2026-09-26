@@ -7415,6 +7415,50 @@ class TestSelfSwitchProvenance:
         # Reported as a repair, not a silent already-active no-op.
         assert result["reason"] == "repaired"
 
+    @pytest.mark.parametrize(
+        "live_tokens, profile, expected",
+        [
+            # Live is the slot's own backup: nothing to ask about.
+            (("sk-1", "rt-1"), None, {"state": "matches"}),
+            # Diverged and the probe failed.
+            (("sk-x", "rt-x"), None, {"state": "unknown"}),
+            # Rotated, but resolves to this slot by uuid.
+            (("sk-x", "rt-x"), {"uuid": "uuid-1", "email": "test@example.com",
+                                "organizationUuid": ""}, {"state": "own"}),
+            # Another saved slot, matched by uuid.
+            (("sk-x", "rt-x"), {"uuid": "uuid-2", "email": "account2@example.com",
+                                "organizationUuid": ""},
+             {"state": "other", "email": "account2@example.com", "slot": "2"}),
+            # Same email and org as slot 1 but a new uuid: a recycled
+            # address is another account, never this slot.
+            (("sk-x", "rt-x"), {"uuid": "uuid-new", "email": "test@example.com",
+                                "organizationUuid": ""},
+             {"state": "other", "email": "test@example.com", "slot": None}),
+        ],
+    )
+    def test_live_credential_owner_states(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+        live_tokens, profile, expected,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-1", "refreshToken": "rt-1",
+        }})
+        live_state = {"creds": json.dumps({"claudeAiOauth": {
+            "accessToken": live_tokens[0], "refreshToken": live_tokens[1],
+        }})}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            with patch("openswap.oauth.fetch_oauth_profile", return_value=profile):
+                assert switcher.live_credential_owner(1) == expected
+        finally:
+            for p in patches:
+                p.stop()
+
 
 class TestDuplicateAccountDetection:
     def _switcher(self, temp_home, sample_sequence_data):

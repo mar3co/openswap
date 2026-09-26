@@ -253,12 +253,34 @@ class LiveMixin:
     def _active_read_degraded(self) -> bool:
         return self._active_verdict().degraded
 
-    def live_credential_owner(self) -> dict | None:
-        """Who the live token belongs to when it diverged from the active
-        slot's backup: ``{"uuid", "email", "organizationUuid"}``, or None when
-        it matches the backup or could not be resolved. Makes a network call;
-        never call it while holding a lock."""
-        return self._prefetch_live_identity()["resolved"]
+    def live_credential_owner(self, num: str | int) -> dict:
+        """Whose login the live credential is, relative to slot ``num``.
+
+        ``{"state": ...}`` where state is ``"matches"`` (the live bytes are
+        the slot's own backup lineage), ``"own"`` (rotated, but resolved to
+        this slot), ``"other"`` (another account: ``email`` and, when it is
+        a saved account, ``slot``) or ``"unknown"`` (couldn't be resolved).
+        Uuid-first matching, like the switch classifier. Makes a network
+        call; never call it while holding a lock.
+        """
+        num = str(num)
+        email = (self.slot_identity(num) or ("",))[0]
+        if self._live_matches_slot_backup(num, email):
+            return {"state": "matches"}
+        resolved = self._prefetch_live_identity()["resolved"]
+        if resolved is None:
+            return {"state": "unknown"}
+        accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+        owner = next(
+            (
+                str(slot) for slot in accounts
+                if self._resolved_matches_slot_identity(str(slot), resolved)
+            ),
+            None,
+        )
+        if owner == num:
+            return {"state": "own"}
+        return {"state": "other", "email": resolved.get("email"), "slot": owner}
 
     def _prefetch_live_identity(self) -> dict:
         """Resolve the live credential's owner BEFORE the locks are taken.

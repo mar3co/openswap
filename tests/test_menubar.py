@@ -2844,9 +2844,11 @@ def test_account_click_routes_login_mismatch_to_explained_repair():
     assert claude_branch.index("_repair_reconcile(") < claude_branch.index("_confirm_switch(")
     repair = text[text.index("def _repair_reconcile") : text.index("def _capture_relogin")]
     # Look up whose login is live and explain it before touching anything.
-    assert "live_credential_owner()" in repair
-    # Identity is the slot number; short names can collide across accounts.
-    assert "str(owner_num) != str(num)" in repair
+    # The engine decides ownership (uuid-first), never display names.
+    assert "live_credential_owner(num)" in repair
+    assert "_name_for_identity" not in repair
+    # Already fixed since the card was drawn: refresh, don't prompt.
+    assert repair.index('"matches"') < repair.index("self._alert(")
     assert "reconcile_dialog_copy(" in repair
     assert repair.index("self._alert(") < repair.index("switch_to(")
     # Unverifiable owner: offer a fresh sign-in instead of a blind restore.
