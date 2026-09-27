@@ -1,10 +1,10 @@
-# OpenSwap remote worker: architecture research
+# Remote Agent Host: architecture research
 
 Researched 2026-09-27. This document separates observed provider capabilities from proposed OpenSwap design. It does not establish provider subscription eligibility or approve a particular credential integration; use the companion provider research for that release gate.
 
 ## Recommendation
 
-Ship **Remote Worker as an opt-in OpenSwap feature**, with a separately testable host process and versioned protocol. OpenTag is the first remote client. Preserve the ability to distribute that host independently later; do not create a separate OpenServer product before the integration proves useful.
+Ship **Remote Agent Host as an opt-in OpenSwap feature**, with a separately testable host process and versioned protocol. OpenTag is the first remote client. Preserve the ability to distribute that host independently later; do not create a separate OpenServer product before the integration proves useful.
 
 The value is a unified, permissioned way to dispatch work to users' existing machines and receive durable results across providers. Remote access alone is already offered by both major providers. The differentiation should be OpenTag coordination, account-aware local execution where permitted, a consistent run API, and reliable artifacts.
 
@@ -29,7 +29,7 @@ Use **host-initiated HTTPS polling for an initial deployment**, with an asynchro
 | Mesh VPN / tailnet | Private addressing and existing device controls; less bespoke transport for technical users | Hosted OpenTag would need approved tailnet connectivity; users must install/manage network membership; network membership is not run authorization | Developer prototype / later self-hosted option |
 | Direct inbound HTTPS | Less relay infrastructure in reachable environments | Port forwarding, CGNAT, TLS lifecycle, changing addresses, and broad internet attack surface become user problems | Avoid as consumer default |
 
-OpenTag code findings from the companion repository review: custom remote MCP endpoints require public HTTPS and reject private/loopback/CGNAT destinations outside a dogfood exception. Defaults include a 15-second tool timeout, 32 KB content cap and 256 KB body cap. Therefore OpenTag should call a public asynchronous facade, not the laptop's private address, and should fetch artifact references instead of embedding large results. Its existing managed write gate covers particular billing integrations, so worker dispatch must be deliberately connected to mutation approval logic.
+OpenTag findings from the companion repository review are recorded in [mar3co/opentag#135](https://github.com/mar3co/opentag/issues/135) (private repository). Their consequences: hosted OpenTag only calls public HTTPS endpoints, so it must reach a public asynchronous facade rather than the laptop's private address; tool calls have a short per-call budget and bounded responses, so it should fetch artifact references instead of embedding large results; and its existing write-approval gates are integration-specific, so worker dispatch must be deliberately connected to mutation approval logic.
 
 Do not place a permanent worker socket inside a short-lived request handler. A polling MVP can accept bounded HTTP requests; a later WebSocket implementation should use infrastructure designed to keep connections alive.
 
@@ -42,7 +42,7 @@ Do not place a permanent worker socket inside a short-lived request handler. A p
 
 Execution: OpenTag submits a structured job → service validates controller scope and records an idempotent command → host fetches and authorizes it locally → provider adapter runs → host persists and forwards sequenced events → OpenTag reads status and artifact references. The host is authoritative about whether execution began or finished; the service is authoritative about submission receipt and queued delivery.
 
-MVP operations: `list_workers`, `list_workspaces`, `submit_run`, `get_run`, `get_events(after_cursor)`, `cancel_run`, `list_artifacts`, `read_artifact`. Add `respond_to_approval` only with authenticated human approval routing and provider adapter support. Every mutating operation includes a unique operation ID. `submit_run` returns a run ID promptly; it never holds a tool invocation open until research finishes.
+MVP operations: `workers_list`, `workspaces_list`, `jobs_submit`, `jobs_get`, `jobs_events` (cursor-based), `jobs_cancel`, `artifacts_list`, `artifacts_get`. Add `jobs_approve` and `jobs_resume` only with authenticated human approval routing and provider adapter support. Every mutating operation includes a unique operation ID. `jobs_submit` returns a job ID promptly; it never holds a tool invocation open until research finishes.
 
 Suggested request fields: host ID, registered workspace ID, provider adapter ID, opaque account profile ID, prompt, policy preset, runtime budget, queue deadline and idempotency key. The host resolves workspace/profile IDs locally. Negotiate protocol and adapter capabilities so unsupported resume/approval modes are rejected before launch.
 
@@ -65,7 +65,7 @@ Persist job identity, selected adapter/profile, workspace, policy snapshot, budg
 
 Suggested states: `queued`, `claimed`, `starting`, `running`, `waiting_for_approval`, `cancel_requested`, `succeeded`, `failed`, `cancelled`, `interrupted`, `expired`. Track host connectivity separately (`online`, `offline`, last seen). A dropped connection must not turn a running job into success/failure. Do not describe offline as sleeping unless the host actually reported a sleep transition.
 
-Events carry `run_id`, monotonically increasing per-run sequence, event ID, timestamp and typed payload. Reconnection resumes from a cursor and tolerates duplicates. Acknowledgements mean events are durably stored, not merely written to a socket. Coalesce token deltas, bound buffers and retain final status even if verbose logs are truncated.
+Events carry `job_id`, monotonically increasing per-job sequence, event ID, timestamp and typed payload. Reconnection resumes from a cursor and tolerates duplicates. Acknowledgements mean events are durably stored, not merely written to a socket. Coalesce token deltas, bound buffers and retain final status even if verbose logs are truncated.
 
 Deduplicate submission retries using the stable operation ID, including across process restarts. Use a host-specific lease/epoch to prevent two host processes from claiming the same command. Do not promise exactly-once external side effects: if a process crashes after an action but before recording its result, mark the outcome uncertain and reconcile or require review instead of blindly rerunning.
 
@@ -89,7 +89,7 @@ Push notifications should signal `needs_input`, selected failures, and optionall
 
 Acceptance tests:
 
-1. A phone on a different network starts a run without inbound laptop ports; submission returns a run ID within OpenTag's 15-second timeout (target under two seconds in normal conditions).
+1. A phone on a different network starts a run without inbound laptop ports; submission returns a job ID within OpenTag's per-call tool budget (target under two seconds in normal conditions).
 2. Repeating the same submission before/after a response loss produces one run; restarting the host does not lose that mapping.
 3. Disconnecting the client and reconnecting shows a consistent event history and the correct final result; duplicate events do not duplicate UI entries.
 4. A disconnected host is visibly unavailable; no job is falsely reported started. Queue expiry/cancellation wins over a later delivery if queueing is enabled.

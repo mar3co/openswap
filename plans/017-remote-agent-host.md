@@ -12,7 +12,7 @@ Start with a single-owner, macOS, Codex research pilot. Prove account isolation 
 
 ## What the repositories already provide
 
-Inspected local checkouts: OpenSwap `353dec0`, OpenTag `6b50753`. Findings describe these checkouts, not an audit of deployed production.
+Inspected local checkouts: OpenSwap `6ec5c71` (main) and the private OpenTag repository. Findings describe these checkouts, not an audit of deployed production. OpenTag-specific code findings and the connector work are tracked in [mar3co/opentag#135](https://github.com/mar3co/opentag/issues/135); only their consequences for OpenSwap are recorded here.
 
 | Existing surface | Consequence for this feature |
 | --- | --- |
@@ -21,12 +21,12 @@ Inspected local checkouts: OpenSwap `353dec0`, OpenTag `6b50753`. Findings descr
 | Old session-run mode was deliberately removed | Introduce a clearly scoped worker feature; do not silently restore the old session product |
 | Account/session helpers exist, with shared settings and other inherited resources | Audit and narrow worker configuration; a separate profile directory is not an OS sandbox |
 | OpenTag already calls authenticated remote MCP servers over public HTTPS | An asynchronous MCP adapter is a natural first integration |
-| OpenTag rejects private/loopback addresses in hosted MCP use | Hosted OpenTag cannot directly call a user's laptop or tailnet IP; keep these protections |
-| OpenTag MCP defaults to a 15-second call timeout and bounded responses | Return a job ID promptly, then retrieve status/results separately; never hold one tool call for an entire research run |
-| Existing managed MCP write approval covers Chargebee and Stripe specifically | Worker dispatch needs its own approval/policy handling; generic MCP availability is insufficient |
+| Hosted OpenTag only calls public HTTPS endpoints | It cannot reach a user's laptop or tailnet IP directly; the worker needs a public asynchronous facade |
+| OpenTag tool calls have a short per-call budget and bounded responses | Return a job ID promptly, then retrieve status/results separately; never hold one tool call for an entire research run |
+| OpenTag's existing write-approval gates are integration-specific | Worker dispatch needs its own approval/policy handling; generic MCP availability is insufficient |
 | OpenTag currently gates hosted model spending | Track local agent usage separately from hosted planning/summarization and transport costs |
 
-Repository references: OpenSwap [README](https://github.com/mar3co/openswap/blob/353dec0/README.md); OpenTag [MCP transport](https://github.com/mar3co/opentag/blob/6b50753/apps/agent/agent/lib/mcp-tools.ts), [MCP policy](https://github.com/mar3co/opentag/blob/6b50753/packages/core/src/mcp.ts), [managed approval gate](https://github.com/mar3co/opentag/blob/6b50753/apps/agent/agent/lib/stripe-mcp-write.ts), and [product state](https://github.com/mar3co/opentag/blob/6b50753/docs/product.md).
+Repository references: OpenSwap [README](https://github.com/mar3co/openswap/blob/6ec5c71/README.md). OpenTag code references live in [mar3co/opentag#135](https://github.com/mar3co/opentag/issues/135) (private repository).
 
 ## Provider feasibility and product differentiation
 
@@ -46,7 +46,7 @@ Provider web tools can support research, but there is no assumption of parity wi
 | Bundle a separate worker with OpenSwap | Reuses installation and account UX; isolates lifecycle; supports future extraction | Adds worker management and a small control service | Recommend |
 | Launch OpenServer as a new product immediately | Independent identity and cross-platform roadmap | New installer, support surface, onboarding and infrastructure before validating demand | Defer |
 
-OpenSwap owns machine enrollment, local policy, provider adapters and run execution. OpenTag owns requesting work, workspace/user authorization, planning, approval presentation and delivering results. A small control service stores enrollment and job metadata. Keep its protocol independent of OpenTag conversation internals.
+OpenSwap owns machine enrollment, local policy, provider adapters and run execution. OpenTag owns requesting work, workspace/user authorization, planning, approval presentation and delivering results. A small control service stores enrollment and job metadata. Keep its protocol independent of OpenTag conversation internals. Neither product runs such a service today: it is new infrastructure with no owner or budget yet. Recommend that OpenTag's hosting operate it, since it already holds tenant authentication and the MCP client, and settle ownership in the feasibility spike before any transport work starts.
 
 Revisit OpenServer when non-OpenTag clients actually adopt the protocol, Linux/headless installations are requested, teams need several worker machines, or worker releases regularly need a different cadence from the account utility. Give it a package boundary now; a separate brand can wait.
 
@@ -68,15 +68,15 @@ Begin with bounded outbound HTTPS polling, heartbeats and event uploads. This av
 
 The worker should run as an opt-in per-user macOS LaunchAgent under the signed-in user. This keeps local keychain access in the expected user context. Quitting the menu-bar UI need not kill work; signing out, rebooting or losing access to the keychain must be reflected in availability. Do not promise pre-login execution or wake-from-sleep behavior in the first release.
 
-First-use flow: enable Remote tasks in OpenSwap, pair a named OpenTag user/workspace, choose an eligible local account and approved research folder, then run a test task. Show the same job ID and stop control in both products. Coordinate helper installation and updates with OpenSwap's existing app-packaging plans 007–008. Keep implementation ownership separate across OpenSwap's MIT and OpenTag's AGPL repositories rather than casually copying code between them.
+First-use flow: enable Remote tasks (the settings label for Remote Agent Host) in OpenSwap, pair a named OpenTag user/workspace, choose an eligible local account and approved research folder, then run a test task. Show the same job ID and stop control in both products. Coordinate helper installation and updates with OpenSwap's existing app-packaging plans 007–008. Keep implementation ownership separate across OpenSwap's MIT and OpenTag's AGPL repositories rather than casually copying code between them.
 
 ### Job contract
 
-Proposed tools: `workers_list`, `jobs_submit`, `jobs_get`, `jobs_cancel`, and `artifacts_get`. Add `jobs_approve` and `jobs_resume` only when the adapter can implement their semantics reliably. These are new interfaces, not existing tools.
+Proposed tools: `workers_list`, `workspaces_list`, `jobs_submit`, `jobs_get`, `jobs_events` (cursor-based), `jobs_cancel`, `artifacts_list` and `artifacts_get`. Add `jobs_approve` and `jobs_resume` only when the adapter can implement their semantics reliably. These are new interfaces, not existing tools; the supporting reports use the same names.
 
 A submission includes an idempotency key, target worker, provider, task text, predefined capability profile, opaque workspace ID, expiry and runtime limit. The server derives tenant and requesting user from authentication. The worker maps the workspace ID to an approved path. Callers cannot supply arbitrary shell commands, executable paths, environment variables, auth files or unrestricted filesystem paths.
 
-Store the job ID, owner, provider session ID, pinned local account reference, state, lease generation, event cursor, timestamps and artifact metadata. Use queued → leased → running → succeeded/failed/cancelled/expired, with explicit waiting-for-approval and unknown/interrupted states. “Cancellation requested” and “process stopped” are different events.
+Store the job ID, owner, provider session ID, pinned local account reference, state, lease generation, event cursor, timestamps and artifact metadata. Use `queued`, `claimed`, `starting`, `running`, `waiting_for_approval`, `cancel_requested`, `succeeded`, `failed`, `cancelled`, `interrupted` and `expired`, and track worker connectivity (`online`/`offline`, last seen) separately. `cancel_requested` and the provider's actual stop are different events; `interrupted` covers restarts where the outcome is unknown.
 
 Initially reject submissions to offline workers. The queue handles admission/concurrency and brief delivery interruptions, with a deadline on every job. Deliberately queueing new work for an offline machine is a later opt-in capability. On reconnect, recheck expiry, cancellation, authorization and account readiness before launch.
 
@@ -107,7 +107,7 @@ TLS protects transport. In this MVP the trusted control service can process subm
 1. **Feasibility spike and authentication gate.** Pin installed provider versions; test Codex login, headless research, structured events, cancellation and recovery. Prove the selected account is used without changing the user's default login. Inventory auth refresh races and inherited permissions. Resolve Claude's exact permitted integration path separately. Exit: evidence-backed adapter contract and a reproducible local research run.
 2. **Local worker.** Add a separate process, local journal, bounded queue, provider adapter, account leases, output directory and basic status UI/CLI. Keep remote access off. Exit: tasks survive UI restart, limits are enforced, and uncertain restarts cannot create duplicate launches.
 3. **Private remote pilot.** Add enrollment/revocation, owner-only authorization, durable job service, outbound polling, heartbeats, expiries and result upload. Exit: submit from another network with no inbound port; observe truthful offline state and recover connectivity safely.
-4. **OpenTag connector.** Add async tools and a dedicated worker capability scope, approval mapping, worker selector, status/result UI and completion/approval notifications. Register through existing MCP infrastructure while explicitly adding dispatch mutation policy. Exit: an authorized OpenTag request completes research and returns citations/artifacts through a short initial tool call.
+4. **OpenTag connector.** Add async tools and a dedicated worker capability scope, approval mapping, worker selector, status/result UI and completion/approval notifications. Register through existing MCP infrastructure while explicitly adding dispatch mutation policy. OpenTag-side scope is tracked in [mar3co/opentag#135](https://github.com/mar3co/opentag/issues/135). Exit: an authorized OpenTag request completes research and returns citations/artifacts through a short initial tool call.
 5. **Reliability and expansion.** Add replayable events, resume/steer where supported, measured concurrency, multiple workers and a second provider after its gate clears. Reconsider OpenServer packaging using observed demand.
 
 These are implementation slices, not time estimates. Estimate after the provider/account spike; authentication and lifecycle behavior are the main uncertainty.

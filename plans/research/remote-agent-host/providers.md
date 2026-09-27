@@ -4,7 +4,7 @@ Checked 2026-09-27 against official documentation and the installed Codex CLI he
 
 ## Decision summary
 
-A local worker is technically feasible. Prefer a Codex App Server adapter and a separately designed Claude adapter. Do not assume that an SDK, subscription login, and third-party credential management are interchangeable. The strongest product opportunity is a cross-provider task queue, research workflow, and OpenTag connector: both providers already offer native remote control.
+A local worker is technically feasible. Start with a pinned `codex exec --json` adapter for the first bounded research run, assess App Server for later interactive approvals and steering, and design the Claude adapter separately. Do not assume that an SDK, subscription login, and third-party credential management are interchangeable. The strongest product opportunity is a cross-provider task queue, research workflow, and OpenTag connector: both providers already offer native remote control.
 
 ## Codex
 
@@ -17,7 +17,7 @@ A local worker is technically feasible. Prefer a Codex App Server adapter and a 
 - **Research:** local Codex offers hosted web search, cached by default and live with `--search` or configuration. Search events appear in JSON output. Hosted search is separate from the sandbox's command-network controls. This supports ordinary sourced research, but does not establish access to every ChatGPT Deep Research feature through the local CLI. [Web search](https://learn.chatgpt.com/docs/web-search)
 - **Existing competitor:** Codex Remote already starts tasks on a connected Mac/Windows computer from ChatGPT mobile, streams progress, accepts instructions/approvals and shows diffs. Availability depends on rollout/workspace settings; the host must stay awake and online. [Codex Remote](https://learn.chatgpt.com/docs/remote)
 
-Local evidence: installed CLI reports `codex-cli 0.158.0-alpha.2`. Its help includes `exec`, `app-server`, experimental `remote-control`, `--remote`, `--remote-auth-token-env`, `--search`, sandbox and approval options. This establishes local binary surfaces only; pin and test a supported release before shipping.
+Local evidence: a locally installed pre-release CLI (`codex-cli 0.158.0-alpha.2`, not on the default shell PATH) showed help entries for `exec`, `app-server`, experimental `remote-control`, `--remote`, `--remote-auth-token-env`, `--search`, sandbox and approval options. This establishes local binary surfaces only; the pre-release is not the target version. Record the binary location and pin and test a supported release before shipping.
 
 ## Claude Code
 

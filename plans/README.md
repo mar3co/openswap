@@ -66,7 +66,8 @@ install/upgrade rewiring. Three phases with a green-suite gate between them.
 client, and defers a standalone OpenServer product. It includes provider research,
 architecture, staged delivery and acceptance criteria. This is a design proposal;
 merging it does not implement or enable remote execution. Its research snapshots
-are dated 2026-09-27 and must be revalidated during the feasibility spike.
+are dated 2026-09-27 and must be revalidated during the feasibility spike. The
+OpenTag connector side is tracked in mar3co/opentag#135 (private repository).
 
 ## Dependency notes
 

@@ -1,10 +1,10 @@
-# OpenSwap Remote: product boundary research
+# Remote Agent Host: product boundary research
 
-Research date: 2026-09-27. Read-only inspection of the user's local OpenSwap checkout at `mar3co/openswap`, HEAD `353dec06b4eaec499a55aa44e6504966c50cac61`. This is a proposed feature request, not an implemented capability. Provider support and subscription terms require the separate provider research; this document does not establish them.
+Research date: 2026-09-27. Read-only inspection of the user's local OpenSwap checkout at `mar3co/openswap`, HEAD `6ec5c71506313a101ae8a145a9a43b48f0f40ce0` (main). This is a proposed feature request, not an implemented capability. Provider support and subscription terms require the separate provider research; this document does not establish them.
 
 ## Recommendation
 
-Ship **OpenSwap Remote** as an optional OpenSwap feature, implemented by a **separate local worker process bundled with OpenSwap**. Let OpenTag be its first remote client. Keep a versioned worker protocol and provider adapters so the worker can later be packaged independently, without launching a new OpenServer product or repository now.
+Ship **Remote Agent Host** as an optional OpenSwap feature, implemented by a **separate local worker process bundled with OpenSwap**. Let OpenTag be its first remote client. Keep a versioned worker protocol and provider adapters so the worker can later be packaged independently, without launching a new OpenServer product or repository now.
 
 This separates three decisions that need not happen together: the user-facing product is OpenSwap, the runtime is a separate worker process, and the code initially belongs in the OpenSwap repository. A long-running worker should survive a popover reload or menu-bar crash, but users should have one installer and one account setup. The first release should target the Mac already supported by OpenSwap.
 
@@ -47,7 +47,7 @@ These are design judgments informed by the checkout, not externally measured mar
 
 **The versioned contract** can begin with capabilities, submit, status, events, cancel, approval response, and artifact retrieval. Carry opaque device/workspace/account IDs, idempotency key, job attempt, permission profile, requested provider/model, protocol version, and time/size limits. Tokens and raw provider credentials do not belong in the contract. MCP can wrap this contract later; it is not a substitute for job lifecycle or authorization.
 
-**Commercial and approval boundary:** the companion repository review found that OpenTag's current hosted model spend remains gated, including BYOK (`opentag/docs/product.md`), and that generic custom MCP writes do not supply a universal dispatch approval path. Local provider consumption, OpenTag orchestration model usage, and relay/storage costs must be presented separately; “uses your eligible local subscription” must not become “all work is free.” Remote job submission needs an explicit OpenTag tool scope and approval/policy decision, even if exposed through MCP.
+**Commercial and approval boundary:** the companion repository review (recorded in [mar3co/opentag#135](https://github.com/mar3co/opentag/issues/135)) found that OpenTag's current hosted model spend remains gated, including BYOK, and that generic custom MCP writes do not supply a universal dispatch approval path. Local provider consumption, OpenTag orchestration model usage, and relay/storage costs must be presented separately; “uses your eligible local subscription” must not become “all work is free.” Remote job submission needs an explicit OpenTag tool scope and approval/policy decision, even if exposed through MCP.
 
 ## First-use experience
 
