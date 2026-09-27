@@ -56,6 +56,18 @@ validation gate. Plan 009 is independent of 007/008
 but touches `menubar.py`, so do not run it concurrently with 008's
 install/upgrade rewiring. Three phases with a green-suite gate between them.
 
+## Feature proposals
+
+| Plan | Proposal | Status |
+|------|----------|--------|
+| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag | PROPOSED; authentication and lifecycle spike required |
+
+017 recommends an optional OpenSwap worker process, with OpenTag as its first
+client, and defers a standalone OpenServer product. It includes provider research,
+architecture, staged delivery and acceptance criteria. This is a design proposal;
+merging it does not implement or enable remote execution. Its research snapshots
+are dated 2026-09-27 and must be revalidated during the feasibility spike.
+
 ## Dependency notes
 
 - 002 uses 001’s org titles in the hold-reason line (`personal` vs `Ads Online`).
