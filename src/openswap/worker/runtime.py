@@ -492,14 +492,16 @@ class WorkerRuntime:
             try:
                 latest = self.store.get(running.job_id)
             except Exception:
-                # We still own this provider handle, but cannot safely write
-                # through an unknown journal fence. Attempt interruption and
+                # If we still own this provider handle but cannot safely write
+                # through an unknown journal fence, attempt interruption and
                 # update only the durable lease; leave the journal for startup
-                # reconciliation if its current generation cannot be read.
-                try:
-                    self._interrupt_execution(token, run)
-                finally:
-                    self._clear_active()
+                # reconciliation. If an interrupt already ran (and cleared the
+                # handle) before this failure, never interrupt it again.
+                if self._active_run is not None:
+                    try:
+                        self._interrupt_execution(token, run)
+                    finally:
+                        self._clear_active()
                 raise
             reason = (
                 "cancel_requested"
@@ -800,12 +802,12 @@ class WorkerRuntime:
                 pass
             stopped = False
         self._clear_active()
-        try:
-            latest = self.store.get(record.job_id)
-        except Exception:
-            # The lease already records either confirmed stop or uncertainty.
-            # Without a current fence, leave the journal untouched.
-            return record
+        # The lease already records either confirmed stop or uncertainty. A
+        # journal read failure here propagates (like a failed terminal write
+        # below): returning the stale in-flight record would orphan the row for
+        # this process's life, while exiting lets the next start_epoch recover
+        # it as interrupted.
+        latest = self.store.get(record.job_id)
         terminal_states = {
             JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED,
             JobState.INTERRUPTED, JobState.EXPIRED,

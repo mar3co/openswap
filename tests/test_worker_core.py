@@ -235,6 +235,30 @@ def test_journal_failure_while_recording_an_interrupt_is_not_swallowed(tmp_path)
     assert AccountLeaseStore(tmp_path).current().state == "uncertain"
 
 
+def test_journal_reload_failure_after_an_interrupt_is_not_swallowed(tmp_path):
+    update_worker_settings(tmp_path, enabled=True)
+    adapter = _FakeAdapter(stopped=False)
+    identity = stable_account_identity("codex", "journal-reload-test")
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    # A short runtime limit bounds this test if the failure is ever swallowed again.
+    runtime.submit(_submission(runtime_limit_s=1))
+    real_get = runtime.store.get
+
+    def failing_get(job_id):
+        if adapter.interrupt_count:
+            raise OSError("journal unreadable")
+        return real_get(job_id)
+
+    runtime.store.get = failing_get
+    shutdown = threading.Event()
+    shutdown.set()
+
+    with pytest.raises(OSError, match="journal unreadable"):
+        runtime.reconcile_once(shutdown_event=shutdown)
+    assert adapter.interrupt_count == 1 and adapter.start_count == 1
+    assert AccountLeaseStore(tmp_path).current().state == "uncertain"
+
+
 def test_job_that_expires_during_launch_preparation_never_starts(tmp_path):
     update_worker_settings(tmp_path, enabled=True)
 
