@@ -1,6 +1,6 @@
 # Remote Agent Host: architecture research
 
-Researched 2026-09-27. This document separates observed provider capabilities from proposed OpenSwap design. It does not establish provider subscription eligibility or approve a particular credential integration; use the companion provider research for that release gate.
+Researched 2026-09-27. This document separates observed provider capabilities from proposed OpenSwap design. It does not establish provider subscription eligibility or approve a particular credential integration; use the companion provider research for that release gate. Where this report differs from plan 017 on scope, names, limits or phase ordering, the plan supersedes it.
 
 ## Recommendation
 
@@ -8,7 +8,7 @@ Ship **Remote Agent Host as an opt-in OpenSwap feature**, with a separately test
 
 The value is a unified, permissioned way to dispatch work to users' existing machines and receive durable results across providers. Remote access alone is already offered by both major providers. The differentiation should be OpenTag coordination, account-aware local execution where permitted, a consistent run API, and reliable artifacts.
 
-Use **host-initiated HTTPS polling for an initial deployment**, with an asynchronous public API/MCP facade for OpenTag. Add a persistent outbound connection only when the deployment platform supports a long-running relay service and measured latency justifies it. Run provider integrations on the host over local interfaces; never publish a raw provider control socket to the internet.
+Use **host-initiated HTTPS polling for an initial deployment**, with an asynchronous public API/MCP facade for OpenTag. Add a persistent outbound connection only when the hosting can keep long-lived connections and measured latency justifies it. Run provider integrations on the host over local interfaces; never publish a raw provider control socket to the internet.
 
 ## What official products already establish
 
@@ -31,12 +31,12 @@ Use **host-initiated HTTPS polling for an initial deployment**, with an asynchro
 
 OpenTag findings from the companion repository review are recorded in [mar3co/opentag#135](https://github.com/mar3co/opentag/issues/135) (private repository). Their consequences: hosted OpenTag only calls public HTTPS endpoints, so it must reach a public asynchronous facade rather than the laptop's private address; tool calls have a short per-call budget and bounded responses, so it should fetch artifact references instead of embedding large results; and its existing write-approval gates are integration-specific, so worker dispatch must be deliberately connected to mutation approval logic.
 
-Do not place a permanent worker socket inside a short-lived request handler. A polling MVP can accept bounded HTTP requests; a later WebSocket implementation should use infrastructure designed to keep connections alive.
+Do not tie a permanent worker connection to a bounded request lifetime. A polling MVP can accept bounded HTTP requests; a later WebSocket implementation should use infrastructure designed to keep connections alive.
 
 ## Proposed components and data flow
 
 1. **OpenSwap desktop UI** owns opt-in, enrolled controllers, authorized accounts/workspaces, host health, run history and a local disable/stop control.
-2. **OpenSwap host process** owns execution, policy enforcement, account selection, adapter processes, approval state and a durable local event journal. Run it under the logged-in user initially; specify later behavior for logout/reboot explicitly.
+2. **OpenSwap host process** owns execution, policy enforcement, account selection, adapter processes, approval state and a durable local event journal. Run it under the logged-in user initially; logout or reboot marks running jobs `interrupted` and the host offline, as plan 017 specifies.
 3. **Relay/control service** owns controller authentication, device registration, a bounded command queue, transport delivery, durable metadata and notification fan-out. It never receives the user's provider refresh tokens or credential files. Provider credentials still travel to the relevant provider as required by its authentication protocol.
 4. **OpenTag connector** discovers eligible hosts/workspaces, submits tasks and renders status/results. It does not choose arbitrary local paths, shell commands or provider executable arguments.
 
@@ -44,14 +44,14 @@ Execution: OpenTag submits a structured job → service validates controller sco
 
 MVP operations: `workers_list`, `workspaces_list`, `jobs_submit`, `jobs_get`, `jobs_events` (cursor-based), `jobs_cancel`, `artifacts_list`, `artifacts_get`. Add `jobs_approve` and `jobs_resume` only with authenticated human approval routing and provider adapter support. Every mutating operation includes a unique operation ID. `jobs_submit` returns a job ID promptly; it never holds a tool invocation open until research finishes.
 
-Suggested request fields: host ID, registered workspace ID, provider adapter ID, opaque account profile ID, prompt, policy preset, runtime budget, queue deadline and idempotency key. The host resolves workspace/profile IDs locally. Negotiate protocol and adapter capabilities so unsupported resume/approval modes are rejected before launch.
+Suggested request fields: host ID, registered workspace ID, provider adapter ID, prompt, policy preset, runtime budget, queue deadline and idempotency key. The request names no account or model; the host resolves workspace IDs locally and uses the locally pinned account. Negotiate protocol and adapter capabilities so unsupported resume/approval modes are rejected before launch.
 
 ## Pairing and access design
 
 - Enrollment begins on the host, displaying a short-lived, single-use pairing code/QR. An authenticated OpenTag user claims it and the local user confirms the controller identity and scope. Expired/replayed codes fail. Avoid pairing through a reusable link that grants blanket execution.
 - Generate a device credential in OS-protected storage. Issue separate short-lived controller grants bound to owner, host, allowed workspace/profile IDs and allowed actions. Pairing, execution credentials, provider credentials and notification tokens are separate secrets.
-- The relay checks identity and scope; the host independently checks every command against its local allowlist and policy. Do not trust an account/profile ID just because the relay supplied it.
-- Revoking a controller immediately stops new submissions at the service, closes its access to existing run data, and invalidates queued commands. Host polling responses carry revocation state; a host that has not refreshed authorization must not start new remote work after its authorization lease expires. Cancellation of already-running work is a separate explicit choice.
+- The relay checks identity and scope; the host independently checks every command against its local allowlist and policy. Do not trust a workspace ID just because the relay supplied it.
+- Revoking a controller immediately stops new submissions at the service, closes its access to existing run data, and invalidates queued commands. Host polling responses carry revocation state; a host that has not refreshed authorization must not start new remote work after its authorization lease expires. A job already running finishes or hits its runtime limit unless the owner also cancels it locally.
 - Run a single owner and one active job per host in the MVP. Select the account before launch and pin it for the job. Never change global provider credentials beneath a running process; do not promise concurrency until per-process credential/state isolation is proven.
 - Register allowed directories locally. Canonicalize filesystem paths and defend against symlink/path traversal in artifact access. A worktree avoids file-edit conflicts; it is not a security sandbox.
 - Apply OS/provider sandbox boundaries where supported, per-adapter tool restrictions and dedicated output directories. “Research” is a task description, not a security guarantee. Research presets may read approved project files and write outputs while shell/network/connector capabilities remain explicitly constrained.
@@ -79,17 +79,17 @@ Artifacts are allowlisted output objects with ID, name, size, media type, hash a
 
 Keep approvals separate from model-generated messages. Bind each request to the exact run, tool/action, arguments digest, permission scope, host epoch and expiration. A human sees the concrete command/change and approves or rejects once. Local and remote UIs race through a single resolution record; stale or repeated responses fail safely. An unavailable approver leaves the run waiting or expires it under its preset; it does not silently enable unrestricted execution.
 
-Push notifications should signal `needs_input`, selected failures, and optionally completion. Include an authenticated deep link, not sensitive prompts or credentials. Notification delivery is best-effort and never an approval. Deduplicate by approval/event ID, respect quiet hours, and display pending decisions reliably inside OpenTag even if mobile delivery fails. Implement actual push only after checking OpenTag's mobile/web delivery capabilities; this document does not claim the current research session can send custom push messages.
+Push notifications should signal `waiting_for_approval` (once in-run approvals exist), selected failures, and optionally completion. Include an authenticated deep link, not sensitive prompts or credentials. Notification delivery is best-effort and never an approval. Deduplicate by approval/event ID, respect quiet hours, and display pending decisions reliably inside OpenTag even if mobile delivery fails. Implement actual push only after checking OpenTag's mobile/web delivery capabilities; this document does not claim the current research session can send custom push messages.
 
 ## Delivery phases and acceptance criteria
 
 **Phase 0: compatibility and authorization spike.** Prove one provider adapter can start, stream, finish, interrupt and recover a task using an approved auth method. Verify account isolation and remote approval behavior on pinned versions. Produce a support matrix; an unsupported subscription path blocks that adapter, not the protocol work.
 
-**Phase 1: private MVP.** Codex-first read-only research over approved source workspaces, with writes limited to a dedicated output directory; subject to the Phase 0 authentication/compatibility gate. Single user, single host, single active run; manual account selection; registered workspaces; polling relay; asynchronous OpenTag connector; terminal summaries/artifacts; explicit offline rejection and cancellation. Claude subscription-backed orchestration stays gated on the exact permitted credential and invocation path; a later BYOK offering is an explicit expansion of scope. Keep code in separate `host`, `protocol`, `adapter` and `connector` modules even if packaged through OpenSwap.
+**Phase 1: private MVP.** Codex-first read-only research over approved source workspaces, with writes limited to a dedicated output directory; subject to the Phase 0 authentication/compatibility gate. Single user, single host, single active run; manual account selection; registered workspaces; polling relay; asynchronous OpenTag connector (plan 017 splits these into phases 3 and 4, with a test-only submit CLI proving phase 3); terminal summaries/artifacts; explicit offline rejection and cancellation. Claude subscription-backed orchestration stays gated on the exact permitted credential and invocation path; a later API-key offering is an explicit expansion of scope. Keep code in separate `host`, `protocol`, `adapter` and `connector` modules even if packaged through OpenSwap.
 
 Acceptance tests:
 
-1. A phone on a different network starts a run without inbound laptop ports; submission returns a job ID within OpenTag's per-call tool budget (target under two seconds in normal conditions).
+1. A phone on a different network starts a run without inbound laptop ports; submission returns a job ID well inside OpenTag's per-call tool budget.
 2. Repeating the same submission before/after a response loss produces one run; restarting the host does not lose that mapping.
 3. Disconnecting the client and reconnecting shows a consistent event history and the correct final result; duplicate events do not duplicate UI entries.
 4. A disconnected host is visibly unavailable; no job is falsely reported started. Queue expiry/cancellation wins over a later delivery if queueing is enabled.
@@ -97,7 +97,7 @@ Acceptance tests:
 6. Unknown workspace/profile IDs and artifact path escapes fail on the host. Provider and host secrets do not appear in relay payloads or artifacts.
 7. Cancel is acknowledged promptly when online and eventually reports the provider's actual interruption outcome; unsupported cancellation cannot masquerade as success.
 8. Crash during an ambiguous side effect produces `interrupted`/uncertain status, with no automatic duplicate action.
-9. An approval cannot be answered by an agent tool call without the configured human approval path. Two clients cannot both apply the same decision.
+9. An approval cannot be answered by an agent tool call without the configured human approval path. Two clients cannot both apply the same decision. (In-run approvals are plan 017 phase 6; in the first release this applies to the pre-launch approval only.)
 10. A second run queues/rejects clearly; it does not switch credentials or write concurrently into the active workspace.
 
 **Phase 2: reliability and broader execution.** Second provider after eligibility review, provider-version compatibility tests, per-process account isolation, concurrent worktrees, durable approval routing, notifications, explicit queued-offline behavior, and optional persistent relay connections. Add resource/concurrency quotas and support diagnostics before widening permissions.

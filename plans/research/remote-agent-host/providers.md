@@ -1,6 +1,6 @@
 # OpenSwap remote execution: provider capability research
 
-Checked 2026-09-27 against official documentation and the installed Codex CLI help. These are documentation findings, not completed integration tests or legal advice. No credentials were inspected and no provider jobs were launched.
+Checked 2026-09-27 against official documentation and the installed Codex CLI help. These are documentation findings, not completed integration tests or legal advice. No credentials were inspected and no provider jobs were launched. Where this report differs from plan 017 on scope, names, limits or phase ordering, the plan supersedes it.
 
 ## Decision summary
 
@@ -31,7 +31,7 @@ Local evidence: a locally installed pre-release CLI (`codex-cli 0.158.0-alpha.2`
 
 These are engineering recommendations inferred from the documented boundaries:
 
-1. Keep one local provider-owned auth context per enrolled account/profile. Pin a job to its profile for its lifetime. Never switch the global auth file while jobs are running. Start with one active job per profile; test higher concurrency deliberately.
+1. Keep one local provider-owned auth context per enrolled account/profile. Pin a job to its profile for its lifetime. Never switch the global auth file while jobs are running. Start with one active job per host, which implies one per profile; test per-profile concurrency deliberately later.
 2. Implement `probe`, `start`, `resume`, `events`, `interrupt`, and capability flags such as approvals, live research, usage reporting and supported billing mode. Preserve provider session IDs separately from OpenSwap job IDs.
 3. Show billing mode before dispatch. Stop or queue when limits/auth fail; never silently buy credits, switch to API billing, rotate to another account, or replay a possibly completed action.
 4. Use approved working directories, a fresh worktree for code edits, read-only research tools by default, and a durable waiting-for-user state for approvals. Sandbox enforcement and approval UX are different layers.

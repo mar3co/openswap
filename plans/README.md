@@ -30,7 +30,7 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 015  | Desktop recovery and quiet completion feedback | P1 | M | — | DONE; profile detection still blocked |
 | 016  | App-aware ChatGPT switching | P1 | M | 014, 015, PR #49 | DONE |
 
-Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED
+Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED. Feature proposals use PROPOSED until accepted into the execution order.
 
 010's implementation and review fixes merged in PR #36 on 2026-09-17 UTC;
 the deferred manual UI verification keeps its overall status IN PROGRESS.

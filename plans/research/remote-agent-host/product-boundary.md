@@ -1,6 +1,6 @@
 # Remote Agent Host: product boundary research
 
-Research date: 2026-09-27. Read-only inspection of the user's local OpenSwap checkout at `mar3co/openswap`, HEAD `6ec5c71506313a101ae8a145a9a43b48f0f40ce0` (main). This is a proposed feature request, not an implemented capability. Provider support and subscription terms require the separate provider research; this document does not establish them.
+Research date: 2026-09-27. Read-only inspection of the user's local OpenSwap checkout at `mar3co/openswap`, HEAD `6ec5c71506313a101ae8a145a9a43b48f0f40ce0` (main). This is a proposed feature request, not an implemented capability. Provider support and subscription terms require the separate provider research; this document does not establish them. Where this report differs from plan 017 on scope, names, limits or phase ordering, the plan supersedes it.
 
 ## Recommendation
 
@@ -18,8 +18,8 @@ The promise is: “Send a research task to your Mac from OpenTag; use an approve
 | Accounts and switching are behind `Engine`/`AccountEngine`, with separate Claude and Codex engines. | `docs/architecture.md:34`; `src/openswap/engine/protocol.py:17` | Reuse the engine boundary. Add a local account-reservation/session contract; do not put credential logic in the OpenTag connector. |
 | Existing scheduled kickoff invokes `claude -p` and `codex exec`. | `src/openswap/kickoff.py:282`, `:301`, `:340`, `:358` | Headless invocation is already an architectural precedent, but kickoff is a short ping, not a durable session runner. |
 | `openswap run`, `map`, and `unmap` were deliberately removed; session-profile tests cover kickoff, not launching terminal sessions. | `src/openswap/cli.py:1453`; `docs/testing.md:9`; `docs/architecture.md:42` | Build and validate a new job runner; do not describe the old session feature as shipping or restore its former UX by accident. |
-| Claude isolated profiles may share settings, skills, commands, agents, and MCP definitions from the user's ordinary environment. | `src/openswap/session.py:1`, `:61`, `:101` | Remote research must have an explicit tool/config inheritance policy. A fresh config directory alone does not prove restricted permissions. |
-| Claude profile credentials and backups require stale markers, quiescence checks, and adoption of refreshed generations. | `src/openswap/engine/session_profile.py:161`; `src/openswap/session.py:91` | Avoid “copy credentials and launch many workers.” Start with one job per account and coordinated refresh ownership. |
+| Claude isolated profiles may share settings, skills, commands, agents, and MCP definitions from the user's ordinary environment. | `src/openswap/session.py:1`, `:71`, `:101` | Remote research must have an explicit tool/config inheritance policy. A fresh config directory alone does not prove restricted permissions. |
+| Claude profile credentials and backups require stale markers, quiescence checks, and adoption of refreshed generations. | `src/openswap/engine/session_profile.py:164`; `src/openswap/session.py:91` | Avoid “copy credentials and launch many workers.” Start with one job per account and coordinated refresh ownership. |
 | Codex slot directories also serve as `CODEX_HOME`; accounts can be moved/swapped between slots. | `docs/architecture.md:36`, `:83`; `README.md` command table | Long-lived remote bindings need stable opaque account IDs, not mutable slot numbers. |
 | Existing process detection excludes `codex exec` and `codex app-server` from live Codex TUI detection. | `docs/architecture.md:53`; `docs/menubar.md:54` | Remote jobs need their own persisted liveness/account leases. Existing busy detection is insufficient. |
 | OpenSwap already uses per-user launchd services. | `src/openswap/launch_agent.py:65`, `:141` | Use a separate per-user worker service, not a privileged system daemon. Test login, logout, lock, sleep, and upgrade behavior explicitly. |
@@ -45,9 +45,9 @@ These are design judgments informed by the checkout, not externally measured mar
 
 **The transport owns** authenticated device registration, bounded task delivery, acknowledgment, expiring leases, and reconnect/replay behavior. An outbound device connection is the preferred design. The concrete hosting/transport choice depends on the OpenTag stack research; “WebSocket relay” should not be assumed deployable on the current hosting platform. No public inbound port is needed for the intended product.
 
-**The versioned contract** can begin with capabilities, submit, status, events, cancel, approval response, and artifact retrieval. Carry opaque device/workspace/account IDs, idempotency key, job attempt, permission profile, requested provider/model, protocol version, and time/size limits. Tokens and raw provider credentials do not belong in the contract. MCP can wrap this contract later; it is not a substitute for job lifecycle or authorization.
+**The versioned contract** begins with the operations plan 017 names (`workers_list`, `workspaces_list`, `jobs_submit`, `jobs_get`, `jobs_events`, `jobs_cancel`, `artifacts_list`, `artifacts_get`), with `jobs_approve` and `jobs_resume` deferred. Carry opaque device and workspace IDs, idempotency key, permission profile, provider, protocol version, and time/size limits. The request names no account or model, and tokens and raw provider credentials do not belong in it. An asynchronous MCP adapter is the first OpenTag transport for this contract; MCP is not a substitute for job lifecycle or authorization.
 
-**Commercial and approval boundary:** the companion repository review (recorded in [mar3co/opentag#135](https://github.com/mar3co/opentag/issues/135)) found that OpenTag's current hosted model spend remains gated, including BYOK, and that generic custom MCP writes do not supply a universal dispatch approval path. Local provider consumption, OpenTag orchestration model usage, and relay/storage costs must be presented separately; “uses your eligible local subscription” must not become “all work is free.” Remote job submission needs an explicit OpenTag tool scope and approval/policy decision, even if exposed through MCP.
+**Commercial and approval boundary:** the companion repository review (recorded in [mar3co/opentag#135](https://github.com/mar3co/opentag/issues/135)) found that OpenTag's current hosted model spend remains gated regardless of who supplies the model keys, and that generic custom MCP writes do not supply a universal dispatch approval path. Local provider consumption, OpenTag orchestration model usage, and relay/storage costs must be presented separately; “uses your eligible local subscription” must not become “all work is free.” Remote job submission needs an explicit OpenTag tool scope and approval/policy decision, even if exposed through MCP.
 
 ## First-use experience
 
@@ -56,11 +56,11 @@ These are design judgments informed by the checkout, not externally measured mar
 3. Choose which local accounts can run remote work; default to an explicitly selected account and show provider-specific availability. Do not promise that every account in the roster is remotely usable.
 4. Select a task profile and approved working location. Start with restricted research and a dedicated output directory; broader code edits are a separate profile.
 5. Send a test task from OpenTag. See the same job ID, state, requester, provider/account alias, and stop control in OpenSwap.
-6. On later tasks, OpenTag shows queued, running, needs approval, completed, failed, canceled, or interrupted; device offline is distinct from task failure. An “unknown after disconnect” condition must not trigger a duplicate launch.
+6. On later tasks, OpenTag shows the plan 017 states under friendly labels: queued, starting (`claimed`/`starting`), running, waiting for approval, completed (`succeeded`), failed, cancelled, interrupted and expired; device offline is distinct from task failure. An “unknown after disconnect” condition must not trigger a duplicate launch.
 
 OpenSwap should have a compact activity view: current job, who requested it, elapsed time, account alias, pause new tasks, stop job, and disconnect workspace. Show unavailable/locked/sleeping/reauthentication states in plain language. Avoid foreground desktop restarts as part of task dispatch.
 
-The product's notification design should send actionable approval/failure/completion signals through OpenTag's configured channels, with no repeated alerts on routine reconnects. Push delivery is an integration capability to verify, not a guarantee merely because a notification was created.
+The product's notification design should send actionable approval/failure/completion signals through OpenTag's configured notification surfaces, with no repeated alerts on routine reconnects. Push delivery is an integration capability to verify, not a guarantee merely because a notification was created.
 
 ## Staged implementation
 
@@ -70,19 +70,19 @@ Use disposable directories and a user-authorized account to verify a restricted 
 
 ### 1. Local worker, no remote dispatch
 
-Introduce a worker package within OpenSwap, with no AppKit/rumps imports, and a local IPC surface. Add persisted jobs/events, account leases, stable account identity, per-account concurrency of one, and child-process termination. MVP account selection is pinned at job start; no mid-session auto-rotation or silent provider fallback. Exercise ordinary switching/kickoff/removal concurrently with a worker reservation.
+Introduce a worker package within OpenSwap, with no AppKit/rumps imports, and a local IPC surface. Add persisted jobs/events, account leases, stable account identity, one active job per host (which implies one per account), and child-process termination. MVP account selection is pinned at job start; no mid-session auto-rotation or silent provider fallback. Exercise ordinary switching/kickoff/removal concurrently with a worker reservation.
 
-### 2. One-device OpenTag integration
+### 2. One-device OpenTag integration (plan 017 phases 3 and 4)
 
 Pair a single owner's Mac, accept idempotent tasks via outbound transport, stream resumable status, and return a bounded final report/artifacts. Queued tasks have an expiry. After a crash, reconcile the recorded process/session and report interrupted/unknown when necessary; do not blindly resubmit work that may have already caused effects. Revoke access, cancel a job, and pause new work from the device.
 
-### 3. Harden and package
+### 3. Harden and package (plan 017 phase 5)
 
 Package the optional helper with the current OpenSwap installer/app pipeline. Verify upgrade while busy, Keychain lock, network interruption, sleep/wake, logout/reboot, output retention, provider CLI compatibility, resource limits, and local versus remote account operations. Acceptance requires that existing account switching and menu-bar behavior remain usable when remote work is disabled or the helper is unavailable.
 
 ### Later expansion
 
-Multiple devices, simultaneous jobs across independently enrolled accounts, workspace permissions, code-edit profiles, additional client integrations/MCP, a headless installer, and Linux/Windows support are separate milestones. Subscription eligibility and provider authorization still apply per account/provider; more saved subscriptions does not by itself establish safe concurrency or transferable entitlements.
+Multiple devices, simultaneous jobs across independently enrolled accounts, workspace permissions, code-edit profiles, additional client integrations beyond the first MCP adapter, a headless installer, and Linux/Windows support are separate milestones. Subscription eligibility and provider authorization still apply per account/provider; more saved subscriptions does not by itself establish safe concurrency or transferable entitlements.
 
 ## Extraction criteria for OpenServer
 
