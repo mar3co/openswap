@@ -612,6 +612,28 @@ def test_probe_normal_leader_exit_refuses_and_cleans_live_helper(tmp_path):
     assert marker.read_text() == before
 
 
+@pytest.mark.skipif(os.name != "posix", reason="bounded probe pipes need POSIX selectors")
+def test_probe_refuses_when_a_periodic_descendant_scan_fails(tmp_path, monkeypatch):
+    fake = _executable(
+        tmp_path / "fake-codex",
+        "import sys, time\ntime.sleep(0.2)\nsys.stdout.write('codex-cli 1.2.3\\n')\n",
+    )
+    real_track = spike._track_descendants
+    calls = {"n": 0}
+
+    def flaky_track(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return False  # ps failed or ran out of budget for this scan
+        return real_track(*args, **kwargs)
+
+    monkeypatch.setattr(spike, "_track_descendants", flaky_track)
+    with pytest.raises(SpikeError, match="cleanup was uncertain"):
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=5
+        )
+
+
 @pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
 @pytest.mark.xdist_group("spike_procs")
 def test_probe_refuses_and_terminates_setsid_detached_helper(tmp_path):

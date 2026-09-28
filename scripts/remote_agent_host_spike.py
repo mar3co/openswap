@@ -89,6 +89,7 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
     cleanup_uncertain = False
     leftovers = False
     detached = False
+    tracking_incomplete = False
     tracked: dict[int, tuple[int, str, str, int | None, str, bool]] = {}
     last_snapshot = 0.0
     try:
@@ -111,7 +112,10 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
                 # Best effort: descendants are attributed by parent pid while
                 # the leader is alive, so one that calls setsid() is still ours.
                 last_snapshot = now
-                _track_descendants(process.pid, tracked, deadline=deadline)
+                # A missed scan could miss a helper that forks, detaches and
+                # is reparented before the next one, so it refuses the result.
+                if not _track_descendants(process.pid, tracked, deadline=deadline):
+                    tracking_incomplete = True
             # Observe exit BEFORE selecting: anything the group wrote before
             # it went quiet is then already readable, so an empty select after
             # that observation really means no output is left.
@@ -152,7 +156,7 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
         # Group signals miss a descendant that left the group, so hunt the
         # tracked ones before the leader is reaped. Any found refuses the result.
         detached, detached_certain = _sweep_probe_descendants(process, tracked)
-        cleanup_uncertain = cleanup_uncertain or not detached_certain
+        cleanup_uncertain = cleanup_uncertain or not detached_certain or tracking_incomplete
         _reap_leader(process, timeout_s=PROBE_CLEANUP_WAIT_S)
     except BaseException:
         _cleanup_probe_process(process)
