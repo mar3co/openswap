@@ -24,15 +24,19 @@ in 13.52s`; the pytest header reported `2879 items` and 18 workers. The baseline
 header and summary also differed by one, so the exact final summary is retained
 here rather than attempting to reconcile the runner's item count.
 
-The discovered Codex CLI is ChatGPT app-bundled `0.158.0-alpha.2.1`, a
-pre-release that is not a supported release pin. `--version` and `exec --help`
-were inspected with temporary homes, without reading or creating auth. The
-spike harness and synthetic tests cover local helper behavior: inert child
-process cancellation and uncertain-journal recovery do not prove provider
-`codex exec` cancellation or recovery. The low-level Seatbelt test also does
-not show that `codex exec` applies the profile. No live account test,
-refresh-race test, or web-research run has been performed. See the
-[Codex spike record](research/remote-agent-host/spike-codex.md).
+The ChatGPT app-bundled Codex CLI is `0.158.0-alpha.2.1` (pre-release). A
+separate official stable ARM macOS release, `0.157.1`, was downloaded to
+`/private/tmp` and verified against its published SHA-256 before testing. Its
+`codex sandbox --permission-profile research-test` wrapper allowed synthetic
+workspace read/write and denied sibling read/write plus synthetic
+`CODEX_HOME/auth.json` and `config.toml` reads. This narrows the stable-version
+uncertainty for that low-level wrapper only; it does not prove `codex exec`
+applies the profile. The spike harness and synthetic tests cover local helper
+behavior: inert child-process cancellation and uncertain-journal recovery do
+not prove provider `codex exec` cancellation or recovery. No live account test,
+refresh-race test, authenticated execution, or web-research run has been
+performed. See the [Codex spike record](research/remote-agent-host/spike-codex.md)
+and [stable CLI probe](research/remote-agent-host/spike-stable-cli.md).
 
 No real provider auth, auth files, Keychain items or credentials have been
 inspected or changed, and no authenticated `codex exec` provider job or Claude
@@ -45,7 +49,7 @@ requiring credentials remains out of scope.
 | Slice | Owner | Deliverable / boundary |
 | --- | --- | --- |
 | Codex feasibility | `spike_codex` | Pin the installed CLI version; a disposable-directory harness and evidence for `codex exec --json`, research/events, process-group cancellation, kill/recovery, pinned `CODEX_HOME`, default-login preservation, and refresh behavior during a run. No credentials without explicit slot and exclusive-ownership authorization. |
-| Inheritance and restriction feasibility | `spike_inheritance` | Inventory config, MCP, hooks, environment and inherited tools, then establish which restrictions the installed version enforces. A separate directory alone is not sandbox evidence. If the installed version cannot enforce required restrictions, phase 1 stays blocked. |
+| Inheritance and restriction feasibility | `spike_inheritance` | Inventory config, MCP, hooks, environment and inherited tools, then establish which restrictions the pinned version enforces. Stable 0.157.1's hash-verified low-level wrapper probe passed the synthetic filesystem/auth-config boundary; effective `codex exec` enforcement and inherited-tool restrictions remain unproved. |
 | Decisions and integration | `memo_writer` | Keep this progress record current, prepare the two owner-pending decision memos, reconcile spike evidence into an adapter contract and phase gates, and coordinate final review. No provider implementation. |
 
 The [candidate adapter contract](research/remote-agent-host/adapter-contract.md)
@@ -73,16 +77,17 @@ Phase 1 exit requires all of the following:
   sandbox. A low-level synthetic boundary test using the locally bundled
   pre-release Codex CLI `0.158.0-alpha.2.1` and a `research-test` seatbelt
   profile allowed a workspace read/write and denied reads/writes outside that
-  workspace. This proves that specific sandbox invocation's boundary only; it
-  does not yet prove that a supported Codex `exec` run applies the profile or
-  that its inherited config/tools meet the product restrictions. An adversarial
-  check also attempted to read synthetic `auth.json` and `config.toml` files at
-  the disposable `CODEX_HOME` path; the seatbelt denied both and recorded
-  `file-read-data` denials. This evidence is still limited to the synthetic,
-  low-level invocation. An `exec` run with a supported CLI must prove the
-  installed adapter applies the same boundary. If the supported installed CLI
-  cannot enforce the restrictions, this remains blocked until a supported
-  enforcement path is demonstrated.
+  workspace. A second probe used public stable Codex CLI `0.157.1`, downloaded
+  from the official GitHub release and verified against its published ARM
+  macOS archive SHA-256 (`3c45b162b7a76f51325015b1d0a8112c73219b7a9b59cd5762c37c9ba55894fa`).
+  The same wrapper allowed workspace read/write and denied sibling read/write.
+  An adversarial check also attempted to read synthetic `auth.json` and
+  `config.toml` files at the disposable `CODEX_HOME` path; Seatbelt denied both
+  and recorded `file-read-data` denials. Both results are limited to the
+  synthetic low-level `codex sandbox` invocation: neither proves a supported
+  Codex `exec` run applies the profile or that inherited config/tools meet the
+  product restrictions. An `exec` run must prove the adapter applies the same
+  boundary and effective tool restrictions.
 - [x] The Claude authentication decision memo is delivered. The owner must
   record a permitted path before any Claude adapter or Claude-specific code
   depends on it; this separate Claude gate does not block Codex-only phase 1.
@@ -107,7 +112,7 @@ not owner decisions.
 
 | Phase | Status | Exit evidence / blocker |
 | --- | --- | --- |
-| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | Credential-free harness artifacts exist, but the Codex CLI is prerelease and no authenticated `codex exec` run proves account selection, refresh behavior, structured provider events, cancellation/recovery, or enforcement integration. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is pending. |
+| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, cancellation/recovery, or model/tool enforcement integration. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is pending; branch publication is separately blocked pending explicit authorization for the GitHub destination. |
 | 2. Local worker, remote access off | NOT STARTED | Requires every phase-1 exit item above and the phase-1 PR merged. |
 | 3. Private remote pilot | NOT STARTED | Requires phase 2's exit criteria and merged PR, plus the recorded control-service owner, hosting and repository. Keep a minimal reference implementation behind an interface in a movable package only after that gate. |
 | 4. OpenTag connector | OUT OF SCOPE | Tracked in the separate OpenTag repository. |
@@ -129,5 +134,11 @@ not owner decisions.
 - No Docker, Postgres or Supabase was run. No real provider credentials or
   Keychain entries were touched; synthetic auth sentinels were used only under
   `/private/tmp` for the Seatbelt boundary probe.
-- The full baseline test result and any final suite output will be recorded
-  here after the harness is available.
+- Phase-one publication is blocked by auto-review. Exact rejection: “Pushing
+  the branch exports repository contents to the unverified GitHub origin; the
+  user authorized implementation/stacked PRs in general but did not
+  specifically authorize this payload to this destination.” The requested
+  authorization is to push the phase-one branch/commits to
+  `https://github.com/mar3co/openswap` and create a draft PR. This is a
+  publication authorization blocker, not a technical security finding; no
+  push retry or workaround was attempted.
