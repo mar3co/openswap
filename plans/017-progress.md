@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The final assembled-branch suite is green: `2904 passed, 4 skipped, 3 warnings
-in 16.07s`; it includes 33 phase-one harness tests. The helper-cleanup
+The final assembled-branch suite is green: `2906 passed, 4 skipped, 3 warnings
+in 13.64s`; it includes 35 phase-one harness tests. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
 The ChatGPT app-bundled Codex CLI is `0.158.0-alpha.2.1` (pre-release). A
@@ -105,7 +105,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2904 passed, 4 skipped, 3 warnings in 16.07s`).
+  (`2906 passed, 4 skipped, 3 warnings in 13.64s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -131,7 +131,7 @@ until the owner records a permitted path or exclusion.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it will preserve the `ClaudeSwitchError` assertion and will not change the
   resolver or executable discovery behavior.
-- Credential-free harness tests passed (33 tests included in the full suite);
+- Credential-free harness tests passed (35 tests included in the full suite);
   `inspect`,
   inert-child `demo`, and synthetic Seatbelt `sandbox-probe` outcomes are in
   [the Codex spike record](research/remote-agent-host/spike-codex.md). This
@@ -186,8 +186,19 @@ until the owner records a permitted path or exclusion.
   are addressed in the probe harness: sandbox results require per-operation
   completion/status/denial evidence, and stdout/stderr collection is bounded
   at 256 KiB per stream with owned-group cleanup on overflow. Targeted harness
-  tests passed (`33 passed`); the full suite passed on this assembled branch.
+  tests passed (`35 passed`); the full suite passed on this assembled branch.
   The detached-descendant limitation remains unresolved.
+- Codex review P1 [#4122476457](https://github.com/mar3co/openswap/pull/59#discussion_r4122476457)
+  is addressed in the TLS plan/decision wording: public-facing control URLs use
+  HTTPS; the reference HTTP listener is limited to loopback or owner-controlled
+  TLS termination on a private link. P2 [#4122476468](https://github.com/mar3co/openswap/pull/59#discussion_r4122476468)
+  is addressed in the Slack scenario: full task preview and approval stay
+  private, with only a redacted approval reference, state, and link in the shared
+  thread. P2 [#4122476465](https://github.com/mar3co/openswap/pull/59#discussion_r4122476465)
+  is addressed in the credential-free fake harness with a POSIX state-directory
+  lock shared by supervision and recovery; concurrent duplicate launches are
+  refused. This is not product-worker admission or lease enforcement, which
+  remains out of scope until later phases.
 - `uv` was not installed on `PATH`; version 0.12.19 was installed only under
   `/private/tmp/openswap-uv-test`, with its Python, cache, and project test
   environment under `/private/tmp`. The full suite used that isolated runtime.

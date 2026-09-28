@@ -612,6 +612,7 @@ def test_probe_bounds_both_output_streams_and_cleans_owned_group(
     assert heartbeat.read_text() == before
 
 
+@pytest.mark.skipif(os.name != "posix", reason="fake-harness state locking is POSIX-only")
 def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -632,6 +633,84 @@ def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):
     assert not launches.exists()
     rows = [json.loads(line) for line in (state / "journal.jsonl").read_text().splitlines()]
     assert [row["state"] for row in rows] == ["starting", "interrupted"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake-harness flock reservation is POSIX-only")
+def test_fake_supervisor_atomically_reserves_state_against_supervisor_and_recovery(tmp_path):
+    state = tmp_path / "state"
+    launches = tmp_path / "launches"
+    entered = tmp_path / "reservation-entered"
+    release = tmp_path / "release-reservation"
+    fake = _executable(
+        tmp_path / "slow-fake",
+        "import pathlib\n"
+        f"with pathlib.Path({str(launches)!r}).open('a') as stream: stream.write('launched\\n')\n"
+        "print('{\"type\":\"thread.started\"}', flush=True)\n"
+    )
+    driver = _executable(
+        tmp_path / "supervisor-driver",
+        "import pathlib,sys\n"
+        "import scripts.remote_agent_host_spike as spike\n"
+        "mode,state,command,job,entered,release=sys.argv[1:]\n"
+        "if mode=='run' and entered!='-':\n"
+        " original=spike._read_jsonl\n"
+        " def gated_read(path):\n"
+        "  records=original(path)\n"
+        "  pathlib.Path(entered).touch()\n"
+        "  deadline=__import__('time').monotonic()+5\n"
+        "  while not pathlib.Path(release).exists() and __import__('time').monotonic()<deadline: __import__('time').sleep(0.01)\n"
+        "  return records\n"
+        " spike._read_jsonl=gated_read\n"
+        "try:\n"
+        " if mode=='run': print(spike.supervise_fake_command([command],state_dir=pathlib.Path(state),timeout_s=5,job_id=job)['state'])\n"
+        " else: print(spike.recover_uncertain_runs(pathlib.Path(state)))\n"
+        "except spike.SpikeError as exc:\n"
+        " print('refused:'+str(exc)); raise SystemExit(3)\n",
+    )
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONPATH": repo_root}
+    leader = subprocess.Popen(
+        [sys.executable, str(driver), "run", str(state), str(fake), "same-job",
+         str(entered), str(release)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 3
+        while not entered.exists() and leader.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert entered.exists(), "first supervisor did not reach the journal reservation window"
+        duplicate = subprocess.run(
+            [sys.executable, str(driver), "run", str(state), str(fake), "same-job", "-", "-"],
+            env=env, capture_output=True, text=True, timeout=2,
+        )
+        recovery = subprocess.run(
+            [sys.executable, str(driver), "recover", str(state), str(fake), "unused", "-", "-"],
+            env=env, capture_output=True, text=True, timeout=2,
+        )
+    finally:
+        release.touch()
+        try:
+            leader_stdout, leader_stderr = leader.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            leader.kill()
+            leader_stdout, leader_stderr = leader.communicate(timeout=2)
+
+    assert leader.returncode == 0, leader_stderr
+    assert leader_stdout.strip() == "succeeded"
+    assert duplicate.returncode == 3
+    assert duplicate.stdout.startswith("refused:Another fake-harness supervisor")
+    assert recovery.returncode == 3
+    assert recovery.stdout.startswith("refused:Another fake-harness supervisor")
+    assert launches.read_text().splitlines() == ["launched"]
+    journal = [json.loads(line) for line in (state / "journal.jsonl").read_text().splitlines()]
+    assert [row["state"] for row in journal] == ["starting", "running", "succeeded"]
+
+
+def test_fake_harness_state_lock_fails_closed_without_posix(monkeypatch, tmp_path):
+    monkeypatch.setattr(spike.os, "name", "nt")
+    with pytest.raises(SpikeError, match="state locking requires POSIX"):
+        with spike._locked_state_directory(tmp_path):
+            pytest.fail("non-POSIX fake-harness lock must not be acquired")
 
 
 def test_authenticated_codex_path_is_disabled_even_with_explicit_temp_home(tmp_path):

@@ -24,6 +24,11 @@ one-use pairing code approved locally and exchanged for a device key stored
 under the existing `openswap` Keychain service. Who may issue codes, and how
 that maps to people and workspaces, is the backend's concern.
 
+The reference implementation may use plain HTTP only on loopback for local
+development or behind owner-controlled TLS termination on a private backend
+link. A public-facing service URL must use HTTPS; never expose the reference
+server's plain HTTP listener directly to another network.
+
 Consequences for the plan:
 
 - The protocol specification, worker client and reference server live in

@@ -11,6 +11,7 @@ Codex cancellation semantics.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -204,8 +205,36 @@ def _latest(records: list[dict], job_id: str) -> dict | None:
     return next((row for row in reversed(records) if row.get("job_id") == job_id), None)
 
 
+@contextmanager
+def _locked_state_directory(state_dir: Path):
+    """Exclusively protect this POSIX fake-harness state directory."""
+    if os.name != "posix":
+        raise SpikeError("Atomic fake-harness state locking requires POSIX.")
+    import fcntl
+
+    lock_fd = os.open(state_dir / "supervisor.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SpikeError("Another fake-harness supervisor or recovery is active.") from None
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
 def recover_uncertain_runs(state_dir: Path) -> list[str]:
-    """Mark intents without terminal outcomes interrupted; never relaunch."""
+    """Mark idle intents without terminal outcomes interrupted; never relaunch."""
+    state_dir = state_dir.expanduser().absolute()
+    _private_dir(state_dir)
+    with _locked_state_directory(state_dir):
+        return _recover_uncertain_runs_locked(state_dir)
+
+
+def _recover_uncertain_runs_locked(state_dir: Path) -> list[str]:
     journal = state_dir / "journal.jsonl"
     latest: dict[str, dict] = {}
     for row in _read_jsonl(journal):
@@ -369,13 +398,24 @@ def supervise_fake_command(
     argv: Sequence[str], *, state_dir: Path, timeout_s: float, grace_s: float = 0.5,
     job_id: str | None = None,
 ) -> dict:
-    """Run only an explicit fake command in its own cancellable process group."""
+    """Run one explicit fake command under an exclusive state-directory lock."""
     if not argv or timeout_s <= 0 or grace_s < 0:
         raise SpikeError("A command, positive timeout, and non-negative grace period are required.")
     if not Path(argv[0]).is_absolute():
         raise SpikeError("Fake executable must be an absolute path.")
     state_dir = state_dir.expanduser().absolute()
     _private_dir(state_dir)
+    with _locked_state_directory(state_dir):
+        return _supervise_fake_command_locked(
+            argv, state_dir=state_dir, timeout_s=timeout_s, grace_s=grace_s, job_id=job_id
+        )
+
+
+def _supervise_fake_command_locked(
+    argv: Sequence[str], *, state_dir: Path, timeout_s: float, grace_s: float,
+    job_id: str | None,
+) -> dict:
+    """Run after atomically reserving the harness state directory."""
     job_id = job_id or str(uuid.uuid4())
     journal = state_dir / "journal.jsonl"
     if _latest(_read_jsonl(journal), job_id) is not None:
