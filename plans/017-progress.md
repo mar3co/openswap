@@ -112,7 +112,7 @@ not owner decisions.
 
 | Phase | Status | Exit evidence / blocker |
 | --- | --- | --- |
-| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, cancellation/recovery, or model/tool enforcement integration. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is pending; branch publication is separately blocked pending explicit authorization for the GitHub destination. |
+| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, cancellation/recovery, or model/tool enforcement integration. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is pending. Publication to the GitHub origin is now authorized and in progress; opening a draft PR will not satisfy the exit gates. |
 | 2. Local worker, remote access off | NOT STARTED | Requires every phase-1 exit item above and the phase-1 PR merged. |
 | 3. Private remote pilot | NOT STARTED | Requires phase 2's exit criteria and merged PR, plus the recorded control-service owner, hosting and repository. Keep a minimal reference implementation behind an interface in a movable package only after that gate. |
 | 4. OpenTag connector | OUT OF SCOPE | Tracked in the separate OpenTag repository. |
@@ -134,11 +134,7 @@ not owner decisions.
 - No Docker, Postgres or Supabase was run. No real provider credentials or
   Keychain entries were touched; synthetic auth sentinels were used only under
   `/private/tmp` for the Seatbelt boundary probe.
-- Phase-one publication is blocked by auto-review. Exact rejection: “Pushing
-  the branch exports repository contents to the unverified GitHub origin; the
-  user authorized implementation/stacked PRs in general but did not
-  specifically authorize this payload to this destination.” The requested
-  authorization is to push the phase-one branch/commits to
-  `https://github.com/mar3co/openswap` and create a draft PR. This is a
-  publication authorization blocker, not a technical security finding; no
-  push retry or workaround was attempted.
+- The owner has now explicitly authorized publishing this phase-one branch to
+  `https://github.com/mar3co/openswap` and creating a draft PR. Publication is
+  authorized but not yet complete; the draft PR will not satisfy the technical
+  or owner-decision exit gates above.
