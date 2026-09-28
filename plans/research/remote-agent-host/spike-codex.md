@@ -127,7 +127,7 @@ inspect: codex-cli 0.158.0-alpha.2.1; exec_json=true; sandbox_option=true;
 demo:    state=cancelled; returncode=-15; event_names=[thread.started]
 sandbox: inside read/write allowed; outside read/write denied;
          synthetic CODEX_HOME auth/config reads denied; no exec/model run
-tests:   121 passed (full assembled suite: 2,994 passed, 4 skipped, 3 warnings)
+tests:   122 passed (full assembled suite: 2,995 passed, 4 skipped, 3 warnings)
 ```
 
 After the bounded process-group runner was added, the official stable ARM
@@ -138,7 +138,7 @@ workspace and `CODEX_HOME` sentinels allowed workspace read/write and denied
 sibling read/write plus synthetic `auth.json` and `config.toml` reads. This is
 wrapper-only Seatbelt evidence; it does not establish `codex exec` enforcement
 or account selection. The helper-cleanup regression passed in isolation
-(`1 passed in 1.19s`); all 121 harness cases are included in the full-suite
+(`1 passed in 1.19s`); all 122 harness cases are included in the full-suite
 result above. The two recorded evidence rows from that recheck:
 
 ```json

@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest assembled-branch suite is green: `2994 passed, 4 skipped, 3 warnings
-in 31.30s`; it includes 121 phase-one harness tests and two direct tests of the
+The latest assembled-branch suite is green: `2995 passed, 4 skipped, 3 warnings
+in 30.82s`; it includes 122 phase-one harness tests and two direct tests of the
 Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
@@ -108,7 +108,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2994 passed, 4 skipped, 3 warnings in 31.30s`).
+  (`2995 passed, 4 skipped, 3 warnings in 30.82s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -208,7 +208,9 @@ until the owner records a permitted path or exclusion.
   Without pidfds, escaped-helper cleanup takes one process-table scan per
   round, bounded by the cleanup deadline, instead of one unbounded scan per
   helper. Descriptor readiness uses `poll()` (no FD_SETSIZE limit), and a
-  polling failure is never taken as process exit. A failed final probe scan still sweeps
+  polling failure is never taken as process exit. The leader-exit fallback
+  (`ps` state, where `waitid(WNOWAIT)` is unavailable) is bounded by the same
+  deadline as the scans. A failed final probe scan still sweeps
   descendants recorded by earlier scans. A pidfd verified by its re-read
   keeps that re-read's group and identity, so a child that called `setsid()`
   between snapshot and open is still recognised as escaped.
