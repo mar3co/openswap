@@ -840,6 +840,13 @@ def test_setsid_detached_descendant_forces_interrupted_and_is_terminated(tmp_pat
         assert supervision[0]["state"] == "interrupted"
         assert supervision[0]["escaped_descendants"] == [detached_pid]
         assert supervision[0]["escaped_descendants_terminated"] is True
+        assert supervision[0]["escaped_descendant_signalling"] in (
+            spike.SIGNALLING_PIDFD, spike.SIGNALLING_IDENTITY_CHECK
+        )
+        # Cleanup is only recorded as certain where a non-reusable handle exists.
+        assert supervision[0]["escaped_cleanup_certain"] is (
+            supervision[0]["escaped_descendant_signalling"] == spike.SIGNALLING_PIDFD
+        )
         journal = _read_rows(tmp_path / "state" / "journal.jsonl")
         assert journal[-1]["state"] == "interrupted"
         assert journal[1]["state"] == "running" and isinstance(journal[1]["pgid"], int)
@@ -1187,12 +1194,13 @@ def test_track_descendants_drops_reused_pid_with_new_birth_identity(monkeypatch)
          (4343, 100, 4343, "S", "birth-C")],
     ])
     monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: None)
     tracked: dict = {}
     spike._track_descendants(100, tracked)
-    assert tracked == {4242: (4242, "S", "birth-A")}
+    assert tracked == {4242: (4242, "S", "birth-A", None)}
     spike._track_descendants(100, tracked)
     assert 4242 not in tracked
-    assert tracked == {4343: (4343, "S", "birth-C")}
+    assert tracked == {4343: (4343, "S", "birth-C", None)}
 
 
 def test_terminate_pids_never_signals_a_pid_whose_identity_changed(monkeypatch):
@@ -1204,9 +1212,37 @@ def test_terminate_pids_never_signals_a_pid_whose_identity_changed(monkeypatch):
         sent.append((pid, sig))
 
     monkeypatch.setattr(spike.os, "kill", fake_kill)
-    monkeypatch.setattr(spike, "_pid_birth", lambda pid: "someone-else")
-    assert spike._terminate_pids({987654: "ours"}, grace_s=0.05) is True
+    monkeypatch.setattr(spike, "_pid_identity", lambda pid: "someone-else")
+    gone, mode = spike._terminate_pids({987654: ("ours", None)}, grace_s=0.05)
+    assert gone is True
+    assert mode == spike.SIGNALLING_IDENTITY_CHECK
     assert sent == []
+
+
+def test_identity_includes_start_time_group_and_command():
+    table_identity = spike._identity("Tue Sep 22 19:30:46 2026", 4242, "/usr/bin/python3 helper.py")
+    assert table_identity == "Tue Sep 22 19:30:46 2026|pgid=4242|/usr/bin/python3 helper.py"
+    # Same second, different group or command: not the same process.
+    assert spike._identity("Tue Sep 22 19:30:46 2026", 4243, "/usr/bin/python3 helper.py") != table_identity
+    assert spike._identity("Tue Sep 22 19:30:46 2026", 4242, "/bin/sleep 30") != table_identity
+
+
+@pytest.mark.skipif(os.name != "posix", reason="ps identity lookup is POSIX-only")
+def test_pid_identity_matches_process_table_entry_for_live_process():
+    sleeper = subprocess.Popen(
+        ["/bin/sleep", "5"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    try:
+        table = spike._process_table()
+        assert table is not None
+        row = next(entry for entry in table if entry[0] == sleeper.pid)
+        assert spike._pid_identity(sleeper.pid) == row[4]
+        assert f"pgid={sleeper.pid}" in row[4]
+    finally:
+        sleeper.kill()
+        sleeper.wait(timeout=5)
+    assert spike._pid_identity(sleeper.pid) is None
 
 
 @pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")

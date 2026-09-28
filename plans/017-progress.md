@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest assembled-branch suite is green: `2931 passed, 4 skipped, 3 warnings
-in 16.36s`; it includes 58 phase-one harness tests and two direct tests of the
+The latest assembled-branch suite is green: `2933 passed, 4 skipped, 3 warnings
+in 16.98s`; it includes 60 phase-one harness tests and two direct tests of the
 Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
@@ -108,7 +108,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2931 passed, 4 skipped, 3 warnings in 16.36s`).
+  (`2933 passed, 4 skipped, 3 warnings in 16.98s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -142,6 +142,9 @@ until the owner records a permitted path or exclusion.
   Follow-up Codex findings on the tracker were fixed too: descendants are
   identified by pid plus start time so a reused pid is never signalled, and
   the exception path terminates tracked detached descendants as well.
+  Signalling uses a non-reusable pidfd where the OS offers one; on macOS the
+  identity re-check and the signal remain separate operations, so evidence
+  records `escaped_cleanup_certain: false` there rather than claiming safety.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the
