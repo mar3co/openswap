@@ -279,6 +279,15 @@ class AccountLeaseStore:
         with self.mutation_guard():
             return self._read_lease()
 
+    def read_current(self) -> AccountLease | None:
+        """Read and validate the atomic lease document without creating locks.
+
+        This is for read-only status snapshots. Lease files are replaced as a
+        complete document, so readers may observe either generation but never
+        need to mutate or create the provider lock path.
+        """
+        return self._read_lease()
+
     def _require_token(self, token: LeaseToken) -> AccountLease:
         lease = self._read_lease()
         if lease is None or lease.token() != token:

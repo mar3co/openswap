@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
 import os
 from pathlib import Path
 import sqlite3
@@ -48,22 +47,12 @@ def _unavailable_provider() -> ProviderAvailability:
 
 
 def _lease_is_quarantined(backup_root: Path) -> bool:
-    """Read the atomically replaced lease record without waiting on provider locks."""
-    path = Path(backup_root) / "worker" / "leases" / "codex.json"
+    """Treat every malformed lease document as quarantined in read-only status."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or data.get("schema_version") != 1:
-            return True
-        lease = data.get("lease")
-        if lease is None:
-            return True
-        if not isinstance(lease, dict) or lease.get("state") not in {"active", "uncertain", "released"}:
-            return True
-        return lease["state"] != "released"
-    except FileNotFoundError:
-        return False
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+        lease = AccountLeaseStore(Path(backup_root), "codex").read_current()
+    except Exception:
         return True
+    return lease is not None and lease.state != "released"
 
 
 def _snapshot_from_store(
@@ -396,17 +385,24 @@ class WorkerRuntime:
                         return final
                 self.sleeper(0.05)
         except Exception:
-            self.leases.mark_uncertain(token, "execution_uncertain")
-            self._clear_active()
-            current = self.store.get(running.job_id)
-            if current.state in {JobState.RUNNING, JobState.CANCEL_REQUESTED}:
-                return self.store.transition(
-                    current.job_id, expected_states=(current.state,),
-                    new_state=JobState.INTERRUPTED, worker_epoch=self.worker_epoch,
-                    expected_generation=current.generation,
-                    diagnostic_code="execution_uncertain",
-                )
-            raise
+            try:
+                latest = self.store.get(running.job_id)
+            except Exception:
+                # We still own this provider handle, but cannot safely write
+                # through an unknown journal fence. Attempt interruption and
+                # update only the durable lease; leave the journal for startup
+                # reconciliation if its current generation cannot be read.
+                try:
+                    self._interrupt_execution(token, run)
+                finally:
+                    self._clear_active()
+                raise
+            reason = (
+                "cancel_requested"
+                if latest.state == JobState.CANCEL_REQUESTED
+                else "provider_error"
+            )
+            return self._interrupt_active(latest, reason)
 
     def heartbeat(self) -> None:
         self.store.heartbeat(self.worker_pid, self.worker_epoch)
@@ -510,20 +506,18 @@ class WorkerRuntime:
                 expected_generation=record.generation,
                 diagnostic_code="execution_uncertain",
             )
-        try:
-            result = self.adapter.interrupt(run)
-        except Exception:
-            result = None
-        if isinstance(result, InterruptResult) and result.execution_stopped is True:
-            self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+        stopped = self._interrupt_execution(token, run)
+        if stopped:
             if reason in {"cancel_requested", "worker_shutdown"}:
                 new_state = JobState.CANCELLED
                 diagnostic = "cancel_requested" if reason == "cancel_requested" else "worker_disabled"
-            else:
+            elif reason == "runtime_limit_reached":
                 new_state = JobState.FAILED
                 diagnostic = "runtime_limit_reached"
+            else:
+                new_state = JobState.FAILED
+                diagnostic = "provider_unavailable"
         else:
-            self.leases.mark_uncertain(token, "execution_uncertain")
             new_state = JobState.INTERRUPTED
             diagnostic = "execution_uncertain"
         self._clear_active()
@@ -532,6 +526,18 @@ class WorkerRuntime:
             worker_epoch=self.worker_epoch, expected_generation=record.generation,
             diagnostic_code=diagnostic,
         )
+
+    def _interrupt_execution(self, token, run) -> bool:
+        """Attempt to stop an owned run and persist only explicit stop proof."""
+        try:
+            result = self.adapter.interrupt(run)
+        except Exception:
+            result = None
+        if isinstance(result, InterruptResult) and result.execution_stopped is True:
+            self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+            return True
+        self.leases.mark_uncertain(token, "execution_uncertain")
+        return False
 
     def _clear_active(self) -> None:
         self._active_lease = None

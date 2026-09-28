@@ -115,6 +115,64 @@ def test_read_only_snapshot_does_not_create_state_and_real_adapter_is_disabled(t
     assert not (tmp_path / "worker").exists()
 
 
+def test_read_only_snapshot_quarantines_incomplete_released_lease(tmp_path):
+    lease_dir = tmp_path / "worker" / "leases"
+    lease_dir.mkdir(mode=0o700, parents=True)
+    (lease_dir / "codex.json").write_text(
+        json.dumps({"schema_version": 1, "lease_generation": 1, "lease": {"state": "released"}}),
+        encoding="utf-8",
+    )
+
+    snapshot = read_worker_snapshot(tmp_path)
+
+    assert snapshot.lease_quarantined is True
+
+
+@pytest.mark.parametrize(
+    ("stopped", "expected_state", "expected_lease"),
+    [
+        (True, JobState.CANCELLED, "released"),
+        (False, JobState.INTERRUPTED, "uncertain"),
+    ],
+)
+def test_stale_event_after_stop_interrupts_owned_provider_run(
+    tmp_path, stopped, expected_state, expected_lease,
+):
+    update_worker_settings(tmp_path, enabled=True)
+
+    class CancelDuringEvents(_FakeAdapter):
+        runtime = None
+        job_id = None
+        interrupt_count = 0
+
+        def events(self, run, *, after_cursor):
+            self.runtime.stop(self.job_id)
+            return (SafeEvent(
+                job_id=self.job_id,
+                cursor=21,
+                timestamp=datetime.now(timezone.utc),
+                kind=SafeEventKind.DIAGNOSTIC,
+                diagnostic_code="provider_unavailable",
+            ),)
+
+        def interrupt(self, run):
+            self.interrupt_count += 1
+            return super().interrupt(run)
+
+    adapter = CancelDuringEvents(stopped=stopped)
+    identity = stable_account_identity("codex", "cancel-during-events-test")
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    job = runtime.submit(_submission())
+    adapter.runtime = runtime
+    adapter.job_id = job.job_id
+
+    result = runtime.reconcile_once()
+
+    assert result.state == expected_state
+    assert adapter.interrupt_count == 1
+    assert AccountLeaseStore(tmp_path).current().state == expected_lease
+
+
 def test_local_workspace_registry_is_opaque_disjoint_and_persisted(tmp_path):
     output = tmp_path / "approved-output"
     source = tmp_path / "approved-source"
