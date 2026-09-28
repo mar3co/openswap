@@ -186,7 +186,7 @@ CODEX_RELOGIN_CARD_NOTE = (
 )
 RESTORE_CARD_NOTE = "Click to restore the saved Claude login."
 MISSING_LOGIN_CARD_NOTE = "Action required · Sign in with Claude Code."
-RECONCILE_CARD_NOTE = "Action required · Login mismatch. Click to repair."
+RECONCILE_CARD_NOTE = "Action required · Login mismatch. Click for details."
 _CLAUDE_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 
 
@@ -1299,6 +1299,61 @@ def relogin_wrong_account_message(plan: ReloginClickPlan) -> str:
         f"Claude Code is using {live_name} right now. "
         f"Your saved {live_name} account is not removed. "
         f"Continue to sign in as {plan.slot_name}?"
+    )
+
+
+def reconcile_dialog_copy(
+    slot_name: str,
+    slot_email: str,
+    *,
+    owner_email: str | None,
+    owner_name: str | None,
+) -> tuple[str, str, str]:
+    """(title, body, ok button) for a login-mismatch card click.
+
+    ``owner_email`` is who the live token really belongs to (None when it
+    could not be checked); ``owner_name`` is set only when that account is
+    saved in OpenSwap. The body says what each choice does before anything
+    is touched, so the user can fix the source of the mismatch first.
+    """
+    expected = f"{slot_name} ({slot_email})" if slot_email else slot_name
+    if owner_email is None:
+        return (
+            "Couldn't check Claude Code's login",
+            (
+                f"OpenSwap expects {expected}, but Claude Code's current login "
+                f"doesn't match {slot_name}'s saved login, and OpenSwap couldn't "
+                "confirm whose it is. Nothing has been changed.\n\n"
+                "Check your connection and try again, or sign in again as "
+                f"{slot_name}."
+            ),
+            f"Sign in as {slot_name}",
+        )
+    if owner_name:
+        other = (
+            f"To use {owner_name} instead: click Cancel, then click "
+            f"{owner_name}'s card. That switches to {owner_name}'s saved "
+            "login; if it's out of date, you'll need to sign in again."
+        )
+    else:
+        other = (
+            f"To keep using {owner_email}: click Cancel and add it as an "
+            "account first."
+        )
+    owner = owner_name or owner_email
+    return (
+        "Claude Code is on a different account",
+        (
+            f"OpenSwap expects {expected}, but Claude Code's current login "
+            f"belongs to {owner_email}.\n\n"
+            f"To use {slot_name}: click Restore. OpenSwap puts {slot_name}'s "
+            f"saved login back and keeps {owner}'s login.\n\n"
+            f"{other}\n\n"
+            f"If you signed in as {owner} in the Claude app or another Claude "
+            f"Code window, sign in there as {slot_name} too, or it will switch "
+            "back."
+        ),
+        f"Restore {slot_name}",
     )
 
 

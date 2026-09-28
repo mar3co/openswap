@@ -1607,6 +1607,21 @@ class SwitchMixin:
             result["message"] = (
                 f"Activated Account-{to['number']} ({to['email']}) from stored backup"
             )
+        # Likewise a reconciled self-switch rewrote a diverged live login;
+        # the menu bar needs to tell that apart from a true no-op. Only when
+        # the under-lock classifier verified ownership: "unresolved" (the
+        # live bytes moved after the pre-lock lookup) proves nothing.
+        elif (
+            result is not None
+            and provenance is not None
+            and not result["switched"]
+            and op.get("outgoing") not in (None, "unresolved")
+        ):
+            to = result["to"]
+            result["reason"] = "repaired"
+            result["message"] = (
+                f"Repaired Account-{to['number']} ({to['email']}) live login"
+            )
         return result
 
     def _self_switch_action(self, slot: str, email: str) -> tuple[str, dict | None]:
@@ -2502,7 +2517,10 @@ class SwitchMixin:
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        return {
+            "from": from_ref, "to": to_ref, "warnings": warnings_out,
+            "outgoing": kind,
+        }
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active
