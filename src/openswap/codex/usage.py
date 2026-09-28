@@ -122,6 +122,9 @@ def read_rate_limits(
     if failure is not None:
         failure._openswap_process_stopped = stopped
         raise failure
+    # Owner decision (plan 017): as for a kickoff ping, the direct app-server
+    # child's exit is the stop evidence for this short usage read; a helper it
+    # detached could outlive it (the documented best-effort process-tree limit).
     if not stopped:
         error = CodexUsageError("app-server stop could not be confirmed")
         error._openswap_process_stopped = False

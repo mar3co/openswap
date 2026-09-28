@@ -97,24 +97,29 @@ def _wait_until_unloaded(uid: int | None = None) -> bool:
     return True
 
 
+def _service_state(printed_stdout: str) -> tuple[str | None, int | None]:
+    """The top-level ``state`` and ``pid`` from ``launchctl print`` output."""
+    state: str | None = None
+    pid: int | None = None
+    for line in printed_stdout.splitlines():
+        if not line.startswith("\t") or line.startswith("\t\t"):
+            continue
+        stripped = line.strip()
+        if state is None and stripped.startswith("state = "):
+            state = stripped.removeprefix("state = ").strip()
+        elif pid is None and stripped.startswith("pid = "):
+            raw = stripped.removeprefix("pid = ").strip()
+            if raw.isdigit():
+                pid = int(raw)
+    return state, pid
+
+
 def status(home: Path | None = None, uid: int | None = None) -> dict:
     """Report worker service state; never starts, installs, or enables it."""
     _require_macos()
     printed = _launchctl("print", _service_target(uid))
     loaded = printed.returncode == 0
-    state: str | None = None
-    pid: int | None = None
-    if loaded:
-        for line in printed.stdout.splitlines():
-            if not line.startswith("\t") or line.startswith("\t\t"):
-                continue
-            stripped = line.strip()
-            if state is None and stripped.startswith("state = "):
-                state = stripped.removeprefix("state = ").strip()
-            elif pid is None and stripped.startswith("pid = "):
-                raw = stripped.removeprefix("pid = ").strip()
-                if raw.isdigit():
-                    pid = int(raw)
+    state, pid = _service_state(printed.stdout) if loaded else (None, None)
     target = plist_path(home)
     return {
         "label": LABEL,
@@ -136,8 +141,21 @@ def install(
     program = program or menubar_launch_agent.resolve_program()
     target = plist_path(home)
     out_log, err_log = log_paths(home)
-    if _is_loaded(uid):
+    printed = _launchctl("print", _service_target(uid))
+    if printed.returncode == 0:
         # Enabling twice must not tear down a worker that may own a live job.
+        # A loaded job with no running process (it exited cleanly, which
+        # KeepAlive does not relaunch, or a disable stopped short of bootout)
+        # is started so enable never reports success with no worker running.
+        state, pid = _service_state(printed.stdout)
+        kickstarted = False
+        if state != "running" and pid is None:
+            kicked = _launchctl("kickstart", _service_target(uid))
+            if kicked.returncode != 0:
+                raise ClaudeSwitchError(
+                    f"launchctl kickstart failed (exit {kicked.returncode})."
+                )
+            kickstarted = True
         return {
             "label": LABEL,
             "plist": str(target),
@@ -145,6 +163,7 @@ def install(
             "stdout_log": str(out_log),
             "stderr_log": str(err_log),
             "already_loaded": True,
+            "kickstarted": kickstarted,
         }
     try:
         target.parent.mkdir(parents=True, exist_ok=True)

@@ -122,6 +122,27 @@ def test_install_is_idempotent_for_loaded_worker_and_does_not_rewrite_plist(
     assert target.read_bytes() == b"existing plist"
 
 
+def test_install_kickstarts_a_loaded_but_inactive_worker(tmp_path, monkeypatch):
+    target = worker_launch_agent.plist_path(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"existing plist")
+    calls = []
+
+    def run(*args):
+        calls.append(args)
+        if args[0] == "print":
+            return _completed(stdout="\tstate = not running\n")
+        return _completed()
+
+    monkeypatch.setattr(worker_launch_agent, "_launchctl", run)
+    result = worker_launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+
+    service = f"gui/{UID}/{worker_launch_agent.LABEL}"
+    assert calls == [("print", service), ("kickstart", service)]
+    assert result["already_loaded"] is True and result["kickstarted"] is True
+    assert target.read_bytes() == b"existing plist"
+
+
 def test_uninstall_boots_out_worker_and_removes_only_its_plist(tmp_path, monkeypatch):
     target = worker_launch_agent.plist_path(tmp_path)
     target.parent.mkdir(parents=True)

@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3146 passed, 4 skipped, 3 warnings in 30.81s`.
+`3147 passed, 4 skipped, 3 warnings in 33.51s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -295,7 +295,10 @@ child's exit is accepted as stop evidence and its lease is released. A
 detached helper could outlive it; this is the best-effort process-tree limit
 recorded in [the cancellation boundary](research/remote-agent-host/cancellation-boundary.md),
 accepted so routine pings do not quarantine the account. A kickoff timeout
-still leaves the lease uncertain.
+still leaves the lease uncertain. The same decision applies to the short
+Codex usage read (`codex app-server`): its direct child's exit releases the
+lease. Enable also kickstarts a LaunchAgent that is loaded but has no running
+process, so it never reports success with no worker running.
 
 ## Deviations and verification
 
