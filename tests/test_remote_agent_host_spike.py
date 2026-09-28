@@ -1006,6 +1006,47 @@ def test_unrecovered_running_job_blocks_start_and_recovery_records_group_livenes
     assert spike._read_jsonl(other / "journal.jsonl")[-1]["group_still_alive"] is False
 
 
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+def test_recovery_reports_zombie_only_group_as_not_alive(tmp_path):
+    # An exited child we deliberately do not reap stays a zombie in its group;
+    # killpg(0) still succeeds for it, but nothing there can execute.
+    child = subprocess.Popen(["/bin/sleep", "0"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            row = next((e for e in spike._process_table() or [] if e[0] == child.pid), None)
+            if row is not None and row[3].startswith("Z"):
+                break
+            time.sleep(0.02)
+        else:
+            pytest.skip("child never observed as a zombie")
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        (state / "journal.jsonl").write_text(
+            json.dumps({"job_id": "zombie", "state": "running", "pgid": child.pid}) + "\n",
+            encoding="utf-8",
+        )
+        assert recover_uncertain_runs(state) == ["zombie"]
+        assert spike._read_jsonl(state / "journal.jsonl")[-1]["group_still_alive"] is False
+    finally:
+        child.wait(timeout=5)
+
+
+def test_escaped_descendants_reads_the_callers_scan_without_rescanning(monkeypatch):
+    def no_scan(*args, **kwargs):
+        raise AssertionError("_escaped_descendants must not scan on its own")
+
+    monkeypatch.setattr(spike, "_process_table", no_scan)
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+    tracked = {
+        4242: (4242, "Ss", "tA", None, "tA|pgid=4242|helper", True),
+        4343: (100, "S", "tB", None, "tB|pgid=100|in-group", True),
+    }
+    assert spike._escaped_descendants(100, tracked) == {4242: ("tA|pgid=4242|helper", None, True)}
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions are required")
 def test_private_dir_creates_each_missing_ancestor_with_owner_only_mode(tmp_path):
     state = tmp_path / "a" / "b" / "leaf"

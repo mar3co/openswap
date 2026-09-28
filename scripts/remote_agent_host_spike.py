@@ -234,16 +234,7 @@ def _pid_state(pid: int) -> str | None:
 
 
 def _probe_group_running(pgid: int) -> bool:
-    observed = _group_has_running_members(pgid)
-    if observed is not None:
-        return observed
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return _group_alive(pgid)
 
 
 def _cleanup_probe_process(process: subprocess.Popen) -> bool:
@@ -436,6 +427,12 @@ def _recover_uncertain_runs_locked(state_dir: Path) -> list[str]:
 
 
 def _group_alive(pgid: int) -> bool:
+    """Whether any process in ``pgid`` can still execute (zombies excluded)."""
+    observed = _group_has_running_members(pgid)
+    if observed is not None:
+        return observed
+    # Without enumeration, killpg(0) also succeeds for a zombie-only group, so
+    # this fallback errs toward "alive".
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -592,6 +589,7 @@ def _abort_supervision(
         pass
     try:
         _terminate_group(process, reader, grace_s=grace_s)
+        _track_descendants(process.pid, tracked)
         leftover = _escaped_descendants(process.pid, tracked)
         if leftover:
             _terminate_pids(leftover, grace_s=grace_s)
@@ -861,8 +859,11 @@ def _pid_alive(pid: int) -> bool:
 def _escaped_descendants(
     leader_pid: int, tracked: dict[int, tuple[int, str, str, int | None, str, bool]]
 ) -> dict[int, tuple[str, int | None, bool]]:
-    """Tracked pids outside the leader's group that are still alive: identity, handle, verified."""
-    _track_descendants(leader_pid, tracked)
+    """Tracked pids outside the leader's group that are still alive: identity, handle, verified.
+
+    Reads ``tracked`` as the caller's latest :func:`_track_descendants` scan
+    left it; it never scans itself, so a failed scan cannot go unreported.
+    """
     return {
         pid: (identity, handle, verified)
         for pid, (pgid, stat, _birth, handle, identity, verified) in sorted(tracked.items())

@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest assembled-branch suite is green: `2972 passed, 4 skipped, 3 warnings
-in 23.77s`; it includes 99 phase-one harness tests and two direct tests of the
+The latest assembled-branch suite is green: `2974 passed, 4 skipped, 3 warnings
+in 23.39s`; it includes 101 phase-one harness tests and two direct tests of the
 Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
@@ -108,7 +108,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2972 passed, 4 skipped, 3 warnings in 23.77s`).
+  (`2974 passed, 4 skipped, 3 warnings in 23.39s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -183,7 +183,10 @@ until the owner records a permitted path or exclusion.
   supervision and probe loops are bounded by the job's remaining time, so a
   slow `ps` cannot postpone cancellation. A live pidfd whose re-validation
   scan fails or runs out of time is kept as an unverified entry, never
-  dropped.
+  dropped. The escaped-descendant check reads the caller's last scan rather
+  than scanning again, so a failed scan always reaches
+  `descendant_tracking_complete`. Recovery's `group_still_alive` ignores
+  zombies.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the
