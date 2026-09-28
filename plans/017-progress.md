@@ -52,7 +52,7 @@ requiring credentials remains out of scope.
 | --- | --- | --- |
 | Codex feasibility | `spike_codex` | Pin the installed CLI version; a disposable-directory harness and evidence for `codex exec --json`, research/events, process-group cancellation, kill/recovery, pinned `CODEX_HOME`, default-login preservation, and refresh behavior during a run. No credentials without explicit slot and exclusive-ownership authorization. |
 | Inheritance and restriction feasibility | `spike_inheritance` | Inventory config, MCP, hooks, environment and inherited tools, then establish which restrictions the pinned version enforces. Stable 0.157.1's hash-verified low-level wrapper probe passed the synthetic filesystem/auth-config boundary; effective `codex exec` enforcement and inherited-tool restrictions remain unproved. |
-| Decisions and integration | `memo_writer` | Keep this progress record current, prepare the two owner-pending decision memos, reconcile spike evidence into an adapter contract and phase gates, and coordinate final review. No provider implementation. |
+| Decisions and integration | `memo_writer` | Keep this progress record current; preserve the recorded control-service decision and pending Claude-auth decision; reconcile spike evidence into an adapter contract and phase gates; coordinate final review. No provider implementation. |
 
 The [candidate adapter contract](research/remote-agent-host/adapter-contract.md)
 defines `probe`, `start`, `events`, and `interrupt`; it is provisional, not yet

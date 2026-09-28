@@ -46,7 +46,11 @@ Consequences for the plan:
   connections, so the protocol stays deployable on serverless hosting such as
   OpenTag's.
 
-## Decision needed
+## Pre-decision questions (superseded)
+
+The questions and options below preserve the earlier analysis. The owner
+decision and record at the top and bottom of this memo supersede any pending
+decision or gate language in this historical section.
 
 Record all three together:
 
@@ -66,7 +70,7 @@ The synthetic seatbelt test there proves only a low-level local filesystem
 boundary; it does not choose a service operator, approve a hosting provider, or
 authorize service code.
 
-## Options
+## Options considered (superseded historical analysis)
 
 | Option | Benefits | Costs and boundaries |
 | --- | --- | --- |
@@ -75,26 +79,12 @@ authorize service code.
 | Third-party hosted operator or managed service | May reduce custom infrastructure work. | Introduces a separate data processor and owner, contractual/security review, ongoing cost, and a dependency that neither repository controls. |
 | User/self-hosted service | Gives an operator control over data location and availability. | Increases deployment, upgrades, support burden, and configuration complexity; a self-hosted relay still does not replace job authorization on the worker. |
 
-## Recommendation and gate
+## Earlier recommendation (superseded)
 
-_Superseded by the Decision above; kept as the pre-decision analysis._
-
-Favor OpenTag operating the service and owning its repository, consistent with
-plan 017's recommendation: OpenTag is the first client and already owns the
-tenant identity and MCP request surface. This is a recommendation, not the
-owner's decision. The owner still needs to choose the hosting provider and
-cloud account after selecting an operator, including its data, retention,
-support, and cost terms. If the owner selects a different operator, the
-repository should follow that operator. Keep any phase-3 reference package
-clearly separated and movable behind an interface until the decision is
-recorded; it must not quietly establish production hosting or ownership.
-
-Plan 017's supporting research recommended OpenTag as the control-service
-operator and its repository for the implementation, while hosting must follow
-the owner's recorded choice. This is not the owner's answer and does not
-authorize production deployment. Phase 1 remains blocked until the owner
-records operator, hosting, and repository. Phase 3 remains unstarted until
-phase 2 exits and is merged as well.
+The earlier recommendation favored OpenTag as operator and repository. It is
+retained only as historical context; the recorded owner decision above
+supersedes it. Production deployment and phase progression remain subject to
+their current plan gates, not this superseded recommendation.
 
 ## Owner record
 
