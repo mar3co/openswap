@@ -10,7 +10,7 @@ The worker may call only these operations:
 |---|---|
 | `probe` | Readiness check for the pinned local Codex installation and locally selected identity. Return typed availability, supported version and safe diagnostic codes. Do not start a conversation, change authentication, or return secrets. |
 | `start` | Start one admitted job in the already-approved research workspace using the fixed Codex adapter. Return the provider process/session reference privately to the local journal, plus a safe initial event. Do not resume or fork another provider session. |
-| `events` | Consume the running process's JSONL stream, normalize it into sequenced local job events, and redact credential-like material before persistence or relay. Cursor reads replay journaled events only; they do not alter execution. |
+| `events` | Consume the running process's JSONL stream, normalize it into sequenced local job events, and redact credential-like material before persistence or relay. Cursor reads replay journaled events only; they do not alter execution. A provider read may remain in flight while `interrupt` runs concurrently. The worker keeps at most one tracked reader; while it is blocked, the control/deadline driver remains responsive, no replacement reader or job starts, and any late result after interruption is discarded. Only the driver writes the journal. |
 | `interrupt` | Signal the supervised provider process group, observe termination, and report stop-requested versus execution-stopped distinctly. Never report completion before the process is stopped. |
 
 The phase-one probe supervises the initial process group and, in the fake

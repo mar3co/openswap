@@ -169,8 +169,10 @@ LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
 The Phase 2 full-suite validation on the currently integrated PR #59 snapshot
-`f684ebf` is green: `3068 passed, 4 skipped, 3 warnings in 17.13s` (3,072
-collected). The newer PR #59 head has not been merged into this tree.
+`f684ebf` is green: `3074 passed, 4 skipped, 3 warnings in 18.41s`. The run
+used the existing test environment with narrowly elevated permissions for
+disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
+has not been merged into this tree.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -211,6 +213,16 @@ kickoff resolves the live identity from public global-config metadata while
 holding the provider mutation guard and refuses unmatched or ambiguous roster
 identities; failures in post-launch journal transitions interrupt the owned
 run and retain an uncertain lease unless the adapter proves it stopped.
+Follow-ups #4125504755 and #4125504772 are addressed: event reads run on one
+tracked reader while the worker control/deadline driver remains responsive;
+interrupt may run concurrently with a blocked read, no replacement read or
+job is admitted while that reader remains active, and late results after
+interruption are discarded. The fake-adapter regression covers stop,
+shutdown, and deadline during a blocked read; it does not establish that a
+real provider read is interruptible or pass the Phase 1 process-tree gate.
+Claude transfer import now acquires the provider mutation guard before
+migration or credential/roster writes, and refuses active, uncertain, or
+corrupt lease state without changing those files.
 
 ## Deviations and verification
 

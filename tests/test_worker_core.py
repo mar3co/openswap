@@ -481,6 +481,84 @@ def test_deadline_and_shutdown_require_explicit_stop_proof(
 
 
 @pytest.mark.parametrize(
+    ("trigger", "expected_state"),
+    [
+        ("stop", JobState.CANCELLED),
+        ("shutdown", JobState.CANCELLED),
+        ("deadline", JobState.FAILED),
+    ],
+)
+def test_blocked_event_reader_is_interruptible_and_blocks_next_job(
+    tmp_path, trigger, expected_state,
+):
+    update_worker_settings(tmp_path, enabled=True)
+
+    class BlockingEventsAdapter(_FakeAdapter):
+        def __init__(self):
+            super().__init__(stopped=True)
+            self.events_entered = threading.Event()
+            self.release_events = threading.Event()
+
+        def events(self, run, *, after_cursor):
+            self.event_cursors.append(after_cursor)
+            self.events_entered.set()
+            assert self.release_events.wait(5)
+            # This stale completion must be discarded after interruption.
+            return (_finished_event(run_job_id, cursor=21),)
+
+    identity = stable_account_identity("codex", f"blocked-events-{trigger}")
+    adapter = BlockingEventsAdapter()
+    clock = [0.0]
+    runtime = WorkerRuntime(
+        tmp_path, adapter=adapter, account_identity=identity,
+        monotonic=lambda: clock[0],
+    )
+    first = runtime.submit(_submission(f"blocked-{trigger}"))
+    runtime.submit(_submission(f"queued-{trigger}"))
+    run_job_id = first.job_id
+    shutdown = threading.Event()
+    results = []
+    runner = threading.Thread(
+        target=lambda: results.append(runtime.reconcile_once(shutdown_event=shutdown)),
+    )
+    runner.start()
+    assert adapter.events_entered.wait(3)
+
+    if trigger == "stop":
+        assert runtime.stop(first.job_id).accepted is True
+    elif trigger == "shutdown":
+        shutdown.set()
+    else:
+        clock[0] = 601.0
+
+    runner.join(3)
+    try:
+        assert not runner.is_alive()
+        assert len(results) == 1
+        assert results[0].state == expected_state
+        assert adapter.interrupt_count == 1
+        assert adapter.start_count == 1
+        # The old events() call is still blocked, so no second job/read starts.
+        assert runtime.reconcile_once() is None
+        queued = runtime.store.queue(limit=1)
+        assert len(queued) == 1 and queued[0].state == JobState.QUEUED
+        assert not any(
+            event.kind == SafeEventKind.PROVIDER_FINISHED
+            for event in runtime.events(first.job_id).events
+        )
+    finally:
+        adapter.release_events.set()
+    reader = runtime._event_reader
+    if reader is not None:
+        reader.join(3)
+        assert not reader.is_alive()
+    assert not any(
+        event.kind == SafeEventKind.PROVIDER_FINISHED
+        for event in runtime.events(first.job_id).events
+    )
+
+
+@pytest.mark.parametrize(
     ("stopped", "expected_state", "expected_lease"),
     [
         (True, JobState.CANCELLED, "released"),

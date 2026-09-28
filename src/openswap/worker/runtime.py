@@ -236,6 +236,8 @@ class WorkerRuntime:
         self.worker_epoch, self.recovered_job_ids = self.store.start_epoch(self.worker_pid)
         self._admission_lock = threading.RLock()
         self._launch_lock = threading.RLock()
+        self._event_reader_lock = threading.Lock()
+        self._event_reader: threading.Thread | None = None
         self._active_run = None
         self._active_lease = None
 
@@ -307,6 +309,15 @@ class WorkerRuntime:
 
     def reconcile_once(self, *, shutdown_event: threading.Event | None = None) -> JobRecord | None:
         """Process at most one job; injectable adapters are for tests only."""
+        # A prior provider read may still be blocked after cancellation. Keep
+        # it tracked and refuse new work until it quiesces; late events must
+        # never be applied to another job.
+        with self._event_reader_lock:
+            if self._event_reader is not None:
+                if self._event_reader.is_alive():
+                    self.heartbeat()
+                    return None
+                self._event_reader = None
         with self._admission_lock:
             policy = load_worker_settings(self.backup_root)
             if not policy.enabled or policy.paused:
@@ -348,7 +359,12 @@ class WorkerRuntime:
                     return self._interrupt_active(current, "cancel_requested")
                 if self.monotonic() >= deadline:
                     return self._interrupt_active(current, "runtime_limit_reached")
-                events = self.adapter.events(run, after_cursor=provider_cursor)
+                events, interrupt_reason = self._read_events_while_monitoring(
+                    run, provider_cursor, current, deadline, shutdown_event,
+                )
+                if interrupt_reason is not None:
+                    latest = self.store.get(running.job_id)
+                    return self._interrupt_active(latest, interrupt_reason)
                 if not isinstance(events, tuple) or len(events) > 100:
                     raise RuntimeError("provider_event_batch_too_large")
                 for event in events:
@@ -462,6 +478,87 @@ class WorkerRuntime:
                 else "provider_error"
             )
             return self._interrupt_active(latest, reason)
+
+    def _read_events_while_monitoring(
+        self, run, provider_cursor: int, record: JobRecord, deadline: float,
+        shutdown_event: threading.Event | None,
+    ) -> tuple[tuple[SafeEvent, ...] | None, str | None]:
+        """Read provider events without blocking the control/deadline driver.
+
+        There is at most one tracked reader. The reader only calls the adapter
+        and stores its result; this reconcile thread remains the sole journal
+        writer. An unfinished read is retained across interruption and blocks
+        admission until it exits.
+        """
+        completed = threading.Event()
+        result: dict[str, object] = {}
+
+        def read() -> None:
+            try:
+                result["events"] = self.adapter.events(run, after_cursor=provider_cursor)
+            except BaseException as error:
+                result["error"] = error
+            finally:
+                completed.set()
+
+        reader = threading.Thread(
+            target=read, name=f"openswap-event-reader-{record.job_id}", daemon=True,
+        )
+        with self._event_reader_lock:
+            prior = self._event_reader
+            if prior is not None and prior.is_alive():
+                return None, "event_reader_busy"
+            self._event_reader = reader
+            reader.start()
+
+        interrupt_reason = None
+        while not completed.wait(0.05):
+            self.heartbeat()
+            # Let the caller's owned-run cleanup handle unreadable journal
+            # state; an unobserved read is never treated as stop proof.
+            current = self.store.get(record.job_id)
+            if not load_worker_settings(self.backup_root).enabled:
+                interrupt_reason = "worker_shutdown"
+            elif shutdown_event is not None and shutdown_event.is_set():
+                interrupt_reason = "worker_shutdown"
+            elif current.state == JobState.CANCEL_REQUESTED:
+                interrupt_reason = "cancel_requested"
+            elif self.monotonic() >= deadline:
+                interrupt_reason = "runtime_limit_reached"
+            if interrupt_reason is not None:
+                return None, interrupt_reason
+
+        # completion is signaled in the reader's finally block; wait for that
+        # already-finished call's thread frame to exit before permitting a new
+        # reader. This wait cannot be held by provider I/O because events()
+        # has returned, and heartbeat/control checks remain responsive.
+        while reader.is_alive():
+            reader.join(timeout=0.05)
+            if not reader.is_alive():
+                break
+            self.heartbeat()
+            current = self.store.get(record.job_id)
+            if not load_worker_settings(self.backup_root).enabled:
+                interrupt_reason = "worker_shutdown"
+            elif shutdown_event is not None and shutdown_event.is_set():
+                interrupt_reason = "worker_shutdown"
+            elif current.state == JobState.CANCEL_REQUESTED:
+                interrupt_reason = "cancel_requested"
+            elif self.monotonic() >= deadline:
+                interrupt_reason = "runtime_limit_reached"
+            if interrupt_reason is not None:
+                return None, interrupt_reason
+        with self._event_reader_lock:
+            if self._event_reader is reader and not reader.is_alive():
+                self._event_reader = None
+        if "error" in result:
+            error = result["error"]
+            if isinstance(error, Exception):
+                raise error
+            raise RuntimeError("provider_event_read_failed")
+        if "events" not in result:
+            raise RuntimeError("provider_event_read_failed")
+        return result["events"], None
 
     def _finalize_proven_terminal(self, token, event: SafeEvent) -> JobRecord:
         """Honor a journaled provider stop proof despite a stale state fence."""

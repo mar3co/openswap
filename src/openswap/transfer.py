@@ -22,9 +22,9 @@ from openswap.exceptions import (
     TransferError,
 )
 from openswap.fsutil import replace_with_retry
-from openswap.locking import FileLock
 from openswap.models import Platform, get_timestamp, normalize_alias
 from openswap.oauth import credential_fingerprint
+from openswap.worker.leases import AccountLeaseStore
 
 if TYPE_CHECKING:
     from openswap.switcher import ClaudeAccountSwitcher
@@ -395,7 +395,9 @@ def import_accounts(
 
     # Pass 1: validate every account before any writes. A malformed account
     # later in the list must not leave earlier accounts half-imported.
-    local_data = switcher._get_sequence_data_migrated() or {}
+    # Pass 1 is validation only. The migration helper may rewrite the roster,
+    # so defer it to the guarded commit section below.
+    local_data = switcher._get_sequence_data() or {}
     local_aliases: dict[str, tuple[str, str]] = {
         (acc.get("alias") or "").lower(): (
             acc.get("email", ""), acc.get("organizationUuid", "") or "",
@@ -483,7 +485,10 @@ def import_accounts(
     )
     resolved_active_slot: str | None = None
 
-    with FileLock(switcher.lock_file):
+    with AccountLeaseStore(
+        switcher.backup_dir, "claude"
+    ).mutation_guard() as lease_guard:
+        lease_guard.assert_available()
         data = switcher._get_sequence_data_migrated() or _empty_sequence()
         try:
             for entry in normalized:
