@@ -286,14 +286,17 @@ def _sweep_probe_descendants(
 
 
 def _refuse_symlinked_components(path: Path) -> None:
-    """Refuse a path that traverses a symlink someone other than root owns.
+    """Refuse a path that traverses any symlink other than a top-level system link.
 
     A symlinked component (not just the leaf) would redirect every directory
-    and file we create into its target. Root-owned system links such as
-    macOS's ``/tmp`` -> ``/private/tmp`` are trusted; elsewhere (and on
-    platforms without POSIX ownership) any symlink is refused.
+    and file we create into its target. Only a root-owned symlink directly
+    under the filesystem root (macOS's ``/tmp``, ``/var`` and ``/etc`` ->
+    ``/private/...``) is trusted; ownership alone is not enough, because a
+    harness run as root would own every link it could be tricked into
+    following. On platforms without POSIX ownership any symlink is refused.
     """
-    current = Path(path.absolute().anchor)
+    anchor = Path(path.absolute().anchor)
+    current = anchor
     for part in path.absolute().parts[1:]:
         current = current / part
         try:
@@ -302,7 +305,9 @@ def _refuse_symlinked_components(path: Path) -> None:
             # Missing (we create the rest below) or not a directory: the
             # creation step raises the real error, reported with details withheld.
             return
-        if stat_module.S_ISLNK(status.st_mode) and (os.name != "posix" or status.st_uid != 0):
+        if stat_module.S_ISLNK(status.st_mode) and not (
+            os.name == "posix" and status.st_uid == 0 and current.parent == anchor
+        ):
             raise SpikeError("Private output path must not traverse a symlink.")
 
 

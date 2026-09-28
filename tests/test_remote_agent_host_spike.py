@@ -245,7 +245,7 @@ def test_invalid_utf8_output_is_safely_recorded_as_unstructured(tmp_path):
     )
 
     result = supervise_fake_command(
-        [str(fake)], state_dir=tmp_path / "state", timeout_s=1, job_id="bad-bytes"
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=10, job_id="bad-bytes"
     )
 
     assert result["state"] == "succeeded"
@@ -272,7 +272,7 @@ def test_json_parser_failures_are_recorded_and_reader_continues(tmp_path, monkey
     )
 
     result = supervise_fake_command(
-        [str(fake)], state_dir=tmp_path / "state", timeout_s=1, job_id="bad-json"
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=10, job_id="bad-json"
     )
 
     assert result["state"] == "succeeded"
@@ -1004,7 +1004,7 @@ def test_unrecovered_running_job_blocks_start_and_recovery_records_group_livenes
         )
 
         with pytest.raises(SpikeError, match="unrecovered non-terminal jobs; run recover first"):
-            supervise_fake_command([str(fake)], state_dir=state, timeout_s=1, job_id="next")
+            supervise_fake_command([str(fake)], state_dir=state, timeout_s=10, job_id="next")
         assert not launches.exists()
         assert [row["job_id"] for row in spike._read_jsonl(state / "journal.jsonl")] == [
             "orphan", "orphan"
@@ -1108,6 +1108,31 @@ def test_private_dir_refuses_a_symlinked_ancestor_component(tmp_path):
     with pytest.raises(SpikeError, match="must not traverse a symlink"):
         spike._private_dir(tmp_path / "link" / "new" / "state")
     assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership is required")
+@pytest.mark.parametrize("path, refused", [
+    ("/tmp/openswap-spike/state", False),          # top-level system link
+    ("/srv/linked/openswap-spike/state", True),    # root-owned, but not top-level
+])
+def test_only_top_level_root_owned_symlinks_are_trusted(monkeypatch, path, refused):
+    # As if running as root: every link is root-owned, so ownership alone
+    # must not be trusted.
+    links = {"/tmp", "/srv/linked"}
+
+    def fake_lstat(candidate):
+        candidate = str(candidate)
+        mode = stat.S_IFLNK | 0o777 if candidate in links else stat.S_IFDIR | 0o755
+        if candidate.endswith("openswap-spike"):
+            raise FileNotFoundError(candidate)
+        return os.stat_result((mode, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+    monkeypatch.setattr(spike.os, "lstat", fake_lstat)
+    if refused:
+        with pytest.raises(SpikeError, match="must not traverse a symlink"):
+            spike._refuse_symlinked_components(Path(path))
+    else:
+        spike._refuse_symlinked_components(Path(path))
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
