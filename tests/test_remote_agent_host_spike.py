@@ -851,6 +851,7 @@ def test_setsid_detached_descendant_forces_interrupted_and_is_terminated(tmp_pat
             supervision[0]["escaped_descendant_signalling"] == spike.SIGNALLING_PIDFD
         )
         assert supervision[0]["descendant_tracking_complete"] is True
+        assert supervision[0]["escaped_descendants_unverified"] == []
         journal = _read_rows(tmp_path / "state" / "journal.jsonl")
         assert journal[-1]["state"] == "interrupted"
         assert journal[1]["state"] == "running" and isinstance(journal[1]["pgid"], int)
@@ -1203,10 +1204,10 @@ def test_track_descendants_drops_reused_pid_with_new_birth_identity(monkeypatch)
     monkeypatch.setattr(spike, "_open_pidfd", lambda pid: None)
     tracked: dict = {}
     spike._track_descendants(100, tracked)
-    assert tracked == {4242: (4242, "S", "tA", None, "tA|pgid=4242|child")}
+    assert tracked == {4242: (4242, "S", "tA", None, "tA|pgid=4242|child", True)}
     spike._track_descendants(100, tracked)
     assert 4242 not in tracked
-    assert tracked == {4343: (4343, "S", "tC", None, "tC|pgid=4343|child")}
+    assert tracked == {4343: (4343, "S", "tC", None, "tC|pgid=4343|child", True)}
 
 
 def test_track_descendants_keeps_child_whose_group_and_command_changed_after_reparent(monkeypatch):
@@ -1227,8 +1228,10 @@ def test_track_descendants_keeps_child_whose_group_and_command_changed_after_rep
     tracked: dict = {}
     spike._track_descendants(100, tracked)
     spike._track_descendants(100, tracked)
-    assert tracked == {4242: (4242, "Ss", "tA", None, "tA|pgid=4242|helper --detached")}
-    assert spike._escaped_descendants(100, tracked) == {4242: ("tA|pgid=4242|helper --detached", None)}
+    assert tracked == {4242: (4242, "Ss", "tA", None, "tA|pgid=4242|helper --detached", True)}
+    assert spike._escaped_descendants(100, tracked) == {
+        4242: ("tA|pgid=4242|helper --detached", None, True)
+    }
 
 
 def test_track_descendants_evicts_reused_pid_even_when_it_holds_a_pidfd(monkeypatch):
@@ -1291,7 +1294,7 @@ def test_terminate_pids_never_signals_a_pid_whose_identity_changed(monkeypatch):
 
     monkeypatch.setattr(spike.os, "kill", fake_kill)
     monkeypatch.setattr(spike, "_pid_identity", lambda pid: "someone-else")
-    gone, mode = spike._terminate_pids({987654: ("ours", None)}, grace_s=0.05)
+    gone, mode = spike._terminate_pids({987654: ("ours", None, True)}, grace_s=0.05)
     assert gone is True
     assert mode == spike.SIGNALLING_IDENTITY_CHECK
     assert sent == []
@@ -1377,8 +1380,19 @@ def test_terminate_pids_counts_exited_unreaped_pidfd_descendant_as_gone(monkeypa
 
     monkeypatch.setattr(spike.signal, "pidfd_send_signal", fake_pidfd_send_signal, raising=False)
     monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: True)
-    gone, mode = spike._terminate_pids({4242: ("ours", 42)}, grace_s=0.05)
+    gone, mode = spike._terminate_pids({4242: ("ours", 42, True)}, grace_s=0.05)
     assert gone is True
+    assert mode == spike.SIGNALLING_PIDFD
+    assert sent == []
+
+
+def test_terminate_pids_never_signals_an_unverified_entry_and_reports_not_gone(monkeypatch):
+    sent = []
+    monkeypatch.setattr(spike.signal, "pidfd_send_signal",
+                        lambda handle, sig: sent.append((handle, sig)) if sig else None, raising=False)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    gone, mode = spike._terminate_pids({4242: ("ours", 42, False)}, grace_s=0.05)
+    assert gone is False
     assert mode == spike.SIGNALLING_PIDFD
     assert sent == []
 
@@ -1394,7 +1408,7 @@ def test_terminate_pids_signals_live_pidfd_descendant_until_it_exits(monkeypatch
 
     monkeypatch.setattr(spike.signal, "pidfd_send_signal", fake_pidfd_send_signal, raising=False)
     monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: exited["value"])
-    gone, mode = spike._terminate_pids({4242: ("ours", 42)}, grace_s=0.5)
+    gone, mode = spike._terminate_pids({4242: ("ours", 42, True)}, grace_s=0.5)
     assert gone is True
     assert mode == spike.SIGNALLING_PIDFD
     assert sent == [(42, signal.SIGTERM)]
@@ -1420,19 +1434,68 @@ def test_pid_identity_reports_zombie_as_gone(tmp_path):
         child.wait(timeout=5)
 
 
-def test_track_descendants_refuses_handle_whose_identity_changed_after_open(monkeypatch):
+def test_track_descendants_refuses_handle_when_start_time_changed_after_open(monkeypatch):
     closed = []
     monkeypatch.setattr(spike, "_process_table",
                         lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
                                  (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
     monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 77)
-    # Reused within the same second: same start time, different parent/command.
-    monkeypatch.setattr(spike, "_pid_row", lambda pid: (1, 4242, "tA", "tA|pgid=4242|stranger"))
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tB", "tB|pgid=4242|stranger"))
     monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
     tracked: dict = {}
     spike._track_descendants(100, tracked)
     assert tracked == {}
     assert closed == [77]
+
+
+def test_track_descendants_keeps_but_never_verifies_handle_when_parent_changed_after_open(monkeypatch):
+    closed = []
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 77)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    # Same second, but reparented before the re-read: could be ours (parent
+    # exited) or a same-second stranger. Track it, never signal it.
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (1, 4242, "tA", "tA|pgid=4242|stranger"))
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked == {4242: (4242, "S", "tA", 77, "tA|pgid=4242|child", False)}
+    assert closed == []
+
+
+def test_track_descendants_verifies_handle_when_child_changed_group_and_command_but_parent_matches(monkeypatch):
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 100, 100, "S", "tA", "tA|pgid=100|python fake")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 79)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    # setsid() and exec() happened between the snapshot and the re-read; the
+    # parent is still our leader, so the handle is proven ours.
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tA", "tA|pgid=4242|helper"))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][3] == 79 and tracked[4242][5] is True
+
+
+def test_track_descendants_upgrades_unverified_entry_when_later_snapshot_shows_our_parent(monkeypatch):
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
+    ])
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 80)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (1, 4242, "tA", "tA|pgid=4242|child"))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][5] is False
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][5] is True
 
 
 @pytest.mark.skipif(os.name != "posix", reason="zombie observation is POSIX-only")
@@ -1518,7 +1581,24 @@ def test_track_descendants_accepts_handle_when_full_row_still_matches(monkeypatc
     monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
     tracked: dict = {}
     spike._track_descendants(100, tracked)
-    assert tracked == {4242: (4242, "S", "tA", 78, "tA|pgid=4242|child")}
+    assert tracked == {4242: (4242, "S", "tA", 78, "tA|pgid=4242|child", True)}
     spike._track_descendants(100, tracked)  # a live, matching entry survives
-    assert tracked == {4242: (4242, "S", "tA", 78, "tA|pgid=4242|child")}
+    assert tracked == {4242: (4242, "S", "tA", 78, "tA|pgid=4242|child", True)}
     assert closed == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_terminate_group_observes_leader_exit_without_reaping():
+    process = subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+    try:
+        uncertain = spike._terminate_group(process, threading.Thread(), grace_s=0.5)
+        assert uncertain is False
+        # Exited (a zombie holds the pid, so the pgid stays reserved) but not reaped.
+        assert spike._leader_exited(process) is True
+        assert process.returncode is None
+    finally:
+        spike._reap_leader(process, timeout_s=5.0)
+    assert process.returncode is not None

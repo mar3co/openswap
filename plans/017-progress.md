@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest assembled-branch suite is green: `2955 passed, 4 skipped, 3 warnings
-in 17.63s`; it includes 82 phase-one harness tests and two direct tests of the
+The latest assembled-branch suite is green: `2960 passed, 4 skipped, 3 warnings
+in 17.48s`; it includes 87 phase-one harness tests and two direct tests of the
 Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
@@ -108,7 +108,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2955 passed, 4 skipped, 3 warnings in 17.63s`).
+  (`2960 passed, 4 skipped, 3 warnings in 17.48s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -160,8 +160,12 @@ until the owner records a permitted path or exclusion.
   changed, or its pidfd reads as exited) is evicted before attribution so a
   reused pid never seeds discovery of a stranger's children. The version
   probe persists only a digits-and-dots version token.
-  A freshly opened pidfd is accepted only if the pid's parent, group,
-  command and start time all still match the snapshot.
+  A freshly opened pidfd is refused if the pid's start time changed, proven
+  ours if its parent is still in the run (group and command changes do not
+  matter), and otherwise kept as unverified: tracked and reported, never
+  signalled, still forcing `interrupted` if alive. Group termination observes
+  the leader's exit without reaping it; the leader is reaped only after
+  descendant discovery and cleanup.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the
