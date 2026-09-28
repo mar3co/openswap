@@ -24,6 +24,7 @@ from openswap.exceptions import (
     ValidationError,
 )
 from openswap.usage_store import FetchRecord, UsageEntry, UsageStore
+from openswap.worker.leases import AccountLeaseStore, LeaseConflictError, stable_account_identity
 from openswap.macos_keychain import KeychainError
 from openswap.models import Platform, normalize_alias
 from openswap.paths import get_backup_root, get_credentials_path
@@ -1002,6 +1003,23 @@ class TestAdoptSessionCredential:
         assert switcher.read_account_credentials("2", self.EMAIL) == profile
         # The profile is the source of that generation, not a stale seed.
         assert (session_dir / ".credentials.json").read_text() == profile
+
+    def test_active_worker_lease_refuses_profile_adoption(self, temp_home: Path):
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        self._seed_profile(switcher, profile)
+        store = AccountLeaseStore(switcher.backup_dir, "claude")
+        store.acquire(
+            job_id="job-active",
+            account_identity=stable_account_identity("claude", self.EMAIL, "org-uuid"),
+            worker_pid=123,
+            worker_epoch=1,
+            ttl_s=60,
+        )
+        with pytest.raises(LeaseConflictError):
+            switcher._adopt_session_credential("2", self.EMAIL, "org-uuid")
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
     def test_live_profile_is_not_adopted(self, temp_home: Path):
         backup = _oauth_creds("sk-backup", -3600)
@@ -5463,6 +5481,23 @@ class TestSwitchSkipsBrokenSlots:
 
         with pytest.raises(SwitchError, match="has no stored credentials"):
             s.switch_to("2")
+
+    def test_worker_lease_refuses_claude_switch_before_live_mutation(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        before = s.sequence_file.read_bytes()
+        store = AccountLeaseStore(s.backup_dir, "claude")
+        token = store.acquire(
+            job_id="job-active",
+            account_identity=stable_account_identity("claude", "a@example.com", ""),
+            worker_pid=123,
+            worker_epoch=1,
+            ttl_s=60,
+        )
+        with pytest.raises(LeaseConflictError):
+            s.switch_to("1")
+        assert s.sequence_file.read_bytes() == before
+        assert store.current().token() == token
 
     def test_switch_to_missing_config_actionable_error(self, temp_home: Path):
         """switch_to a target with creds but no config raises a distinct error."""

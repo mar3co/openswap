@@ -1,6 +1,6 @@
 # Codex research adapter contract (provisional)
 
-Status: proposed for phase 1 only. **Not cleared for implementation.** Plan 017 is canonical. This contract is intentionally one-shot: `probe`, `start`, `events`, `interrupt`. It has no `resume` or approval operation. It does not authorize phase 2 until the stable-version, authentication, effective-tool, filesystem, refresh-race, cancellation, and recovery gates are met.
+Status: provisional. On 2026-09-28 the owner authorized phase-2 local worker infrastructure to proceed in parallel with the ongoing phase-1 review. This permits implementing the local protocol, journal, queue, leases and IPC against fake or disabled adapters; it does not pass any phase-1 evidence gate. Real Codex execution remains disabled until the stable-version, authentication, effective-tool, filesystem, refresh-race, cancellation, and recovery gates are met. Plan 017 is canonical. This contract is intentionally one-shot: `probe`, `start`, `events`, `interrupt`. It has no `resume` or approval operation.
 
 ## Contract boundary
 

@@ -186,6 +186,11 @@ def test_idle_kickoff_sets_config_dir_and_does_not_rewrite_default(
         captured_live["env"] = kwargs.get("env") or {}
         return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
+    # The live-login kickoff is for the managed active account, so seed the
+    # roster's active slot explicitly; account seeding alone leaves it unset.
+    roster = s._get_sequence_data() or {}
+    roster["activeAccountNumber"] = "1"
+    s._write_json(s.sequence_file, roster)
     invoke_kickoff(
         None,
         which=fake_which,

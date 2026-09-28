@@ -1399,6 +1399,13 @@ def _menubar_service(args) -> int:
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
+    # The worker is a separate local process. Dispatch before legacy migration,
+    # theme/TLS setup, or any account engine construction so its startup cannot
+    # touch provider state or import the menu-bar UI.
+    if len(sys.argv) > 1 and sys.argv[1] == "worker":
+        from openswap.worker.cli import main as worker_main
+
+        sys.exit(worker_main(sys.argv[2:]))
     _migrate_legacy_cswap_state()
     if _invoked_as_removed_cswap_command():
         error("The 'cswap' command has been removed. Use 'openswap' instead.")
@@ -1499,6 +1506,8 @@ Commands:
   %(prog)s import <path>              import accounts
   %(prog)s menubar                    macOS menu bar extra
   %(prog)s menubar --install-service  keep the extra running via launchd
+  %(prog)s worker status              show local Remote tasks worker status
+  %(prog)s worker enable|disable      opt in or out of the local worker
   %(prog)s widget --install           macOS Desktop / Notification Center widget
   %(prog)s statusline --install       opt-in: wrap Claude Code status line
   %(prog)s purge                      remove all openswap data

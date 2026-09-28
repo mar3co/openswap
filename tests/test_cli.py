@@ -71,6 +71,7 @@ _CORE_HELP_VERBS = (
     "add-token",
     "remove",
     "menubar",
+    "worker",
     "widget",
     "auto",
     "statusline",
@@ -132,6 +133,30 @@ class TestCLI:
         assert "--status" not in options_section
         # ...and the note that they keep working is still present.
         assert "keep working" in result.stdout
+
+    def test_worker_cli_dispatches_before_legacy_migration_or_engine_init(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(sys, "argv", ["openswap", "worker", "status", "--json"])
+        monkeypatch.setattr(
+            cli,
+            "_migrate_legacy_cswap_state",
+            lambda: pytest.fail("worker startup must skip legacy migration"),
+        )
+        monkeypatch.setattr(
+            cli,
+            "ClaudeAccountSwitcher",
+            lambda **_kwargs: pytest.fail("worker CLI must not construct the account engine"),
+        )
+        monkeypatch.setattr(
+            "openswap.worker.cli.main",
+            lambda argv: captured.append(argv) or 0,
+        )
+
+        with pytest.raises(SystemExit) as exited:
+            cli.main()
+
+        assert exited.value.code == 0
+        assert captured == [["status", "--json"]]
 
     def test_no_args_prints_help(self):
         """Bare `openswap` prints help (the terminal dashboard used to take this)."""

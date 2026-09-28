@@ -60,7 +60,7 @@ install/upgrade rewiring. Three phases with a green-suite gate between them.
 
 | Plan | Proposal | Status |
 |------|----------|--------|
-| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag or a self-hosted server | IN PROGRESS; phase 1 blocked pending Codex execution and restriction evidence ([progress](017-progress.md)) |
+| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag or a self-hosted server | IN PROGRESS; Phase 1 remains blocked; owner-authorized Phase 2 local-only worker infrastructure is underway ([progress](017-progress.md)) |
 
 017 recommends an optional OpenSwap worker process, with OpenTag as its first
 client, a pluggable control service (OpenTag-hosted, self-hosted MIT reference
@@ -70,13 +70,20 @@ architecture, staged delivery and acceptance criteria. This is a design proposal
 merging it does not implement or enable remote execution. Its research snapshots
 are dated 2026-09-27 and must be revalidated during the feasibility spike. The
 OpenTag connector side is tracked in mar3co/opentag#135 (private repository).
-Phase 1 is being executed as a credential-free feasibility spike until the
-owner authorizes a specific account context and exclusive auth ownership. The
-Claude auth decision is a separate gate before any Claude adapter; it does not
-block Codex-only work. PR [#59](https://github.com/mar3co/openswap/pull/59) is
-ready for review, but its evidence and merge do not replace the remaining
-technical phase gates. Phases 2 and 3 remain unstarted. See
-[017 progress](017-progress.md).
+Phase 1 remains blocked pending supported-version authenticated execution,
+restriction, cancellation/recovery and account-ownership evidence. The owner
+authorized Phase 2 local-only infrastructure to proceed in parallel; remote
+access stays off and the production Codex adapter remains disabled. The Claude
+auth decision is a separate gate before any Claude adapter. PR
+[#59](https://github.com/mar3co/openswap/pull/59) is ready for review, but its
+evidence and merge do not replace the remaining technical Phase 1 gates.
+Phase 3 remains unstarted. The local worker defaults off; the UI exposes its
+opt-in/status/stop/pause controls, and the CLI provides `openswap worker
+enable|status|stop|pause|disable`. `settings.json` stores the local enabled and
+paused policy, approved opaque workspace mappings, and optional pinned
+account reference. Phase 2 has no job-submission command or submit RPC. The
+production Codex adapter reports unavailable; only synthetic fake-adapter
+tests exercise job execution and lifecycle. See [017 progress](017-progress.md).
 
 ## Dependency notes
 

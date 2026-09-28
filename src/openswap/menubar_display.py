@@ -168,6 +168,50 @@ def combine_title_pct(show_5h: bool, show_7d: bool) -> str:
         return "7d"
     return "off"
 REFRESH_LABELS: dict[int, str] = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
+
+
+def _remote_tasks_status_copy(
+    snapshot: dict, *, enabled: bool, paused: bool,
+) -> str:
+    """Render only bounded status fields; never expose job/provider payloads."""
+    process = snapshot.get("process_state")
+    if process not in {"stopped", "starting", "running", "stopping", "stale", "unavailable"}:
+        process = "unavailable"
+    provider = snapshot.get("provider")
+    provider_available = isinstance(provider, dict) and provider.get("available") is True
+    diagnostic = provider.get("diagnostic_code") if isinstance(provider, dict) else None
+    if not isinstance(diagnostic, str) or not diagnostic.isascii() or len(diagnostic) > 64:
+        diagnostic = "unavailable"
+    diagnostic = "".join(c for c in diagnostic if c.isalnum() or c in "_-") or "unavailable"
+    active = snapshot.get("active_job")
+    active_state = active.get("state") if isinstance(active, dict) else None
+    if not isinstance(active_state, str) or active_state not in {
+        "queued", "claimed", "starting", "running", "waiting_for_approval",
+        "cancel_requested", "succeeded", "failed", "cancelled", "interrupted",
+        "expired",
+    }:
+        active_state = "idle" if active is None else "unknown"
+    queue = snapshot.get("queue_depth")
+    if type(queue) is not int or queue < 0:
+        queue = 0
+    provider_label = "available" if provider_available else diagnostic
+    operation = snapshot.get("operation")
+    if not isinstance(operation, str) or operation not in {
+        "worker_enable_or_disable", "worker_admission_update", "worker_stop_requested",
+        "worker_control_busy", "worker_status_checking",
+    }:
+        operation = None
+    notice = snapshot.get("diagnostic_notice")
+    if not isinstance(notice, str) or not notice.isascii() or len(notice) > 64:
+        notice = None
+    if notice is not None:
+        notice = "".join(c for c in notice if c.isalnum() or c in "_-") or None
+    tail = f" · {operation}" if operation else (f" · {notice}" if notice else "")
+    return (
+        f"{'enabled' if enabled else 'disabled'} · {process} · "
+        f"admission {'paused' if paused else 'open'} · provider {provider_label} · "
+        f"job {active_state} · queue {min(queue, 999)}{tail}"
+    )
 SETTINGS_PAGE = "settings"
 MAIN_PAGE = "main"
 SETTINGS_SECTION_GENERAL = "general"
@@ -322,6 +366,9 @@ def settings_page_rows(
     threshold: float,
     has_codex: bool = False,
     codex_enabled: bool = True,
+    worker_enabled: bool = False,
+    worker_paused: bool = False,
+    worker_status: dict | None = None,
     section: str | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
@@ -383,6 +430,46 @@ def settings_page_rows(
             "id": "title_scoped",
             "label": "Claude model limits",
             "value": bool(settings.title_scoped),
+        },
+        {
+            "kind": "group",
+            "style": "section",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "group_remote_tasks",
+            "label": "Remote tasks",
+        },
+        {
+            "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_enabled",
+            "label": "Enable local worker",
+            "value": bool(worker_enabled),
+        },
+        {
+            "kind": "status",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_status",
+            "label": "Status",
+            "value": _remote_tasks_status_copy(
+                worker_status or {}, enabled=worker_enabled, paused=worker_paused,
+            ),
+        },
+        {
+            "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_paused",
+            "label": "Pause admission",
+            "value": bool(worker_paused),
+            "disabled": not worker_enabled,
+        },
+        {
+            "kind": "button",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_stop",
+            "label": "Active job",
+            "title": "Stop",
+            "value": _worker_active_job_id(worker_status or {}),
+            "disabled": _worker_active_job_id(worker_status or {}) is None,
         },
         {
             "kind": "group",
@@ -591,6 +678,14 @@ def settings_page_rows(
             section = SETTINGS_SECTION_GENERAL
         rows = [row for row in rows if row["section"] == section]
     return rows
+
+
+def _worker_active_job_id(snapshot: dict) -> str | None:
+    active = snapshot.get("active_job")
+    job_id = active.get("job_id") if isinstance(active, dict) else None
+    if isinstance(job_id, str) and job_id and len(job_id) <= 128 and job_id.isascii():
+        return job_id
+    return None
 
 
 # After the pointer leaves the popover (not on open). Click-outside still

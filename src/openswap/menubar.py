@@ -180,6 +180,22 @@ def run(switcher, codex=None) -> int:
             self._desktop_switching = False
             self._desktop_result = None
             self._desktop_status = "Experimental · Switching reopens ChatGPT"
+            from openswap.settings import load_worker_settings
+            self._worker_policy = load_worker_settings(switcher.backup_dir)
+            self._worker_status_cache = {
+                "process_state": "unavailable",
+                "provider": {"available": False, "diagnostic_code": "status_checking"},
+                "active_job": None,
+                "queue_depth": 0,
+                "lease_quarantined": True,
+                "operation": "worker_status_checking",
+            }
+            self._worker_status_inflight = False
+            self._worker_last_refresh_at = 0.0
+            self._worker_operation = None
+            self._worker_result = None
+            self._worker_generation = 0
+            self._worker_result_lock = threading.Lock()
             self._desktop_app = DesktopApp()
             self._desktop_app_lock = threading.Lock()
             self._chatgpt_capability = DesktopCapability("checking", "checking")
@@ -423,6 +439,16 @@ def run(switcher, codex=None) -> int:
         def on_sync_tick(self, _timer):
             self._poll_login()
             self._drain_desktop_result()
+            self._drain_worker_result()
+            panel = self._panel
+            if (
+                panel is not None
+                and panel.is_shown()
+                and getattr(panel, "_page", None) == SETTINGS_PAGE
+                and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_GENERAL
+                and time.monotonic() - self._worker_last_refresh_at >= 4.0
+            ):
+                self._worker_view_active()
             if self._desktop_switching:
                 return
             self._consume_widget_command()
@@ -588,6 +614,134 @@ def run(switcher, codex=None) -> int:
             ):
                 if getattr(panel, "_selected_provider", None) == "chatgpt":
                     self._on_chatgpt_view_active()
+                panel.reload()
+
+        def _worker_view_active(self):
+            """Refresh only the local, redacted worker snapshot off the UI thread."""
+            if self._worker_status_inflight or self._worker_operation is not None:
+                return
+            self._worker_status_inflight = True
+            self._worker_last_refresh_at = time.monotonic()
+            self._worker_generation += 1
+            generation = self._worker_generation
+            threading.Thread(
+                target=self._worker_status_worker,
+                args=(generation,),
+                daemon=True,
+            ).start()
+
+        def _worker_status_worker(self, generation):
+            try:
+                from openswap.worker.cli import read_status
+
+                snapshot = read_status(self.switcher.backup_dir)
+            except Exception:
+                snapshot = {
+                    "process_state": "unavailable",
+                    "provider": {"available": False, "diagnostic_code": "status_unavailable"},
+                    "active_job": None,
+                    "queue_depth": 0,
+                    "lease_quarantined": True,
+                }
+            with self._worker_result_lock:
+                if generation == self._worker_generation:
+                    self._worker_result = (generation, snapshot, None, None)
+
+        def _worker_action(self, row_id, value):
+            if self._worker_operation is not None:
+                return
+            self._worker_operation = {
+                "remote_tasks_enabled": "worker_enable_or_disable",
+                "remote_tasks_paused": "worker_admission_update",
+                "remote_tasks_stop": "worker_stop_requested",
+            }.get(row_id)
+            if self._worker_operation is None:
+                return
+            self._worker_status_cache = dict(self._worker_status_cache)
+            self._worker_status_cache["operation"] = self._worker_operation
+            self._worker_generation += 1
+            generation = self._worker_generation
+            threading.Thread(
+                target=self._worker_action_worker,
+                args=(generation, row_id, value),
+                daemon=True,
+            ).start()
+
+        def _worker_action_worker(self, generation, row_id, value):
+            diagnostic = None
+            try:
+                from openswap.settings import load_worker_settings
+                from openswap.worker.cli import (
+                    disable_worker,
+                    enable_worker,
+                    request_pause,
+                    request_stop,
+                    read_status,
+                )
+
+                root = self.switcher.backup_dir
+                if row_id == "remote_tasks_enabled":
+                    if self._worker_policy.enabled:
+                        ok, _result, diagnostic = disable_worker(root)
+                        if not ok:
+                            diagnostic = diagnostic or "worker_disable_blocked"
+                    else:
+                        enable_worker(root)
+                elif row_id == "remote_tasks_paused":
+                    result = request_pause(root, not self._worker_policy.paused)
+                    if result.get("accepted") is not True:
+                        diagnostic = result.get("diagnostic_code") or "pause_refused"
+                elif row_id == "remote_tasks_stop":
+                    if not isinstance(value, str) or not value:
+                        diagnostic = "job_identity_unknown"
+                    else:
+                        result = request_stop(root, value)
+                        if result.get("accepted") is not True:
+                            diagnostic = result.get("diagnostic_code") or "stop_refused"
+                self._worker_policy = load_worker_settings(root)
+                snapshot = read_status(root)
+            except Exception:
+                snapshot = {
+                    "process_state": "unavailable",
+                    "provider": {"available": False, "diagnostic_code": "status_unavailable"},
+                    "active_job": None,
+                    "queue_depth": 0,
+                    "lease_quarantined": True,
+                }
+                diagnostic = diagnostic or "worker_control_failed"
+                try:
+                    from openswap.settings import load_worker_settings
+
+                    self._worker_policy = load_worker_settings(self.switcher.backup_dir)
+                except Exception:
+                    pass
+            with self._worker_result_lock:
+                if generation == self._worker_generation:
+                    self._worker_result = (generation, snapshot, None, diagnostic)
+
+        def _drain_worker_result(self):
+            with self._worker_result_lock:
+                result = self._worker_result
+                if result is None:
+                    return
+                generation, snapshot, _unused, diagnostic = result
+                self._worker_result = None
+            if generation != self._worker_generation:
+                if self._worker_operation is None:
+                    self._worker_status_inflight = False
+                return
+            self._worker_status_inflight = False
+            self._worker_operation = None
+            self._worker_status_cache = dict(snapshot)
+            self._worker_status_cache.pop("operation", None)
+            self._worker_status_cache["diagnostic_notice"] = diagnostic
+            panel = self._panel
+            if (
+                panel is not None
+                and panel.is_shown()
+                and getattr(panel, "_page", None) == SETTINGS_PAGE
+                and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_GENERAL
+            ):
                 panel.reload()
 
         def _stop_codex_engine(self):
@@ -1094,6 +1248,10 @@ def run(switcher, codex=None) -> int:
                 on_empty_action=self._on_empty_action,
                 login_state=lambda: dict(self._login_ui_state),
                 on_login_action=self._on_login_action,
+                worker_enabled=lambda: self._worker_policy.enabled,
+                worker_paused=lambda: self._worker_policy.paused,
+                worker_status=lambda: self._worker_status_cache,
+                on_worker_view_active=self._worker_view_active,
             )
             self._panel.attach(nsitem)
 
@@ -1240,7 +1398,11 @@ def run(switcher, codex=None) -> int:
             return self._guard(lambda: self.codex.set_account_disabled(number, False))
 
         def _on_setting(self, row_id, value):
-            if row_id == "menu_bar_provider":
+            if row_id in {
+                "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_stop",
+            }:
+                self._worker_action(row_id, value)
+            elif row_id == "menu_bar_provider":
                 if value not in MENU_BAR_PROVIDER_CHOICES:
                     return
                 self.settings.menu_bar_provider = value

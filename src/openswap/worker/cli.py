@@ -1,0 +1,386 @@
+"""Early, credential-free CLI boundary for local worker operations."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import json
+import sys
+import time
+from pathlib import Path
+
+from openswap.exceptions import ClaudeSwitchError
+from openswap.locking import FileLock
+from openswap.paths import get_backup_root
+from openswap.settings import load_worker_settings, update_worker_settings
+from openswap.worker.client import WorkerClient
+from openswap.worker.ipc import IpcError, socket_path
+from openswap.worker.journal import LocalJobStore
+from openswap.worker.launch_agent import install, uninstall
+from openswap.worker.runtime import read_worker_snapshot
+
+_DISABLE_WAIT_SECONDS = 3.0
+_DISABLE_POLL_SECONDS = 0.1
+_LIFECYCLE_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+@contextmanager
+def lifecycle_lock(backup_root: Path):
+    """Serialize opt-in, pause and disable transitions across CLI/UI clients."""
+    # FileLock creates its parent with the process umask (often 0755). Create
+    # and validate the worker root first so lifecycle.lock remains under the
+    # same 0700 boundary required by the journal and lease store.
+    try:
+        LocalJobStore(Path(backup_root))._ensure_private_dir()
+    except Exception:
+        raise ClaudeSwitchError("worker_state_unavailable") from None
+    lock = FileLock(
+        Path(backup_root) / "worker" / "lifecycle.lock",
+        timeout=_LIFECYCLE_LOCK_TIMEOUT_SECONDS,
+    )
+    try:
+        with lock:
+            yield
+    except Exception as exc:
+        # Expose only a stable local diagnostic, never lock path/system detail.
+        from openswap.exceptions import LockError
+
+        if isinstance(exc, LockError):
+            raise ClaudeSwitchError("worker_lifecycle_busy") from None
+        raise
+
+
+def _snapshot(backup_root: Path) -> dict:
+    try:
+        return WorkerClient(socket_path(backup_root)).status()
+    except IpcError as exc:
+        if str(exc) != "worker_unavailable":
+            raise
+        return read_worker_snapshot(backup_root).to_dict()
+
+
+def read_status(backup_root: Path) -> dict:
+    """Read worker status without constructing runtime or touching credentials."""
+    return _snapshot(Path(backup_root))
+
+
+def request_stop(backup_root: Path, job_id: str | None) -> dict:
+    """Request interruption for one active job, optionally resolved by worker."""
+    return WorkerClient(socket_path(Path(backup_root))).stop(job_id)
+
+
+def request_pause(backup_root: Path, paused: bool) -> dict:
+    """Persist admission policy and request the worker's barrier update."""
+    root = Path(backup_root)
+    with lifecycle_lock(root):
+        previous = load_worker_settings(root)
+        update_worker_settings(root, paused=paused)
+
+        def restore_previous() -> bool:
+            try:
+                update_worker_settings(root, paused=previous.paused)
+                return True
+            except (OSError, RuntimeError, ValueError):
+                return False
+
+        try:
+            result = WorkerClient(socket_path(root)).set_paused(paused)
+        except IpcError as exc:
+            if str(exc) != "worker_unavailable":
+                restore_previous()
+                raise
+            result = {"accepted": True, "diagnostic_code": "worker_not_running"}
+        if result.get("accepted") is not True:
+            restored = restore_previous()
+            if not restored:
+                return {
+                    "accepted": False,
+                    "paused": load_worker_settings(root).paused,
+                    "diagnostic_code": "settings_unavailable",
+                }
+        persisted = load_worker_settings(root)
+        return {
+            "accepted": result.get("accepted") is True,
+            "paused": persisted.paused,
+            "diagnostic_code": result.get("diagnostic_code"),
+        }
+
+
+def enable_worker(backup_root: Path) -> dict:
+    """Persist opt-in and idempotently install the per-user helper."""
+    root = Path(backup_root)
+    with lifecycle_lock(root):
+        previous = load_worker_settings(root)
+        update_worker_settings(root, enabled=True)
+        try:
+            service = install()
+        except ClaudeSwitchError:
+            try:
+                update_worker_settings(root, enabled=previous.enabled)
+            except (OSError, RuntimeError, ValueError):
+                pass
+            raise
+        return {"enabled": True, "service": service}
+
+
+def _write(payload: dict, *, as_json: bool, human: str | None = None) -> None:
+    if as_json:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(human if human is not None else json.dumps(payload, sort_keys=True))
+
+
+def _safe_to_disable(snapshot: dict) -> str | None:
+    """Return a safe diagnostic if work or its account lease may remain live."""
+    if snapshot.get("lease_quarantined") is not False:
+        return "lease_state_unknown"
+    if snapshot.get("process_state") in {"stale", "unavailable", "starting", "stopping"}:
+        return "worker_state_unknown"
+    if snapshot.get("active_job") is not None:
+        return "job_still_active"
+    if snapshot.get("process_state") not in {"stopped", "running"}:
+        return "worker_state_unknown"
+    return None
+
+
+def disable_worker(backup_root: Path) -> tuple[bool, dict, str | None]:
+    """Pause first; only unload after the worker proves idle and unleased."""
+    with lifecycle_lock(backup_root):
+        return _disable_locked(backup_root)
+
+
+def _safe_snapshot(backup_root: Path) -> dict:
+    """Best-effort fail-closed snapshot for control error paths."""
+    try:
+        return _snapshot(backup_root)
+    except Exception:
+        try:
+            return read_worker_snapshot(backup_root).to_dict()
+        except Exception:
+            return {
+                "enabled": True,
+                "paused": True,
+                "process_state": "unavailable",
+                "active_job": None,
+                "lease_quarantined": True,
+            }
+
+
+def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
+    try:
+        update_worker_settings(backup_root, enabled=True, paused=True)
+    except (OSError, RuntimeError, ValueError):
+        return False, {}, "settings_unavailable"
+    client = WorkerClient(socket_path(backup_root))
+    try:
+        pause_result = client.set_paused(True)
+        if pause_result.get("accepted") is not True:
+            return _blocked(
+                backup_root, _safe_snapshot(backup_root),
+                pause_result.get("diagnostic_code") or "pause_refused",
+            )
+    except IpcError as exc:
+        if str(exc) != "worker_unavailable":
+            return _blocked(backup_root, _safe_snapshot(backup_root), str(exc))
+
+    try:
+        snapshot = _snapshot(backup_root)
+    except IpcError as exc:
+        return _blocked(backup_root, _safe_snapshot(backup_root), str(exc))
+    except Exception:
+        return _blocked(backup_root, _safe_snapshot(backup_root), "worker_status_unavailable")
+    active = snapshot.get("active_job")
+    if active is not None:
+        job_id = active.get("job_id") if isinstance(active, dict) else None
+        if not isinstance(job_id, str) or not job_id:
+            return _blocked(backup_root, snapshot, "job_identity_unknown")
+        try:
+            result = client.stop(job_id)
+        except IpcError as exc:
+            return _blocked(backup_root, _safe_snapshot(backup_root), str(exc))
+        except Exception:
+            return _blocked(backup_root, _safe_snapshot(backup_root), "worker_status_unavailable")
+        if result.get("accepted") is not True:
+            return _blocked(
+                backup_root,
+                _safe_snapshot(backup_root),
+                result.get("diagnostic_code") or "stop_refused",
+            )
+
+        deadline = time.monotonic() + _DISABLE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            time.sleep(_DISABLE_POLL_SECONDS)
+            try:
+                snapshot = _snapshot(backup_root)
+            except IpcError as exc:
+                return _blocked(
+                    backup_root,
+                    _safe_snapshot(backup_root),
+                    str(exc),
+                )
+            except Exception:
+                return _blocked(
+                    backup_root, _safe_snapshot(backup_root), "worker_status_unavailable"
+                )
+            if _safe_to_disable(snapshot) is None:
+                break
+        else:
+            return _blocked(
+                backup_root,
+                snapshot,
+                _safe_to_disable(snapshot) or "job_stop_not_confirmed",
+            )
+
+    diagnostic = _safe_to_disable(snapshot)
+    if diagnostic is not None:
+        return _blocked(backup_root, snapshot, diagnostic)
+
+    # Policy is changed only after the active job and lease are confirmed safe.
+    try:
+        update_worker_settings(backup_root, enabled=False, paused=True)
+    except (OSError, RuntimeError, ValueError):
+        return _blocked(backup_root, snapshot, "settings_unavailable")
+    try:
+        service = uninstall(home=Path.home())
+    except ClaudeSwitchError:
+        # Keep a loaded helper from becoming unintentionally active after an
+        # unload failure. Pause remains on so it cannot admit work.
+        try:
+            update_worker_settings(backup_root, enabled=True, paused=True)
+        except (OSError, RuntimeError, ValueError):
+            return False, _safe_snapshot(backup_root), "settings_unavailable"
+        return False, _safe_snapshot(backup_root), "worker_unload_failed"
+    return True, {"snapshot": _safe_snapshot(backup_root), "service": service}, None
+
+
+def _blocked(backup_root: Path, snapshot: dict, diagnostic: str) -> tuple[bool, dict, str]:
+    """Keep the helper opted in but paused whenever safe disable is unproved."""
+    try:
+        update_worker_settings(backup_root, enabled=True, paused=True)
+    except (OSError, RuntimeError, ValueError):
+        diagnostic = "settings_unavailable"
+    return False, snapshot, diagnostic
+
+
+def _run(backup_root: Path) -> int:
+    try:
+        with lifecycle_lock(backup_root):
+            if not load_worker_settings(backup_root).enabled:
+                print("Worker is disabled. Enable Remote tasks before starting it.")
+                return 0
+    except ClaudeSwitchError:
+        print("Worker lifecycle is busy; try again shortly.", file=sys.stderr)
+        return 1
+    # Imported only in the dedicated worker command, after the default-off
+    # policy check. The runtime owns its own SQLite journal and local socket.
+    from openswap.worker.runtime import run_worker
+
+    return int(run_worker(backup_root))
+
+
+def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="openswap worker",
+        description="Control the opt-in, local-only Remote Agent Host worker.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    run = commands.add_parser("run", help="run the background worker process")
+    del run
+    status_parser = commands.add_parser("status", help="show local worker status")
+    status_parser.add_argument("--json", action="store_true")
+    stop_parser = commands.add_parser("stop", help="request interruption of the active job")
+    stop_parser.add_argument("job_id", nargs="?", help="omit to target the active job")
+    stop_parser.add_argument("--json", action="store_true")
+    pause_parser = commands.add_parser("pause", help="pause or reopen job admission")
+    pause_parser.add_argument("--off", action="store_true", help="reopen admission")
+    pause_parser.add_argument("--json", action="store_true")
+    enable_parser = commands.add_parser("enable", help="opt in and install the worker LaunchAgent")
+    enable_parser.add_argument("--json", action="store_true")
+    disable_parser = commands.add_parser("disable", help="safely stop and disable the worker")
+    disable_parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    root = Path(backup_root) if backup_root is not None else get_backup_root()
+
+    if args.command == "run":
+        return _run(root)
+    if args.command == "status":
+        try:
+            snapshot = read_status(root)
+        except Exception:
+            print("Worker status unavailable.", file=sys.stderr)
+            return 1
+        _write(snapshot, as_json=args.json, human=_format_status(snapshot))
+        return 0
+    if args.command == "stop":
+        try:
+            result = request_stop(root, args.job_id)
+        except IpcError as exc:
+            print(f"Could not request worker stop: {exc}", file=sys.stderr)
+            return 1
+        if result.get("accepted") is not True:
+            _write(result, as_json=args.json, human="Worker refused the stop request.")
+            return 1
+        _write(
+            result,
+            as_json=args.json,
+            human="Stop requested; execution status will update when confirmed.",
+        )
+        return 0
+    if args.command == "pause":
+        paused = not args.off
+        try:
+            payload = request_pause(root, paused)
+        except (IpcError, ClaudeSwitchError):
+            print("Could not update worker admission.", file=sys.stderr)
+            return 1
+        except (OSError, RuntimeError, ValueError):
+            print("Could not update worker admission settings.", file=sys.stderr)
+            return 1
+        _write(
+            payload,
+            as_json=args.json,
+            human="Worker admission paused." if paused else "Worker admission reopened.",
+        )
+        return 0 if payload["accepted"] else 1
+    if args.command == "enable":
+        try:
+            payload = enable_worker(root)
+        except ClaudeSwitchError as exc:
+            print("Could not enable worker.", file=sys.stderr)
+            return 1
+        _write(payload, as_json=args.json, human="Remote tasks worker enabled.")
+        return 0
+    if args.command == "disable":
+        try:
+            ok, result, diagnostic = disable_worker(root)
+        except ClaudeSwitchError:
+            print("Worker lifecycle is busy; try again shortly.", file=sys.stderr)
+            return 1
+        if not ok:
+            print(
+                f"Worker remains enabled and admission-paused ({diagnostic}).",
+                file=sys.stderr,
+            )
+            return 1
+        payload = {"enabled": False, **result}
+        _write(payload, as_json=args.json, human="Remote tasks worker disabled.")
+        return 0
+    parser.error("unsupported worker command")
+    return 2
+
+
+def _format_status(snapshot: dict) -> str:
+    enabled = "enabled" if snapshot.get("enabled") is True else "disabled"
+    process = snapshot.get("process_state", "unavailable")
+    admission = "paused" if snapshot.get("paused") is True else "open"
+    provider = snapshot.get("provider") or {}
+    provider_state = (
+        "available" if provider.get("available") is True
+        else provider.get("diagnostic_code") or "unavailable"
+    )
+    active = snapshot.get("active_job")
+    job = f"; job {active.get('job_id')} ({active.get('state')})" if active else ""
+    return (
+        f"Remote tasks: {enabled}; worker: {process}; admission: {admission}; "
+        f"provider: {provider_state}{job}"
+    )

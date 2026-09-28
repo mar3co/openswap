@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,24 @@ from openswap.kickoff import (
     parse_kickoff_time,
 )
 from openswap.session import AUTH_OVERRIDE_ENV_VARS
+
+
+def _fake_lease_roster(monkeypatch, tmp_path: Path, provider: str) -> Path:
+    root = tmp_path / "openswap-data"
+    root.mkdir()
+    state_dir = root / "codex" if provider == "codex" else root
+    state_dir.mkdir(exist_ok=True)
+    row = (
+        {"accountId": "acct-fake", "email": "fake@example.test"}
+        if provider == "codex"
+        else {"email": "fake@example.test", "organizationUuid": "org-fake"}
+    )
+    (state_dir / "sequence.json").write_text(
+        json.dumps({"activeAccountNumber": "1", "accounts": {"1": row}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("openswap.kickoff.paths.get_backup_root", lambda: root)
+    return root
 
 
 # --- due-once-per-local-day ----------------------------------------------------
@@ -184,7 +203,8 @@ def test_eligibility_open_five_hour_with_future_reset_is_skipped():
 
 # --- invoke path ---------------------------------------------------------------
 
-def test_invoke_kickoff_print_argv_session_dir_and_returning_subprocess(tmp_path: Path):
+def test_invoke_kickoff_print_argv_session_dir_and_returning_subprocess(tmp_path: Path, monkeypatch):
+    _fake_lease_roster(monkeypatch, tmp_path, "claude")
     session_dir = tmp_path / "sessions" / "1-a_x.com"
     session_dir.mkdir(parents=True)
     captured: dict = {}
@@ -223,10 +243,11 @@ def test_invoke_kickoff_source_uses_subprocess_not_exec():
     assert "os.execvpe(" not in src
     assert "os.execvp(" not in src
     assert "os.exec(" not in src
-    assert "run_fn(" in src
+    assert "_run_kickoff_with_lease(" in src
 
 
-def test_invoke_codex_kickoff_exec_argv_and_home(tmp_path):
+def test_invoke_codex_kickoff_exec_argv_and_home(tmp_path, monkeypatch):
+    _fake_lease_roster(monkeypatch, tmp_path, "codex")
     captured = {}
     def fake_which(name): return "/opt/fake/codex" if name == "codex" else None
     def fake_run(argv, **kw):
@@ -240,7 +261,8 @@ def test_invoke_codex_kickoff_exec_argv_and_home(tmp_path):
     assert "OPENAI_API_KEY" not in captured["kw"]["env"]
     assert captured["kw"]["stdin"] is subprocess.DEVNULL
 
-def test_invoke_codex_kickoff_live_login_has_no_codex_home():
+def test_invoke_codex_kickoff_live_login_has_no_codex_home(tmp_path, monkeypatch):
+    _fake_lease_roster(monkeypatch, tmp_path, "codex")
     captured = {}
     def fake_run(argv, **kw):
         captured["kw"] = kw
@@ -263,8 +285,9 @@ def test_invoke_kickoff_missing_claude_raises(tmp_path: Path):
         invoke_kickoff(tmp_path, which=lambda _name: None, run=lambda *_a, **_k: None)
 
 
-def test_invoke_kickoff_default_login_omits_config_dir():
+def test_invoke_kickoff_default_login_omits_config_dir(tmp_path: Path, monkeypatch):
     """Live default login: no second credential copy, no CLAUDE_CONFIG_DIR."""
+    _fake_lease_roster(monkeypatch, tmp_path, "claude")
     captured: dict = {}
 
     def fake_which(name: str):
@@ -295,6 +318,38 @@ def test_invoke_kickoff_default_login_omits_config_dir():
     assert captured["kwargs"].get("cwd") in (None, "")
     assert captured["kwargs"].get("check") is False
     assert result.returncode == 0
+
+
+def test_kickoff_timeout_quarantines_account_and_refuses_replay(tmp_path: Path, monkeypatch):
+    from openswap.kickoff import paths
+    from openswap.worker.leases import AccountLeaseStore, LeaseConflictError
+
+    root = _fake_lease_roster(monkeypatch, tmp_path, "codex")
+    started = []
+
+    def timed_out(argv, **kwargs):
+        started.append(list(argv))
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    invoke = lambda run: invoke_codex_kickoff(
+        None,
+        which=lambda _name: "/opt/fake/codex",
+        run=run,
+        timeout=0.01,
+        environ={"PATH": "/usr/bin"},
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        invoke(timed_out)
+    lease = AccountLeaseStore(root, "codex").current()
+    assert lease.state == "uncertain"
+    assert lease.reason == "kickoff_timeout"
+
+    def must_not_relaunch(*_args, **_kwargs):
+        pytest.fail("kickoff was replayed after uncertain timeout")
+
+    with pytest.raises(LeaseConflictError):
+        invoke(must_not_relaunch)
+    assert len(started) == 1
 
 
 def test_build_kickoff_argv_is_print_mode():

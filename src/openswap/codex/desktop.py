@@ -28,6 +28,7 @@ from openswap.codex.engine import CodexEngine
 from openswap.exceptions import ClaudeSwitchError
 from openswap.models import get_timestamp
 from openswap.settings import load_settings
+from openswap.worker.leases import AccountLeaseStore
 
 
 class DesktopSwitchError(ClaudeSwitchError):
@@ -331,7 +332,8 @@ class DesktopSwitcher:
                 "Pause Codex automatic switching first: run "
                 "'openswap config set autoswitch.codexEnabled false'."
             )
-        with self.engine._lock():
+        with AccountLeaseStore(self.engine.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             recovery = self._read_recovery()
             app_info = self.app.preflight(self.engine.home)
             was_running = bool(self.app.is_running())
@@ -479,7 +481,8 @@ class DesktopSwitcher:
                 "'openswap config set autoswitch.codexEnabled false'."
             )
 
-        with self.engine._lock():
+        with AccountLeaseStore(self.engine.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             if self.recovery_file.exists():
                 raise DesktopSwitchError(
                     "An unresolved desktop recovery record already exists. Keep the app "

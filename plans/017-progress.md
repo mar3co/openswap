@@ -6,10 +6,14 @@ execution; it does not mean that remote execution is implemented or enabled.
 
 ## Current status
 
-**Phase 1: IN PROGRESS, exit BLOCKED.** Only the feasibility spike and its
-written decisions are in scope. There is no product code. PR #59 is ready for
-review; opening or merging it does not substitute for the remaining technical
-evidence gates. Phases 2 and 3 have not started.
+**Phase 1: IN PROGRESS, exit BLOCKED.** The remaining technical evidence gates
+are unresolved. PR #59 is ready for review; opening or merging it does not
+substitute for those gates. On 2026-09-28 the owner explicitly authorized
+Phase 2 local-worker infrastructure to proceed in parallel with their Phase 1
+work. This changes sequencing only: no Phase 1 gate is waived or marked passed.
+Phase 2 local-only implementation is underway under that owner authorization;
+remote access stays off and live Codex execution stays disabled. Phase 3 has
+not started.
 
 The baseline `uv run pytest` completed before this branch's changes: 2870
 passed, 4 skipped, 1 failed, 3 warnings (15.15s). The failure is
@@ -19,9 +23,11 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest assembled-branch suite is green: `2911 passed, 4 skipped, 3 warnings
-in 15.01s`; it includes 40 phase-one harness tests. The helper-cleanup
-regression also passed in isolation (`1 passed in 1.19s`).
+The last full-suite result before Phase 2 changes, at the assembled Phase 1
+branch, was `2911 passed, 4 skipped, 3 warnings in 15.01s`; it included 40
+Phase 1 harness tests. It is historical baseline evidence, not validation of
+this Phase 2 branch. The helper-cleanup regression passed in isolation
+(`1 passed in 1.19s`).
 
 The ChatGPT app-bundled Codex CLI is `0.158.0-alpha.2.1` (pre-release). A
 separate official stable ARM macOS release, `0.157.1`, was downloaded to
@@ -103,7 +109,9 @@ Phase 1 exit requires all of the following:
   [decision memo](research/remote-agent-host/decision-control-service.md).
 - [x] Both written decision memos have been delivered for owner review.
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
-  reviewed; phase-one PR is merged before phase 2 begins.
+  reviewed and PR #59 is merged as Phase 1 signoff. This remains required
+  before real Codex execution, but does not block owner-authorized local-only
+  Phase 2 infrastructure work.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
   (`2911 passed, 4 skipped, 3 warnings in 15.01s`).
 
@@ -120,14 +128,61 @@ until the owner records a permitted path or exclusion.
 | Phase | Status | Exit evidence / blocker |
 | --- | --- | --- |
 | 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction shows the current wrapper can return success while a detached helper remains alive. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 is open and ready for review; it does not satisfy the remaining technical exit gates. |
-| 2. Local worker, remote access off | NOT STARTED | Requires every phase-1 exit item above and the phase-1 PR merged. |
+| 2. Local worker, remote access off | IN PROGRESS — local-only core | Owner authorized local infrastructure to overlap Phase 1; no Phase 1 gate is waived. Remote access stays off and live Codex stays disabled. |
 | 3. Private remote pilot | NOT STARTED | Requires phase 2's exit criteria and merged PR. Builds the protocol specification, configurable backend URL and the MIT reference server as product code; the pilot runs against a self-hosted instance. |
 | 4. OpenTag connector | OUT OF SCOPE | Tracked in the separate OpenTag repository. |
 | 5–6 | OUT OF SCOPE | Do not start. |
 
+## Phase 2 local-worker plan (owner-authorized overlap)
+
+The owner authorized local Phase 2 infrastructure to overlap the open Phase 1
+review. The authorization does not pass or waive any Phase 1 gate. Phase 2 is
+limited to an opt-in local worker: remote access remains off, the production
+Codex adapter always reports unavailable, and no provider account or job is
+used. Phase 3's control server, enrollment, polling and result upload are not
+part of this work.
+
+| Slice | Boundary and proposed interface |
+| --- | --- |
+| Core policy and journal (`settings.py`, `worker/models.py`, `worker/journal.py`) | Add default-off `WorkerSettings(enabled=False, paused=False)` to shared `settings.json`; persist a validated opaque workspace map (registered output root plus disjoint read-only roots) and an optional stable opaque Codex account reference. Writes use a settings-specific cross-process lock; reads are side-effect-free. Store private state under `<backup_root>/worker`. Use stdlib SQLite transactions for jobs/events; no server database. |
+| Typed runtime (`worker/runtime.py`) | Internal-only `JobSubmission(idempotency_key, provider='codex', task, capability_profile, workspace_id, expires_at, runtime_limit_s)`. Reject unknown fields; accept no account, model, path, environment or argv. `WorkerRuntime.submit/get/events/cancel/status` is callable only in-process; no submit RPC or CLI in Phase 2. |
+| State, queue and fencing | Preserve plan states, including `waiting_for_approval` in the canonical enum, but never emit that unsupported state in Phase 2. Keep worker-process health separate. Bound pending jobs and active execution to one per host. Persist startup epoch and job generation; every state/event write compares both. Restart reconciliation marks uncertain work `interrupted` and never relaunches it automatically. Store job ID, locally derived owner reference, provider session ID if known, private pinned-account reference, epoch/generation and timestamps. Persist task text only in the private local DB; status/IPC exposes no raw task or provider text. Events use a typed safe-data allowlist and safe diagnostic codes. Output paths derive only from registered workspace IDs and local job IDs; no caller path, upload or artifact transfer in Phase 2. |
+| Lease and stop boundary | Use the shared provider mutation lock and lease store; release only with explicit `UNLAUNCHED` or `CONFIRMED_STOPPED` evidence. Timeout, stale worker, ambiguous start, or detached-descendant uncertainty remains quarantined. An interrupted job alone does not prove that its lease may be released. |
+| Provider boundary (`worker/adapter.py`) | Define `ProviderAdapter.probe/start/events/interrupt`. The production factory returns an unavailable Codex adapter with safe code `live_adapter_disabled`; no executable path or caller argv injection can enable it. A fake adapter is available only to tests. Provider-finished events carry explicit execution-stopped proof; no proof means `interrupted` plus retained account quarantine. Phase 1 sandbox, auth, tool-inheritance, cancellation and recovery gates remain required for any later real adapter. |
+| Account lease integration | Lease owner API: `AccountLeaseStore(backup_root, provider).acquire(job_id, stable_account_id, worker_pid, worker_epoch, ttl_s) -> LeaseToken`, `renew(token, ttl_s)`, `mark_uncertain(token, reason)`, and `release(token, evidence)` where evidence is only `UNLAUNCHED` or `CONFIRMED_STOPPED`. `mutation_guard()` acquires the existing provider `FileLock` once and exposes `assert_unleased(account_ids)`; engine methods resolve stable identities under that guard, then mutate. Lease generation is distinct from worker epoch. Uncertain/expired leases remain quarantined; journal state is not a second lease authority. |
+| Local control and UI (`worker/ipc.py`, sibling-owned) | A private versioned AF_UNIX socket exposes only `status`, `stop`, and `pause`; no submit RPC. `WorkerSnapshot(enabled, paused, process_state, remote_connectivity='disabled', provider, active_job, queue_depth)` and `ControlResult(accepted, job_id=None, diagnostic_code=None)` live in `worker/models.py`. Stop is request acknowledgement, never proof of execution stopped; `set_paused(False)` reopens admission only and never resumes a job. CLI verbs are `worker run|status|stop|pause|enable|disable`; the menu is a thin status/IPC client. Status reading is a pure read-only snapshot: it does not construct runtime/Engine, create default directories or read credentials. |
+
+The local persistence surface is `LocalJobStore.create/claim/transition/append_event/get/list_events/start_epoch`; state changes use transactional expected-state + epoch/generation checks and events have per-job monotonic cursors. The daemon holds a process singleton lock before `start_epoch`; startup adopts only queued work and marks uncertain active work interrupted. IPC callback signatures are `status() -> WorkerSnapshot`, `stop(job_id: str | None) -> ControlResult`, and `set_paused(paused: bool) -> ControlResult`. Stop acknowledgments do not prove execution stopped, and stale/unavailable health or an unresolved lease blocks disable. The IPC and LaunchAgent/CLI seams are owned by the UI/inheritance slice; core models, journal, worker policy/configuration, adapter and runtime are owned by the core slice.
+
+Phase 2 validation is fake-only: persistence across
+worker/UI restart, bounded admission, state transitions, stale-epoch refusal,
+lease enforcement, IPC allowlisting and early CLI routing. Acceptance includes
+one subprocess-level fake worker test showing work survives status-client
+recreation, duplicate admission is refused, stop acknowledgement is not
+execution-stopped proof, and restart marks ambiguous work interrupted without
+relaunch. It does not claim that Codex is executable under the required
+boundary. No `launchctl` command is run against the user's login session;
+LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
+3 remains unstarted.
+
+Current Phase 2 validation is green on the assembled branch: `2984 passed,
+4 skipped, 3 warnings in 16.36s`. Focused core journal,
+settings, disabled-adapter and fake lifecycle tests passed (`20 passed`); the
+separate subprocess acceptance passed (`1 passed`). It verifies client
+recreation/idempotency, singleton refusal, a stop acknowledgement remaining
+nonterminal with the lease quarantined, and restart recovery to `interrupted`
+without adapter relaunch. The first assembled run exposed a missing
+`activeAccountNumber` in a live-kickoff test fixture; the fixture now declares
+the managed account explicitly, and kickoff identity resolution remains
+fail-closed. All provider behavior in these tests is synthetic; this result
+does not clear Phase 1 gates or enable live Codex execution.
+
 ## Deviations and verification
 
-- No deviation from plan 017's scope or ordering.
+- Phase ordering overlaps only because the owner explicitly authorized local
+  Phase 2 infrastructure while Phase 1 remains in progress. This does not
+  waive Phase 1 evidence gates or authorize Phase 3, provider execution, or
+  credentials.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it will preserve the `ClaudeSwitchError` assertion and will not change the
   resolver or executable discovery behavior.
@@ -222,5 +277,6 @@ until the owner records a permitted path or exclusion.
   Keychain entries were touched; synthetic auth sentinels were used only under
   `/private/tmp` for the Seatbelt boundary probe.
 - PR [#59](https://github.com/mar3co/openswap/pull/59) is open and ready for
-  review against `main`. Its merge remains a phase-2 prerequisite, not a
-  substitute for the unchecked technical evidence above.
+  review against `main`; its review/merge is Phase 1 signoff and does not clear
+  the remaining technical evidence gates or block the owner-authorized local
+  Phase 2 work.

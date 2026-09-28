@@ -1,0 +1,145 @@
+"""Focused CLI lifecycle safety tests for the opt-in local worker."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import os
+import stat
+
+from openswap.worker import cli
+from openswap.worker.journal import LocalJobStore
+from openswap.settings import load_worker_settings, update_worker_settings
+
+
+class _Client:
+    def __init__(self, _path):
+        self.stop_ids = []
+        self.paused = []
+
+    def set_paused(self, paused):
+        self.paused.append(paused)
+        return {"accepted": True}
+
+    def stop(self, job_id):
+        self.stop_ids.append(job_id)
+        return {"accepted": True, "job_id": job_id}
+
+
+def test_disable_pauses_targets_the_snapshot_job_and_waits_for_terminal_state(
+    tmp_path: Path, monkeypatch
+):
+    writes = []
+    snapshots = iter(
+        [
+            {
+                "process_state": "running",
+                "enabled": True,
+                "paused": True,
+                "lease_quarantined": False,
+                "active_job": {"job_id": "job-safe-1", "state": "running"},
+            },
+            {
+                "process_state": "running",
+                "enabled": True,
+                "paused": True,
+                "lease_quarantined": False,
+                "active_job": None,
+            },
+        ]
+    )
+    client = _Client(None)
+    monkeypatch.setattr(cli, "WorkerClient", lambda _path: client)
+    monkeypatch.setattr(cli, "_snapshot", lambda _root: next(snapshots))
+    monkeypatch.setattr(
+        cli,
+        "update_worker_settings",
+        lambda _root, **values: writes.append(values),
+    )
+    monkeypatch.setattr(cli, "uninstall", lambda **_kwargs: {"unloaded": True})
+    monkeypatch.setattr(cli, "_DISABLE_POLL_SECONDS", 0)
+
+    ok, result, diagnostic = cli.disable_worker(tmp_path)
+
+    assert ok is True
+    assert diagnostic is None
+    assert client.paused == [True]
+    assert client.stop_ids == ["job-safe-1"]
+    assert writes == [
+        {"enabled": True, "paused": True},
+        {"enabled": False, "paused": True},
+    ]
+    assert result["snapshot"]["active_job"] is None
+
+
+def test_disable_keeps_worker_enabled_paused_when_lease_state_is_unknown(
+    tmp_path: Path, monkeypatch
+):
+    writes = []
+    client = _Client(None)
+    snapshot = {
+        "process_state": "running",
+        "enabled": True,
+        "paused": True,
+        "lease_quarantined": True,
+        "active_job": None,
+    }
+    monkeypatch.setattr(cli, "WorkerClient", lambda _path: client)
+    monkeypatch.setattr(cli, "_snapshot", lambda _root: snapshot)
+    monkeypatch.setattr(
+        cli,
+        "update_worker_settings",
+        lambda _root, **values: writes.append(values),
+    )
+    monkeypatch.setattr(
+        cli,
+        "uninstall",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("unsafe unload")),
+    )
+
+    ok, _result, diagnostic = cli.disable_worker(tmp_path)
+
+    assert ok is False
+    assert diagnostic == "lease_state_unknown"
+    assert client.paused == [True]
+    assert writes[0] == {"enabled": True, "paused": True}
+    assert writes[-1] == {"enabled": True, "paused": True}
+
+
+def test_enable_creates_private_worker_root_before_lifecycle_lock(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(cli, "install", lambda: {"already_loaded": False})
+
+    result = cli.enable_worker(tmp_path)
+
+    worker_dir = tmp_path / "worker"
+    assert result["enabled"] is True
+    assert load_worker_settings(tmp_path).enabled is True
+    info = worker_dir.lstat()
+    assert stat.S_ISDIR(info.st_mode)
+    assert not stat.S_ISLNK(info.st_mode)
+    assert info.st_uid == os.getuid()
+    assert stat.S_IMODE(info.st_mode) == 0o700
+    LocalJobStore(tmp_path)._ensure_private_dir()
+
+
+def test_rejected_pause_restores_previous_paused_policy(tmp_path: Path, monkeypatch):
+    class RefusingClient:
+        def __init__(self, _path):
+            pass
+
+        def set_paused(self, paused):
+            assert paused is True
+            return {"accepted": False, "diagnostic_code": "pause_refused"}
+
+    update_worker_settings(tmp_path, enabled=True, paused=True)
+    monkeypatch.setattr(cli, "WorkerClient", RefusingClient)
+
+    result = cli.request_pause(tmp_path, True)
+
+    assert result == {
+        "accepted": False,
+        "paused": True,
+        "diagnostic_code": "pause_refused",
+    }
+    assert load_worker_settings(tmp_path).paused is True

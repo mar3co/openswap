@@ -1,0 +1,625 @@
+"""Local-only, single-active-job coordinator for the Phase 2 worker."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import sqlite3
+import signal
+import stat
+import threading
+import time
+from urllib.parse import quote
+
+from openswap.settings import load_worker_settings, update_worker_settings
+from openswap.worker.adapter import ProviderAdapter, production_adapter
+from openswap.locking import FileLock
+from openswap.worker.journal import AdmissionError, LocalJobStore, StaleWriteError
+from openswap.worker.leases import (
+    AccountLeaseStore,
+    LeaseConflictError,
+    LeaseStateError,
+    ReleaseEvidence,
+)
+from openswap.worker.models import (
+    ControlResult,
+    EventPage,
+    JobRecord,
+    JobState,
+    JobSubmission,
+    ProviderAvailability,
+    RemoteConnectivity,
+    ResolvedWorkspace,
+    WorkerProcessState,
+    WorkerSnapshot,
+    SafeEventKind,
+    ProviderRun,
+)
+
+HEALTH_STALE_AFTER_SECONDS = 30.0
+LOCAL_OWNER_REF = "local-user"
+
+
+def _unavailable_provider() -> ProviderAvailability:
+    return ProviderAvailability(False, "live_adapter_disabled", None)
+
+
+def _lease_is_quarantined(backup_root: Path) -> bool:
+    """Read the atomically replaced lease record without waiting on provider locks."""
+    path = Path(backup_root) / "worker" / "leases" / "codex.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("schema_version") != 1:
+            return True
+        lease = data.get("lease")
+        if lease is None:
+            return True
+        if not isinstance(lease, dict) or lease.get("state") not in {"active", "uncertain", "released"}:
+            return True
+        return lease["state"] != "released"
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+        return True
+
+
+def _snapshot_from_store(
+    backup_root: Path,
+    *,
+    process_state: WorkerProcessState,
+    enabled: bool,
+    paused: bool,
+    store: LocalJobStore | None = None,
+    last_seen_at: datetime | None = None,
+    worker_pid: int | None = None,
+) -> WorkerSnapshot:
+    active_job = None
+    queue_depth = 0
+    if store is not None:
+        try:
+            active = store.active()
+            active_job = active.snapshot() if active else None
+            queue_depth = len(store.queue())
+            pid, seen = store.health()
+            worker_pid = worker_pid if worker_pid is not None else pid
+            last_seen_at = last_seen_at or seen
+        except (OSError, sqlite3.Error, RuntimeError, ValueError):
+            process_state = WorkerProcessState.UNAVAILABLE
+            active_job = None
+            queue_depth = 0
+            worker_pid = None
+            last_seen_at = None
+    return WorkerSnapshot(
+        enabled=enabled,
+        paused=paused,
+        process_state=process_state,
+        remote_connectivity=RemoteConnectivity.DISABLED,
+        provider=_unavailable_provider(),
+        active_job=active_job,
+        queue_depth=queue_depth,
+        last_seen_at=last_seen_at,
+        worker_pid=worker_pid,
+        lease_quarantined=_lease_is_quarantined(backup_root),
+    )
+
+
+def read_worker_snapshot(backup_root: Path, *, now: datetime | None = None) -> WorkerSnapshot:
+    """Pure read-only CLI/UI fallback; never creates state or loads credentials."""
+    backup_root = Path(backup_root)
+    policy = load_worker_settings(backup_root)
+    db_path = backup_root / "worker" / "jobs.sqlite3"
+    try:
+        db_info = db_path.lstat()
+    except FileNotFoundError:
+        return _snapshot_from_store(
+            backup_root, process_state=WorkerProcessState.STOPPED,
+            enabled=policy.enabled, paused=policy.paused,
+        )
+    except OSError:
+        return WorkerSnapshot(
+            enabled=policy.enabled, paused=policy.paused,
+            process_state=WorkerProcessState.UNAVAILABLE,
+            remote_connectivity=RemoteConnectivity.DISABLED,
+            provider=_unavailable_provider(), active_job=None, queue_depth=0,
+            lease_quarantined=True,
+        )
+    state_dir = db_path.parent
+    try:
+        state_info = state_dir.lstat()
+    except OSError:
+        state_info = None
+    if (
+        stat.S_ISLNK(db_info.st_mode) or not stat.S_ISREG(db_info.st_mode)
+        or state_info is None or stat.S_ISLNK(state_info.st_mode)
+        or not stat.S_ISDIR(state_info.st_mode)
+        or (os.name != "nt" and (state_info.st_uid != os.getuid() or state_info.st_mode & 0o077))
+    ):
+        return WorkerSnapshot(
+            enabled=policy.enabled, paused=policy.paused,
+            process_state=WorkerProcessState.UNAVAILABLE,
+            remote_connectivity=RemoteConnectivity.DISABLED,
+            provider=_unavailable_provider(), active_job=None, queue_depth=0,
+            lease_quarantined=True,
+        )
+    db: sqlite3.Connection | None = None
+    try:
+        uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
+        db = sqlite3.connect(uri, uri=True, timeout=0.25)
+        db.row_factory = sqlite3.Row
+        metadata = {row["key"]: row["value"] for row in db.execute(
+            "SELECT key,value FROM metadata WHERE key IN ('worker_pid','last_seen_at')"
+        )}
+        row = db.execute(
+            "SELECT * FROM jobs WHERE state IN ('claimed','starting','running','cancel_requested') "
+            "ORDER BY updated_at LIMIT 1"
+        ).fetchone()
+        queue_depth = db.execute("SELECT COUNT(*) FROM jobs WHERE state='queued'").fetchone()[0]
+        active_job = LocalJobStore._record(row).snapshot() if row else None
+        raw_pid = metadata.get("worker_pid")
+        pid = int(raw_pid) if raw_pid else None
+        seen = datetime.fromisoformat(metadata["last_seen_at"]) if metadata.get("last_seen_at") else None
+        current = now or datetime.now(timezone.utc)
+        state = WorkerProcessState.STOPPED
+        if pid and seen:
+            age = (current - seen).total_seconds()
+            if age < 0 or age > HEALTH_STALE_AFTER_SECONDS:
+                state = WorkerProcessState.STALE
+            elif _pid_exists(pid):
+                state = WorkerProcessState.RUNNING
+            else:
+                state = WorkerProcessState.STALE
+        return WorkerSnapshot(
+            enabled=policy.enabled,
+            paused=policy.paused,
+            process_state=state,
+            remote_connectivity=RemoteConnectivity.DISABLED,
+            provider=_unavailable_provider(),
+            active_job=active_job,
+            queue_depth=queue_depth,
+            last_seen_at=seen,
+            worker_pid=pid,
+            lease_quarantined=_lease_is_quarantined(backup_root),
+        )
+    except (OSError, sqlite3.Error, ValueError, KeyError):
+        return WorkerSnapshot(
+            enabled=policy.enabled,
+            paused=policy.paused,
+            process_state=WorkerProcessState.UNAVAILABLE,
+            remote_connectivity=RemoteConnectivity.DISABLED,
+            provider=_unavailable_provider(),
+            active_job=None,
+            queue_depth=0,
+            lease_quarantined=True,
+        )
+    finally:
+        if db is not None:
+            db.close()
+
+
+def _pid_exists(pid: int) -> bool:
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+class WorkerRuntime:
+    """In-process submission/control API; no submit RPC or CLI is provided."""
+
+    def __init__(
+        self,
+        backup_root: Path,
+        *,
+        adapter: ProviderAdapter | None = None,
+        owner_ref: str = LOCAL_OWNER_REF,
+        max_pending: int = 20,
+        account_identity: str | None = None,
+        clock=time.time,
+        monotonic=time.monotonic,
+        sleeper=time.sleep,
+    ):
+        self.backup_root = Path(backup_root)
+        self.store = LocalJobStore(self.backup_root, max_pending=max_pending)
+        self.adapter = adapter if adapter is not None else production_adapter()
+        self.owner_ref = owner_ref
+        self.account_identity = account_identity or load_worker_settings(self.backup_root).pinned_account_ref
+        self.clock = clock
+        self.monotonic = monotonic
+        self.sleeper = sleeper
+        self.leases = AccountLeaseStore(self.backup_root, "codex")
+        self.worker_pid = os.getpid()
+        self.worker_epoch, self.recovered_job_ids = self.store.start_epoch(self.worker_pid)
+        self._admission_lock = threading.RLock()
+        self._launch_lock = threading.RLock()
+        self._active_run = None
+        self._active_lease = None
+
+    def submit(self, submission: JobSubmission) -> JobRecord:
+        with self._admission_lock:
+            policy = load_worker_settings(self.backup_root)
+            if not policy.enabled:
+                raise AdmissionError("local worker is disabled")
+            if policy.paused:
+                raise AdmissionError("local worker admission is paused")
+            if submission.expires_at <= datetime.now(timezone.utc):
+                raise AdmissionError("job is expired")
+            return self.store.create(
+                submission, owner_ref=self.owner_ref, worker_epoch=self.worker_epoch,
+            )
+
+    def get(self, job_id: str) -> JobRecord:
+        return self.store.get(job_id)
+
+    def events(self, job_id: str, *, after_cursor: int = 0, limit: int = 100) -> EventPage:
+        return self.store.list_events(job_id, after_cursor=after_cursor, limit=limit)
+
+    def cancel(self, job_id: str) -> JobRecord:
+        with self._launch_lock:
+            record = self.store.get(job_id)
+            return self.store.cancel(
+                job_id, worker_epoch=self.worker_epoch, expected_generation=record.generation,
+            )
+
+    def status(self) -> WorkerSnapshot:
+        policy = load_worker_settings(self.backup_root)
+        return _snapshot_from_store(
+            self.backup_root, process_state=WorkerProcessState.RUNNING,
+            enabled=policy.enabled, paused=policy.paused, store=self.store,
+            worker_pid=self.worker_pid,
+        )
+
+    def stop(self, job_id: str | None) -> ControlResult:
+        with self._launch_lock:
+            record = self.store.active()
+            if record is None:
+                if job_id is None:
+                    return ControlResult(True, diagnostic_code="no_active_job")
+                try:
+                    self.store.get(job_id)
+                except KeyError:
+                    return ControlResult(False, job_id=job_id, diagnostic_code="job_not_found")
+                return ControlResult(True, job_id=job_id, diagnostic_code="job_not_active")
+            if job_id is not None and record.job_id != job_id:
+                return ControlResult(False, job_id=job_id, diagnostic_code="active_job_mismatch")
+            try:
+                updated = self.store.cancel(
+                    record.job_id, worker_epoch=self.worker_epoch,
+                    expected_generation=record.generation,
+                )
+            except StaleWriteError:
+                return ControlResult(False, job_id=record.job_id, diagnostic_code="stale_job_state")
+            return ControlResult(True, job_id=updated.job_id, diagnostic_code="stop_requested")
+
+    def set_paused(self, paused: bool) -> ControlResult:
+        if type(paused) is not bool:
+            return ControlResult(False, diagnostic_code="invalid_pause_value")
+        try:
+            with self._admission_lock:
+                update_worker_settings(self.backup_root, paused=paused)
+        except (OSError, RuntimeError, ValueError):
+            return ControlResult(False, diagnostic_code="settings_unavailable")
+        return ControlResult(True, diagnostic_code="admission_paused" if paused else "admission_open")
+
+    def reconcile_once(self, *, shutdown_event: threading.Event | None = None) -> JobRecord | None:
+        """Process at most one job; injectable adapters are for tests only."""
+        with self._admission_lock:
+            policy = load_worker_settings(self.backup_root)
+            if not policy.enabled or policy.paused:
+                return None
+            queued = self.store.queue(limit=1)
+            if not queued:
+                return None
+            item = queued[0]
+            if item.expires_at <= datetime.now(timezone.utc):
+                return self.store.transition(
+                    item.job_id, expected_states=(JobState.QUEUED,),
+                    new_state=JobState.EXPIRED, worker_epoch=self.worker_epoch,
+                    expected_generation=item.generation, diagnostic_code="job_expired",
+                )
+            claimed = self.store.claim(
+                item.job_id, worker_epoch=self.worker_epoch,
+                expected_generation=item.generation,
+            )
+
+        with self._launch_lock:
+            prepared = self._prepare_run(claimed)
+        if isinstance(prepared, JobRecord):
+            return prepared
+        running, run, token = prepared
+        deadline = self.monotonic() + running.runtime_limit_s
+        current = running
+        provider_cursor = run.provider_event_cursor
+        try:
+            while True:
+                self.heartbeat()
+                current = self.store.get(running.job_id)
+                if shutdown_event is not None and shutdown_event.is_set():
+                    return self._interrupt_active(current, "worker_shutdown")
+                if current.state == JobState.CANCEL_REQUESTED:
+                    return self._interrupt_active(current, "cancel_requested")
+                if self.monotonic() >= deadline:
+                    return self._interrupt_active(current, "runtime_limit_reached")
+                events = self.adapter.events(run, after_cursor=provider_cursor)
+                if not isinstance(events, tuple) or len(events) > 100:
+                    raise RuntimeError("provider_event_batch_too_large")
+                for event in events:
+                    if (event.job_id != current.job_id or type(event.cursor) is not int
+                            or event.cursor <= provider_cursor):
+                        raise RuntimeError("adapter_event_job_mismatch")
+                    self.store.append_event(
+                        current.job_id, kind=event.kind, state=event.state,
+                        diagnostic_code=event.diagnostic_code,
+                        worker_epoch=self.worker_epoch,
+                        expected_generation=current.generation,
+                        execution_stopped=event.execution_stopped,
+                    )
+                    provider_cursor = event.cursor
+                    current = self.store.get(current.job_id)
+                    if event.kind == SafeEventKind.PROVIDER_FINISHED:
+                        final_state = event.state
+                        if final_state not in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED}:
+                            raise RuntimeError("invalid_provider_terminal_state")
+                        if not event.execution_stopped:
+                            self.leases.mark_uncertain(token, "execution_uncertain")
+                            self._clear_active()
+                            return self.store.transition(
+                                current.job_id, expected_states=(current.state,),
+                                new_state=JobState.INTERRUPTED,
+                                worker_epoch=self.worker_epoch,
+                                expected_generation=current.generation,
+                                diagnostic_code="execution_uncertain",
+                            )
+                        if current.state not in {JobState.RUNNING, JobState.CANCEL_REQUESTED}:
+                            raise RuntimeError("unexpected_provider_terminal_state")
+                        if current.state == JobState.CANCEL_REQUESTED:
+                            final_state = JobState.CANCELLED
+                        final = self.store.transition(
+                            current.job_id, expected_states=(current.state,),
+                            new_state=final_state, worker_epoch=self.worker_epoch,
+                            expected_generation=current.generation,
+                            diagnostic_code=event.diagnostic_code,
+                        )
+                        self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+                        self._clear_active()
+                        return final
+                self.sleeper(0.05)
+        except Exception:
+            self.leases.mark_uncertain(token, "execution_uncertain")
+            self._clear_active()
+            current = self.store.get(running.job_id)
+            if current.state in {JobState.RUNNING, JobState.CANCEL_REQUESTED}:
+                return self.store.transition(
+                    current.job_id, expected_states=(current.state,),
+                    new_state=JobState.INTERRUPTED, worker_epoch=self.worker_epoch,
+                    expected_generation=current.generation,
+                    diagnostic_code="execution_uncertain",
+                )
+            raise
+
+    def heartbeat(self) -> None:
+        self.store.heartbeat(self.worker_pid, self.worker_epoch)
+
+    def _prepare_run(self, claimed: JobRecord):
+        current = self.store.get(claimed.job_id)
+        if current.state == JobState.CANCEL_REQUESTED:
+            return self.store.transition(
+                current.job_id, expected_states=(JobState.CANCEL_REQUESTED,),
+                new_state=JobState.CANCELLED, worker_epoch=self.worker_epoch,
+                expected_generation=current.generation,
+                diagnostic_code="cancel_requested",
+            )
+        try:
+            availability = self.adapter.probe()
+        except Exception:
+            availability = ProviderAvailability(False, "provider_unavailable", None)
+        if not availability.available:
+            return self.store.transition(
+                current.job_id, expected_states=(JobState.CLAIMED,),
+                new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
+                expected_generation=current.generation,
+                diagnostic_code=availability.diagnostic_code or "provider_unavailable",
+            )
+        if self.account_identity is None:
+            return self.store.transition(
+                current.job_id, expected_states=(JobState.CLAIMED,),
+                new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
+                expected_generation=current.generation, diagnostic_code="provider_unavailable",
+            )
+        starting = self.store.transition(
+            current.job_id, expected_states=(JobState.CLAIMED,),
+            new_state=JobState.STARTING, worker_epoch=self.worker_epoch,
+            expected_generation=current.generation,
+            pinned_account_ref=self.account_identity,
+        )
+        try:
+            token = self.leases.acquire(
+                job_id=starting.job_id, account_identity=self.account_identity,
+                worker_pid=self.worker_pid, worker_epoch=self.worker_epoch,
+                ttl_s=starting.runtime_limit_s + 60,
+            )
+        except LeaseConflictError:
+            return self.store.transition(
+                starting.job_id, expected_states=(JobState.STARTING,),
+                new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
+                expected_generation=starting.generation, diagnostic_code="lease_conflict",
+            )
+        except LeaseStateError:
+            return self.store.transition(
+                starting.job_id, expected_states=(JobState.STARTING,),
+                new_state=JobState.INTERRUPTED, worker_epoch=self.worker_epoch,
+                expected_generation=starting.generation, diagnostic_code="execution_uncertain",
+            )
+        self._active_lease = token
+        try:
+            workspace = self._resolve_workspace(starting.workspace_id, starting.job_id)
+        except Exception:
+            self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
+            self._clear_active()
+            return self.store.transition(
+                starting.job_id, expected_states=(JobState.STARTING,),
+                new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
+                expected_generation=starting.generation, diagnostic_code="provider_unavailable",
+            )
+        try:
+            run = self.adapter.start(starting, workspace, worker_epoch=self.worker_epoch)
+            if not isinstance(run, ProviderRun):
+                raise RuntimeError("invalid_provider_run")
+            self._active_run = run
+        except Exception:
+            self.leases.mark_uncertain(token, "launch_uncertain")
+            self._clear_active()
+            return self.store.transition(
+                starting.job_id, expected_states=(JobState.STARTING,),
+                new_state=JobState.INTERRUPTED, worker_epoch=self.worker_epoch,
+                expected_generation=starting.generation,
+                diagnostic_code="execution_uncertain",
+            )
+        running = self.store.transition(
+            starting.job_id, expected_states=(JobState.STARTING,),
+            new_state=JobState.RUNNING, worker_epoch=self.worker_epoch,
+            expected_generation=starting.generation,
+            provider_session_id=run.session_id,
+        )
+        return self.store.get(running.job_id), run, token
+
+    def _interrupt_active(self, record: JobRecord, reason: str) -> JobRecord:
+        token, run = self._active_lease, self._active_run
+        if token is None or run is None:
+            if token is not None:
+                self.leases.mark_uncertain(token, "execution_uncertain")
+            self._clear_active()
+            return self.store.transition(
+                record.job_id, expected_states=(record.state,),
+                new_state=JobState.INTERRUPTED, worker_epoch=self.worker_epoch,
+                expected_generation=record.generation,
+                diagnostic_code="execution_uncertain",
+            )
+        try:
+            result = self.adapter.interrupt(run)
+        except Exception:
+            result = None
+        if result is not None and result.execution_stopped:
+            self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+            if reason in {"cancel_requested", "worker_shutdown"}:
+                new_state = JobState.CANCELLED
+                diagnostic = "cancel_requested" if reason == "cancel_requested" else "worker_disabled"
+            else:
+                new_state = JobState.FAILED
+                diagnostic = "runtime_limit_reached"
+        else:
+            self.leases.mark_uncertain(token, "execution_uncertain")
+            new_state = JobState.INTERRUPTED
+            diagnostic = "execution_uncertain"
+        self._clear_active()
+        return self.store.transition(
+            record.job_id, expected_states=(record.state,), new_state=new_state,
+            worker_epoch=self.worker_epoch, expected_generation=record.generation,
+            diagnostic_code=diagnostic,
+        )
+
+    def _clear_active(self) -> None:
+        self._active_lease = None
+        self._active_run = None
+
+    def _resolve_workspace(self, workspace_id: str, job_id: str) -> ResolvedWorkspace:
+        settings = load_worker_settings(self.backup_root)
+        workspace = next((item for item in settings.workspaces if item.workspace_id == workspace_id), None)
+        if workspace is None:
+            raise ValueError("workspace is not registered")
+        base_root = workspace.output_root
+        base_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        base_info = base_root.lstat()
+        if base_root.is_symlink() or not base_root.is_dir():
+            raise ValueError("registered workspace is unsafe")
+        if os.name != "nt" and (base_info.st_uid != os.getuid() or base_info.st_mode & 0o077):
+            raise ValueError("registered workspace permissions are unsafe")
+        output_root = base_root / job_id
+        output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = output_root.lstat()
+        if output_root.is_symlink() or not output_root.is_dir():
+            raise ValueError("registered workspace is unsafe")
+        if os.name != "nt" and (info.st_uid != os.getuid() or info.st_mode & 0o077):
+            raise ValueError("registered workspace permissions are unsafe")
+        for source in workspace.readonly_roots:
+            try:
+                info = source.lstat()
+            except OSError:
+                raise ValueError("approved read-only source is unavailable") from None
+            if source.is_symlink() or not source.is_dir():
+                raise ValueError("approved read-only source is unsafe")
+            if os.name != "nt" and info.st_uid != os.getuid():
+                raise ValueError("approved read-only source is not locally owned")
+        return ResolvedWorkspace(
+            workspace_id=workspace_id, output_root=output_root,
+            readonly_sources=workspace.readonly_roots,
+        )
+
+def run_worker(backup_root: Path, *, runtime_factory=WorkerRuntime) -> int:
+    """Run the default-off worker daemon with a process-lifetime singleton lock."""
+    from openswap.worker.ipc import serve, socket_path
+
+    store = LocalJobStore(backup_root)
+    store._ensure_private_dir()
+    lifecycle_lock = FileLock(Path(backup_root) / "worker" / "lifecycle.lock", timeout=3)
+    instance_lock = FileLock(Path(backup_root) / "worker" / "instance.lock", timeout=0)
+    if not lifecycle_lock.acquire(timeout=3):
+        return 1
+    if not instance_lock.acquire(timeout=0):
+        lifecycle_lock.release()
+        return 1
+    stop_event = threading.Event()
+    try:
+        if not load_worker_settings(backup_root).enabled:
+            return 0
+        runtime = runtime_factory(backup_root)
+        ready_event = threading.Event()
+        server = threading.Thread(
+            target=serve,
+            args=(socket_path(backup_root), runtime, stop_event),
+            kwargs={"ready_event": ready_event},
+            name="openswap-worker-ipc", daemon=False,
+        )
+        server.start()
+        if not ready_event.wait(3.0) or not server.is_alive():
+            stop_event.set()
+            server.join(timeout=3)
+            return 1
+        lifecycle_lock.release()
+        original_handlers = {}
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                original_handlers[signum] = signal.signal(signum, lambda *_: stop_event.set())
+            except ValueError:
+                pass  # Embedded/test callers may not run in the main thread.
+        try:
+            while not stop_event.is_set():
+                if not server.is_alive():
+                    stop_event.set()
+                    return 1
+                runtime.heartbeat()
+                runtime.reconcile_once(shutdown_event=stop_event)
+                stop_event.wait(0.2)
+        finally:
+            stop_event.set()
+            server.join(timeout=3)
+            if server.is_alive():
+                server.join()
+            for signum, handler in original_handlers.items():
+                signal.signal(signum, handler)
+        return 0
+    except Exception:
+        # An ambiguous in-flight run remains quarantined by the lease store;
+        # process shutdown is never treated as proof that it stopped.
+        return 1
+    finally:
+        lifecycle_lock.release()
+        instance_lock.release()
