@@ -19,8 +19,9 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The final assembled-branch suite is green: `2893 passed, 4 skipped, 3 warnings
-in 13.77s`. The phase-one harness tests pass: `22 passed`.
+The final assembled-branch suite is green: `2896 passed, 4 skipped, 3 warnings
+in 16.66s`; it includes 25 phase-one harness tests. The helper-cleanup
+regression also passed in isolation (`1 passed in 1.19s`).
 
 The ChatGPT app-bundled Codex CLI is `0.158.0-alpha.2.1` (pre-release). A
 separate official stable ARM macOS release, `0.157.1`, was downloaded to
@@ -98,7 +99,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2893 passed, 4 skipped, 3 warnings in 13.77s`).
+  (`2896 passed, 4 skipped, 3 warnings in 16.66s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -124,7 +125,8 @@ until the owner records a permitted path or exclusion.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it will preserve the `ClaudeSwitchError` assertion and will not change the
   resolver or executable discovery behavior.
-- Credential-free harness tests passed (`22 passed`); `inspect`,
+- Credential-free harness tests passed (25 tests included in the full suite);
+  `inspect`,
   inert-child `demo`, and synthetic Seatbelt `sandbox-probe` outcomes are in
   [the Codex spike record](research/remote-agent-host/spike-codex.md). This
   establishes only helper and local sandbox behavior, not provider execution.
@@ -148,6 +150,18 @@ until the owner records a permitted path or exclusion.
   `unstructured-output`, and the reader continues to record the next valid
   event. Python 3.14 parses the nested fixture, so the test injects a bounded
   `RecursionError` for that input to exercise the failure path.
+- Codex review finding [P2 #4121829706](https://github.com/mar3co/openswap/pull/59#discussion_r4121829706)
+  is addressed in the Slack example: an opaque workspace ID maps locally to a
+  writable research/output workspace plus a separately approved read-only
+  checkout; caller-supplied paths are not accepted. Finding [P2 #4121829716](https://github.com/mar3co/openswap/pull/59#discussion_r4121829716)
+  is addressed in credential-free CLI probes by cleaning their owned process
+  groups after timeouts or leader exit. No provider execution is implied.
+- With the new bounded probe runner, the already-hash-verified stable `0.157.1`
+  binary was rechecked: `inspect` reported `codex-cli 0.157.1` and
+  `no_auth_performed=true`; the synthetic `sandbox-probe` allowed workspace
+  read/write and denied sibling read/write plus synthetic `CODEX_HOME` auth and
+  config reads. This remains wrapper-only evidence; no `codex exec` or provider
+  job was run.
 - `uv` was not installed on `PATH`; version 0.12.19 was installed only under
   `/private/tmp/openswap-uv-test`, with its Python, cache, and project test
   environment under `/private/tmp`. The full suite used that isolated runtime.

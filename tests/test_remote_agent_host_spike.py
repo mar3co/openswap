@@ -297,7 +297,7 @@ def test_inspect_cli_sanitizes_probe_launch_and_timeout_errors(
             _raise_probe_failure(failure, command)
         return subprocess.CompletedProcess(command, 0, "codex-cli 1.0-test\n", "")
 
-    monkeypatch.setattr(spike.subprocess, "run", fake_run)
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
 
     code = spike._main([
         "inspect", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")
@@ -337,7 +337,7 @@ def test_sandbox_probe_sanitizes_subprocess_failures(
             _raise_probe_failure(failure, command)
         return subprocess.CompletedProcess(command, 1, "", "")
 
-    monkeypatch.setattr(spike.subprocess, "run", fake_run)
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
 
     code = spike._main([
         "sandbox-probe", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")
@@ -352,6 +352,92 @@ def test_sandbox_probe_sanitizes_subprocess_failures(
     assert str(fake) not in captured.err
     assert "Traceback" not in captured.err
     assert len(calls) == (1 if stage == "first" else 2)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="owned process-group cleanup is POSIX-only")
+@pytest.mark.parametrize("probe", ["inspect", "sandbox"])
+def test_probe_timeout_kills_term_ignoring_helper_group(tmp_path, monkeypatch, capsys, probe):
+    marker = tmp_path / "helper"
+    helper = _executable(
+        tmp_path / "helper.py",
+        "import pathlib, signal, time\n"
+        f"marker = pathlib.Path({str(marker)!r})\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "i = 0\n"
+        "while True:\n"
+        " i += 1\n"
+        " marker.write_text(str(i))\n"
+        " time.sleep(0.03)\n",
+    )
+    code = (
+        "import pathlib,subprocess,sys,time\n"
+        f"marker=pathlib.Path({str(marker)!r})\n"
+        f"helper=subprocess.Popen([sys.executable,{str(helper)!r}])\n"
+        "(marker.with_suffix('.pid')).write_text(str(helper.pid))\n"
+        "time.sleep(60)\n"
+    )
+    fake = _executable(tmp_path / "fake-codex", code)
+    real_run_probe = spike._run_probe
+
+    def fast_probe(command, *, env, cwd, timeout_s):
+        return real_run_probe(command, env=env, cwd=cwd, timeout_s=1.0)
+
+    monkeypatch.setattr(spike, "_run_probe", fast_probe)
+    args = (["inspect", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")]
+            if probe == "inspect" else
+            ["sandbox-probe", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")])
+
+    code = spike._main(args)
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert "refused:" in captured.err
+    assert "Traceback" not in captured.err
+    assert (marker.with_suffix(".pid")).exists()
+    assert marker.exists()
+    before = marker.read_text()
+    time.sleep(0.15)
+    assert marker.read_text() == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="owned process-group cleanup is POSIX-only")
+def test_probe_normal_leader_exit_refuses_and_cleans_live_helper(tmp_path):
+    marker = tmp_path / "helper"
+    helper = _executable(
+        tmp_path / "helper.py",
+        "import pathlib, signal, time\n"
+        f"marker = pathlib.Path({str(marker)!r})\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "i = 0\n"
+        "while True:\n"
+        " i += 1\n"
+        " marker.write_text(str(i))\n"
+        " time.sleep(0.03)\n",
+    )
+    fake = _executable(
+        tmp_path / "fake-codex",
+        (
+            "import pathlib,subprocess,sys\n"
+            f"marker=pathlib.Path({str(marker)!r})\n"
+            f"helper=subprocess.Popen([sys.executable,{str(helper)!r}], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "marker.with_suffix('.pid').write_text(str(helper.pid))\n"
+            "deadline=__import__('time').monotonic()+1\n"
+            "while not marker.exists() and __import__('time').monotonic()<deadline: __import__('time').sleep(0.01)\n"
+        ),
+    )
+
+    with pytest.raises(SpikeError, match="result was refused"):
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=2
+        )
+
+    assert marker.with_suffix(".pid").exists()
+    assert marker.exists()
+    before = marker.read_text()
+    time.sleep(0.15)
+    assert marker.read_text() == before
 
 
 def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):

@@ -31,11 +31,80 @@ LIVE_CODEX_ENABLED = False
 MAX_RETAINED_EVENT_NAMES = 256
 MAX_EVENT_LINE_CHARS = 64 * 1024
 EVENT_NAMES_TRUNCATED = "event-names-truncated"
+PROBE_TERMINATION_GRACE_S = 0.15
+PROBE_CLEANUP_WAIT_S = 0.5
 _EVENT_NAME = re.compile(r"^[a-zA-Z0-9_.-]{1,80}$")
 
 
 class SpikeError(RuntimeError):
     """A fail-closed harness error suitable for display to an operator."""
+
+
+def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
+               timeout_s: float) -> subprocess.CompletedProcess:
+    """Run a credential-free probe and refuse success if its owned group lingers."""
+    process = subprocess.Popen(
+        list(command), env=env, cwd=cwd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=(os.name == "posix"),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _cleanup_probe_process(process)
+        raise subprocess.TimeoutExpired(command, timeout_s) from None
+    except BaseException:
+        _cleanup_probe_process(process)
+        raise
+
+    if os.name == "posix" and _probe_group_running(process.pid):
+        _cleanup_probe_process(process)
+        raise SpikeError("Probe left a child process running; result was refused.")
+    try:
+        decoded_stdout = stdout.decode("utf-8")
+        decoded_stderr = stderr.decode("utf-8")
+    except UnicodeDecodeError:
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, decoded_stdout, decoded_stderr)
+
+
+def _probe_group_running(pgid: int) -> bool:
+    observed = _group_has_running_members(pgid)
+    if observed is not None:
+        return observed
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _cleanup_probe_process(process: subprocess.Popen) -> bool:
+    """Bounded cleanup for this probe's session; return whether it is uncertain."""
+    if os.name == "posix":
+        _signal_group(process, signal.SIGTERM)
+        deadline = time.monotonic() + PROBE_TERMINATION_GRACE_S
+        while _probe_group_running(process.pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if _probe_group_running(process.pid):
+            _signal_group(process, signal.SIGKILL)
+    elif process.poll() is None:
+        process.terminate()
+
+    try:
+        process.communicate(timeout=PROBE_CLEANUP_WAIT_S)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            _signal_group(process, signal.SIGKILL)
+        elif process.poll() is None:
+            process.kill()
+        try:
+            process.communicate(timeout=PROBE_CLEANUP_WAIT_S)
+        except subprocess.TimeoutExpired:
+            return True
+    return process.poll() is None or (os.name == "posix" and _probe_group_running(process.pid))
 
 
 def _private_dir(path: Path) -> None:
@@ -344,12 +413,10 @@ def inspect_codex(codex_bin: str | None, evidence_dir: Path) -> dict:
             codex_home = home / "codex"
             codex_home.mkdir(mode=0o700)
             env = {"PATH": os.defpath, "HOME": str(home), "CODEX_HOME": str(codex_home)}
-            version = subprocess.run([str(binary), "--version"], env=env, cwd=temp,
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, text=True, timeout=10, check=False)
-            help_result = subprocess.run([str(binary), "exec", "--help"], env=env, cwd=temp,
-                                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                         stderr=subprocess.PIPE, text=True, timeout=15, check=False)
+            version = _run_probe([str(binary), "--version"], env=env, cwd=temp,
+                                 timeout_s=10)
+            help_result = _run_probe([str(binary), "exec", "--help"], env=env, cwd=temp,
+                                     timeout_s=15)
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
         raise SpikeError("Codex version/help probe could not complete.") from None
     version_text = version.stdout.strip()
@@ -411,18 +478,16 @@ def probe_low_level_sandbox(codex_bin: str | None, evidence_dir: Path) -> dict:
             f"printf outside-write > {shlex.quote(str(outside / 'write-test.txt'))}"
         )
         try:
-            result = subprocess.run(
+            result = _run_probe(
                 [binary, "sandbox", "--permission-profile", "research-test", "--log-denials",
                  "--cd", str(workspace), "/bin/sh", "-c", command],
-                env=env, cwd=temp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, timeout=20, check=False,
+                env=env, cwd=temp, timeout_s=20,
             )
-            auth_read = subprocess.run(
+            auth_read = _run_probe(
                 [binary, "sandbox", "--permission-profile", "research-test", "--log-denials",
                  "--cd", str(workspace), "/bin/sh", "-c",
                  'cat "$CODEX_HOME/auth.json"; cat "$CODEX_HOME/config.toml"'],
-                env=env, cwd=temp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, timeout=20, check=False,
+                env=env, cwd=temp, timeout_s=20,
             )
         except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
             raise SpikeError("Codex sandbox probe could not complete.") from None

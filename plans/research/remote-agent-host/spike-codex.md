@@ -112,8 +112,19 @@ inspect: codex-cli 0.158.0-alpha.2.1; exec_json=true; sandbox_option=true;
 demo:    state=cancelled; returncode=-15; event_names=[thread.started]
 sandbox: inside read/write allowed; outside read/write denied;
          synthetic CODEX_HOME auth/config reads denied; no exec/model run
-tests:   22 passed
+tests:   25 passed (full assembled suite: 2,896 passed, 4 skipped, 3 warnings)
 ```
+
+After the bounded process-group runner was added, the official stable ARM
+macOS `0.157.1` binary was also checked from `/private/tmp`. `inspect` reported
+`version=codex-cli 0.157.1`, `matches_discovered_pin=false`, and
+`no_auth_performed=true`. A credential-free `sandbox-probe` using synthetic
+workspace and `CODEX_HOME` sentinels allowed workspace read/write and denied
+sibling read/write plus synthetic `auth.json` and `config.toml` reads. This is
+wrapper-only Seatbelt evidence; it does not establish `codex exec` enforcement
+or account selection. The helper-cleanup regression passed in isolation
+(`1 passed in 1.19s`); all 25 harness tests are included in the full-suite
+result above.
 
 The fake-process harness includes regression coverage for the Codex review
 findings on [PR #59](https://github.com/mar3co/openswap/pull/59): finding
@@ -143,6 +154,12 @@ valid event. Both parser failures are retained as `unstructured-output`, and
 the next event is still collected. Python 3.14 parses this nesting depth, so
 the test injects a `RecursionError` for the nested record to exercise that
 failure path.
+
+Finding [#4121829716](https://github.com/mar3co/openswap/pull/59#discussion_r4121829716)
+is covered by a bounded process-group runner: timeout and normal leader exit
+both clean up owned descendants, and probe launch failures remain sanitized.
+These fake-process regressions validate helper lifecycle handling, not Codex
+provider cancellation behavior.
 
 The `sandbox-probe` pass required an escalated but credential-free local run so
 macOS could launch the sandbox wrapper. The actual `exec` and `sandbox` wrappers
