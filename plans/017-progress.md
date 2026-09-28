@@ -169,7 +169,7 @@ LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
 The Phase 2 full-suite validation on the currently integrated PR #59 snapshot
-`f684ebf` is green: `3081 passed, 4 skipped, 3 warnings in 17.00s`. The run
+`f684ebf` is green: `3082 passed, 4 skipped, 3 warnings in 20.02s`. The run
 used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree.
@@ -241,6 +241,12 @@ Follow-up #4125894568 is addressed: a released lease is valid only when its
 reason is exactly `unlaunched` or `confirmed_stopped`; absent or other
 syntactically safe reasons remain quarantined. Existing malformed-lease test
 cases cover both invalid forms.
+Follow-up #4126005126 is addressed: disable retains the lifecycle lock while
+waiting boundedly for the worker's process-lifetime instance lock to become
+available after opt-out and service unload. Timeout leaves policy disabled
+and paused, reports that stop is unconfirmed, and blocks re-enable while the
+old process still owns the lock. The regression uses a fake lock holder and
+mocked service, with no real LaunchAgent operation.
 
 ## Deviations and verification
 

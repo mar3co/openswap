@@ -6,6 +6,8 @@ from pathlib import Path
 import os
 import stat
 
+import pytest
+
 from openswap.worker import cli
 from openswap.worker.journal import LocalJobStore
 from openswap.settings import load_worker_settings, update_worker_settings
@@ -103,6 +105,59 @@ def test_disable_keeps_worker_enabled_paused_when_lease_state_is_unknown(
     assert client.paused == [True]
     assert writes[0] == {"enabled": True, "paused": True}
     assert writes[-1] == {"enabled": True, "paused": True}
+
+
+def test_disable_waits_for_manual_worker_and_enable_refuses_held_instance_lock(
+    tmp_path: Path, monkeypatch, capsys
+):
+    from openswap.exceptions import ClaudeSwitchError
+    from openswap.locking import FileLock
+
+    update_worker_settings(tmp_path, enabled=True)
+    LocalJobStore(tmp_path)._ensure_private_dir()
+    instance_lock = FileLock(tmp_path / "worker" / "instance.lock", timeout=0)
+    assert instance_lock.acquire(timeout=0)
+    monkeypatch.setattr(cli, "WorkerClient", lambda _path: _Client(None))
+    monkeypatch.setattr(
+        cli,
+        "_snapshot",
+        lambda _root: {
+            "process_state": "running",
+            "enabled": True,
+            "paused": True,
+            "lease_quarantined": False,
+            "active_job": None,
+        },
+    )
+    monkeypatch.setattr(cli, "uninstall", lambda **_kwargs: {"unloaded": False})
+    monkeypatch.setattr(cli, "_DISABLE_EXIT_WAIT_SECONDS", 0.02)
+    monkeypatch.setattr(cli, "_DISABLE_POLL_SECONDS", 0.001)
+    installs = []
+    monkeypatch.setattr(cli, "install", lambda: installs.append(True))
+
+    try:
+        exit_code = cli.main(["disable"], backup_root=tmp_path)
+
+        assert exit_code == 1
+        assert capsys.readouterr().err == (
+            "Worker stop is not confirmed; it remains disabled and "
+            "admission-paused. Wait for it to exit before enabling.\n"
+        )
+        policy = load_worker_settings(tmp_path)
+        assert policy.enabled is False
+        assert policy.paused is True
+
+        with pytest.raises(ClaudeSwitchError, match="worker_stop_unconfirmed"):
+            cli.enable_worker(tmp_path)
+        assert load_worker_settings(tmp_path).enabled is False
+        assert installs == []
+    finally:
+        instance_lock.release()
+
+    assert cli._worker_instance_lock_is_free(tmp_path) is True
+    assert cli.enable_worker(tmp_path)["enabled"] is True
+    assert load_worker_settings(tmp_path).enabled is True
+    assert installs == [True]
 
 
 def test_enable_creates_private_worker_root_before_lifecycle_lock(

@@ -22,6 +22,7 @@ from openswap.worker.runtime import read_worker_snapshot
 
 _DISABLE_WAIT_SECONDS = 3.0
 _DISABLE_POLL_SECONDS = 0.1
+_DISABLE_EXIT_WAIT_SECONDS = 3.0
 _LIFECYCLE_LOCK_TIMEOUT_SECONDS = 5.0
 
 
@@ -124,6 +125,8 @@ def enable_worker(backup_root: Path) -> dict:
     _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
         previous = load_worker_settings(root)
+        if previous.enabled is not True and not _worker_instance_lock_is_free(root):
+            raise ClaudeSwitchError("worker_stop_unconfirmed")
         persisted = update_worker_settings(root, enabled=True)
         if persisted.enabled is not True:
             # A malformed pinned account/workspace policy fails closed in the
@@ -170,6 +173,36 @@ def disable_worker(backup_root: Path) -> tuple[bool, dict, str | None]:
     _migrate_legacy_before_worker_state_change(backup_root)
     with lifecycle_lock(backup_root):
         return _disable_locked(backup_root)
+
+
+def _worker_instance_lock_is_free(backup_root: Path) -> bool:
+    """Acquire/release the process-lifetime lock as a shutdown proof."""
+    path = Path(backup_root) / "worker" / "instance.lock"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        return False
+    lock = FileLock(path, timeout=0)
+    try:
+        if not lock.acquire(timeout=0):
+            return False
+    except Exception:
+        return False
+    try:
+        lock.release()
+    except Exception:
+        return False
+    return True
+
+
+def _wait_for_worker_exit(backup_root: Path) -> bool:
+    """Wait boundedly for the daemon to release its process-lifetime lock."""
+    deadline = time.monotonic() + _DISABLE_EXIT_WAIT_SECONDS
+    while True:
+        if _worker_instance_lock_is_free(backup_root):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_DISABLE_POLL_SECONDS, remaining))
 
 
 def _safe_snapshot(backup_root: Path) -> dict:
@@ -273,6 +306,10 @@ def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
         except (OSError, RuntimeError, ValueError):
             return False, _safe_snapshot(backup_root), "settings_unavailable"
         return False, _safe_snapshot(backup_root), "worker_unload_failed"
+    if not _wait_for_worker_exit(backup_root):
+        # Opt-out stays committed. Re-enabling policy here could let the
+        # lingering manual worker continue admitting work before it exits.
+        return False, _safe_snapshot(backup_root), "worker_stop_unconfirmed"
     return True, {"snapshot": _safe_snapshot(backup_root), "service": service}, None
 
 
@@ -379,6 +416,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             message = (
                 "Worker configuration is invalid; fix local worker settings before enabling."
                 if str(exc) == "worker_configuration_invalid"
+                else "Worker is still stopping; wait for it to exit before enabling."
+                if str(exc) == "worker_stop_unconfirmed"
                 else "Could not enable worker."
             )
             print(message, file=sys.stderr)
@@ -392,10 +431,17 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             print("Worker lifecycle is busy; try again shortly.", file=sys.stderr)
             return 1
         if not ok:
-            print(
-                f"Worker remains enabled and admission-paused ({diagnostic}).",
-                file=sys.stderr,
-            )
+            if diagnostic == "worker_stop_unconfirmed":
+                print(
+                    "Worker stop is not confirmed; it remains disabled and "
+                    "admission-paused. Wait for it to exit before enabling.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Worker remains enabled and admission-paused ({diagnostic}).",
+                    file=sys.stderr,
+                )
             return 1
         payload = {"enabled": False, **result}
         _write(payload, as_json=args.json, human="Remote tasks worker disabled.")
