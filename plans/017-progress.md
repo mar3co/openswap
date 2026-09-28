@@ -153,7 +153,8 @@ until the owner records a permitted path or exclusion.
   One process-table snapshot per loop iteration serves both the leader check
   and descendant attribution, and evidence records
   `descendant_tracking_complete: false` if any snapshot failed, because an
-  escaped descendant could then have been missed.
+  escaped descendant could then have been missed; such a run is always
+  `interrupted`, never `succeeded` or `cancelled`.
   Only the immutable start time decides whether a pid was reused; a change
   of process group or command line never evicts a live descendant, and a
   tracked entry whose original process is known to be gone (start time

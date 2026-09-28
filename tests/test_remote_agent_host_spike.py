@@ -1386,10 +1386,10 @@ def test_process_table_scans_are_bounded_by_the_job_deadline(tmp_path, monkeypat
     monkeypatch.setattr(spike, "_process_table", recording_table)
     monkeypatch.setattr(spike, "_append_jsonl", recording_append)
     supervise_fake_command(
-        [str(fake)], state_dir=tmp_path / "state", timeout_s=0.3, grace_s=0.2, job_id="slow-ps",
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=1.0, grace_s=0.2, job_id="slow-ps",
     )
     assert cancelled and budgets
-    assert all(b is not None and b <= 0.3 for b in budgets), budgets
+    assert all(b is not None and b <= 1.0 for b in budgets), budgets
 
 
 def test_track_descendants_evicts_reused_pid_even_when_it_holds_a_pidfd(monkeypatch):
@@ -1796,14 +1796,15 @@ def test_leader_exited_reads_state_from_supplied_snapshot(monkeypatch):
     assert spike._leader_exited(process, []) is True  # unreaped children are always listed
 
 
-def test_supervision_records_incomplete_tracking_when_snapshots_fail(tmp_path, monkeypatch):
+def test_supervision_is_interrupted_when_snapshots_fail(tmp_path, monkeypatch):
     if os.name != "posix":
         pytest.skip("process-group supervision is POSIX-only")
     monkeypatch.setattr(spike, "_process_table", lambda **_: None)
     fake = _executable(tmp_path / "fake-quick", "raise SystemExit(0)\n")
     result = supervise_fake_command([str(fake)], state_dir=tmp_path / "state", timeout_s=10,
                                     job_id="no-snapshots")
-    assert result["state"] == "succeeded"
+    # A helper could have detached unobserved, so success cannot be claimed.
+    assert result["state"] == "interrupted"
     evidence = _read_rows(tmp_path / "state" / "evidence.jsonl")
     supervision = [row for row in evidence if row["kind"] == "supervision_result"]
     assert supervision[0]["descendant_tracking_complete"] is False

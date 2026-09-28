@@ -876,8 +876,9 @@ def _escaped_descendants(
 
 
 PS_TIMEOUT_S = 5.0
-# Floor for a deadline-bounded scan, so one near the deadline can still finish.
-MIN_PS_TIMEOUT_S = 0.05
+# Floor for a deadline-bounded scan, so one near the deadline can still finish
+# on a loaded host (a failed scan forces "interrupted"); it bounds the overrun.
+MIN_PS_TIMEOUT_S = 0.5
 SIGNALLING_PIDFD = "pidfd"
 SIGNALLING_IDENTITY_CHECK = "identity_check"
 
@@ -1132,7 +1133,12 @@ def _supervise_fake_command_locked(
     _close_handles(tracked)
 
     reader.join(timeout=1)
-    if reader.is_alive() or cleanup_uncertain or unexpected_leftovers or escaped:
+    # A failed snapshot may have missed a helper that detached meanwhile, so
+    # success or cancellation cannot be claimed without complete tracking.
+    if (
+        reader.is_alive() or cleanup_uncertain or unexpected_leftovers or escaped
+        or not tracking_complete
+    ):
         final_state = "interrupted"
     elif timed_out:
         final_state = "cancelled"

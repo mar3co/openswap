@@ -233,7 +233,7 @@ records `escaped_cleanup_certain: false` because check and signal are not
 atomic. The leader itself is
 observed as a zombie rather than reaped until group cleanup completes, so the
 process-group id being signalled stays reserved; a failed process-table snapshot
-is recorded as `descendant_tracking_complete: false`; before deciding a terminal state it
+is recorded as `descendant_tracking_complete: false` and forces `interrupted`; before deciding a terminal state it
 re-snapshots, terminates any tracked descendant still alive outside the
 group (TERM, grace, KILL), records them as `escaped_descendants` with
 `escaped_descendants_terminated`, and forces the state to `interrupted`,
