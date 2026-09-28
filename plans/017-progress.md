@@ -64,9 +64,12 @@ Phase 1 exit requires all of the following:
 
 - [ ] A reproducible disposable local research run with a supported,
   version-pinned Codex CLI and an explicitly approved account context.
-- [ ] Evidence for structured events, cancellation of the supervised process
-  group, and restart/kill recovery; no automatic relaunch after an ambiguous
-  side effect.
+- [ ] Evidence for structured events, cancellation of the complete process
+  tree (including detached descendants), and restart/kill recovery; no
+  automatic relaunch after an ambiguous side effect. The credential-free
+  `setsid()` reproduction shows the current probe wrapper can return success
+  while a detached helper continues running, so process-group cleanup alone
+  does not meet this gate.
 - [ ] Evidence that the pinned Codex auth context is used without changing
   the user's default login, and that auth refresh remains authoritative while
   the process is live. This must be established without copying or rolling
@@ -113,7 +116,7 @@ until the owner records a permitted path or exclusion.
 
 | Phase | Status | Exit evidence / blocker |
 | --- | --- | --- |
-| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, cancellation/recovery, or model/tool enforcement integration. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 is open and ready for review; it does not satisfy the remaining technical exit gates. |
+| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction shows the current wrapper can return success while a detached helper remains alive. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 is open and ready for review; it does not satisfy the remaining technical exit gates. |
 | 2. Local worker, remote access off | NOT STARTED | Requires every phase-1 exit item above and the phase-1 PR merged. |
 | 3. Private remote pilot | NOT STARTED | Requires phase 2's exit criteria and merged PR. Builds the protocol specification, configurable backend URL and the MIT reference server as product code; the pilot runs against a self-hosted instance. |
 | 4. OpenTag connector | OUT OF SCOPE | Tracked in the separate OpenTag repository. |
@@ -132,8 +135,8 @@ until the owner records a permitted path or exclusion.
   establishes only helper and local sandbox behavior, not provider execution.
 - Codex PR review findings [P1 #4121377781](https://github.com/mar3co/openswap/pull/59#discussion_r4121377781)
   and [P2 #4121377796](https://github.com/mar3co/openswap/pull/59#discussion_r4121377796)
-  are addressed in the harness: descendants are cleaned up before a terminal
-  result, and malformed UTF-8 is retained as an `unstructured-output` event.
+  are addressed in the harness for descendants in the supervised process
+  group, and malformed UTF-8 is retained as an `unstructured-output` event.
   These fixes have regression tests but still do not demonstrate provider
   `codex exec` behavior.
 - The additional Codex review finding [P2 #4121533420](https://github.com/mar3co/openswap/pull/59#discussion_r4121533420)
@@ -154,8 +157,19 @@ until the owner records a permitted path or exclusion.
   is addressed in the Slack example: an opaque workspace ID maps locally to a
   writable research/output workspace plus a separately approved read-only
   checkout; caller-supplied paths are not accepted. Finding [P2 #4121829716](https://github.com/mar3co/openswap/pull/59#discussion_r4121829716)
-  is addressed in credential-free CLI probes by cleaning their owned process
-  groups after timeouts or leader exit. No provider execution is implied.
+  is covered in credential-free CLI probes by cleaning observed members of
+  their owned process groups after timeouts or leader exit. No provider
+  execution is implied.
+- New Codex review finding [P2 #4122008642](https://github.com/mar3co/openswap/pull/59#discussion_r4122008642)
+  is **REPRODUCED / UNRESOLVED**. An inert disposable fake process showed
+  `_run_probe` returned
+  success while a helper that called `setsid()`, closed inherited output, and
+  wrote a heartbeat remained alive. The helper had a four-second hard
+  self-expiry and was explicitly stopped by its recorded PID immediately after
+  observation. The group wrapper therefore does not prove cleanup of detached
+  descendants; the complete-process-tree cancellation gate remains blocked.
+  See the [cancellation boundary assessment](research/remote-agent-host/cancellation-boundary.md)
+  for documented macOS mechanism limits and the current gate consequence.
 - With the new bounded probe runner, the already-hash-verified stable `0.157.1`
   binary was rechecked: `inspect` reported `codex-cli 0.157.1` and
   `no_auth_performed=true`; the synthetic `sandbox-probe` allowed workspace

@@ -129,7 +129,8 @@ result above.
 The fake-process harness includes regression coverage for the Codex review
 findings on [PR #59](https://github.com/mar3co/openswap/pull/59): finding
 [#4121377781](https://github.com/mar3co/openswap/pull/59#discussion_r4121377781)
-ensures a successful leader exit cannot hide a still-running descendant, and
+ensures a successful leader exit cannot hide a still-running descendant in the
+supervised process group, and
 finding [#4121377796](https://github.com/mar3co/openswap/pull/59#discussion_r4121377796)
 ensures invalid UTF-8 becomes an `unstructured-output` event instead of
 terminating the reader. These tests validate the fake-process harness only;
@@ -157,9 +158,20 @@ failure path.
 
 Finding [#4121829716](https://github.com/mar3co/openswap/pull/59#discussion_r4121829716)
 is covered by a bounded process-group runner: timeout and normal leader exit
-both clean up owned descendants, and probe launch failures remain sanitized.
-These fake-process regressions validate helper lifecycle handling, not Codex
-provider cancellation behavior.
+clean up observed members of the owned process group, and probe launch failures
+remain sanitized. They do not guarantee cleanup of descendants that leave that
+group.
+
+The later review finding
+[#4122008642](https://github.com/mar3co/openswap/pull/59#discussion_r4122008642)
+was reproduced credential-free with a disposable fake executable. It spawned a
+helper that called `setsid()`, redirected stdout/stderr, wrote a heartbeat, and
+had a hard four-second self-expiry. `_run_probe` returned success in 1.816s
+while the helper heartbeat continued; explicitly signaling the recorded helper
+PID stopped it. This demonstrates that process-group checks do not cover a
+descendant that escapes the group and closes inherited pipes. The helper was
+stopped before the temporary directory was removed; no process was left
+running. No arbitrary process-tree tracking or cleanup guarantee is claimed.
 
 The `sandbox-probe` pass required an escalated but credential-free local run so
 macOS could launch the sandbox wrapper. The actual `exec` and `sandbox` wrappers

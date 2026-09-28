@@ -13,6 +13,14 @@ The worker may call only these operations:
 | `events` | Consume the running process's JSONL stream, normalize it into sequenced local job events, and redact credential-like material before persistence or relay. Cursor reads replay journaled events only; they do not alter execution. |
 | `interrupt` | Signal the supervised provider process group, observe termination, and report stop-requested versus execution-stopped distinctly. Never report completion before the process is stopped. |
 
+The phase-one probe currently supervises only the initial process group. A
+credential-free fake `setsid()` child escaped that group, closed inherited
+output, continued writing a heartbeat after `_run_probe` returned success, and
+stopped only after its recorded PID was explicitly signaled. Thus the current
+group wrapper does not satisfy the complete-process-tree interruption gate;
+do not claim an execution-stopped result until detached-descendant handling is
+measured and enforced.
+
 The phase-1 adapter is Codex-only. A remote job cannot choose an executable, executable arguments, provider binary path, environment variable, account, model, auth file, arbitrary path, or tool set. The only locally pinned provider identity is selected before a job and is stable for its lifetime; OpenSwap uses a stable opaque local identity, not a movable slot number. A submission has no account or model field. It carries a task and a registered opaque workspace identifier, which the host resolves to the approved directory.
 
 The host admits **one active provider job per host**. It does not rotate credentials to work around limits. It will not overwrite live auth state, import token snapshots, or copy token files to another profile. If the local identity cannot be used without racing with an interactive Codex process or another refresh writer, `probe` reports unavailable and `start` refuses.
