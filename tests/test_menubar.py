@@ -2491,15 +2491,40 @@ def test_launch_claude_login_missing_claude(monkeypatch):
     # `launch_claude_login` falls back to common install directories after
     # PATH lookup. Simulate the resolver's final missing result so this test
     # stays deterministic on machines with Claude installed in one of them.
-    monkeypatch.setattr(
-        menubar_display, "resolve_claude_bin", lambda **_kwargs: None
-    )
+    seen = {}
+
+    def fake_resolve(**kwargs):
+        seen.update(kwargs)
+        return None
+
+    monkeypatch.setattr(menubar_display, "resolve_claude_bin", fake_resolve)
+    which = lambda _name: None  # noqa: E731
     with pytest.raises(ClaudeSwitchError, match="claude"):
         menubar.launch_claude_login(
             "a@x.com",
-            which=lambda _name: None,
+            which=which,
             run=lambda *_a, **_k: SimpleNamespace(returncode=0),
         )
+    # The caller's `which` must reach the resolver rather than be ignored.
+    assert seen.get("which") is which
+
+
+def test_resolve_claude_bin_returns_none_when_path_and_extra_dirs_miss(tmp_path):
+    assert (
+        menubar_display.resolve_claude_bin(
+            which=lambda _name: None, extra_dirs=(str(tmp_path),)
+        )
+        is None
+    )
+
+
+def test_resolve_claude_bin_falls_back_to_extra_dirs(tmp_path):
+    candidate = tmp_path / "claude"
+    candidate.write_text("#!/bin/sh\n")
+    resolved = menubar_display.resolve_claude_bin(
+        which=lambda _name: None, extra_dirs=(str(tmp_path),)
+    )
+    assert resolved == str(candidate)
 
 
 def test_display_helpers_import_without_rumps():

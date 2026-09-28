@@ -1,6 +1,6 @@
 # Phase 1 spike: Codex configuration and permission inheritance
 
-Checked 2026-09-27. This report distinguishes official documentation, local help, a credential-free local sandbox probe, and behavior still unknown. It does not inspect the user's real Codex configuration, credentials, Keychain, or run a provider job. Plan 017 is canonical; this document does not approve a phase-2 implementation.
+Checked 2026-09-27; updated 2026-09-28. This report distinguishes official documentation, local help, a credential-free local sandbox probe, and behavior still unknown. It does not inspect the user's real Codex configuration, credentials, Keychain, or run a provider job. Plan 017 is canonical; this document does not approve a phase-2 implementation.
 
 ## Result
 
@@ -137,4 +137,4 @@ CODEX_HOME=/private/tmp/openswap-codex-inheritance-home \
   /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex exec --help
 ```
 
-The helper command `node /Users/yohan/.codex/skills/.system/openai-docs/scripts/fetch-codex-manual.mjs` failed because DNS resolution for `developers.openai.com` was unavailable to shell `curl`; official pages were fetched with the approved web documentation capability instead.
+A local Codex docs-fetch helper skill failed because DNS resolution for `developers.openai.com` was unavailable to shell `curl`; official pages were fetched with the approved web documentation capability instead.

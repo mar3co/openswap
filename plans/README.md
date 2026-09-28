@@ -30,7 +30,7 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 015  | Desktop recovery and quiet completion feedback | P1 | M | — | DONE; profile detection still blocked |
 | 016  | App-aware ChatGPT switching | P1 | M | 014, 015, PR #49 | DONE |
 
-Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED. Feature proposals use PROPOSED until accepted into the execution order.
+Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED. Feature proposals use PROPOSED until accepted; 017 is accepted and tracked in its progress log.
 
 010's implementation and review fixes merged in PR #36 on 2026-09-17 UTC;
 the deferred manual UI verification keeps its overall status IN PROGRESS.
@@ -60,7 +60,7 @@ install/upgrade rewiring. Three phases with a green-suite gate between them.
 
 | Plan | Proposal | Status |
 |------|----------|--------|
-| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag or a self-hosted server | IN PROGRESS; Phase 1 remains blocked; owner-authorized Phase 2 local-only worker infrastructure is underway ([progress](017-progress.md)) |
+| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag or a self-hosted server | ACCEPTED; Phase 1 remains blocked; owner-authorized Phase 2 local-only worker is implemented and under review ([progress](017-progress.md)) |
 
 017 recommends an optional OpenSwap worker process, with OpenTag as its first
 client, a pluggable control service (OpenTag-hosted, self-hosted MIT reference

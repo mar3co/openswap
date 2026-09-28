@@ -11,7 +11,7 @@ are unresolved. PR #59 is ready for review; opening or merging it does not
 substitute for those gates. On 2026-09-28 the owner explicitly authorized
 Phase 2 local-worker infrastructure to proceed in parallel with their Phase 1
 work. This changes sequencing only: no Phase 1 gate is waived or marked passed.
-Phase 2 local-only implementation is underway under that owner authorization;
+Phase 2 local-only implementation is implemented and under review under that owner authorization;
 remote access stays off and live Codex execution stays disabled. Phase 3 has
 not started.
 
@@ -23,11 +23,12 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The last full-suite result before Phase 2 changes, at the assembled Phase 1
-branch, was `2911 passed, 4 skipped, 3 warnings in 15.01s`; it included 40
-Phase 1 harness tests. It is historical baseline evidence, not validation of
-this Phase 2 branch. The helper-cleanup regression passed in isolation
-(`1 passed in 1.19s`).
+The latest Phase 1-only assembled suite was green: `2940 passed, 4 skipped, 3
+warnings in 17.79s`; it includes 67 phase-one harness tests and two direct
+tests of the Claude binary resolver's fallback directories. The helper-cleanup
+regression also passed in isolation (`1 passed in 1.19s`). This is Phase 1
+evidence, not validation of the merged Phase 2 tree; the full suite is rerun
+after this merge below.
 
 The ChatGPT app-bundled Codex CLI is `0.158.0-alpha.2.1` (pre-release). A
 separate official stable ARM macOS release, `0.157.1`, was downloaded to
@@ -76,8 +77,10 @@ Phase 1 exit requires all of the following:
 - [ ] Evidence for structured events, cancellation of the complete process
   tree (including detached descendants), and restart/kill recovery; no
   automatic relaunch after an ambiguous side effect. The credential-free
-  `setsid()` reproduction shows the current probe wrapper can return success
-  while a detached helper continues running, so process-group cleanup alone
+  `setsid()` reproduction showed the probe wrapper could return success
+  while a detached helper continued running. The fake harness now tracks
+  descendants by parent pid and forces `interrupted` when one escapes, but
+  the fork/reparent race remains, so process-tree cleanup is best effort and
   does not meet this gate.
 - [ ] Evidence that the pinned Codex auth context is used without changing
   the user's default login, and that auth refresh remains authoritative while
@@ -107,13 +110,13 @@ Phase 1 exit requires all of the following:
   MIT reference server in this repository, or any server implementing the
   published protocol. See the
   [decision memo](research/remote-agent-host/decision-control-service.md).
-- [x] Both written decision memos have been delivered for owner review.
+- [x] Both decision memos delivered; control service decided, Claude path pending.
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed and PR #59 is merged as Phase 1 signoff. This remains required
   before real Codex execution, but does not block owner-authorized local-only
   Phase 2 infrastructure work.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2911 passed, 4 skipped, 3 warnings in 15.01s`).
+  (`2940 passed, 4 skipped, 3 warnings in 17.79s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -127,11 +130,11 @@ until the owner records a permitted path or exclusion.
 
 | Phase | Status | Exit evidence / blocker |
 | --- | --- | --- |
-| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction shows the current wrapper can return success while a detached helper remains alive. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 is open and ready for review; it does not satisfy the remaining technical exit gates. |
-| 2. Local worker, remote access off | IN PROGRESS — local-only core | Owner authorized local infrastructure to overlap Phase 1; no Phase 1 gate is waived. Remote access stays off and live Codex stays disabled. |
+| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction showed the wrapper could return success while a detached helper remained alive; the harness now detects and terminates tracked escaped descendants and reports `interrupted`, but cannot close the fork/reparent race. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 is open and ready for review; it does not satisfy the remaining technical exit gates. |
+| 2. Local worker, remote access off | IMPLEMENTED / UNDER REVIEW — local-only | Owner authorized local infrastructure to overlap Phase 1; no Phase 1 gate is waived. Fake-only validation is recorded below. Remote access stays off and live Codex stays disabled. |
 | 3. Private remote pilot | NOT STARTED | Requires phase 2's exit criteria and merged PR. Builds the protocol specification, configurable backend URL and the MIT reference server as product code; the pilot runs against a self-hosted instance. |
-| 4. OpenTag connector | OUT OF SCOPE | Tracked in the separate OpenTag repository. |
-| 5–6 | OUT OF SCOPE | Do not start. |
+| 4. OpenTag connector | NOT STARTED | OpenTag repository, mar3co/opentag#135; requires phase 3. Out of scope for this PR. |
+| 5–6 | NOT STARTED | Require phase 4. Out of scope for this PR. |
 
 ## Phase 2 local-worker plan (owner-authorized overlap)
 
@@ -165,8 +168,8 @@ boundary. No `launchctl` command is run against the user's login session;
 LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
-Current Phase 2 validation is green on the assembled branch: `2984 passed,
-4 skipped, 3 warnings in 16.36s`. Focused core journal,
+The merged branch full-suite validation is green: `3013 passed, 4 skipped,
+3 warnings in 19.52s` (3,016 collected). Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`20 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
 recreation/idempotency, singleton refusal, a stop acknowledgement remaining
@@ -183,8 +186,32 @@ does not clear Phase 1 gates or enable live Codex execution.
   Phase 2 infrastructure while Phase 1 remains in progress. This does not
   waive Phase 1 evidence gates or authorize Phase 3, provider execution, or
   credentials.
+- A second independent review of the harness found and fixed: recovery
+  crashing on a corrupted journal instead of refusing; tracebacks leaking
+  paths for non-`SpikeError` failures; recovery unable to see a live orphaned
+  group; ancestor directories created with default modes and journal/lock
+  files following symlinks; the fake child inheriting the operator's full
+  environment; raw version output and arbitrary event tokens reaching
+  evidence; a slow post-KILL reap flipping `cancelled` to `interrupted`;
+  directory entries not fsynced after creating the journal or its ancestors.
+  Follow-up Codex findings on the tracker were fixed too: descendants are
+  identified by pid plus start time so a reused pid is never signalled, and
+  the exception path terminates tracked detached descendants as well.
+  Signalling uses a non-reusable pidfd where the OS offers one; on macOS the
+  identity re-check and the signal remain separate operations, so evidence
+  records `escaped_cleanup_certain: false` there rather than claiming safety.
+  An exited but unreaped descendant (a zombie) counts as terminated via pidfd
+  readability or its `Z` process state.
+  The group leader is observed, not reaped, until group cleanup finishes, so
+  the process-group id it reserves cannot be reused while it is signalled; a
+  pidfd opened after a snapshot is discarded if the identity no longer matches.
+  One process-table snapshot per loop iteration serves both the leader check
+  and descendant attribution, and evidence records
+  `descendant_tracking_complete: false` if any snapshot failed, because an
+  escaped descendant could then have been missed.
+  Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
-  it will preserve the `ClaudeSwitchError` assertion and will not change the
+  it preserves the `ClaudeSwitchError` assertion and does not change the
   resolver or executable discovery behavior.
 - Credential-free harness tests passed (40 tests included in the full suite);
   `inspect`,
@@ -219,13 +246,15 @@ does not clear Phase 1 gates or enable live Codex execution.
   their owned process groups after timeouts or leader exit. No provider
   execution is implied.
 - New Codex review finding [P2 #4122008642](https://github.com/mar3co/openswap/pull/59#discussion_r4122008642)
-  is **REPRODUCED / UNRESOLVED**. An inert disposable fake process showed
-  `_run_probe` returned
-  success while a helper that called `setsid()`, closed inherited output, and
-  wrote a heartbeat remained alive. The helper had a four-second hard
-  self-expiry and was explicitly stopped by its recorded PID immediately after
-  observation. The group wrapper therefore does not prove cleanup of detached
-  descendants; the complete-process-tree cancellation gate remains blocked.
+  is **REPRODUCED / MITIGATED BEST-EFFORT**. An inert disposable fake process
+  showed `_run_probe` returned success while a helper that called `setsid()`,
+  closed inherited output, and wrote a heartbeat remained alive. The fake
+  supervisor now snapshots the process table while the leader runs,
+  attributes descendants by parent pid regardless of group, terminates any
+  that escaped, records them in evidence and forces `interrupted`; the
+  reproduction is retained as a regression test. A descendant that forks
+  between the final snapshot and leader exit can still escape, so the
+  complete-process-tree cancellation gate remains blocked.
   See the [cancellation boundary assessment](research/remote-agent-host/cancellation-boundary.md)
   for documented macOS mechanism limits and the current gate consequence.
 - With the new bounded probe runner, the already-hash-verified stable `0.157.1`

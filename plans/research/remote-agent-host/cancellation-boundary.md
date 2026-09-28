@@ -6,7 +6,7 @@ Checked 2026-09-28 against Apple documentation and Codex CLI 0.157.1. This is ar
 
 The current process-group plan cannot guarantee that the whole Codex descendant tree stopped. PR #59 review #4122008642 at `341c49d` identified a child that calls `setsid()` and closes standard streams. The lifecycle-spike owner reproduced that inert case: the parent probe returned while the detached helper continued, then the test cleaned up its known fake PID. This is collaborator-reported test evidence, not a provider-run test. It contradicts any claim that process-group cleanup plus drained pipes proves full-tree termination.
 
-Apple documents `setsid()` as creating a new session and process group whose ID is the caller's PID. Therefore, signaling only the original process group does not include a descendant that successfully creates a separate group. A closed pipe also cannot serve as a liveness signal for such a process. Polling parent PIDs or a process-table snapshot does not close the fork/reparent race and is not a complete remedy.
+Apple documents `setsid()` as creating a new session and process group whose ID is the caller's PID. Therefore, signaling only the original process group does not include a descendant that successfully creates a separate group. A closed pipe also cannot serve as a liveness signal for such a process. Polling parent PIDs or a process-table snapshot does not close the fork/reparent race and is not a complete remedy; the fake harness now does exactly that as a best-effort mitigation (see [spike-codex.md](./spike-codex.md)) and still cannot claim full-tree termination.
 
 ## macOS mechanisms and limits
 

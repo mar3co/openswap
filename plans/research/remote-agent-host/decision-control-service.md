@@ -43,8 +43,8 @@ Consequences for the plan:
 - The operator of each backend owns its data, retention, availability and
   support. For the reference server that is the person who runs it.
 - The worker must poll on short intervals rather than hold long-lived
-  connections, so the protocol stays deployable on serverless hosting such as
-  OpenTag's.
+  connections, so the protocol stays deployable on hosting that cannot hold
+  long-lived connections.
 
 ## Pre-decision questions (superseded)
 

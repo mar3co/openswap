@@ -1,6 +1,6 @@
 # Phase 1 Codex feasibility spike
 
-Research run on 2026-09-27. This records local binary/help evidence and
+Research run on 2026-09-27; updated 2026-09-28 (stable-CLI recheck, detached-descendant reproduction). This records local binary/help evidence and
 credential-free harness tests. No real Codex login, credential file, Keychain
 item, or provider job was accessed; the synthetic sandbox probe creates a fake
 `auth.json` sentinel in its temporary profile. It is not evidence of live account isolation,
@@ -56,17 +56,27 @@ uv run python scripts/remote_agent_host_spike.py recover \
   --state-dir /private/tmp/openswap-codex-spike-demo
 ```
 
-`--state-dir` and `--evidence-dir` create missing directories as private
-directories. On POSIX, existing directories must already have no group or
-world permissions; the harness preserves their mode and refuses unsafe paths.
+`--state-dir` and `--evidence-dir` create each missing ancestor as a
+mode-0700 directory owned by the caller. On POSIX, existing directories must
+already be owned by the caller with no group or world permissions; the harness
+preserves their mode and refuses unsafe paths. Journal, evidence and lock files
+are opened with `O_NOFOLLOW`, so a planted symlink is refused rather than
+followed.
 
 `inspect` invokes only `--version` and `exec --help` under a disposable home.
 `demo` starts only this script's inert child process, cancels its process group,
 and writes a mode-0600 JSONL journal/evidence file. `recover` changes unresolved
 `starting`, `running`, and `cancel_requested` journal entries to
-`interrupted`; an existing job ID is refused on future starts. It never
-replays work. Evidence keeps state names and JSON event type names, not raw
-output, task text, paths, or credentials. The test suite also supplies fake
+`interrupted` and records whether the journaled process group is still alive
+(`group_still_alive`); it never signals or terminates an orphan, because the
+pgid may have been reused. A start is refused while any job's latest state is
+non-terminal, so recovery must run first; an existing job ID is refused on
+future starts. It never replays work. Evidence keeps state names and event
+type names restricted to lowercase dotted identifiers (anything else is
+recorded as `unknown-event`), and the version probe stores nothing unless the
+output matches `codex-cli <token>`. Raw output, task text, paths and
+credentials are never stored. The fake child receives an allowlisted
+environment (`PATH`, `HOME` set to the state directory, `SPIKE_*`). The test suite also supplies fake
 executables to verify process-group signaling and no replay after uncertain
 recovery.
 
@@ -127,8 +137,13 @@ workspace and `CODEX_HOME` sentinels allowed workspace read/write and denied
 sibling read/write plus synthetic `auth.json` and `config.toml` reads. This is
 wrapper-only Seatbelt evidence; it does not establish `codex exec` enforcement
 or account selection. The helper-cleanup regression passed in isolation
-(`1 passed in 1.19s`); all 40 harness cases are included in the full-suite
-result above.
+(`1 passed in 1.19s`); all 67 harness cases are included in the full-suite
+result above. The two recorded evidence rows from that recheck:
+
+```json
+{"kind": "codex_help_probe", "version": "codex-cli 0.157.1", "expected_version": "codex-cli 0.158.0-alpha.2.1", "matches_discovered_pin": false, "pre_release": false, "no_auth_performed": true, "exec_json": true, "ignore_user_config": true, "sandbox_option": true, "skip_git_repo_check": true}
+{"kind": "low_level_sandbox_probe", "inside_read_allowed": true, "inside_write_allowed": true, "outside_read_denied": true, "outside_write_denied": true, "codex_home_auth_and_config_denied": true, "exec_or_model_run": false}
+```
 
 The recovery journal appender separates an unterminated trailing record before
 writing a new JSONL row. The recovery regression preserves the malformed tail
@@ -148,7 +163,10 @@ they do not establish provider execution or cancellation behavior.
 Finding [#4121533420](https://github.com/mar3co/openswap/pull/59#discussion_r4121533420)
 is covered by parameterized tests for `OSError` and timeout failures from both
 the version and help probes. The operator receives a sanitized `refused:`
-message, with no traceback or exception output. These are local CLI-probe
+message, with no traceback or exception output; any other `OSError` or
+`ValueError` reaching the entry point prints a fixed `refused: harness
+failure (details withheld)` line. A corrupted journal (oversized numbers,
+invalid bytes) is skipped row by row rather than crashing recovery. These are local CLI-probe
 failure tests; they do not establish Codex provider execution.
 
 Findings [#4121649254](https://github.com/mar3co/openswap/pull/59#discussion_r4121649254)
@@ -200,12 +218,33 @@ while the helper heartbeat continued; explicitly signaling the recorded helper
 PID stopped it. This demonstrates that process-group checks do not cover a
 descendant that escapes the group and closes inherited pipes. The helper was
 stopped before the temporary directory was removed; no process was left
-running. No arbitrary process-tree tracking or cleanup guarantee is claimed.
+running.
+
+The fake harness now mitigates this best-effort: while the leader is alive it
+snapshots `ps -axo pid=,ppid=,pgid=,stat=,lstart=` and attributes every
+descendant by parent pid regardless of process group, keyed by pid plus a start-time,
+group and command identity so a reused pid is dropped rather than signalled;
+signals go through a non-reusable pidfd where the OS provides one (Linux),
+and on macOS the identity is re-read before each signal while evidence
+records `escaped_cleanup_certain: false` because check and signal are not
+atomic. The leader itself is
+observed as a zombie rather than reaped until group cleanup completes, so the
+process-group id being signalled stays reserved; a failed process-table snapshot
+is recorded as `descendant_tracking_complete: false`; before deciding a terminal state it
+re-snapshots, terminates any tracked descendant still alive outside the
+group (TERM, grace, KILL), records them as `escaped_descendants` with
+`escaped_descendants_terminated`, and forces the state to `interrupted`,
+never `succeeded` or `cancelled`. The reproduction is retained as
+`test_setsid_detached_descendant_forces_interrupted_and_is_terminated`. The
+residual gap stands: a descendant that forks between the final snapshot and
+the leader's exit is reparented before it can be attributed, so no complete
+process-tree cleanup guarantee is claimed and the cancellation gate remains
+blocked until a provider run is measured.
 
 The `sandbox-probe` pass required an escalated but credential-free local run so
-macOS could launch the sandbox wrapper. The actual `exec` and `sandbox` wrappers
-did not share this same provider execution: this proves only the local Seatbelt
-profile boundaries for synthetic files. The live research-run gate remains
+macOS could launch the sandbox wrapper. `codex exec` was never run under this profile;
+the pass proves only the `codex sandbox` wrapper's boundary for synthetic
+files. The live research-run gate remains
 unmet.
 
 ## Current adapter feasibility
