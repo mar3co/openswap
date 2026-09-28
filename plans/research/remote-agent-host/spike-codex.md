@@ -127,7 +127,7 @@ inspect: codex-cli 0.158.0-alpha.2.1; exec_json=true; sandbox_option=true;
 demo:    state=cancelled; returncode=-15; event_names=[thread.started]
 sandbox: inside read/write allowed; outside read/write denied;
          synthetic CODEX_HOME auth/config reads denied; no exec/model run
-tests:   40 passed (full assembled suite: 2,911 passed, 4 skipped, 3 warnings)
+tests:   112 passed (full assembled suite: 2,985 passed, 4 skipped, 3 warnings)
 ```
 
 After the bounded process-group runner was added, the official stable ARM
@@ -138,7 +138,7 @@ workspace and `CODEX_HOME` sentinels allowed workspace read/write and denied
 sibling read/write plus synthetic `auth.json` and `config.toml` reads. This is
 wrapper-only Seatbelt evidence; it does not establish `codex exec` enforcement
 or account selection. The helper-cleanup regression passed in isolation
-(`1 passed in 1.19s`); all 82 harness cases are included in the full-suite
+(`1 passed in 1.19s`); all 112 harness cases are included in the full-suite
 result above. The two recorded evidence rows from that recheck:
 
 ```json
@@ -233,7 +233,7 @@ records `escaped_cleanup_certain: false` because check and signal are not
 atomic. The leader itself is
 observed as a zombie rather than reaped until group cleanup completes, so the
 process-group id being signalled stays reserved; a failed process-table snapshot
-is recorded as `descendant_tracking_complete: false`; before deciding a terminal state it
+is recorded as `descendant_tracking_complete: false` and forces `interrupted`; before deciding a terminal state it
 re-snapshots, terminates any tracked descendant still alive outside the
 group (TERM, grace, KILL), records them as `escaped_descendants` with
 `escaped_descendants_terminated`, and forces the state to `interrupted`,

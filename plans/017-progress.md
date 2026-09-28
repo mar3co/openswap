@@ -23,8 +23,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest Phase 1-only assembled suite was green: `2955 passed, 4 skipped, 3
-warnings in 17.63s`; it includes 82 phase-one harness tests and two direct
+The latest Phase 1-only assembled suite was green: `2985 passed, 4 skipped, 3
+warnings in 28.84s`; it includes 112 phase-one harness tests and two direct
 tests of the Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`). This is Phase 1
 evidence, not validation of the Phase 2 tree; the separate full Phase 2 result
@@ -116,7 +116,7 @@ Phase 1 exit requires all of the following:
   before real Codex execution, but does not block owner-authorized local-only
   Phase 2 infrastructure work.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2955 passed, 4 skipped, 3 warnings in 17.63s`).
+  (`2985 passed, 4 skipped, 3 warnings in 28.84s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -276,22 +276,59 @@ mocked service, with no real LaunchAgent operation.
   One process-table snapshot per loop iteration serves both the leader check
   and descendant attribution, and evidence records
   `descendant_tracking_complete: false` if any snapshot failed, because an
-  escaped descendant could then have been missed.
+  escaped descendant could then have been missed; such a run is always
+  `interrupted`, never `succeeded` or `cancelled`.
   Only the immutable start time decides whether a pid was reused; a change
   of process group or command line never evicts a live descendant, and a
   tracked entry whose original process is known to be gone (start time
   changed, or its pidfd reads as exited) is evicted before attribution so a
   reused pid never seeds discovery of a stranger's children. The version
   probe persists only a digits-and-dots version token.
-  A freshly opened pidfd is accepted only if the pid's parent, group,
-  command and start time all still match the snapshot.
+  A freshly opened pidfd is refused if the pid's start time changed, proven
+  ours if its parent is still in the run (group and command changes do not
+  matter), and otherwise kept as unverified: tracked and reported, never
+  signalled, still forcing `interrupted` if alive. Group termination observes
+  the leader's exit without reaping it; the leader is reaped only after
+  descendant discovery and cleanup. Children of an unverified entry are
+  tracked but inherit its unverified status, so a possibly reused pid never
+  makes a stranger's children signalable. The `inspect` and `sandbox-probe`
+  runner tracks descendants the same way: a helper that calls `setsid()` is
+  terminated and the probe result is refused, and the probe checks for exit
+  before reading so output written just before exit is never dropped. A
+  supervision failure at any point after launch, including the `running`
+  journal append, snapshots descendants, terminates the group and sweeps
+  detached descendants before reaping the leader. Without a pidfd, a
+  descendant counts as gone only when its pid is free, it is a zombie, or its
+  start time changed; a failed snapshot or an unexplained identity change is
+  recorded as uncertain cleanup, never as terminated. A handle-less trusted
+  descendant whose command line changes, or whose parent becomes a process
+  outside the run other than init, loses trust (a same-second pid reuse keeps
+  the start time); a group change alone does not. Process-table scans in the
+  supervision and probe loops are bounded by the job's remaining time, so a
+  slow `ps` cannot postpone cancellation. A live pidfd whose re-validation
+  scan fails or runs out of time is kept as an unverified entry, never
+  dropped. The escaped-descendant check reads the caller's last scan rather
+  than scanning again, so a failed scan always reaches
+  `descendant_tracking_complete`. Recovery's `group_still_alive` ignores
+  zombies. A probe whose periodic descendant scan fails is refused. The
+  runtime budget starts at launch, before the first journal append. A
+  periodic scan never runs past the deadline and none starts in its last
+  0.25 s, and scans during cleanup are bounded as well. A state or evidence
+  path that traverses a symlink not owned by root is refused. Probe cleanup
+  waits, bounded, for killed group members to actually exit. A directory
+  raced into existence during creation is revalidated, and the whole path is
+  re-checked for symlinks afterwards. The event reader is stoppable: if a
+  descendant still holds stdout, it is stopped and the pipe closed before the
+  result is recorded. Only a root-owned symlink directly under `/` (the
+  macOS system links) is trusted in a state or evidence path, so running as
+  root does not widen the exemption. A failed final probe scan still sweeps
+  descendants recorded by earlier scans.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the
   resolver or executable discovery behavior.
-- Credential-free harness tests passed (40 tests included in the full suite);
-  `inspect`,
-  inert-child `demo`, and synthetic Seatbelt `sandbox-probe` outcomes are in
+- Credential-free harness tests passed; `inspect`, inert-child `demo`, and
+  synthetic Seatbelt `sandbox-probe` outcomes are in
   [the Codex spike record](research/remote-agent-host/spike-codex.md). This
   establishes only helper and local sandbox behavior, not provider execution.
 - Codex PR review findings [P1 #4121377781](https://github.com/mar3co/openswap/pull/59#discussion_r4121377781)
