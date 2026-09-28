@@ -97,6 +97,14 @@ def test_timeout_terminates_fake_process_group_including_child(tmp_path):
     assert not (markers / f"{child_pid}.alive").exists()
     journal = [json.loads(line) for line in (tmp_path / "state" / "journal.jsonl").read_text().splitlines()]
     assert [row["state"] for row in journal] == ["starting", "running", "cancel_requested", "cancelled"]
+    evidence = [
+        json.loads(line)
+        for line in (tmp_path / "state" / "evidence.jsonl").read_text().splitlines()
+    ]
+    assert [(row["kind"], row["job_id"]) for row in evidence] == [
+        ("launch_intent", "kill-group"),
+        ("supervision_result", "kill-group"),
+    ]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
@@ -617,7 +625,10 @@ def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
     (state / "journal.jsonl").write_text(
-        json.dumps({"job_id": "uncertain", "state": "starting"}) + "\n"
+        "".join(
+            json.dumps({"job_id": job_id, "state": "starting"}) + "\n"
+            for job_id in ("uncertain", "uncertain-other")
+        )
     )
     launches = tmp_path / "launch-count"
     fake = _executable(
@@ -626,13 +637,22 @@ def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):
         f"pathlib.Path({str(launches)!r}).write_text('launched')\n",
     )
 
-    assert recover_uncertain_runs(state) == ["uncertain"]
+    assert recover_uncertain_runs(state) == ["uncertain", "uncertain-other"]
     with pytest.raises(SpikeError, match="never replayed"):
         supervise_fake_command([str(fake)], state_dir=state, timeout_s=1, job_id="uncertain")
+    with pytest.raises(SpikeError, match="never replayed"):
+        supervise_fake_command([str(fake)], state_dir=state, timeout_s=1, job_id="uncertain-other")
 
     assert not launches.exists()
     rows = [json.loads(line) for line in (state / "journal.jsonl").read_text().splitlines()]
-    assert [row["state"] for row in rows] == ["starting", "interrupted"]
+    assert [row["state"] for row in rows] == [
+        "starting", "starting", "interrupted", "interrupted"
+    ]
+    evidence = [json.loads(line) for line in (state / "evidence.jsonl").read_text().splitlines()]
+    assert [(row["kind"], row["job_id"]) for row in evidence] == [
+        ("recovery", "uncertain"),
+        ("recovery", "uncertain-other"),
+    ]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake-harness flock reservation is POSIX-only")

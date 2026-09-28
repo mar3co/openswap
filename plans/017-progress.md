@@ -199,6 +199,11 @@ until the owner records a permitted path or exclusion.
   lock shared by supervision and recovery; concurrent duplicate launches are
   refused. This is not product-worker admission or lease enforcement, which
   remains out of scope until later phases.
+- Codex review [P2 #4122751355](https://github.com/mar3co/openswap/pull/59#discussion_r4122751355)
+  is addressed in fake-harness evidence: launch, supervision-result, and
+  recovery rows now carry `job_id`, with existing tests checking attribution
+  across two recovered jobs. The detached-descendant cancellation gate remains
+  unresolved.
 - `uv` was not installed on `PATH`; version 0.12.19 was installed only under
   `/private/tmp/openswap-uv-test`, with its Python, cache, and project test
   environment under `/private/tmp`. The full suite used that isolated runtime.

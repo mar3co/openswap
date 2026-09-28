@@ -250,7 +250,10 @@ def _recover_uncertain_runs_locked(state_dir: Path) -> list[str]:
             )
             _append_jsonl(
                 state_dir / "evidence.jsonl",
-                {"kind": "recovery", "state": "interrupted", "reason": "uncertain_after_restart"},
+                {
+                    "kind": "recovery", "job_id": job_id, "state": "interrupted",
+                    "reason": "uncertain_after_restart",
+                },
             )
             interrupted.append(job_id)
     return interrupted
@@ -423,7 +426,10 @@ def _supervise_fake_command_locked(
 
     # The durable intent precedes launch. A restart from here becomes uncertain.
     _append_jsonl(journal, {"job_id": job_id, "state": "starting"})
-    _append_jsonl(state_dir / "evidence.jsonl", {"kind": "launch_intent", "state": "starting"})
+    _append_jsonl(
+        state_dir / "evidence.jsonl",
+        {"kind": "launch_intent", "job_id": job_id, "state": "starting"},
+    )
     try:
         process = subprocess.Popen(
             list(argv),
@@ -488,8 +494,10 @@ def _supervise_fake_command_locked(
     _append_jsonl(journal, {"job_id": job_id, "state": final_state})
     _append_jsonl(
         state_dir / "evidence.jsonl",
-        {"kind": "supervision_result", "state": final_state, "returncode": process.returncode,
-         "event_names": event_names},
+        {
+            "kind": "supervision_result", "job_id": job_id, "state": final_state,
+            "returncode": process.returncode, "event_names": event_names,
+        },
     )
     return {"job_id": job_id, "state": final_state, "returncode": process.returncode,
             "event_names": event_names}
