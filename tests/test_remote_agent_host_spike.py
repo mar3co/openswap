@@ -834,11 +834,11 @@ def test_setsid_detached_descendant_forces_interrupted_and_is_terminated(tmp_pat
         assert pid_file.exists(), "detached child never reported its pid"
         detached_pid = int(pid_file.read_text())
 
-        assert result["returncode"] == 0
-        assert result["state"] == "interrupted"
-        assert _wait_for_pid_exit(detached_pid, 2.0)
         evidence = _read_rows(tmp_path / "state" / "evidence.jsonl")
         supervision = [row for row in evidence if row["kind"] == "supervision_result"]
+        assert result["returncode"] == 0
+        assert result["state"] == "interrupted", supervision
+        assert _wait_for_pid_exit(detached_pid, 2.0), supervision
         assert len(supervision) == 1
         assert supervision[0]["state"] == "interrupted"
         assert supervision[0]["escaped_descendants"] == [detached_pid]

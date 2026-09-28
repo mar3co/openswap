@@ -575,27 +575,20 @@ def _identity(lstart: str, pgid: int, command: str) -> str:
 
 
 def _pid_identity(pid: int) -> str | None:
-    """Current identity of ``pid`` (see :func:`_process_table`), or None when gone."""
-    ps = shutil.which("ps") or "/bin/ps"
-    try:
-        listing = subprocess.run(
-            [ps, "-o", "stat=,lstart=,pgid=,command=", "-p", str(pid)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", timeout=PS_TIMEOUT_S, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    """Current identity of ``pid`` (see :func:`_process_table`), or None when gone.
+
+    Deliberately built from the same listing and parser as the snapshots, so
+    an identity recorded from a snapshot compares equal to one read back here
+    on every ``ps`` implementation. A zombie has exited and cannot execute, so
+    it is reported as gone.
+    """
+    table = _process_table()
+    if table is None:
         return None
-    columns = listing.stdout.split()
-    if len(columns) < 7:
-        return None
-    # A zombie has exited and cannot execute; report it as gone.
-    if columns[0].startswith(("Z", "X")):
-        return None
-    try:
-        pgid = int(columns[6])
-    except ValueError:
-        return None
-    return _identity(" ".join(columns[1:6]), pgid, " ".join(columns[7:]))
+    for entry_pid, _ppid, _pgid, stat, birth in table:
+        if entry_pid == pid:
+            return None if stat.startswith(("Z", "X")) else birth
+    return None
 
 
 def _open_pidfd(pid: int) -> int | None:
