@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3144 passed, 4 skipped, 3 warnings in 30.76s`.
+`3146 passed, 4 skipped, 3 warnings in 30.81s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -286,6 +286,10 @@ propagates instead of returning the stale in-flight record, so the next
 start recovers the row. The subprocess acceptance fixture now holds a stop
 inside the fake interrupt, since event reads are interruptible; it had
 flaked when the worker finished the interrupt before the parent's kill.
+Enabling refuses (`worker_running_unmanaged`) while an unmanaged worker such
+as a manual `openswap worker run` holds the instance lock, instead of
+installing a managed service that could never start; re-enabling an already
+loaded LaunchAgent stays idempotent.
 
 ## Deviations and verification
 

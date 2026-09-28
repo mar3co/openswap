@@ -260,6 +260,26 @@ def test_worker_status_does_not_migrate_legacy_backup(
     assert capsys.readouterr().err == ""
 
 
+@pytest.mark.parametrize("service_loaded, refused", [(False, True), (True, False)])
+def test_enable_refuses_while_a_manual_worker_holds_the_instance_lock(
+    tmp_path: Path, monkeypatch, service_loaded, refused
+):
+    """An enabled policy with a manual `worker run` daemon must not install a
+    second, lock-starved managed worker; a loaded LaunchAgent stays idempotent."""
+    update_worker_settings(tmp_path, enabled=True)
+    installs = []
+    monkeypatch.setattr(cli, "_worker_instance_lock_is_free", lambda root: False)
+    monkeypatch.setattr(cli, "worker_service_status", lambda: {"loaded": service_loaded})
+    monkeypatch.setattr(cli, "install", lambda: installs.append(1) or {"already_loaded": service_loaded})
+    if refused:
+        with pytest.raises(cli.ClaudeSwitchError, match="worker_running_unmanaged"):
+            cli.enable_worker(tmp_path)
+        assert installs == []
+    else:
+        assert cli.enable_worker(tmp_path)["enabled"] is True
+        assert installs == [1]
+
+
 def test_enable_refuses_invalid_pinned_account_without_installing(
     tmp_path: Path, monkeypatch, capsys
 ):

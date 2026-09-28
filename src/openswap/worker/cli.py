@@ -18,6 +18,7 @@ from openswap.worker.client import WorkerClient
 from openswap.worker.ipc import IpcError, socket_path
 from openswap.worker.journal import LocalJobStore
 from openswap.worker.launch_agent import install, uninstall
+from openswap.worker.launch_agent import status as worker_service_status
 from openswap.worker.leases import AccountLeaseStore, ReleaseEvidence
 from openswap.worker.models import JobState
 from openswap.worker.runtime import _pid_exists, read_worker_snapshot
@@ -126,14 +127,28 @@ def request_pause(backup_root: Path, paused: bool) -> dict:
         }
 
 
+def _managed_worker_loaded() -> bool:
+    try:
+        return worker_service_status().get("loaded") is True
+    except (ClaudeSwitchError, OSError):
+        return False
+
+
 def enable_worker(backup_root: Path) -> dict:
     """Persist opt-in and idempotently install the per-user helper."""
     root = Path(backup_root)
     _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
         previous = load_worker_settings(root)
-        if previous.enabled is not True and not _worker_instance_lock_is_free(root):
-            raise ClaudeSwitchError("worker_stop_unconfirmed")
+        if not _worker_instance_lock_is_free(root):
+            # A held instance lock is fine only when it belongs to the already
+            # loaded LaunchAgent (idempotent re-enable). Otherwise another
+            # worker, such as a manual `openswap worker run`, owns it: a newly
+            # bootstrapped service could never start, so refuse.
+            if previous.enabled is not True:
+                raise ClaudeSwitchError("worker_stop_unconfirmed")
+            if not _managed_worker_loaded():
+                raise ClaudeSwitchError("worker_running_unmanaged")
         persisted = update_worker_settings(root, enabled=True)
         if persisted.enabled is not True:
             # A malformed pinned account/workspace policy fails closed in the
