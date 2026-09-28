@@ -550,7 +550,8 @@ def test_probe_timeout_kills_term_ignoring_helper_group(tmp_path, monkeypatch, c
     real_run_probe = spike._run_probe
 
     def fast_probe(command, *, env, cwd, timeout_s):
-        return real_run_probe(command, env=env, cwd=cwd, timeout_s=1.0)
+        # Long enough for a loaded runner to start the helper and record its pid.
+        return real_run_probe(command, env=env, cwd=cwd, timeout_s=3.0)
 
     monkeypatch.setattr(spike, "_run_probe", fast_probe)
     args = (["inspect", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")]
@@ -1324,7 +1325,7 @@ def test_track_descendants_does_not_seed_from_exited_pidfd_entry(monkeypatch):
     assert closed == [60]
 
 
-def test_terminate_pids_never_signals_a_pid_whose_identity_changed(monkeypatch):
+def test_terminate_pids_never_signals_a_pid_whose_start_time_changed(monkeypatch):
     sent = []
 
     def fake_kill(pid, sig):
@@ -1333,9 +1334,33 @@ def test_terminate_pids_never_signals_a_pid_whose_identity_changed(monkeypatch):
         sent.append((pid, sig))
 
     monkeypatch.setattr(spike.os, "kill", fake_kill)
-    monkeypatch.setattr(spike, "_pid_identity", lambda pid: "someone-else")
-    gone, mode = spike._terminate_pids({987654: ("ours", None, True)}, grace_s=0.05)
+    # A new start time means the pid was reused: the original is known gone.
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(987654, 1, 987654, "S", "t1", "t1|pgid=987654|someone-else")])
+    gone, mode = spike._terminate_pids({987654: ("t0|pgid=987654|helper", None, True)}, grace_s=0.05)
     assert gone is True
+    assert mode == spike.SIGNALLING_IDENTITY_CHECK
+    assert sent == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="reaches the SIGKILL branch, which Windows lacks")
+@pytest.mark.parametrize("table", [
+    None,  # the snapshot failed or timed out
+    [(987654, 1, 987654, "S", "t0", "t0|pgid=987654|exec-ed")],  # same start, new command
+])
+def test_terminate_pids_keeps_unknown_identity_uncertain(monkeypatch, table):
+    sent = []
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            return None  # "alive"
+        sent.append((pid, sig))
+
+    monkeypatch.setattr(spike.os, "kill", fake_kill)
+    monkeypatch.setattr(spike, "_process_table", lambda: table)
+    monkeypatch.setattr(spike, "DESCENDANT_KILL_WAIT_S", 0.05)
+    gone, mode = spike._terminate_pids({987654: ("t0|pgid=987654|helper", None, True)}, grace_s=0.05)
+    assert gone is False
     assert mode == spike.SIGNALLING_IDENTITY_CHECK
     assert sent == []
 

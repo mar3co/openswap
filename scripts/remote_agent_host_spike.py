@@ -845,26 +845,43 @@ def _terminate_pids(
     before each signal, but check and signal are still two operations and the
     start time has second resolution, so this path is best effort only; the
     caller records the mode so evidence never claims identity-safe cleanup.
+    A process counts as gone only when that is known: its pid is free, it is a
+    zombie, or its start time changed (reuse). A failed snapshot, or the same
+    start time with a different group or command (possibly our own exec), is
+    uncertain: never signalled, and never reported as gone.
     """
     mode = SIGNALLING_PIDFD if all(h is not None for _b, h, _v in escaped.values()) else SIGNALLING_IDENTITY_CHECK
 
-    def still_ours(pid: int) -> bool:
-        birth, handle, _verified = escaped[pid]
+    def status(pid: int) -> str:
+        """``ours`` (signalable), ``gone``, or ``uncertain``."""
+        identity, handle, _verified = escaped[pid]
         if handle is not None:
             if _pidfd_exited(handle):
-                return False
+                return "gone"
             try:
                 signal.pidfd_send_signal(handle, 0)
             except ProcessLookupError:
-                return False
+                return "gone"
             except OSError:
-                return True
-            return True
-        return _pid_alive(pid) and _pid_identity(pid) == birth
+                return "ours"
+            return "ours"
+        if not _pid_alive(pid):
+            return "gone"
+        table = _process_table()
+        if table is None:
+            return "uncertain"
+        for entry_pid, _ppid, _pgid, stat, birth, current in table:
+            if entry_pid == pid:
+                if stat.startswith(("Z", "X")):
+                    return "gone"
+                if current == identity:
+                    return "ours"
+                return "gone" if birth != identity.split("|", 1)[0] else "uncertain"
+        return "gone"
 
     def signal_all(sig: int) -> None:
-        for pid, (_birth, handle, verified) in escaped.items():
-            if not verified or not still_ours(pid):
+        for pid, (_identity, handle, verified) in escaped.items():
+            if not verified or status(pid) != "ours":
                 continue
             try:
                 if handle is not None:
@@ -876,7 +893,7 @@ def _terminate_pids(
 
     def wait_gone(deadline: float) -> bool:
         while True:
-            if not any(still_ours(pid) for pid in escaped):
+            if all(status(pid) == "gone" for pid in escaped):
                 return True
             if time.monotonic() >= deadline:
                 return False
