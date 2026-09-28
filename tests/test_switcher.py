@@ -1073,6 +1073,132 @@ class TestAdoptSessionCredential:
         assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
 
+@pytest.mark.parametrize("operation", ("swap", "move", "remove"))
+def test_kickoff_lease_fences_claude_slot_profile_mutations(
+    temp_home: Path, sample_sequence_data: dict, operation: str
+):
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    sample_sequence_data["accounts"]["1"]["organizationUuid"] = ""
+    sample_sequence_data["accounts"]["2"]["organizationUuid"] = ""
+    switcher._write_json(switcher.sequence_file, sample_sequence_data)
+    before = switcher.sequence_file.read_bytes()
+
+    profile = switcher._session_dir("1", "account1@example.com")
+    profile.mkdir(parents=True)
+    sentinel = profile / ".credentials.json"
+    sentinel.write_text("profile credential sentinel", encoding="utf-8")
+
+    store = AccountLeaseStore(switcher.backup_dir, "claude")
+    token = store.acquire(
+        job_id="kickoff-held",
+        account_identity=stable_account_identity("claude", "account1@example.com", ""),
+        worker_pid=123,
+        worker_epoch=1,
+        ttl_s=60,
+    )
+
+    with pytest.raises(LeaseConflictError):
+        if operation == "swap":
+            switcher.swap_accounts("1", "2")
+        elif operation == "move":
+            switcher.move_account("1", "3")
+        else:
+            switcher.remove_account("1", assume_yes=True)
+
+    assert switcher.sequence_file.read_bytes() == before
+    assert sentinel.read_text(encoding="utf-8") == "profile credential sentinel"
+    assert store.current().token() == token
+
+
+@pytest.mark.parametrize("operation", ("add_capture", "add_token"))
+def test_kickoff_lease_fences_claude_account_displacement_writers(
+    temp_home: Path, sample_sequence_data: dict, operation: str
+):
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    for record in sample_sequence_data["accounts"].values():
+        record["organizationUuid"] = ""
+        record["organizationName"] = ""
+    switcher._write_json(switcher.sequence_file, sample_sequence_data)
+    before = switcher.sequence_file.read_bytes()
+
+    profile = switcher._session_dir("1", "account1@example.com")
+    profile.mkdir(parents=True)
+    sentinel = profile / ".credentials.json"
+    sentinel.write_text("profile credential sentinel", encoding="utf-8")
+    store = AccountLeaseStore(switcher.backup_dir, "claude")
+    token = store.acquire(
+        job_id="kickoff-held",
+        account_identity=stable_account_identity("claude", "account1@example.com", ""),
+        worker_pid=123,
+        worker_epoch=1,
+        ttl_s=60,
+    )
+
+    if operation == "add_capture":
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "new@example.com",
+                "accountUuid": "uuid-new",
+                "organizationUuid": "",
+            }
+        }), encoding="utf-8")
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "synthetic-live", "refreshToken": "synthetic-refresh"}
+        }), encoding="utf-8")
+        call = lambda: switcher.add_account(slot=1, assume_yes=True)
+    else:
+        call = lambda: switcher.add_account_from_token(
+            "synthetic-token", email="new@example.com", slot=1, assume_yes=True
+        )
+
+    with pytest.raises(LeaseConflictError):
+        call()
+
+    assert switcher.sequence_file.read_bytes() == before
+    assert sentinel.read_text(encoding="utf-8") == "profile credential sentinel"
+    assert store.current().token() == token
+
+
+def test_kickoff_lease_fences_session_profile_bootstrap(
+    temp_home: Path, sample_sequence_data: dict, monkeypatch
+):
+    from openswap.session import SessionManager
+
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    for record in sample_sequence_data["accounts"].values():
+        record["organizationUuid"] = ""
+        record["organizationName"] = ""
+    switcher._write_json(switcher.sequence_file, sample_sequence_data)
+    profile = switcher._session_dir("1", "account1@example.com")
+    profile.mkdir(parents=True)
+    sentinel = profile / ".credentials.json"
+    sentinel.write_text("profile credential sentinel", encoding="utf-8")
+    store = AccountLeaseStore(switcher.backup_dir, "claude")
+    token = store.acquire(
+        job_id="kickoff-held",
+        account_identity=stable_account_identity("claude", "account1@example.com", ""),
+        worker_pid=123,
+        worker_epoch=1,
+        ttl_s=60,
+    )
+    manager = SessionManager(switcher)
+    monkeypatch.setattr(manager, "_is_session_valid", lambda *_args: False)
+    monkeypatch.setattr(
+        switcher, "read_account_credentials",
+        lambda *_args: json.dumps({"claudeAiOauth": {"accessToken": "synthetic"}}),
+    )
+
+    with pytest.raises(LeaseConflictError):
+        manager.setup_session("1", share=False)
+
+    assert sentinel.read_text(encoding="utf-8") == "profile credential sentinel"
+    assert not (profile / ".claude.json").exists()
+    assert store.current().token() == token
+
+
 class TestLiveSessionGuardOnAnUnreadableRecord:
     """A session record we could not READ must not answer "nobody there".
 

@@ -168,9 +168,9 @@ boundary. No `launchctl` command is run against the user's login session;
 LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
-The merged branch full-suite validation is green: `3013 passed, 4 skipped,
-3 warnings in 19.52s` (3,016 collected). Focused core journal,
-settings, disabled-adapter and fake lifecycle tests passed (`20 passed`); the
+The merged branch full-suite validation is green: `3024 passed, 4 skipped,
+3 warnings in 18.95s` (3,028 collected). Focused core journal,
+settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
 recreation/idempotency, singleton refusal, a stop acknowledgement remaining
 nonterminal with the lease quarantined, and restart recovery to `interrupted`
@@ -179,6 +179,15 @@ without adapter relaunch. The first assembled run exposed a missing
 the managed account explicitly, and kickoff identity resolution remains
 fail-closed. All provider behavior in these tests is synthetic; this result
 does not clear Phase 1 gates or enable live Codex execution.
+
+PR #60 review follow-ups #4124363480, #4124363497, #4124363514, and
+#4124442272 are addressed with regression coverage: Claude slot/session
+profile mutations honor worker leases; manually started workers stop when
+opt-in is revoked; malformed pinned-account policy refuses enablement before
+LaunchAgent installation; and menu status applies external policy changes only
+with its generation-matched snapshot. Deadline/shutdown lease release also
+requires an `InterruptResult` whose `execution_stopped` value is literally
+`True`; a truthy string is tested as insufficient proof.
 
 ## Deviations and verification
 

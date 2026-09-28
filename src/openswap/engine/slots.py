@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from openswap.engine.notes import *  # noqa: F403
+from openswap.worker.leases import AccountLeaseStore
 
 class SlotsMixin:
     """Roster (sequence.json), backup Keychain, aliases, disabled flags, slot numbers."""
@@ -320,7 +321,8 @@ class SlotsMixin:
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
         self._refuse_session_shell()
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             return self._swap_accounts_locked(first, second)
 
     def _read_backup_or_abort(self, account_num: str, email: str) -> str:
@@ -726,7 +728,8 @@ class SlotsMixin:
         # the mutation (via the *_locked helpers — FileLock is non-reentrant):
         # a slot number resolved outside the lock could be renumbered by a
         # concurrent swap/move and end up moving the wrong account.
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             self._get_sequence_data_migrated()
 
             num_src = self._resolve_account_identifier(account)
@@ -1318,7 +1321,8 @@ class SlotsMixin:
                 print(dimmed("Cancelled"))
                 return
 
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             data = self._get_sequence_data()
             account_info = (data or {}).get("accounts", {}).get(account_num)
             if not account_info:

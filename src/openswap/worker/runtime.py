@@ -26,6 +26,7 @@ from openswap.worker.leases import (
 from openswap.worker.models import (
     ControlResult,
     EventPage,
+    InterruptResult,
     JobRecord,
     JobState,
     JobSubmission,
@@ -342,6 +343,8 @@ class WorkerRuntime:
             while True:
                 self.heartbeat()
                 current = self.store.get(running.job_id)
+                if not load_worker_settings(self.backup_root).enabled:
+                    return self._interrupt_active(current, "worker_shutdown")
                 if shutdown_event is not None and shutdown_event.is_set():
                     return self._interrupt_active(current, "worker_shutdown")
                 if current.state == JobState.CANCEL_REQUESTED:
@@ -407,6 +410,10 @@ class WorkerRuntime:
 
     def heartbeat(self) -> None:
         self.store.heartbeat(self.worker_pid, self.worker_epoch)
+
+    def mark_stopped(self) -> None:
+        """Clear this process's health record after its server thread exits."""
+        self.store.mark_stopped(self.worker_pid, self.worker_epoch)
 
     def _prepare_run(self, claimed: JobRecord):
         current = self.store.get(claimed.job_id)
@@ -507,7 +514,7 @@ class WorkerRuntime:
             result = self.adapter.interrupt(run)
         except Exception:
             result = None
-        if result is not None and result.execution_stopped:
+        if isinstance(result, InterruptResult) and result.execution_stopped is True:
             self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
             if reason in {"cancel_requested", "worker_shutdown"}:
                 new_state = JobState.CANCELLED
@@ -571,6 +578,8 @@ def run_worker(backup_root: Path, *, runtime_factory=WorkerRuntime) -> int:
     store._ensure_private_dir()
     lifecycle_lock = FileLock(Path(backup_root) / "worker" / "lifecycle.lock", timeout=3)
     instance_lock = FileLock(Path(backup_root) / "worker" / "instance.lock", timeout=0)
+    runtime = None
+    server = None
     if not lifecycle_lock.acquire(timeout=3):
         return 1
     if not instance_lock.acquire(timeout=0):
@@ -605,6 +614,13 @@ def run_worker(backup_root: Path, *, runtime_factory=WorkerRuntime) -> int:
                 if not server.is_alive():
                     stop_event.set()
                     return 1
+                if not load_worker_settings(backup_root).enabled:
+                    # The policy can be disabled outside this process (for
+                    # example, by another supported local control path). An
+                    # active reconcile observes the same policy and interrupts
+                    # with explicit stop proof or leaves the lease quarantined.
+                    stop_event.set()
+                    break
                 runtime.heartbeat()
                 runtime.reconcile_once(shutdown_event=stop_event)
                 stop_event.wait(0.2)
@@ -613,6 +629,7 @@ def run_worker(backup_root: Path, *, runtime_factory=WorkerRuntime) -> int:
             server.join(timeout=3)
             if server.is_alive():
                 server.join()
+            runtime.mark_stopped()
             for signum, handler in original_handlers.items():
                 signal.signal(signum, handler)
         return 0

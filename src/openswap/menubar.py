@@ -631,10 +631,14 @@ def run(switcher, codex=None) -> int:
             ).start()
 
         def _worker_status_worker(self, generation):
+            policy = None
             try:
+                from openswap.settings import load_worker_settings
                 from openswap.worker.cli import read_status
 
-                snapshot = read_status(self.switcher.backup_dir)
+                root = self.switcher.backup_dir
+                snapshot = read_status(root)
+                policy = load_worker_settings(root)
             except Exception:
                 snapshot = {
                     "process_state": "unavailable",
@@ -643,9 +647,15 @@ def run(switcher, codex=None) -> int:
                     "queue_depth": 0,
                     "lease_quarantined": True,
                 }
+                try:
+                    from openswap.settings import load_worker_settings
+
+                    policy = load_worker_settings(self.switcher.backup_dir)
+                except Exception:
+                    pass
             with self._worker_result_lock:
                 if generation == self._worker_generation:
-                    self._worker_result = (generation, snapshot, None, None)
+                    self._worker_result = (generation, snapshot, policy, None)
 
         def _worker_action(self, row_id, value):
             if self._worker_operation is not None:
@@ -669,6 +679,7 @@ def run(switcher, codex=None) -> int:
 
         def _worker_action_worker(self, generation, row_id, value):
             diagnostic = None
+            policy = None
             try:
                 from openswap.settings import load_worker_settings
                 from openswap.worker.cli import (
@@ -698,7 +709,7 @@ def run(switcher, codex=None) -> int:
                         result = request_stop(root, value)
                         if result.get("accepted") is not True:
                             diagnostic = result.get("diagnostic_code") or "stop_refused"
-                self._worker_policy = load_worker_settings(root)
+                policy = load_worker_settings(root)
                 snapshot = read_status(root)
             except Exception:
                 snapshot = {
@@ -712,19 +723,19 @@ def run(switcher, codex=None) -> int:
                 try:
                     from openswap.settings import load_worker_settings
 
-                    self._worker_policy = load_worker_settings(self.switcher.backup_dir)
+                    policy = load_worker_settings(self.switcher.backup_dir)
                 except Exception:
                     pass
             with self._worker_result_lock:
                 if generation == self._worker_generation:
-                    self._worker_result = (generation, snapshot, None, diagnostic)
+                    self._worker_result = (generation, snapshot, policy, diagnostic)
 
         def _drain_worker_result(self):
             with self._worker_result_lock:
                 result = self._worker_result
                 if result is None:
                     return
-                generation, snapshot, _unused, diagnostic = result
+                generation, snapshot, policy, diagnostic = result
                 self._worker_result = None
             if generation != self._worker_generation:
                 if self._worker_operation is None:
@@ -733,6 +744,8 @@ def run(switcher, codex=None) -> int:
             self._worker_status_inflight = False
             self._worker_operation = None
             self._worker_status_cache = dict(snapshot)
+            if policy is not None:
+                self._worker_policy = policy
             self._worker_status_cache.pop("operation", None)
             self._worker_status_cache["diagnostic_notice"] = diagnostic
             panel = self._panel

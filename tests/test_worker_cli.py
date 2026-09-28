@@ -123,6 +123,28 @@ def test_enable_creates_private_worker_root_before_lifecycle_lock(
     LocalJobStore(tmp_path)._ensure_private_dir()
 
 
+def test_enable_refuses_invalid_pinned_account_without_installing(
+    tmp_path: Path, monkeypatch, capsys
+):
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        '{"worker":{"enabled":false,"paused":false,'
+        '"pinnedAccountRef":"invalid reference"}}',
+        encoding="utf-8",
+    )
+    installs = []
+    monkeypatch.setattr(cli, "install", lambda: installs.append(True))
+
+    exit_code = cli.main(["enable"], backup_root=tmp_path)
+
+    assert exit_code == 1
+    assert capsys.readouterr().err == (
+        "Worker configuration is invalid; fix local worker settings before enabling.\n"
+    )
+    assert installs == []
+    assert load_worker_settings(tmp_path).enabled is False
+
+
 def test_rejected_pause_restores_previous_paused_policy(tmp_path: Path, monkeypatch):
     class RefusingClient:
         def __init__(self, _path):

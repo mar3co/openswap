@@ -400,7 +400,8 @@ class SwitchMixin:
             # on a race.
             self._reject_identity_drift_since_verify(identity)
 
-            with FileLock(self.lock_file):
+            with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+                lease_guard.assert_available()
                 seq = self._get_sequence_data() or {}
                 account_num = self._find_account_slot(
                     seq, current_email, current_org_uuid
@@ -533,7 +534,8 @@ class SwitchMixin:
         self._reject_identity_drift_since_verify(identity)
 
         prune_identity = None
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             data = self._get_sequence_data() or {
                 "activeAccountNumber": None,
                 "lastUpdated": "",
@@ -747,7 +749,8 @@ class SwitchMixin:
 
         # If the account already exists (same email, personal), refresh in place.
         if slot is None and self._account_exists(email, ""):
-            with FileLock(self.lock_file):
+            with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+                lease_guard.assert_available()
                 seq = self._get_sequence_data() or {}
                 account_num = self._find_account_slot(seq, email, "")
                 if account_num is None:
@@ -820,7 +823,8 @@ class SwitchMixin:
             account_num = str(self._get_next_account_number())
 
         prune_identity = None
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             data = self._get_sequence_data() or {
                 "activeAccountNumber": None,
                 "lastUpdated": "",

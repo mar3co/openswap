@@ -167,9 +167,14 @@ class AccountLeaseStore:
         )
 
     @contextmanager
-    def mutation_guard(self) -> Iterator[LeaseMutationGuard]:
+    def mutation_guard(self, *, timeout: float | None = None) -> Iterator[LeaseMutationGuard]:
         """Hold the existing provider lock across lease check and mutation."""
-        with FileLock(self.provider_lock):
+        lock = (
+            FileLock(self.provider_lock)
+            if timeout is None
+            else FileLock(self.provider_lock, timeout=timeout)
+        )
+        with lock:
             yield LeaseMutationGuard(self)
 
     def acquire(

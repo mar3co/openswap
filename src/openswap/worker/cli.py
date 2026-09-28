@@ -111,7 +111,16 @@ def enable_worker(backup_root: Path) -> dict:
     root = Path(backup_root)
     with lifecycle_lock(root):
         previous = load_worker_settings(root)
-        update_worker_settings(root, enabled=True)
+        persisted = update_worker_settings(root, enabled=True)
+        if persisted.enabled is not True:
+            # A malformed pinned account/workspace policy fails closed in the
+            # settings parser. Never install a helper after that fail-closed
+            # result, even if the write itself succeeded.
+            try:
+                update_worker_settings(root, enabled=previous.enabled)
+            except (OSError, RuntimeError, ValueError):
+                pass
+            raise ClaudeSwitchError("worker_configuration_invalid")
         try:
             service = install()
         except ClaudeSwitchError:
@@ -346,7 +355,12 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         try:
             payload = enable_worker(root)
         except ClaudeSwitchError as exc:
-            print("Could not enable worker.", file=sys.stderr)
+            message = (
+                "Worker configuration is invalid; fix local worker settings before enabling."
+                if str(exc) == "worker_configuration_invalid"
+                else "Could not enable worker."
+            )
+            print(message, file=sys.stderr)
             return 1
         _write(payload, as_json=args.json, human="Remote tasks worker enabled.")
         return 0

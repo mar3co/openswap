@@ -25,7 +25,7 @@ from openswap.worker.models import (
     SafeEvent,
     SafeEventKind,
 )
-from openswap.worker.runtime import WorkerRuntime, read_worker_snapshot
+from openswap.worker.runtime import WorkerRuntime, read_worker_snapshot, run_worker
 from openswap.worker.leases import AccountLeaseStore, stable_account_identity
 
 
@@ -273,6 +273,7 @@ def test_stop_cannot_race_provider_start_and_ack_is_not_stop_proof(tmp_path):
     [
         ("deadline", True, JobState.FAILED, "released"),
         ("deadline", False, JobState.INTERRUPTED, "uncertain"),
+        ("deadline", "false", JobState.INTERRUPTED, "uncertain"),
         ("shutdown", True, JobState.CANCELLED, "released"),
         ("shutdown", False, JobState.INTERRUPTED, "uncertain"),
     ],
@@ -297,6 +298,59 @@ def test_deadline_and_shutdown_require_explicit_stop_proof(
 
     assert result.state == expected_state
     assert AccountLeaseStore(tmp_path).current().state == expected_lease
+
+
+@pytest.mark.parametrize(
+    ("stopped", "expected_state", "expected_lease"),
+    [
+        (True, JobState.CANCELLED, "released"),
+        (False, JobState.INTERRUPTED, "uncertain"),
+    ],
+)
+def test_manual_worker_exits_when_policy_is_disabled(
+    tmp_path, monkeypatch, stopped, expected_state, expected_lease,
+):
+    update_worker_settings(tmp_path, enabled=True)
+    adapter = _FakeAdapter(stopped=stopped)
+    identity = stable_account_identity("codex", "policy-disable-test")
+    runtime_ready = threading.Event()
+    captured_runtime = []
+    results = []
+
+    def runtime_factory(root):
+        runtime = WorkerRuntime(root, adapter=adapter, account_identity=identity)
+        captured_runtime.append(runtime)
+        runtime_ready.set()
+        return runtime
+
+    def fake_serve(_path, _control, stop_event, *, ready_event=None):
+        if ready_event is not None:
+            ready_event.set()
+        stop_event.wait(5)
+
+    monkeypatch.setattr("openswap.worker.ipc.serve", fake_serve)
+    worker = threading.Thread(
+        target=lambda: results.append(run_worker(tmp_path, runtime_factory=runtime_factory)),
+        daemon=True,
+    )
+    worker.start()
+    assert runtime_ready.wait(2)
+    runtime = captured_runtime[0]
+    job = runtime.submit(_submission())
+    assert adapter.start_entered.wait(2)
+
+    # Simulate a local settings change while this manually started worker is
+    # running, without relying on the LaunchAgent lifecycle.
+    update_worker_settings(tmp_path, enabled=False)
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert results == [0]
+    assert LocalJobStore(tmp_path).get(job.job_id).state == expected_state
+    assert AccountLeaseStore(tmp_path).current().state == expected_lease
+    snapshot = read_worker_snapshot(tmp_path)
+    assert snapshot.process_state.value == "stopped"
+    assert snapshot.active_job is None
 
 
 def test_journal_recovery_adopts_queue_and_interrupts_active_without_relaunch(tmp_path):

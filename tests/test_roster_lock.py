@@ -69,7 +69,7 @@ class TestRosterWritersTakeAccountLock:
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
     ):
         entered.clear()
-        patch_engine_filelock(monkeypatch, SpyLock)
+        monkeypatch.setattr("openswap.worker.leases.FileLock", SpyLock)
         switcher = _switcher_with_roster(temp_home, sample_sequence_data)
 
         switcher.remove_account("2", assume_yes=True)
@@ -96,6 +96,7 @@ class TestRosterWritersTakeAccountLock:
     ):
         entered.clear()
         patch_engine_filelock(monkeypatch, SpyLock)
+        monkeypatch.setattr("openswap.worker.leases.FileLock", SpyLock)
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._init_sequence_file()
@@ -288,6 +289,7 @@ class TestRosterWritersTakeAccountLock:
     ):
         entered.clear()
         patch_engine_filelock(monkeypatch, SpyLock)
+        monkeypatch.setattr("openswap.worker.leases.FileLock", SpyLock)
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._init_sequence_file()

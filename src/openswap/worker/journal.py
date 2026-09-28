@@ -249,6 +249,28 @@ class LocalJobStore:
         finally:
             db.close()
 
+    def mark_stopped(self, worker_pid: int, epoch: int) -> None:
+        """Clear live-process health after shutdown, fenced to this epoch."""
+        if type(worker_pid) is not int or worker_pid <= 0:
+            raise ValueError("worker_pid must be a positive integer")
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            self._assert_epoch_tx(db, epoch)
+            row = db.execute(
+                "SELECT value FROM metadata WHERE key='worker_pid'"
+            ).fetchone()
+            if row is None or row["value"] != str(worker_pid):
+                raise StaleWriteError("worker health belongs to another process")
+            db.execute("UPDATE metadata SET value='' WHERE key='worker_pid'")
+            db.execute("UPDATE metadata SET value='' WHERE key='last_seen_at'")
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
     def health(self) -> tuple[int | None, datetime | None]:
         db = self._connect()
         try:
