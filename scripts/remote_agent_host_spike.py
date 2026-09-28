@@ -6,12 +6,22 @@ inspect ``codex --version`` and ``codex exec --help`` in a disposable home, and
 it can exercise process supervision with a caller-supplied fake executable.
 Neither proves provider login, account isolation, web research, refresh, or
 Codex cancellation semantics.
+
+Process-tree cleanup is best effort. While the fake leader is alive the
+supervisor periodically snapshots ``ps`` and records every descendant by
+parent pid, regardless of process group, so a helper that calls ``setsid()``
+is still found and terminated after the leader exits. A descendant that forks
+between the final snapshot and the leader's exit is reparented before it can
+be attributed to the run and can still escape, so the harness never claims
+complete process-tree cleanup; it only refuses to report ``succeeded`` or
+``cancelled`` when it did observe an escaped descendant.
 """
 
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import errno
 import json
 import math
 import os
@@ -38,7 +48,14 @@ PROBE_TERMINATION_GRACE_S = 0.15
 PROBE_CLEANUP_WAIT_S = 0.5
 MAX_PROBE_OUTPUT_BYTES = 256 * 1024
 PROBE_READ_CHUNK_BYTES = 16 * 1024
-_EVENT_NAME = re.compile(r"^[a-zA-Z0-9_.-]{1,80}$")
+DESCENDANT_SNAPSHOT_INTERVAL_S = 0.05
+DESCENDANT_KILL_WAIT_S = 0.5
+GROUP_KILL_WAIT_S = 0.5
+NON_TERMINAL_STATES = frozenset({"starting", "running", "cancel_requested"})
+# Lowercase dotted identifiers such as Codex's ``thread.started``; anything
+# else (including anything that could carry a token) becomes ``unknown-event``.
+_EVENT_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}(\.[a-z][a-z0-9_]{0,31}){0,3}")
+_VERSION_OUTPUT = re.compile(r"codex-cli \S{1,40}")
 
 
 class SpikeError(RuntimeError):
@@ -79,6 +96,14 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
             events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
             if not selector.get_map() and process.poll() is None:
                 time.sleep(min(remaining, 0.02))
+            if (
+                not events
+                and process.poll() is not None
+                and not _probe_group_running(process.pid)
+            ):
+                # The leader is gone and no group member can still write: with
+                # nothing readable there is no output left, so stop waiting.
+                break
             for key, _ in events:
                 fd = key.fd
                 try:
@@ -167,16 +192,41 @@ def _cleanup_probe_process(process: subprocess.Popen) -> bool:
 
 
 def _private_dir(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Create missing ancestors one by one so every level we own is 0o700,
+    # rather than trusting mkdir(parents=True) to apply the mode above the leaf.
+    missing = []
+    current = path
+    while not current.exists() and current.parent != current:
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
     if not path.is_dir():
         raise SpikeError("Private output path must be a directory.")
-    if os.name == "posix" and path.stat().st_mode & 0o077:
-        raise SpikeError("Existing output directory must not grant group or world access.")
+    if os.name == "posix":
+        status = path.stat()
+        if status.st_mode & 0o077:
+            raise SpikeError("Existing output directory must not grant group or world access.")
+        if status.st_uid != os.getuid():
+            raise SpikeError("Existing output directory must be owned by the current user.")
+
+
+def _open_nofollow(path: Path, flags: int, mode: int = 0o600) -> int:
+    """Open without following a symlink planted at the final path component."""
+    try:
+        return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), mode)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise SpikeError("refusing to follow a symlink") from None
+        raise
 
 
 def _append_jsonl(path: Path, record: dict) -> None:
     _private_dir(path.parent)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = _open_nofollow(path, os.O_RDWR | os.O_CREAT | os.O_APPEND)
     try:
         end = os.lseek(fd, 0, os.SEEK_END)
         separator = b""
@@ -199,11 +249,14 @@ def _append_jsonl(path: Path, record: dict) -> None:
 def _read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
+    with os.fdopen(_open_nofollow(path, os.O_RDONLY), "rb") as stream:
+        raw = stream.read()
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in raw.decode("utf-8", errors="replace").splitlines():
         try:
             row = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            # JSONDecodeError is a ValueError; so is the int-digit limit.
             continue
         if isinstance(row, dict):
             rows.append(row)
@@ -212,7 +265,7 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 def _safe_event_name(value: object) -> str:
     name = str(value or "unknown")
-    return name if _EVENT_NAME.fullmatch(name) else "redacted-event"
+    return name if _EVENT_NAME.fullmatch(name) else "unknown-event"
 
 
 def _latest(records: list[dict], job_id: str) -> dict | None:
@@ -226,7 +279,7 @@ def _locked_state_directory(state_dir: Path):
         raise SpikeError("Atomic fake-harness state locking requires POSIX.")
     import fcntl
 
-    lock_fd = os.open(state_dir / "supervisor.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    lock_fd = _open_nofollow(state_dir / "supervisor.lock", os.O_RDWR | os.O_CREAT)
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -251,26 +304,36 @@ def recover_uncertain_runs(state_dir: Path) -> list[str]:
 def _recover_uncertain_runs_locked(state_dir: Path) -> list[str]:
     journal = state_dir / "journal.jsonl"
     latest: dict[str, dict] = {}
+    latest_running: dict[str, dict] = {}
     for row in _read_jsonl(journal):
         job_id = row.get("job_id")
         if isinstance(job_id, str):
             latest[job_id] = row
+            if row.get("state") == "running":
+                latest_running[job_id] = row
     interrupted = []
     for job_id, row in latest.items():
-        if row.get("state") in {"starting", "running", "cancel_requested"}:
-            _append_jsonl(
-                journal,
-                {"job_id": job_id, "state": "interrupted", "reason": "uncertain_after_restart"},
-            )
-            _append_jsonl(
-                state_dir / "evidence.jsonl",
-                {
-                    "kind": "recovery", "job_id": job_id, "state": "interrupted",
-                    "reason": "uncertain_after_restart",
-                },
-            )
+        if row.get("state") in NON_TERMINAL_STATES:
+            record = {"job_id": job_id, "state": "interrupted", "reason": "uncertain_after_restart"}
+            pgid = latest_running.get(job_id, {}).get("pgid")
+            if isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 1:
+                # Observe only: the pgid may already belong to an unrelated
+                # process after a restart, so recovery never signals it.
+                record["group_still_alive"] = _group_alive(pgid)
+            _append_jsonl(journal, record)
+            _append_jsonl(state_dir / "evidence.jsonl", {"kind": "recovery", **record})
             interrupted.append(job_id)
     return interrupted
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _signal_group(process: subprocess.Popen, sig: int) -> None:
@@ -372,7 +435,113 @@ def _terminate_group(
             process.stdout.close()
     else:
         reader.join(timeout=1)
+    # Give the kernel a moment to reap KILLed members so a slow reap does not
+    # turn a clean cancellation into "interrupted". Once the leader is reaped
+    # its pid (and therefore this pgid) may be reused by an unrelated process,
+    # so this wait is bounded and only ever observes, never re-signals.
+    kill_deadline = time.monotonic() + GROUP_KILL_WAIT_S
+    while time.monotonic() < kill_deadline and _group_running(process.pid, reader):
+        time.sleep(0.02)
     return wait_uncertain or process.poll() is None or _group_running(process.pid, reader)
+
+
+def _process_table() -> list[tuple[int, int, int, str]] | None:
+    """Best-effort ``(pid, ppid, pgid, stat)`` snapshot; None when unavailable."""
+    ps = shutil.which("ps") or "/bin/ps"
+    try:
+        listing = subprocess.run(
+            [ps, "-axo", "pid=,ppid=,pgid=,stat="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listing.returncode != 0:
+        return None
+    table = []
+    for line in listing.stdout.splitlines():
+        columns = line.split()
+        if len(columns) < 3:
+            continue
+        try:
+            pid, ppid, pgid = int(columns[0]), int(columns[1]), int(columns[2])
+        except ValueError:
+            continue
+        table.append((pid, ppid, pgid, columns[3] if len(columns) > 3 else ""))
+    return table
+
+
+def _track_descendants(leader_pid: int, tracked: dict[int, tuple[int, str]]) -> None:
+    """Record every descendant of the leader by parent pid, whatever its pgid.
+
+    ``tracked`` maps pid -> (last observed pgid, last observed stat) and is
+    kept for the life of the run so a descendant that later calls setsid()
+    or is reparented after the leader exits is still attributed to the run.
+    """
+    table = _process_table()
+    if table is None:
+        return
+    known = {leader_pid, *tracked}
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid, pgid, stat in table:
+            if pid == leader_pid:
+                continue
+            if pid in tracked or ppid in known:
+                tracked[pid] = (pgid, stat)
+                if pid not in known:
+                    known.add(pid)
+                    changed = True
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _escaped_descendants(leader_pid: int, tracked: dict[int, tuple[int, str]]) -> list[int]:
+    """Tracked pids outside the leader's group that are still alive (not zombies)."""
+    _track_descendants(leader_pid, tracked)
+    return sorted(
+        pid for pid, (pgid, stat) in tracked.items()
+        if pgid != leader_pid and not stat.startswith(("Z", "X")) and _pid_alive(pid)
+    )
+
+
+def _terminate_pids(pids: Sequence[int], *, grace_s: float) -> bool:
+    """TERM, then KILL, individual escaped pids; return whether all are gone."""
+    def signal_all(sig: int) -> None:
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def wait_gone(deadline: float) -> bool:
+        while True:
+            if not any(_pid_alive(pid) for pid in pids):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+    signal_all(signal.SIGTERM)
+    if wait_gone(time.monotonic() + grace_s):
+        return True
+    signal_all(signal.SIGKILL)
+    return wait_gone(time.monotonic() + DESCENDANT_KILL_WAIT_S)
 
 
 def _collect_event_names(stream, collected: list[str]) -> None:
@@ -443,8 +612,15 @@ def _supervise_fake_command_locked(
     """Run after atomically reserving the harness state directory."""
     job_id = job_id or str(uuid.uuid4())
     journal = state_dir / "journal.jsonl"
-    if _latest(_read_jsonl(journal), job_id) is not None:
+    records = _read_jsonl(journal)
+    if _latest(records, job_id) is not None:
         raise SpikeError("This job ID already exists; uncertain or completed work is never replayed.")
+    latest_states: dict[str, object] = {}
+    for row in records:
+        if isinstance(row.get("job_id"), str):
+            latest_states[row["job_id"]] = row.get("state")
+    if any(state in NON_TERMINAL_STATES for state in latest_states.values()):
+        raise SpikeError("Journal has unrecovered non-terminal jobs; run recover first.")
 
     # The durable intent precedes launch. A restart from here becomes uncertain.
     _append_jsonl(journal, {"job_id": job_id, "state": "starting"})
@@ -452,6 +628,10 @@ def _supervise_fake_command_locked(
         state_dir / "evidence.jsonl",
         {"kind": "launch_intent", "job_id": job_id, "state": "starting"},
     )
+    # Allowlisted environment only: the fake never inherits the operator's
+    # credentials or provider settings. SPIKE_* is the test-marker channel.
+    child_env = {"PATH": os.defpath, "HOME": str(state_dir)}
+    child_env.update({k: v for k, v in os.environ.items() if k.startswith("SPIKE_")})
     try:
         process = subprocess.Popen(
             list(argv),
@@ -461,6 +641,7 @@ def _supervise_fake_command_locked(
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=child_env,
             start_new_session=True,
             close_fds=True,
         )
@@ -473,7 +654,7 @@ def _supervise_fake_command_locked(
         target=_collect_event_names, args=(process.stdout, event_names), daemon=True
     )
     try:
-        _append_jsonl(journal, {"job_id": job_id, "state": "running"})
+        _append_jsonl(journal, {"job_id": job_id, "state": "running", "pgid": process.pid})
         reader.start()
     except BaseException:
         _terminate_group(process, reader, grace_s=grace_s)
@@ -483,8 +664,17 @@ def _supervise_fake_command_locked(
     cleanup_uncertain = False
     leftovers = False
     unexpected_leftovers = False
+    tracked: dict[int, tuple[int, str]] = {}
+    escaped: list[int] = []
+    escaped_terminated = True
     try:
+        next_snapshot = 0.0
         while process.poll() is None and time.monotonic() < deadline:
+            if time.monotonic() >= next_snapshot:
+                # Best effort: descendants are attributed by parent pid while
+                # the leader is alive, whatever group they moved to.
+                _track_descendants(process.pid, tracked)
+                next_snapshot = time.monotonic() + DESCENDANT_SNAPSHOT_INTERVAL_S
             time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         timed_out = process.poll() is None
         if timed_out:
@@ -502,12 +692,17 @@ def _supervise_fake_command_locked(
                 _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
                 cleanup_uncertain = _terminate_group(process, reader, grace_s=grace_s)
         unexpected_leftovers = bool(not timed_out and leftovers)
+        # Re-snapshot once more, then hunt tracked descendants that left the
+        # group (setsid). Anything found forces "interrupted" below.
+        escaped = _escaped_descendants(process.pid, tracked)
+        if escaped:
+            escaped_terminated = _terminate_pids(escaped, grace_s=grace_s)
     except BaseException:
         _terminate_group(process, reader, grace_s=grace_s)
         raise
 
     reader.join(timeout=1)
-    if reader.is_alive() or cleanup_uncertain or unexpected_leftovers:
+    if reader.is_alive() or cleanup_uncertain or unexpected_leftovers or escaped:
         final_state = "interrupted"
     elif timed_out:
         final_state = "cancelled"
@@ -519,6 +714,8 @@ def _supervise_fake_command_locked(
         {
             "kind": "supervision_result", "job_id": job_id, "state": final_state,
             "returncode": process.returncode, "event_names": event_names,
+            "escaped_descendants": escaped,
+            "escaped_descendants_terminated": escaped_terminated,
         },
     )
     return {"job_id": job_id, "state": final_state, "returncode": process.returncode,
@@ -550,6 +747,9 @@ def inspect_codex(codex_bin: str | None, evidence_dir: Path) -> dict:
     help_text = help_result.stdout + help_result.stderr
     if version.returncode != 0 or help_result.returncode != 0 or not version_text:
         raise SpikeError("Codex version/help probe failed; details were not retained.")
+    # Only a bare "codex-cli <token>" line is ever written to evidence.
+    if not _VERSION_OUTPUT.fullmatch(version_text):
+        raise SpikeError("Unrecognised version output")
     observed = {
         "version": version_text,
         "expected_version": DISCOVERED_CODEX_VERSION,
@@ -759,6 +959,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
             result = {}
     except SpikeError as exc:
         print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError):
+        # Never echo an OS error: it can carry paths or other operator details.
+        print("refused: harness failure (details withheld)", file=sys.stderr)
         return 2
     print(json.dumps(result, sort_keys=True))
     return 0
