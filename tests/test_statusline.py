@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ import pytest
 from openswap import statusline as sl
 from openswap.exceptions import ConfigError
 from openswap.models import Platform
+from openswap.settings import _settings_write_lock, atomic_write_json, settings_path
 from tests.test_codex_auth import _auth
 
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
@@ -193,6 +195,59 @@ class TestCurrentAccountLabel:
 
 
 class TestInstallWrap:
+    def test_save_wrap_serializes_with_worker_settings_updates(self, tmp_path: Path, monkeypatch):
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        path = settings_path(backup)
+        path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "worker": {"enabled": True, "paused": False},
+                    "unrelated": {"keep": "value"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        lock_requested = threading.Event()
+        errors: list[BaseException] = []
+        real_lock_factory = _settings_write_lock
+
+        def observed_lock(root: Path):
+            lock_requested.set()
+            return real_lock_factory(root)
+
+        monkeypatch.setattr(sl, "_settings_write_lock", observed_lock)
+
+        def save_statusline():
+            try:
+                sl.save_wrap(backup, inner_command="custom-line", created=True)
+            except BaseException as error:  # propagate worker-thread failures
+                errors.append(error)
+
+        with real_lock_factory(backup):
+            writer = threading.Thread(target=save_statusline)
+            writer.start()
+            assert lock_requested.wait(timeout=2)
+
+            # Model the worker pause update while statusline waits for the same
+            # settings lock. The statusline writer must reread after acquiring it.
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw["worker"]["paused"] = True
+            atomic_write_json(path, raw)
+
+        writer.join(timeout=2)
+        assert not writer.is_alive()
+        assert errors == []
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["worker"]["paused"] is True
+        assert saved["unrelated"] == {"keep": "value"}
+        assert saved["statusline"] == {
+            "innerCommand": "custom-line",
+            "created": True,
+        }
+
     def test_only_openswap_statusline_is_recognized_as_ours(self):
         assert sl.is_our_command("openswap statusline") is True
         assert sl.is_our_command("/usr/local/bin/openswap statusline") is True

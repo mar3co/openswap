@@ -169,7 +169,7 @@ LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
 The Phase 2 full-suite validation on the currently integrated PR #59 snapshot
-`f684ebf` is green: `3078 passed, 4 skipped, 3 warnings in 17.29s`. The run
+`f684ebf` is green: `3079 passed, 4 skipped, 3 warnings in 19.99s`. The run
 used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree.
@@ -231,6 +231,12 @@ the lifecycle lock and before provider locks, preserving the settings-lock
 inode through deletion. A concurrency regression holds the settings writer
 lock while purge waits, then verifies purge removes managed data without
 replacing the lock inode.
+Follow-up #4125777799 is addressed: `statusline.save_wrap` now uses the shared
+settings write lock across its read-modify-write, so status-line setup/removal
+cannot restore stale worker pause/enable policy. A deterministic concurrent
+writer test verifies the worker policy and unrelated settings survive. A
+read-only audit found no other active `settings.json` read-modify-write path
+outside the shared settings helpers and status-line writer.
 
 ## Deviations and verification
 
