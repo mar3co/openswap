@@ -473,16 +473,16 @@ def test_live_default_kickoff_refuses_unmatched_or_ambiguous_identity(
     assert AccountLeaseStore(root, "claude").current() is None
 
 
-def test_kickoff_timeout_releases_lease_as_confirmed_stopped_and_allows_replay(
+def test_kickoff_timeout_quarantines_account_until_owner_confirms_release(
     tmp_path: Path, monkeypatch
 ):
-    """subprocess.run() has already killed and reaped the child by the time
-    TimeoutExpired reaches us, on every platform: that is stop proof, not
-    uncertainty, so the account must not be left quarantined behind a lease
-    only the (now nonexistent) worker CLI could clear."""
+    """subprocess.run() kills only the direct child on timeout; a helper it
+    spawned may still use the profile, so the lease stays uncertain and the
+    kickoff is not replayed until the owner confirms and releases it."""
     from openswap.kickoff import paths
     from openswap.settings import update_worker_settings
-    from openswap.worker.leases import AccountLeaseStore, ReleaseEvidence
+    from openswap.worker import cli as worker_cli
+    from openswap.worker.leases import AccountLeaseStore, LeaseConflictError
     from tests.test_codex_auth import _auth
 
     root = _fake_lease_roster(monkeypatch, tmp_path, "codex")
@@ -509,8 +509,22 @@ def test_kickoff_timeout_releases_lease_as_confirmed_stopped_and_allows_replay(
     with pytest.raises(subprocess.TimeoutExpired):
         invoke(timed_out)
     lease = AccountLeaseStore(root, "codex").current()
-    assert lease.state == "released"
-    assert lease.reason == ReleaseEvidence.CONFIRMED_STOPPED.value
+    assert lease.state == "uncertain"
+    assert lease.reason == "kickoff_timeout"
+
+    def must_not_relaunch(*_args, **_kwargs):
+        pytest.fail("kickoff was replayed after an uncertain timeout")
+
+    with pytest.raises(LeaseConflictError):
+        invoke(must_not_relaunch)
+
+    # The menu process that holds it is still alive; once the lease has
+    # expired, the owner's explicit confirmation releases it.
+    assert worker_cli.release_lease(root, "codex")[2] == "lease_not_expired"
+    with monkeypatch.context() as expired:
+        expired.setattr(AccountLeaseStore, "_now", lambda self: lease.expires_at + 1)
+        assert worker_cli.release_lease(root, "codex")[2] == "stop_unproven_confirm_required"
+        assert worker_cli.release_lease(root, "codex", confirm_stopped=True)[0] is True
 
     def relaunch(argv, **kwargs):
         started.append(list(argv))

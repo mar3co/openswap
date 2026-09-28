@@ -334,10 +334,10 @@ def _run_kickoff_with_lease(provider: str, selected_home, run_fn, argv, **kwargs
     try:
         result = run_fn(argv, **kwargs)
     except subprocess.TimeoutExpired:
-        # subprocess.run() already killed and waited on the child before
-        # raising this, on every platform: the process is confirmed gone,
-        # not merely uncertain.
-        store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+        # subprocess.run() kills and reaps only the direct child; a helper it
+        # spawned may still be using the profile, so stopping is not proven.
+        # The owner can clear this with `openswap worker lease release`.
+        store.mark_uncertain(token, "kickoff_timeout")
         raise
     except OSError:
         store.release(token, ReleaseEvidence.UNLAUNCHED)

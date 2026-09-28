@@ -385,7 +385,9 @@ def test_release_lease_succeeds_after_worker_gone_and_job_terminal_then_switch_w
     assert runtime.store.get(job.job_id).state == JobState.INTERRUPTED
     assert AccountLeaseStore(tmp_path, "codex").current().state == "uncertain"
 
-    ok, result, diagnostic = cli.release_lease(tmp_path)
+    # INTERRUPTED records uncertainty, not a stop: the owner must confirm.
+    assert cli.release_lease(tmp_path) == (False, {}, "stop_unproven_confirm_required")
+    ok, result, diagnostic = cli.release_lease(tmp_path, confirm_stopped=True)
 
     assert ok is True
     assert diagnostic is None
@@ -448,6 +450,25 @@ def test_release_lease_treats_a_missing_worker_job_row_as_unproven(tmp_path: Pat
 
     assert cli.release_lease(tmp_path) == (False, {}, "stop_unproven_confirm_required")
     assert cli.release_lease(tmp_path, confirm_stopped=True)[0] is True
+
+
+def test_release_lease_needs_confirmation_for_an_interrupted_job(tmp_path: Path):
+    """INTERRUPTED records uncertainty, not a stop, even under a newer epoch."""
+    job_store = LocalJobStore(tmp_path)
+    epoch = job_store.current_epoch()
+    job_id = _running_job(job_store, epoch=epoch)
+    AccountLeaseStore(tmp_path, "codex").acquire(
+        job_id=job_id,
+        account_identity=stable_account_identity("codex", "acct-a"),
+        worker_pid=_dead_pid(),
+        worker_epoch=epoch,
+        ttl_s=60,
+    )
+    job_store.start_epoch(os.getpid())  # a replacement worker interrupts the row
+    assert job_store.get(job_id).state == JobState.INTERRUPTED
+
+    assert cli.release_lease(tmp_path) == (False, {}, "stop_unproven_confirm_required")
+    assert cli.release_lease(tmp_path, confirm_stopped=True) == (True, {"lease_state": "released"}, None)
 
 
 def test_lease_release_cli_selects_the_claude_store(tmp_path: Path, capsys):
