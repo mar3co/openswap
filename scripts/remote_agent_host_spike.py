@@ -314,17 +314,20 @@ def inspect_codex(codex_bin: str | None, evidence_dir: Path) -> dict:
     if not binary.is_file():
         raise SpikeError("Codex executable does not exist.")
     _private_dir(evidence_dir)
-    with tempfile.TemporaryDirectory(prefix="openswap-codex-spike-") as temp:
-        home = Path(temp)
-        codex_home = home / "codex"
-        codex_home.mkdir(mode=0o700)
-        env = {"PATH": os.defpath, "HOME": str(home), "CODEX_HOME": str(codex_home)}
-        version = subprocess.run([str(binary), "--version"], env=env, cwd=temp,
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True, timeout=10, check=False)
-        help_result = subprocess.run([str(binary), "exec", "--help"], env=env, cwd=temp,
+    try:
+        with tempfile.TemporaryDirectory(prefix="openswap-codex-spike-") as temp:
+            home = Path(temp)
+            codex_home = home / "codex"
+            codex_home.mkdir(mode=0o700)
+            env = {"PATH": os.defpath, "HOME": str(home), "CODEX_HOME": str(codex_home)}
+            version = subprocess.run([str(binary), "--version"], env=env, cwd=temp,
                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, text=True, timeout=15, check=False)
+                                     stderr=subprocess.PIPE, text=True, timeout=10, check=False)
+            help_result = subprocess.run([str(binary), "exec", "--help"], env=env, cwd=temp,
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise SpikeError("Codex version/help probe could not complete.") from None
     version_text = version.stdout.strip()
     help_text = help_result.stdout + help_result.stderr
     if version.returncode != 0 or help_result.returncode != 0 or not version_text:

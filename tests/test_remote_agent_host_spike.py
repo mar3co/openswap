@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -218,6 +219,39 @@ def test_unavailable_group_enumeration_keeps_existing_group_uncertain(monkeypatc
 
     assert spike._group_running(4321, threading.Thread()) is True
     assert signaled == [(4321, 0)]
+
+
+@pytest.mark.parametrize("stage", ["version", "exec_help"])
+@pytest.mark.parametrize("failure", ["os_error", "timeout"])
+def test_inspect_cli_sanitizes_probe_launch_and_timeout_errors(
+    tmp_path, monkeypatch, capsys, stage, failure
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        current_stage = "version" if command[-1] == "--version" else "exec_help"
+        if current_stage == stage:
+            if failure == "os_error":
+                raise OSError("raw-secret-marker")
+            raise subprocess.TimeoutExpired(command, timeout=0.1, output="raw-secret-marker")
+        return subprocess.CompletedProcess(command, 0, "codex-cli 1.0-test\n", "")
+
+    monkeypatch.setattr(spike.subprocess, "run", fake_run)
+
+    code = spike._main([
+        "inspect", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == "refused: Codex version/help probe could not complete.\n"
+    assert "raw-secret-marker" not in captured.err
+    assert "Traceback" not in captured.err
+    assert len(calls) == (1 if stage == "version" else 2)
 
 
 def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):
