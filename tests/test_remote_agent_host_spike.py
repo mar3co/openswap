@@ -1410,6 +1410,51 @@ def test_exception_after_detach_still_terminates_tracked_descendant(tmp_path, mo
                 pass
 
 
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_startup_journal_failure_still_terminates_detached_descendant(tmp_path, monkeypatch):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-detaching-lingering-provider",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    real_append = spike._append_jsonl
+
+    def failing_append(path, record):
+        if record.get("state") == "running":
+            # A slow disk: the helper has detached before the append fails.
+            deadline = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise OSError("disk full")
+        real_append(path, record)
+
+    monkeypatch.setattr(spike, "_append_jsonl", failing_append)
+    try:
+        with pytest.raises(OSError, match="disk full"):
+            supervise_fake_command(
+                [str(fake)], state_dir=tmp_path / "state", timeout_s=5, grace_s=0.3,
+                job_id="detached-startup-fail",
+            )
+        assert pid_file.exists(), "detached child never reported its pid"
+        assert _wait_for_pid_exit(int(pid_file.read_text()), 2.0)
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), 9)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+
+
 def test_terminate_pids_counts_exited_unreaped_pidfd_descendant_as_gone(monkeypatch):
     sent = []
 

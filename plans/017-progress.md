@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest assembled-branch suite is green: `2963 passed, 4 skipped, 3 warnings
-in 18.99s`; it includes 90 phase-one harness tests and two direct tests of the
+The latest assembled-branch suite is green: `2964 passed, 4 skipped, 3 warnings
+in 20.16s`; it includes 91 phase-one harness tests and two direct tests of the
 Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
@@ -108,7 +108,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2963 passed, 4 skipped, 3 warnings in 18.99s`).
+  (`2964 passed, 4 skipped, 3 warnings in 20.16s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -170,7 +170,10 @@ until the owner records a permitted path or exclusion.
   makes a stranger's children signalable. The `inspect` and `sandbox-probe`
   runner tracks descendants the same way: a helper that calls `setsid()` is
   terminated and the probe result is refused, and the probe checks for exit
-  before reading so output written just before exit is never dropped.
+  before reading so output written just before exit is never dropped. A
+  supervision failure at any point after launch, including the `running`
+  journal append, snapshots descendants, terminates the group and sweeps
+  detached descendants before reaping the leader.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the

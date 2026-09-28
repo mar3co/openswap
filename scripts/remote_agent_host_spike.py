@@ -572,6 +572,36 @@ def _reap_leader(process: subprocess.Popen, timeout_s: float = 1.0) -> None:
         pass
 
 
+def _abort_supervision(
+    process: subprocess.Popen,
+    reader: threading.Thread,
+    tracked: dict[int, tuple[int, str, str, int | None, str, bool]],
+    *,
+    grace_s: float,
+) -> None:
+    """Best-effort cleanup after a supervision failure, then reap the leader.
+
+    A failure after a descendant detached (for example a full disk on a
+    journal append) must not leave that descendant running, so descendants
+    are snapshotted while the leader is still their parent, the group is
+    terminated, and tracked descendants outside the group are swept.
+    """
+    try:
+        _track_descendants(process.pid, tracked)
+    except Exception:
+        pass
+    try:
+        _terminate_group(process, reader, grace_s=grace_s)
+        leftover = _escaped_descendants(process.pid, tracked)
+        if leftover:
+            _terminate_pids(leftover, grace_s=grace_s)
+    except Exception:
+        pass
+    finally:
+        _close_handles(tracked)
+        _reap_leader(process)
+
+
 def _process_table() -> list[tuple[int, int, int, str, str, str]] | None:
     """Best-effort ``(pid, ppid, pgid, stat, birth, identity)`` snapshot; None when unavailable.
 
@@ -968,19 +998,18 @@ def _supervise_fake_command_locked(
     reader = threading.Thread(
         target=_collect_event_names, args=(process.stdout, event_names), daemon=True
     )
+    tracked: dict[int, tuple[int, str, str, int | None, str, bool]] = {}
     try:
         _append_jsonl(journal, {"job_id": job_id, "state": "running", "pgid": process.pid})
         reader.start()
     except BaseException:
-        _terminate_group(process, reader, grace_s=grace_s)
-        _reap_leader(process)
+        _abort_supervision(process, reader, tracked, grace_s=grace_s)
         raise
     deadline = time.monotonic() + timeout_s
     timed_out = False
     cleanup_uncertain = False
     leftovers = False
     unexpected_leftovers = False
-    tracked: dict[int, tuple[int, str, str, int | None, str, bool]] = {}
     escaped: dict[int, tuple[str, int | None, bool]] = {}
     escaped_terminated = True
     escaped_signalling = SIGNALLING_PIDFD
@@ -1029,18 +1058,7 @@ def _supervise_fake_command_locked(
         # Only now is the leader reaped: discovery and cleanup are complete.
         _reap_leader(process, timeout_s=5.0)
     except BaseException:
-        _terminate_group(process, reader, grace_s=grace_s)
-        # A failure after a descendant detached (for example a full disk on the
-        # cancel_requested append) must not leave that descendant running.
-        try:
-            leftover = _escaped_descendants(process.pid, tracked)
-            if leftover:
-                _terminate_pids(leftover, grace_s=grace_s)
-        except Exception:
-            pass
-        finally:
-            _close_handles(tracked)
-            _reap_leader(process)
+        _abort_supervision(process, reader, tracked, grace_s=grace_s)
         raise
     _close_handles(tracked)
 
