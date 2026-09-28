@@ -597,12 +597,23 @@ def _pid_identity(pid: int) -> str | None:
 
 def _pid_birth(pid: int) -> str | None:
     """Immutable start time of ``pid`` from the snapshot parser, or None when gone."""
+    row = _pid_row(pid)
+    return None if row is None else row[2]
+
+
+def _pid_row(pid: int) -> tuple[int, int, str, str] | None:
+    """``(ppid, pgid, birth, identity)`` for a live ``pid``, or None when gone.
+
+    Used to validate a freshly opened pidfd: a pid reused within the same
+    second keeps the same second-resolution start time, so the parent, group
+    and command line must all still match the snapshot as well.
+    """
     table = _process_table()
     if table is None:
         return None
-    for entry_pid, _ppid, _pgid, stat, birth, _identity_ in table:
+    for entry_pid, ppid, pgid, stat, birth, identity in table:
         if entry_pid == pid:
-            return None if stat.startswith(("Z", "X")) else birth
+            return None if stat.startswith(("Z", "X")) else (ppid, pgid, birth, identity)
     return None
 
 
@@ -676,8 +687,9 @@ def _track_descendants(
                     handle = _open_pidfd(pid)
                     # Opening the handle is not atomic with the snapshot: if
                     # the pid was reused in between, the handle binds to a
-                    # stranger. Re-read the start time and refuse a mismatch.
-                    if handle is not None and _pid_birth(pid) != birth:
+                    # stranger. The start time alone has second resolution,
+                    # so parent, group and command must all still match too.
+                    if handle is not None and _pid_row(pid) != (ppid, pgid, birth, identity):
                         try:
                             os.close(handle)
                         except OSError:

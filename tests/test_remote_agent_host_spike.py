@@ -1242,7 +1242,7 @@ def test_track_descendants_never_drops_an_entry_that_holds_a_pidfd(monkeypatch):
     ])
     monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
     monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 55)
-    monkeypatch.setattr(spike, "_pid_birth", lambda pid: "tA")
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tA", "tA|pgid=4242|child"))
     tracked: dict = {}
     spike._track_descendants(100, tracked)
     assert tracked[4242][3] == 55
@@ -1395,7 +1395,8 @@ def test_track_descendants_refuses_handle_whose_identity_changed_after_open(monk
                         lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
                                  (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
     monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 77)
-    monkeypatch.setattr(spike, "_pid_birth", lambda pid: "tB")  # reused after snapshot
+    # Reused within the same second: same start time, different parent/command.
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (1, 4242, "tA", "tA|pgid=4242|stranger"))
     monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
     tracked: dict = {}
     spike._track_descendants(100, tracked)
@@ -1473,3 +1474,17 @@ def test_version_grammar_accepts_real_version_shapes(version):
 @pytest.mark.parametrize("token", ["sk-live-ABC123", "v1", "1", "1.2.3 extra", "../etc", ""])
 def test_version_grammar_rejects_non_version_tokens(token):
     assert not spike._VERSION_OUTPUT.fullmatch(f"codex-cli {token}")
+
+
+def test_track_descendants_accepts_handle_when_full_row_still_matches(monkeypatch):
+    closed = []
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 78)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tA", "tA|pgid=4242|child"))
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked == {4242: (4242, "S", "tA", 78, "tA|pgid=4242|child")}
+    assert closed == []
