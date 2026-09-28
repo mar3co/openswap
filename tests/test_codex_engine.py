@@ -103,6 +103,12 @@ def test_worker_lease_blocks_codex_switch_and_roster_mutations(tmp_path):
     with pytest.raises(LeaseConflictError):
         eng.switch_to("1", json_output=True)
     with pytest.raises(LeaseConflictError):
+        eng.set_account_disabled("1", True)
+    with pytest.raises(LeaseConflictError):
+        eng.set_alias("1", "work")
+    with pytest.raises(LeaseConflictError):
+        eng.unset_alias("1")
+    with pytest.raises(LeaseConflictError):
         eng.move_account("1", "3")
     with pytest.raises(LeaseConflictError):
         eng.swap_accounts("1", "2")

@@ -40,6 +40,7 @@ class LeaseStateError(AccountLeaseError):
 class ReleaseEvidence(str, Enum):
     UNLAUNCHED = "unlaunched"
     CONFIRMED_STOPPED = "confirmed_stopped"
+    OWNER_RELEASED = "owner_released"
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,14 @@ class LeaseMutationGuard:
             ttl_s=ttl_s,
             guard=self,
         )
+
+    def current(self) -> AccountLease | None:
+        """Read the lease while this guard already owns the provider lock."""
+        return self._store._read_lease()
+
+    def release(self, token: LeaseToken, evidence: ReleaseEvidence) -> None:
+        """Release while this guard already owns the provider lock."""
+        self._store._release_locked(token, evidence)
 
 
 class AccountLeaseStore:
@@ -268,12 +277,15 @@ class AccountLeaseStore:
     def release(self, token: LeaseToken, evidence: ReleaseEvidence) -> None:
         if not isinstance(evidence, ReleaseEvidence):
             raise LeaseStateError("Explicit lease release evidence is required.")
-        with self.mutation_guard():
-            lease = self._require_token(token)
-            if lease.state == "released":
-                return
-            released = AccountLease(**{**lease.__dict__, "state": "released", "reason": evidence.value})
-            self._write_document(released)
+        with self.mutation_guard() as guard:
+            guard.release(token, evidence)
+
+    def _release_locked(self, token: LeaseToken, evidence: ReleaseEvidence) -> None:
+        lease = self._require_token(token)
+        if lease.state == "released":
+            return
+        released = AccountLease(**{**lease.__dict__, "state": "released", "reason": evidence.value})
+        self._write_document(released)
 
     def current(self) -> AccountLease | None:
         with self.mutation_guard():
@@ -359,6 +371,7 @@ class AccountLeaseStore:
             if lease.state == "released" and lease.reason not in {
                 ReleaseEvidence.UNLAUNCHED.value,
                 ReleaseEvidence.CONFIRMED_STOPPED.value,
+                ReleaseEvidence.OWNER_RELEASED.value,
             }:
                 raise ValueError
             return lease

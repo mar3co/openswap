@@ -25,6 +25,7 @@ from openswap.codex.auth import CODEX_HOME_ENV
 from openswap.exceptions import SessionError
 from openswap.session import AUTH_OVERRIDE_ENV_VARS
 from openswap import paths
+from openswap.settings import load_worker_settings
 from openswap.worker.leases import AccountLeaseStore, ReleaseEvidence, stable_account_identity
 
 KICKOFF_PROMPT = "ok"
@@ -247,6 +248,31 @@ def _kickoff_account_identity(provider: str, selected_home: Path | str | None) -
             raise SessionError("Cannot verify the account for scheduled kickoff.")
         return stable_account_identity(provider, email, organization)
 
+    if provider == "codex" and selected_home is None:
+        # Same reasoning as the Claude branch above, for the default Codex
+        # login: resolve identity the way the engine does (CodexEngine
+        # current_account_number / _live_slot, via the live auth.json's own
+        # OAuth claims), never the roster's possibly-stale activeAccountNumber.
+        from openswap.codex.auth import auth_path, codex_home, parse_auth
+
+        try:
+            live_text = auth_path(codex_home()).read_text(encoding="utf-8")
+        except OSError:
+            raise SessionError("Cannot verify the account for scheduled kickoff.") from None
+        identity = parse_auth(live_text)
+        if identity is None or not (identity.email or identity.account_id):
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+        matching_slots = [
+            number
+            for number, record in accounts.items()
+            if isinstance(record, dict)
+            and record.get("email") == identity.email
+            and record.get("accountId") == identity.account_id
+        ]
+        if len(matching_slots) != 1 or not identity.account_id:
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+        return stable_account_identity(provider, identity.account_id)
+
     selected_num = str(roster.get("activeAccountNumber") or "")
     if selected_home is not None:
         home = Path(selected_home)
@@ -285,6 +311,13 @@ def _kickoff_account_identity(provider: str, selected_home: Path | str | None) -
 
 def _run_kickoff_with_lease(provider: str, selected_home, run_fn, argv, **kwargs):
     backup_root = paths.get_backup_root()
+    if not load_worker_settings(backup_root).enabled:
+        # Remote tasks were never opted into, so the worker lease this
+        # coordinates with cannot be held by anything else either. Taking one
+        # here anyway would let a bare kickoff timeout quarantine an account
+        # for a feature nobody turned on, with no worker CLI around to clear
+        # it. Match pre-worker behaviour: just run the ping.
+        return run_fn(argv, **kwargs)
     store = AccountLeaseStore(backup_root, provider)
     # Identity is resolved only while holding the same provider lock used for
     # lease acquisition and account mutations, closing the snapshot/acquire race.
@@ -301,7 +334,10 @@ def _run_kickoff_with_lease(provider: str, selected_home, run_fn, argv, **kwargs
     try:
         result = run_fn(argv, **kwargs)
     except subprocess.TimeoutExpired:
-        store.mark_uncertain(token, "kickoff_timeout")
+        # subprocess.run() already killed and waited on the child before
+        # raising this, on every platform: the process is confirmed gone,
+        # not merely uncertain.
+        store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
         raise
     except OSError:
         store.release(token, ReleaseEvidence.UNLAUNCHED)

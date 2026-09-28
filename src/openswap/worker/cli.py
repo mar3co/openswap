@@ -18,12 +18,18 @@ from openswap.worker.client import WorkerClient
 from openswap.worker.ipc import IpcError, socket_path
 from openswap.worker.journal import LocalJobStore
 from openswap.worker.launch_agent import install, uninstall
-from openswap.worker.runtime import read_worker_snapshot
+from openswap.worker.leases import AccountLeaseStore, ReleaseEvidence
+from openswap.worker.models import JobState
+from openswap.worker.runtime import _pid_exists, read_worker_snapshot
 
 _DISABLE_WAIT_SECONDS = 3.0
 _DISABLE_POLL_SECONDS = 0.1
 _DISABLE_EXIT_WAIT_SECONDS = 3.0
 _LIFECYCLE_LOCK_TIMEOUT_SECONDS = 5.0
+_LEASE_TERMINAL_JOB_STATES = {
+    JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED,
+    JobState.INTERRUPTED, JobState.EXPIRED,
+}
 
 
 def _migrate_legacy_before_worker_state_change(backup_root: Path) -> None:
@@ -322,6 +328,47 @@ def _blocked(backup_root: Path, snapshot: dict, diagnostic: str) -> tuple[bool, 
     return False, snapshot, diagnostic
 
 
+def release_lease(backup_root: Path) -> tuple[bool, dict, str | None]:
+    """Manually release a stuck ``active``/``uncertain`` codex account lease.
+
+    This is the only supported way to clear a lease a crashed worker never
+    resolved. It never auto-releases and never relaunches anything: a lease
+    is released only after this proves, from the journal alone, that both
+    (a) the worker process that recorded it is gone — a newer worker epoch
+    has since started, or its recorded pid is no longer alive — and (b) its
+    job is terminal or missing from the journal. Otherwise it refuses. The
+    release itself is recorded as ordinary lease evidence, like every other
+    lease state transition.
+    """
+    root = Path(backup_root)
+    _migrate_legacy_before_worker_state_change(root)
+    job_store = LocalJobStore(root)
+    lease_store = AccountLeaseStore(root, "codex")
+    with lifecycle_lock(root):
+        with lease_store.mutation_guard() as guard:
+            lease = guard.current()
+            if lease is None:
+                return False, {}, "lease_not_found"
+            if lease.state == "released":
+                return True, {"lease_state": "released"}, "already_released"
+            if lease.state not in {"active", "uncertain"}:
+                return False, {}, "lease_state_unknown"
+            owner_gone = (
+                job_store.current_epoch() > lease.worker_epoch
+                or not _pid_exists(lease.worker_pid)
+            )
+            if not owner_gone:
+                return False, {}, "worker_owner_may_be_alive"
+            try:
+                job_resolved = job_store.get(lease.job_id).state in _LEASE_TERMINAL_JOB_STATES
+            except KeyError:
+                job_resolved = True
+            if not job_resolved:
+                return False, {}, "job_not_terminal"
+            guard.release(lease.token(), ReleaseEvidence.OWNER_RELEASED)
+            return True, {"lease_state": "released"}, None
+
+
 def _run(backup_root: Path) -> int:
     try:
         with lifecycle_lock(backup_root):
@@ -358,6 +405,12 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     enable_parser.add_argument("--json", action="store_true")
     disable_parser = commands.add_parser("disable", help="safely stop and disable the worker")
     disable_parser.add_argument("--json", action="store_true")
+    lease_parser = commands.add_parser("lease", help="manage the local worker's account lease")
+    lease_commands = lease_parser.add_subparsers(dest="lease_command", required=True)
+    lease_release_parser = lease_commands.add_parser(
+        "release", help="release a stuck lease once its worker is proven gone"
+    )
+    lease_release_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     root = Path(backup_root) if backup_root is not None else get_backup_root()
 
@@ -445,6 +498,22 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             return 1
         payload = {"enabled": False, **result}
         _write(payload, as_json=args.json, human="Remote tasks worker disabled.")
+        return 0
+    if args.command == "lease" and args.lease_command == "release":
+        try:
+            ok, result, diagnostic = release_lease(root)
+        except ClaudeSwitchError:
+            print("Worker lifecycle is busy; try again shortly.", file=sys.stderr)
+            return 1
+        if not ok:
+            print(f"Lease was not released ({diagnostic}).", file=sys.stderr)
+            return 1
+        payload = {"released": True, **result}
+        human = (
+            "Account lease was already released." if diagnostic == "already_released"
+            else "Account lease released."
+        )
+        _write(payload, as_json=args.json, human=human)
         return 0
     parser.error("unsupported worker command")
     return 2

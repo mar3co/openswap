@@ -183,6 +183,21 @@ class TestCLI:
         assert "Use 'openswap' instead" in capsys.readouterr().err
         migrate.assert_called_once_with()
 
+    def test_stale_cswap_launcher_rejects_worker_subcommand_too(self, capsys, monkeypatch):
+        """A stale `cswap` launcher must not reach the worker CLI either."""
+        monkeypatch.setattr(sys, "argv", ["/usr/local/bin/cswap", "worker", "status"])
+        monkeypatch.setattr(cli, "_migrate_legacy_cswap_state", lambda: None)
+        monkeypatch.setattr(
+            "openswap.worker.cli.main",
+            lambda argv: pytest.fail("worker CLI must not run under 'cswap'"),
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main()
+
+        assert excinfo.value.code == 2
+        assert "Use 'openswap' instead" in capsys.readouterr().err
+
     def test_tui_and_watch_are_gone(self):
         for verb in ("tui", "watch"):
             result = subprocess.run(

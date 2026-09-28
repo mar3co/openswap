@@ -172,7 +172,9 @@ The Phase 2 full-suite validation on the currently integrated PR #59 snapshot
 `f684ebf` is green: `3082 passed, 4 skipped, 3 warnings in 20.02s`. The run
 used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
-has not been merged into this tree.
+has not been merged into this tree. After the PR #60 review-fix pass below,
+the full suite on this tree remains green:
+`3121 passed, 4 skipped, 3 warnings in 28.86s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -247,6 +249,30 @@ available after opt-out and service unload. Timeout leaves policy disabled
 and paused, reports that stop is unconfirmed, and blocks re-enable while the
 old process still owns the lock. The regression uses a fake lock holder and
 mocked service, with no real LaunchAgent operation.
+A follow-up review pass against this tree is addressed: a worker restart now
+marks an `active` lease left by a crashed process `uncertain` (reason
+`worker_restarted`), and an explicit `openswap worker lease release` command
+releases an `active`/`uncertain` lease only after proving its recording
+worker is gone (a newer journal epoch has started, or its pid is no longer
+alive) and its job is terminal or absent from the journal; it never
+auto-releases or relaunches anything. Scheduled kickoff no longer takes a
+lease at all while Remote tasks are disabled, and a kickoff timeout now
+releases its lease as confirmed-stopped (the child is already killed and
+reaped by the time `subprocess.run` raises) instead of leaving it uncertain.
+Default-login Codex kickoff resolves identity from the live `auth.json`
+OAuth claims the same way `CodexEngine.current_account_number` does, rather
+than the roster's possibly-stale `activeAccountNumber`; a now-unnecessary
+`activeAccountNumber` seed in a Claude live-kickoff test fixture was reverted.
+The CLI now rejects a stale `cswap` launcher before dispatching to the worker
+subcommand, so `cswap worker status` gets the removed-command message instead
+of reaching the worker CLI. Codex `set_account_disabled`, `set_alias`, and
+`unset_alias` now hold the same lease mutation guard as the engine's other
+roster mutations. `_resolve_workspace` now refuses an approved read-only
+source that others can write to (readable by others remains allowed).
+The lease release command proves only that the recording worker and its job
+are finished; phase 2 never starts a provider process (the adapter refuses),
+so there is no provider tree to check yet. Before phase 3 enables a real
+adapter, release must also prove the provider process tree has stopped.
 
 ## Deviations and verification
 

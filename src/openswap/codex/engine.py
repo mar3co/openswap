@@ -505,7 +505,8 @@ class CodexEngine:
             return num
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             num, _email, _acc = self.resolve_account(identifier)
             data = self._read_roster()
             rec = self._record(data, num)
@@ -523,7 +524,8 @@ class CodexEngine:
             normalized = normalize_alias(alias)
         except ValueError as e:
             raise ValidationError(str(e)) from e
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             num, _email, _acc = self.resolve_account(identifier)
             data = self._read_roster()
             rec = self._record(data, num)
@@ -540,7 +542,8 @@ class CodexEngine:
             return num, normalized
 
     def unset_alias(self, identifier: str) -> str:
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             num, _email, _acc = self.resolve_account(identifier)
             data = self._read_roster()
             rec = self._record(data, num)

@@ -335,9 +335,11 @@ def test_invoke_kickoff_default_login_omits_config_dir(tmp_path: Path, monkeypat
 def test_live_default_kickoff_leases_detected_identity_not_stale_active_slot(
     tmp_path: Path, monkeypatch
 ):
+    from openswap.settings import update_worker_settings
     from openswap.worker.leases import AccountLeaseStore, stable_account_identity
 
     root = _fake_lease_roster(monkeypatch, tmp_path, "claude")
+    update_worker_settings(root, enabled=True)
     roster_path = root / "sequence.json"
     roster = json.loads(roster_path.read_text(encoding="utf-8"))
     roster["accounts"]["2"] = {
@@ -381,6 +383,46 @@ def test_live_default_kickoff_leases_detected_identity_not_stale_active_slot(
     assert "CLAUDE_CONFIG_DIR" not in captured["env"]
 
 
+def test_live_default_codex_kickoff_leases_detected_identity_not_stale_active_slot(
+    tmp_path: Path, monkeypatch
+):
+    """The default Codex kickoff must resolve identity the way the engine
+    does (auth.json's own OAuth claims), not the roster's possibly-stale
+    ``activeAccountNumber`` (openswap.codex.engine.CodexEngine._live_slot)."""
+    from openswap.settings import update_worker_settings
+    from openswap.worker.leases import AccountLeaseStore, stable_account_identity
+    from tests.test_codex_auth import _auth
+
+    root = _fake_lease_roster(monkeypatch, tmp_path, "codex")
+    update_worker_settings(root, enabled=True)
+    roster_path = root / "codex" / "sequence.json"
+    roster = json.loads(roster_path.read_text(encoding="utf-8"))
+    roster["accounts"]["2"] = {"email": "live-b@example.test", "accountId": "acc-b"}
+    # External Codex login changed to account B, but OpenSwap's remembered
+    # active slot remains A. The lease must follow the profile Codex will use.
+    roster_path.write_text(json.dumps(roster), encoding="utf-8")
+    codex_home_dir = tmp_path / "codex-home"
+    codex_home_dir.mkdir()
+    (codex_home_dir / "auth.json").write_text(
+        _auth(email="live-b@example.test", account_id="acc-b"), encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_dir))
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["lease"] = AccountLeaseStore(root, "codex").current()
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    invoke_codex_kickoff(
+        None, which=lambda _name: "/opt/fake/codex", run=fake_run,
+        environ={"PATH": "/usr/bin"},
+    )
+
+    lease = captured["lease"]
+    assert lease is not None
+    assert lease.account_identity == stable_account_identity("codex", "acc-b")
+
+
 @pytest.mark.parametrize(
     "live_identity,duplicate",
     [
@@ -391,9 +433,11 @@ def test_live_default_kickoff_leases_detected_identity_not_stale_active_slot(
 def test_live_default_kickoff_refuses_unmatched_or_ambiguous_identity(
     tmp_path: Path, monkeypatch, live_identity, duplicate: bool
 ):
+    from openswap.settings import update_worker_settings
     from openswap.worker.leases import AccountLeaseStore
 
     root = _fake_lease_roster(monkeypatch, tmp_path, "claude")
+    update_worker_settings(root, enabled=True)
     roster_path = root / "sequence.json"
     roster = json.loads(roster_path.read_text(encoding="utf-8"))
     if duplicate:
@@ -429,11 +473,26 @@ def test_live_default_kickoff_refuses_unmatched_or_ambiguous_identity(
     assert AccountLeaseStore(root, "claude").current() is None
 
 
-def test_kickoff_timeout_quarantines_account_and_refuses_replay(tmp_path: Path, monkeypatch):
+def test_kickoff_timeout_releases_lease_as_confirmed_stopped_and_allows_replay(
+    tmp_path: Path, monkeypatch
+):
+    """subprocess.run() has already killed and reaped the child by the time
+    TimeoutExpired reaches us, on every platform: that is stop proof, not
+    uncertainty, so the account must not be left quarantined behind a lease
+    only the (now nonexistent) worker CLI could clear."""
     from openswap.kickoff import paths
-    from openswap.worker.leases import AccountLeaseStore, LeaseConflictError
+    from openswap.settings import update_worker_settings
+    from openswap.worker.leases import AccountLeaseStore, ReleaseEvidence
+    from tests.test_codex_auth import _auth
 
     root = _fake_lease_roster(monkeypatch, tmp_path, "codex")
+    update_worker_settings(root, enabled=True)
+    codex_home_dir = tmp_path / "codex-home"
+    codex_home_dir.mkdir()
+    (codex_home_dir / "auth.json").write_text(
+        _auth(email="fake@example.test", account_id="acct-fake"), encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_dir))
     started = []
 
     def timed_out(argv, **kwargs):
@@ -450,15 +509,40 @@ def test_kickoff_timeout_quarantines_account_and_refuses_replay(tmp_path: Path, 
     with pytest.raises(subprocess.TimeoutExpired):
         invoke(timed_out)
     lease = AccountLeaseStore(root, "codex").current()
-    assert lease.state == "uncertain"
-    assert lease.reason == "kickoff_timeout"
+    assert lease.state == "released"
+    assert lease.reason == ReleaseEvidence.CONFIRMED_STOPPED.value
 
-    def must_not_relaunch(*_args, **_kwargs):
-        pytest.fail("kickoff was replayed after uncertain timeout")
+    def relaunch(argv, **kwargs):
+        started.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
-    with pytest.raises(LeaseConflictError):
-        invoke(must_not_relaunch)
-    assert len(started) == 1
+    invoke(relaunch)
+    assert len(started) == 2
+
+
+def test_kickoff_with_worker_disabled_takes_no_lease_and_timeout_leaves_switching_open(
+    tmp_path: Path, monkeypatch
+):
+    """Remote tasks were never enabled, so a kickoff must behave exactly as
+    it did before the worker existed: no lease taken, and a bare timeout
+    cannot block switching afterward."""
+    from openswap.worker.leases import AccountLeaseStore
+
+    root = _fake_lease_roster(monkeypatch, tmp_path, "codex")
+    # Worker settings default to disabled; this test relies on that default.
+
+    def timed_out(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        invoke_codex_kickoff(
+            None, which=lambda _name: "/opt/fake/codex", run=timed_out,
+            timeout=0.01, environ={"PATH": "/usr/bin"},
+        )
+
+    assert AccountLeaseStore(root, "codex").current() is None
+    with AccountLeaseStore(root, "codex").mutation_guard() as guard:
+        guard.assert_available()  # switching is not blocked
 
 
 def test_build_kickoff_argv_is_print_mode():

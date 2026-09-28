@@ -352,6 +352,58 @@ def test_local_workspace_registry_is_opaque_disjoint_and_persisted(tmp_path):
         )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_group_or_world_writable_readonly_root_fails_the_job(tmp_path):
+    """The output root already refuses group/world-writable permissions;
+    an approved read-only source must be held to the same standard, since a
+    concurrently-writable "read-only" source is not actually read-only."""
+    output = tmp_path / "approved-output"
+    source = tmp_path / "approved-source"
+    source.mkdir()
+    os.chmod(source, 0o777)
+    account_ref = stable_account_identity("codex", "locally-pinned-reference")
+    configure_worker_local_policy(
+        tmp_path,
+        pinned_account_ref=account_ref,
+        workspaces=(WorkerWorkspace("research", output, (source,)),),
+    )
+    update_worker_settings(tmp_path, enabled=True)
+    adapter = _FakeAdapter()
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=account_ref)
+    # A short deadline bounds this test even if workspace resolution someday
+    # stops refusing the run before adapter.start(): it would then just poll
+    # to a fast timeout instead of hanging on the fake adapter's empty events.
+    runtime.submit(_submission(runtime_limit_s=1))
+
+    result = runtime.reconcile_once()
+
+    assert result.state == JobState.FAILED
+    assert result.diagnostic_code == "provider_unavailable"
+    assert adapter.start_count == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+@pytest.mark.parametrize("mode, accepted", [(0o755, True), (0o750, True), (0o775, False), (0o757, False)])
+def test_readonly_root_may_be_readable_but_not_writable_by_others(tmp_path, mode, accepted):
+    output = tmp_path / "approved-output"
+    source = tmp_path / "approved-source"
+    source.mkdir()
+    os.chmod(source, mode)
+    account_ref = stable_account_identity("codex", "locally-pinned-reference")
+    configure_worker_local_policy(
+        tmp_path,
+        pinned_account_ref=account_ref,
+        workspaces=(WorkerWorkspace("research", output, (source,)),),
+    )
+    runtime = WorkerRuntime(tmp_path, adapter=_FakeAdapter(), account_identity=account_ref)
+    if accepted:
+        resolved = runtime._resolve_workspace("research", "a" * 32)
+        assert resolved.readonly_sources == (source,)
+    else:
+        with pytest.raises(ValueError, match="permissions are unsafe"):
+            runtime._resolve_workspace("research", "a" * 32)
+
+
 def test_runtime_admission_is_internal_and_disabled_adapter_never_executes(tmp_path):
     update_worker_settings(tmp_path, enabled=True)
     runtime = WorkerRuntime(tmp_path)
@@ -456,6 +508,57 @@ def test_provider_terminal_without_stop_proof_quarantines_lease(tmp_path):
     assert result.state == JobState.INTERRUPTED
     assert result.diagnostic_code == "execution_uncertain"
     assert AccountLeaseStore(tmp_path).current().state == "uncertain"
+
+
+def test_worker_restart_quarantines_an_active_lease_left_by_a_crashed_process(tmp_path):
+    """A worker that crashes mid-job must not leave its lease ``active`` forever.
+
+    ``start_epoch`` already interrupts the orphaned job; a fresh runtime must
+    also stop trusting the lease it left behind, since nothing else will
+    (``LeaseMutationGuard`` refuses ``active``/``uncertain`` leases forever
+    and there is no other supported release path but the owner-invoked one).
+    """
+    update_worker_settings(tmp_path, enabled=True)
+    identity = stable_account_identity("codex", "synthetic-worker-test")
+    crashed = WorkerRuntime(tmp_path, adapter=_FakeAdapter(), account_identity=identity)
+    job = crashed.submit(_submission())
+    claimed = crashed.store.claim(
+        job.job_id, worker_epoch=crashed.worker_epoch, expected_generation=job.generation,
+    )
+    running, _run, _token = crashed._prepare_run(claimed)
+    assert running.state == JobState.RUNNING
+    assert AccountLeaseStore(tmp_path).current().state == "active"
+
+    # The process is gone without ever releasing the lease or stopping the
+    # job (no mark_stopped, no interrupt). A fresh worker starts in its place.
+    restarted = WorkerRuntime(tmp_path, adapter=_FakeAdapter(), account_identity=identity)
+
+    assert job.job_id in restarted.recovered_job_ids
+    assert restarted.store.get(job.job_id).state == JobState.INTERRUPTED
+    lease = AccountLeaseStore(tmp_path).current()
+    assert lease.state == "uncertain"
+    assert lease.reason == "worker_restarted"
+    assert lease.job_id == job.job_id
+
+
+def test_worker_restart_leaves_an_unrelated_released_lease_alone(tmp_path):
+    """Only a lease still ``active`` for a recovered job is ever touched."""
+    update_worker_settings(tmp_path, enabled=True)
+    identity = stable_account_identity("codex", "synthetic-worker-test")
+    adapter = _FakeAdapter()
+    first = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    job = first.submit(_submission())
+    adapter.events_out = (_finished_event(job.job_id),)
+    finished = first.reconcile_once()
+    assert finished.state == JobState.SUCCEEDED
+    released = AccountLeaseStore(tmp_path).current()
+    assert released.state == "released"
+
+    restarted = WorkerRuntime(tmp_path, adapter=_FakeAdapter(), account_identity=identity)
+
+    assert restarted.recovered_job_ids == ()
+    assert AccountLeaseStore(tmp_path).current().token() == released.token()
+    assert AccountLeaseStore(tmp_path).current().state == "released"
 
 
 def test_stop_cannot_race_provider_start_and_ack_is_not_stop_proof(tmp_path):

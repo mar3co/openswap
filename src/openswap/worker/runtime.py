@@ -22,6 +22,7 @@ from openswap.worker.journal import (
     validate_event_fields,
 )
 from openswap.worker.leases import (
+    AccountLeaseError,
     AccountLeaseStore,
     LeaseConflictError,
     LeaseStateError,
@@ -234,12 +235,40 @@ class WorkerRuntime:
         self.leases = AccountLeaseStore(self.backup_root, "codex")
         self.worker_pid = os.getpid()
         self.worker_epoch, self.recovered_job_ids = self.store.start_epoch(self.worker_pid)
+        self._quarantine_lease_for_recovered_jobs()
         self._admission_lock = threading.RLock()
         self._launch_lock = threading.RLock()
         self._event_reader_lock = threading.Lock()
         self._event_reader: threading.Thread | None = None
         self._active_run = None
         self._active_lease = None
+
+    def _quarantine_lease_for_recovered_jobs(self) -> None:
+        """Stop trusting a still-``active`` lease left by a crashed worker.
+
+        ``start_epoch`` already marked any job it recovered as INTERRUPTED,
+        but a prior process that never reached its own cleanup (killed,
+        crashed) leaves its account lease recorded ``active`` forever: no
+        supported path ever proves the account is idle again. Flip it to
+        ``uncertain`` so mutation guards keep refusing (never auto-release)
+        while ``openswap worker lease release`` becomes available to the
+        owner once they confirm the process is really gone.
+        """
+        if not self.recovered_job_ids:
+            return
+        try:
+            lease = self.leases.current()
+        except AccountLeaseError:
+            return
+        if (
+            lease is not None
+            and lease.state == "active"
+            and lease.job_id in self.recovered_job_ids
+        ):
+            try:
+                self.leases.mark_uncertain(lease.token(), "worker_restarted")
+            except AccountLeaseError:
+                pass
 
     def submit(self, submission: JobSubmission) -> JobRecord:
         with self._admission_lock:
@@ -861,6 +890,10 @@ class WorkerRuntime:
                 raise ValueError("approved read-only source is unsafe")
             if os.name != "nt" and info.st_uid != os.getuid():
                 raise ValueError("approved read-only source is not locally owned")
+            # Readable by others is normal for a source checkout; writable by
+            # others is not, since the source could change during the run.
+            if os.name != "nt" and info.st_mode & 0o022:
+                raise ValueError("approved read-only source permissions are unsafe")
         return ResolvedWorkspace(
             workspace_id=workspace_id, output_root=output_root,
             readonly_sources=workspace.readonly_roots,

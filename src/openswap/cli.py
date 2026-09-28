@@ -1399,6 +1399,12 @@ def _menubar_service(args) -> int:
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
+    # Checked before worker dispatch so a stale `cswap` launcher cannot reach
+    # the worker CLI (or anything else) under the removed command name.
+    if _invoked_as_removed_cswap_command():
+        _migrate_legacy_cswap_state()
+        error("The 'cswap' command has been removed. Use 'openswap' instead.")
+        sys.exit(2)
     # The worker is a separate local process. Dispatch before legacy migration,
     # theme/TLS setup, or any account engine construction so its startup cannot
     # touch provider state or import the menu-bar UI.
@@ -1407,9 +1413,6 @@ def main() -> None:
 
         sys.exit(worker_main(sys.argv[2:]))
     _migrate_legacy_cswap_state()
-    if _invoked_as_removed_cswap_command():
-        error("The 'cswap' command has been removed. Use 'openswap' instead.")
-        sys.exit(2)
     _use_native_tls()
     argv = sys.argv[1:]
     try:

@@ -302,6 +302,15 @@ class LocalJobStore:
         finally:
             db.close()
 
+    def current_epoch(self) -> int:
+        """The epoch ``start_epoch`` last recorded (bumped once per worker start)."""
+        db = self._connect()
+        try:
+            row = db.execute("SELECT value FROM metadata WHERE key='worker_epoch'").fetchone()
+            return int(row["value"]) if row is not None else 0
+        finally:
+            db.close()
+
     def create(
         self,
         submission: JobSubmission,
