@@ -810,17 +810,32 @@ def _open_pidfd(pid: int) -> int | None:
         return None
 
 
+def _fd_readable(fd: int, timeout_s: float) -> bool | None:
+    """Whether ``fd`` is readable within ``timeout_s``; None when polling failed.
+
+    ``poll`` has no FD_SETSIZE limit, unlike ``select``, which cannot watch a
+    descriptor numbered 1024 or higher.
+    """
+    poller_factory = getattr(select, "poll", None)
+    try:
+        if poller_factory is None:
+            readable, _, _ = select.select([fd], [], [], timeout_s)
+            return bool(readable)
+        poller = poller_factory()
+        poller.register(fd, select.POLLIN)
+        return bool(poller.poll(max(0, int(timeout_s * 1000))))
+    except (OSError, ValueError):
+        return None
+
+
 def _pidfd_exited(handle: int) -> bool:
     """A pidfd becomes readable once its process has exited, reaped or not.
 
     Orphaned descendants may linger as zombies where PID 1 does not reap
     promptly (containers); they can no longer execute, so they count as gone.
+    A polling failure is uncertainty, never exit: the entry stays tracked.
     """
-    try:
-        readable, _, _ = select.select([handle], [], [], 0)
-    except (OSError, ValueError):
-        return True
-    return bool(readable)
+    return _fd_readable(handle, 0) is True
 
 
 def _close_handles(tracked: Mapping[int, tuple[int, str, str, int | None, str, bool]]) -> None:
@@ -1006,8 +1021,10 @@ def _terminate_pids(
     is never signalled; while it stays alive the result is "not all gone".
 
     With a pidfd the signal is bound to the original process, so a reused pid
-    can never be hit. Without one (macOS) the identity is re-read immediately
-    before each signal, but check and signal are still two operations and the
+    can never be hit. Without one (macOS) the identity is re-read from one
+    process-table scan per round, taken immediately before that round's
+    signals and bounded by the cleanup deadline so a stalled ``ps`` cannot
+    postpone termination; check and signal are still two operations and the
     start time has second resolution, so this path is best effort only; the
     caller records the mode so evidence never claims identity-safe cleanup.
     A process counts as gone only when that is known: its pid is free, it is a
@@ -1016,8 +1033,13 @@ def _terminate_pids(
     uncertain: never signalled, and never reported as gone.
     """
     mode = SIGNALLING_PIDFD if all(h is not None for _b, h, _v in escaped.values()) else SIGNALLING_IDENTITY_CHECK
+    cleanup_deadline = time.monotonic() + grace_s + DESCENDANT_KILL_WAIT_S + CLEANUP_SCAN_BUDGET_S
+    needs_table = mode == SIGNALLING_IDENTITY_CHECK
 
-    def status(pid: int) -> str:
+    def round_table():
+        return _snapshot(cleanup_deadline) if needs_table else None
+
+    def status(pid: int, table) -> str:
         """``ours`` (signalable), ``gone``, or ``uncertain``."""
         identity, handle, _verified = escaped[pid]
         if handle is not None:
@@ -1032,7 +1054,6 @@ def _terminate_pids(
             return "ours"
         if not _pid_alive(pid):
             return "gone"
-        table = _process_table()
         if table is None:
             return "uncertain"
         for entry_pid, _ppid, _pgid, stat, birth, current in table:
@@ -1045,8 +1066,9 @@ def _terminate_pids(
         return "gone"
 
     def signal_all(sig: int) -> None:
+        table = round_table()
         for pid, (_identity, handle, verified) in escaped.items():
-            if not verified or status(pid) != "ours":
+            if not verified or status(pid, table) != "ours":
                 continue
             try:
                 if handle is not None:
@@ -1058,7 +1080,8 @@ def _terminate_pids(
 
     def wait_gone(deadline: float) -> bool:
         while True:
-            if all(status(pid) == "gone" for pid in escaped):
+            table = round_table()
+            if all(status(pid, table) == "gone" for pid in escaped):
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -1132,9 +1155,8 @@ def _collect_polled(fd: int, record, stop: threading.Event) -> None:
     pending = bytearray()
     discarding = False
     while not stop.is_set():
-        try:
-            readable, _, _ = select.select([fd], [], [], 0.05)
-        except (OSError, ValueError):
+        readable = _fd_readable(fd, 0.05)
+        if readable is None:
             return
         if not readable:
             continue

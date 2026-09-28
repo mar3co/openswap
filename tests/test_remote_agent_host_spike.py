@@ -1735,7 +1735,7 @@ def test_terminate_pids_never_signals_a_pid_whose_start_time_changed(monkeypatch
     monkeypatch.setattr(spike.os, "kill", fake_kill)
     # A new start time means the pid was reused: the original is known gone.
     monkeypatch.setattr(spike, "_process_table",
-                        lambda: [(987654, 1, 987654, "S", "t1", "t1|pgid=987654|someone-else")])
+                        lambda **_: [(987654, 1, 987654, "S", "t1", "t1|pgid=987654|someone-else")])
     gone, mode = spike._terminate_pids({987654: ("t0|pgid=987654|helper", None, True)}, grace_s=0.05)
     assert gone is True
     assert mode == spike.SIGNALLING_IDENTITY_CHECK
@@ -1756,7 +1756,7 @@ def test_terminate_pids_keeps_unknown_identity_uncertain(monkeypatch, table):
         sent.append((pid, sig))
 
     monkeypatch.setattr(spike.os, "kill", fake_kill)
-    monkeypatch.setattr(spike, "_process_table", lambda: table)
+    monkeypatch.setattr(spike, "_process_table", lambda **_: table)
     monkeypatch.setattr(spike, "DESCENDANT_KILL_WAIT_S", 0.05)
     gone, mode = spike._terminate_pids({987654: ("t0|pgid=987654|helper", None, True)}, grace_s=0.05)
     assert gone is False
@@ -1877,6 +1877,58 @@ def test_startup_journal_failure_still_terminates_detached_descendant(tmp_path, 
                 os.kill(int(pid_file.read_text()), 9)
             except (ProcessLookupError, PermissionError, ValueError):
                 pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="reaches the SIGKILL branch, which Windows lacks")
+def test_identity_check_cleanup_bounds_its_scans_by_the_cleanup_deadline(monkeypatch):
+    budgets = []
+
+    def stalled_table(timeout_s=None):
+        budgets.append(timeout_s)
+        time.sleep(min(timeout_s if timeout_s is not None else 2.0, 2.0))  # ps hangs
+        return None
+
+    monkeypatch.setattr(spike, "_process_table", stalled_table)
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(spike.os, "kill", lambda pid, sig: None)
+    escaped = {pid: (f"t0|pgid={pid}|helper", None, True) for pid in (4242, 4343, 4444)}
+    start = time.monotonic()
+    gone, mode = spike._terminate_pids(escaped, grace_s=0.0)
+    elapsed = time.monotonic() - start
+    assert gone is False and mode == spike.SIGNALLING_IDENTITY_CHECK
+    assert all(b is not None for b in budgets), budgets
+    # One bounded scan per round, shared by every descendant.
+    limit = spike.DESCENDANT_KILL_WAIT_S + spike.CLEANUP_SCAN_BUDGET_S
+    assert elapsed < limit + 1.0, elapsed
+
+
+@pytest.mark.skipif(os.name != "posix", reason="pipes and poll are POSIX-only here")
+def test_fd_readiness_works_above_fd_setsize_and_poll_errors_are_not_exit(tmp_path):
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < 1100:
+        pytest.skip("cannot open a descriptor above FD_SETSIZE here")
+    read_end, write_end = os.pipe()
+    try:
+        if soft < 1100:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (1100, hard))
+        high = os.dup2(read_end, 1050)
+        try:
+            assert spike._fd_readable(high, 0) is False
+            os.write(write_end, b"x")
+            assert spike._fd_readable(high, 0) is True
+        finally:
+            os.close(high)
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_pidfd_poll_failure_is_not_treated_as_exit(monkeypatch):
+    monkeypatch.setattr(spike, "_fd_readable", lambda fd, timeout_s: None)
+    assert spike._pidfd_exited(99) is False
 
 
 def test_terminate_pids_counts_exited_unreaped_pidfd_descendant_as_gone(monkeypatch):
