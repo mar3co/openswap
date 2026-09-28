@@ -662,17 +662,27 @@ def _track_descendants(
     later calls setsid(), exec()s, or is reparented after the leader exits is
     still attributed to the run. Only the immutable birth (start time) decides
     whether a pid was reused; a change of process group or command line
-    merely updates the entry. An entry that holds a pidfd is never dropped:
-    the handle is bound to the original process, so a reused pid simply
-    reads as exited.
+    merely updates the entry. An entry whose original process is known to be
+    gone (its start time changed, or its pidfd reads as exited) is evicted
+    before attribution, so a reused numeric pid never seeds descendant
+    discovery for an unrelated process's children.
     """
     if table is None:
         table = _process_table()
     if table is None:
         return False
-    for pid, _ppid, _pgid, _stat, birth, _identity_ in table:
-        if pid in tracked and tracked[pid][3] is None and tracked[pid][2] != birth:
+    births = {pid: birth for pid, _ppid, _pgid, _stat, birth, _identity_ in table}
+    for pid in list(tracked):
+        _pgid, _stat, birth, handle, _identity_ = tracked[pid]
+        reused = pid in births and births[pid] != birth
+        exited = handle is not None and _pidfd_exited(handle)
+        if reused or exited:
             del tracked[pid]
+            if handle is not None:
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
     known = {leader_pid, *tracked}
     changed = True
     while changed:

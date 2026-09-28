@@ -1231,23 +1231,54 @@ def test_track_descendants_keeps_child_whose_group_and_command_changed_after_rep
     assert spike._escaped_descendants(100, tracked) == {4242: ("tA|pgid=4242|helper --detached", None)}
 
 
-def test_track_descendants_never_drops_an_entry_that_holds_a_pidfd(monkeypatch):
+def test_track_descendants_evicts_reused_pid_even_when_it_holds_a_pidfd(monkeypatch):
+    closed = []
     tables = iter([
         [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
          (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
-        # Even a changed start time does not evict a handle-backed entry: the
-        # pidfd is bound to the original process and reads as exited.
+        # A changed start time means the original process is gone; the
+        # stranger now holding pid 4242 must not seed discovery of its child.
         [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
-         (4242, 1, 4242, "S", "tB", "tB|pgid=4242|stranger")],
+         (4242, 1, 4242, "S", "tB", "tB|pgid=4242|stranger"),
+         (5555, 4242, 4242, "S", "tB", "tB|pgid=4242|stranger-child")],
     ])
     monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
     monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 55)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
     monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tA", "tA|pgid=4242|child"))
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
     tracked: dict = {}
     spike._track_descendants(100, tracked)
     assert tracked[4242][3] == 55
     spike._track_descendants(100, tracked)
-    assert 4242 in tracked and tracked[4242][3] == 55
+    assert tracked == {}
+    assert closed == [55]
+
+
+def test_track_descendants_does_not_seed_from_exited_pidfd_entry(monkeypatch):
+    closed = []
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
+        # Pid reused within the same second: identical start time, but the
+        # pidfd reports the original exited. Its "child" is a stranger's.
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 1, 4242, "S", "tA", "tA|pgid=4242|stranger"),
+         (5555, 4242, 4242, "S", "tA", "tA|pgid=4242|stranger-child")],
+    ])
+    exited = {"value": False}
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 60)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: exited["value"])
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tA", "tA|pgid=4242|child"))
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][3] == 60
+    exited["value"] = True
+    spike._track_descendants(100, tracked)
+    assert tracked == {}
+    assert closed == [60]
 
 
 def test_terminate_pids_never_signals_a_pid_whose_identity_changed(monkeypatch):
@@ -1482,9 +1513,12 @@ def test_track_descendants_accepts_handle_when_full_row_still_matches(monkeypatc
                         lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
                                  (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
     monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 78)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
     monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tA", "tA|pgid=4242|child"))
     monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
     tracked: dict = {}
     spike._track_descendants(100, tracked)
+    assert tracked == {4242: (4242, "S", "tA", 78, "tA|pgid=4242|child")}
+    spike._track_descendants(100, tracked)  # a live, matching entry survives
     assert tracked == {4242: (4242, "S", "tA", 78, "tA|pgid=4242|child")}
     assert closed == []
