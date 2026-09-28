@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest assembled-branch suite is green: `2911 passed, 4 skipped, 2 warnings
-in 13.46s`; it includes 40 phase-one harness tests. The helper-cleanup
+The latest assembled-branch suite is green: `2911 passed, 4 skipped, 3 warnings
+in 15.01s`; it includes 40 phase-one harness tests. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
 The ChatGPT app-bundled Codex CLI is `0.158.0-alpha.2.1` (pre-release). A
@@ -105,7 +105,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2911 passed, 4 skipped, 2 warnings in 13.46s`).
+  (`2911 passed, 4 skipped, 3 warnings in 15.01s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -210,6 +210,11 @@ until the owner records a permitted path or exclusion.
   never chmodded and must already be private, and timeout/grace values must be
   finite before state creation or process launch. The targeted harness suite
   passed (`40 passed in 6.06s`).
+- Codex review [P2 #4122976297](https://github.com/mar3co/openswap/pull/59#discussion_r4122976297)
+  is addressed in the fake journal appender: before appending it separates an
+  unterminated trailing record with a newline, preserving the existing bytes.
+  The recovery regression verifies one successful recovery after a torn tail
+  and no repeated recovery on the next pass.
 - `uv` was not installed on `PATH`; version 0.12.19 was installed only under
   `/private/tmp/openswap-uv-test`, with its Python, cache, and project test
   environment under `/private/tmp`. The full suite used that isolated runtime.

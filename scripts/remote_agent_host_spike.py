@@ -176,11 +176,24 @@ def _private_dir(path: Path) -> None:
 
 def _append_jsonl(path: Path, record: dict) -> None:
     _private_dir(path.parent)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as stream:
-        stream.write(json.dumps(record, sort_keys=True) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        end = os.lseek(fd, 0, os.SEEK_END)
+        separator = b""
+        if end:
+            os.lseek(fd, end - 1, os.SEEK_SET)
+            if os.read(fd, 1) != b"\n":
+                separator = b"\n"
+        os.lseek(fd, 0, os.SEEK_END)
+        payload = separator + (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        while payload:
+            written = os.write(fd, payload)
+            if written <= 0:
+                raise OSError("JSONL append made no progress")
+            payload = payload[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _read_jsonl(path: Path) -> list[dict]:

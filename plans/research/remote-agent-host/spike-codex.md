@@ -116,7 +116,7 @@ inspect: codex-cli 0.158.0-alpha.2.1; exec_json=true; sandbox_option=true;
 demo:    state=cancelled; returncode=-15; event_names=[thread.started]
 sandbox: inside read/write allowed; outside read/write denied;
          synthetic CODEX_HOME auth/config reads denied; no exec/model run
-tests:   40 passed (full assembled suite: 2,911 passed, 4 skipped, 2 warnings)
+tests:   40 passed (full assembled suite: 2,911 passed, 4 skipped, 3 warnings)
 ```
 
 After the bounded process-group runner was added, the official stable ARM
@@ -129,6 +129,11 @@ wrapper-only Seatbelt evidence; it does not establish `codex exec` enforcement
 or account selection. The helper-cleanup regression passed in isolation
 (`1 passed in 1.19s`); all 40 harness cases are included in the full-suite
 result above.
+
+The recovery journal appender separates an unterminated trailing record before
+writing a new JSONL row. The recovery regression preserves the malformed tail
+as a separate ignored line and verifies the next recovery pass does not repeat
+the interrupted transition.
 
 The fake-process harness includes regression coverage for the Codex review
 findings on [PR #59](https://github.com/mar3co/openswap/pull/59): finding

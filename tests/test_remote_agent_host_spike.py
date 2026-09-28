@@ -669,11 +669,12 @@ def test_probe_bounds_both_output_streams_and_cleans_owned_group(
 def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
-    (state / "journal.jsonl").write_text(
+    journal_path = state / "journal.jsonl"
+    journal_path.write_text(
         "".join(
             json.dumps({"job_id": job_id, "state": "starting"}) + "\n"
             for job_id in ("uncertain", "uncertain-other")
-        )
+        ) + '{"job_id":"partial","state":'
     )
     launches = tmp_path / "launch-count"
     fake = _executable(
@@ -683,15 +684,21 @@ def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):
     )
 
     assert recover_uncertain_runs(state) == ["uncertain", "uncertain-other"]
+    assert recover_uncertain_runs(state) == []
     with pytest.raises(SpikeError, match="never replayed"):
         supervise_fake_command([str(fake)], state_dir=state, timeout_s=1, job_id="uncertain")
     with pytest.raises(SpikeError, match="never replayed"):
         supervise_fake_command([str(fake)], state_dir=state, timeout_s=1, job_id="uncertain-other")
 
     assert not launches.exists()
-    rows = [json.loads(line) for line in (state / "journal.jsonl").read_text().splitlines()]
-    assert [row["state"] for row in rows] == [
-        "starting", "starting", "interrupted", "interrupted"
+    raw_journal = journal_path.read_text().splitlines()
+    assert raw_journal[2] == '{"job_id":"partial","state":'
+    rows = spike._read_jsonl(journal_path)
+    assert [(row["job_id"], row["state"]) for row in rows] == [
+        ("uncertain", "starting"),
+        ("uncertain-other", "starting"),
+        ("uncertain", "interrupted"),
+        ("uncertain-other", "interrupted"),
     ]
     evidence = [json.loads(line) for line in (state / "evidence.jsonl").read_text().splitlines()]
     assert [(row["kind"], row["job_id"]) for row in evidence] == [
