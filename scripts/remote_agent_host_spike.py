@@ -357,9 +357,13 @@ def _private_dir(path: Path) -> None:
     # rather than trusting mkdir(parents=True) to apply the mode above the leaf.
     missing = []
     current = path
-    while not current.exists() and current.parent != current:
+    # lexists, not exists: a component raced in as a symlink must count as
+    # existing (and be validated below), never be walked through as missing.
+    while not os.path.lexists(current) and current.parent != current:
         missing.append(current)
         current = current.parent
+    # Re-validate the existing prefix right before creating anything under it.
+    _refuse_symlinked_components(current)
     for directory in reversed(missing):
         try:
             directory.mkdir(mode=0o700)
@@ -1287,6 +1291,15 @@ def _supervise_fake_command_locked(
         timed_out = not _leader_exited(process)
         if timed_out:
             _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
+        # One short bounded scan while the leader is still unreaped, before any
+        # group signal: a run too short for a periodic scan still attributes a
+        # helper that already detached, before killing the leader reparents it.
+        # A stalled scan delays termination by at most SCAN_WINDOW_S and forces
+        # "interrupted".
+        if not _track_descendants(
+            process.pid, tracked, deadline=time.monotonic() + SCAN_WINDOW_S
+        ):
+            tracking_complete = False
         # A provider parent may exit while a child keeps the pipe or continues
         # work. Clean the group after timeout and after every leader exit, and
         # only report success when enumeration and the output reader are quiet.
