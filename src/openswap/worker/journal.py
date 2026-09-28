@@ -33,7 +33,12 @@ _TERMINAL_STATES = {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED, Job
 _ALLOWED_TRANSITIONS = {
     JobState.QUEUED: {JobState.CLAIMED, JobState.CANCELLED, JobState.EXPIRED},
     JobState.CLAIMED: {JobState.STARTING, JobState.CANCEL_REQUESTED, JobState.FAILED, JobState.INTERRUPTED},
-    JobState.STARTING: {JobState.RUNNING, JobState.CANCEL_REQUESTED, JobState.FAILED, JobState.INTERRUPTED},
+    # EXPIRED from STARTING only before launch: a job that expired while it was
+    # being prepared never starts.
+    JobState.STARTING: {
+        JobState.RUNNING, JobState.CANCEL_REQUESTED, JobState.FAILED, JobState.INTERRUPTED,
+        JobState.EXPIRED,
+    },
     JobState.RUNNING: {JobState.CANCEL_REQUESTED, JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED, JobState.INTERRUPTED},
     JobState.CANCEL_REQUESTED: {JobState.CANCELLED, JobState.FAILED, JobState.INTERRUPTED},
 }

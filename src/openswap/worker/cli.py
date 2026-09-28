@@ -328,22 +328,33 @@ def _blocked(backup_root: Path, snapshot: dict, diagnostic: str) -> tuple[bool, 
     return False, snapshot, diagnostic
 
 
-def release_lease(backup_root: Path) -> tuple[bool, dict, str | None]:
-    """Manually release a stuck ``active``/``uncertain`` codex account lease.
+def release_lease(
+    backup_root: Path, provider: str = "codex", *, confirm_stopped: bool = False
+) -> tuple[bool, dict, str | None]:
+    """Manually release a stuck ``active``/``uncertain`` account lease.
 
-    This is the only supported way to clear a lease a crashed worker never
-    resolved. It never auto-releases and never relaunches anything: a lease
-    is released only after this proves, from the journal alone, that both
-    (a) the worker process that recorded it is gone — a newer worker epoch
-    has since started, or its recorded pid is no longer alive — and (b) its
-    job is terminal or missing from the journal. Otherwise it refuses. The
-    release itself is recorded as ordinary lease evidence, like every other
-    lease state transition.
+    This is the only supported way to clear a lease whose holder never
+    resolved it. It never auto-releases and never relaunches anything; it
+    releases only after this proves the holder is gone:
+
+    - a worker job lease needs its recording worker gone (a newer epoch has
+      started, or its pid is no longer alive) and its job terminal in the
+      journal;
+    - a scheduled-kickoff lease is never journaled, and its provider child can
+      outlive a killed menu process, so it needs the recording pid gone, the
+      lease expired, and ``confirm_stopped`` (the owner attests that no
+      kickoff process is still running);
+    - a worker lease whose job is missing from the journal likewise needs
+      ``confirm_stopped``: a missing row is not stop evidence.
+
+    Otherwise it refuses. The release is recorded as ``owner_released``.
     """
+    if provider not in {"codex", "claude"}:
+        raise ValueError("unsupported lease provider")
     root = Path(backup_root)
     _migrate_legacy_before_worker_state_change(root)
     job_store = LocalJobStore(root)
-    lease_store = AccountLeaseStore(root, "codex")
+    lease_store = AccountLeaseStore(root, provider)
     with lifecycle_lock(root):
         with lease_store.mutation_guard() as guard:
             lease = guard.current()
@@ -353,18 +364,27 @@ def release_lease(backup_root: Path) -> tuple[bool, dict, str | None]:
                 return True, {"lease_state": "released"}, "already_released"
             if lease.state not in {"active", "uncertain"}:
                 return False, {}, "lease_state_unknown"
-            owner_gone = (
-                job_store.current_epoch() > lease.worker_epoch
-                or not _pid_exists(lease.worker_pid)
-            )
-            if not owner_gone:
-                return False, {}, "worker_owner_may_be_alive"
-            try:
-                job_resolved = job_store.get(lease.job_id).state in _LEASE_TERMINAL_JOB_STATES
-            except KeyError:
-                job_resolved = True
-            if not job_resolved:
-                return False, {}, "job_not_terminal"
+            pid_gone = not _pid_exists(lease.worker_pid)
+            if lease.job_id.startswith("kickoff-"):
+                if not pid_gone:
+                    return False, {}, "worker_owner_may_be_alive"
+                if lease.expires_at > lease_store._now():
+                    return False, {}, "lease_not_expired"
+                if not confirm_stopped:
+                    return False, {}, "stop_unproven_confirm_required"
+            else:
+                owner_gone = job_store.current_epoch() > lease.worker_epoch or pid_gone
+                if not owner_gone:
+                    return False, {}, "worker_owner_may_be_alive"
+                try:
+                    job_state = job_store.get(lease.job_id).state
+                except KeyError:
+                    job_state = None
+                if job_state is None:
+                    if not confirm_stopped:
+                        return False, {}, "stop_unproven_confirm_required"
+                elif job_state not in _LEASE_TERMINAL_JOB_STATES:
+                    return False, {}, "job_not_terminal"
             guard.release(lease.token(), ReleaseEvidence.OWNER_RELEASED)
             return True, {"lease_state": "released"}, None
 
@@ -409,6 +429,11 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     lease_commands = lease_parser.add_subparsers(dest="lease_command", required=True)
     lease_release_parser = lease_commands.add_parser(
         "release", help="release a stuck lease once its worker is proven gone"
+    )
+    lease_release_parser.add_argument("--provider", choices=("codex", "claude"), default="codex")
+    lease_release_parser.add_argument(
+        "--confirm-stopped", action="store_true",
+        help="attest that no process using the account is still running, when that cannot be proven",
     )
     lease_release_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -501,12 +526,20 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         return 0
     if args.command == "lease" and args.lease_command == "release":
         try:
-            ok, result, diagnostic = release_lease(root)
+            ok, result, diagnostic = release_lease(
+                root, args.provider, confirm_stopped=args.confirm_stopped
+            )
         except ClaudeSwitchError:
             print("Worker lifecycle is busy; try again shortly.", file=sys.stderr)
             return 1
         if not ok:
             print(f"Lease was not released ({diagnostic}).", file=sys.stderr)
+            if diagnostic == "stop_unproven_confirm_required":
+                print(
+                    "Stopping cannot be proven. Once no kickoff or provider process "
+                    "is running for this account, rerun with --confirm-stopped.",
+                    file=sys.stderr,
+                )
             return 1
         payload = {"released": True, **result}
         human = (

@@ -688,6 +688,16 @@ class WorkerRuntime:
                 new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
                 expected_generation=starting.generation, diagnostic_code="provider_unavailable",
             )
+        # Probe, lease and workspace setup take time: re-check expiry right
+        # before launch so an expired job never starts.
+        if starting.expires_at <= datetime.now(timezone.utc):
+            self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
+            self._clear_active()
+            return self.store.transition(
+                starting.job_id, expected_states=(JobState.STARTING,),
+                new_state=JobState.EXPIRED, worker_epoch=self.worker_epoch,
+                expected_generation=starting.generation, diagnostic_code="job_expired",
+            )
         try:
             run = self.adapter.start(starting, workspace, worker_epoch=self.worker_epoch)
             if not isinstance(run, ProviderRun):
@@ -830,20 +840,18 @@ class WorkerRuntime:
                     diagnostic_code=diagnostic,
                 )
             except StaleWriteError:
-                try:
-                    latest = self.store.get(record.job_id)
-                except Exception:
-                    return latest
+                latest = self.store.get(record.job_id)
                 if latest.state in terminal_states or latest.state not in {
                     JobState.STARTING, JobState.RUNNING, JobState.CANCEL_REQUESTED,
                 }:
                     return latest
                 if latest.state == JobState.CANCEL_REQUESTED and stopped:
                     new_state, diagnostic = JobState.CANCELLED, "cancel_requested"
-            except Exception:
-                # Keep the stop/quarantine evidence and do not re-interrupt an
-                # already handled provider run because journal I/O failed.
-                return latest
+            # Any other journal failure propagates: the stop/quarantine evidence
+            # is already recorded, and returning the stale in-flight record would
+            # orphan the job for this process's life. Exiting lets the next
+            # start_epoch recover it as interrupted; the run is never
+            # re-interrupted or relaunched.
         return latest
 
     def _interrupt_execution(self, token, run) -> bool:

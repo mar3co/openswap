@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3131 passed, 4 skipped, 3 warnings in 30.38s`.
+`3138 passed, 4 skipped, 3 warnings in 30.85s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -273,6 +273,17 @@ The lease release command proves only that the recording worker and its job
 are finished; phase 2 never starts a provider process (the adapter refuses),
 so there is no provider tree to check yet. Before phase 3 enables a real
 adapter, release must also prove the provider process tree has stopped.
+Release covers both providers (`--provider codex|claude`). A kickoff lease, or
+a worker lease whose job is missing from the journal, is never journaled
+evidence of a stop, so it is released only when its recording process is
+gone, the lease has expired, and the owner passes `--confirm-stopped`.
+A job whose expiry passes while it is being prepared now ends `expired`
+before launch (STARTING may move to EXPIRED only before the provider
+starts), and a non-stale journal failure while recording an interrupt now
+propagates instead of returning the stale in-flight record, so the next
+start recovers the row. The subprocess acceptance fixture now holds a stop
+inside the fake interrupt, since event reads are interruptible; it had
+flaked when the worker finished the interrupt before the parent's kill.
 
 ## Deviations and verification
 

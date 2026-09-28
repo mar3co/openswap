@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import os
+import time
 import stat
 import subprocess
 import sys
@@ -45,13 +46,6 @@ def _running_job(store: LocalJobStore, *, epoch: int) -> str:
         worker_epoch=epoch, expected_generation=starting.generation,
     )
     return starting.job_id
-
-
-def _dead_pid() -> int:
-    """A pid guaranteed to no longer belong to any process."""
-    proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    proc.wait()
-    return proc.pid
 
 
 def _dead_pid() -> int:
@@ -403,3 +397,66 @@ def test_release_lease_succeeds_after_worker_gone_and_job_terminal_then_switch_w
     # Switching the account is the real-world proof the account is usable again.
     with AccountLeaseStore(tmp_path, "codex").mutation_guard() as guard:
         guard.assert_available()  # does not raise
+
+
+def _stranded_kickoff_lease(root: Path, provider: str, *, ttl_s: float) -> None:
+    AccountLeaseStore(root, provider).acquire(
+        job_id="kickoff-" + "b" * 32,
+        account_identity=stable_account_identity(provider, "acct-a"),
+        worker_pid=_dead_pid(),
+        worker_epoch=time.time_ns(),
+        ttl_s=ttl_s,
+    )
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+def test_release_lease_needs_expiry_and_confirmation_for_a_stranded_kickoff_lease(
+    tmp_path: Path, provider: str
+):
+    """A kickoff child can outlive its killed menu process and is never
+    journaled, so a missing job row is not stop evidence."""
+    _stranded_kickoff_lease(tmp_path, provider, ttl_s=0.05)
+    time.sleep(0.1)
+
+    assert cli.release_lease(tmp_path, provider) == (False, {}, "stop_unproven_confirm_required")
+    assert AccountLeaseStore(tmp_path, provider).current().state != "released"
+
+    ok, result, diagnostic = cli.release_lease(tmp_path, provider, confirm_stopped=True)
+    assert (ok, diagnostic) == (True, None)
+    lease = AccountLeaseStore(tmp_path, provider).current()
+    assert lease.state == "released" and lease.reason == "owner_released"
+
+
+def test_release_lease_refuses_an_unexpired_kickoff_lease_even_when_confirmed(tmp_path: Path):
+    _stranded_kickoff_lease(tmp_path, "claude", ttl_s=600)
+
+    assert cli.release_lease(tmp_path, "claude", confirm_stopped=True) == (
+        False, {}, "lease_not_expired",
+    )
+
+
+def test_release_lease_treats_a_missing_worker_job_row_as_unproven(tmp_path: Path):
+    job_store = LocalJobStore(tmp_path)
+    job_store._ensure_private_dir()
+    AccountLeaseStore(tmp_path, "codex").acquire(
+        job_id="c" * 32,
+        account_identity=stable_account_identity("codex", "acct-a"),
+        worker_pid=_dead_pid(),
+        worker_epoch=job_store.current_epoch(),
+        ttl_s=60,
+    )
+
+    assert cli.release_lease(tmp_path) == (False, {}, "stop_unproven_confirm_required")
+    assert cli.release_lease(tmp_path, confirm_stopped=True)[0] is True
+
+
+def test_lease_release_cli_selects_the_claude_store(tmp_path: Path, capsys):
+    _stranded_kickoff_lease(tmp_path, "claude", ttl_s=0.05)
+    time.sleep(0.1)
+
+    assert cli.main(["lease", "release", "--provider", "claude"], backup_root=tmp_path) == 1
+    assert "--confirm-stopped" in capsys.readouterr().err
+    assert cli.main(
+        ["lease", "release", "--provider", "claude", "--confirm-stopped"], backup_root=tmp_path
+    ) == 0
+    assert AccountLeaseStore(tmp_path, "claude").current().state == "released"

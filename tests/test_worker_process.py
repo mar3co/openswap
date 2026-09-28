@@ -64,8 +64,11 @@ class InertAdapter:
             time.sleep(0.02)
 
     def interrupt(self, run):
-        record("interrupt_called", "yes")
-        return InterruptResult(True, False, "execution_uncertain")
+        # Event reads are interruptible, so the stop may reach here. Hold it
+        # here, still ambiguous, until the parent kills this process.
+        record(f"interrupt_called_{os.getpid()}", "yes")
+        while True:
+            time.sleep(0.02)
 
 def factory(backup_root):
     runtime = WorkerRuntime(
@@ -240,7 +243,8 @@ def test_worker_process_persists_stop_and_quarantines_ambiguous_restart(tmp_path
         # The same idempotency key resolves to the interrupted record; recovery
         # does not put it back into the queue or launch it again.
         assert (marker / "duplicate_job").read_text(encoding="utf-8") == job_id
-        assert not (marker / "interrupt_called").exists()
+        # The replacement worker never interrupts (or relaunches) the recovered run.
+        assert not (marker / f"interrupt_called_{second.pid}").exists()
     finally:
         if contender is not None and contender.poll() is None:
             _terminate_owned(contender, hard=True)

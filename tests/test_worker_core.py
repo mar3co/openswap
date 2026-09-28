@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import threading
+import time
 from dataclasses import replace
 
 import pytest
@@ -204,6 +205,56 @@ def test_stop_during_interrupt_uses_latest_generation_without_retry(
     assert result.state == expected_state
     assert adapter.interrupt_count == 1
     assert AccountLeaseStore(tmp_path).current().state == expected_lease
+
+
+def test_journal_failure_while_recording_an_interrupt_is_not_swallowed(tmp_path):
+    """A non-stale journal failure must surface (so a restart can recover the
+    row) rather than return the stale in-flight record."""
+    update_worker_settings(tmp_path, enabled=True)
+    adapter = _FakeAdapter(stopped=False)
+    identity = stable_account_identity("codex", "journal-failure-test")
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    # A short runtime limit bounds this test if the failure is ever swallowed again.
+    runtime.submit(_submission(runtime_limit_s=1))
+    real_transition = runtime.store.transition
+
+    def failing_transition(job_id, **kwargs):
+        if kwargs.get("new_state") == JobState.INTERRUPTED:
+            raise OSError("disk full")
+        return real_transition(job_id, **kwargs)
+
+    runtime.store.transition = failing_transition
+    shutdown = threading.Event()
+    shutdown.set()
+
+    with pytest.raises(OSError, match="disk full"):
+        runtime.reconcile_once(shutdown_event=shutdown)
+    assert adapter.interrupt_count == 1
+    # The run was never relaunched and its lease stays quarantined for recovery.
+    assert adapter.start_count == 1
+    assert AccountLeaseStore(tmp_path).current().state == "uncertain"
+
+
+def test_job_that_expires_during_launch_preparation_never_starts(tmp_path):
+    update_worker_settings(tmp_path, enabled=True)
+
+    class SlowProbe(_FakeAdapter):
+        def probe(self):
+            time.sleep(0.6)  # probe, lease and workspace setup outlast the expiry
+            return super().probe()
+
+    adapter = SlowProbe()
+    identity = stable_account_identity("codex", "expiry-during-launch-test")
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    runtime.submit(_submission(expires_at=datetime.now(timezone.utc) + timedelta(seconds=0.3)))
+
+    result = runtime.reconcile_once()
+
+    assert result.state == JobState.EXPIRED
+    assert result.diagnostic_code == "job_expired"
+    assert adapter.start_count == 0
+    lease = AccountLeaseStore(tmp_path).current()
+    assert lease.state == "released" and lease.reason == "unlaunched"
 
 
 @pytest.mark.parametrize("race_point", ["append", "terminal_transition"])
