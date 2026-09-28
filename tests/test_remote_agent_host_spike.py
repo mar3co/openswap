@@ -1130,13 +1130,14 @@ def test_private_dir_refuses_a_symlinked_ancestor_component(tmp_path):
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ownership is required")
 @pytest.mark.parametrize("path, refused", [
-    ("/tmp/openswap-spike/state", False),          # top-level system link
-    ("/srv/linked/openswap-spike/state", True),    # root-owned, but not top-level
+    ("/tmp/openswap-spike/state", False),          # listed macOS link, expected target
+    ("/redirect/openswap-spike/state", True),      # root-owned and top-level, not listed
+    ("/srv/linked/openswap-spike/state", True),    # root-owned, not top-level
 ])
-def test_only_top_level_root_owned_symlinks_are_trusted(monkeypatch, path, refused):
-    # As if running as root: every link is root-owned, so ownership alone
-    # must not be trusted.
-    links = {"/tmp", "/srv/linked"}
+def test_only_listed_system_symlinks_are_trusted(monkeypatch, path, refused):
+    # As if running as root: every link is root-owned, so neither ownership
+    # nor location may earn trust.
+    links = {"/tmp": "private/tmp", "/redirect": "private/tmp", "/srv/linked": "private/tmp"}
 
     def fake_lstat(candidate):
         candidate = str(candidate)
@@ -1145,12 +1146,53 @@ def test_only_top_level_root_owned_symlinks_are_trusted(monkeypatch, path, refus
             raise FileNotFoundError(candidate)
         return os.stat_result((mode, 0, 0, 1, 0, 0, 0, 0, 0, 0))
 
+    monkeypatch.setattr(spike.sys, "platform", "darwin")
     monkeypatch.setattr(spike.os, "lstat", fake_lstat)
+    monkeypatch.setattr(spike.os, "stat", lambda c: os.stat_result((stat.S_IFDIR | 0o1777, 0, 0, 1, 0, 0, 0, 0, 0, 0)))
+    monkeypatch.setattr(spike.os, "readlink", lambda c: links[str(c)])
     if refused:
         with pytest.raises(SpikeError, match="must not traverse a symlink"):
             spike._refuse_symlinked_components(Path(path))
     else:
         spike._refuse_symlinked_components(Path(path))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions are required")
+@pytest.mark.parametrize("mode, refused", [(0o777, True), (0o1777, False), (0o755, False)])
+def test_private_dir_refuses_ancestors_others_can_modify_unless_sticky(tmp_path, mode, refused):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(mode)
+    try:
+        if refused:
+            with pytest.raises(SpikeError, match="others can modify"):
+                spike._private_dir(shared / "state")
+            assert not (shared / "state").exists()
+        else:
+            spike._private_dir(shared / "state")
+    finally:
+        shared.chmod(0o755)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
+def test_private_dir_refuses_a_symlink_raced_in_before_the_missing_path_walk(tmp_path, monkeypatch):
+    target = tmp_path / "elsewhere"
+    target.mkdir(mode=0o700)
+    raced = tmp_path / "a"
+    real_check = spike._refuse_symlinked_components
+    calls = {"n": 0}
+
+    def racing_check(path):
+        calls["n"] += 1
+        real_check(path)
+        if calls["n"] == 1:
+            # Another user plants the missing component right after validation.
+            raced.symlink_to(target, target_is_directory=True)
+
+    monkeypatch.setattr(spike, "_refuse_symlinked_components", racing_check)
+    with pytest.raises(SpikeError, match="must not traverse a symlink"):
+        spike._private_dir(raced / "b" / "state")
+    assert list(target.iterdir()) == []
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
@@ -1530,6 +1572,51 @@ def test_process_table_scans_are_bounded_by_the_job_deadline(tmp_path, monkeypat
     )
     assert cancelled and budgets
     assert all(b is not None and b <= 1.0 for b in budgets), budgets
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_short_timeout_run_still_attributes_a_detached_helper(tmp_path, monkeypatch):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-quick-detacher",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    real_append = spike._append_jsonl
+
+    def slow_running_append(path, record):
+        real_append(path, record)
+        if record.get("state") == "running":
+            # Startup journaling spends the whole budget: no periodic scan runs.
+            deadline = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.3)
+
+    monkeypatch.setattr(spike, "_append_jsonl", slow_running_append)
+    try:
+        result = supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=0.1, grace_s=0.2, job_id="short",
+        )
+        assert pid_file.exists()
+        detached_pid = int(pid_file.read_text())
+        assert result["state"] == "interrupted"
+        assert _wait_for_pid_exit(detached_pid, 2.0)
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
@@ -1924,6 +2011,11 @@ def test_track_descendants_verifies_handle_when_child_changed_group_and_command_
     tracked: dict = {}
     spike._track_descendants(100, tracked)
     assert tracked[4242][3] == 79 and tracked[4242][5] is True
+    # The re-read's group and identity replace the stale snapshot's, so the
+    # detached child counts as escaped even if no later scan succeeds.
+    assert tracked[4242][0] == 4242 and tracked[4242][4] == "tA|pgid=4242|helper"
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+    assert 4242 in spike._escaped_descendants(100, tracked)
 
 
 @pytest.mark.parametrize("handle", [None, 81])

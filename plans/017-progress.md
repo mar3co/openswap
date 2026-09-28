@@ -23,8 +23,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest Phase 1-only assembled suite was green: `2985 passed, 4 skipped, 3
-warnings in 28.84s`; it includes 112 phase-one harness tests and two direct
+The latest Phase 1-only assembled suite was green: `2991 passed, 4 skipped, 3
+warnings in 30.41s`; it includes 118 phase-one harness tests and two direct
 tests of the Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`). This is Phase 1
 evidence, not validation of the Phase 2 tree; the separate full Phase 2 result
@@ -116,7 +116,7 @@ Phase 1 exit requires all of the following:
   before real Codex execution, but does not block owner-authorized local-only
   Phase 2 infrastructure work.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2985 passed, 4 skipped, 3 warnings in 28.84s`).
+  (`2991 passed, 4 skipped, 3 warnings in 30.41s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -345,10 +345,18 @@ adapter, release must also prove the provider process tree has stopped.
   raced into existence during creation is revalidated, and the whole path is
   re-checked for symlinks afterwards. The event reader is stoppable: if a
   descendant still holds stdout, it is stopped and the pipe closed before the
-  result is recorded. Only a root-owned symlink directly under `/` (the
-  macOS system links) is trusted in a state or evidence path, so running as
-  root does not widen the exemption. A failed final probe scan still sweeps
-  descendants recorded by earlier scans.
+  result is recorded. Only the exact macOS system links (`/tmp`, `/var`
+  and `/etc` pointing at `/private/...`) are trusted in a state or evidence
+  path, so running as root does not widen the exemption. Every existing
+  directory on the path must be owned by the user or root and not be
+  modifiable by others unless sticky, so no component can be swapped for a
+  symlink after validation. The missing-path walk does not follow symlinks
+  and the existing prefix is re-validated just before creation. Before any
+  group signal, one short bounded scan attributes descendants, so even a run
+  too short for a periodic scan records a helper that already detached. A failed final probe scan still sweeps
+  descendants recorded by earlier scans. A pidfd verified by its re-read
+  keeps that re-read's group and identity, so a child that called `setsid()`
+  between snapshot and open is still recognised as escaped.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the

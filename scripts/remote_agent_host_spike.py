@@ -289,15 +289,46 @@ def _sweep_probe_descendants(
     return True, all_gone and scanned
 
 
+# The only symlinks trusted in an output path: macOS's root-owned top-level
+# system links, each with its exact expected target.
+_TRUSTED_SYSTEM_LINKS = {
+    "darwin": {"/tmp": "private/tmp", "/var": "private/var", "/etc": "private/etc"},
+}
+
+
+def _trusted_system_link(current: Path, status: os.stat_result) -> bool:
+    expected = _TRUSTED_SYSTEM_LINKS.get(sys.platform, {}).get(str(current))
+    if expected is None or os.name != "posix" or status.st_uid != 0:
+        return False
+    try:
+        return os.readlink(current) in (expected, "/" + expected)
+    except OSError:
+        return False
+
+
+def _refuse_unsafe_directory(current: Path, status: os.stat_result) -> None:
+    # Another user who can modify an ancestor could rename our directory and
+    # put a symlink in its place after validation. A sticky directory (such
+    # as /tmp) lets only an entry's owner rename it, so it stays safe.
+    if os.name != "posix":
+        return
+    if status.st_uid not in (0, os.getuid()):
+        raise SpikeError("Private output path must not sit under another user's directory.")
+    if status.st_mode & 0o022 and not status.st_mode & stat_module.S_ISVTX:
+        raise SpikeError("Private output path must not sit under a directory others can modify.")
+
+
 def _refuse_symlinked_components(path: Path) -> None:
-    """Refuse a path that traverses any symlink other than a top-level system link.
+    """Refuse a path that another user could redirect, before or after validation.
 
     A symlinked component (not just the leaf) would redirect every directory
-    and file we create into its target. Only a root-owned symlink directly
-    under the filesystem root (macOS's ``/tmp``, ``/var`` and ``/etc`` ->
-    ``/private/...``) is trusted; ownership alone is not enough, because a
-    harness run as root would own every link it could be tricked into
-    following. On platforms without POSIX ownership any symlink is refused.
+    and file we create into its target, so only an exactly listed system link
+    (macOS's ``/tmp``, ``/var`` and ``/etc`` -> ``/private/...``) is trusted;
+    ownership or location alone is not, because a harness run as root would
+    own every link it could be tricked into following. Every existing
+    directory must also be owned by us or root and not be modifiable by
+    others unless sticky, so nobody can swap a component for a symlink after
+    this check. On platforms without POSIX ownership any symlink is refused.
     """
     anchor = Path(path.absolute().anchor)
     current = anchor
@@ -309,10 +340,15 @@ def _refuse_symlinked_components(path: Path) -> None:
             # Missing (we create the rest below) or not a directory: the
             # creation step raises the real error, reported with details withheld.
             return
-        if stat_module.S_ISLNK(status.st_mode) and not (
-            os.name == "posix" and status.st_uid == 0 and current.parent == anchor
-        ):
-            raise SpikeError("Private output path must not traverse a symlink.")
+        if stat_module.S_ISLNK(status.st_mode):
+            if not _trusted_system_link(current, status):
+                raise SpikeError("Private output path must not traverse a symlink.")
+            try:
+                status = os.stat(current)
+            except OSError:
+                return
+        if stat_module.S_ISDIR(status.st_mode) and current.parent != current:
+            _refuse_unsafe_directory(current, status)
 
 
 def _private_dir(path: Path) -> None:
@@ -321,9 +357,13 @@ def _private_dir(path: Path) -> None:
     # rather than trusting mkdir(parents=True) to apply the mode above the leaf.
     missing = []
     current = path
-    while not current.exists() and current.parent != current:
+    # lexists, not exists: a component raced in as a symlink must count as
+    # existing (and be validated below), never be walked through as missing.
+    while not os.path.lexists(current) and current.parent != current:
         missing.append(current)
         current = current.parent
+    # Re-validate the existing prefix right before creating anything under it.
+    _refuse_symlinked_components(current)
     for directory in reversed(missing):
         try:
             directory.mkdir(mode=0o700)
@@ -854,6 +894,10 @@ def _track_descendants(
         for pid, ppid, pgid, stat, birth, identity in table:
             if pid == leader_pid:
                 continue
+            if pid in tracked and pid not in existing:
+                # Added earlier in this call from a fresher re-read than this
+                # table; later passes must not overwrite it with stale fields.
+                continue
             if pid in tracked or ppid in known:
                 if pid in tracked:
                     handle = tracked[pid][3]
@@ -898,6 +942,11 @@ def _track_descendants(
                                 pass
                             continue
                         verified = row is not None and row[0] in trusted
+                        if verified:
+                            # The verifying re-read is newer than the snapshot:
+                            # keep its group and identity, so a child that called
+                            # setsid() meanwhile is recognised as outside our group.
+                            pgid, identity = row[1], row[3]
                 tracked[pid] = (pgid, stat, birth, handle, identity, verified)
                 if pid not in known:
                     known.add(pid)
@@ -1242,6 +1291,15 @@ def _supervise_fake_command_locked(
         timed_out = not _leader_exited(process)
         if timed_out:
             _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
+        # One short bounded scan while the leader is still unreaped, before any
+        # group signal: a run too short for a periodic scan still attributes a
+        # helper that already detached, before killing the leader reparents it.
+        # A stalled scan delays termination by at most SCAN_WINDOW_S and forces
+        # "interrupted".
+        if not _track_descendants(
+            process.pid, tracked, deadline=time.monotonic() + SCAN_WINDOW_S
+        ):
+            tracking_complete = False
         # A provider parent may exit while a child keeps the pipe or continues
         # work. Clean the group after timeout and after every leader exit, and
         # only report success when enumeration and the output reader are quiet.
