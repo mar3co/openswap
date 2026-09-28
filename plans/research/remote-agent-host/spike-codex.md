@@ -104,7 +104,7 @@ complete under process termination.
 
 ## Recorded outcomes
 
-The local harness reported:
+The local harness previously reported:
 
 ```text
 inspect: codex-cli 0.158.0-alpha.2.1; exec_json=true; sandbox_option=true;
@@ -112,7 +112,7 @@ inspect: codex-cli 0.158.0-alpha.2.1; exec_json=true; sandbox_option=true;
 demo:    state=cancelled; returncode=-15; event_names=[thread.started]
 sandbox: inside read/write allowed; outside read/write denied;
          synthetic CODEX_HOME auth/config reads denied; no exec/model run
-tests:   25 passed (full assembled suite: 2,896 passed, 4 skipped, 3 warnings)
+tests:   33 passed (full assembled suite: 2,904 passed, 4 skipped, 3 warnings)
 ```
 
 After the bounded process-group runner was added, the official stable ARM
@@ -161,6 +161,26 @@ is covered by a bounded process-group runner: timeout and normal leader exit
 clean up observed members of the owned process group, and probe launch failures
 remain sanitized. They do not guarantee cleanup of descendants that leave that
 group.
+
+The sandbox probe now gives every synthetic operation a unique start,
+completion, and exit-status marker. Denials are counted only when that command
+completed with a nonzero status, its own stderr contains `Operation not
+permitted`, and the corresponding sentinel stayed hidden. The auth/config
+check requires both `cat` operations to complete and be denied independently.
+If Seatbelt initialization fails before the shell runs, or output contains only
+partial/misleading sentinels, the harness refuses instead of recording a
+passing boundary result. A hash-verified stable 0.157.1 run passed this stricter
+probe again with workspace read/write allowed and sibling plus synthetic
+`CODEX_HOME` reads denied.
+
+Findings [#4122150605](https://github.com/mar3co/openswap/pull/59#discussion_r4122150605)
+and [#4122150621](https://github.com/mar3co/openswap/pull/59#discussion_r4122150621)
+are covered by bounded probe collection: stdout and stderr each retain at most
+256 KiB, are read concurrently without unbounded buffers, and overflow stops
+the owned group and returns a sanitized refusal. Cleanup waits on the process
+without re-reading the pipes. Fake stdout-only, stderr-only, and dual-stream
+floods verify refusal and stop a same-group helper. This does not close the
+separately documented detached-descendant gap.
 
 The later review finding
 [#4122008642](https://github.com/mar3co/openswap/pull/59#discussion_r4122008642)

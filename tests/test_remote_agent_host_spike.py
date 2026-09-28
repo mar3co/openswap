@@ -354,6 +354,133 @@ def test_sandbox_probe_sanitizes_subprocess_failures(
     assert len(calls) == (1 if stage == "first" else 2)
 
 
+def _sandbox_markers(
+    operations: dict[str, int], denials: set[str] | frozenset[str] = frozenset()
+) -> str:
+    lines = []
+    for name, status in operations.items():
+        lines.extend((f"probe-start:{name}", f"probe-complete:{name}",
+                      f"probe-status:{name}:{status}"))
+        if name in denials:
+            lines.append(f"probe-denied:{name}")
+    return "\n".join(lines) + "\n"
+
+
+def test_sandbox_probe_requires_each_operation_and_records_real_denial_markers(
+    tmp_path, monkeypatch
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        workspace = Path(command[command.index("--cd") + 1])
+        if len(calls) == 1:
+            (workspace / "write-test.txt").write_text("inside-write", encoding="utf-8")
+            output = "workspace-sentinel\n" + _sandbox_markers(
+                {"inside_read": 0, "outside_read": 1, "inside_write": 0,
+                 "outside_write": 2},
+                {"outside_read", "outside_write"},
+            )
+        else:
+            output = _sandbox_markers(
+                {"auth_read": 1, "config_read": 1}, {"auth_read", "config_read"}
+            )
+        return subprocess.CompletedProcess(command, 1, output, "")
+
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
+
+    result = spike.probe_low_level_sandbox(str(fake), tmp_path / "evidence")
+
+    assert calls and len(calls) == 2
+    assert result["inside_read_allowed"]
+    assert result["outside_read_denied"]
+    assert result["inside_write_allowed"]
+    assert result["outside_write_denied"]
+    assert result["codex_home_auth_and_config_denied"]
+
+
+@pytest.mark.parametrize(
+    ("auth_output", "auth_error"),
+    [
+        ("", "sandbox_apply: Operation not permitted\n"),
+        (_sandbox_markers({"auth_read": 1}, {"auth_read"}), ""),
+    ],
+    ids=["auth-sandbox-setup-failure", "missing-config-operation"],
+)
+def test_sandbox_probe_refuses_when_auth_config_commands_did_not_all_run(
+    tmp_path, monkeypatch, capsys, auth_output, auth_error
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        workspace = Path(command[command.index("--cd") + 1])
+        if len(calls) == 1:
+            (workspace / "write-test.txt").write_text("inside-write", encoding="utf-8")
+            output = "workspace-sentinel\n" + _sandbox_markers(
+                {"inside_read": 0, "outside_read": 1, "inside_write": 0,
+                 "outside_write": 2},
+                {"outside_read", "outside_write"},
+            )
+            return subprocess.CompletedProcess(command, 1, output, "")
+        return subprocess.CompletedProcess(command, 1, auth_output, auth_error)
+
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
+
+    code = spike._main([
+        "sandbox-probe", "--codex-bin", str(fake), "--evidence-dir",
+        str(tmp_path / "evidence"),
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == (
+        "refused: Sandbox commands did not all run to completion; details were not retained.\n"
+    )
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr"),
+    [
+        ("sandbox_apply: Operation not permitted\n", ""),
+        ("workspace-sentinel\n", "sandbox_apply: Operation not permitted\n"),
+    ],
+    ids=["setup-failure", "partial-misleading-output"],
+)
+def test_sandbox_probe_refuses_setup_failure_without_operation_markers(
+    tmp_path, monkeypatch, capsys, stdout, stderr
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1, stdout, stderr)
+
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
+
+    code = spike._main([
+        "sandbox-probe", "--codex-bin", str(fake), "--evidence-dir",
+        str(tmp_path / "evidence"),
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == (
+        "refused: Sandbox commands did not all run to completion; details were not retained.\n"
+    )
+    assert len(calls) == 2
+    assert "workspace-sentinel" not in captured.out
+
+
 @pytest.mark.skipif(os.name != "posix", reason="owned process-group cleanup is POSIX-only")
 @pytest.mark.parametrize("probe", ["inspect", "sandbox"])
 def test_probe_timeout_kills_term_ignoring_helper_group(tmp_path, monkeypatch, capsys, probe):
@@ -438,6 +565,51 @@ def test_probe_normal_leader_exit_refuses_and_cleans_live_helper(tmp_path):
     before = marker.read_text()
     time.sleep(0.15)
     assert marker.read_text() == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bounded probe pipes need POSIX selectors")
+@pytest.mark.parametrize("flood", ["stdout", "stderr", "both"])
+def test_probe_bounds_both_output_streams_and_cleans_owned_group(
+    tmp_path, monkeypatch, flood
+):
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    heartbeat = markers / "heartbeat"
+    helper = _executable(
+        tmp_path / "flood-helper.py",
+        "import pathlib,signal,time\n"
+        f"marker=pathlib.Path({str(heartbeat)!r})\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "i=0\n"
+        "while True:\n"
+        " i+=1; marker.write_text(str(i)); time.sleep(0.02)\n",
+    )
+    fake = _executable(
+        tmp_path / "noisy-codex",
+        "import os,pathlib,subprocess,sys,time\n"
+        f"markers=pathlib.Path({str(markers)!r})\n"
+        f"helper=subprocess.Popen([sys.executable,{str(helper)!r}], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "(markers/'helper.pid').write_text(str(helper.pid))\n"
+        "deadline=time.monotonic()+1\n"
+        "while not (markers/'heartbeat').exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
+        "chunk=b'x'*8192\n"
+        "while True:\n"
+        f" os.write(1,chunk) if {flood!r} in ('stdout','both') else None\n"
+        f" os.write(2,chunk) if {flood!r} in ('stderr','both') else None\n",
+    )
+    monkeypatch.setattr(spike, "MAX_PROBE_OUTPUT_BYTES", 32 * 1024)
+
+    with pytest.raises(SpikeError, match="bounded capture limit") as error:
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=5
+        )
+
+    assert "raw" not in str(error.value)
+    assert (markers / "helper.pid").exists()
+    assert heartbeat.exists()
+    before = heartbeat.read_text()
+    time.sleep(0.15)
+    assert heartbeat.read_text() == before
 
 
 def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):

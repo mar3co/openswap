@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import selectors
 import shlex
 import shutil
 import signal
@@ -33,6 +34,8 @@ MAX_EVENT_LINE_CHARS = 64 * 1024
 EVENT_NAMES_TRUNCATED = "event-names-truncated"
 PROBE_TERMINATION_GRACE_S = 0.15
 PROBE_CLEANUP_WAIT_S = 0.5
+MAX_PROBE_OUTPUT_BYTES = 256 * 1024
+PROBE_READ_CHUNK_BYTES = 16 * 1024
 _EVENT_NAME = re.compile(r"^[a-zA-Z0-9_.-]{1,80}$")
 
 
@@ -42,27 +45,81 @@ class SpikeError(RuntimeError):
 
 def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
                timeout_s: float) -> subprocess.CompletedProcess:
-    """Run a credential-free probe and refuse success if its owned group lingers."""
+    """Run a probe with bounded output capture and owned-group cleanup."""
+    if os.name != "posix":
+        raise SpikeError("Bounded Codex probes require POSIX process supervision.")
     process = subprocess.Popen(
         list(command), env=env, cwd=cwd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=(os.name == "posix"),
+        start_new_session=True,
     )
+    assert process.stdout is not None and process.stderr is not None
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    buffers = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+    selector = None
+    timed_out = False
+    overflowed = False
+    cleanup_uncertain = False
+    leftovers = False
     try:
-        stdout, stderr = process.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        _cleanup_probe_process(process)
-        raise subprocess.TimeoutExpired(command, timeout_s) from None
+        selector = selectors.DefaultSelector()
+        for stream in (process.stdout, process.stderr):
+            fd = stream.fileno()
+            os.set_blocking(fd, False)
+            selector.register(fd, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout_s
+        while process.poll() is None or selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
+            if not selector.get_map() and process.poll() is None:
+                time.sleep(min(remaining, 0.02))
+            for key, _ in events:
+                fd = key.fd
+                try:
+                    chunk = os.read(fd, PROBE_READ_CHUNK_BYTES)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(fd)
+                    continue
+                buffer = buffers[fd]
+                available = MAX_PROBE_OUTPUT_BYTES - len(buffer)
+                if len(chunk) > available:
+                    if available > 0:
+                        buffer.extend(chunk[:available])
+                    overflowed = True
+                    break
+                buffer.extend(chunk)
+            if overflowed:
+                break
+        if timed_out or overflowed:
+            cleanup_uncertain = _cleanup_probe_process(process)
+        else:
+            process.wait()
+            leftovers = _probe_group_running(process.pid)
+            if leftovers:
+                cleanup_uncertain = _cleanup_probe_process(process)
     except BaseException:
         _cleanup_probe_process(process)
         raise
-
-    if os.name == "posix" and _probe_group_running(process.pid):
-        _cleanup_probe_process(process)
-        raise SpikeError("Probe left a child process running; result was refused.")
+    finally:
+        if selector is not None:
+            selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    if overflowed:
+        raise SpikeError("Probe output exceeded the bounded capture limit; result was refused.")
+    if timed_out:
+        raise subprocess.TimeoutExpired(command, timeout_s) from None
+    if cleanup_uncertain or leftovers:
+        raise SpikeError("Probe cleanup was uncertain; result was refused.")
     try:
-        decoded_stdout = stdout.decode("utf-8")
-        decoded_stderr = stderr.decode("utf-8")
+        decoded_stdout = bytes(buffers[stdout_fd]).decode("utf-8")
+        decoded_stderr = bytes(buffers[stderr_fd]).decode("utf-8")
     except UnicodeDecodeError:
         raise
     return subprocess.CompletedProcess(command, process.returncode, decoded_stdout, decoded_stderr)
@@ -82,7 +139,7 @@ def _probe_group_running(pgid: int) -> bool:
 
 
 def _cleanup_probe_process(process: subprocess.Popen) -> bool:
-    """Bounded cleanup for this probe's session; return whether it is uncertain."""
+    """Bounded cleanup for this probe's session without reading its pipes."""
     if os.name == "posix":
         _signal_group(process, signal.SIGTERM)
         deadline = time.monotonic() + PROBE_TERMINATION_GRACE_S
@@ -94,14 +151,14 @@ def _cleanup_probe_process(process: subprocess.Popen) -> bool:
         process.terminate()
 
     try:
-        process.communicate(timeout=PROBE_CLEANUP_WAIT_S)
+        process.wait(timeout=PROBE_CLEANUP_WAIT_S)
     except subprocess.TimeoutExpired:
         if os.name == "posix":
             _signal_group(process, signal.SIGKILL)
         elif process.poll() is None:
             process.kill()
         try:
-            process.communicate(timeout=PROBE_CLEANUP_WAIT_S)
+            process.wait(timeout=PROBE_CLEANUP_WAIT_S)
         except subprocess.TimeoutExpired:
             return True
     return process.poll() is None or (os.name == "posix" and _probe_group_running(process.pid))
@@ -438,6 +495,21 @@ def inspect_codex(codex_bin: str | None, evidence_dir: Path) -> dict:
     return observed
 
 
+def _sandbox_operation_status(output: str, operation: str) -> int | None:
+    lines = output.splitlines()
+    if lines.count(f"probe-start:{operation}") != 1:
+        return None
+    if lines.count(f"probe-complete:{operation}") != 1:
+        return None
+    status_lines = [line for line in lines if line.startswith(f"probe-status:{operation}:")]
+    if len(status_lines) != 1:
+        return None
+    try:
+        return int(status_lines[0].rsplit(":", 1)[1])
+    except ValueError:
+        return None
+
+
 def probe_low_level_sandbox(codex_bin: str | None, evidence_dir: Path) -> dict:
     """Reproduce the synthetic path-boundary test without a model or login."""
     executable = codex_bin or shutil.which("codex")
@@ -471,12 +543,27 @@ def probe_low_level_sandbox(codex_bin: str | None, evidence_dir: Path) -> dict:
         with (codex_home / "config.toml").open("a", encoding="utf-8") as stream:
             stream.write("# synthetic-config-sentinel\n")
         env = {"PATH": os.defpath, "HOME": str(root), "CODEX_HOME": str(codex_home)}
-        command = (
-            f"cat {shlex.quote(str(workspace / 'inside.txt'))}; "
-            f"cat {shlex.quote(str(outside / 'outside.txt'))}; "
-            f"printf inside-write > {shlex.quote(str(workspace / 'write-test.txt'))}; "
-            f"printf outside-write > {shlex.quote(str(outside / 'write-test.txt'))}"
-        )
+        def operation(name: str, command: str) -> str:
+            error_file = shlex.quote(str(workspace / f"{name}.stderr"))
+            return (
+                f"printf 'probe-start:{name}\\n'; "
+                f"{command} 2>{error_file}; status=$?; "
+                f"printf '\\nprobe-complete:{name}\\n'; "
+                f"printf 'probe-status:{name}:%s\\n' \"$status\"; "
+                f"if grep -q 'Operation not permitted' {error_file}; "
+                f"then printf 'probe-denied:{name}\\n'; fi"
+            )
+
+        command = "; ".join((
+            operation("inside_read", f"cat {shlex.quote(str(workspace / 'inside.txt'))}"),
+            operation("outside_read", f"cat {shlex.quote(str(outside / 'outside.txt'))}"),
+            operation("inside_write", f"/bin/sh -c {shlex.quote('printf inside-write > ' + shlex.quote(str(workspace / 'write-test.txt')))}"),
+            operation("outside_write", f"/bin/sh -c {shlex.quote('printf outside-write > ' + shlex.quote(str(outside / 'write-test.txt')))}"),
+        ))
+        auth_command = "; ".join((
+            operation("auth_read", 'cat "$CODEX_HOME/auth.json"'),
+            operation("config_read", 'cat "$CODEX_HOME/config.toml"'),
+        ))
         try:
             result = _run_probe(
                 [binary, "sandbox", "--permission-profile", "research-test", "--log-denials",
@@ -485,30 +572,52 @@ def probe_low_level_sandbox(codex_bin: str | None, evidence_dir: Path) -> dict:
             )
             auth_read = _run_probe(
                 [binary, "sandbox", "--permission-profile", "research-test", "--log-denials",
-                 "--cd", str(workspace), "/bin/sh", "-c",
-                 'cat "$CODEX_HOME/auth.json"; cat "$CODEX_HOME/config.toml"'],
+                 "--cd", str(workspace), "/bin/sh", "-c", auth_command],
                 env=env, cwd=temp, timeout_s=20,
             )
         except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
             raise SpikeError("Codex sandbox probe could not complete.") from None
         combined = result.stdout + result.stderr
         auth_combined = auth_read.stdout + auth_read.stderr
+        first_ops = {
+            name: _sandbox_operation_status(combined, name)
+            for name in ("inside_read", "outside_read", "inside_write", "outside_write")
+        }
+        auth_ops = {
+            name: _sandbox_operation_status(auth_combined, name)
+            for name in ("auth_read", "config_read")
+        }
+        first_denials = set(line.removeprefix("probe-denied:") for line in combined.splitlines()
+                            if line.startswith("probe-denied:"))
+        auth_denials = set(line.removeprefix("probe-denied:") for line in auth_combined.splitlines()
+                           if line.startswith("probe-denied:"))
         observed = {
             "kind": "low_level_sandbox_probe",
             "exec_or_model_run": False,
-            "inside_read_allowed": "workspace-sentinel" in combined,
-            "outside_read_denied": "outside-sentinel" not in combined and "Operation not permitted" in combined,
-            "inside_write_allowed": (workspace / "write-test.txt").exists(),
-            "outside_write_denied": not (outside / "write-test.txt").exists(),
+            "inside_read_allowed": (first_ops["inside_read"] == 0
+                                    and "workspace-sentinel" in combined),
+            "outside_read_denied": (first_ops["outside_read"] not in (None, 0)
+                                    and "outside-sentinel" not in combined
+                                    and "outside_read" in first_denials),
+            "inside_write_allowed": (first_ops["inside_write"] == 0
+                                     and (workspace / "write-test.txt").is_file()
+                                     and (workspace / "write-test.txt").read_text(encoding="utf-8")
+                                     == "inside-write"),
+            "outside_write_denied": (first_ops["outside_write"] not in (None, 0)
+                                     and not (outside / "write-test.txt").exists()
+                                     and "outside_write" in first_denials),
             "codex_home_auth_and_config_denied": (
-                auth_read.returncode != 0
-                and "Operation not permitted" in auth_combined
+                all(status not in (None, 0) for status in auth_ops.values())
+                and {"auth_read", "config_read"}.issubset(auth_denials)
                 and "synthetic-auth-sentinel" not in auth_combined
                 and "synthetic-config-sentinel" not in auth_combined
             ),
         }
-        if result.returncode == 0 or auth_read.returncode == 0:
-            raise SpikeError("Sandbox probe produced an unexpected success; details were not retained.")
+        required_statuses = all(status is not None for status in (*first_ops.values(), *auth_ops.values()))
+        if not required_statuses:
+            raise SpikeError(
+                "Sandbox commands did not all run to completion; details were not retained."
+            )
         expected = (
             observed["inside_read_allowed"], observed["outside_read_denied"],
             observed["inside_write_allowed"], observed["outside_write_denied"],

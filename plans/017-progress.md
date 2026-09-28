@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The final assembled-branch suite is green: `2896 passed, 4 skipped, 3 warnings
-in 16.66s`; it includes 25 phase-one harness tests. The helper-cleanup
+The final assembled-branch suite is green: `2904 passed, 4 skipped, 3 warnings
+in 16.07s`; it includes 33 phase-one harness tests. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
 The ChatGPT app-bundled Codex CLI is `0.158.0-alpha.2.1` (pre-release). A
@@ -30,7 +30,10 @@ separate official stable ARM macOS release, `0.157.1`, was downloaded to
 workspace read/write and denied sibling read/write plus synthetic
 `CODEX_HOME/auth.json` and `config.toml` reads. This narrows the stable-version
 uncertainty for that low-level wrapper only; it does not prove `codex exec`
-applies the profile. The spike harness and synthetic tests cover local helper
+applies the profile. The [bounded no-auth tool-surface experiment](research/remote-agent-host/tool-surface-spike.md)
+reached the loopback mock with five advertised function tools but exited
+without a last-message file; successful CLI completion and the research tool
+surface remain unproven. The spike harness and synthetic tests cover local helper
 behavior: inert child-process cancellation and uncertain-journal recovery do
 not prove provider `codex exec` cancellation or recovery. No live account test,
 refresh-race test, authenticated execution, or web-research run has been
@@ -102,7 +105,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2896 passed, 4 skipped, 3 warnings in 16.66s`).
+  (`2904 passed, 4 skipped, 3 warnings in 16.07s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -128,7 +131,7 @@ until the owner records a permitted path or exclusion.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it will preserve the `ClaudeSwitchError` assertion and will not change the
   resolver or executable discovery behavior.
-- Credential-free harness tests passed (25 tests included in the full suite);
+- Credential-free harness tests passed (33 tests included in the full suite);
   `inspect`,
   inert-child `demo`, and synthetic Seatbelt `sandbox-probe` outcomes are in
   [the Codex spike record](research/remote-agent-host/spike-codex.md). This
@@ -174,8 +177,17 @@ until the owner records a permitted path or exclusion.
   binary was rechecked: `inspect` reported `codex-cli 0.157.1` and
   `no_auth_performed=true`; the synthetic `sandbox-probe` allowed workspace
   read/write and denied sibling read/write plus synthetic `CODEX_HOME` auth and
-  config reads. This remains wrapper-only evidence; no `codex exec` or provider
-  job was run.
+  config reads, with per-operation start/completion/status/denial markers. A
+  later Seatbelt-initialization failure or partial marker output now refuses
+  instead of counting as a passing denial. This remains wrapper-only evidence;
+  no `codex exec` or provider job was run.
+- Codex review findings [P2 #4122150605](https://github.com/mar3co/openswap/pull/59#discussion_r4122150605)
+  and [P2 #4122150621](https://github.com/mar3co/openswap/pull/59#discussion_r4122150621)
+  are addressed in the probe harness: sandbox results require per-operation
+  completion/status/denial evidence, and stdout/stderr collection is bounded
+  at 256 KiB per stream with owned-group cleanup on overflow. Targeted harness
+  tests passed (`33 passed`); the full suite passed on this assembled branch.
+  The detached-descendant limitation remains unresolved.
 - `uv` was not installed on `PATH`; version 0.12.19 was installed only under
   `/private/tmp/openswap-uv-test`, with its Python, cache, and project test
   environment under `/private/tmp`. The full suite used that isolated runtime.
