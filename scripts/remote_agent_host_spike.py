@@ -88,6 +88,9 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
     overflowed = False
     cleanup_uncertain = False
     leftovers = False
+    detached = False
+    tracked: dict[int, tuple[int, str, str, int | None, str, bool]] = {}
+    last_snapshot = 0.0
     try:
         selector = selectors.DefaultSelector()
         for stream in (process.stdout, process.stderr):
@@ -103,15 +106,21 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
             if remaining <= 0:
                 timed_out = True
                 break
-            events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
+            now = time.monotonic()
+            if now - last_snapshot >= DESCENDANT_SNAPSHOT_INTERVAL_S:
+                # Best effort: descendants are attributed by parent pid while
+                # the leader is alive, so one that calls setsid() is still ours.
+                last_snapshot = now
+                _track_descendants(process.pid, tracked)
+            # Observe exit BEFORE selecting: anything the group wrote before
+            # it went quiet is then already readable, so an empty select after
+            # that observation really means no output is left.
             exited = _leader_exited(process)
+            quiet = exited and not _probe_group_running(process.pid)
+            events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
             if not selector.get_map() and not exited:
                 time.sleep(min(remaining, 0.02))
-            if (
-                not events
-                and exited
-                and not _probe_group_running(process.pid)
-            ):
+            if not events and quiet:
                 # The leader is gone and no group member can still write: with
                 # nothing readable there is no output left, so stop waiting.
                 break
@@ -140,12 +149,20 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
             leftovers = _probe_group_running(process.pid)
             if leftovers:
                 cleanup_uncertain = _cleanup_probe_process(process)
-            else:
-                process.wait()
+        # Group signals miss a descendant that left the group, so hunt the
+        # tracked ones before the leader is reaped. Any found refuses the result.
+        detached, detached_certain = _sweep_probe_descendants(process, tracked)
+        cleanup_uncertain = cleanup_uncertain or not detached_certain
+        _reap_leader(process, timeout_s=PROBE_CLEANUP_WAIT_S)
     except BaseException:
         _cleanup_probe_process(process)
+        try:
+            _sweep_probe_descendants(process, tracked)
+        except Exception:
+            pass
         raise
     finally:
+        _close_handles(tracked)
         if selector is not None:
             selector.close()
         process.stdout.close()
@@ -156,6 +173,8 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
         raise SpikeError("Probe output exceeded the bounded capture limit; result was refused.")
     if timed_out:
         raise subprocess.TimeoutExpired(command, timeout_s) from None
+    if detached:
+        raise SpikeError("Probe left a detached descendant; result was refused.")
     if cleanup_uncertain or leftovers:
         raise SpikeError("Probe cleanup was uncertain; result was refused.")
     try:
@@ -228,29 +247,36 @@ def _probe_group_running(pgid: int) -> bool:
 
 
 def _cleanup_probe_process(process: subprocess.Popen) -> bool:
-    """Bounded cleanup for this probe's session without reading its pipes."""
-    if os.name == "posix":
-        _signal_group(process, signal.SIGTERM)
-        deadline = time.monotonic() + PROBE_TERMINATION_GRACE_S
-        while _probe_group_running(process.pid) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if _probe_group_running(process.pid):
-            _signal_group(process, signal.SIGKILL)
-    elif process.poll() is None:
-        process.terminate()
+    """Bounded cleanup for this probe's session without reading its pipes.
 
-    try:
-        process.wait(timeout=PROBE_CLEANUP_WAIT_S)
-    except subprocess.TimeoutExpired:
-        if os.name == "posix":
-            _signal_group(process, signal.SIGKILL)
-        elif process.poll() is None:
-            process.kill()
-        try:
-            process.wait(timeout=PROBE_CLEANUP_WAIT_S)
-        except subprocess.TimeoutExpired:
+    The leader is observed, not reaped: its pid (and so our pgid) stays
+    reserved until the caller has finished hunting detached descendants.
+    Returns whether cleanup is uncertain.
+    """
+    _signal_group(process, signal.SIGTERM)
+    deadline = time.monotonic() + PROBE_TERMINATION_GRACE_S
+    while _probe_group_running(process.pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if _probe_group_running(process.pid):
+        _signal_group(process, signal.SIGKILL)
+    if not _wait_leader_exited(process, PROBE_CLEANUP_WAIT_S):
+        _signal_group(process, signal.SIGKILL)
+        if not _wait_leader_exited(process, PROBE_CLEANUP_WAIT_S):
             return True
-    return process.poll() is None or (os.name == "posix" and _probe_group_running(process.pid))
+    return _probe_group_running(process.pid)
+
+
+def _sweep_probe_descendants(
+    process: subprocess.Popen, tracked: dict[int, tuple[int, str, str, int | None, str, bool]]
+) -> tuple[bool, bool]:
+    """Terminate tracked probe descendants outside its group: (any found, cleanup certain)."""
+    if not _track_descendants(process.pid, tracked):
+        return False, False
+    escaped = _escaped_descendants(process.pid, tracked)
+    if not escaped:
+        return False, True
+    all_gone, _mode = _terminate_pids(escaped, grace_s=PROBE_TERMINATION_GRACE_S)
+    return True, all_gone
 
 
 def _private_dir(path: Path) -> None:
@@ -678,11 +704,13 @@ def _track_descendants(
     before attribution, so a reused numeric pid never seeds descendant
     discovery for an unrelated process's children.
 
-    ``verified`` records whether a freshly opened pidfd was proven to belong
-    to this run: the pid's parent was the leader or a tracked descendant when
-    re-read after the open. Group and command changes (setsid, exec) do not
-    affect that proof. An unverified entry is tracked and reported but never
-    signalled, and it still forces an ``interrupted`` result if alive.
+    ``verified`` records whether an entry was proven to belong to this run:
+    its parent was the leader or a verified descendant (re-read after opening
+    a pidfd, when one is used). Group and command changes (setsid, exec) do
+    not affect that proof. An unverified entry is tracked and reported but
+    never signalled, and it still forces an ``interrupted`` result if alive.
+    Its children are tracked too, but inherit its unverified status: a
+    possibly reused pid must never vouch for an unrelated process's children.
     """
     if table is None:
         table = _process_table()
@@ -701,6 +729,7 @@ def _track_descendants(
                 except OSError:
                     pass
     known = {leader_pid, *tracked}
+    trusted = {leader_pid, *(pid for pid, entry in tracked.items() if entry[5])}
     # Entries present before this snapshot; only they may be upgraded to
     # verified by it. A pid added in this same pass was validated against a
     # fresher row than this table, so this table cannot vouch for it.
@@ -716,10 +745,10 @@ def _track_descendants(
                     handle = tracked[pid][3]
                     # A later snapshot showing our leader (or a verified
                     # descendant) as the parent proves the entry is ours.
-                    verified = tracked[pid][5] or (pid in existing and ppid in known)
+                    verified = tracked[pid][5] or (pid in existing and ppid in trusted)
                 else:
                     handle = _open_pidfd(pid)
-                    verified = True
+                    verified = ppid in trusted
                     if handle is not None:
                         # Opening the handle is not atomic with the snapshot:
                         # if the pid was reused in between, the handle binds
@@ -735,10 +764,13 @@ def _track_descendants(
                             except OSError:
                                 pass
                             continue
-                        verified = row[0] in known
+                        verified = row[0] in trusted
                 tracked[pid] = (pgid, stat, birth, handle, identity, verified)
                 if pid not in known:
                     known.add(pid)
+                    changed = True
+                if verified and pid not in trusted:
+                    trusted.add(pid)
                     changed = True
     return True
 

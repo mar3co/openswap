@@ -611,6 +611,46 @@ def test_probe_normal_leader_exit_refuses_and_cleans_live_helper(tmp_path):
     assert marker.read_text() == before
 
 
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_refuses_and_terminates_setsid_detached_helper(tmp_path):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-codex",
+        "import os, pathlib, sys, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "deadline = time.monotonic() + 2\n"
+        "while not pid_file.exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+        # Linger so the ppid link is visible to at least one snapshot.
+        "time.sleep(0.5)\n"
+        "sys.stdout.write('codex-cli 1.2.3\\n')\n",
+    )
+    detached_pid = None
+    try:
+        with pytest.raises(SpikeError, match="detached descendant"):
+            spike._run_probe(
+                [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=5
+            )
+        assert pid_file.exists(), "detached helper never reported its pid"
+        detached_pid = int(pid_file.read_text())
+        assert _wait_for_pid_exit(detached_pid, 2.0)
+    finally:
+        if detached_pid is None and pid_file.exists():
+            detached_pid = int(pid_file.read_text())
+        if detached_pid is not None:
+            try:
+                os.kill(detached_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 @pytest.mark.skipif(os.name != "posix", reason="bounded probe pipes need POSIX selectors")
 @pytest.mark.xdist_group("spike_procs")
 @pytest.mark.parametrize("flood", ["stdout", "stderr", "both"])
@@ -1479,6 +1519,23 @@ def test_track_descendants_verifies_handle_when_child_changed_group_and_command_
     tracked: dict = {}
     spike._track_descendants(100, tracked)
     assert tracked[4242][3] == 79 and tracked[4242][5] is True
+
+
+@pytest.mark.parametrize("handle", [None, 81])
+def test_track_descendants_children_of_unverified_entry_stay_unverified(monkeypatch, handle):
+    # 4242 may be a same-second stranger; its child is tracked (and forces
+    # "interrupted" if alive) but must never become signalable through it.
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 1, 4242, "S", "tA", "tA|pgid=4242|child"),
+                                 (5555, 4242, 4242, "S", "tB", "tB|pgid=4242|grandchild")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: handle)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda fd: False)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (4242, 4242, "tB", "tB|pgid=4242|grandchild"))
+    tracked = {4242: (4242, "S", "tA", 80, "tA|pgid=4242|child", False)}
+    spike._track_descendants(100, tracked)
+    assert tracked[5555][5] is False
+    assert tracked[4242][5] is False
 
 
 def test_track_descendants_upgrades_unverified_entry_when_later_snapshot_shows_our_parent(monkeypatch):
