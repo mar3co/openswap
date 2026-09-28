@@ -1931,6 +1931,25 @@ def test_pidfd_poll_failure_is_not_treated_as_exit(monkeypatch):
     assert spike._pidfd_exited(99) is False
 
 
+def test_leader_exit_fallback_scan_is_bounded_by_the_deadline(monkeypatch):
+    budgets = []
+    monkeypatch.delattr(spike.os, "waitid", raising=False)
+    monkeypatch.setattr(spike, "_pid_state", lambda pid, timeout_s=None: budgets.append(timeout_s) or "S")
+    process = SimpleNamespace(returncode=None, pid=4242, poll=lambda: None)
+
+    assert spike._leader_exited(process, None, deadline=time.monotonic() + 0.2) is False
+    assert budgets and budgets[0] is not None and budgets[0] <= 0.2
+
+
+def test_leader_exit_observation_never_reaps_when_every_check_fails(monkeypatch):
+    monkeypatch.delattr(spike.os, "waitid", raising=False)
+    monkeypatch.setattr(spike, "_pid_state", lambda pid, timeout_s=None: None)
+    process = SimpleNamespace(returncode=None, pid=4242,
+                              poll=lambda: pytest.fail("observation must not reap the leader"))
+
+    assert spike._leader_exited(process, None, deadline=time.monotonic() + 0.2) is False
+
+
 def test_terminate_pids_counts_exited_unreaped_pidfd_descendant_as_gone(monkeypatch):
     sent = []
 

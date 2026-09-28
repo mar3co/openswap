@@ -123,7 +123,7 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
             # Observe exit BEFORE selecting: anything the group wrote before
             # it went quiet is then already readable, so an empty select after
             # that observation really means no output is left.
-            exited = _leader_exited(process)
+            exited = _leader_exited(process, deadline=deadline)
             quiet = exited and not _probe_group_running(process.pid)
             events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
             if not selector.get_map() and not exited:
@@ -194,7 +194,9 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
 
 
 def _leader_exited(
-    process: subprocess.Popen, table: list[tuple[int, int, int, str, str, str]] | None = None
+    process: subprocess.Popen,
+    table: list[tuple[int, int, int, str, str, str]] | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """Whether the group leader has exited, observed WITHOUT reaping it.
 
@@ -202,7 +204,11 @@ def _leader_exited(
     for reuse by an unrelated process. Keeping the leader as a zombie until
     group cleanup is finished reserves that id. ``waitid(WNOWAIT)`` is used
     where available; otherwise the process table's state column (``Z``)
-    serves. Only when neither works does this fall back to a reaping poll.
+    serves, then a single-pid ``ps`` state lookup. It never reaps: when no
+    observation works the leader is reported as not known to have exited,
+    so callers time out into cleanup and an uncertain (``interrupted``)
+    result rather than free the pid while cleanup still depends on it.
+    With ``deadline`` the ``ps`` fallback is bounded by the time left.
     """
     if process.returncode is not None:
         return True
@@ -220,20 +226,21 @@ def _leader_exited(
                 return stat.startswith(("Z", "X"))
         # An unreaped child is always listed; missing means it is gone.
         return True
-    state = _pid_state(process.pid)
+    state = _pid_state(process.pid, timeout_s=None if deadline is None else _ps_budget(deadline))
     if state is not None:
         return state.startswith(("Z", "X"))
-    return process.poll() is not None
+    return False
 
 
-def _pid_state(pid: int) -> str | None:
+def _pid_state(pid: int, timeout_s: float | None = None) -> str | None:
     """The ``ps`` state column for ``pid`` (``Z`` for an unreaped exit), or None."""
     ps = shutil.which("ps") or "/bin/ps"
     try:
         listing = subprocess.run(
             [ps, "-o", "stat=", "-p", str(pid)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", timeout=PS_TIMEOUT_S, check=False,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=PS_TIMEOUT_S if timeout_s is None else timeout_s, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -649,12 +656,16 @@ def _terminate_group(
     kill_deadline = time.monotonic() + GROUP_KILL_WAIT_S
     while time.monotonic() < kill_deadline and _group_running(process.pid, reader):
         time.sleep(0.02)
-    return wait_uncertain or not _leader_exited(process) or _group_running(process.pid, reader)
+    return (
+        wait_uncertain
+        or not _leader_exited(process, deadline=time.monotonic() + SCAN_WINDOW_S)
+        or _group_running(process.pid, reader)
+    )
 
 
 def _wait_leader_exited(process: subprocess.Popen, timeout_s: float) -> bool:
     deadline = time.monotonic() + timeout_s
-    while not _leader_exited(process):
+    while not _leader_exited(process, deadline=deadline):
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.02)
@@ -1304,13 +1315,13 @@ def _supervise_fake_command_locked(
                     # Best effort: descendants are attributed by parent pid
                     # while the leader is alive, whatever group they moved to.
                     _track_descendants(process.pid, tracked, table, deadline)
-            if _leader_exited(process, table):
+            if _leader_exited(process, table, deadline=deadline):
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             time.sleep(min(DESCENDANT_SNAPSHOT_INTERVAL_S, remaining))
-        timed_out = not _leader_exited(process)
+        timed_out = not _leader_exited(process, deadline=time.monotonic() + SCAN_WINDOW_S)
         if timed_out:
             _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
         # One short bounded scan while the leader is still unreaped, before any
