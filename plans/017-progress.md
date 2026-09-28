@@ -290,6 +290,12 @@ Enabling refuses (`worker_running_unmanaged`) while an unmanaged worker such
 as a manual `openswap worker run` holds the instance lock, instead of
 installing a managed service that could never start; re-enabling an already
 loaded LaunchAgent stays idempotent.
+Owner decision (2026-09-28): when a kickoff ping exits normally, the direct
+child's exit is accepted as stop evidence and its lease is released. A
+detached helper could outlive it; this is the best-effort process-tree limit
+recorded in [the cancellation boundary](research/remote-agent-host/cancellation-boundary.md),
+accepted so routine pings do not quarantine the account. A kickoff timeout
+still leaves the lease uncertain.
 
 ## Deviations and verification
 

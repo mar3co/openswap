@@ -345,6 +345,11 @@ def _run_kickoff_with_lease(provider: str, selected_home, run_fn, argv, **kwargs
     except BaseException:
         store.mark_uncertain(token, "kickoff_outcome_unknown")
         raise
+    # Owner decision (plan 017): for a scheduled kickoff ping, the direct
+    # child's normal exit is the stop evidence. A helper it detached could
+    # outlive it; that is the same best-effort process-tree limit recorded in
+    # the phase-one cancellation-boundary research, accepted here so a routine
+    # ping does not leave the account quarantined.
     store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
     return result
 
