@@ -23,12 +23,12 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest Phase 1-only assembled suite was green: `2940 passed, 4 skipped, 3
-warnings in 17.79s`; it includes 67 phase-one harness tests and two direct
+The latest Phase 1-only assembled suite was green: `2955 passed, 4 skipped, 3
+warnings in 17.63s`; it includes 82 phase-one harness tests and two direct
 tests of the Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`). This is Phase 1
-evidence, not validation of the merged Phase 2 tree; the full suite is rerun
-after this merge below.
+evidence, not validation of the Phase 2 tree; the separate full Phase 2 result
+is recorded below.
 
 The ChatGPT app-bundled Codex CLI is `0.158.0-alpha.2.1` (pre-release). A
 separate official stable ARM macOS release, `0.157.1`, was downloaded to
@@ -116,7 +116,7 @@ Phase 1 exit requires all of the following:
   before real Codex execution, but does not block owner-authorized local-only
   Phase 2 infrastructure work.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2940 passed, 4 skipped, 3 warnings in 17.79s`).
+  (`2955 passed, 4 skipped, 3 warnings in 17.63s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -168,8 +168,8 @@ boundary. No `launchctl` command is run against the user's login session;
 LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
-The merged branch full-suite validation is green: `3024 passed, 4 skipped,
-3 warnings in 18.95s` (3,028 collected). Focused core journal,
+The merged branch full-suite validation is green: `3039 passed, 4 skipped,
+3 warnings in 19.99s` (3,043 collected). Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
 recreation/idempotency, singleton refusal, a stop acknowledgement remaining
@@ -218,6 +218,14 @@ requires an `InterruptResult` whose `execution_stopped` value is literally
   and descendant attribution, and evidence records
   `descendant_tracking_complete: false` if any snapshot failed, because an
   escaped descendant could then have been missed.
+  Only the immutable start time decides whether a pid was reused; a change
+  of process group or command line never evicts a live descendant, and a
+  tracked entry whose original process is known to be gone (start time
+  changed, or its pidfd reads as exited) is evicted before attribution so a
+  reused pid never seeds discovery of a stranger's children. The version
+  probe persists only a digits-and-dots version token.
+  A freshly opened pidfd is accepted only if the pid's parent, group,
+  command and start time all still match the snapshot.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the

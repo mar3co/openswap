@@ -74,7 +74,8 @@ non-terminal, so recovery must run first; an existing job ID is refused on
 future starts. It never replays work. Evidence keeps state names and event
 type names restricted to lowercase dotted identifiers (anything else is
 recorded as `unknown-event`), and the version probe stores nothing unless the
-output matches `codex-cli <token>`. Raw output, task text, paths and
+output matches `codex-cli <digits-and-dots version>` with an optional
+pre-release suffix. Raw output, task text, paths and
 credentials are never stored. The fake child receives an allowlisted
 environment (`PATH`, `HOME` set to the state directory, `SPIKE_*`). The test suite also supplies fake
 executables to verify process-group signaling and no replay after uncertain
@@ -137,7 +138,7 @@ workspace and `CODEX_HOME` sentinels allowed workspace read/write and denied
 sibling read/write plus synthetic `auth.json` and `config.toml` reads. This is
 wrapper-only Seatbelt evidence; it does not establish `codex exec` enforcement
 or account selection. The helper-cleanup regression passed in isolation
-(`1 passed in 1.19s`); all 67 harness cases are included in the full-suite
+(`1 passed in 1.19s`); all 82 harness cases are included in the full-suite
 result above. The two recorded evidence rows from that recheck:
 
 ```json
@@ -222,8 +223,10 @@ running.
 
 The fake harness now mitigates this best-effort: while the leader is alive it
 snapshots `ps -axo pid=,ppid=,pgid=,stat=,lstart=` and attributes every
-descendant by parent pid regardless of process group, keyed by pid plus a start-time,
-group and command identity so a reused pid is dropped rather than signalled;
+descendant by parent pid regardless of process group, keyed by pid plus immutable start
+time so a reused pid is dropped rather than signalled while a live child that
+changed group or command stays tracked; the full start-time, group and
+command identity is re-read before each signal;
 signals go through a non-reusable pidfd where the OS provides one (Linux),
 and on macOS the identity is re-read before each signal while evidence
 records `escaped_cleanup_certain: false` because check and signal are not

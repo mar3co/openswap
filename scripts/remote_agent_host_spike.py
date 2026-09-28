@@ -60,7 +60,9 @@ NON_TERMINAL_STATES = frozenset({"starting", "running", "cancel_requested"})
 # Lowercase dotted identifiers such as Codex's ``thread.started``; anything
 # else (including anything that could carry a token) becomes ``unknown-event``.
 _EVENT_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}(\.[a-z][a-z0-9_]{0,31}){0,3}")
-_VERSION_OUTPUT = re.compile(r"codex-cli \S{1,40}")
+# A version is digits and dots with an optional pre-release suffix; a bare
+# token of any other shape (which could be a secret) is never persisted.
+_VERSION_OUTPUT = re.compile(r"codex-cli \d{1,4}(?:\.\d{1,4}){1,3}(?:-[0-9A-Za-z][0-9A-Za-z.]{0,23})?")
 
 
 class SpikeError(RuntimeError):
@@ -165,7 +167,7 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
 
 
 def _leader_exited(
-    process: subprocess.Popen, table: list[tuple[int, int, int, str, str]] | None = None
+    process: subprocess.Popen, table: list[tuple[int, int, int, str, str, str]] | None = None
 ) -> bool:
     """Whether the group leader has exited, observed WITHOUT reaping it.
 
@@ -186,7 +188,7 @@ def _leader_exited(
         except OSError:
             pass
     if table is not None:
-        for pid, _ppid, _pgid, stat, _birth in table:
+        for pid, _ppid, _pgid, stat, _birth, _identity_ in table:
             if pid == process.pid:
                 return stat.startswith(("Z", "X"))
         # An unreaped child is always listed; missing means it is gone.
@@ -527,14 +529,15 @@ def _terminate_group(
     return wait_uncertain or process.poll() is None or _group_running(process.pid, reader)
 
 
-def _process_table() -> list[tuple[int, int, int, str, str]] | None:
-    """Best-effort ``(pid, ppid, pgid, stat, birth)`` snapshot; None when unavailable.
+def _process_table() -> list[tuple[int, int, int, str, str, str]] | None:
+    """Best-effort ``(pid, ppid, pgid, stat, birth, identity)`` snapshot; None when unavailable.
 
-    ``birth`` is an identity string built from the start time (``lstart``,
-    second resolution), the process group and the command line, so a pid
-    reused by an unrelated process is very unlikely to match a tracked one.
-    Where the OS offers a non-reusable handle (``pidfd`` on Linux) the harness
-    prefers it; see :func:`_open_pidfd`.
+    ``birth`` is the immutable start time (``lstart``, second resolution) used
+    to detect a reused pid without ever dropping a live descendant whose
+    mutable fields changed. ``identity`` adds the process group and command
+    line and is compared immediately before a signal is sent. Where the OS
+    offers a non-reusable handle (``pidfd`` on Linux) the harness prefers it;
+    see :func:`_open_pidfd`.
     """
     ps = shutil.which("ps") or "/bin/ps"
     try:
@@ -564,9 +567,10 @@ def _process_table() -> list[tuple[int, int, int, str, str]] | None:
             continue
         stat = columns[3] if len(columns) > 3 else ""
         # lstart is five tokens ("Tue Sep 22 19:30:46 2026"); the rest is the
-        # command line. Fold pgid in so the identity survives reparenting.
-        birth = _identity(" ".join(columns[4:9]), pgid, " ".join(columns[9:]))
-        table.append((pid, ppid, pgid, stat, birth))
+        # command line.
+        birth = " ".join(columns[4:9])
+        identity = _identity(birth, pgid, " ".join(columns[9:]))
+        table.append((pid, ppid, pgid, stat, birth, identity))
     return table
 
 
@@ -575,27 +579,42 @@ def _identity(lstart: str, pgid: int, command: str) -> str:
 
 
 def _pid_identity(pid: int) -> str | None:
-    """Current identity of ``pid`` (see :func:`_process_table`), or None when gone."""
-    ps = shutil.which("ps") or "/bin/ps"
-    try:
-        listing = subprocess.run(
-            [ps, "-o", "stat=,lstart=,pgid=,command=", "-p", str(pid)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", timeout=PS_TIMEOUT_S, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    """Current identity of ``pid`` (see :func:`_process_table`), or None when gone.
+
+    Deliberately built from the same listing and parser as the snapshots, so
+    an identity recorded from a snapshot compares equal to one read back here
+    on every ``ps`` implementation. A zombie has exited and cannot execute, so
+    it is reported as gone.
+    """
+    table = _process_table()
+    if table is None:
         return None
-    columns = listing.stdout.split()
-    if len(columns) < 7:
+    for entry_pid, _ppid, _pgid, stat, _birth, identity in table:
+        if entry_pid == pid:
+            return None if stat.startswith(("Z", "X")) else identity
+    return None
+
+
+def _pid_birth(pid: int) -> str | None:
+    """Immutable start time of ``pid`` from the snapshot parser, or None when gone."""
+    row = _pid_row(pid)
+    return None if row is None else row[2]
+
+
+def _pid_row(pid: int) -> tuple[int, int, str, str] | None:
+    """``(ppid, pgid, birth, identity)`` for a live ``pid``, or None when gone.
+
+    Used to validate a freshly opened pidfd: a pid reused within the same
+    second keeps the same second-resolution start time, so the parent, group
+    and command line must all still match the snapshot as well.
+    """
+    table = _process_table()
+    if table is None:
         return None
-    # A zombie has exited and cannot execute; report it as gone.
-    if columns[0].startswith(("Z", "X")):
-        return None
-    try:
-        pgid = int(columns[6])
-    except ValueError:
-        return None
-    return _identity(" ".join(columns[1:6]), pgid, " ".join(columns[7:]))
+    for entry_pid, ppid, pgid, stat, birth, identity in table:
+        if entry_pid == pid:
+            return None if stat.startswith(("Z", "X")) else (ppid, pgid, birth, identity)
+    return None
 
 
 def _open_pidfd(pid: int) -> int | None:
@@ -622,8 +641,8 @@ def _pidfd_exited(handle: int) -> bool:
     return bool(readable)
 
 
-def _close_handles(tracked: Mapping[int, tuple[int, str, str, int | None]]) -> None:
-    for _pgid, _stat, _birth, handle in tracked.values():
+def _close_handles(tracked: Mapping[int, tuple[int, str, str, int | None, str]]) -> None:
+    for _pgid, _stat, _birth, handle, _identity_ in tracked.values():
         if handle is not None:
             try:
                 os.close(handle)
@@ -633,26 +652,32 @@ def _close_handles(tracked: Mapping[int, tuple[int, str, str, int | None]]) -> N
 
 def _track_descendants(
     leader_pid: int,
-    tracked: dict[int, tuple[int, str, str, int | None]],
-    table: list[tuple[int, int, int, str, str]] | None = None,
+    tracked: dict[int, tuple[int, str, str, int | None, str]],
+    table: list[tuple[int, int, int, str, str, str]] | None = None,
 ) -> bool:
     """Record every descendant of the leader by parent pid, whatever its pgid.
 
-    ``tracked`` maps pid -> (last observed pgid, stat, identity, pidfd or
-    None) and is
-    kept for the life of the run so a descendant that later calls setsid()
-    or is reparented after the leader exits is still attributed to the run.
-    A pid that reappears with a different birth identity belonged to a
-    process that already exited and was reused; it is dropped and only
-    re-attributed if its new parent is part of this run.
+    ``tracked`` maps pid -> (last observed pgid, stat, birth, pidfd or None,
+    latest identity) and is kept for the life of the run so a descendant that
+    later calls setsid(), exec()s, or is reparented after the leader exits is
+    still attributed to the run. Only the immutable birth (start time) decides
+    whether a pid was reused; a change of process group or command line
+    merely updates the entry. An entry whose original process is known to be
+    gone (its start time changed, or its pidfd reads as exited) is evicted
+    before attribution, so a reused numeric pid never seeds descendant
+    discovery for an unrelated process's children.
     """
     if table is None:
         table = _process_table()
     if table is None:
         return False
-    for pid, _ppid, _pgid, _stat, birth in table:
-        if pid in tracked and tracked[pid][2] != birth:
-            handle = tracked.pop(pid)[3]
+    births = {pid: birth for pid, _ppid, _pgid, _stat, birth, _identity_ in table}
+    for pid in list(tracked):
+        _pgid, _stat, birth, handle, _identity_ = tracked[pid]
+        reused = pid in births and births[pid] != birth
+        exited = handle is not None and _pidfd_exited(handle)
+        if reused or exited:
+            del tracked[pid]
             if handle is not None:
                 try:
                     os.close(handle)
@@ -662,7 +687,7 @@ def _track_descendants(
     changed = True
     while changed:
         changed = False
-        for pid, ppid, pgid, stat, birth in table:
+        for pid, ppid, pgid, stat, birth, identity in table:
             if pid == leader_pid:
                 continue
             if pid in tracked or ppid in known:
@@ -672,14 +697,15 @@ def _track_descendants(
                     handle = _open_pidfd(pid)
                     # Opening the handle is not atomic with the snapshot: if
                     # the pid was reused in between, the handle binds to a
-                    # stranger. Re-read the identity and refuse a mismatch.
-                    if handle is not None and _pid_identity(pid) != birth:
+                    # stranger. The start time alone has second resolution,
+                    # so parent, group and command must all still match too.
+                    if handle is not None and _pid_row(pid) != (ppid, pgid, birth, identity):
                         try:
                             os.close(handle)
                         except OSError:
                             pass
                         continue
-                tracked[pid] = (pgid, stat, birth, handle)
+                tracked[pid] = (pgid, stat, birth, handle, identity)
                 if pid not in known:
                     known.add(pid)
                     changed = True
@@ -697,12 +723,13 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _escaped_descendants(
-    leader_pid: int, tracked: dict[int, tuple[int, str, str, int | None]]
+    leader_pid: int, tracked: dict[int, tuple[int, str, str, int | None, str]]
 ) -> dict[int, tuple[str, int | None]]:
     """Tracked pids outside the leader's group that are still alive, with identity and handle."""
     _track_descendants(leader_pid, tracked)
     return {
-        pid: (birth, handle) for pid, (pgid, stat, birth, handle) in sorted(tracked.items())
+        pid: (identity, handle)
+        for pid, (pgid, stat, _birth, handle, identity) in sorted(tracked.items())
         if pgid != leader_pid and not stat.startswith(("Z", "X")) and _pid_alive(pid)
     }
 
@@ -886,7 +913,7 @@ def _supervise_fake_command_locked(
     cleanup_uncertain = False
     leftovers = False
     unexpected_leftovers = False
-    tracked: dict[int, tuple[int, str, str, int | None]] = {}
+    tracked: dict[int, tuple[int, str, str, int | None, str]] = {}
     escaped: dict[int, tuple[str, int | None]] = {}
     escaped_terminated = True
     escaped_signalling = SIGNALLING_PIDFD
