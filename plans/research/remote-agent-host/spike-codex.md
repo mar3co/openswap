@@ -137,7 +137,7 @@ workspace and `CODEX_HOME` sentinels allowed workspace read/write and denied
 sibling read/write plus synthetic `auth.json` and `config.toml` reads. This is
 wrapper-only Seatbelt evidence; it does not establish `codex exec` enforcement
 or account selection. The helper-cleanup regression passed in isolation
-(`1 passed in 1.19s`); all 54 harness cases are included in the full-suite
+(`1 passed in 1.19s`); all 55 harness cases are included in the full-suite
 result above. The two recorded evidence rows from that recheck:
 
 ```json
