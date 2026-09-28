@@ -211,6 +211,37 @@ def test_invalid_utf8_output_is_safely_recorded_as_unstructured(tmp_path):
     assert result["event_names"] == ["unstructured-output"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="fake executable shebang test is POSIX-only")
+def test_json_parser_failures_are_recorded_and_reader_continues(tmp_path, monkeypatch):
+    original_loads = spike.json.loads
+
+    def raise_for_deep_input(value, *args, **kwargs):
+        if isinstance(value, str) and value.startswith("[" * 100):
+            raise RecursionError("synthetic deep-input parser failure")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(spike.json, "loads", raise_for_deep_input)
+    fake = _executable(
+        tmp_path / "fake-malformed-json",
+        "import json, sys\n"
+        "sys.stdout.write('9' * 5000 + '\\n')\n"
+        "sys.stdout.write('[' * 6000 + '0' + ']' * 6000 + '\\n')\n"
+        "sys.stdout.write(json.dumps({'type': 'after'}) + '\\n')\n"
+        "sys.stdout.flush()\n",
+    )
+
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=1, job_id="bad-json"
+    )
+
+    assert result["state"] == "succeeded"
+    assert result["event_names"] == [
+        "unstructured-output",
+        "unstructured-output",
+        "after",
+    ]
+
+
 @pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
 def test_noisy_fake_output_is_bounded_and_cancellation_still_completes(tmp_path):
     fake = _executable(

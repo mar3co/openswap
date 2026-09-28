@@ -230,7 +230,7 @@ def _collect_event_names(stream, collected: list[str]) -> None:
             continue
         try:
             item = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (ValueError, RecursionError, UnicodeDecodeError):
             record("unstructured-output")
             continue
         if isinstance(item, dict):

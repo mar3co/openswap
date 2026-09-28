@@ -112,7 +112,7 @@ inspect: codex-cli 0.158.0-alpha.2.1; exec_json=true; sandbox_option=true;
 demo:    state=cancelled; returncode=-15; event_names=[thread.started]
 sandbox: inside read/write allowed; outside read/write denied;
          synthetic CODEX_HOME auth/config reads denied; no exec/model run
-tests:   21 passed
+tests:   22 passed
 ```
 
 The fake-process harness includes regression coverage for the Codex review
@@ -136,6 +136,13 @@ are covered by noisy-output and subprocess-failure tests: output lines and
 retained event names have explicit caps while the pipe continues draining, and
 both sandbox probes return sanitized refusals for launch, timeout, or decode
 failures.
+
+Finding [#4121751784](https://github.com/mar3co/openswap/pull/59#discussion_r4121751784)
+is covered with a 5,000-digit integer and below-cap nested JSON followed by a
+valid event. Both parser failures are retained as `unstructured-output`, and
+the next event is still collected. Python 3.14 parses this nesting depth, so
+the test injects a `RecursionError` for the nested record to exercise that
+failure path.
 
 The `sandbox-probe` pass required an escalated but credential-free local run so
 macOS could launch the sandbox wrapper. The actual `exec` and `sandbox` wrappers

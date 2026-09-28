@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The final assembled-branch suite is green: `2892 passed, 4 skipped, 3 warnings
-in 13.45s`. The phase-one harness tests pass: `21 passed`.
+The final assembled-branch suite is green: `2893 passed, 4 skipped, 3 warnings
+in 13.77s`. The phase-one harness tests pass: `22 passed`.
 
 The ChatGPT app-bundled Codex CLI is `0.158.0-alpha.2.1` (pre-release). A
 separate official stable ARM macOS release, `0.157.1`, was downloaded to
@@ -98,7 +98,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2892 passed, 4 skipped, 3 warnings in 13.45s`).
+  (`2893 passed, 4 skipped, 3 warnings in 13.77s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -124,7 +124,7 @@ until the owner records a permitted path or exclusion.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it will preserve the `ClaudeSwitchError` assertion and will not change the
   resolver or executable discovery behavior.
-- Credential-free harness tests passed (`21 passed`); `inspect`,
+- Credential-free harness tests passed (`22 passed`); `inspect`,
   inert-child `demo`, and synthetic Seatbelt `sandbox-probe` outcomes are in
   [the Codex spike record](research/remote-agent-host/spike-codex.md). This
   establishes only helper and local sandbox behavior, not provider execution.
@@ -143,6 +143,11 @@ until the owner records a permitted path or exclusion.
   are addressed: stdout draining now bounds each line and retained event names,
   and sandbox-probe launch/timeout/decode failures produce sanitized refusals.
   Regression tests exercise noisy output and each sandbox subprocess failure.
+- Codex review finding [P2 #4121751784](https://github.com/mar3co/openswap/pull/59#discussion_r4121751784)
+  is addressed: oversized integer and deep-JSON parser failures become
+  `unstructured-output`, and the reader continues to record the next valid
+  event. Python 3.14 parses the nested fixture, so the test injects a bounded
+  `RecursionError` for that input to exercise the failure path.
 - `uv` was not installed on `PATH`; version 0.12.19 was installed only under
   `/private/tmp/openswap-uv-test`, with its Python, cache, and project test
   environment under `/private/tmp`. The full suite used that isolated runtime.
