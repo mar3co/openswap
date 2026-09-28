@@ -1174,3 +1174,76 @@ def test_append_jsonl_fsyncs_containing_directory_and_new_ancestors(tmp_path, mo
     assert (leaf / "journal.jsonl").read_text().strip() == json.dumps(
         {"job_id": "durable", "state": "starting"}, sort_keys=True
     )
+
+
+def test_track_descendants_drops_reused_pid_with_new_birth_identity(monkeypatch):
+    tables = iter([
+        [(100, 1, 100, "Ss", "birth-leader"), (4242, 100, 4242, "S", "birth-A")],
+        # 4242 exited and its pid was reused by an unrelated process with a new
+        # start time and a parent outside the run; 4343 is a genuine new child.
+        [(100, 1, 100, "Ss", "birth-leader"), (4242, 1, 4242, "S", "birth-B"),
+         (4343, 100, 4343, "S", "birth-C")],
+    ])
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked == {4242: (4242, "S", "birth-A")}
+    spike._track_descendants(100, tracked)
+    assert 4242 not in tracked
+    assert tracked == {4343: (4343, "S", "birth-C")}
+
+
+def test_terminate_pids_never_signals_a_pid_whose_identity_changed(monkeypatch):
+    sent = []
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            return None  # "alive"
+        sent.append((pid, sig))
+
+    monkeypatch.setattr(spike.os, "kill", fake_kill)
+    monkeypatch.setattr(spike, "_pid_birth", lambda pid: "someone-else")
+    assert spike._terminate_pids({987654: "ours"}, grace_s=0.05) is True
+    assert sent == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_exception_after_detach_still_terminates_tracked_descendant(tmp_path, monkeypatch):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-detaching-lingering-provider",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    real_append = spike._append_jsonl
+
+    def failing_append(path, record):
+        if record.get("state") == "cancel_requested":
+            raise OSError("disk full")
+        real_append(path, record)
+
+    monkeypatch.setattr(spike, "_append_jsonl", failing_append)
+    try:
+        with pytest.raises(OSError, match="disk full"):
+            supervise_fake_command(
+                [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.3,
+                job_id="detached-then-fail",
+            )
+        assert pid_file.exists(), "detached child never reported its pid"
+        detached_pid = int(pid_file.read_text())
+        assert _wait_for_pid_exit(detached_pid, 2.0)
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), 9)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass

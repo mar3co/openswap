@@ -137,7 +137,7 @@ workspace and `CODEX_HOME` sentinels allowed workspace read/write and denied
 sibling read/write plus synthetic `auth.json` and `config.toml` reads. This is
 wrapper-only Seatbelt evidence; it does not establish `codex exec` enforcement
 or account selection. The helper-cleanup regression passed in isolation
-(`1 passed in 1.19s`); all 55 harness cases are included in the full-suite
+(`1 passed in 1.19s`); all 58 harness cases are included in the full-suite
 result above. The two recorded evidence rows from that recheck:
 
 ```json
@@ -221,8 +221,9 @@ stopped before the temporary directory was removed; no process was left
 running.
 
 The fake harness now mitigates this best-effort: while the leader is alive it
-snapshots `ps -axo pid=,ppid=,pgid=,stat=` and attributes every descendant by
-parent pid regardless of process group; before deciding a terminal state it
+snapshots `ps -axo pid=,ppid=,pgid=,stat=,lstart=` and attributes every
+descendant by parent pid regardless of process group, keyed by pid plus start
+time so a reused pid is dropped rather than signalled; before deciding a terminal state it
 re-snapshots, terminates any tracked descendant still alive outside the
 group (TERM, grace, KILL), records them as `escaped_descendants` with
 `escaped_descendants_terminated`, and forces the state to `interrupted`,

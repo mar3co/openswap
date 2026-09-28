@@ -37,7 +37,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 DISCOVERED_CODEX_VERSION = "codex-cli 0.158.0-alpha.2.1"
 LIVE_CODEX_ENABLED = False
@@ -466,12 +466,16 @@ def _terminate_group(
     return wait_uncertain or process.poll() is None or _group_running(process.pid, reader)
 
 
-def _process_table() -> list[tuple[int, int, int, str]] | None:
-    """Best-effort ``(pid, ppid, pgid, stat)`` snapshot; None when unavailable."""
+def _process_table() -> list[tuple[int, int, int, str, str]] | None:
+    """Best-effort ``(pid, ppid, pgid, stat, birth)`` snapshot; None when unavailable.
+
+    ``birth`` is the process start time (``lstart``), used as a stable identity
+    so a pid reused by an unrelated process is never mistaken for a tracked one.
+    """
     ps = shutil.which("ps") or "/bin/ps"
     try:
         listing = subprocess.run(
-            [ps, "-axo", "pid=,ppid=,pgid=,stat="],
+            [ps, "-axo", "pid=,ppid=,pgid=,stat=,lstart="],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -494,29 +498,52 @@ def _process_table() -> list[tuple[int, int, int, str]] | None:
             pid, ppid, pgid = int(columns[0]), int(columns[1]), int(columns[2])
         except ValueError:
             continue
-        table.append((pid, ppid, pgid, columns[3] if len(columns) > 3 else ""))
+        stat = columns[3] if len(columns) > 3 else ""
+        birth = " ".join(columns[4:])
+        table.append((pid, ppid, pgid, stat, birth))
     return table
 
 
-def _track_descendants(leader_pid: int, tracked: dict[int, tuple[int, str]]) -> None:
+def _pid_birth(pid: int) -> str | None:
+    """Current start-time identity of ``pid``, or None when it is gone."""
+    ps = shutil.which("ps") or "/bin/ps"
+    try:
+        listing = subprocess.run(
+            [ps, "-o", "lstart=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", timeout=1, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    birth = " ".join(listing.stdout.split())
+    return birth or None
+
+
+def _track_descendants(leader_pid: int, tracked: dict[int, tuple[int, str, str]]) -> None:
     """Record every descendant of the leader by parent pid, whatever its pgid.
 
-    ``tracked`` maps pid -> (last observed pgid, last observed stat) and is
+    ``tracked`` maps pid -> (last observed pgid, stat, birth identity) and is
     kept for the life of the run so a descendant that later calls setsid()
     or is reparented after the leader exits is still attributed to the run.
+    A pid that reappears with a different birth identity belonged to a
+    process that already exited and was reused; it is dropped and only
+    re-attributed if its new parent is part of this run.
     """
     table = _process_table()
     if table is None:
         return
+    for pid, _ppid, _pgid, _stat, birth in table:
+        if pid in tracked and tracked[pid][2] != birth:
+            del tracked[pid]
     known = {leader_pid, *tracked}
     changed = True
     while changed:
         changed = False
-        for pid, ppid, pgid, stat in table:
+        for pid, ppid, pgid, stat, birth in table:
             if pid == leader_pid:
                 continue
             if pid in tracked or ppid in known:
-                tracked[pid] = (pgid, stat)
+                tracked[pid] = (pgid, stat, birth)
                 if pid not in known:
                     known.add(pid)
                     changed = True
@@ -532,19 +559,28 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _escaped_descendants(leader_pid: int, tracked: dict[int, tuple[int, str]]) -> list[int]:
-    """Tracked pids outside the leader's group that are still alive (not zombies)."""
+def _escaped_descendants(leader_pid: int, tracked: dict[int, tuple[int, str, str]]) -> dict[int, str]:
+    """Tracked pids outside the leader's group that are still alive, with identity."""
     _track_descendants(leader_pid, tracked)
-    return sorted(
-        pid for pid, (pgid, stat) in tracked.items()
+    return {
+        pid: birth for pid, (pgid, stat, birth) in sorted(tracked.items())
         if pgid != leader_pid and not stat.startswith(("Z", "X")) and _pid_alive(pid)
-    )
+    }
 
 
-def _terminate_pids(pids: Sequence[int], *, grace_s: float) -> bool:
-    """TERM, then KILL, individual escaped pids; return whether all are gone."""
+def _terminate_pids(escaped: Mapping[int, str], *, grace_s: float) -> bool:
+    """TERM, then KILL, escaped pids whose identity still matches; return whether all are gone.
+
+    The birth identity is re-read immediately before each signal so a pid that
+    was reused by an unrelated process in the meantime is left alone.
+    """
+    def still_ours(pid: int) -> bool:
+        return _pid_alive(pid) and _pid_birth(pid) == escaped[pid]
+
     def signal_all(sig: int) -> None:
-        for pid in pids:
+        for pid in escaped:
+            if not still_ours(pid):
+                continue
             try:
                 os.kill(pid, sig)
             except (ProcessLookupError, PermissionError):
@@ -552,7 +588,7 @@ def _terminate_pids(pids: Sequence[int], *, grace_s: float) -> bool:
 
     def wait_gone(deadline: float) -> bool:
         while True:
-            if not any(_pid_alive(pid) for pid in pids):
+            if not any(still_ours(pid) for pid in escaped):
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -685,8 +721,8 @@ def _supervise_fake_command_locked(
     cleanup_uncertain = False
     leftovers = False
     unexpected_leftovers = False
-    tracked: dict[int, tuple[int, str]] = {}
-    escaped: list[int] = []
+    tracked: dict[int, tuple[int, str, str]] = {}
+    escaped: dict[int, str] = {}
     escaped_terminated = True
     try:
         next_snapshot = 0.0
@@ -720,6 +756,14 @@ def _supervise_fake_command_locked(
             escaped_terminated = _terminate_pids(escaped, grace_s=grace_s)
     except BaseException:
         _terminate_group(process, reader, grace_s=grace_s)
+        # A failure after a descendant detached (for example a full disk on the
+        # cancel_requested append) must not leave that descendant running.
+        try:
+            leftover = _escaped_descendants(process.pid, tracked)
+            if leftover:
+                _terminate_pids(leftover, grace_s=grace_s)
+        except Exception:
+            pass
         raise
 
     reader.join(timeout=1)
@@ -735,7 +779,7 @@ def _supervise_fake_command_locked(
         {
             "kind": "supervision_result", "job_id": job_id, "state": final_state,
             "returncode": process.returncode, "event_names": event_names,
-            "escaped_descendants": escaped,
+            "escaped_descendants": sorted(escaped),
             "escaped_descendants_terminated": escaped_terminated,
         },
     )
