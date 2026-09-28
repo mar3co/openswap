@@ -1386,6 +1386,7 @@ def test_terminate_pids_counts_exited_unreaped_pidfd_descendant_as_gone(monkeypa
     assert sent == []
 
 
+@pytest.mark.skipif(os.name != "posix", reason="reaches the SIGKILL branch, which Windows lacks")
 def test_terminate_pids_never_signals_an_unverified_entry_and_reports_not_gone(monkeypatch):
     sent = []
     monkeypatch.setattr(spike.signal, "pidfd_send_signal",
