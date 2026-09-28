@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest assembled-branch suite is green: `2927 passed, 4 skipped, 3 warnings
-in 18.81s`; it includes 58 phase-one harness tests and two direct tests of the
+The latest assembled-branch suite is green: `2931 passed, 4 skipped, 3 warnings
+in 16.36s`; it includes 58 phase-one harness tests and two direct tests of the
 Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
@@ -108,7 +108,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2927 passed, 4 skipped, 3 warnings in 18.81s`).
+  (`2931 passed, 4 skipped, 3 warnings in 16.36s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements

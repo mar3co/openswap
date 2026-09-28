@@ -926,7 +926,9 @@ def test_unrecovered_running_job_blocks_start_and_recovery_records_group_livenes
             "reason": "uncertain_after_restart", "group_still_alive": True,
         }]
 
-        result = supervise_fake_command([str(fake)], state_dir=state, timeout_s=2, job_id="next")
+        # Generous timeout: a Python fake's start-up under a loaded CI runner
+        # must not turn this success path into a cancellation.
+        result = supervise_fake_command([str(fake)], state_dir=state, timeout_s=10, job_id="next")
         assert result["state"] == "succeeded"
         assert launches.exists()
     finally:
