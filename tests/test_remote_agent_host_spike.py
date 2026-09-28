@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -1152,3 +1153,23 @@ def test_non_positive_timeout_or_negative_grace_refuses_before_state_or_launch(
 
     assert not state.exists()
     assert not launches.exists()
+
+
+def test_append_jsonl_fsyncs_containing_directory_and_new_ancestors(tmp_path, monkeypatch):
+    synced_dirs = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            synced_dirs.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(spike.os, "fsync", recording_fsync)
+    leaf = tmp_path / "a" / "b" / "leaf"
+    spike._append_jsonl(leaf / "journal.jsonl", {"job_id": "durable", "state": "starting"})
+    # One directory fsync per newly created ancestor (a, b, leaf) plus one for
+    # the journal's containing directory after the append.
+    assert len(synced_dirs) == 4
+    assert (leaf / "journal.jsonl").read_text().strip() == json.dumps(
+        {"job_id": "durable", "state": "starting"}, sort_keys=True
+    )

@@ -204,6 +204,9 @@ def _private_dir(path: Path) -> None:
             directory.mkdir(mode=0o700)
         except FileExistsError:
             pass
+        else:
+            # A new directory entry is only durable once its parent is synced.
+            _fsync_dir(directory.parent)
     if not path.is_dir():
         raise SpikeError("Private output path must be a directory.")
     if os.name == "posix":
@@ -212,6 +215,15 @@ def _private_dir(path: Path) -> None:
             raise SpikeError("Existing output directory must not grant group or world access.")
         if status.st_uid != os.getuid():
             raise SpikeError("Existing output directory must be owned by the current user.")
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Persist a directory's entries (new files or subdirectories) to disk."""
+    fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _open_nofollow(path: Path, flags: int, mode: int = 0o600) -> int:
@@ -244,6 +256,10 @@ def _append_jsonl(path: Path, record: dict) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+    # fsync on the file does not persist a newly created journal's directory
+    # entry; without this a crash after launch could lose the launch intent and
+    # let the same job ID be accepted again.
+    _fsync_dir(path.parent)
 
 
 def _read_jsonl(path: Path) -> list[dict]:
