@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -532,6 +533,30 @@ def test_kickoff_timeout_quarantines_account_until_owner_confirms_release(
 
     invoke(relaunch)
     assert len(started) == 2
+
+
+def test_kickoff_with_worker_disabled_still_refuses_a_leftover_unresolved_lease(
+    tmp_path: Path, monkeypatch
+):
+    from openswap.worker.leases import AccountLeaseStore, LeaseConflictError, stable_account_identity
+
+    root = _fake_lease_roster(monkeypatch, tmp_path, "codex")
+    store = AccountLeaseStore(root, "codex")
+    token = store.acquire(
+        job_id="kickoff-" + "f" * 32,
+        account_identity=stable_account_identity("codex", "acct-fake"),
+        worker_pid=os.getpid(), worker_epoch=1, ttl_s=60,
+    )
+    store.mark_uncertain(token, "kickoff_timeout")
+
+    def must_not_run(*_args, **_kwargs):
+        pytest.fail("kickoff ran against an unresolved lease")
+
+    with pytest.raises(LeaseConflictError):
+        invoke_codex_kickoff(
+            None, which=lambda _name: "/opt/fake/codex", run=must_not_run,
+            timeout=0.01, environ={"PATH": "/usr/bin"},
+        )
 
 
 def test_kickoff_with_worker_disabled_takes_no_lease_and_timeout_leaves_switching_open(

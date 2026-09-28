@@ -501,6 +501,18 @@ def test_ipc_startup_failure_clears_the_worker_health_record(tmp_path, monkeypat
     assert read_worker_snapshot(tmp_path).to_dict()["process_state"] == "stopped"
 
 
+def test_status_reports_a_claude_kickoff_lease_as_quarantined(tmp_path):
+    assert read_worker_snapshot(tmp_path).lease_quarantined is False
+    store = AccountLeaseStore(tmp_path, "claude")
+    token = store.acquire(
+        job_id="kickoff-" + "e" * 32,
+        account_identity=stable_account_identity("claude", "a@example.test", ""),
+        worker_pid=os.getpid(), worker_epoch=1, ttl_s=60,
+    )
+    store.mark_uncertain(token, "kickoff_timeout")
+    assert read_worker_snapshot(tmp_path).lease_quarantined is True
+
+
 def test_runtime_admission_is_internal_and_disabled_adapter_never_executes(tmp_path):
     update_worker_settings(tmp_path, enabled=True)
     runtime = WorkerRuntime(tmp_path)

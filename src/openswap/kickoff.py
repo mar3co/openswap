@@ -26,7 +26,9 @@ from openswap.exceptions import SessionError
 from openswap.session import AUTH_OVERRIDE_ENV_VARS
 from openswap import paths
 from openswap.settings import load_worker_settings
-from openswap.worker.leases import AccountLeaseStore, ReleaseEvidence, stable_account_identity
+from openswap.worker.leases import (
+    AccountLeaseStore, LeaseConflictError, ReleaseEvidence, stable_account_identity,
+)
 
 KICKOFF_PROMPT = "ok"
 KICKOFF_TIMEOUT_S = 90.0
@@ -311,14 +313,19 @@ def _kickoff_account_identity(provider: str, selected_home: Path | str | None) -
 
 def _run_kickoff_with_lease(provider: str, selected_home, run_fn, argv, **kwargs):
     backup_root = paths.get_backup_root()
-    if not load_worker_settings(backup_root).enabled:
-        # Remote tasks were never opted into, so the worker lease this
-        # coordinates with cannot be held by anything else either. Taking one
-        # here anyway would let a bare kickoff timeout quarantine an account
-        # for a feature nobody turned on, with no worker CLI around to clear
-        # it. Match pre-worker behaviour: just run the ping.
-        return run_fn(argv, **kwargs)
     store = AccountLeaseStore(backup_root, provider)
+    if not load_worker_settings(backup_root).enabled:
+        # With Remote tasks off no lease is taken, so a bare kickoff timeout
+        # cannot quarantine an account for a feature nobody turned on (matching
+        # pre-worker behaviour). An unresolved lease left from when it was on
+        # still refuses the ping. The read takes no lock (lease documents are
+        # replaced atomically), so this path adds no contention with switching.
+        leftover = store.read_current()
+        if leftover is not None and leftover.state != "released":
+            raise LeaseConflictError(
+                f"Cannot run a {provider} kickoff while an account lease is unresolved."
+            )
+        return run_fn(argv, **kwargs)
     # Identity is resolved only while holding the same provider lock used for
     # lease acquisition and account mutations, closing the snapshot/acquire race.
     with store.mutation_guard() as guard:

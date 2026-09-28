@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3151 passed, 4 skipped, 3 warnings in 30.71s`.
+`3153 passed, 4 skipped, 3 warnings in 30.37s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -310,7 +310,10 @@ usage reads alike) as a short-lived probe, so a lease left uncertain by the
 long-lived menu process can be released after expiry with
 `--confirm-stopped`. A journal read that fails right after an interrupt also
 propagates, and the loop's error handler never interrupts a run a second time
-once an interrupt has already handled it.
+once an interrupt has already handled it. Worker status (and so disable)
+counts an unresolved lease in either provider's store, and a kickoff with
+Remote tasks off still refuses to run while a leftover lease is unresolved,
+using a lock-free read so it adds no contention with switching.
 
 ## Deviations and verification
 

@@ -54,12 +54,19 @@ def _unavailable_provider() -> ProviderAvailability:
 
 
 def _lease_is_quarantined(backup_root: Path) -> bool:
-    """Treat every malformed lease document as quarantined in read-only status."""
-    try:
-        lease = AccountLeaseStore(Path(backup_root), "codex").read_current()
-    except Exception:
-        return True
-    return lease is not None and lease.state != "released"
+    """Whether any provider's lease is unresolved (malformed counts as unresolved).
+
+    Both stores are checked: a Claude kickoff lease must block disable just as
+    a Codex worker lease does, or disabling would let kickoff bypass it.
+    """
+    for provider in ("codex", "claude"):
+        try:
+            lease = AccountLeaseStore(Path(backup_root), provider).read_current()
+        except Exception:
+            return True
+        if lease is not None and lease.state != "released":
+            return True
+    return False
 
 
 def _snapshot_from_store(
