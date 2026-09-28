@@ -1069,6 +1069,17 @@ def test_escaped_descendants_reads_the_callers_scan_without_rescanning(monkeypat
     assert spike._escaped_descendants(100, tracked) == {4242: ("tA|pgid=4242|helper", None, True)}
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
+def test_private_dir_refuses_a_symlinked_directory(tmp_path):
+    target = tmp_path / "real"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "state"
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(SpikeError, match="must not be a symlink"):
+        spike._private_dir(link)
+    assert list(target.iterdir()) == []
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions are required")
 def test_private_dir_creates_each_missing_ancestor_with_owner_only_mode(tmp_path):
     state = tmp_path / "a" / "b" / "leaf"
@@ -1374,8 +1385,8 @@ def test_process_table_scans_are_bounded_by_the_job_deadline(tmp_path, monkeypat
     real_append = spike._append_jsonl
 
     def recording_table(timeout_s=None):
-        if not cancelled:
-            budgets.append(timeout_s)
+        # Recorded before and after cancellation: cleanup scans are bounded too.
+        budgets.append(timeout_s)
         return None  # as if ps timed out
 
     def recording_append(path, record):
@@ -1390,6 +1401,34 @@ def test_process_table_scans_are_bounded_by_the_job_deadline(tmp_path, monkeypat
     )
     assert cancelled and budgets
     assert all(b is not None and b <= 1.0 for b in budgets), budgets
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path, monkeypatch):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    marks: dict = {}
+    real_append = spike._append_jsonl
+
+    def slow_append(path, record):
+        state = record.get("state")
+        if state == "running":
+            time.sleep(1.6)  # a slow fsync on the state directory
+            real_append(path, record)
+            marks["running_done"] = time.monotonic()
+            return
+        if state == "cancel_requested":
+            marks["cancel"] = time.monotonic()
+        real_append(path, record)
+
+    monkeypatch.setattr(spike, "_append_jsonl", slow_append)
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.2, job_id="slow-fsync",
+    )
+    assert result["state"] in ("cancelled", "interrupted")
+    # The 1.5 s budget was already spent during the append, so cancellation
+    # follows at once instead of granting another full timeout.
+    assert marks["cancel"] - marks["running_done"] < 0.75
 
 
 def test_track_descendants_evicts_reused_pid_even_when_it_holds_a_pidfd(monkeypatch):

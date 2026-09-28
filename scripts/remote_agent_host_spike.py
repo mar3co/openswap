@@ -35,6 +35,7 @@ import selectors
 import shlex
 import shutil
 import signal
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -265,7 +266,9 @@ def _sweep_probe_descendants(
     process: subprocess.Popen, tracked: dict[int, tuple[int, str, str, int | None, str, bool]]
 ) -> tuple[bool, bool]:
     """Terminate tracked probe descendants outside its group: (any found, cleanup certain)."""
-    if not _track_descendants(process.pid, tracked):
+    if not _track_descendants(
+        process.pid, tracked, deadline=time.monotonic() + CLEANUP_SCAN_BUDGET_S
+    ):
         return False, False
     escaped = _escaped_descendants(process.pid, tracked)
     if not escaped:
@@ -290,10 +293,17 @@ def _private_dir(path: Path) -> None:
         else:
             # A new directory entry is only durable once its parent is synced.
             _fsync_dir(directory.parent)
-    if not path.is_dir():
+    # lstat, not stat: a symlinked directory would redirect every file we
+    # create into its target, and O_NOFOLLOW on file names does not cover it.
+    try:
+        status = os.lstat(path)
+    except OSError:
+        raise SpikeError("Private output path must be a directory.") from None
+    if stat_module.S_ISLNK(status.st_mode):
+        raise SpikeError("Private output directory must not be a symlink.")
+    if not stat_module.S_ISDIR(status.st_mode):
         raise SpikeError("Private output path must be a directory.")
     if os.name == "posix":
-        status = path.stat()
         if status.st_mode & 0o077:
             raise SpikeError("Existing output directory must not grant group or world access.")
         if status.st_uid != os.getuid():
@@ -588,12 +598,12 @@ def _abort_supervision(
     terminated, and tracked descendants outside the group are swept.
     """
     try:
-        _track_descendants(process.pid, tracked)
+        _track_descendants(process.pid, tracked, deadline=time.monotonic() + CLEANUP_SCAN_BUDGET_S)
     except Exception:
         pass
     try:
         _terminate_group(process, reader, grace_s=grace_s)
-        _track_descendants(process.pid, tracked)
+        _track_descendants(process.pid, tracked, deadline=time.monotonic() + CLEANUP_SCAN_BUDGET_S)
         leftover = _escaped_descendants(process.pid, tracked)
         if leftover:
             _terminate_pids(leftover, grace_s=grace_s)
@@ -879,6 +889,9 @@ PS_TIMEOUT_S = 5.0
 # Floor for a deadline-bounded scan, so one near the deadline can still finish
 # on a loaded host (a failed scan forces "interrupted"); it bounds the overrun.
 MIN_PS_TIMEOUT_S = 0.5
+# A cleanup-time scan (after a timeout or failure) is bounded too, so a slow
+# `ps` cannot let a detached helper run on; a failed scan forces "interrupted".
+CLEANUP_SCAN_BUDGET_S = 1.0
 SIGNALLING_PIDFD = "pidfd"
 SIGNALLING_IDENTITY_CHECK = "identity_check"
 
@@ -1061,6 +1074,9 @@ def _supervise_fake_command_locked(
     except OSError as exc:
         _append_jsonl(journal, {"job_id": job_id, "state": "failed", "reason": "fake_start_error"})
         raise SpikeError(f"Fake executable could not be started ({type(exc).__name__}).") from None
+    # The runtime budget starts at launch, so a slow journal append below
+    # cannot extend how long the child runs.
+    deadline = time.monotonic() + timeout_s
 
     event_names: list[str] = []
     reader = threading.Thread(
@@ -1073,7 +1089,6 @@ def _supervise_fake_command_locked(
     except BaseException:
         _abort_supervision(process, reader, tracked, grace_s=grace_s)
         raise
-    deadline = time.monotonic() + timeout_s
     timed_out = False
     cleanup_uncertain = False
     leftovers = False
@@ -1120,7 +1135,9 @@ def _supervise_fake_command_locked(
         unexpected_leftovers = bool(not timed_out and leftovers)
         # Re-snapshot once more, then hunt tracked descendants that left the
         # group (setsid). Anything found forces "interrupted" below.
-        if not _track_descendants(process.pid, tracked):
+        if not _track_descendants(
+            process.pid, tracked, deadline=time.monotonic() + CLEANUP_SCAN_BUDGET_S
+        ):
             tracking_complete = False
         escaped = _escaped_descendants(process.pid, tracked)
         if escaped:
