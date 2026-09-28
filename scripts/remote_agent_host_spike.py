@@ -262,6 +262,11 @@ def _cleanup_probe_process(process: subprocess.Popen) -> bool:
         _signal_group(process, signal.SIGKILL)
         if not _wait_leader_exited(process, PROBE_CLEANUP_WAIT_S):
             return True
+    # SIGKILL takes effect only when a member leaves the kernel (for example a
+    # slow disk write), so wait, bounded, for the group to actually be gone.
+    deadline = time.monotonic() + PROBE_CLEANUP_WAIT_S
+    while _probe_group_running(process.pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
     return _probe_group_running(process.pid)
 
 

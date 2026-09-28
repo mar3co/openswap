@@ -634,6 +634,25 @@ def test_probe_refuses_when_a_periodic_descendant_scan_fails(tmp_path, monkeypat
         )
 
 
+def test_probe_cleanup_waits_for_killed_group_members_to_leave(monkeypatch):
+    # A killed member can linger briefly (for example in a slow disk write);
+    # cleanup must wait for it rather than return while it still runs.
+    running = iter([True, True, True, True, False])
+    states = []
+
+    def group_running(pgid):
+        state = next(running, False)
+        states.append(state)
+        return state
+
+    monkeypatch.setattr(spike, "_probe_group_running", group_running)
+    monkeypatch.setattr(spike, "_signal_group", lambda process, sig: None)
+    monkeypatch.setattr(spike, "_wait_leader_exited", lambda process, timeout_s: True)
+    monkeypatch.setattr(spike, "PROBE_TERMINATION_GRACE_S", 0.0)
+    assert spike._cleanup_probe_process(SimpleNamespace(pid=4242)) is False
+    assert states[-1] is False
+
+
 @pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
 @pytest.mark.xdist_group("spike_procs")
 def test_probe_refuses_and_terminates_setsid_detached_helper(tmp_path):
