@@ -95,17 +95,19 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
         deadline = time.monotonic() + timeout_s
         # The leader is observed, not reaped, until group cleanup is done so
         # its pid (and therefore our pgid) cannot be reused meanwhile.
-        while not _leader_exited(process) or selector.get_map():
+        exited = False
+        while not exited or selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
                 break
             events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
-            if not selector.get_map() and not _leader_exited(process):
+            exited = _leader_exited(process)
+            if not selector.get_map() and not exited:
                 time.sleep(min(remaining, 0.02))
             if (
                 not events
-                and _leader_exited(process)
+                and exited
                 and not _probe_group_running(process.pid)
             ):
                 # The leader is gone and no group member can still write: with
@@ -162,7 +164,9 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
     return subprocess.CompletedProcess(command, process.returncode, decoded_stdout, decoded_stderr)
 
 
-def _leader_exited(process: subprocess.Popen) -> bool:
+def _leader_exited(
+    process: subprocess.Popen, table: list[tuple[int, int, int, str, str]] | None = None
+) -> bool:
     """Whether the group leader has exited, observed WITHOUT reaping it.
 
     A reaped leader frees its pid, and with it the process-group id we signal,
@@ -181,6 +185,12 @@ def _leader_exited(process: subprocess.Popen) -> bool:
             return True
         except OSError:
             pass
+    if table is not None:
+        for pid, _ppid, _pgid, stat, _birth in table:
+            if pid == process.pid:
+                return stat.startswith(("Z", "X"))
+        # An unreaped child is always listed; missing means it is gone.
+        return True
     state = _pid_state(process.pid)
     if state is not None:
         return state.startswith(("Z", "X"))
@@ -194,7 +204,7 @@ def _pid_state(pid: int) -> str | None:
         listing = subprocess.run(
             [ps, "-o", "stat=", "-p", str(pid)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", timeout=1, check=False,
+            text=True, encoding="utf-8", errors="replace", timeout=PS_TIMEOUT_S, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -536,7 +546,7 @@ def _process_table() -> list[tuple[int, int, int, str, str]] | None:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=1,
+            timeout=PS_TIMEOUT_S,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -571,7 +581,7 @@ def _pid_identity(pid: int) -> str | None:
         listing = subprocess.run(
             [ps, "-o", "stat=,lstart=,pgid=,command=", "-p", str(pid)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", timeout=1, check=False,
+            text=True, encoding="utf-8", errors="replace", timeout=PS_TIMEOUT_S, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -621,7 +631,11 @@ def _close_handles(tracked: Mapping[int, tuple[int, str, str, int | None]]) -> N
                 pass
 
 
-def _track_descendants(leader_pid: int, tracked: dict[int, tuple[int, str, str, int | None]]) -> None:
+def _track_descendants(
+    leader_pid: int,
+    tracked: dict[int, tuple[int, str, str, int | None]],
+    table: list[tuple[int, int, int, str, str]] | None = None,
+) -> bool:
     """Record every descendant of the leader by parent pid, whatever its pgid.
 
     ``tracked`` maps pid -> (last observed pgid, stat, identity, pidfd or
@@ -632,9 +646,10 @@ def _track_descendants(leader_pid: int, tracked: dict[int, tuple[int, str, str, 
     process that already exited and was reused; it is dropped and only
     re-attributed if its new parent is part of this run.
     """
-    table = _process_table()
     if table is None:
-        return
+        table = _process_table()
+    if table is None:
+        return False
     for pid, _ppid, _pgid, _stat, birth in table:
         if pid in tracked and tracked[pid][2] != birth:
             handle = tracked.pop(pid)[3]
@@ -668,6 +683,7 @@ def _track_descendants(leader_pid: int, tracked: dict[int, tuple[int, str, str, 
                 if pid not in known:
                     known.add(pid)
                     changed = True
+    return True
 
 
 def _pid_alive(pid: int) -> bool:
@@ -691,6 +707,7 @@ def _escaped_descendants(
     }
 
 
+PS_TIMEOUT_S = 5.0
 SIGNALLING_PIDFD = "pidfd"
 SIGNALLING_IDENTITY_CHECK = "identity_check"
 
@@ -873,17 +890,26 @@ def _supervise_fake_command_locked(
     escaped: dict[int, tuple[str, int | None]] = {}
     escaped_terminated = True
     escaped_signalling = SIGNALLING_PIDFD
+    tracking_complete = True
     try:
-        next_snapshot = 0.0
         # The leader is observed, never reaped, until group cleanup is done:
-        # a zombie keeps its pid, so the pgid we signal cannot be reused.
-        while not _leader_exited(process) and time.monotonic() < deadline:
-            if time.monotonic() >= next_snapshot:
+        # a zombie keeps its pid, so the pgid we signal cannot be reused. One
+        # process-table snapshot per iteration serves both the leader check and
+        # descendant attribution, keeping `ps` pressure low on loaded runners.
+        while True:
+            table = _process_table()
+            if table is None:
+                tracking_complete = False
+            else:
                 # Best effort: descendants are attributed by parent pid while
                 # the leader is alive, whatever group they moved to.
-                _track_descendants(process.pid, tracked)
-                next_snapshot = time.monotonic() + DESCENDANT_SNAPSHOT_INTERVAL_S
-            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+                _track_descendants(process.pid, tracked, table)
+            if _leader_exited(process, table):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(DESCENDANT_SNAPSHOT_INTERVAL_S, remaining))
         timed_out = not _leader_exited(process)
         if timed_out:
             _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
@@ -901,6 +927,8 @@ def _supervise_fake_command_locked(
         unexpected_leftovers = bool(not timed_out and leftovers)
         # Re-snapshot once more, then hunt tracked descendants that left the
         # group (setsid). Anything found forces "interrupted" below.
+        if not _track_descendants(process.pid, tracked):
+            tracking_complete = False
         escaped = _escaped_descendants(process.pid, tracked)
         if escaped:
             escaped_terminated, escaped_signalling = _terminate_pids(escaped, grace_s=grace_s)
@@ -940,6 +968,9 @@ def _supervise_fake_command_locked(
             # identity-check path cannot rule out a pid reused between check
             # and signal, so cleanup is recorded as uncertain there.
             "escaped_descendant_signalling": escaped_signalling,
+            # False when any process-table snapshot failed during the run, so
+            # an escaped descendant could have been missed.
+            "descendant_tracking_complete": tracking_complete,
             "escaped_cleanup_certain": bool(escaped)
             and escaped_terminated
             and escaped_signalling == SIGNALLING_PIDFD,

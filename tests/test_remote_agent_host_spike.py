@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -849,6 +850,7 @@ def test_setsid_detached_descendant_forces_interrupted_and_is_terminated(tmp_pat
         assert supervision[0]["escaped_cleanup_certain"] is (
             supervision[0]["escaped_descendant_signalling"] == spike.SIGNALLING_PIDFD
         )
+        assert supervision[0]["descendant_tracking_complete"] is True
         journal = _read_rows(tmp_path / "state" / "journal.jsonl")
         assert journal[-1]["state"] == "interrupted"
         assert journal[1]["state"] == "running" and isinstance(journal[1]["pgid"], int)
@@ -1372,3 +1374,27 @@ def test_leader_exit_is_observed_without_reaping():
     finally:
         process.wait(timeout=5)
     assert process.returncode == 0
+
+
+def test_leader_exited_reads_state_from_supplied_snapshot(monkeypatch):
+    process = SimpleNamespace(returncode=None, pid=100, poll=lambda: None)
+    monkeypatch.setattr(spike.os, "waitid", None, raising=False)
+    monkeypatch.setattr(spike, "_pid_state", lambda pid: pytest.fail("must use the snapshot"))
+    running = [(100, 1, 100, "Ss", "leader")]
+    zombie = [(100, 1, 100, "Z", "leader")]
+    assert spike._leader_exited(process, running) is False
+    assert spike._leader_exited(process, zombie) is True
+    assert spike._leader_exited(process, []) is True  # unreaped children are always listed
+
+
+def test_supervision_records_incomplete_tracking_when_snapshots_fail(tmp_path, monkeypatch):
+    if os.name != "posix":
+        pytest.skip("process-group supervision is POSIX-only")
+    monkeypatch.setattr(spike, "_process_table", lambda: None)
+    fake = _executable(tmp_path / "fake-quick", "raise SystemExit(0)\n")
+    result = supervise_fake_command([str(fake)], state_dir=tmp_path / "state", timeout_s=10,
+                                    job_id="no-snapshots")
+    assert result["state"] == "succeeded"
+    evidence = _read_rows(tmp_path / "state" / "evidence.jsonl")
+    supervision = [row for row in evidence if row["kind"] == "supervision_result"]
+    assert supervision[0]["descendant_tracking_complete"] is False
