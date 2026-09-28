@@ -810,17 +810,32 @@ def _open_pidfd(pid: int) -> int | None:
         return None
 
 
+def _fd_readable(fd: int, timeout_s: float) -> bool | None:
+    """Whether ``fd`` is readable within ``timeout_s``; None when polling failed.
+
+    ``poll`` has no FD_SETSIZE limit, unlike ``select``, which cannot watch a
+    descriptor numbered 1024 or higher.
+    """
+    poller_factory = getattr(select, "poll", None)
+    try:
+        if poller_factory is None:
+            readable, _, _ = select.select([fd], [], [], timeout_s)
+            return bool(readable)
+        poller = poller_factory()
+        poller.register(fd, select.POLLIN)
+        return bool(poller.poll(max(0, int(timeout_s * 1000))))
+    except (OSError, ValueError):
+        return None
+
+
 def _pidfd_exited(handle: int) -> bool:
     """A pidfd becomes readable once its process has exited, reaped or not.
 
     Orphaned descendants may linger as zombies where PID 1 does not reap
     promptly (containers); they can no longer execute, so they count as gone.
+    A polling failure is uncertainty, never exit: the entry stays tracked.
     """
-    try:
-        readable, _, _ = select.select([handle], [], [], 0)
-    except (OSError, ValueError):
-        return True
-    return bool(readable)
+    return _fd_readable(handle, 0) is True
 
 
 def _close_handles(tracked: Mapping[int, tuple[int, str, str, int | None, str, bool]]) -> None:
@@ -1140,9 +1155,8 @@ def _collect_polled(fd: int, record, stop: threading.Event) -> None:
     pending = bytearray()
     discarding = False
     while not stop.is_set():
-        try:
-            readable, _, _ = select.select([fd], [], [], 0.05)
-        except (OSError, ValueError):
+        readable = _fd_readable(fd, 0.05)
+        if readable is None:
             return
         if not readable:
             continue

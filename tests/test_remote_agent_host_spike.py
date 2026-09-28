@@ -1902,6 +1902,35 @@ def test_identity_check_cleanup_bounds_its_scans_by_the_cleanup_deadline(monkeyp
     assert elapsed < limit + 1.0, elapsed
 
 
+@pytest.mark.skipif(os.name != "posix", reason="pipes and poll are POSIX-only here")
+def test_fd_readiness_works_above_fd_setsize_and_poll_errors_are_not_exit(tmp_path):
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < 1100:
+        pytest.skip("cannot open a descriptor above FD_SETSIZE here")
+    read_end, write_end = os.pipe()
+    try:
+        if soft < 1100:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (1100, hard))
+        high = os.dup2(read_end, 1050)
+        try:
+            assert spike._fd_readable(high, 0) is False
+            os.write(write_end, b"x")
+            assert spike._fd_readable(high, 0) is True
+        finally:
+            os.close(high)
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_pidfd_poll_failure_is_not_treated_as_exit(monkeypatch):
+    monkeypatch.setattr(spike, "_fd_readable", lambda fd, timeout_s: None)
+    assert spike._pidfd_exited(99) is False
+
+
 def test_terminate_pids_counts_exited_unreaped_pidfd_descendant_as_gone(monkeypatch):
     sent = []
 
