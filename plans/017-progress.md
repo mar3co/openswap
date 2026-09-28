@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest assembled-branch suite is green: `2991 passed, 4 skipped, 3 warnings
-in 30.41s`; it includes 118 phase-one harness tests and two direct tests of the
+The latest assembled-branch suite is green: `2992 passed, 4 skipped, 3 warnings
+in 30.29s`; it includes 119 phase-one harness tests and two direct tests of the
 Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
@@ -108,7 +108,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2991 passed, 4 skipped, 3 warnings in 30.41s`).
+  (`2992 passed, 4 skipped, 3 warnings in 30.29s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -204,7 +204,10 @@ until the owner records a permitted path or exclusion.
   symlink after validation. The missing-path walk does not follow symlinks
   and the existing prefix is re-validated just before creation. Before any
   group signal, one short bounded scan attributes descendants, so even a run
-  too short for a periodic scan records a helper that already detached. A failed final probe scan still sweeps
+  too short for a periodic scan records a helper that already detached.
+  Without pidfds, escaped-helper cleanup takes one process-table scan per
+  round, bounded by the cleanup deadline, instead of one unbounded scan per
+  helper. A failed final probe scan still sweeps
   descendants recorded by earlier scans. A pidfd verified by its re-read
   keeps that re-read's group and identity, so a child that called `setsid()`
   between snapshot and open is still recognised as escaped.
