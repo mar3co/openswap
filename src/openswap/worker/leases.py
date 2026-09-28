@@ -356,6 +356,11 @@ class AccountLeaseStore:
                 raise ValueError
             if lease.reason is not None and (not isinstance(lease.reason, str) or not _REASON_RE.fullmatch(lease.reason)):
                 raise ValueError
+            if lease.state == "released" and lease.reason not in {
+                ReleaseEvidence.UNLAUNCHED.value,
+                ReleaseEvidence.CONFIRMED_STOPPED.value,
+            }:
+                raise ValueError
             return lease
         except (KeyError, TypeError, ValueError):
             raise LeaseStateError("Account lease state is invalid; refusing operation.") from None

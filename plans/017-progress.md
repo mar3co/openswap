@@ -169,7 +169,7 @@ LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
 The Phase 2 full-suite validation on the currently integrated PR #59 snapshot
-`f684ebf` is green: `3079 passed, 4 skipped, 3 warnings in 19.99s`. The run
+`f684ebf` is green: `3081 passed, 4 skipped, 3 warnings in 17.00s`. The run
 used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree.
@@ -237,6 +237,10 @@ cannot restore stale worker pause/enable policy. A deterministic concurrent
 writer test verifies the worker policy and unrelated settings survive. A
 read-only audit found no other active `settings.json` read-modify-write path
 outside the shared settings helpers and status-line writer.
+Follow-up #4125894568 is addressed: a released lease is valid only when its
+reason is exactly `unlaunched` or `confirmed_stopped`; absent or other
+syntactically safe reasons remain quarantined. Existing malformed-lease test
+cases cover both invalid forms.
 
 ## Deviations and verification
 

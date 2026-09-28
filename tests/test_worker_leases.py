@@ -69,6 +69,8 @@ def test_lease_generation_is_distinct_and_increments_after_release(tmp_path):
         lambda document: document["lease"].update(expires_at=float("nan")),
         lambda document: document["lease"].update(expires_at=float("inf")),
         lambda document: document["lease"].update(lease_generation=2),
+        lambda document: document["lease"].update(state="released", reason="operator_override"),
+        lambda document: document["lease"].update(state="released", reason=None),
         lambda document: document.update(lease_generation=math.inf),
         b"\xff\xfe",
         b"[" * 1500 + b"]" * 1500,
