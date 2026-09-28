@@ -20,7 +20,7 @@ The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
 The latest assembled-branch suite is green: `2985 passed, 4 skipped, 3 warnings
-in 28.84s`; it includes 112 phase-one harness tests and two direct tests of the
+in 29.17s`; it includes 112 phase-one harness tests and two direct tests of the
 Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
@@ -108,7 +108,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2985 passed, 4 skipped, 3 warnings in 28.84s`).
+  (`2985 passed, 4 skipped, 3 warnings in 29.17s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -199,7 +199,9 @@ until the owner records a permitted path or exclusion.
   result is recorded. Only a root-owned symlink directly under `/` (the
   macOS system links) is trusted in a state or evidence path, so running as
   root does not widen the exemption. A failed final probe scan still sweeps
-  descendants recorded by earlier scans.
+  descendants recorded by earlier scans. A pidfd verified by its re-read
+  keeps that re-read's group and identity, so a child that called `setsid()`
+  between snapshot and open is still recognised as escaped.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the

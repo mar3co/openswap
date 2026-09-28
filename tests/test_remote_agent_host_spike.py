@@ -1924,6 +1924,11 @@ def test_track_descendants_verifies_handle_when_child_changed_group_and_command_
     tracked: dict = {}
     spike._track_descendants(100, tracked)
     assert tracked[4242][3] == 79 and tracked[4242][5] is True
+    # The re-read's group and identity replace the stale snapshot's, so the
+    # detached child counts as escaped even if no later scan succeeds.
+    assert tracked[4242][0] == 4242 and tracked[4242][4] == "tA|pgid=4242|helper"
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+    assert 4242 in spike._escaped_descendants(100, tracked)
 
 
 @pytest.mark.parametrize("handle", [None, 81])

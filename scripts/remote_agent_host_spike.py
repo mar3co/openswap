@@ -854,6 +854,10 @@ def _track_descendants(
         for pid, ppid, pgid, stat, birth, identity in table:
             if pid == leader_pid:
                 continue
+            if pid in tracked and pid not in existing:
+                # Added earlier in this call from a fresher re-read than this
+                # table; later passes must not overwrite it with stale fields.
+                continue
             if pid in tracked or ppid in known:
                 if pid in tracked:
                     handle = tracked[pid][3]
@@ -898,6 +902,11 @@ def _track_descendants(
                                 pass
                             continue
                         verified = row is not None and row[0] in trusted
+                        if verified:
+                            # The verifying re-read is newer than the snapshot:
+                            # keep its group and identity, so a child that called
+                            # setsid() meanwhile is recognised as outside our group.
+                            pgid, identity = row[1], row[3]
                 tracked[pid] = (pgid, stat, birth, handle, identity, verified)
                 if pid not in known:
                     known.add(pid)
