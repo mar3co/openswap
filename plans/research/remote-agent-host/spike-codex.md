@@ -127,7 +127,7 @@ inspect: codex-cli 0.158.0-alpha.2.1; exec_json=true; sandbox_option=true;
 demo:    state=cancelled; returncode=-15; event_names=[thread.started]
 sandbox: inside read/write allowed; outside read/write denied;
          synthetic CODEX_HOME auth/config reads denied; no exec/model run
-tests:   40 passed (full assembled suite: 2,911 passed, 4 skipped, 3 warnings)
+tests:   87 passed (full assembled suite: 2,960 passed, 4 skipped, 3 warnings)
 ```
 
 After the bounded process-group runner was added, the official stable ARM

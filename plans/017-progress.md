@@ -170,9 +170,8 @@ until the owner records a permitted path or exclusion.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the
   resolver or executable discovery behavior.
-- Credential-free harness tests passed (40 tests included in the full suite);
-  `inspect`,
-  inert-child `demo`, and synthetic Seatbelt `sandbox-probe` outcomes are in
+- Credential-free harness tests passed; `inspect`, inert-child `demo`, and
+  synthetic Seatbelt `sandbox-probe` outcomes are in
   [the Codex spike record](research/remote-agent-host/spike-codex.md). This
   establishes only helper and local sandbox behavior, not provider execution.
 - Codex PR review findings [P1 #4121377781](https://github.com/mar3co/openswap/pull/59#discussion_r4121377781)

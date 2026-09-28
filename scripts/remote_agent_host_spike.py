@@ -612,12 +612,6 @@ def _pid_identity(pid: int) -> str | None:
     return None
 
 
-def _pid_birth(pid: int) -> str | None:
-    """Immutable start time of ``pid`` from the snapshot parser, or None when gone."""
-    row = _pid_row(pid)
-    return None if row is None else row[2]
-
-
 def _pid_row(pid: int) -> tuple[int, int, str, str] | None:
     """``(ppid, pgid, birth, identity)`` for a live ``pid``, or None when gone.
 

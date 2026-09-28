@@ -1319,7 +1319,7 @@ def test_pid_identity_matches_process_table_entry_for_live_process():
         assert table is not None
         row = next(entry for entry in table if entry[0] == sleeper.pid)
         assert spike._pid_identity(sleeper.pid) == row[5]
-        assert spike._pid_birth(sleeper.pid) == row[4]
+        assert spike._pid_row(sleeper.pid) == (row[1], row[2], row[4], row[5])
         assert f"pgid={sleeper.pid}" in row[5]
         assert row[5].startswith(row[4])
     finally:
