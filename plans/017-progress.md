@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3150 passed, 4 skipped, 3 warnings in 31.17s`.
+`3151 passed, 4 skipped, 3 warnings in 30.71s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -308,7 +308,9 @@ own health record before exiting, so status and disable never see it as a
 stale live worker. Release treats every non-worker lease (kickoff and Codex
 usage reads alike) as a short-lived probe, so a lease left uncertain by the
 long-lived menu process can be released after expiry with
-`--confirm-stopped`.
+`--confirm-stopped`. A journal read that fails right after an interrupt also
+propagates, and the loop's error handler never interrupts a run a second time
+once an interrupt has already handled it.
 
 ## Deviations and verification
 
