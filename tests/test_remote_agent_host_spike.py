@@ -1155,6 +1155,7 @@ def test_non_positive_timeout_or_negative_grace_refuses_before_state_or_launch(
     assert not launches.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="directory fsync is POSIX-only")
 def test_append_jsonl_fsyncs_containing_directory_and_new_ancestors(tmp_path, monkeypatch):
     synced_dirs = []
     real_fsync = os.fsync

@@ -219,6 +219,11 @@ def _private_dir(path: Path) -> None:
 
 def _fsync_dir(directory: Path) -> None:
     """Persist a directory's entries (new files or subdirectories) to disk."""
+    if os.name != "posix":
+        # Windows cannot open a directory handle this way and has no
+        # equivalent directory fsync; the harness's durability claims are
+        # POSIX-only, matching the rest of the process supervision.
+        return
     fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(fd)
