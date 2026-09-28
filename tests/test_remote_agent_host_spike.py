@@ -1191,20 +1191,63 @@ def test_append_jsonl_fsyncs_containing_directory_and_new_ancestors(tmp_path, mo
 
 def test_track_descendants_drops_reused_pid_with_new_birth_identity(monkeypatch):
     tables = iter([
-        [(100, 1, 100, "Ss", "birth-leader"), (4242, 100, 4242, "S", "birth-A")],
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
         # 4242 exited and its pid was reused by an unrelated process with a new
         # start time and a parent outside the run; 4343 is a genuine new child.
-        [(100, 1, 100, "Ss", "birth-leader"), (4242, 1, 4242, "S", "birth-B"),
-         (4343, 100, 4343, "S", "birth-C")],
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 1, 4242, "S", "tB", "tB|pgid=4242|stranger"),
+         (4343, 100, 4343, "S", "tC", "tC|pgid=4343|child")],
     ])
     monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
     monkeypatch.setattr(spike, "_open_pidfd", lambda pid: None)
     tracked: dict = {}
     spike._track_descendants(100, tracked)
-    assert tracked == {4242: (4242, "S", "birth-A", None)}
+    assert tracked == {4242: (4242, "S", "tA", None, "tA|pgid=4242|child")}
     spike._track_descendants(100, tracked)
     assert 4242 not in tracked
-    assert tracked == {4343: (4343, "S", "birth-C", None)}
+    assert tracked == {4343: (4343, "S", "tC", None, "tC|pgid=4343|child")}
+
+
+def test_track_descendants_keeps_child_whose_group_and_command_changed_after_reparent(monkeypatch):
+    # Same start time throughout: the child called setsid() (new pgid) and
+    # exec()'d a helper (new command) and was reparented to 1 before the next
+    # snapshot. It must stay tracked and be reported as escaped.
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 100, "S", "tA", "tA|pgid=100|python fake")],
+        [(100, 1, 100, "Z", "t0", "t0|pgid=100|leader"),
+         (4242, 1, 4242, "Ss", "tA", "tA|pgid=4242|helper --detached")],
+        [(100, 1, 100, "Z", "t0", "t0|pgid=100|leader"),
+         (4242, 1, 4242, "Ss", "tA", "tA|pgid=4242|helper --detached")],
+    ])
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: None)
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    spike._track_descendants(100, tracked)
+    assert tracked == {4242: (4242, "Ss", "tA", None, "tA|pgid=4242|helper --detached")}
+    assert spike._escaped_descendants(100, tracked) == {4242: ("tA|pgid=4242|helper --detached", None)}
+
+
+def test_track_descendants_never_drops_an_entry_that_holds_a_pidfd(monkeypatch):
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
+        # Even a changed start time does not evict a handle-backed entry: the
+        # pidfd is bound to the original process and reads as exited.
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 1, 4242, "S", "tB", "tB|pgid=4242|stranger")],
+    ])
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 55)
+    monkeypatch.setattr(spike, "_pid_birth", lambda pid: "tA")
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][3] == 55
+    spike._track_descendants(100, tracked)
+    assert 4242 in tracked and tracked[4242][3] == 55
 
 
 def test_terminate_pids_never_signals_a_pid_whose_identity_changed(monkeypatch):
@@ -1241,8 +1284,10 @@ def test_pid_identity_matches_process_table_entry_for_live_process():
         table = spike._process_table()
         assert table is not None
         row = next(entry for entry in table if entry[0] == sleeper.pid)
-        assert spike._pid_identity(sleeper.pid) == row[4]
-        assert f"pgid={sleeper.pid}" in row[4]
+        assert spike._pid_identity(sleeper.pid) == row[5]
+        assert spike._pid_birth(sleeper.pid) == row[4]
+        assert f"pgid={sleeper.pid}" in row[5]
+        assert row[5].startswith(row[4])
     finally:
         sleeper.kill()
         sleeper.wait(timeout=5)
@@ -1347,9 +1392,10 @@ def test_pid_identity_reports_zombie_as_gone(tmp_path):
 def test_track_descendants_refuses_handle_whose_identity_changed_after_open(monkeypatch):
     closed = []
     monkeypatch.setattr(spike, "_process_table",
-                        lambda: [(100, 1, 100, "Ss", "leader"), (4242, 100, 4242, "S", "birth-A")])
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
     monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 77)
-    monkeypatch.setattr(spike, "_pid_identity", lambda pid: "birth-B")  # reused after snapshot
+    monkeypatch.setattr(spike, "_pid_birth", lambda pid: "tB")  # reused after snapshot
     monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
     tracked: dict = {}
     spike._track_descendants(100, tracked)
@@ -1380,8 +1426,8 @@ def test_leader_exited_reads_state_from_supplied_snapshot(monkeypatch):
     process = SimpleNamespace(returncode=None, pid=100, poll=lambda: None)
     monkeypatch.setattr(spike.os, "waitid", None, raising=False)
     monkeypatch.setattr(spike, "_pid_state", lambda pid: pytest.fail("must use the snapshot"))
-    running = [(100, 1, 100, "Ss", "leader")]
-    zombie = [(100, 1, 100, "Z", "leader")]
+    running = [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader")]
+    zombie = [(100, 1, 100, "Z", "t0", "t0|pgid=100|leader")]
     assert spike._leader_exited(process, running) is False
     assert spike._leader_exited(process, zombie) is True
     assert spike._leader_exited(process, []) is True  # unreaped children are always listed
@@ -1398,3 +1444,32 @@ def test_supervision_records_incomplete_tracking_when_snapshots_fail(tmp_path, m
     evidence = _read_rows(tmp_path / "state" / "evidence.jsonl")
     supervision = [row for row in evidence if row["kind"] == "supervision_result"]
     assert supervision[0]["descendant_tracking_complete"] is False
+
+
+def test_inspect_refuses_version_token_that_is_not_a_version_number(tmp_path, capsys):
+    fake = _executable(
+        tmp_path / "codex",
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        " print('codex-cli sk-live-ABC123')\n"
+        "else:\n"
+        " print('usage: codex exec [--json] [--skip-git-repo-check]')\n",
+    )
+    evidence_dir = tmp_path / "evidence"
+    code = spike._main(["inspect", "--codex-bin", str(fake), "--evidence-dir", str(evidence_dir)])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.err.startswith("refused:")
+    assert "sk-live" not in captured.out + captured.err
+    stored = (evidence_dir / "evidence.jsonl").read_text() if (evidence_dir / "evidence.jsonl").exists() else ""
+    assert "sk-live" not in stored
+
+
+@pytest.mark.parametrize("version", ["0.157.1", "0.158.0-alpha.2.1", "99.0-test", "1.2.3.4-rc.1"])
+def test_version_grammar_accepts_real_version_shapes(version):
+    assert spike._VERSION_OUTPUT.fullmatch(f"codex-cli {version}")
+
+
+@pytest.mark.parametrize("token", ["sk-live-ABC123", "v1", "1", "1.2.3 extra", "../etc", ""])
+def test_version_grammar_rejects_non_version_tokens(token):
+    assert not spike._VERSION_OUTPUT.fullmatch(f"codex-cli {token}")
