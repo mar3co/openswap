@@ -1130,13 +1130,14 @@ def test_private_dir_refuses_a_symlinked_ancestor_component(tmp_path):
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ownership is required")
 @pytest.mark.parametrize("path, refused", [
-    ("/tmp/openswap-spike/state", False),          # top-level system link
-    ("/srv/linked/openswap-spike/state", True),    # root-owned, but not top-level
+    ("/tmp/openswap-spike/state", False),          # listed macOS link, expected target
+    ("/redirect/openswap-spike/state", True),      # root-owned and top-level, not listed
+    ("/srv/linked/openswap-spike/state", True),    # root-owned, not top-level
 ])
-def test_only_top_level_root_owned_symlinks_are_trusted(monkeypatch, path, refused):
-    # As if running as root: every link is root-owned, so ownership alone
-    # must not be trusted.
-    links = {"/tmp", "/srv/linked"}
+def test_only_listed_system_symlinks_are_trusted(monkeypatch, path, refused):
+    # As if running as root: every link is root-owned, so neither ownership
+    # nor location may earn trust.
+    links = {"/tmp": "private/tmp", "/redirect": "private/tmp", "/srv/linked": "private/tmp"}
 
     def fake_lstat(candidate):
         candidate = str(candidate)
@@ -1145,12 +1146,32 @@ def test_only_top_level_root_owned_symlinks_are_trusted(monkeypatch, path, refus
             raise FileNotFoundError(candidate)
         return os.stat_result((mode, 0, 0, 1, 0, 0, 0, 0, 0, 0))
 
+    monkeypatch.setattr(spike.sys, "platform", "darwin")
     monkeypatch.setattr(spike.os, "lstat", fake_lstat)
+    monkeypatch.setattr(spike.os, "stat", lambda c: os.stat_result((stat.S_IFDIR | 0o1777, 0, 0, 1, 0, 0, 0, 0, 0, 0)))
+    monkeypatch.setattr(spike.os, "readlink", lambda c: links[str(c)])
     if refused:
         with pytest.raises(SpikeError, match="must not traverse a symlink"):
             spike._refuse_symlinked_components(Path(path))
     else:
         spike._refuse_symlinked_components(Path(path))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions are required")
+@pytest.mark.parametrize("mode, refused", [(0o777, True), (0o1777, False), (0o755, False)])
+def test_private_dir_refuses_ancestors_others_can_modify_unless_sticky(tmp_path, mode, refused):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(mode)
+    try:
+        if refused:
+            with pytest.raises(SpikeError, match="others can modify"):
+                spike._private_dir(shared / "state")
+            assert not (shared / "state").exists()
+        else:
+            spike._private_dir(shared / "state")
+    finally:
+        shared.chmod(0o755)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")

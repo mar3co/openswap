@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest assembled-branch suite is green: `2985 passed, 4 skipped, 3 warnings
-in 29.17s`; it includes 112 phase-one harness tests and two direct tests of the
+The latest assembled-branch suite is green: `2989 passed, 4 skipped, 3 warnings
+in 29.25s`; it includes 116 phase-one harness tests and two direct tests of the
 Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`).
 
@@ -108,7 +108,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2985 passed, 4 skipped, 3 warnings in 29.17s`).
+  (`2989 passed, 4 skipped, 3 warnings in 29.25s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -196,9 +196,12 @@ until the owner records a permitted path or exclusion.
   raced into existence during creation is revalidated, and the whole path is
   re-checked for symlinks afterwards. The event reader is stoppable: if a
   descendant still holds stdout, it is stopped and the pipe closed before the
-  result is recorded. Only a root-owned symlink directly under `/` (the
-  macOS system links) is trusted in a state or evidence path, so running as
-  root does not widen the exemption. A failed final probe scan still sweeps
+  result is recorded. Only the exact macOS system links (`/tmp`, `/var`
+  and `/etc` pointing at `/private/...`) are trusted in a state or evidence
+  path, so running as root does not widen the exemption. Every existing
+  directory on the path must be owned by the user or root and not be
+  modifiable by others unless sticky, so no component can be swapped for a
+  symlink after validation. A failed final probe scan still sweeps
   descendants recorded by earlier scans. A pidfd verified by its re-read
   keeps that re-read's group and identity, so a child that called `setsid()`
   between snapshot and open is still recognised as escaped.

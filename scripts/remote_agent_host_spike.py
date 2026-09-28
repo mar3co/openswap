@@ -289,15 +289,46 @@ def _sweep_probe_descendants(
     return True, all_gone and scanned
 
 
+# The only symlinks trusted in an output path: macOS's root-owned top-level
+# system links, each with its exact expected target.
+_TRUSTED_SYSTEM_LINKS = {
+    "darwin": {"/tmp": "private/tmp", "/var": "private/var", "/etc": "private/etc"},
+}
+
+
+def _trusted_system_link(current: Path, status: os.stat_result) -> bool:
+    expected = _TRUSTED_SYSTEM_LINKS.get(sys.platform, {}).get(str(current))
+    if expected is None or os.name != "posix" or status.st_uid != 0:
+        return False
+    try:
+        return os.readlink(current) in (expected, "/" + expected)
+    except OSError:
+        return False
+
+
+def _refuse_unsafe_directory(current: Path, status: os.stat_result) -> None:
+    # Another user who can modify an ancestor could rename our directory and
+    # put a symlink in its place after validation. A sticky directory (such
+    # as /tmp) lets only an entry's owner rename it, so it stays safe.
+    if os.name != "posix":
+        return
+    if status.st_uid not in (0, os.getuid()):
+        raise SpikeError("Private output path must not sit under another user's directory.")
+    if status.st_mode & 0o022 and not status.st_mode & stat_module.S_ISVTX:
+        raise SpikeError("Private output path must not sit under a directory others can modify.")
+
+
 def _refuse_symlinked_components(path: Path) -> None:
-    """Refuse a path that traverses any symlink other than a top-level system link.
+    """Refuse a path that another user could redirect, before or after validation.
 
     A symlinked component (not just the leaf) would redirect every directory
-    and file we create into its target. Only a root-owned symlink directly
-    under the filesystem root (macOS's ``/tmp``, ``/var`` and ``/etc`` ->
-    ``/private/...``) is trusted; ownership alone is not enough, because a
-    harness run as root would own every link it could be tricked into
-    following. On platforms without POSIX ownership any symlink is refused.
+    and file we create into its target, so only an exactly listed system link
+    (macOS's ``/tmp``, ``/var`` and ``/etc`` -> ``/private/...``) is trusted;
+    ownership or location alone is not, because a harness run as root would
+    own every link it could be tricked into following. Every existing
+    directory must also be owned by us or root and not be modifiable by
+    others unless sticky, so nobody can swap a component for a symlink after
+    this check. On platforms without POSIX ownership any symlink is refused.
     """
     anchor = Path(path.absolute().anchor)
     current = anchor
@@ -309,10 +340,15 @@ def _refuse_symlinked_components(path: Path) -> None:
             # Missing (we create the rest below) or not a directory: the
             # creation step raises the real error, reported with details withheld.
             return
-        if stat_module.S_ISLNK(status.st_mode) and not (
-            os.name == "posix" and status.st_uid == 0 and current.parent == anchor
-        ):
-            raise SpikeError("Private output path must not traverse a symlink.")
+        if stat_module.S_ISLNK(status.st_mode):
+            if not _trusted_system_link(current, status):
+                raise SpikeError("Private output path must not traverse a symlink.")
+            try:
+                status = os.stat(current)
+            except OSError:
+                return
+        if stat_module.S_ISDIR(status.st_mode) and current.parent != current:
+            _refuse_unsafe_directory(current, status)
 
 
 def _private_dir(path: Path) -> None:
