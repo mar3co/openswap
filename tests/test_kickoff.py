@@ -287,7 +287,19 @@ def test_invoke_kickoff_missing_claude_raises(tmp_path: Path):
 
 def test_invoke_kickoff_default_login_omits_config_dir(tmp_path: Path, monkeypatch):
     """Live default login: no second credential copy, no CLAUDE_CONFIG_DIR."""
-    _fake_lease_roster(monkeypatch, tmp_path, "claude")
+    root = _fake_lease_roster(monkeypatch, tmp_path, "claude")
+    default_config = tmp_path / "default-claude.json"
+    default_config.write_text(
+        json.dumps({"oauthAccount": {
+            "emailAddress": "fake@example.test",
+            "organizationUuid": "org-fake",
+        }}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "openswap.kickoff.paths.get_default_global_config_path",
+        lambda: default_config,
+    )
     captured: dict = {}
 
     def fake_which(name: str):
@@ -318,6 +330,103 @@ def test_invoke_kickoff_default_login_omits_config_dir(tmp_path: Path, monkeypat
     assert captured["kwargs"].get("cwd") in (None, "")
     assert captured["kwargs"].get("check") is False
     assert result.returncode == 0
+
+
+def test_live_default_kickoff_leases_detected_identity_not_stale_active_slot(
+    tmp_path: Path, monkeypatch
+):
+    from openswap.worker.leases import AccountLeaseStore, stable_account_identity
+
+    root = _fake_lease_roster(monkeypatch, tmp_path, "claude")
+    roster_path = root / "sequence.json"
+    roster = json.loads(roster_path.read_text(encoding="utf-8"))
+    roster["accounts"]["2"] = {
+        "email": "live-b@example.test",
+        "organizationUuid": "org-b",
+    }
+    # External Claude login changed to account B, but OpenSwap's remembered
+    # active slot remains A. The lease must follow the profile Claude will use.
+    roster_path.write_text(json.dumps(roster), encoding="utf-8")
+    default_config = tmp_path / "default-claude.json"
+    default_config.write_text(
+        json.dumps({"oauthAccount": {
+            "emailAddress": "live-b@example.test",
+            "organizationUuid": "org-b",
+        }}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "openswap.kickoff.paths.get_default_global_config_path",
+        lambda: default_config,
+    )
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["lease"] = AccountLeaseStore(root, "claude").current()
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    invoke_kickoff(
+        None,
+        which=lambda _name: "/opt/fake/claude",
+        run=fake_run,
+        environ={"PATH": "/usr/bin", "CLAUDE_CONFIG_DIR": "/tmp/other"},
+    )
+
+    lease = captured["lease"]
+    assert lease is not None
+    assert lease.account_identity == stable_account_identity(
+        "claude", "live-b@example.test", "org-b"
+    )
+    assert "CLAUDE_CONFIG_DIR" not in captured["env"]
+
+
+@pytest.mark.parametrize(
+    "live_identity,duplicate",
+    [
+        (("unmanaged@example.test", "org-unknown"), False),
+        (("fake@example.test", "org-fake"), True),
+    ],
+)
+def test_live_default_kickoff_refuses_unmatched_or_ambiguous_identity(
+    tmp_path: Path, monkeypatch, live_identity, duplicate: bool
+):
+    from openswap.worker.leases import AccountLeaseStore
+
+    root = _fake_lease_roster(monkeypatch, tmp_path, "claude")
+    roster_path = root / "sequence.json"
+    roster = json.loads(roster_path.read_text(encoding="utf-8"))
+    if duplicate:
+        roster["accounts"]["2"] = dict(roster["accounts"]["1"])
+        roster_path.write_text(json.dumps(roster), encoding="utf-8")
+    default_config = tmp_path / "default-claude.json"
+    default_config.write_text(
+        json.dumps({"oauthAccount": {
+            "emailAddress": live_identity[0],
+            "organizationUuid": live_identity[1],
+        }}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "openswap.kickoff.paths.get_default_global_config_path",
+        lambda: default_config,
+    )
+    run_called = False
+
+    def fake_run(*_args, **_kwargs):
+        nonlocal run_called
+        run_called = True
+
+    with pytest.raises(SessionError, match="Cannot verify the account"):
+        invoke_kickoff(
+            None,
+            which=lambda _name: "/opt/fake/claude",
+            run=fake_run,
+            environ={"PATH": "/usr/bin"},
+        )
+
+    assert not run_called
+    assert AccountLeaseStore(root, "claude").current() is None
 
 
 def test_kickoff_timeout_quarantines_account_and_refuses_replay(tmp_path: Path, monkeypatch):

@@ -169,7 +169,7 @@ LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
 The Phase 2 full-suite validation on the currently integrated PR #59 snapshot
-`f684ebf` is green: `3061 passed, 4 skipped, 3 warnings in 20.25s` (3,065
+`f684ebf` is green: `3068 passed, 4 skipped, 3 warnings in 17.13s` (3,072
 collected). The newer PR #59 head has not been merged into this tree.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
@@ -206,6 +206,11 @@ interrupting an already-finished run; purge now refuses while the worker is
 enabled, running, installed/loaded, or unresolved and requires explicit
 disable before retry. Purge keeps lifecycle/provider lock anchors while
 removing worker data; it never disables or unloads the worker automatically.
+Follow-ups #4125207619 and #4125207629 are addressed: default-login Claude
+kickoff resolves the live identity from public global-config metadata while
+holding the provider mutation guard and refuses unmatched or ambiguous roster
+identities; failures in post-launch journal transitions interrupt the owned
+run and retain an uncertain lease unless the adapter proves it stopped.
 
 ## Deviations and verification
 

@@ -205,6 +205,48 @@ def _kickoff_account_identity(provider: str, selected_home: Path | str | None) -
     if not isinstance(accounts, dict):
         raise SessionError("Cannot verify the account for scheduled kickoff.")
 
+    if provider == "claude" and selected_home is None:
+        # The no-override kickoff runs against Claude's default profile, whose
+        # identity can change outside OpenSwap without updating activeAccountNumber.
+        # Read only the public account metadata from the default global config;
+        # never inspect credential contents to choose a lease identity.
+        try:
+            default_config = json.loads(
+                paths.get_default_global_config_path().read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            raise SessionError("Cannot verify the account for scheduled kickoff.") from None
+        oauth_account = (
+            default_config.get("oauthAccount")
+            if isinstance(default_config, dict)
+            else None
+        )
+        if not isinstance(oauth_account, dict):
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+        email = oauth_account.get("emailAddress")
+        organization = oauth_account.get("organizationUuid", "")
+        if organization is None:
+            organization = ""
+        if (
+            not isinstance(email, str)
+            or not email
+            or not isinstance(organization, str)
+        ):
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+
+        # Use the engine's canonical (email, organizationUuid) slot semantics,
+        # but reject duplicates instead of choosing the first matching row.
+        matching_slots = [
+            number
+            for number, record in accounts.items()
+            if isinstance(record, dict)
+            and record.get("email") == email
+            and record.get("organizationUuid", "") == organization
+        ]
+        if len(matching_slots) != 1:
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+        return stable_account_identity(provider, email, organization)
+
     selected_num = str(roster.get("activeAccountNumber") or "")
     if selected_home is not None:
         home = Path(selected_home)

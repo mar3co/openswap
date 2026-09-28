@@ -576,13 +576,65 @@ class WorkerRuntime:
                 expected_generation=starting.generation,
                 diagnostic_code="execution_uncertain",
             )
-        running = self.store.transition(
-            starting.job_id, expected_states=(JobState.STARTING,),
-            new_state=JobState.RUNNING, worker_epoch=self.worker_epoch,
-            expected_generation=starting.generation,
-            provider_session_id=run.session_id,
-        )
-        return self.store.get(running.job_id), run, token
+        try:
+            running = self.store.transition(
+                starting.job_id, expected_states=(JobState.STARTING,),
+                new_state=JobState.RUNNING, worker_epoch=self.worker_epoch,
+                expected_generation=starting.generation,
+                provider_session_id=run.session_id,
+            )
+            return self.store.get(running.job_id), run, token
+        except Exception:
+            recovered = self._cleanup_started_run(starting, run, token)
+            if recovered is not None:
+                return recovered
+            raise
+
+    def _cleanup_started_run(self, starting: JobRecord, run: ProviderRun, token) -> JobRecord | None:
+        """Stop an owned launch if post-start journal work fails; never replay it."""
+        stopped = False
+        try:
+            stopped = self._interrupt_execution(token, run)
+        except Exception:
+            # A failed lease write cannot turn uncertain execution into proof.
+            try:
+                self.leases.mark_uncertain(token, "execution_uncertain")
+            except Exception:
+                pass
+        finally:
+            self._clear_active()
+
+        try:
+            latest = self.store.get(starting.job_id)
+        except Exception:
+            return None
+        if latest.state in {
+            JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED,
+            JobState.INTERRUPTED, JobState.EXPIRED,
+        }:
+            return latest
+        if latest.state not in {
+            JobState.STARTING, JobState.RUNNING, JobState.CANCEL_REQUESTED,
+        }:
+            return None
+        if stopped and latest.state == JobState.CANCEL_REQUESTED:
+            final_state = JobState.CANCELLED
+            diagnostic = "cancel_requested"
+        elif stopped:
+            final_state = JobState.FAILED
+            diagnostic = "provider_unavailable"
+        else:
+            final_state = JobState.INTERRUPTED
+            diagnostic = "execution_uncertain"
+        try:
+            return self.store.transition(
+                latest.job_id, expected_states=(latest.state,),
+                new_state=final_state, worker_epoch=self.worker_epoch,
+                expected_generation=latest.generation,
+                diagnostic_code=diagnostic,
+            )
+        except Exception:
+            return None
 
     def _interrupt_active(self, record: JobRecord, reason: str) -> JobRecord:
         token, run = self._active_lease, self._active_run

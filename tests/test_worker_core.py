@@ -143,7 +143,6 @@ def test_stale_event_after_stop_interrupts_owned_provider_run(
     class CancelDuringEvents(_FakeAdapter):
         runtime = None
         job_id = None
-        interrupt_count = 0
 
         def events(self, run, *, after_cursor):
             self.runtime.stop(self.job_id)
@@ -154,10 +153,6 @@ def test_stale_event_after_stop_interrupts_owned_provider_run(
                 kind=SafeEventKind.DIAGNOSTIC,
                 diagnostic_code="provider_unavailable",
             ),)
-
-        def interrupt(self, run):
-            self.interrupt_count += 1
-            return super().interrupt(run)
 
     adapter = CancelDuringEvents(stopped=stopped)
     identity = stable_account_identity("codex", "cancel-during-events-test")
@@ -249,6 +244,55 @@ def test_malformed_provider_stop_proof_is_not_preserved(tmp_path):
     assert AccountLeaseStore(tmp_path).current().state == "uncertain"
 
 
+@pytest.mark.parametrize("failure_point", ["running_transition", "running_get"])
+@pytest.mark.parametrize(
+    ("stopped", "expected_state", "expected_lease"),
+    [
+        (True, JobState.FAILED, "released"),
+        (False, JobState.INTERRUPTED, "uncertain"),
+    ],
+)
+def test_post_start_journal_failure_interrupts_owned_run(
+    tmp_path, failure_point, stopped, expected_state, expected_lease,
+):
+    update_worker_settings(tmp_path, enabled=True)
+    adapter = _FakeAdapter(stopped=stopped)
+    identity = stable_account_identity("codex", "post-start-journal-failure-test")
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    job = runtime.submit(_submission())
+    original_transition = runtime.store.transition
+    original_get = runtime.store.get
+    failed = False
+
+    def fail_running_transition(job_id, **kwargs):
+        nonlocal failed
+        if not failed and kwargs.get("new_state") == JobState.RUNNING:
+            failed = True
+            raise RuntimeError("synthetic_journal_failure")
+        return original_transition(job_id, **kwargs)
+
+    def fail_running_get(job_id):
+        nonlocal failed
+        current = original_get(job_id)
+        if not failed and current.state == JobState.RUNNING:
+            failed = True
+            raise RuntimeError("synthetic_journal_failure")
+        return current
+
+    if failure_point == "running_transition":
+        runtime.store.transition = fail_running_transition
+    else:
+        runtime.store.get = fail_running_get
+
+    result = runtime.reconcile_once()
+
+    assert failed is True
+    assert adapter.start_count == 1
+    assert adapter.interrupt_count == 1
+    assert result.state == expected_state
+    assert AccountLeaseStore(tmp_path).current().state == expected_lease
+
+
 def test_local_workspace_registry_is_opaque_disjoint_and_persisted(tmp_path):
     output = tmp_path / "approved-output"
     source = tmp_path / "approved-source"
@@ -306,6 +350,7 @@ class _FakeAdapter:
         self.start_entered = threading.Event()
         self.release_start = threading.Event()
         self.start_count = 0
+        self.interrupt_count = 0
         self.event_cursors = []
         self.workspace = None
 
@@ -326,6 +371,7 @@ class _FakeAdapter:
         return result
 
     def interrupt(self, run):
+        self.interrupt_count += 1
         return InterruptResult(True, self.stopped, None)
 
 
