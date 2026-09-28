@@ -60,7 +60,7 @@ install/upgrade rewiring. Three phases with a green-suite gate between them.
 
 | Plan | Proposal | Status |
 |------|----------|--------|
-| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag | PROPOSED; authentication and lifecycle spike required |
+| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag | IN PROGRESS; phase 1 blocked pending evidence and owner decisions ([progress](017-progress.md)) |
 
 017 recommends an optional OpenSwap worker process, with OpenTag as its first
 client, and defers a standalone OpenServer product. It includes provider research,
@@ -68,6 +68,10 @@ architecture, staged delivery and acceptance criteria. This is a design proposal
 merging it does not implement or enable remote execution. Its research snapshots
 are dated 2026-09-27 and must be revalidated during the feasibility spike. The
 OpenTag connector side is tracked in mar3co/opentag#135 (private repository).
+Phase 1 is being executed as a credential-free feasibility spike until the
+owner authorizes a specific account context and exclusive auth ownership. Phase
+2 and phase 3 remain unstarted; neither technical evidence in a draft PR nor a
+draft PR itself satisfies the phase gate. See [017 progress](017-progress.md).
 
 ## Dependency notes
 

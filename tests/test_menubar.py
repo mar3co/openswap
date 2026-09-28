@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from openswap import menubar
+from openswap import menubar_display
 from openswap.autoswitch import (
     AllExhaustedEvent,
     ConfigWarningEvent,
@@ -2428,7 +2429,13 @@ def test_launch_claude_login_opens_command_file(tmp_path):
     assert calls[0][1] == str(dest)
 
 
-def test_launch_claude_login_missing_claude():
+def test_launch_claude_login_missing_claude(monkeypatch):
+    # `launch_claude_login` falls back to common install directories after
+    # PATH lookup. Simulate the resolver's final missing result so this test
+    # stays deterministic on machines with Claude installed in one of them.
+    monkeypatch.setattr(
+        menubar_display, "resolve_claude_bin", lambda **_kwargs: None
+    )
     with pytest.raises(ClaudeSwitchError, match="claude"):
         menubar.launch_claude_login(
             "a@x.com",
