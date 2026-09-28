@@ -78,9 +78,28 @@ def _parse_stamp(value: str) -> datetime:
 def _safe_diagnostic(code: str | None) -> str | None:
     if code is None:
         return None
-    if code not in _SAFE_DIAGNOSTICS:
+    if not isinstance(code, str) or code not in _SAFE_DIAGNOSTICS:
         raise ValueError("diagnostic_code is not allowlisted")
     return code
+
+
+def validate_event_fields(
+    *,
+    kind: SafeEventKind,
+    state: JobState | None,
+    diagnostic_code: str | None,
+    execution_stopped: bool,
+) -> str | None:
+    """Validate and normalize the shared safe-event data contract."""
+    if (
+        not isinstance(kind, SafeEventKind)
+        or (state is not None and not isinstance(state, JobState))
+        or state == JobState.WAITING_FOR_APPROVAL
+        or type(execution_stopped) is not bool
+        or (execution_stopped and kind != SafeEventKind.PROVIDER_FINISHED)
+    ):
+        raise ValueError("event kind or state is unsupported")
+    return _safe_diagnostic(diagnostic_code)
 
 
 class LocalJobStore:
@@ -411,11 +430,10 @@ class LocalJobStore:
         diagnostic_code: str | None = None,
         execution_stopped: bool = False,
     ) -> SafeEvent:
-        if (not isinstance(kind, SafeEventKind) or state == JobState.WAITING_FOR_APPROVAL
-                or type(execution_stopped) is not bool
-                or (execution_stopped and kind != SafeEventKind.PROVIDER_FINISHED)):
-            raise ValueError("event kind or state is unsupported")
-        diagnostic_code = _safe_diagnostic(diagnostic_code)
+        diagnostic_code = validate_event_fields(
+            kind=kind, state=state, diagnostic_code=diagnostic_code,
+            execution_stopped=execution_stopped,
+        )
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")

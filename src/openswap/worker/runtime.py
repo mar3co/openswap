@@ -15,7 +15,12 @@ from urllib.parse import quote
 from openswap.settings import load_worker_settings, update_worker_settings
 from openswap.worker.adapter import ProviderAdapter, production_adapter
 from openswap.locking import FileLock
-from openswap.worker.journal import AdmissionError, LocalJobStore, StaleWriteError
+from openswap.worker.journal import (
+    AdmissionError,
+    LocalJobStore,
+    StaleWriteError,
+    validate_event_fields,
+)
 from openswap.worker.leases import (
     AccountLeaseStore,
     LeaseConflictError,
@@ -35,6 +40,7 @@ from openswap.worker.models import (
     WorkerProcessState,
     WorkerSnapshot,
     SafeEventKind,
+    SafeEvent,
     ProviderRun,
 )
 
@@ -328,6 +334,8 @@ class WorkerRuntime:
         deadline = self.monotonic() + running.runtime_limit_s
         current = running
         provider_cursor = run.provider_event_cursor
+        finished_event_candidate = None
+        finished_event_proof = None
         try:
             while True:
                 self.heartbeat()
@@ -344,22 +352,46 @@ class WorkerRuntime:
                 if not isinstance(events, tuple) or len(events) > 100:
                     raise RuntimeError("provider_event_batch_too_large")
                 for event in events:
-                    if (event.job_id != current.job_id or type(event.cursor) is not int
+                    if (not isinstance(event, SafeEvent)
+                            or event.job_id != current.job_id or type(event.cursor) is not int
                             or event.cursor <= provider_cursor):
                         raise RuntimeError("adapter_event_job_mismatch")
-                    self.store.append_event(
-                        current.job_id, kind=event.kind, state=event.state,
-                        diagnostic_code=event.diagnostic_code,
-                        worker_epoch=self.worker_epoch,
-                        expected_generation=current.generation,
-                        execution_stopped=event.execution_stopped,
-                    )
-                    provider_cursor = event.cursor
-                    current = self.store.get(current.job_id)
                     if event.kind == SafeEventKind.PROVIDER_FINISHED:
                         final_state = event.state
                         if final_state not in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED}:
                             raise RuntimeError("invalid_provider_terminal_state")
+                    validated_diagnostic = validate_event_fields(
+                        kind=event.kind, state=event.state,
+                        diagnostic_code=event.diagnostic_code,
+                        execution_stopped=event.execution_stopped,
+                    )
+                    if (
+                        event.kind == SafeEventKind.PROVIDER_FINISHED
+                        and event.execution_stopped is True
+                    ):
+                        # Candidate only: lease release still requires the
+                        # journal to accept this event under a current fence.
+                        finished_event_candidate = event
+                    appended = self.store.append_event(
+                        current.job_id, kind=event.kind, state=event.state,
+                        diagnostic_code=validated_diagnostic,
+                        worker_epoch=self.worker_epoch,
+                        expected_generation=current.generation,
+                        execution_stopped=event.execution_stopped,
+                    )
+                    if (
+                        event.kind == SafeEventKind.PROVIDER_FINISHED
+                        and type(appended.execution_stopped) is bool
+                        and appended.execution_stopped is True
+                    ):
+                        # The journal validated the strict stop-proof type and
+                        # durably accepted this provider event. Preserve that
+                        # proof if a concurrent cancel fences the final state
+                        # transition below.
+                        finished_event_proof = appended
+                    provider_cursor = event.cursor
+                    current = self.store.get(current.job_id)
+                    if event.kind == SafeEventKind.PROVIDER_FINISHED:
                         if not event.execution_stopped:
                             self.leases.mark_uncertain(token, "execution_uncertain")
                             self._clear_active()
@@ -384,7 +416,34 @@ class WorkerRuntime:
                         self._clear_active()
                         return final
                 self.sleeper(0.05)
-        except Exception:
+        except Exception as error:
+            if finished_event_proof is not None:
+                return self._finalize_proven_terminal(token, finished_event_proof)
+            if finished_event_candidate is not None and isinstance(error, StaleWriteError):
+                retried = None
+                try:
+                    latest = self.store.get(running.job_id)
+                    if latest.state in {JobState.RUNNING, JobState.CANCEL_REQUESTED}:
+                        retried = self.store.append_event(
+                            latest.job_id, kind=finished_event_candidate.kind,
+                            state=finished_event_candidate.state,
+                            diagnostic_code=finished_event_candidate.diagnostic_code,
+                            worker_epoch=self.worker_epoch,
+                            expected_generation=latest.generation,
+                            execution_stopped=finished_event_candidate.execution_stopped,
+                        )
+                except Exception:
+                    # If the terminal proof cannot be journaled under a fresh
+                    # fence, fall through to ordinary interruption handling;
+                    # that path quarantines unless interrupt independently
+                    # proves the run stopped.
+                    retried = None
+                if (
+                    retried is not None
+                    and type(retried.execution_stopped) is bool
+                    and retried.execution_stopped is True
+                ):
+                    return self._finalize_proven_terminal(token, retried)
             try:
                 latest = self.store.get(running.job_id)
             except Exception:
@@ -403,6 +462,37 @@ class WorkerRuntime:
                 else "provider_error"
             )
             return self._interrupt_active(latest, reason)
+
+    def _finalize_proven_terminal(self, token, event: SafeEvent) -> JobRecord:
+        """Honor a journaled provider stop proof despite a stale state fence."""
+        self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+        self._clear_active()
+        for attempt in range(2):
+            current = self.store.get(event.job_id)
+            if current.state in {
+                JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED,
+                JobState.INTERRUPTED, JobState.EXPIRED,
+            }:
+                return current
+            if current.state == JobState.CANCEL_REQUESTED:
+                final_state = JobState.CANCELLED
+                diagnostic = "cancel_requested"
+            elif current.state == JobState.RUNNING:
+                final_state = event.state
+                diagnostic = event.diagnostic_code
+            else:
+                raise RuntimeError("proven_provider_terminal_state_unavailable")
+            try:
+                return self.store.transition(
+                    current.job_id, expected_states=(current.state,),
+                    new_state=final_state, worker_epoch=self.worker_epoch,
+                    expected_generation=current.generation,
+                    diagnostic_code=diagnostic,
+                )
+            except StaleWriteError:
+                if attempt == 1:
+                    raise
+        raise RuntimeError("proven_provider_terminal_state_unavailable")
 
     def heartbeat(self) -> None:
         self.store.heartbeat(self.worker_pid, self.worker_epoch)

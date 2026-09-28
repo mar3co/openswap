@@ -168,8 +168,9 @@ boundary. No `launchctl` command is run against the user's login session;
 LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
-The merged branch full-suite validation after the legacy migration fix is
-green: `3051 passed, 4 skipped, 3 warnings in 20.32s` (3,055 collected).
+The Phase 2 full-suite validation on the currently integrated PR #59 snapshot
+`f684ebf` is green: `3061 passed, 4 skipped, 3 warnings in 20.25s` (3,065
+collected). The newer PR #59 head has not been merged into this tree.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -199,6 +200,12 @@ and `pause` use the canonical legacy-backup migration before creating worker
 state; `status` remains read-only and `stop` remains IPC-only. A regression
 checks migration precedes private worker-root creation and status leaves the
 legacy directory untouched.
+Follow-ups #4125129888 and #4125129902 are addressed: a durably journaled
+provider-finished stop proof survives a stale terminal transition without
+interrupting an already-finished run; purge now refuses while the worker is
+enabled, running, installed/loaded, or unresolved and requires explicit
+disable before retry. Purge keeps lifecycle/provider lock anchors while
+removing worker data; it never disables or unloads the worker automatically.
 
 ## Deviations and verification
 

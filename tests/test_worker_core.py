@@ -173,6 +173,82 @@ def test_stale_event_after_stop_interrupts_owned_provider_run(
     assert AccountLeaseStore(tmp_path).current().state == expected_lease
 
 
+@pytest.mark.parametrize("race_point", ["append", "terminal_transition"])
+def test_provider_finished_proof_survives_concurrent_stop(tmp_path, race_point):
+    update_worker_settings(tmp_path, enabled=True)
+
+    class FinishedAdapter(_FakeAdapter):
+        interrupt_count = 0
+
+        def events(self, run, *, after_cursor):
+            self.event_cursors.append(after_cursor)
+            return (_finished_event(
+                run_job_id, state=JobState.SUCCEEDED, stopped=True, cursor=21,
+            ),)
+
+        def interrupt(self, run):
+            self.interrupt_count += 1
+            return InterruptResult(True, False, "provider_unavailable")
+
+    identity = stable_account_identity("codex", "finished-stop-race-test")
+    run_job_id = ""
+    adapter = FinishedAdapter()
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    job = runtime.submit(_submission())
+    run_job_id = job.job_id
+    original_transition = runtime.store.transition
+    original_append_event = runtime.store.append_event
+    injected_stop = False
+
+    def stop_before_terminal_transition(job_id, **kwargs):
+        nonlocal injected_stop
+        if not injected_stop and kwargs.get("new_state") == JobState.SUCCEEDED:
+            injected_stop = True
+            result = runtime.stop(job_id)
+            assert result.accepted is True
+        return original_transition(job_id, **kwargs)
+
+    def stop_before_event_append(job_id, **kwargs):
+        nonlocal injected_stop
+        if (
+            not injected_stop
+            and kwargs.get("kind") == SafeEventKind.PROVIDER_FINISHED
+            and kwargs.get("execution_stopped") is True
+        ):
+            injected_stop = True
+            result = runtime.stop(job_id)
+            assert result.accepted is True
+        return original_append_event(job_id, **kwargs)
+
+    if race_point == "append":
+        runtime.store.append_event = stop_before_event_append
+    else:
+        runtime.store.transition = stop_before_terminal_transition
+
+    result = runtime.reconcile_once()
+
+    assert injected_stop is True
+    assert result.state == JobState.CANCELLED
+    assert adapter.interrupt_count == 0
+    assert AccountLeaseStore(tmp_path).current().state == "released"
+
+
+def test_malformed_provider_stop_proof_is_not_preserved(tmp_path):
+    update_worker_settings(tmp_path, enabled=True)
+    adapter = _FakeAdapter(stopped=False)
+    identity = stable_account_identity("codex", "malformed-provider-proof-test")
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    job = runtime.submit(_submission())
+    adapter.events_out = (
+        _finished_event(job.job_id, stopped="true"),
+    )
+
+    result = runtime.reconcile_once()
+
+    assert result.state == JobState.INTERRUPTED
+    assert AccountLeaseStore(tmp_path).current().state == "uncertain"
+
+
 def test_local_workspace_registry_is_opaque_disjoint_and_persisted(tmp_path):
     output = tmp_path / "approved-output"
     source = tmp_path / "approved-source"

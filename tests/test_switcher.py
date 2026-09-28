@@ -1271,6 +1271,101 @@ def test_purge_refuses_active_or_uncertain_provider_lease(
     assert current.state == ("uncertain" if uncertain else "active")
 
 
+@pytest.mark.parametrize("process_state", ["running", "starting", "unavailable"])
+def test_purge_refuses_live_or_unknown_worker(
+    temp_home: Path, monkeypatch: pytest.MonkeyPatch, process_state: str
+):
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    switcher.platform = Platform.LINUX
+    marker = switcher.backup_dir / "preserve-for-worker-refusal.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    monkeypatch.setattr(
+        "openswap.worker.cli._snapshot",
+        lambda _root: {
+            "process_state": process_state,
+            "active_job": None,
+            "lease_quarantined": False,
+        },
+    )
+
+    with patch("builtins.input", return_value="y"), pytest.raises(
+        SessionError, match="openswap worker disable"
+    ):
+        switcher.purge()
+
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+@pytest.mark.parametrize("service", [{"loaded": True, "installed": False}, {"loaded": False, "installed": True}])
+def test_purge_refuses_loaded_or_installed_worker(
+    temp_home: Path, monkeypatch: pytest.MonkeyPatch, service: dict
+):
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    switcher.platform = Platform.MACOS
+    marker = switcher.backup_dir / "preserve-for-service-refusal.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    monkeypatch.setattr(
+        "openswap.worker.cli._snapshot",
+        lambda _root: {
+            "process_state": "stopped",
+            "active_job": None,
+            "lease_quarantined": False,
+        },
+    )
+    monkeypatch.setattr("openswap.worker.launch_agent.status", lambda: service)
+
+    with patch("builtins.input", return_value="y"), pytest.raises(
+        SessionError, match="openswap worker disable"
+    ):
+        switcher.purge()
+
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_purge_refuses_enabled_worker(temp_home: Path):
+    from openswap.settings import update_worker_settings
+
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    switcher.platform = Platform.LINUX
+    update_worker_settings(switcher.backup_dir, enabled=True)
+    marker = switcher.backup_dir / "preserve-for-enabled-worker.txt"
+    marker.write_text("preserve", encoding="utf-8")
+
+    with patch("builtins.input", return_value="y"), pytest.raises(
+        SessionError, match="openswap worker disable"
+    ):
+        switcher.purge()
+
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_purge_refuses_manual_worker_lock(temp_home: Path):
+    from openswap.locking import FileLock
+    from openswap.worker.cli import lifecycle_lock
+
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    switcher.platform = Platform.LINUX
+    marker = switcher.backup_dir / "preserve-for-manual-worker.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    with lifecycle_lock(switcher.backup_dir):
+        pass
+    running = FileLock(switcher.backup_dir / "worker" / "instance.lock", timeout=0)
+    assert running.acquire(timeout=0)
+    try:
+        with patch("builtins.input", return_value="y"), pytest.raises(
+            SessionError, match="openswap worker disable"
+        ):
+            switcher.purge()
+    finally:
+        running.release()
+
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
 class TestLiveSessionGuardOnAnUnreadableRecord:
     """A session record we could not READ must not answer "nobody there".
 
@@ -5215,15 +5310,22 @@ class TestPurgeLegacyCleanup:
         claude_lock = backup_dir / ".lock"
         codex_lock = backup_dir / "codex" / ".lock"
         lock_inodes = (claude_lock.stat().st_ino, codex_lock.stat().st_ino)
+        from openswap.worker.cli import lifecycle_lock
+
+        with lifecycle_lock(backup_dir):
+            lifecycle_path = backup_dir / "worker" / "lifecycle.lock"
+            lifecycle_inode = lifecycle_path.stat().st_ino
         (backup_dir / "purge-me.txt").write_text("managed data")
 
         with patch("builtins.input", return_value="y"):
             switcher.purge()
 
         assert not legacy.exists()
-        assert {entry.name for entry in backup_dir.iterdir()} == {".lock", "codex"}
+        assert {entry.name for entry in backup_dir.iterdir()} == {".lock", "codex", "worker"}
         assert {entry.name for entry in (backup_dir / "codex").iterdir()} == {".lock"}
+        assert {entry.name for entry in (backup_dir / "worker").iterdir()} == {"lifecycle.lock"}
         assert (claude_lock.stat().st_ino, codex_lock.stat().st_ino) == lock_inodes
+        assert lifecycle_path.stat().st_ino == lifecycle_inode
 
     def test_purge_prompt_lists_legacy_when_present(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
@@ -5549,6 +5651,7 @@ class TestPurge:
         mock_keyring = MagicMock()
         with patch("builtins.input", return_value="y"), \
              patch("openswap.engine.engine.macos_keychain") as mock_kc, \
+             patch("openswap.worker.launch_agent.status", return_value={"loaded": False, "installed": False}), \
              patch.dict(sys.modules, {"keyring": mock_keyring}):
             switcher.purge()
 
