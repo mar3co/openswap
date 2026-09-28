@@ -45,7 +45,7 @@ def build_plist(program: list[str] | None = None, home: Path | None = None) -> b
     return plistlib.dumps(
         {
             "Label": LABEL,
-            "ProgramArguments": [*program, "worker", "run"],
+            "ProgramArguments": [*program, "worker", "run", "--managed"],
             "RunAtLoad": True,
             # A clean worker exit (for example, opt-out) must not relaunch.
             # Explicit disable also bootouts the service below.
@@ -159,7 +159,7 @@ def install(
         return {
             "label": LABEL,
             "plist": str(target),
-            "program": [*program, "worker", "run"],
+            "program": [*program, "worker", "run", "--managed"],
             "stdout_log": str(out_log),
             "stderr_log": str(err_log),
             "already_loaded": True,
@@ -180,7 +180,7 @@ def install(
     return {
         "label": LABEL,
         "plist": str(target),
-        "program": [*program, "worker", "run"],
+        "program": [*program, "worker", "run", "--managed"],
         "stdout_log": str(out_log),
         "stderr_log": str(err_log),
         "already_loaded": False,

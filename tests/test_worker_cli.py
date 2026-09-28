@@ -280,6 +280,31 @@ def test_enable_refuses_while_a_manual_worker_holds_the_instance_lock(
         assert installs == [1]
 
 
+def test_manual_run_refuses_while_the_launch_agent_is_loaded(tmp_path: Path, monkeypatch, capsys):
+    from openswap.worker import runtime as worker_runtime
+
+    update_worker_settings(tmp_path, enabled=True)
+    monkeypatch.setattr(cli, "_managed_worker_loaded", lambda: True)
+    started = []
+
+    def factory(root):
+        started.append(root)
+        raise RuntimeError("must not start")
+
+    real_run_worker = worker_runtime.run_worker
+    monkeypatch.setattr(
+        worker_runtime, "run_worker",
+        lambda root, **kwargs: real_run_worker(root, runtime_factory=factory, **kwargs),
+    )
+    assert cli.main(["run"], backup_root=tmp_path) == 1
+    assert "LaunchAgent is running the worker" in capsys.readouterr().err
+    assert started == []
+
+    # The LaunchAgent's own start passes --managed and is not refused.
+    assert cli.main(["run", "--managed"], backup_root=tmp_path) == 1  # factory raised
+    assert started == [tmp_path]
+
+
 def test_enable_refuses_invalid_pinned_account_without_installing(
     tmp_path: Path, monkeypatch, capsys
 ):

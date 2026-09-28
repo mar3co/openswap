@@ -38,7 +38,7 @@ def test_worker_plist_has_separate_label_and_headless_argv(tmp_path):
 
     assert parsed["Label"] == worker_launch_agent.LABEL
     assert parsed["Label"] != "com.opensoft.openswap.menubar"
-    assert parsed["ProgramArguments"] == [*PROGRAM, "worker", "run"]
+    assert parsed["ProgramArguments"] == [*PROGRAM, "worker", "run", "--managed"]
     assert parsed["RunAtLoad"] is True
     assert parsed["KeepAlive"] == {"SuccessfulExit": False}
     assert "ProcessType" not in parsed
@@ -89,7 +89,7 @@ def test_install_writes_worker_plist_and_bootstraps_only_worker_service(
     result = worker_launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
 
     plist = plistlib.loads(worker_launch_agent.plist_path(tmp_path).read_bytes())
-    assert plist["ProgramArguments"] == [*PROGRAM, "worker", "run"]
+    assert plist["ProgramArguments"] == [*PROGRAM, "worker", "run", "--managed"]
     assert calls == [
         ("print", f"gui/{UID}/{worker_launch_agent.LABEL}"),
         (
@@ -98,7 +98,7 @@ def test_install_writes_worker_plist_and_bootstraps_only_worker_service(
             str(worker_launch_agent.plist_path(tmp_path)),
         ),
     ]
-    assert result["program"] == [*PROGRAM, "worker", "run"]
+    assert result["program"] == [*PROGRAM, "worker", "run", "--managed"]
     assert result["already_loaded"] is False
 
 

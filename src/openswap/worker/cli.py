@@ -406,7 +406,7 @@ def release_lease(
             return True, {"lease_state": "released"}, None
 
 
-def _run(backup_root: Path) -> int:
+def _run(backup_root: Path, *, managed: bool = False) -> int:
     try:
         with lifecycle_lock(backup_root):
             if not load_worker_settings(backup_root).enabled:
@@ -417,9 +417,17 @@ def _run(backup_root: Path) -> int:
         return 1
     # Imported only in the dedicated worker command, after the default-off
     # policy check. The runtime owns its own SQLite journal and local socket.
-    from openswap.worker.runtime import run_worker
+    from openswap.worker.runtime import WORKER_REFUSED_MANAGED, run_worker
 
-    return int(run_worker(backup_root))
+    result = int(run_worker(backup_root, managed=managed, service_loaded=_managed_worker_loaded))
+    if result == WORKER_REFUSED_MANAGED:
+        print(
+            "The Remote tasks LaunchAgent is running the worker; "
+            "disable it before running the worker manually.",
+            file=sys.stderr,
+        )
+        return 1
+    return result
 
 
 def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> int:
@@ -429,7 +437,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     )
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="run the background worker process")
-    del run
+    # Passed only by the LaunchAgent: a manual run refuses while it is loaded.
+    run.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)
     status_parser = commands.add_parser("status", help="show local worker status")
     status_parser.add_argument("--json", action="store_true")
     stop_parser = commands.add_parser("stop", help="request interruption of the active job")
@@ -464,7 +473,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             return 1
 
     if args.command == "run":
-        return _run(root)
+        return _run(root, managed=args.managed)
     if args.command == "status":
         try:
             snapshot = read_status(root)

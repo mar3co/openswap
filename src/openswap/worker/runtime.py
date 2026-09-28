@@ -907,8 +907,24 @@ class WorkerRuntime:
             readonly_sources=workspace.readonly_roots,
         )
 
-def run_worker(backup_root: Path, *, runtime_factory=WorkerRuntime) -> int:
-    """Run the default-off worker daemon with a process-lifetime singleton lock."""
+WORKER_REFUSED_MANAGED = 2
+
+
+def run_worker(
+    backup_root: Path,
+    *,
+    runtime_factory=WorkerRuntime,
+    managed: bool = True,
+    service_loaded=None,
+) -> int:
+    """Run the default-off worker daemon with a process-lifetime singleton lock.
+
+    ``service_loaded`` (when given) reports whether the per-user LaunchAgent is
+    loaded. An unmanaged start (``managed=False``, a manual ``worker run``)
+    refuses with ``WORKER_REFUSED_MANAGED`` while it is, and the check runs
+    under the same lifecycle lock as the policy check and singleton
+    acquisition, so a concurrent enable cannot leave two competing workers.
+    """
     from openswap.worker.ipc import serve, socket_path
 
     store = LocalJobStore(backup_root)
@@ -926,6 +942,8 @@ def run_worker(backup_root: Path, *, runtime_factory=WorkerRuntime) -> int:
     try:
         if not load_worker_settings(backup_root).enabled:
             return 0
+        if not managed and service_loaded is not None and service_loaded():
+            return WORKER_REFUSED_MANAGED
         runtime = runtime_factory(backup_root)
         ready_event = threading.Event()
         server = threading.Thread(

@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3147 passed, 4 skipped, 3 warnings in 33.51s`.
+`3148 passed, 4 skipped, 3 warnings in 32.96s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -298,7 +298,11 @@ accepted so routine pings do not quarantine the account. A kickoff timeout
 still leaves the lease uncertain. The same decision applies to the short
 Codex usage read (`codex app-server`): its direct child's exit releases the
 lease. Enable also kickstarts a LaunchAgent that is loaded but has no running
-process, so it never reports success with no worker running.
+process, so it never reports success with no worker running. The
+LaunchAgent starts the worker with a hidden `--managed` flag; a manual
+`openswap worker run` refuses while the LaunchAgent is loaded, checked under
+the same lifecycle lock as the policy check and singleton acquisition, so a
+racing enable cannot leave two competing workers.
 
 ## Deviations and verification
 
