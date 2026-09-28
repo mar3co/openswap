@@ -168,8 +168,9 @@ boundary. No `launchctl` command is run against the user's login session;
 LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
-The merged branch full-suite validation is green: `3049 passed, 4 skipped,
-3 warnings in 20.34s` (3,053 collected). Focused core journal,
+The merged branch full-suite validation after the legacy migration fix is
+green: `3051 passed, 4 skipped, 3 warnings in 20.32s` (3,055 collected).
+Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
 recreation/idempotency, singleton refusal, a stop acknowledgement remaining
@@ -193,6 +194,11 @@ release also requires an `InterruptResult` whose `execution_stopped` value is
 literally `True`; a truthy string is tested as insufficient proof.
 Cancellation/event races route through provider interruption, and malformed
 released lease documents remain quarantined in read-only snapshots.
+Follow-up #4124975047 is also addressed: worker `run`, `enable`, `disable`,
+and `pause` use the canonical legacy-backup migration before creating worker
+state; `status` remains read-only and `stop` remains IPC-only. A regression
+checks migration precedes private worker-root creation and status leaves the
+legacy directory untouched.
 
 ## Deviations and verification
 

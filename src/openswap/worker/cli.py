@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from openswap import paths
 from openswap.exceptions import ClaudeSwitchError
 from openswap.locking import FileLock
 from openswap.paths import get_backup_root
@@ -22,6 +23,16 @@ from openswap.worker.runtime import read_worker_snapshot
 _DISABLE_WAIT_SECONDS = 3.0
 _DISABLE_POLL_SECONDS = 0.1
 _LIFECYCLE_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+def _migrate_legacy_before_worker_state_change(backup_root: Path) -> None:
+    """Run the canonical backup migration before worker code creates its root."""
+    if paths.migrate_legacy_backup_dir(Path(backup_root)):
+        print(
+            f"openswap: migrated data from {paths.get_legacy_backup_root()} "
+            f"to {backup_root}",
+            file=sys.stderr,
+        )
 
 
 @contextmanager
@@ -72,6 +83,7 @@ def request_stop(backup_root: Path, job_id: str | None) -> dict:
 def request_pause(backup_root: Path, paused: bool) -> dict:
     """Persist admission policy and request the worker's barrier update."""
     root = Path(backup_root)
+    _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
         previous = load_worker_settings(root)
         update_worker_settings(root, paused=paused)
@@ -109,6 +121,7 @@ def request_pause(backup_root: Path, paused: bool) -> dict:
 def enable_worker(backup_root: Path) -> dict:
     """Persist opt-in and idempotently install the per-user helper."""
     root = Path(backup_root)
+    _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
         previous = load_worker_settings(root)
         persisted = update_worker_settings(root, enabled=True)
@@ -154,6 +167,7 @@ def _safe_to_disable(snapshot: dict) -> str | None:
 
 def disable_worker(backup_root: Path) -> tuple[bool, dict, str | None]:
     """Pause first; only unload after the worker proves idle and unleased."""
+    _migrate_legacy_before_worker_state_change(backup_root)
     with lifecycle_lock(backup_root):
         return _disable_locked(backup_root)
 
@@ -309,6 +323,13 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     disable_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     root = Path(backup_root) if backup_root is not None else get_backup_root()
+
+    if args.command in {"run", "enable", "disable", "pause"}:
+        try:
+            _migrate_legacy_before_worker_state_change(root)
+        except ClaudeSwitchError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "run":
         return _run(root)

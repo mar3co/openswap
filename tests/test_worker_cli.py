@@ -123,6 +123,46 @@ def test_enable_creates_private_worker_root_before_lifecycle_lock(
     LocalJobStore(tmp_path)._ensure_private_dir()
 
 
+def test_worker_enable_migrates_legacy_backup_before_creating_worker_root(
+    temp_home: Path, monkeypatch, capsys
+):
+    legacy = temp_home / ".claude-swap-backup"
+    legacy.mkdir()
+    (legacy / "accounts.json").write_text('{"kept":true}', encoding="utf-8")
+    target = temp_home / "Library" / "Application Support" / "OpenSwap"
+    monkeypatch.setattr(cli.paths, "get_legacy_backup_root", lambda: legacy)
+    monkeypatch.setattr(cli, "install", lambda: {"already_loaded": False})
+
+    result = cli.enable_worker(target)
+
+    assert result["enabled"] is True
+    assert not legacy.exists()
+    assert (target / "accounts.json").read_text(encoding="utf-8") == '{"kept":true}'
+    assert (target / "worker").is_dir()
+    assert cli.paths.migrate_legacy_backup_dir(target) is False
+    assert capsys.readouterr().err == (
+        f"openswap: migrated data from {legacy} to {target}\n"
+    )
+
+
+def test_worker_status_does_not_migrate_legacy_backup(
+    temp_home: Path, monkeypatch, capsys
+):
+    legacy = temp_home / ".claude-swap-backup"
+    legacy.mkdir()
+    (legacy / "accounts.json").write_text('{"keep":true}', encoding="utf-8")
+    target = temp_home / "Library" / "Application Support" / "OpenSwap"
+    monkeypatch.setattr(cli.paths, "get_legacy_backup_root", lambda: legacy)
+
+    result = cli.main(["status", "--json"], backup_root=target)
+
+    assert result == 0
+    assert legacy.exists()
+    assert (legacy / "accounts.json").exists()
+    assert not target.exists()
+    assert capsys.readouterr().err == ""
+
+
 def test_enable_refuses_invalid_pinned_account_without_installing(
     tmp_path: Path, monkeypatch, capsys
 ):
