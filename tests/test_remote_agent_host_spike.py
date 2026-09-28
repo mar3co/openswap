@@ -1254,7 +1254,9 @@ def test_track_descendants_drops_reused_pid_with_new_birth_identity(monkeypatch)
 def test_track_descendants_keeps_child_whose_group_and_command_changed_after_reparent(monkeypatch):
     # Same start time throughout: the child called setsid() (new pgid) and
     # exec()'d a helper (new command) and was reparented to 1 before the next
-    # snapshot. It must stay tracked and be reported as escaped.
+    # snapshot. It must stay tracked and be reported as escaped, but without
+    # a pidfd a changed command could equally be a same-second pid reuse, so
+    # it is no longer trusted enough to signal.
     tables = iter([
         [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
          (4242, 100, 100, "S", "tA", "tA|pgid=100|python fake")],
@@ -1269,10 +1271,62 @@ def test_track_descendants_keeps_child_whose_group_and_command_changed_after_rep
     tracked: dict = {}
     spike._track_descendants(100, tracked)
     spike._track_descendants(100, tracked)
-    assert tracked == {4242: (4242, "Ss", "tA", None, "tA|pgid=4242|helper --detached", True)}
+    assert tracked == {4242: (4242, "Ss", "tA", None, "tA|pgid=4242|helper --detached", False)}
     assert spike._escaped_descendants(100, tracked) == {
-        4242: ("tA|pgid=4242|helper --detached", None, True)
+        4242: ("tA|pgid=4242|helper --detached", None, False)
     }
+
+
+@pytest.mark.parametrize("second_row, still_verified", [
+    # setsid() then reparented to init: same command, stays trusted.
+    ((4242, 1, 4242, "Ss", "tA", "tA|pgid=4242|python fake"), True),
+    # Same start time, but now parented by a stranger: possibly a reused pid.
+    ((4242, 777, 777, "S", "tA", "tA|pgid=777|python fake"), False),
+    # Same start time, new command line: possibly a reused pid.
+    ((4242, 100, 100, "S", "tA", "tA|pgid=100|sshd"), False),
+])
+def test_track_descendants_revokes_handleless_trust_on_possible_reuse(
+    monkeypatch, second_row, still_verified
+):
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 100, "S", "tA", "tA|pgid=100|python fake")],
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"), second_row],
+    ])
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: None)
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][5] is True
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][5] is still_verified
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_process_table_scans_are_bounded_by_the_job_deadline(tmp_path, monkeypatch):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    budgets: list = []
+    cancelled: list = []
+    real_append = spike._append_jsonl
+
+    def recording_table(timeout_s=None):
+        if not cancelled:
+            budgets.append(timeout_s)
+        return None  # as if ps timed out
+
+    def recording_append(path, record):
+        if record.get("state") == "cancel_requested":
+            cancelled.append(True)
+        real_append(path, record)
+
+    monkeypatch.setattr(spike, "_process_table", recording_table)
+    monkeypatch.setattr(spike, "_append_jsonl", recording_append)
+    supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=0.3, grace_s=0.2, job_id="slow-ps",
+    )
+    assert cancelled and budgets
+    assert all(b is not None and b <= 0.3 for b in budgets), budgets
 
 
 def test_track_descendants_evicts_reused_pid_even_when_it_holds_a_pidfd(monkeypatch):
@@ -1659,7 +1713,7 @@ def test_leader_exited_reads_state_from_supplied_snapshot(monkeypatch):
 def test_supervision_records_incomplete_tracking_when_snapshots_fail(tmp_path, monkeypatch):
     if os.name != "posix":
         pytest.skip("process-group supervision is POSIX-only")
-    monkeypatch.setattr(spike, "_process_table", lambda: None)
+    monkeypatch.setattr(spike, "_process_table", lambda **_: None)
     fake = _executable(tmp_path / "fake-quick", "raise SystemExit(0)\n")
     result = supervise_fake_command([str(fake)], state_dir=tmp_path / "state", timeout_s=10,
                                     job_id="no-snapshots")

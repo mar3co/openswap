@@ -111,7 +111,7 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
                 # Best effort: descendants are attributed by parent pid while
                 # the leader is alive, so one that calls setsid() is still ours.
                 last_snapshot = now
-                _track_descendants(process.pid, tracked)
+                _track_descendants(process.pid, tracked, deadline=deadline)
             # Observe exit BEFORE selecting: anything the group wrote before
             # it went quiet is then already readable, so an empty select after
             # that observation really means no output is left.
@@ -602,7 +602,18 @@ def _abort_supervision(
         _reap_leader(process)
 
 
-def _process_table() -> list[tuple[int, int, int, str, str, str]] | None:
+def _ps_budget(deadline: float | None) -> float:
+    """``ps`` timeout that cannot carry a scan far past a supervision deadline."""
+    if deadline is None:
+        return PS_TIMEOUT_S
+    return min(PS_TIMEOUT_S, max(deadline - time.monotonic(), MIN_PS_TIMEOUT_S))
+
+
+def _snapshot(deadline: float | None) -> list[tuple[int, int, int, str, str, str]] | None:
+    return _process_table() if deadline is None else _process_table(timeout_s=_ps_budget(deadline))
+
+
+def _process_table(timeout_s: float | None = None) -> list[tuple[int, int, int, str, str, str]] | None:
     """Best-effort ``(pid, ppid, pgid, stat, birth, identity)`` snapshot; None when unavailable.
 
     ``birth`` is the immutable start time (``lstart``, second resolution) used
@@ -622,7 +633,7 @@ def _process_table() -> list[tuple[int, int, int, str, str, str]] | None:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=PS_TIMEOUT_S,
+            timeout=PS_TIMEOUT_S if timeout_s is None else timeout_s,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -651,6 +662,10 @@ def _identity(lstart: str, pgid: int, command: str) -> str:
     return f"{lstart}|pgid={pgid}|{command}"
 
 
+def _command_of(identity: str) -> str:
+    return identity.split("|", 2)[-1]
+
+
 def _pid_identity(pid: int) -> str | None:
     """Current identity of ``pid`` (see :func:`_process_table`), or None when gone.
 
@@ -668,14 +683,14 @@ def _pid_identity(pid: int) -> str | None:
     return None
 
 
-def _pid_row(pid: int) -> tuple[int, int, str, str] | None:
+def _pid_row(pid: int, timeout_s: float | None = None) -> tuple[int, int, str, str] | None:
     """``(ppid, pgid, birth, identity)`` for a live ``pid``, or None when gone.
 
     Used to validate a freshly opened pidfd: a pid reused within the same
     second keeps the same second-resolution start time, so the parent, group
     and command line must all still match the snapshot as well.
     """
-    table = _process_table()
+    table = _process_table() if timeout_s is None else _process_table(timeout_s=timeout_s)
     if table is None:
         return None
     for entry_pid, ppid, pgid, stat, birth, identity in table:
@@ -721,6 +736,7 @@ def _track_descendants(
     leader_pid: int,
     tracked: dict[int, tuple[int, str, str, int | None, str, bool]],
     table: list[tuple[int, int, int, str, str, str]] | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """Record every descendant of the leader by parent pid, whatever its pgid.
 
@@ -741,9 +757,17 @@ def _track_descendants(
     never signalled, and it still forces an ``interrupted`` result if alive.
     Its children are tracked too, but inherit its unverified status: a
     possibly reused pid must never vouch for an unrelated process's children.
+
+    Without a pidfd, a pid reused within the same second keeps the same start
+    time, so a trusted handle-less entry loses trust if its command line
+    changes or its parent becomes a process outside the run (other than
+    init). A group change alone (setsid) keeps trust.
+
+    With ``deadline``, every ``ps`` scan is bounded by the time left, and a
+    pidfd that cannot be re-validated in time is kept unverified.
     """
     if table is None:
-        table = _process_table()
+        table = _snapshot(deadline)
     if table is None:
         return False
     births = {pid: birth for pid, _ppid, _pgid, _stat, birth, _identity_ in table}
@@ -776,6 +800,16 @@ def _track_descendants(
                     # A later snapshot showing our leader (or a verified
                     # descendant) as the parent proves the entry is ours.
                     verified = tracked[pid][5] or (pid in existing and ppid in trusted)
+                    if (
+                        handle is None
+                        and verified
+                        and pid in existing
+                        and (
+                            _command_of(identity) != _command_of(tracked[pid][4])
+                            or (ppid not in known and ppid != 1)
+                        )
+                    ):
+                        verified = False
                 else:
                     handle = _open_pidfd(pid)
                     verified = ppid in trusted
@@ -787,7 +821,15 @@ def _track_descendants(
                         # parent is still in this run proves ownership even if
                         # the group or command changed meanwhile; otherwise
                         # keep the handle but never signal through it.
-                        row = _pid_row(pid)
+                        if deadline is not None and time.monotonic() >= deadline:
+                            tracked[pid] = (pgid, stat, birth, handle, identity, False)
+                            if pid not in known:
+                                known.add(pid)
+                                changed = True
+                            continue
+                        row = _pid_row(pid) if deadline is None else _pid_row(
+                            pid, timeout_s=_ps_budget(deadline)
+                        )
                         if row is None or row[2] != birth:
                             try:
                                 os.close(handle)
@@ -828,6 +870,8 @@ def _escaped_descendants(
 
 
 PS_TIMEOUT_S = 5.0
+# Floor for a deadline-bounded scan, so one near the deadline can still finish.
+MIN_PS_TIMEOUT_S = 0.05
 SIGNALLING_PIDFD = "pidfd"
 SIGNALLING_IDENTITY_CHECK = "identity_check"
 
@@ -1037,13 +1081,15 @@ def _supervise_fake_command_locked(
         # process-table snapshot per iteration serves both the leader check and
         # descendant attribution, keeping `ps` pressure low on loaded runners.
         while True:
-            table = _process_table()
+            # Scans are bounded by the job deadline so a slow `ps` cannot
+            # postpone cancellation.
+            table = _snapshot(deadline)
             if table is None:
                 tracking_complete = False
             else:
                 # Best effort: descendants are attributed by parent pid while
                 # the leader is alive, whatever group they moved to.
-                _track_descendants(process.pid, tracked, table)
+                _track_descendants(process.pid, tracked, table, deadline)
             if _leader_exited(process, table):
                 break
             remaining = deadline - time.monotonic()
