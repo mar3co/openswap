@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from openswap.engine.notes import *  # noqa: F403
+from openswap.worker.leases import (
+    AccountLeaseStore,
+    LeaseConflictError,
+    stable_account_identity,
+)
 
 class SnapshotMixin:
     """AccountsSnapshot assembler. Store-only paint does not read idle backup credentials."""
@@ -423,9 +428,17 @@ class SnapshotMixin:
             # below (the one step that can touch ~/.claude.json).
             with (
                 FileLock(self.credentials_dir / f".consume-{account_num}.lock"),
-                FileLock(self.lock_file),
+                AccountLeaseStore(
+                    self.backup_dir, "claude"
+                ).mutation_guard() as lease_guard,
                 claude_credentials_lock(),
             ):
+                account_identity = self._claude_lease_identity(
+                    account_num, email, org_uuid
+                )
+                if account_identity is None:
+                    return _defer(force_refresh)
+                lease_guard.assert_unleased((account_identity,))
                 live = self._read_credentials()
                 if live is None:
                     # Read ERROR (locked keychain, unreadable store) — not
@@ -756,6 +769,10 @@ class SnapshotMixin:
                 account_num,
             )
             return _defer(force_refresh)
+        except LeaseConflictError:
+            # A provider file lock serializes writes but is released between
+            # refreshes. The durable account lease must also block this POST.
+            return _defer(force_refresh)
         except Exception:
             # _fetch_account_usage promises never to raise into the collect
             # pass (a raising worker would kill the whole pass for every
@@ -867,9 +884,17 @@ class SnapshotMixin:
                     return
                 self._provenance_warned.discard((account_num, email, "resync"))
             with (
-                FileLock(self.lock_file),
+                AccountLeaseStore(
+                    self.backup_dir, "claude"
+                ).mutation_guard() as lease_guard,
                 claude_credentials_lock(),
             ):
+                account_identity = self._claude_lease_identity(
+                    account_num, email, org_uuid
+                )
+                if account_identity is None:
+                    return
+                lease_guard.assert_unleased((account_identity,))
                 # Identity re-check under the lock: a switch/login landing in
                 # the gap means the live store is no longer this account's.
                 if not self._live_identity_matches(email, org_uuid):
@@ -904,7 +929,7 @@ class SnapshotMixin:
                     "credential (rotation completed outside a collect pass).",
                     account_num,
                 )
-        except LockError:
+        except (LockError, LeaseConflictError):
             return  # holder is mid-operation; the next pass retries
         except Exception:
             self._logger.warning(
@@ -912,6 +937,20 @@ class SnapshotMixin:
                 "newer-generation check still guards the next expiry.",
                 account_num, exc_info=True,
             )
+
+    def _claude_lease_identity(
+        self, account_num: str, email: str, org_uuid: str
+    ) -> str | None:
+        """Resolve the current roster identity while the provider lock is held."""
+        data = self._get_sequence_data()
+        record = (data or {}).get("accounts", {}).get(str(account_num))
+        if not isinstance(record, dict):
+            return None
+        current_email = record.get("email") or ""
+        current_org = record.get("organizationUuid") or ""
+        if current_email != email or current_org != org_uuid:
+            return None
+        return stable_account_identity("claude", current_email, current_org)
 
     def _static_usage_sentinel(
         self, account_info: tuple[int, str, str, str, bool, str, str]

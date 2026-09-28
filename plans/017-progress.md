@@ -168,8 +168,8 @@ boundary. No `launchctl` command is run against the user's login session;
 LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
-The merged branch full-suite validation is green: `3039 passed, 4 skipped,
-3 warnings in 19.99s` (3,043 collected). Focused core journal,
+The merged branch full-suite validation is green: `3046 passed, 4 skipped,
+3 warnings in 18.82s` (3,050 collected). Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
 recreation/idempotency, singleton refusal, a stop acknowledgement remaining
@@ -180,14 +180,16 @@ the managed account explicitly, and kickoff identity resolution remains
 fail-closed. All provider behavior in these tests is synthetic; this result
 does not clear Phase 1 gates or enable live Codex execution.
 
-PR #60 review follow-ups #4124363480, #4124363497, #4124363514, and
-#4124442272 are addressed with regression coverage: Claude slot/session
-profile mutations honor worker leases; manually started workers stop when
-opt-in is revoked; malformed pinned-account policy refuses enablement before
-LaunchAgent installation; and menu status applies external policy changes only
-with its generation-matched snapshot. Deadline/shutdown lease release also
-requires an `InterruptResult` whose `execution_stopped` value is literally
-`True`; a truthy string is tested as insufficient proof.
+PR #60 review follow-ups #4124363480, #4124363497, #4124363514,
+#4124442272, #4124700038, and #4124700051 are addressed with regression
+coverage: Claude slot/session mutations and refresh-token consumers honor
+worker leases; purge refuses active or uncertain leases and retains provider
+lock inodes while deleting other backup data; manually started workers stop
+when opt-in is revoked; malformed pinned-account policy refuses enablement
+before LaunchAgent installation; and menu status applies external policy
+changes only with its generation-matched snapshot. Deadline/shutdown lease
+release also requires an `InterruptResult` whose `execution_stopped` value is
+literally `True`; a truthy string is tested as insufficient proof.
 
 ## Deviations and verification
 

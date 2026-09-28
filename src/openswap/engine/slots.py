@@ -1024,10 +1024,12 @@ class SlotsMixin:
         """Persist rotated credentials to a slot's backup store, under the lock.
 
         For inactive accounts only — never routes to the active store. Mirrors
-        the persist callback ``_fetch_account_usage`` uses. The caller must NOT
-        hold ``self.lock_file`` (FileLock is non-reentrant).
+        the persist callback ``_fetch_account_usage`` uses. The provider
+        mutation guard atomically checks the worker lease and holds the same
+        provider lock through the write.
         """
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as guard:
+            guard.assert_available()
             self._write_account_credentials(account_num, email, credentials)
 
     def account_identity(self, account_num: str) -> dict:

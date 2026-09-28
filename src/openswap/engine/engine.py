@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+
 from openswap.engine.notes import *  # noqa: F403
 from openswap.engine.consume import ConsumeMixin
 from openswap.engine.freshen import FreshenMixin
@@ -11,6 +13,7 @@ from openswap.engine.session_profile import SessionProfileMixin
 from openswap.engine.slots import SlotsMixin
 from openswap.engine.snapshot import SnapshotMixin
 from openswap.engine.switch import SwitchMixin
+from openswap.worker.leases import AccountLeaseStore
 
 
 class Engine(
@@ -291,13 +294,20 @@ class Engine(
           macOS both the Keychain items via ``security`` and any fallback ``.enc``
           files), plus a best-effort sweep of any pre-migration keyring / Windows
           Credential Manager entries left behind
-        - The active backup directory (XDG path on Linux/WSL, ~/.claude-swap-backup elsewhere)
+        - All managed data under the active backup directory; the Claude and
+          Codex provider lock files remain as empty concurrency anchors
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
         """
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
-        legacy_distinct = legacy != self.backup_dir
+        provider_lock_paths = (
+            self.backup_dir / ".lock",
+            self.backup_dir / "codex" / ".lock",
+        )
+        legacy_distinct = legacy != self.backup_dir and not any(
+            _path_is_within(lock_path, legacy) for lock_path in provider_lock_paths
+        )
 
         # Refuse while any session-mode claude is running: purging would pull
         # its profile (and keychain entry) out from under a live process.
@@ -356,6 +366,36 @@ class Engine(
             print(dimmed("Cancelled"))
             return
 
+        # Confirmation stays outside the locks. Once confirmed, hold both
+        # provider mutation locks in stable path order through deletion so a
+        # worker cannot acquire a lease between the check and removal. Purge
+        # removes shared backup data, so both durable lease records must be safe.
+        stores = [
+            AccountLeaseStore(self.backup_dir, provider)
+            for provider in ("claude", "codex")
+        ]
+        codex_dir = self.backup_dir / "codex"
+        if (
+            self.backup_dir.is_symlink()
+            or codex_dir.is_symlink()
+            or (self.backup_dir / ".lock").is_symlink()
+            or (codex_dir / ".lock").is_symlink()
+        ):
+            raise SessionError(
+                "Provider lock paths contain a symlink; refusing to purge "
+                "account and lease state."
+            )
+        stores.sort(key=lambda store: str(store.provider_lock))
+        with ExitStack() as stack:
+            for store in stores:
+                guard = stack.enter_context(store.mutation_guard())
+                guard.assert_available()
+            self._purge_confirmed(legacy, legacy_distinct, session_dirs)
+
+    def _purge_confirmed(
+        self, legacy: Path, legacy_distinct: bool, session_dirs: list[Path]
+    ) -> None:
+        """Delete purge targets while both provider mutation locks are held."""
         removed_items = []
 
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
@@ -416,15 +456,19 @@ class Engine(
                 f"Session profiles: {', '.join(d.name for d in session_dirs)}"
             )
 
-        # Remove backup directory
+        # Remove managed data, but preserve the provider lock files and their
+        # parent directories. Unlinking a held lock inode would let another
+        # process create a new lock at the same path and bypass this guard.
         if self.backup_dir.exists():
             # Close log handlers before deleting (required on Windows)
             for handler in self._logger.handlers[:]:
                 handler.close()
                 self._logger.removeHandler(handler)
 
-            shutil.rmtree(self.backup_dir)
-            removed_items.append(f"Directory: {self.backup_dir}")
+            self._remove_backup_data_preserving_provider_locks()
+            removed_items.append(
+                f"Backup data: {self.backup_dir} (provider lock files retained)"
+            )
 
         # Also clean a stale legacy directory if it somehow still exists
         # (e.g. a partial pre-migration state, or files re-created after init).
@@ -444,3 +488,37 @@ class Engine(
 
         print(f"\n{accent('Purge complete.')}")
 
+    def _remove_backup_data_preserving_provider_locks(self) -> None:
+        """Remove the backup contents without unlinking held provider locks."""
+        root = self.backup_dir
+        for child in list(root.iterdir()):
+            if child.name == ".lock":
+                if child.is_symlink() or not child.is_file():
+                    raise SessionError("Claude provider lock path is unsafe; refusing purge.")
+                continue
+            if child.name == "codex" and not child.is_symlink() and child.is_dir():
+                for codex_child in list(child.iterdir()):
+                    if codex_child.name == ".lock":
+                        if codex_child.is_symlink() or not codex_child.is_file():
+                            raise SessionError("Codex provider lock path is unsafe; refusing purge.")
+                        continue
+                    self._remove_purge_entry(codex_child)
+                continue
+            self._remove_purge_entry(child)
+
+    @staticmethod
+    def _remove_purge_entry(path: Path) -> None:
+        """Remove one entry without following a symlink to an external tree."""
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    """Return whether ``path`` is ``root`` or one of its descendants."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from openswap.engine.notes import *  # noqa: F403
+from openswap.worker.leases import AccountLeaseError, AccountLeaseStore
 
 class ConsumeMixin:
     """One-time refresh-token consume: CAS on fingerprint, unclaimed stash on persist failure."""
@@ -23,13 +26,14 @@ class ConsumeMixin:
         A refresh token is one-time-use, so the POST must consume the
         provably-freshest copy of the slot's grant — never a caller's
         snapshot, which may be a superseded generation. The whole sequence
-        runs under that consume lock (re-read → POST → CAS) so two consumers
-        can never POST the same grant; the slot ``FileLock`` itself never
-        covers the network call.
+        runs under the per-slot consume lock (re-read → POST → CAS) so two
+        consumers cannot POST the same grant. It also holds the provider
+        mutation guard through POST and persistence so a worker lease cannot
+        begin with the generation whose grant was just consumed.
 
-        The body below is the sequence: adopt a stashed successor and re-read
-        under the slot lock, POST outside it, then CAS on the refresh-token
-        fingerprint and either persist or stash. A consumed generation is
+        The body below adopts any stashed successor, re-reads the current
+        generation, POSTs it, then CASes on the refresh-token fingerprint and
+        either persists or stashes the successor. A consumed generation is
         never discarded — a stash is adopted by the next pass — and the gate
         never raises after the grant is consumed, since callers run in the
         never-raises collect pass.
@@ -66,13 +70,12 @@ class ConsumeMixin:
             return oauth.RefreshOutcome(None, "store-unmirrored")
 
         # Consume serialization: one in-flight consume per slot, held across
-        # re-read → POST → CAS. The slot FileLock cannot cover the POST
-        # (network never runs under a lock others contend on), which left a
-        # window where a second gate re-read the unchanged backup and POSTed
-        # the same one-time-use grant (freshen vs collector). This dedicated
-        # lock is contended ONLY by other gates — waiting on it is exactly
-        # the serialization wanted, and the POST is bounded (10 s), so a
-        # loser waits briefly or defers.
+        # re-read → POST → CAS. The provider mutation guard also spans this
+        # bounded refresh request so kickoff cannot acquire a durable lease
+        # between consuming a one-time grant and persisting its successor.
+        # The consume lock serializes refresh consumers; provider lock order
+        # is consume lock then provider lock, and no lease path takes the
+        # consume lock.
         consume_lock = FileLock(
             self.credentials_dir / f".consume-{account_num}.lock"
         )
@@ -87,16 +90,36 @@ class ConsumeMixin:
             # blame the network for local serialization working as designed.
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
-            return self._consume_backup_grant_locked(
-                account_num, email, snapshot
-            )
+            try:
+                with AccountLeaseStore(
+                    self.backup_dir, "claude"
+                ).mutation_guard() as guard:
+                    guard.assert_available()
+                    return self._consume_backup_grant_locked(
+                        account_num, email, snapshot
+                    )
+            except AccountLeaseError:
+                # A durable active, uncertain, or unreadable lease prevents
+                # refresh-token use. Nothing was POSTed, so this is a
+                # deferred pass rather than a failed grant.
+                self._logger.info(
+                    "A worker lease blocks backup refresh for account %s; "
+                    "deferring to the next pass.", account_num,
+                )
+                return oauth.RefreshOutcome(None, "consume-busy")
+            except LockError:
+                self._logger.info(
+                    "Provider mutation lock is busy; deferring backup "
+                    "refresh for account %s.", account_num,
+                )
+                return oauth.RefreshOutcome(None, "consume-busy")
         finally:
             consume_lock.release()
 
     def _consume_backup_grant_locked(
         self, account_num: str, email: str, snapshot: str
     ) -> "oauth.RefreshOutcome":
-        """Body of ``consume_backup_grant``; caller holds the consume lock."""
+        """Body of ``consume_backup_grant``; caller holds both guards."""
         from openswap.session import (
             is_session_stale,
             read_session_credentials,
@@ -105,7 +128,9 @@ class ConsumeMixin:
         )
 
         try:
-            with FileLock(self.lock_file):
+            # ``consume_backup_grant`` holds the provider mutation guard for
+            # this entire helper, including the refresh request and CAS.
+            with nullcontext():
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -304,7 +329,8 @@ class ConsumeMixin:
         outcome_creds = result.credentials
         try:
             try:
-                with FileLock(self.lock_file):
+                # The outer provider mutation guard remains held here.
+                with nullcontext():
                     store_now, store_unreadable = (
                         self._read_account_credentials_ex(account_num, email)
                     )

@@ -1199,6 +1199,78 @@ def test_kickoff_lease_fences_session_profile_bootstrap(
     assert store.current().token() == token
 
 
+def test_kickoff_lease_fences_backup_refresh_consumers(
+    temp_home: Path, sample_sequence_data: dict
+):
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    sample_sequence_data["accounts"]["1"]["organizationUuid"] = ""
+    switcher._write_json(switcher.sequence_file, sample_sequence_data)
+    old = json.dumps({"claudeAiOauth": {
+        "accessToken": "synthetic-old", "refreshToken": "synthetic-refresh",
+        "expiresAt": 1000,
+    }})
+    new = json.dumps({"claudeAiOauth": {
+        "accessToken": "synthetic-new", "refreshToken": "synthetic-next",
+        "expiresAt": 9999999999000,
+    }})
+    switcher._write_account_credentials("1", "account1@example.com", old)
+    store = AccountLeaseStore(switcher.backup_dir, "claude")
+    token = store.acquire(
+        job_id="kickoff-held",
+        account_identity=stable_account_identity(
+            "claude", "account1@example.com", ""
+        ),
+        worker_pid=123,
+        worker_epoch=1,
+        ttl_s=60,
+    )
+
+    with patch("openswap.oauth.try_refresh_oauth_credentials") as refresh:
+        outcome = switcher.consume_backup_grant(
+            "1", "account1@example.com", old
+        )
+    assert outcome.error == "consume-busy"
+    refresh.assert_not_called()
+    assert switcher.read_account_credentials("1", "account1@example.com") == old
+
+    with pytest.raises(LeaseConflictError):
+        switcher.persist_backup_credentials("1", "account1@example.com", new)
+    assert switcher.read_account_credentials("1", "account1@example.com") == old
+    assert store.current().token() == token
+
+
+@pytest.mark.parametrize(
+    "provider,uncertain",
+    [("claude", False), ("claude", True), ("codex", False), ("codex", True)],
+)
+def test_purge_refuses_active_or_uncertain_provider_lease(
+    temp_home: Path, provider: str, uncertain: bool
+):
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    marker = switcher.backup_dir / "purge-must-not-delete.txt"
+    marker.write_text("preserve while lease is unresolved", encoding="utf-8")
+    store = AccountLeaseStore(switcher.backup_dir, provider)
+    token = store.acquire(
+        job_id="held-for-purge-test",
+        account_identity=stable_account_identity(provider, "synthetic-account"),
+        worker_pid=123,
+        worker_epoch=1,
+        ttl_s=60,
+    )
+    if uncertain:
+        store.mark_uncertain(token, "test_uncertain")
+
+    with patch("builtins.input", return_value="y"), pytest.raises(LeaseConflictError):
+        switcher.purge()
+
+    assert marker.read_text(encoding="utf-8") == "preserve while lease is unresolved"
+    current = store.current()
+    assert current is not None
+    assert current.state == ("uncertain" if uncertain else "active")
+
+
 class TestLiveSessionGuardOnAnUnreadableRecord:
     """A session record we could not READ must not answer "nobody there".
 
@@ -1904,6 +1976,50 @@ class TestActiveAccountRefresh:
             "openswap.oauth.fetch_oauth_profile", return_value=None
         ):
             yield
+
+    def test_durable_lease_defers_active_token_refresh(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        AccountLeaseStore(switcher.backup_dir, "claude").acquire(
+            job_id="worker-refresh",
+            account_identity=stable_account_identity("claude", "test@example.com", ""),
+            worker_pid=os.getpid(), worker_epoch=1, ttl_s=60,
+        )
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(switcher, "_read_account_credentials", return_value=self._EXPIRED), \
+             patch.object(switcher, "_live_identity_matches", return_value=True), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch.object(switcher, "_write_account_credentials") as write_backup, \
+             patch("openswap.oauth.try_refresh_oauth_credentials") as refresh:
+            switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        refresh.assert_not_called()
+        write_live.assert_not_called()
+        write_backup.assert_not_called()
+
+    def test_durable_lease_blocks_rotated_backup_resync(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        switcher = self._switcher(sample_sequence_data)
+        fp = oauth.credential_fingerprint(self._REFRESHED) or ""
+        switcher._probe_verdicts[
+            switcher._lineage_key("1", "test@example.com", fp)
+        ] = True
+        AccountLeaseStore(switcher.backup_dir, "claude").acquire(
+            job_id="worker-resync",
+            account_identity=stable_account_identity("claude", "test@example.com", ""),
+            worker_pid=os.getpid(), worker_epoch=1, ttl_s=60,
+        )
+        with patch.object(switcher, "_read_account_credentials", return_value=self._EXPIRED), \
+             patch.object(switcher, "_read_credentials", return_value=self._REFRESHED), \
+             patch.object(switcher, "_live_identity_matches", return_value=True), \
+             patch.object(switcher, "_write_account_credentials") as write_backup:
+            switcher._resync_rotated_backup(
+                "1", "test@example.com", "", self._REFRESHED
+            )
+
+        write_backup.assert_not_called()
 
     def test_expired_refreshes_under_locks_and_persists_both_stores(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -5092,12 +5208,22 @@ class TestPurgeLegacyCleanup:
     ):
         switcher, backup_dir, legacy = self._make_switcher_then_recreate_legacy(monkeypatch)
         (legacy / "ghost.txt").write_text("should be removed")
+        from openswap.worker.leases import AccountLeaseStore
+
+        for provider in ("claude", "codex"):
+            AccountLeaseStore(backup_dir, provider).current()
+        claude_lock = backup_dir / ".lock"
+        codex_lock = backup_dir / "codex" / ".lock"
+        lock_inodes = (claude_lock.stat().st_ino, codex_lock.stat().st_ino)
+        (backup_dir / "purge-me.txt").write_text("managed data")
 
         with patch("builtins.input", return_value="y"):
             switcher.purge()
 
         assert not legacy.exists()
-        assert not backup_dir.exists()
+        assert {entry.name for entry in backup_dir.iterdir()} == {".lock", "codex"}
+        assert {entry.name for entry in (backup_dir / "codex").iterdir()} == {".lock"}
+        assert (claude_lock.stat().st_ino, codex_lock.stat().st_ino) == lock_inodes
 
     def test_purge_prompt_lists_legacy_when_present(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
@@ -10592,66 +10718,42 @@ class TestConsumeGateLockFailures:
         s._write_json(s.sequence_file, sample_sequence_data)
         return s
 
-    def test_lock_failure_before_post_is_transient(
+    def test_provider_lock_failure_before_post_is_busy(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
     ):
         from openswap.exceptions import LockError as LE
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
-        from openswap.locking import FileLock as real_lock
-
         class FailingLock:
-            def __init__(self, *a, **k): pass
-            # The per-slot consume lock acquires cleanly; the SLOT lock
-            # (window 1) is the one held elsewhere.
-            def acquire(self, *a, **k): return True
-            def release(self): pass
+            def __init__(self, *a, **k):
+                pass
             def __enter__(self): raise LE("held elsewhere")
             def __exit__(self, *a): return False
 
-        from tests.conftest import patch_engine_filelock
-
-        patch_engine_filelock(monkeypatch, FailingLock)
+        monkeypatch.setattr("openswap.worker.leases.FileLock", FailingLock)
         with patch("openswap.oauth.try_refresh_oauth_credentials") as post:
             out = s.consume_backup_grant("1", "test@example.com", self._OLD)
         post.assert_not_called()          # nothing consumed
-        assert out.error == "transient"   # clean defer, no raise
+        assert out.error == "consume-busy"  # clean defer, no raise
 
-    def test_lock_failure_after_post_stashes_successor(
+    def test_persist_failure_after_post_stashes_successor(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
     ):
-        from openswap.exceptions import LockError as LE
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
-        from openswap.locking import FileLock as real_lock
-        calls = {"n": 0}
 
-        class SecondLockFails:
-            def __init__(self, *a, **k):
-                self._inner = real_lock(*a, **k)
-            # consume lock (acquire/release) works; the second SLOT lock
-            # window (the CAS persist) is the one that fails.
-            def acquire(self, *a, **k):
-                return self._inner.acquire(*a, **k)
-            def release(self):
-                self._inner.release()
-            def __enter__(self):
-                calls["n"] += 1
-                if calls["n"] == 2:
-                    raise LE("held elsewhere")
-                return self._inner.__enter__()
-            def __exit__(self, *a):
-                return self._inner.__exit__(*a)
+        def fail_persist(*_args, **_kwargs):
+            raise OSError("synthetic credential-store write failure")
 
-        from tests.conftest import patch_engine_filelock
-
-        patch_engine_filelock(monkeypatch, SecondLockFails)
+        monkeypatch.setattr(s, "_write_account_credentials", fail_persist)
         with patch("openswap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)):
             out = s.consume_backup_grant("1", "test@example.com", self._OLD)
         # successor survives: returned to the caller AND stashed
         assert out.credentials == self._NEW
+        assert out.error == "transient"
+        assert s.read_account_credentials("1", "test@example.com") == self._OLD
         assert s.list_unclaimed_credentials(), "successor must be stashed"
 
     def test_a_stashed_successor_is_not_reported_as_freshened(
@@ -10668,39 +10770,21 @@ class TestConsumeGateLockFailures:
         LockError here, which aborted the tick — safe by accident. Stashing is
         the better behaviour; reporting it as success is not.
         """
-        from openswap.exceptions import LockError as LE
-        from openswap.locking import FileLock as real_lock
-
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
-        calls = {"n": 0}
 
-        class SecondLockFails:
-            def __init__(self, *a, **k):
-                self._inner = real_lock(*a, **k)
-            def acquire(self, *a, **k):
-                return self._inner.acquire(*a, **k)
-            def release(self):
-                self._inner.release()
-            def __enter__(self):
-                calls["n"] += 1
-                if calls["n"] == 2:
-                    raise LE("held elsewhere")
-                return self._inner.__enter__()
-            def __exit__(self, *a):
-                return self._inner.__exit__(*a)
+        def fail_persist(*_args, **_kwargs):
+            raise OSError("synthetic credential-store write failure")
 
-        from tests.conftest import patch_engine_filelock
-
-        patch_engine_filelock(monkeypatch, SecondLockFails)
+        monkeypatch.setattr(s, "_write_account_credentials", fail_persist)
         with patch("openswap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)):
-            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+            status = s.freshen_backup("1", "test@example.com")
 
         # The store still holds the spent generation — the premise of the bug.
         assert s.read_account_credentials("1", "test@example.com") == self._OLD
-        # So the outcome must not read as a completed refresh.
-        assert out.error is not None, (
+        # So freshen must not read the stashed response as a completed refresh.
+        assert status == "transient", (
             "a stashed successor reads as freshened; autoswitch will switch "
             "onto the consumed generation still in the store"
         )
