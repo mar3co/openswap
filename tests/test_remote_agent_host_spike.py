@@ -1075,8 +1075,18 @@ def test_private_dir_refuses_a_symlinked_directory(tmp_path):
     target.mkdir(mode=0o700)
     link = tmp_path / "state"
     link.symlink_to(target, target_is_directory=True)
-    with pytest.raises(SpikeError, match="must not be a symlink"):
+    with pytest.raises(SpikeError, match="symlink"):
         spike._private_dir(link)
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
+def test_private_dir_refuses_a_symlinked_ancestor_component(tmp_path):
+    target = tmp_path / "real"
+    target.mkdir(mode=0o700)
+    (tmp_path / "link").symlink_to(target, target_is_directory=True)
+    with pytest.raises(SpikeError, match="must not traverse a symlink"):
+        spike._private_dir(tmp_path / "link" / "new" / "state")
     assert list(target.iterdir()) == []
 
 
@@ -1401,6 +1411,33 @@ def test_process_table_scans_are_bounded_by_the_job_deadline(tmp_path, monkeypat
     )
     assert cancelled and budgets
     assert all(b is not None and b <= 1.0 for b in budgets), budgets
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_stalled_scans_never_carry_a_short_run_past_its_deadline(tmp_path, monkeypatch):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    marks: dict = {}
+    real_append = spike._append_jsonl
+
+    def stalled_table(timeout_s=None):
+        time.sleep(min(timeout_s if timeout_s is not None else 0.0, 2.0))  # ps hangs
+        return None
+
+    def recording_append(path, record):
+        if record.get("state") == "cancel_requested":
+            marks["cancel"] = time.monotonic()
+        real_append(path, record)
+
+    monkeypatch.setattr(spike, "_process_table", stalled_table)
+    monkeypatch.setattr(spike, "_append_jsonl", recording_append)
+    start = time.monotonic()
+    supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=0.2, grace_s=0.2, job_id="stall",
+    )
+    # No scan may start within SCAN_WINDOW_S of the deadline or run past it,
+    # so cancellation is requested close to the 0.2 s budget.
+    assert marks["cancel"] - start < 0.45
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")

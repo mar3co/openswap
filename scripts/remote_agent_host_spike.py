@@ -109,7 +109,10 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
                 timed_out = True
                 break
             now = time.monotonic()
-            if now - last_snapshot >= DESCENDANT_SNAPSHOT_INTERVAL_S:
+            if (
+                now - last_snapshot >= DESCENDANT_SNAPSHOT_INTERVAL_S
+                and deadline - now >= SCAN_WINDOW_S
+            ):
                 # Best effort: descendants are attributed by parent pid while
                 # the leader is alive, so one that calls setsid() is still ours.
                 last_snapshot = now
@@ -277,7 +280,29 @@ def _sweep_probe_descendants(
     return True, all_gone
 
 
+def _refuse_symlinked_components(path: Path) -> None:
+    """Refuse a path that traverses a symlink someone other than root owns.
+
+    A symlinked component (not just the leaf) would redirect every directory
+    and file we create into its target. Root-owned system links such as
+    macOS's ``/tmp`` -> ``/private/tmp`` are trusted; elsewhere (and on
+    platforms without POSIX ownership) any symlink is refused.
+    """
+    current = Path(path.absolute().anchor)
+    for part in path.absolute().parts[1:]:
+        current = current / part
+        try:
+            status = os.lstat(current)
+        except OSError:
+            # Missing (we create the rest below) or not a directory: the
+            # creation step raises the real error, reported with details withheld.
+            return
+        if stat_module.S_ISLNK(status.st_mode) and (os.name != "posix" or status.st_uid != 0):
+            raise SpikeError("Private output path must not traverse a symlink.")
+
+
 def _private_dir(path: Path) -> None:
+    _refuse_symlinked_components(path)
     # Create missing ancestors one by one so every level we own is 0o700,
     # rather than trusting mkdir(parents=True) to apply the mode above the leaf.
     missing = []
@@ -615,7 +640,7 @@ def _abort_supervision(
 
 
 def _ps_budget(deadline: float | None) -> float:
-    """``ps`` timeout that cannot carry a scan far past a supervision deadline."""
+    """``ps`` timeout that cannot carry a scan past a supervision deadline."""
     if deadline is None:
         return PS_TIMEOUT_S
     return min(PS_TIMEOUT_S, max(deadline - time.monotonic(), MIN_PS_TIMEOUT_S))
@@ -886,9 +911,13 @@ def _escaped_descendants(
 
 
 PS_TIMEOUT_S = 5.0
-# Floor for a deadline-bounded scan, so one near the deadline can still finish
-# on a loaded host (a failed scan forces "interrupted"); it bounds the overrun.
-MIN_PS_TIMEOUT_S = 0.5
+# A deadline-bounded scan never runs past the deadline (this floor only keeps
+# the timeout positive). No periodic scan starts with less than
+# SCAN_WINDOW_S left, so a loaded host cannot fail one near the deadline and
+# turn a genuine cancellation into "interrupted"; the cleanup scan after the
+# timeout still attributes the leader's children.
+MIN_PS_TIMEOUT_S = 0.01
+SCAN_WINDOW_S = 0.25
 # A cleanup-time scan (after a timeout or failure) is bounded too, so a slow
 # `ps` cannot let a detached helper run on; a failed scan forces "interrupted".
 CLEANUP_SCAN_BUDGET_S = 1.0
@@ -1105,13 +1134,15 @@ def _supervise_fake_command_locked(
         while True:
             # Scans are bounded by the job deadline so a slow `ps` cannot
             # postpone cancellation.
-            table = _snapshot(deadline)
-            if table is None:
-                tracking_complete = False
-            else:
-                # Best effort: descendants are attributed by parent pid while
-                # the leader is alive, whatever group they moved to.
-                _track_descendants(process.pid, tracked, table, deadline)
+            table = None
+            if deadline - time.monotonic() >= SCAN_WINDOW_S:
+                table = _snapshot(deadline)
+                if table is None:
+                    tracking_complete = False
+                else:
+                    # Best effort: descendants are attributed by parent pid
+                    # while the leader is alive, whatever group they moved to.
+                    _track_descendants(process.pid, tracked, table, deadline)
             if _leader_exited(process, table):
                 break
             remaining = deadline - time.monotonic()
