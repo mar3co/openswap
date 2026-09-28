@@ -516,6 +516,25 @@ def test_release_lease_needs_confirmation_for_an_interrupted_job(tmp_path: Path)
     assert cli.release_lease(tmp_path, confirm_stopped=True) == (True, {"lease_state": "released"}, None)
 
 
+def test_release_lease_recovers_an_uncertain_usage_lease_held_by_a_live_menu(tmp_path: Path):
+    """A usage read's lease is a short-lived probe: its long-lived holder (the
+    menu process) stays alive, so expiry plus confirmation must suffice."""
+    store = AccountLeaseStore(tmp_path, "codex")
+    token = store.acquire(
+        job_id="usage-" + "d" * 32,
+        account_identity=stable_account_identity("codex", "acct-a"),
+        worker_pid=os.getpid(),  # the menu process is still running
+        worker_epoch=time.time_ns(),
+        ttl_s=0.05,
+    )
+    store.mark_uncertain(token, "usage_stop_unconfirmed")
+    time.sleep(0.1)
+
+    assert cli.release_lease(tmp_path) == (False, {}, "stop_unproven_confirm_required")
+    assert cli.release_lease(tmp_path, confirm_stopped=True)[0] is True
+    assert AccountLeaseStore(tmp_path, "codex").current().state == "released"
+
+
 def test_lease_release_cli_selects_the_claude_store(tmp_path: Path, capsys):
     _stranded_kickoff_lease(tmp_path, "claude", ttl_s=0.05)
     time.sleep(0.1)

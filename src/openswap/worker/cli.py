@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,8 @@ _DISABLE_EXIT_WAIT_SECONDS = 3.0
 _LIFECYCLE_LOCK_TIMEOUT_SECONDS = 5.0
 # Terminal states that carry stop evidence. INTERRUPTED is terminal but records
 # uncertainty (the provider may have survived), so it needs owner confirmation.
+# Journaled worker jobs have 32-hex ids; kickoff-* and usage-* probe leases do not.
+_WORKER_JOB_ID = re.compile(r"[a-f0-9]{32}")
 _LEASE_STOP_PROVEN_JOB_STATES = {
     JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED, JobState.EXPIRED,
 }
@@ -358,11 +361,13 @@ def release_lease(
       that proves a stop;
     - a worker lease whose job is ``interrupted`` or missing from the journal
       also needs ``confirm_stopped``: neither is stop evidence;
-    - a scheduled-kickoff lease is never journaled, and a provider helper can
-      outlive both a timeout and a killed menu process, so it needs the lease
-      expired and ``confirm_stopped`` (the owner attests that no kickoff
-      process is still running), plus its recording pid gone while the lease
-      is still ``active`` (an ``uncertain`` one was already given up).
+    - a short-lived probe lease (scheduled kickoff, Codex usage read: any
+      lease whose job is not a journaled worker job) is never journaled, and a
+      provider helper can outlive both a timeout and a killed menu process, so
+      it needs the lease expired and ``confirm_stopped`` (the owner attests
+      that no such process is still running), plus its recording pid gone
+      while the lease is still ``active`` (an ``uncertain`` one was already
+      given up by its long-lived holder).
 
     Otherwise it refuses. The release is recorded as ``owner_released``.
     """
@@ -382,7 +387,7 @@ def release_lease(
             if lease.state not in {"active", "uncertain"}:
                 return False, {}, "lease_state_unknown"
             pid_gone = not _pid_exists(lease.worker_pid)
-            if lease.job_id.startswith("kickoff-"):
+            if not _WORKER_JOB_ID.fullmatch(lease.job_id):
                 if lease.state == "active" and not pid_gone:
                     return False, {}, "worker_owner_may_be_alive"
                 if lease.expires_at > lease_store._now():

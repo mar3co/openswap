@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3149 passed, 4 skipped, 3 warnings in 30.83s`.
+`3150 passed, 4 skipped, 3 warnings in 31.17s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -305,7 +305,10 @@ the same lifecycle lock as the policy check and singleton acquisition, so a
 racing enable cannot leave two competing workers. A worker whose control
 socket fails to start (or that fails after creating its runtime) clears its
 own health record before exiting, so status and disable never see it as a
-stale live worker.
+stale live worker. Release treats every non-worker lease (kickoff and Codex
+usage reads alike) as a short-lived probe, so a lease left uncertain by the
+long-lived menu process can be released after expiry with
+`--confirm-stopped`.
 
 ## Deviations and verification
 
