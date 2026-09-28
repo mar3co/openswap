@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -1285,3 +1286,56 @@ def test_exception_after_detach_still_terminates_tracked_descendant(tmp_path, mo
                 os.kill(int(pid_file.read_text()), 9)
             except (ProcessLookupError, PermissionError, ValueError):
                 pass
+
+
+def test_terminate_pids_counts_exited_unreaped_pidfd_descendant_as_gone(monkeypatch):
+    sent = []
+
+    def fake_pidfd_send_signal(handle, sig):
+        # A zombie still accepts signal 0 until something reaps it.
+        if sig != 0:
+            sent.append((handle, sig))
+
+    monkeypatch.setattr(spike.signal, "pidfd_send_signal", fake_pidfd_send_signal, raising=False)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: True)
+    gone, mode = spike._terminate_pids({4242: ("ours", 42)}, grace_s=0.05)
+    assert gone is True
+    assert mode == spike.SIGNALLING_PIDFD
+    assert sent == []
+
+
+def test_terminate_pids_signals_live_pidfd_descendant_until_it_exits(monkeypatch):
+    sent = []
+    exited = {"value": False}
+
+    def fake_pidfd_send_signal(handle, sig):
+        if sig != 0:
+            sent.append((handle, sig))
+            exited["value"] = True  # the process dies on TERM
+
+    monkeypatch.setattr(spike.signal, "pidfd_send_signal", fake_pidfd_send_signal, raising=False)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: exited["value"])
+    gone, mode = spike._terminate_pids({4242: ("ours", 42)}, grace_s=0.5)
+    assert gone is True
+    assert mode == spike.SIGNALLING_PIDFD
+    assert sent == [(42, signal.SIGTERM)]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="ps identity lookup is POSIX-only")
+def test_pid_identity_reports_zombie_as_gone(tmp_path):
+    # A child we deliberately do not reap stays a zombie until wait().
+    child = subprocess.Popen(["/bin/sleep", "0"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            table = spike._process_table() or []
+            row = next((entry for entry in table if entry[0] == child.pid), None)
+            if row is not None and row[3].startswith("Z"):
+                break
+            time.sleep(0.02)
+        else:
+            pytest.skip("child did not become an observable zombie in time")
+        assert spike._pid_identity(child.pid) is None
+    finally:
+        child.wait(timeout=5)

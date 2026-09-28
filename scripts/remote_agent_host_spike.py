@@ -30,6 +30,7 @@ import json
 import math
 import os
 import re
+import select
 import selectors
 import shlex
 import shutil
@@ -522,20 +523,23 @@ def _pid_identity(pid: int) -> str | None:
     ps = shutil.which("ps") or "/bin/ps"
     try:
         listing = subprocess.run(
-            [ps, "-o", "lstart=,pgid=,command=", "-p", str(pid)],
+            [ps, "-o", "stat=,lstart=,pgid=,command=", "-p", str(pid)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", timeout=1, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     columns = listing.stdout.split()
-    if len(columns) < 6:
+    if len(columns) < 7:
+        return None
+    # A zombie has exited and cannot execute; report it as gone.
+    if columns[0].startswith(("Z", "X")):
         return None
     try:
-        pgid = int(columns[5])
+        pgid = int(columns[6])
     except ValueError:
         return None
-    return _identity(" ".join(columns[:5]), pgid, " ".join(columns[6:]))
+    return _identity(" ".join(columns[1:6]), pgid, " ".join(columns[7:]))
 
 
 def _open_pidfd(pid: int) -> int | None:
@@ -547,6 +551,19 @@ def _open_pidfd(pid: int) -> int | None:
         return opener(pid)
     except OSError:
         return None
+
+
+def _pidfd_exited(handle: int) -> bool:
+    """A pidfd becomes readable once its process has exited, reaped or not.
+
+    Orphaned descendants may linger as zombies where PID 1 does not reap
+    promptly (containers); they can no longer execute, so they count as gone.
+    """
+    try:
+        readable, _, _ = select.select([handle], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    return bool(readable)
 
 
 def _close_handles(tracked: Mapping[int, tuple[int, str, str, int | None]]) -> None:
@@ -636,6 +653,8 @@ def _terminate_pids(
     def still_ours(pid: int) -> bool:
         birth, handle = escaped[pid]
         if handle is not None:
+            if _pidfd_exited(handle):
+                return False
             try:
                 signal.pidfd_send_signal(handle, 0)
             except ProcessLookupError:
