@@ -634,6 +634,7 @@ def test_probe_refuses_when_a_periodic_descendant_scan_fails(tmp_path, monkeypat
         )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="the SIGKILL branch is POSIX-only")
 def test_probe_cleanup_waits_for_killed_group_members_to_leave(monkeypatch):
     # A killed member can linger briefly (for example in a slow disk write);
     # cleanup must wait for it rather than return while it still runs.
@@ -1107,6 +1108,62 @@ def test_private_dir_refuses_a_symlinked_ancestor_component(tmp_path):
     with pytest.raises(SpikeError, match="must not traverse a symlink"):
         spike._private_dir(tmp_path / "link" / "new" / "state")
     assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
+def test_private_dir_refuses_a_component_raced_into_a_symlink(tmp_path, monkeypatch):
+    target = tmp_path / "elsewhere"
+    target.mkdir(mode=0o700)
+    raced = tmp_path / "a"
+    real_mkdir = Path.mkdir
+
+    def racing_mkdir(self, *args, **kwargs):
+        if self == raced:
+            # Another user wins the race between our check and mkdir.
+            raced.symlink_to(target, target_is_directory=True)
+            raise FileExistsError(str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", racing_mkdir)
+    with pytest.raises(SpikeError, match="must not traverse a symlink"):
+        spike._private_dir(raced / "b" / "state")
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_event_reader_is_stopped_when_an_unkillable_holder_keeps_stdout_open(tmp_path, monkeypatch):
+    pid_file = tmp_path / "holder.pid"
+    fake = _executable(
+        tmp_path / "fake-pipe-holder",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"  # keeps the inherited stdout pipe open
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "deadline = time.monotonic() + 2\n"
+        "while not pid_file.exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+        "time.sleep(0.5)\n",
+    )
+    # The holder can never be signalled, as if its identity could not be proven.
+    monkeypatch.setattr(spike, "_terminate_pids", lambda escaped, grace_s: (False, spike.SIGNALLING_PIDFD))
+    before = {t.ident for t in threading.enumerate()}
+    try:
+        result = supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=5, grace_s=0.2, job_id="holder",
+        )
+        assert result["state"] == "interrupted"
+        leftover = [t for t in threading.enumerate()
+                    if t.ident not in before and t.name != "MainThread" and t.is_alive()]
+        assert leftover == []
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions are required")

@@ -319,10 +319,19 @@ def _private_dir(path: Path) -> None:
         try:
             directory.mkdir(mode=0o700)
         except FileExistsError:
-            pass
+            # Someone created it between our check and mkdir: it must be a
+            # real directory, never a symlink we would then create through.
+            try:
+                raced = os.lstat(directory)
+            except OSError:
+                raise SpikeError("Private output path changed while it was created.") from None
+            if not stat_module.S_ISDIR(raced.st_mode):
+                raise SpikeError("Private output path must not traverse a symlink.")
         else:
             # A new directory entry is only durable once its parent is synced.
             _fsync_dir(directory.parent)
+    # Re-check the whole path now that every component exists.
+    _refuse_symlinked_components(path)
     # lstat, not stat: a symlinked directory would redirect every file we
     # create into its target, and O_NOFOLLOW on file names does not cover it.
     try:
@@ -1004,9 +1013,13 @@ def _terminate_pids(
     return wait_gone(time.monotonic() + DESCENDANT_KILL_WAIT_S), mode
 
 
-def _collect_event_names(stream, collected: list[str]) -> None:
+def _collect_event_names(
+    stream, collected: list[str], stop: threading.Event | None = None
+) -> None:
     # Drain while running so even a noisy fake cannot fill the pipe and block
     # the leader before the timeout. Keep each line and the event list bounded.
+    # With ``stop`` the pipe is polled, so the caller can end the reader even
+    # while an escaped descendant still holds the write end open.
     truncated = False
 
     def record(name: str) -> None:
@@ -1016,6 +1029,10 @@ def _collect_event_names(stream, collected: list[str]) -> None:
         elif not truncated:
             collected.append(EVENT_NAMES_TRUNCATED)
             truncated = True
+
+    if stop is not None:
+        _collect_polled(stream.fileno(), record, stop)
+        return
 
     while True:
         line = stream.readline(MAX_EVENT_LINE_CHARS + 1)
@@ -1038,6 +1055,66 @@ def _collect_event_names(stream, collected: list[str]) -> None:
             record(_safe_event_name(item.get("type")))
         else:
             record("non-object-event")
+
+
+def _record_event_line(text: str, record) -> None:
+    try:
+        item = json.loads(text)
+    except (ValueError, RecursionError):
+        record("unstructured-output")
+        return
+    if isinstance(item, dict):
+        record(_safe_event_name(item.get("type")))
+    else:
+        record("non-object-event")
+
+
+def _collect_polled(fd: int, record, stop: threading.Event) -> None:
+    """Bounded line reader over a raw pipe that returns promptly once ``stop`` is set."""
+    pending = bytearray()
+    discarding = False
+    while not stop.is_set():
+        try:
+            readable, _, _ = select.select([fd], [], [], 0.05)
+        except (OSError, ValueError):
+            return
+        if not readable:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            return
+        if not chunk:
+            if pending and not discarding:
+                line = bytes(pending)
+                if len(line) > MAX_EVENT_LINE_CHARS:
+                    record("unstructured-output")
+                else:
+                    _record_event_line(line.decode("utf-8", errors="replace"), record)
+            return
+        pending.extend(chunk)
+        while True:
+            newline = pending.find(b"\n")
+            if discarding:
+                # Drop the rest of an oversized record in bounded chunks.
+                if newline < 0:
+                    pending.clear()
+                    break
+                del pending[: newline + 1]
+                discarding = False
+                continue
+            if newline < 0:
+                if len(pending) > MAX_EVENT_LINE_CHARS:
+                    record("unstructured-output")
+                    discarding = True
+                    pending.clear()
+                break
+            line = bytes(pending[:newline])
+            del pending[: newline + 1]
+            if len(line) > MAX_EVENT_LINE_CHARS:
+                record("unstructured-output")
+                continue
+            _record_event_line(line.decode("utf-8", errors="replace"), record)
 
 
 def supervise_fake_command(
@@ -1098,9 +1175,6 @@ def _supervise_fake_command_locked(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             env=child_env,
             start_new_session=True,
             close_fds=True,
@@ -1113,8 +1187,9 @@ def _supervise_fake_command_locked(
     deadline = time.monotonic() + timeout_s
 
     event_names: list[str] = []
+    reader_stop = threading.Event()
     reader = threading.Thread(
-        target=_collect_event_names, args=(process.stdout, event_names), daemon=True
+        target=_collect_event_names, args=(process.stdout, event_names, reader_stop), daemon=True
     )
     tracked: dict[int, tuple[int, str, str, int | None, str, bool]] = {}
     try:
@@ -1122,6 +1197,7 @@ def _supervise_fake_command_locked(
         reader.start()
     except BaseException:
         _abort_supervision(process, reader, tracked, grace_s=grace_s)
+        reader_stop.set()
         raise
     timed_out = False
     cleanup_uncertain = False
@@ -1182,14 +1258,24 @@ def _supervise_fake_command_locked(
         _reap_leader(process, timeout_s=5.0)
     except BaseException:
         _abort_supervision(process, reader, tracked, grace_s=grace_s)
+        reader_stop.set()
         raise
     _close_handles(tracked)
 
     reader.join(timeout=1)
+    reader_stuck = reader.is_alive()
+    if reader_stuck:
+        # Something (an escaped descendant) still holds the pipe open: stop
+        # the reader so it cannot outlive this run or change recorded events.
+        reader_stop.set()
+        reader.join(timeout=1)
+    if not reader.is_alive() and process.stdout is not None:
+        process.stdout.close()
+    event_names = list(event_names)
     # A failed snapshot may have missed a helper that detached meanwhile, so
     # success or cancellation cannot be claimed without complete tracking.
     if (
-        reader.is_alive() or cleanup_uncertain or unexpected_leftovers or escaped
+        reader_stuck or cleanup_uncertain or unexpected_leftovers or escaped
         or not tracking_complete
     ):
         final_state = "interrupted"
