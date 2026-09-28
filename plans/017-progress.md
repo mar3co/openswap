@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3148 passed, 4 skipped, 3 warnings in 32.96s`.
+`3149 passed, 4 skipped, 3 warnings in 30.83s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -302,7 +302,10 @@ process, so it never reports success with no worker running. The
 LaunchAgent starts the worker with a hidden `--managed` flag; a manual
 `openswap worker run` refuses while the LaunchAgent is loaded, checked under
 the same lifecycle lock as the policy check and singleton acquisition, so a
-racing enable cannot leave two competing workers.
+racing enable cannot leave two competing workers. A worker whose control
+socket fails to start (or that fails after creating its runtime) clears its
+own health record before exiting, so status and disable never see it as a
+stale live worker.
 
 ## Deviations and verification
 

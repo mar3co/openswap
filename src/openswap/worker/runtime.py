@@ -910,6 +910,15 @@ class WorkerRuntime:
 WORKER_REFUSED_MANAGED = 2
 
 
+def _mark_stopped_quietly(runtime) -> None:
+    if runtime is None:
+        return
+    try:
+        runtime.mark_stopped()
+    except Exception:
+        pass
+
+
 def run_worker(
     backup_root: Path,
     *,
@@ -956,6 +965,9 @@ def run_worker(
         if not ready_event.wait(3.0) or not server.is_alive():
             stop_event.set()
             server.join(timeout=3)
+            # start_epoch already recorded this process as the live worker;
+            # clear it so status and disable do not see a stale worker.
+            _mark_stopped_quietly(runtime)
             return 1
         lifecycle_lock.release()
         original_handlers = {}
@@ -990,7 +1002,9 @@ def run_worker(
         return 0
     except Exception:
         # An ambiguous in-flight run remains quarantined by the lease store;
-        # process shutdown is never treated as proof that it stopped.
+        # process shutdown is never treated as proof that it stopped. Only the
+        # worker's health record is cleared, so disable can still proceed.
+        _mark_stopped_quietly(runtime)
         return 1
     finally:
         lifecycle_lock.release()

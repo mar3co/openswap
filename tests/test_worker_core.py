@@ -455,6 +455,28 @@ def test_readonly_root_may_be_readable_but_not_writable_by_others(tmp_path, mode
             runtime._resolve_workspace("research", "a" * 32)
 
 
+def test_ipc_startup_failure_clears_the_worker_health_record(tmp_path, monkeypatch):
+    from openswap.worker import ipc
+
+    update_worker_settings(tmp_path, enabled=True)
+    runtimes = []
+
+    def factory(root):
+        runtime = WorkerRuntime(root)
+        runtimes.append(runtime)
+        return runtime
+
+    def failing_serve(path, runtime, stop_event, *, ready_event):
+        return None  # could not bind the control socket; never signals ready
+
+    monkeypatch.setattr(ipc, "serve", failing_serve)
+    monkeypatch.setattr(threading.Event, "wait", lambda self, timeout=None: self.is_set())
+
+    assert run_worker(tmp_path, runtime_factory=factory) == 1
+    assert len(runtimes) == 1
+    assert read_worker_snapshot(tmp_path).to_dict()["process_state"] == "stopped"
+
+
 def test_runtime_admission_is_internal_and_disabled_adapter_never_executes(tmp_path):
     update_worker_settings(tmp_path, enabled=True)
     runtime = WorkerRuntime(tmp_path)
