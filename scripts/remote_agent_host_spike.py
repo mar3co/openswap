@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import json
+import math
 import os
 import re
 import selectors
@@ -167,10 +168,10 @@ def _cleanup_probe_process(process: subprocess.Popen) -> bool:
 
 def _private_dir(path: Path) -> None:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        path.chmod(0o700)
-    except OSError:
-        pass
+    if not path.is_dir():
+        raise SpikeError("Private output path must be a directory.")
+    if os.name == "posix" and path.stat().st_mode & 0o077:
+        raise SpikeError("Existing output directory must not grant group or world access.")
 
 
 def _append_jsonl(path: Path, record: dict) -> None:
@@ -402,8 +403,16 @@ def supervise_fake_command(
     job_id: str | None = None,
 ) -> dict:
     """Run one explicit fake command under an exclusive state-directory lock."""
-    if not argv or timeout_s <= 0 or grace_s < 0:
-        raise SpikeError("A command, positive timeout, and non-negative grace period are required.")
+    if (
+        not argv
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0
+        or not math.isfinite(grace_s)
+        or grace_s < 0
+    ):
+        raise SpikeError(
+            "A command, finite positive timeout, and finite non-negative grace period are required."
+        )
     if not Path(argv[0]).is_absolute():
         raise SpikeError("Fake executable must be an absolute path.")
     state_dir = state_dir.expanduser().absolute()

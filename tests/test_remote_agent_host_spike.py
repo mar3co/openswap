@@ -107,6 +107,51 @@ def test_timeout_terminates_fake_process_group_including_child(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("timeout_s", float("nan")),
+        ("timeout_s", float("inf")),
+        ("grace_s", float("nan")),
+        ("grace_s", float("inf")),
+    ],
+)
+def test_non_finite_supervision_durations_refuse_before_state_or_launch(tmp_path, field, value):
+    launches = tmp_path / "launched"
+    fake = _executable(
+        tmp_path / "fake-provider",
+        f"import pathlib; pathlib.Path({str(launches)!r}).touch()\n",
+    )
+    state = tmp_path / "state"
+    options = {"timeout_s": 1.0, "grace_s": 0.5}
+    options[field] = value
+
+    with pytest.raises(SpikeError, match="finite"):
+        supervise_fake_command([str(fake)], state_dir=state, **options)
+
+    assert not state.exists()
+    assert not launches.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions are required")
+def test_unsafe_existing_state_directory_permissions_are_preserved_and_refused(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o750)
+    state.chmod(0o750)
+    launches = tmp_path / "launch-count"
+    fake = _executable(
+        tmp_path / "must-not-run",
+        f"import pathlib; pathlib.Path({str(launches)!r}).touch()\n",
+    )
+
+    with pytest.raises(SpikeError, match="must not grant group or world access"):
+        supervise_fake_command([str(fake)], state_dir=state, timeout_s=1)
+
+    assert state.stat().st_mode & 0o777 == 0o750
+    assert not (state / "journal.jsonl").exists()
+    assert not launches.exists()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
 def test_timeout_kills_child_that_ignores_term_before_reporting_cancelled(tmp_path):
     child_script = tmp_path / "ignore-term-child.py"
@@ -623,7 +668,7 @@ def test_probe_bounds_both_output_streams_and_cleans_owned_group(
 @pytest.mark.skipif(os.name != "posix", reason="fake-harness state locking is POSIX-only")
 def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):
     state = tmp_path / "state"
-    state.mkdir()
+    state.mkdir(mode=0o700)
     (state / "journal.jsonl").write_text(
         "".join(
             json.dumps({"job_id": job_id, "state": "starting"}) + "\n"
@@ -653,6 +698,7 @@ def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):
         ("recovery", "uncertain"),
         ("recovery", "uncertain-other"),
     ]
+    assert state.stat().st_mode & 0o777 == 0o700
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake-harness flock reservation is POSIX-only")

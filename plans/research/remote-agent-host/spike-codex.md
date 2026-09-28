@@ -56,6 +56,10 @@ uv run python scripts/remote_agent_host_spike.py recover \
   --state-dir /private/tmp/openswap-codex-spike-demo
 ```
 
+`--state-dir` and `--evidence-dir` create missing directories as private
+directories. On POSIX, existing directories must already have no group or
+world permissions; the harness preserves their mode and refuses unsafe paths.
+
 `inspect` invokes only `--version` and `exec --help` under a disposable home.
 `demo` starts only this script's inert child process, cancels its process group,
 and writes a mode-0600 JSONL journal/evidence file. `recover` changes unresolved
@@ -112,7 +116,7 @@ inspect: codex-cli 0.158.0-alpha.2.1; exec_json=true; sandbox_option=true;
 demo:    state=cancelled; returncode=-15; event_names=[thread.started]
 sandbox: inside read/write allowed; outside read/write denied;
          synthetic CODEX_HOME auth/config reads denied; no exec/model run
-tests:   35 passed (full assembled suite: 2,906 passed, 4 skipped, 3 warnings)
+tests:   40 passed (full assembled suite: 2,911 passed, 4 skipped, 2 warnings)
 ```
 
 After the bounded process-group runner was added, the official stable ARM
@@ -123,7 +127,7 @@ workspace and `CODEX_HOME` sentinels allowed workspace read/write and denied
 sibling read/write plus synthetic `auth.json` and `config.toml` reads. This is
 wrapper-only Seatbelt evidence; it does not establish `codex exec` enforcement
 or account selection. The helper-cleanup regression passed in isolation
-(`1 passed in 1.19s`); all 35 harness cases are included in the full-suite
+(`1 passed in 1.19s`); all 40 harness cases are included in the full-suite
 result above.
 
 The fake-process harness includes regression coverage for the Codex review
