@@ -784,15 +784,16 @@ def test_authenticated_codex_path_is_disabled_even_with_explicit_temp_home(tmp_p
 
 
 def _wait_for_pid_exit(pid: int, timeout_s: float) -> bool:
+    """True once the pid is gone or is an exited-but-unreaped zombie.
+
+    Mirrors the harness: where PID 1 does not reap orphans promptly the
+    process lingers as a zombie that still accepts signal 0 but cannot run.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if spike._pid_identity(pid) is None:
             return True
-        except PermissionError:
-            pass
-        time.sleep(0.02)
+        time.sleep(0.05)
     return False
 
 
@@ -1339,3 +1340,35 @@ def test_pid_identity_reports_zombie_as_gone(tmp_path):
         assert spike._pid_identity(child.pid) is None
     finally:
         child.wait(timeout=5)
+
+
+def test_track_descendants_refuses_handle_whose_identity_changed_after_open(monkeypatch):
+    closed = []
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "leader"), (4242, 100, 4242, "S", "birth-A")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 77)
+    monkeypatch.setattr(spike, "_pid_identity", lambda pid: "birth-B")  # reused after snapshot
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked == {}
+    assert closed == [77]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="zombie observation is POSIX-only")
+def test_leader_exit_is_observed_without_reaping():
+    process = subprocess.Popen(["/bin/sleep", "0"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+    try:
+        deadline = time.monotonic() + 5
+        while not spike._leader_exited(process) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert spike._leader_exited(process)
+        # Not reaped: the pid, and so the process-group id, is still reserved.
+        assert process.returncode is None
+        assert spike._pid_alive(process.pid)
+        assert spike._group_running(process.pid, threading.Thread()) is False
+    finally:
+        process.wait(timeout=5)
+    assert process.returncode == 0

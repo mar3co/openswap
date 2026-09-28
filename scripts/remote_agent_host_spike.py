@@ -93,17 +93,19 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
             os.set_blocking(fd, False)
             selector.register(fd, selectors.EVENT_READ)
         deadline = time.monotonic() + timeout_s
-        while process.poll() is None or selector.get_map():
+        # The leader is observed, not reaped, until group cleanup is done so
+        # its pid (and therefore our pgid) cannot be reused meanwhile.
+        while not _leader_exited(process) or selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
                 break
             events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
-            if not selector.get_map() and process.poll() is None:
+            if not selector.get_map() and not _leader_exited(process):
                 time.sleep(min(remaining, 0.02))
             if (
                 not events
-                and process.poll() is not None
+                and _leader_exited(process)
                 and not _probe_group_running(process.pid)
             ):
                 # The leader is gone and no group member can still write: with
@@ -131,10 +133,11 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
         if timed_out or overflowed:
             cleanup_uncertain = _cleanup_probe_process(process)
         else:
-            process.wait()
             leftovers = _probe_group_running(process.pid)
             if leftovers:
                 cleanup_uncertain = _cleanup_probe_process(process)
+            else:
+                process.wait()
     except BaseException:
         _cleanup_probe_process(process)
         raise
@@ -143,6 +146,8 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
             selector.close()
         process.stdout.close()
         process.stderr.close()
+        if process.returncode is None and _leader_exited(process):
+            process.wait()
     if overflowed:
         raise SpikeError("Probe output exceeded the bounded capture limit; result was refused.")
     if timed_out:
@@ -155,6 +160,46 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
     except UnicodeDecodeError:
         raise
     return subprocess.CompletedProcess(command, process.returncode, decoded_stdout, decoded_stderr)
+
+
+def _leader_exited(process: subprocess.Popen) -> bool:
+    """Whether the group leader has exited, observed WITHOUT reaping it.
+
+    A reaped leader frees its pid, and with it the process-group id we signal,
+    for reuse by an unrelated process. Keeping the leader as a zombie until
+    group cleanup is finished reserves that id. ``waitid(WNOWAIT)`` is used
+    where available; otherwise the process table's state column (``Z``)
+    serves. Only when neither works does this fall back to a reaping poll.
+    """
+    if process.returncode is not None:
+        return True
+    waitid = getattr(os, "waitid", None)
+    if waitid is not None and hasattr(os, "WNOWAIT"):
+        try:
+            return waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        except ChildProcessError:
+            return True
+        except OSError:
+            pass
+    state = _pid_state(process.pid)
+    if state is not None:
+        return state.startswith(("Z", "X"))
+    return process.poll() is not None
+
+
+def _pid_state(pid: int) -> str | None:
+    """The ``ps`` state column for ``pid`` (``Z`` for an unreaped exit), or None."""
+    ps = shutil.which("ps") or "/bin/ps"
+    try:
+        listing = subprocess.run(
+            [ps, "-o", "stat=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", timeout=1, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    state = listing.stdout.strip()
+    return state or None
 
 
 def _probe_group_running(pgid: int) -> bool:
@@ -424,7 +469,8 @@ def _group_running(pgid: int, reader: threading.Thread) -> bool:
         return observed
     # Without enumeration, EOF alone cannot prove that all descendants exited
     # because a child may have closed stdout. Treat any remaining group as
-    # uncertain; killpg(0) may include zombies, which is safer than success.
+    # uncertain; killpg(0) may include zombies (including the deliberately
+    # unreaped leader), which errs toward "interrupted" rather than success.
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -605,7 +651,19 @@ def _track_descendants(leader_pid: int, tracked: dict[int, tuple[int, str, str, 
             if pid == leader_pid:
                 continue
             if pid in tracked or ppid in known:
-                handle = tracked[pid][3] if pid in tracked else _open_pidfd(pid)
+                if pid in tracked:
+                    handle = tracked[pid][3]
+                else:
+                    handle = _open_pidfd(pid)
+                    # Opening the handle is not atomic with the snapshot: if
+                    # the pid was reused in between, the handle binds to a
+                    # stranger. Re-read the identity and refuse a mismatch.
+                    if handle is not None and _pid_identity(pid) != birth:
+                        try:
+                            os.close(handle)
+                        except OSError:
+                            pass
+                        continue
                 tracked[pid] = (pgid, stat, birth, handle)
                 if pid not in known:
                     known.add(pid)
@@ -817,14 +875,16 @@ def _supervise_fake_command_locked(
     escaped_signalling = SIGNALLING_PIDFD
     try:
         next_snapshot = 0.0
-        while process.poll() is None and time.monotonic() < deadline:
+        # The leader is observed, never reaped, until group cleanup is done:
+        # a zombie keeps its pid, so the pgid we signal cannot be reused.
+        while not _leader_exited(process) and time.monotonic() < deadline:
             if time.monotonic() >= next_snapshot:
                 # Best effort: descendants are attributed by parent pid while
                 # the leader is alive, whatever group they moved to.
                 _track_descendants(process.pid, tracked)
                 next_snapshot = time.monotonic() + DESCENDANT_SNAPSHOT_INTERVAL_S
             time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-        timed_out = process.poll() is None
+        timed_out = not _leader_exited(process)
         if timed_out:
             _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
         # A provider parent may exit while a child keeps the pipe or continues
@@ -833,7 +893,6 @@ def _supervise_fake_command_locked(
         if timed_out:
             cleanup_uncertain = _terminate_group(process, reader, grace_s=grace_s)
         else:
-            process.wait()
             reader.join(timeout=0.05)
             leftovers = _group_running(process.pid, reader)
             if leftovers:
@@ -845,6 +904,8 @@ def _supervise_fake_command_locked(
         escaped = _escaped_descendants(process.pid, tracked)
         if escaped:
             escaped_terminated, escaped_signalling = _terminate_pids(escaped, grace_s=grace_s)
+        if process.returncode is None:
+            process.wait()
     except BaseException:
         _terminate_group(process, reader, grace_s=grace_s)
         # A failure after a descendant detached (for example a full disk on the

@@ -137,7 +137,7 @@ workspace and `CODEX_HOME` sentinels allowed workspace read/write and denied
 sibling read/write plus synthetic `auth.json` and `config.toml` reads. This is
 wrapper-only Seatbelt evidence; it does not establish `codex exec` enforcement
 or account selection. The helper-cleanup regression passed in isolation
-(`1 passed in 1.19s`); all 63 harness cases are included in the full-suite
+(`1 passed in 1.19s`); all 65 harness cases are included in the full-suite
 result above. The two recorded evidence rows from that recheck:
 
 ```json
@@ -227,7 +227,9 @@ group and command identity so a reused pid is dropped rather than signalled;
 signals go through a non-reusable pidfd where the OS provides one (Linux),
 and on macOS the identity is re-read before each signal while evidence
 records `escaped_cleanup_certain: false` because check and signal are not
-atomic; before deciding a terminal state it
+atomic. The leader itself is
+observed as a zombie rather than reaped until group cleanup completes, so the
+process-group id being signalled stays reserved; before deciding a terminal state it
 re-snapshots, terminates any tracked descendant still alive outside the
 group (TERM, grace, KILL), records them as `escaped_descendants` with
 `escaped_descendants_terminated`, and forces the state to `interrupted`,
