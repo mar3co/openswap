@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
+import scripts.remote_agent_host_spike as spike
 from scripts.remote_agent_host_spike import (
     SpikeError,
     inspect_codex,
@@ -143,6 +145,78 @@ def test_timeout_kills_child_that_ignores_term_before_reporting_cancelled(tmp_pa
     assert beat.read_text() == first_value
     assert (markers / "parent.stopped").exists()
     assert result["state"] == "cancelled"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
+def test_successful_parent_with_live_child_is_interrupted_and_child_is_killed(tmp_path):
+    child_script = tmp_path / "orphan-child.py"
+    child_script.write_text(
+        "import os, pathlib, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "root = pathlib.Path(os.environ['SPIKE_MARKERS'])\n"
+        "beat = root / 'heartbeat'\n"
+        "while True:\n"
+        " beat.write_text(str(time.monotonic_ns()))\n"
+        " time.sleep(0.03)\n",
+        encoding="utf-8",
+    )
+    fake = _executable(
+        tmp_path / "fake-parent-exits-successfully",
+        "import os, pathlib, subprocess, sys, time\n"
+        "root = pathlib.Path(os.environ['SPIKE_MARKERS'])\n"
+        f"subprocess.Popen([sys.executable, {str(child_script)!r}])\n"
+        "deadline = time.monotonic() + 2\n"
+        "while not (root / 'heartbeat').exists() and time.monotonic() < deadline:\n"
+        " time.sleep(0.01)\n"
+        "raise SystemExit(0)\n",
+    )
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    old = os.environ.get("SPIKE_MARKERS")
+    os.environ["SPIKE_MARKERS"] = str(markers)
+    try:
+        result = supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=3, grace_s=0.15,
+            job_id="leader-exited",
+        )
+    finally:
+        if old is None:
+            os.environ.pop("SPIKE_MARKERS", None)
+        else:
+            os.environ["SPIKE_MARKERS"] = old
+
+    beat = markers / "heartbeat"
+    assert result["returncode"] == 0
+    assert result["state"] == "interrupted"
+    first_value = beat.read_text()
+    time.sleep(0.15)
+    assert beat.read_text() == first_value
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake executable shebang test is POSIX-only")
+def test_invalid_utf8_output_is_safely_recorded_as_unstructured(tmp_path):
+    fake = _executable(
+        tmp_path / "fake-invalid-output",
+        "import sys\n"
+        "sys.stdout.buffer.write(b'\\xff\\n')\n"
+        "sys.stdout.flush()\n",
+    )
+
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=1, job_id="bad-bytes"
+    )
+
+    assert result["state"] == "succeeded"
+    assert result["event_names"] == ["unstructured-output"]
+
+
+def test_unavailable_group_enumeration_keeps_existing_group_uncertain(monkeypatch):
+    signaled = []
+    monkeypatch.setattr(spike, "_group_has_running_members", lambda _pgid: None)
+    monkeypatch.setattr(spike.os, "killpg", lambda pgid, sig: signaled.append((pgid, sig)))
+
+    assert spike._group_running(4321, threading.Thread()) is True
+    assert signaled == [(4321, 0)]
 
 
 def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):

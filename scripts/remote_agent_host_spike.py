@@ -105,14 +105,99 @@ def _signal_group(process: subprocess.Popen, sig: int) -> None:
         pass
 
 
-def _group_exists(pgid: int) -> bool:
+def _group_has_running_members(pgid: int) -> bool | None:
+    """Return whether the group has non-zombie processes; None if unavailable."""
+    if sys.platform.startswith("linux"):
+        proc_root = Path("/proc")
+        try:
+            for entry in proc_root.iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    stat = (entry / "stat").read_text(encoding="utf-8")
+                    fields = stat[stat.rfind(")") + 2 :].split()
+                    # After comm: state, ppid, pgrp, ...
+                    if len(fields) > 2 and int(fields[2]) == pgid and fields[0] not in {"Z", "X"}:
+                        return True
+                except (OSError, ValueError):
+                    continue
+            return False
+        except OSError:
+            pass
+    if sys.platform == "darwin":
+        try:
+            listing = subprocess.run(
+                ["/bin/ps", "-axo", "pid=,pgid=,stat="],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if listing.returncode != 0:
+            return None
+        for line in listing.stdout.splitlines():
+            columns = line.split()
+            if len(columns) >= 3:
+                try:
+                    member_group = int(columns[1])
+                except ValueError:
+                    continue
+                if member_group == pgid and not columns[2].startswith(("Z", "X")):
+                    return True
+        return False
+    return None
+
+
+def _group_running(pgid: int, reader: threading.Thread) -> bool:
+    observed = _group_has_running_members(pgid)
+    if observed is not None:
+        return observed
+    # Without enumeration, EOF alone cannot prove that all descendants exited
+    # because a child may have closed stdout. Treat any remaining group as
+    # uncertain; killpg(0) may include zombies, which is safer than success.
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
-        return False
+        return reader.is_alive()
     except PermissionError:
         return True
     return True
+
+
+def _terminate_group(
+    process: subprocess.Popen,
+    reader: threading.Thread,
+    *,
+    grace_s: float,
+) -> bool:
+    """TERM, then KILL only our process group; return if cleanup is uncertain."""
+    _signal_group(process, signal.SIGTERM)
+    grace_deadline = time.monotonic() + grace_s
+    while _group_running(process.pid, reader) and time.monotonic() < grace_deadline:
+        time.sleep(0.03)
+    if _group_running(process.pid, reader):
+        _signal_group(process, signal.SIGKILL)
+    wait_uncertain = False
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        _signal_group(process, signal.SIGKILL)
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            wait_uncertain = True
+    if reader.ident is None:
+        if process.stdout is not None:
+            process.stdout.close()
+    else:
+        reader.join(timeout=1)
+    return wait_uncertain or process.poll() is None or _group_running(process.pid, reader)
 
 
 def _collect_event_names(stream, collected: list[str]) -> None:
@@ -156,6 +241,8 @@ def supervise_fake_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             start_new_session=True,
             close_fds=True,
         )
@@ -163,39 +250,51 @@ def supervise_fake_command(
         _append_jsonl(journal, {"job_id": job_id, "state": "failed", "reason": "fake_start_error"})
         raise SpikeError(f"Fake executable could not be started ({type(exc).__name__}).") from None
 
-    _append_jsonl(journal, {"job_id": job_id, "state": "running"})
     event_names: list[str] = []
     reader = threading.Thread(
         target=_collect_event_names, args=(process.stdout, event_names), daemon=True
     )
-    reader.start()
+    try:
+        _append_jsonl(journal, {"job_id": job_id, "state": "running"})
+        reader.start()
+    except BaseException:
+        _terminate_group(process, reader, grace_s=grace_s)
+        raise
     deadline = time.monotonic() + timeout_s
     timed_out = False
-    while process.poll() is None and time.monotonic() < deadline:
-        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-    if process.poll() is None:
-        timed_out = True
-        _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
-        _signal_group(process, signal.SIGTERM)
-        grace_deadline = time.monotonic() + grace_s
-        while _group_exists(process.pid) and time.monotonic() < grace_deadline:
-            time.sleep(0.01)
-        # The group leader can exit while descendants ignore TERM. Escalate
-        # against the original process group even if Popen.wait() has returned.
-        if _group_exists(process.pid):
-            _signal_group(process, signal.SIGKILL)
+    cleanup_uncertain = False
+    leftovers = False
+    unexpected_leftovers = False
     try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        _signal_group(process, signal.SIGKILL)
-        process.wait()
-    if timed_out and _group_exists(process.pid):
-        _signal_group(process, signal.SIGKILL)
-    reader.join(timeout=2)
-    if timed_out and reader.is_alive():
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+        timed_out = process.poll() is None
+        if timed_out:
+            _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
+        # A provider parent may exit while a child keeps the pipe or continues
+        # work. Clean the group after timeout and after every leader exit, and
+        # only report success when enumeration and the output reader are quiet.
+        if timed_out:
+            cleanup_uncertain = _terminate_group(process, reader, grace_s=grace_s)
+        else:
+            process.wait()
+            reader.join(timeout=0.05)
+            leftovers = _group_running(process.pid, reader)
+            if leftovers:
+                _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
+                cleanup_uncertain = _terminate_group(process, reader, grace_s=grace_s)
+        unexpected_leftovers = bool(not timed_out and leftovers)
+    except BaseException:
+        _terminate_group(process, reader, grace_s=grace_s)
+        raise
+
+    reader.join(timeout=1)
+    if reader.is_alive() or cleanup_uncertain or unexpected_leftovers:
         final_state = "interrupted"
+    elif timed_out:
+        final_state = "cancelled"
     else:
-        final_state = "cancelled" if timed_out else ("succeeded" if process.returncode == 0 else "failed")
+        final_state = "succeeded" if process.returncode == 0 else "failed"
     _append_jsonl(journal, {"job_id": job_id, "state": final_state})
     _append_jsonl(
         state_dir / "evidence.jsonl",
