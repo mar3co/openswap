@@ -273,16 +273,20 @@ def _cleanup_probe_process(process: subprocess.Popen) -> bool:
 def _sweep_probe_descendants(
     process: subprocess.Popen, tracked: dict[int, tuple[int, str, str, int | None, str, bool]]
 ) -> tuple[bool, bool]:
-    """Terminate tracked probe descendants outside its group: (any found, cleanup certain)."""
-    if not _track_descendants(
+    """Terminate tracked probe descendants outside its group: (any found, cleanup certain).
+
+    A failed final scan still sweeps the descendants earlier scans recorded
+    (group cleanup cannot reach one that called setsid()); the failure only
+    makes the result uncertain.
+    """
+    scanned = _track_descendants(
         process.pid, tracked, deadline=time.monotonic() + CLEANUP_SCAN_BUDGET_S
-    ):
-        return False, False
+    )
     escaped = _escaped_descendants(process.pid, tracked)
     if not escaped:
-        return False, True
+        return False, scanned
     all_gone, _mode = _terminate_pids(escaped, grace_s=PROBE_TERMINATION_GRACE_S)
-    return True, all_gone
+    return True, all_gone and scanned
 
 
 def _refuse_symlinked_components(path: Path) -> None:

@@ -634,6 +634,24 @@ def test_probe_refuses_when_a_periodic_descendant_scan_fails(tmp_path, monkeypat
         )
 
 
+def test_probe_sweep_still_terminates_known_descendants_when_final_scan_fails(monkeypatch):
+    terminated = []
+    monkeypatch.setattr(spike, "_track_descendants", lambda *a, **k: False)  # ps failed
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+
+    def fake_terminate(escaped, grace_s):
+        terminated.append(sorted(escaped))
+        return True, spike.SIGNALLING_PIDFD
+
+    monkeypatch.setattr(spike, "_terminate_pids", fake_terminate)
+    # Recorded by an earlier periodic scan: it called setsid(), leaving the group.
+    tracked = {4242: (4242, "Ss", "tA", 7, "tA|pgid=4242|helper", True)}
+    found, certain = spike._sweep_probe_descendants(SimpleNamespace(pid=100), tracked)
+    assert terminated == [[4242]]
+    assert found is True
+    assert certain is False
+
+
 @pytest.mark.skipif(os.name != "posix", reason="the SIGKILL branch is POSIX-only")
 def test_probe_cleanup_waits_for_killed_group_members_to_leave(monkeypatch):
     # A killed member can linger briefly (for example in a slow disk write);
