@@ -1599,6 +1599,29 @@ def test_pid_identity_reports_zombie_as_gone(tmp_path):
         child.wait(timeout=5)
 
 
+@pytest.mark.parametrize("handle_exited, expected", [
+    (False, {4242: (4242, "S", "tA", 77, "tA|pgid=4242|child", False)}),
+    (True, {}),
+])
+def test_track_descendants_keeps_live_pidfd_when_revalidation_scan_fails(
+    monkeypatch, handle_exited, expected
+):
+    closed = []
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 77)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: handle_exited)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid, timeout_s=None: None)  # ps failed
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    # A live handle stays tracked (forcing "interrupted") but is never
+    # signalled; only a handle that reads as exited is dropped.
+    assert tracked == expected
+    assert closed == ([77] if handle_exited else [])
+
+
 def test_track_descendants_refuses_handle_when_start_time_changed_after_open(monkeypatch):
     closed = []
     monkeypatch.setattr(spike, "_process_table",

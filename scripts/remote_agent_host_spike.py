@@ -821,22 +821,23 @@ def _track_descendants(
                         # parent is still in this run proves ownership even if
                         # the group or command changed meanwhile; otherwise
                         # keep the handle but never signal through it.
-                        if deadline is not None and time.monotonic() >= deadline:
-                            tracked[pid] = (pgid, stat, birth, handle, identity, False)
-                            if pid not in known:
-                                known.add(pid)
-                                changed = True
-                            continue
-                        row = _pid_row(pid) if deadline is None else _pid_row(
-                            pid, timeout_s=_ps_budget(deadline)
-                        )
-                        if row is None or row[2] != birth:
+                        # If the re-read is out of time or fails while the
+                        # handle is still live, the child may be ours: keep it
+                        # tracked but unverified rather than dropping it.
+                        row = None
+                        if deadline is None or time.monotonic() < deadline:
+                            row = _pid_row(pid) if deadline is None else _pid_row(
+                                pid, timeout_s=_ps_budget(deadline)
+                            )
+                        if (row is None and _pidfd_exited(handle)) or (
+                            row is not None and row[2] != birth
+                        ):
                             try:
                                 os.close(handle)
                             except OSError:
                                 pass
                             continue
-                        verified = row[0] in trusted
+                        verified = row is not None and row[0] in trusted
                 tracked[pid] = (pgid, stat, birth, handle, identity, verified)
                 if pid not in known:
                     known.add(pid)
