@@ -204,7 +204,10 @@ def _leader_exited(
     for reuse by an unrelated process. Keeping the leader as a zombie until
     group cleanup is finished reserves that id. ``waitid(WNOWAIT)`` is used
     where available; otherwise the process table's state column (``Z``)
-    serves. Only when neither works does this fall back to a reaping poll.
+    serves, then a single-pid ``ps`` state lookup. It never reaps: when no
+    observation works the leader is reported as not known to have exited,
+    so callers time out into cleanup and an uncertain (``interrupted``)
+    result rather than free the pid while cleanup still depends on it.
     With ``deadline`` the ``ps`` fallback is bounded by the time left.
     """
     if process.returncode is not None:
@@ -226,7 +229,7 @@ def _leader_exited(
     state = _pid_state(process.pid, timeout_s=None if deadline is None else _ps_budget(deadline))
     if state is not None:
         return state.startswith(("Z", "X"))
-    return process.poll() is not None
+    return False
 
 
 def _pid_state(pid: int, timeout_s: float | None = None) -> str | None:
