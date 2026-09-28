@@ -1,9 +1,45 @@
 # Decision memo: control-service operator, hosting, and repository
 
-**Status: PENDING OWNER DECISION.** Plan 017 requires this decision to be
-recorded before phase 1 exits and before any phase-3 service or transport work
-starts. This memo presents options; it does not choose an operator, provider,
-hosting environment, or repository for the owner.
+**Status: DECIDED 2026-09-28 (Yohan Marshall).** See [Decision](#decision)
+and [Owner record](#owner-record). The options and gate analysis below are
+kept as the record of what was considered.
+
+## Decision
+
+OpenSwap supports a pluggable control service behind one configured URL. The
+same versioned worker protocol serves three backends:
+
+1. **OpenTag-hosted.** OpenTag operates its own implementation of the protocol
+   on its existing hosting and identity, in the OpenTag repository. Pairing
+   codes are issued from the OpenTag portal and bound to a workspace user.
+2. **Self-hosted reference server.** OpenSwap ships a minimal MIT reference
+   server in this repository: single owner, plain HTTP API, no dependencies
+   beyond Python and its standard library, deployable on any host the owner
+   controls. It issues pairing codes to whoever runs it.
+3. **Custom server.** Anyone may implement the published protocol
+   specification; OpenSwap treats it like any other backend.
+
+OpenSwap itself gains no accounts or login. Identity on the Mac is always a
+one-use pairing code approved locally and exchanged for a device key stored
+under the existing `openswap` Keychain service. Who may issue codes, and how
+that maps to people and workspaces, is the backend's concern.
+
+Consequences for the plan:
+
+- The protocol specification, worker client and reference server live in
+  `mar3co/openswap`. OpenTag's implementation lives in `mar3co/opentag` and
+  is tracked in mar3co/opentag#135. Nothing OpenTag-specific enters this
+  repository.
+- Phase 3's "durable job service" is the reference server, a product
+  deliverable rather than a throwaway; the pilot runs against a self-hosted
+  instance and needs no OpenTag account.
+- Phase 4 begins with OpenTag implementing the protocol server-side, then the
+  connector work already listed.
+- The operator of each backend owns its data, retention, availability and
+  support. For the reference server that is the person who runs it.
+- The worker must poll on short intervals rather than hold long-lived
+  connections, so the protocol stays deployable on serverless hosting such as
+  OpenTag's.
 
 ## Decision needed
 
@@ -36,6 +72,8 @@ authorize service code.
 
 ## Recommendation and gate
 
+_Superseded by the Decision above; kept as the pre-decision analysis._
+
 Favor OpenTag operating the service and owning its repository, consistent with
 plan 017's recommendation: OpenTag is the first client and already owns the
 tenant identity and MCP request surface. This is a recommendation, not the
@@ -55,7 +93,11 @@ phase 2 exits and is merged as well.
 
 ## Owner record
 
-- Operator: **Pending**
-- Hosting: **Pending**
-- Repository: **Pending**
-- Decision date / owner: **Pending**
+- Operator: the operator of whichever backend the owner points the worker at.
+  OpenTag (mar3co) operates the OpenTag-hosted backend; a self-hosting owner
+  operates their own reference-server instance.
+- Hosting: OpenTag backend on OpenTag's existing hosting and identity
+  provider; reference server on any host the owner controls.
+- Repository: protocol specification, worker client and reference server in
+  `mar3co/openswap`; OpenTag's implementation in `mar3co/opentag`.
+- Decision date / owner: 2026-09-28 / Yohan Marshall

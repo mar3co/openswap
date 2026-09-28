@@ -91,30 +91,32 @@ Phase 1 exit requires all of the following:
 - [x] The Claude authentication decision memo is delivered. The owner must
   record a permitted path before any Claude adapter or Claude-specific code
   depends on it; this separate Claude gate does not block Codex-only phase 1.
-- [ ] The owner records the control-service operator, hosting, and repository.
-  No phase-3 transport or service code starts before that answer.
+- [x] The owner records the control-service operator, hosting, and repository
+  (2026-09-28): pluggable backend behind one URL; OpenTag-hosted, self-hosted
+  MIT reference server in this repository, or any server implementing the
+  published protocol. See the
+  [decision memo](research/remote-agent-host/decision-control-service.md).
 - [x] Both written decision memos have been delivered for owner review.
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
   (`2876 passed, 4 skipped, 3 warnings in 13.52s`).
 
-The control-service operator/hosting/repository decision is still pending and
-blocks phase 1 exit. The Claude memo is delivered and its auth-path answer is
+The control-service decision is recorded: the protocol specification, worker
+client and MIT reference server live in this repository, OpenTag implements
+the same protocol in its own repository, and the worker selects a backend by
+URL. The phase-3 reference server is therefore a product deliverable, not a
+movable placeholder. The Claude memo is delivered and its auth-path answer is
 still pending, but that does not block Codex-only work; no Claude code starts
-until the owner records a permitted path or exclusion. Current recommendations
-are Codex-only for this phase and OpenTag as the service operator/repository
-with hosting chosen by the owner; keep any phase-3 reference package clearly
-separated and movable until ownership is recorded. These recommendations are
-not owner decisions.
+until the owner records a permitted path or exclusion.
 
 ## Phase status
 
 | Phase | Status | Exit evidence / blocker |
 | --- | --- | --- |
-| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, cancellation/recovery, or model/tool enforcement integration. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is pending. Publication to the GitHub origin is now authorized and in progress; opening a draft PR will not satisfy the exit gates. |
+| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, cancellation/recovery, or model/tool enforcement integration. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. Publication to the GitHub origin is now authorized and in progress; opening a draft PR will not satisfy the exit gates. |
 | 2. Local worker, remote access off | NOT STARTED | Requires every phase-1 exit item above and the phase-1 PR merged. |
-| 3. Private remote pilot | NOT STARTED | Requires phase 2's exit criteria and merged PR, plus the recorded control-service owner, hosting and repository. Keep a minimal reference implementation behind an interface in a movable package only after that gate. |
+| 3. Private remote pilot | NOT STARTED | Requires phase 2's exit criteria and merged PR. Builds the protocol specification, configurable backend URL and the MIT reference server as product code; the pilot runs against a self-hosted instance. |
 | 4. OpenTag connector | OUT OF SCOPE | Tracked in the separate OpenTag repository. |
 | 5–6 | OUT OF SCOPE | Do not start. |
 
