@@ -210,6 +210,7 @@ def test_invalid_utf8_output_is_safely_recorded_as_unstructured(tmp_path):
     assert result["event_names"] == ["unstructured-output"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="killpg process groups are POSIX-only")
 def test_unavailable_group_enumeration_keeps_existing_group_uncertain(monkeypatch):
     signaled = []
     monkeypatch.setattr(spike, "_group_has_running_members", lambda _pgid: None)
