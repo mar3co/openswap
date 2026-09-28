@@ -112,7 +112,7 @@ inspect: codex-cli 0.158.0-alpha.2.1; exec_json=true; sandbox_option=true;
 demo:    state=cancelled; returncode=-15; event_names=[thread.started]
 sandbox: inside read/write allowed; outside read/write denied;
          synthetic CODEX_HOME auth/config reads denied; no exec/model run
-tests:   12 passed in 3.67s
+tests:   21 passed
 ```
 
 The fake-process harness includes regression coverage for the Codex review
@@ -129,6 +129,13 @@ is covered by parameterized tests for `OSError` and timeout failures from both
 the version and help probes. The operator receives a sanitized `refused:`
 message, with no traceback or exception output. These are local CLI-probe
 failure tests; they do not establish Codex provider execution.
+
+Findings [#4121649254](https://github.com/mar3co/openswap/pull/59#discussion_r4121649254)
+and [#4121649264](https://github.com/mar3co/openswap/pull/59#discussion_r4121649264)
+are covered by noisy-output and subprocess-failure tests: output lines and
+retained event names have explicit caps while the pipe continues draining, and
+both sandbox probes return sanitized refusals for launch, timeout, or decode
+failures.
 
 The `sandbox-probe` pass required an escalated but credential-free local run so
 macOS could launch the sandbox wrapper. The actual `exec` and `sandbox` wrappers

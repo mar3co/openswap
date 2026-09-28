@@ -19,8 +19,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The final assembled-branch suite is green: `2883 passed, 4 skipped, 3 warnings
-in 13.76s`. The phase-one harness tests pass: `12 passed in 3.67s`.
+The final assembled-branch suite is green: `2892 passed, 4 skipped, 3 warnings
+in 13.45s`. The phase-one harness tests pass: `21 passed`.
 
 The ChatGPT app-bundled Codex CLI is `0.158.0-alpha.2.1` (pre-release). A
 separate official stable ARM macOS release, `0.157.1`, was downloaded to
@@ -98,7 +98,7 @@ Phase 1 exit requires all of the following:
 - [ ] The phase-one evidence, adapter contract and reproducible harness are
   reviewed; phase-one PR is merged before phase 2 begins.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2883 passed, 4 skipped, 3 warnings in 13.76s`).
+  (`2892 passed, 4 skipped, 3 warnings in 13.45s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -124,7 +124,7 @@ until the owner records a permitted path or exclusion.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it will preserve the `ClaudeSwitchError` assertion and will not change the
   resolver or executable discovery behavior.
-- Credential-free harness tests passed (`12 passed in 3.67s`); `inspect`,
+- Credential-free harness tests passed (`21 passed`); `inspect`,
   inert-child `demo`, and synthetic Seatbelt `sandbox-probe` outcomes are in
   [the Codex spike record](research/remote-agent-host/spike-codex.md). This
   establishes only helper and local sandbox behavior, not provider execution.
@@ -138,6 +138,11 @@ until the owner records a permitted path or exclusion.
   is addressed: local version/help launch errors and timeouts are returned as a
   sanitized `refused:` result. Parameterized tests verify both calls and both
   failure types without exposing exception output.
+- Codex review findings [P2 #4121649254](https://github.com/mar3co/openswap/pull/59#discussion_r4121649254)
+  and [P2 #4121649264](https://github.com/mar3co/openswap/pull/59#discussion_r4121649264)
+  are addressed: stdout draining now bounds each line and retained event names,
+  and sandbox-probe launch/timeout/decode failures produce sanitized refusals.
+  Regression tests exercise noisy output and each sandbox subprocess failure.
 - `uv` was not installed on `PATH`; version 0.12.19 was installed only under
   `/private/tmp/openswap-uv-test`, with its Python, cache, and project test
   environment under `/private/tmp`. The full suite used that isolated runtime.

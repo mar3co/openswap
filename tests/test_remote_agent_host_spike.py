@@ -211,6 +211,35 @@ def test_invalid_utf8_output_is_safely_recorded_as_unstructured(tmp_path):
     assert result["event_names"] == ["unstructured-output"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
+def test_noisy_fake_output_is_bounded_and_cancellation_still_completes(tmp_path):
+    fake = _executable(
+        tmp_path / "fake-noisy-provider",
+        "import json, sys, time\n"
+        f"sys.stdout.write('x' * ({spike.MAX_EVENT_LINE_CHARS} + 100_000) + '\\n')\n"
+        "for i in range(10000):\n"
+        " sys.stdout.write(json.dumps({'type': f'event-{i}'}) + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n",
+    )
+
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=2, grace_s=0.2,
+        job_id="noisy-output",
+    )
+
+    assert result["state"] == "cancelled"
+    assert result["returncode"] < 0
+    assert result["event_names"][0] == "unstructured-output"
+    assert result["event_names"].count(spike.EVENT_NAMES_TRUNCATED) == 1
+    assert len(result["event_names"]) <= spike.MAX_RETAINED_EVENT_NAMES + 1
+    journal = [
+        json.loads(line)
+        for line in (tmp_path / "state" / "journal.jsonl").read_text().splitlines()
+    ]
+    assert journal[-1]["state"] == "cancelled"
+
+
 @pytest.mark.skipif(os.name != "posix", reason="killpg process groups are POSIX-only")
 def test_unavailable_group_enumeration_keeps_existing_group_uncertain(monkeypatch):
     signaled = []
@@ -222,7 +251,7 @@ def test_unavailable_group_enumeration_keeps_existing_group_uncertain(monkeypatc
 
 
 @pytest.mark.parametrize("stage", ["version", "exec_help"])
-@pytest.mark.parametrize("failure", ["os_error", "timeout"])
+@pytest.mark.parametrize("failure", ["os_error", "timeout", "unicode_error"])
 def test_inspect_cli_sanitizes_probe_launch_and_timeout_errors(
     tmp_path, monkeypatch, capsys, stage, failure
 ):
@@ -234,9 +263,7 @@ def test_inspect_cli_sanitizes_probe_launch_and_timeout_errors(
         calls.append(command)
         current_stage = "version" if command[-1] == "--version" else "exec_help"
         if current_stage == stage:
-            if failure == "os_error":
-                raise OSError("raw-secret-marker")
-            raise subprocess.TimeoutExpired(command, timeout=0.1, output="raw-secret-marker")
+            _raise_probe_failure(failure, command)
         return subprocess.CompletedProcess(command, 0, "codex-cli 1.0-test\n", "")
 
     monkeypatch.setattr(spike.subprocess, "run", fake_run)
@@ -250,8 +277,50 @@ def test_inspect_cli_sanitizes_probe_launch_and_timeout_errors(
     assert captured.out == ""
     assert captured.err == "refused: Codex version/help probe could not complete.\n"
     assert "raw-secret-marker" not in captured.err
+    assert str(fake) not in captured.err
     assert "Traceback" not in captured.err
     assert len(calls) == (1 if stage == "version" else 2)
+
+
+def _raise_probe_failure(failure, command):
+    if failure == "os_error":
+        raise OSError("raw-secret-marker /private/tmp/raw-secret-path")
+    if failure == "timeout":
+        raise subprocess.TimeoutExpired(command, timeout=0.1, output="raw-secret-marker")
+    raise UnicodeDecodeError("utf-8", b"\\xffsecret", 0, 1, "raw-secret-marker")
+
+
+@pytest.mark.parametrize("stage", ["first", "second"])
+@pytest.mark.parametrize("failure", ["os_error", "timeout", "unicode_error"])
+def test_sandbox_probe_sanitizes_subprocess_failures(
+    tmp_path, monkeypatch, capsys, stage, failure
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        current_stage = "first" if len(calls) == 1 else "second"
+        if current_stage == stage:
+            _raise_probe_failure(failure, command)
+        return subprocess.CompletedProcess(command, 1, "", "")
+
+    monkeypatch.setattr(spike.subprocess, "run", fake_run)
+
+    code = spike._main([
+        "sandbox-probe", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == "refused: Codex sandbox probe could not complete.\n"
+    assert "raw-secret-marker" not in captured.err
+    assert "/private/tmp/raw-secret-path" not in captured.err
+    assert str(fake) not in captured.err
+    assert "Traceback" not in captured.err
+    assert len(calls) == (1 if stage == "first" else 2)
 
 
 def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):

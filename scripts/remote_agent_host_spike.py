@@ -28,6 +28,9 @@ from typing import Sequence
 
 DISCOVERED_CODEX_VERSION = "codex-cli 0.158.0-alpha.2.1"
 LIVE_CODEX_ENABLED = False
+MAX_RETAINED_EVENT_NAMES = 256
+MAX_EVENT_LINE_CHARS = 64 * 1024
+EVENT_NAMES_TRUNCATED = "event-names-truncated"
 _EVENT_NAME = re.compile(r"^[a-zA-Z0-9_.-]{1,80}$")
 
 
@@ -202,17 +205,38 @@ def _terminate_group(
 
 def _collect_event_names(stream, collected: list[str]) -> None:
     # Drain while running so even a noisy fake cannot fill the pipe and block
-    # the leader before the timeout. Only event names survive this thread.
-    for line in stream:
+    # the leader before the timeout. Keep each line and the event list bounded.
+    truncated = False
+
+    def record(name: str) -> None:
+        nonlocal truncated
+        if len(collected) < MAX_RETAINED_EVENT_NAMES:
+            collected.append(name)
+        elif not truncated:
+            collected.append(EVENT_NAMES_TRUNCATED)
+            truncated = True
+
+    while True:
+        line = stream.readline(MAX_EVENT_LINE_CHARS + 1)
+        if not line:
+            return
+        if len(line) > MAX_EVENT_LINE_CHARS:
+            # Discard the rest of an oversized JSONL record in bounded chunks.
+            while not line.endswith("\n"):
+                line = stream.readline(MAX_EVENT_LINE_CHARS + 1)
+                if not line:
+                    break
+            record("unstructured-output")
+            continue
         try:
             item = json.loads(line)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            collected.append("unstructured-output")
+            record("unstructured-output")
             continue
         if isinstance(item, dict):
-            collected.append(_safe_event_name(item.get("type")))
+            record(_safe_event_name(item.get("type")))
         else:
-            collected.append("non-object-event")
+            record("non-object-event")
 
 
 def supervise_fake_command(
@@ -326,7 +350,7 @@ def inspect_codex(codex_bin: str | None, evidence_dir: Path) -> dict:
             help_result = subprocess.run([str(binary), "exec", "--help"], env=env, cwd=temp,
                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, text=True, timeout=15, check=False)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
         raise SpikeError("Codex version/help probe could not complete.") from None
     version_text = version.stdout.strip()
     help_text = help_result.stdout + help_result.stderr
@@ -386,19 +410,22 @@ def probe_low_level_sandbox(codex_bin: str | None, evidence_dir: Path) -> dict:
             f"printf inside-write > {shlex.quote(str(workspace / 'write-test.txt'))}; "
             f"printf outside-write > {shlex.quote(str(outside / 'write-test.txt'))}"
         )
-        result = subprocess.run(
-            [binary, "sandbox", "--permission-profile", "research-test", "--log-denials",
-             "--cd", str(workspace), "/bin/sh", "-c", command],
-            env=env, cwd=temp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, timeout=20, check=False,
-        )
-        auth_read = subprocess.run(
-            [binary, "sandbox", "--permission-profile", "research-test", "--log-denials",
-             "--cd", str(workspace), "/bin/sh", "-c",
-             'cat "$CODEX_HOME/auth.json"; cat "$CODEX_HOME/config.toml"'],
-            env=env, cwd=temp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, timeout=20, check=False,
-        )
+        try:
+            result = subprocess.run(
+                [binary, "sandbox", "--permission-profile", "research-test", "--log-denials",
+                 "--cd", str(workspace), "/bin/sh", "-c", command],
+                env=env, cwd=temp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, timeout=20, check=False,
+            )
+            auth_read = subprocess.run(
+                [binary, "sandbox", "--permission-profile", "research-test", "--log-denials",
+                 "--cd", str(workspace), "/bin/sh", "-c",
+                 'cat "$CODEX_HOME/auth.json"; cat "$CODEX_HOME/config.toml"'],
+                env=env, cwd=temp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, timeout=20, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+            raise SpikeError("Codex sandbox probe could not complete.") from None
         combined = result.stdout + result.stderr
         auth_combined = auth_read.stdout + auth_read.stderr
         observed = {
