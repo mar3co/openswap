@@ -169,7 +169,7 @@ LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 3 remains unstarted.
 
 The Phase 2 full-suite validation on the currently integrated PR #59 snapshot
-`f684ebf` is green: `3074 passed, 4 skipped, 3 warnings in 18.41s`. The run
+`f684ebf` is green: `3078 passed, 4 skipped, 3 warnings in 17.29s`. The run
 used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree.
@@ -223,6 +223,14 @@ real provider read is interruptible or pass the Phase 1 process-tree gate.
 Claude transfer import now acquires the provider mutation guard before
 migration or credential/roster writes, and refuses active, uncertain, or
 corrupt lease state without changing those files.
+Follow-ups #4125619349, #4125619361, and #4125619374 are addressed: after
+provider interruption the runtime reloads the latest job generation while
+preserving confirmed stop proof; automatic active-credential restoration
+defers under a worker lease; and purge holds the canonical settings lock after
+the lifecycle lock and before provider locks, preserving the settings-lock
+inode through deletion. A concurrency regression holds the settings writer
+lock while purge waits, then verifies purge removes managed data without
+replacing the lock inode.
 
 ## Deviations and verification
 

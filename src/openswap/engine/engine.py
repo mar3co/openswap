@@ -305,6 +305,7 @@ class Engine(
         provider_lock_paths = (
             self.backup_dir / ".lock",
             self.backup_dir / "codex" / ".lock",
+            self.backup_dir / ".settings.lock",
             self.backup_dir / "worker" / "lifecycle.lock",
         )
         legacy_distinct = legacy != self.backup_dir and not any(
@@ -379,6 +380,7 @@ class Engine(
         ]
         codex_dir = self.backup_dir / "codex"
         worker_dir = self.backup_dir / "worker"
+        settings_lock_path = self.backup_dir / ".settings.lock"
         lifecycle_path = worker_dir / "lifecycle.lock"
         if (
             self.backup_dir.is_symlink()
@@ -386,28 +388,37 @@ class Engine(
             or worker_dir.is_symlink()
             or (self.backup_dir / ".lock").is_symlink()
             or (codex_dir / ".lock").is_symlink()
+            or settings_lock_path.is_symlink()
+            or (settings_lock_path.exists() and not settings_lock_path.is_file())
             or lifecycle_path.is_symlink()
         ):
             raise SessionError(
-                "Worker or provider lock paths contain a symlink; refusing "
+                "A worker, provider, or settings lock path is unsafe; refusing "
                 "to purge account and lease state."
             )
         from openswap.worker.cli import lifecycle_lock
+        from openswap.settings import _settings_write_lock
 
         with lifecycle_lock(self.backup_dir):
-            stores.sort(key=lambda store: str(store.provider_lock))
-            # Refuse active/uncertain leases before worker checks; release the
-            # provider locks before status IPC, then recheck before deletion.
-            with ExitStack() as stack:
-                for store in stores:
-                    guard = stack.enter_context(store.mutation_guard())
-                    guard.assert_available()
-            self._refuse_worker_restart_locked()
-            with ExitStack() as stack:
-                for store in stores:
-                    guard = stack.enter_context(store.mutation_guard())
-                    guard.assert_available()
-                self._purge_confirmed(legacy, legacy_distinct, session_dirs)
+            # Use the canonical settings lock after the lifecycle lock and
+            # before provider locks. This serializes purge with every settings
+            # writer and keeps the lock inode stable while settings.json is
+            # removed, so a waiting writer cannot proceed through an unlinked
+            # lock and race a replacement lock.
+            with _settings_write_lock(self.backup_dir):
+                stores.sort(key=lambda store: str(store.provider_lock))
+                # Refuse active/uncertain leases before worker checks; release
+                # provider locks before status IPC, then recheck before delete.
+                with ExitStack() as stack:
+                    for store in stores:
+                        guard = stack.enter_context(store.mutation_guard())
+                        guard.assert_available()
+                self._refuse_worker_restart_locked()
+                with ExitStack() as stack:
+                    for store in stores:
+                        guard = stack.enter_context(store.mutation_guard())
+                        guard.assert_available()
+                    self._purge_confirmed(legacy, legacy_distinct, session_dirs)
 
     def _refuse_worker_restart_locked(self) -> None:
         """Require an explicitly disabled and stopped worker before purge."""
@@ -503,7 +514,7 @@ class Engine(
     def _purge_confirmed(
         self, legacy: Path, legacy_distinct: bool, session_dirs: list[Path]
     ) -> None:
-        """Delete purge targets while both provider mutation locks are held."""
+        """Delete purge targets while settings and provider locks are held."""
         removed_items = []
 
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
@@ -564,18 +575,20 @@ class Engine(
                 f"Session profiles: {', '.join(d.name for d in session_dirs)}"
             )
 
-        # Remove managed data, but preserve provider and lifecycle lock files
-        # and their parent directories. Unlinking a held lock inode would let
-        # another process create a new lock at the same path and bypass it.
+        # Remove managed data, but preserve settings, provider and lifecycle
+        # lock files and their parent directories. Unlinking a held lock inode
+        # would let another process create a new lock at the same path and
+        # bypass it.
         if self.backup_dir.exists():
             # Close log handlers before deleting (required on Windows)
             for handler in self._logger.handlers[:]:
                 handler.close()
                 self._logger.removeHandler(handler)
 
-            self._remove_backup_data_preserving_provider_locks()
+            self._remove_backup_data_preserving_locks()
             removed_items.append(
-                f"Backup data: {self.backup_dir} (provider and lifecycle lock files retained)"
+                f"Backup data: {self.backup_dir} "
+                "(settings, provider and lifecycle lock files retained)"
             )
 
         # Also clean a stale legacy directory if it somehow still exists
@@ -596,10 +609,14 @@ class Engine(
 
         print(f"\n{accent('Purge complete.')}")
 
-    def _remove_backup_data_preserving_provider_locks(self) -> None:
-        """Remove backup data without unlinking held provider/lifecycle locks."""
+    def _remove_backup_data_preserving_locks(self) -> None:
+        """Remove backup data without unlinking held settings/provider locks."""
         root = self.backup_dir
         for child in list(root.iterdir()):
+            if child.name == ".settings.lock":
+                if child.is_symlink() or not child.is_file():
+                    raise SessionError("Settings lock path is unsafe; refusing purge.")
+                continue
             if child.name == ".lock":
                 if child.is_symlink() or not child.is_file():
                     raise SessionError("Claude provider lock path is unsafe; refusing purge.")

@@ -745,9 +745,43 @@ class WorkerRuntime:
                 expected_generation=record.generation,
                 diagnostic_code="execution_uncertain",
             )
-        stopped = self._interrupt_execution(token, run)
+        # Interruption may overlap a stop request, which advances the journal
+        # generation while the provider is being asked to stop. Preserve the
+        # result of this one interrupt attempt and finalize only against a
+        # freshly loaded fence; never retry interrupt after explicit proof.
+        try:
+            stopped = self._interrupt_execution(token, run)
+        except Exception:
+            # A lease persistence failure is not stop proof. Quarantine best
+            # effort, and do not let reconcile's outer handler call interrupt
+            # a second time for the same owned handle.
+            try:
+                self.leases.mark_uncertain(token, "execution_uncertain")
+            except Exception:
+                pass
+            stopped = False
+        self._clear_active()
+        try:
+            latest = self.store.get(record.job_id)
+        except Exception:
+            # The lease already records either confirmed stop or uncertainty.
+            # Without a current fence, leave the journal untouched.
+            return record
+        terminal_states = {
+            JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED,
+            JobState.INTERRUPTED, JobState.EXPIRED,
+        }
+        if latest.state in terminal_states:
+            return latest
+        if latest.state not in {
+            JobState.STARTING, JobState.RUNNING, JobState.CANCEL_REQUESTED,
+        }:
+            return latest
         if stopped:
-            if reason in {"cancel_requested", "worker_shutdown"}:
+            if latest.state == JobState.CANCEL_REQUESTED:
+                new_state = JobState.CANCELLED
+                diagnostic = "cancel_requested"
+            elif reason in {"cancel_requested", "worker_shutdown"}:
                 new_state = JobState.CANCELLED
                 diagnostic = "cancel_requested" if reason == "cancel_requested" else "worker_disabled"
             elif reason == "runtime_limit_reached":
@@ -759,12 +793,29 @@ class WorkerRuntime:
         else:
             new_state = JobState.INTERRUPTED
             diagnostic = "execution_uncertain"
-        self._clear_active()
-        return self.store.transition(
-            record.job_id, expected_states=(record.state,), new_state=new_state,
-            worker_epoch=self.worker_epoch, expected_generation=record.generation,
-            diagnostic_code=diagnostic,
-        )
+        for attempt in range(2):
+            try:
+                return self.store.transition(
+                    latest.job_id, expected_states=(latest.state,), new_state=new_state,
+                    worker_epoch=self.worker_epoch, expected_generation=latest.generation,
+                    diagnostic_code=diagnostic,
+                )
+            except StaleWriteError:
+                try:
+                    latest = self.store.get(record.job_id)
+                except Exception:
+                    return latest
+                if latest.state in terminal_states or latest.state not in {
+                    JobState.STARTING, JobState.RUNNING, JobState.CANCEL_REQUESTED,
+                }:
+                    return latest
+                if latest.state == JobState.CANCEL_REQUESTED and stopped:
+                    new_state, diagnostic = JobState.CANCELLED, "cancel_requested"
+            except Exception:
+                # Keep the stop/quarantine evidence and do not re-interrupt an
+                # already handled provider run because journal I/O failed.
+                return latest
+        return latest
 
     def _interrupt_execution(self, token, run) -> bool:
         """Attempt to stop an owned run and persist only explicit stop proof."""

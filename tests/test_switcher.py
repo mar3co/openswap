@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -1364,6 +1365,64 @@ def test_purge_refuses_manual_worker_lock(temp_home: Path):
         running.release()
 
     assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_purge_waits_for_settings_writer_and_preserves_lock_inode(
+    temp_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from openswap.settings import _settings_write_lock
+
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    switcher.platform = Platform.LINUX
+    backup_dir = switcher.backup_dir
+    marker = backup_dir / "remove-after-settings-writer.txt"
+    marker.write_text("managed", encoding="utf-8")
+
+    settings_lock = _settings_write_lock(backup_dir)
+    assert settings_lock.acquire(timeout=0)
+    settings_lock_path = backup_dir / ".settings.lock"
+    settings_inode = settings_lock_path.stat().st_ino
+    purge_started = threading.Event()
+    settings_lock_attempted = threading.Event()
+    purge_done = threading.Event()
+    purge_errors = []
+
+    def observed_settings_lock(root):
+        settings_lock_attempted.set()
+        return _settings_write_lock(root)
+
+    monkeypatch.setattr("openswap.settings._settings_write_lock", observed_settings_lock)
+
+    def purge():
+        purge_started.set()
+        try:
+            with patch("builtins.input", return_value="y"):
+                switcher.purge()
+        except BaseException as exc:
+            purge_errors.append(exc)
+        finally:
+            purge_done.set()
+
+    thread = threading.Thread(target=purge, daemon=True)
+    thread.start()
+    try:
+        assert purge_started.wait(2)
+        assert settings_lock_attempted.wait(2)
+        # Purge must wait for the same lock used by settings writers rather
+        # than delete the lock path while another writer holds its inode.
+        assert not purge_done.wait(0.2)
+        assert marker.exists()
+    finally:
+        settings_lock.release()
+
+    assert purge_done.wait(5)
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert purge_errors == []
+    assert not marker.exists()
+    assert settings_lock_path.is_file()
+    assert settings_lock_path.stat().st_ino == settings_inode
 
 
 class TestLiveSessionGuardOnAnUnreadableRecord:
@@ -5311,21 +5370,28 @@ class TestPurgeLegacyCleanup:
         codex_lock = backup_dir / "codex" / ".lock"
         lock_inodes = (claude_lock.stat().st_ino, codex_lock.stat().st_ino)
         from openswap.worker.cli import lifecycle_lock
+        from openswap.settings import _settings_write_lock
 
         with lifecycle_lock(backup_dir):
             lifecycle_path = backup_dir / "worker" / "lifecycle.lock"
             lifecycle_inode = lifecycle_path.stat().st_ino
+        with _settings_write_lock(backup_dir):
+            settings_lock_path = backup_dir / ".settings.lock"
+            settings_inode = settings_lock_path.stat().st_ino
         (backup_dir / "purge-me.txt").write_text("managed data")
 
         with patch("builtins.input", return_value="y"):
             switcher.purge()
 
         assert not legacy.exists()
-        assert {entry.name for entry in backup_dir.iterdir()} == {".lock", "codex", "worker"}
+        assert {entry.name for entry in backup_dir.iterdir()} == {
+            ".lock", ".settings.lock", "codex", "worker"
+        }
         assert {entry.name for entry in (backup_dir / "codex").iterdir()} == {".lock"}
         assert {entry.name for entry in (backup_dir / "worker").iterdir()} == {"lifecycle.lock"}
         assert (claude_lock.stat().st_ino, codex_lock.stat().st_ino) == lock_inodes
         assert lifecycle_path.stat().st_ino == lifecycle_inode
+        assert settings_lock_path.stat().st_ino == settings_inode
 
     def test_purge_prompt_lists_legacy_when_present(
         self, temp_home: Path, monkeypatch: pytest.MonkeyPatch, capsys
@@ -9862,6 +9928,40 @@ class TestMissingActiveCredentialUsageFallback:
         assert entry.sentinel is None
         assert s._active_backup_repaired() is True
         write_live.assert_called_once_with(backup)
+
+    def test_active_credential_restore_defers_while_worker_lease_is_held(
+        self, temp_home: Path, monkeypatch,
+    ):
+        s = self._switcher(temp_home, monkeypatch)
+        s.platform = Platform.LINUX
+        backup = self._backup()
+        fingerprint = oauth.credential_fingerprint(backup) or ""
+        key = s._lineage_key("2", "ads@example.com", fingerprint)
+        s._probe_verdicts[key] = True
+        monkeypatch.setattr(
+            s, "_read_account_credentials_ex", lambda *_: (backup, False)
+        )
+        live_empty = json.dumps({"claudeAiOauth": {
+            "accessToken": "", "refreshToken": "", "expiresAt": 0,
+        }})
+        s._write_credentials(live_empty)
+        store = AccountLeaseStore(s.backup_dir, "claude")
+        store.acquire(
+            job_id="worker-active-restore",
+            account_identity=stable_account_identity(
+                "claude", "ads@example.com", "org-ads"
+            ),
+            worker_pid=123,
+            worker_epoch=1,
+            ttl_s=60,
+        )
+
+        result = s._auto_restore_missing_active_credential(
+            "2", "ads@example.com", "org-ads", backup
+        )
+
+        assert result == "deferred"
+        assert s._read_credentials() == live_empty
 
     def test_status_path_uses_saved_credential_and_auto_restores(
         self, temp_home: Path, monkeypatch,

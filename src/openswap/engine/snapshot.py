@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from openswap.engine.notes import *  # noqa: F403
 from openswap.worker.leases import (
+    AccountLeaseError,
     AccountLeaseStore,
     LeaseConflictError,
     stable_account_identity,
@@ -1137,10 +1138,18 @@ class SnapshotMixin:
 
         try:
             with (
-                FileLock(self.lock_file),
+                AccountLeaseStore(
+                    self.backup_dir, "claude"
+                ).mutation_guard() as lease_guard,
                 claude_credentials_lock(),
                 claude_config_lock(),
             ):
+                account_identity = self._claude_lease_identity(
+                    account_num, email, org_uuid
+                )
+                if account_identity is None:
+                    return "deferred"
+                lease_guard.assert_unleased((account_identity,))
                 if not self._live_identity_matches(email, org_uuid):
                     return "deferred"
                 live = self._read_credentials()
@@ -1158,7 +1167,7 @@ class SnapshotMixin:
                 self._write_credentials(
                     self._prepare_credentials_for_activation(current_backup, live)
                 )
-        except LockError:
+        except (LockError, AccountLeaseError):
             return "deferred"
         except Exception:
             self._logger.warning(

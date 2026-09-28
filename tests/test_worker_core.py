@@ -168,6 +168,44 @@ def test_stale_event_after_stop_interrupts_owned_provider_run(
     assert AccountLeaseStore(tmp_path).current().state == expected_lease
 
 
+@pytest.mark.parametrize(
+    ("stopped", "expected_state", "expected_lease"),
+    [
+        (True, JobState.CANCELLED, "released"),
+        (False, JobState.INTERRUPTED, "uncertain"),
+    ],
+)
+def test_stop_during_interrupt_uses_latest_generation_without_retry(
+    tmp_path, stopped, expected_state, expected_lease,
+):
+    update_worker_settings(tmp_path, enabled=True)
+
+    class StopDuringInterrupt(_FakeAdapter):
+        runtime = None
+        job_id = None
+
+        def interrupt(self, run):
+            self.interrupt_count += 1
+            result = self.runtime.stop(self.job_id)
+            assert result.accepted is True
+            return InterruptResult(True, stopped, None)
+
+    adapter = StopDuringInterrupt(stopped=stopped)
+    identity = stable_account_identity("codex", "stop-during-interrupt-test")
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    job = runtime.submit(_submission())
+    adapter.runtime = runtime
+    adapter.job_id = job.job_id
+    shutdown = threading.Event()
+    shutdown.set()
+
+    result = runtime.reconcile_once(shutdown_event=shutdown)
+
+    assert result.state == expected_state
+    assert adapter.interrupt_count == 1
+    assert AccountLeaseStore(tmp_path).current().state == expected_lease
+
+
 @pytest.mark.parametrize("race_point", ["append", "terminal_transition"])
 def test_provider_finished_proof_survives_concurrent_stop(tmp_path, race_point):
     update_worker_settings(tmp_path, enabled=True)
