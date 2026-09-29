@@ -1895,22 +1895,24 @@ def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path
     fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
     marks: dict = {}
     real_append = spike._append_jsonl
-
     real_signal = spike._signal_group
+    terminated = threading.Event()
 
-    def slow_append(path, record):
+    def stalled_append(path, record):
         if record.get("state") == "running":
-            time.sleep(1.6)  # a slow fsync on the state directory
+            # Storage stays stalled until the deadline is enforced (capped so
+            # a regression fails instead of hanging).
+            marks["unblocked_by_term"] = terminated.wait(10)
             real_append(path, record)
-            marks["running_done"] = time.monotonic()
             return
         real_append(path, record)
 
     def recording_signal(process, sig):
-        marks.setdefault(sig, time.monotonic())
+        if sig == signal.SIGTERM:
+            terminated.set()
         real_signal(process, sig)
 
-    monkeypatch.setattr(spike, "_append_jsonl", slow_append)
+    monkeypatch.setattr(spike, "_append_jsonl", stalled_append)
     monkeypatch.setattr(spike, "_signal_group", recording_signal)
     result = supervise_fake_command(
         [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.2, job_id="slow-fsync",
@@ -1918,7 +1920,7 @@ def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path
     assert result["state"] in ("cancelled", "interrupted")
     # The append runs off the supervising thread, so the 1.5 s deadline is
     # enforced while it is still blocked, not after it returns.
-    assert marks[signal.SIGTERM] < marks["running_done"]
+    assert marks["unblocked_by_term"] is True
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
