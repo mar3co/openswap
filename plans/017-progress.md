@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3201 passed, 5 skipped, 3 warnings in 48.11s`.
+`3217 passed, 5 skipped, 3 warnings in 51.72s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -325,6 +325,9 @@ private temporary copy, so status never recreates a sidecar.
 Claude `remove_account` now runs the legacy org-field roster migration under
 the lease guard, as move already did, so a blocked removal cannot rewrite
 `sequence.json` first.
+The worker's pid liveness probe no longer uses `os.kill(pid, 0)` on Windows,
+where signal 0 is `CTRL_C_EVENT` and interrupts every console process; it
+uses `OpenProcess`/`GetExitCodeProcess` and treats anything unclear as alive.
 The CLI now rejects a stale `cswap` launcher before dispatching to the worker
 subcommand, so `cswap worker status` gets the removed-command message instead
 of reaching the worker CLI. Codex `set_account_disabled`, `set_alias`, and

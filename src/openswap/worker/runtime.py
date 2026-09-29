@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import signal
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -238,6 +239,10 @@ def read_worker_snapshot(backup_root: Path, *, now: datetime | None = None) -> W
 def _pid_exists(pid: int) -> bool:
     if type(pid) is not int or pid <= 0:
         return False
+    if sys.platform == "win32":
+        # os.kill(pid, 0) is not a probe on Windows: signal 0 is CTRL_C_EVENT,
+        # which interrupts every process on the console.
+        return _pid_exists_windows(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -247,6 +252,32 @@ def _pid_exists(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _pid_exists_windows(pid: int) -> bool:
+    """Liveness without signalling; anything unclear counts as alive."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        process_query_limited_information = 0x1000
+        still_active = 259
+        error_invalid_parameter = 87
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            error = kernel32.GetLastError()
+            if error == error_invalid_parameter:
+                return False  # no process has this pid
+            return True  # access denied, or unknown: fail closed
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return True
 
 
 class WorkerRuntime:

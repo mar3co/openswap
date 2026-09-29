@@ -197,6 +197,33 @@ def test_read_only_snapshot_reads_wal_without_shm_and_creates_nothing(tmp_path):
     assert sorted(entry.name for entry in restored.iterdir()) == before
 
 
+def test_pid_exists_reports_this_process_alive_and_a_reaped_child_gone():
+    import subprocess
+    import sys as _sys
+
+    from openswap.worker.runtime import _pid_exists
+
+    child = subprocess.Popen([_sys.executable, "-c", "pass"])
+    child.wait()
+
+    assert _pid_exists(os.getpid()) is True
+    assert _pid_exists(child.pid) is False
+
+
+def test_pid_exists_never_signals_on_windows(monkeypatch):
+    """Signal 0 is CTRL_C_EVENT on Windows: probing must not use os.kill."""
+    import openswap.worker.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        runtime_module.os, "kill", lambda *_a: pytest.fail("os.kill used as a Windows probe")
+    )
+    monkeypatch.setattr(runtime_module, "_pid_exists_windows", lambda pid: pid == 4242)
+
+    assert runtime_module._pid_exists(4242) is True
+    assert runtime_module._pid_exists(4243) is False
+
+
 def test_read_only_snapshot_quarantines_incomplete_released_lease(tmp_path):
     lease_dir = tmp_path / "worker" / "leases"
     lease_dir.mkdir(mode=0o700, parents=True)
