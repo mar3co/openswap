@@ -2103,7 +2103,8 @@ def test_leader_exit_fallback_scan_is_bounded_by_the_deadline(monkeypatch):
     process = SimpleNamespace(returncode=None, pid=4242, poll=lambda: None)
 
     assert spike._leader_exited(process, None, deadline=time.monotonic() + 0.2) is False
-    assert budgets and budgets[0] is not None and budgets[0] <= 0.2
+    # (t + 0.2) - t can round just above 0.2 when the clock has not ticked.
+    assert budgets and budgets[0] is not None and budgets[0] <= 0.2 + 1e-6
 
 
 def test_leader_exit_observation_never_reaps_when_every_check_fails(monkeypatch):
