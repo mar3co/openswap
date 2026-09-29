@@ -318,7 +318,44 @@ def _kickoff_account_identity(provider: str, selected_home: Path | str | None) -
     return stable_account_identity(provider, email, str(organization))
 
 
+def _launch_tracked_run(launch: dict):
+    """``subprocess.run`` (``check=False``) that records when the child exists.
+
+    Only an ``OSError`` raised before ``Popen`` returns proves the kickoff
+    never launched; one raised later (pipe communication or cleanup) may
+    leave a detached helper running.
+    """
+
+    def run(argv, *, timeout=None, capture_output=False, check=False, **popen_kwargs):
+        if check:
+            raise ValueError("kickoff runs never use check=True")
+        if capture_output:
+            popen_kwargs["stdout"] = subprocess.PIPE
+            popen_kwargs["stderr"] = subprocess.PIPE
+        process = subprocess.Popen(argv, **popen_kwargs)
+        launch["started"] = True
+        with process:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise
+            except BaseException:
+                process.kill()
+                raise
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+    return run
+
+
 def _run_kickoff_with_lease(provider: str, selected_home, run_fn, argv, **kwargs):
+    # With the default runner a launch failure is provable; an injected runner
+    # cannot say whether it launched, so its OSError stays uncertain.
+    launch: dict | None = None
+    if run_fn is None:
+        launch = {}
+        run_fn = _launch_tracked_run(launch)
     backup_root = paths.get_backup_root()
     store = AccountLeaseStore(backup_root, provider)
     if not load_worker_settings(backup_root).enabled:
@@ -354,7 +391,10 @@ def _run_kickoff_with_lease(provider: str, selected_home, run_fn, argv, **kwargs
         store.mark_uncertain(token, "kickoff_timeout")
         raise
     except OSError:
-        store.release(token, ReleaseEvidence.UNLAUNCHED)
+        if launch is not None and not launch.get("started"):
+            store.release(token, ReleaseEvidence.UNLAUNCHED)
+        else:
+            store.mark_uncertain(token, "kickoff_outcome_unknown")
         raise
     except BaseException:
         store.mark_uncertain(token, "kickoff_outcome_unknown")
@@ -497,11 +537,11 @@ def invoke_kickoff(
     pings the live default login (no ``CLAUDE_CONFIG_DIR``) so the backup
     refresh token is not spent a second time.
 
-    Uses a returning ``subprocess.run`` (or the injected ``run``). Never calls
+    Uses a returning ``subprocess.run`` equivalent (or the injected ``run``). Never calls
     ``os.execvpe`` / ``os.execvp`` — the menu-bar process must keep running.
     """
     which_fn = shutil.which if which is None else which
-    run_fn = subprocess.run if run is None else run
+    run_fn = run
     claude_bin = which_fn("claude")
     if not claude_bin:
         raise SessionError(
@@ -554,7 +594,7 @@ def invoke_codex_kickoff(
     live login (no ``CODEX_HOME``). Uses a returning ``subprocess.run``.
     """
     which_fn = shutil.which if which is None else which
-    run_fn = subprocess.run if run is None else run
+    run_fn = run
     codex_bin = which_fn("codex")
     if not codex_bin:
         raise SessionError(

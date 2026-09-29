@@ -479,6 +479,87 @@ def test_live_default_kickoff_refuses_unmatched_or_ambiguous_identity(
     assert AccountLeaseStore(root, "claude").current() is None
 
 
+@pytest.mark.parametrize(
+    "failure,expected_state",
+    [("popen", "released"), ("communicate", "uncertain"), ("injected", "uncertain")],
+)
+def test_kickoff_oserror_releases_the_lease_only_when_launch_is_disproved(
+    tmp_path: Path, monkeypatch, failure: str, expected_state: str
+):
+    """Only a Popen failure proves the ping never launched; an OSError after
+    launch (or from an injected runner that cannot say) stays uncertain."""
+    from openswap.settings import update_worker_settings
+    from openswap.worker.leases import AccountLeaseStore
+    from tests.test_codex_auth import _auth
+
+    root = _fake_lease_roster(monkeypatch, tmp_path, "codex")
+    update_worker_settings(root, enabled=True)
+    codex_home_dir = tmp_path / "codex-home"
+    codex_home_dir.mkdir()
+    (codex_home_dir / "auth.json").write_text(
+        _auth(email="fake@example.test", account_id="acct-fake"), encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_dir))
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            if failure == "popen":
+                raise FileNotFoundError(argv[0])
+
+        def communicate(self, timeout=None):
+            raise OSError("pipe failed after launch")
+
+        def kill(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def injected(argv, **kwargs):
+        raise OSError("unknown launch outcome")
+
+    monkeypatch.setattr("openswap.kickoff.subprocess.Popen", FakePopen)
+    with pytest.raises(OSError):
+        invoke_codex_kickoff(
+            None,
+            which=lambda _name: "/opt/fake/codex",
+            run=injected if failure == "injected" else None,
+            environ={"PATH": "/usr/bin"},
+        )
+
+    assert AccountLeaseStore(root, "codex").read_current().state == expected_state
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake executable uses a POSIX shebang")
+def test_default_kickoff_runner_captures_output_and_confirms_stop(tmp_path: Path, monkeypatch):
+    from openswap.settings import update_worker_settings
+    from openswap.worker.leases import AccountLeaseStore
+    from tests.test_codex_auth import _auth
+
+    root = _fake_lease_roster(monkeypatch, tmp_path, "codex")
+    update_worker_settings(root, enabled=True)
+    codex_home_dir = tmp_path / "codex-home"
+    codex_home_dir.mkdir()
+    (codex_home_dir / "auth.json").write_text(
+        _auth(email="fake@example.test", account_id="acct-fake"), encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_dir))
+    fake = tmp_path / "fake-codex"
+    fake.write_text("#!/bin/sh\necho pong\n", encoding="utf-8")
+    fake.chmod(0o700)
+
+    result = invoke_codex_kickoff(
+        None, which=lambda _name: str(fake), environ={"PATH": "/usr/bin:/bin"}
+    )
+
+    assert (result.returncode, result.stdout) == (0, "pong\n")
+    lease = AccountLeaseStore(root, "codex").read_current()
+    assert lease.state == "released"
+
+
 def test_kickoff_timeout_quarantines_account_until_owner_confirms_release(
     tmp_path: Path, monkeypatch
 ):
