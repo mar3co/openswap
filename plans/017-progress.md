@@ -23,8 +23,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest Phase 1-only assembled suite was green: `2995 passed, 4 skipped, 3
-warnings in 29.40s`; it includes 122 phase-one harness tests and two direct
+The latest Phase 1-only assembled suite was green: `2997 passed, 4 skipped, 3
+warnings in 29.69s`; it includes 124 phase-one harness tests and two direct
 tests of the Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`). This is Phase 1
 evidence, not validation of the Phase 2 tree; the separate full Phase 2 result
@@ -116,7 +116,7 @@ Phase 1 exit requires all of the following:
   before real Codex execution, but does not block owner-authorized local-only
   Phase 2 infrastructure work.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2995 passed, 4 skipped, 3 warnings in 29.40s`).
+  (`2997 passed, 4 skipped, 3 warnings in 29.69s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3152 passed, 4 skipped, 3 warnings in 29.57s`.
+`3154 passed, 4 skipped, 3 warnings in 30.04s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -405,7 +405,11 @@ using a lock-free read so it adds no contention with switching.
   `interrupted`. A failed final probe scan still sweeps
   descendants recorded by earlier scans. A pidfd verified by its re-read
   keeps that re-read's group and identity, so a child that called `setsid()`
-  between snapshot and open is still recognised as escaped.
+  between snapshot and open is still recognised as escaped. A probe that
+  fails mid-run scans descendants before signalling its group, while a
+  helper that detached since the last scan is still the leader's child. A
+  directory raced in during creation must pass the ownership and permission
+  check before anything is created beneath it.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the

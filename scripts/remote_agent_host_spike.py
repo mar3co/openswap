@@ -163,6 +163,15 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
         cleanup_uncertain = cleanup_uncertain or not detached_certain or tracking_incomplete
         _reap_leader(process, timeout_s=PROBE_CLEANUP_WAIT_S)
     except BaseException:
+        # Snapshot first, while the leader is still the parent of anything
+        # that detached since the last periodic scan; killing the group
+        # reparents such a helper and the sweep could no longer find it.
+        try:
+            _track_descendants(
+                process.pid, tracked, deadline=time.monotonic() + CLEANUP_SCAN_BUDGET_S
+            )
+        except Exception:
+            pass
         _cleanup_probe_process(process)
         try:
             _sweep_probe_descendants(process, tracked)
@@ -383,6 +392,9 @@ def _private_dir(path: Path) -> None:
                 raise SpikeError("Private output path changed while it was created.") from None
             if not stat_module.S_ISDIR(raced.st_mode):
                 raise SpikeError("Private output path must not traverse a symlink.")
+            # Validate before creating beneath it: another user's raced-in
+            # directory could be swapped for a symlink before the next mkdir.
+            _refuse_unsafe_directory(directory, raced)
         else:
             # A new directory entry is only durable once its parent is synced.
             _fsync_dir(directory.parent)
