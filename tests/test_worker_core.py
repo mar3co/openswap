@@ -711,7 +711,8 @@ def test_stop_during_slow_provider_start_is_acknowledged_and_enforced(tmp_path):
 
     assert not runner.is_alive()
     assert results["stop"].accepted is True
-    assert results["stop"].diagnostic_code == "stop_requested"
+    # start() was already committed: the reply says so truthfully.
+    assert results["stop"].diagnostic_code == "stop_after_launch_committed"
     assert results["run"].state == JobState.CANCELLED
     assert adapter.start_count == 1
     assert adapter.interrupt_count == 1
@@ -827,6 +828,31 @@ def test_stop_or_shutdown_just_before_start_never_launches(tmp_path, trigger, ex
 
     assert result.state == expected_state
     assert adapter.start_count == 0
+    assert AccountLeaseStore(tmp_path).current().state == "released"
+
+
+def test_stop_right_after_the_launch_fence_reports_the_committed_launch(tmp_path):
+    update_worker_settings(tmp_path, enabled=True)
+    identity = stable_account_identity("codex", "synthetic-worker-test")
+    stops = []
+
+    class StopAtStartAdapter(_FakeAdapter):
+        def start(self, job, workspace, *, worker_epoch):
+            # The fence passed and released the lock; a stop lands before
+            # the provider actually launches.
+            stops.append(runtime.stop(job.job_id))
+            return super().start(job, workspace, worker_epoch=worker_epoch)
+
+    adapter = StopAtStartAdapter(stopped=True)
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    runtime.submit(_submission())
+
+    result = runtime.reconcile_once()
+
+    assert stops[0].accepted is True
+    assert stops[0].diagnostic_code == "stop_after_launch_committed"
+    assert result.state == JobState.CANCELLED
+    assert adapter.start_count == 1 and adapter.interrupt_count == 1
     assert AccountLeaseStore(tmp_path).current().state == "released"
 
 

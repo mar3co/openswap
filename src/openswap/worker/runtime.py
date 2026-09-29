@@ -250,6 +250,10 @@ class WorkerRuntime:
         self._quarantine_lease_for_recovered_jobs()
         self._admission_lock = threading.RLock()
         self._launch_lock = threading.RLock()
+        # Set under _launch_lock when the final fence passes and start() is
+        # about to run: a stop after that point is reported as arriving after
+        # the launch was committed (it is enforced by interrupting the run).
+        self._launch_committed: str | None = None
         self._event_reader_lock = threading.Lock()
         self._event_reader: threading.Thread | None = None
         self._active_run = None
@@ -336,6 +340,12 @@ class WorkerRuntime:
                 )
             except StaleWriteError:
                 return ControlResult(False, job_id=record.job_id, diagnostic_code="stale_job_state")
+            if self._launch_committed == record.job_id:
+                # The provider start was already committed: it cannot be
+                # prevented, only interrupted once start() returns.
+                return ControlResult(
+                    True, job_id=updated.job_id, diagnostic_code="stop_after_launch_committed",
+                )
             return ControlResult(True, job_id=updated.job_id, diagnostic_code="stop_requested")
 
     def set_paused(self, paused: bool) -> ControlResult:
@@ -718,6 +728,7 @@ class WorkerRuntime:
                     expected_generation=starting.generation,
                     provider_session_id=run.session_id,
                 )
+                self._launch_committed = None
                 return self.store.get(running.job_id), run, token, deadline
         except Exception:
             recovered = self._cleanup_started_run(starting, run, token)
@@ -783,6 +794,10 @@ class WorkerRuntime:
             try:
                 with self._launch_lock:
                     skipped = self._launch_fence(starting.job_id, shutdown_event)
+                    if skipped is None:
+                        # Committed atomically with the fence: any stop from
+                        # here on is reported as after the launch.
+                        self._launch_committed = starting.job_id
                 if skipped is not None:
                     with outcome_lock:
                         outcome["skipped"] = skipped
@@ -1078,6 +1093,7 @@ class WorkerRuntime:
     def _clear_active(self) -> None:
         self._active_lease = None
         self._active_run = None
+        self._launch_committed = None
 
     def _resolve_workspace(self, workspace_id: str, job_id: str) -> ResolvedWorkspace:
         settings = load_worker_settings(self.backup_root)
