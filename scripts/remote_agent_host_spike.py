@@ -159,7 +159,9 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
                 cleanup_uncertain = _cleanup_probe_process(process)
         # Group signals miss a descendant that left the group, so hunt the
         # tracked ones before the leader is reaped. Any found refuses the result.
-        detached, detached_certain = _sweep_probe_descendants(process, tracked)
+        detached, detached_certain = _sweep_probe_descendants(
+            process, tracked, tracking_incomplete=tracking_incomplete
+        )
         cleanup_uncertain = cleanup_uncertain or not detached_certain or tracking_incomplete
         _reap_leader(process, timeout_s=PROBE_CLEANUP_WAIT_S)
     except BaseException:
@@ -257,8 +259,8 @@ def _pid_state(pid: int, timeout_s: float | None = None) -> str | None:
     return state or None
 
 
-def _probe_group_running(pgid: int) -> bool:
-    return _group_alive(pgid)
+def _probe_group_running(pgid: int, deadline: float | None = None) -> bool:
+    return _group_alive(pgid, deadline)
 
 
 def _cleanup_probe_process(process: subprocess.Popen) -> bool:
@@ -270,9 +272,10 @@ def _cleanup_probe_process(process: subprocess.Popen) -> bool:
     """
     _signal_group(process, signal.SIGTERM)
     deadline = time.monotonic() + PROBE_TERMINATION_GRACE_S
-    while _probe_group_running(process.pid) and time.monotonic() < deadline:
+    while _probe_group_running(process.pid, deadline) and time.monotonic() < deadline:
         time.sleep(0.02)
-    if _probe_group_running(process.pid):
+    # A scan that cannot finish by the grace deadline errs toward "running".
+    if _probe_group_running(process.pid, deadline):
         _signal_group(process, signal.SIGKILL)
     if not _wait_leader_exited(process, PROBE_CLEANUP_WAIT_S):
         _signal_group(process, signal.SIGKILL)
@@ -287,7 +290,10 @@ def _cleanup_probe_process(process: subprocess.Popen) -> bool:
 
 
 def _sweep_probe_descendants(
-    process: subprocess.Popen, tracked: dict[int, tuple[int, str, str, int | None, str, bool]]
+    process: subprocess.Popen,
+    tracked: dict[int, tuple[int, str, str, int | None, str, bool]],
+    *,
+    tracking_incomplete: bool = False,
 ) -> tuple[bool, bool]:
     """Terminate tracked probe descendants outside its group: (any found, cleanup certain).
 
@@ -298,7 +304,9 @@ def _sweep_probe_descendants(
     scanned = _track_descendants(
         process.pid, tracked, deadline=time.monotonic() + CLEANUP_SCAN_BUDGET_S
     )
-    escaped = _escaped_descendants(process.pid, tracked)
+    escaped = _escaped_descendants(
+        process.pid, tracked, include_grouped_pidfds=tracking_incomplete or not scanned
+    )
     if not escaped:
         return False, scanned
     all_gone, _mode = _terminate_pids(escaped, grace_s=PROBE_TERMINATION_GRACE_S)
@@ -547,9 +555,9 @@ def _recover_uncertain_runs_locked(state_dir: Path) -> list[str]:
     return interrupted
 
 
-def _group_alive(pgid: int) -> bool:
+def _group_alive(pgid: int, deadline: float | None = None) -> bool:
     """Whether any process in ``pgid`` can still execute (zombies excluded)."""
-    observed = _group_has_running_members(pgid)
+    observed = _group_has_running_members(pgid, deadline)
     if observed is not None:
         return observed
     # Without enumeration, killpg(0) also succeeds for a zombie-only group, so
@@ -570,8 +578,12 @@ def _signal_group(process: subprocess.Popen, sig: int) -> None:
         pass
 
 
-def _group_has_running_members(pgid: int) -> bool | None:
-    """Return whether the group has non-zombie processes; None if unavailable."""
+def _group_has_running_members(pgid: int, deadline: float | None = None) -> bool | None:
+    """Return whether the group has non-zombie processes; None if unavailable.
+
+    On macOS the ``ps`` scan is bounded by ``deadline`` (one second at most),
+    so a stalled ``ps`` cannot postpone a signal past its grace deadline.
+    """
     if sys.platform.startswith("linux"):
         proc_root = Path("/proc")
         try:
@@ -599,7 +611,7 @@ def _group_has_running_members(pgid: int) -> bool | None:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=1,
+                timeout=min(GROUP_SCAN_TIMEOUT_S, _ps_budget(deadline)),
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
@@ -619,8 +631,10 @@ def _group_has_running_members(pgid: int) -> bool | None:
     return None
 
 
-def _group_running(pgid: int, reader: threading.Thread) -> bool:
-    observed = _group_has_running_members(pgid)
+def _group_running(
+    pgid: int, reader: threading.Thread, deadline: float | None = None
+) -> bool:
+    observed = _group_has_running_members(pgid, deadline)
     if observed is not None:
         return observed
     # Without enumeration, EOF alone cannot prove that all descendants exited
@@ -645,9 +659,10 @@ def _terminate_group(
     """TERM, then KILL only our process group; return if cleanup is uncertain."""
     _signal_group(process, signal.SIGTERM)
     grace_deadline = time.monotonic() + grace_s
-    while _group_running(process.pid, reader) and time.monotonic() < grace_deadline:
+    while _group_running(process.pid, reader, grace_deadline) and time.monotonic() < grace_deadline:
         time.sleep(0.03)
-    if _group_running(process.pid, reader):
+    # A scan that cannot finish by the grace deadline errs toward "running".
+    if _group_running(process.pid, reader, grace_deadline):
         _signal_group(process, signal.SIGKILL)
     # Observe the leader's exit without reaping it: the caller reaps only after
     # descendant discovery and cleanup, so the leader's pid (our pgid, and the
@@ -714,8 +729,12 @@ def _abort_supervision(
         pass
     try:
         _terminate_group(process, reader, grace_s=grace_s)
-        _track_descendants(process.pid, tracked, deadline=time.monotonic() + CLEANUP_SCAN_BUDGET_S)
-        leftover = _escaped_descendants(process.pid, tracked)
+        scanned = _track_descendants(
+            process.pid, tracked, deadline=time.monotonic() + CLEANUP_SCAN_BUDGET_S
+        )
+        leftover = _escaped_descendants(
+            process.pid, tracked, include_grouped_pidfds=not scanned
+        )
         if leftover:
             _terminate_pids(leftover, grace_s=grace_s)
     except Exception:
@@ -1006,21 +1025,34 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _escaped_descendants(
-    leader_pid: int, tracked: dict[int, tuple[int, str, str, int | None, str, bool]]
+    leader_pid: int,
+    tracked: dict[int, tuple[int, str, str, int | None, str, bool]],
+    *,
+    include_grouped_pidfds: bool = False,
 ) -> dict[int, tuple[str, int | None, bool]]:
     """Tracked pids outside the leader's group that are still alive: identity, handle, verified.
 
     Reads ``tracked`` as the caller's latest :func:`_track_descendants` scan
     left it; it never scans itself, so a failed scan cannot go unreported.
+    With ``include_grouped_pidfds`` (tracking was incomplete) a live pidfd
+    counts even if its cached group is the leader's: the child may have
+    called setsid() after its last successful scan, and the pidfd still
+    identifies it safely.
     """
-    return {
-        pid: (identity, handle, verified)
-        for pid, (pgid, stat, _birth, handle, identity, verified) in sorted(tracked.items())
-        if pgid != leader_pid and not stat.startswith(("Z", "X")) and _pid_alive(pid)
-    }
+    escaped = {}
+    for pid, (pgid, stat, _birth, handle, identity, verified) in sorted(tracked.items()):
+        if stat.startswith(("Z", "X")):
+            continue
+        if pgid != leader_pid:
+            if _pid_alive(pid):
+                escaped[pid] = (identity, handle, verified)
+        elif include_grouped_pidfds and handle is not None and not _pidfd_exited(handle):
+            escaped[pid] = (identity, handle, verified)
+    return escaped
 
 
 PS_TIMEOUT_S = 5.0
+GROUP_SCAN_TIMEOUT_S = 1.0
 # A deadline-bounded scan never runs past the deadline (this floor only keeps
 # the timeout positive). No periodic scan starts with less than
 # SCAN_WINDOW_S left, so a loaded host cannot fail one near the deadline and
@@ -1334,8 +1366,6 @@ def _supervise_fake_command_locked(
                 break
             time.sleep(min(DESCENDANT_SNAPSHOT_INTERVAL_S, remaining))
         timed_out = not _leader_exited(process, deadline=time.monotonic() + SCAN_WINDOW_S)
-        if timed_out:
-            _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
         # One short bounded scan while the leader is still unreaped, before any
         # group signal: a run too short for a periodic scan still attributes a
         # helper that already detached, before killing the leader reparents it.
@@ -1348,14 +1378,19 @@ def _supervise_fake_command_locked(
         # A provider parent may exit while a child keeps the pipe or continues
         # work. Clean the group after timeout and after every leader exit, and
         # only report success when enumeration and the output reader are quiet.
+        # Terminate before journaling the cancellation: an fsync on stalled
+        # storage must not keep a timed-out provider running. If the append
+        # then fails, the journal still holds the non-terminal "running" row,
+        # so recovery reports the job as interrupted.
         if timed_out:
             cleanup_uncertain = _terminate_group(process, reader, grace_s=grace_s)
+            _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
         else:
             reader.join(timeout=0.05)
             leftovers = _group_running(process.pid, reader)
             if leftovers:
-                _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
                 cleanup_uncertain = _terminate_group(process, reader, grace_s=grace_s)
+                _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
         unexpected_leftovers = bool(not timed_out and leftovers)
         # Re-snapshot once more, then hunt tracked descendants that left the
         # group (setsid). Anything found forces "interrupted" below.
@@ -1363,7 +1398,9 @@ def _supervise_fake_command_locked(
             process.pid, tracked, deadline=time.monotonic() + CLEANUP_SCAN_BUDGET_S
         ):
             tracking_complete = False
-        escaped = _escaped_descendants(process.pid, tracked)
+        escaped = _escaped_descendants(
+            process.pid, tracked, include_grouped_pidfds=not tracking_complete
+        )
         if escaped:
             escaped_terminated, escaped_signalling = _terminate_pids(escaped, grace_s=grace_s)
         # Only now is the leader reaped: discovery and cleanup are complete.

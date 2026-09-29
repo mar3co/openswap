@@ -23,8 +23,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest Phase 1-only assembled suite was green: `2997 passed, 4 skipped, 3
-warnings in 29.69s`; it includes 124 phase-one harness tests and two direct
+The latest Phase 1-only assembled suite was green: `2999 passed, 5 skipped, 3
+warnings in 33.63s`; it includes 127 phase-one harness tests and two direct
 tests of the Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`). This is Phase 1
 evidence, not validation of the Phase 2 tree; the separate full Phase 2 result
@@ -116,7 +116,7 @@ Phase 1 exit requires all of the following:
   before real Codex execution, but does not block owner-authorized local-only
   Phase 2 infrastructure work.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2997 passed, 4 skipped, 3 warnings in 29.69s`).
+  (`2999 passed, 5 skipped, 3 warnings in 33.63s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -412,7 +412,13 @@ using a lock-free read so it adds no contention with switching.
   fails mid-run scans descendants before signalling its group, while a
   helper that detached since the last scan is still the leader's child. A
   directory raced in during creation must pass the ownership and permission
-  check before anything is created beneath it.
+  check before anything is created beneath it. When tracking was incomplete,
+  cleanup also sweeps live pidfd descendants still cached in the leader's
+  group, since one may have called `setsid()` after its last scan. A timeout
+  terminates the group before journaling `cancel_requested`, so stalled
+  storage cannot keep a provider running; a failed append leaves the
+  recoverable `running` row. macOS group scans during termination are
+  bounded by the grace deadline, so a stalled `ps` cannot delay SIGKILL.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the
