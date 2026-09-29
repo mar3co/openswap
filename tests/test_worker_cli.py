@@ -409,7 +409,7 @@ def test_release_lease_succeeds_after_worker_gone_and_job_terminal_then_switch_w
     claimed = runtime.store.claim(
         job.job_id, worker_epoch=runtime.worker_epoch, expected_generation=job.generation,
     )
-    running, _run, _token = runtime._prepare_run(claimed)
+    running, _run, _token, _deadline = runtime._prepare_run(claimed)
     assert running.state == JobState.RUNNING
     stuck_lease = AccountLeaseStore(tmp_path, "codex").current()
     assert stuck_lease.state == "active"

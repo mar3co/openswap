@@ -380,8 +380,9 @@ class WorkerRuntime:
         prepared = self._prepare_run(claimed, shutdown_event)
         if isinstance(prepared, JobRecord):
             return prepared
-        running, run, token = prepared
-        deadline = self.monotonic() + running.runtime_limit_s
+        # The runtime limit started when start() was called, not when it
+        # returned: startup spends the same budget.
+        running, run, token, deadline = prepared
         current = running
         provider_cursor = run.provider_event_cursor
         finished_event_candidate = None
@@ -670,7 +671,10 @@ class WorkerRuntime:
             return prepared
         starting, token, workspace = prepared
         try:
-            run, abandon_reason = self._start_while_monitoring(starting, workspace, shutdown_event)
+            deadline = self.monotonic() + starting.runtime_limit_s
+            run, abandon_reason = self._start_while_monitoring(
+                starting, workspace, shutdown_event, deadline,
+            )
             if abandon_reason is None and not isinstance(run, ProviderRun):
                 raise RuntimeError("invalid_provider_run")
         except Exception:
@@ -708,7 +712,7 @@ class WorkerRuntime:
                     expected_generation=starting.generation,
                     provider_session_id=run.session_id,
                 )
-                return self.store.get(running.job_id), run, token
+                return self.store.get(running.job_id), run, token, deadline
         except Exception:
             recovered = self._cleanup_started_run(starting, run, token)
             if recovered is not None:
@@ -717,6 +721,7 @@ class WorkerRuntime:
 
     def _start_while_monitoring(
         self, starting: JobRecord, workspace, shutdown_event: threading.Event | None,
+        deadline: float,
     ) -> tuple[ProviderRun | None, str | None]:
         """Call ``start()`` on a tracked thread so stop, shutdown and the
         runtime limit stay enforceable while it runs.
@@ -755,7 +760,6 @@ class WorkerRuntime:
             self._event_reader = thread
             thread.start()
 
-        deadline = self.monotonic() + starting.runtime_limit_s
         cancel_grace_until = None
         while not completed.wait(0.05):
             self.heartbeat()

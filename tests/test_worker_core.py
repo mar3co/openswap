@@ -640,7 +640,7 @@ def test_worker_restart_quarantines_an_active_lease_left_by_a_crashed_process(tm
     claimed = crashed.store.claim(
         job.job_id, worker_epoch=crashed.worker_epoch, expected_generation=job.generation,
     )
-    running, _run, _token = crashed._prepare_run(claimed)
+    running, _run, _token, _deadline = crashed._prepare_run(claimed)
     assert running.state == JobState.RUNNING
     assert AccountLeaseStore(tmp_path).current().state == "active"
 
@@ -801,6 +801,34 @@ def test_deadline_and_shutdown_require_explicit_stop_proof(
 
     assert result.state == expected_state
     assert AccountLeaseStore(tmp_path).current().state == expected_lease
+
+
+def test_runtime_limit_counts_time_spent_in_provider_start(tmp_path):
+    update_worker_settings(tmp_path, enabled=True)
+    identity = stable_account_identity("codex", "synthetic-worker-test")
+    clock = [0.0]
+
+    class SlowStartAdapter(_FakeAdapter):
+        def start(self, job, workspace, *, worker_epoch):
+            clock[0] += 9.0  # startup spends most of the 10 s limit
+            return super().start(job, workspace, worker_epoch=worker_epoch)
+
+        def events(self, run, *, after_cursor):
+            clock[0] += 2.0
+            return super().events(run, after_cursor=after_cursor)
+
+    adapter = SlowStartAdapter(stopped=True)
+    runtime = WorkerRuntime(
+        tmp_path, adapter=adapter, account_identity=identity, monotonic=lambda: clock[0],
+    )
+    runtime.submit(_submission(runtime_limit_s=10))
+
+    result = runtime.reconcile_once()
+
+    # Without the startup time the loop would have granted a fresh 10 s.
+    assert result.state == JobState.FAILED
+    assert result.diagnostic_code == "runtime_limit_reached"
+    assert len(adapter.event_cursors) == 1
 
 
 @pytest.mark.parametrize(

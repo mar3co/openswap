@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3176 passed, 5 skipped, 3 warnings in 39.20s`.
+`3179 passed, 5 skipped, 3 warnings in 41.27s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -285,6 +285,8 @@ the runtime limit is enforced while it runs. After a stop, start has a
 that still has not returned is abandoned: the job is interrupted, the
 lease is quarantined, admission stays blocked until the thread exits, and
 a late handle is interrupted best effort (never stop proof).
+The runtime limit starts when `start()` is called, so time spent starting
+counts against it instead of the running loop granting a fresh limit.
 The CLI now rejects a stale `cswap` launcher before dispatching to the worker
 subcommand, so `cswap worker status` gets the removed-command message instead
 of reaching the worker CLI. Codex `set_account_disabled`, `set_alias`, and
