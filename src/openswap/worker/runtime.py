@@ -666,7 +666,7 @@ class WorkerRuntime:
         except Exception:
             availability = ProviderAvailability(False, "provider_unavailable", None)
         with self._launch_lock:
-            prepared = self._prepare_launch(claimed, availability)
+            prepared = self._prepare_launch(claimed, availability, shutdown_event)
         if isinstance(prepared, JobRecord):
             return prepared
         starting, token, workspace = prepared
@@ -793,11 +793,25 @@ class WorkerRuntime:
                 raise outcome["error"]
             return outcome.get("run"), None
 
-    def _prepare_launch(self, claimed: JobRecord, availability: ProviderAvailability):
+    def _prepare_launch(
+        self, claimed: JobRecord, availability: ProviderAvailability,
+        shutdown_event: threading.Event | None = None,
+    ):
         """Journal and lease steps before launch; runs under the control lock."""
         current = self.store.get(claimed.job_id)
         if current.state == JobState.CANCEL_REQUESTED:
             return self._cancel_before_launch(current)
+        # A shutdown or opt-out that arrived while probe() ran records no
+        # journal cancellation, so check it here, before any lease or launch.
+        if (
+            (shutdown_event is not None and shutdown_event.is_set())
+            or not load_worker_settings(self.backup_root).enabled
+        ):
+            return self.store.transition(
+                current.job_id, expected_states=(JobState.CLAIMED,),
+                new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
+                expected_generation=current.generation, diagnostic_code="worker_disabled",
+            )
         if not availability.available:
             return self.store.transition(
                 current.job_id, expected_states=(JobState.CLAIMED,),

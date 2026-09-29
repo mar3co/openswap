@@ -197,8 +197,7 @@ def test_stop_during_interrupt_uses_latest_generation_without_retry(
     job = runtime.submit(_submission())
     adapter.runtime = runtime
     adapter.job_id = job.job_id
-    shutdown = threading.Event()
-    shutdown.set()
+    shutdown = _ShutdownAfterLaunch(adapter)
 
     result = runtime.reconcile_once(shutdown_event=shutdown)
 
@@ -224,8 +223,7 @@ def test_journal_failure_while_recording_an_interrupt_is_not_swallowed(tmp_path)
         return real_transition(job_id, **kwargs)
 
     runtime.store.transition = failing_transition
-    shutdown = threading.Event()
-    shutdown.set()
+    shutdown = _ShutdownAfterLaunch(adapter)
 
     with pytest.raises(OSError, match="disk full"):
         runtime.reconcile_once(shutdown_event=shutdown)
@@ -250,8 +248,7 @@ def test_journal_reload_failure_after_an_interrupt_is_not_swallowed(tmp_path):
         return real_get(job_id)
 
     runtime.store.get = failing_get
-    shutdown = threading.Event()
-    shutdown.set()
+    shutdown = _ShutdownAfterLaunch(adapter)
 
     with pytest.raises(OSError, match="journal unreadable"):
         runtime.reconcile_once(shutdown_event=shutdown)
@@ -541,6 +538,20 @@ def test_expired_queued_job_becomes_expired_without_adapter_start(tmp_path):
     assert adapter.start_count == 0
 
 
+class _ShutdownAfterLaunch:
+    """A shutdown signal that arrives once the provider has launched.
+
+    A shutdown already set before launch never starts the provider, so tests
+    of interrupting a running provider must deliver it afterwards.
+    """
+
+    def __init__(self, adapter):
+        self._adapter = adapter
+
+    def is_set(self) -> bool:
+        return self._adapter.start_count > 0
+
+
 class _FakeAdapter:
     def __init__(self, events=(), *, stopped=True, block_start=False, block_probe=False):
         self.events_out = tuple(events)
@@ -749,6 +760,35 @@ def test_hung_provider_start_is_abandoned_as_uncertain_and_blocks_admission(
     assert adapter.interrupt_count == 1  # the late handle is interrupted
 
 
+@pytest.mark.parametrize("trigger", ["shutdown", "opt_out"])
+def test_shutdown_during_slow_probe_never_launches(tmp_path, trigger):
+    update_worker_settings(tmp_path, enabled=True)
+    identity = stable_account_identity("codex", "synthetic-worker-test")
+    adapter = _FakeAdapter(block_probe=True)
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    runtime.submit(_submission())
+    shutdown = threading.Event()
+    results = {}
+    runner = threading.Thread(
+        target=lambda: results.setdefault("run", runtime.reconcile_once(shutdown_event=shutdown))
+    )
+
+    runner.start()
+    assert adapter.probe_entered.wait(3)
+    if trigger == "shutdown":
+        shutdown.set()
+    else:
+        update_worker_settings(tmp_path, enabled=False)
+    adapter.release_probe.set()
+    runner.join(3)
+
+    assert not runner.is_alive()
+    assert results["run"].state == JobState.FAILED
+    assert results["run"].diagnostic_code == "worker_disabled"
+    assert adapter.start_count == 0
+    assert AccountLeaseStore(tmp_path).current() is None
+
+
 def test_stop_during_slow_probe_cancels_before_launch(tmp_path):
     update_worker_settings(tmp_path, enabled=True)
     identity = stable_account_identity("codex", "synthetic-worker-test")
@@ -793,9 +833,7 @@ def test_deadline_and_shutdown_require_explicit_stop_proof(
         monotonic=lambda: clock[0], sleeper=lambda _: clock.__setitem__(0, 11.0),
     )
     runtime.submit(_submission(runtime_limit_s=10))
-    shutdown = threading.Event()
-    if reason == "shutdown":
-        shutdown.set()
+    shutdown = _ShutdownAfterLaunch(adapter) if reason == "shutdown" else threading.Event()
 
     result = runtime.reconcile_once(shutdown_event=shutdown)
 
