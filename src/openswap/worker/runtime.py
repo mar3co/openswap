@@ -373,8 +373,7 @@ class WorkerRuntime:
                 expected_generation=item.generation,
             )
 
-        with self._launch_lock:
-            prepared = self._prepare_run(claimed)
+        prepared = self._prepare_run(claimed)
         if isinstance(prepared, JobRecord):
             return prepared
         running, run, token = prepared
@@ -636,19 +635,72 @@ class WorkerRuntime:
         """Clear this process's health record after its server thread exits."""
         self.store.mark_stopped(self.worker_pid, self.worker_epoch)
 
+    def _cancel_before_launch(self, current: JobRecord, token=None) -> JobRecord:
+        if token is not None:
+            self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
+            self._clear_active()
+        return self.store.transition(
+            current.job_id, expected_states=(JobState.CANCEL_REQUESTED,),
+            new_state=JobState.CANCELLED, worker_epoch=self.worker_epoch,
+            expected_generation=current.generation,
+            diagnostic_code="cancel_requested",
+        )
+
     def _prepare_run(self, claimed: JobRecord):
-        current = self.store.get(claimed.job_id)
-        if current.state == JobState.CANCEL_REQUESTED:
-            return self.store.transition(
-                current.job_id, expected_states=(JobState.CANCEL_REQUESTED,),
-                new_state=JobState.CANCELLED, worker_epoch=self.worker_epoch,
-                expected_generation=current.generation,
-                diagnostic_code="cancel_requested",
-            )
+        # Provider calls (probe, start) run without the control lock so stop()
+        # and cancel() stay responsive; every journal step is taken under it
+        # against a freshly read fence. A stop that lands during start() makes
+        # the STARTING -> RUNNING write stale, and the started run is then
+        # interrupted instead of replayed.
+        with self._launch_lock:
+            current = self.store.get(claimed.job_id)
+            if current.state == JobState.CANCEL_REQUESTED:
+                return self._cancel_before_launch(current)
         try:
             availability = self.adapter.probe()
         except Exception:
             availability = ProviderAvailability(False, "provider_unavailable", None)
+        with self._launch_lock:
+            prepared = self._prepare_launch(claimed, availability)
+        if isinstance(prepared, JobRecord):
+            return prepared
+        starting, token, workspace = prepared
+        try:
+            run = self.adapter.start(starting, workspace, worker_epoch=self.worker_epoch)
+            if not isinstance(run, ProviderRun):
+                raise RuntimeError("invalid_provider_run")
+            self._active_run = run
+        except Exception:
+            self.leases.mark_uncertain(token, "launch_uncertain")
+            self._clear_active()
+            with self._launch_lock:
+                latest = self.store.get(starting.job_id)
+                return self.store.transition(
+                    latest.job_id, expected_states=(latest.state,),
+                    new_state=JobState.INTERRUPTED, worker_epoch=self.worker_epoch,
+                    expected_generation=latest.generation,
+                    diagnostic_code="execution_uncertain",
+                )
+        try:
+            with self._launch_lock:
+                running = self.store.transition(
+                    starting.job_id, expected_states=(JobState.STARTING,),
+                    new_state=JobState.RUNNING, worker_epoch=self.worker_epoch,
+                    expected_generation=starting.generation,
+                    provider_session_id=run.session_id,
+                )
+                return self.store.get(running.job_id), run, token
+        except Exception:
+            recovered = self._cleanup_started_run(starting, run, token)
+            if recovered is not None:
+                return recovered
+            raise
+
+    def _prepare_launch(self, claimed: JobRecord, availability: ProviderAvailability):
+        """Journal and lease steps before launch; runs under the control lock."""
+        current = self.store.get(claimed.job_id)
+        if current.state == JobState.CANCEL_REQUESTED:
+            return self._cancel_before_launch(current)
         if not availability.available:
             return self.store.transition(
                 current.job_id, expected_states=(JobState.CLAIMED,),
@@ -707,33 +759,7 @@ class WorkerRuntime:
                 new_state=JobState.EXPIRED, worker_epoch=self.worker_epoch,
                 expected_generation=starting.generation, diagnostic_code="job_expired",
             )
-        try:
-            run = self.adapter.start(starting, workspace, worker_epoch=self.worker_epoch)
-            if not isinstance(run, ProviderRun):
-                raise RuntimeError("invalid_provider_run")
-            self._active_run = run
-        except Exception:
-            self.leases.mark_uncertain(token, "launch_uncertain")
-            self._clear_active()
-            return self.store.transition(
-                starting.job_id, expected_states=(JobState.STARTING,),
-                new_state=JobState.INTERRUPTED, worker_epoch=self.worker_epoch,
-                expected_generation=starting.generation,
-                diagnostic_code="execution_uncertain",
-            )
-        try:
-            running = self.store.transition(
-                starting.job_id, expected_states=(JobState.STARTING,),
-                new_state=JobState.RUNNING, worker_epoch=self.worker_epoch,
-                expected_generation=starting.generation,
-                provider_session_id=run.session_id,
-            )
-            return self.store.get(running.job_id), run, token
-        except Exception:
-            recovered = self._cleanup_started_run(starting, run, token)
-            if recovered is not None:
-                return recovered
-            raise
+        return starting, token, workspace
 
     def _cleanup_started_run(self, starting: JobRecord, run: ProviderRun, token) -> JobRecord | None:
         """Stop an owned launch if post-start journal work fails; never replay it."""

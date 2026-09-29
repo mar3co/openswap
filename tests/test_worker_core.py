@@ -542,10 +542,13 @@ def test_expired_queued_job_becomes_expired_without_adapter_start(tmp_path):
 
 
 class _FakeAdapter:
-    def __init__(self, events=(), *, stopped=True, block_start=False):
+    def __init__(self, events=(), *, stopped=True, block_start=False, block_probe=False):
         self.events_out = tuple(events)
         self.stopped = stopped
         self.block_start = block_start
+        self.block_probe = block_probe
+        self.probe_entered = threading.Event()
+        self.release_probe = threading.Event()
         self.start_entered = threading.Event()
         self.release_start = threading.Event()
         self.start_count = 0
@@ -554,6 +557,9 @@ class _FakeAdapter:
         self.workspace = None
 
     def probe(self):
+        self.probe_entered.set()
+        if self.block_probe:
+            assert self.release_probe.wait(3)
         return ProviderAvailability(True, None, "fake-test")
 
     def start(self, job, workspace, *, worker_epoch):
@@ -670,7 +676,7 @@ def test_worker_restart_leaves_an_unrelated_released_lease_alone(tmp_path):
     assert AccountLeaseStore(tmp_path).current().state == "released"
 
 
-def test_stop_cannot_race_provider_start_and_ack_is_not_stop_proof(tmp_path):
+def test_stop_during_slow_provider_start_is_acknowledged_and_enforced(tmp_path):
     update_worker_settings(tmp_path, enabled=True)
     identity = stable_account_identity("codex", "synthetic-worker-test")
     adapter = _FakeAdapter(block_start=True, stopped=True)
@@ -683,19 +689,43 @@ def test_stop_cannot_race_provider_start_and_ack_is_not_stop_proof(tmp_path):
     runner.start()
     assert adapter.start_entered.wait(3)
     stopper.start()
-    # The stop write is serialized behind the provider-start decision. It is
-    # not acknowledged until start returns and the active generation is known.
-    assert "stop" not in results
+    # start() runs without the control lock: the stop is journaled while the
+    # provider is still starting, then enforced once start returns.
+    stopper.join(3)
+    assert not stopper.is_alive()
+    assert runtime.get(job.job_id).state == JobState.CANCEL_REQUESTED
     adapter.release_start.set()
     runner.join(3)
-    stopper.join(3)
 
-    assert not runner.is_alive() and not stopper.is_alive()
+    assert not runner.is_alive()
     assert results["stop"].accepted is True
     assert results["stop"].diagnostic_code == "stop_requested"
     assert results["run"].state == JobState.CANCELLED
     assert adapter.start_count == 1
+    assert adapter.interrupt_count == 1
     assert AccountLeaseStore(tmp_path).current().state == "released"
+
+
+def test_stop_during_slow_probe_cancels_before_launch(tmp_path):
+    update_worker_settings(tmp_path, enabled=True)
+    identity = stable_account_identity("codex", "synthetic-worker-test")
+    adapter = _FakeAdapter(block_probe=True)
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    job = runtime.submit(_submission())
+    results = {}
+    runner = threading.Thread(target=lambda: results.setdefault("run", runtime.reconcile_once()))
+
+    runner.start()
+    assert adapter.probe_entered.wait(3)
+    stopped = runtime.stop(job.job_id)
+    adapter.release_probe.set()
+    runner.join(3)
+
+    assert not runner.is_alive()
+    assert stopped.accepted is True
+    assert results["run"].state == JobState.CANCELLED
+    assert adapter.start_count == 0
+    assert AccountLeaseStore(tmp_path).current() is None
 
 
 @pytest.mark.parametrize(
