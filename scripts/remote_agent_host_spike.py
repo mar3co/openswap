@@ -1405,7 +1405,9 @@ def _supervise_fake_command_locked(
                     # while the leader is alive, whatever group they moved to.
                     _track_descendants(process.pid, tracked, table, deadline)
             if _leader_exited(process, table, deadline=deadline):
-                exited_in_time = True
+                # Only an exit observed by the deadline counts; one seen after
+                # it (a late resume, or a check that ran past it) is a timeout.
+                exited_in_time = time.monotonic() <= deadline
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:

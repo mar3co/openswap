@@ -1837,6 +1837,33 @@ def test_supervision_failure_waits_for_the_running_row_before_releasing_the_lock
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
 @pytest.mark.xdist_group("spike_procs")
+def test_in_loop_exit_observed_past_the_deadline_is_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 0.6
+    fake = _executable(tmp_path / "fake-late-exit", f"import time\ntime.sleep({timeout_s + 0.1})\n")
+    real_exited = spike._leader_exited
+    start = time.monotonic()
+
+    def check_that_crosses_the_deadline(process, table=None, deadline=None):
+        # The in-loop check starts before the deadline but returns after the
+        # child exited late.
+        if deadline is not None and time.monotonic() > start + timeout_s - 0.2:
+            time.sleep(max(0.0, start + timeout_s + 0.2 - time.monotonic()))
+            return real_exited(process, table, deadline)
+        return False
+
+    monkeypatch.setattr(spike, "_leader_exited", check_that_crosses_the_deadline)
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=timeout_s, grace_s=0.2,
+        job_id="late-in-loop",
+    )
+
+    states = [row["state"] for row in _read_rows(tmp_path / "state" / "journal.jsonl")]
+    assert result["state"] != "succeeded"
+    assert "cancel_requested" in states
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
 def test_exit_seen_only_after_the_deadline_is_still_a_timeout(tmp_path, monkeypatch):
     timeout_s = 0.6
     # The child exits 0.1 s after the deadline.
