@@ -1814,6 +1814,32 @@ def test_group_kill_is_not_delayed_by_a_stalled_macos_group_scan(monkeypatch):
         process.wait(timeout=5)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="probe process groups are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_every_probe_and_termination_group_scan_is_deadline_bounded(tmp_path, monkeypatch):
+    fake = _executable(tmp_path / "fake-codex", "print('codex-cli 1.2.3')\n")
+    deadlines: list = []
+    real_members = spike._group_has_running_members
+
+    def recording_members(pgid, deadline=None):
+        deadlines.append(deadline)
+        return real_members(pgid, deadline)
+
+    monkeypatch.setattr(spike, "_group_has_running_members", recording_members)
+    spike._run_probe(
+        [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=5
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        spike._terminate_group(process, threading.Thread(target=lambda: None), grace_s=0.1)
+    finally:
+        process.wait(timeout=5)
+
+    assert deadlines and all(d is not None for d in deadlines), deadlines
+
+
 @pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="pidfds are Linux-only")
 @pytest.mark.xdist_group("spike_procs")
 def test_failed_final_scan_sweeps_a_pidfd_child_cached_in_the_leader_group(monkeypatch):
@@ -2103,7 +2129,8 @@ def test_leader_exit_fallback_scan_is_bounded_by_the_deadline(monkeypatch):
     process = SimpleNamespace(returncode=None, pid=4242, poll=lambda: None)
 
     assert spike._leader_exited(process, None, deadline=time.monotonic() + 0.2) is False
-    assert budgets and budgets[0] is not None and budgets[0] <= 0.2
+    # (t + 0.2) - t can round just above 0.2 when the clock has not ticked.
+    assert budgets and budgets[0] is not None and budgets[0] <= 0.2 + 1e-6
 
 
 def test_leader_exit_observation_never_reaps_when_every_check_fails(monkeypatch):

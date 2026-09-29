@@ -23,8 +23,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest Phase 1-only assembled suite was green: `2999 passed, 5 skipped, 3
-warnings in 33.63s`; it includes 127 phase-one harness tests and two direct
+The latest Phase 1-only assembled suite was green: `3000 passed, 5 skipped, 3
+warnings in 33.82s`; it includes 128 phase-one harness tests and two direct
 tests of the Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`). This is Phase 1
 evidence, not validation of the Phase 2 tree; the separate full Phase 2 result
@@ -116,7 +116,7 @@ Phase 1 exit requires all of the following:
   before real Codex execution, but does not block owner-authorized local-only
   Phase 2 infrastructure work.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2999 passed, 5 skipped, 3 warnings in 33.63s`).
+  (`3000 passed, 5 skipped, 3 warnings in 33.82s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -421,6 +421,9 @@ using a lock-free read so it adds no contention with switching.
   storage cannot keep a provider running; a failed append leaves the
   recoverable `running` row. macOS group scans during termination are
   bounded by the grace deadline, so a stalled `ps` cannot delay SIGKILL.
+  Every other group-liveness check is bounded too: by the probe's runtime
+  deadline while it runs, by the post-KILL wait deadline, and by a short
+  window for the final checks, where a stalled scan counts as still running.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the
