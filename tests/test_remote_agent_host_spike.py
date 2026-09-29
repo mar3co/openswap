@@ -1052,8 +1052,10 @@ def test_timeout_terminates_tracked_detached_helper_before_journaling_cancellati
 
 
 @pytest.mark.skipif(os.name != "posix", reason="harness state locking is POSIX-only")
-@pytest.mark.parametrize("state", [[], {"x": 1}, None, 3])
-def test_non_string_journal_state_is_recovered_and_blocks_new_launches(tmp_path, state):
+@pytest.mark.parametrize(
+    "state", [[], {"x": 1}, None, 3, "queued", "waiting_for_approval", "bogus"]
+)
+def test_unrecognised_journal_state_is_recovered_and_blocks_new_launches(tmp_path, state):
     state_dir = tmp_path / "state"
     state_dir.mkdir(mode=0o700)
     (state_dir / "journal.jsonl").write_text(
@@ -1758,21 +1760,12 @@ def test_short_timeout_run_still_attributes_a_detached_helper(tmp_path, monkeypa
         "    os._exit(0)\n"
         "time.sleep(30)\n",
     )
-    real_append = spike._append_jsonl
-
-    def slow_running_append(path, record):
-        real_append(path, record)
-        if record.get("state") == "running":
-            # Startup journaling spends the whole budget: no periodic scan runs.
-            deadline = time.monotonic() + 5
-            while not pid_file.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            time.sleep(0.3)
-
-    monkeypatch.setattr(spike, "_append_jsonl", slow_running_append)
+    # A scan window longer than the run: no periodic scan ever starts, as for
+    # a run shorter than SCAN_WINDOW_S. Only the pre-signal scan can see it.
+    monkeypatch.setattr(spike, "SCAN_WINDOW_S", 10.0)
     try:
         result = supervise_fake_command(
-            [str(fake)], state_dir=tmp_path / "state", timeout_s=0.1, grace_s=0.2, job_id="short",
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=1.0, grace_s=0.2, job_id="short",
         )
         assert pid_file.exists()
         detached_pid = int(pid_file.read_text())
@@ -1839,9 +1832,9 @@ def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path
         [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.2, job_id="slow-fsync",
     )
     assert result["state"] in ("cancelled", "interrupted")
-    # The 1.5 s budget was already spent during the append, so termination
-    # follows at once instead of granting another full timeout.
-    assert marks[signal.SIGTERM] - marks["running_done"] < 0.75 + spike.SCAN_WINDOW_S
+    # The append runs off the supervising thread, so the 1.5 s deadline is
+    # enforced while it is still blocked, not after it returns.
+    assert marks[signal.SIGTERM] < marks["running_done"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")

@@ -57,12 +57,16 @@ PROBE_READ_CHUNK_BYTES = 16 * 1024
 DESCENDANT_SNAPSHOT_INTERVAL_S = 0.05
 DESCENDANT_KILL_WAIT_S = 0.5
 GROUP_KILL_WAIT_S = 0.5
-NON_TERMINAL_STATES = frozenset({"starting", "running", "cancel_requested"})
+TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "interrupted", "expired"})
 
 
 def _is_non_terminal(state: object) -> bool:
-    """A malformed (non-string) state proves no outcome, so it stays uncertain."""
-    return not isinstance(state, str) or state in NON_TERMINAL_STATES
+    """Only a recognised terminal state proves an outcome.
+
+    Anything else (a newer worker's ``queued`` or ``waiting_for_approval``,
+    a malformed string, or a non-string) stays uncertain.
+    """
+    return not isinstance(state, str) or state not in TERMINAL_STATES
 
 
 # Lowercase dotted identifiers such as Codex's ``thread.started``; anything
@@ -1342,8 +1346,25 @@ def _supervise_fake_command_locked(
         target=_collect_event_names, args=(process.stdout, event_names, reader_stop), daemon=True
     )
     tracked: dict[int, tuple[int, str, str, int | None, str, bool]] = {}
+    # The child is already running, so the "running" row is written off the
+    # supervising thread: a stalled fsync must not stop the loop below from
+    # enforcing the deadline. Every later journal row waits for it first.
+    running_row_errors: list[BaseException] = []
+
+    def write_running_row() -> None:
+        try:
+            _append_jsonl(journal, {"job_id": job_id, "state": "running", "pgid": process.pid})
+        except BaseException as exc:
+            running_row_errors.append(exc)
+
+    running_row = threading.Thread(target=write_running_row, daemon=True)
+
+    def raise_if_running_row_failed() -> None:
+        if not running_row.is_alive() and running_row_errors:
+            raise running_row_errors[0]
+
     try:
-        _append_jsonl(journal, {"job_id": job_id, "state": "running", "pgid": process.pid})
+        running_row.start()
         reader.start()
     except BaseException:
         _abort_supervision(process, reader, tracked, grace_s=grace_s)
@@ -1363,6 +1384,7 @@ def _supervise_fake_command_locked(
         # process-table snapshot per iteration serves both the leader check and
         # descendant attribution, keeping `ps` pressure low on loaded runners.
         while True:
+            raise_if_running_row_failed()
             # Scans are bounded by the job deadline so a slow `ps` cannot
             # postpone cancellation.
             table = None
@@ -1417,6 +1439,8 @@ def _supervise_fake_command_locked(
         # not keep any of them running. If the append fails, the journal
         # still holds the non-terminal "running" row, so recovery reports the
         # job as interrupted.
+        running_row.join()
+        raise_if_running_row_failed()
         if timed_out or leftovers:
             _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
         # Only now is the leader reaped: discovery and cleanup are complete.
