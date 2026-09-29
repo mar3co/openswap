@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3198 passed, 5 skipped, 3 warnings in 51.23s`.
+`3201 passed, 5 skipped, 3 warnings in 48.11s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -322,6 +322,9 @@ The read-only status fallback opens a fully checkpointed journal with
 it cannot write. WAL content with its `-shm` present is read in place with
 `mode=ro`; WAL content without `-shm` (no live writer) is read from a
 private temporary copy, so status never recreates a sidecar.
+Claude `remove_account` now runs the legacy org-field roster migration under
+the lease guard, as move already did, so a blocked removal cannot rewrite
+`sequence.json` first.
 The CLI now rejects a stale `cswap` launcher before dispatching to the worker
 subcommand, so `cswap worker status` gets the removed-command message instead
 of reaching the worker CLI. Codex `set_account_disabled`, `set_alias`, and

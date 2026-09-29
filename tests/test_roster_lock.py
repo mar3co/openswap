@@ -74,7 +74,9 @@ class TestRosterWritersTakeAccountLock:
 
         switcher.remove_account("2", assume_yes=True)
 
-        assert entered == [switcher.lock_file]
+        # Once for the legacy-roster migration, once for the removal: the
+        # confirmation prompts between them must not hold the lock.
+        assert entered == [switcher.lock_file, switcher.lock_file]
         data = switcher._get_sequence_data()
         assert "2" not in data["accounts"]
 
