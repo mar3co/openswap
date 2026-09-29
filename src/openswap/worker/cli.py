@@ -336,10 +336,11 @@ def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
     try:
         service = uninstall(home=Path.home())
     except ClaudeSwitchError:
-        # Keep a loaded helper from becoming unintentionally active after an
-        # unload failure. Pause remains on so it cannot admit work.
+        # The unload failed, so the committed opt-out is rolled back to the
+        # prior opt-in (never forced on); pause stays on so a still-loaded
+        # helper cannot admit work.
         try:
-            update_worker_settings(backup_root, enabled=True, paused=True)
+            update_worker_settings(backup_root, enabled=was_enabled, paused=True)
         except (OSError, RuntimeError, ValueError):
             return False, _safe_snapshot(backup_root), "settings_unavailable"
         return False, _safe_snapshot(backup_root), "worker_unload_failed"

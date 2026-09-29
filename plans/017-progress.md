@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3184 passed, 5 skipped, 3 warnings in 47.98s`.
+`3186 passed, 5 skipped, 3 warnings in 50.43s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -273,7 +273,8 @@ runner shows `Popen` itself failed; an `OSError` after launch, or from an
 injected runner, leaves the lease `uncertain`.
 A blocked `worker disable` now pauses without changing the opt-in and
 restores the previous `enabled` value, so retrying it on an already
-disabled worker never re-enables Remote tasks.
+disabled worker never re-enables Remote tasks. The same holds when the
+LaunchAgent unload fails: the prior opt-in is restored, paused.
 Provider `probe()` and `start()` now run outside the control lock, so a
 stop during a slow start is acknowledged at once. Journal and lease steps
 stay under the lock, the cancellation is re-read right before launch, and

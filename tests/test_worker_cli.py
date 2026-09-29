@@ -140,6 +140,39 @@ def test_disable_keeps_prior_opt_in_paused_when_lease_state_is_unknown(
     assert writes[-1] == {"enabled": was_enabled, "paused": True}
 
 
+@pytest.mark.parametrize("was_enabled", [True, False])
+def test_disable_keeps_prior_opt_in_paused_when_unload_fails(
+    tmp_path: Path, monkeypatch, was_enabled: bool
+):
+    writes = []
+    client = _Client(None)
+    snapshot = {
+        "process_state": "stopped",
+        "enabled": was_enabled,
+        "paused": True,
+        "lease_quarantined": False,
+        "active_job": None,
+    }
+    monkeypatch.setattr(cli, "WorkerClient", lambda _path: client)
+    monkeypatch.setattr(cli, "_snapshot", lambda _root: snapshot)
+    monkeypatch.setattr(
+        cli,
+        "update_worker_settings",
+        lambda _root, **values: writes.append(values) or SimpleNamespace(enabled=was_enabled),
+    )
+    monkeypatch.setattr(
+        cli,
+        "uninstall",
+        lambda **_kwargs: (_ for _ in ()).throw(cli.ClaudeSwitchError("bootout failed")),
+    )
+
+    ok, _result, diagnostic = cli.disable_worker(tmp_path)
+
+    assert ok is False
+    assert diagnostic == "worker_unload_failed"
+    assert writes[-1] == {"enabled": was_enabled, "paused": True}
+
+
 def test_disable_waits_for_manual_worker_and_enable_refuses_held_instance_lock(
     tmp_path: Path, monkeypatch, capsys
 ):
