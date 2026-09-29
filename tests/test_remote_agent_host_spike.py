@@ -1944,6 +1944,46 @@ def test_exit_seen_only_after_the_deadline_is_still_a_timeout(tmp_path, monkeypa
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
 @pytest.mark.xdist_group("spike_procs")
+@pytest.mark.parametrize("path", ["supervise", "probe"])
+def test_time_spent_creating_the_process_counts_toward_the_timeout(tmp_path, monkeypatch, path):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    real_popen = subprocess.Popen
+    real_signal = spike._signal_group
+    marks: dict = {}
+    delayed = []
+
+    def descheduled_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        if not delayed:  # only the child itself, not later ps scans
+            delayed.append(True)
+            time.sleep(1.5)  # the parent is descheduled while the child runs
+        return process
+
+    def recording_signal(process, sig):
+        marks.setdefault(sig, time.monotonic())
+        real_signal(process, sig)
+
+    monkeypatch.setattr(spike.subprocess, "Popen", descheduled_popen)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
+    start = time.monotonic()
+    if path == "supervise":
+        supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=1.0, grace_s=0.2,
+            job_id="slow-spawn",
+        )
+    else:
+        with pytest.raises(subprocess.TimeoutExpired):
+            spike._run_probe(
+                [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path),
+                timeout_s=1.0,
+            )
+    # The 1 s budget was spent while Popen had not returned: termination
+    # starts at once, not a full timeout after Popen.
+    assert marks[signal.SIGTERM] - start < 1.5 + spike.SCAN_WINDOW_S + 0.35
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
 def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path, monkeypatch):
     fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
     marks: dict = {}
