@@ -58,6 +58,13 @@ DESCENDANT_SNAPSHOT_INTERVAL_S = 0.05
 DESCENDANT_KILL_WAIT_S = 0.5
 GROUP_KILL_WAIT_S = 0.5
 NON_TERMINAL_STATES = frozenset({"starting", "running", "cancel_requested"})
+
+
+def _is_non_terminal(state: object) -> bool:
+    """A malformed (non-string) state proves no outcome, so it stays uncertain."""
+    return not isinstance(state, str) or state in NON_TERMINAL_STATES
+
+
 # Lowercase dotted identifiers such as Codex's ``thread.started``; anything
 # else (including anything that could carry a token) becomes ``unknown-event``.
 _EVENT_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}(\.[a-z][a-z0-9_]{0,31}){0,3}")
@@ -550,7 +557,7 @@ def _recover_uncertain_runs_locked(state_dir: Path) -> list[str]:
                 latest_running[job_id] = row
     interrupted = []
     for job_id, row in latest.items():
-        if row.get("state") in NON_TERMINAL_STATES:
+        if _is_non_terminal(row.get("state")):
             record = {"job_id": job_id, "state": "interrupted", "reason": "uncertain_after_restart"}
             pgid = latest_running.get(job_id, {}).get("pgid")
             if isinstance(pgid, int) and not isinstance(pgid, bool) and pgid > 1:
@@ -1299,7 +1306,7 @@ def _supervise_fake_command_locked(
     for row in records:
         if isinstance(row.get("job_id"), str):
             latest_states[row["job_id"]] = row.get("state")
-    if any(state in NON_TERMINAL_STATES for state in latest_states.values()):
+    if any(_is_non_terminal(state) for state in latest_states.values()):
         raise SpikeError("Journal has unrecovered non-terminal jobs; run recover first.")
 
     # The durable intent precedes launch. A restart from here becomes uncertain.
@@ -1386,19 +1393,13 @@ def _supervise_fake_command_locked(
         # A provider parent may exit while a child keeps the pipe or continues
         # work. Clean the group after timeout and after every leader exit, and
         # only report success when enumeration and the output reader are quiet.
-        # Terminate before journaling the cancellation: an fsync on stalled
-        # storage must not keep a timed-out provider running. If the append
-        # then fails, the journal still holds the non-terminal "running" row,
-        # so recovery reports the job as interrupted.
         if timed_out:
             cleanup_uncertain = _terminate_group(process, reader, grace_s=grace_s)
-            _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
         else:
             reader.join(timeout=0.05)
             leftovers = _group_running(process.pid, reader, time.monotonic() + SCAN_WINDOW_S)
             if leftovers:
                 cleanup_uncertain = _terminate_group(process, reader, grace_s=grace_s)
-                _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
         unexpected_leftovers = bool(not timed_out and leftovers)
         # Re-snapshot once more, then hunt tracked descendants that left the
         # group (setsid). Anything found forces "interrupted" below.
@@ -1411,6 +1412,13 @@ def _supervise_fake_command_locked(
         )
         if escaped:
             escaped_terminated, escaped_signalling = _terminate_pids(escaped, grace_s=grace_s)
+        # Journal the cancellation only after the group and every tracked
+        # escaped descendant were signalled: an fsync on stalled storage must
+        # not keep any of them running. If the append fails, the journal
+        # still holds the non-terminal "running" row, so recovery reports the
+        # job as interrupted.
+        if timed_out or leftovers:
+            _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
         # Only now is the leader reaped: discovery and cleanup are complete.
         _reap_leader(process, timeout_s=5.0)
     except BaseException:

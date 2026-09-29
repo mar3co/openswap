@@ -1005,6 +1005,70 @@ def _read_rows(path: Path) -> list[dict]:
 
 @pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
 @pytest.mark.xdist_group("spike_procs")
+def test_timeout_terminates_tracked_detached_helper_before_journaling_cancellation(
+    tmp_path, monkeypatch
+):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-detaching-provider",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    alive_at_journal: list = []
+    real_append = spike._append_jsonl
+
+    def recording_append(path, record):
+        if record.get("state") == "cancel_requested":
+            helper = int(pid_file.read_text())
+            alive_at_journal.append(spike._pid_identity(helper) is not None)
+        real_append(path, record)
+
+    monkeypatch.setattr(spike, "_append_jsonl", recording_append)
+    detached_pid = None
+    try:
+        result = supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.2,
+            job_id="detached-timeout",
+        )
+        detached_pid = int(pid_file.read_text())
+        assert result["state"] == "interrupted"
+        assert alive_at_journal == [False]
+    finally:
+        if detached_pid is None and pid_file.exists():
+            detached_pid = int(pid_file.read_text())
+        if detached_pid is not None:
+            try:
+                os.kill(detached_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize("state", [[], {"x": 1}, None, 3])
+def test_non_string_journal_state_is_recovered_and_blocks_new_launches(tmp_path, state):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    (state_dir / "journal.jsonl").write_text(
+        json.dumps({"job_id": "odd", "state": state}) + "\n", encoding="utf-8"
+    )
+    os.chmod(state_dir / "journal.jsonl", 0o600)
+    fake = _executable(tmp_path / "fake-provider", "raise SystemExit(0)\n")
+
+    with pytest.raises(SpikeError, match="unrecovered non-terminal"):
+        supervise_fake_command([str(fake)], state_dir=state_dir, timeout_s=1.0, grace_s=0.1)
+    assert spike.recover_uncertain_runs(state_dir) == ["odd"]
+    assert spike.recover_uncertain_runs(state_dir) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
 def test_setsid_detached_descendant_forces_interrupted_and_is_terminated(tmp_path):
     pid_file = tmp_path / "detached.pid"
     fake = _executable(
@@ -1784,10 +1848,12 @@ def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path
 def test_timeout_kills_term_ignoring_provider_before_journaling_cancellation(
     tmp_path, monkeypatch
 ):
+    ready = tmp_path / "ignoring-term"
     fake = _executable(
         tmp_path / "fake-stubborn-provider",
-        "import signal, time\n"
+        "import pathlib, signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"pathlib.Path({str(ready)!r}).touch()\n"
         "time.sleep(30)\n",
     )
     order: list = []
@@ -1801,17 +1867,20 @@ def test_timeout_kills_term_ignoring_provider_before_journaling_cancellation(
         real_append(path, record)
 
     def recording_signal(process, sig):
+        if sig == signal.SIGTERM:
+            assert ready.exists(), "fake had not installed its SIGTERM handler"
         order.append(sig)
         real_signal(process, sig)
 
     monkeypatch.setattr(spike, "_append_jsonl", stalled_append)
     monkeypatch.setattr(spike, "_signal_group", recording_signal)
     result = supervise_fake_command(
-        [str(fake)], state_dir=tmp_path / "state", timeout_s=0.5, grace_s=0.1, job_id="stubborn",
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.1, job_id="stubborn",
     )
 
     assert result["state"] in ("cancelled", "interrupted")
-    assert order.index(signal.SIGKILL) < order.index("journal")
+    assert signal.SIGKILL in order and "journal" in order, order
+    assert order.index(signal.SIGKILL) < order.index("journal"), order
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
