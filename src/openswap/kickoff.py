@@ -254,7 +254,7 @@ def _kickoff_account_identity(provider: str, selected_home: Path | str | None) -
             for number, record in accounts.items()
             if isinstance(record, dict)
             and record.get("email") == email
-            and record.get("organizationUuid", "") == organization
+            and (record.get("organizationUuid") or "") == organization
         ]
         if len(matching_slots) != 1:
             raise SessionError("Cannot verify the account for scheduled kickoff.")

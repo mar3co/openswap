@@ -333,8 +333,10 @@ def test_invoke_kickoff_default_login_omits_config_dir(tmp_path: Path, monkeypat
     assert result.returncode == 0
 
 
+# A personal account's roster row may store a null organization.
+@pytest.mark.parametrize("organization", ["org-b", None])
 def test_live_default_kickoff_leases_detected_identity_not_stale_active_slot(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, organization
 ):
     from openswap.settings import update_worker_settings
     from openswap.worker.leases import AccountLeaseStore, stable_account_identity
@@ -345,7 +347,7 @@ def test_live_default_kickoff_leases_detected_identity_not_stale_active_slot(
     roster = json.loads(roster_path.read_text(encoding="utf-8"))
     roster["accounts"]["2"] = {
         "email": "live-b@example.test",
-        "organizationUuid": "org-b",
+        "organizationUuid": organization,
     }
     # External Claude login changed to account B, but OpenSwap's remembered
     # active slot remains A. The lease must follow the profile Claude will use.
@@ -354,7 +356,7 @@ def test_live_default_kickoff_leases_detected_identity_not_stale_active_slot(
     default_config.write_text(
         json.dumps({"oauthAccount": {
             "emailAddress": "live-b@example.test",
-            "organizationUuid": "org-b",
+            "organizationUuid": organization,
         }}),
         encoding="utf-8",
     )
@@ -379,7 +381,7 @@ def test_live_default_kickoff_leases_detected_identity_not_stale_active_slot(
     lease = captured["lease"]
     assert lease is not None
     assert lease.account_identity == stable_account_identity(
-        "claude", "live-b@example.test", "org-b"
+        "claude", "live-b@example.test", organization or ""
     )
     assert "CLAUDE_CONFIG_DIR" not in captured["env"]
 
