@@ -771,6 +771,47 @@ def test_probe_exception_snapshots_descendants_before_group_cleanup(tmp_path, mo
                 pass
 
 
+@pytest.mark.skipif(os.name != "posix", reason="setsid() detachment is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_timeout_without_a_periodic_scan_still_terminates_detached_helper(
+    tmp_path, monkeypatch
+):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-codex",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    # A scan window longer than the timeout: no periodic scan ever runs, as
+    # for a real probe timeout shorter than SCAN_WINDOW_S.
+    monkeypatch.setattr(spike, "SCAN_WINDOW_S", 10.0)
+    detached_pid = None
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            spike._run_probe(
+                [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=2
+            )
+        assert pid_file.exists(), "detached helper never reported its pid"
+        detached_pid = int(pid_file.read_text())
+        assert _wait_for_pid_exit(detached_pid, 2.0)
+    finally:
+        if detached_pid is None and pid_file.exists():
+            detached_pid = int(pid_file.read_text())
+        if detached_pid is not None:
+            try:
+                os.kill(detached_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 @pytest.mark.skipif(os.name != "posix", reason="bounded probe pipes need POSIX selectors")
 @pytest.mark.xdist_group("spike_procs")
 @pytest.mark.parametrize("flood", ["stderr", "both"])

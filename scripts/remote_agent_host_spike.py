@@ -151,14 +151,20 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
                 buffer.extend(chunk)
             if overflowed:
                 break
-        if timed_out or overflowed:
-            cleanup_uncertain = _cleanup_probe_process(process)
-        else:
+        if not (timed_out or overflowed):
             leftovers = _probe_group_running(
                 process.pid, time.monotonic() + SCAN_WINDOW_S
             )
-            if leftovers:
-                cleanup_uncertain = _cleanup_probe_process(process)
+        if timed_out or overflowed or leftovers:
+            # One short bounded scan before signalling, while the leader is
+            # still the parent of a helper that detached since the last
+            # periodic scan (or of any helper, for a run too short for one):
+            # killing the group reparents it beyond the sweep's reach.
+            if not _track_descendants(
+                process.pid, tracked, deadline=time.monotonic() + SCAN_WINDOW_S
+            ):
+                tracking_incomplete = True
+            cleanup_uncertain = _cleanup_probe_process(process)
         # Group signals miss a descendant that left the group, so hunt the
         # tracked ones before the leader is reaped. Any found refuses the result.
         detached, detached_certain = _sweep_probe_descendants(
