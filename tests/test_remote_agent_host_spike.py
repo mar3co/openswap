@@ -1051,6 +1051,7 @@ def test_timeout_terminates_tracked_detached_helper_before_journaling_cancellati
                 pass
 
 
+@pytest.mark.skipif(os.name != "posix", reason="harness state locking is POSIX-only")
 @pytest.mark.parametrize("state", [[], {"x": 1}, None, 3])
 def test_non_string_journal_state_is_recovered_and_blocks_new_launches(tmp_path, state):
     state_dir = tmp_path / "state"
