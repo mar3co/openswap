@@ -1075,13 +1075,19 @@ class TestAdoptSessionCredential:
 
 
 @pytest.mark.parametrize("operation", ("swap", "move", "remove"))
+@pytest.mark.parametrize("legacy_roster", (False, True))
 def test_kickoff_lease_fences_claude_slot_profile_mutations(
-    temp_home: Path, sample_sequence_data: dict, operation: str
+    temp_home: Path, sample_sequence_data: dict, operation: str, legacy_roster: bool
 ):
     switcher = ClaudeAccountSwitcher()
     switcher._setup_directories()
-    sample_sequence_data["accounts"]["1"]["organizationUuid"] = ""
-    sample_sequence_data["accounts"]["2"]["organizationUuid"] = ""
+    for number in ("1", "2"):
+        if legacy_roster:
+            # A pre-organization roster: its migration rewrites sequence.json,
+            # so it too must wait behind the lease.
+            sample_sequence_data["accounts"][number].pop("organizationUuid", None)
+        else:
+            sample_sequence_data["accounts"][number]["organizationUuid"] = ""
     switcher._write_json(switcher.sequence_file, sample_sequence_data)
     before = switcher.sequence_file.read_bytes()
 

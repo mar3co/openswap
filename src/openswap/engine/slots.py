@@ -1258,8 +1258,13 @@ class SlotsMixin:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
-        # Ensure org fields are migrated before resolving accounts
-        self._get_sequence_data_migrated()
+        # Ensure org fields are migrated before resolving accounts. The
+        # migration rewrites sequence.json, so it runs under the lease guard
+        # (as move does); the prompts below stay outside it and the removal
+        # re-checks under the guard.
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
+            self._get_sequence_data_migrated()
 
         # Resolve identifier
         if not identifier.isdigit():
