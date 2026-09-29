@@ -319,7 +319,7 @@ def test_noisy_fake_output_is_bounded_and_cancellation_still_completes(tmp_path)
 @pytest.mark.skipif(os.name != "posix", reason="killpg process groups are POSIX-only")
 def test_unavailable_group_enumeration_keeps_existing_group_uncertain(monkeypatch):
     signaled = []
-    monkeypatch.setattr(spike, "_group_has_running_members", lambda _pgid: None)
+    monkeypatch.setattr(spike, "_group_has_running_members", lambda _pgid, _deadline=None: None)
     monkeypatch.setattr(spike.os, "killpg", lambda pgid, sig: signaled.append((pgid, sig)))
 
     assert spike._group_running(4321, threading.Thread()) is True
@@ -662,7 +662,7 @@ def test_probe_cleanup_waits_for_killed_group_members_to_leave(monkeypatch):
     running = iter([True, True, True, True, False])
     states = []
 
-    def group_running(pgid):
+    def group_running(pgid, deadline=None):
         state = next(running, False)
         states.append(state)
         return state
@@ -1685,26 +1685,25 @@ def test_short_timeout_run_still_attributes_a_detached_helper(tmp_path, monkeypa
 def test_stalled_scans_never_carry_a_short_run_past_its_deadline(tmp_path, monkeypatch):
     fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
     marks: dict = {}
-    real_append = spike._append_jsonl
+    real_signal = spike._signal_group
 
     def stalled_table(timeout_s=None):
         time.sleep(min(timeout_s if timeout_s is not None else 0.0, 2.0))  # ps hangs
         return None
 
-    def recording_append(path, record):
-        if record.get("state") == "cancel_requested":
-            marks["cancel"] = time.monotonic()
-        real_append(path, record)
+    def recording_signal(process, sig):
+        marks.setdefault(sig, time.monotonic())
+        real_signal(process, sig)
 
     monkeypatch.setattr(spike, "_process_table", stalled_table)
-    monkeypatch.setattr(spike, "_append_jsonl", recording_append)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
     start = time.monotonic()
     supervise_fake_command(
         [str(fake)], state_dir=tmp_path / "state", timeout_s=0.2, grace_s=0.2, job_id="stall",
     )
-    # No scan may start within SCAN_WINDOW_S of the deadline or run past it,
-    # so cancellation is requested close to the 0.2 s budget.
-    assert marks["cancel"] - start < 0.45
+    # No scan may start within SCAN_WINDOW_S of the deadline or run past it;
+    # only the pre-signal scan (at most SCAN_WINDOW_S) precedes SIGTERM.
+    assert marks[signal.SIGTERM] - start < 0.2 + spike.SCAN_WINDOW_S + 0.25
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
@@ -1714,25 +1713,130 @@ def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path
     marks: dict = {}
     real_append = spike._append_jsonl
 
+    real_signal = spike._signal_group
+
     def slow_append(path, record):
-        state = record.get("state")
-        if state == "running":
+        if record.get("state") == "running":
             time.sleep(1.6)  # a slow fsync on the state directory
             real_append(path, record)
             marks["running_done"] = time.monotonic()
             return
-        if state == "cancel_requested":
-            marks["cancel"] = time.monotonic()
         real_append(path, record)
 
+    def recording_signal(process, sig):
+        marks.setdefault(sig, time.monotonic())
+        real_signal(process, sig)
+
     monkeypatch.setattr(spike, "_append_jsonl", slow_append)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
     result = supervise_fake_command(
         [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.2, job_id="slow-fsync",
     )
     assert result["state"] in ("cancelled", "interrupted")
-    # The 1.5 s budget was already spent during the append, so cancellation
+    # The 1.5 s budget was already spent during the append, so termination
     # follows at once instead of granting another full timeout.
-    assert marks["cancel"] - marks["running_done"] < 0.75
+    assert marks[signal.SIGTERM] - marks["running_done"] < 0.75 + spike.SCAN_WINDOW_S
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_timeout_kills_term_ignoring_provider_before_journaling_cancellation(
+    tmp_path, monkeypatch
+):
+    fake = _executable(
+        tmp_path / "fake-stubborn-provider",
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "time.sleep(30)\n",
+    )
+    order: list = []
+    real_append = spike._append_jsonl
+    real_signal = spike._signal_group
+
+    def stalled_append(path, record):
+        if record.get("state") == "cancel_requested":
+            order.append("journal")
+            time.sleep(0.5)  # fsync on stalled storage
+        real_append(path, record)
+
+    def recording_signal(process, sig):
+        order.append(sig)
+        real_signal(process, sig)
+
+    monkeypatch.setattr(spike, "_append_jsonl", stalled_append)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=0.5, grace_s=0.1, job_id="stubborn",
+    )
+
+    assert result["state"] in ("cancelled", "interrupted")
+    assert order.index(signal.SIGKILL) < order.index("journal")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_group_kill_is_not_delayed_by_a_stalled_macos_group_scan(monkeypatch):
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import signal, time\n"
+         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+         "time.sleep(30)\n"],
+        start_new_session=True,
+    )
+    time.sleep(0.2)  # let the child install its handler
+    real_run = subprocess.run
+    killed: dict = {}
+    real_signal = spike._signal_group
+
+    def stalled_ps(argv, *args, **kwargs):
+        if argv[:2] == ["/bin/ps", "-axo"] and argv[2] == "pid=,pgid=,stat=":
+            time.sleep(kwargs["timeout"])
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return real_run(argv, *args, **kwargs)
+
+    def recording_signal(proc, sig):
+        killed.setdefault(sig, time.monotonic())
+        real_signal(proc, sig)
+
+    monkeypatch.setattr(spike.sys, "platform", "darwin")
+    monkeypatch.setattr(spike.subprocess, "run", stalled_ps)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
+    reader = threading.Thread(target=lambda: None)
+    try:
+        start = time.monotonic()
+        spike._terminate_group(process, reader, grace_s=0.0)
+        # Before the fix each of the two pre-kill scans could take 1 s.
+        assert killed[signal.SIGKILL] - start < 0.5
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):  # macOS: zombie-only group
+            pass
+        process.wait(timeout=5)
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="pidfds are Linux-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_failed_final_scan_sweeps_a_pidfd_child_cached_in_the_leader_group(monkeypatch):
+    leader = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                              start_new_session=True)
+    # A verified child that called setsid() after its last successful scan:
+    # its cached group is still the leader's.
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                             start_new_session=True)
+    handle = os.pidfd_open(child.pid)
+    tracked = {child.pid: (leader.pid, "S", "0", handle, "0|child", True)}
+    monkeypatch.setattr(spike, "_track_descendants", lambda *a, **k: False)
+    try:
+        detached, certain = spike._sweep_probe_descendants(leader, tracked)
+        assert detached is True
+        assert certain is False
+        assert child.wait(timeout=5) is not None
+    finally:
+        os.close(handle)
+        for proc in (leader, child):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
 
 
 def test_track_descendants_evicts_reused_pid_even_when_it_holds_a_pidfd(monkeypatch):
