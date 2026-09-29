@@ -190,6 +190,16 @@ def _five_hour_resets_at_ts(usage: dict | str | None) -> float | None:
     return dt.timestamp()
 
 
+def _is_codex_slot_home(selected_home: Path | str | None, backup_root: Path) -> bool:
+    if selected_home is None:
+        return False
+    try:
+        slots_dir = (backup_root / "codex" / "slots").resolve()
+        return Path(selected_home).resolve().parent == slots_dir
+    except OSError:
+        return False
+
+
 def _kickoff_account_identity(provider: str, selected_home: Path | str | None) -> str:
     """Resolve a kickoff's stable identity from the local OpenSwap roster.
 
@@ -250,15 +260,17 @@ def _kickoff_account_identity(provider: str, selected_home: Path | str | None) -
             raise SessionError("Cannot verify the account for scheduled kickoff.")
         return stable_account_identity(provider, email, organization)
 
-    if provider == "codex" and selected_home is None:
-        # Same reasoning as the Claude branch above, for the default Codex
-        # login: resolve identity the way the engine does (CodexEngine
-        # current_account_number / _live_slot, via the live auth.json's own
-        # OAuth claims), never the roster's possibly-stale activeAccountNumber.
+    if provider == "codex" and not _is_codex_slot_home(selected_home, backup_root):
+        # Same reasoning as the Claude branch above, for the live Codex login
+        # (``None``, or the engine's own home as the menu bar passes it):
+        # resolve identity the way the engine does (CodexEngine
+        # current_account_number / _live_slot, via the auth.json the child
+        # will use), never the roster's possibly-stale activeAccountNumber.
         from openswap.codex.auth import auth_path, codex_home, parse_auth
 
+        live_home = codex_home() if selected_home is None else Path(selected_home)
         try:
-            live_text = auth_path(codex_home()).read_text(encoding="utf-8")
+            live_text = auth_path(live_home).read_text(encoding="utf-8")
         except OSError:
             raise SessionError("Cannot verify the account for scheduled kickoff.") from None
         identity = parse_auth(live_text)
@@ -279,12 +291,7 @@ def _kickoff_account_identity(provider: str, selected_home: Path | str | None) -
     if selected_home is not None:
         home = Path(selected_home)
         if provider == "codex":
-            expected_parent = (backup_root / "codex" / "slots").resolve()
-            try:
-                if home.resolve().parent == expected_parent:
-                    selected_num = home.name
-            except OSError:
-                pass
+            selected_num = home.name
         else:
             from openswap.session import slugify_email
 

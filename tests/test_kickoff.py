@@ -384,12 +384,14 @@ def test_live_default_kickoff_leases_detected_identity_not_stale_active_slot(
     assert "CLAUDE_CONFIG_DIR" not in captured["env"]
 
 
+@pytest.mark.parametrize("explicit_home", [False, True])
 def test_live_default_codex_kickoff_leases_detected_identity_not_stale_active_slot(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, explicit_home: bool
 ):
     """The default Codex kickoff must resolve identity the way the engine
     does (auth.json's own OAuth claims), not the roster's possibly-stale
-    ``activeAccountNumber`` (openswap.codex.engine.CodexEngine._live_slot)."""
+    ``activeAccountNumber`` (openswap.codex.engine.CodexEngine._live_slot),
+    whether it gets ``None`` or the live home the menu bar passes."""
     from openswap.settings import update_worker_settings
     from openswap.worker.leases import AccountLeaseStore, stable_account_identity
     from tests.test_codex_auth import _auth
@@ -415,7 +417,8 @@ def test_live_default_codex_kickoff_leases_detected_identity_not_stale_active_sl
         return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
     invoke_codex_kickoff(
-        None, which=lambda _name: "/opt/fake/codex", run=fake_run,
+        codex_home_dir if explicit_home else None,
+        which=lambda _name: "/opt/fake/codex", run=fake_run,
         environ={"PATH": "/usr/bin"},
     )
 

@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3154 passed, 4 skipped, 3 warnings in 30.04s`.
+`3155 passed, 4 skipped, 3 warnings in 33.24s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -263,6 +263,9 @@ Default-login Codex kickoff resolves identity from the live `auth.json`
 OAuth claims the same way `CodexEngine.current_account_number` does, rather
 than the roster's possibly-stale `activeAccountNumber`; a now-unnecessary
 `activeAccountNumber` seed in a Claude live-kickoff test fixture was reverted.
+The same live-`auth.json` resolution applies when the menu bar passes the
+engine's own Codex home instead of `None`; only a slot directory uses the
+roster record.
 The CLI now rejects a stale `cswap` launcher before dispatching to the worker
 subcommand, so `cswap worker status` gets the removed-command message instead
 of reaching the worker CLI. Codex `set_account_disabled`, `set_alias`, and
