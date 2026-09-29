@@ -124,7 +124,7 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
             # it went quiet is then already readable, so an empty select after
             # that observation really means no output is left.
             exited = _leader_exited(process, deadline=deadline)
-            quiet = exited and not _probe_group_running(process.pid)
+            quiet = exited and not _probe_group_running(process.pid, deadline)
             events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
             if not selector.get_map() and not exited:
                 time.sleep(min(remaining, 0.02))
@@ -154,7 +154,9 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
         if timed_out or overflowed:
             cleanup_uncertain = _cleanup_probe_process(process)
         else:
-            leftovers = _probe_group_running(process.pid)
+            leftovers = _probe_group_running(
+                process.pid, time.monotonic() + SCAN_WINDOW_S
+            )
             if leftovers:
                 cleanup_uncertain = _cleanup_probe_process(process)
         # Group signals miss a descendant that left the group, so hunt the
@@ -284,9 +286,9 @@ def _cleanup_probe_process(process: subprocess.Popen) -> bool:
     # SIGKILL takes effect only when a member leaves the kernel (for example a
     # slow disk write), so wait, bounded, for the group to actually be gone.
     deadline = time.monotonic() + PROBE_CLEANUP_WAIT_S
-    while _probe_group_running(process.pid) and time.monotonic() < deadline:
+    while _probe_group_running(process.pid, deadline) and time.monotonic() < deadline:
         time.sleep(0.02)
-    return _probe_group_running(process.pid)
+    return _probe_group_running(process.pid, time.monotonic() + SCAN_WINDOW_S)
 
 
 def _sweep_probe_descendants(
@@ -681,12 +683,12 @@ def _terminate_group(
     # its pid (and therefore this pgid) may be reused by an unrelated process,
     # so this wait is bounded and only ever observes, never re-signals.
     kill_deadline = time.monotonic() + GROUP_KILL_WAIT_S
-    while time.monotonic() < kill_deadline and _group_running(process.pid, reader):
+    while time.monotonic() < kill_deadline and _group_running(process.pid, reader, kill_deadline):
         time.sleep(0.02)
     return (
         wait_uncertain
         or not _leader_exited(process, deadline=time.monotonic() + SCAN_WINDOW_S)
-        or _group_running(process.pid, reader)
+        or _group_running(process.pid, reader, time.monotonic() + SCAN_WINDOW_S)
     )
 
 
@@ -1387,7 +1389,7 @@ def _supervise_fake_command_locked(
             _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
         else:
             reader.join(timeout=0.05)
-            leftovers = _group_running(process.pid, reader)
+            leftovers = _group_running(process.pid, reader, time.monotonic() + SCAN_WINDOW_S)
             if leftovers:
                 cleanup_uncertain = _terminate_group(process, reader, grace_s=grace_s)
                 _append_jsonl(journal, {"job_id": job_id, "state": "cancel_requested"})
