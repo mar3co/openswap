@@ -23,8 +23,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest Phase 1-only assembled suite was green: `3011 passed, 5 skipped, 3
-warnings in 42.01s`; it includes 139 phase-one harness tests and two direct
+The latest Phase 1-only assembled suite was green: `3016 passed, 5 skipped, 3
+warnings in 47.84s`; it includes 144 phase-one harness tests and two direct
 tests of the Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`). This is Phase 1
 evidence, not validation of the Phase 2 tree; the separate full Phase 2 result
@@ -116,7 +116,7 @@ Phase 1 exit requires all of the following:
   before real Codex execution, but does not block owner-authorized local-only
   Phase 2 infrastructure work.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`3011 passed, 5 skipped, 3 warnings in 42.01s`).
+  (`3016 passed, 5 skipped, 3 warnings in 47.84s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3179 passed, 5 skipped, 3 warnings in 41.27s`.
+`3184 passed, 5 skipped, 3 warnings in 47.98s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -454,8 +454,12 @@ using a lock-free read so it adds no contention with switching.
   written off the supervising thread, so a stalled fsync cannot stop the
   deadline from being enforced; later rows wait for it to land, and every
   exception path joins it before the state lock is released. Whether a run
-  timed out is decided at the original deadline: an exit seen only by a
-  later, slower check is still a timeout, never a success.
+  timed out is decided at the original deadline: an exit observed after it,
+  whether by a later check or an in-loop check that ran past it, is still a
+  timeout, never a success. Probes apply the same rule to the leader's exit
+  and to the quiet-group check, timing out as soon as either observation
+  crosses the deadline. Both runtime budgets start just before `Popen`, so
+  time spent creating the process counts toward them.
   Each has a regression test. None of this establishes provider behavior.
 - The test-only missing-Claude fixture correction is a test determinism fix;
   it preserves the `ClaudeSwitchError` assertion and does not change the

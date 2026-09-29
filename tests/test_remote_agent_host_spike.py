@@ -812,6 +812,59 @@ def test_probe_timeout_without_a_periodic_scan_still_terminates_detached_helper(
                 pass
 
 
+@pytest.mark.skipif(os.name != "posix", reason="probe process groups are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_exit_observed_past_the_deadline_is_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 0.6
+    fake = _executable(
+        tmp_path / "fake-late-codex",
+        # Output is complete in time; only the exit comes late.
+        f"import sys, time\nprint('codex-cli 1.2.3', flush=True)\ntime.sleep({timeout_s + 0.1})\n",
+    )
+    real_exited = spike._leader_exited
+    start = time.monotonic()
+
+    def check_that_crosses_the_deadline(process, table=None, deadline=None):
+        # The exit check starts before the deadline but returns after the
+        # CLI finished late.
+        if time.monotonic() > start + timeout_s - 0.2:
+            time.sleep(max(0.0, start + timeout_s + 0.2 - time.monotonic()))
+            return real_exited(process, table, deadline)
+        return False
+
+    monkeypatch.setattr(spike, "_leader_exited", check_that_crosses_the_deadline)
+    with pytest.raises(subprocess.TimeoutExpired):
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path),
+            timeout_s=timeout_s,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="probe process groups are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_group_quiet_observed_past_the_deadline_is_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 1.0
+    # The leader writes its output and exits just before the deadline.
+    fake = _executable(
+        tmp_path / "fake-codex",
+        f"import time\nprint('codex-cli 1.2.3', flush=True)\ntime.sleep({timeout_s - 0.15})\n",
+    )
+    start = time.monotonic()
+
+    def slow_group_check(pgid, deadline=None):
+        # A delayed ps: the group only looks quiet after the deadline.
+        if time.monotonic() > start + timeout_s - 0.4:
+            time.sleep(max(0.0, start + timeout_s + 0.1 - time.monotonic()))
+        return False
+
+    monkeypatch.setattr(spike, "_probe_group_running", slow_group_check)
+    with pytest.raises(subprocess.TimeoutExpired):
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path),
+            timeout_s=timeout_s,
+        )
+
+
 @pytest.mark.skipif(os.name != "posix", reason="bounded probe pipes need POSIX selectors")
 @pytest.mark.xdist_group("spike_procs")
 @pytest.mark.parametrize("flood", ["stderr", "both"])
@@ -1837,6 +1890,33 @@ def test_supervision_failure_waits_for_the_running_row_before_releasing_the_lock
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
 @pytest.mark.xdist_group("spike_procs")
+def test_in_loop_exit_observed_past_the_deadline_is_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 0.6
+    fake = _executable(tmp_path / "fake-late-exit", f"import time\ntime.sleep({timeout_s + 0.1})\n")
+    real_exited = spike._leader_exited
+    start = time.monotonic()
+
+    def check_that_crosses_the_deadline(process, table=None, deadline=None):
+        # The in-loop check starts before the deadline but returns after the
+        # child exited late.
+        if deadline is not None and time.monotonic() > start + timeout_s - 0.2:
+            time.sleep(max(0.0, start + timeout_s + 0.2 - time.monotonic()))
+            return real_exited(process, table, deadline)
+        return False
+
+    monkeypatch.setattr(spike, "_leader_exited", check_that_crosses_the_deadline)
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=timeout_s, grace_s=0.2,
+        job_id="late-in-loop",
+    )
+
+    states = [row["state"] for row in _read_rows(tmp_path / "state" / "journal.jsonl")]
+    assert result["state"] != "succeeded"
+    assert "cancel_requested" in states
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
 def test_exit_seen_only_after_the_deadline_is_still_a_timeout(tmp_path, monkeypatch):
     timeout_s = 0.6
     # The child exits 0.1 s after the deadline.
@@ -1864,26 +1944,68 @@ def test_exit_seen_only_after_the_deadline_is_still_a_timeout(tmp_path, monkeypa
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
 @pytest.mark.xdist_group("spike_procs")
-def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path, monkeypatch):
+@pytest.mark.parametrize("path", ["supervise", "probe"])
+def test_time_spent_creating_the_process_counts_toward_the_timeout(tmp_path, monkeypatch, path):
     fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
-    marks: dict = {}
-    real_append = spike._append_jsonl
-
+    real_popen = subprocess.Popen
     real_signal = spike._signal_group
+    marks: dict = {}
+    delayed = []
 
-    def slow_append(path, record):
-        if record.get("state") == "running":
-            time.sleep(1.6)  # a slow fsync on the state directory
-            real_append(path, record)
-            marks["running_done"] = time.monotonic()
-            return
-        real_append(path, record)
+    def descheduled_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        if not delayed:  # only the child itself, not later ps scans
+            delayed.append(True)
+            time.sleep(1.5)  # the parent is descheduled while the child runs
+        return process
 
     def recording_signal(process, sig):
         marks.setdefault(sig, time.monotonic())
         real_signal(process, sig)
 
-    monkeypatch.setattr(spike, "_append_jsonl", slow_append)
+    monkeypatch.setattr(spike.subprocess, "Popen", descheduled_popen)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
+    start = time.monotonic()
+    if path == "supervise":
+        supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=1.0, grace_s=0.2,
+            job_id="slow-spawn",
+        )
+    else:
+        with pytest.raises(subprocess.TimeoutExpired):
+            spike._run_probe(
+                [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path),
+                timeout_s=1.0,
+            )
+    # The 1 s budget was spent while Popen had not returned: termination
+    # starts at once, not a full timeout after Popen.
+    assert marks[signal.SIGTERM] - start < 1.5 + spike.SCAN_WINDOW_S + 0.35
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path, monkeypatch):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    marks: dict = {}
+    real_append = spike._append_jsonl
+    real_signal = spike._signal_group
+    terminated = threading.Event()
+
+    def stalled_append(path, record):
+        if record.get("state") == "running":
+            # Storage stays stalled until the deadline is enforced (capped so
+            # a regression fails instead of hanging).
+            marks["unblocked_by_term"] = terminated.wait(10)
+            real_append(path, record)
+            return
+        real_append(path, record)
+
+    def recording_signal(process, sig):
+        if sig == signal.SIGTERM:
+            terminated.set()
+        real_signal(process, sig)
+
+    monkeypatch.setattr(spike, "_append_jsonl", stalled_append)
     monkeypatch.setattr(spike, "_signal_group", recording_signal)
     result = supervise_fake_command(
         [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.2, job_id="slow-fsync",
@@ -1891,7 +2013,7 @@ def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path
     assert result["state"] in ("cancelled", "interrupted")
     # The append runs off the supervising thread, so the 1.5 s deadline is
     # enforced while it is still blocked, not after it returns.
-    assert marks[signal.SIGTERM] < marks["running_done"]
+    assert marks["unblocked_by_term"] is True
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")

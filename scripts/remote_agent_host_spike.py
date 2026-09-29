@@ -86,6 +86,9 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
     """Run a probe with bounded output capture and owned-group cleanup."""
     if os.name != "posix":
         raise SpikeError("Bounded Codex probes require POSIX process supervision.")
+    # Taken before Popen: the child may already run before Popen returns, so
+    # process creation counts toward the budget.
+    deadline = time.monotonic() + timeout_s
     process = subprocess.Popen(
         list(command), env=env, cwd=cwd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -110,7 +113,6 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
             fd = stream.fileno()
             os.set_blocking(fd, False)
             selector.register(fd, selectors.EVENT_READ)
-        deadline = time.monotonic() + timeout_s
         # The leader is observed, not reaped, until group cleanup is done so
         # its pid (and therefore our pgid) cannot be reused meanwhile.
         exited = False
@@ -134,8 +136,20 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
             # Observe exit BEFORE selecting: anything the group wrote before
             # it went quiet is then already readable, so an empty select after
             # that observation really means no output is left.
-            exited = _leader_exited(process, deadline=deadline)
+            if not exited:
+                exited = _leader_exited(process, deadline=deadline)
+                if exited and time.monotonic() > deadline:
+                    # Only an exit observed by the deadline counts; one seen
+                    # after it (a slow scan or a late resume) is a timeout.
+                    timed_out = True
+                    break
             quiet = exited and not _probe_group_running(process.pid, deadline)
+            if exited and time.monotonic() > deadline:
+                # The group-quiet check itself ran past the deadline: time out
+                # here, since with both pipes closed the loop would otherwise
+                # end without reaching the timeout check.
+                timed_out = True
+                break
             events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
             if not selector.get_map() and not exited:
                 time.sleep(min(remaining, 0.02))
@@ -1323,6 +1337,9 @@ def _supervise_fake_command_locked(
     # credentials or provider settings. SPIKE_* is the test-marker channel.
     child_env = {"PATH": os.defpath, "HOME": str(state_dir)}
     child_env.update({k: v for k, v in os.environ.items() if k.startswith("SPIKE_")})
+    # The runtime budget starts before Popen: the child may already run before
+    # Popen returns, and a slow journal append below cannot extend it either.
+    deadline = time.monotonic() + timeout_s
     try:
         process = subprocess.Popen(
             list(argv),
@@ -1336,9 +1353,6 @@ def _supervise_fake_command_locked(
     except OSError as exc:
         _append_jsonl(journal, {"job_id": job_id, "state": "failed", "reason": "fake_start_error"})
         raise SpikeError(f"Fake executable could not be started ({type(exc).__name__}).") from None
-    # The runtime budget starts at launch, so a slow journal append below
-    # cannot extend how long the child runs.
-    deadline = time.monotonic() + timeout_s
 
     event_names: list[str] = []
     reader_stop = threading.Event()
@@ -1405,7 +1419,9 @@ def _supervise_fake_command_locked(
                     # while the leader is alive, whatever group they moved to.
                     _track_descendants(process.pid, tracked, table, deadline)
             if _leader_exited(process, table, deadline=deadline):
-                exited_in_time = True
+                # Only an exit observed by the deadline counts; one seen after
+                # it (a late resume, or a check that ran past it) is a timeout.
+                exited_in_time = time.monotonic() <= deadline
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
