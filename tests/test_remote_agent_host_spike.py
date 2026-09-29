@@ -1,0 +1,2687 @@
+from __future__ import annotations
+
+import json
+import os
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+from types import SimpleNamespace
+from pathlib import Path
+
+import pytest
+
+import scripts.remote_agent_host_spike as spike
+from scripts.remote_agent_host_spike import (
+    SpikeError,
+    inspect_codex,
+    recover_uncertain_runs,
+    run_live_codex,
+    supervise_fake_command,
+)
+
+def _executable(path: Path, source: str) -> Path:
+    path.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
+    path.chmod(0o700)
+    return path
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake executable shebang test is POSIX-only")
+def test_inspect_codex_uses_only_disposable_home_and_records_help(tmp_path):
+    fake = _executable(
+        tmp_path / "fake-codex",
+        "import os, sys\n"
+        "assert os.environ['CODEX_HOME'] == os.path.join(os.environ['HOME'], 'codex')\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        " print('codex-cli 99.0-test')\n"
+        "elif sys.argv[1:] == ['exec', '--help']:\n"
+        " print('--json --sandbox --skip-git-repo-check --ignore-user-config')\n"
+        " print('  --api-key secret-token-value   (example value in help output)')\n"
+        "else: raise SystemExit(4)\n",
+    )
+
+    result = inspect_codex(str(fake), tmp_path / "evidence")
+
+    assert result == {
+        "version": "codex-cli 99.0-test",
+        "expected_version": "codex-cli 0.158.0-alpha.2.1",
+        "matches_discovered_pin": False,
+        "pre_release": False,
+        "exec_json": True,
+        "skip_git_repo_check": True,
+        "ignore_user_config": True,
+        "sandbox_option": True,
+        "no_auth_performed": True,
+    }
+    stored = (tmp_path / "evidence" / "evidence.jsonl").read_text()
+    assert "codex-cli 99.0-test" in stored
+    assert "secret-token-value" not in stored
+    assert "secret" not in stored.lower()
+    assert not (tmp_path / "evidence" / "journal.jsonl").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_timeout_terminates_fake_process_group_including_child(tmp_path, monkeypatch):
+    fake = _executable(
+        tmp_path / "fake-provider",
+        "import os, pathlib, signal, subprocess, sys, time\n"
+        "root = pathlib.Path(os.environ['SPIKE_MARKERS'])\n"
+        "def stop(_sig, _frame):\n"
+        " (root / f'{os.getpid()}.stopped').touch()\n"
+        " raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "code = \"import os,pathlib,signal,time; p=pathlib.Path(os.environ['SPIKE_MARKERS']); alive=p/f'{os.getpid()}.alive'; stopped=p/f'{os.getpid()}.stopped'; alive.touch(); signal.signal(signal.SIGTERM, lambda s,f: (stopped.touch(), alive.unlink(), (_ for _ in ()).throw(SystemExit(0)))); (p/f'{os.getpid()}.pid').write_text(str(os.getpid())); time.sleep(60)\"\n"
+        "child = subprocess.Popen([sys.executable, '-c', code])\n"
+        "(root / f'{os.getpid()}.pid').write_text(str(os.getpid()))\n"
+        "(root / f'{os.getpid()}.alive').touch()\n"
+        "(root / 'child.pid').write_text(str(child.pid))\n"
+        "time.sleep(60)\n",
+    )
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    monkeypatch.setenv("SPIKE_MARKERS", str(markers))
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=2.0, grace_s=1.0,
+        job_id="kill-group",
+    )
+
+    child_pid = (markers / "child.pid").read_text()
+    assert result["state"] == "cancelled"
+    deadline = time.monotonic() + 2
+    while not (markers / f"{child_pid}.stopped").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert (markers / f"{child_pid}.stopped").exists()
+    assert not (markers / f"{child_pid}.alive").exists()
+    journal = [json.loads(line) for line in (tmp_path / "state" / "journal.jsonl").read_text().splitlines()]
+    assert [row["state"] for row in journal] == ["starting", "running", "cancel_requested", "cancelled"]
+    evidence = [
+        json.loads(line)
+        for line in (tmp_path / "state" / "evidence.jsonl").read_text().splitlines()
+    ]
+    assert [(row["kind"], row["job_id"]) for row in evidence] == [
+        ("launch_intent", "kill-group"),
+        ("supervision_result", "kill-group"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("timeout_s", float("nan")),
+        ("timeout_s", float("inf")),
+        ("timeout_s", 0.0),
+        ("timeout_s", -1.0),
+        ("grace_s", float("nan")),
+        ("grace_s", float("inf")),
+        ("grace_s", -0.1),
+    ],
+)
+def test_invalid_supervision_durations_refuse_before_state_or_launch(tmp_path, field, value):
+    launches = tmp_path / "launched"
+    fake = _executable(
+        tmp_path / "fake-provider",
+        f"import pathlib; pathlib.Path({str(launches)!r}).touch()\n",
+    )
+    state = tmp_path / "state"
+    options = {"timeout_s": 1.0, "grace_s": 0.5}
+    options[field] = value
+
+    with pytest.raises(SpikeError, match="finite positive timeout"):
+        supervise_fake_command([str(fake)], state_dir=state, **options)
+
+    assert not state.exists()
+    assert not launches.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions are required")
+def test_unsafe_existing_state_directory_permissions_are_preserved_and_refused(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o750)
+    state.chmod(0o750)
+    launches = tmp_path / "launch-count"
+    fake = _executable(
+        tmp_path / "must-not-run",
+        f"import pathlib; pathlib.Path({str(launches)!r}).touch()\n",
+    )
+
+    with pytest.raises(SpikeError, match="must not grant group or world access"):
+        supervise_fake_command([str(fake)], state_dir=state, timeout_s=1)
+
+    assert state.stat().st_mode & 0o777 == 0o750
+    assert not (state / "journal.jsonl").exists()
+    assert not launches.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_timeout_kills_child_that_ignores_term_before_reporting_cancelled(tmp_path, monkeypatch):
+    child_script = tmp_path / "ignore-term-child.py"
+    child_script.write_text(
+        "import os, pathlib, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "root = pathlib.Path(os.environ['SPIKE_MARKERS'])\n"
+        "(root / 'child.pid').write_text(str(os.getpid()))\n"
+        "beat = root / 'heartbeat'\n"
+        "while True:\n"
+        " beat.write_text(str(time.monotonic_ns()))\n"
+        " time.sleep(0.03)\n",
+        encoding="utf-8",
+    )
+    fake = _executable(
+        tmp_path / "fake-provider-ignoring-term",
+        "import os, pathlib, signal, subprocess, sys, time\n"
+        "root = pathlib.Path(os.environ['SPIKE_MARKERS'])\n"
+        "def stop(_sig, _frame):\n"
+        " (root / 'parent.stopped').touch()\n"
+        " raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        f"child = subprocess.Popen([sys.executable, {str(child_script)!r}])\n"
+        "(root / 'parent.pid').write_text(str(os.getpid()))\n"
+        "time.sleep(60)\n",
+    )
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    monkeypatch.setenv("SPIKE_MARKERS", str(markers))
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=2.0, grace_s=0.2,
+        job_id="kill-ignoring-child",
+    )
+
+    beat = markers / "heartbeat"
+    first_value = beat.read_text()
+    time.sleep(0.15)
+    assert beat.read_text() == first_value
+    assert (markers / "parent.stopped").exists()
+    assert result["state"] == "cancelled"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_successful_parent_with_live_child_is_interrupted_and_child_is_killed(tmp_path, monkeypatch):
+    child_script = tmp_path / "orphan-child.py"
+    child_script.write_text(
+        "import os, pathlib, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "root = pathlib.Path(os.environ['SPIKE_MARKERS'])\n"
+        "beat = root / 'heartbeat'\n"
+        "while True:\n"
+        " beat.write_text(str(time.monotonic_ns()))\n"
+        " time.sleep(0.03)\n",
+        encoding="utf-8",
+    )
+    fake = _executable(
+        tmp_path / "fake-parent-exits-successfully",
+        "import os, pathlib, subprocess, sys, time\n"
+        "root = pathlib.Path(os.environ['SPIKE_MARKERS'])\n"
+        f"subprocess.Popen([sys.executable, {str(child_script)!r}])\n"
+        "deadline = time.monotonic() + 2\n"
+        "while not (root / 'heartbeat').exists() and time.monotonic() < deadline:\n"
+        " time.sleep(0.01)\n"
+        "raise SystemExit(0)\n",
+    )
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    monkeypatch.setenv("SPIKE_MARKERS", str(markers))
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=3, grace_s=0.15,
+        job_id="leader-exited",
+    )
+
+    beat = markers / "heartbeat"
+    assert result["returncode"] == 0
+    assert result["state"] == "interrupted"
+    first_value = beat.read_text()
+    time.sleep(0.15)
+    assert beat.read_text() == first_value
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake executable shebang test is POSIX-only")
+def test_invalid_utf8_output_is_safely_recorded_as_unstructured(tmp_path):
+    fake = _executable(
+        tmp_path / "fake-invalid-output",
+        "import sys\n"
+        "sys.stdout.buffer.write(b'\\xff\\n')\n"
+        "sys.stdout.flush()\n",
+    )
+
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=10, job_id="bad-bytes"
+    )
+
+    assert result["state"] == "succeeded"
+    assert result["event_names"] == ["unstructured-output"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake executable shebang test is POSIX-only")
+def test_json_parser_failures_are_recorded_and_reader_continues(tmp_path, monkeypatch):
+    original_loads = spike.json.loads
+
+    def raise_for_deep_input(value, *args, **kwargs):
+        if isinstance(value, str) and value.startswith("[" * 100):
+            raise RecursionError("synthetic deep-input parser failure")
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(spike.json, "loads", raise_for_deep_input)
+    fake = _executable(
+        tmp_path / "fake-malformed-json",
+        "import json, sys\n"
+        "sys.stdout.write('9' * 5000 + '\\n')\n"
+        "sys.stdout.write('[' * 6000 + '0' + ']' * 6000 + '\\n')\n"
+        "sys.stdout.write(json.dumps({'type': 'after'}) + '\\n')\n"
+        "sys.stdout.flush()\n",
+    )
+
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=10, job_id="bad-json"
+    )
+
+    assert result["state"] == "succeeded"
+    assert result["event_names"] == [
+        "unstructured-output",
+        "unstructured-output",
+        "after",
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_noisy_fake_output_is_bounded_and_cancellation_still_completes(tmp_path):
+    fake = _executable(
+        tmp_path / "fake-noisy-provider",
+        "import json, sys, time\n"
+        f"sys.stdout.write('x' * ({spike.MAX_EVENT_LINE_CHARS} + 100_000) + '\\n')\n"
+        "for i in range(10000):\n"
+        " sys.stdout.write(json.dumps({'type': f'event_{i}'}) + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n",
+    )
+
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=2, grace_s=0.2,
+        job_id="noisy-output",
+    )
+
+    assert result["state"] == "cancelled"
+    assert result["returncode"] < 0
+    assert result["event_names"][0] == "unstructured-output"
+    assert result["event_names"].count(spike.EVENT_NAMES_TRUNCATED) == 1
+    assert len(result["event_names"]) <= spike.MAX_RETAINED_EVENT_NAMES + 1
+    journal = [
+        json.loads(line)
+        for line in (tmp_path / "state" / "journal.jsonl").read_text().splitlines()
+    ]
+    assert journal[-1]["state"] == "cancelled"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="killpg process groups are POSIX-only")
+def test_unavailable_group_enumeration_keeps_existing_group_uncertain(monkeypatch):
+    signaled = []
+    monkeypatch.setattr(spike, "_group_has_running_members", lambda _pgid, _deadline=None: None)
+    monkeypatch.setattr(spike.os, "killpg", lambda pgid, sig: signaled.append((pgid, sig)))
+
+    assert spike._group_running(4321, threading.Thread()) is True
+    assert signaled == [(4321, 0)]
+
+
+@pytest.mark.parametrize("stage", ["version", "exec_help"])
+@pytest.mark.parametrize("failure", ["os_error", "timeout", "unicode_error"])
+def test_inspect_cli_sanitizes_probe_launch_and_timeout_errors(
+    tmp_path, monkeypatch, capsys, stage, failure
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        current_stage = "version" if command[-1] == "--version" else "exec_help"
+        if current_stage == stage:
+            _raise_probe_failure(failure, command)
+        return subprocess.CompletedProcess(command, 0, "codex-cli 1.0-test\n", "")
+
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
+
+    code = spike._main([
+        "inspect", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == "refused: Codex version/help probe could not complete.\n"
+    assert "raw-secret-marker" not in captured.err
+    assert str(fake) not in captured.err
+    assert "Traceback" not in captured.err
+    assert len(calls) == (1 if stage == "version" else 2)
+
+
+def _raise_probe_failure(failure, command):
+    if failure == "os_error":
+        raise OSError("raw-secret-marker /private/tmp/raw-secret-path")
+    if failure == "timeout":
+        raise subprocess.TimeoutExpired(command, timeout=0.1, output="raw-secret-marker")
+    raise UnicodeDecodeError("utf-8", b"\\xffsecret", 0, 1, "raw-secret-marker")
+
+
+@pytest.mark.parametrize("stage", ["first", "second"])
+@pytest.mark.parametrize("failure", ["os_error", "timeout", "unicode_error"])
+def test_sandbox_probe_sanitizes_subprocess_failures(
+    tmp_path, monkeypatch, capsys, stage, failure
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        current_stage = "first" if len(calls) == 1 else "second"
+        if current_stage == stage:
+            _raise_probe_failure(failure, command)
+        return subprocess.CompletedProcess(command, 1, "", "")
+
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
+
+    code = spike._main([
+        "sandbox-probe", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == "refused: Codex sandbox probe could not complete.\n"
+    assert "raw-secret-marker" not in captured.err
+    assert "/private/tmp/raw-secret-path" not in captured.err
+    assert str(fake) not in captured.err
+    assert "Traceback" not in captured.err
+    assert len(calls) == (1 if stage == "first" else 2)
+
+
+def _sandbox_markers(
+    operations: dict[str, int], denials: set[str] | frozenset[str] = frozenset()
+) -> str:
+    lines = []
+    for name, status in operations.items():
+        lines.extend((f"probe-start:{name}", f"probe-complete:{name}",
+                      f"probe-status:{name}:{status}"))
+        if name in denials:
+            lines.append(f"probe-denied:{name}")
+    return "\n".join(lines) + "\n"
+
+
+def test_sandbox_probe_requires_each_operation_and_records_real_denial_markers(
+    tmp_path, monkeypatch
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        workspace = Path(command[command.index("--cd") + 1])
+        if len(calls) == 1:
+            (workspace / "write-test.txt").write_text("inside-write", encoding="utf-8")
+            output = "workspace-sentinel\n" + _sandbox_markers(
+                {"inside_read": 0, "outside_read": 1, "inside_write": 0,
+                 "outside_write": 2},
+                {"outside_read", "outside_write"},
+            )
+        else:
+            output = _sandbox_markers(
+                {"auth_read": 1, "config_read": 1}, {"auth_read", "config_read"}
+            )
+        return subprocess.CompletedProcess(command, 1, output, "")
+
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
+
+    result = spike.probe_low_level_sandbox(str(fake), tmp_path / "evidence")
+
+    assert calls and len(calls) == 2
+    assert result["inside_read_allowed"]
+    assert result["outside_read_denied"]
+    assert result["inside_write_allowed"]
+    assert result["outside_write_denied"]
+    assert result["codex_home_auth_and_config_denied"]
+
+
+@pytest.mark.parametrize(
+    ("auth_output", "auth_error"),
+    [
+        ("", "sandbox_apply: Operation not permitted\n"),
+        (_sandbox_markers({"auth_read": 1}, {"auth_read"}), ""),
+    ],
+    ids=["auth-sandbox-setup-failure", "missing-config-operation"],
+)
+def test_sandbox_probe_refuses_when_auth_config_commands_did_not_all_run(
+    tmp_path, monkeypatch, capsys, auth_output, auth_error
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        workspace = Path(command[command.index("--cd") + 1])
+        if len(calls) == 1:
+            (workspace / "write-test.txt").write_text("inside-write", encoding="utf-8")
+            output = "workspace-sentinel\n" + _sandbox_markers(
+                {"inside_read": 0, "outside_read": 1, "inside_write": 0,
+                 "outside_write": 2},
+                {"outside_read", "outside_write"},
+            )
+            return subprocess.CompletedProcess(command, 1, output, "")
+        return subprocess.CompletedProcess(command, 1, auth_output, auth_error)
+
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
+
+    code = spike._main([
+        "sandbox-probe", "--codex-bin", str(fake), "--evidence-dir",
+        str(tmp_path / "evidence"),
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == (
+        "refused: Sandbox commands did not all run to completion; details were not retained.\n"
+    )
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr"),
+    [
+        ("sandbox_apply: Operation not permitted\n", ""),
+        ("workspace-sentinel\n", "sandbox_apply: Operation not permitted\n"),
+    ],
+    ids=["setup-failure", "partial-misleading-output"],
+)
+def test_sandbox_probe_refuses_setup_failure_without_operation_markers(
+    tmp_path, monkeypatch, capsys, stdout, stderr
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1, stdout, stderr)
+
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
+
+    code = spike._main([
+        "sandbox-probe", "--codex-bin", str(fake), "--evidence-dir",
+        str(tmp_path / "evidence"),
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == (
+        "refused: Sandbox commands did not all run to completion; details were not retained.\n"
+    )
+    assert len(calls) == 2
+    assert "workspace-sentinel" not in captured.out
+
+
+@pytest.mark.skipif(os.name != "posix", reason="owned process-group cleanup is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+@pytest.mark.parametrize("probe", ["inspect", "sandbox"])
+def test_probe_timeout_kills_term_ignoring_helper_group(tmp_path, monkeypatch, capsys, probe):
+    marker = tmp_path / "helper"
+    helper = _executable(
+        tmp_path / "helper.py",
+        "import pathlib, signal, time\n"
+        f"marker = pathlib.Path({str(marker)!r})\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "i = 0\n"
+        "while True:\n"
+        " i += 1\n"
+        " marker.write_text(str(i))\n"
+        " time.sleep(0.03)\n",
+    )
+    code = (
+        "import pathlib,subprocess,sys,time\n"
+        f"marker=pathlib.Path({str(marker)!r})\n"
+        f"helper=subprocess.Popen([sys.executable,{str(helper)!r}])\n"
+        "(marker.with_suffix('.pid')).write_text(str(helper.pid))\n"
+        "time.sleep(60)\n"
+    )
+    fake = _executable(tmp_path / "fake-codex", code)
+    real_run_probe = spike._run_probe
+
+    def fast_probe(command, *, env, cwd, timeout_s):
+        # Long enough for a loaded runner to start the helper and record its pid.
+        return real_run_probe(command, env=env, cwd=cwd, timeout_s=3.0)
+
+    monkeypatch.setattr(spike, "_run_probe", fast_probe)
+    args = (["inspect", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")]
+            if probe == "inspect" else
+            ["sandbox-probe", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")])
+
+    code = spike._main(args)
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert captured.out == ""
+    assert "refused:" in captured.err
+    assert "Traceback" not in captured.err
+    assert (marker.with_suffix(".pid")).exists()
+    assert marker.exists()
+    before = marker.read_text()
+    time.sleep(0.15)
+    assert marker.read_text() == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="owned process-group cleanup is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_normal_leader_exit_refuses_and_cleans_live_helper(tmp_path):
+    marker = tmp_path / "helper"
+    helper = _executable(
+        tmp_path / "helper.py",
+        "import pathlib, signal, time\n"
+        f"marker = pathlib.Path({str(marker)!r})\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "i = 0\n"
+        "while True:\n"
+        " i += 1\n"
+        " marker.write_text(str(i))\n"
+        " time.sleep(0.03)\n",
+    )
+    fake = _executable(
+        tmp_path / "fake-codex",
+        (
+            "import pathlib,subprocess,sys\n"
+            f"marker=pathlib.Path({str(marker)!r})\n"
+            f"helper=subprocess.Popen([sys.executable,{str(helper)!r}], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "marker.with_suffix('.pid').write_text(str(helper.pid))\n"
+            "deadline=__import__('time').monotonic()+1\n"
+            "while not marker.exists() and __import__('time').monotonic()<deadline: __import__('time').sleep(0.01)\n"
+        ),
+    )
+
+    with pytest.raises(SpikeError, match="result was refused"):
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=2
+        )
+
+    assert marker.with_suffix(".pid").exists()
+    assert marker.exists()
+    before = marker.read_text()
+    time.sleep(0.15)
+    assert marker.read_text() == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bounded probe pipes need POSIX selectors")
+def test_probe_refuses_when_a_periodic_descendant_scan_fails(tmp_path, monkeypatch):
+    fake = _executable(
+        tmp_path / "fake-codex",
+        "import sys, time\ntime.sleep(0.2)\nsys.stdout.write('codex-cli 1.2.3\\n')\n",
+    )
+    real_track = spike._track_descendants
+    calls = {"n": 0}
+
+    def flaky_track(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return False  # ps failed or ran out of budget for this scan
+        return real_track(*args, **kwargs)
+
+    monkeypatch.setattr(spike, "_track_descendants", flaky_track)
+    with pytest.raises(SpikeError, match="cleanup was uncertain"):
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=5
+        )
+
+
+def test_probe_sweep_still_terminates_known_descendants_when_final_scan_fails(monkeypatch):
+    terminated = []
+    monkeypatch.setattr(spike, "_track_descendants", lambda *a, **k: False)  # ps failed
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+
+    def fake_terminate(escaped, grace_s):
+        terminated.append(sorted(escaped))
+        return True, spike.SIGNALLING_PIDFD
+
+    monkeypatch.setattr(spike, "_terminate_pids", fake_terminate)
+    # Recorded by an earlier periodic scan: it called setsid(), leaving the group.
+    tracked = {4242: (4242, "Ss", "tA", 7, "tA|pgid=4242|helper", True)}
+    found, certain = spike._sweep_probe_descendants(SimpleNamespace(pid=100), tracked)
+    assert terminated == [[4242]]
+    assert found is True
+    assert certain is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the SIGKILL branch is POSIX-only")
+def test_probe_cleanup_waits_for_killed_group_members_to_leave(monkeypatch):
+    # A killed member can linger briefly (for example in a slow disk write);
+    # cleanup must wait for it rather than return while it still runs.
+    running = iter([True, True, True, True, False])
+    states = []
+
+    def group_running(pgid, deadline=None):
+        state = next(running, False)
+        states.append(state)
+        return state
+
+    monkeypatch.setattr(spike, "_probe_group_running", group_running)
+    monkeypatch.setattr(spike, "_signal_group", lambda process, sig: None)
+    monkeypatch.setattr(spike, "_wait_leader_exited", lambda process, timeout_s: True)
+    monkeypatch.setattr(spike, "PROBE_TERMINATION_GRACE_S", 0.0)
+    assert spike._cleanup_probe_process(SimpleNamespace(pid=4242)) is False
+    assert states[-1] is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_refuses_and_terminates_setsid_detached_helper(tmp_path):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-codex",
+        "import os, pathlib, sys, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "deadline = time.monotonic() + 2\n"
+        "while not pid_file.exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+        # Linger so the ppid link is visible to at least one snapshot.
+        "time.sleep(0.5)\n"
+        "sys.stdout.write('codex-cli 1.2.3\\n')\n",
+    )
+    detached_pid = None
+    try:
+        with pytest.raises(SpikeError, match="detached descendant"):
+            spike._run_probe(
+                [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=5
+            )
+        assert pid_file.exists(), "detached helper never reported its pid"
+        detached_pid = int(pid_file.read_text())
+        assert _wait_for_pid_exit(detached_pid, 2.0)
+    finally:
+        if detached_pid is None and pid_file.exists():
+            detached_pid = int(pid_file.read_text())
+        if detached_pid is not None:
+            try:
+                os.kill(detached_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid() detachment is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_exception_snapshots_descendants_before_group_cleanup(tmp_path, monkeypatch):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-codex",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    real_track = spike._track_descendants
+    real_exited = spike._leader_exited
+    failed = {"yes": False}
+
+    def track_after_failure(*args, **kwargs):
+        # The helper detaches after the last periodic scan: only scans made
+        # once the failure is raised can see it.
+        return real_track(*args, **kwargs) if failed["yes"] else True
+
+    def failing_exit_check(process, *args, **kwargs):
+        if failed["yes"]:
+            return real_exited(process, *args, **kwargs)
+        deadline = time.monotonic() + 3
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        failed["yes"] = True
+        raise RuntimeError("selector failure")
+
+    monkeypatch.setattr(spike, "_track_descendants", track_after_failure)
+    monkeypatch.setattr(spike, "_leader_exited", failing_exit_check)
+    detached_pid = None
+    try:
+        with pytest.raises(RuntimeError, match="selector failure"):
+            spike._run_probe(
+                [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=10
+            )
+        assert pid_file.exists(), "detached helper never reported its pid"
+        detached_pid = int(pid_file.read_text())
+        assert _wait_for_pid_exit(detached_pid, 2.0)
+    finally:
+        if detached_pid is None and pid_file.exists():
+            detached_pid = int(pid_file.read_text())
+        if detached_pid is not None:
+            try:
+                os.kill(detached_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid() detachment is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_timeout_without_a_periodic_scan_still_terminates_detached_helper(
+    tmp_path, monkeypatch
+):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-codex",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    # A scan window longer than the timeout: no periodic scan ever runs, as
+    # for a real probe timeout shorter than SCAN_WINDOW_S.
+    monkeypatch.setattr(spike, "SCAN_WINDOW_S", 10.0)
+    detached_pid = None
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            spike._run_probe(
+                [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=2
+            )
+        assert pid_file.exists(), "detached helper never reported its pid"
+        detached_pid = int(pid_file.read_text())
+        assert _wait_for_pid_exit(detached_pid, 2.0)
+    finally:
+        if detached_pid is None and pid_file.exists():
+            detached_pid = int(pid_file.read_text())
+        if detached_pid is not None:
+            try:
+                os.kill(detached_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="probe process groups are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_exit_observed_past_the_deadline_is_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 0.6
+    fake = _executable(
+        tmp_path / "fake-late-codex",
+        # Output is complete in time; only the exit comes late.
+        f"import sys, time\nprint('codex-cli 1.2.3', flush=True)\ntime.sleep({timeout_s + 0.1})\n",
+    )
+    real_exited = spike._leader_exited
+    start = time.monotonic()
+
+    def check_that_crosses_the_deadline(process, table=None, deadline=None):
+        # The exit check starts before the deadline but returns after the
+        # CLI finished late.
+        if time.monotonic() > start + timeout_s - 0.2:
+            time.sleep(max(0.0, start + timeout_s + 0.2 - time.monotonic()))
+            return real_exited(process, table, deadline)
+        return False
+
+    monkeypatch.setattr(spike, "_leader_exited", check_that_crosses_the_deadline)
+    with pytest.raises(subprocess.TimeoutExpired):
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path),
+            timeout_s=timeout_s,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="probe process groups are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_group_quiet_observed_past_the_deadline_is_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 1.0
+    # The leader writes its output and exits just before the deadline.
+    fake = _executable(
+        tmp_path / "fake-codex",
+        f"import time\nprint('codex-cli 1.2.3', flush=True)\ntime.sleep({timeout_s - 0.15})\n",
+    )
+    start = time.monotonic()
+
+    def slow_group_check(pgid, deadline=None):
+        # A delayed ps: the group only looks quiet after the deadline.
+        if time.monotonic() > start + timeout_s - 0.4:
+            time.sleep(max(0.0, start + timeout_s + 0.1 - time.monotonic()))
+        return False
+
+    monkeypatch.setattr(spike, "_probe_group_running", slow_group_check)
+    with pytest.raises(subprocess.TimeoutExpired):
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path),
+            timeout_s=timeout_s,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bounded probe pipes need POSIX selectors")
+@pytest.mark.xdist_group("spike_procs")
+@pytest.mark.parametrize("flood", ["stderr", "both"])
+def test_probe_bounds_both_output_streams_and_cleans_owned_group(
+    tmp_path, monkeypatch, flood
+):
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    heartbeat = markers / "heartbeat"
+    helper = _executable(
+        tmp_path / "flood-helper.py",
+        "import pathlib,signal,time\n"
+        f"marker=pathlib.Path({str(heartbeat)!r})\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "i=0\n"
+        "while True:\n"
+        " i+=1; marker.write_text(str(i)); time.sleep(0.02)\n",
+    )
+    fake = _executable(
+        tmp_path / "noisy-codex",
+        "import os,pathlib,subprocess,sys,time\n"
+        f"markers=pathlib.Path({str(markers)!r})\n"
+        f"helper=subprocess.Popen([sys.executable,{str(helper)!r}], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "(markers/'helper.pid').write_text(str(helper.pid))\n"
+        "deadline=time.monotonic()+1\n"
+        "while not (markers/'heartbeat').exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
+        "chunk=b'x'*8192\n"
+        "while True:\n"
+        f" os.write(1,chunk) if {flood!r} in ('stdout','both') else None\n"
+        f" os.write(2,chunk) if {flood!r} in ('stderr','both') else None\n",
+    )
+    monkeypatch.setattr(spike, "MAX_PROBE_OUTPUT_BYTES", 32 * 1024)
+
+    with pytest.raises(SpikeError, match="bounded capture limit") as error:
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=5
+        )
+
+    assert "raw" not in str(error.value)
+    assert (markers / "helper.pid").exists()
+    assert heartbeat.exists()
+    before = heartbeat.read_text()
+    time.sleep(0.15)
+    assert heartbeat.read_text() == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake-harness state locking is POSIX-only")
+def test_uncertain_recovery_is_interrupted_and_never_relaunches(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    journal_path = state / "journal.jsonl"
+    journal_path.write_text(
+        "".join(
+            json.dumps({"job_id": job_id, "state": "starting"}) + "\n"
+            for job_id in ("uncertain", "uncertain-other")
+        ) + '{"job_id":"partial","state":'
+    )
+    launches = tmp_path / "launch-count"
+    fake = _executable(
+        tmp_path / "must-not-run",
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(launches)!r}).write_text('launched')\n",
+    )
+
+    assert recover_uncertain_runs(state) == ["uncertain", "uncertain-other"]
+    assert recover_uncertain_runs(state) == []
+    with pytest.raises(SpikeError, match="never replayed"):
+        supervise_fake_command([str(fake)], state_dir=state, timeout_s=1, job_id="uncertain")
+    with pytest.raises(SpikeError, match="never replayed"):
+        supervise_fake_command([str(fake)], state_dir=state, timeout_s=1, job_id="uncertain-other")
+
+    assert not launches.exists()
+    raw_journal = journal_path.read_text().splitlines()
+    assert raw_journal[2] == '{"job_id":"partial","state":'
+    rows = spike._read_jsonl(journal_path)
+    assert [(row["job_id"], row["state"]) for row in rows] == [
+        ("uncertain", "starting"),
+        ("uncertain-other", "starting"),
+        ("uncertain", "interrupted"),
+        ("uncertain-other", "interrupted"),
+    ]
+    evidence = [json.loads(line) for line in (state / "evidence.jsonl").read_text().splitlines()]
+    assert [(row["kind"], row["job_id"]) for row in evidence] == [
+        ("recovery", "uncertain"),
+        ("recovery", "uncertain-other"),
+    ]
+    assert state.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake-harness flock reservation is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_fake_supervisor_atomically_reserves_state_against_supervisor_and_recovery(tmp_path):
+    state = tmp_path / "state"
+    launches = tmp_path / "launches"
+    entered = tmp_path / "reservation-entered"
+    release = tmp_path / "release-reservation"
+    fake = _executable(
+        tmp_path / "slow-fake",
+        "import pathlib\n"
+        f"with pathlib.Path({str(launches)!r}).open('a') as stream: stream.write('launched\\n')\n"
+        "print('{\"type\":\"thread.started\"}', flush=True)\n"
+    )
+    driver = _executable(
+        tmp_path / "supervisor-driver",
+        "import pathlib,sys\n"
+        "import scripts.remote_agent_host_spike as spike\n"
+        "mode,state,command,job,entered,release=sys.argv[1:]\n"
+        "if mode=='run' and entered!='-':\n"
+        " original=spike._read_jsonl\n"
+        " def gated_read(path):\n"
+        "  records=original(path)\n"
+        "  pathlib.Path(entered).touch()\n"
+        "  deadline=__import__('time').monotonic()+5\n"
+        "  while not pathlib.Path(release).exists() and __import__('time').monotonic()<deadline: __import__('time').sleep(0.01)\n"
+        "  return records\n"
+        " spike._read_jsonl=gated_read\n"
+        "try:\n"
+        " if mode=='run': print(spike.supervise_fake_command([command],state_dir=pathlib.Path(state),timeout_s=5,job_id=job)['state'])\n"
+        " else: print(spike.recover_uncertain_runs(pathlib.Path(state)))\n"
+        "except spike.SpikeError as exc:\n"
+        " print('refused:'+str(exc)); raise SystemExit(3)\n",
+    )
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONPATH": repo_root}
+    leader = subprocess.Popen(
+        [sys.executable, str(driver), "run", str(state), str(fake), "same-job",
+         str(entered), str(release)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not entered.exists() and leader.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert entered.exists(), "first supervisor did not reach the journal reservation window"
+        duplicate = subprocess.run(
+            [sys.executable, str(driver), "run", str(state), str(fake), "same-job", "-", "-"],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+        recovery = subprocess.run(
+            [sys.executable, str(driver), "recover", str(state), str(fake), "unused", "-", "-"],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+    finally:
+        release.touch()
+        try:
+            leader_stdout, leader_stderr = leader.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            leader.kill()
+            leader_stdout, leader_stderr = leader.communicate(timeout=2)
+
+    assert leader.returncode == 0, leader_stderr
+    assert leader_stdout.strip() == "succeeded"
+    assert duplicate.returncode == 3
+    assert duplicate.stdout.startswith("refused:Another fake-harness supervisor")
+    assert recovery.returncode == 3
+    assert recovery.stdout.startswith("refused:Another fake-harness supervisor")
+    assert launches.read_text().splitlines() == ["launched"]
+    journal = [json.loads(line) for line in (state / "journal.jsonl").read_text().splitlines()]
+    assert [row["state"] for row in journal] == ["starting", "running", "succeeded"]
+
+
+def test_fake_harness_state_lock_fails_closed_without_posix(monkeypatch, tmp_path):
+    monkeypatch.setattr(spike.os, "name", "nt")
+    with pytest.raises(SpikeError, match="state locking requires POSIX"):
+        with spike._locked_state_directory(tmp_path):
+            pytest.fail("non-POSIX fake-harness lock must not be acquired")
+
+
+def test_authenticated_codex_path_is_disabled_even_with_explicit_temp_home(tmp_path):
+    with pytest.raises(SpikeError, match="Live Codex runs are disabled"):
+        run_live_codex(task="research", codex_home=tmp_path / "isolated")
+
+
+def _wait_for_pid_exit(pid: int, timeout_s: float) -> bool:
+    """True once the pid is gone or is an exited-but-unreaped zombie.
+
+    Mirrors the harness: where PID 1 does not reap orphans promptly the
+    process lingers as a zombie that still accepts signal 0 but cannot run.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if spike._pid_identity(pid) is None:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _read_rows(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_timeout_terminates_tracked_detached_helper_before_journaling_cancellation(
+    tmp_path, monkeypatch
+):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-detaching-provider",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    alive_at_journal: list = []
+    real_append = spike._append_jsonl
+
+    def recording_append(path, record):
+        if record.get("state") == "cancel_requested":
+            helper = int(pid_file.read_text())
+            alive_at_journal.append(spike._pid_identity(helper) is not None)
+        real_append(path, record)
+
+    monkeypatch.setattr(spike, "_append_jsonl", recording_append)
+    detached_pid = None
+    try:
+        result = supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.2,
+            job_id="detached-timeout",
+        )
+        detached_pid = int(pid_file.read_text())
+        assert result["state"] == "interrupted"
+        assert alive_at_journal == [False]
+    finally:
+        if detached_pid is None and pid_file.exists():
+            detached_pid = int(pid_file.read_text())
+        if detached_pid is not None:
+            try:
+                os.kill(detached_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="harness state locking is POSIX-only")
+@pytest.mark.parametrize(
+    "state", [[], {"x": 1}, None, 3, "queued", "waiting_for_approval", "bogus"]
+)
+def test_unrecognised_journal_state_is_recovered_and_blocks_new_launches(tmp_path, state):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    (state_dir / "journal.jsonl").write_text(
+        json.dumps({"job_id": "odd", "state": state}) + "\n", encoding="utf-8"
+    )
+    os.chmod(state_dir / "journal.jsonl", 0o600)
+    fake = _executable(tmp_path / "fake-provider", "raise SystemExit(0)\n")
+
+    with pytest.raises(SpikeError, match="unrecovered non-terminal"):
+        supervise_fake_command([str(fake)], state_dir=state_dir, timeout_s=1.0, grace_s=0.1)
+    assert spike.recover_uncertain_runs(state_dir) == ["odd"]
+    assert spike.recover_uncertain_runs(state_dir) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_setsid_detached_descendant_forces_interrupted_and_is_terminated(tmp_path):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-detaching-provider",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "deadline = time.monotonic() + 2\n"
+        "while not pid_file.exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+        # The parent lingers briefly so the ppid link exists for at least one
+        # supervisor snapshot; the harness documents that an immediate exit
+        # after fork is the residual best-effort gap.
+        "time.sleep(0.5)\n"
+        "raise SystemExit(0)\n",
+    )
+
+    try:
+        result = supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=5, grace_s=0.5,
+            job_id="detached",
+        )
+        assert pid_file.exists(), "detached child never reported its pid"
+        detached_pid = int(pid_file.read_text())
+
+        evidence = _read_rows(tmp_path / "state" / "evidence.jsonl")
+        supervision = [row for row in evidence if row["kind"] == "supervision_result"]
+        assert result["returncode"] == 0
+        assert result["state"] == "interrupted", supervision
+        assert _wait_for_pid_exit(detached_pid, 2.0), supervision
+        assert len(supervision) == 1
+        assert supervision[0]["state"] == "interrupted"
+        assert supervision[0]["escaped_descendants"] == [detached_pid]
+        assert supervision[0]["escaped_descendants_terminated"] is True
+        assert supervision[0]["escaped_descendant_signalling"] in (
+            spike.SIGNALLING_PIDFD, spike.SIGNALLING_IDENTITY_CHECK
+        )
+        # Cleanup is only recorded as certain where a non-reusable handle exists.
+        assert supervision[0]["escaped_cleanup_certain"] is (
+            supervision[0]["escaped_descendant_signalling"] == spike.SIGNALLING_PIDFD
+        )
+        assert supervision[0]["descendant_tracking_complete"] is True
+        assert supervision[0]["escaped_descendants_unverified"] == []
+        journal = _read_rows(tmp_path / "state" / "journal.jsonl")
+        assert journal[-1]["state"] == "interrupted"
+        assert journal[1]["state"] == "running" and isinstance(journal[1]["pgid"], int)
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), 9)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake-harness state locking is POSIX-only")
+def test_recover_tolerates_oversized_numbers_and_invalid_bytes_in_journal(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    journal = state / "journal.jsonl"
+    journal.write_bytes(
+        json.dumps({"job_id": "first", "state": "starting"}).encode() + b"\n"
+        + b"9" * 5000 + b"\n"
+        + b'{"job_id":"\xff","state":"starting"}\n'
+        + b"\xff\n"
+        + json.dumps({"job_id": "second", "state": "running"}).encode() + b"\n"
+    )
+
+    assert recover_uncertain_runs(state) == ["first", "\ufffd", "second"]
+
+    rows = spike._read_jsonl(journal)
+    assert [(row["job_id"], row["state"]) for row in rows][-3:] == [
+        ("first", "interrupted"), ("\ufffd", "interrupted"), ("second", "interrupted"),
+    ]
+
+
+def test_cli_withholds_os_error_details_when_state_dir_cannot_be_created(tmp_path, capsys):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+
+    code = spike._main(["recover", "--state-dir", str(blocker / "leaf")])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == "refused: harness failure (details withheld)\n"
+    assert "Traceback" not in captured.err
+    assert str(tmp_path) not in captured.err
+    assert "blocker" not in captured.err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="killpg liveness probes are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_unrecovered_running_job_blocks_start_and_recovery_records_group_liveness(tmp_path):
+    sleeper = subprocess.Popen(
+        ["/bin/sleep", "30"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    launches = tmp_path / "launch-count"
+    fake = _executable(
+        tmp_path / "must-not-run",
+        f"import pathlib; pathlib.Path({str(launches)!r}).touch()\n",
+    )
+    try:
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        (state / "journal.jsonl").write_text(
+            json.dumps({"job_id": "orphan", "state": "starting"}) + "\n"
+            + json.dumps({"job_id": "orphan", "state": "running", "pgid": sleeper.pid}) + "\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SpikeError, match="unrecovered non-terminal jobs; run recover first"):
+            supervise_fake_command([str(fake)], state_dir=state, timeout_s=10, job_id="next")
+        assert not launches.exists()
+        assert [row["job_id"] for row in spike._read_jsonl(state / "journal.jsonl")] == [
+            "orphan", "orphan"
+        ]
+
+        assert recover_uncertain_runs(state) == ["orphan"]
+        assert sleeper.poll() is None, "recovery must observe, never signal, the recorded group"
+        journal = spike._read_jsonl(state / "journal.jsonl")
+        assert journal[-1]["state"] == "interrupted"
+        assert journal[-1]["group_still_alive"] is True
+        evidence = _read_rows(state / "evidence.jsonl")
+        assert evidence == [{
+            "kind": "recovery", "job_id": "orphan", "state": "interrupted",
+            "reason": "uncertain_after_restart", "group_still_alive": True,
+        }]
+
+        # Generous timeout: a Python fake's start-up under a loaded CI runner
+        # must not turn this success path into a cancellation.
+        result = supervise_fake_command([str(fake)], state_dir=state, timeout_s=10, job_id="next")
+        assert result["state"] == "succeeded"
+        assert launches.exists()
+    finally:
+        try:
+            os.killpg(sleeper.pid, 9)
+        except ProcessLookupError:
+            pass
+        sleeper.wait(timeout=5)
+
+    dead_pgid = sleeper.pid
+    other = tmp_path / "other-state"
+    other.mkdir(mode=0o700)
+    (other / "journal.jsonl").write_text(
+        json.dumps({"job_id": "gone", "state": "running", "pgid": dead_pgid}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert recover_uncertain_runs(other) == ["gone"]
+
+    evidence = _read_rows(other / "evidence.jsonl")
+    assert evidence[0]["group_still_alive"] is False
+    assert spike._read_jsonl(other / "journal.jsonl")[-1]["group_still_alive"] is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+def test_recovery_reports_zombie_only_group_as_not_alive(tmp_path):
+    # An exited child we deliberately do not reap stays a zombie in its group;
+    # killpg(0) still succeeds for it, but nothing there can execute.
+    child = subprocess.Popen(["/bin/sleep", "0"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            row = next((e for e in spike._process_table() or [] if e[0] == child.pid), None)
+            if row is not None and row[3].startswith("Z"):
+                break
+            time.sleep(0.02)
+        else:
+            pytest.skip("child never observed as a zombie")
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        (state / "journal.jsonl").write_text(
+            json.dumps({"job_id": "zombie", "state": "running", "pgid": child.pid}) + "\n",
+            encoding="utf-8",
+        )
+        assert recover_uncertain_runs(state) == ["zombie"]
+        assert spike._read_jsonl(state / "journal.jsonl")[-1]["group_still_alive"] is False
+    finally:
+        child.wait(timeout=5)
+
+
+def test_escaped_descendants_reads_the_callers_scan_without_rescanning(monkeypatch):
+    def no_scan(*args, **kwargs):
+        raise AssertionError("_escaped_descendants must not scan on its own")
+
+    monkeypatch.setattr(spike, "_process_table", no_scan)
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+    tracked = {
+        4242: (4242, "Ss", "tA", None, "tA|pgid=4242|helper", True),
+        4343: (100, "S", "tB", None, "tB|pgid=100|in-group", True),
+    }
+    assert spike._escaped_descendants(100, tracked) == {4242: ("tA|pgid=4242|helper", None, True)}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
+def test_private_dir_refuses_a_symlinked_directory(tmp_path):
+    target = tmp_path / "real"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "state"
+    link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(SpikeError, match="symlink"):
+        spike._private_dir(link)
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
+def test_private_dir_refuses_a_symlinked_ancestor_component(tmp_path):
+    target = tmp_path / "real"
+    target.mkdir(mode=0o700)
+    (tmp_path / "link").symlink_to(target, target_is_directory=True)
+    with pytest.raises(SpikeError, match="must not traverse a symlink"):
+        spike._private_dir(tmp_path / "link" / "new" / "state")
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership is required")
+@pytest.mark.parametrize("path, refused", [
+    ("/tmp/openswap-spike/state", False),          # listed macOS link, expected target
+    ("/redirect/openswap-spike/state", True),      # root-owned and top-level, not listed
+    ("/srv/linked/openswap-spike/state", True),    # root-owned, not top-level
+])
+def test_only_listed_system_symlinks_are_trusted(monkeypatch, path, refused):
+    # As if running as root: every link is root-owned, so neither ownership
+    # nor location may earn trust.
+    links = {"/tmp": "private/tmp", "/redirect": "private/tmp", "/srv/linked": "private/tmp"}
+
+    def fake_lstat(candidate):
+        candidate = str(candidate)
+        mode = stat.S_IFLNK | 0o777 if candidate in links else stat.S_IFDIR | 0o755
+        if candidate.endswith("openswap-spike"):
+            raise FileNotFoundError(candidate)
+        return os.stat_result((mode, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+    monkeypatch.setattr(spike.sys, "platform", "darwin")
+    monkeypatch.setattr(spike.os, "lstat", fake_lstat)
+    monkeypatch.setattr(spike.os, "stat", lambda c: os.stat_result((stat.S_IFDIR | 0o1777, 0, 0, 1, 0, 0, 0, 0, 0, 0)))
+    monkeypatch.setattr(spike.os, "readlink", lambda c: links[str(c)])
+    if refused:
+        with pytest.raises(SpikeError, match="must not traverse a symlink"):
+            spike._refuse_symlinked_components(Path(path))
+    else:
+        spike._refuse_symlinked_components(Path(path))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions are required")
+@pytest.mark.parametrize("mode, refused", [(0o777, True), (0o1777, False), (0o755, False)])
+def test_private_dir_refuses_ancestors_others_can_modify_unless_sticky(tmp_path, mode, refused):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(mode)
+    try:
+        if refused:
+            with pytest.raises(SpikeError, match="others can modify"):
+                spike._private_dir(shared / "state")
+            assert not (shared / "state").exists()
+        else:
+            spike._private_dir(shared / "state")
+    finally:
+        shared.chmod(0o755)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
+def test_private_dir_refuses_a_symlink_raced_in_before_the_missing_path_walk(tmp_path, monkeypatch):
+    target = tmp_path / "elsewhere"
+    target.mkdir(mode=0o700)
+    raced = tmp_path / "a"
+    real_check = spike._refuse_symlinked_components
+    calls = {"n": 0}
+
+    def racing_check(path):
+        calls["n"] += 1
+        real_check(path)
+        if calls["n"] == 1:
+            # Another user plants the missing component right after validation.
+            raced.symlink_to(target, target_is_directory=True)
+
+    monkeypatch.setattr(spike, "_refuse_symlinked_components", racing_check)
+    with pytest.raises(SpikeError, match="must not traverse a symlink"):
+        spike._private_dir(raced / "b" / "state")
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
+def test_private_dir_refuses_a_component_raced_into_a_symlink(tmp_path, monkeypatch):
+    target = tmp_path / "elsewhere"
+    target.mkdir(mode=0o700)
+    raced = tmp_path / "a"
+    real_mkdir = Path.mkdir
+
+    def racing_mkdir(self, *args, **kwargs):
+        if self == raced:
+            # Another user wins the race between our check and mkdir.
+            raced.symlink_to(target, target_is_directory=True)
+            raise FileExistsError(str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", racing_mkdir)
+    with pytest.raises(SpikeError, match="must not traverse a symlink"):
+        spike._private_dir(raced / "b" / "state")
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
+def test_private_dir_refuses_an_unsafe_directory_raced_in_before_creating_beneath_it(
+    tmp_path, monkeypatch
+):
+    raced = tmp_path / "a"
+    real_mkdir = Path.mkdir
+
+    def racing_mkdir(self, *args, **kwargs):
+        if self == raced:
+            # Another user wins the race with a real directory others can modify.
+            real_mkdir(self)
+            os.chmod(self, 0o777)
+            raise FileExistsError(str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", racing_mkdir)
+    try:
+        with pytest.raises(SpikeError, match="others can modify"):
+            spike._private_dir(raced / "b" / "state")
+        assert list(raced.iterdir()) == []
+    finally:
+        os.chmod(raced, 0o700)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_event_reader_is_stopped_when_an_unkillable_holder_keeps_stdout_open(tmp_path, monkeypatch):
+    pid_file = tmp_path / "holder.pid"
+    fake = _executable(
+        tmp_path / "fake-pipe-holder",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"  # keeps the inherited stdout pipe open
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "deadline = time.monotonic() + 2\n"
+        "while not pid_file.exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+        "time.sleep(0.5)\n",
+    )
+    # The holder can never be signalled, as if its identity could not be proven.
+    monkeypatch.setattr(spike, "_terminate_pids", lambda escaped, grace_s: (False, spike.SIGNALLING_PIDFD))
+    before = {t.ident for t in threading.enumerate()}
+    try:
+        result = supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=5, grace_s=0.2, job_id="holder",
+        )
+        assert result["state"] == "interrupted"
+        leftover = [t for t in threading.enumerate()
+                    if t.ident not in before and t.name != "MainThread" and t.is_alive()]
+        assert leftover == []
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions are required")
+def test_private_dir_creates_each_missing_ancestor_with_owner_only_mode(tmp_path):
+    state = tmp_path / "a" / "b" / "leaf"
+
+    assert recover_uncertain_runs(state) == []
+
+    for created in (tmp_path / "a", tmp_path / "a" / "b", state):
+        assert created.is_dir()
+        assert created.stat().st_mode & 0o777 == 0o700
+        assert created.stat().st_uid == os.getuid()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink refusal relies on O_NOFOLLOW")
+def test_symlinked_journal_is_refused_and_target_is_untouched(tmp_path, capsys):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    target = tmp_path / "victim.txt"
+    target.write_text("original-contents\n", encoding="utf-8")
+    (state / "journal.jsonl").symlink_to(target)
+    fake = _executable(
+        tmp_path / "must-not-run",
+        f"import pathlib; pathlib.Path({str(tmp_path / 'launched')!r}).touch()\n",
+    )
+
+    with pytest.raises(SpikeError, match="refusing to follow a symlink"):
+        supervise_fake_command([str(fake)], state_dir=state, timeout_s=1, job_id="symlink")
+    code = spike._main(["demo", "--state-dir", str(state), "--timeout", "0.2"])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.err == "refused: refusing to follow a symlink\n"
+    assert target.read_text(encoding="utf-8") == "original-contents\n"
+    assert (state / "journal.jsonl").is_symlink()
+    assert not (tmp_path / "launched").exists()
+    assert not (state / "evidence.jsonl").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake executable shebang test is POSIX-only")
+def test_fake_child_environment_is_allowlisted(tmp_path, monkeypatch):
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    monkeypatch.setenv("FAKE_SECRET_TOKEN", "abc")
+    monkeypatch.setenv("SPIKE_MARKERS", str(markers))
+    fake = _executable(
+        tmp_path / "fake-env-reporter",
+        "import json, os, pathlib\n"
+        "token = os.environ.get('FAKE_SECRET_TOKEN')\n"
+        "print(json.dumps({'type': 'env.' + ('leaked' if token else 'clean'), 'token': token}), flush=True)\n"
+        "pathlib.Path(os.environ['SPIKE_MARKERS'], 'env.json').write_text(json.dumps(dict(os.environ)))\n",
+    )
+    state = tmp_path / "state"
+
+    result = supervise_fake_command([str(fake)], state_dir=state, timeout_s=2, job_id="env")
+
+    assert result["state"] == "succeeded"
+    assert result["event_names"] == ["env.clean"]
+    observed = json.loads((markers / "env.json").read_text())
+    assert "FAKE_SECRET_TOKEN" not in observed
+    assert observed["SPIKE_MARKERS"] == str(markers)
+    assert observed["HOME"] == str(state)
+    assert observed["PATH"] == os.defpath
+    # The child interpreter adds LC_CTYPE (PEP 538 locale coercion) and macOS
+    # CoreFoundation adds __CF_USER_TEXT_ENCODING; neither comes from us.
+    runtime_added = {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+    assert not {k for k in observed if not k.startswith("SPIKE_")} - {"PATH", "HOME"} - runtime_added
+    stored = (state / "journal.jsonl").read_text() + (state / "evidence.jsonl").read_text()
+    assert "abc" not in stored
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake executable shebang test is POSIX-only")
+def test_non_conforming_event_types_are_recorded_as_unknown_event(tmp_path):
+    fake = _executable(
+        tmp_path / "fake-token-event",
+        "import json, sys\n"
+        "sys.stdout.write(json.dumps({'type': 'sk-live-ABC123'}) + '\\n')\n"
+        "sys.stdout.write(json.dumps({'type': 'Thread.Started'}) + '\\n')\n"
+        "sys.stdout.write(json.dumps({'type': 'a.b.c.d.e'}) + '\\n')\n"
+        "sys.stdout.write(json.dumps({'type': 'item.completed'}) + '\\n')\n"
+        "sys.stdout.write('secret-token-value\\n')\n"
+        "sys.stdout.flush()\n",
+    )
+
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=2, job_id="token-event"
+    )
+
+    assert result["state"] == "succeeded"
+    assert result["event_names"] == [
+        "unknown-event", "unknown-event", "unknown-event", "item.completed", "unstructured-output",
+    ]
+    stored = (
+        (tmp_path / "state" / "journal.jsonl").read_text()
+        + (tmp_path / "state" / "evidence.jsonl").read_text()
+    )
+    assert "sk-live-ABC123" not in stored
+    assert "ABC123" not in stored
+    assert "secret-token-value" not in stored
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake executable shebang test is POSIX-only")
+@pytest.mark.parametrize(
+    ("version_line", "secret"),
+    [("codex-cli 0.157.1 SECRET=xyz", "xyz"), ("codex-cli sk-live-ABC123", "sk-live")],
+)
+def test_inspect_refuses_unrecognised_version_output_without_retaining_it(
+    tmp_path, capsys, version_line, secret
+):
+    fake = _executable(
+        tmp_path / "fake-codex",
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        f" print({version_line!r})\n"
+        "elif sys.argv[1:] == ['exec', '--help']:\n"
+        " print('--json')\n"
+        "else: raise SystemExit(4)\n",
+    )
+
+    code = spike._main([
+        "inspect", "--codex-bin", str(fake), "--evidence-dir", str(tmp_path / "evidence")
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == "refused: Unrecognised version output\n"
+    evidence = tmp_path / "evidence" / "evidence.jsonl"
+    assert not evidence.exists() or secret not in evidence.read_text()
+
+
+@pytest.mark.parametrize(
+    ("first_output_extra", "outside_write_file", "failed"),
+    [
+        ("outside-sentinel\n", False, "outside_read_denied"),
+        ("", True, "outside_write_denied"),
+    ],
+    ids=["outside-sentinel-leaked", "outside-write-file-exists"],
+)
+def test_sandbox_probe_refuses_when_boundary_is_not_confirmed(
+    tmp_path, monkeypatch, capsys, first_output_extra, outside_write_file, failed
+):
+    fake = tmp_path / "fake-codex"
+    fake.touch()
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        workspace = Path(command[command.index("--cd") + 1])
+        if len(calls) == 1:
+            (workspace / "write-test.txt").write_text("inside-write", encoding="utf-8")
+            if outside_write_file:
+                (workspace.parent / "outside" / "write-test.txt").write_text(
+                    "outside-write", encoding="utf-8"
+                )
+            output = "workspace-sentinel\n" + first_output_extra + _sandbox_markers(
+                {"inside_read": 0, "outside_read": 1, "inside_write": 0,
+                 "outside_write": 2},
+                {"outside_read", "outside_write"},
+            )
+        else:
+            output = _sandbox_markers(
+                {"auth_read": 1, "config_read": 1}, {"auth_read", "config_read"}
+            )
+        return subprocess.CompletedProcess(command, 1, output, "")
+
+    monkeypatch.setattr(spike, "_run_probe", fake_run)
+
+    code = spike._main([
+        "sandbox-probe", "--codex-bin", str(fake), "--evidence-dir",
+        str(tmp_path / "evidence"),
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == (
+        f"refused: Sandbox probe did not confirm: {failed}. Raw output was not retained.\n"
+    )
+    assert "outside-sentinel" not in captured.err
+    assert len(calls) == 2
+    assert not (tmp_path / "evidence" / "evidence.jsonl").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="directory fsync is POSIX-only")
+def test_append_jsonl_fsyncs_containing_directory_and_new_ancestors(tmp_path, monkeypatch):
+    synced_dirs = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            synced_dirs.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(spike.os, "fsync", recording_fsync)
+    leaf = tmp_path / "a" / "b" / "leaf"
+    spike._append_jsonl(leaf / "journal.jsonl", {"job_id": "durable", "state": "starting"})
+    # One directory fsync per newly created ancestor (a, b, leaf) plus one for
+    # the journal's containing directory after the append.
+    assert len(synced_dirs) == 4
+    assert (leaf / "journal.jsonl").read_text().strip() == json.dumps(
+        {"job_id": "durable", "state": "starting"}, sort_keys=True
+    )
+
+
+def test_track_descendants_drops_reused_pid_with_new_birth_identity(monkeypatch):
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
+        # 4242 exited and its pid was reused by an unrelated process with a new
+        # start time and a parent outside the run; 4343 is a genuine new child.
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 1, 4242, "S", "tB", "tB|pgid=4242|stranger"),
+         (4343, 100, 4343, "S", "tC", "tC|pgid=4343|child")],
+    ])
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: None)
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked == {4242: (4242, "S", "tA", None, "tA|pgid=4242|child", True)}
+    spike._track_descendants(100, tracked)
+    assert 4242 not in tracked
+    assert tracked == {4343: (4343, "S", "tC", None, "tC|pgid=4343|child", True)}
+
+
+def test_track_descendants_keeps_child_whose_group_and_command_changed_after_reparent(monkeypatch):
+    # Same start time throughout: the child called setsid() (new pgid) and
+    # exec()'d a helper (new command) and was reparented to 1 before the next
+    # snapshot. It must stay tracked and be reported as escaped, but without
+    # a pidfd a changed command could equally be a same-second pid reuse, so
+    # it is no longer trusted enough to signal.
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 100, "S", "tA", "tA|pgid=100|python fake")],
+        [(100, 1, 100, "Z", "t0", "t0|pgid=100|leader"),
+         (4242, 1, 4242, "Ss", "tA", "tA|pgid=4242|helper --detached")],
+        [(100, 1, 100, "Z", "t0", "t0|pgid=100|leader"),
+         (4242, 1, 4242, "Ss", "tA", "tA|pgid=4242|helper --detached")],
+    ])
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: None)
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    spike._track_descendants(100, tracked)
+    assert tracked == {4242: (4242, "Ss", "tA", None, "tA|pgid=4242|helper --detached", False)}
+    assert spike._escaped_descendants(100, tracked) == {
+        4242: ("tA|pgid=4242|helper --detached", None, False)
+    }
+
+
+@pytest.mark.parametrize("second_row, still_verified", [
+    # setsid() then reparented to init: same command, stays trusted.
+    ((4242, 1, 4242, "Ss", "tA", "tA|pgid=4242|python fake"), True),
+    # Same start time, but now parented by a stranger: possibly a reused pid.
+    ((4242, 777, 777, "S", "tA", "tA|pgid=777|python fake"), False),
+    # Same start time, new command line: possibly a reused pid.
+    ((4242, 100, 100, "S", "tA", "tA|pgid=100|sshd"), False),
+])
+def test_track_descendants_revokes_handleless_trust_on_possible_reuse(
+    monkeypatch, second_row, still_verified
+):
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 100, "S", "tA", "tA|pgid=100|python fake")],
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"), second_row],
+    ])
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: None)
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][5] is True
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][5] is still_verified
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_process_table_scans_are_bounded_by_the_job_deadline(tmp_path, monkeypatch):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    budgets: list = []
+    cancelled: list = []
+    real_append = spike._append_jsonl
+
+    def recording_table(timeout_s=None):
+        # Recorded before and after cancellation: cleanup scans are bounded too.
+        budgets.append(timeout_s)
+        return None  # as if ps timed out
+
+    def recording_append(path, record):
+        if record.get("state") == "cancel_requested":
+            cancelled.append(True)
+        real_append(path, record)
+
+    monkeypatch.setattr(spike, "_process_table", recording_table)
+    monkeypatch.setattr(spike, "_append_jsonl", recording_append)
+    supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=1.0, grace_s=0.2, job_id="slow-ps",
+    )
+    assert cancelled and budgets
+    assert all(b is not None and b <= 1.0 for b in budgets), budgets
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_short_timeout_run_still_attributes_a_detached_helper(tmp_path, monkeypatch):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-quick-detacher",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    # A scan window longer than the run: no periodic scan ever starts, as for
+    # a run shorter than SCAN_WINDOW_S. Only the pre-signal scan can see it.
+    monkeypatch.setattr(spike, "SCAN_WINDOW_S", 10.0)
+    try:
+        result = supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=1.0, grace_s=0.2, job_id="short",
+        )
+        assert pid_file.exists()
+        detached_pid = int(pid_file.read_text())
+        assert result["state"] == "interrupted"
+        assert _wait_for_pid_exit(detached_pid, 2.0)
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_stalled_scans_never_carry_a_short_run_past_its_deadline(tmp_path, monkeypatch):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    marks: dict = {}
+    real_signal = spike._signal_group
+
+    def stalled_table(timeout_s=None):
+        time.sleep(min(timeout_s if timeout_s is not None else 0.0, 2.0))  # ps hangs
+        return None
+
+    def recording_signal(process, sig):
+        marks.setdefault(sig, time.monotonic())
+        real_signal(process, sig)
+
+    monkeypatch.setattr(spike, "_process_table", stalled_table)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
+    start = time.monotonic()
+    supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=0.2, grace_s=0.2, job_id="stall",
+    )
+    # No scan may start within SCAN_WINDOW_S of the deadline or run past it;
+    # only the pre-signal scan (at most SCAN_WINDOW_S) precedes SIGTERM.
+    assert marks[signal.SIGTERM] - start < 0.2 + spike.SCAN_WINDOW_S + 0.25
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_supervision_failure_waits_for_the_running_row_before_releasing_the_lock(
+    tmp_path, monkeypatch
+):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    written: list = []
+    real_append = spike._append_jsonl
+
+    def slow_running_append(path, record):
+        if record.get("state") == "running":
+            time.sleep(0.5)  # a slow fsync on the state directory
+            real_append(path, record)
+            written.append("running")
+            return
+        real_append(path, record)
+
+    def failing_snapshot(deadline):
+        raise RuntimeError("snapshot failed")
+
+    monkeypatch.setattr(spike, "_append_jsonl", slow_running_append)
+    monkeypatch.setattr(spike, "_snapshot", failing_snapshot)
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=5, grace_s=0.2, job_id="late-row",
+        )
+    # The writer finished inside the locked scope, so recovery cannot race it.
+    assert written == ["running"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_in_loop_exit_observed_past_the_deadline_is_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 0.6
+    fake = _executable(tmp_path / "fake-late-exit", f"import time\ntime.sleep({timeout_s + 0.1})\n")
+    real_exited = spike._leader_exited
+    start = time.monotonic()
+
+    def check_that_crosses_the_deadline(process, table=None, deadline=None):
+        # The in-loop check starts before the deadline but returns after the
+        # child exited late.
+        if deadline is not None and time.monotonic() > start + timeout_s - 0.2:
+            time.sleep(max(0.0, start + timeout_s + 0.2 - time.monotonic()))
+            return real_exited(process, table, deadline)
+        return False
+
+    monkeypatch.setattr(spike, "_leader_exited", check_that_crosses_the_deadline)
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=timeout_s, grace_s=0.2,
+        job_id="late-in-loop",
+    )
+
+    states = [row["state"] for row in _read_rows(tmp_path / "state" / "journal.jsonl")]
+    assert result["state"] != "succeeded"
+    assert "cancel_requested" in states
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_exit_seen_only_after_the_deadline_is_still_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 0.6
+    # The child exits 0.1 s after the deadline.
+    fake = _executable(tmp_path / "fake-late-exit", f"import time\ntime.sleep({timeout_s + 0.1})\n")
+    real_exited = spike._leader_exited
+    start = time.monotonic()
+
+    def slow_fallback(process, table=None, deadline=None):
+        # No waitid: exit is only observable through a slow ps fallback.
+        if deadline is not None and deadline > start + timeout_s + 0.05:
+            time.sleep(max(0.0, deadline - time.monotonic()))
+            return real_exited(process, table, deadline)
+        return False
+
+    monkeypatch.setattr(spike, "_leader_exited", slow_fallback)
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=timeout_s, grace_s=0.2,
+        job_id="late-exit",
+    )
+
+    states = [row["state"] for row in _read_rows(tmp_path / "state" / "journal.jsonl")]
+    assert result["state"] != "succeeded"
+    assert "cancel_requested" in states
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+@pytest.mark.parametrize("path", ["supervise", "probe"])
+def test_time_spent_creating_the_process_counts_toward_the_timeout(tmp_path, monkeypatch, path):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    real_popen = subprocess.Popen
+    real_signal = spike._signal_group
+    marks: dict = {}
+    delayed = []
+
+    def descheduled_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        if not delayed:  # only the child itself, not later ps scans
+            delayed.append(True)
+            time.sleep(1.5)  # the parent is descheduled while the child runs
+        return process
+
+    def recording_signal(process, sig):
+        marks.setdefault(sig, time.monotonic())
+        real_signal(process, sig)
+
+    monkeypatch.setattr(spike.subprocess, "Popen", descheduled_popen)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
+    start = time.monotonic()
+    if path == "supervise":
+        supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=1.0, grace_s=0.2,
+            job_id="slow-spawn",
+        )
+    else:
+        with pytest.raises(subprocess.TimeoutExpired):
+            spike._run_probe(
+                [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path),
+                timeout_s=1.0,
+            )
+    # The 1 s budget was spent while Popen had not returned: termination
+    # starts at once, not a full timeout after Popen.
+    assert marks[signal.SIGTERM] - start < 1.5 + spike.SCAN_WINDOW_S + 0.35
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path, monkeypatch):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    marks: dict = {}
+    real_append = spike._append_jsonl
+    real_signal = spike._signal_group
+    terminated = threading.Event()
+
+    def stalled_append(path, record):
+        if record.get("state") == "running":
+            # Storage stays stalled until the deadline is enforced (capped so
+            # a regression fails instead of hanging).
+            marks["unblocked_by_term"] = terminated.wait(10)
+            real_append(path, record)
+            return
+        real_append(path, record)
+
+    def recording_signal(process, sig):
+        if sig == signal.SIGTERM:
+            terminated.set()
+        real_signal(process, sig)
+
+    monkeypatch.setattr(spike, "_append_jsonl", stalled_append)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.2, job_id="slow-fsync",
+    )
+    assert result["state"] in ("cancelled", "interrupted")
+    # The append runs off the supervising thread, so the 1.5 s deadline is
+    # enforced while it is still blocked, not after it returns.
+    assert marks["unblocked_by_term"] is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_timeout_kills_term_ignoring_provider_before_journaling_cancellation(
+    tmp_path, monkeypatch
+):
+    ready = tmp_path / "ignoring-term"
+    fake = _executable(
+        tmp_path / "fake-stubborn-provider",
+        "import pathlib, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"pathlib.Path({str(ready)!r}).touch()\n"
+        "time.sleep(30)\n",
+    )
+    order: list = []
+    real_append = spike._append_jsonl
+    real_signal = spike._signal_group
+
+    def stalled_append(path, record):
+        if record.get("state") == "cancel_requested":
+            order.append("journal")
+            time.sleep(0.5)  # fsync on stalled storage
+        real_append(path, record)
+
+    def recording_signal(process, sig):
+        if sig == signal.SIGTERM:
+            assert ready.exists(), "fake had not installed its SIGTERM handler"
+        order.append(sig)
+        real_signal(process, sig)
+
+    monkeypatch.setattr(spike, "_append_jsonl", stalled_append)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.1, job_id="stubborn",
+    )
+
+    assert result["state"] in ("cancelled", "interrupted")
+    assert signal.SIGKILL in order and "journal" in order, order
+    assert order.index(signal.SIGKILL) < order.index("journal"), order
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_group_kill_is_not_delayed_by_a_stalled_macos_group_scan(monkeypatch):
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import signal, time\n"
+         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+         "time.sleep(30)\n"],
+        start_new_session=True,
+    )
+    time.sleep(0.2)  # let the child install its handler
+    real_run = subprocess.run
+    killed: dict = {}
+    real_signal = spike._signal_group
+
+    def stalled_ps(argv, *args, **kwargs):
+        if argv[:2] == ["/bin/ps", "-axo"] and argv[2] == "pid=,pgid=,stat=":
+            time.sleep(kwargs["timeout"])
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return real_run(argv, *args, **kwargs)
+
+    def recording_signal(proc, sig):
+        killed.setdefault(sig, time.monotonic())
+        real_signal(proc, sig)
+
+    monkeypatch.setattr(spike.sys, "platform", "darwin")
+    monkeypatch.setattr(spike.subprocess, "run", stalled_ps)
+    monkeypatch.setattr(spike, "_signal_group", recording_signal)
+    reader = threading.Thread(target=lambda: None)
+    try:
+        start = time.monotonic()
+        spike._terminate_group(process, reader, grace_s=0.0)
+        # Before the fix each of the two pre-kill scans could take 1 s.
+        assert killed[signal.SIGKILL] - start < 0.5
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):  # macOS: zombie-only group
+            pass
+        process.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="probe process groups are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_every_probe_and_termination_group_scan_is_deadline_bounded(tmp_path, monkeypatch):
+    fake = _executable(tmp_path / "fake-codex", "print('codex-cli 1.2.3')\n")
+    deadlines: list = []
+    real_members = spike._group_has_running_members
+
+    def recording_members(pgid, deadline=None):
+        deadlines.append(deadline)
+        return real_members(pgid, deadline)
+
+    monkeypatch.setattr(spike, "_group_has_running_members", recording_members)
+    spike._run_probe(
+        [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=5
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        spike._terminate_group(process, threading.Thread(target=lambda: None), grace_s=0.1)
+    finally:
+        process.wait(timeout=5)
+
+    assert deadlines and all(d is not None for d in deadlines), deadlines
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="pidfds are Linux-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_failed_final_scan_sweeps_a_pidfd_child_cached_in_the_leader_group(monkeypatch):
+    leader = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                              start_new_session=True)
+    # A verified child that called setsid() after its last successful scan:
+    # its cached group is still the leader's.
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                             start_new_session=True)
+    handle = os.pidfd_open(child.pid)
+    tracked = {child.pid: (leader.pid, "S", "0", handle, "0|child", True)}
+    monkeypatch.setattr(spike, "_track_descendants", lambda *a, **k: False)
+    try:
+        detached, certain = spike._sweep_probe_descendants(leader, tracked)
+        assert detached is True
+        assert certain is False
+        assert child.wait(timeout=5) is not None
+    finally:
+        os.close(handle)
+        for proc in (leader, child):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_track_descendants_evicts_reused_pid_even_when_it_holds_a_pidfd(monkeypatch):
+    closed = []
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
+        # A changed start time means the original process is gone; the
+        # stranger now holding pid 4242 must not seed discovery of its child.
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 1, 4242, "S", "tB", "tB|pgid=4242|stranger"),
+         (5555, 4242, 4242, "S", "tB", "tB|pgid=4242|stranger-child")],
+    ])
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 55)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tA", "tA|pgid=4242|child"))
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][3] == 55
+    spike._track_descendants(100, tracked)
+    assert tracked == {}
+    assert closed == [55]
+
+
+def test_track_descendants_does_not_seed_from_exited_pidfd_entry(monkeypatch):
+    closed = []
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
+        # Pid reused within the same second: identical start time, but the
+        # pidfd reports the original exited. Its "child" is a stranger's.
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 1, 4242, "S", "tA", "tA|pgid=4242|stranger"),
+         (5555, 4242, 4242, "S", "tA", "tA|pgid=4242|stranger-child")],
+    ])
+    exited = {"value": False}
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 60)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: exited["value"])
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tA", "tA|pgid=4242|child"))
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][3] == 60
+    exited["value"] = True
+    spike._track_descendants(100, tracked)
+    assert tracked == {}
+    assert closed == [60]
+
+
+def test_terminate_pids_never_signals_a_pid_whose_start_time_changed(monkeypatch):
+    sent = []
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            return None  # "alive"
+        sent.append((pid, sig))
+
+    monkeypatch.setattr(spike.os, "kill", fake_kill)
+    # A new start time means the pid was reused: the original is known gone.
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda **_: [(987654, 1, 987654, "S", "t1", "t1|pgid=987654|someone-else")])
+    gone, mode = spike._terminate_pids({987654: ("t0|pgid=987654|helper", None, True)}, grace_s=0.05)
+    assert gone is True
+    assert mode == spike.SIGNALLING_IDENTITY_CHECK
+    assert sent == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="reaches the SIGKILL branch, which Windows lacks")
+@pytest.mark.parametrize("table", [
+    None,  # the snapshot failed or timed out
+    [(987654, 1, 987654, "S", "t0", "t0|pgid=987654|exec-ed")],  # same start, new command
+])
+def test_terminate_pids_keeps_unknown_identity_uncertain(monkeypatch, table):
+    sent = []
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            return None  # "alive"
+        sent.append((pid, sig))
+
+    monkeypatch.setattr(spike.os, "kill", fake_kill)
+    monkeypatch.setattr(spike, "_process_table", lambda **_: table)
+    monkeypatch.setattr(spike, "DESCENDANT_KILL_WAIT_S", 0.05)
+    gone, mode = spike._terminate_pids({987654: ("t0|pgid=987654|helper", None, True)}, grace_s=0.05)
+    assert gone is False
+    assert mode == spike.SIGNALLING_IDENTITY_CHECK
+    assert sent == []
+
+
+def test_identity_includes_start_time_group_and_command():
+    table_identity = spike._identity("Tue Sep 22 19:30:46 2026", 4242, "/usr/bin/python3 helper.py")
+    assert table_identity == "Tue Sep 22 19:30:46 2026|pgid=4242|/usr/bin/python3 helper.py"
+    # Same second, different group or command: not the same process.
+    assert spike._identity("Tue Sep 22 19:30:46 2026", 4243, "/usr/bin/python3 helper.py") != table_identity
+    assert spike._identity("Tue Sep 22 19:30:46 2026", 4242, "/bin/sleep 30") != table_identity
+
+
+@pytest.mark.skipif(os.name != "posix", reason="ps identity lookup is POSIX-only")
+def test_pid_identity_matches_process_table_entry_for_live_process():
+    sleeper = subprocess.Popen(
+        ["/bin/sleep", "5"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    try:
+        table = spike._process_table()
+        assert table is not None
+        row = next(entry for entry in table if entry[0] == sleeper.pid)
+        assert spike._pid_identity(sleeper.pid) == row[5]
+        assert spike._pid_row(sleeper.pid) == (row[1], row[2], row[4], row[5])
+        assert f"pgid={sleeper.pid}" in row[5]
+        assert row[5].startswith(row[4])
+    finally:
+        sleeper.kill()
+        sleeper.wait(timeout=5)
+    assert spike._pid_identity(sleeper.pid) is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_exception_after_detach_still_terminates_tracked_descendant(tmp_path, monkeypatch):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-detaching-lingering-provider",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    real_append = spike._append_jsonl
+
+    def failing_append(path, record):
+        if record.get("state") == "cancel_requested":
+            raise OSError("disk full")
+        real_append(path, record)
+
+    monkeypatch.setattr(spike, "_append_jsonl", failing_append)
+    try:
+        with pytest.raises(OSError, match="disk full"):
+            supervise_fake_command(
+                [str(fake)], state_dir=tmp_path / "state", timeout_s=1.5, grace_s=0.3,
+                job_id="detached-then-fail",
+            )
+        assert pid_file.exists(), "detached child never reported its pid"
+        detached_pid = int(pid_file.read_text())
+        assert _wait_for_pid_exit(detached_pid, 2.0)
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), 9)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="setsid/fork descendant tracking is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_startup_journal_failure_still_terminates_detached_descendant(tmp_path, monkeypatch):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-detaching-lingering-provider",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    real_append = spike._append_jsonl
+
+    def failing_append(path, record):
+        if record.get("state") == "running":
+            # A slow disk: the helper has detached before the append fails.
+            deadline = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise OSError("disk full")
+        real_append(path, record)
+
+    monkeypatch.setattr(spike, "_append_jsonl", failing_append)
+    try:
+        with pytest.raises(OSError, match="disk full"):
+            supervise_fake_command(
+                [str(fake)], state_dir=tmp_path / "state", timeout_s=5, grace_s=0.3,
+                job_id="detached-startup-fail",
+            )
+        assert pid_file.exists(), "detached child never reported its pid"
+        assert _wait_for_pid_exit(int(pid_file.read_text()), 2.0)
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), 9)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="reaches the SIGKILL branch, which Windows lacks")
+def test_identity_check_cleanup_bounds_its_scans_by_the_cleanup_deadline(monkeypatch):
+    budgets = []
+
+    def stalled_table(timeout_s=None):
+        budgets.append(timeout_s)
+        time.sleep(min(timeout_s if timeout_s is not None else 2.0, 2.0))  # ps hangs
+        return None
+
+    monkeypatch.setattr(spike, "_process_table", stalled_table)
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(spike.os, "kill", lambda pid, sig: None)
+    escaped = {pid: (f"t0|pgid={pid}|helper", None, True) for pid in (4242, 4343, 4444)}
+    start = time.monotonic()
+    gone, mode = spike._terminate_pids(escaped, grace_s=0.0)
+    elapsed = time.monotonic() - start
+    assert gone is False and mode == spike.SIGNALLING_IDENTITY_CHECK
+    assert all(b is not None for b in budgets), budgets
+    # One bounded scan per round, shared by every descendant.
+    limit = spike.DESCENDANT_KILL_WAIT_S + spike.CLEANUP_SCAN_BUDGET_S
+    assert elapsed < limit + 1.0, elapsed
+
+
+@pytest.mark.skipif(os.name != "posix", reason="pipes and poll are POSIX-only here")
+def test_fd_readiness_works_above_fd_setsize_and_poll_errors_are_not_exit(tmp_path):
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < 1100:
+        pytest.skip("cannot open a descriptor above FD_SETSIZE here")
+    read_end, write_end = os.pipe()
+    try:
+        if soft < 1100:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (1100, hard))
+        high = os.dup2(read_end, 1050)
+        try:
+            assert spike._fd_readable(high, 0) is False
+            os.write(write_end, b"x")
+            assert spike._fd_readable(high, 0) is True
+        finally:
+            os.close(high)
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_pidfd_poll_failure_is_not_treated_as_exit(monkeypatch):
+    monkeypatch.setattr(spike, "_fd_readable", lambda fd, timeout_s: None)
+    assert spike._pidfd_exited(99) is False
+
+
+def test_leader_exit_fallback_scan_is_bounded_by_the_deadline(monkeypatch):
+    budgets = []
+    monkeypatch.delattr(spike.os, "waitid", raising=False)
+    monkeypatch.setattr(spike, "_pid_state", lambda pid, timeout_s=None: budgets.append(timeout_s) or "S")
+    process = SimpleNamespace(returncode=None, pid=4242, poll=lambda: None)
+
+    assert spike._leader_exited(process, None, deadline=time.monotonic() + 0.2) is False
+    # (t + 0.2) - t can round just above 0.2 when the clock has not ticked.
+    assert budgets and budgets[0] is not None and budgets[0] <= 0.2 + 1e-6
+
+
+def test_leader_exit_observation_never_reaps_when_every_check_fails(monkeypatch):
+    monkeypatch.delattr(spike.os, "waitid", raising=False)
+    monkeypatch.setattr(spike, "_pid_state", lambda pid, timeout_s=None: None)
+    process = SimpleNamespace(returncode=None, pid=4242,
+                              poll=lambda: pytest.fail("observation must not reap the leader"))
+
+    assert spike._leader_exited(process, None, deadline=time.monotonic() + 0.2) is False
+
+
+def test_terminate_pids_counts_exited_unreaped_pidfd_descendant_as_gone(monkeypatch):
+    sent = []
+
+    def fake_pidfd_send_signal(handle, sig):
+        # A zombie still accepts signal 0 until something reaps it.
+        if sig != 0:
+            sent.append((handle, sig))
+
+    monkeypatch.setattr(spike.signal, "pidfd_send_signal", fake_pidfd_send_signal, raising=False)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: True)
+    gone, mode = spike._terminate_pids({4242: ("ours", 42, True)}, grace_s=0.05)
+    assert gone is True
+    assert mode == spike.SIGNALLING_PIDFD
+    assert sent == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="reaches the SIGKILL branch, which Windows lacks")
+def test_terminate_pids_never_signals_an_unverified_entry_and_reports_not_gone(monkeypatch):
+    sent = []
+    monkeypatch.setattr(spike.signal, "pidfd_send_signal",
+                        lambda handle, sig: sent.append((handle, sig)) if sig else None, raising=False)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    gone, mode = spike._terminate_pids({4242: ("ours", 42, False)}, grace_s=0.05)
+    assert gone is False
+    assert mode == spike.SIGNALLING_PIDFD
+    assert sent == []
+
+
+def test_terminate_pids_signals_live_pidfd_descendant_until_it_exits(monkeypatch):
+    sent = []
+    exited = {"value": False}
+
+    def fake_pidfd_send_signal(handle, sig):
+        if sig != 0:
+            sent.append((handle, sig))
+            exited["value"] = True  # the process dies on TERM
+
+    monkeypatch.setattr(spike.signal, "pidfd_send_signal", fake_pidfd_send_signal, raising=False)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: exited["value"])
+    gone, mode = spike._terminate_pids({4242: ("ours", 42, True)}, grace_s=0.5)
+    assert gone is True
+    assert mode == spike.SIGNALLING_PIDFD
+    assert sent == [(42, signal.SIGTERM)]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="ps identity lookup is POSIX-only")
+def test_pid_identity_reports_zombie_as_gone(tmp_path):
+    # A child we deliberately do not reap stays a zombie until wait().
+    child = subprocess.Popen(["/bin/sleep", "0"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            table = spike._process_table() or []
+            row = next((entry for entry in table if entry[0] == child.pid), None)
+            if row is not None and row[3].startswith("Z"):
+                break
+            time.sleep(0.02)
+        else:
+            pytest.skip("child did not become an observable zombie in time")
+        assert spike._pid_identity(child.pid) is None
+    finally:
+        child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("handle_exited, expected", [
+    (False, {4242: (4242, "S", "tA", 77, "tA|pgid=4242|child", False)}),
+    (True, {}),
+])
+def test_track_descendants_keeps_live_pidfd_when_revalidation_scan_fails(
+    monkeypatch, handle_exited, expected
+):
+    closed = []
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 77)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: handle_exited)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid, timeout_s=None: None)  # ps failed
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    # A live handle stays tracked (forcing "interrupted") but is never
+    # signalled; only a handle that reads as exited is dropped.
+    assert tracked == expected
+    assert closed == ([77] if handle_exited else [])
+
+
+def test_track_descendants_refuses_handle_when_start_time_changed_after_open(monkeypatch):
+    closed = []
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 77)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tB", "tB|pgid=4242|stranger"))
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked == {}
+    assert closed == [77]
+
+
+def test_track_descendants_keeps_but_never_verifies_handle_when_parent_changed_after_open(monkeypatch):
+    closed = []
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 77)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    # Same second, but reparented before the re-read: could be ours (parent
+    # exited) or a same-second stranger. Track it, never signal it.
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (1, 4242, "tA", "tA|pgid=4242|stranger"))
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked == {4242: (4242, "S", "tA", 77, "tA|pgid=4242|child", False)}
+    assert closed == []
+
+
+def test_track_descendants_verifies_handle_when_child_changed_group_and_command_but_parent_matches(monkeypatch):
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 100, 100, "S", "tA", "tA|pgid=100|python fake")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 79)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    # setsid() and exec() happened between the snapshot and the re-read; the
+    # parent is still our leader, so the handle is proven ours.
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tA", "tA|pgid=4242|helper"))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][3] == 79 and tracked[4242][5] is True
+    # The re-read's group and identity replace the stale snapshot's, so the
+    # detached child counts as escaped even if no later scan succeeds.
+    assert tracked[4242][0] == 4242 and tracked[4242][4] == "tA|pgid=4242|helper"
+    monkeypatch.setattr(spike, "_pid_alive", lambda pid: True)
+    assert 4242 in spike._escaped_descendants(100, tracked)
+
+
+@pytest.mark.parametrize("handle", [None, 81])
+def test_track_descendants_children_of_unverified_entry_stay_unverified(monkeypatch, handle):
+    # 4242 may be a same-second stranger; its child is tracked (and forces
+    # "interrupted" if alive) but must never become signalable through it.
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 1, 4242, "S", "tA", "tA|pgid=4242|child"),
+                                 (5555, 4242, 4242, "S", "tB", "tB|pgid=4242|grandchild")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: handle)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda fd: False)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (4242, 4242, "tB", "tB|pgid=4242|grandchild"))
+    tracked = {4242: (4242, "S", "tA", 80, "tA|pgid=4242|child", False)}
+    spike._track_descendants(100, tracked)
+    assert tracked[5555][5] is False
+    assert tracked[4242][5] is False
+
+
+def test_track_descendants_upgrades_unverified_entry_when_later_snapshot_shows_our_parent(monkeypatch):
+    tables = iter([
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
+        [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+         (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")],
+    ])
+    monkeypatch.setattr(spike, "_process_table", lambda: next(tables))
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 80)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (1, 4242, "tA", "tA|pgid=4242|child"))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][5] is False
+    spike._track_descendants(100, tracked)
+    assert tracked[4242][5] is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="zombie observation is POSIX-only")
+def test_leader_exit_is_observed_without_reaping():
+    process = subprocess.Popen(["/bin/sleep", "0"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+    try:
+        deadline = time.monotonic() + 5
+        while not spike._leader_exited(process) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert spike._leader_exited(process)
+        # Not reaped: the pid, and so the process-group id, is still reserved.
+        assert process.returncode is None
+        assert spike._pid_alive(process.pid)
+        assert spike._group_running(process.pid, threading.Thread()) is False
+    finally:
+        process.wait(timeout=5)
+    assert process.returncode == 0
+
+
+def test_leader_exited_reads_state_from_supplied_snapshot(monkeypatch):
+    process = SimpleNamespace(returncode=None, pid=100, poll=lambda: None)
+    monkeypatch.setattr(spike.os, "waitid", None, raising=False)
+    monkeypatch.setattr(spike, "_pid_state", lambda pid: pytest.fail("must use the snapshot"))
+    running = [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader")]
+    zombie = [(100, 1, 100, "Z", "t0", "t0|pgid=100|leader")]
+    assert spike._leader_exited(process, running) is False
+    assert spike._leader_exited(process, zombie) is True
+    assert spike._leader_exited(process, []) is True  # unreaped children are always listed
+
+
+def test_supervision_is_interrupted_when_snapshots_fail(tmp_path, monkeypatch):
+    if os.name != "posix":
+        pytest.skip("process-group supervision is POSIX-only")
+    monkeypatch.setattr(spike, "_process_table", lambda **_: None)
+    fake = _executable(tmp_path / "fake-quick", "raise SystemExit(0)\n")
+    result = supervise_fake_command([str(fake)], state_dir=tmp_path / "state", timeout_s=10,
+                                    job_id="no-snapshots")
+    # A helper could have detached unobserved, so success cannot be claimed.
+    assert result["state"] == "interrupted"
+    evidence = _read_rows(tmp_path / "state" / "evidence.jsonl")
+    supervision = [row for row in evidence if row["kind"] == "supervision_result"]
+    assert supervision[0]["descendant_tracking_complete"] is False
+
+
+@pytest.mark.parametrize("version", ["0.157.1", "0.158.0-alpha.2.1", "99.0-test", "1.2.3.4-rc.1"])
+def test_version_grammar_accepts_real_version_shapes(version):
+    assert spike._VERSION_OUTPUT.fullmatch(f"codex-cli {version}")
+
+
+@pytest.mark.parametrize("token", ["sk-live-ABC123", "v1", "1", "1.2.3 extra", "../etc", ""])
+def test_version_grammar_rejects_non_version_tokens(token):
+    assert not spike._VERSION_OUTPUT.fullmatch(f"codex-cli {token}")
+
+
+def test_track_descendants_accepts_handle_when_full_row_still_matches(monkeypatch):
+    closed = []
+    monkeypatch.setattr(spike, "_process_table",
+                        lambda: [(100, 1, 100, "Ss", "t0", "t0|pgid=100|leader"),
+                                 (4242, 100, 4242, "S", "tA", "tA|pgid=4242|child")])
+    monkeypatch.setattr(spike, "_open_pidfd", lambda pid: 78)
+    monkeypatch.setattr(spike, "_pidfd_exited", lambda handle: False)
+    monkeypatch.setattr(spike, "_pid_row", lambda pid: (100, 4242, "tA", "tA|pgid=4242|child"))
+    monkeypatch.setattr(spike.os, "close", lambda fd: closed.append(fd))
+    tracked: dict = {}
+    spike._track_descendants(100, tracked)
+    assert tracked == {4242: (4242, "S", "tA", 78, "tA|pgid=4242|child", True)}
+    spike._track_descendants(100, tracked)  # a live, matching entry survives
+    assert tracked == {4242: (4242, "S", "tA", 78, "tA|pgid=4242|child", True)}
+    assert closed == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_terminate_group_observes_leader_exit_without_reaping():
+    process = subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+    try:
+        uncertain = spike._terminate_group(process, threading.Thread(), grace_s=0.5)
+        assert uncertain is False
+        # Exited (a zombie holds the pid, so the pgid stays reserved) but not reaped.
+        assert spike._leader_exited(process) is True
+        assert process.returncode is None
+    finally:
+        spike._reap_leader(process, timeout_s=5.0)
+    assert process.returncode is not None
