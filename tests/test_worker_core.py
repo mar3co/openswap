@@ -117,6 +117,53 @@ def test_read_only_snapshot_does_not_create_state_and_real_adapter_is_disabled(t
     assert not (tmp_path / "worker").exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions")
+def test_read_only_snapshot_creates_no_journal_sidecars_even_in_a_read_only_dir(tmp_path):
+    import sqlite3
+
+    store = LocalJobStore(tmp_path)
+    store.create(_submission(), owner_ref="local-user", worker_epoch=store.current_epoch())
+    db_path = tmp_path / "worker" / "jobs.sqlite3"
+    wal = db_path.with_name(db_path.name + "-wal")
+    shm = db_path.with_name(db_path.name + "-shm")
+    # A stopped worker's fully checkpointed journal, without sidecars.
+    connection = sqlite3.connect(db_path)
+    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    connection.close()
+    for sidecar in (wal, shm):
+        if sidecar.exists():
+            sidecar.unlink()
+    worker_dir = db_path.parent
+    worker_dir.chmod(0o500)
+    try:
+        snapshot = read_worker_snapshot(tmp_path)
+    finally:
+        worker_dir.chmod(0o700)
+
+    assert snapshot.process_state.value != "unavailable"
+    assert snapshot.queue_depth == 1
+    assert not wal.exists() and not shm.exists()
+
+
+def test_read_only_snapshot_still_reads_uncheckpointed_wal_content(tmp_path):
+    import sqlite3
+
+    store = LocalJobStore(tmp_path)
+    store.create(_submission(), owner_ref="local-user", worker_epoch=store.current_epoch())
+    db_path = tmp_path / "worker" / "jobs.sqlite3"
+    # A live reader keeps the WAL from being checkpointed on close.
+    keeper = sqlite3.connect(db_path)
+    keeper.execute("SELECT COUNT(*) FROM jobs").fetchone()
+    try:
+        store.create(_submission("key-2"), owner_ref="local-user", worker_epoch=store.current_epoch())
+        assert db_path.with_name(db_path.name + "-wal").stat().st_size > 0
+        snapshot = read_worker_snapshot(tmp_path)
+    finally:
+        keeper.close()
+
+    assert snapshot.queue_depth == 2
+
+
 def test_read_only_snapshot_quarantines_incomplete_released_lease(tmp_path):
     lease_dir = tmp_path / "worker" / "leases"
     lease_dir.mkdir(mode=0o700, parents=True)

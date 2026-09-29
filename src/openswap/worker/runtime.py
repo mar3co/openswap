@@ -154,7 +154,18 @@ def read_worker_snapshot(backup_root: Path, *, now: datetime | None = None) -> W
         )
     db: sqlite3.Connection | None = None
     try:
-        uri = f"file:{quote(str(db_path.resolve()))}?mode=ro"
+        # mode=ro alone makes SQLite recreate missing WAL sidecars (and fail in
+        # a directory it cannot write). With no WAL content the journal is
+        # fully checkpointed, so open it immutable: nothing is created and
+        # nothing unmerged can be missed. Existing WAL content is read with
+        # mode=ro, whose sidecars then already exist.
+        wal = db_path.with_name(db_path.name + "-wal")
+        try:
+            wal_has_content = wal.lstat().st_size > 0
+        except FileNotFoundError:
+            wal_has_content = False
+        access = "mode=ro" if wal_has_content else "mode=ro&immutable=1"
+        uri = f"file:{quote(str(db_path.resolve()))}?{access}"
         db = sqlite3.connect(uri, uri=True, timeout=0.25)
         db.row_factory = sqlite3.Row
         metadata = {row["key"]: row["value"] for row in db.execute(
