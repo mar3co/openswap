@@ -812,6 +812,34 @@ def test_probe_timeout_without_a_periodic_scan_still_terminates_detached_helper(
                 pass
 
 
+@pytest.mark.skipif(os.name != "posix", reason="probe process groups are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_exit_observed_past_the_deadline_is_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 0.6
+    fake = _executable(
+        tmp_path / "fake-late-codex",
+        # Output is complete in time; only the exit comes late.
+        f"import sys, time\nprint('codex-cli 1.2.3', flush=True)\ntime.sleep({timeout_s + 0.1})\n",
+    )
+    real_exited = spike._leader_exited
+    start = time.monotonic()
+
+    def check_that_crosses_the_deadline(process, table=None, deadline=None):
+        # The exit check starts before the deadline but returns after the
+        # CLI finished late.
+        if time.monotonic() > start + timeout_s - 0.2:
+            time.sleep(max(0.0, start + timeout_s + 0.2 - time.monotonic()))
+            return real_exited(process, table, deadline)
+        return False
+
+    monkeypatch.setattr(spike, "_leader_exited", check_that_crosses_the_deadline)
+    with pytest.raises(subprocess.TimeoutExpired):
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path),
+            timeout_s=timeout_s,
+        )
+
+
 @pytest.mark.skipif(os.name != "posix", reason="bounded probe pipes need POSIX selectors")
 @pytest.mark.xdist_group("spike_procs")
 @pytest.mark.parametrize("flood", ["stderr", "both"])

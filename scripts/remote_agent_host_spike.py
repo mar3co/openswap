@@ -134,8 +134,20 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
             # Observe exit BEFORE selecting: anything the group wrote before
             # it went quiet is then already readable, so an empty select after
             # that observation really means no output is left.
-            exited = _leader_exited(process, deadline=deadline)
-            quiet = exited and not _probe_group_running(process.pid, deadline)
+            if not exited:
+                exited = _leader_exited(process, deadline=deadline)
+                if exited and time.monotonic() > deadline:
+                    # Only an exit observed by the deadline counts; one seen
+                    # after it (a slow scan or a late resume) is a timeout.
+                    timed_out = True
+                    break
+            # Quiet must also be observed by the deadline; otherwise the next
+            # iteration takes the timeout path.
+            quiet = (
+                exited
+                and not _probe_group_running(process.pid, deadline)
+                and time.monotonic() <= deadline
+            )
             events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
             if not selector.get_map() and not exited:
                 time.sleep(min(remaining, 0.02))
