@@ -840,6 +840,31 @@ def test_probe_exit_observed_past_the_deadline_is_a_timeout(tmp_path, monkeypatc
         )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="probe process groups are POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_group_quiet_observed_past_the_deadline_is_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 1.0
+    # The leader writes its output and exits just before the deadline.
+    fake = _executable(
+        tmp_path / "fake-codex",
+        f"import time\nprint('codex-cli 1.2.3', flush=True)\ntime.sleep({timeout_s - 0.15})\n",
+    )
+    start = time.monotonic()
+
+    def slow_group_check(pgid, deadline=None):
+        # A delayed ps: the group only looks quiet after the deadline.
+        if time.monotonic() > start + timeout_s - 0.4:
+            time.sleep(max(0.0, start + timeout_s + 0.1 - time.monotonic()))
+        return False
+
+    monkeypatch.setattr(spike, "_probe_group_running", slow_group_check)
+    with pytest.raises(subprocess.TimeoutExpired):
+        spike._run_probe(
+            [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path),
+            timeout_s=timeout_s,
+        )
+
+
 @pytest.mark.skipif(os.name != "posix", reason="bounded probe pipes need POSIX selectors")
 @pytest.mark.xdist_group("spike_procs")
 @pytest.mark.parametrize("flood", ["stderr", "both"])

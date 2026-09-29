@@ -141,13 +141,13 @@ def _run_probe(command: Sequence[str], *, env: dict[str, str], cwd: str,
                     # after it (a slow scan or a late resume) is a timeout.
                     timed_out = True
                     break
-            # Quiet must also be observed by the deadline; otherwise the next
-            # iteration takes the timeout path.
-            quiet = (
-                exited
-                and not _probe_group_running(process.pid, deadline)
-                and time.monotonic() <= deadline
-            )
+            quiet = exited and not _probe_group_running(process.pid, deadline)
+            if exited and time.monotonic() > deadline:
+                # The group-quiet check itself ran past the deadline: time out
+                # here, since with both pipes closed the loop would otherwise
+                # end without reaching the timeout check.
+                timed_out = True
+                break
             events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
             if not selector.get_map() and not exited:
                 time.sleep(min(remaining, 0.02))
