@@ -164,6 +164,39 @@ def test_read_only_snapshot_still_reads_uncheckpointed_wal_content(tmp_path):
     assert snapshot.queue_depth == 2
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions")
+def test_read_only_snapshot_reads_wal_without_shm_and_creates_nothing(tmp_path):
+    import shutil
+    import sqlite3
+
+    source = tmp_path / "source"
+    store = LocalJobStore(source)
+    store.create(_submission(), owner_ref="local-user", worker_epoch=store.current_epoch())
+    source_db = source / "worker" / "jobs.sqlite3"
+    keeper = sqlite3.connect(source_db)  # keeps the WAL uncheckpointed
+    keeper.execute("SELECT COUNT(*) FROM jobs").fetchone()
+    try:
+        store.create(_submission("key-2"), owner_ref="local-user", worker_epoch=store.current_epoch())
+        # A restored or partly cleaned journal: WAL content, but no -shm.
+        restored = tmp_path / "restored" / "worker"
+        restored.mkdir(mode=0o700, parents=True)
+        shutil.copyfile(source_db, restored / "jobs.sqlite3")
+        shutil.copyfile(source_db.with_name("jobs.sqlite3-wal"), restored / "jobs.sqlite3-wal")
+    finally:
+        keeper.close()
+    assert (restored / "jobs.sqlite3-wal").stat().st_size > 0
+    before = sorted(entry.name for entry in restored.iterdir())
+    restored.chmod(0o500)
+    try:
+        snapshot = read_worker_snapshot(tmp_path / "restored")
+    finally:
+        restored.chmod(0o700)
+
+    assert snapshot.process_state.value != "unavailable"
+    assert snapshot.queue_depth == 2
+    assert sorted(entry.name for entry in restored.iterdir()) == before
+
+
 def test_read_only_snapshot_quarantines_incomplete_released_lease(tmp_path):
     lease_dir = tmp_path / "worker" / "leases"
     lease_dir.mkdir(mode=0o700, parents=True)

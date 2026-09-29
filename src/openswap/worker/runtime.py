@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import signal
 import stat
+import tempfile
 import threading
 import time
 from urllib.parse import quote
@@ -153,19 +155,32 @@ def read_worker_snapshot(backup_root: Path, *, now: datetime | None = None) -> W
             lease_quarantined=True,
         )
     db: sqlite3.Connection | None = None
+    scratch: tempfile.TemporaryDirectory | None = None
     try:
         # mode=ro alone makes SQLite recreate missing WAL sidecars (and fail in
         # a directory it cannot write). With no WAL content the journal is
         # fully checkpointed, so open it immutable: nothing is created and
-        # nothing unmerged can be missed. Existing WAL content is read with
-        # mode=ro, whose sidecars then already exist.
+        # nothing unmerged can be missed. WAL content with its -shm present is
+        # read in place with mode=ro. WAL content without -shm means no live
+        # writer (a running journal always has one), so read a private copy
+        # rather than let SQLite recreate -shm beside the journal.
         wal = db_path.with_name(db_path.name + "-wal")
+        shm = db_path.with_name(db_path.name + "-shm")
         try:
             wal_has_content = wal.lstat().st_size > 0
         except FileNotFoundError:
             wal_has_content = False
-        access = "mode=ro" if wal_has_content else "mode=ro&immutable=1"
-        uri = f"file:{quote(str(db_path.resolve()))}?{access}"
+        open_path, access = db_path, "mode=ro&immutable=1"
+        if wal_has_content:
+            if os.path.lexists(shm):
+                access = "mode=ro"
+            else:
+                scratch = tempfile.TemporaryDirectory(prefix="openswap-status-")
+                open_path = Path(scratch.name) / db_path.name
+                shutil.copyfile(db_path, open_path)
+                shutil.copyfile(wal, open_path.with_name(open_path.name + "-wal"))
+                access = "mode=ro"
+        uri = f"file:{quote(str(open_path.resolve()))}?{access}"
         db = sqlite3.connect(uri, uri=True, timeout=0.25)
         db.row_factory = sqlite3.Row
         metadata = {row["key"]: row["value"] for row in db.execute(
@@ -216,6 +231,8 @@ def read_worker_snapshot(backup_root: Path, *, now: datetime | None = None) -> W
     finally:
         if db is not None:
             db.close()
+        if scratch is not None:
+            scratch.cleanup()
 
 
 def _pid_exists(pid: int) -> bool:

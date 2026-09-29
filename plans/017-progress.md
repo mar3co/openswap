@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3197 passed, 5 skipped, 3 warnings in 51.27s`.
+`3198 passed, 5 skipped, 3 warnings in 51.23s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -319,7 +319,9 @@ atomic would mean holding the control lock across `start()`, which the
 earlier responsiveness fix removed.
 The read-only status fallback opens a fully checkpointed journal with
 `immutable=1`, so it never recreates WAL sidecars and works in a directory
-it cannot write; existing WAL content is still read with `mode=ro`.
+it cannot write. WAL content with its `-shm` present is read in place with
+`mode=ro`; WAL content without `-shm` (no live writer) is read from a
+private temporary copy, so status never recreates a sidecar.
 The CLI now rejects a stale `cswap` launcher before dispatching to the worker
 subcommand, so `cswap worker status` gets the removed-command message instead
 of reaching the worker CLI. Codex `set_account_disabled`, `set_alias`, and
