@@ -248,8 +248,10 @@ def _safe_snapshot(backup_root: Path) -> dict:
 
 
 def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
+    # Pause without touching the opt-in: retrying disable on an already
+    # disabled worker must never re-enable it, even when a check blocks.
     try:
-        update_worker_settings(backup_root, enabled=True, paused=True)
+        was_enabled = update_worker_settings(backup_root, paused=True).enabled
     except (OSError, RuntimeError, ValueError):
         return False, {}, "settings_unavailable"
     client = WorkerClient(socket_path(backup_root))
@@ -257,33 +259,38 @@ def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
         pause_result = client.set_paused(True)
         if pause_result.get("accepted") is not True:
             return _blocked(
-                backup_root, _safe_snapshot(backup_root),
+                backup_root, was_enabled, _safe_snapshot(backup_root),
                 pause_result.get("diagnostic_code") or "pause_refused",
             )
     except IpcError as exc:
         if str(exc) != "worker_unavailable":
-            return _blocked(backup_root, _safe_snapshot(backup_root), str(exc))
+            return _blocked(backup_root, was_enabled, _safe_snapshot(backup_root), str(exc))
 
     try:
         snapshot = _snapshot(backup_root)
     except IpcError as exc:
-        return _blocked(backup_root, _safe_snapshot(backup_root), str(exc))
+        return _blocked(backup_root, was_enabled, _safe_snapshot(backup_root), str(exc))
     except Exception:
-        return _blocked(backup_root, _safe_snapshot(backup_root), "worker_status_unavailable")
+        return _blocked(
+            backup_root, was_enabled, _safe_snapshot(backup_root), "worker_status_unavailable"
+        )
     active = snapshot.get("active_job")
     if active is not None:
         job_id = active.get("job_id") if isinstance(active, dict) else None
         if not isinstance(job_id, str) or not job_id:
-            return _blocked(backup_root, snapshot, "job_identity_unknown")
+            return _blocked(backup_root, was_enabled, snapshot, "job_identity_unknown")
         try:
             result = client.stop(job_id)
         except IpcError as exc:
-            return _blocked(backup_root, _safe_snapshot(backup_root), str(exc))
+            return _blocked(backup_root, was_enabled, _safe_snapshot(backup_root), str(exc))
         except Exception:
-            return _blocked(backup_root, _safe_snapshot(backup_root), "worker_status_unavailable")
+            return _blocked(
+                backup_root, was_enabled, _safe_snapshot(backup_root), "worker_status_unavailable"
+            )
         if result.get("accepted") is not True:
             return _blocked(
                 backup_root,
+                was_enabled,
                 _safe_snapshot(backup_root),
                 result.get("diagnostic_code") or "stop_refused",
             )
@@ -296,31 +303,36 @@ def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
             except IpcError as exc:
                 return _blocked(
                     backup_root,
+                    was_enabled,
                     _safe_snapshot(backup_root),
                     str(exc),
                 )
             except Exception:
                 return _blocked(
-                    backup_root, _safe_snapshot(backup_root), "worker_status_unavailable"
+                    backup_root,
+                    was_enabled,
+                    _safe_snapshot(backup_root),
+                    "worker_status_unavailable",
                 )
             if _safe_to_disable(snapshot) is None:
                 break
         else:
             return _blocked(
                 backup_root,
+                was_enabled,
                 snapshot,
                 _safe_to_disable(snapshot) or "job_stop_not_confirmed",
             )
 
     diagnostic = _safe_to_disable(snapshot)
     if diagnostic is not None:
-        return _blocked(backup_root, snapshot, diagnostic)
+        return _blocked(backup_root, was_enabled, snapshot, diagnostic)
 
     # Policy is changed only after the active job and lease are confirmed safe.
     try:
         update_worker_settings(backup_root, enabled=False, paused=True)
     except (OSError, RuntimeError, ValueError):
-        return _blocked(backup_root, snapshot, "settings_unavailable")
+        return _blocked(backup_root, was_enabled, snapshot, "settings_unavailable")
     try:
         service = uninstall(home=Path.home())
     except ClaudeSwitchError:
@@ -338,10 +350,12 @@ def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
     return True, {"snapshot": _safe_snapshot(backup_root), "service": service}, None
 
 
-def _blocked(backup_root: Path, snapshot: dict, diagnostic: str) -> tuple[bool, dict, str]:
-    """Keep the helper opted in but paused whenever safe disable is unproved."""
+def _blocked(
+    backup_root: Path, was_enabled: bool, snapshot: dict, diagnostic: str
+) -> tuple[bool, dict, str]:
+    """Keep the prior opt-in, paused, whenever safe disable is unproved."""
     try:
-        update_worker_settings(backup_root, enabled=True, paused=True)
+        update_worker_settings(backup_root, enabled=was_enabled, paused=True)
     except (OSError, RuntimeError, ValueError):
         diagnostic = "settings_unavailable"
     return False, snapshot, diagnostic

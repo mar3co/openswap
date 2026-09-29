@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 import os
 import time
 import stat
@@ -59,6 +60,7 @@ def test_disable_pauses_targets_the_snapshot_job_and_waits_for_terminal_state(
     tmp_path: Path, monkeypatch
 ):
     writes = []
+    was_enabled = True
     snapshots = iter(
         [
             {
@@ -83,7 +85,7 @@ def test_disable_pauses_targets_the_snapshot_job_and_waits_for_terminal_state(
     monkeypatch.setattr(
         cli,
         "update_worker_settings",
-        lambda _root, **values: writes.append(values),
+        lambda _root, **values: writes.append(values) or SimpleNamespace(enabled=was_enabled),
     )
     monkeypatch.setattr(cli, "uninstall", lambda **_kwargs: {"unloaded": True})
     monkeypatch.setattr(cli, "_DISABLE_POLL_SECONDS", 0)
@@ -95,15 +97,18 @@ def test_disable_pauses_targets_the_snapshot_job_and_waits_for_terminal_state(
     assert client.paused == [True]
     assert client.stop_ids == ["job-safe-1"]
     assert writes == [
-        {"enabled": True, "paused": True},
+        {"paused": True},
         {"enabled": False, "paused": True},
     ]
     assert result["snapshot"]["active_job"] is None
 
 
-def test_disable_keeps_worker_enabled_paused_when_lease_state_is_unknown(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize("was_enabled", [True, False])
+def test_disable_keeps_prior_opt_in_paused_when_lease_state_is_unknown(
+    tmp_path: Path, monkeypatch, was_enabled: bool
 ):
+    """A blocked disable pauses without changing the opt-in, so retrying it on
+    an already-disabled worker never re-enables Remote tasks."""
     writes = []
     client = _Client(None)
     snapshot = {
@@ -118,7 +123,7 @@ def test_disable_keeps_worker_enabled_paused_when_lease_state_is_unknown(
     monkeypatch.setattr(
         cli,
         "update_worker_settings",
-        lambda _root, **values: writes.append(values),
+        lambda _root, **values: writes.append(values) or SimpleNamespace(enabled=was_enabled),
     )
     monkeypatch.setattr(
         cli,
@@ -131,8 +136,8 @@ def test_disable_keeps_worker_enabled_paused_when_lease_state_is_unknown(
     assert ok is False
     assert diagnostic == "lease_state_unknown"
     assert client.paused == [True]
-    assert writes[0] == {"enabled": True, "paused": True}
-    assert writes[-1] == {"enabled": True, "paused": True}
+    assert writes[0] == {"paused": True}
+    assert writes[-1] == {"enabled": was_enabled, "paused": True}
 
 
 def test_disable_waits_for_manual_worker_and_enable_refuses_held_instance_lock(
