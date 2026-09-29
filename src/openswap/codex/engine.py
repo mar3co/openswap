@@ -422,7 +422,10 @@ class CodexEngine:
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
 
-        with self._lock():
+        # The lease guard holds the same provider lock as ``_lock()``: a leased
+        # account's roster must not change under a worker, usage read or kickoff.
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             if self.sequence_file.exists():
                 try:
                     data = json.loads(self.sequence_file.read_text(encoding="utf-8"))

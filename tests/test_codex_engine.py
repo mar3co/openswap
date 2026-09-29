@@ -114,6 +114,8 @@ def test_worker_lease_blocks_codex_switch_and_roster_mutations(tmp_path):
         eng.swap_accounts("1", "2")
     with pytest.raises(LeaseConflictError):
         eng.remove_account("1", assume_yes=True)
+    with pytest.raises(LeaseConflictError):
+        eng.add_oauth_account(_auth(email="c@x.com", account_id="acc-c"))
     assert eng._live_text() == live_before
     assert eng.sequence_file.read_bytes() == roster_before
     assert store.current().token() == token
