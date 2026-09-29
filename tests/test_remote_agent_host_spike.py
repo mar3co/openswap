@@ -715,6 +715,62 @@ def test_probe_refuses_and_terminates_setsid_detached_helper(tmp_path):
                 pass
 
 
+@pytest.mark.skipif(os.name != "posix", reason="setsid() detachment is POSIX-only")
+@pytest.mark.xdist_group("spike_procs")
+def test_probe_exception_snapshots_descendants_before_group_cleanup(tmp_path, monkeypatch):
+    pid_file = tmp_path / "detached.pid"
+    fake = _executable(
+        tmp_path / "fake-codex",
+        "import os, pathlib, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    devnull = os.open('/dev/null', os.O_RDWR)\n"
+        "    for fd in (0, 1, 2): os.dup2(devnull, fd)\n"
+        "    pid_file.write_text(str(os.getpid()))\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n",
+    )
+    real_track = spike._track_descendants
+    real_exited = spike._leader_exited
+    failed = {"yes": False}
+
+    def track_after_failure(*args, **kwargs):
+        # The helper detaches after the last periodic scan: only scans made
+        # once the failure is raised can see it.
+        return real_track(*args, **kwargs) if failed["yes"] else True
+
+    def failing_exit_check(process, *args, **kwargs):
+        if failed["yes"]:
+            return real_exited(process, *args, **kwargs)
+        deadline = time.monotonic() + 3
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        failed["yes"] = True
+        raise RuntimeError("selector failure")
+
+    monkeypatch.setattr(spike, "_track_descendants", track_after_failure)
+    monkeypatch.setattr(spike, "_leader_exited", failing_exit_check)
+    detached_pid = None
+    try:
+        with pytest.raises(RuntimeError, match="selector failure"):
+            spike._run_probe(
+                [str(fake), "--version"], env={"PATH": os.defpath}, cwd=str(tmp_path), timeout_s=10
+            )
+        assert pid_file.exists(), "detached helper never reported its pid"
+        detached_pid = int(pid_file.read_text())
+        assert _wait_for_pid_exit(detached_pid, 2.0)
+    finally:
+        if detached_pid is None and pid_file.exists():
+            detached_pid = int(pid_file.read_text())
+        if detached_pid is not None:
+            try:
+                os.kill(detached_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 @pytest.mark.skipif(os.name != "posix", reason="bounded probe pipes need POSIX selectors")
 @pytest.mark.xdist_group("spike_procs")
 @pytest.mark.parametrize("flood", ["stderr", "both"])
@@ -1216,6 +1272,30 @@ def test_private_dir_refuses_a_component_raced_into_a_symlink(tmp_path, monkeypa
     with pytest.raises(SpikeError, match="must not traverse a symlink"):
         spike._private_dir(raced / "b" / "state")
     assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and permissions are required")
+def test_private_dir_refuses_an_unsafe_directory_raced_in_before_creating_beneath_it(
+    tmp_path, monkeypatch
+):
+    raced = tmp_path / "a"
+    real_mkdir = Path.mkdir
+
+    def racing_mkdir(self, *args, **kwargs):
+        if self == raced:
+            # Another user wins the race with a real directory others can modify.
+            real_mkdir(self)
+            os.chmod(self, 0o777)
+            raise FileExistsError(str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", racing_mkdir)
+    try:
+        with pytest.raises(SpikeError, match="others can modify"):
+            spike._private_dir(raced / "b" / "state")
+        assert list(raced.iterdir()) == []
+    finally:
+        os.chmod(raced, 0o700)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
