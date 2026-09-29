@@ -540,6 +540,41 @@ def test_release_lease_needs_confirmation_for_an_interrupted_job(tmp_path: Path)
     assert cli.release_lease(tmp_path, confirm_stopped=True) == (True, {"lease_state": "released"}, None)
 
 
+def test_release_lease_from_a_live_worker_needs_a_terminal_job_and_confirmation(tmp_path: Path):
+    """The recording worker is still running (same epoch, live pid): an
+    unproven interrupt quarantined the lease, and the owner's confirmation is
+    the only way back without killing the worker."""
+    job_store = LocalJobStore(tmp_path)
+    epoch = job_store.current_epoch()
+    job_id = _running_job(job_store, epoch=epoch)
+    lease_store = AccountLeaseStore(tmp_path, "codex")
+    token = lease_store.acquire(
+        job_id=job_id,
+        account_identity=stable_account_identity("codex", "acct-a"),
+        worker_pid=os.getpid(),
+        worker_epoch=epoch,
+        ttl_s=60,
+    )
+
+    # While the job is still running, the live worker keeps its lease.
+    assert cli.release_lease(tmp_path, confirm_stopped=True) == (
+        False, {}, "worker_owner_may_be_alive"
+    )
+
+    running = job_store.get(job_id)
+    job_store.transition(
+        job_id, expected_states=(JobState.RUNNING,), new_state=JobState.INTERRUPTED,
+        worker_epoch=epoch, expected_generation=running.generation,
+        diagnostic_code="execution_uncertain",
+    )
+    lease_store.mark_uncertain(token, "execution_uncertain")
+
+    assert cli.release_lease(tmp_path) == (False, {}, "stop_unproven_confirm_required")
+    assert cli.release_lease(tmp_path, confirm_stopped=True) == (
+        True, {"lease_state": "released"}, None
+    )
+
+
 def test_release_lease_recovers_an_uncertain_usage_lease_held_by_a_live_menu(tmp_path: Path):
     """A usage read's lease is a short-lived probe: its long-lived holder (the
     menu process) stays alive, so expiry plus confirmation must suffice."""

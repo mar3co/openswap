@@ -376,6 +376,11 @@ def release_lease(
       that proves a stop;
     - a worker lease whose job is ``interrupted`` or missing from the journal
       also needs ``confirm_stopped``: neither is stop evidence;
+    - while the recording worker is still running, its lease can be released
+      only with ``confirm_stopped`` and only once the journal shows the job
+      terminal: the worker has then dropped the lease and admits no new work
+      on the quarantined account, so the owner's confirmation is the same
+      evidence as after the worker exited;
     - a short-lived probe lease (scheduled kickoff, Codex usage read: any
       lease whose job is not a journaled worker job) is never journaled, and a
       provider helper can outlive both a timeout and a killed menu process, so
@@ -411,13 +416,19 @@ def release_lease(
                     return False, {}, "stop_unproven_confirm_required"
             else:
                 owner_gone = job_store.current_epoch() > lease.worker_epoch or pid_gone
-                if not owner_gone:
-                    return False, {}, "worker_owner_may_be_alive"
                 try:
                     job_state = job_store.get(lease.job_id).state
                 except KeyError:
                     job_state = None
-                if job_state is None or job_state == JobState.INTERRUPTED:
+                if not owner_gone:
+                    job_terminal = job_state == JobState.INTERRUPTED or (
+                        job_state in _LEASE_STOP_PROVEN_JOB_STATES
+                    )
+                    if not job_terminal:
+                        return False, {}, "worker_owner_may_be_alive"
+                    if not confirm_stopped:
+                        return False, {}, "stop_unproven_confirm_required"
+                elif job_state is None or job_state == JobState.INTERRUPTED:
                     if not confirm_stopped:
                         return False, {}, "stop_unproven_confirm_required"
                 elif job_state not in _LEASE_STOP_PROVEN_JOB_STATES:
