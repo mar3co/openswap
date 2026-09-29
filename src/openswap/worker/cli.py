@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import json
 import re
 import sys
@@ -152,7 +152,15 @@ def enable_worker(backup_root: Path) -> dict:
                 raise ClaudeSwitchError("worker_stop_unconfirmed")
             if not _managed_worker_loaded():
                 raise ClaudeSwitchError("worker_running_unmanaged")
-        persisted = update_worker_settings(root, enabled=True)
+        # A scheduled kickoff running without a lease (Remote tasks off) holds
+        # its provider's unleased-run lock; enabling now would let the worker
+        # lease that account under it. Hold both locks across the opt-in.
+        with ExitStack() as unleased:
+            for provider in ("codex", "claude"):
+                store = AccountLeaseStore(root, provider)
+                if not unleased.enter_context(store.unleased_run(timeout=0)):
+                    raise ClaudeSwitchError("kickoff_in_progress")
+            persisted = update_worker_settings(root, enabled=True)
         if persisted.enabled is not True:
             # A malformed pinned account/workspace policy fails closed in the
             # settings parser. Never install a helper after that fail-closed

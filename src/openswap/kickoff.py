@@ -349,6 +349,10 @@ def _launch_tracked_run(launch: dict):
     return run
 
 
+# How long a kickoff waits for an in-progress worker enable to finish.
+_UNLEASED_RUN_WAIT_S = 5.0
+
+
 def _run_kickoff_with_lease(provider: str, selected_home, run_fn, argv, **kwargs):
     # With the default runner a launch failure is provable; an injected runner
     # cannot say whether it launched, so its OSError stays uncertain.
@@ -361,15 +365,25 @@ def _run_kickoff_with_lease(provider: str, selected_home, run_fn, argv, **kwargs
     if not load_worker_settings(backup_root).enabled:
         # With Remote tasks off no lease is taken, so a bare kickoff timeout
         # cannot quarantine an account for a feature nobody turned on (matching
-        # pre-worker behaviour). An unresolved lease left from when it was on
-        # still refuses the ping. The read takes no lock (lease documents are
-        # replaced atomically), so this path adds no contention with switching.
-        leftover = store.read_current()
-        if leftover is not None and leftover.state != "released":
-            raise LeaseConflictError(
-                f"Cannot run a {provider} kickoff while an account lease is unresolved."
-            )
-        return run_fn(argv, **kwargs)
+        # pre-worker behaviour). The unleased-run lock keeps Remote tasks from
+        # being enabled (and a worker leasing this account) while it runs; the
+        # policy is re-read once it is held, since enabling may have won it.
+        with store.unleased_run(timeout=_UNLEASED_RUN_WAIT_S) as held:
+            if not held:
+                raise LeaseConflictError(
+                    f"Cannot run a {provider} kickoff while Remote tasks is changing."
+                )
+            if not load_worker_settings(backup_root).enabled:
+                # An unresolved lease left from when it was on still refuses
+                # the ping. The read takes no lock (lease documents are
+                # replaced atomically), so this adds no contention with
+                # switching.
+                leftover = store.read_current()
+                if leftover is not None and leftover.state != "released":
+                    raise LeaseConflictError(
+                        f"Cannot run a {provider} kickoff while an account lease is unresolved."
+                    )
+                return run_fn(argv, **kwargs)
     # Identity is resolved only while holding the same provider lock used for
     # lease acquisition and account mutations, closing the snapshot/acquire race.
     with store.mutation_guard() as guard:

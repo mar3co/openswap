@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -668,6 +669,85 @@ def test_kickoff_with_worker_disabled_takes_no_lease_and_timeout_leaves_switchin
     assert AccountLeaseStore(root, "codex").current() is None
     with AccountLeaseStore(root, "codex").mutation_guard() as guard:
         guard.assert_available()  # switching is not blocked
+
+
+def test_enabling_remote_tasks_is_refused_during_an_unleased_kickoff(
+    tmp_path: Path, monkeypatch
+):
+    """A kickoff with Remote tasks off runs without a lease; enabling the
+    worker mid-run would let it lease the same account, so it is refused."""
+    from openswap.exceptions import ClaudeSwitchError
+    from openswap.settings import load_worker_settings
+    from openswap.worker import cli as worker_cli
+
+    root = _fake_lease_roster(monkeypatch, tmp_path, "codex")
+    monkeypatch.setattr(
+        worker_cli, "install", lambda: pytest.fail("installed during an unleased kickoff")
+    )
+    refused = []
+
+    def run_and_try_enabling(argv, **kwargs):
+        with pytest.raises(ClaudeSwitchError, match="kickoff_in_progress"):
+            worker_cli.enable_worker(root)
+        refused.append(True)
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    invoke_codex_kickoff(
+        None, which=lambda _name: "/opt/fake/codex", run=run_and_try_enabling,
+        environ={"PATH": "/usr/bin"},
+    )
+
+    assert refused == [True]
+    assert load_worker_settings(root).enabled is False
+
+
+def test_kickoff_waiting_on_an_enable_rereads_policy_and_takes_a_lease(
+    tmp_path: Path, monkeypatch
+):
+    """If enabling wins the unleased-run lock first, the kickoff waits, then
+    sees Remote tasks on and takes the leased path."""
+    import threading
+
+    from openswap.settings import update_worker_settings
+    from openswap.worker.leases import AccountLeaseStore
+    from tests.test_codex_auth import _auth
+
+    root = _fake_lease_roster(monkeypatch, tmp_path, "codex")
+    codex_home_dir = tmp_path / "codex-home"
+    codex_home_dir.mkdir()
+    (codex_home_dir / "auth.json").write_text(
+        _auth(email="fake@example.test", account_id="acct-fake"), encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_dir))
+    store = AccountLeaseStore(root, "codex")
+    holding = threading.Event()
+    release = threading.Event()
+
+    def enabling():
+        with store.unleased_run(timeout=0) as held:
+            assert held
+            holding.set()
+            time.sleep(0.2)  # the kickoff reads "disabled" and waits on the lock
+            update_worker_settings(root, enabled=True)
+            release.wait(3)
+
+    enabler = threading.Thread(target=enabling)
+    enabler.start()
+    assert holding.wait(3)
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["lease"] = AccountLeaseStore(root, "codex").current()
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    threading.Timer(0.4, release.set).start()
+    invoke_codex_kickoff(
+        None, which=lambda _name: "/opt/fake/codex", run=fake_run,
+        environ={"PATH": "/usr/bin"},
+    )
+    enabler.join(3)
+
+    assert captured["lease"] is not None and captured["lease"].state == "active"
 
 
 def test_build_kickoff_argv_is_print_mode():

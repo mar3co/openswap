@@ -189,6 +189,26 @@ class AccountLeaseStore:
         with lock:
             yield LeaseMutationGuard(self)
 
+    @contextmanager
+    def unleased_run(self, *, timeout: float) -> Iterator[bool]:
+        """Hold this provider's unleased-run lock; yields whether it was won.
+
+        A scheduled kickoff that takes no lease (Remote tasks off) holds it for
+        its whole run, and enabling the worker must win it first, so a worker
+        can never be enabled, and lease the account, while such a run is live.
+        """
+        if not self.backup_root.is_dir():
+            raise LeaseStateError("Account backup directory is unavailable.")
+        self._ensure_private_dir(self.lease_dir.parent)
+        self._ensure_private_dir(self.lease_dir)
+        lock = FileLock(self.lease_dir / f"{self.provider}.unleased.lock", timeout=timeout)
+        acquired = lock.acquire()
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                lock.release()
+
     def acquire(
         self,
         *,
