@@ -1363,12 +1363,19 @@ def _supervise_fake_command_locked(
         if not running_row.is_alive() and running_row_errors:
             raise running_row_errors[0]
 
+    def settle_running_row() -> None:
+        # The writer must never outlive the locked supervision scope: a late
+        # "running" row after recovery would make a finished job look live.
+        if running_row.ident is not None:
+            running_row.join()
+
     try:
         running_row.start()
         reader.start()
     except BaseException:
         _abort_supervision(process, reader, tracked, grace_s=grace_s)
         reader_stop.set()
+        settle_running_row()
         raise
     timed_out = False
     cleanup_uncertain = False
@@ -1448,6 +1455,7 @@ def _supervise_fake_command_locked(
     except BaseException:
         _abort_supervision(process, reader, tracked, grace_s=grace_s)
         reader_stop.set()
+        settle_running_row()
         raise
     _close_handles(tracked)
 

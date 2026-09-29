@@ -1807,6 +1807,36 @@ def test_stalled_scans_never_carry_a_short_run_past_its_deadline(tmp_path, monke
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
 @pytest.mark.xdist_group("spike_procs")
+def test_supervision_failure_waits_for_the_running_row_before_releasing_the_lock(
+    tmp_path, monkeypatch
+):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    written: list = []
+    real_append = spike._append_jsonl
+
+    def slow_running_append(path, record):
+        if record.get("state") == "running":
+            time.sleep(0.5)  # a slow fsync on the state directory
+            real_append(path, record)
+            written.append("running")
+            return
+        real_append(path, record)
+
+    def failing_snapshot(deadline):
+        raise RuntimeError("snapshot failed")
+
+    monkeypatch.setattr(spike, "_append_jsonl", slow_running_append)
+    monkeypatch.setattr(spike, "_snapshot", failing_snapshot)
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=5, grace_s=0.2, job_id="late-row",
+        )
+    # The writer finished inside the locked scope, so recovery cannot race it.
+    assert written == ["running"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
 def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path, monkeypatch):
     fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
     marks: dict = {}
