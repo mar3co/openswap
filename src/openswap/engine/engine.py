@@ -295,8 +295,8 @@ class Engine(
           files), plus a best-effort sweep of any pre-migration keyring / Windows
           Credential Manager entries left behind
         - All managed data under the active backup directory; Claude and
-          Codex provider locks and the worker lifecycle lock remain as empty
-          concurrency anchors
+          Codex provider locks, the worker lifecycle lock and the unleased
+          kickoff locks remain as empty concurrency anchors
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
         """
@@ -307,6 +307,8 @@ class Engine(
             self.backup_dir / "codex" / ".lock",
             self.backup_dir / ".settings.lock",
             self.backup_dir / "worker" / "lifecycle.lock",
+            self.backup_dir / "worker" / "leases" / "claude.unleased.lock",
+            self.backup_dir / "worker" / "leases" / "codex.unleased.lock",
         )
         legacy_distinct = legacy != self.backup_dir and not any(
             _path_is_within(lock_path, legacy) for lock_path in provider_lock_paths
@@ -418,6 +420,13 @@ class Engine(
                     for store in stores:
                         guard = stack.enter_context(store.mutation_guard())
                         guard.assert_available()
+                    # A kickoff with Remote tasks off holds only its unleased-run
+                    # lock: refuse while one runs, and hold both so none starts.
+                    for store in stores:
+                        if not stack.enter_context(store.unleased_run(timeout=0)):
+                            raise SessionError(
+                                "A scheduled kickoff is running; retry purge when it finishes."
+                            )
                     self._purge_confirmed(legacy, legacy_distinct, session_dirs)
 
     def _refuse_worker_restart_locked(self) -> None:
@@ -637,6 +646,22 @@ class Engine(
                                 "Worker lifecycle lock path is unsafe; refusing purge."
                             )
                         continue
+                    if (
+                        worker_child.name == "leases"
+                        and not worker_child.is_symlink()
+                        and worker_child.is_dir()
+                    ):
+                        # Keep the held unleased-run lock inodes (and their
+                        # directory); remove every lease document.
+                        for lease_child in list(worker_child.iterdir()):
+                            if lease_child.name in _UNLEASED_LOCK_NAMES:
+                                if lease_child.is_symlink() or not lease_child.is_file():
+                                    raise SessionError(
+                                        "Unleased-run lock path is unsafe; refusing purge."
+                                    )
+                                continue
+                            self._remove_purge_entry(lease_child)
+                        continue
                     self._remove_purge_entry(worker_child)
                 continue
             self._remove_purge_entry(child)
@@ -648,6 +673,9 @@ class Engine(
             path.unlink()
         else:
             shutil.rmtree(path)
+
+
+_UNLEASED_LOCK_NAMES = frozenset({"claude.unleased.lock", "codex.unleased.lock"})
 
 
 def _path_is_within(path: Path, root: Path) -> bool:

@@ -1367,6 +1367,31 @@ def test_purge_refuses_manual_worker_lock(temp_home: Path):
     assert marker.read_text(encoding="utf-8") == "preserve"
 
 
+def test_purge_refuses_while_an_unleased_kickoff_runs_and_keeps_its_lock(
+    temp_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from openswap.worker.leases import AccountLeaseStore
+
+    switcher = ClaudeAccountSwitcher()
+    switcher._setup_directories()
+    switcher.platform = Platform.LINUX
+    backup_dir = switcher.backup_dir
+    marker = backup_dir / "keep-while-kickoff-runs.txt"
+    marker.write_text("managed", encoding="utf-8")
+    monkeypatch.setattr(switcher, "_refuse_worker_restart_locked", lambda: None)
+    store = AccountLeaseStore(backup_dir, "codex")
+
+    with store.unleased_run(timeout=0) as held:  # a kickoff with Remote tasks off
+        assert held
+        lock_path = backup_dir / "worker" / "leases" / "codex.unleased.lock"
+        inode = lock_path.stat().st_ino
+        with patch("builtins.input", return_value="y"):
+            with pytest.raises(SessionError, match="scheduled kickoff is running"):
+                switcher.purge()
+        assert marker.exists()
+        assert lock_path.stat().st_ino == inode
+
+
 def test_purge_waits_for_settings_writer_and_preserves_lock_inode(
     temp_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -5388,7 +5413,13 @@ class TestPurgeLegacyCleanup:
             ".lock", ".settings.lock", "codex", "worker"
         }
         assert {entry.name for entry in (backup_dir / "codex").iterdir()} == {".lock"}
-        assert {entry.name for entry in (backup_dir / "worker").iterdir()} == {"lifecycle.lock"}
+        assert {entry.name for entry in (backup_dir / "worker").iterdir()} == {
+            "lifecycle.lock", "leases"
+        }
+        # Only the unleased kickoff lock anchors survive; lease documents go.
+        assert {entry.name for entry in (backup_dir / "worker" / "leases").iterdir()} == {
+            "claude.unleased.lock", "codex.unleased.lock"
+        }
         assert (claude_lock.stat().st_ino, codex_lock.stat().st_ino) == lock_inodes
         assert lifecycle_path.stat().st_ino == lifecycle_inode
         assert settings_lock_path.stat().st_ino == settings_inode
