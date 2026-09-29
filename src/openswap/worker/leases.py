@@ -23,6 +23,9 @@ LEASE_SCHEMA_VERSION = 1
 _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _IDENTITY_RE = re.compile(r"^[a-z][a-z0-9_-]*:[0-9a-f]{64}$")
 _REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# An abandoned provider start() that has not returned yet: it may still
+# launch, so even a confirmed release must wait until it quiesces.
+START_PENDING_REASON = "start_pending"
 
 
 class AccountLeaseError(ClaudeSwitchError):

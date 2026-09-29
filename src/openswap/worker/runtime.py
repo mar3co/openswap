@@ -27,6 +27,7 @@ from openswap.worker.leases import (
     LeaseConflictError,
     LeaseStateError,
     ReleaseEvidence,
+    START_PENDING_REASON,
 )
 from openswap.worker.models import (
     ControlResult,
@@ -672,10 +673,13 @@ class WorkerRuntime:
         starting, token, workspace = prepared
         try:
             deadline = self.monotonic() + starting.runtime_limit_s
-            run, abandon_reason = self._start_while_monitoring(
-                starting, workspace, shutdown_event, deadline,
+            run, abandon_reason, skipped_reason = self._start_while_monitoring(
+                starting, workspace, shutdown_event, deadline, token,
             )
-            if abandon_reason is None and not isinstance(run, ProviderRun):
+            if (
+                abandon_reason is None and skipped_reason is None
+                and not isinstance(run, ProviderRun)
+            ):
                 raise RuntimeError("invalid_provider_run")
         except Exception:
             self.leases.mark_uncertain(token, "launch_uncertain")
@@ -688,12 +692,14 @@ class WorkerRuntime:
                     expected_generation=latest.generation,
                     diagnostic_code="execution_uncertain",
                 )
+        if skipped_reason is not None:
+            return self._finish_unlaunched(starting, token, skipped_reason)
         if abandon_reason is not None:
             # start() never returned a handle, so whether it launched is
-            # unknown and nothing can be interrupted: quarantine the lease and
-            # record the job interrupted. The tracked start thread still
-            # blocks admission until it exits.
-            self.leases.mark_uncertain(token, "launch_uncertain")
+            # unknown and nothing can be interrupted. The monitor already
+            # quarantined the lease as START_PENDING_REASON; the tracked start
+            # thread blocks admission (and a live-worker lease release) until
+            # it exits. Record the job interrupted.
             self._clear_active()
             with self._launch_lock:
                 latest = self.store.get(starting.job_id)
@@ -719,25 +725,68 @@ class WorkerRuntime:
                 return recovered
             raise
 
+    def _launch_fence(self, job_id: str, shutdown_event: threading.Event | None) -> str | None:
+        """Why a launch must not start now, read under the control lock."""
+        latest = self.store.get(job_id)
+        if latest.state == JobState.CANCEL_REQUESTED:
+            return "cancel_requested"
+        if latest.expires_at <= datetime.now(timezone.utc):
+            return "job_expired"
+        if (
+            (shutdown_event is not None and shutdown_event.is_set())
+            or not load_worker_settings(self.backup_root).enabled
+        ):
+            return "worker_shutdown"
+        return None
+
+    def _finish_unlaunched(self, starting: JobRecord, token, reason: str) -> JobRecord:
+        """Record a launch the start thread declined: nothing was started."""
+        self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
+        self._clear_active()
+        with self._launch_lock:
+            latest = self.store.get(starting.job_id)
+            if latest.state == JobState.CANCEL_REQUESTED:
+                return self._cancel_before_launch(latest)
+            new_state, diagnostic = (
+                (JobState.EXPIRED, "job_expired") if reason == "job_expired"
+                else (JobState.FAILED, "worker_disabled")
+            )
+            return self.store.transition(
+                latest.job_id, expected_states=(JobState.STARTING,),
+                new_state=new_state, worker_epoch=self.worker_epoch,
+                expected_generation=latest.generation, diagnostic_code=diagnostic,
+            )
+
     def _start_while_monitoring(
         self, starting: JobRecord, workspace, shutdown_event: threading.Event | None,
-        deadline: float,
-    ) -> tuple[ProviderRun | None, str | None]:
+        deadline: float, token,
+    ) -> tuple[ProviderRun | None, str | None, str | None]:
         """Call ``start()`` on a tracked thread so stop, shutdown and the
         runtime limit stay enforceable while it runs.
 
-        Returns ``(run, None)`` once start returns, raises its error, or
-        returns ``(None, reason)`` when the launch is abandoned. A stop gets
+        Returns ``(run, None, None)`` once start returns, raises its error,
+        ``(None, None, reason)`` when the thread declined to launch (the
+        cancellation, expiry and shutdown fences are re-read under the
+        control lock immediately before ``start()``), or ``(None, reason,
+        None)`` when a hung launch is abandoned. A stop gets
         START_CANCEL_GRACE_SECONDS for start to return a handle it can
-        interrupt with proof. A late handle from an abandoned start is
-        interrupted best effort and is never stop proof.
+        interrupt with proof. An abandoned start keeps the lease
+        START_PENDING_REASON until the thread exits; a late handle is then
+        interrupted best effort, never as stop proof.
         """
         outcome: dict[str, object] = {}
         outcome_lock = threading.Lock()
         completed = threading.Event()
 
         def start() -> None:
+            late = False
             try:
+                with self._launch_lock:
+                    skipped = self._launch_fence(starting.job_id, shutdown_event)
+                if skipped is not None:
+                    with outcome_lock:
+                        outcome["skipped"] = skipped
+                    return
                 run = self.adapter.start(starting, workspace, worker_epoch=self.worker_epoch)
                 with outcome_lock:
                     outcome["run"] = run
@@ -750,7 +799,15 @@ class WorkerRuntime:
             except BaseException as error:
                 with outcome_lock:
                     outcome["error"] = error
+                    late = outcome.get("abandoned", False)
             finally:
+                if late:
+                    # The abandoned call has now returned: the lease stays
+                    # uncertain, but it may be released on confirmation.
+                    try:
+                        self.leases.mark_uncertain(token, "launch_uncertain")
+                    except Exception:
+                        pass
                 completed.set()
 
         thread = threading.Thread(
@@ -777,9 +834,13 @@ class WorkerRuntime:
                     reason = "cancel_requested"
             if reason is not None:
                 with outcome_lock:
-                    if "run" not in outcome and "error" not in outcome:
+                    if not outcome:
+                        # Marked before the flag, under the same lock the start
+                        # thread reports through, so its quiesce update always
+                        # lands after this one.
+                        self.leases.mark_uncertain(token, START_PENDING_REASON)
                         outcome["abandoned"] = True
-                        return None, reason
+                        return None, reason, None
                 break  # start returned meanwhile: handle it normally
         # start() has returned, so this join waits only for the thread frame
         # to exit; the slot is then free for the first event read.
@@ -791,7 +852,9 @@ class WorkerRuntime:
         with outcome_lock:
             if "error" in outcome:
                 raise outcome["error"]
-            return outcome.get("run"), None
+            if "skipped" in outcome:
+                return None, None, outcome["skipped"]
+            return outcome.get("run"), None, None
 
     def _prepare_launch(
         self, claimed: JobRecord, availability: ProviderAvailability,

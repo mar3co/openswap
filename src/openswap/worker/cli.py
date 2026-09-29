@@ -20,7 +20,7 @@ from openswap.worker.ipc import IpcError, socket_path
 from openswap.worker.journal import LocalJobStore
 from openswap.worker.launch_agent import install, uninstall
 from openswap.worker.launch_agent import status as worker_service_status
-from openswap.worker.leases import AccountLeaseStore, ReleaseEvidence
+from openswap.worker.leases import START_PENDING_REASON, AccountLeaseStore, ReleaseEvidence
 from openswap.worker.models import JobState
 from openswap.worker.runtime import _pid_exists, read_worker_snapshot
 
@@ -380,7 +380,9 @@ def release_lease(
       only with ``confirm_stopped`` and only once the journal shows the job
       terminal: the worker has then dropped the lease and admits no new work
       on the quarantined account, so the owner's confirmation is the same
-      evidence as after the worker exited;
+      evidence as after the worker exited. A lease still marked
+      ``start_pending`` (an abandoned ``start()`` that has not returned) is
+      refused until the worker records that the call returned;
     - a short-lived probe lease (scheduled kickoff, Codex usage read: any
       lease whose job is not a journaled worker job) is never journaled, and a
       provider helper can outlive both a timeout and a killed menu process, so
@@ -426,6 +428,10 @@ def release_lease(
                     )
                     if not job_terminal:
                         return False, {}, "worker_owner_may_be_alive"
+                    if lease.reason == START_PENDING_REASON:
+                        # An abandoned start() may still launch: wait for the
+                        # worker to record that it returned.
+                        return False, {}, "provider_start_pending"
                     if not confirm_stopped:
                         return False, {}, "stop_unproven_confirm_required"
                 elif job_state is None or job_state == JobState.INTERRUPTED:

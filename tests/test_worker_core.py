@@ -26,6 +26,7 @@ from openswap.worker.models import (
     SafeEvent,
     SafeEventKind,
 )
+from openswap.worker import cli as worker_cli
 from openswap.worker.runtime import WorkerRuntime, read_worker_snapshot, run_worker
 from openswap.worker.leases import AccountLeaseStore, stable_account_identity
 
@@ -752,12 +753,22 @@ def test_hung_provider_start_is_abandoned_as_uncertain_and_blocks_admission(
     runtime.submit(_submission("key-2"))
     assert runtime.reconcile_once() is None  # the hung start still blocks admission
     assert adapter.start_count == 1
+    # The start may still launch, so even a confirmed release must wait.
+    assert worker_cli.release_lease(tmp_path, confirm_stopped=True) == (
+        False, {}, "provider_start_pending"
+    )
 
     adapter.release_start.set()
     deadline = time.monotonic() + 3
-    while adapter.interrupt_count == 0 and time.monotonic() < deadline:
+    while (
+        AccountLeaseStore(tmp_path).current().reason != "launch_uncertain"
+        and time.monotonic() < deadline
+    ):
         time.sleep(0.01)
     assert adapter.interrupt_count == 1  # the late handle is interrupted
+    assert worker_cli.release_lease(tmp_path, confirm_stopped=True) == (
+        True, {"lease_state": "released"}, None
+    )
 
 
 @pytest.mark.parametrize("trigger", ["shutdown", "opt_out"])
@@ -787,6 +798,36 @@ def test_shutdown_during_slow_probe_never_launches(tmp_path, trigger):
     assert results["run"].diagnostic_code == "worker_disabled"
     assert adapter.start_count == 0
     assert AccountLeaseStore(tmp_path).current() is None
+
+
+@pytest.mark.parametrize(
+    ("trigger", "expected_state"),
+    [("stop", JobState.CANCELLED), ("shutdown", JobState.FAILED)],
+)
+def test_stop_or_shutdown_just_before_start_never_launches(tmp_path, trigger, expected_state):
+    update_worker_settings(tmp_path, enabled=True)
+    identity = stable_account_identity("codex", "synthetic-worker-test")
+    adapter = _FakeAdapter()
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    job = runtime.submit(_submission())
+    shutdown = threading.Event()
+    real_fence = runtime._launch_fence
+
+    def late_signal_fence(job_id, shutdown_event):
+        # Lands after the preparation step released the lock, just before
+        # the start thread's own fence read.
+        if trigger == "stop":
+            assert runtime.stop(job.job_id).accepted is True
+        else:
+            shutdown.set()
+        return real_fence(job_id, shutdown_event)
+
+    runtime._launch_fence = late_signal_fence
+    result = runtime.reconcile_once(shutdown_event=shutdown)
+
+    assert result.state == expected_state
+    assert adapter.start_count == 0
+    assert AccountLeaseStore(tmp_path).current().state == "released"
 
 
 def test_stop_during_slow_probe_cancels_before_launch(tmp_path):
