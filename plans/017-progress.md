@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3171 passed, 5 skipped, 3 warnings in 38.73s`.
+`3176 passed, 5 skipped, 3 warnings in 39.20s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -279,6 +279,12 @@ stop during a slow start is acknowledged at once. Journal and lease steps
 stay under the lock, the cancellation is re-read right before launch, and
 a stop that lands during `start()` makes the RUNNING write stale, so the
 started run is interrupted rather than replayed.
+`start()` itself runs on a tracked thread, so a stop, shutdown, opt-out or
+the runtime limit is enforced while it runs. After a stop, start has a
+2 s grace to return a handle that can be interrupted with proof; a start
+that still has not returned is abandoned: the job is interrupted, the
+lease is quarantined, admission stays blocked until the thread exits, and
+a late handle is interrupted best effort (never stop proof).
 The CLI now rejects a stale `cswap` launcher before dispatching to the worker
 subcommand, so `cswap worker status` gets the removed-command message instead
 of reaching the worker CLI. Codex `set_account_disabled`, `set_alias`, and

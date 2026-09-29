@@ -46,6 +46,10 @@ from openswap.worker.models import (
 )
 
 HEALTH_STALE_AFTER_SECONDS = 30.0
+# After a stop arrives while the provider is still starting, how long start()
+# may take to return a handle (so the stop can be enforced with proof) before
+# the launch is abandoned as uncertain.
+START_CANCEL_GRACE_SECONDS = 2.0
 LOCAL_OWNER_REF = "local-user"
 
 
@@ -345,9 +349,9 @@ class WorkerRuntime:
 
     def reconcile_once(self, *, shutdown_event: threading.Event | None = None) -> JobRecord | None:
         """Process at most one job; injectable adapters are for tests only."""
-        # A prior provider read may still be blocked after cancellation. Keep
-        # it tracked and refuse new work until it quiesces; late events must
-        # never be applied to another job.
+        # A prior provider call (an event read, or a start() abandoned after
+        # a stop) may still be blocked. Keep it tracked and refuse new work
+        # until it quiesces; late results must never reach another job.
         with self._event_reader_lock:
             if self._event_reader is not None:
                 if self._event_reader.is_alive():
@@ -373,7 +377,7 @@ class WorkerRuntime:
                 expected_generation=item.generation,
             )
 
-        prepared = self._prepare_run(claimed)
+        prepared = self._prepare_run(claimed, shutdown_event)
         if isinstance(prepared, JobRecord):
             return prepared
         running, run, token = prepared
@@ -646,7 +650,7 @@ class WorkerRuntime:
             diagnostic_code="cancel_requested",
         )
 
-    def _prepare_run(self, claimed: JobRecord):
+    def _prepare_run(self, claimed: JobRecord, shutdown_event: threading.Event | None = None):
         # Provider calls (probe, start) run without the control lock so stop()
         # and cancel() stay responsive; every journal step is taken under it
         # against a freshly read fence. A stop that lands during start() makes
@@ -666,10 +670,9 @@ class WorkerRuntime:
             return prepared
         starting, token, workspace = prepared
         try:
-            run = self.adapter.start(starting, workspace, worker_epoch=self.worker_epoch)
-            if not isinstance(run, ProviderRun):
+            run, abandon_reason = self._start_while_monitoring(starting, workspace, shutdown_event)
+            if abandon_reason is None and not isinstance(run, ProviderRun):
                 raise RuntimeError("invalid_provider_run")
-            self._active_run = run
         except Exception:
             self.leases.mark_uncertain(token, "launch_uncertain")
             self._clear_active()
@@ -681,6 +684,22 @@ class WorkerRuntime:
                     expected_generation=latest.generation,
                     diagnostic_code="execution_uncertain",
                 )
+        if abandon_reason is not None:
+            # start() never returned a handle, so whether it launched is
+            # unknown and nothing can be interrupted: quarantine the lease and
+            # record the job interrupted. The tracked start thread still
+            # blocks admission until it exits.
+            self.leases.mark_uncertain(token, "launch_uncertain")
+            self._clear_active()
+            with self._launch_lock:
+                latest = self.store.get(starting.job_id)
+                return self.store.transition(
+                    latest.job_id, expected_states=(latest.state,),
+                    new_state=JobState.INTERRUPTED, worker_epoch=self.worker_epoch,
+                    expected_generation=latest.generation,
+                    diagnostic_code="execution_uncertain",
+                )
+        self._active_run = run
         try:
             with self._launch_lock:
                 running = self.store.transition(
@@ -695,6 +714,80 @@ class WorkerRuntime:
             if recovered is not None:
                 return recovered
             raise
+
+    def _start_while_monitoring(
+        self, starting: JobRecord, workspace, shutdown_event: threading.Event | None,
+    ) -> tuple[ProviderRun | None, str | None]:
+        """Call ``start()`` on a tracked thread so stop, shutdown and the
+        runtime limit stay enforceable while it runs.
+
+        Returns ``(run, None)`` once start returns, raises its error, or
+        returns ``(None, reason)`` when the launch is abandoned. A stop gets
+        START_CANCEL_GRACE_SECONDS for start to return a handle it can
+        interrupt with proof. A late handle from an abandoned start is
+        interrupted best effort and is never stop proof.
+        """
+        outcome: dict[str, object] = {}
+        outcome_lock = threading.Lock()
+        completed = threading.Event()
+
+        def start() -> None:
+            try:
+                run = self.adapter.start(starting, workspace, worker_epoch=self.worker_epoch)
+                with outcome_lock:
+                    outcome["run"] = run
+                    late = outcome.get("abandoned", False)
+                if late and isinstance(run, ProviderRun):
+                    try:
+                        self.adapter.interrupt(run)
+                    except BaseException:
+                        pass
+            except BaseException as error:
+                with outcome_lock:
+                    outcome["error"] = error
+            finally:
+                completed.set()
+
+        thread = threading.Thread(
+            target=start, name=f"openswap-provider-start-{starting.job_id}", daemon=True,
+        )
+        with self._event_reader_lock:
+            self._event_reader = thread
+            thread.start()
+
+        deadline = self.monotonic() + starting.runtime_limit_s
+        cancel_grace_until = None
+        while not completed.wait(0.05):
+            self.heartbeat()
+            reason = None
+            if not load_worker_settings(self.backup_root).enabled:
+                reason = "worker_shutdown"
+            elif shutdown_event is not None and shutdown_event.is_set():
+                reason = "worker_shutdown"
+            elif self.monotonic() >= deadline:
+                reason = "runtime_limit_reached"
+            elif self.store.get(starting.job_id).state == JobState.CANCEL_REQUESTED:
+                if cancel_grace_until is None:
+                    cancel_grace_until = self.monotonic() + START_CANCEL_GRACE_SECONDS
+                elif self.monotonic() >= cancel_grace_until:
+                    reason = "cancel_requested"
+            if reason is not None:
+                with outcome_lock:
+                    if "run" not in outcome and "error" not in outcome:
+                        outcome["abandoned"] = True
+                        return None, reason
+                break  # start returned meanwhile: handle it normally
+        # start() has returned, so this join waits only for the thread frame
+        # to exit; the slot is then free for the first event read.
+        completed.wait()
+        thread.join()
+        with self._event_reader_lock:
+            if self._event_reader is thread:
+                self._event_reader = None
+        with outcome_lock:
+            if "error" in outcome:
+                raise outcome["error"]
+            return outcome.get("run"), None
 
     def _prepare_launch(self, claimed: JobRecord, availability: ProviderAvailability):
         """Journal and lease steps before launch; runs under the control lock."""

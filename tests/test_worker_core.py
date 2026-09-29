@@ -706,6 +706,49 @@ def test_stop_during_slow_provider_start_is_acknowledged_and_enforced(tmp_path):
     assert AccountLeaseStore(tmp_path).current().state == "released"
 
 
+@pytest.mark.parametrize("trigger", ["stop", "shutdown"])
+def test_hung_provider_start_is_abandoned_as_uncertain_and_blocks_admission(
+    tmp_path, monkeypatch, trigger
+):
+    import openswap.worker.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "START_CANCEL_GRACE_SECONDS", 0.1)
+    update_worker_settings(tmp_path, enabled=True)
+    identity = stable_account_identity("codex", "synthetic-worker-test")
+    adapter = _FakeAdapter(block_start=True)
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
+    job = runtime.submit(_submission())
+    shutdown = threading.Event()
+    results = {}
+    runner = threading.Thread(
+        target=lambda: results.setdefault("run", runtime.reconcile_once(shutdown_event=shutdown))
+    )
+
+    runner.start()
+    assert adapter.start_entered.wait(3)
+    if trigger == "stop":
+        assert runtime.stop(job.job_id).accepted is True
+    else:
+        shutdown.set()
+    runner.join(3)
+
+    # start() never returned a handle: nothing could be interrupted, so the
+    # job is interrupted and the lease quarantined, not released.
+    assert not runner.is_alive()
+    assert results["run"].state == JobState.INTERRUPTED
+    assert results["run"].diagnostic_code == "execution_uncertain"
+    assert AccountLeaseStore(tmp_path).current().state == "uncertain"
+    runtime.submit(_submission("key-2"))
+    assert runtime.reconcile_once() is None  # the hung start still blocks admission
+    assert adapter.start_count == 1
+
+    adapter.release_start.set()
+    deadline = time.monotonic() + 3
+    while adapter.interrupt_count == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert adapter.interrupt_count == 1  # the late handle is interrupted
+
+
 def test_stop_during_slow_probe_cancels_before_launch(tmp_path):
     update_worker_settings(tmp_path, enabled=True)
     identity = stable_account_identity("codex", "synthetic-worker-test")
