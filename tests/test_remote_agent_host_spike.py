@@ -1807,6 +1807,63 @@ def test_stalled_scans_never_carry_a_short_run_past_its_deadline(tmp_path, monke
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
 @pytest.mark.xdist_group("spike_procs")
+def test_supervision_failure_waits_for_the_running_row_before_releasing_the_lock(
+    tmp_path, monkeypatch
+):
+    fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
+    written: list = []
+    real_append = spike._append_jsonl
+
+    def slow_running_append(path, record):
+        if record.get("state") == "running":
+            time.sleep(0.5)  # a slow fsync on the state directory
+            real_append(path, record)
+            written.append("running")
+            return
+        real_append(path, record)
+
+    def failing_snapshot(deadline):
+        raise RuntimeError("snapshot failed")
+
+    monkeypatch.setattr(spike, "_append_jsonl", slow_running_append)
+    monkeypatch.setattr(spike, "_snapshot", failing_snapshot)
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        supervise_fake_command(
+            [str(fake)], state_dir=tmp_path / "state", timeout_s=5, grace_s=0.2, job_id="late-row",
+        )
+    # The writer finished inside the locked scope, so recovery cannot race it.
+    assert written == ["running"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
+def test_exit_seen_only_after_the_deadline_is_still_a_timeout(tmp_path, monkeypatch):
+    timeout_s = 0.6
+    # The child exits 0.1 s after the deadline.
+    fake = _executable(tmp_path / "fake-late-exit", f"import time\ntime.sleep({timeout_s + 0.1})\n")
+    real_exited = spike._leader_exited
+    start = time.monotonic()
+
+    def slow_fallback(process, table=None, deadline=None):
+        # No waitid: exit is only observable through a slow ps fallback.
+        if deadline is not None and deadline > start + timeout_s + 0.05:
+            time.sleep(max(0.0, deadline - time.monotonic()))
+            return real_exited(process, table, deadline)
+        return False
+
+    monkeypatch.setattr(spike, "_leader_exited", slow_fallback)
+    result = supervise_fake_command(
+        [str(fake)], state_dir=tmp_path / "state", timeout_s=timeout_s, grace_s=0.2,
+        job_id="late-exit",
+    )
+
+    states = [row["state"] for row in _read_rows(tmp_path / "state" / "journal.jsonl")]
+    assert result["state"] != "succeeded"
+    assert "cancel_requested" in states
+
+
+@pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
+@pytest.mark.xdist_group("spike_procs")
 def test_runtime_deadline_starts_at_launch_not_after_the_running_append(tmp_path, monkeypatch):
     fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
     marks: dict = {}

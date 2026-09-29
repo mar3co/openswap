@@ -1363,12 +1363,19 @@ def _supervise_fake_command_locked(
         if not running_row.is_alive() and running_row_errors:
             raise running_row_errors[0]
 
+    def settle_running_row() -> None:
+        # The writer must never outlive the locked supervision scope: a late
+        # "running" row after recovery would make a finished job look live.
+        if running_row.ident is not None:
+            running_row.join()
+
     try:
         running_row.start()
         reader.start()
     except BaseException:
         _abort_supervision(process, reader, tracked, grace_s=grace_s)
         reader_stop.set()
+        settle_running_row()
         raise
     timed_out = False
     cleanup_uncertain = False
@@ -1378,6 +1385,7 @@ def _supervise_fake_command_locked(
     escaped_terminated = True
     escaped_signalling = SIGNALLING_PIDFD
     tracking_complete = True
+    exited_in_time = False
     try:
         # The leader is observed, never reaped, until group cleanup is done:
         # a zombie keeps its pid, so the pgid we signal cannot be reused. One
@@ -1397,12 +1405,15 @@ def _supervise_fake_command_locked(
                     # while the leader is alive, whatever group they moved to.
                     _track_descendants(process.pid, tracked, table, deadline)
             if _leader_exited(process, table, deadline=deadline):
+                exited_in_time = True
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             time.sleep(min(DESCENDANT_SNAPSHOT_INTERVAL_S, remaining))
-        timed_out = not _leader_exited(process, deadline=time.monotonic() + SCAN_WINDOW_S)
+        # Decided at the original deadline: an exit observed only by a later
+        # check (a slow ps fallback) is still a timeout, never a success.
+        timed_out = not exited_in_time
         # One short bounded scan while the leader is still unreaped, before any
         # group signal: a run too short for a periodic scan still attributes a
         # helper that already detached, before killing the leader reparents it.
@@ -1448,6 +1459,7 @@ def _supervise_fake_command_locked(
     except BaseException:
         _abort_supervision(process, reader, tracked, grace_s=grace_s)
         reader_stop.set()
+        settle_running_row()
         raise
     _close_handles(tracked)
 
