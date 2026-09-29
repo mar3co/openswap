@@ -23,8 +23,8 @@ install locations and finds this machine's `/opt/homebrew/bin/claude` (2.1.274).
 The isolated test still fails with a temporary HOME and `PATH=/usr/bin:/bin`.
 A narrow test-only correction now simulates the missing-resolver result without
 changing product behavior; the isolated test passes (`1 passed in 0.74s`).
-The latest Phase 1-only assembled suite was green: `2996 passed, 4 skipped, 3
-warnings in 30.31s`; it includes 123 phase-one harness tests and two direct
+The latest Phase 1-only assembled suite was green: `2995 passed, 4 skipped, 3
+warnings in 29.40s`; it includes 122 phase-one harness tests and two direct
 tests of the Claude binary resolver's fallback directories. The helper-cleanup
 regression also passed in isolation (`1 passed in 1.19s`). This is Phase 1
 evidence, not validation of the Phase 2 tree; the separate full Phase 2 result
@@ -116,7 +116,7 @@ Phase 1 exit requires all of the following:
   before real Codex execution, but does not block owner-authorized local-only
   Phase 2 infrastructure work.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
-  (`2996 passed, 4 skipped, 3 warnings in 30.31s`).
+  (`2995 passed, 4 skipped, 3 warnings in 29.40s`).
 
 The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3153 passed, 4 skipped, 3 warnings in 30.37s`.
+`3152 passed, 4 skipped, 3 warnings in 29.57s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client

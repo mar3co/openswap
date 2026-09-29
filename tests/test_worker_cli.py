@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import os
 import time
@@ -15,22 +14,9 @@ import pytest
 from openswap.worker import cli
 from openswap.worker.journal import LocalJobStore
 from openswap.worker.leases import AccountLeaseStore, ReleaseEvidence, stable_account_identity
-from openswap.worker.models import JobState, JobSubmission
+from openswap.worker.models import JobState
 from openswap.settings import load_worker_settings, update_worker_settings
-
-
-def _submission(key: str = "key-1", **changes) -> JobSubmission:
-    values = {
-        "idempotency_key": key,
-        "provider": "codex",
-        "task": "Research this topic",
-        "capability_profile": "research",
-        "workspace_id": "research",
-        "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
-        "runtime_limit_s": 600,
-    }
-    values.update(changes)
-    return JobSubmission(**values)
+from tests.test_worker_core import _submission
 
 
 def _running_job(store: LocalJobStore, *, epoch: int) -> str:
