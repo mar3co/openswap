@@ -136,7 +136,8 @@ def test_wire_timestamps_use_z_like_models():
 
 @pytest.mark.parametrize("value", ["2026-10-01T00:00:00Z", "2026-10-01t00:00:00z", "2026-10-01T00:00:00.5Z",
                                   "2026-10-01T00:00:00.123456+00:00", "2026-10-01T02:30:00+02:30",
-                                  "2026-09-30T23:00:00-01:00"])
+                                  "2026-09-30T23:00:00-01:00", "2026-10-01T20:00:00+20:00",
+                                  "2026-09-30T00:01:00-23:59"])
 def test_timestamp_accepts_rfc3339(value):
     assert timestamp(value) == datetime(2026, 10, 1, tzinfo=timezone.utc).replace(
         microsecond=timestamp(value).microsecond)

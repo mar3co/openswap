@@ -12,6 +12,7 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from contextlib import closing
 
+from openswap.worker.models import SafeEventKind
 from openswap.worker.protocol import (
     Artifact, DEVICE_TTL_SECONDS, HEARTBEAT_SECONDS, LEASE_SECONDS, MAX_ARTIFACTS,
     MISSED_HEARTBEATS, ProtocolError, Submission, TERMINAL, event_from_dict,
@@ -20,6 +21,8 @@ from openswap.worker.protocol import (
 
 # Jobs whose cancel flag a reconnecting worker must still enforce.
 ENFORCE_CANCEL = ("claimed", "starting", "running", "cancel_requested", "interrupted")
+# Heartbeat lists at most this many: live jobs first, then the newest unconfirmed interruptions.
+MAX_CANCEL_IDS = 100
 
 
 def stamp(seconds: float) -> str:
@@ -168,8 +171,9 @@ class ControlStore:
         if op == "register":
             fields(value, set())
             epoch = device["epoch"] + 1
-            # Only heartbeat counts as liveness; a registration alone leaves the worker offline.
-            db.execute("UPDATE devices SET epoch=? WHERE id=?", (epoch, device["id"]))
+            # Only heartbeat counts as liveness; a registration alone leaves the worker offline,
+            # even when the previous incarnation's heartbeat is still fresh.
+            db.execute("UPDATE devices SET epoch=?,seen=NULL WHERE id=?", (epoch, device["id"]))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state IN "
                        "('claimed','starting','running','cancel_requested')", (device["id"],))
             return {"worker_id": device["id"], "worker_epoch": epoch,
@@ -180,8 +184,8 @@ class ControlStore:
             if op == "heartbeat":
                 db.execute("UPDATE devices SET seen=? WHERE id=?", (now, device["id"]))
                 cancelled = db.execute(
-                    "SELECT id FROM jobs WHERE device=? AND cancel=1 AND confirmed=0 AND state IN (?,?,?,?,?) ORDER BY rowid",
-                    (device["id"], *ENFORCE_CANCEL))
+                    "SELECT id FROM jobs WHERE device=? AND cancel=1 AND confirmed=0 AND state IN (?,?,?,?,?) "
+                    "ORDER BY state='interrupted', rowid DESC LIMIT ?", (device["id"], *ENFORCE_CANCEL, MAX_CANCEL_IDS))
                 return {"last_seen_at": stamp(now), "cancel_job_ids": [r[0] for r in cancelled]}
             if device["seen"] is None or device["seen"] <= now - HEARTBEAT_SECONDS * MISSED_HEARTBEATS:
                 raise ProtocolError("offline_worker", 409)
@@ -240,7 +244,7 @@ class ControlStore:
             return self._summary(job)
         if op == "cancel":
             state = job["state"]
-            if state not in TERMINAL or state == "interrupted":
+            if state not in TERMINAL or (state == "interrupted" and not job["confirmed"]):
                 state = "interrupted" if state == "interrupted" else "cancelled" if state == "queued" else "cancel_requested"
                 db.execute("UPDATE jobs SET state=?,cancel=1 WHERE id=?", (state, job["id"]))
             return {"job_id": job["id"], "state": state}
@@ -290,7 +294,9 @@ class ControlStore:
                         raise ProtocolError("cursor_conflict", 409)
                     db.execute("INSERT INTO events VALUES (?,?,?)", (job["id"], event.cursor, payload))
                     cursor = event.cursor
-                    if event.state is not None and event.state.value in {"starting", "running", "cancel_requested"}:
+                    # Only state_changed moves the service-side job; other kinds merely record a state.
+                    if (event.kind == SafeEventKind.STATE_CHANGED and event.state is not None
+                            and event.state.value in {"starting", "running", "cancel_requested"}):
                         order = {"claimed": 0, "starting": 1, "running": 2, "cancel_requested": 3}
                         current = self._job(db, job["id"], device)["state"]
                         if current in order and order[event.state.value] >= order[current]:
