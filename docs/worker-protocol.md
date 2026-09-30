@@ -18,6 +18,11 @@ non-finite numbers, unsupported versions, and oversized bodies. Responses are
 JSON objects, status 200 on success, with `Cache-Control: no-store`. Maximum
 encoded request/response size is 1,500,000 bytes; event pages contain at most
 200 events. Requests have a bounded timeout (reference client: 5 seconds).
+The reference client sends heartbeats from a thread of their own, on a fixed
+cadence, so probes, event pages and artifact uploads (each bounded, but not a
+whole pass) can never delay liveness past the 15-second deadline; that thread
+also renews the lease of an admitted claim that is still waiting for its
+launch fence.
 
 Except `pair`, every request uses `Authorization: Bearer <device_key>`. Keys
 are random 256-bit-or-stronger opaque secrets, stored hashed by the server and
