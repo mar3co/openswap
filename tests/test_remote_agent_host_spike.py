@@ -62,9 +62,25 @@ def test_inspect_codex_uses_only_disposable_home_and_records_help(tmp_path):
     assert not (tmp_path / "evidence" / "journal.jsonl").exists()
 
 
+@pytest.fixture
+def generous_scan_budgets(monkeypatch):
+    """Keep a slow ``ps`` from turning a clean cancellation into ``interrupted``.
+
+    The harness deliberately bounds every process-table scan (a quarter second
+    for the checks around group cleanup) and reports ``interrupted`` when one
+    cannot finish, because an unfinished scan could hide a detached helper.
+    That fail-closed choice is covered by its own tests. The tests below assert
+    the clean-cancellation path itself, so they widen the budgets: on a loaded
+    macOS CI runner ``ps -ax`` alone can take longer than the default window.
+    """
+    for name in ("SCAN_WINDOW_S", "CLEANUP_SCAN_BUDGET_S", "GROUP_SCAN_TIMEOUT_S"):
+        monkeypatch.setattr(spike, name, 10.0)
+
 @pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
 @pytest.mark.xdist_group("spike_procs")
-def test_timeout_terminates_fake_process_group_including_child(tmp_path, monkeypatch):
+def test_timeout_terminates_fake_process_group_including_child(
+    tmp_path, monkeypatch, generous_scan_budgets
+):
     fake = _executable(
         tmp_path / "fake-provider",
         "import os, pathlib, signal, subprocess, sys, time\n"
@@ -157,7 +173,9 @@ def test_unsafe_existing_state_directory_permissions_are_preserved_and_refused(t
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
 @pytest.mark.xdist_group("spike_procs")
-def test_timeout_kills_child_that_ignores_term_before_reporting_cancelled(tmp_path, monkeypatch):
+def test_timeout_kills_child_that_ignores_term_before_reporting_cancelled(
+    tmp_path, monkeypatch, generous_scan_budgets
+):
     child_script = tmp_path / "ignore-term-child.py"
     child_script.write_text(
         "import os, pathlib, signal, time\n"
@@ -288,7 +306,9 @@ def test_json_parser_failures_are_recorded_and_reader_continues(tmp_path, monkey
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group supervision is POSIX-only")
 @pytest.mark.xdist_group("spike_procs")
-def test_noisy_fake_output_is_bounded_and_cancellation_still_completes(tmp_path):
+def test_noisy_fake_output_is_bounded_and_cancellation_still_completes(
+    tmp_path, generous_scan_budgets
+):
     fake = _executable(
         tmp_path / "fake-noisy-provider",
         "import json, sys, time\n"
