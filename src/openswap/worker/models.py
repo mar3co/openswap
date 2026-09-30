@@ -40,9 +40,16 @@ MAX_JOB_RUNTIME_SECONDS = 4 * 60 * 60
 
 
 class RemoteConnectivity(StrEnum):
-    """Phase 2 is local-only; no service connection is attempted."""
+    """Connectivity to the control service, tracked separately from job state.
+
+    Phase 2 only ever reports ``disabled``; the remaining values are the
+    protocol's vocabulary for a paired worker.
+    """
 
     DISABLED = "disabled"
+    ONLINE = "online"
+    OFFLINE = "offline"
+    REVOKED = "revoked"
 
 
 @dataclass(frozen=True)
