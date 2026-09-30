@@ -10,7 +10,7 @@ Codex execution remains disabled until Plan 017's live-evidence gates pass.
 Use HTTPS with certificate verification against the operating system trust
 store. HTTP is allowed only for literal loopback IPs or `localhost`. Redirects
 are forbidden. The service URL is an origin, without credentials, path, query,
-or fragment. All operations below are `POST /v1/<operation>`, with UTF-8 JSON
+or fragment; scheme and host are canonicalized to lowercase. All operations below are `POST /v1/<operation>`, with UTF-8 JSON
 objects, `Content-Type: application/json` and an exact `Content-Length`;
 `Transfer-Encoding: chunked` is rejected. Every field listed is required
 unless described as optional. Reject unknown fields, duplicate JSON keys,
@@ -18,6 +18,11 @@ non-finite numbers, unsupported versions, and oversized bodies. Responses are
 JSON objects, status 200 on success, with `Cache-Control: no-store`. Maximum
 encoded request/response size is 1,500,000 bytes; event pages contain at most
 200 events. Requests have a bounded timeout (reference client: 5 seconds).
+The reference client sends heartbeats from a thread of their own, on a fixed
+cadence, so probes, event pages and artifact uploads (each bounded, but not a
+whole pass) can never delay liveness past the 15-second deadline; that thread
+also renews the lease of an admitted claim that is still waiting for its
+launch fence.
 
 Except `pair`, every request uses `Authorization: Bearer <device_key>`. Keys
 are random 256-bit-or-stronger opaque secrets, stored hashed by the server and
@@ -57,7 +62,8 @@ control character (below U+0020) other than the newline, carriage return and
 tab permitted in `task`. Epochs and cursors are JSON integers (never
 booleans), bounded at 2^53-1. Timestamps are strict RFC 3339 date-times,
 `YYYY-MM-DDThh:mm:ss[.fraction](Z|±hh:mm)`, with `T`/`Z` accepted in either
-case; a space separator, basic format, week dates, hour `24` and offsets with
+case and at most six fractional digits; a space separator, basic format, week
+dates, hour `24`, leap seconds (`:60`), longer fractions and offsets with
 seconds are refused. The server returns UTC with the `Z` designator. Server
 time determines deadlines.
 
@@ -95,7 +101,8 @@ worker without a heartbeat in the last 15 seconds is refused with
 A claim contains `job_id`, `epoch` (monotonically increasing fencing generation),
 `lease_until`, and `submission` (the original closed object). The worker first
 registers; registration increments its durable worker epoch and interrupts any
-prior claimed/active job, without requeueing it. Every worker mutation carries
+prior claimed/active job, without requeueing it, and does not by itself mark
+the worker live. Every worker mutation carries
 that epoch. Poll atomically grants one job and a 20-second lease, and repeated
 polls replay the same unexpired claim. At most one nonterminal claim per worker
 is permitted. Renew before expiry; an expired lease cannot be revived: `renew`
@@ -126,8 +133,11 @@ last-seen timestamp. `waiting_for_approval` is reserved; v1 provides no
 approval/resume operation and fails closed.
 
 Queued expiry becomes `expired`; queued cancel becomes `cancelled`. Claim
-moves `queued` to `claimed`. Uploaded safe `state_changed` events report
-`starting`/`running` or stop request; final outcomes use `reconcile`. Cancel
+moves `queued` to `claimed`. Uploaded events are the worker's replayable
+journal and may record any state, but a service applies a `state_changed`
+event to the job only for `starting`/`running`/`cancel_requested`; a terminal
+state in an event is stored, never applied. Final outcomes change job state
+only through `reconcile` with stopped or unlaunched proof. Cancel
 of claimed/starting/running sets `cancel_requested`, propagated by heartbeat
 and renew/job reads. The separate `cancel_requested` flag persists even when
 heartbeat loss changes the state to `interrupted`; reconnect must enforce it.
@@ -155,10 +165,15 @@ failure/cancellation/expiry. `reconcile` accepts only a terminal `state`;
 `succeeded` always requires stopped proof, so `succeeded` with
 `unlaunched: true` (or without `execution_stopped: true`) returns
 `invalid_state`, as does any other terminal state carrying neither proof. An
-uncertain outcome stays `interrupted`. Reconciliation and event/result uploads
+uncertain outcome stays `interrupted` and remains provisional: it can still be
+reconciled to the true outcome later. Reconciliation and event/result uploads
 are allowed after lease loss for the same worker/job epoch, but never after
 revocation or device expiry. Confirmed terminal reconciliation is idempotent;
-conflicting terminal outcomes return `invalid_state`.
+conflicting terminal outcomes return `invalid_state`. This includes
+`interrupted` confirmed with `execution_stopped: true` or `unlaunched: true`:
+it is terminal like the other confirmed outcomes, a later different terminal
+`state` returns `invalid_state`, and `heartbeat` no longer lists the job in
+`cancel_job_ids`.
 
 Revoking a device denies **all** subsequent data access, submissions and claims
 immediately, interrupts its service-side active jobs, and causes the Mac to
@@ -269,15 +284,26 @@ was stored) is an orphan and `pair` replaces it. New enrollment at the same
 URL receives separate claim/upload journal bindings, scoped by the worker ID;
 nothing key-derived is written to disk.
 
-`openswap worker unpair [url]` removes the key and clears the URL. With an
+`openswap worker unpair [url]` clears the URL, then removes the key. With an
 explicit URL it removes that enrollment's item even when settings no longer
 reference it, clearing the configured URL only when it is the same origin.
-New launches also recheck Keychain availability. Unpair/revocation do not stop
+New launches also recheck Keychain availability, and the guard's authorization
+(the normalized URL and worker ID it verified) is re-verified against
+`settings.json` alone, under the launch lock, immediately before the launch
+commits: after `unpair` returns, no remote launch that was not already
+committed can start (it fails `worker_disabled` and releases its lease
+unlaunched). An already committed run continues: unpair/revocation do not stop
 an already running local job. The operator can revoke its worker ID
 separately. After locally enabling and configuring a permitted
-account/workspace, `worker run` maintains outbound connectivity. With no
-configured URL it performs no network or Keychain access. The production
-adapter still refuses jobs in this phase.
+account/workspace, `worker run` maintains outbound connectivity: it re-reads
+the enrollment and heartbeats on one thread and synchronizes on another, and
+both write the durable status from the client's shared connectivity. The
+registration (worker epoch) is replaced only when the enrollment changes or is
+gone/expired locally; a locked Keychain, a transport fault or a failed status
+write reports `offline` and keeps it, since re-registering interrupts the
+service-side jobs of the registration it replaces. With no configured URL it
+performs no network or Keychain access. The production adapter still refuses
+jobs in this phase.
 
 `worker status --json` includes `remote_connectivity` and
 `remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.

@@ -40,13 +40,24 @@ MAX_JOB_RUNTIME_SECONDS = 4 * 60 * 60
 
 
 class RemoteConnectivity(StrEnum):
-    """Service connectivity is separate from provider/job/process state."""
+    """Connectivity to the control service, tracked separately from provider/job/process state."""
 
     DISABLED = "disabled"
     ONLINE = "online"
     OFFLINE = "offline"
     REVOKED = "revoked"
     EXPIRED = "expired"  # the enrollment's key reached its 30-day limit; re-pair
+
+
+@dataclass(frozen=True)
+class RemoteAuthorization:
+    """What a remote launch guard verified: the normalized service URL and the
+    worker ID of the enrollment it checked. The runtime re-reads the configured
+    URL at the commit point and refuses a launch whose enrollment has since been
+    unpaired, without Keychain or network access."""
+
+    url: str
+    worker_id: str
 
 
 @dataclass(frozen=True)

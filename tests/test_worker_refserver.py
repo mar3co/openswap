@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
+from contextlib import closing
 import http.client
 import json
 import os
 import socket
+import sqlite3
 import threading
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -25,6 +27,7 @@ def service(tmp_path):
     paired = store.request("pair", {"code": store.issue_code()})
     key = paired["device_key"]
     epoch = store.request("register", {}, key)["worker_epoch"]
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
     return store, ticks, paired["worker_id"], key, epoch
 
 
@@ -346,3 +349,90 @@ def test_http_auth_is_checked_before_the_body_is_read(service):
             server.shutdown()
             thread.join(2)
             assert not thread.is_alive()
+
+
+def test_register_alone_leaves_the_worker_offline_until_the_first_heartbeat(tmp_path):
+    path = tmp_path / "private" / "server.sqlite3"
+    ticks = [datetime.now(timezone.utc).timestamp()]
+    store = ControlStore(path, clock=lambda: ticks[0])
+    paired = store.request("pair", {"code": store.issue_code()})
+    key = paired["device_key"]
+    epoch = store.request("register", {}, key)["worker_epoch"]
+    service = store, ticks, paired["worker_id"], key, epoch
+    with pytest.raises(ProtocolError, match="offline_worker"):
+        submit(service)
+    with pytest.raises(ProtocolError, match="offline_worker"):
+        store.request("poll", {"worker_epoch": epoch}, key)
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
+    submit(service)
+    assert store.request("poll", {"worker_epoch": epoch}, key)["claim"] is not None
+    ticks[0] += 16  # a re-registration after heartbeat loss must not revive liveness either
+    epoch = store.request("register", {}, key)["worker_epoch"]
+    with pytest.raises(ProtocolError, match="offline_worker"):
+        submit((store, ticks, paired["worker_id"], key, epoch), "second")
+    with pytest.raises(ProtocolError, match="offline_worker"):
+        store.request("poll", {"worker_epoch": epoch}, key)
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
+    submit((store, ticks, paired["worker_id"], key, epoch), "second")
+
+
+def test_confirmed_interruption_is_terminal_and_leaves_the_cancel_list(service):
+    store, ticks, _, key, epoch = service
+    result, _ = submit(service)
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    store.request("cancel", {"job_id": result["job_id"]}, key)
+    ticks[0] += 16  # heartbeat loss: a provisional interruption
+    assert store.request("job", {"job_id": result["job_id"]}, key)["state"] == "interrupted"
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == [result["job_id"]]
+    uncertain = {**fence(service, claim), "state": "interrupted", "execution_stopped": False, "unlaunched": False}
+    assert store.request("reconcile", uncertain, key)["state"] == "interrupted"
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == [result["job_id"]]
+    confirmed = {**uncertain, "execution_stopped": True}
+    assert store.request("reconcile", confirmed, key)["state"] == "interrupted"
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == []
+    assert store.request("reconcile", confirmed, key)["state"] == "interrupted"
+    assert store.request("reconcile", uncertain, key)["state"] == "interrupted"
+    for state in ("succeeded", "failed", "cancelled"):
+        with pytest.raises(ProtocolError, match="invalid_state"):
+            store.request("reconcile", {**confirmed, "state": state}, key)
+    assert store.request("job", {"job_id": result["job_id"]}, key)["state"] == "interrupted"
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == []
+
+
+def test_provisional_interruption_still_yields_to_the_true_outcome(service):
+    store, ticks, _, key, epoch = service
+    result, _ = submit(service)
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    store.request("cancel", {"job_id": result["job_id"]}, key)
+    ticks[0] += 16
+    assert store.request("job", {"job_id": result["job_id"]}, key)["state"] == "interrupted"
+    uncertain = {**fence(service, claim), "state": "interrupted", "execution_stopped": False, "unlaunched": False}
+    store.request("reconcile", uncertain, key)
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == [result["job_id"]]
+    assert store.request("reconcile", {**uncertain, "state": "cancelled", "execution_stopped": True}, key)["state"] == "cancelled"
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == []
+    with pytest.raises(ProtocolError, match="invalid_state"):
+        store.request("reconcile", {**uncertain, "state": "interrupted", "unlaunched": True}, key)
+    # An unlaunched confirmation is as final as a stopped one.
+    second, _ = submit(service, "second")
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    ticks[0] += 16
+    store.request("reconcile", {**fence(service, claim), "state": "interrupted", "execution_stopped": False,
+                                "unlaunched": True}, key)
+    with pytest.raises(ProtocolError, match="invalid_state"):
+        store.request("reconcile", {**fence(service, claim), "state": "expired", "execution_stopped": False,
+                                    "unlaunched": True}, key)
+
+
+def test_existing_database_gains_the_confirmed_column(tmp_path):
+    path = tmp_path / "private" / "server.sqlite3"
+    path.parent.mkdir(mode=0o700)
+    with closing(sqlite3.connect(path)) as db, db:  # a jobs table written before the column existed
+        db.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, device TEXT NOT NULL, idem TEXT NOT NULL, "
+                   "payload TEXT NOT NULL, state TEXT NOT NULL, expiry REAL NOT NULL, epoch INTEGER NOT NULL DEFAULT 0, "
+                   "lease REAL, cursor INTEGER NOT NULL DEFAULT 0, cancel INTEGER NOT NULL DEFAULT 0, UNIQUE(device,idem))")
+    os.chmod(path, 0o600)
+    store = ControlStore(path)
+    with closing(store.connect()) as db:
+        assert "confirmed" in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
+    ControlStore(path)  # reopening is idempotent

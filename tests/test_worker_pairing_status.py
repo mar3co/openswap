@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 import threading
+import time
 
 import pytest
 
@@ -291,3 +292,165 @@ def test_service_reported_device_expiry_stops_claims_as_expired(remote_setup):
     before = len(transport.calls)
     remote.tick()
     assert len(transport.calls) == before  # no further requests until a new enrollment
+
+
+def test_pair_and_unpair_normalize_hostname_case(tmp_path, keychain):
+    """Pairing, unpairing, status and the journal all hash the normalized origin."""
+    pairing.pair(tmp_path, "https://Control.Example", "one-use", transport=PairTransport())
+    assert load_worker_settings(tmp_path).control_service_url == "https://control.example"
+    assert ("openswap", pairing.account_name("https://control.example")) in keychain
+    assert pairing.account_name("HTTPS://Control.Example/") == pairing.account_name("https://control.example")
+    seen = datetime.now(timezone.utc)
+    save_status(tmp_path, "https://control.example", "online", seen)
+    update_worker_settings(tmp_path, enabled=True)
+    assert read_status(tmp_path, now=seen) == (RemoteConnectivity.ONLINE, seen)
+    pairing.unpair(tmp_path, "https://control.example")
+    assert not keychain and load_worker_settings(tmp_path).control_service_url is None
+
+
+def _enrollment(paired):
+    return pairing.Enrollment(paired["worker_id"], paired["device_key"], datetime.now(timezone.utc) + timedelta(days=30))
+
+
+def test_configured_run_heartbeats_and_synchronizes_on_two_threads(remote_setup, monkeypatch):
+    from tests.test_worker_remote import BlockingTransport, StoreTransport, submit
+    from openswap.worker import remote_state
+    from openswap.worker.remote import RemoteClient
+    remote, runtime, adapter, store, _, paired, _ = remote_setup
+    job_id = submit(remote_setup)
+    monkeypatch.setattr(remote_state, "HEARTBEAT_SECONDS", 0.05)
+    enrollment = _enrollment(paired)  # one value: the identity compares by value
+    recording = BlockingTransport(StoreTransport(store, paired["device_key"]), set(), threading.Event())
+    clients = []
+
+    def factory(runtime, url, key, *, worker_id):
+        clients.append(RemoteClient(runtime, url, key, worker_id=worker_id, transport=recording))
+        return clients[-1]
+
+    configured = ConfiguredRemote(runtime, client_factory=factory, enrollment_loader=lambda _: enrollment)
+    stop = threading.Event()
+    thread = threading.Thread(target=configured.run, args=(stop,), daemon=True)  # a failure must not hang pytest
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not runtime.store.queue():
+            time.sleep(0.02)
+        assert runtime.store.queue(), "the synchronization thread never claimed the job"
+        # The heartbeat thread writes the status right after the heartbeat that
+        # admitted synchronization; read it against the client's own clock since
+        # the shortened cadence also shortens the staleness window.
+        status = lambda: read_status(runtime.backup_root, now=clients[0].last_seen_at)[0]  # noqa: E731
+        while time.monotonic() < deadline and status() != RemoteConnectivity.ONLINE:
+            time.sleep(0.02)
+        assert status() == RemoteConnectivity.ONLINE
+        by_thread = lambda op: {name for o, _, name in recording.stamps if o == op}  # noqa: E731
+        assert by_thread("register") == {thread.name} and thread.name in by_thread("heartbeat")
+        assert by_thread("poll") == {"openswap-worker-remote-sync"}
+        assert runtime.reconcile_once().state.value == "succeeded"
+        while time.monotonic() < deadline and clients[0].journal.pending():
+            time.sleep(0.02)
+        assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "succeeded"
+        assert len(clients) == 1 and configured.client is clients[0]
+        # Unpairing (the URL is cleared first) ends the client from the heartbeat thread.
+        configure_worker_service(runtime.backup_root, None)
+        while time.monotonic() < deadline and configured.client is not None:
+            time.sleep(0.02)
+        assert configured.client is None and read_status(runtime.backup_root)[0] == RemoteConnectivity.DISABLED
+    finally:
+        stop.set()
+        thread.join(2)
+    assert not thread.is_alive()
+    assert not any(t.name == "openswap-worker-remote-sync" and t.is_alive() for t in threading.enumerate())
+    assert adapter.starts == 1
+
+
+def test_status_reflects_a_synchronization_thread_failure(remote_setup):
+    remote, runtime, _, _, _, paired, transport = remote_setup
+    enrollment = _enrollment(paired)  # one value: the identity compares by value
+    configured = ConfiguredRemote(runtime, client_factory=lambda *_, **__: remote, enrollment_loader=lambda _: enrollment)
+    configured.tick()
+    assert read_status(runtime.backup_root)[0] == RemoteConnectivity.ONLINE
+    transport.reject["poll"] = ProtocolError("service_unavailable", 503)
+    configured._sync_pass()  # what the second thread runs each cadence
+    assert remote.state == "offline" and read_status(runtime.backup_root)[0] == RemoteConnectivity.OFFLINE
+    configured._heartbeat_pass()
+    assert read_status(runtime.backup_root)[0] == RemoteConnectivity.ONLINE
+
+
+def test_status_write_failure_keeps_the_registration(remote_setup, monkeypatch):
+    """A failed remote-status.json write must not rebuild the client: re-registering
+    would interrupt the service-side jobs of the registration it replaces."""
+    from openswap.worker import remote_state
+    remote, runtime, _, _, _, paired, transport = remote_setup
+    enrollment = _enrollment(paired)  # one value: the identity compares by value
+    configured = ConfiguredRemote(runtime, client_factory=lambda *_, **__: remote, enrollment_loader=lambda _: enrollment)
+    configured.tick()
+    epoch, registrations = remote.worker_epoch, transport.calls.count("register")
+    monkeypatch.setattr(remote_state, "HEARTBEAT_SECONDS", 0.01)
+    failures = []
+
+    def failing_write(*args, **kwargs):
+        failures.append(args)
+        raise OSError("status file unavailable")
+
+    monkeypatch.setattr(remote_state, "save_status", failing_write)
+    stop = threading.Event()
+    thread = threading.Thread(target=configured.run, args=(stop,), daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len(failures) < 4:
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        thread.join(2)
+    assert not thread.is_alive() and len(failures) >= 4
+    assert configured.client is remote and remote.worker_epoch == epoch
+    assert transport.calls.count("register") == registrations
+    assert remote.state == "offline"  # unwritable status closes the launch fence...
+    monkeypatch.undo()
+    configured.tick()  # ...until the next successful pass, still without re-registering
+    assert read_status(runtime.backup_root)[0] == RemoteConnectivity.ONLINE
+    assert transport.calls.count("register") == registrations
+
+
+def _claimed_row(setup, idem):
+    from tests.test_worker_remote import submit
+    remote, runtime, _, _, _, _, _ = setup
+    submit(setup, idem)
+    remote.tick()
+    return runtime.store.queue()[0]
+
+
+def test_unpair_before_the_launch_commit_never_starts(remote_setup, keychain):
+    """The guard authorized the launch; unpair landed before the commit point."""
+    from openswap.worker.models import RemoteAuthorization
+    remote, runtime, adapter, _, _, _, _ = remote_setup
+    root, url = runtime.backup_root, remote.url
+    keychain[("openswap", pairing.account_name(url))] = "{}"
+    local = _claimed_row(remote_setup, "one")
+
+    def guard(job_id):
+        assert remote.launch_allowed(job_id) == RemoteAuthorization(url, remote.worker_id)
+        pairing.unpair(root)  # clears worker.controlServiceUrl, then deletes the key
+        return True
+
+    runtime.remote_launch_guard = guard
+    result = runtime.reconcile_once()
+    assert (result.state.value, result.diagnostic_code) == ("failed", "worker_disabled")
+    assert adapter.starts == 0 and not keychain and load_worker_settings(root).control_service_url is None
+    lease = runtime.leases.read_current()
+    assert lease.job_id == local.job_id and (lease.state, lease.reason) == ("released", "unlaunched")
+
+    # A token for another enrollment's URL is refused the same way.
+    configure_worker_service(root, url)
+    local = _claimed_row(remote_setup, "two")
+    runtime.remote_launch_guard = lambda _: RemoteAuthorization("https://other.example", "someone")
+    result = runtime.reconcile_once()
+    assert (result.job_id, result.state.value, result.diagnostic_code) == (local.job_id, "failed", "worker_disabled")
+    assert adapter.starts == 0
+
+    # The verified token for the configured URL launches as before.
+    local = _claimed_row(remote_setup, "three")
+    runtime.remote_launch_guard = remote.launch_allowed
+    assert runtime.reconcile_once().state.value == "succeeded" and adapter.starts == 1

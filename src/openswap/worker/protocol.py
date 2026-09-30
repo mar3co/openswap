@@ -6,10 +6,11 @@ from datetime import datetime, timezone
 import base64
 import hashlib
 import ipaddress
+import math
 import re
 from urllib.parse import urlsplit
 
-from openswap.worker.models import JobSubmission, JobState, SafeEvent, SafeEventKind
+from openswap.worker.models import MAX_JOB_RUNTIME_SECONDS, JobSubmission, JobState, SafeEvent, SafeEventKind
 from openswap.worker.journal import validate_event_fields
 
 VERSION = 1
@@ -49,19 +50,26 @@ def integer(value: object, minimum: int = 0) -> int:
     return value
 
 
-_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})")
+# Fractions are capped at microseconds: longer ones would be truncated silently
+# and two distinct expiries could canonicalize to one idempotent payload.
+# Seconds are 00-59: RFC 3339 leap seconds (":60") are excluded from the wire
+# grammar because they cannot be represented as a datetime instant.
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?([Zz]|[+-][01]\d:[0-5]\d)")
 
 
 def timestamp(value: object) -> datetime:
-    """Strict RFC 3339 date-time with an explicit offset: no space separator, basic format or week dates."""
+    """Strict RFC 3339 date-time with an explicit offset: no space separator, basic format, week dates
+    or more than six fractional digits."""
     raw = text(value, 64)
     if not _RFC3339.fullmatch(raw):
         raise ProtocolError("invalid_request")
     try:
         parsed = datetime.fromisoformat(raw[:10] + "T" + raw[11:].upper().replace("Z", "+00:00"))
-    except ValueError:
+        # Instants whose UTC form leaves the representable range (year 1 or
+        # 9999 at an extreme offset) are wire errors, not internal ones.
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         raise ProtocolError("invalid_request") from None
-    return parsed.astimezone(timezone.utc)
 
 
 def stamp(value: datetime) -> str:
@@ -72,7 +80,7 @@ def stamp(value: datetime) -> str:
 def validate_url(url: object) -> str:
     """Only literal loopback addresses/localhost permit HTTP; never follow redirects.
 
-    Returns the normalized origin (lowercase scheme, no trailing slash). Non-strings,
+    Returns the normalized origin (lowercase scheme and host, no trailing slash). Non-strings,
     whitespace, control characters, `?` and `#` are refused even when empty.
     """
     try:
@@ -94,14 +102,22 @@ def validate_url(url: object) -> str:
                 or (parts.scheme == "http" and not loopback)
                 or (port is not None and port == 0)):
             raise ValueError
-        return parts._replace(scheme=parts.scheme.lower()).geturl().rstrip("/")
+        # Hostnames are case-insensitive: one origin must hash to one enrollment.
+        return parts._replace(scheme=parts.scheme.lower(), netloc=parts.netloc.lower()).geturl().rstrip("/")
     except (TypeError, ValueError):
         raise ProtocolError("https_required") from None
 
 
 def runtime_limit(value: object) -> int | float:
-    """Normalize the runtime limit so 600 and 600.0 share one canonical wire form."""
-    if type(value) not in (int, float):
+    """Normalize the runtime limit so 600 and 600.0 share one canonical wire form.
+
+    The documented bound (finite, greater than zero, at most 14,400 s) is
+    enforced here, before model construction, so an oversized integer cannot
+    overflow the model's float check.
+    """
+    if type(value) not in (int, float) or (isinstance(value, float) and not math.isfinite(value)):
+        raise ProtocolError("invalid_request")
+    if not 0 < value <= MAX_JOB_RUNTIME_SECONDS:
         raise ProtocolError("invalid_request")
     return int(value) if isinstance(value, float) and value.is_integer() else value
 
