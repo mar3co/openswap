@@ -1,6 +1,8 @@
 """Operator-only reference service CLI. No secrets are read from remote callers."""
 import argparse
+import os
 from pathlib import Path
+import sqlite3
 import sys
 
 from openswap.worker.protocol import ProtocolError
@@ -21,6 +23,7 @@ def main(argv=None):
         if name == "revoke":
             command.add_argument("worker_id")
     args = parser.parse_args(argv)
+    previous_umask = os.umask(0o077)  # SQLite journal/WAL sidecars must stay owner-private too
     try:
         store = ControlStore(args.database)
         if args.command == "pair-code":
@@ -37,6 +40,8 @@ def main(argv=None):
                 except KeyboardInterrupt:
                     pass
         return 0
-    except (OSError, ValueError, ProtocolError):
+    except (OSError, ValueError, ProtocolError, sqlite3.Error):
         print("Reference service unavailable; check private database permissions and TLS bind policy.", file=sys.stderr)
         return 1
+    finally:
+        os.umask(previous_umask)

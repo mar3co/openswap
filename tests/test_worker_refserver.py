@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
+import http.client
 import json
+import os
+import socket
 import threading
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -10,6 +13,7 @@ import pytest
 from openswap.worker.protocol import Artifact, ProtocolError, Submission
 from openswap.worker.models import JobSubmission, JobState, SafeEvent, SafeEventKind
 from openswap.worker.refserver import ControlStore, make_server
+from openswap.worker.refserver import cli as refserver_cli
 from openswap.worker import cli
 
 
@@ -68,10 +72,12 @@ def test_owner_scope_revocation_and_auth(service):
     store, _, worker_id, key, _ = service
     result, payload = submit(service)
     other = store.request("pair", {"code": store.issue_code()})
-    for operation, data in [("job", {"job_id": result["job_id"]}), ("submit", payload),
-                            ("cancel", {"job_id": result["job_id"]}),
-                            ("artifacts", {"job_id": result["job_id"]})]:
-        with pytest.raises(ProtocolError, match="forbidden"):
+    with pytest.raises(ProtocolError, match="forbidden"):
+        store.request("submit", payload, other["device_key"])
+    # Another owner's job is indistinguishable from an unknown ID: no existence oracle.
+    for operation, data in [("job", {"job_id": result["job_id"]}), ("cancel", {"job_id": result["job_id"]}),
+                            ("artifacts", {"job_id": result["job_id"]}), ("job", {"job_id": "missing"})]:
+        with pytest.raises(ProtocolError, match="not_found"):
             store.request(operation, data, other["device_key"])
     store.revoke(worker_id)
     for operation, data in [("job", {"job_id": result["job_id"]}), ("submit", payload),
@@ -175,6 +181,166 @@ def test_http_strict_parsing_and_pairing(service):
             body = json.dumps({"code": store.issue_code()}).encode()
             with urlopen(Request(url, body, {"Content-Type": "application/json"}), timeout=2) as response:
                 assert json.load(response)["worker_id"]
+        finally:
+            server.shutdown()
+            thread.join(2)
+            assert not thread.is_alive()
+
+
+def test_heartbeat_lists_only_cancellations_still_needing_enforcement(service):
+    store, ticks, _, key, epoch = service
+    queued, _ = submit(service, "queued")
+    assert store.request("cancel", {"job_id": queued["job_id"]}, key)["state"] == "cancelled"
+    finished, _ = submit(service, "finished")
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    assert claim["job_id"] == finished["job_id"]
+    store.request("cancel", {"job_id": finished["job_id"]}, key)
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == [finished["job_id"]]
+    store.request("reconcile", {**fence(service, claim), "state": "cancelled", "execution_stopped": True,
+                                "unlaunched": False}, key)
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == []
+    active, _ = submit(service, "active")
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    store.request("cancel", {"job_id": active["job_id"]}, key)
+    ticks[0] += 16  # heartbeat loss interrupts the job; the flag must still be enforced on reconnect
+    assert store.request("job", {"job_id": active["job_id"]}, key)["state"] == "interrupted"
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == [active["job_id"]]
+
+
+def test_event_driven_cancel_requested_sets_the_flag(service):
+    store, ticks, _, key, epoch = service
+    submit(service)
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    assert store.request("renew", fence(service, claim), key)["cancel_requested"] is False
+    event = SafeEvent(claim["job_id"], 1, datetime.fromtimestamp(ticks[0], timezone.utc),
+                      SafeEventKind.STATE_CHANGED, JobState.CANCEL_REQUESTED).to_dict()
+    store.request("events", {**fence(service, claim), "after_cursor": 0, "events": [event]}, key)
+    assert store.request("job", {"job_id": claim["job_id"]}, key) == {
+        **store.request("job", {"job_id": claim["job_id"]}, key), "state": "cancel_requested", "cancel_requested": True}
+    assert store.request("renew", fence(service, claim), key)["cancel_requested"] is True
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == [claim["job_id"]]
+
+
+def test_upload_before_success_is_invalid_state(service):
+    store, _, _, key, epoch = service
+    submit(service)
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    artifact = Artifact("result.md", b"early").to_dict()
+    with pytest.raises(ProtocolError, match="invalid_state"):
+        store.request("upload", {**fence(service, claim), "artifact": artifact}, key)
+    store.request("reconcile", {**fence(service, claim), "state": "failed", "execution_stopped": True,
+                                "unlaunched": False}, key)
+    with pytest.raises(ProtocolError, match="invalid_state"):
+        store.request("upload", {**fence(service, claim), "artifact": artifact}, key)
+    assert store.request("artifacts", {"job_id": claim["job_id"]}, key)["artifacts"] == []
+
+
+def test_register_bumps_epoch_and_interrupts_the_active_claim(service):
+    store, _, _, key, epoch = service
+    submit(service)
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    registered = store.request("register", {}, key)
+    assert registered["worker_epoch"] == epoch + 1
+    assert store.request("job", {"job_id": claim["job_id"]}, key)["state"] == "interrupted"
+    with pytest.raises(ProtocolError, match="stale_epoch"):
+        store.request("renew", fence(service, claim), key)
+    with pytest.raises(ProtocolError, match="stale_epoch"):
+        store.request("poll", {"worker_epoch": epoch}, key)
+    assert store.request("poll", {"worker_epoch": registered["worker_epoch"]}, key)["claim"] is None
+
+
+def test_concurrent_polls_grant_exactly_one_claim(service):
+    store, _, _, key, epoch = service
+    submit(service)
+    barrier, results, errors = threading.Barrier(2), [], []
+
+    def poll():
+        try:
+            barrier.wait(2)
+            results.append(store.request("poll", {"worker_epoch": epoch}, key)["claim"])
+        except Exception as exc:  # pragma: no cover - surfaced by the assertion below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=poll) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert not errors and len(results) == 2 and results[0] == results[1]
+    assert results[0]["epoch"] == 1
+    assert store.request("job", {"job_id": results[0]["job_id"]}, key)["epoch"] == 1
+
+
+def test_cli_reports_sqlite_errors_and_restores_umask(tmp_path, capsys, monkeypatch):
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    (private / "not-a-database.sqlite3").mkdir(mode=0o700)
+    before = os.umask(0)
+    os.umask(before)
+    assert refserver_cli.main(["pair-code", "--database", str(private / "not-a-database.sqlite3")]) == 1
+    assert "unavailable" in capsys.readouterr().err
+    seen = {}
+
+    class Recording:
+        def __init__(self, path):
+            seen["umask"] = os.umask(0)
+            os.umask(seen["umask"])
+
+        def issue_code(self):
+            return "code"
+
+    monkeypatch.setattr(refserver_cli, "ControlStore", Recording)
+    assert refserver_cli.main(["pair-code", "--database", str(private / "service.sqlite3")]) == 0
+    assert seen["umask"] == 0o077
+    after = os.umask(0)
+    os.umask(after)
+    assert after == before
+
+
+def _raw_request(port, request_bytes, timeout=2):
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock.sendall(request_bytes)
+        response = http.client.HTTPResponse(sock)
+        response.begin()
+        return response.status, dict(response.getheaders()), json.loads(response.read())
+
+
+def test_http_auth_is_checked_before_the_body_is_read(service):
+    store = service[0]
+    with make_server(store, port=0) as server:
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        thread.start()
+        port = server.server_port
+        try:
+            # Content-Length promises 40 bytes that never arrive; a body read would stall for the
+            # 5 s socket timeout, so a prompt 401 proves the credential check came first.
+            for auth in ("", "Authorization: Basic abc\r\n", "Authorization: Bearer \r\n",
+                         "Authorization: Bearer a\r\nAuthorization: Bearer b\r\n",
+                         "Authorization: Bearer " + "k" * 201 + "\r\n"):
+                request = (f"POST /v1/register HTTP/1.1\r\nHost: x\r\n{auth}Content-Type: application/json\r\n"
+                           "Content-Length: 40\r\n\r\n").encode()
+                status, headers, body = _raw_request(port, request)
+                assert (status, body) == (401, {"error": "unauthorized"})
+                assert headers["Server"] == "OpenSwapReference/1"
+            status, _, body = _raw_request(port, b"POST /v1/pair HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                                                b"Content-Length: 40\r\n\r\n", timeout=8)
+            assert (status, body) == (503, {"error": "service_unavailable"})
+            for method in ("GET", "HEAD", "PUT", "DELETE"):
+                status, headers, body = _raw_request(port, f"{method} /v1/register HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+                assert (status, headers["Allow"], body) == (405, "POST", {"error": "invalid_request"})
+            key = store.request("pair", {"code": store.issue_code()})["device_key"]
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+            with urlopen(Request(f"http://127.0.0.1:{port}/v1/register", b"{}", headers), timeout=2) as response:
+                assert json.load(response)["worker_epoch"] == 1
+
+            def explode(*_):
+                raise RuntimeError("bug")
+
+            server.store = type("Broken", (), {"request": staticmethod(explode)})()
+            with pytest.raises(HTTPError) as failure:
+                urlopen(Request(f"http://127.0.0.1:{port}/v1/register", b"{}", headers), timeout=2)
+            assert failure.value.code == 500 and json.load(failure.value) == {"error": "service_unavailable"}
+            failure.value.close()
         finally:
             server.shutdown()
             thread.join(2)

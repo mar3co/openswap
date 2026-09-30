@@ -323,6 +323,7 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
         try:
             control_url = validate_url(control_url)
         except ProtocolError:
+            _logger.warning("settings.json worker control service URL is invalid; disabling the worker")
             return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
     raw_workspaces = section.get("workspaces")
     workspaces: list[WorkerWorkspace] = []
@@ -728,6 +729,7 @@ def configure_worker_service(backup_root: Path, url: str | None) -> WorkerSettin
         url = validate_url(url)
     with _settings_write_lock(backup_root):
         raw = _read_raw_for_write(settings_path(backup_root))
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
         section = raw.setdefault("worker", {})
         if not isinstance(section, dict):
             raise ValueError("invalid worker settings")
