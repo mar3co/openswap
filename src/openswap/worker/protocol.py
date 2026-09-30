@@ -49,11 +49,14 @@ def integer(value: object, minimum: int = 0) -> int:
     return value
 
 
-_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})")
+# Fractions are capped at microseconds: longer ones would be truncated silently
+# and two distinct expiries could canonicalize to one idempotent payload.
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):\d{2}:\d{2}(\.\d{1,6})?([Zz]|[+-]\d{2}:\d{2})")
 
 
 def timestamp(value: object) -> datetime:
-    """Strict RFC 3339 date-time with an explicit offset: no space separator, basic format or week dates."""
+    """Strict RFC 3339 date-time with an explicit offset: no space separator, basic format, week dates
+    or more than six fractional digits."""
     raw = text(value, 64)
     if not _RFC3339.fullmatch(raw):
         raise ProtocolError("invalid_request")
@@ -72,7 +75,7 @@ def stamp(value: datetime) -> str:
 def validate_url(url: object) -> str:
     """Only literal loopback addresses/localhost permit HTTP; never follow redirects.
 
-    Returns the normalized origin (lowercase scheme, no trailing slash). Non-strings,
+    Returns the normalized origin (lowercase scheme and host, no trailing slash). Non-strings,
     whitespace, control characters, `?` and `#` are refused even when empty.
     """
     try:
@@ -94,7 +97,8 @@ def validate_url(url: object) -> str:
                 or (parts.scheme == "http" and not loopback)
                 or (port is not None and port == 0)):
             raise ValueError
-        return parts._replace(scheme=parts.scheme.lower()).geturl().rstrip("/")
+        # Hostnames are case-insensitive: one origin must hash to one enrollment.
+        return parts._replace(scheme=parts.scheme.lower(), netloc=parts.netloc.lower()).geturl().rstrip("/")
     except (TypeError, ValueError):
         raise ProtocolError("https_required") from None
 

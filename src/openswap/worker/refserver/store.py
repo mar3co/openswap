@@ -57,7 +57,8 @@ class ControlStore:
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, device TEXT NOT NULL, idem TEXT NOT NULL, payload TEXT NOT NULL,
                     state TEXT NOT NULL, expiry REAL NOT NULL, epoch INTEGER NOT NULL DEFAULT 0,
-                    lease REAL, cursor INTEGER NOT NULL DEFAULT 0, cancel INTEGER NOT NULL DEFAULT 0, UNIQUE(device,idem));
+                    lease REAL, cursor INTEGER NOT NULL DEFAULT 0, cancel INTEGER NOT NULL DEFAULT 0,
+                    confirmed INTEGER NOT NULL DEFAULT 0, UNIQUE(device,idem));
                 CREATE TABLE IF NOT EXISTS events (
                     job TEXT NOT NULL, cursor INTEGER NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY(job,cursor));
@@ -65,6 +66,8 @@ class ControlStore:
                     job TEXT NOT NULL, name TEXT NOT NULL, hash TEXT NOT NULL, content BLOB NOT NULL,
                     PRIMARY KEY(job,name));
             ''')
+            if "confirmed" not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:
+                db.execute("ALTER TABLE jobs ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
         if os.name != "nt":
             os.chmod(self.path, 0o600)
 
@@ -165,7 +168,8 @@ class ControlStore:
         if op == "register":
             fields(value, set())
             epoch = device["epoch"] + 1
-            db.execute("UPDATE devices SET epoch=?,seen=? WHERE id=?", (epoch, now, device["id"]))
+            # Only heartbeat counts as liveness; a registration alone leaves the worker offline.
+            db.execute("UPDATE devices SET epoch=? WHERE id=?", (epoch, device["id"]))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state IN "
                        "('claimed','starting','running','cancel_requested')", (device["id"],))
             return {"worker_id": device["id"], "worker_epoch": epoch,
@@ -176,7 +180,7 @@ class ControlStore:
             if op == "heartbeat":
                 db.execute("UPDATE devices SET seen=? WHERE id=?", (now, device["id"]))
                 cancelled = db.execute(
-                    "SELECT id FROM jobs WHERE device=? AND cancel=1 AND state IN (?,?,?,?,?) ORDER BY rowid",
+                    "SELECT id FROM jobs WHERE device=? AND cancel=1 AND confirmed=0 AND state IN (?,?,?,?,?) ORDER BY rowid",
                     (device["id"], *ENFORCE_CANCEL))
                 return {"last_seen_at": stamp(now), "cancel_job_ids": [r[0] for r in cancelled]}
             if device["seen"] is None or device["seen"] <= now - HEARTBEAT_SECONDS * MISSED_HEARTBEATS:
@@ -255,9 +259,12 @@ class ControlStore:
                     or type(unlaunched) is not bool or (state == "succeeded" and (not stopped or unlaunched))
                     or (state != "interrupted" and not (stopped or unlaunched))):
                 raise ProtocolError("invalid_state")
-            if job["state"] in TERMINAL - {"interrupted"} and state != job["state"]:
+            # A provisional interruption (heartbeat loss, re-registration, revocation) still yields to the
+            # journal's true outcome; once a worker confirms any outcome with proof it is final.
+            if job["state"] in TERMINAL and (job["state"] != "interrupted" or job["confirmed"]) and state != job["state"]:
                 raise ProtocolError("invalid_state")
-            db.execute("UPDATE jobs SET state=? WHERE id=?", (state, job["id"]))
+            db.execute("UPDATE jobs SET state=?,confirmed=max(confirmed,?) WHERE id=?",
+                       (state, int(stopped or unlaunched), job["id"]))
             return {"job_id": job["id"], "state": state}
         if op == "events":
             after = integer(data["after_cursor"])

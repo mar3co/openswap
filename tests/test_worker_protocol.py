@@ -7,7 +7,7 @@ from openswap.settings import load_worker_settings, configure_worker_service, se
 from openswap.worker.protocol import (
     MAX_ARTIFACT, Artifact, Claim, ProtocolError, Submission, timestamp, validate_url, event_from_dict,
 )
-from openswap.worker.models import JobSubmission, _iso
+from openswap.worker.models import JobSubmission, RemoteConnectivity, _iso
 
 
 def submission():
@@ -53,6 +53,7 @@ def test_valid_urls(url):
 def test_url_normalizes_scheme_and_trailing_slash():
     assert validate_url("HTTPS://host/") == "https://host"
     assert validate_url("HTTP://localhost:9000") == "http://localhost:9000"
+    assert validate_url("https://Control.Example:8443") == "https://control.example:8443"
 
 
 def test_invalid_control_service_url_loads_disabled(tmp_path, caplog):
@@ -63,6 +64,20 @@ def test_invalid_control_service_url_loads_disabled(tmp_path, caplog):
             loaded = load_worker_settings(tmp_path)
         assert loaded.control_service_url is None and not loaded.enabled
         assert "control service URL is invalid" in caplog.text
+
+
+def test_configure_worker_service_replaces_malformed_section(tmp_path):
+    path = settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schemaVersion": 1, "keep": "me", "worker": None}))
+    configure_worker_service(tmp_path, "https://control.example")
+    raw = json.loads(path.read_text())
+    assert raw["keep"] == "me" and raw["worker"]["controlServiceUrl"] == "https://control.example"
+    assert load_worker_settings(tmp_path).control_service_url == "https://control.example"
+
+
+def test_remote_connectivity_matches_protocol_vocabulary():
+    assert {state.value for state in RemoteConnectivity} == {"disabled", "online", "offline", "revoked"}
 
 
 def test_configure_worker_service_writes_schema_version(tmp_path):
@@ -107,7 +122,7 @@ def test_wire_timestamps_use_z_like_models():
 
 
 @pytest.mark.parametrize("value", ["2026-10-01T00:00:00Z", "2026-10-01t00:00:00z", "2026-10-01T00:00:00.5Z",
-                                  "2026-10-01T00:00:00.123456789+00:00", "2026-10-01T02:30:00+02:30",
+                                  "2026-10-01T00:00:00.123456+00:00", "2026-10-01T02:30:00+02:30",
                                   "2026-09-30T23:00:00-01:00"])
 def test_timestamp_accepts_rfc3339(value):
     assert timestamp(value) == datetime(2026, 10, 1, tzinfo=timezone.utc).replace(
@@ -116,6 +131,7 @@ def test_timestamp_accepts_rfc3339(value):
 
 @pytest.mark.parametrize("value", ["2026-10-01 00:00:00Z", "20261001T000000Z", "2026-W40-4T00:00:00Z",
                                   "2026-10-01T00:00:00+00:00:00", "2026-10-01T00:00:00", "2026-10-01T24:00:00Z",
+                                  "2026-10-01T00:00:00.1234567Z", "2026-10-01T00:00:00.Z",
                                   "2026-10-01", "2026-10-01T00:00Z", "2026-10-01T00:00:00+0000",
                                   "2026-10-01T00:00:00Z ", "2026-13-01T00:00:00Z", "", None, 1_700_000_000])
 def test_timestamp_rejects_loose_forms(value):
