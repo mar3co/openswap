@@ -75,7 +75,7 @@ def stamp(value: datetime) -> str:
 def validate_url(url: object) -> str:
     """Only literal loopback addresses/localhost permit HTTP; never follow redirects.
 
-    Returns the normalized origin (lowercase scheme, no trailing slash). Non-strings,
+    Returns the normalized origin (lowercase scheme and host, no trailing slash). Non-strings,
     whitespace, control characters, `?` and `#` are refused even when empty.
     """
     try:
@@ -97,7 +97,8 @@ def validate_url(url: object) -> str:
                 or (parts.scheme == "http" and not loopback)
                 or (port is not None and port == 0)):
             raise ValueError
-        return parts._replace(scheme=parts.scheme.lower()).geturl().rstrip("/")
+        # Hostnames are case-insensitive: one origin must hash to one enrollment.
+        return parts._replace(scheme=parts.scheme.lower(), netloc=parts.netloc.lower()).geturl().rstrip("/")
     except (TypeError, ValueError):
         raise ProtocolError("https_required") from None
 

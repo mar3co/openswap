@@ -10,7 +10,7 @@ Codex execution remains disabled until Plan 017's live-evidence gates pass.
 Use HTTPS with certificate verification against the operating system trust
 store. HTTP is allowed only for literal loopback IPs or `localhost`. Redirects
 are forbidden. The service URL is an origin, without credentials, path, query,
-or fragment. All operations below are `POST /v1/<operation>`, with UTF-8 JSON
+or fragment; scheme and host are canonicalized to lowercase. All operations below are `POST /v1/<operation>`, with UTF-8 JSON
 objects, `Content-Type: application/json` and an exact `Content-Length`;
 `Transfer-Encoding: chunked` is rejected. Every field listed is required
 unless described as optional. Reject unknown fields, duplicate JSON keys,

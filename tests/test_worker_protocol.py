@@ -53,6 +53,7 @@ def test_valid_urls(url):
 def test_url_normalizes_scheme_and_trailing_slash():
     assert validate_url("HTTPS://host/") == "https://host"
     assert validate_url("HTTP://localhost:9000") == "http://localhost:9000"
+    assert validate_url("https://Control.Example:8443") == "https://control.example:8443"
 
 
 def test_invalid_control_service_url_loads_disabled(tmp_path, caplog):
