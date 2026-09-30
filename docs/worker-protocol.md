@@ -11,7 +11,8 @@ Use HTTPS with certificate verification against the operating system trust
 store. HTTP is allowed only for literal loopback IPs or `localhost`. Redirects
 are forbidden. The service URL is an origin, without credentials, path, query,
 or fragment. All operations below are `POST /v1/<operation>`, with UTF-8 JSON
-objects and `Content-Type: application/json`. Every field listed is required
+objects, `Content-Type: application/json` and an exact `Content-Length`;
+`Transfer-Encoding: chunked` is rejected. Every field listed is required
 unless described as optional. Reject unknown fields, duplicate JSON keys,
 non-finite numbers, unsupported versions, and oversized bodies. Responses are
 JSON objects, status 200 on success, with `Cache-Control: no-store`. Maximum
@@ -51,9 +52,14 @@ Enrollment does not enable local execution or select an account/workspace.
 | `artifacts` | `job_id`; optional `name` | `artifacts` (metadata array), or `artifact` (content object when name supplied) |
 | `reconcile` | `worker_epoch`, `job_id`, `epoch`, `state`, `execution_stopped` (boolean), `unlaunched` (boolean) | `job_id`, `state` |
 
-IDs are opaque strings of 1–200 characters. Epochs and cursors are JSON
-integers (never booleans), bounded at 2^53-1. Timestamps are RFC 3339 with an
-explicit UTC offset; the server returns UTC. Server time determines deadlines.
+IDs are opaque strings of 1–200 characters; no string field may contain a
+control character (below U+0020) other than the newline, carriage return and
+tab permitted in `task`. Epochs and cursors are JSON integers (never
+booleans), bounded at 2^53-1. Timestamps are strict RFC 3339 date-times,
+`YYYY-MM-DDThh:mm:ss[.fraction](Z|±hh:mm)`, with `T`/`Z` accepted in either
+case; a space separator, basic format, week dates, hour `24` and offsets with
+seconds are refused. The server returns UTC with the `Z` designator. Server
+time determines deadlines.
 
 Submission is a closed object containing exactly:
 
@@ -70,15 +76,21 @@ Submission is a closed object containing exactly:
 }
 ```
 
-Task is 1–32,000 characters; idempotency key/workspace ID are 1–200; profile
-is at most 80. v1 accepts only `codex`/`research`. Runtime is finite, greater
-than zero and at most 14,400 seconds. Expiry must be in the future and no more
-than 24 hours away at first admission. A submission names **no account, model,
-path, environment, executable or argv**. The Mac resolves the opaque workspace
-ID and pins the locally approved account. Reusing an idempotency key with the
-identical normalized payload returns the same job even if the worker later
-goes offline; changing its payload returns `idempotency_conflict`. A new
-submission to a worker without a heartbeat in the last 15 seconds is refused.
+Task is 1–32,000 characters and may span lines; idempotency key/workspace ID
+are 1–200; profile is at most 80. v1 accepts only `codex`/`research`. Runtime
+is a finite JSON number greater than zero and at most 14,400 seconds. Expiry
+must be in the future and no more than 24 hours away at first admission. A
+submission names **no account, model, path, environment, executable or
+argv**. The Mac resolves the opaque workspace ID and pins the locally approved
+account. `worker_id` must be the authenticated key's own worker; any other
+value returns `forbidden`. Reusing an idempotency key with the identical
+normalized payload returns the same job even if the worker later goes
+offline; changing its payload returns `idempotency_conflict`. Normalization
+renders `runtime_limit_s` as an integer when it is integral (`600` and
+`600.0` are the same payload) and as a float otherwise, and `expires_at` as
+UTC with `Z`; every other field compares verbatim. A new submission to a
+worker without a heartbeat in the last 15 seconds is refused with
+`offline_worker`.
 
 A claim contains `job_id`, `epoch` (monotonically increasing fencing generation),
 `lease_until`, and `submission` (the original closed object). The worker first
@@ -86,9 +98,14 @@ registers; registration increments its durable worker epoch and interrupts any
 prior claimed/active job, without requeueing it. Every worker mutation carries
 that epoch. Poll atomically grants one job and a 20-second lease, and repeated
 polls replay the same unexpired claim. At most one nonterminal claim per worker
-is permitted. Renew before expiry; an expired lease cannot be revived. All
-uploads carry the original job epoch; old worker/job epochs return
-`stale_epoch`. Leases govern admission, **not termination of a running job**.
+is permitted. Renew before expiry; an expired lease cannot be revived: `renew`
+after `lease_until`, or on a terminal job, returns `lease_lost`, and `poll`
+returns `lease_lost` while the worker's active claim has an expired lease
+rather than granting another job. Only `heartbeat` counts as liveness; `poll`
+from a worker without a heartbeat in the last 15 seconds returns
+`offline_worker`. All uploads carry the original job epoch; old worker/job
+epochs return `stale_epoch`. Leases govern admission, **not termination of a
+running job**.
 
 ## State, loss of connectivity, and cancellation
 
@@ -121,7 +138,10 @@ before launching. A previously launched or interrupted job is never relaunched.
 Reconcile the journal's true outcome even when the server already marked it
 interrupted: a terminal `state` with `execution_stopped: true` establishes a
 confirmed stopped result, while `unlaunched: true` establishes pre-launch
-failure/cancellation/expiry. `succeeded` always requires stopped proof. An
+failure/cancellation/expiry. `reconcile` accepts only a terminal `state`;
+`succeeded` always requires stopped proof, so `succeeded` with
+`unlaunched: true` (or without `execution_stopped: true`) returns
+`invalid_state`, as does any other terminal state carrying neither proof. An
 uncertain outcome stays `interrupted`. Reconciliation and event/result uploads
 are allowed after lease loss for the same worker/job epoch, but never after
 revocation or device expiry. Confirmed terminal reconciliation is idempotent;
@@ -156,7 +176,9 @@ Artifact contains exactly `name`, `size`, `sha256` (lowercase hex digest),
 letters/digits/underscore/dot/hyphen, beginning with a letter or digit. Maximum
 size is 1 MiB each, at most eight artifacts per job. Validate decoded size and
 SHA-256 before atomic storage. Same name/content replay is idempotent; a
-changed artifact returns `artifact_conflict`. Upload only for successful jobs.
+changed artifact returns `artifact_conflict`. Upload only for successful jobs:
+`upload` for a job whose state is not `succeeded` returns `invalid_state`, and
+decoded content above 1 MiB returns `artifact_too_large` before any hash check.
 The worker exports an explicit list (pilot default: `result.md`) from that
 job's approved output directory. Never glob, traverse symlinks, upload source
 checkouts, logs, auth/session files, or recursively archive directories.
