@@ -35,8 +35,10 @@ def fields(value: object, required: set[str], optional: set[str] = frozenset()) 
     return value
 
 
-def text(value: object, limit: int = 200) -> str:
-    if not isinstance(value, str) or not value or len(value) > limit or any(ord(c) < 32 for c in value):
+def text(value: object, limit: int = 200, *, allow_multiline: bool = False) -> str:
+    """Bounded non-empty string; control characters are refused except newline/CR/tab when multiline."""
+    if not isinstance(value, str) or not value or len(value) > limit or any(
+            ord(c) < 32 and not (allow_multiline and c in "\n\r\t") for c in value):
         raise ProtocolError("invalid_request")
     return value
 
@@ -47,19 +49,36 @@ def integer(value: object, minimum: int = 0) -> int:
     return value
 
 
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})")
+
+
 def timestamp(value: object) -> datetime:
+    """Strict RFC 3339 date-time with an explicit offset: no space separator, basic format or week dates."""
+    raw = text(value, 64)
+    if not _RFC3339.fullmatch(raw):
+        raise ProtocolError("invalid_request")
     try:
-        parsed = datetime.fromisoformat(text(value, 64).replace("Z", "+00:00"))
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise ValueError
-        return parsed.astimezone(timezone.utc)
-    except (ValueError, TypeError):
+        parsed = datetime.fromisoformat(raw[:10] + "T" + raw[11:].upper().replace("Z", "+00:00"))
+    except ValueError:
         raise ProtocolError("invalid_request") from None
+    return parsed.astimezone(timezone.utc)
 
 
-def validate_url(url: str) -> str:
-    """Only literal loopback addresses/localhost permit HTTP; never follow redirects."""
+def stamp(value: datetime) -> str:
+    """Wire form of a timestamp: UTC with the `Z` designator, matching models._iso."""
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def validate_url(url: object) -> str:
+    """Only literal loopback addresses/localhost permit HTTP; never follow redirects.
+
+    Returns the normalized origin (lowercase scheme, no trailing slash). Non-strings,
+    whitespace, control characters, `?` and `#` are refused even when empty.
+    """
     try:
+        if (not isinstance(url, str) or not url or len(url) > 2048 or "?" in url or "#" in url
+                or any(c.isspace() or ord(c) < 32 for c in url)):
+            raise ValueError
         parts = urlsplit(url)
         host = parts.hostname
         port = parts.port
@@ -75,9 +94,16 @@ def validate_url(url: str) -> str:
                 or (parts.scheme == "http" and not loopback)
                 or (port is not None and port == 0)):
             raise ValueError
-        return url.rstrip("/")
+        return parts._replace(scheme=parts.scheme.lower()).geturl().rstrip("/")
     except (TypeError, ValueError):
         raise ProtocolError("https_required") from None
+
+
+def runtime_limit(value: object) -> int | float:
+    """Normalize the runtime limit so 600 and 600.0 share one canonical wire form."""
+    if type(value) not in (int, float):
+        raise ProtocolError("invalid_request")
+    return int(value) if isinstance(value, float) and value.is_integer() else value
 
 
 @dataclass(frozen=True)
@@ -90,12 +116,10 @@ class Submission:
         data = fields(value, {"worker_id", "idempotency_key", "provider", "task", "capability_profile",
                               "workspace_id", "expires_at", "runtime_limit_s"})
         try:
-            if type(data["runtime_limit_s"]) not in (int, float):
-                raise ValueError
             job = JobSubmission(text(data["idempotency_key"]), text(data["provider"]),
-                                text(data["task"], 32_000), text(data["capability_profile"], 80),
+                                text(data["task"], 32_000, allow_multiline=True), text(data["capability_profile"], 80),
                                 text(data["workspace_id"]), timestamp(data["expires_at"]),
-                                data["runtime_limit_s"])
+                                runtime_limit(data["runtime_limit_s"]))
             return cls(text(data["worker_id"]), job)
         except (ValueError, TypeError):
             raise ProtocolError("invalid_request") from None
@@ -104,7 +128,7 @@ class Submission:
         return {"worker_id": self.worker_id, "idempotency_key": self.job.idempotency_key,
                 "provider": self.job.provider, "task": self.job.task,
                 "capability_profile": self.job.capability_profile, "workspace_id": self.job.workspace_id,
-                "expires_at": self.job.expires_at.isoformat(), "runtime_limit_s": self.job.runtime_limit_s}
+                "expires_at": stamp(self.job.expires_at), "runtime_limit_s": runtime_limit(self.job.runtime_limit_s)}
 
 
 @dataclass(frozen=True)
@@ -121,7 +145,7 @@ class Claim:
                    Submission.from_dict(data["submission"]))
 
     def to_dict(self) -> dict:
-        return {"job_id": self.job_id, "epoch": self.epoch, "lease_until": self.lease_until.isoformat(),
+        return {"job_id": self.job_id, "epoch": self.epoch, "lease_until": stamp(self.lease_until),
                 "submission": self.submission.to_dict()}
 
 
@@ -157,9 +181,14 @@ class Artifact:
         if size > MAX_ARTIFACT:
             raise ProtocolError("artifact_too_large", 413)
         try:
-            content = base64.b64decode(text(data["content_base64"], MAX_BODY), validate=True) if size else b""
+            encoded = data["content_base64"]
+            if not isinstance(encoded, str) or len(encoded) > MAX_BODY:
+                raise ValueError
+            content = base64.b64decode(encoded, validate=True)
         except ValueError:
             raise ProtocolError("invalid_request") from None
+        if len(content) > MAX_ARTIFACT:
+            raise ProtocolError("artifact_too_large", 413)
         if len(content) != size or hashlib.sha256(content).hexdigest() != data["sha256"]:
             raise ProtocolError("hash_mismatch")
         return cls(name, content)
