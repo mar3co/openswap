@@ -86,10 +86,12 @@ class Transport:
 
 class RemoteJournal:
     """Claim receipt and upload acknowledgements survive response loss/restart."""
-    def __init__(self, runtime, url, device_key):
+    def __init__(self, runtime, url, worker_id):
         runtime.store._ensure_private_dir()
         self.path = runtime.store.state_dir / "remote.sqlite3"
-        self.service = hashlib.sha256((url + "\0" + device_key).encode()).hexdigest()
+        # Bindings are scoped to one enrollment at one service. The worker ID
+        # is per enrollment and not secret, so nothing key-derived is on disk.
+        self.service = hashlib.sha256((url + "\0" + worker_id).encode()).hexdigest()
         if self.path.is_symlink():
             raise ValueError("unsafe remote journal")
         try:
@@ -136,10 +138,11 @@ class RemoteClient:
     queries this client; a network failure prevents that launch, never kills a
     job that has already started. Tests inject transport/adapters, not binaries.
     """
-    def __init__(self, runtime, url: str, key: str, *, transport=None, artifact_names=("result.md",)):
+    def __init__(self, runtime, url: str, key: str, *, worker_id: str = "", transport=None,
+                 artifact_names=("result.md",)):
         self.runtime, self.url = runtime, validate_url(url)
         self.transport = transport or Transport(self.url, key)
-        self.journal = RemoteJournal(runtime, self.url, key)
+        self.journal = RemoteJournal(runtime, self.url, worker_id)
         self.stop_event = threading.Event()
         self.worker_epoch = None
         self.state = "offline"
@@ -207,8 +210,8 @@ class RemoteClient:
         if policy.control_service_url != self.url:
             self.state = "disabled"
             return
-        if self.state == "revoked":
-            return
+        if self.state in {"revoked", "expired"}:
+            return  # only a new enrollment (re-pair) can restore access
         try:
             if self.worker_epoch is None:
                 registered = self.transport.request("register", {})
@@ -240,7 +243,8 @@ class RemoteClient:
                 self.journal.remember(claim)  # persist before local admission
                 self._sync(self.journal.pending()[0])
         except ProtocolError as exc:
-            self.state = ("revoked" if exc.code in {"revoked", "unauthorized", "device_expired"}
+            self.state = ("revoked" if exc.code in {"revoked", "unauthorized"}
+                          else "expired" if exc.code == "device_expired"
                           else "online" if exc.code == "lease_lost" else "offline")
         except (KeyError, TypeError, ValueError, OSError, sqlite3.Error, AdmissionError):
             self.state = "offline"

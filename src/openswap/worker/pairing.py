@@ -1,7 +1,7 @@
 """Device enrollment stored only in the user's macOS login Keychain."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -19,7 +19,7 @@ SERVICE = "openswap"
 @dataclass(frozen=True)
 class Enrollment:
     worker_id: str
-    device_key: str
+    device_key: str = field(repr=False)  # never in logs, tracebacks or status output
     expires_at: datetime
 
 
@@ -53,10 +53,10 @@ def pair(root: Path, url: str, code: str, *, transport=None) -> str:
     """Invoking this local command is the owner's explicit pairing approval."""
     require_macos()
     url = validate_url(url)
-    prior_url = load_worker_settings(root).control_service_url
-    if prior_url is not None:
-        raise ProtocolError("unpair_before_pairing")
-    if load_enrollment(url) is not None:
+    # A live enrollment (settings name a URL) must be unpaired first. With no
+    # configured URL, any item left at this account is an orphan from a reset
+    # or an interrupted pairing, and the new key simply replaces it.
+    if load_worker_settings(root).control_service_url is not None:
         raise ProtocolError("unpair_before_pairing")
     result = (transport or Transport(url)).request("pair", {"code": text(code)})
     data = fields(result, {"worker_id", "device_key", "expires_at"})
@@ -82,13 +82,21 @@ def pair(root: Path, url: str, code: str, *, transport=None) -> str:
     return enrollment.worker_id
 
 
-def unpair(root: Path) -> None:
+def unpair(root: Path, url: str | None = None) -> None:
+    """Remove the enrollment for the configured URL, or for an explicit ``url``.
+
+    The explicit form also recovers an orphaned Keychain item when settings no
+    longer name a URL. The configured URL is cleared only when it is the one
+    being unpaired.
+    """
     require_macos()
-    url = load_worker_settings(root).control_service_url
-    if url is None:
+    configured = load_worker_settings(root).control_service_url
+    target = validate_url(url) if url is not None else configured
+    if target is None:
         return
     try:
-        macos_keychain.delete_password(SERVICE, account_name(url))
+        macos_keychain.delete_password(SERVICE, account_name(target))
     except macos_keychain.KEYCHAIN_ERRORS:
         raise ProtocolError("device_key_unavailable") from None
-    configure_worker_service(root, None)
+    if configured is not None and account_name(configured) == account_name(target):
+        configure_worker_service(root, None)

@@ -821,6 +821,10 @@ class WorkerRuntime:
         latest = self.store.get(job_id)
         if latest.state == JobState.CANCEL_REQUESTED:
             return "cancel_requested"
+        if latest.state != JobState.STARTING:
+            # Already finalized (an abandoned launch records the job
+            # interrupted): a provider must never start for a finished job.
+            return "worker_shutdown"
         if latest.expires_at <= datetime.now(timezone.utc):
             return "job_expired"
         if (
@@ -888,13 +892,27 @@ class WorkerRuntime:
                     skipped = self._launch_fence(starting.job_id, shutdown_event)
                     if skipped is None and not remote_allowed:
                         skipped = "worker_shutdown"
-                    if skipped is None:
-                        # Committed atomically with the fence: any stop from
-                        # here on is reported as after the launch.
-                        self._launch_committed = starting.job_id
-                if skipped is not None:
                     with outcome_lock:
-                        outcome["skipped"] = skipped
+                        # Decided under the same lock the monitor abandons
+                        # through: a launch given up on while the guard ran
+                        # (stop, deadline or shutdown) never reaches start().
+                        abandoned = outcome.get("abandoned")
+                        if skipped is None and abandoned:
+                            skipped = "job_expired" if abandoned == "runtime_limit_reached" else str(abandoned)
+                        if skipped is None:
+                            # Committed atomically with the fence: any stop from
+                            # here on is reported as after the launch.
+                            self._launch_committed = starting.job_id
+                        else:
+                            outcome["skipped"] = skipped
+                if skipped is not None:
+                    if abandoned:
+                        # The monitor recorded the job interrupted and the lease
+                        # start-pending; nothing started, so release it with proof.
+                        try:
+                            self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
+                        except Exception:
+                            pass
                     return
                 run = self.adapter.start(starting, workspace, worker_epoch=self.worker_epoch)
                 with outcome_lock:
@@ -948,7 +966,7 @@ class WorkerRuntime:
                         # thread reports through, so its quiesce update always
                         # lands after this one.
                         self.leases.mark_uncertain(token, START_PENDING_REASON)
-                        outcome["abandoned"] = True
+                        outcome["abandoned"] = reason
                         return None, reason, None
                 break  # start returned meanwhile: handle it normally
         # start() has returned, so this join waits only for the thread frame
