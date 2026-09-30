@@ -60,7 +60,7 @@ install/upgrade rewiring. Three phases with a green-suite gate between them.
 
 | Plan | Proposal | Status |
 |------|----------|--------|
-| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag or a self-hosted server | ACCEPTED; Phase 1 remains blocked; owner-authorized Phase 2 local-only worker is implemented and under review ([progress](017-progress.md)) |
+| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag or a self-hosted server | ACCEPTED; Phase 1 signoff (#59) and the local-only Phase 2 worker (#60) are merged; Phase 1 live-evidence gates remain blocked; Phase 3 not started ([progress](017-progress.md)) |
 
 017 recommends an optional OpenSwap worker process, with OpenTag as its first
 client, a pluggable control service (OpenTag-hosted, self-hosted MIT reference
@@ -75,9 +75,13 @@ restriction, cancellation/recovery and account-ownership evidence. The owner
 authorized Phase 2 local-only infrastructure to proceed in parallel; remote
 access stays off and the production Codex adapter remains disabled. The Claude
 auth decision is a separate gate before any Claude adapter. PR
-[#59](https://github.com/mar3co/openswap/pull/59) is ready for review, but its
-evidence and merge do not replace the remaining technical Phase 1 gates.
-Phase 3 remains unstarted. The local worker defaults off; the UI exposes its
+[#59](https://github.com/mar3co/openswap/pull/59) merged on 2026-09-30 as
+Phase 1 signoff and PR [#60](https://github.com/mar3co/openswap/pull/60)
+merged the local-only Phase 2 worker the same day; neither merge replaces the
+remaining technical Phase 1 gates, which need an owner-authorized account
+context and an authenticated `codex exec` run. Phase 3 remains unstarted; its
+credential-free scaffolding may overlap the open gates under owner
+authorization. The local worker defaults off; the UI exposes its
 opt-in/status/stop/pause controls, and the CLI provides `openswap worker
 enable|status|stop|pause|disable`. `settings.json` stores the local enabled and
 paused policy, approved opaque workspace mappings, and optional pinned

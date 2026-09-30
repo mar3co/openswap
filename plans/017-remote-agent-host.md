@@ -1,6 +1,6 @@
 # OpenSwap feature proposal: Remote Agent Host
 
-Status: accepted; phase 1 in progress, remote execution not implemented (see the [progress log](017-progress.md)). Research date: September 27, 2026; control-service decision recorded September 28, 2026.
+Status: accepted; phase 1 signoff (#59) and the local-only phase 2 worker (#60) are merged; phase 1's live-evidence gates remain open, remote execution is not implemented and live Codex execution stays disabled (see the [progress log](017-progress.md)). Research date: September 27, 2026; control-service decision recorded September 28, 2026.
 
 ## Recommendation
 
