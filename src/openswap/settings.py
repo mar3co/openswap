@@ -89,6 +89,8 @@ class WorkerSettings:
     paused: bool = False
     pinned_account_ref: str | None = None
     control_service_url: str | None = None
+    # The worker ID the configured URL was paired as; a re-pair changes it.
+    control_service_worker_id: str | None = None
     workspaces: tuple[WorkerWorkspace, ...] = ()
 
 
@@ -325,6 +327,12 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
         except ProtocolError:
             _logger.warning("settings.json worker control service URL is invalid; disabling the worker")
             return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
+    control_worker = section.get("controlServiceWorkerId")
+    if control_worker is not None and (
+            control_url is None or not isinstance(control_worker, str) or not control_worker
+            or len(control_worker) > 200 or any(ord(c) < 32 for c in control_worker)):
+        _logger.warning("settings.json worker control service identity is invalid; disabling the worker")
+        return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
     raw_workspaces = section.get("workspaces")
     workspaces: list[WorkerWorkspace] = []
     if raw_workspaces is None:
@@ -366,6 +374,7 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
         paused=paused,
         pinned_account_ref=pinned,
         control_service_url=control_url,
+        control_service_worker_id=control_worker,
         workspaces=tuple(workspaces),
     )
 
@@ -722,8 +731,9 @@ def atomic_write_json(path: Path, data: dict) -> None:
         raise
 
 
-def configure_worker_service(backup_root: Path, url: str | None) -> WorkerSettings:
-    """Persist the owner-selected URL; configuring it alone never enables remote work."""
+def configure_worker_service(backup_root: Path, url: str | None, worker_id: str | None = None) -> WorkerSettings:
+    """Persist the owner-selected URL (and the worker ID it was paired as); configuring
+    it alone never enables remote work. Clearing the URL clears the worker ID too."""
     if url is not None:
         from openswap.worker.protocol import validate_url
         url = validate_url(url)
@@ -737,5 +747,9 @@ def configure_worker_service(backup_root: Path, url: str | None) -> WorkerSettin
             section = {}
             raw["worker"] = section
         section["controlServiceUrl"] = url
+        if url is not None and worker_id is not None:
+            section["controlServiceWorkerId"] = worker_id
+        else:
+            section.pop("controlServiceWorkerId", None)
         atomic_write_json(settings_path(backup_root), raw)
     return load_worker_settings(backup_root)

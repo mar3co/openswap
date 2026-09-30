@@ -53,8 +53,9 @@ def integer(value: object, minimum: int = 0) -> int:
 # Fractions are capped at microseconds: longer ones would be truncated silently
 # and two distinct expiries could canonicalize to one idempotent payload.
 # Seconds are 00-59: RFC 3339 leap seconds (":60") are excluded from the wire
-# grammar because they cannot be represented as a datetime instant.
-_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?([Zz]|[+-][01]\d:[0-5]\d)")
+# grammar because they cannot be represented as a datetime instant. Offset
+# hours use the same 00-23 range as the time of day.
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?([Zz]|[+-]([01]\d|2[0-3]):[0-5]\d)")
 
 
 def timestamp(value: object) -> datetime:
@@ -102,8 +103,12 @@ def validate_url(url: object) -> str:
                 or (parts.scheme == "http" and not loopback)
                 or (port is not None and port == 0)):
             raise ValueError
-        # Hostnames are case-insensitive: one origin must hash to one enrollment.
-        return parts._replace(scheme=parts.scheme.lower(), netloc=parts.netloc.lower()).geturl().rstrip("/")
+        # Hostnames are case-insensitive and a default port is implied: one origin
+        # must hash to one enrollment.
+        scheme, netloc = parts.scheme.lower(), parts.netloc.lower()
+        if port == {"http": 80, "https": 443}[scheme] or (port is None and netloc.endswith(":")):
+            netloc = netloc.rsplit(":", 1)[0]
+        return parts._replace(scheme=scheme, netloc=netloc).geturl().rstrip("/")
     except (TypeError, ValueError):
         raise ProtocolError("https_required") from None
 

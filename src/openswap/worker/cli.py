@@ -573,8 +573,14 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                 worker_id = pair(root, args.url, args.code)
                 print(f"Paired worker {worker_id}. Local execution policy is still controlled on this Mac.")
             else:
-                unpair(root, args.url)
-                print("Worker unpaired; remote access disabled.")
+                if unpair(root, args.url):
+                    print("Worker unpaired; remote access disabled.")
+                elif load_worker_settings(root).control_service_url is not None:
+                    # Only an orphan was removed: the configured enrollment is still live.
+                    print("Removed the saved enrollment for that service. Remote access to the "
+                          "configured service is unchanged; run `unpair` without a URL to disable it.")
+                else:
+                    print("Removed any saved enrollment for that service; no control service is configured.")
             return 0
         except ProtocolError as exc:
             print(f"Could not {args.command}: {exc.code}.", file=sys.stderr)
