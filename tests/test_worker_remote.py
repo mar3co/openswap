@@ -296,6 +296,51 @@ def test_rejected_artifact_is_skipped_and_the_claim_completes(remote_setup, tmp_
     assert len(runtime.store.queue()) == 1 and adapter.starts == 1
 
 
+def test_cursor_conflict_ends_the_binding_instead_of_retrying_forever(remote_setup):
+    """A divergent server history cannot be repaired by replay: diagnose, finish the binding, keep claiming."""
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    next_id = submit(remote_setup, "next")
+    remote.tick()
+    local = runtime.reconcile_once()
+    assert local.state == JobState.SUCCEEDED
+    transport.reject["events"] = ProtocolError("cursor_conflict", 409)
+    remote.tick()
+    assert remote.state == "online"
+    assert [b["remote_id"] for b in remote.journal.pending()] == [next_id]
+    assert remote.journal.binding(local.job_id)["done"] == 1
+    page = runtime.events(local.job_id, after_cursor=0, limit=200)
+    assert [e.diagnostic_code for e in page.events if e.diagnostic_code] == ["remote_sync_conflict"]
+    # The outcome was reported as uncertain, never as the unproven local success; no artifact left.
+    reconcile = [data for op, data in transport.requests if op == "reconcile" and data["job_id"] == job_id]
+    assert [(r["state"], r["execution_stopped"], r["unlaunched"]) for r in reconcile] == [("interrupted", False, False)]
+    assert "upload" not in transport.calls
+    key = paired["device_key"]
+    assert store.request("job", {"job_id": job_id}, key)["state"] == "interrupted"
+    # The next claim was admitted in the same tick; the local outcome stands untouched.
+    assert len(runtime.store.queue()) == 1 and adapter.starts == 1
+    assert runtime.get(local.job_id).state == JobState.SUCCEEDED
+
+
+def test_cursor_conflict_with_an_unreachable_service_is_retried_not_dropped(remote_setup):
+    remote, runtime, _, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    local = runtime.reconcile_once()
+    transport.reject["events"] = ProtocolError("cursor_conflict", 409)
+    transport.reject["reconcile"] = ProtocolError("service_unavailable", 503)
+    remote.tick()
+    assert remote.state == "offline" and remote.journal.binding(local.job_id)["done"] == 0
+    page = runtime.events(local.job_id, after_cursor=0, limit=200)
+    assert not any(e.diagnostic_code == "remote_sync_conflict" for e in page.events)
+    transport.reject["events"] = ProtocolError("cursor_conflict", 409)
+    remote.tick()
+    assert remote.state == "online" and remote.journal.binding(local.job_id)["done"] == 1
+    page = runtime.events(local.job_id, after_cursor=0, limit=200)
+    assert [e.diagnostic_code for e in page.events if e.diagnostic_code] == ["remote_sync_conflict"]
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "interrupted"
+
+
 def test_transport_failure_during_upload_keeps_the_claim_pending(remote_setup):
     remote, runtime, _, store, _, paired, transport = remote_setup
     job_id = submit(remote_setup)
@@ -482,6 +527,29 @@ def test_remembered_but_never_admitted_claim_reconciles_unlaunched_after_restart
     assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "interrupted"
 
 
+@pytest.mark.parametrize("status, code", [
+    (400, "invalid_request"), (400, "invalid_code"), (400, "hash_mismatch"), (400, "invalid_state"),
+    (401, "unauthorized"), (401, "device_expired"), (403, "revoked"), (403, "forbidden"),
+    (404, "not_found"), (404, "unsupported_version"), (409, "offline_worker"), (409, "idempotency_conflict"),
+    (409, "stale_epoch"), (409, "lease_lost"), (409, "cursor_conflict"), (409, "artifact_conflict"),
+    (409, "queue_full"), (413, "body_too_large"), (413, "artifact_too_large"), (413, "artifact_limit"),
+    (503, "service_unavailable"),
+])
+def test_live_transport_surfaces_every_documented_error_code(status, code):
+    """The documented codes pass through unchanged; anything else is still rewritten."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CannedHandler)
+    server.reply = (status, {}, json.dumps({"error": code}).encode())
+    thread = serve(server)
+    try:
+        with pytest.raises(ProtocolError) as failure:
+            Transport(f"http://127.0.0.1:{server.server_port}", "key").request("submit", {})
+        assert (failure.value.code, failure.value.status) == (code, status)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(6)
+
+
 class CannedHandler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -535,6 +603,7 @@ def test_live_transport_maps_reference_server_statuses(tmp_path):
     ((409, {}, b'{"error":"vendor_specific_text"}'), ("service_unavailable", 409)),
     ((409, {}, b'{"error":"artifact_conflict"}'), ("artifact_conflict", 409)),
     ((503, {}, b""), ("invalid_response", 400)),
+    ((400, {}, b'{"error":"invalid_request"}'), ("invalid_request", 400)),
 ])
 def test_live_transport_refuses_unsafe_responses(reply, expected):
     server = ThreadingHTTPServer(("127.0.0.1", 0), CannedHandler)

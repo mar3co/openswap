@@ -5,29 +5,64 @@ from pathlib import Path
 from uuid import uuid4
 
 from openswap.settings import load_worker_settings
-from openswap.worker.models import JobSubmission
+from openswap.worker.models import JobState, JobSubmission
 from openswap.worker.pairing import load_enrollment
-from openswap.worker.protocol import ProtocolError, Submission, validate_url
+from openswap.worker.protocol import ProtocolError, Submission, fields, text, timestamp, validate_url
 from openswap.worker.remote import Transport
 
 
+def resolve_expiry(*, expires_in: float | None = None, expires_at: datetime | str | None = None) -> datetime:
+    """Exactly one of a relative or an absolute expiry, at most a day ahead.
+
+    A retry has to resend the identical payload, so it must pass the absolute
+    ``expires_at`` of the first attempt: a fresh relative value would change the
+    payload and the service would answer ``idempotency_conflict``.
+    """
+    if (expires_in is None) == (expires_at is None):
+        raise ProtocolError("invalid_request")
+    now = datetime.now(timezone.utc)
+    if expires_at is None:
+        if (type(expires_in) not in (int, float) or not math.isfinite(expires_in)
+                or not 0 < expires_in <= 86400):
+            raise ProtocolError("invalid_request")
+        return now + timedelta(seconds=expires_in)
+    if isinstance(expires_at, str):
+        expires_at = timestamp(expires_at)
+    if (not isinstance(expires_at, datetime) or expires_at.tzinfo is None
+            or not 0 < (expires_at - now).total_seconds() <= 86400):
+        raise ProtocolError("invalid_request")
+    return expires_at
+
+
 def submit_test(root: Path, *, url: str, task: str, workspace_id: str,
-                runtime_limit: float, expires_in: float, acknowledged: bool,
+                runtime_limit: float, acknowledged: bool, expires_in: float | None = None,
+                expires_at: datetime | str | None = None, idempotency_key: str | None = None,
                 transport=None) -> dict:
+    """Submit one canonical test job; a retry with the same key returns the same job.
+
+    The key defaults to a fresh random value. Callers that may retry after a
+    lost response must reuse the key and the absolute expiry they sent, or the
+    service admits a second job (new key) or refuses the changed payload.
+    """
     if acknowledged is not True:
         raise ProtocolError("test_tool_acknowledgement_required")
     url = validate_url(url)
+    key = uuid4().hex if idempotency_key is None else text(idempotency_key)
     if load_worker_settings(root).control_service_url != url:
         raise ProtocolError("device_not_paired")
     enrollment = load_enrollment(url)
     if enrollment is None:
         raise ProtocolError("device_not_paired")
-    if not math.isfinite(expires_in) or not 0 < expires_in <= 86400:
-        raise ProtocolError("invalid_request")
+    expiry = resolve_expiry(expires_in=expires_in, expires_at=expires_at)
     try:
-        job = JobSubmission(uuid4().hex, "codex", task, "research", workspace_id,
-                            datetime.now(timezone.utc) + timedelta(seconds=expires_in), runtime_limit)
+        job = JobSubmission(key, "codex", task, "research", workspace_id, expiry, runtime_limit)
         request = Submission.from_dict(Submission(enrollment.worker_id, job).to_dict())
     except (TypeError, ValueError, OverflowError):
         raise ProtocolError("invalid_request") from None
-    return (transport or Transport(url, enrollment.device_key)).request("submit", request.to_dict())
+    result = (transport or Transport(url, enrollment.device_key)).request("submit", request.to_dict())
+    # The response is untrusted: only a bounded job ID and a known state are printed.
+    try:
+        fields(result, {"job_id", "state"})
+        return {"job_id": text(result["job_id"]), "state": JobState(result["state"]).value}
+    except (ProtocolError, ValueError):
+        raise ProtocolError("invalid_response") from None
