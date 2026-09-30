@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import threading
 import time
 
@@ -778,3 +779,37 @@ def test_heartbeats_keep_their_cadence_while_renewal_is_blocked(remote_setup, mo
         stop.set()
         thread.join(2)
     assert not thread.is_alive()
+
+
+@pytest.mark.skipif(os.open not in os.supports_dir_fd, reason="needs dir_fd support")
+def test_artifact_open_never_follows_a_swapped_output_directory(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "result.md").write_text("local secret")
+    job_dir = tmp_path / "output" / "job"
+    job_dir.parent.mkdir()
+    job_dir.symlink_to(outside, target_is_directory=True)  # swapped in after the resolve() check
+    with pytest.raises(ProtocolError, match="invalid_request"):
+        remote_mod._open_artifact(job_dir, "result.md")
+    job_dir.unlink()
+    job_dir.mkdir()
+    (job_dir / "result.md").write_text("inside")
+    before, fd = remote_mod._open_artifact(job_dir, "result.md")
+    with os.fdopen(fd, "rb") as stream:
+        assert stream.read() == b"inside" and before.st_size == 6
+
+
+def test_clock_offset_never_lags_the_service_by_the_response_latency(remote_setup):
+    remote, _, _, _, ticks, _, transport = remote_setup
+    original = transport.request
+
+    def slow(operation, data):
+        ticks[0] = datetime.now(timezone.utc).timestamp()  # the service stamps on arrival
+        value = original(operation, data)
+        if operation == "heartbeat":
+            time.sleep(0.3)  # the response is slow to come back
+        return value
+
+    transport.request = slow
+    remote.heartbeat_tick()
+    assert remote._skew >= timedelta(seconds=-0.05)  # deadlines err early, never late
