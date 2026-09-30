@@ -117,8 +117,11 @@ Canonical states are `queued`, `claimed`, `starting`, `running`,
 is reserved; v1 provides no approval/resume operation and fails closed.
 
 Queued expiry becomes `expired`; queued cancel becomes `cancelled`. Claim
-moves `queued` to `claimed`. Uploaded safe `state_changed` events report
-`starting`/`running` or stop request; final outcomes use `reconcile`. Cancel
+moves `queued` to `claimed`. Uploaded events are the worker's replayable
+journal and may record any state, but a service applies a `state_changed`
+event to the job only for `starting`/`running`/`cancel_requested`; a terminal
+state in an event is stored, never applied. Final outcomes change job state
+only through `reconcile` with stopped or unlaunched proof. Cancel
 of claimed/starting/running sets `cancel_requested`, propagated by heartbeat
 and renew/job reads. The separate `cancel_requested` flag persists even when
 heartbeat loss changes the state to `interrupted`; reconnect must enforce it.
