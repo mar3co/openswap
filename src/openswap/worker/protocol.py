@@ -52,7 +52,9 @@ def integer(value: object, minimum: int = 0) -> int:
 
 # Fractions are capped at microseconds: longer ones would be truncated silently
 # and two distinct expiries could canonicalize to one idempotent payload.
-_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):\d{2}:\d{2}(\.\d{1,6})?([Zz]|[+-]\d{2}:\d{2})")
+# Seconds are 00-59: RFC 3339 leap seconds (":60") are excluded from the wire
+# grammar because they cannot be represented as a datetime instant.
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?([Zz]|[+-][01]\d:[0-5]\d)")
 
 
 def timestamp(value: object) -> datetime:
