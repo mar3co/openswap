@@ -12,7 +12,7 @@ import pytest
 from openswap.settings import configure_worker_service, update_worker_settings
 from openswap.worker import remote as remote_mod
 from openswap.worker.journal import StaleWriteError
-from openswap.worker.leases import stable_account_identity
+from openswap.worker.leases import ReleaseEvidence, stable_account_identity
 from openswap.worker.models import (JobSubmission, JobState, ProviderAvailability, ProviderRun,
                                      SafeEvent, SafeEventKind, InterruptResult)
 from openswap.worker.protocol import Artifact, MAX_ARTIFACT, MAX_BODY, ProtocolError, Submission
@@ -643,6 +643,8 @@ def test_live_transport_maps_reference_server_statuses(tmp_path):
     ((200, {}, b"x" * (MAX_BODY + 1)), ("body_too_large", 413)),
     ((200, {}, b"[]"), ("invalid_response", 400)),
     ((200, {}, b"not json"), ("invalid_response", 400)),
+    ((200, {}, b'{"worker_epoch":1,"worker_epoch":2}'), ("invalid_response", 400)),
+    ((200, {}, b'{"worker_epoch":NaN}'), ("invalid_response", 400)),
     ((409, {}, b'{"error":"vendor_specific_text"}'), ("service_unavailable", 409)),
     ((409, {}, b'{"error":"artifact_conflict"}'), ("artifact_conflict", 409)),
     ((503, {}, b""), ("invalid_response", 400)),
@@ -659,3 +661,120 @@ def test_live_transport_refuses_unsafe_responses(reply, expected):
         server.shutdown()
         server.server_close()
         thread.join(2)
+
+
+def test_reserved_approval_state_is_never_launched(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    original = transport.request
+    approval = lambda op, data: ({**original(op, data), "state": "waiting_for_approval"}
+                                 if op in {"job", "renew"} else original(op, data))
+    monkeypatch.setattr(transport, "request", approval)
+    remote.tick()  # never admitted: reconciled as a failed, unlaunched claim
+    reconcile = [data for op, data in transport.requests if op == "reconcile"][-1]
+    assert (reconcile["state"], reconcile["unlaunched"]) == ("failed", True)
+    assert not runtime.store.queue() and adapter.starts == 0
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "failed"
+    monkeypatch.setattr(transport, "request", original)
+    submit(remote_setup, "two")
+    remote.tick()
+    local = runtime.store.queue()[0]
+    monkeypatch.setattr(transport, "request", approval)
+    assert remote.launch_allowed(local.job_id) is False  # the final launch fence refuses it too
+
+
+@pytest.mark.parametrize("mismatch", [{"job_id": "someone-else"}, {"epoch": 99}, {"event_cursor": -1},
+                                      {"expires_at": "soon"}])
+def test_job_response_for_another_claim_never_cancels(remote_setup, monkeypatch, mismatch):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    submit(remote_setup)
+    remote.tick()
+    local = runtime.store.queue()[0]
+    original = transport.request
+    monkeypatch.setattr(transport, "request", lambda op, data: {**original(op, data), **mismatch,
+                                                                "cancel_requested": True}
+                        if op == "job" else original(op, data))
+    remote.tick()
+    assert remote.state == "offline"
+    assert runtime.store.get(local.job_id).state == JobState.QUEUED
+
+
+def test_claim_expiry_is_judged_on_the_service_clock(remote_setup):
+    remote, runtime, adapter, store, ticks, paired, _ = remote_setup
+    ticks[0] -= 3600  # the Mac runs an hour ahead of the service
+    remote.heartbeat_tick()
+    job_id = submit(remote_setup)  # expires 100 s after service time: already past on the Mac's clock
+    remote.tick()
+    assert runtime.reconcile_once().state == JobState.SUCCEEDED
+    remote.tick()
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "succeeded"
+
+
+def test_replacement_enrollment_does_not_inherit_old_bindings(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    submit(remote_setup)
+    monkeypatch.setattr(runtime, "submit", lambda *a, **k: (_ for _ in ()).throw(OSError("crash before admission")))
+    remote.tick()
+    assert remote.journal.pending()
+    monkeypatch.undo()
+    replacement = store.request("pair", {"code": store.issue_code()})
+    fresh = StoreTransport(store, replacement["device_key"])
+    client = RemoteClient(runtime, remote.url, replacement["device_key"], transport=fresh)
+    assert client.journal.pending() == []
+    client.tick()  # register and heartbeat: the replacement is live
+    job_id = store.request("submit", Submission(replacement["worker_id"], JobSubmission(
+        "fresh", "codex", "Research", "research", "research",
+        datetime.fromtimestamp(remote_setup[4][0] + 100, timezone.utc), 60)).to_dict(), replacement["device_key"])
+    client.tick()
+    client.tick()
+    assert "poll" in fresh.calls and runtime.store.queue()[0].idempotency_key.startswith("remote:")
+    assert job_id
+
+
+def test_provisional_interruption_stays_pending_until_stop_proof(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    monkeypatch.setattr(adapter, "start", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("start uncertain")))
+    assert runtime.reconcile_once().state == JobState.INTERRUPTED
+    lease = runtime.leases.read_current()
+    assert lease.job_id == runtime.store.get_by_idempotency_key(remote._idempotency_key(
+        remote_mod.Claim.from_dict(json.loads(remote.journal.pending()[0]["claim"])))).job_id
+    assert lease.state == "uncertain"
+    remote.tick()
+    reconcile = [data for op, data in transport.requests if op == "reconcile"][-1]
+    assert (reconcile["state"], reconcile["execution_stopped"], reconcile["unlaunched"]) == ("interrupted", False, False)
+    assert remote.journal.pending(), "a provisional interruption must stay pending while proof may arrive"
+    runtime.leases.release(lease.token(), ReleaseEvidence.CONFIRMED_STOPPED)
+    remote.tick()
+    reconcile = [data for op, data in transport.requests if op == "reconcile"][-1]
+    assert (reconcile["state"], reconcile["execution_stopped"]) == ("interrupted", True)
+    assert remote.journal.pending() == []
+    assert store.request("heartbeat", {"worker_epoch": remote.worker_epoch}, paired["device_key"])["cancel_job_ids"] == []
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "interrupted"
+
+
+def test_heartbeats_keep_their_cadence_while_renewal_is_blocked(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, ticks, paired, transport = remote_setup
+    submit(remote_setup)
+    remote.tick()  # admitted: the renewal thread now has a claim to renew
+    assert remote._admitted is not None
+    monkeypatch.setattr(remote_mod, "HEARTBEAT_SECONDS", 0.05)
+    stop = threading.Event()
+    blocking = BlockingTransport(transport, {"renew"}, stop)
+    remote.transport = blocking
+    thread = threading.Thread(target=remote.run, args=(stop,), daemon=True)
+    thread.start()
+    try:
+        assert blocking.blocked.wait(5)
+        blocked_at = time.monotonic()
+        while time.monotonic() - blocked_at < 0.6:
+            time.sleep(0.05)
+        heartbeats = [t for op, t, _ in blocking.stamps if op == "heartbeat" and t >= blocked_at]
+        assert len(heartbeats) >= 8, heartbeats
+        assert all(b - a < 0.25 for a, b in zip(heartbeats, heartbeats[1:])), heartbeats
+        assert all(name != thread.name for op, _, name in blocking.stamps if op == "renew")
+    finally:
+        stop.set()
+        thread.join(2)
+    assert not thread.is_alive()

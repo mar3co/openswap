@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -12,6 +12,7 @@ import sqlite3
 import ssl
 import stat
 import threading
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from uuid import uuid4
@@ -25,10 +26,25 @@ from openswap.worker.protocol import (
 )
 
 STATES = frozenset(state.value for state in JobState)
+# Reserved by the protocol: v1 has no approval/resume operation, so it fails closed.
+APPROVAL = "waiting_for_approval"
 # Validation failures the service (or the local export check) reports for one
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
                                  "hash_mismatch", "invalid_request"})
+
+
+def _unique(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+
+
+def _nonfinite(_):
+    raise ValueError("non-finite number")
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -76,7 +92,8 @@ class Transport:
         if len(raw) > MAX_BODY:
             raise ProtocolError("body_too_large", 413)
         try:
-            value = json.loads(raw)
+            # Duplicate keys are refused, never resolved last-wins, before any control decision.
+            value = json.loads(raw, object_pairs_hook=_unique, parse_constant=_nonfinite)
             if not isinstance(value, dict):
                 raise ValueError
             return value
@@ -86,10 +103,13 @@ class Transport:
 
 class RemoteJournal:
     """Claim receipt and upload acknowledgements survive response loss/restart."""
-    def __init__(self, runtime, url):
+    def __init__(self, runtime, url, key):
         runtime.store._ensure_private_dir()
         self.path = runtime.store.state_dir / "remote.sqlite3"
-        self.service = hashlib.sha256(url.encode()).hexdigest()
+        # Namespaced by enrollment, not just URL: a replacement device paired against the
+        # same service must never inherit bindings the revoked or expired one can no longer read.
+        enrollment = hashlib.sha256(key.encode()).hexdigest()
+        self.service = hashlib.sha256((url + "\0" + enrollment).encode()).hexdigest()
         if self.path.is_symlink():
             raise ValueError("unsafe remote journal")
         try:
@@ -145,11 +165,12 @@ class RemoteClient:
     def __init__(self, runtime, url: str, key: str, *, transport=None, artifact_names=("result.md",)):
         self.runtime, self.url = runtime, validate_url(url)
         self.transport = transport or Transport(self.url, key)
-        self.journal = RemoteJournal(runtime, self.url)
+        self.journal = RemoteJournal(runtime, self.url, key)
         self.stop_event = threading.Event()
         self.worker_epoch = None
         self.state = "offline"
         self.last_seen_at = None
+        self._skew = timedelta(0)  # service clock minus local clock, from the last heartbeat
         self._lock = threading.Lock()
         self._admitted = None  # claim whose lease the heartbeat thread keeps renewing
         self.artifact_names = tuple(artifact_names)
@@ -194,15 +215,32 @@ class RemoteClient:
             else:
                 self.state = "offline"
 
-    def _job_response(self, operation, data):
-        """``job``/``renew`` with a real boolean cancel flag and a known state.
+    def _server_now(self):
+        """Deadlines are the service's: expiry is judged on its clock, not the Mac's."""
+        return datetime.now(timezone.utc) + self._skew
 
-        Anything else is a malformed response, handled like a transport failure:
-        it never cancels or launches local work.
+    def _job_response(self, operation, claim):
+        """``job``/``renew`` for ``claim`` with a real boolean cancel flag and a known state.
+
+        A ``job`` response must also describe that claim (ID and epoch) with a valid
+        cursor and expiry; ``renew`` must carry a valid lease. Anything else is a
+        malformed response, handled like a transport failure: it never cancels or
+        launches local work.
         """
+        data = {"job_id": claim.job_id} if operation == "job" else self._fence(claim)
         remote = self.transport.request(operation, data)
-        if type(remote.get("cancel_requested")) is not bool or remote.get("state") not in STATES:
-            raise ProtocolError("invalid_response")
+        try:
+            if type(remote.get("cancel_requested")) is not bool or remote.get("state") not in STATES:
+                raise ProtocolError("invalid_response")
+            if operation == "job":
+                integer(remote["event_cursor"])
+                timestamp(remote["expires_at"])
+                if remote["job_id"] != claim.job_id or integer(remote["epoch"], 1) != claim.epoch:
+                    raise ProtocolError("invalid_response")
+            else:
+                timestamp(remote["lease_until"])
+        except (KeyError, ProtocolError):
+            raise ProtocolError("invalid_response") from None
         return remote
 
     def launch_allowed(self, local_id: str) -> bool:
@@ -217,11 +255,12 @@ class RemoteClient:
                 or policy.control_service_url != self.url or not policy.enabled or policy.paused):
             return False
         claim = Claim.from_dict(json.loads(binding["claim"]))
-        if min(local.expires_at, claim.submission.job.expires_at) <= datetime.now(timezone.utc):
+        if local.expires_at <= datetime.now(timezone.utc) or claim.submission.job.expires_at <= self._server_now():
             return False
         try:
-            remote = self._job_response("renew", self._fence(claim))
-            return remote["state"] not in TERMINAL and remote["state"] != "cancel_requested" and not remote["cancel_requested"]
+            remote = self._job_response("renew", claim)
+            return (remote["state"] not in TERMINAL and remote["state"] not in {"cancel_requested", APPROVAL}
+                    and not remote["cancel_requested"])
         except (ProtocolError, KeyError, ValueError, TypeError):
             return False
 
@@ -256,6 +295,7 @@ class RemoteClient:
             seen = timestamp(heartbeat["last_seen_at"])
             with self._lock:
                 self.last_seen_at = seen
+                self._skew = seen - datetime.now(timezone.utc)
             self._connectivity()
             return self.state == "online"
         except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
@@ -263,7 +303,7 @@ class RemoteClient:
             return False
 
     def renew_admitted(self):
-        """Renew the admitted claim's lease from the heartbeat thread.
+        """Renew the admitted claim's lease from the renewal thread.
 
         The lease governs admission only, and a lost lease cannot be revived, so a
         pass blocked in event pages or artifact uploads must not let a claim that
@@ -274,7 +314,7 @@ class RemoteClient:
         if claim is None or self.worker_epoch is None:
             return
         try:
-            self._job_response("renew", self._fence(claim))
+            self._job_response("renew", claim)
         except ProtocolError as exc:
             if exc.code != "lease_lost":
                 raise
@@ -320,7 +360,7 @@ class RemoteClient:
 
     def _sync(self, binding):
         claim = Claim.from_dict(json.loads(binding["claim"]))
-        remote = self._job_response("job", {"job_id": claim.job_id})
+        remote = self._job_response("job", claim)
         local_id = binding["local_id"]
         local = None
         if local_id:
@@ -334,14 +374,16 @@ class RemoteClient:
             idem = self._idempotency_key(claim)
             local = self.runtime.store.get_by_idempotency_key(idem)
             if local is None:
-                if remote["state"] in TERMINAL or claim.submission.job.expires_at <= datetime.now(timezone.utc) or remote["cancel_requested"]:
+                if (remote["state"] in TERMINAL or remote["state"] == APPROVAL or remote["cancel_requested"]
+                        or claim.submission.job.expires_at <= self._server_now()):
                     # Nothing was ever admitted locally, so nothing launched.
-                    state = "interrupted" if remote["state"] == "interrupted" else "cancelled" if remote["cancel_requested"] else "expired"
+                    state = ("interrupted" if remote["state"] == "interrupted" else "cancelled" if remote["cancel_requested"]
+                             else "failed" if remote["state"] == APPROVAL else "expired")
                     self.transport.request("reconcile", {**self._fence(claim), "state": state,
                                                          "execution_stopped": False, "unlaunched": True})
                     self.journal.update(claim.job_id, done=1)
                     return
-                self._job_response("renew", self._fence(claim))
+                self._job_response("renew", claim)
                 self._admitted = claim
                 if self.stop_event.is_set():
                     return
@@ -349,7 +391,11 @@ class RemoteClient:
                 # launch fence may query it the moment the job is queued.
                 local_id = local_id or uuid4().hex
                 self.journal.update(claim.job_id, local_id=local_id)
-                local = self.runtime.submit(replace(claim.submission.job, idempotency_key=idem), job_id=local_id)
+                # The local runtime judges expiry on the Mac's clock: hand it the service
+                # deadline translated into local time.
+                job = claim.submission.job
+                local = self.runtime.submit(replace(job, idempotency_key=idem, expires_at=job.expires_at - self._skew),
+                                            job_id=local_id)
             if local.job_id != local_id:
                 local_id = local.job_id
                 self.journal.update(claim.job_id, local_id=local_id)
@@ -362,7 +408,7 @@ class RemoteClient:
             self.runtime.cancel(local_id)
             local = self.runtime.get(local_id)
         if local.state.value not in TERMINAL:
-            self._job_response("renew", self._fence(claim))
+            self._job_response("renew", claim)
             self._admitted = claim
         self._forward_events(claim, local_id, binding["cursor"])
         local = self.runtime.get(local_id)
@@ -374,8 +420,10 @@ class RemoteClient:
             if state == "succeeded" and self.upload_results(claim, local):
                 # Relay the rejection diagnostics before acknowledging the claim.
                 self._forward_events(claim, local_id, self.journal.binding(local_id)["cursor"])
-            self.journal.update(claim.job_id, done=1)
             self._admitted = None
+            if state == "interrupted" and not (stopped or unlaunched) and self._proof_pending(local):
+                return  # provisional: stay pending so later stop proof is still reconciled
+            self.journal.update(claim.job_id, done=1)
 
     def _forward_events(self, claim, local_id, cursor):
         # One page per tick keeps requests bounded; terminal jobs are not
@@ -396,8 +444,19 @@ class RemoteClient:
                 break
             page = self.runtime.events(local_id, after_cursor=cursor, limit=200)
 
+    def _proof_pending(self, local):
+        """Whether stop proof for an uncertain run may still arrive: its account lease is
+        still held or quarantined. That lease also blocks new claims, so a retained
+        provisional binding never holds back work that could otherwise run."""
+        lease = self.runtime.leases.read_current()
+        return lease is not None and lease.job_id == local.job_id and lease.state != "released"
+
     def _proof(self, local):
         if local.state.value == "interrupted":
+            # Only the lease can later establish what happened to an uncertain run.
+            lease = self.runtime.leases.read_current()
+            if lease is not None and lease.job_id == local.job_id and lease.state == "released":
+                return lease.reason == "confirmed_stopped", lease.reason == "unlaunched"
             return False, False
         if local.state.value == "failed" and local.diagnostic_code == "lease_conflict":
             return False, True  # no account lease was ever acquired: nothing launched
@@ -470,27 +529,42 @@ class RemoteClient:
         self.transport.request("upload", {**self._fence(claim), "artifact": Artifact(name, content).to_dict()})
 
     def run(self, stop_event: threading.Event):
-        """Heartbeat on this thread at the fixed cadence; synchronize on a second thread.
+        """Heartbeat on this thread on an absolute schedule; renew and synchronize on two others.
 
         Every request is bounded by a 5 s timeout but a synchronization pass is not
         (probe, event pages, artifact uploads), and the service interrupts a live job
-        after 15 s without a heartbeat. Keeping the two on independent deadlines is
-        what stops a slow pass from getting a running job spuriously ``interrupted``.
-        Both threads stop on ``stop_event``; the second is joined before returning.
+        after 15 s without a heartbeat. Heartbeats are due every ``HEARTBEAT_SECONDS``
+        from the previous due time, not from when the last one returned, and nothing
+        else shares their thread, so consecutive heartbeats reach the service at most
+        one period plus one request timeout apart. All threads stop on ``stop_event``
+        and are joined before returning.
         """
         self.stop_event = stop_event
-        sync = threading.Thread(target=self._sync_loop, name="openswap-worker-remote-sync", daemon=True)
-        sync.start()
+        helpers = [threading.Thread(target=self._sync_loop, name="openswap-worker-remote-sync", daemon=True),
+                   threading.Thread(target=self._renew_loop, name="openswap-worker-remote-renew", daemon=True)]
+        for helper in helpers:
+            helper.start()
         try:
+            due = time.monotonic()
             while not stop_event.is_set():
                 try:
-                    if self.heartbeat_tick():
-                        self.renew_admitted()
+                    self.heartbeat_tick()
                 except Exception as exc:
                     self._connectivity(exc)
-                stop_event.wait(HEARTBEAT_SECONDS)
+                due = max(due + HEARTBEAT_SECONDS, time.monotonic())
+                stop_event.wait(due - time.monotonic())
         finally:
-            sync.join()
+            for helper in helpers:
+                helper.join()
+
+    def _renew_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                if self.state == "online":
+                    self.renew_admitted()
+            except Exception as exc:
+                self._connectivity(exc)
+            self.stop_event.wait(HEARTBEAT_SECONDS)
 
     def _sync_loop(self):
         while not self.stop_event.is_set():
