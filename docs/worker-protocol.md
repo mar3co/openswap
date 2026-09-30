@@ -57,8 +57,8 @@ control character (below U+0020) other than the newline, carriage return and
 tab permitted in `task`. Epochs and cursors are JSON integers (never
 booleans), bounded at 2^53-1. Timestamps are strict RFC 3339 date-times,
 `YYYY-MM-DDThh:mm:ss[.fraction](Z|±hh:mm)`, with `T`/`Z` accepted in either
-case; a space separator, basic format, week dates, hour `24` and offsets with
-seconds are refused. The server returns UTC with the `Z` designator. Server
+case and at most six fractional digits; a space separator, basic format, week
+dates, hour `24`, longer fractions and offsets with seconds are refused. The server returns UTC with the `Z` designator. Server
 time determines deadlines.
 
 Submission is a closed object containing exactly:

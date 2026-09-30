@@ -49,11 +49,14 @@ def integer(value: object, minimum: int = 0) -> int:
     return value
 
 
-_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})")
+# Fractions are capped at microseconds: longer ones would be truncated silently
+# and two distinct expiries could canonicalize to one idempotent payload.
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]([01]\d|2[0-3]):\d{2}:\d{2}(\.\d{1,6})?([Zz]|[+-]\d{2}:\d{2})")
 
 
 def timestamp(value: object) -> datetime:
-    """Strict RFC 3339 date-time with an explicit offset: no space separator, basic format or week dates."""
+    """Strict RFC 3339 date-time with an explicit offset: no space separator, basic format, week dates
+    or more than six fractional digits."""
     raw = text(value, 64)
     if not _RFC3339.fullmatch(raw):
         raise ProtocolError("invalid_request")
