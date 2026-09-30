@@ -55,7 +55,8 @@ def test_worker_settings_default_off_and_preserve_other_sections(tmp_path):
     assert updated.enabled is True and updated.paused is True
     assert raw["autoswitch"] == {"threshold": 80}
     assert raw["other"] == {"x": 1}
-    assert (settings.stat().st_mode & 0o777) == 0o600
+    if os.name == "posix":  # Windows has no POSIX file modes
+        assert (settings.stat().st_mode & 0o777) == 0o600
 
 
 def test_malformed_worker_policy_fails_closed(tmp_path):
@@ -208,6 +209,19 @@ def test_pid_exists_reports_this_process_alive_and_a_reaped_child_gone():
 
     assert _pid_exists(os.getpid()) is True
     assert _pid_exists(child.pid) is False
+
+
+def test_long_socket_path_works_without_a_posix_uid(tmp_path, monkeypatch):
+    """Windows has no os.getuid; status and purge build this path there."""
+    from openswap.worker import ipc
+
+    monkeypatch.delattr(ipc.os, "getuid", raising=False)
+    root = tmp_path / ("x" * 120)
+
+    first = ipc.socket_path(root)
+    assert first == ipc.socket_path(root)
+    assert first.name == "control.sock"
+    assert len(os.fsencode(first)) <= ipc.MAX_SOCKET_PATH_BYTES
 
 
 def test_pid_exists_never_signals_on_windows(monkeypatch):

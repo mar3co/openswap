@@ -13,6 +13,10 @@ from pathlib import Path
 import pytest
 
 from openswap.worker import ipc
+
+# The control socket is a private AF_UNIX socket checked by POSIX owner and
+# mode; the worker only runs on POSIX hosts.
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="worker IPC is POSIX-only")
 from openswap.worker.client import WorkerClient
 from openswap.worker.models import (
     ControlResult,
@@ -56,19 +60,19 @@ def running_server(tmp_path):
     control = FakeControl()
     stop_event = threading.Event()
     errors = []
+    ready = threading.Event()
 
     def run():
         try:
-            ipc.serve(path, control, stop_event)
+            ipc.serve(path, control, stop_event, ready_event=ready)
         except Exception as exc:  # propagate thread failures to the test
             errors.append(exc)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    deadline = time.monotonic() + 2
-    while not path.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert path.exists(), f"worker IPC socket did not become ready: {errors!r}"
+    # The socket file exists from bind(); only after listen() is a connect
+    # guaranteed to be accepted, so wait for serve() to say so.
+    assert ready.wait(2), f"worker IPC socket did not become ready: {errors!r}"
     yield path, control, stop_event, thread, errors
     stop_event.set()
     # Wake an accept() already in progress. The server polls at a short timeout.

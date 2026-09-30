@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import stat
+import tempfile
 import time
 from pathlib import Path
 from threading import Event
@@ -42,7 +43,12 @@ def socket_path(backup_root: Path) -> Path:
     if len(os.fsencode(candidate)) <= MAX_SOCKET_PATH_BYTES:
         return candidate
     digest = hashlib.sha256(os.fsencode(os.path.abspath(root))).hexdigest()[:16]
-    return Path("/tmp") / f"openswap-worker-{os.getuid()}-{digest}" / "control.sock"
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        # No POSIX uid (Windows): the worker never serves there, so this path
+        # only has to be deterministic for a client that will find nothing.
+        return Path(tempfile.gettempdir()) / f"openswap-worker-{digest}" / "control.sock"
+    return Path("/tmp") / f"openswap-worker-{getuid()}-{digest}" / "control.sock"
 
 
 def _object_dict(value: object) -> dict:
