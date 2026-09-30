@@ -51,3 +51,15 @@ def test_artifact_validation(change):
 def test_events_refuse_unstructured_payload():
     with pytest.raises(ProtocolError):
         event_from_dict({"raw": "secret"})
+
+
+def test_multiline_task_is_valid_text():
+    from dataclasses import replace
+    request = submission()
+    request = replace(request, job=replace(request.job, task="Research this:\n- topic one\n- topic two"))
+    assert Submission.from_dict(request.to_dict()) == request
+
+
+def test_url_rejects_whitespace_before_parsing():
+    with pytest.raises(ProtocolError, match="https_required"):
+        validate_url("\nhttps://control.example")

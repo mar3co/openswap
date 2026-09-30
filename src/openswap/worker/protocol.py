@@ -35,8 +35,8 @@ def fields(value: object, required: set[str], optional: set[str] = frozenset()) 
     return value
 
 
-def text(value: object, limit: int = 200) -> str:
-    if not isinstance(value, str) or not value or len(value) > limit or any(ord(c) < 32 for c in value):
+def text(value: object, limit: int = 200, *, allow_multiline: bool = False) -> str:
+    if not isinstance(value, str) or not value or len(value) > limit or any(ord(c) < 32 and not (allow_multiline and c in "\n\r\t") for c in value):
         raise ProtocolError("invalid_request")
     return value
 
@@ -60,6 +60,8 @@ def timestamp(value: object) -> datetime:
 def validate_url(url: str) -> str:
     """Only literal loopback addresses/localhost permit HTTP; never follow redirects."""
     try:
+        if not isinstance(url, str) or len(url) > 2048 or any(c.isspace() or ord(c) < 32 for c in url):
+            raise ValueError
         parts = urlsplit(url)
         host = parts.hostname
         port = parts.port
@@ -75,7 +77,7 @@ def validate_url(url: str) -> str:
                 or (parts.scheme == "http" and not loopback)
                 or (port is not None and port == 0)):
             raise ValueError
-        return url.rstrip("/")
+        return parts.geturl().rstrip("/")
     except (TypeError, ValueError):
         raise ProtocolError("https_required") from None
 
@@ -93,7 +95,7 @@ class Submission:
             if type(data["runtime_limit_s"]) not in (int, float):
                 raise ValueError
             job = JobSubmission(text(data["idempotency_key"]), text(data["provider"]),
-                                text(data["task"], 32_000), text(data["capability_profile"], 80),
+                                text(data["task"], 32_000, allow_multiline=True), text(data["capability_profile"], 80),
                                 text(data["workspace_id"]), timestamp(data["expires_at"]),
                                 data["runtime_limit_s"])
             return cls(text(data["worker_id"]), job)

@@ -16,9 +16,11 @@ parallel with their Phase 1 work. This changed sequencing only: no Phase 1
 gate is waived or marked passed. PR #60, the local-only Phase 2 worker, merged
 to `main` on 2026-09-30 as merge commit `225211d` with CI green on macOS,
 Linux and Windows and a clean Codex review (56 resolved threads). Remote
-access stays off and live Codex execution stays disabled. Phase 3 has not
-started; its scaffolding is credential-free and may overlap the open Phase 1
-gates under the same owner authorization model as Phase 2.
+access remains default-off and live Codex execution stays disabled. Phase 3
+credential-free scaffolding is implemented in the five-PR stack
+#63–#67 under the owner's explicit authorization to overlap the open Phase 1
+gates. Its local protocol/service/client evidence does not pass Phase 1 or the
+Phase 3 network exit gate. The production Codex adapter remains disabled.
 
 The next unblocking step is Phase 1 live evidence: the owner names a Codex
 account context (a dedicated roster slot or disposable account) and is present
@@ -142,7 +144,7 @@ until the owner records a permitted path or exclusion.
 | --- | --- | --- |
 | 1. Feasibility spike and authentication gate | SIGNOFF MERGED (#59) / EVIDENCE BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction showed the wrapper could return success while a detached helper remained alive; the harness now detects and terminates tracked escaped descendants and reports `interrupted`, but cannot close the fork/reparent race. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 merged 2026-09-30 (`39438ca`) as review signoff; merging does not satisfy the remaining technical exit gates. Next step: an owner-authorized account context and an authenticated `codex exec` run. |
 | 2. Local worker, remote access off | MERGED (#60) — local-only | Owner authorized local infrastructure to overlap Phase 1; no Phase 1 gate is waived. PR #60 merged 2026-09-30 (`225211d`); CI green on macOS, Linux and Windows; Codex review clean on `556ca11`. Fake-only validation is recorded below. Remote access stays off, the production Codex adapter still refuses, and live Codex stays disabled. Open follow-up before any real adapter: lease release must also prove the provider process tree has stopped. |
-| 3. Private remote pilot | NOT STARTED | Phase 2 is merged. Builds the protocol specification, configurable backend URL, pairing/enrollment, polling/heartbeats and the MIT reference server as product code; the pilot runs against a self-hosted instance with the fake adapter until Phase 1 evidence clears. Credential-free scaffolding may overlap the open Phase 1 gates under owner authorization. |
+| 3. Private remote pilot | SCAFFOLDING IN REVIEW (#63–#67) / EXIT OPEN | Owner explicitly authorized credential-free Phase 3 overlap. The protocol, reference server, polling/heartbeats, enrollment/status and guarded test CLI have loopback fake-adapter evidence. Real owner-controlled HTTPS deployment, submission from another network and backend replacement still need the owner. Production Codex remains disabled pending Phase 1. |
 | 4. OpenTag connector | NOT STARTED | OpenTag repository, mar3co/opentag#135; requires phase 3. |
 | 5–6 | NOT STARTED | Require phase 4. |
 
@@ -152,8 +154,8 @@ The owner authorized local Phase 2 infrastructure to overlap the open Phase 1
 review. The authorization does not pass or waive any Phase 1 gate. Phase 2 is
 limited to an opt-in local worker: remote access remains off, the production
 Codex adapter always reports unavailable, and no provider account or job is
-used. Phase 3's control server, enrollment, polling and result upload are not
-part of this work.
+used. Phase 3's control server, enrollment, polling and result upload were not
+part of the Phase 2 slice; the later Phase 3 work is recorded below.
 
 | Slice | Boundary and proposed interface |
 | --- | --- |
@@ -176,7 +178,7 @@ execution-stopped proof, and restart marks ambiguous work interrupted without
 relaunch. It does not claim that Codex is executable under the required
 boundary. No `launchctl` command is run against the user's login session;
 LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
-3 remains unstarted.
+3 scaffolding is implemented; its owner network pilot remains open.
 
 The Phase 2 full-suite validation on the currently integrated PR #59 snapshot
 `f684ebf` is green: `3082 passed, 4 skipped, 3 warnings in 20.02s`. The run
@@ -402,10 +404,10 @@ using a lock-free read so it adds no contention with switching.
 
 ## Deviations and verification
 
-- Phase ordering overlaps only because the owner explicitly authorized local
-  Phase 2 infrastructure while Phase 1 remains in progress. This does not
-  waive Phase 1 evidence gates or authorize Phase 3, provider execution, or
-  credentials.
+- Phase ordering overlaps because the owner explicitly authorized local
+  Phase 2 infrastructure and subsequently credential-free Phase 3 scaffolding
+  while Phase 1 remains in progress. Neither authorization waives Phase 1
+  evidence gates or authorizes live provider execution or provider credentials.
 - A second independent review of the harness found and fixed: recovery
   crashing on a corrupted journal instead of refusing; tracebacks leaking
   paths for non-`SpikeError` failures; recovery unable to see a live orphaned
@@ -630,3 +632,73 @@ using a lock-free read so it adds no contention with switching.
   plan still targets macOS; these fixes keep the shared code and tests
   honest on the other CI platforms. A macOS IPC test race (connection
   refused before the fake server listened) was fixed with a readiness event.
+
+## Phase 3: private remote pilot scaffolding
+
+**Implementation delivered for review; exit gate remains OPEN.** The owner
+explicitly authorized credential-free Phase 3 work to overlap the still-open
+Phase 1 gates. This is a sequencing deviation, not a provider-safety waiver.
+The five branches target the branch immediately below them:
+
+| Slice | Pull request | Scope |
+| --- | --- | --- |
+| 3a | [#63](https://github.com/mar3co/openswap/pull/63) | [v1 protocol](../docs/worker-protocol.md), strict wire types, default-None service URL |
+| 3b | [#64](https://github.com/mar3co/openswap/pull/64) | single-owner SQLite/http.server control service and operator CLI |
+| 3c | [#65](https://github.com/mar3co/openswap/pull/65) | outbound HTTPS transport, durable claim bindings, heartbeat/lease/event/result reconciliation |
+| 3d | [#66](https://github.com/mar3co/openswap/pull/66) | local pairing, Keychain-only key, unpair, daemon configuration, CLI/menu connectivity |
+| 3e | [#67](https://github.com/mar3co/openswap/pull/67) | guarded test-only submit, loopback end-to-end tests, progress documentation |
+
+Tests start the reference HTTP server on loopback in-process, approve pairing
+through the CLI with a mocked login Keychain, submit through `submit-test`, run
+one inert fake-adapter job, retrieve cursor events and SHA-256-verified result
+bytes, and prove unlisted files stay local. A second test drives configured
+background polling using readiness events. This proves the credential-free
+transport and durable integration, **not** live research, provider isolation,
+real TLS termination or submission from another network. No provider binaries,
+provider credential stores, real Keychain items or launchctl state are used.
+
+Unit tests additionally cover offline admission rejection, duplicate creation,
+claim/worker fences, lease loss without killing running local work, revocation,
+pre-launch expiry/cancel/authorization checks, reconnect cancellation and true
+outcomes after service interruption, upload-response replay, unknown outcome
+recovery without relaunch, explicit artifact limits and non-loopback HTTPS
+requirements. Production execution still uses `UnavailableCodexAdapter`.
+
+| Branch head | Full suite | Phase 3 tests serially |
+| --- | --- | --- |
+| 3a | 3242 passed, 5 skipped | 21 passed |
+| 3b | 3251 passed, 5 skipped | 30 passed |
+| 3c | 3267 passed, 5 skipped | 46 passed |
+| 3d | 3280 passed, 5 skipped | 59 passed |
+| 3e | 3291 passed, 5 skipped | 70 passed |
+
+Full suites use `uv run pytest -q`; serial Phase 3 runs use `-n0` with the
+five new Phase 3 test modules. The inherited desktop `CODEX_CLI_PATH` override
+is removed for test isolation and the uv cache stays under `/private/tmp`.
+Each completed full run has the same three existing pytest fixture warnings.
+Socket and synthetic-process tests require local execution permission. These
+are macOS results; only 3a receives CI while stacked PR bases remain branches.
+Linux/Windows behavior is designed/tested with portable HTTP/SQLite paths and
+mocked macOS enrollment; CI on upper slices runs after reviewer retargeting.
+
+Remaining owner exit evidence:
+
+- [ ] Deploy a real owner-controlled HTTPS service, with a private reference
+  HTTP backend behind TLS termination; validate truststore certificate checks.
+- [ ] Submit using the test CLI **from another network**, with no inbound
+  network listener on the Mac, and observe outage/reconnect behavior there.
+- [ ] Demonstrate backend replacement through URL configuration and enrollment,
+  without code changes, against an independently deployed compatible server.
+- [ ] Eventually clear Phase 1's live-adapter gates and run real research with
+  the authorized local account; this stack does not enable that adapter.
+
+Recorded scope/deviations: the reference service retains data until its owner
+explicitly deletes the stopped database/backups; v1 has no remote retention or
+delete API. Enrollment keys expire after 30 days and require local re-pairing.
+The pilot exports only explicitly named `result.md` by default (at most eight
+files, 1 MiB each), never directory discovery. The single-owner test CLI uses
+the locally paired key; requester/provider accounts are not added. Pairing is
+unsupported outside macOS, while HTTP/SQLite/fake-adapter tests are portable.
+No third-party backend internals or connector implementation enter this stack.
+The cancellation/process-tree gates and strict `execution_stopped is True`
+lease-release checks remain intact.

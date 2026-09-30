@@ -216,3 +216,35 @@ access. The production adapter still refuses jobs in this phase.
 CLI and menu-bar status expose connectivity and service last seen without
 revealing keys, tasks or paths. Old heartbeats become offline after 15 seconds,
 and a stopped local worker is never reported as online.
+
+## Test-only submission and local evidence
+
+The owner test command requires a paired device at the selected URL and an
+explicit acknowledgement on every invocation:
+
+```sh
+openswap worker submit-test --url https://control.example \
+  --task 'Research this bounded topic' --workspace-id research \
+  --runtime-limit 600 --expires-in 3600 --i-understand-this-is-a-test-tool
+```
+
+It generates a fresh idempotency key and sends only the canonical submission.
+It prints JSON job ID/state and returns promptly; it never supplies an adapter,
+model, account, path or command. A new submission requires the worker online.
+The command is **test-only** and does not bypass the disabled production Codex
+adapter or local owner policy. Fake adapters are Python test injections, not a
+CLI feature. A production paired worker can heartbeat, but it will not execute
+provider jobs until its live adapter gates are cleared.
+
+Run the credential-free roundtrip and deterministic failure tests with:
+
+```sh
+uv run pytest -q -n0 tests/test_worker_protocol.py tests/test_worker_refserver.py \
+  tests/test_worker_remote.py tests/test_worker_pairing_status.py \
+  tests/test_worker_remote_e2e.py
+```
+
+Tests mock Keychain and use an inert adapter. They prove loopback pairing,
+guarded submission, background polling, one launch, replayable safe events and
+explicit hash-verified result retrieval. They do not establish a real HTTPS
+deployment, another-network submission, provider permissions or live research.

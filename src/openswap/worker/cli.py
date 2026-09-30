@@ -493,6 +493,13 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     pair_parser.add_argument("url")
     pair_parser.add_argument("code")
     commands.add_parser("unpair", help="remove the device key and configured service URL")
+    submit_parser = commands.add_parser("submit-test", help="TEST ONLY: submit a bounded research job to a paired service")
+    submit_parser.add_argument("--url", required=True)
+    submit_parser.add_argument("--task", required=True)
+    submit_parser.add_argument("--workspace-id", required=True)
+    submit_parser.add_argument("--runtime-limit", required=True, type=float)
+    submit_parser.add_argument("--expires-in", required=True, type=float)
+    submit_parser.add_argument("--i-understand-this-is-a-test-tool", action="store_true")
     status_parser = commands.add_parser("status", help="show local worker status")
     status_parser.add_argument("--json", action="store_true")
     stop_parser = commands.add_parser("stop", help="request interruption of the active job")
@@ -518,6 +525,22 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     lease_release_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(arguments)
     root = Path(backup_root) if backup_root is not None else get_backup_root()
+
+    if args.command == "submit-test":
+        from openswap.worker.submit_test import submit_test
+        from openswap.worker.protocol import ProtocolError
+        try:
+            result = submit_test(root, url=args.url, task=args.task, workspace_id=args.workspace_id,
+                                 runtime_limit=args.runtime_limit, expires_in=args.expires_in,
+                                 acknowledged=args.i_understand_this_is_a_test_tool)
+        except ProtocolError as exc:
+            print(f"Test submission refused: {exc.code}.", file=sys.stderr)
+            return 1
+        except (OSError, RuntimeError, ValueError):
+            print("Test submission refused: local configuration unavailable.", file=sys.stderr)
+            return 1
+        print(json.dumps(result))
+        return 0
 
     if args.command in {"pair", "unpair"}:
         from openswap.worker.pairing import pair, unpair

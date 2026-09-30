@@ -60,7 +60,7 @@ install/upgrade rewiring. Three phases with a green-suite gate between them.
 
 | Plan | Proposal | Status |
 |------|----------|--------|
-| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag or a self-hosted server | ACCEPTED; Phase 1 signoff (#59) and the local-only Phase 2 worker (#60) are merged; Phase 1 live-evidence gates remain blocked; Phase 3 not started ([progress](017-progress.md)) |
+| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag or a self-hosted server | ACCEPTED; Phase 1 signoff (#59) and the local-only Phase 2 worker (#60) are merged; Phase 1 live-evidence gates remain blocked; Phase 3 credential-free scaffolding in review (#63–#67); owner HTTPS/network pilot still open ([progress](017-progress.md)) |
 
 017 recommends an optional OpenSwap worker process, with OpenTag as its first
 client, a pluggable control service (OpenTag-hosted, self-hosted MIT reference
@@ -79,13 +79,20 @@ auth decision is a separate gate before any Claude adapter. PR
 Phase 1 signoff and PR [#60](https://github.com/mar3co/openswap/pull/60)
 merged the local-only Phase 2 worker the same day; neither merge replaces the
 remaining technical Phase 1 gates, which need an owner-authorized account
-context and an authenticated `codex exec` run. Phase 3 remains unstarted; its
-credential-free scaffolding may overlap the open gates under owner
-authorization. The local worker defaults off; the UI exposes its
+context and an authenticated `codex exec` run. Phase 3 credential-free
+scaffolding is delivered as stacked PRs #63–#67
+under explicit owner authorization to overlap the open gates. Its exit remains
+open pending owner-run HTTPS deployment and submission from another network.
+The local worker defaults off; the UI exposes its
 opt-in/status/stop/pause controls, and the CLI provides `openswap worker
 enable|status|stop|pause|disable`. `settings.json` stores the local enabled and
 paused policy, approved opaque workspace mappings, and optional pinned
-account reference. Phase 2 has no job-submission command or submit RPC. The
+account reference. The Phase 3 test-only `worker submit-test` command requires
+local pairing and
+`--i-understand-this-is-a-test-tool`; the reference service and
+[protocol](../docs/worker-protocol.md) provide the credential-free round trip.
+Pair/unpair use login Keychain on macOS; service connectivity and remote last
+seen are independent of local process/provider status. The
 production Codex adapter reports unavailable; only synthetic fake-adapter
 tests exercise job execution and lifecycle. See [017 progress](017-progress.md).
 

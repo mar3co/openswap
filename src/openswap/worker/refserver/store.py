@@ -71,7 +71,7 @@ class ControlStore:
         return db
 
     def issue_code(self) -> str:
-        code = secrets.token_urlsafe(24)
+        code = "pair_" + secrets.token_urlsafe(24)
         with closing(self.connect()) as db, db:
             db.execute("DELETE FROM codes WHERE expiry<=?", (self.clock(),))
             db.execute("INSERT INTO codes VALUES (?,?)", (digest(code), self.clock() + 600))
