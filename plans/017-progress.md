@@ -6,14 +6,24 @@ execution; it does not mean that remote execution is implemented or enabled.
 
 ## Current status
 
-**Phase 1: IN PROGRESS, exit BLOCKED.** The remaining technical evidence gates
-are unresolved. PR #59 is ready for review; opening or merging it does not
-substitute for those gates. On 2026-09-28 the owner explicitly authorized
-Phase 2 local-worker infrastructure to proceed in parallel with their Phase 1
-work. This changes sequencing only: no Phase 1 gate is waived or marked passed.
-Phase 2 local-only implementation is implemented and under review under that owner authorization;
-remote access stays off and live Codex execution stays disabled. Phase 3 has
-not started.
+**Phase 1: signoff PR merged, live-evidence exit gates still BLOCKED.**
+PR #59 merged to `main` on 2026-09-30 as merge commit `39438ca`. Merging it is
+the review signoff only; it does not substitute for the technical evidence
+gates below, all of which still require an owner-authorized Codex account
+context and an authenticated `codex exec` run. On 2026-09-28 the owner
+explicitly authorized Phase 2 local-worker infrastructure to proceed in
+parallel with their Phase 1 work. This changed sequencing only: no Phase 1
+gate is waived or marked passed. PR #60, the local-only Phase 2 worker, merged
+to `main` on 2026-09-30 as merge commit `225211d` with CI green on macOS,
+Linux and Windows and a clean Codex review (56 resolved threads). Remote
+access stays off and live Codex execution stays disabled. Phase 3 has not
+started; its scaffolding is credential-free and may overlap the open Phase 1
+gates under the same owner authorization model as Phase 2.
+
+The next unblocking step is Phase 1 live evidence: the owner names a Codex
+account context (a dedicated roster slot or disposable account) and is present
+while the merged harness runs a real `codex exec --json` research task in a
+disposable workspace. Until then every result recorded here is synthetic.
 
 The baseline `uv run pytest` completed before this branch's changes: 2870
 passed, 4 skipped, 1 failed, 3 warnings (15.15s). The failure is
@@ -111,10 +121,10 @@ Phase 1 exit requires all of the following:
   published protocol. See the
   [decision memo](research/remote-agent-host/decision-control-service.md).
 - [x] Both decision memos delivered; control service decided, Claude path pending.
-- [ ] The phase-one evidence, adapter contract and reproducible harness are
-  reviewed and PR #59 is merged as Phase 1 signoff. This remains required
-  before real Codex execution, but does not block owner-authorized local-only
-  Phase 2 infrastructure work.
+- [x] The phase-one evidence, adapter contract and reproducible harness are
+  reviewed and PR #59 is merged as Phase 1 signoff (2026-09-30, `39438ca`;
+  Codex review clean on `7d1f9c8`, 78 resolved threads). Signoff is not
+  evidence: the unchecked gates above still block real Codex execution.
 - [x] Full OpenSwap pytest suite is green on the assembled phase-one branch
   (`3016 passed, 5 skipped, 3 warnings in 47.84s`).
 
@@ -130,11 +140,11 @@ until the owner records a permitted path or exclusion.
 
 | Phase | Status | Exit evidence / blocker |
 | --- | --- | --- |
-| 1. Feasibility spike and authentication gate | IN PROGRESS / BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction showed the wrapper could return success while a detached helper remained alive; the harness now detects and terminates tracked escaped descendants and reports `interrupted`, but cannot close the fork/reparent race. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 is open and ready for review; it does not satisfy the remaining technical exit gates. |
-| 2. Local worker, remote access off | IMPLEMENTED / UNDER REVIEW — local-only | Owner authorized local infrastructure to overlap Phase 1; no Phase 1 gate is waived. Fake-only validation is recorded below. Remote access stays off and live Codex stays disabled. |
-| 3. Private remote pilot | NOT STARTED | Requires phase 2's exit criteria and merged PR. Builds the protocol specification, configurable backend URL and the MIT reference server as product code; the pilot runs against a self-hosted instance. |
-| 4. OpenTag connector | NOT STARTED | OpenTag repository, mar3co/opentag#135; requires phase 3. Out of scope for this PR. |
-| 5–6 | NOT STARTED | Require phase 4. Out of scope for this PR. |
+| 1. Feasibility spike and authentication gate | SIGNOFF MERGED (#59) / EVIDENCE BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction showed the wrapper could return success while a detached helper remained alive; the harness now detects and terminates tracked escaped descendants and reports `interrupted`, but cannot close the fork/reparent race. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 merged 2026-09-30 (`39438ca`) as review signoff; merging does not satisfy the remaining technical exit gates. Next step: an owner-authorized account context and an authenticated `codex exec` run. |
+| 2. Local worker, remote access off | MERGED (#60) — local-only | Owner authorized local infrastructure to overlap Phase 1; no Phase 1 gate is waived. PR #60 merged 2026-09-30 (`225211d`); CI green on macOS, Linux and Windows; Codex review clean on `556ca11`. Fake-only validation is recorded below. Remote access stays off, the production Codex adapter still refuses, and live Codex stays disabled. Open follow-up before any real adapter: lease release must also prove the provider process tree has stopped. |
+| 3. Private remote pilot | NOT STARTED | Phase 2 is merged. Builds the protocol specification, configurable backend URL, pairing/enrollment, polling/heartbeats and the MIT reference server as product code; the pilot runs against a self-hosted instance with the fake adapter until Phase 1 evidence clears. Credential-free scaffolding may overlap the open Phase 1 gates under owner authorization. |
+| 4. OpenTag connector | NOT STARTED | OpenTag repository, mar3co/opentag#135; requires phase 3. |
+| 5–6 | NOT STARTED | Require phase 4. |
 
 ## Phase 2 local-worker plan (owner-authorized overlap)
 
@@ -171,10 +181,12 @@ LaunchAgent behavior is verified with mocks. Phase 1 remains blocked and Phase
 The Phase 2 full-suite validation on the currently integrated PR #59 snapshot
 `f684ebf` is green: `3082 passed, 4 skipped, 3 warnings in 20.02s`. The run
 used the existing test environment with narrowly elevated permissions for
-disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
-has not been merged into this tree. After the PR #60 review-fix pass below,
-the full suite on this tree remains green:
-`3221 passed, 5 skipped, 3 warnings in 47.97s`.
+disposable AF_UNIX sockets and fake-process supervision. The final PR #59
+head (`7d1f9c8`) was merged into this tree before PR #60 merged. After the
+PR #60 review-fix pass below, the full suite on this tree remains green:
+`3221 passed, 5 skipped, 3 warnings in 47.97s`. The merged `main` at
+`225211d` passed CI on all three jobs (`test`, `test-windows`,
+`macos-keychain`).
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -604,7 +616,17 @@ using a lock-free read so it adds no contention with switching.
 - No Docker, Postgres or Supabase was run. No real provider credentials or
   Keychain entries were touched; synthetic auth sentinels were used only under
   `/private/tmp` for the Seatbelt boundary probe.
-- PR [#59](https://github.com/mar3co/openswap/pull/59) is open and ready for
-  review against `main`; its review/merge is Phase 1 signoff and does not clear
-  the remaining technical evidence gates or block the owner-authorized local
-  Phase 2 work.
+- PR [#59](https://github.com/mar3co/openswap/pull/59) merged to `main` on
+  2026-09-30 (`39438ca`) as Phase 1 signoff; it does not clear the remaining
+  technical evidence gates. PR [#60](https://github.com/mar3co/openswap/pull/60)
+  merged the same day (`225211d`) with the local-only Phase 2 worker.
+- Windows CI on PR #60 found three bugs that the macOS-only development had
+  missed, all fixed before merge: `os.kill(pid, 0)` on Windows sends
+  `CTRL_C_EVENT` to the whole console, so pid liveness now uses
+  `OpenProcess`/`GetExitCodeProcess` and treats an unclear answer as alive;
+  the IPC socket path no longer needs `os.getuid`; and the worker client
+  raises `IpcError("worker_unavailable")` when `socket.AF_UNIX` is missing,
+  which had broken `worker status` and, through it, `purge` on Windows. The
+  plan still targets macOS; these fixes keep the shared code and tests
+  honest on the other CI platforms. A macOS IPC test race (connection
+  refused before the fake server listened) was fixed with a readiness event.
