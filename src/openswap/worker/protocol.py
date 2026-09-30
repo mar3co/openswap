@@ -195,6 +195,10 @@ class Artifact:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", name) or name in {".", ".."}:
             raise ProtocolError("invalid_request")
         size = integer(data["size"])
+        digest = data["sha256"]
+        # A malformed digest is a schema error; hash_mismatch is for a well-formed one that differs.
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ProtocolError("invalid_request")
         if size > MAX_ARTIFACT:
             raise ProtocolError("artifact_too_large", 413)
         try:
@@ -206,6 +210,6 @@ class Artifact:
             raise ProtocolError("invalid_request") from None
         if len(content) > MAX_ARTIFACT:
             raise ProtocolError("artifact_too_large", 413)
-        if len(content) != size or hashlib.sha256(content).hexdigest() != data["sha256"]:
+        if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
             raise ProtocolError("hash_mismatch")
         return cls(name, content)
