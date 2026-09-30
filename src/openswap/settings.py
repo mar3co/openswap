@@ -88,6 +88,7 @@ class WorkerSettings:
     enabled: bool = False
     paused: bool = False
     pinned_account_ref: str | None = None
+    control_service_url: str | None = None
     workspaces: tuple[WorkerWorkspace, ...] = ()
 
 
@@ -316,6 +317,13 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
     if pinned is not None and (not isinstance(pinned, str) or not _PINNED_ACCOUNT_RE.fullmatch(pinned)):
         _logger.warning("settings.json worker account reference is invalid; disabling the worker")
         return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
+    control_url = section.get("controlServiceUrl")
+    if control_url is not None:
+        from openswap.worker.protocol import ProtocolError, validate_url
+        try:
+            control_url = validate_url(control_url)
+        except ProtocolError:
+            return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
     raw_workspaces = section.get("workspaces")
     workspaces: list[WorkerWorkspace] = []
     if raw_workspaces is None:
@@ -356,6 +364,7 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
         enabled=enabled,
         paused=paused,
         pinned_account_ref=pinned,
+        control_service_url=control_url,
         workspaces=tuple(workspaces),
     )
 
@@ -710,3 +719,18 @@ def atomic_write_json(path: Path, data: dict) -> None:
         except OSError:
             pass
         raise
+
+
+def configure_worker_service(backup_root: Path, url: str | None) -> WorkerSettings:
+    """Persist the owner-selected URL; configuring it alone never enables remote work."""
+    if url is not None:
+        from openswap.worker.protocol import validate_url
+        url = validate_url(url)
+    with _settings_write_lock(backup_root):
+        raw = _read_raw_for_write(settings_path(backup_root))
+        section = raw.setdefault("worker", {})
+        if not isinstance(section, dict):
+            raise ValueError("invalid worker settings")
+        section["controlServiceUrl"] = url
+        atomic_write_json(settings_path(backup_root), raw)
+    return load_worker_settings(backup_root)
