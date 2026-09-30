@@ -43,8 +43,8 @@ Enrollment does not enable local execution or select an account/workspace.
 | `heartbeat` | `worker_epoch` | `last_seen_at`, `cancel_job_ids` (array of IDs) |
 | `submit` | submission object below | `job_id`, `state` |
 | `poll` | `worker_epoch` | `claim` (claim object below, or null) |
-| `renew` | `worker_epoch`, `job_id`, `epoch` | `lease_until`, `state` |
-| `job` | `job_id` | `job_id`, `state`, `epoch`, `event_cursor`, `expires_at` |
+| `renew` | `worker_epoch`, `job_id`, `epoch` | `lease_until`, `state`, `cancel_requested` (boolean) |
+| `job` | `job_id` | `job_id`, `state`, `epoch`, `event_cursor`, `expires_at`, `cancel_requested` (boolean) |
 | `cancel` | `job_id` | `job_id`, `state` |
 | `events` | `job_id`, `after_cursor` (integer >= 0); optional `worker_epoch`, `epoch`, `events` | `events` (array), `next_cursor` |
 | `upload` | `worker_epoch`, `job_id`, `epoch`, `artifact` (below) | `name`, `size`, `sha256` |
@@ -102,7 +102,9 @@ Queued expiry becomes `expired`; queued cancel becomes `cancelled`. Claim
 moves `queued` to `claimed`. Uploaded safe `state_changed` events report
 `starting`/`running` or stop request; final outcomes use `reconcile`. Cancel
 of claimed/starting/running sets `cancel_requested`, propagated by heartbeat
-and renew/job reads. Repeated cancellation is idempotent. A terminal outcome
+and renew/job reads. The separate `cancel_requested` flag persists even when
+heartbeat loss changes the state to `interrupted`; reconnect must enforce it.
+Repeated cancellation is idempotent. A terminal outcome
 is not overwritten by a late cancel. A cancel request is never stop proof.
 
 After three missed five-second heartbeats the service reports the worker

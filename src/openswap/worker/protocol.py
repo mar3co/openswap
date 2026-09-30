@@ -157,7 +157,10 @@ class Artifact:
         if size > MAX_ARTIFACT:
             raise ProtocolError("artifact_too_large", 413)
         try:
-            content = base64.b64decode(text(data["content_base64"], MAX_BODY), validate=True) if size else b""
+            encoded = data["content_base64"]
+            if not isinstance(encoded, str) or len(encoded) > MAX_BODY:
+                raise ValueError
+            content = base64.b64decode(encoded, validate=True)
         except ValueError:
             raise ProtocolError("invalid_request") from None
         if len(content) != size or hashlib.sha256(content).hexdigest() != data["sha256"]:
