@@ -46,6 +46,7 @@ class RemoteConnectivity(StrEnum):
     ONLINE = "online"
     OFFLINE = "offline"
     REVOKED = "revoked"
+    EXPIRED = "expired"  # the enrollment's key reached its 30-day limit; re-pair
 
 
 @dataclass(frozen=True)

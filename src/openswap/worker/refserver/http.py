@@ -25,6 +25,10 @@ def _nonfinite(_):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "OpenSwapReference/1"
+    sys_version = ""
+
+    def version_string(self):
+        return self.server_version  # never advertise the Python version
 
     def setup(self):
         super().setup()
@@ -37,6 +41,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self.path.startswith("/v1/") or self.path.count("/") != 2:
                 raise ProtocolError("unsupported_version", 404)
+            key = None
+            if self.path != "/v1/pair":
+                # Refuse an absent or malformed credential before reading a single body byte.
+                auth = self.headers.get_all("Authorization", [])
+                if len(auth) != 1 or not auth[0].startswith("Bearer ") or not 7 < len(auth[0]) <= 207:
+                    raise ProtocolError("unauthorized", 401)
+                key = auth[0][7:]
             if self.headers.get_content_type() != "application/json" or self.headers.get("Transfer-Encoding"):
                 raise ProtocolError("invalid_request")
             lengths = self.headers.get_all("Content-Length", [])
@@ -49,8 +60,6 @@ class Handler(BaseHTTPRequestHandler):
             if len(body) != length:
                 raise ProtocolError("invalid_request")
             data = json.loads(body, object_pairs_hook=_unique, parse_constant=_nonfinite)
-            auth = self.headers.get_all("Authorization", [])
-            key = auth[0][7:] if len(auth) == 1 and auth[0].startswith("Bearer ") else None
             result = self.server.store.request(self.path[4:], data, key)
             self._reply(200, result)
         except ProtocolError as exc:
@@ -59,13 +68,22 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "invalid_request"})
         except (OSError, sqlite3.Error):
             self._reply(503, {"error": "service_unavailable"})
+        except Exception:  # never let a bug surface a traceback or an empty reply
+            self._reply(500, {"error": "service_unavailable"})
 
-    def _reply(self, status, value):
+    def _method_not_allowed(self):
+        self._reply(405, {"error": "invalid_request"}, allow="POST")
+
+    do_GET = do_HEAD = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = _method_not_allowed
+
+    def _reply(self, status, value, *, allow=None):
         encoded = json.dumps(value, allow_nan=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
+        if allow:
+            self.send_header("Allow", allow)
         self.end_headers()
         self.wfile.write(encoded)
 

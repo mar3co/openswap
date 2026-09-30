@@ -1,17 +1,21 @@
 from __future__ import annotations
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
 
 import pytest
 
 from openswap.settings import configure_worker_service, update_worker_settings
+from openswap.worker import remote as remote_mod
+from openswap.worker.journal import StaleWriteError
 from openswap.worker.leases import stable_account_identity
 from openswap.worker.models import (JobSubmission, JobState, ProviderAvailability, ProviderRun,
                                      SafeEvent, SafeEventKind, InterruptResult)
-from openswap.worker.protocol import Artifact, ProtocolError, Submission
-from openswap.worker.refserver import ControlStore
+from openswap.worker.protocol import Artifact, MAX_ARTIFACT, MAX_BODY, ProtocolError, Submission
+from openswap.worker.refserver import ControlStore, make_server
 from openswap.worker.remote import RemoteClient, Transport, NoRedirect
 from openswap.worker.runtime import WorkerRuntime
 
@@ -50,12 +54,17 @@ class StoreTransport:
         self.store, self.key = store, key
         self.unreachable = False
         self.calls = []
+        self.requests = []
         self.drop_response = None
+        self.reject = {}  # operation -> ProtocolError raised once instead of serving it
 
     def request(self, operation, data):
         self.calls.append(operation)
+        self.requests.append((operation, data))
         if self.unreachable:
             raise ProtocolError("service_unavailable", 503)
+        if operation in self.reject:
+            raise self.reject.pop(operation)
         value = self.store.request(operation, data, self.key)
         if self.drop_response == operation:
             self.drop_response = None
@@ -253,20 +262,289 @@ def test_no_redirects_or_invalid_urls():
         NoRedirect().redirect_request(None, None, 302, "redirect", {}, "https://elsewhere")
 
 
-def test_artifact_export_refuses_symlink(remote_setup, tmp_path):
-    remote, runtime, _, _, _, _, _ = remote_setup
-    submit(remote_setup)
+@pytest.mark.parametrize("rejection", ["symlink", "oversized", "service_conflict"])
+def test_rejected_artifact_is_skipped_and_the_claim_completes(remote_setup, tmp_path, rejection):
+    """A refused result must never wedge the claim: it is skipped, journaled, and the next job runs."""
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    next_id = submit(remote_setup, "next")
     remote.tick()
     result = runtime.reconcile_once()
-    directory = runtime.backup_root / "worker" / "research" / result.job_id
-    secret = tmp_path / "secret"
-    secret.write_text("not a result")
-    path = directory / "result.md"
-    path.unlink()
-    try:
-        path.symlink_to(secret)
-    except OSError:
-        pytest.skip("symlinks unavailable for this Windows user")
+    path = runtime.backup_root / "worker" / "research" / result.job_id / "result.md"
+    if rejection == "symlink":
+        secret = tmp_path / "secret"
+        secret.write_text("not a result")
+        path.unlink()
+        try:
+            path.symlink_to(secret)
+        except OSError:
+            pytest.skip("symlinks unavailable for this Windows user")
+    elif rejection == "oversized":
+        path.write_bytes(b"x" * (MAX_ARTIFACT + 1))
+    else:
+        transport.reject["upload"] = ProtocolError("artifact_conflict", 409)
     remote.tick()
-    assert remote.journal.pending()  # no artifact acknowledgement
+    key = paired["device_key"]
+    assert [b["remote_id"] for b in remote.journal.pending()] == [next_id] and remote.state == "online"
+    assert store.request("job", {"job_id": job_id}, key)["state"] == "succeeded"
+    assert store.request("artifacts", {"job_id": job_id}, key)["artifacts"] == []
+    events = store.request("events", {"job_id": job_id, "after_cursor": 0}, key)["events"]
+    assert [e["kind"] for e in events if e["diagnostic_code"] == "artifact_rejected"] == ["diagnostic"]
+    if rejection == "symlink":
+        assert secret.read_text() not in json.dumps(transport.requests)  # the target was never read
+    # The second claim was admitted in the same tick instead of blocking forever.
+    assert len(runtime.store.queue()) == 1 and adapter.starts == 1
+
+
+def test_transport_failure_during_upload_keeps_the_claim_pending(remote_setup):
+    remote, runtime, _, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    runtime.reconcile_once()
+    transport.reject["upload"] = ProtocolError("lease_lost", 409)
+    remote.tick()
+    assert remote.journal.pending()
+    remote.tick()
+    assert remote.journal.pending() == []
+    assert len(store.request("artifacts", {"job_id": job_id}, paired["device_key"])["artifacts"]) == 1
+
+
+def test_probe_failure_is_survived_and_claims_resume(remote_setup):
+    remote, runtime, adapter, _, _, _, transport = remote_setup
+    submit(remote_setup)
+
+    def broken_probe():
+        raise RuntimeError("provider binary misbehaved")
+
+    adapter.probe = broken_probe
+    before = len(transport.calls)
+    remote.tick()
+    assert remote.state == "online" and "poll" not in transport.calls[before:]
+    del adapter.probe
+    remote.tick()
+    assert runtime.store.queue()
+
+
+def test_run_loop_survives_a_journal_error_and_keeps_ticking(remote_setup, monkeypatch):
+    remote, runtime, _, store, _, paired, _ = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    store.request("cancel", {"job_id": job_id}, paired["device_key"])
+    original_cancel, failures = runtime.cancel, []
+
+    def flaky_cancel(local_id):
+        if not failures:
+            failures.append(local_id)
+            raise StaleWriteError("cancel lost its fence")  # RuntimeError: outside tick's own allowlist
+        return original_cancel(local_id)
+
+    monkeypatch.setattr(runtime, "cancel", flaky_cancel)
+    monkeypatch.setattr(remote_mod, "HEARTBEAT_SECONDS", 0.01)
+    ticks, enough = [], threading.Event()
+    original_tick = remote.tick
+
+    def counted_tick():
+        entered = remote.state  # what run() left behind after the previous tick
+        try:
+            original_tick()
+            ticks.append((entered, "returned"))
+        except Exception:
+            ticks.append((entered, "raised"))
+            raise
+        finally:
+            if len(ticks) >= 3:
+                enough.set()
+
+    monkeypatch.setattr(remote, "tick", counted_tick)
+    stop = threading.Event()
+    thread = threading.Thread(target=remote.run, args=(stop,))
+    thread.start()
+    assert enough.wait(5), "the remote thread died"
+    stop.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert failures and ticks[0] == ("online", "raised") and ticks[1] == ("offline", "returned")
+    assert ticks[-1] == ("online", "returned")
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "cancelled"
+
+
+def test_binding_is_published_before_local_admission(remote_setup, monkeypatch):
+    """The reconcile loop may reach the launch fence the instant a job is queued."""
+    remote, runtime, adapter, store, _, paired, _ = remote_setup
+    job_id = submit(remote_setup)
+    original_submit, raced = runtime.submit, []
+
+    def racing_submit(submission, **kwargs):
+        record = original_submit(submission, **kwargs)
+        assert remote.launch_allowed(record.job_id) is True
+        raced.append(runtime.reconcile_once())
+        return record
+
+    monkeypatch.setattr(runtime, "submit", racing_submit)
+    remote.tick()
+    assert raced[0].state == JobState.SUCCEEDED and raced[0].diagnostic_code != "worker_disabled"
+    assert adapter.starts == 1
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "succeeded"
+    assert remote.journal.pending() == []
+
+
+def test_reserved_local_id_without_admission_is_admitted_once(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, _, paired, _ = remote_setup
+    job_id = submit(remote_setup)
+    original_submit = runtime.submit
+
+    def crashing_submit(submission, **kwargs):
+        monkeypatch.setattr(runtime, "submit", original_submit)
+        raise OSError("journal unavailable")
+
+    monkeypatch.setattr(runtime, "submit", crashing_submit)
+    remote.tick()
     assert remote.state == "offline"
+    binding = remote.journal.pending()[0]
+    assert binding["local_id"] and not runtime.store.queue()
+    remote.tick()
+    assert [job.job_id for job in runtime.store.queue()] == [binding["local_id"]]
+    assert runtime.reconcile_once().state == JobState.SUCCEEDED
+    remote.tick()
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "succeeded"
+    assert adapter.starts == 1
+
+
+def test_long_remote_job_id_fits_the_idempotency_key(remote_setup):
+    remote, runtime, adapter, store, _, paired, _ = remote_setup
+    long_id = "j" * 200
+    with closing(store.connect()) as db, db:
+        db.execute("UPDATE jobs SET id=? WHERE id=?", (long_id, submit(remote_setup)))
+    remote.tick()
+    local = runtime.store.queue()[0]
+    assert local.idempotency_key.startswith("remote:") and len(local.idempotency_key) < 200
+    assert runtime.reconcile_once().state == JobState.SUCCEEDED
+    remote.tick()
+    assert store.request("job", {"job_id": long_id}, paired["device_key"])["state"] == "succeeded"
+    assert adapter.starts == 1
+
+
+@pytest.mark.parametrize("malformed", [{"cancel_requested": "false"}, {"cancel_requested": 1}, {"state": "bogus"}])
+def test_malformed_job_response_never_cancels_or_launches(remote_setup, monkeypatch, malformed):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    submit(remote_setup)
+    remote.tick()
+    local = runtime.store.queue()[0]
+    original = transport.request
+    monkeypatch.setattr(transport, "request", lambda op, data: {**original(op, data), **malformed}
+                        if op in {"job", "renew"} else original(op, data))
+    remote.tick()
+    assert remote.state == "offline"
+    assert runtime.store.get(local.job_id).state == JobState.QUEUED
+    assert remote.launch_allowed(local.job_id) is False
+    monkeypatch.setattr(transport, "request", original)
+    remote.tick()
+    assert remote.state == "online" and runtime.reconcile_once().state == JobState.SUCCEEDED
+
+
+def test_stale_worker_epoch_reports_offline_and_reregisters(remote_setup):
+    remote, _, _, store, _, paired, transport = remote_setup
+    superseded = store.request("register", {}, paired["device_key"])["worker_epoch"]
+    remote.tick()
+    assert remote.state == "offline" and remote.worker_epoch is None
+    remote.tick()
+    assert remote.state == "online" and remote.worker_epoch == superseded + 1
+    assert transport.calls[-3:-1] == ["register", "heartbeat"]
+
+
+def test_lease_conflict_failure_reconciles_as_failed_unlaunched(remote_setup):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    runtime.leases.acquire(job_id="f" * 32, account_identity=runtime.account_identity,
+                           worker_pid=runtime.worker_pid, worker_epoch=runtime.worker_epoch, ttl_s=120)
+    result = runtime.reconcile_once()
+    assert (result.state, result.diagnostic_code) == (JobState.FAILED, "lease_conflict")
+    remote.tick()
+    reconcile = [data for op, data in transport.requests if op == "reconcile"][-1]
+    assert (reconcile["state"], reconcile["unlaunched"], reconcile["execution_stopped"]) == ("failed", True, False)
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "failed"
+    assert adapter.starts == 0
+
+
+def test_remembered_but_never_admitted_claim_reconciles_unlaunched_after_restart(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    monkeypatch.setattr(runtime, "submit", lambda *a, **k: (_ for _ in ()).throw(OSError("crash before admission")))
+    remote.tick()
+    assert remote.journal.pending()
+    restarted = WorkerRuntime(runtime.backup_root, adapter=adapter, account_identity=runtime.account_identity)
+    client = RemoteClient(restarted, remote.url, paired["device_key"], transport=transport)
+    client.tick()
+    reconcile = [data for op, data in transport.requests if op == "reconcile"][-1]
+    assert (reconcile["state"], reconcile["unlaunched"]) == ("interrupted", True)
+    assert client.journal.pending() == [] and not restarted.store.queue() and adapter.starts == 0
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "interrupted"
+
+
+class CannedHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        status, headers, body = self.server.reply
+        self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def serve(server):
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    return thread
+
+
+def test_live_transport_maps_reference_server_statuses(tmp_path):
+    store = ControlStore(tmp_path / "service" / "db")
+    with make_server(store, port=0) as server:
+        thread = serve(server)
+        try:
+            url = f"http://127.0.0.1:{server.server_port}"
+            paired = Transport(url).request("pair", {"code": store.issue_code()})
+            transport = Transport(url, paired["device_key"])
+            assert transport.request("register", {})["worker_epoch"] == 1
+            assert transport.request("poll", {"worker_epoch": 1}) == {"claim": None}
+            with pytest.raises(ProtocolError) as failure:
+                transport.request("heartbeat", {"worker_epoch": 7})
+            assert (failure.value.code, failure.value.status) == ("stale_epoch", 409)
+            with pytest.raises(ProtocolError) as failure:
+                Transport(url, "not-the-key").request("register", {})
+            assert (failure.value.code, failure.value.status) == ("unauthorized", 401)
+            with pytest.raises(ProtocolError) as failure:
+                transport.request("job", {"job_id": "missing"})
+            assert (failure.value.code, failure.value.status) == ("not_found", 404)
+        finally:
+            server.shutdown()
+            thread.join(2)
+
+
+@pytest.mark.parametrize("reply, expected", [
+    ((302, {"Location": "http://127.0.0.1:9/v1/register"}, b"{}"), ("redirect_refused", 400)),
+    ((200, {}, b"x" * (MAX_BODY + 1)), ("body_too_large", 413)),
+    ((200, {}, b"[]"), ("invalid_response", 400)),
+    ((200, {}, b"not json"), ("invalid_response", 400)),
+    ((409, {}, b'{"error":"vendor_specific_text"}'), ("service_unavailable", 409)),
+    ((409, {}, b'{"error":"artifact_conflict"}'), ("artifact_conflict", 409)),
+    ((503, {}, b""), ("invalid_response", 400)),
+])
+def test_live_transport_refuses_unsafe_responses(reply, expected):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CannedHandler)
+    server.reply = reply
+    thread = serve(server)
+    try:
+        with pytest.raises(ProtocolError) as failure:
+            Transport(f"http://127.0.0.1:{server.server_port}", "key").request("register", {})
+        assert (failure.value.code, failure.value.status) == expected
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)

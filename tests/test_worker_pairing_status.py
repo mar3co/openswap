@@ -146,7 +146,7 @@ def test_configured_client_hot_reload_and_keychain_lock(remote_setup):
         if locked[0]:
             raise ProtocolError("device_key_unavailable")
         return enrollment
-    def factory(*_):
+    def factory(*_, **__):
         clients.append(remote)
         return remote
     configured = ConfiguredRemote(runtime, client_factory=factory, enrollment_loader=load)
@@ -173,8 +173,9 @@ def test_repair_same_url_does_not_reuse_prior_enrollment_bindings(remote_setup):
     assert remote.journal.pending()
     paired = store.request("pair", {"code": store.issue_code()})
     transport = StoreTransport(store, paired["device_key"])
-    repaired = RemoteClient(runtime, remote.url, paired["device_key"], transport=transport)
+    repaired = RemoteClient(runtime, remote.url, paired["device_key"], worker_id=paired["worker_id"], transport=transport)
     assert repaired.journal.pending() == []
+    assert paired["device_key"] not in json.dumps([remote.journal.service, repaired.journal.service])
     assert repaired.journal.service != remote.journal.service
     result = runtime.reconcile_once()
     assert result.state.value == "failed"  # the old enrollment's queued row cannot launch
@@ -202,3 +203,91 @@ def test_blocked_remote_authorization_does_not_hold_control_lock(remote_setup):
     runner.join(2)
     assert not runner.is_alive()
     assert results[0].state.value == "cancelled" and adapter.starts == 0
+
+
+def test_orphaned_keychain_item_is_replaced_or_removed(tmp_path, keychain):
+    """Settings lost the URL (reset, or pair failed after the Keychain write): recovery must not need a manual Keychain edit."""
+    url = "http://localhost:8765"
+    account = ("openswap", pairing.account_name(url))
+    keychain[account] = json.dumps({"worker_id": "orphan", "device_key": "stale-key",
+                                    "expires_at": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()})
+    # An explicit unpair removes the item although settings name no URL.
+    pairing.unpair(tmp_path, url)
+    assert not keychain
+    keychain[account] = json.dumps({"worker_id": "orphan", "device_key": "stale-key",
+                                    "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()})
+    # Re-pairing replaces the orphan instead of refusing forever.
+    assert pairing.pair(tmp_path, url, "one-use", transport=PairTransport()) == "worker"
+    assert json.loads(keychain[account])["worker_id"] == "worker" and len(keychain) == 1
+    assert load_worker_settings(tmp_path).control_service_url == url
+    # A live enrollment still needs an unpair first, at the same or another URL.
+    with pytest.raises(ProtocolError, match="unpair_before_pairing"):
+        pairing.pair(tmp_path, url, "one-use", transport=PairTransport())
+    with pytest.raises(ProtocolError, match="unpair_before_pairing"):
+        pairing.pair(tmp_path, "https://another.example", "one-use", transport=PairTransport())
+
+
+def test_explicit_unpair_of_another_url_keeps_the_live_enrollment(tmp_path, keychain):
+    pairing.pair(tmp_path, "http://localhost:8765", "one-use", transport=PairTransport())
+    other = ("openswap", pairing.account_name("https://old.example"))
+    keychain[other] = json.dumps({"worker_id": "old", "device_key": "old-key",
+                                  "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()})
+    pairing.unpair(tmp_path, "https://old.example/")
+    assert other not in keychain and len(keychain) == 1
+    assert load_worker_settings(tmp_path).control_service_url == "http://localhost:8765"
+    pairing.unpair(tmp_path, "HTTP://localhost:8765/")  # normalized to the configured origin
+    assert not keychain and load_worker_settings(tmp_path).control_service_url is None
+
+
+def test_unpair_cli_accepts_an_explicit_url(tmp_path, keychain, capsys):
+    account = ("openswap", pairing.account_name("http://localhost:8765"))
+    keychain[account] = json.dumps({"worker_id": "orphan", "device_key": "stale-key",
+                                    "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()})
+    assert cli.main(["unpair", "http://localhost:8765"], backup_root=tmp_path) == 0
+    assert not keychain and "stale-key" not in capsys.readouterr().out
+    assert cli.main(["unpair", "ftp://nope"], backup_root=tmp_path) == 1
+    assert "https_required" in capsys.readouterr().err
+
+
+def test_enrollment_and_identity_never_print_the_key():
+    enrollment = pairing.Enrollment("worker", "synthetic-device-key", datetime.now(timezone.utc))
+    assert "synthetic-device-key" not in repr(enrollment) and "synthetic-device-key" not in str((enrollment,))
+    assert enrollment.device_key == "synthetic-device-key"
+
+    class Runtime:
+        backup_root = None
+        remote_launch_guard = None
+    configured = ConfiguredRemote(Runtime(), enrollment_loader=lambda _: enrollment)
+    configured.identity = ("https://control.example", enrollment)
+    assert "synthetic-device-key" not in repr(configured.identity)
+    assert configured.identity == ("https://control.example",
+                                   pairing.Enrollment("worker", "synthetic-device-key", enrollment.expires_at))
+    assert configured.identity != ("https://control.example", pairing.Enrollment("worker", "rotated", enrollment.expires_at))
+
+
+def test_locally_expired_enrollment_shows_expired_not_revoked(remote_setup):
+    remote, runtime, _, _, _, paired, _ = remote_setup
+    expired = pairing.Enrollment(paired["worker_id"], paired["device_key"], datetime.now(timezone.utc) - timedelta(seconds=1))
+
+    def load(url):
+        if expired.expires_at <= datetime.now(timezone.utc):
+            raise ProtocolError("device_expired", 401)
+        return expired
+    configured = ConfiguredRemote(runtime, client_factory=lambda *_, **__: remote, enrollment_loader=load)
+    configured.tick()
+    assert read_status(runtime.backup_root)[0] == RemoteConnectivity.EXPIRED
+    assert read_worker_snapshot(runtime.backup_root).remote_connectivity == RemoteConnectivity.EXPIRED
+    snapshot = {"enabled": True, "paused": False, "process_state": "running", "provider": {"available": False},
+                "remote_connectivity": "expired", "remote_last_seen_at": None}
+    assert "service: expired" in cli._format_status(snapshot)
+    assert "service expired" in _remote_tasks_status_copy(snapshot, enabled=True, paused=False)
+
+
+def test_service_reported_device_expiry_stops_claims_as_expired(remote_setup):
+    remote, _, _, store, ticks, _, transport = remote_setup
+    ticks[0] += 31 * 86400
+    remote.tick()
+    assert remote.state == "expired"
+    before = len(transport.calls)
+    remote.tick()
+    assert len(transport.calls) == before  # no further requests until a new enrollment

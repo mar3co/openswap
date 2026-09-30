@@ -65,7 +65,7 @@ class ConfiguredRemote:
             return False
         try:
             enrollment = self.enrollment_loader(self.client.url)
-            if enrollment is None or self.identity != (self.client.url, enrollment.worker_id, enrollment.device_key):
+            if enrollment is None or self.identity != (self.client.url, enrollment):
                 return False
         except ProtocolError:
             return False
@@ -84,9 +84,12 @@ class ConfiguredRemote:
             enrollment = self.enrollment_loader(url)
             if enrollment is None:
                 raise ProtocolError("device_key_unavailable")
-            identity = (url, enrollment.worker_id, enrollment.device_key)
+            # Enrollment compares by value (a re-pair changes it) but its
+            # repr omits the key, so the identity is safe to print.
+            identity = (url, enrollment)
             if identity != self.identity:
-                self.client = self.client_factory(self.runtime, url, enrollment.device_key)
+                self.client = self.client_factory(self.runtime, url, enrollment.device_key,
+                                                  worker_id=enrollment.worker_id)
                 self.identity = identity
                 self.client.stop_event = self.stop_event
                 # RemoteClient installs its standalone guard; keep the
@@ -95,7 +98,10 @@ class ConfiguredRemote:
             self.client.tick()
             save_status(root, url, self.client.state, self.client.last_seen_at)
         except ProtocolError as exc:
-            state = "revoked" if exc.code in {"revoked", "device_expired", "unauthorized"} else "offline"
+            # A locally expired enrollment is not a revocation: the owner
+            # simply has to re-pair.
+            state = ("revoked" if exc.code in {"revoked", "unauthorized"}
+                     else "expired" if exc.code == "device_expired" else "offline")
             seen = self.client.last_seen_at if self.client else None
             if self.client is not None and self.client.url == url:
                 self.client.state = state

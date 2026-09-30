@@ -15,12 +15,15 @@ from contextlib import closing
 from openswap.worker.protocol import (
     Artifact, DEVICE_TTL_SECONDS, HEARTBEAT_SECONDS, LEASE_SECONDS, MAX_ARTIFACTS,
     MISSED_HEARTBEATS, ProtocolError, Submission, TERMINAL, event_from_dict,
-    fields, integer, text,
+    fields, integer, text, stamp as wire_stamp,
 )
+
+# Jobs whose cancel flag a reconnecting worker must still enforce.
+ENFORCE_CANCEL = ("claimed", "starting", "running", "cancel_requested", "interrupted")
 
 
 def stamp(seconds: float) -> str:
-    return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+    return wire_stamp(datetime.fromtimestamp(seconds, timezone.utc))
 
 
 def digest(secret: str) -> str:
@@ -92,10 +95,26 @@ class ControlStore:
                    "(SELECT id FROM devices WHERE seen IS NULL OR seen<=?)",
                    (now - HEARTBEAT_SECONDS * MISSED_HEARTBEATS,))
 
+    @staticmethod
+    def _device(db, key, now):
+        """Authenticate a device key; read-only, so it runs before any write lock or sweep."""
+        if not key or len(key) > 200:
+            raise ProtocolError("unauthorized", 401)
+        device = db.execute("SELECT * FROM devices WHERE key_hash=?", (digest(key),)).fetchone()
+        if device is None:
+            raise ProtocolError("unauthorized", 401)
+        if device["revoked"]:
+            raise ProtocolError("revoked", 403)
+        if device["expiry"] <= now:
+            raise ProtocolError("device_expired", 401)
+        return device
+
     def request(self, operation: str, value: object, key: str | None = None) -> dict:
         db = self.connect()
         try:
             now = self.clock()
+            if operation != "pair":
+                self._device(db, key, now)
             self._sweep(db, now)
             db.commit()
             db.execute("BEGIN IMMEDIATE")
@@ -111,15 +130,8 @@ class ControlStore:
                            (worker_id, digest(device_key), now + DEVICE_TTL_SECONDS))
                 result = {"worker_id": worker_id, "device_key": device_key, "expires_at": stamp(now + DEVICE_TTL_SECONDS)}
             else:
-                if not key or len(key) > 200:
-                    raise ProtocolError("unauthorized", 401)
-                device = db.execute("SELECT * FROM devices WHERE key_hash=?", (digest(key),)).fetchone()
-                if device is None:
-                    raise ProtocolError("unauthorized", 401)
-                if device["revoked"]:
-                    raise ProtocolError("revoked", 403)
-                if device["expiry"] <= now:
-                    raise ProtocolError("device_expired", 401)
+                # Re-read inside the write transaction so a concurrent revocation cannot race the check.
+                device = self._device(db, key, now)
                 result = self._authorized(db, operation, value, device, now)
             db.commit()
             return result
@@ -134,10 +146,8 @@ class ControlStore:
     @staticmethod
     def _job(db, job_id, device):
         job = db.execute("SELECT * FROM jobs WHERE id=?", (text(job_id),)).fetchone()
-        if job is None:
-            raise ProtocolError("not_found", 404)
-        if job["device"] != device["id"]:
-            raise ProtocolError("forbidden", 403)
+        if job is None or job["device"] != device["id"]:
+            raise ProtocolError("not_found", 404)  # another owner's job is indistinguishable from none
         return job
 
     def _fence(self, data, job, device):
@@ -165,7 +175,9 @@ class ControlStore:
             self._epoch(data, device)
             if op == "heartbeat":
                 db.execute("UPDATE devices SET seen=? WHERE id=?", (now, device["id"]))
-                cancelled = db.execute("SELECT id FROM jobs WHERE device=? AND cancel=1", (device["id"],))
+                cancelled = db.execute(
+                    "SELECT id FROM jobs WHERE device=? AND cancel=1 AND state IN (?,?,?,?,?) ORDER BY rowid",
+                    (device["id"], *ENFORCE_CANCEL))
                 return {"last_seen_at": stamp(now), "cancel_job_ids": [r[0] for r in cancelled]}
             if device["seen"] is None or device["seen"] <= now - HEARTBEAT_SECONDS * MISSED_HEARTBEATS:
                 raise ProtocolError("offline_worker", 409)
@@ -275,7 +287,8 @@ class ControlStore:
                         order = {"claimed": 0, "starting": 1, "running": 2, "cancel_requested": 3}
                         current = self._job(db, job["id"], device)["state"]
                         if current in order and order[event.state.value] >= order[current]:
-                            db.execute("UPDATE jobs SET state=? WHERE id=?", (event.state.value, job["id"]))
+                            db.execute("UPDATE jobs SET state=?,cancel=max(cancel,?) WHERE id=?",
+                                       (event.state.value, int(event.state.value == "cancel_requested"), job["id"]))
                 db.execute("UPDATE jobs SET cursor=? WHERE id=?", (cursor, job["id"]))
             rows = db.execute("SELECT payload,cursor FROM events WHERE job=? AND cursor>? ORDER BY cursor LIMIT 200", (job["id"], after)).fetchall()
             return {"events": [json.loads(r[0]) for r in rows], "next_cursor": rows[-1][1] if rows else after}

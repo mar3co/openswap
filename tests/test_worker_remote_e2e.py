@@ -34,7 +34,7 @@ def test_loopback_pair_cli_submit_fake_run_events_and_artifact(tmp_path, keychai
             adapter = FakeAdapter()
             runtime = WorkerRuntime(root, adapter=adapter,
                                     account_identity=stable_account_identity("codex", "synthetic-e2e"))
-            remote = RemoteClient(runtime, url, enrollment.device_key)
+            remote = RemoteClient(runtime, url, enrollment.device_key, worker_id=enrollment.worker_id)
             remote.tick()
             assert remote.state == "online"
             capsys.readouterr()
@@ -110,8 +110,8 @@ def test_configured_background_polling_loop(tmp_path, keychain, capsys, monkeypa
             runtime = WorkerRuntime(root, adapter=FakeAdapter(),
                                     account_identity=stable_account_identity("codex", "synthetic-background"))
             original_submit = runtime.submit
-            def record_submit(submission):
-                result = original_submit(submission)
+            def record_submit(submission, **kwargs):
+                result = original_submit(submission, **kwargs)
                 admitted.set()
                 return result
             runtime.submit = record_submit
@@ -123,8 +123,9 @@ def test_configured_background_polling_loop(tmp_path, keychain, capsys, monkeypa
                     if operation == "upload":
                         uploaded.set()
                     return response
-            def factory(runtime, origin, key):
-                return RemoteClient(runtime, origin, key, transport=ObservedTransport(origin, key))
+            def factory(runtime, origin, key, *, worker_id=""):
+                return RemoteClient(runtime, origin, key, worker_id=worker_id,
+                                    transport=ObservedTransport(origin, key))
             configured = ConfiguredRemote(runtime, client_factory=factory)
             polling = threading.Thread(target=configured.run, args=(stop,))
             polling.start()

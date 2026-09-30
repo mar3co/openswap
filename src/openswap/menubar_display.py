@@ -208,7 +208,7 @@ def _remote_tasks_status_copy(
         notice = "".join(c for c in notice if c.isalnum() or c in "_-") or None
     remote = snapshot.get("remote_connectivity")
     service = ""
-    if remote in {"online", "offline", "revoked"}:
+    if remote in {"online", "offline", "revoked", "expired"}:
         service = f" · service {remote}"
         seen = snapshot.get("remote_last_seen_at")
         if isinstance(seen, str) and len(seen) <= 40:

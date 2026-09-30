@@ -492,7 +492,11 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     pair_parser = commands.add_parser("pair", help="approve enrollment locally and store its device key in login Keychain")
     pair_parser.add_argument("url")
     pair_parser.add_argument("code")
-    commands.add_parser("unpair", help="remove the device key and configured service URL")
+    unpair_parser = commands.add_parser(
+        "unpair", help="remove the device key and configured service URL; pass a URL to remove an enrollment "
+                       "that settings no longer reference",
+    )
+    unpair_parser.add_argument("url", nargs="?", default=None, help="service URL to unpair (default: the configured one)")
     submit_parser = commands.add_parser("submit-test", help="TEST ONLY: submit a bounded research job to a paired service")
     submit_parser.add_argument("--url", required=True)
     submit_parser.add_argument("--task", required=True)
@@ -550,7 +554,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                 worker_id = pair(root, args.url, args.code)
                 print(f"Paired worker {worker_id}. Local execution policy is still controlled on this Mac.")
             else:
-                unpair(root)
+                unpair(root, args.url)
                 print("Worker unpaired; remote access disabled.")
             return 0
         except ProtocolError as exc:
