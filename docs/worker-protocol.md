@@ -22,7 +22,10 @@ encoded request/response size is 1,500,000 bytes; event pages contain at most
 Except `pair`, every request uses `Authorization: Bearer <device_key>`. Keys
 are random 256-bit-or-stronger opaque secrets, stored hashed by the server and
 in the Mac's login Keychain under service `openswap`. Keys expire 30 days after
-enrollment; re-pair to renew. Never log keys, codes, prompts, or request bodies.
+enrollment. To renew, the operator issues a renewal code for the existing
+worker ID; pairing with it (after a local unpair) rotates that worker's key and
+expiry in place and keeps its ID, so its jobs, events and artifacts stay
+reachable, and the old key stops working. A revoked worker cannot be renewed. Never log keys, codes, prompts, or request bodies.
 The backend derives owner identity from authentication. The reference server
 has one owner: its operator. A key is scoped to its enrolled worker and that
 worker's jobs, events and artifacts; it cannot select another worker. A more

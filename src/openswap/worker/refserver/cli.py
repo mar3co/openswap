@@ -22,12 +22,15 @@ def main(argv=None):
                                  help="non-loopback HTTP must sit behind owner-controlled TLS termination on a private backend link")
         if name == "revoke":
             command.add_argument("worker_id")
+        if name == "pair-code":
+            command.add_argument("--renew", metavar="WORKER_ID",
+                                 help="renewal code: pairing rotates this worker's key and keeps its ID and jobs")
     args = parser.parse_args(argv)
     previous_umask = os.umask(0o077)  # SQLite journal/WAL sidecars must stay owner-private too
     try:
         store = ControlStore(args.database)
         if args.command == "pair-code":
-            print(store.issue_code())
+            print(store.issue_code(args.renew))
         elif args.command == "revoke":
             store.revoke(args.worker_id)
             print("Device revoked.")
