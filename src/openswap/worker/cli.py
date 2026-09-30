@@ -535,13 +535,17 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     root = Path(backup_root) if backup_root is not None else get_backup_root()
 
     if args.command == "submit-test":
+        import shlex
         from uuid import uuid4
         from openswap.worker.submit_test import resolve_expiry, submit_test
         from openswap.worker.protocol import ProtocolError, stamp
         key = uuid4().hex if args.idempotency_key is None else args.idempotency_key
         expires_at = None
         try:
-            expires_at = resolve_expiry(expires_in=args.expires_in, expires_at=args.expires_at)
+            # A retry (explicit key and expiry) resends the original payload even
+            # after its expiry, so the service can return the original job.
+            expires_at = resolve_expiry(expires_in=args.expires_in, expires_at=args.expires_at,
+                                        allow_past=args.idempotency_key is not None and args.expires_at is not None)
             result = submit_test(root, url=args.url, task=args.task, workspace_id=args.workspace_id,
                                  runtime_limit=args.runtime_limit, expires_at=expires_at,
                                  acknowledged=args.i_understand_this_is_a_test_tool, idempotency_key=key)
@@ -555,9 +559,9 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         # The service may have committed the job before the response was lost:
         # a retry must resend the identical submission (same key, same absolute
         # expiry) so it returns that job instead of admitting a second one.
-        retry = f"--idempotency-key {key}"
+        retry = f"--idempotency-key {shlex.quote(key)}"
         if expires_at is not None:
-            retry += f" --expires-at {stamp(expires_at)}"
+            retry += f" --expires-at {shlex.quote(stamp(expires_at))}"
         print(f"Retry with {retry} to reuse the same submission.", file=sys.stderr)
         return 1
 

@@ -334,7 +334,14 @@ them repeats the identical payload, so the retry returns the same job instead
 of admitting a second one. `--expires-in` (relative seconds) and `--expires-at`
 (RFC 3339) are mutually exclusive and one is required; a retry must use the
 printed absolute form, since a recomputed relative expiry changes the payload
-and the service answers `idempotency_conflict`. Errors from the service (for
+and the service answers `idempotency_conflict`. The hint is shell-quoted, so a
+key containing spaces can be pasted back. When both `--idempotency-key` and
+`--expires-at` are given explicitly, the tool sends the payload even after
+that expiry has passed: the service's idempotent replay runs before its expiry
+validation, so it returns the original job (or `idempotency_conflict`), while a
+new key with a past expiry is refused by the service as `invalid_request`. A
+generated key or a relative expiry is still refused locally unless the expiry
+lies in the future. Errors from the service (for
 example `queue_full`, `offline_worker`, `idempotency_conflict`) are printed by
 code with exit status 1.
 The command is **test-only** and does not bypass the disabled production Codex

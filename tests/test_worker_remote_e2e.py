@@ -313,3 +313,54 @@ def test_https_transport_uses_truststore_even_with_uppercase_scheme(monkeypatch)
     transport = Transport("HTTPS://control.example")
     assert transport.url == "https://control.example"
     assert calls == [ssl.PROTOCOL_TLS_CLIENT]
+
+
+def test_submit_test_retry_after_the_original_expiry_returns_the_original_job(tmp_path, keychain):
+    """An explicit key with an explicit expiry is a retry: the payload goes out as it was,
+    and the service's idempotent replay (which precedes its expiry validation) answers."""
+    ticks = [datetime.now(timezone.utc).timestamp() - 900]  # the service admitted the job 15 minutes ago
+    store = ControlStore(tmp_path / "service" / "db", clock=lambda: ticks[0])
+    root, url = tmp_path / "local", "http://127.0.0.1:8765"
+    pairing.pair(root, url, store.issue_code(), transport=StoreTransport(store, None))
+    transport = StoreTransport(store, load_enrollment(url).device_key)
+    transport.request("register", {})
+    transport.request("heartbeat", {"worker_epoch": 1})
+    expires_at = stamp(datetime.now(timezone.utc) - timedelta(seconds=300))  # already past, locally
+    same = dict(_arguments(url, expires_in=None, expires_at=expires_at), idempotency_key="late-retry")
+    original = submit_test(root, **same, transport=transport)
+    assert original["state"] == "queued"
+    ticks[0] += 900  # the service's clock catches up: the job's expiry has passed there too
+    transport.request("heartbeat", {"worker_epoch": 1})  # the worker is still live at the service
+    retried = submit_test(root, **same, transport=transport)
+    assert retried["job_id"] == original["job_id"]
+    with closing(store.connect()) as db:
+        assert [row[0] for row in db.execute("SELECT id FROM jobs")] == [original["job_id"]]
+    # Without an explicit key the local check still refuses a past expiry before any request.
+    before = len(transport.calls)
+    with pytest.raises(ProtocolError, match="invalid_request"):
+        submit_test(root, **_arguments(url, expires_in=None, expires_at=expires_at), transport=transport)
+    assert len(transport.calls) == before
+    # A new key with a past expiry reaches the service, which refuses it; nothing was admitted.
+    with pytest.raises(ProtocolError, match="invalid_request"):
+        submit_test(root, **{**same, "idempotency_key": "fresh-key"}, transport=transport)
+    with closing(store.connect()) as db:
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+
+
+def test_submit_test_cli_shell_quotes_the_retry_hint(tmp_path, keychain, monkeypatch, capsys):
+    import shlex
+    store, root, url, transport = _paired_store(tmp_path)
+    transport.unreachable = True
+    monkeypatch.setattr(submit_test_module, "Transport", lambda *_: transport)
+    arguments = ["submit-test", "--url", url, "--task", "test", "--workspace-id", "research",
+                 "--runtime-limit", "60", "--expires-in", "600", "--i-understand-this-is-a-test-tool",
+                 "--idempotency-key", "keep this key"]
+    assert cli.main(arguments, backup_root=root) == 1
+    err = capsys.readouterr().err
+    assert "--idempotency-key 'keep this key' --expires-at " in err
+    hint = shlex.split(err.split("Retry with ")[1].split(" to reuse")[0])
+    assert hint[:2] == ["--idempotency-key", "keep this key"] and hint[2] == "--expires-at"
+    transport.unreachable = False
+    retry = [a for a in arguments if a not in {"--expires-in", "600"}]
+    assert cli.main([*retry, "--expires-at", hint[3]], backup_root=root) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "queued"
