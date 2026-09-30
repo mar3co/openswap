@@ -95,7 +95,8 @@ worker without a heartbeat in the last 15 seconds is refused with
 A claim contains `job_id`, `epoch` (monotonically increasing fencing generation),
 `lease_until`, and `submission` (the original closed object). The worker first
 registers; registration increments its durable worker epoch and interrupts any
-prior claimed/active job, without requeueing it. Every worker mutation carries
+prior claimed/active job, without requeueing it, and does not by itself mark
+the worker live. Every worker mutation carries
 that epoch. Poll atomically grants one job and a 20-second lease, and repeated
 polls replay the same unexpired claim. At most one nonterminal claim per worker
 is permitted. Renew before expiry; an expired lease cannot be revived: `renew`
@@ -145,10 +146,15 @@ failure/cancellation/expiry. `reconcile` accepts only a terminal `state`;
 `succeeded` always requires stopped proof, so `succeeded` with
 `unlaunched: true` (or without `execution_stopped: true`) returns
 `invalid_state`, as does any other terminal state carrying neither proof. An
-uncertain outcome stays `interrupted`. Reconciliation and event/result uploads
+uncertain outcome stays `interrupted` and remains provisional: it can still be
+reconciled to the true outcome later. Reconciliation and event/result uploads
 are allowed after lease loss for the same worker/job epoch, but never after
 revocation or device expiry. Confirmed terminal reconciliation is idempotent;
-conflicting terminal outcomes return `invalid_state`.
+conflicting terminal outcomes return `invalid_state`. This includes
+`interrupted` confirmed with `execution_stopped: true` or `unlaunched: true`:
+it is terminal like the other confirmed outcomes, a later different terminal
+`state` returns `invalid_state`, and `heartbeat` no longer lists the job in
+`cancel_job_ids`.
 
 Revoking a device denies **all** subsequent data access, submissions and claims
 immediately, interrupts its service-side active jobs, and causes the Mac to
