@@ -47,6 +47,51 @@ def _nonfinite(_):
     raise ValueError("non-finite number")
 
 
+def _open_artifact(directory: Path, name: str):
+    """``(lstat, fd)`` for a regular file ``name`` directly in ``directory``, or ``None``.
+
+    Where the platform supports it, everything is anchored on one descriptor for
+    the checked directory, so a provider that swaps the directory for a symlink
+    afterwards cannot redirect the read. Windows (no ``dir_fd``) keeps the path
+    checks and the inode comparison the caller makes after opening.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd:
+        path = directory / name
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(before.st_mode):
+            raise ProtocolError("invalid_request")
+        if before.st_size > MAX_ARTIFACT:
+            raise ProtocolError("artifact_too_large", 413)
+        return before, os.open(path, os.O_RDONLY | nofollow)
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ProtocolError("invalid_request") from None
+    try:
+        if not stat.S_ISDIR(os.fstat(dir_fd).st_mode):
+            raise ProtocolError("invalid_request")
+        try:
+            before = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(before.st_mode):
+            raise ProtocolError("invalid_request")
+        if before.st_size > MAX_ARTIFACT:
+            raise ProtocolError("artifact_too_large", 413)
+        try:
+            return before, os.open(name, os.O_RDONLY | nofollow, dir_fd=dir_fd)
+        except OSError:
+            raise ProtocolError("invalid_request") from None
+    finally:
+        os.close(dir_fd)
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *_args, **_kwargs):
         raise ProtocolError("redirect_refused")
@@ -291,11 +336,14 @@ class RemoteClient:
             if self.worker_epoch is None:
                 registered = self.transport.request("register", {})
                 self.worker_epoch = integer(registered["worker_epoch"], 1)
+            sent = datetime.now(timezone.utc)
             heartbeat = self._worker_request("heartbeat")
             seen = timestamp(heartbeat["last_seen_at"])
             with self._lock:
                 self.last_seen_at = seen
-                self._skew = seen - datetime.now(timezone.utc)
+                # Measured against the send time, the offset can only overstate the
+                # service clock by the round trip: deadlines err early, never late.
+                self._skew = seen - sent
             self._connectivity()
             return self.state == "online"
         except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
@@ -509,16 +557,10 @@ class RemoteClient:
         directory = workspace.output_root / local.job_id
         if directory.is_symlink() or directory.resolve() != directory:
             raise ProtocolError("invalid_request")
-        path = directory / name
-        try:
-            before = path.lstat()
-        except FileNotFoundError:
+        opened = _open_artifact(directory, name)
+        if opened is None:
             return  # an absent optional result is not an error
-        if not stat.S_ISREG(before.st_mode):
-            raise ProtocolError("invalid_request")
-        if before.st_size > MAX_ARTIFACT:
-            raise ProtocolError("artifact_too_large", 413)
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        before, fd = opened
         with os.fdopen(fd, "rb") as stream:
             current = os.fstat(stream.fileno())
             if (current.st_ino, current.st_dev) != (before.st_ino, before.st_dev):
