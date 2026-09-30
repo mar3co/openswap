@@ -675,6 +675,8 @@ requirements. Production execution still uses `UnavailableCodexAdapter`.
 | 3e (as opened) | 3291 passed, 5 skipped | 70 passed |
 | 3d fixes merged into 3e (`c9ef38d`) | 3373 passed, 5 skipped | 152 passed |
 | 3e fixed head (`f74c6dc`) | 3419 passed, 5 skipped | 198 passed |
+| 3d round-two head (`e53d4b3`) | 3393 passed, 5 skipped | 172 passed (five modules; the e2e module lives in 3e) |
+| 3e round-two head (this PR's head) | 3450 passed, 5 skipped | 229 passed |
 
 Full suites use `uv run pytest -q`; serial Phase 3 runs use `-n0` with the
 six Phase 3 test modules (the review pass added
@@ -694,8 +696,11 @@ stack), confirmed all twelve pre-existing Codex bot comments against the code,
 and reproduced the HIGH findings with scratch tests before any fix. Fixes were
 applied bottom-up on the existing branches, each merged forward into the next
 (no force-push, no rebase), with a regression test per behavioural fix:
-3a `f210c97`, 3b `2e65e5e`, 3c `1df969c`, 3d `424d74e`, 3e `f74c6dc`. All
-five PRs are pending merge; nothing below is on `main` yet.
+3a `f210c97`, 3b `2e65e5e`, 3c `1df969c`, 3d `424d74e`, 3e `f74c6dc` in the
+first round. A second round answered the Codex re-review of those fixes the
+same way (each branch merged forward, one regression test per fix); the final
+heads are 3a `967b35f`, 3b `1994296`, 3c `64c7b02`, 3d `e53d4b3` and, for 3e,
+this PR's head. All five PRs are pending merge; nothing below is on `main` yet.
 
 HIGH bugs fixed:
 
@@ -730,6 +735,37 @@ the service response; the transport surfaces every documented error code; a
 `cursor_conflict` ends the claim with an uncertain outcome instead of an
 endless offline retry. `docs/worker-protocol.md` was updated wherever wire
 behaviour changed.
+
+Round two (Codex re-review of the fixes, same day) closed:
+
+- **Heartbeat thread (3c).** `RemoteClient.run` heartbeats on its own thread at
+  the fixed cadence and synchronizes on `openswap-worker-remote-sync`, so a
+  slow pass (probe, event pages, uploads) can no longer cost liveness and get a
+  running job spuriously `interrupted`; the heartbeat thread also renews the
+  admitted claim's lease. `ConfiguredRemote.run` (3d) drives the same two halves,
+  re-reading the enrollment on the heartbeat thread, and both threads write
+  `remote-status.json` from the shared connectivity.
+- **Confirmed interruptions (3b).** A reconciled `interrupted` with
+  `execution_stopped: true` or `unlaunched: true` is terminal like every other
+  confirmed outcome and leaves `cancel_job_ids`.
+- **Register liveness (3b).** `register` no longer marks the worker live; only
+  a heartbeat does, so `submit`/`poll` answer `offline_worker` until then.
+- **Unpair/launch boundary (3d).** `unpair` clears the URL before deleting the
+  key; the launch guard returns the URL and worker ID it verified, and the
+  runtime re-reads `settings.json` under the launch lock before committing, so
+  after `unpair` returns no uncommitted remote launch can start.
+- **Registration kept on local faults (3d).** A failed status write or locked
+  Keychain no longer discards the client and re-registers (which interrupted
+  the service-side jobs of the replaced registration); it reports `offline`.
+- **Retry after expiry (3e).** An explicit `--idempotency-key` with an explicit
+  `--expires-at` is sent even after that expiry, so the service's idempotent
+  replay returns the original job; the retry hint is shell-quoted.
+- Smaller items: connectivity keeps all five values with `expired` final like
+  `revoked`; `validate_url` lowercases scheme and host and every enrollment
+  path hashes the normalized origin; the timestamp grammar bounds fields and
+  refuses leap seconds; `runtime_limit()` enforces the 14,400 s bound and
+  overflowing timestamps map to `invalid_request`; terminal `state_changed`
+  events are stored, never applied.
 
 Still open after this pass (design gaps, not regressions):
 
