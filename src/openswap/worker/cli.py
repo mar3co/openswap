@@ -587,10 +587,17 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                     file=sys.stderr,
                 )
             else:
-                print(
-                    f"Worker remains enabled and admission-paused ({diagnostic}).",
-                    file=sys.stderr,
-                )
+                # A blocked disable restores the prior opt-in, so report the
+                # persisted policy rather than assuming it is still enabled.
+                try:
+                    state = "enabled" if load_worker_settings(root).enabled else "disabled"
+                except Exception:
+                    state = None
+                if state is None:
+                    message = f"Worker disable was blocked ({diagnostic}); admission stays paused."
+                else:
+                    message = f"Worker remains {state} and admission-paused ({diagnostic})."
+                print(message, file=sys.stderr)
             return 1
         payload = {"enabled": False, **result}
         _write(payload, as_json=args.json, human="Remote tasks worker disabled.")

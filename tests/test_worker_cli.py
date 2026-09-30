@@ -239,8 +239,9 @@ def test_enable_creates_private_worker_root_before_lifecycle_lock(
     info = worker_dir.lstat()
     assert stat.S_ISDIR(info.st_mode)
     assert not stat.S_ISLNK(info.st_mode)
-    assert info.st_uid == os.getuid()
-    assert stat.S_IMODE(info.st_mode) == 0o700
+    if os.name == "posix":  # Windows has no POSIX owner or mode bits
+        assert info.st_uid == os.getuid()
+        assert stat.S_IMODE(info.st_mode) == 0o700
     LocalJobStore(tmp_path)._ensure_private_dir()
 
 
@@ -263,6 +264,33 @@ def test_worker_enable_migrates_legacy_backup_before_creating_worker_root(
     assert cli.paths.migrate_legacy_backup_dir(target) is False
     assert capsys.readouterr().err == (
         f"openswap: migrated data from {legacy} to {target}\n"
+    )
+
+
+def test_status_reports_a_stopped_worker_on_hosts_without_unix_sockets(
+    tmp_path: Path, monkeypatch
+):
+    """Windows has no AF_UNIX: status (and purge, which reads it) must fall
+    back to the read-only snapshot instead of raising."""
+    import socket
+
+    monkeypatch.delattr(socket, "AF_UNIX", raising=False)
+
+    assert cli.read_status(tmp_path)["process_state"] == "stopped"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_blocked_disable_reports_the_persisted_opt_in(
+    tmp_path: Path, monkeypatch, capsys, enabled: bool
+):
+    update_worker_settings(tmp_path, enabled=enabled)
+    monkeypatch.setattr(cli, "disable_worker", lambda _root: (False, {}, "lease_state_unknown"))
+
+    assert cli.main(["disable"], backup_root=tmp_path) == 1
+
+    state = "enabled" if enabled else "disabled"
+    assert capsys.readouterr().err == (
+        f"Worker remains {state} and admission-paused (lease_state_unknown).\n"
     )
 
 

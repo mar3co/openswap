@@ -55,7 +55,11 @@ class WorkerClient:
             raise IpcError("invalid_request") from None
         if len(encoded) > 4096:
             raise IpcError("request_too_large")
-        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        family = getattr(socket, "AF_UNIX", None)
+        if family is None:
+            # No Unix sockets (Windows): the worker never runs on this host.
+            raise IpcError("worker_unavailable")
+        connection = socket.socket(family, socket.SOCK_STREAM)
         connection.settimeout(IO_TIMEOUT_SECONDS)
         try:
             connection.connect(str(self.socket_path))

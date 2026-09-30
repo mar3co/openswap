@@ -174,7 +174,7 @@ used the existing test environment with narrowly elevated permissions for
 disposable AF_UNIX sockets and fake-process supervision. The newer PR #59 head
 has not been merged into this tree. After the PR #60 review-fix pass below,
 the full suite on this tree remains green:
-`3218 passed, 5 skipped, 3 warnings in 48.38s`.
+`3221 passed, 5 skipped, 3 warnings in 47.97s`.
 Focused core journal,
 settings, disabled-adapter and fake lifecycle tests passed (`22 passed`); the
 separate subprocess acceptance passed (`1 passed`). It verifies client
@@ -332,6 +332,10 @@ The control-socket path no longer needs `os.getuid`, so worker status and
 purge work on Windows (where the worker never runs); the AF_UNIX IPC tests
 are POSIX-only and wait for the server's ready signal instead of the socket
 file, which exists before `listen()`.
+The IPC client reports the worker unavailable on hosts without `AF_UNIX`,
+so status falls back to the read-only snapshot and purge works on Windows.
+A blocked `worker disable` now reports the persisted opt-in instead of
+always saying the worker remains enabled.
 The CLI now rejects a stale `cswap` launcher before dispatching to the worker
 subcommand, so `cswap worker status` gets the removed-command message instead
 of reaching the worker CLI. Codex `set_account_disabled`, `set_alias`, and
