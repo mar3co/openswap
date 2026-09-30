@@ -730,9 +730,12 @@ def configure_worker_service(backup_root: Path, url: str | None) -> WorkerSettin
     with _settings_write_lock(backup_root):
         raw = _read_raw_for_write(settings_path(backup_root))
         raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
-        section = raw.setdefault("worker", {})
+        section = raw.get("worker")
         if not isinstance(section, dict):
-            raise ValueError("invalid worker settings")
+            # Like the other worker writers: a malformed section is replaced,
+            # unrelated settings are kept, and configuration stays usable.
+            section = {}
+            raw["worker"] = section
         section["controlServiceUrl"] = url
         atomic_write_json(settings_path(backup_root), raw)
     return load_worker_settings(backup_root)

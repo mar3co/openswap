@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
+import time
 
 import pytest
 
@@ -340,32 +341,138 @@ def test_run_loop_survives_a_journal_error_and_keeps_ticking(remote_setup, monke
 
     monkeypatch.setattr(runtime, "cancel", flaky_cancel)
     monkeypatch.setattr(remote_mod, "HEARTBEAT_SECONDS", 0.01)
-    ticks, enough = [], threading.Event()
-    original_tick = remote.tick
+    passes, enough = [], threading.Event()
+    original_sync = remote.sync_tick
 
-    def counted_tick():
-        entered = remote.state  # what run() left behind after the previous tick
+    def counted_sync(policy=None):
         try:
-            original_tick()
-            ticks.append((entered, "returned"))
+            original_sync(policy)
+            passes.append(("returned", remote.state))
         except Exception:
-            ticks.append((entered, "raised"))
+            passes.append(("raised", remote.state))
             raise
         finally:
-            if len(ticks) >= 3:
+            if len(passes) >= 3:
                 enough.set()
 
-    monkeypatch.setattr(remote, "tick", counted_tick)
+    monkeypatch.setattr(remote, "sync_tick", counted_sync)
     stop = threading.Event()
-    thread = threading.Thread(target=remote.run, args=(stop,))
+    thread = threading.Thread(target=remote.run, args=(stop,), daemon=True)  # a failure must not hang pytest
     thread.start()
-    assert enough.wait(5), "the remote thread died"
+    try:
+        assert enough.wait(5), "the synchronization thread died"
+    finally:
+        stop.set()
+        thread.join(2)
+    assert not thread.is_alive()
+    # The fault escaped sync_tick's own allowlist, was folded into connectivity by the
+    # loop, and the next pass (admitted again by a fresh heartbeat) completed the cancel.
+    assert failures and passes[0] == ("raised", "online") and passes[-1] == ("returned", "online")
+    assert remote.state == "online"
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "cancelled"
+
+
+class BlockingTransport:
+    """Serves the store, but stalls chosen operations until released or until stop."""
+    def __init__(self, inner, stall, release):
+        self.inner, self.stall, self.release = inner, stall, release
+        self.stamps = []  # (operation, monotonic time, thread name)
+        self.blocked = threading.Event()
+
+    def request(self, operation, data):
+        self.stamps.append((operation, time.monotonic(), threading.current_thread().name))
+        if operation in self.stall:
+            self.blocked.set()
+            self.release.wait(30)
+        return self.inner.request(operation, data)
+
+
+def test_heartbeats_keep_their_cadence_while_synchronization_is_blocked(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, ticks, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    monkeypatch.setattr(remote_mod, "HEARTBEAT_SECONDS", 0.05)
+    release = threading.Event()
+    blocking = BlockingTransport(transport, {"poll"}, release)
+    remote.transport = blocking
+    stop = threading.Event()
+    thread = threading.Thread(target=remote.run, args=(stop,), daemon=True)  # a failure must not hang pytest
+    thread.start()
+    try:
+        assert blocking.blocked.wait(5), "synchronization never reached the stalled poll"
+        blocked_at = time.monotonic()
+        while time.monotonic() - blocked_at < 0.6:  # twelve cadences with poll still hung
+            time.sleep(0.05)
+        heartbeats = [t for op, t, _ in blocking.stamps if op == "heartbeat" and t >= blocked_at]
+        assert len(heartbeats) >= 8, heartbeats
+        assert all(b - a < 0.25 for a, b in zip(heartbeats, heartbeats[1:])), heartbeats
+        assert remote.state == "online"
+        threads = {name for op, _, name in blocking.stamps if op in {"heartbeat", "register"}}
+        assert threads == {thread.name} and all(
+            name == "openswap-worker-remote-sync" for op, _, name in blocking.stamps if op == "poll")
+        release.set()  # the claim is admitted once the poll returns; the runtime launches it
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not runtime.store.queue():
+            time.sleep(0.02)
+        result = runtime.reconcile_once()
+        assert result is not None and result.state == JobState.SUCCEEDED
+        while time.monotonic() < deadline and remote.journal.pending():
+            time.sleep(0.02)
+        assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "succeeded"
+    finally:
+        release.set()
+        stop.set()
+        thread.join(2)
+    assert not thread.is_alive()
+    assert not any(t.name == "openswap-worker-remote-sync" and t.is_alive() for t in threading.enumerate())
+
+
+def test_stop_event_ends_both_threads_promptly_even_mid_request(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, ticks, paired, transport = remote_setup
+    submit(remote_setup)
+    monkeypatch.setattr(remote_mod, "HEARTBEAT_SECONDS", 0.05)
+    stop = threading.Event()
+    blocking = BlockingTransport(transport, {"poll"}, stop)  # the stalled request returns on stop
+    remote.transport = blocking
+    thread = threading.Thread(target=remote.run, args=(stop,), daemon=True)  # a failure must not hang pytest
+    thread.start()
+    assert blocking.blocked.wait(5)
+    started = time.monotonic()
     stop.set()
     thread.join(2)
-    assert not thread.is_alive()
-    assert failures and ticks[0] == ("online", "raised") and ticks[1] == ("offline", "returned")
-    assert ticks[-1] == ("online", "returned")
-    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "cancelled"
+    assert not thread.is_alive() and time.monotonic() - started < 1.5
+    assert not any(t.name == "openswap-worker-remote-sync" and t.is_alive() for t in threading.enumerate())
+    assert adapter.starts == 0  # a claim granted during shutdown is never admitted
+
+
+def test_heartbeat_thread_renews_the_admitted_claim(remote_setup):
+    remote, runtime, adapter, store, ticks, paired, transport = remote_setup
+    submit(remote_setup)
+    remote.tick()  # claims and admits at t0 with a lease until t0+20; the runtime has not launched yet
+    claim_id = remote.journal.pending()[0]["remote_id"]
+    assert remote._admitted is not None and remote._admitted.job_id == claim_id
+    ticks[0] += 12
+    remote.heartbeat_tick()
+    before = len(transport.calls)
+    remote.renew_admitted()
+    assert transport.calls[before:] == ["renew"]
+    ticks[0] += 12  # t0+24: the original lease has lapsed; only the heartbeat-side renewal carried it
+    remote.heartbeat_tick()
+    result = runtime.reconcile_once()  # the launch fence renews inside the carried lease
+    assert result is not None and result.state == JobState.SUCCEEDED
+    remote.tick()
+    assert store.request("job", {"job_id": claim_id}, paired["device_key"])["state"] == "succeeded"
+    assert remote.journal.pending() == [] and remote._admitted is None
+    # A lost lease cannot be revived: renewals stop and the outcome is left to synchronization.
+    submit(remote_setup, "two")
+    remote.tick()
+    assert remote._admitted is not None
+    ticks[0] += 21
+    remote.heartbeat_tick()
+    remote.renew_admitted()
+    assert remote._admitted is None and remote.state == "online"
+    before = len(transport.calls)
+    remote.renew_admitted()  # nothing to renew: no request
+    assert transport.calls[before:] == []
 
 
 def test_binding_is_published_before_local_admission(remote_setup, monkeypatch):
@@ -512,6 +619,10 @@ def test_live_transport_maps_reference_server_statuses(tmp_path):
             paired = Transport(url).request("pair", {"code": store.issue_code()})
             transport = Transport(url, paired["device_key"])
             assert transport.request("register", {})["worker_epoch"] == 1
+            with pytest.raises(ProtocolError) as failure:  # registration alone is not liveness
+                transport.request("poll", {"worker_epoch": 1})
+            assert (failure.value.code, failure.value.status) == ("offline_worker", 409)
+            assert transport.request("heartbeat", {"worker_epoch": 1})["cancel_job_ids"] == []
             assert transport.request("poll", {"worker_epoch": 1}) == {"claim": None}
             with pytest.raises(ProtocolError) as failure:
                 transport.request("heartbeat", {"worker_epoch": 7})

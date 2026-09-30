@@ -40,7 +40,7 @@ MAX_JOB_RUNTIME_SECONDS = 4 * 60 * 60
 
 
 class RemoteConnectivity(StrEnum):
-    """Service connectivity is separate from provider/job/process state."""
+    """Connectivity to the control service, tracked separately from provider/job/process state."""
 
     DISABLED = "disabled"
     ONLINE = "online"

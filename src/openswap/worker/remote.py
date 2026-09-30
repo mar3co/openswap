@@ -29,6 +29,8 @@ STATES = frozenset(state.value for state in JobState)
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
                                  "hash_mismatch", "invalid_request"})
+# Connectivity states that only a new enrollment (re-pair) can leave.
+FINAL = frozenset({"revoked", "expired"})
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -132,11 +134,17 @@ class RemoteJournal:
 
 
 class RemoteClient:
-    """One daemon thread for heartbeats, admission and durable upload replay.
+    """Heartbeats on one thread; admission and durable upload replay on another.
 
     The existing runtime remains the only launch driver. Its final launch fence
     queries this client; a network failure prevents that launch, never kills a
     job that has already started. Tests inject transport/adapters, not binaries.
+
+    ``run`` owns both threads. ``tick`` is the synchronous composition of the two
+    halves (``heartbeat_tick`` then ``sync_tick``) for callers that drive the
+    client themselves. Connectivity, the worker epoch and the admitted claim are
+    the only state shared across threads; the Transport is shared too, which is
+    safe because urllib opens one connection per request and pools none.
     """
     def __init__(self, runtime, url: str, key: str, *, worker_id: str = "", transport=None,
                  artifact_names=("result.md",)):
@@ -147,6 +155,8 @@ class RemoteClient:
         self.worker_epoch = None
         self.state = "offline"
         self.last_seen_at = None
+        self._lock = threading.Lock()
+        self._admitted = None  # claim whose lease the heartbeat thread keeps renewing
         self.artifact_names = tuple(artifact_names)
         if len(self.artifact_names) > 8:
             raise ValueError("too many explicit artifacts")
@@ -168,8 +178,28 @@ class RemoteClient:
             return self.transport.request(operation, {"worker_epoch": self.worker_epoch})
         except ProtocolError as exc:
             if exc.code == "stale_epoch":
-                self.worker_epoch = None
+                with self._lock:
+                    self.worker_epoch = None
             raise
+
+    def _connectivity(self, failure=None):
+        """Fold one request outcome from either thread into the shared connectivity state.
+
+        Any failure reports ``offline`` (or ``revoked``/``expired``); only a heartbeat
+        success reports ``online``. Revocation and device expiry are final for this
+        client (only a new enrollment restores access), so nothing overrides them.
+        """
+        with self._lock:
+            if self.state in FINAL:
+                return
+            if failure is None:
+                self.state = "online"
+            elif isinstance(failure, ProtocolError):
+                self.state = ("revoked" if failure.code in {"revoked", "unauthorized"}
+                              else "expired" if failure.code == "device_expired"
+                              else "online" if failure.code == "lease_lost" else "offline")
+            else:
+                self.state = "offline"
 
     def _job_response(self, operation, data):
         """``job``/``renew`` with a real boolean cancel flag and a known state.
@@ -203,24 +233,74 @@ class RemoteClient:
             return False
 
     def tick(self):
-        """One bounded transport pass. No sleeping; tests control readiness/time."""
+        """One bounded synchronous pass: heartbeat, then synchronization. No sleeping; tests control time."""
         if self.stop_event.is_set():
             return
         policy = load_worker_settings(self.runtime.backup_root)
+        if self.heartbeat_tick(policy):
+            self.sync_tick(policy)
+
+    def heartbeat_tick(self, policy=None) -> bool:
+        """The liveness half of a tick: register when needed, then heartbeat.
+
+        Returns whether the worker is online. Bounded by two request timeouts and
+        never waits on synchronization work, so a slow pass cannot cost liveness.
+        """
+        if self.stop_event.is_set():
+            return False
+        policy = policy or load_worker_settings(self.runtime.backup_root)
         if policy.control_service_url != self.url:
-            self.state = "disabled"
-            return
-        if self.state in {"revoked", "expired"}:
-            return  # only a new enrollment (re-pair) can restore access
+            with self._lock:
+                self.state = "disabled"
+            return False
+        if self.state in FINAL:
+            return False  # only a new enrollment (re-pair) can restore access
         try:
             if self.worker_epoch is None:
                 registered = self.transport.request("register", {})
                 self.worker_epoch = integer(registered["worker_epoch"], 1)
             heartbeat = self._worker_request("heartbeat")
-            self.last_seen_at = timestamp(heartbeat["last_seen_at"])
-            self.state = "online"
-            pending = self.journal.pending()
-            for binding in pending:
+            seen = timestamp(heartbeat["last_seen_at"])
+            with self._lock:
+                self.last_seen_at = seen
+            self._connectivity()
+            return self.state == "online"
+        except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
+            self._connectivity(exc)
+            return False
+
+    def renew_admitted(self):
+        """Renew the admitted claim's lease from the heartbeat thread.
+
+        The lease governs admission only, and a lost lease cannot be revived, so a
+        pass blocked in event pages or artifact uploads must not let a claim that
+        is waiting for its launch fence expire. ``lease_lost`` ends the renewals;
+        the synchronization thread still reconciles that job's outcome.
+        """
+        claim = self._admitted
+        if claim is None or self.worker_epoch is None:
+            return
+        try:
+            self._job_response("renew", self._fence(claim))
+        except ProtocolError as exc:
+            if exc.code != "lease_lost":
+                raise
+            if self._admitted is claim:
+                self._admitted = None
+
+    def sync_tick(self, policy=None):
+        """The synchronization half of a tick: replay pending bindings, then claim new work.
+
+        Runs only while the heartbeat half reports ``online`` with a known epoch.
+        """
+        if self.stop_event.is_set():
+            return
+        policy = policy or load_worker_settings(self.runtime.backup_root)
+        with self._lock:
+            if self.state != "online" or self.worker_epoch is None or policy.control_service_url != self.url:
+                return
+        try:
+            for binding in self.journal.pending():
                 self._sync(binding)
             # Pending work, including an expired remote lease on a running job,
             # blocks new claims until its outcome/events/artifacts are acknowledged.
@@ -242,12 +322,8 @@ class RemoteClient:
                 claim = Claim.from_dict(response["claim"])
                 self.journal.remember(claim)  # persist before local admission
                 self._sync(self.journal.pending()[0])
-        except ProtocolError as exc:
-            self.state = ("revoked" if exc.code in {"revoked", "unauthorized"}
-                          else "expired" if exc.code == "device_expired"
-                          else "online" if exc.code == "lease_lost" else "offline")
-        except (KeyError, TypeError, ValueError, OSError, sqlite3.Error, AdmissionError):
-            self.state = "offline"
+        except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error, AdmissionError) as exc:
+            self._connectivity(exc)
 
     def _sync(self, binding):
         claim = Claim.from_dict(json.loads(binding["claim"]))
@@ -273,6 +349,7 @@ class RemoteClient:
                     self.journal.update(claim.job_id, done=1)
                     return
                 self._job_response("renew", self._fence(claim))
+                self._admitted = claim
                 if self.stop_event.is_set():
                     return
                 # The binding is published before admission: the runtime's
@@ -293,6 +370,7 @@ class RemoteClient:
             local = self.runtime.get(local_id)
         if local.state.value not in TERMINAL:
             self._job_response("renew", self._fence(claim))
+            self._admitted = claim
         self._forward_events(claim, local_id, binding["cursor"])
         local = self.runtime.get(local_id)
         if local.state.value in TERMINAL:
@@ -304,6 +382,7 @@ class RemoteClient:
                 # Relay the rejection diagnostics before acknowledging the claim.
                 self._forward_events(claim, local_id, self.journal.binding(local_id)["cursor"])
             self.journal.update(claim.job_id, done=1)
+            self._admitted = None
 
     def _forward_events(self, claim, local_id, cursor):
         # One page per tick keeps requests bounded; terminal jobs are not
@@ -398,12 +477,34 @@ class RemoteClient:
         self.transport.request("upload", {**self._fence(claim), "artifact": Artifact(name, content).to_dict()})
 
     def run(self, stop_event: threading.Event):
+        """Heartbeat on this thread at the fixed cadence; synchronize on a second thread.
+
+        Every request is bounded by a 5 s timeout but a synchronization pass is not
+        (probe, event pages, artifact uploads), and the service interrupts a live job
+        after 15 s without a heartbeat. Keeping the two on independent deadlines is
+        what stops a slow pass from getting a running job spuriously ``interrupted``.
+        Both threads stop on ``stop_event``; the second is joined before returning.
+        """
         self.stop_event = stop_event
-        while not stop_event.is_set():
+        sync = threading.Thread(target=self._sync_loop, name="openswap-worker-remote-sync", daemon=True)
+        sync.start()
+        try:
+            while not stop_event.is_set():
+                try:
+                    if self.heartbeat_tick():
+                        self.renew_admitted()
+                except Exception as exc:
+                    self._connectivity(exc)
+                stop_event.wait(HEARTBEAT_SECONDS)
+        finally:
+            sync.join()
+
+    def _sync_loop(self):
+        while not self.stop_event.is_set():
             try:
-                self.tick()
-            except Exception:
-                # A journal or adapter fault must not end heartbeating for the
-                # process lifetime; the next tick retries at the usual cadence.
-                self.state = "offline"
-            stop_event.wait(HEARTBEAT_SECONDS)
+                self.sync_tick()
+            except Exception as exc:
+                # A journal or adapter fault must not end synchronization for the
+                # process lifetime; the next pass retries at the usual cadence.
+                self._connectivity(exc)
+            self.stop_event.wait(HEARTBEAT_SECONDS)
