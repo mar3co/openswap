@@ -18,6 +18,12 @@ from openswap.oauth import credential_fingerprint
 from openswap.switcher import ClaudeAccountSwitcher
 from openswap.transfer import export_accounts, import_accounts
 from openswap.usage_store import FetchRecord
+from openswap.worker.leases import (
+    AccountLeaseStore,
+    LeaseConflictError,
+    LeaseStateError,
+    stable_account_identity,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +251,7 @@ class TestImportSequenceCommit:
             def __exit__(self, *exc):
                 return False
 
-        monkeypatch.setattr("openswap.transfer.FileLock", SpyLock)
+        monkeypatch.setattr("openswap.worker.leases.FileLock", SpyLock)
         with patch("pathlib.Path.home", return_value=dst_home):
             with patch.dict(os.environ, {"HOME": str(dst_home)}):
                 dst = _linux_switcher(dst_home)
@@ -253,6 +259,71 @@ class TestImportSequenceCommit:
                 assert entered == [dst.lock_file]
                 seq = dst._get_sequence_data()
                 assert set(seq["accounts"].keys()) == {"1", "2"}
+
+    @pytest.mark.parametrize(
+        ("lease_state", "error_type"),
+        [
+            ("active", LeaseConflictError),
+            ("uncertain", LeaseConflictError),
+            ("corrupt", LeaseStateError),
+        ],
+    )
+    def test_import_refuses_claude_lease_before_credential_or_roster_writes(
+        self, temp_home: Path, lease_state: str, error_type
+    ):
+        src = _linux_switcher(temp_home / "src")
+        _seed_account(
+            src,
+            1,
+            "same@example.com",
+            "org-a",
+            creds={**SAMPLE_CREDS, "_marker": "incoming"},
+        )
+        out = temp_home / "incoming.openswap"
+        export_accounts(src, str(out))
+
+        dst = _linux_switcher(temp_home / "dst")
+        _seed_account(
+            dst,
+            1,
+            "same@example.com",
+            "org-a",
+            creds={**SAMPLE_CREDS, "_marker": "existing"},
+        )
+        # Legacy rows can trigger a roster migration on read. Import must defer
+        # even that roster rewrite until after the provider lease guard passes.
+        dst_data = dst._get_sequence_data() or {}
+        dst_data["accounts"]["1"].pop("organizationUuid")
+        dst._write_json(dst.sequence_file, dst_data)
+        before_credentials = dst.read_account_credentials("1", "same@example.com")
+        before_config = dst._read_account_config("1", "same@example.com")
+        before_roster = dst.sequence_file.read_bytes()
+
+        store = AccountLeaseStore(dst.backup_dir, "claude")
+        if lease_state == "corrupt":
+            worker_root = dst.backup_dir / "worker"
+            worker_root.mkdir(mode=0o700, exist_ok=True)
+            store.lease_file.parent.mkdir(mode=0o700, exist_ok=True)
+            store.lease_file.write_text("{malformed", encoding="utf-8")
+        else:
+            token = store.acquire(
+                job_id="transfer-import-test",
+                account_identity=stable_account_identity(
+                    "claude", "same@example.com", "org-a"
+                ),
+                worker_pid=123,
+                worker_epoch=1,
+                ttl_s=60,
+            )
+            if lease_state == "uncertain":
+                store.mark_uncertain(token, "test_uncertain")
+
+        with pytest.raises(error_type):
+            import_accounts(dst, str(out), force=True)
+
+        assert dst.read_account_credentials("1", "same@example.com") == before_credentials
+        assert dst._read_account_config("1", "same@example.com") == before_config
+        assert dst.sequence_file.read_bytes() == before_roster
 
     def test_import_commits_prefix_if_later_slot_write_fails(self, temp_home: Path):
         src = _linux_switcher(temp_home)

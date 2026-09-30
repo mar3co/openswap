@@ -851,6 +851,10 @@ class MenuBarPanel:
         on_empty_action=None,
         login_state=None,
         on_login_action=None,
+        worker_enabled=None,
+        worker_paused=None,
+        worker_status=None,
+        on_worker_view_active=None,
     ):
         self._on_switch = on_switch
         self._on_rotate = on_rotate
@@ -875,6 +879,10 @@ class MenuBarPanel:
         self._on_empty_action = on_empty_action
         self._login_state = login_state or (lambda: {"stage": "idle"})
         self._on_login_action = on_login_action
+        self._worker_enabled = worker_enabled or (lambda: False)
+        self._worker_paused = worker_paused or (lambda: False)
+        self._worker_status = worker_status or (lambda: {})
+        self._on_worker_view_active = on_worker_view_active
         self._login_alias = ""
         self._login_alias_field = None
         self._login_brand_started_at = None
@@ -1185,6 +1193,11 @@ class MenuBarPanel:
             else SETTINGS_SECTION_GENERAL
         )
         self._page = SETTINGS_PAGE
+        if (
+            self._settings_section == SETTINGS_SECTION_GENERAL
+            and self._on_worker_view_active is not None
+        ):
+            self._on_worker_view_active()
         self.reload()
 
     def _show_main(self, _sender=None):
@@ -1757,12 +1770,23 @@ class MenuBarPanel:
             )
         except Exception:
             codex_enabled = True
+        try:
+            worker_enabled = bool(self._worker_enabled())
+            worker_paused = bool(self._worker_paused())
+            worker_status = self._worker_status()
+            if not isinstance(worker_status, dict):
+                worker_status = {}
+        except Exception:
+            worker_enabled, worker_paused, worker_status = False, False, {}
         rows = settings_page_rows(
             settings,
             strategy=strategy,
             threshold=threshold,
             has_codex=has_codex,
             codex_enabled=codex_enabled,
+            worker_enabled=worker_enabled,
+            worker_paused=worker_paused,
+            worker_status=worker_status,
             section=self._settings_section,
         )
 
@@ -1788,6 +1812,8 @@ class MenuBarPanel:
             kind = row.get("kind")
             if kind == "group":
                 return 34.0 if row.get("style") == "hint" else SETTINGS_GROUP_H
+            if kind == "status":
+                return 44.0
             if kind == "toggle":
                 return SETTINGS_TOGGLE_H
             if kind == "popup":
@@ -1899,6 +1925,40 @@ class MenuBarPanel:
                     row["id"],
                     font_small,
                 )
+            elif kind == "status":
+                root.addSubview_(
+                    _label(
+                        row.get("label") or "",
+                        font_small,
+                        pal["muted"],
+                        NSMakeRect(PAD, y, inner_w, 14),
+                    )
+                )
+                value_label = _label(
+                    row.get("value") or "Worker status unavailable",
+                    font_small,
+                    pal["muted"],
+                    NSMakeRect(PAD, y + 14, inner_w, h - 14),
+                )
+                _wrap(value_label)
+                root.addSubview_(value_label)
+            elif kind == "button":
+                root.addSubview_(
+                    _label(
+                        row.get("label") or "",
+                        font_body,
+                        pal["fg"],
+                        NSMakeRect(PAD, y + 5, inner_w - 78, 20),
+                    )
+                )
+                button = self._add_button(
+                    root,
+                    row.get("title") or "Action",
+                    NSMakeRect(PANEL_WIDTH - PAD - 70, y + 2, 70, 26),
+                    lambda _s, rid=row["id"], v=row.get("value"): self._emit_setting(rid, v),
+                    font_small,
+                )
+                button.setEnabled_(not bool(row.get("disabled")))
             elif kind == "choice":
                 root.addSubview_(
                     _label(

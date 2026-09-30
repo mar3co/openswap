@@ -13,6 +13,7 @@ import json
 import os
 import plistlib
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +31,7 @@ from openswap.autoswitch import (
     SwitchEvent,
 )
 from openswap.exceptions import ClaudeSwitchError
+from openswap.settings import WorkerSettings, update_worker_settings
 from openswap.switcher import (
     USAGE_API_KEY,
     USAGE_FOREIGN_CREDENTIAL,
@@ -300,6 +302,121 @@ def test_settings_page_sections_separate_display_from_provider_automation():
         row["section"] == menubar.SETTINGS_SECTION_AUTOMATION
         for row in automation
     )
+
+
+def test_remote_tasks_settings_are_opt_in_redacted_and_stop_targets_job_id():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(),
+        strategy="best",
+        threshold=90,
+        worker_enabled=True,
+        worker_paused=True,
+        worker_status={
+            "process_state": "running",
+            "provider": {"available": False, "diagnostic_code": "live_adapter_disabled"},
+            "active_job": {
+                "job_id": "job-local-7",
+                "state": "cancel_requested",
+                "task": "sensitive task text",
+            },
+            "queue_depth": 1,
+        },
+        section=menubar.SETTINGS_SECTION_GENERAL,
+    )
+    by_id = {row["id"]: row for row in rows}
+
+    assert by_id["remote_tasks_enabled"]["value"] is True
+    assert by_id["remote_tasks_paused"]["value"] is True
+    assert by_id["remote_tasks_stop"]["value"] == "job-local-7"
+    assert by_id["remote_tasks_stop"]["disabled"] is False
+    status = by_id["remote_tasks_status"]["value"]
+    assert "provider live_adapter_disabled" in status
+    assert "cancel_requested" in status
+    assert "sensitive task text" not in status
+
+    off_rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(),
+        strategy="best",
+        threshold=90,
+        section=menubar.SETTINGS_SECTION_GENERAL,
+    )
+    off = {row["id"]: row for row in off_rows}
+    assert off["remote_tasks_enabled"]["value"] is False
+    assert off["remote_tasks_paused"]["disabled"] is True
+    assert off["remote_tasks_stop"]["disabled"] is True
+
+    available_rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(),
+        strategy="best",
+        threshold=90,
+        worker_enabled=True,
+        worker_status={
+            "process_state": "running",
+            "provider": {"available": True, "diagnostic_code": None},
+            "active_job": {"job_id": "job-local-8", "state": "succeeded"},
+        },
+        section=menubar.SETTINGS_SECTION_GENERAL,
+    )
+    available = {row["id"]: row for row in available_rows}
+    assert "provider available" in available["remote_tasks_status"]["value"]
+    assert "job succeeded" in available["remote_tasks_status"]["value"]
+
+
+def test_worker_status_poll_refreshes_policy_and_discards_stale_policy(
+    tmp_path: Path, monkeypatch
+):
+    from tests.menubar_harness import extract_class
+
+    update_worker_settings(tmp_path, enabled=True, paused=True)
+    monkeypatch.setattr(
+        "openswap.worker.cli.read_status",
+        lambda _root: {
+            "process_state": "running",
+            "enabled": True,
+            "paused": True,
+            "active_job": None,
+            "queue_depth": 0,
+        },
+    )
+    app_type = extract_class(
+        menubar.__file__,
+        "MenuBarApp",
+        {"_worker_status_worker", "_drain_worker_result"},
+        {},
+    )
+    app = app_type()
+    app.switcher = SimpleNamespace(backup_dir=tmp_path)
+    app._worker_generation = 4
+    app._worker_result_lock = threading.Lock()
+    app._worker_status_inflight = True
+    app._worker_operation = None
+    app._worker_policy = WorkerSettings()
+    app._worker_status_cache = {"process_state": "unavailable"}
+    app._worker_result = None
+    app._panel = None
+
+    # The status read observes policy changed by a separate CLI process and
+    # applies snapshot and policy together when the UI drains that generation.
+    app._worker_status_worker(4)
+    app._drain_worker_result()
+    assert app._worker_policy.enabled is True
+    assert app._worker_policy.paused is True
+    assert app._worker_status_cache["process_state"] == "running"
+
+    # A result from an older status generation cannot overwrite a newer policy.
+    latest_policy = WorkerSettings(enabled=False, paused=False)
+    app._worker_policy = latest_policy
+    app._worker_generation = 5
+    app._worker_status_inflight = True
+    app._worker_result = (
+        4,
+        {"process_state": "stale"},
+        WorkerSettings(enabled=True, paused=True),
+        None,
+    )
+    app._drain_worker_result()
+    assert app._worker_policy is latest_policy
+    assert app._worker_status_cache["process_state"] == "running"
 
 
 def test_settings_page_rows_include_required_ids_and_values():
@@ -1427,7 +1544,7 @@ def test_apply_hold_line_reloads_open_main_panel_only_when_copy_changes():
         "self._reload_main_panel_if_shown()"
     )
     reload_fn = text[
-        text.index("def _reload_main_panel_if_shown") : text.index("def _stop_engine")
+        text.index("def _reload_main_panel_if_shown") : text.index("def _worker_view_active")
     ]
     assert "== MAIN_PAGE" in reload_fn
     assert "SETTINGS_PAGE" not in reload_fn
@@ -3050,7 +3167,7 @@ def test_every_settings_row_is_dispatched():
         threshold=90,
     )
     for row in rows:
-        if row["kind"] == "group":
+        if row["kind"] in {"group", "status"}:
             continue
         assert f'"{row["id"]}"' in body, row["id"]
 

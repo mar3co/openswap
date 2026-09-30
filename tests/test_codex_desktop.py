@@ -8,6 +8,7 @@ from openswap.codex import desktop
 from openswap.codex.desktop import DesktopSwitchError, DesktopSwitcher
 from openswap.codex.desktop_app import DesktopAppError
 from openswap.codex.engine import CodexEngine
+from openswap.worker.leases import AccountLeaseStore, LeaseConflictError, stable_account_identity
 from tests.test_codex_auth import _auth, _jwt
 
 
@@ -294,6 +295,26 @@ def test_quit_timeout_does_not_write_target(tmp_path):
             "1", confirm_restart=True, confirm_idle=True
         )
     assert engine._live_text() == original
+
+
+def test_desktop_switch_refuses_worker_lease_before_quitting_app(tmp_path):
+    engine = setup_engine(tmp_path)
+    original = engine._live_text()
+    app = FakeApp()
+    store = AccountLeaseStore(engine.backup_dir, "codex")
+    store.acquire(
+        job_id="job-active",
+        account_identity=stable_account_identity("codex", "acc-b"),
+        worker_pid=123,
+        worker_epoch=1,
+        ttl_s=60,
+    )
+    with pytest.raises(LeaseConflictError):
+        DesktopSwitcher(engine, app).switch(
+            "1", confirm_restart=True, confirm_idle=True
+        )
+    assert engine._live_text() == original
+    assert not any(call[0] == "quit" for call in app.calls)
 
 
 def test_allows_ordinary_model_options_but_rejects_custom_provider(tmp_path):

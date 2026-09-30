@@ -83,30 +83,55 @@ def read_rate_limits(
     env = dict(os.environ if environ is None else environ)
     env.pop("OPENAI_API_KEY", None)
     env[CODEX_HOME_ENV] = str(home)
-    proc = popen(
-        [codex_bin, "app-server"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, env=env, cwd=str(home),
-    )
+    try:
+        proc = popen(
+            [codex_bin, "app-server"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, env=env, cwd=str(home),
+        )
+    except OSError as exc:
+        # Popen failed before creating a process, so callers may release this
+        # short reservation with explicit unlaunched evidence.
+        exc._openswap_unlaunched = True
+        raise
     killer = threading.Timer(timeout, getattr(proc, "kill", lambda: None))
     killer.start()
+    failure = None
     try:
         _send(proc, {"id": 1, "method": "initialize", "params": {"clientInfo": CLIENT_INFO}})
         _await(proc, 1)
         _send(proc, {"method": "initialized"})
         _send(proc, {"id": 2, "method": "account/rateLimits/read", "params": {}})
         result = _await(proc, 2)
+    except BaseException as exc:
+        failure = exc
     finally:
         killer.cancel()
+        stopped = False
         try:
             proc.terminate()
             proc.wait(timeout=5)
+            stopped = True
         except Exception:
             try:
                 proc.kill()
+                proc.wait(timeout=5)
+                stopped = True
             except Exception:
-                pass
+                stopped = False
+    if failure is not None:
+        failure._openswap_process_stopped = stopped
+        raise failure
+    # Owner decision (plan 017): as for a kickoff ping, the direct app-server
+    # child's exit is the stop evidence for this short usage read; a helper it
+    # detached could outlive it (the documented best-effort process-tree limit).
+    if not stopped:
+        error = CodexUsageError("app-server stop could not be confirmed")
+        error._openswap_process_stopped = False
+        raise error
     limits = result.get("rateLimits")
     if not isinstance(limits, dict):
-        raise CodexUsageError("app-server reply had no rateLimits")
+        error = CodexUsageError("app-server reply had no rateLimits")
+        error._openswap_process_stopped = stopped
+        raise error
     return limits

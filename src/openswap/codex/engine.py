@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -23,6 +24,7 @@ from openswap.exceptions import (
     AccountNotFoundError,
     ClaudeSwitchError,
     ConfigError,
+    LockError,
     ValidationError,
 )
 from openswap.json_output import SCHEMA_VERSION, USAGE_API_KEY, USAGE_NO_CREDENTIALS, account_row
@@ -39,6 +41,12 @@ from openswap.printer import accent, bolded, dimmed, muted
 from openswap.settings import atomic_write_json
 from openswap.usage_store import FetchRecord, UsageEntry, UsageStore, with_sentinel
 from openswap.engine.notes import _usage_entry_lines
+from openswap.worker.leases import (
+    AccountLeaseStore,
+    AccountLeaseError,
+    ReleaseEvidence,
+    stable_account_identity,
+)
 
 
 class CodexAuthError(ClaudeSwitchError):
@@ -235,17 +243,16 @@ class CodexEngine:
         a different slot, or the roster lock is busy. Skips the write when
         the slot already holds a newer ``last_refresh`` generation.
         """
-        lock = self._lock()
-        if not lock.acquire():
-            return False
         try:
-            live = self._live_text()
-            if self._live_slot(live) != str(num):
-                return False
-            self._write_slot_from_live(num, live)
-            return True
-        finally:
-            lock.release()
+            with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as guard:
+                guard.assert_unleased()
+                live = self._live_text()
+                if self._live_slot(live) != str(num):
+                    return False
+                self._write_slot_from_live(num, live)
+                return True
+        except (AccountLeaseError, LockError):
+            return False
 
     # -- identity / roster lookups -------------------------------------------
 
@@ -322,16 +329,53 @@ class CodexEngine:
     def set_poll_policy_inputs(self, threshold: float, models: tuple[str, ...]) -> None:
         self._poll_inputs = (threshold, models)
 
+    def _read_limits_with_lease(
+        self, number: str, home: Path, account_id: str, codex_bin: str
+    ) -> dict:
+        """Run app-server only after reserving the stable account identity."""
+        store = AccountLeaseStore(self.backup_dir, "codex", clock=self.clock)
+        with store.mutation_guard() as guard:
+            guard.assert_available()
+            record = self._record(self._read_roster(), number)
+            if record.get("accountId") != account_id:
+                raise CodexAuthError("The Codex account changed before its usage probe.")
+            if home == self.home:
+                live_identity = parse_auth(self._live_text())
+                if live_identity is None or live_identity.account_id != account_id:
+                    raise CodexAuthError("The live Codex account changed before its usage probe.")
+            elif home.resolve() != self._slot_dir(number).resolve():
+                raise CodexAuthError("The Codex slot changed before its usage probe.")
+            token = guard.acquire(
+                job_id=f"usage-{uuid.uuid4().hex}",
+                account_identity=stable_account_identity("codex", account_id),
+                worker_pid=os.getpid(),
+                worker_epoch=time.time_ns(),
+                ttl_s=60.0,
+            )
+        try:
+            result = self._read_limits(home, codex_bin=codex_bin)
+        except BaseException as exc:
+            if getattr(exc, "_openswap_unlaunched", False):
+                store.release(token, ReleaseEvidence.UNLAUNCHED)
+            elif getattr(exc, "_openswap_process_stopped", False):
+                store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+            else:
+                store.mark_uncertain(token, "usage_outcome_unknown")
+            raise
+        store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+        return result
+
     # -- mutations ------------------------------------------------------------
 
     def add_account(self, alias: str | None = None) -> str:
-        live = self._live_text()
-        ident = parse_auth(live)
-        if ident is None:
-            raise CodexAuthError(
-                f"No Codex login found at {auth_path(self.home)}. Run 'codex login' first."
-            )
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as guard:
+            guard.assert_unleased()
+            live = self._live_text()
+            ident = parse_auth(live)
+            if ident is None:
+                raise CodexAuthError(
+                    f"No Codex login found at {auth_path(self.home)}. Run 'codex login' first."
+                )
             data = self._read_roster()
             existing = self._find_slot(ident, live)
             if existing is not None:
@@ -378,7 +422,10 @@ class CodexEngine:
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
 
-        with self._lock():
+        # The lease guard holds the same provider lock as ``_lock()``: a leased
+        # account's roster must not change under a worker, usage read or kickoff.
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             if self.sequence_file.exists():
                 try:
                     data = json.loads(self.sequence_file.read_text(encoding="utf-8"))
@@ -461,7 +508,8 @@ class CodexEngine:
             return num
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             num, _email, _acc = self.resolve_account(identifier)
             data = self._read_roster()
             rec = self._record(data, num)
@@ -479,7 +527,8 @@ class CodexEngine:
             normalized = normalize_alias(alias)
         except ValueError as e:
             raise ValidationError(str(e)) from e
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             num, _email, _acc = self.resolve_account(identifier)
             data = self._read_roster()
             rec = self._record(data, num)
@@ -496,7 +545,8 @@ class CodexEngine:
             return num, normalized
 
     def unset_alias(self, identifier: str) -> str:
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             num, _email, _acc = self.resolve_account(identifier)
             data = self._read_roster()
             rec = self._record(data, num)
@@ -525,7 +575,8 @@ class CodexEngine:
             if confirm.lower() != "y":
                 print(dimmed("Cancelled"))
                 return
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             num, email, _acc = self.resolve_account(identifier)
             data = self._read_roster()
             accounts = dict(data.get("accounts") or {})
@@ -607,7 +658,8 @@ class CodexEngine:
 
     def swap_accounts(self, first: str, second: str) -> tuple[str, str]:
         """Exchange two Codex accounts' slot numbers under the roster lock."""
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             return self._swap_accounts_locked(first, second)
 
     def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
@@ -654,7 +706,8 @@ class CodexEngine:
                 "(use `swap` to trade two accounts by identifier)"
             )
         target = str(int(target))
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             num_src, _email, _acc = self.resolve_account(account)
             data = self._read_roster()
             accounts = data.get("accounts") or {}
@@ -712,7 +765,8 @@ class CodexEngine:
         self, identifier: str, json_output: bool = False, force: bool = False,
         *, automatic: bool = False,
     ) -> dict | None:
-        with self._lock():
+        with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             # Recheck under the same lock as desktop switching: an auto tick
             # already in flight must not overwrite the operator's selection
             # after they disable rotation for an experimental desktop test.
@@ -928,7 +982,9 @@ class CodexEngine:
                 live_before = self._live_text() if home == self.home else None
                 fetched_ok = False
                 try:
-                    limits = self._read_limits(home, codex_bin=bin_path)
+                    limits = self._read_limits_with_lease(
+                        num, home, identities[num][1], codex_bin=bin_path
+                    )
                     usage = rate_limits_to_usage(limits, now)
                     records[num] = FetchRecord(usage=usage, error=None)
                     fetched_ok = True

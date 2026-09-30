@@ -18,6 +18,7 @@ from openswap.codex.auth import parse_auth
 from openswap.exceptions import AccountNotFoundError, TransferError
 from openswap.fsutil import replace_with_retry
 from openswap.models import Platform, get_timestamp, normalize_alias
+from openswap.worker.leases import AccountLeaseStore
 
 if TYPE_CHECKING:
     from openswap.codex.engine import CodexEngine
@@ -400,7 +401,8 @@ def import_accounts(
     )
     resolved_active_slot: str | None = None
 
-    with engine._lock():
+    with AccountLeaseStore(engine.backup_dir, "codex").mutation_guard() as lease_guard:
+        lease_guard.assert_unleased()
         data = dict(engine._read_roster())
         accounts_map = dict(data.get("accounts") or {})
         data["accounts"] = accounts_map

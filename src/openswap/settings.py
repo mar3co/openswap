@@ -16,6 +16,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from pathlib import Path
 
 from openswap.exceptions import ConfigError
 from openswap.fsutil import replace_with_retry
+from openswap.locking import FileLock
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -68,6 +70,25 @@ class UiSettings:
     color theme; ``auto`` follows terminal-background detection."""
 
     theme: str = "auto"
+
+
+@dataclass(frozen=True)
+class WorkerWorkspace:
+    """Locally approved mapping; never selected by remote task fields."""
+
+    workspace_id: str
+    output_root: Path
+    readonly_roots: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
+class WorkerSettings:
+    """Explicit local-worker policy. Both controls default to fail-closed."""
+
+    enabled: bool = False
+    paused: bool = False
+    pinned_account_ref: str | None = None
+    workspaces: tuple[WorkerWorkspace, ...] = ()
 
 
 _SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
@@ -162,6 +183,10 @@ _AUTOSWITCH_KEYS: dict[str, str] = {
 
 def settings_path(backup_root: Path) -> Path:
     return backup_root / SETTINGS_FILENAME
+
+
+def _settings_write_lock(backup_root: Path) -> FileLock:
+    return FileLock(backup_root / ".settings.lock")
 
 
 def parse_model_names(value: str | None) -> tuple[str, ...]:
@@ -267,18 +292,196 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
     return _ui_from_raw(_read_raw(settings_path(backup_root)))
 
 
+_WORKSPACE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_PINNED_ACCOUNT_RE = re.compile(r"^codex:[0-9a-f]{64}$")
+
+
+def _default_worker_workspace(backup_root: Path) -> WorkerWorkspace:
+    return WorkerWorkspace(
+        workspace_id="research",
+        output_root=(Path(backup_root) / "worker" / "research").resolve(),
+    )
+
+
+def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
+    section = raw.get("worker")
+    if not isinstance(section, dict):
+        return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
+    enabled = section.get("enabled", False)
+    paused = section.get("paused", False)
+    if type(enabled) is not bool or type(paused) is not bool:
+        _logger.warning("settings.json worker policy is invalid; disabling the worker")
+        return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
+    pinned = section.get("pinnedAccountRef")
+    if pinned is not None and (not isinstance(pinned, str) or not _PINNED_ACCOUNT_RE.fullmatch(pinned)):
+        _logger.warning("settings.json worker account reference is invalid; disabling the worker")
+        return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
+    raw_workspaces = section.get("workspaces")
+    workspaces: list[WorkerWorkspace] = []
+    if raw_workspaces is None:
+        workspaces = [_default_worker_workspace(backup_root)]
+    elif isinstance(raw_workspaces, dict) and len(raw_workspaces) <= 16:
+        try:
+            for workspace_id, config in raw_workspaces.items():
+                if not isinstance(workspace_id, str) or not _WORKSPACE_ID_RE.fullmatch(workspace_id):
+                    raise ValueError
+                if not isinstance(config, dict):
+                    raise ValueError
+                root_text = config.get("outputRoot")
+                readonly_text = config.get("readonlyRoots", [])
+                if (not isinstance(root_text, str) or len(root_text) > 2048
+                        or not Path(root_text).is_absolute()
+                        or not isinstance(readonly_text, list) or len(readonly_text) > 16
+                        or any(not isinstance(item, str) or len(item) > 2048
+                               or not Path(item).is_absolute() for item in readonly_text)):
+                    raise ValueError
+                output = Path(root_text).resolve()
+                readonly = tuple(Path(item).resolve() for item in readonly_text)
+                if any(
+                    output == root or output.is_relative_to(root) or root.is_relative_to(output)
+                    for root in readonly
+                ):
+                    raise ValueError
+                workspaces.append(WorkerWorkspace(workspace_id, output, readonly))
+        except (TypeError, ValueError, OSError):
+            _logger.warning("settings.json worker workspace registry is invalid; disabling the worker")
+            return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
+    else:
+        _logger.warning("settings.json worker workspace registry is invalid; disabling the worker")
+        return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
+    if not workspaces:
+        _logger.warning("settings.json worker workspace registry is empty; disabling the worker")
+        return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
+    return WorkerSettings(
+        enabled=enabled,
+        paused=paused,
+        pinned_account_ref=pinned,
+        workspaces=tuple(workspaces),
+    )
+
+
+def load_worker_settings(backup_root: Path) -> WorkerSettings:
+    """Read default-off worker policy without creating directories or files."""
+    return _worker_from_raw(_read_raw(settings_path(backup_root)), Path(backup_root))
+
+
+def update_worker_settings(
+    backup_root: Path,
+    *,
+    enabled: bool | None = None,
+    paused: bool | None = None,
+) -> WorkerSettings:
+    """Atomically update explicit worker policy while preserving other settings."""
+    if enabled is not None and type(enabled) is not bool:
+        raise ValueError("enabled must be a bool or None")
+    if paused is not None and type(paused) is not bool:
+        raise ValueError("paused must be a bool or None")
+    path = settings_path(backup_root)
+    with _settings_write_lock(backup_root):
+        raw = _read_raw_for_write(path)
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        section = raw.get("worker")
+        if not isinstance(section, dict):
+            section = {}
+        current = _worker_from_raw(raw, Path(backup_root))
+        if not isinstance(section.get("workspaces"), dict):
+            section["workspaces"] = {
+                workspace.workspace_id: {
+                    "outputRoot": str(workspace.output_root),
+                    "readonlyRoots": [str(root) for root in workspace.readonly_roots],
+                }
+                for workspace in current.workspaces
+            }
+        section.setdefault("pinnedAccountRef", current.pinned_account_ref)
+        section["enabled"] = current.enabled if enabled is None else enabled
+        section["paused"] = current.paused if paused is None else paused
+        raw["worker"] = section
+        atomic_write_json(path, raw)
+        return _worker_from_raw(raw, Path(backup_root))
+
+
+def configure_worker_local_policy(
+    backup_root: Path,
+    *,
+    pinned_account_ref: str | None,
+    workspaces: tuple[WorkerWorkspace, ...],
+) -> WorkerSettings:
+    """Persist locally approved opaque account/workspace references.
+
+    This is a local configuration API only. Job submissions and IPC cannot
+    override the pinned account or supply paths.
+    """
+    if pinned_account_ref is not None and (
+        not isinstance(pinned_account_ref, str)
+        or not _PINNED_ACCOUNT_RE.fullmatch(pinned_account_ref)
+    ):
+        raise ValueError("pinned account reference is invalid")
+    if not isinstance(workspaces, tuple) or not 1 <= len(workspaces) <= 16:
+        raise ValueError("one to sixteen approved workspaces are required")
+    ids: set[str] = set()
+    encoded: dict[str, dict[str, object]] = {}
+    for workspace in workspaces:
+        if (not isinstance(workspace, WorkerWorkspace)
+                or not isinstance(workspace.workspace_id, str)
+                or not _WORKSPACE_ID_RE.fullmatch(workspace.workspace_id)
+                or workspace.workspace_id in ids):
+            raise ValueError("workspace identifiers must be unique bounded names")
+        ids.add(workspace.workspace_id)
+        output = Path(workspace.output_root)
+        readonly = tuple(Path(path) for path in workspace.readonly_roots)
+        if not output.is_absolute() or len(str(output)) > 2048:
+            raise ValueError("workspace output root must be an absolute local path")
+        if len(readonly) > 16 or any(not path.is_absolute() or len(str(path)) > 2048 for path in readonly):
+            raise ValueError("read-only roots must be bounded absolute paths")
+        resolved_output = output.resolve()
+        resolved_readonly = tuple(path.resolve() for path in readonly)
+        if any(
+            resolved_output == path
+            or resolved_output.is_relative_to(path)
+            or path.is_relative_to(resolved_output)
+            for path in resolved_readonly
+        ):
+            raise ValueError("writable output and read-only roots must be disjoint")
+        encoded[workspace.workspace_id] = {
+            "outputRoot": str(resolved_output),
+            "readonlyRoots": [str(path) for path in resolved_readonly],
+        }
+    path = settings_path(backup_root)
+    with _settings_write_lock(backup_root):
+        raw = _read_raw_for_write(path)
+        section = raw.get("worker")
+        if not isinstance(section, dict):
+            section = {}
+        section["pinnedAccountRef"] = pinned_account_ref
+        section["workspaces"] = encoded
+        section.setdefault("enabled", False)
+        section.setdefault("paused", False)
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        raw["worker"] = section
+        parsed = _worker_from_raw(raw, Path(backup_root))
+        if parsed.workspaces != tuple(
+            WorkerWorkspace(workspace_id, Path(config["outputRoot"]),
+                            tuple(Path(item) for item in config["readonlyRoots"]))
+            for workspace_id, config in encoded.items()
+        ) or parsed.pinned_account_ref != pinned_account_ref:
+            raise ValueError("worker local policy failed validation")
+        atomic_write_json(path, raw)
+        return parsed
+
+
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)
-    raw = _read_raw(path)
-    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
-    section = raw.get("autoswitch")
-    if not isinstance(section, dict):
-        section = {}
-    for field, json_key in _AUTOSWITCH_KEYS.items():
-        section[json_key] = getattr(settings, field)
-    raw["autoswitch"] = section
-    atomic_write_json(path, raw)
+    with _settings_write_lock(backup_root):
+        raw = _read_raw(path)
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        section = raw.get("autoswitch")
+        if not isinstance(section, dict):
+            section = {}
+        for field, json_key in _AUTOSWITCH_KEYS.items():
+            section[json_key] = getattr(settings, field)
+        raw["autoswitch"] = section
+        atomic_write_json(path, raw)
 
 
 def setting_spec(dotted_key: str) -> SettingSpec:
@@ -393,14 +596,15 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     spec = setting_spec(dotted_key)
     value = parse_setting_value(spec, raw_value)
     path = settings_path(backup_root)
-    raw = _read_raw_for_write(path)
-    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
-    section = raw.get(spec.section)
-    if not isinstance(section, dict):
-        section = {}
-    section[spec.json_key] = value
-    raw[spec.section] = section
-    atomic_write_json(path, raw)
+    with _settings_write_lock(backup_root):
+        raw = _read_raw_for_write(path)
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        section = raw.get(spec.section)
+        if not isinstance(section, dict):
+            section = {}
+        section[spec.json_key] = value
+        raw[spec.section] = section
+        atomic_write_json(path, raw)
     return value
 
 
@@ -408,16 +612,17 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     """Remove one key from settings.json; False if it wasn't set (no write)."""
     spec = setting_spec(dotted_key)
     path = settings_path(backup_root)
-    raw = _read_raw_for_write(path)
-    section = raw.get(spec.section)
-    if not isinstance(section, dict) or spec.json_key not in section:
-        return False
-    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
-    del section[spec.json_key]
-    if not section:
-        del raw[spec.section]
-    atomic_write_json(path, raw)
-    return True
+    with _settings_write_lock(backup_root):
+        raw = _read_raw_for_write(path)
+        section = raw.get(spec.section)
+        if not isinstance(section, dict) or spec.json_key not in section:
+            return False
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        del section[spec.json_key]
+        if not section:
+            del raw[spec.section]
+        atomic_write_json(path, raw)
+        return True
 
 
 def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, bool]]:

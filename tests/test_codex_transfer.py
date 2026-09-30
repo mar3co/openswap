@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from openswap.exceptions import TransferError
+from openswap.worker.leases import AccountLeaseStore, LeaseConflictError, stable_account_identity
 from openswap.codex.transfer import export_accounts, import_accounts
 from tests.test_codex_auth import _auth
 from tests.test_codex_engine import _engine, _login
@@ -66,6 +67,25 @@ def test_export_import_round_trip_two_oauth_slots(tmp_path):
     assert json.loads(dst._slot_text("1"))["tokens"]["refresh_token"] == "rt-a"
     assert json.loads(dst._slot_text("2"))["tokens"]["refresh_token"] == "rt-b"
     assert not (dst_home / "auth.json").exists()
+
+
+def test_import_cannot_overwrite_slot_while_worker_lease_is_active(tmp_path):
+    src, _ = _two_oauth_slots(tmp_path / "src")
+    envelope = tmp_path / "bundle.json"
+    export_accounts(src, str(envelope), account="1")
+    dst, _ = _two_oauth_slots(tmp_path / "dst")
+    before = dst._slot_text("1")
+    store = AccountLeaseStore(dst.backup_dir, "codex")
+    store.acquire(
+        job_id="job-active",
+        account_identity=stable_account_identity("codex", "acc-1"),
+        worker_pid=123,
+        worker_epoch=1,
+        ttl_s=60,
+    )
+    with pytest.raises(LeaseConflictError):
+        import_accounts(dst, str(envelope), force=True)
+    assert dst._slot_text("1") == before
 
 
 def test_export_import_round_trip_multiple_api_keys(tmp_path):

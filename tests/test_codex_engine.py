@@ -6,6 +6,7 @@ import sys
 import pytest
 from openswap.codex.engine import CodexEngine, CodexAuthError, CodexSwitchError
 from openswap.exceptions import ConfigError, ValidationError
+from openswap.worker.leases import AccountLeaseStore, LeaseConflictError, stable_account_identity
 from openswap.engine.protocol import AccountEngine
 from openswap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from tests.test_codex_auth import _auth
@@ -83,6 +84,58 @@ def test_switch_to_writes_live_and_captures_outgoing(tmp_path):
     assert "rt-a1" in (home / "auth.json").read_text()
     assert "rt-b2" in (eng.slots_dir / "2" / "auth.json").read_text()   # newest generation kept
     assert eng.current_account_number() == "1"
+
+
+def test_worker_lease_blocks_codex_switch_and_roster_mutations(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a"); eng.add_account()
+    _login(home, email="b@x.com", account_id="acc-b"); eng.add_account()
+    live_before = eng._live_text()
+    roster_before = eng.sequence_file.read_bytes()
+    store = AccountLeaseStore(eng.backup_dir, "codex")
+    token = store.acquire(
+        job_id="job-active",
+        account_identity=stable_account_identity("codex", "acc-a"),
+        worker_pid=123,
+        worker_epoch=1,
+        ttl_s=60,
+    )
+    with pytest.raises(LeaseConflictError):
+        eng.switch_to("1", json_output=True)
+    with pytest.raises(LeaseConflictError):
+        eng.set_account_disabled("1", True)
+    with pytest.raises(LeaseConflictError):
+        eng.set_alias("1", "work")
+    with pytest.raises(LeaseConflictError):
+        eng.unset_alias("1")
+    with pytest.raises(LeaseConflictError):
+        eng.move_account("1", "3")
+    with pytest.raises(LeaseConflictError):
+        eng.swap_accounts("1", "2")
+    with pytest.raises(LeaseConflictError):
+        eng.remove_account("1", assume_yes=True)
+    with pytest.raises(LeaseConflictError):
+        eng.add_oauth_account(_auth(email="c@x.com", account_id="acc-c"))
+    assert eng._live_text() == live_before
+    assert eng.sequence_file.read_bytes() == roster_before
+    assert store.current().token() == token
+
+
+def test_worker_lease_skips_live_codex_usage_process(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a"); eng.add_account()
+    eng._test_calls.clear()
+    store = AccountLeaseStore(eng.backup_dir, "codex")
+    store.acquire(
+        job_id="job-active",
+        account_identity=stable_account_identity("codex", "acc-a"),
+        worker_pid=123,
+        worker_epoch=1,
+        ttl_s=60,
+    )
+    snapshot = eng.accounts_snapshot(fetch={"1"})
+    assert eng._test_calls == []
+    assert snapshot.accounts[0].usage.last_good is None
 
 def test_switch_to_same_slot_is_already_active(tmp_path):
     eng, home = _engine(tmp_path)

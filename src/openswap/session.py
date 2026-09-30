@@ -57,6 +57,7 @@ from openswap.paths import get_default_global_config_path
 from openswap.printer import dimmed, warning
 from openswap.process_detection import ClaudeSession, scan_sessions
 from openswap.settings import atomic_write_json
+from openswap.worker.leases import AccountLeaseStore
 
 if TYPE_CHECKING:
     from openswap.switcher import ClaudeAccountSwitcher
@@ -597,7 +598,10 @@ class SessionManager:
                     "continuing with the stored credentials."
                 )
 
-        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+        with AccountLeaseStore(self.switcher.backup_dir, "claude").mutation_guard(
+            timeout=_BOOTSTRAP_LOCK_TIMEOUT
+        ) as lease_guard:
+            lease_guard.assert_available()
             # Re-evaluate the marker under the lock, then re-check validity:
             # another setup_session may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):

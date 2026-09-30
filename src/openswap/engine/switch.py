@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from openswap.engine.notes import *  # noqa: F403
+from openswap.worker.leases import AccountLeaseStore
 
 class SwitchMixin:
     """Capture, activate, classify outgoing live bytes, shared MCP merge."""
@@ -399,7 +400,8 @@ class SwitchMixin:
             # on a race.
             self._reject_identity_drift_since_verify(identity)
 
-            with FileLock(self.lock_file):
+            with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+                lease_guard.assert_available()
                 seq = self._get_sequence_data() or {}
                 account_num = self._find_account_slot(
                     seq, current_email, current_org_uuid
@@ -532,7 +534,8 @@ class SwitchMixin:
         self._reject_identity_drift_since_verify(identity)
 
         prune_identity = None
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             data = self._get_sequence_data() or {
                 "activeAccountNumber": None,
                 "lastUpdated": "",
@@ -746,7 +749,8 @@ class SwitchMixin:
 
         # If the account already exists (same email, personal), refresh in place.
         if slot is None and self._account_exists(email, ""):
-            with FileLock(self.lock_file):
+            with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+                lease_guard.assert_available()
                 seq = self._get_sequence_data() or {}
                 account_num = self._find_account_slot(seq, email, "")
                 if account_num is None:
@@ -819,7 +823,8 @@ class SwitchMixin:
             account_num = str(self._get_next_account_number())
 
         prune_identity = None
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             data = self._get_sequence_data() or {
                 "activeAccountNumber": None,
                 "lastUpdated": "",
@@ -2015,7 +2020,12 @@ class SwitchMixin:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with (
+            AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard,
+            claude_credentials_lock(),
+            claude_config_lock(),
+        ):
+            lease_guard.assert_unleased()
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None

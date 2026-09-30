@@ -21,7 +21,12 @@ from pathlib import Path
 from openswap.codex.auth import parse_auth
 from openswap.exceptions import ConfigError
 from openswap.fsutil import replace_with_retry
-from openswap.settings import SETTINGS_SCHEMA_VERSION, atomic_write_json, settings_path
+from openswap.settings import (
+    SETTINGS_SCHEMA_VERSION,
+    _settings_write_lock,
+    atomic_write_json,
+    settings_path,
+)
 
 PAINT_COMMAND = "openswap statusline"
 LEGACY_PAINT_COMMAND = "cswap statusline"
@@ -298,17 +303,18 @@ def save_wrap(
     created: bool,
 ) -> None:
     path = settings_path(backup_root)
-    raw = _read_json_for_write(path)
-    if inner_command is None and not created:
-        raw.pop("statusline", None)
-    else:
-        raw["statusline"] = {
-            "innerCommand": inner_command,
-            "created": created,
-        }
-    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     backup_root.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, raw)
+    with _settings_write_lock(backup_root):
+        raw = _read_json_for_write(path)
+        if inner_command is None and not created:
+            raw.pop("statusline", None)
+        else:
+            raw["statusline"] = {
+                "innerCommand": inner_command,
+                "created": created,
+            }
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        atomic_write_json(path, raw)
 
 
 def is_our_command(command: str | None) -> bool:
