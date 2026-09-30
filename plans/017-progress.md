@@ -676,7 +676,8 @@ requirements. Production execution still uses `UnavailableCodexAdapter`.
 | 3d fixes merged into 3e (`c9ef38d`) | 3373 passed, 5 skipped | 152 passed |
 | 3e fixed head (`f74c6dc`) | 3419 passed, 5 skipped | 198 passed |
 | 3d round-two head (`e53d4b3`) | 3393 passed, 5 skipped | 172 passed (five modules; the e2e module lives in 3e) |
-| 3e round-two head (this PR's head) | 3450 passed, 5 skipped | 229 passed |
+| 3e round-two head (`0031697`) | 3450 passed, 5 skipped | 229 passed |
+| 3e round-three head (this PR's head) | 3482 passed, 5 skipped | not re-run serially |
 
 Full suites use `uv run pytest -q`; serial Phase 3 runs use `-n0` with the
 six Phase 3 test modules (the review pass added
@@ -698,9 +699,11 @@ applied bottom-up on the existing branches, each merged forward into the next
 (no force-push, no rebase), with a regression test per behavioural fix:
 3a `f210c97`, 3b `2e65e5e`, 3c `1df969c`, 3d `424d74e`, 3e `f74c6dc` in the
 first round. A second round answered the Codex re-review of those fixes the
-same way (each branch merged forward, one regression test per fix); the final
-heads are 3a `967b35f`, 3b `1994296`, 3c `64c7b02`, 3d `e53d4b3` and, for 3e,
-this PR's head. All five PRs are pending merge; nothing below is on `main` yet.
+same way (each branch merged forward, one regression test per fix), with heads
+3a `967b35f`, 3b `1994296`, 3c `64c7b02`, 3d `e53d4b3`, 3e `0031697`. A third
+round answered the next Codex re-review (3a `6c1b5ed`, 3b `eb13955`, 3c
+`b4aee58`, 3d `29d1da0`, 3e this PR's head). All five PRs are pending merge;
+nothing below is on `main` yet.
 
 HIGH bugs fixed:
 
@@ -766,6 +769,33 @@ Round two (Codex re-review of the fixes, same day) closed:
   refuses leap seconds; `runtime_limit()` enforces the 14,400 s bound and
   overflowing timestamps map to `invalid_request`; terminal `state_changed`
   events are stored, never applied.
+
+Round three (the next Codex re-review, same day) closed:
+
+- **Heartbeat deadline (3c, 3d).** Heartbeats are due on an absolute schedule
+  and lease renewal moved to its own `openswap-worker-remote-renew` thread, so
+  consecutive heartbeats reach the service at most one period plus one request
+  timeout apart. `ConfiguredRemote.run` does the same.
+- **Bindings per enrollment (3c, 3d).** The remote journal is keyed by service
+  URL and enrollment (worker ID, or a key digest without one), so a replacement
+  device paired against the same URL never inherits an unreadable binding.
+- **Provisional interruptions (3c).** An `interrupted` outcome without proof
+  keeps its binding pending while the job's account lease is still held or
+  quarantined; a later `confirmed_stopped` release is reconciled as confirmed.
+- **Re-pair of the same URL (3d).** Pairing records the worker ID in
+  `settings.json` and the launch commit refuses an authorization from any other
+  worker; the configured guard authorizes only while its captured client is
+  still the active one.
+- **Reference server (3b).** `register` clears the previous incarnation's
+  liveness; a late cancel leaves a confirmed interruption alone; only
+  `state_changed` events move the job; `cancel_job_ids` is capped at 100 (live
+  jobs first, then the newest unconfirmed interruptions).
+- Smaller items: `waiting_for_approval` fails closed at admission and in the
+  launch fence; service responses with duplicate keys or non-finite numbers
+  are refused; a `job` response must match the claim's ID and epoch; claim
+  expiry is judged on the service clock; offsets through `±23:59` are accepted;
+  `validate_url` drops default ports; `unpair <url>` says when only an orphan
+  was removed; a `submit-test` retry has no age limit on a past expiry.
 
 Still open after this pass (design gaps, not regressions):
 

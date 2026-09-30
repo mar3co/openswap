@@ -218,6 +218,13 @@ def test_resolve_expiry_requires_exactly_one_bounded_form(kwargs):
         resolve_expiry(**kwargs)
 
 
+def test_resolve_expiry_allows_any_past_expiry_for_a_retry_but_still_caps_the_future():
+    long_ago = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    assert resolve_expiry(expires_at=long_ago, allow_past=True) == long_ago
+    with pytest.raises(ProtocolError, match="invalid_request"):
+        resolve_expiry(expires_at="2999-01-01T00:00:00Z", allow_past=True)
+
+
 def test_resolve_expiry_round_trips_the_printed_stamp():
     later = resolve_expiry(expires_in=600)
     assert resolve_expiry(expires_at=stamp(later)) == later
@@ -364,3 +371,19 @@ def test_submit_test_cli_shell_quotes_the_retry_hint(tmp_path, keychain, monkeyp
     retry = [a for a in arguments if a not in {"--expires-in", "600"}]
     assert cli.main([*retry, "--expires-at", hint[3]], backup_root=root) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "queued"
+
+
+def test_submit_test_retry_days_after_the_original_expiry_returns_the_original_job(tmp_path, keychain):
+    ticks = [datetime.now(timezone.utc).timestamp() - 3 * 86400]  # accepted three days ago
+    store = ControlStore(tmp_path / "service" / "db", clock=lambda: ticks[0])
+    root, url = tmp_path / "local", "http://127.0.0.1:8765"
+    pairing.pair(root, url, store.issue_code(), transport=StoreTransport(store, None))
+    transport = StoreTransport(store, load_enrollment(url).device_key)
+    transport.request("register", {})
+    transport.request("heartbeat", {"worker_epoch": 1})
+    expires_at = stamp(datetime.fromtimestamp(ticks[0] + 600, timezone.utc))
+    same = dict(_arguments(url, expires_in=None, expires_at=expires_at), idempotency_key="old-retry")
+    original = submit_test(root, **same, transport=transport)  # service time: expiry still ahead
+    ticks[0] = datetime.now(timezone.utc).timestamp()
+    transport.request("heartbeat", {"worker_epoch": 1})
+    assert submit_test(root, **same, transport=transport)["job_id"] == original["job_id"]

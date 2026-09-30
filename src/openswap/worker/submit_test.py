@@ -32,8 +32,12 @@ def resolve_expiry(*, expires_in: float | None = None, expires_at: datetime | st
         return now + timedelta(seconds=expires_in)
     if isinstance(expires_at, str):
         expires_at = timestamp(expires_at)
-    if (not isinstance(expires_at, datetime) or expires_at.tzinfo is None
-            or not (-86400 if allow_past else 0) < (expires_at - now).total_seconds() <= 86400):
+    if not isinstance(expires_at, datetime) or expires_at.tzinfo is None:
+        raise ProtocolError("invalid_request")
+    # A retry's past expiry has no age limit: the service keeps the idempotency
+    # record, so even a job accepted long ago can still be recovered by its key.
+    ahead = (expires_at - now).total_seconds()
+    if ahead > 86400 or (ahead <= 0 and not allow_past):
         raise ProtocolError("invalid_request")
     return expires_at
 
