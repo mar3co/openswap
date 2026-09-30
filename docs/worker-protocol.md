@@ -121,6 +121,9 @@ moves `queued` to `claimed`. Uploaded safe `state_changed` events report
 of claimed/starting/running sets `cancel_requested`, propagated by heartbeat
 and renew/job reads. The separate `cancel_requested` flag persists even when
 heartbeat loss changes the state to `interrupted`; reconnect must enforce it.
+A worker-uploaded `state_changed` event to `cancel_requested` sets the same
+flag. `heartbeat` lists only jobs whose flag still needs enforcement (claimed,
+starting, running, cancel_requested or interrupted), never finished ones.
 Repeated cancellation is idempotent. A terminal outcome
 is not overwritten by a late cancel. A cancel request is never stop proof.
 
@@ -192,16 +195,21 @@ Errors are JSON `{"error":"code"}` without exception details. HTTP 400:
 `unauthorized`, `device_expired`; 403: `revoked`, `forbidden`; 404: `not_found`,
 `unsupported_version`; 409: `offline_worker`, `idempotency_conflict`,
 `stale_epoch`, `lease_lost`, `cursor_conflict`, `artifact_conflict`, `queue_full`;
-413: `body_too_large`, `artifact_too_large`, `artifact_limit`; 503:
-`service_unavailable`. Retry transport/503 failures with bounded polling, not
-mutations under new idempotency keys. Treat 401/403 as no new admission.
+413: `body_too_large`, `artifact_too_large`, `artifact_limit`; 500/503:
+`service_unavailable`. Non-`POST` methods return 405 `invalid_request`. A job
+belonging to another owner is reported as `not_found`, never `forbidden`, so
+job IDs cannot be probed for existence. Except for `pair`, a missing or
+malformed `Authorization` header is refused before the body is read. Retry
+transport/503 failures with bounded polling, not mutations under new
+idempotency keys. Treat 401/403 as no new admission.
 
 Enrollment, codes, epochs, jobs, events and artifact bytes are durable in
 SQLite. Reference queue limit: 20 queued jobs per worker. The reference service
 retains data until its operator deletes the stopped service's private database
 and backups; there is no automatic retention or network deletion API in v1.
 Revocation removes access, not data. Operators own retention, deletion, backups
-and TLS termination. Run with `umask 077` in an owner-private state directory:
+and TLS termination. Run in an owner-private state directory; the CLI applies
+`umask 077` itself so SQLite journal sidecars stay owner-private:
 
 ```sh
 openswap worker refserver pair-code --database /private/path/pilot.sqlite3
