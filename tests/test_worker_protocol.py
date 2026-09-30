@@ -112,6 +112,19 @@ def test_runtime_limit_normalization_is_canonical():
             Submission.from_dict({**payload, "runtime_limit_s": bad})
 
 
+@pytest.mark.parametrize("bad", [10 ** 310, 0, -1, 14_401, 14_400.5, float("inf"), float("nan"), True])
+def test_runtime_limit_bounds_are_wire_errors(bad):
+    payload = submission().to_dict()
+    with pytest.raises(ProtocolError, match="invalid_request"):
+        Submission.from_dict({**payload, "runtime_limit_s": bad})
+
+
+@pytest.mark.parametrize("value", ["0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-14:00"])
+def test_out_of_range_utc_instants_are_wire_errors(value):
+    with pytest.raises(ProtocolError, match="invalid_request"):
+        timestamp(value)
+
+
 def test_wire_timestamps_use_z_like_models():
     request = submission()
     expected = _iso(request.job.expires_at)

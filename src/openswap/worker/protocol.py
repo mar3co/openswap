@@ -6,10 +6,11 @@ from datetime import datetime, timezone
 import base64
 import hashlib
 import ipaddress
+import math
 import re
 from urllib.parse import urlsplit
 
-from openswap.worker.models import JobSubmission, JobState, SafeEvent, SafeEventKind
+from openswap.worker.models import MAX_JOB_RUNTIME_SECONDS, JobSubmission, JobState, SafeEvent, SafeEventKind
 from openswap.worker.journal import validate_event_fields
 
 VERSION = 1
@@ -62,9 +63,11 @@ def timestamp(value: object) -> datetime:
         raise ProtocolError("invalid_request")
     try:
         parsed = datetime.fromisoformat(raw[:10] + "T" + raw[11:].upper().replace("Z", "+00:00"))
-    except ValueError:
+        # Instants whose UTC form leaves the representable range (year 1 or
+        # 9999 at an extreme offset) are wire errors, not internal ones.
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         raise ProtocolError("invalid_request") from None
-    return parsed.astimezone(timezone.utc)
 
 
 def stamp(value: datetime) -> str:
@@ -104,8 +107,15 @@ def validate_url(url: object) -> str:
 
 
 def runtime_limit(value: object) -> int | float:
-    """Normalize the runtime limit so 600 and 600.0 share one canonical wire form."""
-    if type(value) not in (int, float):
+    """Normalize the runtime limit so 600 and 600.0 share one canonical wire form.
+
+    The documented bound (finite, greater than zero, at most 14,400 s) is
+    enforced here, before model construction, so an oversized integer cannot
+    overflow the model's float check.
+    """
+    if type(value) not in (int, float) or (isinstance(value, float) and not math.isfinite(value)):
+        raise ProtocolError("invalid_request")
+    if not 0 < value <= MAX_JOB_RUNTIME_SECONDS:
         raise ProtocolError("invalid_request")
     return int(value) if isinstance(value, float) and value.is_integer() else value
 
