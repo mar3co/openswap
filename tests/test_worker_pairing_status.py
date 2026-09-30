@@ -454,3 +454,74 @@ def test_unpair_before_the_launch_commit_never_starts(remote_setup, keychain):
     local = _claimed_row(remote_setup, "three")
     runtime.remote_launch_guard = remote.launch_allowed
     assert runtime.reconcile_once().state.value == "succeeded" and adapter.starts == 1
+
+
+@pytest.mark.parametrize("spelling, origin", [
+    ("https://Example.com:443", "https://example.com"), ("https://example.com:443/", "https://example.com"),
+    ("http://localhost:80", "http://localhost"), ("http://[::1]:80", "http://[::1]"),
+    ("https://example.com:", "https://example.com"), ("https://example.com:8443", "https://example.com:8443"),
+])
+def test_default_ports_hash_to_one_enrollment(spelling, origin):
+    from openswap.worker.protocol import validate_url
+    assert validate_url(spelling) == origin
+    assert pairing.account_name(spelling) == pairing.account_name(origin)
+
+
+def test_unpair_with_the_default_port_spelled_out(tmp_path, keychain):
+    pairing.pair(tmp_path, "https://control.example", "one-use", transport=PairTransport())
+    assert pairing.unpair(tmp_path, "https://control.example:443") is True
+    assert not keychain and load_worker_settings(tmp_path).control_service_url is None
+
+
+def test_pairing_records_the_worker_id_and_unpair_clears_it(tmp_path, keychain):
+    pairing.pair(tmp_path, "http://localhost:8765", "one-use", transport=PairTransport())
+    assert load_worker_settings(tmp_path).control_service_worker_id == "worker"
+    pairing.unpair(tmp_path)
+    assert load_worker_settings(tmp_path).control_service_worker_id is None
+    assert "controlServiceWorkerId" not in (tmp_path / "settings.json").read_text()
+
+
+def test_repair_of_the_same_url_refuses_the_old_enrollments_authorization(remote_setup):
+    """Unpair then re-pair the same URL between the guard and the commit point."""
+    from openswap.worker.models import RemoteAuthorization
+    remote, runtime, adapter, _, _, _, _ = remote_setup
+    configure_worker_service(runtime.backup_root, remote.url, "old-worker")
+    local = _claimed_row(remote_setup, "one")
+
+    def guard(job_id):
+        configure_worker_service(runtime.backup_root, remote.url, "new-worker")  # the re-pair
+        return RemoteAuthorization(remote.url, "old-worker")
+
+    runtime.remote_launch_guard = guard
+    result = runtime.reconcile_once()
+    assert (result.job_id, result.state.value, result.diagnostic_code) == (local.job_id, "failed", "worker_disabled")
+    assert adapter.starts == 0
+
+
+def test_configured_guard_refuses_a_client_replaced_during_the_keychain_read(remote_setup):
+    remote, runtime, adapter, store, _, paired, _ = remote_setup
+    old = _enrollment(paired)
+    configured = ConfiguredRemote(runtime, client_factory=lambda *_, **__: remote, enrollment_loader=lambda _: old)
+    configured.tick()
+    local = _claimed_row(remote_setup, "one")
+    replacement = pairing.Enrollment("new-worker", "new-key", old.expires_at)
+
+    def repaired(url):
+        # Unpair and re-pair land while the guard waits on the Keychain: the heartbeat
+        # thread installs a new client for the new enrollment.
+        configured._set_client(object(), (url, replacement))
+        return replacement
+
+    configured.enrollment_loader = repaired
+    assert configured.launch_allowed(local.job_id) is False
+
+
+def test_unpair_cli_reports_when_the_configured_service_stays_active(tmp_path, keychain, capsys):
+    pairing.pair(tmp_path, "http://localhost:8765", "one-use", transport=PairTransport())
+    keychain[("openswap", pairing.account_name("https://old.example"))] = "{}"
+    assert cli.main(["unpair", "https://old.example"], backup_root=tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "remote access disabled" not in out and "unchanged" in out
+    assert load_worker_settings(tmp_path).control_service_url == "http://localhost:8765"
+    assert cli.main(["unpair"], backup_root=tmp_path) == 0
+    assert "remote access disabled" in capsys.readouterr().out

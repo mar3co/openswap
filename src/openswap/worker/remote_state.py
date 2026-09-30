@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import threading
+import time
 
 from openswap.settings import atomic_write_json, load_worker_settings
 from openswap.worker.models import RemoteConnectivity
@@ -46,11 +47,11 @@ def read_status(root, *, now=None):
 class ConfiguredRemote:
     """Reload the URL/key on each poll; unpair prevents new work immediately.
 
-    ``run`` mirrors ``RemoteClient.run``: this thread re-reads the enrollment,
-    heartbeats and renews the admitted claim at the fixed cadence, while a
-    second thread synchronizes (probe, event pages, artifact uploads). Both
-    threads write ``remote-status.json`` from the client's shared connectivity
-    after each pass. The client (and its worker epoch) is rebuilt only when the
+    ``run`` mirrors ``RemoteClient.run``: this thread re-reads the enrollment
+    and heartbeats on an absolute schedule, a second renews the admitted claim,
+    and a third synchronizes (probe, event pages, artifact uploads). The
+    heartbeat and synchronization threads write ``remote-status.json`` from the
+    client's shared connectivity after each pass. The client (and its worker epoch) is rebuilt only when the
     enrollment identity changes (URL, worker ID or key) or the enrollment is
     gone/expired locally; a locked Keychain, a transport fault or a failed status
     write keeps it and reports ``offline``, so nothing re-registers (which would
@@ -63,12 +64,14 @@ class ConfiguredRemote:
         self.identity = None
         self.stop_event = threading.Event()
         self._status_lock = threading.Lock()  # a status write reflects the state read for it
+        self._client_lock = threading.Lock()  # client and identity change together
         runtime.remote_launch_guard = self.launch_allowed
 
     def launch_allowed(self, job_id):
         if not self.runtime.get(job_id).idempotency_key.startswith("remote:"):
             return True
-        client = self.client
+        with self._client_lock:
+            client, identity = self.client, self.identity
         if self.stop_event.is_set() or client is None:
             return False
         # Re-read authorization in Keychain before every launch; a removed or
@@ -78,11 +81,19 @@ class ConfiguredRemote:
             return False
         try:
             enrollment = self.enrollment_loader(client.url)
-            if enrollment is None or self.identity != (client.url, enrollment):
+            # The captured client must still be the active one for this exact enrollment:
+            # an unpair and re-pair of the same URL while the loader ran replaces both.
+            with self._client_lock:
+                current = self.client is client and self.identity == identity
+            if enrollment is None or not current or identity != (client.url, enrollment):
                 return False
         except ProtocolError:
             return False
         return client.launch_allowed(job_id)
+
+    def _set_client(self, client, identity):
+        with self._client_lock:
+            self.client, self.identity = client, identity
 
     def _save(self, client):
         with self._status_lock:
@@ -99,7 +110,7 @@ class ConfiguredRemote:
         if self.stop_event.is_set():
             return None
         if not policy.enabled or url is None:
-            self.client, self.identity = None, None
+            self._set_client(None, None)
             return None
         try:
             enrollment = self.enrollment_loader(url)
@@ -115,14 +126,14 @@ class ConfiguredRemote:
                 self._save(client)
             else:
                 seen = client.last_seen_at if client is not None else None
-                self.client, self.identity = None, None
+                self._set_client(None, None)
                 with self._status_lock:
                     save_status(root, url, state, seen)
             return None
         if enrollment is None:
             # Unpaired (the key is gone) while settings still name the URL.
             seen = self.client.last_seen_at if self.client is not None else None
-            self.client, self.identity = None, None
+            self._set_client(None, None)
             with self._status_lock:
                 save_status(root, url, "offline", seen)
             return None
@@ -130,14 +141,14 @@ class ConfiguredRemote:
         # repr omits the key, so the identity is safe to print.
         identity = (url, enrollment)
         if identity != self.identity:
-            self.client, self.identity = None, None  # never drive a stale enrollment
+            self._set_client(None, None)  # never drive a stale enrollment
             client = self.client_factory(self.runtime, url, enrollment.device_key,
                                          worker_id=enrollment.worker_id)
             client.stop_event = self.stop_event
             # RemoteClient installs its standalone guard; keep the
             # configured guard that also rechecks Keychain availability.
             self.runtime.remote_launch_guard = self.launch_allowed
-            self.client, self.identity = client, identity
+            self._set_client(client, identity)
         return self.client
 
     def tick(self):
@@ -153,11 +164,19 @@ class ConfiguredRemote:
         if client is None:
             return
         try:
-            if client.heartbeat_tick():
-                client.renew_admitted()
+            client.heartbeat_tick()
         except Exception as exc:
             client._connectivity(exc)
         self._save(client)
+
+    def _renew_pass(self):
+        client = self.client
+        if client is None or client.state != "online":
+            return
+        try:
+            client.renew_admitted()
+        except Exception as exc:
+            client._connectivity(exc)
 
     def _sync_pass(self):
         client = self.client
@@ -181,22 +200,30 @@ class ConfiguredRemote:
 
     def run(self, stop_event):
         self.stop_event = stop_event
-        sync = threading.Thread(target=self._sync_loop, name="openswap-worker-remote-sync", daemon=True)
-        sync.start()
+        helpers = [threading.Thread(target=self._loop, args=(self._sync_pass,),
+                                    name="openswap-worker-remote-sync", daemon=True),
+                   threading.Thread(target=self._loop, args=(self._renew_pass,),
+                                    name="openswap-worker-remote-renew", daemon=True)]
+        for helper in helpers:
+            helper.start()
         try:
+            due = time.monotonic()
             while not stop_event.is_set():
                 try:
                     self._heartbeat_pass()
                 except Exception as exc:
                     self._offline(exc)
-                stop_event.wait(HEARTBEAT_SECONDS)
+                # Due on an absolute schedule, like RemoteClient.run.
+                due = max(due + HEARTBEAT_SECONDS, time.monotonic())
+                stop_event.wait(due - time.monotonic())
         finally:
-            sync.join()
+            for helper in helpers:
+                helper.join()
 
-    def _sync_loop(self):
+    def _loop(self, one_pass):
         while not self.stop_event.is_set():
             try:
-                self._sync_pass()
+                one_pass()
             except Exception as exc:
                 self._offline(exc)
             self.stop_event.wait(HEARTBEAT_SECONDS)

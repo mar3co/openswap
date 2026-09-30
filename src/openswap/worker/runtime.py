@@ -846,9 +846,12 @@ class WorkerRuntime:
                 authorization is True or isinstance(authorization, RemoteAuthorization)
             ):
                 return "worker_shutdown"
+            # A worker ID recorded at pairing also catches an unpair followed by a
+            # re-pair of the same URL: the new enrollment is a different worker.
             if policy.control_service_url is None or (
                 isinstance(authorization, RemoteAuthorization)
-                and policy.control_service_url != authorization.url
+                and (policy.control_service_url != authorization.url
+                     or policy.control_service_worker_id not in {None, authorization.worker_id})
             ):
                 return "unpaired"
         return None

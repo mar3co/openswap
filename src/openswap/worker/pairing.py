@@ -71,7 +71,7 @@ def pair(root: Path, url: str, code: str, *, transport=None) -> str:
     except macos_keychain.KEYCHAIN_ERRORS:
         raise ProtocolError("device_key_unavailable") from None
     try:
-        configure_worker_service(root, url)
+        configure_worker_service(root, url, enrollment.worker_id)
     except (OSError, RuntimeError, ValueError):
         # A key must not become an orphan when URL persistence fails.
         try:
@@ -82,7 +82,7 @@ def pair(root: Path, url: str, code: str, *, transport=None) -> str:
     return enrollment.worker_id
 
 
-def unpair(root: Path, url: str | None = None) -> None:
+def unpair(root: Path, url: str | None = None) -> bool:
     """Remove the enrollment for the configured URL, or for an explicit ``url``.
 
     The explicit form also recovers an orphaned Keychain item when settings no
@@ -92,15 +92,20 @@ def unpair(root: Path, url: str | None = None) -> None:
     remote launch that was not already committed can start, however the
     Keychain call goes. A key left behind by a failed delete is an orphan that
     an explicit ``unpair <url>`` removes.
+
+    Returns whether the configured enrollment was the one removed; ``False``
+    means only an orphan was cleaned up and any configured service is untouched.
     """
     require_macos()
     configured = load_worker_settings(root).control_service_url
     target = validate_url(url) if url is not None else configured
     if target is None:
-        return
-    if configured is not None and account_name(configured) == account_name(target):
+        return False
+    removed = configured is not None and account_name(configured) == account_name(target)
+    if removed:
         configure_worker_service(root, None)
     try:
         macos_keychain.delete_password(SERVICE, account_name(target))
     except macos_keychain.KEYCHAIN_ERRORS:
         raise ProtocolError("device_key_unavailable") from None
+    return removed
