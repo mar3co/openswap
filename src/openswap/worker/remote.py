@@ -14,13 +14,21 @@ import stat
 import threading
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from uuid import uuid4
 
 from openswap.settings import load_worker_settings
-from openswap.worker.journal import AdmissionError
+from openswap.worker.journal import AdmissionError, JournalError
+from openswap.worker.models import JobState, SafeEventKind
 from openswap.worker.protocol import (
     Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, ProtocolError,
     TERMINAL, integer, timestamp, validate_url,
 )
+
+STATES = frozenset(state.value for state in JobState)
+# Validation failures the service (or the local export check) reports for one
+# artifact. They never clear on retry, so they end that artifact, not the claim.
+ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
+                                 "hash_mismatch", "invalid_request"})
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -55,7 +63,8 @@ class Transport:
             code = result.get("error", "service_unavailable")
             # Error bodies are untrusted: never expose arbitrary service text.
             allowed = {"revoked", "unauthorized", "device_expired", "lease_lost", "stale_epoch", "offline_worker",
-                       "invalid_code", "invalid_request", "forbidden", "not_found", "invalid_state"}
+                       "invalid_code", "invalid_request", "forbidden", "not_found", "invalid_state",
+                       *ARTIFACT_REJECTIONS}
             raise ProtocolError(code if code in allowed else "service_unavailable", exc.code) from None
         except (URLError, TimeoutError, OSError):
             raise ProtocolError("service_unavailable", 503) from None
@@ -145,6 +154,31 @@ class RemoteClient:
     def _fence(self, claim):
         return {"job_id": claim.job_id, "epoch": claim.epoch, "worker_epoch": self.worker_epoch}
 
+    def _idempotency_key(self, claim):
+        # Fixed length whatever the remote ID's size (IDs may be 200 characters).
+        return "remote:" + hashlib.sha256((self.journal.service + "\0" + claim.job_id).encode()).hexdigest()
+
+    def _worker_request(self, operation):
+        """``heartbeat``/``poll``: a stale worker epoch means another registration
+        superseded this one, so re-register on the next tick instead of reporting online."""
+        try:
+            return self.transport.request(operation, {"worker_epoch": self.worker_epoch})
+        except ProtocolError as exc:
+            if exc.code == "stale_epoch":
+                self.worker_epoch = None
+            raise
+
+    def _job_response(self, operation, data):
+        """``job``/``renew`` with a real boolean cancel flag and a known state.
+
+        Anything else is a malformed response, handled like a transport failure:
+        it never cancels or launches local work.
+        """
+        remote = self.transport.request(operation, data)
+        if type(remote.get("cancel_requested")) is not bool or remote.get("state") not in STATES:
+            raise ProtocolError("invalid_response")
+        return remote
+
     def launch_allowed(self, local_id: str) -> bool:
         # No client lock is held during runtime control calls: the launch lock
         # and the independent heartbeat driver cannot deadlock each other.
@@ -160,7 +194,7 @@ class RemoteClient:
         if min(local.expires_at, claim.submission.job.expires_at) <= datetime.now(timezone.utc):
             return False
         try:
-            remote = self.transport.request("renew", self._fence(claim))
+            remote = self._job_response("renew", self._fence(claim))
             return remote["state"] not in TERMINAL and remote["state"] != "cancel_requested" and not remote["cancel_requested"]
         except (ProtocolError, KeyError, ValueError, TypeError):
             return False
@@ -179,7 +213,7 @@ class RemoteClient:
             if self.worker_epoch is None:
                 registered = self.transport.request("register", {})
                 self.worker_epoch = integer(registered["worker_epoch"], 1)
-            heartbeat = self.transport.request("heartbeat", {"worker_epoch": self.worker_epoch})
+            heartbeat = self._worker_request("heartbeat")
             self.last_seen_at = timestamp(heartbeat["last_seen_at"])
             self.state = "online"
             pending = self.journal.pending()
@@ -194,42 +228,57 @@ class RemoteClient:
             lease = self.runtime.leases.read_current()
             if lease is not None and lease.state != "released":
                 return
-            if not self.runtime.adapter.probe().available or self.runtime.account_identity is None:
+            try:
+                availability = self.runtime.adapter.probe()
+            except Exception:
+                return  # an unavailable provider claims nothing; the heartbeat still counts
+            if not availability.available or self.runtime.account_identity is None:
                 return
-            response = self.transport.request("poll", {"worker_epoch": self.worker_epoch})
+            response = self._worker_request("poll")
             if response["claim"] is not None:
                 claim = Claim.from_dict(response["claim"])
                 self.journal.remember(claim)  # persist before local admission
                 self._sync(self.journal.pending()[0])
         except ProtocolError as exc:
             self.state = ("revoked" if exc.code in {"revoked", "unauthorized", "device_expired"}
-                          else "online" if exc.code in {"lease_lost", "stale_epoch"} else "offline")
+                          else "online" if exc.code == "lease_lost" else "offline")
         except (KeyError, TypeError, ValueError, OSError, sqlite3.Error, AdmissionError):
             self.state = "offline"
 
     def _sync(self, binding):
         claim = Claim.from_dict(json.loads(binding["claim"]))
-        remote = self.transport.request("job", {"job_id": claim.job_id})
+        remote = self._job_response("job", {"job_id": claim.job_id})
         local_id = binding["local_id"]
-        local = self.runtime.get(local_id) if local_id else None
+        local = None
+        if local_id:
+            try:
+                local = self.runtime.get(local_id)
+            except KeyError:
+                pass  # the ID was reserved but admission never completed
         if local is None:
-            # Deterministic identity recovers the crash window between local
-            # admission and saving the mapping, without a second launch.
-            idem = "remote:" + self.journal.service + ":" + claim.job_id
+            # Deterministic identity recovers a mapping from before the ID was
+            # reserved ahead of admission, without a second launch.
+            idem = self._idempotency_key(claim)
             local = self.runtime.store.get_by_idempotency_key(idem)
             if local is None:
                 if remote["state"] in TERMINAL or claim.submission.job.expires_at <= datetime.now(timezone.utc) or remote["cancel_requested"]:
+                    # Nothing was ever admitted locally, so nothing launched.
                     state = "interrupted" if remote["state"] == "interrupted" else "cancelled" if remote["cancel_requested"] else "expired"
                     self.transport.request("reconcile", {**self._fence(claim), "state": state,
-                                                         "execution_stopped": False, "unlaunched": state != "interrupted"})
+                                                         "execution_stopped": False, "unlaunched": True})
                     self.journal.update(claim.job_id, done=1)
                     return
-                self.transport.request("renew", self._fence(claim))
+                self._job_response("renew", self._fence(claim))
                 if self.stop_event.is_set():
                     return
-                local = self.runtime.submit(replace(claim.submission.job, idempotency_key=idem))
-            local_id = local.job_id
-            self.journal.update(claim.job_id, local_id=local_id)
+                # The binding is published before admission: the runtime's
+                # launch fence may query it the moment the job is queued.
+                local_id = local_id or uuid4().hex
+                self.journal.update(claim.job_id, local_id=local_id)
+                local = self.runtime.submit(replace(claim.submission.job, idempotency_key=idem), job_id=local_id)
+            if local.job_id != local_id:
+                local_id = local.job_id
+                self.journal.update(claim.job_id, local_id=local_id)
         if remote["cancel_requested"] and local.state.value not in TERMINAL:
             self.runtime.cancel(local_id)
             local = self.runtime.get(local_id)
@@ -239,7 +288,7 @@ class RemoteClient:
             self.runtime.cancel(local_id)
             local = self.runtime.get(local_id)
         if local.state.value not in TERMINAL:
-            self.transport.request("renew", self._fence(claim))
+            self._job_response("renew", self._fence(claim))
         self._forward_events(claim, local_id, binding["cursor"])
         local = self.runtime.get(local_id)
         if local.state.value in TERMINAL:
@@ -247,8 +296,9 @@ class RemoteClient:
             state = local.state.value if stopped or unlaunched else "interrupted"
             self.transport.request("reconcile", {**self._fence(claim), "state": state,
                                                  "execution_stopped": stopped, "unlaunched": unlaunched})
-            if state == "succeeded":
-                self.upload_results(claim, local)
+            if state == "succeeded" and self.upload_results(claim, local):
+                # Relay the rejection diagnostics before acknowledging the claim.
+                self._forward_events(claim, local_id, self.journal.binding(local_id)["cursor"])
             self.journal.update(claim.job_id, done=1)
 
     def _forward_events(self, claim, local_id, cursor):
@@ -258,7 +308,7 @@ class RemoteClient:
         while page.events:
             if self.stop_event.is_set():
                 raise ProtocolError("service_unavailable", 503)
-            self.transport.request("heartbeat", {"worker_epoch": self.worker_epoch})
+            self._worker_request("heartbeat")
             events = [replace(event, job_id=claim.job_id).to_dict() for event in page.events]
             response = self.transport.request("events", {**self._fence(claim), "after_cursor": cursor, "events": events})
             ack = integer(response["next_cursor"])
@@ -273,6 +323,8 @@ class RemoteClient:
     def _proof(self, local):
         if local.state.value == "interrupted":
             return False, False
+        if local.state.value == "failed" and local.diagnostic_code == "lease_conflict":
+            return False, True  # no account lease was ever acquired: nothing launched
         cursor, launched, stopped = 0, False, False
         while True:
             page = self.runtime.events(local.job_id, after_cursor=cursor, limit=200)
@@ -286,7 +338,35 @@ class RemoteClient:
             return stopped or lease.reason == "confirmed_stopped", lease.reason == "unlaunched"
         return stopped, not launched and local.pinned_account_ref is None
 
-    def upload_results(self, claim, local):
+    def upload_results(self, claim, local) -> bool:
+        """Upload the explicit artifact list; returns whether any artifact was refused.
+
+        A refused artifact (oversized, symlinked, replaced mid-read, over the
+        per-job limit, or conflicting with a stored copy) would be refused on
+        every retry, so it is skipped and journaled as ``artifact_rejected``
+        rather than holding the claim, and every other claim, pending forever.
+        Transport, lease and authorization failures still propagate for retry.
+        """
+        rejected = False
+        for name in self.artifact_names:  # explicit list; never discover files
+            if self.stop_event.is_set():
+                raise ProtocolError("service_unavailable", 503)
+            self._worker_request("heartbeat")
+            try:
+                self._upload_artifact(claim, local, name)
+            except ProtocolError as exc:
+                if exc.code not in ARTIFACT_REJECTIONS:
+                    raise
+                rejected = True
+                try:
+                    self.runtime.store.append_event(
+                        local.job_id, kind=SafeEventKind.DIAGNOSTIC, diagnostic_code="artifact_rejected",
+                        worker_epoch=self.runtime.worker_epoch, expected_generation=local.generation)
+                except JournalError:
+                    pass  # a job from an earlier worker epoch cannot take new events
+        return rejected
+
+    def _upload_artifact(self, claim, local, name):
         policy = load_worker_settings(self.runtime.backup_root)
         workspace = next((w for w in policy.workspaces if w.workspace_id == local.workspace_id), None)
         if workspace is None:
@@ -294,29 +374,32 @@ class RemoteClient:
         directory = workspace.output_root / local.job_id
         if directory.is_symlink() or directory.resolve() != directory:
             raise ProtocolError("invalid_request")
-        for name in self.artifact_names:  # explicit list; never discover files
-            if self.stop_event.is_set():
-                raise ProtocolError("service_unavailable", 503)
-            self.transport.request("heartbeat", {"worker_epoch": self.worker_epoch})
-            path = directory / name
-            try:
-                before = path.lstat()
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_ARTIFACT:
-                raise ProtocolError("artifact_too_large", 413)
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            with os.fdopen(fd, "rb") as stream:
-                current = os.fstat(stream.fileno())
-                if (current.st_ino, current.st_dev) != (before.st_ino, before.st_dev):
-                    raise ProtocolError("invalid_request")
-                content = stream.read(MAX_ARTIFACT + 1)
-            if len(content) > MAX_ARTIFACT:
-                raise ProtocolError("artifact_too_large", 413)
-            self.transport.request("upload", {**self._fence(claim), "artifact": Artifact(name, content).to_dict()})
+        path = directory / name
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            return  # an absent optional result is not an error
+        if not stat.S_ISREG(before.st_mode):
+            raise ProtocolError("invalid_request")
+        if before.st_size > MAX_ARTIFACT:
+            raise ProtocolError("artifact_too_large", 413)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as stream:
+            current = os.fstat(stream.fileno())
+            if (current.st_ino, current.st_dev) != (before.st_ino, before.st_dev):
+                raise ProtocolError("invalid_request")
+            content = stream.read(MAX_ARTIFACT + 1)
+        if len(content) > MAX_ARTIFACT:
+            raise ProtocolError("artifact_too_large", 413)
+        self.transport.request("upload", {**self._fence(claim), "artifact": Artifact(name, content).to_dict()})
 
     def run(self, stop_event: threading.Event):
         self.stop_event = stop_event
         while not stop_event.is_set():
-            self.tick()
+            try:
+                self.tick()
+            except Exception:
+                # A journal or adapter fault must not end heartbeating for the
+                # process lifetime; the next tick retries at the usual cadence.
+                self.state = "offline"
             stop_event.wait(HEARTBEAT_SECONDS)

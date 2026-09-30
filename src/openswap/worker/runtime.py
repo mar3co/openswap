@@ -365,7 +365,8 @@ class WorkerRuntime:
             except AccountLeaseError:
                 pass
 
-    def submit(self, submission: JobSubmission) -> JobRecord:
+    def submit(self, submission: JobSubmission, *, job_id: str | None = None) -> JobRecord:
+        """Admit a job; ``job_id`` lets a caller publish the ID before the row exists."""
         with self._admission_lock:
             policy = load_worker_settings(self.backup_root)
             if not policy.enabled:
@@ -375,7 +376,7 @@ class WorkerRuntime:
             if submission.expires_at <= datetime.now(timezone.utc):
                 raise AdmissionError("job is expired")
             return self.store.create(
-                submission, owner_ref=self.owner_ref, worker_epoch=self.worker_epoch,
+                submission, owner_ref=self.owner_ref, worker_epoch=self.worker_epoch, job_id=job_id,
             )
 
     def get(self, job_id: str) -> JobRecord:
