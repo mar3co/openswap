@@ -97,7 +97,8 @@ A claim contains `job_id`, `epoch` (monotonically increasing fencing generation)
 `lease_until`, and `submission` (the original closed object). The worker first
 registers; registration increments its durable worker epoch and interrupts any
 prior claimed/active job, without requeueing it, and does not by itself mark
-the worker live. Every worker mutation carries
+the worker live: it clears the previous incarnation's liveness, so only a
+heartbeat carrying the new epoch makes the worker live again. Every worker mutation carries
 that epoch. Poll atomically grants one job and a 20-second lease, and repeated
 polls replay the same unexpired claim. At most one nonterminal claim per worker
 is permitted. Renew before expiry; an expired lease cannot be revived: `renew`
@@ -128,9 +129,12 @@ and renew/job reads. The separate `cancel_requested` flag persists even when
 heartbeat loss changes the state to `interrupted`; reconnect must enforce it.
 A worker-uploaded `state_changed` event to `cancel_requested` sets the same
 flag. `heartbeat` lists only jobs whose flag still needs enforcement (claimed,
-starting, running, cancel_requested or interrupted), never finished ones.
+starting, running, cancel_requested or unconfirmed interrupted), never
+finished ones or confirmed interruptions, and returns at most 100 IDs: jobs
+that are still live first, then the newest unconfirmed interruptions.
 Repeated cancellation is idempotent. A terminal outcome
-is not overwritten by a late cancel. A cancel request is never stop proof.
+is not overwritten by a late cancel; an `interrupted` job confirmed with
+proof counts as terminal here too. A cancel request is never stop proof.
 
 After three missed five-second heartbeats the service reports the worker
 `offline` and active jobs `interrupted`. It evaluates this deadline on every

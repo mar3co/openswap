@@ -249,6 +249,7 @@ def test_register_bumps_epoch_and_interrupts_the_active_claim(service):
         store.request("renew", fence(service, claim), key)
     with pytest.raises(ProtocolError, match="stale_epoch"):
         store.request("poll", {"worker_epoch": epoch}, key)
+    store.request("heartbeat", {"worker_epoch": registered["worker_epoch"]}, key)
     assert store.request("poll", {"worker_epoch": registered["worker_epoch"]}, key)["claim"] is None
 
 
@@ -435,3 +436,58 @@ def test_existing_database_gains_the_confirmed_column(tmp_path):
     with closing(store.connect()) as db:
         assert "confirmed" in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
     ControlStore(path)  # reopening is idempotent
+
+
+def test_register_clears_the_previous_incarnations_liveness(service):
+    store, ticks, _, key, epoch = service
+    ticks[0] += 1  # the old heartbeat is still fresh
+    epoch = store.request("register", {}, key)["worker_epoch"]
+    with pytest.raises(ProtocolError, match="offline_worker"):
+        store.request("poll", {"worker_epoch": epoch}, key)
+    with pytest.raises(ProtocolError, match="offline_worker"):
+        submit(service)
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
+    assert store.request("poll", {"worker_epoch": epoch}, key) == {"claim": None}
+
+
+def test_late_cancel_leaves_a_confirmed_interruption_alone(service):
+    store, _, _, key, epoch = service
+    submit(service)
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    store.request("reconcile", {**fence(service, claim), "state": "interrupted", "execution_stopped": True,
+                                "unlaunched": False}, key)
+    assert store.request("cancel", {"job_id": claim["job_id"]}, key)["state"] == "interrupted"
+    assert store.request("job", {"job_id": claim["job_id"]}, key)["cancel_requested"] is False
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == []
+
+
+@pytest.mark.parametrize("kind", [SafeEventKind.PROVIDER_STARTED, SafeEventKind.STOP_REQUESTED,
+                                  SafeEventKind.DIAGNOSTIC])
+def test_only_state_changed_events_move_the_job(service, kind):
+    store, ticks, _, key, epoch = service
+    submit(service)
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    event = SafeEvent(claim["job_id"], 1, datetime.fromtimestamp(ticks[0], timezone.utc),
+                      kind, JobState.CANCEL_REQUESTED).to_dict()
+    store.request("events", {**fence(service, claim), "after_cursor": 0, "events": [event]}, key)
+    job = store.request("job", {"job_id": claim["job_id"]}, key)
+    assert (job["state"], job["cancel_requested"]) == ("claimed", False)
+
+
+def test_heartbeat_cancel_list_is_bounded_newest_first(service, monkeypatch):
+    from openswap.worker.refserver import store as store_module
+    monkeypatch.setattr(store_module, "MAX_CANCEL_IDS", 3)
+    store, _, _, key, epoch = service
+    ids = []
+    for n in range(5):  # cancel -> register cycles leave unconfirmed cancelled interruptions behind
+        submit(service, f"k{n}")
+        claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+        store.request("cancel", {"job_id": claim["job_id"]}, key)
+        ids.append(claim["job_id"])
+        epoch = store.request("register", {}, key)["worker_epoch"]
+        store.request("heartbeat", {"worker_epoch": epoch}, key)
+    submit(service, "live")
+    live = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    store.request("cancel", {"job_id": live["job_id"]}, key)
+    listed = store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"]
+    assert listed == [live["job_id"], ids[4], ids[3]]
