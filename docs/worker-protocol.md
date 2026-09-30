@@ -272,15 +272,26 @@ was stored) is an orphan and `pair` replaces it. New enrollment at the same
 URL receives separate claim/upload journal bindings, scoped by the worker ID;
 nothing key-derived is written to disk.
 
-`openswap worker unpair [url]` removes the key and clears the URL. With an
+`openswap worker unpair [url]` clears the URL, then removes the key. With an
 explicit URL it removes that enrollment's item even when settings no longer
 reference it, clearing the configured URL only when it is the same origin.
-New launches also recheck Keychain availability. Unpair/revocation do not stop
+New launches also recheck Keychain availability, and the guard's authorization
+(the normalized URL and worker ID it verified) is re-verified against
+`settings.json` alone, under the launch lock, immediately before the launch
+commits: after `unpair` returns, no remote launch that was not already
+committed can start (it fails `worker_disabled` and releases its lease
+unlaunched). An already committed run continues: unpair/revocation do not stop
 an already running local job. The operator can revoke its worker ID
 separately. After locally enabling and configuring a permitted
-account/workspace, `worker run` maintains outbound connectivity. With no
-configured URL it performs no network or Keychain access. The production
-adapter still refuses jobs in this phase.
+account/workspace, `worker run` maintains outbound connectivity: it re-reads
+the enrollment and heartbeats on one thread and synchronizes on another, and
+both write the durable status from the client's shared connectivity. The
+registration (worker epoch) is replaced only when the enrollment changes or is
+gone/expired locally; a locked Keychain, a transport fault or a failed status
+write reports `offline` and keeps it, since re-registering interrupts the
+service-side jobs of the registration it replaces. With no configured URL it
+performs no network or Keychain access. The production adapter still refuses
+jobs in this phase.
 
 `worker status --json` includes `remote_connectivity` and
 `remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.

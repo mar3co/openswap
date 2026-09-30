@@ -50,6 +50,17 @@ class RemoteConnectivity(StrEnum):
 
 
 @dataclass(frozen=True)
+class RemoteAuthorization:
+    """What a remote launch guard verified: the normalized service URL and the
+    worker ID of the enrollment it checked. The runtime re-reads the configured
+    URL at the commit point and refuses a launch whose enrollment has since been
+    unpaired, without Keychain or network access."""
+
+    url: str
+    worker_id: str
+
+
+@dataclass(frozen=True)
 class ProviderAvailability:
     available: bool
     diagnostic_code: str | None

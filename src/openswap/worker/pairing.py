@@ -87,16 +87,20 @@ def unpair(root: Path, url: str | None = None) -> None:
 
     The explicit form also recovers an orphaned Keychain item when settings no
     longer name a URL. The configured URL is cleared only when it is the one
-    being unpaired.
+    being unpaired, and it is cleared *before* the key is deleted: the runtime
+    re-reads the URL at every launch's commit point, so once it is gone no
+    remote launch that was not already committed can start, however the
+    Keychain call goes. A key left behind by a failed delete is an orphan that
+    an explicit ``unpair <url>`` removes.
     """
     require_macos()
     configured = load_worker_settings(root).control_service_url
     target = validate_url(url) if url is not None else configured
     if target is None:
         return
+    if configured is not None and account_name(configured) == account_name(target):
+        configure_worker_service(root, None)
     try:
         macos_keychain.delete_password(SERVICE, account_name(target))
     except macos_keychain.KEYCHAIN_ERRORS:
         raise ProtocolError("device_key_unavailable") from None
-    if configured is not None and account_name(configured) == account_name(target):
-        configure_worker_service(root, None)

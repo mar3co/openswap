@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from openswap.settings import load_worker_settings
 from openswap.worker.journal import AdmissionError, JournalError
-from openswap.worker.models import JobState, SafeEventKind
+from openswap.worker.models import JobState, RemoteAuthorization, SafeEventKind
 from openswap.worker.protocol import (
     Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, ProtocolError,
     TERMINAL, integer, timestamp, validate_url,
@@ -148,7 +148,7 @@ class RemoteClient:
     """
     def __init__(self, runtime, url: str, key: str, *, worker_id: str = "", transport=None,
                  artifact_names=("result.md",)):
-        self.runtime, self.url = runtime, validate_url(url)
+        self.runtime, self.url, self.worker_id = runtime, validate_url(url), worker_id
         self.transport = transport or Transport(self.url, key)
         self.journal = RemoteJournal(runtime, self.url, worker_id)
         self.stop_event = threading.Event()
@@ -212,7 +212,10 @@ class RemoteClient:
             raise ProtocolError("invalid_response")
         return remote
 
-    def launch_allowed(self, local_id: str) -> bool:
+    def launch_allowed(self, local_id: str) -> bool | RemoteAuthorization:
+        """``True`` for local jobs; for a remote job, the authorization the service
+        just granted (URL and worker ID), or ``False``. The runtime re-checks the
+        token's URL against settings at the commit point."""
         # No client lock is held during runtime control calls: the launch lock
         # and the independent heartbeat driver cannot deadlock each other.
         local = self.runtime.get(local_id)
@@ -228,7 +231,9 @@ class RemoteClient:
             return False
         try:
             remote = self._job_response("renew", self._fence(claim))
-            return remote["state"] not in TERMINAL and remote["state"] != "cancel_requested" and not remote["cancel_requested"]
+            if remote["state"] in TERMINAL or remote["state"] == "cancel_requested" or remote["cancel_requested"]:
+                return False
+            return RemoteAuthorization(self.url, self.worker_id)
         except (ProtocolError, KeyError, ValueError, TypeError):
             return False
 

@@ -41,6 +41,7 @@ from openswap.worker.models import (
     JobState,
     JobSubmission,
     ProviderAvailability,
+    RemoteAuthorization,
     RemoteConnectivity,
     ResolvedWorkspace,
     WorkerProcessState,
@@ -816,8 +817,18 @@ class WorkerRuntime:
                 return recovered
             raise
 
-    def _launch_fence(self, job_id: str, shutdown_event: threading.Event | None) -> str | None:
-        """Why a launch must not start now, read under the control lock."""
+    def _launch_fence(
+        self, job_id: str, shutdown_event: threading.Event | None,
+        authorization: object = True,
+    ) -> str | None:
+        """Why a launch must not start now, read under the control lock.
+
+        ``authorization`` is what the remote launch guard returned outside the
+        lock. For a remote job it is re-verified here against settings.json
+        alone (no Keychain, no network): ``unpair`` clears the configured URL
+        before it removes the key, so a launch the guard authorized moments
+        before an unpair finds the URL gone (or changed) and never commits.
+        """
         latest = self.store.get(job_id)
         if latest.state == JobState.CANCEL_REQUESTED:
             return "cancel_requested"
@@ -827,13 +838,19 @@ class WorkerRuntime:
             return "worker_shutdown"
         if latest.expires_at <= datetime.now(timezone.utc):
             return "job_expired"
-        if (
-            (shutdown_event is not None and shutdown_event.is_set())
-            or not load_worker_settings(self.backup_root).enabled
-        ):
+        policy = load_worker_settings(self.backup_root)
+        if (shutdown_event is not None and shutdown_event.is_set()) or not policy.enabled:
             return "worker_shutdown"
-        if latest.idempotency_key.startswith("remote:") and self.remote_launch_guard is None:
-            return "worker_shutdown"
+        if latest.idempotency_key.startswith("remote:"):
+            if self.remote_launch_guard is None or not (
+                authorization is True or isinstance(authorization, RemoteAuthorization)
+            ):
+                return "worker_shutdown"
+            if policy.control_service_url is None or (
+                isinstance(authorization, RemoteAuthorization)
+                and policy.control_service_url != authorization.url
+            ):
+                return "unpaired"
         return None
 
     def _finish_unlaunched(self, starting: JobRecord, token, reason: str) -> JobRecord:
@@ -882,16 +899,14 @@ class WorkerRuntime:
                 # start thread without holding the local control lock. Stop
                 # and the runtime deadline stay responsive, and the final
                 # local fence below observes anything that changed meanwhile.
-                remote_allowed = True
+                authorization: object = True
                 if self.remote_launch_guard is not None:
                     try:
-                        remote_allowed = self.remote_launch_guard(starting.job_id) is True
+                        authorization = self.remote_launch_guard(starting.job_id)
                     except Exception:
-                        remote_allowed = False
+                        authorization = False
                 with self._launch_lock:
-                    skipped = self._launch_fence(starting.job_id, shutdown_event)
-                    if skipped is None and not remote_allowed:
-                        skipped = "worker_shutdown"
+                    skipped = self._launch_fence(starting.job_id, shutdown_event, authorization)
                     with outcome_lock:
                         # Decided under the same lock the monitor abandons
                         # through: a launch given up on while the guard ran

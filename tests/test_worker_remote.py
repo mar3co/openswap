@@ -13,7 +13,7 @@ from openswap.settings import configure_worker_service, update_worker_settings
 from openswap.worker import remote as remote_mod
 from openswap.worker.journal import StaleWriteError
 from openswap.worker.leases import stable_account_identity
-from openswap.worker.models import (JobSubmission, JobState, ProviderAvailability, ProviderRun,
+from openswap.worker.models import (JobSubmission, JobState, ProviderAvailability, ProviderRun, RemoteAuthorization,
                                      SafeEvent, SafeEventKind, InterruptResult)
 from openswap.worker.protocol import Artifact, MAX_ARTIFACT, MAX_BODY, ProtocolError, Submission
 from openswap.worker.refserver import ControlStore, make_server
@@ -483,7 +483,7 @@ def test_binding_is_published_before_local_admission(remote_setup, monkeypatch):
 
     def racing_submit(submission, **kwargs):
         record = original_submit(submission, **kwargs)
-        assert remote.launch_allowed(record.job_id) is True
+        assert remote.launch_allowed(record.job_id) == RemoteAuthorization(remote.url, remote.worker_id)
         raced.append(runtime.reconcile_once())
         return record
 
