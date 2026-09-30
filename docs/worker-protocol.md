@@ -192,3 +192,27 @@ Default listener is `127.0.0.1:8765`. Non-loopback bind requires
 backend link behind owner-controlled TLS termination. Never expose it directly.
 Pair codes are printed only to the operator's terminal. Testing with fake
 adapters proves transport/journaling, not provider safety or a real HTTPS pilot.
+
+## Local enrollment and status
+
+`openswap worker pair <url> <code>` is the local approval: it exchanges the
+one-use code and stores enrollment in login Keychain under service `openswap`,
+using a URL-scoped worker-device account name. It writes only the origin URL to
+`worker.controlServiceUrl` in `settings.json`, leaving enabled/paused policy,
+the pinned account and workspace registry unchanged. Pair/unpair are explicitly
+unsupported outside macOS; there is no secret-file fallback. Unpair before
+pairing a different backend or renewing an expired enrollment. New enrollment
+at the same URL receives separate claim/upload journal bindings.
+
+`openswap worker unpair` removes the key and clears the URL. New launches also
+recheck Keychain availability. Unpair/revocation do not stop an already running
+local job. The operator can revoke its worker ID separately. After locally
+enabling and configuring a permitted account/workspace, `worker run` maintains
+outbound connectivity. With no configured URL it performs no network or Keychain
+access. The production adapter still refuses jobs in this phase.
+
+`worker status --json` includes `remote_connectivity` and
+`remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.
+CLI and menu-bar status expose connectivity and service last seen without
+revealing keys, tasks or paths. Old heartbeats become offline after 15 seconds,
+and a stopped local worker is never reported as online.

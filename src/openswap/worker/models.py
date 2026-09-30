@@ -40,9 +40,12 @@ MAX_JOB_RUNTIME_SECONDS = 4 * 60 * 60
 
 
 class RemoteConnectivity(StrEnum):
-    """Phase 2 is local-only; no service connection is attempted."""
+    """Service connectivity is separate from provider/job/process state."""
 
     DISABLED = "disabled"
+    ONLINE = "online"
+    OFFLINE = "offline"
+    REVOKED = "revoked"
 
 
 @dataclass(frozen=True)
@@ -207,6 +210,7 @@ class WorkerSnapshot:
     last_seen_at: datetime | None = None
     worker_pid: int | None = None
     lease_quarantined: bool = True
+    remote_last_seen_at: datetime | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -220,6 +224,7 @@ class WorkerSnapshot:
             "last_seen_at": _iso(self.last_seen_at) if self.last_seen_at else None,
             "worker_pid": self.worker_pid,
             "lease_quarantined": self.lease_quarantined,
+            "remote_last_seen_at": _iso(self.remote_last_seen_at) if self.remote_last_seen_at else None,
         }
 
 

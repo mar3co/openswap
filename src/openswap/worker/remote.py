@@ -77,10 +77,10 @@ class Transport:
 
 class RemoteJournal:
     """Claim receipt and upload acknowledgements survive response loss/restart."""
-    def __init__(self, runtime, url):
+    def __init__(self, runtime, url, device_key):
         runtime.store._ensure_private_dir()
         self.path = runtime.store.state_dir / "remote.sqlite3"
-        self.service = hashlib.sha256(url.encode()).hexdigest()
+        self.service = hashlib.sha256((url + "\0" + device_key).encode()).hexdigest()
         if self.path.is_symlink():
             raise ValueError("unsafe remote journal")
         try:
@@ -130,7 +130,7 @@ class RemoteClient:
     def __init__(self, runtime, url: str, key: str, *, transport=None, artifact_names=("result.md",)):
         self.runtime, self.url = runtime, validate_url(url)
         self.transport = transport or Transport(self.url, key)
-        self.journal = RemoteJournal(runtime, self.url)
+        self.journal = RemoteJournal(runtime, self.url, key)
         self.stop_event = threading.Event()
         self.worker_epoch = None
         self.state = "offline"

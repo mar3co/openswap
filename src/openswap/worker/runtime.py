@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from dataclasses import replace
 import os
 from pathlib import Path
 import shutil
@@ -77,7 +78,7 @@ def _lease_is_quarantined(backup_root: Path) -> bool:
     return False
 
 
-def _snapshot_from_store(
+def _local_snapshot_from_store(
     backup_root: Path,
     *,
     process_state: WorkerProcessState,
@@ -117,7 +118,25 @@ def _snapshot_from_store(
     )
 
 
+def _with_remote_status(snapshot, backup_root, *, now=None):
+    from openswap.worker.remote_state import read_status
+    state, seen = read_status(Path(backup_root), now=now)
+    # A stopped/stale local worker cannot be online just because it wrote a
+    # recent service heartbeat before exit. Revocation remains visible.
+    if snapshot.process_state != WorkerProcessState.RUNNING and state == RemoteConnectivity.ONLINE:
+        state = RemoteConnectivity.OFFLINE
+    return replace(snapshot, remote_connectivity=state, remote_last_seen_at=seen)
+
+
+def _snapshot_from_store(backup_root, **kwargs):
+    return _with_remote_status(_local_snapshot_from_store(backup_root, **kwargs), backup_root)
+
+
 def read_worker_snapshot(backup_root: Path, *, now: datetime | None = None) -> WorkerSnapshot:
+    return _with_remote_status(_read_local_worker_snapshot(backup_root, now=now), backup_root, now=now)
+
+
+def _read_local_worker_snapshot(backup_root: Path, *, now: datetime | None = None) -> WorkerSnapshot:
     """Pure read-only CLI/UI fallback; never creates state or loads credentials."""
     backup_root = Path(backup_root)
     policy = load_worker_settings(backup_root)
@@ -810,12 +829,6 @@ class WorkerRuntime:
             return "worker_shutdown"
         if latest.idempotency_key.startswith("remote:") and self.remote_launch_guard is None:
             return "worker_shutdown"
-        if self.remote_launch_guard is not None:
-            try:
-                if not self.remote_launch_guard(job_id):
-                    return "worker_shutdown"
-            except Exception:
-                return "worker_shutdown"
         return None
 
     def _finish_unlaunched(self, starting: JobRecord, token, reason: str) -> JobRecord:
@@ -860,8 +873,20 @@ class WorkerRuntime:
         def start() -> None:
             late = False
             try:
+                # Network/Keychain checks may block; do them on the tracked
+                # start thread without holding the local control lock. Stop
+                # and the runtime deadline stay responsive, and the final
+                # local fence below observes anything that changed meanwhile.
+                remote_allowed = True
+                if self.remote_launch_guard is not None:
+                    try:
+                        remote_allowed = self.remote_launch_guard(starting.job_id) is True
+                    except Exception:
+                        remote_allowed = False
                 with self._launch_lock:
                     skipped = self._launch_fence(starting.job_id, shutdown_event)
+                    if skipped is None and not remote_allowed:
+                        skipped = "worker_shutdown"
                     if skipped is None:
                         # Committed atomically with the fence: any stop from
                         # here on is reported as after the launch.
@@ -1264,6 +1289,9 @@ def run_worker(
             # clear it so status and disable do not see a stale worker.
             _mark_stopped_quietly(runtime)
             return 1
+        if remote_factory is None:
+            from openswap.worker.remote_state import ConfiguredRemote
+            remote_factory = ConfiguredRemote
         if remote_factory is not None:
             remote = remote_factory(runtime)
             if remote is not None:

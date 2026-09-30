@@ -206,11 +206,24 @@ def _remote_tasks_status_copy(
         notice = None
     if notice is not None:
         notice = "".join(c for c in notice if c.isalnum() or c in "_-") or None
+    remote = snapshot.get("remote_connectivity")
+    service = ""
+    if remote in {"online", "offline", "revoked"}:
+        service = f" · service {remote}"
+        seen = snapshot.get("remote_last_seen_at")
+        if isinstance(seen, str) and len(seen) <= 40:
+            try:
+                from datetime import datetime
+                parsed = datetime.fromisoformat(seen.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    service += f" · last seen {parsed.isoformat()}"
+            except ValueError:
+                pass
     tail = f" · {operation}" if operation else (f" · {notice}" if notice else "")
     return (
         f"{'enabled' if enabled else 'disabled'} · {process} · "
         f"admission {'paused' if paused else 'open'} · provider {provider_label} · "
-        f"job {active_state} · queue {min(queue, 999)}{tail}"
+        f"job {active_state} · queue {min(queue, 999)}{service}{tail}"
     )
 SETTINGS_PAGE = "settings"
 MAIN_PAGE = "main"
