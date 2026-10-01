@@ -290,7 +290,7 @@ def test_cli_reports_sqlite_errors_and_restores_umask(tmp_path, capsys, monkeypa
             seen["umask"] = os.umask(0)
             os.umask(seen["umask"])
 
-        def issue_code(self):
+        def issue_code(self, worker_id=None):
             return "code"
 
     monkeypatch.setattr(refserver_cli, "ControlStore", Recording)
@@ -491,3 +491,39 @@ def test_heartbeat_cancel_list_is_bounded_newest_first(service, monkeypatch):
     store.request("cancel", {"job_id": live["job_id"]}, key)
     listed = store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"]
     assert listed == [live["job_id"], ids[4], ids[3]]
+
+
+def test_renewal_code_rotates_the_key_and_keeps_the_worker(service):
+    store, ticks, worker_id, key, epoch = service
+    job, _ = submit(service)
+    ticks[0] += 29 * 86400
+    renewed = store.request("pair", {"code": store.issue_code(worker_id)})
+    assert renewed["worker_id"] == worker_id and renewed["device_key"] != key
+    with pytest.raises(ProtocolError, match="unauthorized"):
+        store.request("register", {}, key)  # the old key stops working at once
+    ticks[0] += 2 * 86400  # past the original expiry, inside the renewed one
+    new_key = renewed["device_key"]
+    assert store.request("job", {"job_id": job["job_id"]}, new_key)["job_id"] == job["job_id"]
+    epoch = store.request("register", {}, new_key)["worker_epoch"]
+    store.request("heartbeat", {"worker_epoch": epoch}, new_key)
+
+
+def test_renewal_code_refuses_unknown_and_revoked_workers(service):
+    store, _, worker_id, _, _ = service
+    with pytest.raises(ProtocolError, match="not_found"):
+        store.issue_code("nobody")
+    code = store.issue_code(worker_id)
+    store.revoke(worker_id)
+    with pytest.raises(ProtocolError, match="invalid_code"):
+        store.request("pair", {"code": code})  # revoked after the code was issued
+    with pytest.raises(ProtocolError, match="revoked"):
+        store.issue_code(worker_id)
+
+
+def test_refserver_cli_issues_a_renewal_code(tmp_path, capsys):
+    path = tmp_path / "private" / "server.sqlite3"
+    store = ControlStore(path)
+    worker_id = store.request("pair", {"code": store.issue_code()})["worker_id"]
+    assert refserver_cli.main(["pair-code", "--database", str(path), "--renew", worker_id]) == 0
+    code = capsys.readouterr().out.strip()
+    assert store.request("pair", {"code": code})["worker_id"] == worker_id

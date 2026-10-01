@@ -182,3 +182,14 @@ def test_oversize_content_is_artifact_too_large_not_hash_mismatch():
 def test_events_refuse_unstructured_payload():
     with pytest.raises(ProtocolError):
         event_from_dict({"raw": "secret"})
+
+
+@pytest.mark.parametrize("digest", ["A" * 64, "a" * 63, "g" * 64, None, 5])
+def test_malformed_digest_is_invalid_request_not_hash_mismatch(digest):
+    with pytest.raises(ProtocolError, match="invalid_request"):
+        Artifact.from_dict({**Artifact("result.md", b"x").to_dict(), "sha256": digest})
+
+
+def test_well_formed_wrong_digest_is_hash_mismatch():
+    with pytest.raises(ProtocolError, match="hash_mismatch"):
+        Artifact.from_dict({**Artifact("result.md", b"x").to_dict(), "sha256": "0" * 64})
