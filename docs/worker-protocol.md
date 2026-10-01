@@ -131,8 +131,10 @@ failure.
 Canonical states are `queued`, `claimed`, `starting`, `running`,
 `waiting_for_approval`, `cancel_requested`, `succeeded`, `failed`, `cancelled`,
 `interrupted`, `expired`. Connectivity is separate: `disabled`, `online`,
-`offline`, `revoked`, with a remote last-seen timestamp. `waiting_for_approval`
-is reserved; v1 provides no approval/resume operation and fails closed.
+`offline`, `revoked`, `expired` (the enrollment's 30-day key lifetime ended,
+locally or as reported by the service; re-pair to continue), with a remote
+last-seen timestamp. `waiting_for_approval` is reserved; v1 provides no
+approval/resume operation and fails closed.
 
 Queued expiry becomes `expired`; queued cancel becomes `cancelled`. Claim
 moves `queued` to `claimed`. Uploaded events are the worker's replayable
@@ -260,3 +262,46 @@ Default listener is `127.0.0.1:8765`. Non-loopback bind requires
 backend link behind owner-controlled TLS termination. Never expose it directly.
 Pair codes are printed only to the operator's terminal. Testing with fake
 adapters proves transport/journaling, not provider safety or a real HTTPS pilot.
+
+## Local enrollment and status
+
+`openswap worker pair <url> <code>` is the local approval: it exchanges the
+one-use code and stores enrollment in login Keychain under service `openswap`,
+using a URL-scoped worker-device account name. It writes only the origin URL to
+`worker.controlServiceUrl` in `settings.json`, leaving enabled/paused policy,
+the pinned account and workspace registry unchanged. Pair/unpair are explicitly
+unsupported outside macOS; there is no secret-file fallback. While settings
+name a URL, pairing (at that URL or another) is refused with
+`unpair_before_pairing`: unpair first to change backends or renew an expired
+enrollment. When settings name no URL, a Keychain item left behind at the
+requested URL (after a settings reset, or a pairing interrupted after the key
+was stored) is an orphan and `pair` replaces it. New enrollment at the same
+URL receives separate claim/upload journal bindings, scoped by the worker ID;
+nothing key-derived is written to disk.
+
+`openswap worker unpair [url]` clears the URL, then removes the key. With an
+explicit URL it removes that enrollment's item even when settings no longer
+reference it, clearing the configured URL only when it is the same origin.
+New launches also recheck Keychain availability, and the guard's authorization
+(the normalized URL and worker ID it verified) is re-verified against
+`settings.json` alone, under the launch lock, immediately before the launch
+commits: after `unpair` returns, no remote launch that was not already
+committed can start (it fails `worker_disabled` and releases its lease
+unlaunched). An already committed run continues: unpair/revocation do not stop
+an already running local job. The operator can revoke its worker ID
+separately. After locally enabling and configuring a permitted
+account/workspace, `worker run` maintains outbound connectivity: it re-reads
+the enrollment and heartbeats on one thread and synchronizes on another, and
+both write the durable status from the client's shared connectivity. The
+registration (worker epoch) is replaced only when the enrollment changes or is
+gone/expired locally; a locked Keychain, a transport fault or a failed status
+write reports `offline` and keeps it, since re-registering interrupts the
+service-side jobs of the registration it replaces. With no configured URL it
+performs no network or Keychain access. The production adapter still refuses
+jobs in this phase.
+
+`worker status --json` includes `remote_connectivity` and
+`remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.
+CLI and menu-bar status expose connectivity and service last seen without
+revealing keys, tasks or paths. Old heartbeats become offline after 15 seconds,
+and a stopped local worker is never reported as online.

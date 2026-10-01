@@ -103,8 +103,12 @@ def validate_url(url: object) -> str:
                 or (parts.scheme == "http" and not loopback)
                 or (port is not None and port == 0)):
             raise ValueError
-        # Hostnames are case-insensitive: one origin must hash to one enrollment.
-        return parts._replace(scheme=parts.scheme.lower(), netloc=parts.netloc.lower()).geturl().rstrip("/")
+        # Hostnames are case-insensitive and a default port is implied: one origin
+        # must hash to one enrollment.
+        scheme, netloc = parts.scheme.lower(), parts.netloc.lower()
+        if port == {"http": 80, "https": 443}[scheme] or (port is None and netloc.endswith(":")):
+            netloc = netloc.rsplit(":", 1)[0]
+        return parts._replace(scheme=scheme, netloc=netloc).geturl().rstrip("/")
     except (TypeError, ValueError):
         raise ProtocolError("https_required") from None
 

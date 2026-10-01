@@ -77,7 +77,7 @@ def test_configure_worker_service_replaces_malformed_section(tmp_path):
 
 
 def test_remote_connectivity_matches_protocol_vocabulary():
-    assert {state.value for state in RemoteConnectivity} == {"disabled", "online", "offline", "revoked"}
+    assert {state.value for state in RemoteConnectivity} == {"disabled", "online", "offline", "revoked", "expired"}
 
 
 def test_configure_worker_service_writes_schema_version(tmp_path):

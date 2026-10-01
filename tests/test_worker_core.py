@@ -935,14 +935,14 @@ def test_stop_or_shutdown_just_before_start_never_launches(tmp_path, trigger, ex
     shutdown = threading.Event()
     real_fence = runtime._launch_fence
 
-    def late_signal_fence(job_id, shutdown_event):
+    def late_signal_fence(job_id, shutdown_event, *authorization):
         # Lands after the preparation step released the lock, just before
         # the start thread's own fence read.
         if trigger == "stop":
             assert runtime.stop(job.job_id).accepted is True
         else:
             shutdown.set()
-        return real_fence(job_id, shutdown_event)
+        return real_fence(job_id, shutdown_event, *authorization)
 
     runtime._launch_fence = late_signal_fence
     result = runtime.reconcile_once(shutdown_event=shutdown)

@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from openswap.settings import load_worker_settings
 from openswap.worker.journal import AdmissionError, JournalError
-from openswap.worker.models import JobState, SafeEventKind
+from openswap.worker.models import JobState, RemoteAuthorization, SafeEventKind
 from openswap.worker.protocol import (
     Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, ProtocolError,
     TERMINAL, integer, timestamp, validate_url,
@@ -34,6 +34,8 @@ APPROVAL = "waiting_for_approval"
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
                                  "hash_mismatch", "invalid_request"})
+# Connectivity states that only a new enrollment (re-pair) can leave.
+FINAL = frozenset({"revoked", "expired"})
 
 
 def _unique(pairs):
@@ -258,16 +260,18 @@ class RemoteClient:
     def _connectivity(self, failure=None):
         """Fold one request outcome from either thread into the shared connectivity state.
 
-        Any failure reports ``offline`` (or ``revoked``); only a heartbeat success reports
-        ``online``. Revocation is final for this client, so nothing overrides it.
+        Any failure reports ``offline`` (or ``revoked``/``expired``); only a heartbeat
+        success reports ``online``. Revocation and device expiry are final for this
+        client (only a new enrollment restores access), so nothing overrides them.
         """
         with self._lock:
-            if self.state == "revoked":
+            if self.state in FINAL:
                 return
             if failure is None:
                 self.state = "online"
             elif isinstance(failure, ProtocolError):
-                self.state = ("revoked" if failure.code in {"revoked", "unauthorized", "device_expired"}
+                self.state = ("revoked" if failure.code in {"revoked", "unauthorized"}
+                              else "expired" if failure.code == "device_expired"
                               else "online" if failure.code == "lease_lost" else "offline")
             else:
                 self.state = "offline"
@@ -300,7 +304,10 @@ class RemoteClient:
             raise ProtocolError("invalid_response") from None
         return remote
 
-    def launch_allowed(self, local_id: str) -> bool:
+    def launch_allowed(self, local_id: str) -> bool | RemoteAuthorization:
+        """``True`` for local jobs; for a remote job, the authorization the service
+        just granted (URL and worker ID), or ``False``. The runtime re-checks the
+        token's URL against settings at the commit point."""
         # No client lock is held during runtime control calls: the launch lock
         # and the independent heartbeat driver cannot deadlock each other.
         local = self.runtime.get(local_id)
@@ -316,8 +323,9 @@ class RemoteClient:
             return False
         try:
             remote = self._job_response("renew", claim)
-            return (remote["state"] not in TERMINAL and remote["state"] not in {"cancel_requested", APPROVAL}
-                    and not remote["cancel_requested"])
+            if remote["state"] in TERMINAL or remote["state"] in {"cancel_requested", APPROVAL} or remote["cancel_requested"]:
+                return False
+            return RemoteAuthorization(self.url, self.worker_id)
         except (ProtocolError, KeyError, ValueError, TypeError):
             return False
 
@@ -343,8 +351,8 @@ class RemoteClient:
             with self._lock:
                 self.state = "disabled"
             return False
-        if self.state == "revoked":
-            return False
+        if self.state in FINAL:
+            return False  # only a new enrollment (re-pair) can restore access
         try:
             if self.worker_epoch is None:
                 registered = self.transport.request("register", {})

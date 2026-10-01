@@ -482,13 +482,21 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         return refserver_main(arguments[1:])
     parser = argparse.ArgumentParser(
         prog="openswap worker",
-        description="Control the opt-in, local-only Remote Agent Host worker.",
+        description="Control the opt-in Remote Agent Host worker.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("refserver", help="serve the reference protocol or manage pairing/revocation")
     run = commands.add_parser("run", help="run the background worker process")
     # Passed only by the LaunchAgent: a manual run refuses while it is loaded.
     run.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)
+    pair_parser = commands.add_parser("pair", help="approve enrollment locally and store its device key in login Keychain")
+    pair_parser.add_argument("url")
+    pair_parser.add_argument("code")
+    unpair_parser = commands.add_parser(
+        "unpair", help="remove the device key and configured service URL; pass a URL to remove an enrollment "
+                       "that settings no longer reference",
+    )
+    unpair_parser.add_argument("url", nargs="?", default=None, help="service URL to unpair (default: the configured one)")
     status_parser = commands.add_parser("status", help="show local worker status")
     status_parser.add_argument("--json", action="store_true")
     stop_parser = commands.add_parser("stop", help="request interruption of the active job")
@@ -514,6 +522,37 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     lease_release_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(arguments)
     root = Path(backup_root) if backup_root is not None else get_backup_root()
+
+    if args.command in {"pair", "unpair"}:
+        from openswap.worker.pairing import pair, unpair
+        from openswap.worker.protocol import ProtocolError
+        try:
+            # Both write under the backup root (settings, the pairing lock), so legacy
+            # data must move first or a later enable finds both roots populated.
+            _migrate_legacy_before_worker_state_change(root)
+        except ClaudeSwitchError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        try:
+            if args.command == "pair":
+                worker_id = pair(root, args.url, args.code)
+                print(f"Paired worker {worker_id}. Local execution policy is still controlled on this Mac.")
+            else:
+                if unpair(root, args.url):
+                    print("Worker unpaired; remote access disabled.")
+                elif load_worker_settings(root).control_service_url is not None:
+                    # Only an orphan was removed: the configured enrollment is still live.
+                    print("Removed the saved enrollment for that service. Remote access to the "
+                          "configured service is unchanged; run `unpair` without a URL to disable it.")
+                else:
+                    print("Removed any saved enrollment for that service; no control service is configured.")
+            return 0
+        except ProtocolError as exc:
+            print(f"Could not {args.command}: {exc.code}.", file=sys.stderr)
+            return 1
+        except (OSError, RuntimeError, ValueError):
+            print(f"Could not {args.command}: local settings unavailable.", file=sys.stderr)
+            return 1
 
     if args.command in {"run", "enable", "disable", "pause"}:
         try:
@@ -644,9 +683,11 @@ def _format_status(snapshot: dict) -> str:
         "available" if provider.get("available") is True
         else provider.get("diagnostic_code") or "unavailable"
     )
+    remote = snapshot.get("remote_connectivity", "disabled")
+    seen = snapshot.get("remote_last_seen_at") or "never"
     active = snapshot.get("active_job")
     job = f"; job {active.get('job_id')} ({active.get('state')})" if active else ""
     return (
         f"Remote tasks: {enabled}; worker: {process}; admission: {admission}; "
-        f"provider: {provider_state}{job}"
+        f"provider: {provider_state}; service: {remote}; service last seen: {seen}{job}"
     )
