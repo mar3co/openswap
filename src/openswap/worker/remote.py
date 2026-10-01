@@ -486,8 +486,7 @@ class RemoteClient:
                     # An owner's cancel outranks a provisional interruption: nothing ran either way.
                     state = ("cancelled" if remote["cancel_requested"] else "interrupted" if remote["state"] == "interrupted"
                              else "failed" if remote["state"] == APPROVAL else "expired")
-                    self.transport.request("reconcile", {**self._fence(claim), "state": state,
-                                                         "execution_stopped": False, "unlaunched": True})
+                    self._reconcile(claim, state, stopped=False, unlaunched=True)
                     self.journal.update(claim.job_id, done=1)
                     return
                 self._job_response("renew", claim)
@@ -525,8 +524,7 @@ class RemoteClient:
         if local.state.value in TERMINAL:
             stopped, unlaunched = self._proof(local)
             state = local.state.value if stopped or unlaunched else "interrupted"
-            self.transport.request("reconcile", {**self._fence(claim), "state": state,
-                                                 "execution_stopped": stopped, "unlaunched": unlaunched})
+            self._reconcile(claim, state, stopped=stopped, unlaunched=unlaunched)
             if state == "succeeded" and self.upload_results(claim, local):
                 # Relay the rejection diagnostics before acknowledging the claim.
                 self._forward_events(claim, local_id, self.journal.binding(local_id)["cursor"])
@@ -534,6 +532,14 @@ class RemoteClient:
             if state == "interrupted" and not (stopped or unlaunched) and self._proof_pending(local):
                 return  # provisional: stay pending so later stop proof is still reconciled
             self.journal.update(claim.job_id, done=1)
+
+    def _reconcile(self, claim, state, *, stopped, unlaunched):
+        """Report an outcome; only an acknowledgement for exactly this job and state counts,
+        so a malformed reply leaves the binding pending for a retry instead of retiring it."""
+        ack = self.transport.request("reconcile", {**self._fence(claim), "state": state,
+                                                   "execution_stopped": stopped, "unlaunched": unlaunched})
+        if ack.get("job_id") != claim.job_id or ack.get("state") != state:
+            raise ProtocolError("invalid_response")
 
     def _forward_events(self, claim, local_id, cursor) -> bool:
         """Upload local events after ``cursor``; returns whether the claim is still live.
@@ -579,8 +585,7 @@ class RemoteClient:
             return
         claim = Claim.from_dict(json.loads(binding["claim"]))
         try:
-            self.transport.request("reconcile", {**self._fence(claim), "state": local.state.value,
-                                                 "execution_stopped": stopped, "unlaunched": unlaunched})
+            self._reconcile(claim, local.state.value, stopped=stopped, unlaunched=unlaunched)
         except ProtocolError:
             pass
 
@@ -681,7 +686,11 @@ class RemoteClient:
             content = stream.read(MAX_ARTIFACT + 1)
         if len(content) > MAX_ARTIFACT:
             raise ProtocolError("artifact_too_large", 413)
-        self.transport.request("upload", {**self._fence(claim), "artifact": Artifact(name, content).to_dict()})
+        artifact = Artifact(name, content).to_dict()
+        ack = self.transport.request("upload", {**self._fence(claim), "artifact": artifact})
+        # The claim completes only once the service confirms exactly what was sent.
+        if any(ack.get(field) != artifact[field] for field in ("name", "size", "sha256")):
+            raise ProtocolError("invalid_response")
 
     def run(self, stop_event: threading.Event):
         """Heartbeat on this thread on an absolute schedule; renew and synchronize on two others.

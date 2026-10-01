@@ -60,7 +60,15 @@ def _pairing_lock(root: Path) -> FileLock:
 def _locked(root: Path, operation, *args, **kwargs):
     try:
         with _pairing_lock(root):
-            return operation(root, *args, **kwargs)
+            try:
+                return operation(root, *args, **kwargs)
+            finally:
+                # Any pairing change (including a renewal that keeps the URL and worker
+                # ID) starts the new enrollment without the old one's saved status.
+                try:
+                    (Path(root) / "worker" / "remote-status.json").unlink(missing_ok=True)
+                except OSError:
+                    pass
     except LockError:
         raise ProtocolError("pairing_in_progress") from None
 

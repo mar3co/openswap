@@ -1,7 +1,7 @@
 """Safe durable connectivity status and configured transport lifecycle."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import threading
@@ -20,10 +20,18 @@ def _identity(url, worker_id):
     return hashlib.sha256((url + "\0" + (worker_id or "")).encode()).hexdigest()
 
 
-def save_status(root, url, state, seen, worker_id=None):
-    atomic_write_json(root / "worker" / "remote-status.json", {
+STATUS_FILE = ("worker", "remote-status.json")
+
+
+def save_status(root, url, state, seen, worker_id=None, received=None):
+    """``seen`` is the service's timestamp, kept for display; ``received`` is the Mac's
+    time for that heartbeat (default ``seen``), which alone decides freshness so a
+    skewed service clock cannot make a live connection read as offline."""
+    received = received or seen
+    atomic_write_json(root.joinpath(*STATUS_FILE), {
         "service": _identity(url, worker_id), "state": state,
         "last_seen_at": seen.isoformat() if seen else None,
+        "received_at": received.isoformat() if received else None,
     })
 
 
@@ -34,12 +42,13 @@ def read_status(root, *, now=None):
         return RemoteConnectivity.DISABLED, None
     now = now or datetime.now(timezone.utc)
     try:
-        data = json.loads((root / "worker" / "remote-status.json").read_text(encoding="utf-8"))
+        data = json.loads(root.joinpath(*STATUS_FILE).read_text(encoding="utf-8"))
         if data["service"] != _identity(policy.control_service_url, policy.control_service_worker_id):
             return RemoteConnectivity.OFFLINE, None
         state = RemoteConnectivity(data["state"])
         seen = timestamp(data["last_seen_at"]) if data["last_seen_at"] else None
-        if state == RemoteConnectivity.ONLINE and (seen is None or not -HEARTBEAT_SECONDS <= (now - seen).total_seconds() < HEARTBEAT_SECONDS * MISSED_HEARTBEATS):
+        received = timestamp(data["received_at"]) if data.get("received_at") else seen
+        if state == RemoteConnectivity.ONLINE and (received is None or not -HEARTBEAT_SECONDS <= (now - received).total_seconds() < HEARTBEAT_SECONDS * MISSED_HEARTBEATS):
             state = RemoteConnectivity.OFFLINE
         return state, seen
     except (OSError, KeyError, TypeError, ValueError, ProtocolError):
@@ -99,8 +108,11 @@ class ConfiguredRemote:
 
     def _save(self, client):
         with self._status_lock:
-            save_status(self.runtime.backup_root, client.url, client.state, client.last_seen_at,
-                        client.worker_id or None)
+            seen = client.last_seen_at
+            # The heartbeat's local send time: the service timestamp less the measured offset.
+            received = seen - getattr(client, "_skew", timedelta(0)) if seen else None
+            save_status(self.runtime.backup_root, client.url, client.state, seen,
+                        client.worker_id or None, received)
 
     def _resolve(self):
         """Re-read policy and enrollment; return the client to drive this pass, or None.

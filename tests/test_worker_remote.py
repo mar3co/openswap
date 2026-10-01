@@ -999,3 +999,20 @@ def test_remote_idempotency_prefix_is_reserved(remote_setup):
         runtime.submit(job)
     with pytest.raises(remote_mod.AdmissionError):
         runtime.submit(replace(job, idempotency_key="plain"), remote=True)
+
+
+@pytest.mark.parametrize("operation, reply", [("reconcile", {}), ("reconcile", {"job_id": "other", "state": "succeeded"}),
+                                              ("upload", {}), ("upload", {"name": "result.md", "size": 1, "sha256": "0" * 64})])
+def test_unacknowledged_outcome_or_upload_keeps_the_binding(remote_setup, monkeypatch, operation, reply):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    submit(remote_setup)
+    remote.tick()
+    assert runtime.reconcile_once().state == JobState.SUCCEEDED
+    original = transport.request
+    monkeypatch.setattr(transport, "request", lambda op, data: (original(op, data), reply)[1]
+                        if op == operation else original(op, data))
+    remote.tick()
+    assert remote.journal.pending(), "a malformed acknowledgement must not retire the binding"
+    monkeypatch.setattr(transport, "request", original)
+    remote.tick()
+    assert remote.journal.pending() == []
