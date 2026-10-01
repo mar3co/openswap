@@ -149,7 +149,8 @@ class ControlStore:
                 if row[1] is not None:
                     # Renewal: rotate the key in place; a worker revoked since the code was issued stays revoked.
                     worker_id = row[1]
-                    if not db.execute("UPDATE devices SET key_hash=?,expiry=? WHERE id=? AND revoked=0",
+                    # Like registration, rotation clears liveness: only a heartbeat with the new key restores it.
+                    if not db.execute("UPDATE devices SET key_hash=?,expiry=?,seen=NULL WHERE id=? AND revoked=0",
                                       (digest(device_key), now + DEVICE_TTL_SECONDS, worker_id)).rowcount:
                         raise ProtocolError("invalid_code")
                 else:
@@ -321,6 +322,9 @@ class ControlStore:
                             and event.state.value in {"starting", "running", "cancel_requested"}):
                         order = {"claimed": 0, "starting": 1, "running": 2, "cancel_requested": 3}
                         current = self._job(db, job["id"], device)["state"]
+                        if event.state.value == "cancel_requested" and current == "interrupted":
+                            # The state is not moved back, but the persistent flag still records the request.
+                            db.execute("UPDATE jobs SET cancel=1 WHERE id=? AND confirmed=0", (job["id"],))
                         if current in order and order[event.state.value] >= order[current]:
                             db.execute("UPDATE jobs SET state=?,cancel=max(cancel,?) WHERE id=?",
                                        (event.state.value, int(event.state.value == "cancel_requested"), job["id"]))

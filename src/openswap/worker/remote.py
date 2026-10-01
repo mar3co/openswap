@@ -26,6 +26,8 @@ from openswap.worker.protocol import (
 )
 
 STATES = frozenset(state.value for state in JobState)
+# The protocol caps heartbeat cancel_job_ids; a longer list is a malformed response.
+MAX_CANCEL_IDS = 100
 # Reserved by the protocol: v1 has no approval/resume operation, so it fails closed.
 APPROVAL = "waiting_for_approval"
 # Validation failures the service (or the local export check) reports for one
@@ -220,7 +222,9 @@ class RemoteClient:
                  artifact_names=("result.md",)):
         self.runtime, self.url, self.worker_id = runtime, validate_url(url), worker_id
         self.transport = transport or Transport(self.url, key)
-        # The worker ID is per enrollment and not secret; without one, a digest of the key stands in.
+        # Keyed by the stable worker ID, so a key renewal (same worker) keeps its bindings
+        # while a replacement enrollment (new worker) starts clean. Without an ID, a digest
+        # of the key stands in.
         self.journal = RemoteJournal(runtime, self.url, worker_id or hashlib.sha256(key.encode()).hexdigest())
         self.stop_event = threading.Event()
         self.worker_epoch = None
@@ -359,7 +363,8 @@ class RemoteClient:
             heartbeat = self._worker_request("heartbeat")
             seen = timestamp(heartbeat["last_seen_at"])
             cancel_ids = heartbeat["cancel_job_ids"]
-            if not isinstance(cancel_ids, list) or not all(isinstance(i, str) and 0 < len(i) <= 200 for i in cancel_ids):
+            if (not isinstance(cancel_ids, list) or len(cancel_ids) > MAX_CANCEL_IDS
+                    or not all(isinstance(i, str) and 0 < len(i) <= 200 for i in cancel_ids)):
                 raise ProtocolError("invalid_response")
             with self._lock:
                 self.last_seen_at = seen
@@ -417,6 +422,8 @@ class RemoteClient:
                 continue
             if local.state.value not in TERMINAL:
                 self.runtime.cancel(local.job_id)
+            elif binding["done"]:
+                self._reconcile_ended(binding, local)
 
     def sync_tick(self, policy=None):
         """The synchronization half of a tick: replay pending bindings, then claim new work.
@@ -495,7 +502,7 @@ class RemoteClient:
                 # deadline translated into local time.
                 job = claim.submission.job
                 local = self.runtime.submit(replace(job, idempotency_key=idem, expires_at=job.expires_at - self._skew),
-                                            job_id=local_id)
+                                            job_id=local_id, remote=True)
             if local.job_id != local_id:
                 local_id = local.job_id
                 self.journal.update(claim.job_id, local_id=local_id)
@@ -559,6 +566,23 @@ class RemoteClient:
                 break
             page = self.runtime.events(local_id, after_cursor=cursor, limit=200)
         return True
+
+    def _reconcile_ended(self, binding, local):
+        """Report a proven outcome for a binding that ended without one (a
+        ``cursor_conflict``), so a cancelled run does not stay listed forever.
+
+        Best effort: the service keeps listing the job until its outcome is
+        confirmed, so a failure here is retried on a later heartbeat.
+        """
+        stopped, unlaunched = self._proof(local)
+        if not (stopped or unlaunched):
+            return
+        claim = Claim.from_dict(json.loads(binding["claim"]))
+        try:
+            self.transport.request("reconcile", {**self._fence(claim), "state": local.state.value,
+                                                 "execution_stopped": stopped, "unlaunched": unlaunched})
+        except ProtocolError:
+            pass
 
     def _abandon(self, claim, local_id):
         """End a binding whose service history diverged; local execution is untouched.
