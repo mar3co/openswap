@@ -16,7 +16,15 @@ From the repo root:
 ```
 
 Needs Xcode, xcodegen, and uv. Output: `packaging/macos/dist/OpenSwap.app`
-(gitignored). Bundle size on this spike Mac: 26M.
+plus `OpenSwap-<version>.zip` and `.sha256` (all gitignored). Bundle size on
+this spike Mac: 26M. The version comes from `pyproject.toml`;
+`OPENSWAP_BUILD_NUMBER` (CI: the run number) sets `CFBundleVersion`.
+
+Ship or copy the zip, not the `.app` folder. It is made with `ditto` after
+stapling; copying the folder by other means (including
+`actions/upload-artifact`) drops execute bits and symlinks and breaks the
+signature. To try a CI build, download the `OpenSwap-app` artifact and unpack
+the zip inside it with `ditto -x -k OpenSwap-*.zip .`.
 
 For an isolated experimental build without replacing the ordinary dist app,
 set absolute `OPENSWAP_DIST_DIR`, `OPENSWAP_BUILD_DIR`, and
@@ -48,6 +56,28 @@ Repository secrets (Settings → Secrets and variables → Actions):
 
 `SIGNING_P12_PASSWORD` is an accepted alias for the .p12 password. Encode
 with `base64 -i cert.p12 | pbcopy` (no line wraps).
+
+If notarization is rejected, `build.sh` prints Apple's `notarytool log` for
+the submission before failing, so the reason is in the job log.
+
+## Releasing
+
+1. Bump `version` in `pyproject.toml`, commit, and push tag `v<version>`.
+   The workflow fails if the tag and the pyproject version disagree.
+2. `macOS app` builds, signs, notarizes, unpacks the zip and assesses that
+   copy, then drafts a GitHub release with `OpenSwap-<version>.zip`, its
+   `.sha256`, and `openswap.rb` rendered from
+   `packaging/homebrew/openswap.rb.in`.
+3. Check the draft and publish it. `Homebrew tap`
+   (`.github/workflows/homebrew-tap.yml`) then copies `openswap.rb` into
+   `mar3co/homebrew-openswap/Casks/`. It needs repository secret
+   `HOMEBREW_TAP_TOKEN` (fine-grained token, Contents read/write on the tap
+   repo only); without it the job warns and the cask is copied by hand. It
+   can be re-run for any tag from the Actions tab.
+
+Users then install with `brew install --cask mar3co/openswap/openswap`. The
+app code still assumes a uv install until plan 008 lands; do not publish a
+release before that.
 
 ## Spike verdict
 

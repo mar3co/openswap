@@ -2,7 +2,10 @@ name: macOS app
 
 # Freeze OpenSwap.app on a macOS runner. Sign and notarize when repository
 # secrets are present. Pull requests always freeze unsigned (do not expose
-# the production certificate to PR code). Tag builds require the certificate.
+# the production certificate to PR code). Tag builds require the certificate
+# and end in a draft GitHub release carrying the zip, its checksum, and the
+# rendered Homebrew cask. Publishing that draft is a person's call; the
+# homebrew-tap workflow then copies the cask into the tap.
 
 on:
   workflow_dispatch:
@@ -11,6 +14,7 @@ on:
   pull_request:
     paths:
       - "packaging/macos/**"
+      - "packaging/homebrew/**"
       - "macos/OpenSwapWidget/**"
       - ".github/workflows/macos-app.yml"
 
@@ -38,6 +42,17 @@ jobs:
             exit 1
           fi
 
+      # pyproject.toml is the one place the version is written; the tag must
+      # agree with it or the cask URL and the app's own version drift apart.
+      - name: Tag matches pyproject version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(awk -F'"' '/^version = /{print $2; exit}' pyproject.toml)"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match pyproject version ${version} (expected v${version})" >&2
+            exit 1
+          fi
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -45,6 +60,14 @@ jobs:
 
       - name: Install xcodegen
         run: brew install xcodegen
+
+      # Render with a dummy checksum; this checks the template, not a release.
+      - name: Lint Homebrew cask
+        run: |
+          mkdir -p "$RUNNER_TEMP/Casks"
+          bash packaging/homebrew/render-cask.sh 0.0.0 "$(printf '0%.0s' $(seq 64))" \
+            > "$RUNNER_TEMP/Casks/openswap.rb"
+          brew style "$RUNNER_TEMP/Casks/openswap.rb"
 
       - name: Import signing material
         if: ${{ github.event_name != 'pull_request' && env.HAS_SIGNING_P12 == 'true' }}
@@ -59,22 +82,67 @@ jobs:
         run: bash packaging/macos/ci-import-signing-keychain.sh
 
       - name: Freeze (sign and notarize when identity is set)
+        env:
+          OPENSWAP_BUILD_NUMBER: ${{ github.run_number }}
         run: bash packaging/macos/build.sh
 
       # build.sh exits 0 when it cannot sign, so a green run is not by itself
-      # proof of a shippable app. Assert it on the one path that ships.
+      # proof of a shippable app. Assert it on the one path that ships, against
+      # the zip that ships: unpack it the way a download would be and assess
+      # that copy rather than the build folder.
       - name: Tag builds must be signed, notarized, and stapled
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          APP=packaging/macos/dist/OpenSwap.app
+          ZIP="$(ls packaging/macos/dist/OpenSwap-*.zip)"
+          CHECK="$RUNNER_TEMP/zip-check"
+          rm -rf "$CHECK" && mkdir -p "$CHECK"
+          ditto -x -k "$ZIP" "$CHECK"
+          APP="$CHECK/OpenSwap.app"
           codesign --verify --deep --strict --verbose=2 "$APP"
           xcrun stapler validate "$APP"
           spctl --assess --type execute --verbose=2 "$APP"
+          "$APP/Contents/MacOS/OpenSwap" --version
 
-      - name: Upload OpenSwap.app
+      # The zip, not the .app folder: upload-artifact drops execute bits and
+      # symlinks, which leaves a bundle that neither launches nor verifies.
+      - name: Upload OpenSwap zip
         uses: actions/upload-artifact@v4
         with:
           name: OpenSwap-app
-          path: packaging/macos/dist/OpenSwap.app
+          path: |
+            packaging/macos/dist/OpenSwap-*.zip
+            packaging/macos/dist/OpenSwap-*.zip.sha256
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    needs: macos-app
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: OpenSwap-app
+          path: dist
+
+      - name: Render cask
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sha256="$(cut -d' ' -f1 < "dist/OpenSwap-${version}.zip.sha256")"
+          bash packaging/homebrew/render-cask.sh "$version" "$sha256" > dist/openswap.rb
+          cat dist/openswap.rb
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --title "OpenSwap ${version}" --generate-notes \
+            "dist/OpenSwap-${version}.zip" \
+            "dist/OpenSwap-${version}.zip.sha256" \
+            dist/openswap.rb
