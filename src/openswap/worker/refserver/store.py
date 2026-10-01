@@ -53,7 +53,7 @@ class ControlStore:
                 pass
         with closing(self.connect()) as db, db:
             db.executescript('''
-                CREATE TABLE IF NOT EXISTS codes (hash TEXT PRIMARY KEY, expiry REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS codes (hash TEXT PRIMARY KEY, expiry REAL NOT NULL, device TEXT);
                 CREATE TABLE IF NOT EXISTS devices (
                     id TEXT PRIMARY KEY, key_hash TEXT UNIQUE NOT NULL, expiry REAL NOT NULL,
                     revoked INTEGER NOT NULL DEFAULT 0, epoch INTEGER NOT NULL DEFAULT 0, seen REAL);
@@ -71,6 +71,8 @@ class ControlStore:
             ''')
             if "confirmed" not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
+            if "device" not in {r[1] for r in db.execute("PRAGMA table_info(codes)")}:
+                db.execute("ALTER TABLE codes ADD COLUMN device TEXT")
         if os.name != "nt":
             os.chmod(self.path, 0o600)
 
@@ -79,11 +81,23 @@ class ControlStore:
         db.row_factory = sqlite3.Row
         return db
 
-    def issue_code(self) -> str:
+    def issue_code(self, worker_id: str | None = None) -> str:
+        """A one-use pairing code; with ``worker_id``, a renewal code for that worker.
+
+        Pairing with a renewal code rotates the existing worker's key and expiry and
+        keeps its ID, so its jobs, events and artifacts stay reachable; the old key
+        stops working. A revoked worker cannot be renewed.
+        """
         code = "pair_" + secrets.token_urlsafe(24)
         with closing(self.connect()) as db, db:
+            if worker_id is not None:
+                device = db.execute("SELECT revoked FROM devices WHERE id=?", (worker_id,)).fetchone()
+                if device is None:
+                    raise ProtocolError("not_found", 404)
+                if device["revoked"]:
+                    raise ProtocolError("revoked", 403)
             db.execute("DELETE FROM codes WHERE expiry<=?", (self.clock(),))
-            db.execute("INSERT INTO codes VALUES (?,?)", (digest(code), self.clock() + 600))
+            db.execute("INSERT INTO codes VALUES (?,?,?)", (digest(code), self.clock() + 600, worker_id))
         return code
 
     def revoke(self, worker_id: str) -> None:
@@ -127,13 +141,21 @@ class ControlStore:
             if operation == "pair":
                 data = fields(value, {"code"})
                 hashed = digest(text(data["code"]))
-                row = db.execute("SELECT expiry FROM codes WHERE hash=?", (hashed,)).fetchone()
+                row = db.execute("SELECT expiry,device FROM codes WHERE hash=?", (hashed,)).fetchone()
                 if row is None or row[0] <= now:
                     raise ProtocolError("invalid_code")
                 db.execute("DELETE FROM codes WHERE hash=?", (hashed,))
-                worker_id, device_key = uuid4().hex, secrets.token_urlsafe(32)
-                db.execute("INSERT INTO devices(id,key_hash,expiry) VALUES (?,?,?)",
-                           (worker_id, digest(device_key), now + DEVICE_TTL_SECONDS))
+                device_key = secrets.token_urlsafe(32)
+                if row[1] is not None:
+                    # Renewal: rotate the key in place; a worker revoked since the code was issued stays revoked.
+                    worker_id = row[1]
+                    if not db.execute("UPDATE devices SET key_hash=?,expiry=? WHERE id=? AND revoked=0",
+                                      (digest(device_key), now + DEVICE_TTL_SECONDS, worker_id)).rowcount:
+                        raise ProtocolError("invalid_code")
+                else:
+                    worker_id = uuid4().hex
+                    db.execute("INSERT INTO devices(id,key_hash,expiry) VALUES (?,?,?)",
+                               (worker_id, digest(device_key), now + DEVICE_TTL_SECONDS))
                 result = {"worker_id": worker_id, "device_key": device_key, "expires_at": stamp(now + DEVICE_TTL_SECONDS)}
             else:
                 # Re-read inside the write transaction so a concurrent revocation cannot race the check.

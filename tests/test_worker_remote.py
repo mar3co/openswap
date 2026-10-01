@@ -386,6 +386,7 @@ def test_run_loop_survives_a_journal_error_and_keeps_ticking(remote_setup, monke
         return original_cancel(local_id)
 
     monkeypatch.setattr(runtime, "cancel", flaky_cancel)
+    monkeypatch.setattr(remote, "enforce_cancellations", lambda: None)  # exercise the sync thread's path
     monkeypatch.setattr(remote_mod, "HEARTBEAT_SECONDS", 0.01)
     passes, enough = [], threading.Event()
     original_sync = remote.sync_tick
@@ -882,3 +883,62 @@ def test_clock_offset_never_lags_the_service_by_the_response_latency(remote_setu
     transport.request = slow
     remote.heartbeat_tick()
     assert remote._skew >= timedelta(seconds=-0.05)  # deadlines err early, never late
+
+
+def test_heartbeat_cancellation_reaches_the_run_while_sync_is_blocked(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, ticks, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    local = runtime.store.queue()[0]
+    store.request("cancel", {"job_id": job_id}, paired["device_key"])
+    monkeypatch.setattr(remote_mod, "HEARTBEAT_SECONDS", 0.02)
+    stop = threading.Event()
+    remote.transport = BlockingTransport(transport, {"job"}, stop)  # every sync pass hangs on its first request
+    thread = threading.Thread(target=remote.run, args=(stop,), daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and runtime.store.get(local.job_id).state.value == "queued":
+            time.sleep(0.02)
+        assert runtime.store.get(local.job_id).state.value in {"cancelled", "cancel_requested"}
+    finally:
+        stop.set()
+        thread.join(2)
+    assert not thread.is_alive() and adapter.starts == 0
+
+
+def test_renew_reported_cancellation_is_enforced(remote_setup, monkeypatch):
+    remote, runtime, _, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    local = runtime.store.queue()[0]
+    original = transport.request
+    monkeypatch.setattr(transport, "request", lambda op, data: {**original(op, data), "cancel_requested": True}
+                        if op == "renew" else original(op, data))
+    remote.renew_admitted()
+    remote.enforce_cancellations()
+    assert runtime.store.get(local.job_id).state.value in {"cancelled", "cancel_requested"}
+
+
+def test_malformed_cancel_list_is_an_invalid_heartbeat(remote_setup, monkeypatch):
+    remote, _, _, _, _, _, transport = remote_setup
+    original = transport.request
+    monkeypatch.setattr(transport, "request", lambda op, data: {**original(op, data), "cancel_job_ids": [5]}
+                        if op == "heartbeat" else original(op, data))
+    assert remote.heartbeat_tick() is False and remote.state == "offline"
+
+
+def test_unadmitted_claim_cancelled_after_interruption_reconciles_as_cancelled(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, ticks, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    monkeypatch.setattr(runtime, "submit", lambda *a, **k: (_ for _ in ()).throw(OSError("crash before admission")))
+    remote.tick()
+    monkeypatch.undo()
+    epoch = store.request("register", {}, paired["device_key"])["worker_epoch"]  # interrupts the claim
+    store.request("cancel", {"job_id": job_id}, paired["device_key"])
+    remote.worker_epoch = None
+    remote.tick()
+    reconcile = [data for op, data in transport.requests if op == "reconcile"][-1]
+    assert (reconcile["state"], reconcile["unlaunched"]) == ("cancelled", True)
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "cancelled"
+    assert adapter.starts == 0 and epoch
