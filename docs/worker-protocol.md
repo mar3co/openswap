@@ -18,6 +18,11 @@ non-finite numbers, unsupported versions, and oversized bodies. Responses are
 JSON objects, status 200 on success, with `Cache-Control: no-store`. Maximum
 encoded request/response size is 1,500,000 bytes; event pages contain at most
 200 events. Requests have a bounded timeout (reference client: 5 seconds).
+The reference client sends heartbeats from a thread of their own, on a fixed
+cadence, so probes, event pages and artifact uploads (each bounded, but not a
+whole pass) can never delay liveness past the 15-second deadline; that thread
+also renews the lease of an admitted claim that is still waiting for its
+launch fence.
 
 Except `pair`, every request uses `Authorization: Bearer <device_key>`. Keys
 are random 256-bit-or-stronger opaque secrets, stored hashed by the server and
@@ -110,8 +115,16 @@ returns `lease_lost` while the worker's active claim has an expired lease
 rather than granting another job. Only `heartbeat` counts as liveness; `poll`
 from a worker without a heartbeat in the last 15 seconds returns
 `offline_worker`. All uploads carry the original job epoch; old worker/job
-epochs return `stale_epoch`. Leases govern admission, **not termination of a
-running job**.
+epochs return `stale_epoch`. A worker whose `heartbeat` or `poll` returns
+`stale_epoch` has been superseded by a newer registration; it must report
+`offline` and register again before any further mutation. Leases govern
+admission, **not termination of a running job**.
+
+`renew` and `job` responses carry `cancel_requested` as a JSON boolean and
+`state` as one of the canonical states below. A worker treats any other value
+(for example the string `"false"`) as a malformed response: it neither cancels
+nor launches local work on it, and retries as it would after a transport
+failure.
 
 ## State, loss of connectivity, and cancellation
 
@@ -182,7 +195,10 @@ job), `timestamp`, `kind`, `state` (or null), `diagnostic_code` (or null),
 allowed on `provider_finished`. Diagnostics: `live_adapter_disabled`,
 `provider_unavailable`, `job_expired`, `cancel_requested`, `execution_uncertain`,
 `lease_conflict`, `worker_restarted`, `invalid_transition`, `worker_disabled`,
-`runtime_limit_reached`, `provider_auth_unavailable`, `provider_rate_limited`.
+`runtime_limit_reached`, `provider_auth_unavailable`, `provider_rate_limited`,
+`artifact_rejected` (a `diagnostic` event: one explicit artifact was refused by
+the size, hash, limit, conflict or export-safety checks and was skipped; the
+job outcome stands).
 No free-form provider payloads, local paths or account/session identifiers are
 accepted. Upload with `events`, `worker_epoch`, `epoch` together; read by
 omitting all three. Upload at most 200 events; identical cursor replay is
@@ -201,7 +217,12 @@ changed artifact returns `artifact_conflict`. Upload only for successful jobs:
 decoded content above 1 MiB returns `artifact_too_large` before any hash check.
 The worker exports an explicit list (pilot default: `result.md`) from that
 job's approved output directory. Never glob, traverse symlinks, upload source
-checkouts, logs, auth/session files, or recursively archive directories.
+checkouts, logs, auth/session files, or recursively archive directories. An
+artifact refused by these checks (`artifact_too_large`, `artifact_limit`,
+`artifact_conflict`, `hash_mismatch`, or a local export-safety failure) is
+skipped and reported with an `artifact_rejected` diagnostic event; the job's
+reconciled outcome is unaffected and the claim completes without it. Only
+transport, lease and authorization failures defer the upload for retry.
 Operator and owner must ensure selected results contain no provider secrets.
 The service supplies metadata lists and bounded authenticated downloads.
 

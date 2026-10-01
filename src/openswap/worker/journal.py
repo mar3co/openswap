@@ -48,6 +48,7 @@ _SAFE_DIAGNOSTICS = {
     "worker_restarted", "invalid_transition", "worker_disabled",
     "runtime_limit_reached",
     "provider_auth_unavailable", "provider_rate_limited",
+    "artifact_rejected",
 }
 
 

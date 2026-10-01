@@ -317,6 +317,7 @@ class WorkerRuntime:
         self._event_reader: threading.Thread | None = None
         self._active_run = None
         self._active_lease = None
+        self.remote_launch_guard = None
 
     def _quarantine_lease_for_recovered_jobs(self) -> None:
         """Stop trusting a still-``active`` lease left by a crashed worker.
@@ -345,7 +346,14 @@ class WorkerRuntime:
             except AccountLeaseError:
                 pass
 
-    def submit(self, submission: JobSubmission) -> JobRecord:
+    def submit(self, submission: JobSubmission, *, job_id: str | None = None, remote: bool = False) -> JobRecord:
+        """Admit a job; ``job_id`` lets a caller publish the ID before the row exists.
+
+        The ``remote:`` idempotency prefix marks a job admitted by the remote client
+        (its launch needs remote authorization), so only that client may use it.
+        """
+        if submission.idempotency_key.startswith("remote:") != remote:
+            raise AdmissionError("the remote: idempotency prefix is reserved for remote jobs")
         with self._admission_lock:
             policy = load_worker_settings(self.backup_root)
             if not policy.enabled:
@@ -355,7 +363,7 @@ class WorkerRuntime:
             if submission.expires_at <= datetime.now(timezone.utc):
                 raise AdmissionError("job is expired")
             return self.store.create(
-                submission, owner_ref=self.owner_ref, worker_epoch=self.worker_epoch,
+                submission, owner_ref=self.owner_ref, worker_epoch=self.worker_epoch, job_id=job_id,
             )
 
     def get(self, job_id: str) -> JobRecord:
@@ -807,6 +815,14 @@ class WorkerRuntime:
             or not load_worker_settings(self.backup_root).enabled
         ):
             return "worker_shutdown"
+        if latest.idempotency_key.startswith("remote:") and self.remote_launch_guard is None:
+            return "worker_shutdown"
+        if self.remote_launch_guard is not None:
+            try:
+                if not self.remote_launch_guard(job_id):
+                    return "worker_shutdown"
+            except Exception:
+                return "worker_shutdown"
         return None
 
     def _finish_unlaunched(self, starting: JobRecord, token, reason: str) -> JobRecord:
@@ -1207,6 +1223,7 @@ def run_worker(
     backup_root: Path,
     *,
     runtime_factory=WorkerRuntime,
+    remote_factory=None,
     managed: bool = True,
     service_loaded=None,
 ) -> int:
@@ -1226,6 +1243,7 @@ def run_worker(
     instance_lock = FileLock(Path(backup_root) / "worker" / "instance.lock", timeout=0)
     runtime = None
     server = None
+    remote_thread = None
     if not lifecycle_lock.acquire(timeout=3):
         return 1
     if not instance_lock.acquire(timeout=0):
@@ -1253,6 +1271,12 @@ def run_worker(
             # clear it so status and disable do not see a stale worker.
             _mark_stopped_quietly(runtime)
             return 1
+        if remote_factory is not None:
+            remote = remote_factory(runtime)
+            if remote is not None:
+                remote_thread = threading.Thread(target=remote.run, args=(stop_event,),
+                                                 name="openswap-worker-remote", daemon=True)
+                remote_thread.start()
         lifecycle_lock.release()
         original_handlers = {}
         for signum in (signal.SIGTERM, signal.SIGINT):
@@ -1291,5 +1315,8 @@ def run_worker(
         _mark_stopped_quietly(runtime)
         return 1
     finally:
+        stop_event.set()
+        if remote_thread is not None:
+            remote_thread.join(timeout=6)
         lifecycle_lock.release()
         instance_lock.release()
