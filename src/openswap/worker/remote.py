@@ -181,6 +181,12 @@ class RemoteJournal:
         with closing(self.connect()) as db:
             return db.execute("SELECT * FROM bindings WHERE service=? AND done=0 ORDER BY rowid", (self.service,)).fetchall()
 
+    def by_remote(self, remote_id):
+        """The binding for a remote ID whether or not it is done: cancellation must
+        reach a local run for as long as it executes."""
+        with closing(self.connect()) as db:
+            return db.execute("SELECT * FROM bindings WHERE service=? AND remote_id=?", (self.service, remote_id)).fetchone()
+
     def binding(self, local_id):
         with closing(self.connect()) as db:
             return db.execute("SELECT * FROM bindings WHERE service=? AND local_id=?", (self.service, local_id)).fetchone()
@@ -217,7 +223,8 @@ class RemoteClient:
         self.last_seen_at = None
         self._skew = timedelta(0)  # service clock minus local clock, from the last heartbeat
         self._lock = threading.Lock()
-        self._admitted = None  # claim whose lease the heartbeat thread keeps renewing
+        self._admitted = None  # claim whose lease the renewal thread keeps renewing
+        self._cancels = set()  # remote IDs the service asked to cancel, enforced off the heartbeat thread
         self.artifact_names = tuple(artifact_names)
         if len(self.artifact_names) > 8:
             raise ValueError("too many explicit artifacts")
@@ -315,6 +322,7 @@ class RemoteClient:
             return
         policy = load_worker_settings(self.runtime.backup_root)
         if self.heartbeat_tick(policy):
+            self.enforce_cancellations()
             self.sync_tick(policy)
 
     def heartbeat_tick(self, policy=None) -> bool:
@@ -339,11 +347,16 @@ class RemoteClient:
             sent = datetime.now(timezone.utc)
             heartbeat = self._worker_request("heartbeat")
             seen = timestamp(heartbeat["last_seen_at"])
+            cancel_ids = heartbeat["cancel_job_ids"]
+            if not isinstance(cancel_ids, list) or not all(isinstance(i, str) and 0 < len(i) <= 200 for i in cancel_ids):
+                raise ProtocolError("invalid_response")
             with self._lock:
                 self.last_seen_at = seen
                 # Measured against the send time, the offset can only overstate the
                 # service clock by the round trip: deadlines err early, never late.
                 self._skew = seen - sent
+                # Only queued here: runtime control calls never delay the next heartbeat.
+                self._cancels.update(cancel_ids)
             self._connectivity()
             return self.state == "online"
         except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
@@ -362,12 +375,37 @@ class RemoteClient:
         if claim is None or self.worker_epoch is None:
             return
         try:
-            self._job_response("renew", claim)
+            remote = self._job_response("renew", claim)
         except ProtocolError as exc:
             if exc.code != "lease_lost":
                 raise
             if self._admitted is claim:
                 self._admitted = None
+            return
+        if remote["cancel_requested"]:
+            with self._lock:
+                self._cancels.add(claim.job_id)
+
+    def enforce_cancellations(self):
+        """Apply the cancellations heartbeat and renewal reported to their local runs.
+
+        Runs on the renewal thread (and in ``tick``), so a synchronization pass
+        blocked on the network cannot hold an owner's cancel back. A remote ID
+        with no running local job is dropped; the service keeps listing it until
+        its outcome is confirmed, so nothing is lost.
+        """
+        with self._lock:
+            pending, self._cancels = self._cancels, set()
+        for remote_id in pending:
+            binding = self.journal.by_remote(remote_id)
+            if binding is None or not binding["local_id"]:
+                continue
+            try:
+                local = self.runtime.get(binding["local_id"])
+            except KeyError:
+                continue
+            if local.state.value not in TERMINAL:
+                self.runtime.cancel(local.job_id)
 
     def sync_tick(self, policy=None):
         """The synchronization half of a tick: replay pending bindings, then claim new work.
@@ -425,7 +463,8 @@ class RemoteClient:
                 if (remote["state"] in TERMINAL or remote["state"] == APPROVAL or remote["cancel_requested"]
                         or claim.submission.job.expires_at <= self._server_now()):
                     # Nothing was ever admitted locally, so nothing launched.
-                    state = ("interrupted" if remote["state"] == "interrupted" else "cancelled" if remote["cancel_requested"]
+                    # An owner's cancel outranks a provisional interruption: nothing ran either way.
+                    state = ("cancelled" if remote["cancel_requested"] else "interrupted" if remote["state"] == "interrupted"
                              else "failed" if remote["state"] == APPROVAL else "expired")
                     self.transport.request("reconcile", {**self._fence(claim), "state": state,
                                                          "execution_stopped": False, "unlaunched": True})
@@ -604,6 +643,7 @@ class RemoteClient:
             try:
                 if self.state == "online":
                     self.renew_admitted()
+                self.enforce_cancellations()
             except Exception as exc:
                 self._connectivity(exc)
             self.stop_event.wait(HEARTBEAT_SECONDS)
