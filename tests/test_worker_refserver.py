@@ -527,3 +527,26 @@ def test_refserver_cli_issues_a_renewal_code(tmp_path, capsys):
     assert refserver_cli.main(["pair-code", "--database", str(path), "--renew", worker_id]) == 0
     code = capsys.readouterr().out.strip()
     assert store.request("pair", {"code": code})["worker_id"] == worker_id
+
+
+def test_key_rotation_clears_the_previous_keys_liveness(service):
+    store, ticks, worker_id, key, epoch = service
+    ticks[0] += 1  # the old key's heartbeat is still fresh
+    renewed = store.request("pair", {"code": store.issue_code(worker_id)})
+    with pytest.raises(ProtocolError, match="offline_worker"):
+        submit(service[:3] + (renewed["device_key"], epoch))
+
+
+def test_cancel_requested_event_after_heartbeat_loss_still_sets_the_flag(service):
+    store, ticks, _, key, epoch = service
+    submit(service)
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    ticks[0] += 16  # heartbeat loss: the job becomes interrupted
+    assert store.request("job", {"job_id": claim["job_id"]}, key)["state"] == "interrupted"
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
+    event = SafeEvent(claim["job_id"], 1, datetime.fromtimestamp(ticks[0], timezone.utc),
+                      SafeEventKind.STATE_CHANGED, JobState.CANCEL_REQUESTED).to_dict()
+    store.request("events", {**fence(service, claim), "after_cursor": 0, "events": [event]}, key)
+    job = store.request("job", {"job_id": claim["job_id"]}, key)
+    assert (job["state"], job["cancel_requested"]) == ("interrupted", True)
+    assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == [claim["job_id"]]
