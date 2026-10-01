@@ -679,7 +679,8 @@ requirements. Production execution still uses `UnavailableCodexAdapter`.
 | 3e round-two head (`0031697`) | 3450 passed, 5 skipped | 229 passed |
 | 3e round-three head (`9153334`) | 3482 passed, 5 skipped | not re-run serially |
 | 3e round-four head (`ffe0994`) | 3502 passed, 5 skipped | not re-run serially |
-| 3e round-five head (this PR's head) | 3509 passed, 5 skipped | not re-run serially |
+| 3e round-five head (`b5bd3b6`) | 3509 passed, 5 skipped | not re-run serially |
+| 3e round-six head (this PR's head) | 3516 passed, 5 skipped | not re-run serially |
 
 Full suites use `uv run pytest -q`; serial Phase 3 runs use `-n0` with the
 six Phase 3 test modules (the review pass added
@@ -707,7 +708,9 @@ round answered the next Codex re-review (3a `6c1b5ed`, 3b `eb13955`, 3c
 `b4aee58`, 3d `29d1da0`, 3e `9153334`), and a fourth the one after that (3a
 `412e25d`, 3b `fc9bdae`, 3c `c5747d3`, 3d `74c30db`, 3e `ffe0994`), and a
 fifth after that (3a unchanged with a clean Codex review, 3b `f35892e`, 3c
-`c435f8a`, 3d `cb4dc6b`, 3e this PR's head). All five PRs are pending merge;
+`c435f8a`, 3d `cb4dc6b`, 3e `b5bd3b6`). Codex then approved 3a, 3b and 3e; a
+sixth round closed the last 3c/3d findings (3c `1f5f1c9`, 3d `18ea392`, 3e
+this PR's head). All five PRs are pending merge;
 nothing below is on `main` yet.
 
 HIGH bugs fixed:
@@ -826,6 +829,12 @@ reserved for remote admission; the configured renewal loop drains queued
 cancellations; `pair`/`unpair` migrate legacy data first; and a binding that
 ended on a `cursor_conflict` still reports its proven outcome once the run
 stops.
+
+Round six closed: a binding retires only on a reconcile acknowledgement that
+names the same job and state, and an upload only on one that echoes the sent
+artifact's name, size and digest; saved connectivity status is judged fresh on
+the Mac's receipt time (the service timestamp stays for display), and every
+pairing change, including a renewal, deletes the old status.
 
 Still open after this pass (design gaps, not regressions):
 
