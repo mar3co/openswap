@@ -338,9 +338,10 @@ def test_configured_run_heartbeats_and_synchronizes_on_two_threads(remote_setup,
             time.sleep(0.02)
         assert runtime.store.queue(), "the synchronization thread never claimed the job"
         # The heartbeat thread writes the status right after the heartbeat that
-        # admitted synchronization; read it against the client's own clock since
-        # the shortened cadence also shortens the staleness window.
-        status = lambda: read_status(runtime.backup_root, now=clients[0].last_seen_at)[0]  # noqa: E731
+        # admitted synchronization; read it at that heartbeat's local receipt time
+        # since the shortened cadence also shortens the staleness window.
+        status = lambda: read_status(  # noqa: E731
+            runtime.backup_root, now=clients[0].last_seen_at - clients[0]._skew)[0]
         while time.monotonic() < deadline and status() != RemoteConnectivity.ONLINE:
             time.sleep(0.02)
         assert status() == RemoteConnectivity.ONLINE
@@ -597,3 +598,35 @@ def test_configured_renewal_loop_drains_cancellations(remote_setup):
     remote.state = "offline"  # nothing to renew: cancellations are applied anyway
     configured._renew_pass()
     assert runtime.store.get(local.job_id).state.value in {"cancelled", "cancel_requested"}
+
+
+def test_status_freshness_uses_local_receipt_time_under_clock_skew(tmp_path):
+    configure_worker_service(tmp_path, "https://control.example", "worker")
+    update_worker_settings(tmp_path, enabled=True)
+    now = datetime.now(timezone.utc)
+    service_time = now + timedelta(minutes=10)  # the service clock runs ten minutes ahead
+    save_status(tmp_path, "https://control.example", "online", service_time, "worker", now)
+    assert read_status(tmp_path, now=now) == (RemoteConnectivity.ONLINE, service_time)
+    assert read_status(tmp_path, now=now + timedelta(seconds=20))[0] == RemoteConnectivity.OFFLINE
+
+
+def test_configured_status_stays_online_when_the_service_clock_is_ahead(remote_setup):
+    remote, runtime, _, _, ticks, paired, _ = remote_setup
+    configure_worker_service(runtime.backup_root, remote.url, paired["worker_id"])
+    enrollment = _enrollment(paired)
+    configured = ConfiguredRemote(runtime, client_factory=lambda *_, **__: remote, enrollment_loader=lambda _: enrollment)
+    remote.worker_id = paired["worker_id"]
+    ticks[0] += 600  # service ten minutes ahead of the Mac
+    configured.tick()
+    assert read_status(runtime.backup_root)[0] == RemoteConnectivity.ONLINE
+
+
+def test_renewal_pairing_drops_the_old_keys_status(tmp_path, keychain):
+    pairing.pair(tmp_path, "https://control.example", "one-use", transport=PairTransport())
+    update_worker_settings(tmp_path, enabled=True)
+    seen = datetime.now(timezone.utc)
+    save_status(tmp_path, "https://control.example", "expired", seen, "worker")
+    assert read_status(tmp_path, now=seen)[0] == RemoteConnectivity.EXPIRED
+    pairing.unpair(tmp_path)
+    pairing.pair(tmp_path, "https://control.example", "one-use", transport=PairTransport())  # same worker ID
+    assert read_status(tmp_path, now=seen) == (RemoteConnectivity.OFFLINE, None)
