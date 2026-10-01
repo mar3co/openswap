@@ -476,11 +476,16 @@ def _run(backup_root: Path, *, managed: bool = False) -> int:
 
 
 def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "refserver":
+        from openswap.worker.refserver.cli import main as refserver_main
+        return refserver_main(arguments[1:])
     parser = argparse.ArgumentParser(
         prog="openswap worker",
         description="Control the opt-in, local-only Remote Agent Host worker.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("refserver", help="serve the reference protocol or manage pairing/revocation")
     run = commands.add_parser("run", help="run the background worker process")
     # Passed only by the LaunchAgent: a manual run refuses while it is loaded.
     run.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)
@@ -507,7 +512,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         help="attest that no process using the account is still running, when that cannot be proven",
     )
     lease_release_parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     root = Path(backup_root) if backup_root is not None else get_backup_root()
 
     if args.command in {"run", "enable", "disable", "pause"}:
