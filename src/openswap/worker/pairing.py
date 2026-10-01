@@ -9,6 +9,8 @@ from pathlib import Path
 import sys
 
 from openswap import macos_keychain
+from openswap.exceptions import LockError
+from openswap.locking import FileLock
 from openswap.settings import configure_worker_service, load_worker_settings
 from openswap.worker.protocol import ProtocolError, fields, text, timestamp, validate_url
 from openswap.worker.remote import Transport
@@ -49,9 +51,27 @@ def load_enrollment(url: str) -> Enrollment | None:
         raise ProtocolError("device_key_unavailable") from None
 
 
+def _pairing_lock(root: Path) -> FileLock:
+    """Serializes whole pair/unpair transactions across processes, so a key and the
+    worker ID recorded in settings always come from the same enrollment."""
+    return FileLock(Path(root) / ".worker-pairing.lock", timeout=15.0)
+
+
+def _locked(root: Path, operation, *args, **kwargs):
+    try:
+        with _pairing_lock(root):
+            return operation(root, *args, **kwargs)
+    except LockError:
+        raise ProtocolError("pairing_in_progress") from None
+
+
 def pair(root: Path, url: str, code: str, *, transport=None) -> str:
     """Invoking this local command is the owner's explicit pairing approval."""
     require_macos()
+    return _locked(root, _pair, url, code, transport=transport)
+
+
+def _pair(root: Path, url: str, code: str, *, transport=None) -> str:
     url = validate_url(url)
     # A live enrollment (settings name a URL) must be unpaired first. With no
     # configured URL, any item left at this account is an orphan from a reset
@@ -83,6 +103,12 @@ def pair(root: Path, url: str, code: str, *, transport=None) -> str:
 
 
 def unpair(root: Path, url: str | None = None) -> bool:
+    """Remove the configured enrollment, or the one for an explicit ``url``; see ``_unpair``."""
+    require_macos()
+    return _locked(root, _unpair, url)
+
+
+def _unpair(root: Path, url: str | None = None) -> bool:
     """Remove the enrollment for the configured URL, or for an explicit ``url``.
 
     The explicit form also recovers an orphaned Keychain item when settings no

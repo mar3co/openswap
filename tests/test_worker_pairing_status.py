@@ -301,7 +301,7 @@ def test_pair_and_unpair_normalize_hostname_case(tmp_path, keychain):
     assert ("openswap", pairing.account_name("https://control.example")) in keychain
     assert pairing.account_name("HTTPS://Control.Example/") == pairing.account_name("https://control.example")
     seen = datetime.now(timezone.utc)
-    save_status(tmp_path, "https://control.example", "online", seen)
+    save_status(tmp_path, "https://control.example", "online", seen, "worker")
     update_worker_settings(tmp_path, enabled=True)
     assert read_status(tmp_path, now=seen) == (RemoteConnectivity.ONLINE, seen)
     pairing.unpair(tmp_path, "https://control.example")
@@ -319,6 +319,7 @@ def test_configured_run_heartbeats_and_synchronizes_on_two_threads(remote_setup,
     remote, runtime, adapter, store, _, paired, _ = remote_setup
     job_id = submit(remote_setup)
     monkeypatch.setattr(remote_state, "HEARTBEAT_SECONDS", 0.05)
+    configure_worker_service(runtime.backup_root, remote.url, paired["worker_id"])  # as pairing records it
     enrollment = _enrollment(paired)  # one value: the identity compares by value
     recording = BlockingTransport(StoreTransport(store, paired["device_key"]), set(), threading.Event())
     clients = []
@@ -525,3 +526,51 @@ def test_unpair_cli_reports_when_the_configured_service_stays_active(tmp_path, k
     assert load_worker_settings(tmp_path).control_service_url == "http://localhost:8765"
     assert cli.main(["unpair"], backup_root=tmp_path) == 0
     assert "remote access disabled" in capsys.readouterr().out
+
+
+def test_repair_of_the_same_url_does_not_inherit_the_old_status(tmp_path, keychain):
+    pairing.pair(tmp_path, "https://control.example", "one-use", transport=PairTransport())
+    update_worker_settings(tmp_path, enabled=True)
+    seen = datetime.now(timezone.utc)
+    save_status(tmp_path, "https://control.example", "revoked", seen, "worker")
+    assert read_status(tmp_path, now=seen)[0] == RemoteConnectivity.REVOKED
+    pairing.unpair(tmp_path)
+
+    class Replacement:
+        def request(self, operation, data):
+            return {"worker_id": "replacement", "device_key": "another-key",
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()}
+    pairing.pair(tmp_path, "https://control.example", "one-use", transport=Replacement())
+    assert read_status(tmp_path, now=seen) == (RemoteConnectivity.OFFLINE, None)
+
+
+def test_pairing_transactions_are_serialized(tmp_path, keychain):
+    entered, release, order = threading.Event(), threading.Event(), []
+
+    class Slow:
+        def request(self, operation, data):
+            order.append("first-network")
+            entered.set()
+            release.wait(5)
+            return PairTransport().request(operation, data)
+    first = threading.Thread(target=pairing.pair, args=(tmp_path, "http://localhost:8765", "one-use"),
+                             kwargs={"transport": Slow()})
+    first.start()
+    assert entered.wait(5)
+    second = threading.Thread(target=lambda: order.append(("unpair", pairing.unpair(tmp_path))))
+    second.start()
+    time.sleep(0.3)
+    assert order == ["first-network"]  # unpair waits for the whole pairing transaction
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert order == ["first-network", ("unpair", True)]
+    assert not keychain and load_worker_settings(tmp_path).control_service_url is None
+
+
+def test_busy_pairing_lock_is_reported(tmp_path, keychain, monkeypatch):
+    from openswap.locking import FileLock
+    monkeypatch.setattr(pairing, "_pairing_lock", lambda root: FileLock(root / ".worker-pairing.lock", timeout=0.1))
+    with FileLock(tmp_path / ".worker-pairing.lock"):
+        with pytest.raises(ProtocolError, match="pairing_in_progress"):
+            pairing.unpair(tmp_path)

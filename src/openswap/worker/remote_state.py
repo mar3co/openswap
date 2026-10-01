@@ -14,13 +14,15 @@ from openswap.worker.remote import RemoteClient
 from openswap.worker.pairing import load_enrollment
 
 
-def _identity(url):
-    return hashlib.sha256(url.encode()).hexdigest()
+def _identity(url, worker_id):
+    # Scoped to the paired worker as well as the URL: a re-pair of the same URL
+    # must not inherit the previous enrollment's online/revoked/expired status.
+    return hashlib.sha256((url + "\0" + (worker_id or "")).encode()).hexdigest()
 
 
-def save_status(root, url, state, seen):
+def save_status(root, url, state, seen, worker_id=None):
     atomic_write_json(root / "worker" / "remote-status.json", {
-        "service": _identity(url), "state": state,
+        "service": _identity(url, worker_id), "state": state,
         "last_seen_at": seen.isoformat() if seen else None,
     })
 
@@ -33,7 +35,7 @@ def read_status(root, *, now=None):
     now = now or datetime.now(timezone.utc)
     try:
         data = json.loads((root / "worker" / "remote-status.json").read_text(encoding="utf-8"))
-        if data["service"] != _identity(policy.control_service_url):
+        if data["service"] != _identity(policy.control_service_url, policy.control_service_worker_id):
             return RemoteConnectivity.OFFLINE, None
         state = RemoteConnectivity(data["state"])
         seen = timestamp(data["last_seen_at"]) if data["last_seen_at"] else None
@@ -97,7 +99,8 @@ class ConfiguredRemote:
 
     def _save(self, client):
         with self._status_lock:
-            save_status(self.runtime.backup_root, client.url, client.state, client.last_seen_at)
+            save_status(self.runtime.backup_root, client.url, client.state, client.last_seen_at,
+                        client.worker_id or None)
 
     def _resolve(self):
         """Re-read policy and enrollment; return the client to drive this pass, or None.
@@ -128,14 +131,14 @@ class ConfiguredRemote:
                 seen = client.last_seen_at if client is not None else None
                 self._set_client(None, None)
                 with self._status_lock:
-                    save_status(root, url, state, seen)
+                    save_status(root, url, state, seen, policy.control_service_worker_id)
             return None
         if enrollment is None:
             # Unpaired (the key is gone) while settings still name the URL.
             seen = self.client.last_seen_at if self.client is not None else None
             self._set_client(None, None)
             with self._status_lock:
-                save_status(root, url, "offline", seen)
+                save_status(root, url, "offline", seen, policy.control_service_worker_id)
             return None
         # Enrollment compares by value (a re-pair changes it) but its
         # repr omits the key, so the identity is safe to print.
