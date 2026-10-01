@@ -295,7 +295,8 @@ def test_cli_reports_sqlite_errors_and_restores_umask(tmp_path, capsys, monkeypa
 
     monkeypatch.setattr(refserver_cli, "ControlStore", Recording)
     assert refserver_cli.main(["pair-code", "--database", str(private / "service.sqlite3")]) == 0
-    assert seen["umask"] == 0o077
+    if os.name == "posix":  # Windows keeps only the owner-write umask bit, so it reads back as 0
+        assert seen["umask"] == 0o077
     after = os.umask(0)
     os.umask(after)
     assert after == before
