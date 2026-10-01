@@ -26,6 +26,8 @@ from openswap.worker.protocol import (
 )
 
 STATES = frozenset(state.value for state in JobState)
+# The protocol caps heartbeat cancel_job_ids; a longer list is a malformed response.
+MAX_CANCEL_IDS = 100
 # Reserved by the protocol: v1 has no approval/resume operation, so it fails closed.
 APPROVAL = "waiting_for_approval"
 # Validation failures the service (or the local export check) reports for one
@@ -148,12 +150,11 @@ class Transport:
 
 class RemoteJournal:
     """Claim receipt and upload acknowledgements survive response loss/restart."""
-    def __init__(self, runtime, url, key):
+    def __init__(self, runtime, url, enrollment):
         runtime.store._ensure_private_dir()
         self.path = runtime.store.state_dir / "remote.sqlite3"
-        # Namespaced by enrollment, not just URL: a replacement device paired against the
-        # same service must never inherit bindings the revoked or expired one can no longer read.
-        enrollment = hashlib.sha256(key.encode()).hexdigest()
+        # Bindings are scoped to one enrollment at one service: a replacement device
+        # paired against the same URL never inherits bindings the old one can no longer read.
         self.service = hashlib.sha256((url + "\0" + enrollment).encode()).hexdigest()
         if self.path.is_symlink():
             raise ValueError("unsafe remote journal")
@@ -213,10 +214,14 @@ class RemoteClient:
     the only state shared across threads; the Transport is shared too, which is
     safe because urllib opens one connection per request and pools none.
     """
-    def __init__(self, runtime, url: str, key: str, *, transport=None, artifact_names=("result.md",)):
-        self.runtime, self.url = runtime, validate_url(url)
+    def __init__(self, runtime, url: str, key: str, *, worker_id: str = "", transport=None,
+                 artifact_names=("result.md",)):
+        self.runtime, self.url, self.worker_id = runtime, validate_url(url), worker_id
         self.transport = transport or Transport(self.url, key)
-        self.journal = RemoteJournal(runtime, self.url, key)
+        # Keyed by the stable worker ID, so a key renewal (same worker) keeps its bindings
+        # while a replacement enrollment (new worker) starts clean. Without an ID, a digest
+        # of the key stands in.
+        self.journal = RemoteJournal(runtime, self.url, worker_id or hashlib.sha256(key.encode()).hexdigest())
         self.stop_event = threading.Event()
         self.worker_epoch = None
         self.state = "offline"
@@ -348,7 +353,8 @@ class RemoteClient:
             heartbeat = self._worker_request("heartbeat")
             seen = timestamp(heartbeat["last_seen_at"])
             cancel_ids = heartbeat["cancel_job_ids"]
-            if not isinstance(cancel_ids, list) or not all(isinstance(i, str) and 0 < len(i) <= 200 for i in cancel_ids):
+            if (not isinstance(cancel_ids, list) or len(cancel_ids) > MAX_CANCEL_IDS
+                    or not all(isinstance(i, str) and 0 < len(i) <= 200 for i in cancel_ids)):
                 raise ProtocolError("invalid_response")
             with self._lock:
                 self.last_seen_at = seen
@@ -482,7 +488,7 @@ class RemoteClient:
                 # deadline translated into local time.
                 job = claim.submission.job
                 local = self.runtime.submit(replace(job, idempotency_key=idem, expires_at=job.expires_at - self._skew),
-                                            job_id=local_id)
+                                            job_id=local_id, remote=True)
             if local.job_id != local_id:
                 local_id = local.job_id
                 self.journal.update(claim.job_id, local_id=local_id)

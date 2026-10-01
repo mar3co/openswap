@@ -873,3 +873,34 @@ def test_unadmitted_claim_cancelled_after_interruption_reconciles_as_cancelled(r
     assert (reconcile["state"], reconcile["unlaunched"]) == ("cancelled", True)
     assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "cancelled"
     assert adapter.starts == 0 and epoch
+
+
+def test_key_renewal_for_the_same_worker_keeps_its_bindings(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    client = RemoteClient(runtime, remote.url, paired["device_key"], worker_id=paired["worker_id"], transport=transport)
+    submit(remote_setup)
+    monkeypatch.setattr(runtime, "submit", lambda *a, **k: (_ for _ in ()).throw(OSError("crash before admission")))
+    client.tick()
+    assert client.journal.pending()
+    renewed = store.request("pair", {"code": store.issue_code(paired["worker_id"])})
+    after = RemoteClient(runtime, remote.url, renewed["device_key"], worker_id=paired["worker_id"],
+                         transport=StoreTransport(store, renewed["device_key"]))
+    assert [b["remote_id"] for b in after.journal.pending()] == [b["remote_id"] for b in client.journal.pending()]
+
+
+def test_heartbeat_with_too_many_cancellations_is_malformed(remote_setup, monkeypatch):
+    remote, _, _, _, _, _, transport = remote_setup
+    original = transport.request
+    monkeypatch.setattr(transport, "request", lambda op, data: {**original(op, data), "cancel_job_ids": [
+        f"job-{n}" for n in range(remote_mod.MAX_CANCEL_IDS + 1)]} if op == "heartbeat" else original(op, data))
+    assert remote.heartbeat_tick() is False and remote._cancels == set()
+
+
+def test_remote_idempotency_prefix_is_reserved(remote_setup):
+    _, runtime, _, _, ticks, _, _ = remote_setup
+    job = JobSubmission("remote:local-looking", "codex", "Research", "research", "research",
+                        datetime.fromtimestamp(ticks[0] + 100, timezone.utc), 60)
+    with pytest.raises(remote_mod.AdmissionError):
+        runtime.submit(job)
+    with pytest.raises(remote_mod.AdmissionError):
+        runtime.submit(replace(job, idempotency_key="plain"), remote=True)

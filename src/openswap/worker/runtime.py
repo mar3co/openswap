@@ -346,8 +346,14 @@ class WorkerRuntime:
             except AccountLeaseError:
                 pass
 
-    def submit(self, submission: JobSubmission, *, job_id: str | None = None) -> JobRecord:
-        """Admit a job; ``job_id`` lets a caller publish the ID before the row exists."""
+    def submit(self, submission: JobSubmission, *, job_id: str | None = None, remote: bool = False) -> JobRecord:
+        """Admit a job; ``job_id`` lets a caller publish the ID before the row exists.
+
+        The ``remote:`` idempotency prefix marks a job admitted by the remote client
+        (its launch needs remote authorization), so only that client may use it.
+        """
+        if submission.idempotency_key.startswith("remote:") != remote:
+            raise AdmissionError("the remote: idempotency prefix is reserved for remote jobs")
         with self._admission_lock:
             policy = load_worker_settings(self.backup_root)
             if not policy.enabled:
