@@ -559,9 +559,10 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         # The service may have committed the job before the response was lost:
         # a retry must resend the identical submission (same key, same absolute
         # expiry) so it returns that job instead of admitting a second one.
-        retry = f"--idempotency-key {shlex.quote(key)}"
+        # The attached --flag=value form keeps a value that starts with "-" an argument.
+        retry = f"--idempotency-key={shlex.quote(key)}"
         if expires_at is not None:
-            retry += f" --expires-at {shlex.quote(stamp(expires_at))}"
+            retry += f" --expires-at={shlex.quote(stamp(expires_at))}"
         print(f"Retry with {retry} to reuse the same submission.", file=sys.stderr)
         return 1
 

@@ -942,3 +942,24 @@ def test_unadmitted_claim_cancelled_after_interruption_reconciles_as_cancelled(r
     assert (reconcile["state"], reconcile["unlaunched"]) == ("cancelled", True)
     assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "cancelled"
     assert adapter.starts == 0 and epoch
+
+
+def test_cancel_still_reaches_a_running_job_after_a_cursor_conflict(remote_setup):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    adapter.finish.clear()
+    runner = threading.Thread(target=runtime.reconcile_once, daemon=True)
+    runner.start()
+    try:
+        assert adapter.entered.wait(2)
+        local = runtime.store.active()
+        transport.reject["events"] = ProtocolError("cursor_conflict", 409)
+        remote.tick()
+        assert remote.journal.by_remote(job_id)["done"] == 1  # the binding ended...
+        store.request("cancel", {"job_id": job_id}, paired["device_key"])
+        remote.tick()  # ...but the heartbeat's cancel list still reaches the run
+        assert runtime.store.get(local.job_id).state.value in {"cancel_requested", "cancelled"}
+    finally:
+        adapter.finish.set()
+        runner.join(5)

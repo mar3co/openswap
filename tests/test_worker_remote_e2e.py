@@ -238,11 +238,11 @@ def test_submit_test_cli_prints_the_key_to_reuse_on_failure(tmp_path, keychain, 
                  "--runtime-limit", "60", "--expires-in", "600", "--i-understand-this-is-a-test-tool"]
     assert cli.main([*arguments, "--idempotency-key", "keep-this-key"], backup_root=root) == 1
     err = capsys.readouterr().err
-    assert "service_unavailable" in err and "--idempotency-key keep-this-key --expires-at " in err
+    assert "service_unavailable" in err and "--idempotency-key=keep-this-key --expires-at=" in err
     assert cli.main(arguments, backup_root=root) == 1
     hint = capsys.readouterr().err.split("Retry with ")[1].split(" to reuse")[0].split()
-    generated, expires_at = hint[1], hint[3]
-    assert hint[::2] == ["--idempotency-key", "--expires-at"]
+    assert [h.split("=", 1)[0] for h in hint] == ["--idempotency-key", "--expires-at"]
+    generated, expires_at = (h.split("=", 1)[1] for h in hint)
     assert len(generated) == 32 and int(generated, 16) >= 0  # a fresh key was generated and printed
     # Retrying with the printed hint resends the identical submission.
     transport.unreachable = False
@@ -302,7 +302,7 @@ def test_submit_test_cli_surfaces_queue_full_over_http(tmp_path, keychain, capsy
                              "--runtime-limit", "60", "--expires-in", "600", "--idempotency-key", "overflow",
                              "--i-understand-this-is-a-test-tool"], backup_root=root) == 1
             err = capsys.readouterr().err
-            assert "queue_full" in err and "service_unavailable" not in err and "--idempotency-key overflow" in err
+            assert "queue_full" in err and "service_unavailable" not in err and "--idempotency-key=overflow" in err
         finally:
             server.shutdown()
             serving.join(WAIT)
@@ -364,12 +364,12 @@ def test_submit_test_cli_shell_quotes_the_retry_hint(tmp_path, keychain, monkeyp
                  "--idempotency-key", "keep this key"]
     assert cli.main(arguments, backup_root=root) == 1
     err = capsys.readouterr().err
-    assert "--idempotency-key 'keep this key' --expires-at " in err
+    assert "--idempotency-key='keep this key' --expires-at=" in err
     hint = shlex.split(err.split("Retry with ")[1].split(" to reuse")[0])
-    assert hint[:2] == ["--idempotency-key", "keep this key"] and hint[2] == "--expires-at"
+    assert hint[0] == "--idempotency-key=keep this key" and hint[1].startswith("--expires-at=")
     transport.unreachable = False
-    retry = [a for a in arguments if a not in {"--expires-in", "600"}]
-    assert cli.main([*retry, "--expires-at", hint[3]], backup_root=root) == 0
+    retry = [a for a in arguments if a not in {"--expires-in", "600", "--idempotency-key", "keep this key"}]
+    assert cli.main([*retry, *hint], backup_root=root) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "queued"
 
 
@@ -387,3 +387,17 @@ def test_submit_test_retry_days_after_the_original_expiry_returns_the_original_j
     ticks[0] = datetime.now(timezone.utc).timestamp()
     transport.request("heartbeat", {"worker_epoch": 1})
     assert submit_test(root, **same, transport=transport)["job_id"] == original["job_id"]
+
+
+def test_submit_test_retry_hint_keeps_a_dash_prefixed_key(tmp_path, keychain, monkeypatch, capsys):
+    import shlex
+    store, root, url, transport = _paired_store(tmp_path)
+    transport.unreachable = True
+    monkeypatch.setattr(submit_test_module, "Transport", lambda *_: transport)
+    base = ["submit-test", "--url", url, "--task", "test", "--workspace-id", "research",
+            "--runtime-limit", "60", "--i-understand-this-is-a-test-tool"]
+    assert cli.main([*base, "--expires-in", "600", "--idempotency-key=-retry"], backup_root=root) == 1
+    hint = shlex.split(capsys.readouterr().err.split("Retry with ")[1].split(" to reuse")[0])
+    assert hint[0] == "--idempotency-key=-retry"
+    transport.unreachable = False
+    assert cli.main([*base, *hint], backup_root=root) == 0

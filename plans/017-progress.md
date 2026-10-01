@@ -677,7 +677,8 @@ requirements. Production execution still uses `UnavailableCodexAdapter`.
 | 3e fixed head (`f74c6dc`) | 3419 passed, 5 skipped | 198 passed |
 | 3d round-two head (`e53d4b3`) | 3393 passed, 5 skipped | 172 passed (five modules; the e2e module lives in 3e) |
 | 3e round-two head (`0031697`) | 3450 passed, 5 skipped | 229 passed |
-| 3e round-three head (this PR's head) | 3482 passed, 5 skipped | not re-run serially |
+| 3e round-three head (`9153334`) | 3482 passed, 5 skipped | not re-run serially |
+| 3e round-four head (this PR's head) | 3502 passed, 5 skipped | not re-run serially |
 
 Full suites use `uv run pytest -q`; serial Phase 3 runs use `-n0` with the
 six Phase 3 test modules (the review pass added
@@ -702,7 +703,8 @@ first round. A second round answered the Codex re-review of those fixes the
 same way (each branch merged forward, one regression test per fix), with heads
 3a `967b35f`, 3b `1994296`, 3c `64c7b02`, 3d `e53d4b3`, 3e `0031697`. A third
 round answered the next Codex re-review (3a `6c1b5ed`, 3b `eb13955`, 3c
-`b4aee58`, 3d `29d1da0`, 3e this PR's head). All five PRs are pending merge;
+`b4aee58`, 3d `29d1da0`, 3e `9153334`), and a fourth the one after that (3a
+`412e25d`, 3b `fc9bdae`, 3c `c5747d3`, 3d `74c30db`, 3e this PR's head). All five PRs are pending merge;
 nothing below is on `main` yet.
 
 HIGH bugs fixed:
@@ -796,6 +798,22 @@ Round three (the next Codex re-review, same day) closed:
   expiry is judged on the service clock; offsets through `±23:59` are accepted;
   `validate_url` drops default ports; `unpair <url>` says when only an orphan
   was removed; a `submit-test` retry has no age limit on a past expiry.
+
+Round four closed:
+
+- **Key renewal keeps the worker (3b).** `pair-code --renew <worker_id>` issues
+  a renewal code; pairing with it rotates that worker's key and expiry in place,
+  so its jobs, events and artifacts (and the Mac's journal bindings, keyed by
+  worker ID) carry over. Revoked workers cannot be renewed.
+- **Cancellation off the heartbeat path (3c).** Heartbeat `cancel_job_ids` and
+  renew's `cancel_requested` are queued and applied by the renewal thread to
+  any still-running local job, including one whose binding ended on a
+  `cursor_conflict`; a blocked synchronization pass no longer delays a cancel.
+- **Pairing (3d).** Saved connectivity status is scoped to the paired worker
+  ID, and `pair`/`unpair` run as whole transactions under a cross-process lock.
+- Smaller items: a malformed artifact digest is `invalid_request`; an
+  unadmitted claim that is both interrupted and cancelled reconciles as
+  `cancelled`; the retry hint uses `--flag=value` so dash-prefixed keys survive.
 
 Still open after this pass (design gaps, not regressions):
 
