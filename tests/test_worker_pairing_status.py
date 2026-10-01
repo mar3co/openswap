@@ -574,3 +574,26 @@ def test_busy_pairing_lock_is_reported(tmp_path, keychain, monkeypatch):
     with FileLock(tmp_path / ".worker-pairing.lock"):
         with pytest.raises(ProtocolError, match="pairing_in_progress"):
             pairing.unpair(tmp_path)
+
+
+def test_unpair_migrates_legacy_backup_before_writing(temp_home, keychain, monkeypatch, capsys):
+    legacy = temp_home / ".claude-swap-backup"
+    legacy.mkdir()
+    (legacy / "accounts.json").write_text('{"kept":true}', encoding="utf-8")
+    target = temp_home / "Library" / "Application Support" / "OpenSwap"
+    monkeypatch.setattr(cli.paths, "get_legacy_backup_root", lambda: legacy)
+    assert cli.main(["unpair", "https://old.example"], backup_root=target) == 0
+    assert not legacy.exists()
+    assert (target / "accounts.json").read_text(encoding="utf-8") == '{"kept":true}'
+
+
+def test_configured_renewal_loop_drains_cancellations(remote_setup):
+    remote, runtime, adapter, store, _, paired, _ = remote_setup
+    enrollment = _enrollment(paired)
+    configured = ConfiguredRemote(runtime, client_factory=lambda *_, **__: remote, enrollment_loader=lambda _: enrollment)
+    configured.tick()
+    local = _claimed_row(remote_setup, "one")
+    remote._cancels.add(remote.journal.binding(local.job_id)["remote_id"])  # queued by a heartbeat
+    remote.state = "offline"  # nothing to renew: cancellations are applied anyway
+    configured._renew_pass()
+    assert runtime.store.get(local.job_id).state.value in {"cancelled", "cancel_requested"}

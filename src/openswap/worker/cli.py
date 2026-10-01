@@ -527,6 +527,13 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         from openswap.worker.pairing import pair, unpair
         from openswap.worker.protocol import ProtocolError
         try:
+            # Both write under the backup root (settings, the pairing lock), so legacy
+            # data must move first or a later enable finds both roots populated.
+            _migrate_legacy_before_worker_state_change(root)
+        except ClaudeSwitchError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        try:
             if args.command == "pair":
                 worker_id = pair(root, args.url, args.code)
                 print(f"Paired worker {worker_id}. Local execution policy is still controlled on this Mac.")

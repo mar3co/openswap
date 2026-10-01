@@ -173,11 +173,15 @@ class ConfiguredRemote:
         self._save(client)
 
     def _renew_pass(self):
+        """Renew the admitted claim and apply queued cancellations, like ``RemoteClient._renew_loop``;
+        cancellations are applied even when nothing needs renewing."""
         client = self.client
-        if client is None or client.state != "online":
+        if client is None:
             return
         try:
-            client.renew_admitted()
+            if client.state == "online":
+                client.renew_admitted()
+            client.enforce_cancellations()
         except Exception as exc:
             client._connectivity(exc)
 
