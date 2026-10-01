@@ -200,14 +200,24 @@ allowed on `provider_finished`. Diagnostics: `live_adapter_disabled`,
 `runtime_limit_reached`, `provider_auth_unavailable`, `provider_rate_limited`,
 `artifact_rejected` (a `diagnostic` event: one explicit artifact was refused by
 the size, hash, limit, conflict or export-safety checks and was skipped; the
-job outcome stands).
+job outcome stands), `remote_sync_conflict` (local only: the service refused
+this job's event history with `cursor_conflict`, so the worker stopped
+syncing it; see below).
 No free-form provider payloads, local paths or account/session identifiers are
 accepted. Upload with `events`, `worker_epoch`, `epoch` together; read by
 omitting all three. Upload at most 200 events; identical cursor replay is
 idempotent, differing replay or gaps return `cursor_conflict`. Responses return
 up to 200 events strictly after `after_cursor`; `next_cursor` is the last
 returned cursor (or the supplied cursor). Persist acknowledgements locally;
-a lost response may replay already stored events.
+a lost response may replay already stored events. `cursor_conflict` is
+permanent for that job: no replay can repair a diverged history, and the
+service keeps re-offering an unreconciled active job on every `poll`. The
+worker therefore reports the outcome as uncertain (`reconcile` with
+`interrupted`, `execution_stopped: false`, `unlaunched: false`), records a
+local `remote_sync_conflict` diagnostic and ends the claim, so later claims
+are not blocked by an endless "offline" retry. Only an unreachable service
+defers that to the next tick. Local execution and the local journal are
+unaffected; the job's later local events and results are not uploaded.
 
 Artifact contains exactly `name`, `size`, `sha256` (lowercase hex digest),
 `content_base64` (RFC 4648 padded base64). Name is a basename of 1–100 ASCII
@@ -236,7 +246,9 @@ Errors are JSON `{"error":"code"}` without exception details. HTTP 400:
 `unsupported_version`; 409: `offline_worker`, `idempotency_conflict`,
 `stale_epoch`, `lease_lost`, `cursor_conflict`, `artifact_conflict`, `queue_full`;
 413: `body_too_large`, `artifact_too_large`, `artifact_limit`; 500/503:
-`service_unavailable`. Non-`POST` methods return 405 `invalid_request`. A job
+`service_unavailable`. The worker surfaces exactly these codes and reports any
+other error body as `service_unavailable`, so service text never reaches the
+owner. Non-`POST` methods return 405 `invalid_request`. A job
 belonging to another owner is reported as `not_found`, never `forbidden`, so
 job IDs cannot be probed for existence. Except for `pair`, a missing or
 malformed `Authorization` header is refused before the body is read. Retry
@@ -305,3 +317,55 @@ jobs in this phase.
 CLI and menu-bar status expose connectivity and service last seen without
 revealing keys, tasks or paths. Old heartbeats become offline after 15 seconds,
 and a stopped local worker is never reported as online.
+
+## Test-only submission and local evidence
+
+The owner test command requires a paired device at the selected URL and an
+explicit acknowledgement on every invocation:
+
+```sh
+openswap worker submit-test --url https://control.example \
+  --task 'Research this bounded topic' --workspace-id research \
+  --runtime-limit 600 --expires-in 3600 --i-understand-this-is-a-test-tool
+```
+
+It sends only the canonical submission and prints the validated JSON job ID
+and state (any other response shape, unknown state or extra field is refused
+as `invalid_response` with exit status 1 and nothing echoed). It never supplies
+an adapter, model, account, path or command. A new submission requires the
+worker online. The idempotency key is generated unless `--idempotency-key`
+(1–200 characters, no control characters) is given. Because the service may
+have committed the job before a response was lost, every failure prints the
+exact `--idempotency-key` and absolute `--expires-at` to retry with; resending
+them repeats the identical payload, so the retry returns the same job instead
+of admitting a second one. `--expires-in` (relative seconds) and `--expires-at`
+(RFC 3339) are mutually exclusive and one is required; a retry must use the
+printed absolute form, since a recomputed relative expiry changes the payload
+and the service answers `idempotency_conflict`. The hint is shell-quoted, so a
+key containing spaces can be pasted back. When both `--idempotency-key` and
+`--expires-at` are given explicitly, the tool sends the payload even after
+that expiry has passed: the service's idempotent replay runs before its expiry
+validation, so it returns the original job (or `idempotency_conflict`), while a
+new key with a past expiry is refused by the service as `invalid_request`. A
+generated key or a relative expiry is still refused locally unless the expiry
+lies in the future. Errors from the service (for
+example `queue_full`, `offline_worker`, `idempotency_conflict`) are printed by
+code with exit status 1.
+The command is **test-only** and does not bypass the disabled production Codex
+adapter or local owner policy. Fake adapters are Python test injections, not a
+CLI feature. A production paired worker can heartbeat, but it will not execute
+provider jobs until its live adapter gates are cleared.
+
+Run the credential-free roundtrip and deterministic failure tests with:
+
+```sh
+uv run pytest -q -n0 tests/test_worker_protocol.py tests/test_worker_refserver.py \
+  tests/test_worker_remote.py tests/test_worker_pairing_status.py \
+  tests/test_worker_launch_abandon.py tests/test_worker_remote_e2e.py
+```
+
+Tests mock Keychain and use an inert adapter. They prove loopback pairing,
+guarded submission, idempotent retry, background polling, one launch,
+replayable safe events and explicit hash-verified result retrieval (including
+refusal of tampered bytes or digests). They do not establish a real HTTPS
+deployment, another-network submission, provider permissions or live research.

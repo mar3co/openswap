@@ -34,6 +34,12 @@ APPROVAL = "waiting_for_approval"
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
                                  "hash_mismatch", "invalid_request"})
+# Every documented service error code. Error bodies are untrusted: any other
+# text is reported as ``service_unavailable`` rather than surfaced.
+SERVICE_ERRORS = frozenset({"revoked", "unauthorized", "device_expired", "lease_lost", "stale_epoch", "offline_worker",
+                            "invalid_code", "invalid_request", "forbidden", "not_found", "invalid_state",
+                            "unsupported_version", "idempotency_conflict", "cursor_conflict", "queue_full",
+                            "body_too_large", "service_unavailable", *ARTIFACT_REJECTIONS})
 # Connectivity states that only a new enrollment (re-pair) can leave.
 FINAL = frozenset({"revoked", "expired"})
 
@@ -126,11 +132,7 @@ class Transport:
             with exc:
                 result = self._read(exc)
             code = result.get("error", "service_unavailable")
-            # Error bodies are untrusted: never expose arbitrary service text.
-            allowed = {"revoked", "unauthorized", "device_expired", "lease_lost", "stale_epoch", "offline_worker",
-                       "invalid_code", "invalid_request", "forbidden", "not_found", "invalid_state",
-                       *ARTIFACT_REJECTIONS}
-            raise ProtocolError(code if code in allowed else "service_unavailable", exc.code) from None
+            raise ProtocolError(code if code in SERVICE_ERRORS else "service_unavailable", exc.code) from None
         except (URLError, TimeoutError, OSError):
             raise ProtocolError("service_unavailable", 503) from None
         return result
@@ -420,6 +422,8 @@ class RemoteClient:
                 continue
             if local.state.value not in TERMINAL:
                 self.runtime.cancel(local.job_id)
+            elif binding["done"]:
+                self._reconcile_ended(binding, local)
 
     def sync_tick(self, policy=None):
         """The synchronization half of a tick: replay pending bindings, then claim new work.
@@ -454,7 +458,9 @@ class RemoteClient:
             if response["claim"] is not None:
                 claim = Claim.from_dict(response["claim"])
                 self.journal.remember(claim)  # persist before local admission
-                self._sync(self.journal.pending()[0])
+                pending = self.journal.pending()
+                if pending:  # a re-offered claim that already ended here has nothing to sync
+                    self._sync(pending[0])
         except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error, AdmissionError) as exc:
             self._connectivity(exc)
 
@@ -510,7 +516,10 @@ class RemoteClient:
         if local.state.value not in TERMINAL:
             self._job_response("renew", claim)
             self._admitted = claim
-        self._forward_events(claim, local_id, binding["cursor"])
+        if not self._forward_events(claim, local_id, binding["cursor"]):
+            if self._admitted is claim:
+                self._admitted = None  # the binding ended; nothing is left to renew
+            return
         local = self.runtime.get(local_id)
         if local.state.value in TERMINAL:
             stopped, unlaunched = self._proof(local)
@@ -532,7 +541,13 @@ class RemoteClient:
         if ack.get("job_id") != claim.job_id or ack.get("state") != state:
             raise ProtocolError("invalid_response")
 
-    def _forward_events(self, claim, local_id, cursor):
+    def _forward_events(self, claim, local_id, cursor) -> bool:
+        """Upload local events after ``cursor``; returns whether the claim is still live.
+
+        ``cursor_conflict`` means the service holds a different history for this
+        job. No replay can repair that, so the binding ends instead of being
+        retried forever as "offline" and blocking every later claim.
+        """
         # One page per tick keeps requests bounded; terminal jobs are not
         # acknowledged until every event page is durable at the service.
         page = self.runtime.events(local_id, after_cursor=cursor, limit=200)
@@ -541,7 +556,13 @@ class RemoteClient:
                 raise ProtocolError("service_unavailable", 503)
             self._worker_request("heartbeat")
             events = [replace(event, job_id=claim.job_id).to_dict() for event in page.events]
-            response = self.transport.request("events", {**self._fence(claim), "after_cursor": cursor, "events": events})
+            try:
+                response = self.transport.request("events", {**self._fence(claim), "after_cursor": cursor, "events": events})
+            except ProtocolError as exc:
+                if exc.code != "cursor_conflict":
+                    raise
+                self._abandon(claim, local_id)
+                return False
             ack = integer(response["next_cursor"])
             if ack != page.next_cursor:
                 raise ProtocolError("invalid_response")
@@ -550,6 +571,49 @@ class RemoteClient:
             if self.runtime.get(local_id).state.value not in TERMINAL:
                 break
             page = self.runtime.events(local_id, after_cursor=cursor, limit=200)
+        return True
+
+    def _reconcile_ended(self, binding, local):
+        """Report a proven outcome for a binding that ended without one (a
+        ``cursor_conflict``), so a cancelled run does not stay listed forever.
+
+        Best effort: the service keeps listing the job until its outcome is
+        confirmed, so a failure here is retried on a later heartbeat.
+        """
+        stopped, unlaunched = self._proof(local)
+        if not (stopped or unlaunched):
+            return
+        claim = Claim.from_dict(json.loads(binding["claim"]))
+        try:
+            self._reconcile(claim, local.state.value, stopped=stopped, unlaunched=unlaunched)
+        except ProtocolError:
+            pass
+
+    def _abandon(self, claim, local_id):
+        """End a binding whose service history diverged; local execution is untouched.
+
+        The service re-offers an active job on every poll until it is
+        reconciled, so the outcome is reported as uncertain (``interrupted``
+        with nothing proven) first. Only an unreachable service defers that to
+        the next tick; any definitive answer ends the binding, and the local
+        journal records a ``remote_sync_conflict`` diagnostic.
+        """
+        try:
+            self.transport.request("reconcile", {**self._fence(claim), "state": "interrupted",
+                                                 "execution_stopped": False, "unlaunched": False})
+        except ProtocolError as exc:
+            if exc.code in {"service_unavailable", "invalid_response"}:
+                raise
+        self._diagnose(self.runtime.get(local_id), "remote_sync_conflict")
+        self.journal.update(claim.job_id, done=1)
+
+    def _diagnose(self, local, code):
+        try:
+            self.runtime.store.append_event(
+                local.job_id, kind=SafeEventKind.DIAGNOSTIC, diagnostic_code=code,
+                worker_epoch=self.runtime.worker_epoch, expected_generation=local.generation)
+        except JournalError:
+            pass  # a job from an earlier worker epoch cannot take new events
 
     def _proof_pending(self, local):
         """Whether stop proof for an uncertain run may still arrive: its account lease is
@@ -600,12 +664,7 @@ class RemoteClient:
                 if exc.code not in ARTIFACT_REJECTIONS:
                     raise
                 rejected = True
-                try:
-                    self.runtime.store.append_event(
-                        local.job_id, kind=SafeEventKind.DIAGNOSTIC, diagnostic_code="artifact_rejected",
-                        worker_epoch=self.runtime.worker_epoch, expected_generation=local.generation)
-                except JournalError:
-                    pass  # a job from an earlier worker epoch cannot take new events
+                self._diagnose(local, "artifact_rejected")
         return rejected
 
     def _upload_artifact(self, claim, local, name):

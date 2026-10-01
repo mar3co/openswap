@@ -497,6 +497,17 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                        "that settings no longer reference",
     )
     unpair_parser.add_argument("url", nargs="?", default=None, help="service URL to unpair (default: the configured one)")
+    submit_parser = commands.add_parser("submit-test", help="TEST ONLY: submit a bounded research job to a paired service")
+    submit_parser.add_argument("--url", required=True)
+    submit_parser.add_argument("--task", required=True)
+    submit_parser.add_argument("--workspace-id", required=True)
+    submit_parser.add_argument("--runtime-limit", required=True, type=float)
+    expiry = submit_parser.add_mutually_exclusive_group(required=True)
+    expiry.add_argument("--expires-in", type=float, help="seconds from now (at most 86400)")
+    expiry.add_argument("--expires-at", help="absolute RFC 3339 expiry; a retry must repeat the one it printed")
+    submit_parser.add_argument("--idempotency-key", default=None,
+                               help="reuse the key printed by a failed attempt so a retry cannot admit a second job")
+    submit_parser.add_argument("--i-understand-this-is-a-test-tool", action="store_true")
     status_parser = commands.add_parser("status", help="show local worker status")
     status_parser.add_argument("--json", action="store_true")
     stop_parser = commands.add_parser("stop", help="request interruption of the active job")
@@ -522,6 +533,38 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     lease_release_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(arguments)
     root = Path(backup_root) if backup_root is not None else get_backup_root()
+
+    if args.command == "submit-test":
+        import shlex
+        from uuid import uuid4
+        from openswap.worker.submit_test import resolve_expiry, submit_test
+        from openswap.worker.protocol import ProtocolError, stamp
+        key = uuid4().hex if args.idempotency_key is None else args.idempotency_key
+        expires_at = None
+        try:
+            # A retry (explicit key and expiry) resends the original payload even
+            # after its expiry, so the service can return the original job.
+            expires_at = resolve_expiry(expires_in=args.expires_in, expires_at=args.expires_at,
+                                        allow_past=args.idempotency_key is not None and args.expires_at is not None)
+            result = submit_test(root, url=args.url, task=args.task, workspace_id=args.workspace_id,
+                                 runtime_limit=args.runtime_limit, expires_at=expires_at,
+                                 acknowledged=args.i_understand_this_is_a_test_tool, idempotency_key=key)
+        except ProtocolError as exc:
+            print(f"Test submission refused: {exc.code}.", file=sys.stderr)
+        except (OSError, RuntimeError, ValueError):
+            print("Test submission refused: local configuration unavailable.", file=sys.stderr)
+        else:
+            print(json.dumps(result))
+            return 0
+        # The service may have committed the job before the response was lost:
+        # a retry must resend the identical submission (same key, same absolute
+        # expiry) so it returns that job instead of admitting a second one.
+        # The attached --flag=value form keeps a value that starts with "-" an argument.
+        retry = f"--idempotency-key={shlex.quote(key)}"
+        if expires_at is not None:
+            retry += f" --expires-at={shlex.quote(stamp(expires_at))}"
+        print(f"Retry with {retry} to reuse the same submission.", file=sys.stderr)
+        return 1
 
     if args.command in {"pair", "unpair"}:
         from openswap.worker.pairing import pair, unpair

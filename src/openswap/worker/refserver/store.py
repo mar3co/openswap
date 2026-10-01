@@ -88,7 +88,7 @@ class ControlStore:
         keeps its ID, so its jobs, events and artifacts stay reachable; the old key
         stops working. A revoked worker cannot be renewed.
         """
-        code = secrets.token_urlsafe(24)
+        code = "pair_" + secrets.token_urlsafe(24)
         with closing(self.connect()) as db, db:
             if worker_id is not None:
                 device = db.execute("SELECT revoked FROM devices WHERE id=?", (worker_id,)).fetchone()

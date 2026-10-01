@@ -157,6 +157,7 @@ def test_cli_operator_commands(tmp_path, capsys):
     path = tmp_path / "private" / "service.sqlite3"
     assert cli.main(["refserver", "pair-code", "--database", str(path)], backup_root=tmp_path) == 0
     code = capsys.readouterr().out.strip()
+    assert code.startswith("pair_")  # always a positional CLI argument, never an option
     store = ControlStore(path)
     paired = store.request("pair", {"code": code})
     assert cli.main(["refserver", "revoke", "--database", str(path), paired["worker_id"]], backup_root=tmp_path) == 0
