@@ -24,8 +24,10 @@ from openswap.worker.runtime import WorkerRuntime
 from openswap.worker.submit_test import resolve_expiry, submit_test
 
 # Longer than the transport's 5 s socket timeout, so a blocked request cannot
-# leave a thread alive at join time and mask the real failure.
-WAIT = 6
+# leave a thread alive at join time and mask the real failure, and generous
+# enough for a loaded Windows runner: every use waits on an event or a join,
+# so a passing run never spends it.
+WAIT = 20
 
 
 def test_loopback_pair_cli_submit_fake_run_events_and_artifact(tmp_path, keychain, capsys):
