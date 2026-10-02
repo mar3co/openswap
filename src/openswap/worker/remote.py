@@ -482,9 +482,17 @@ class RemoteClient:
             if local is None:
                 if (remote["state"] in TERMINAL or remote["state"] == APPROVAL or remote["cancel_requested"]
                         or claim.submission.job.expires_at <= self._server_now()):
-                    # Nothing was ever admitted locally, so nothing launched.
-                    # An owner's cancel outranks a provisional interruption: nothing ran either way.
-                    state = ("cancelled" if remote["cancel_requested"] else "interrupted" if remote["state"] == "interrupted"
+                    if remote["state"] == "succeeded":
+                        # Only a worker holding stop proof can confirm a success, and the
+                        # service has one: there is nothing to restate, so the binding ends.
+                        self.journal.update(claim.job_id, done=1)
+                        return
+                    # Nothing was ever admitted locally, so nothing launched. An outcome the
+                    # service already holds (say, a ``failed`` whose acknowledgement was lost)
+                    # is replayed as is, so the retry cannot conflict with it. An owner's cancel
+                    # outranks a provisional interruption: nothing ran either way.
+                    state = (remote["state"] if remote["state"] in TERMINAL and remote["state"] != "interrupted"
+                             else "cancelled" if remote["cancel_requested"] else "interrupted" if remote["state"] == "interrupted"
                              else "failed" if remote["state"] == APPROVAL else "expired")
                     self._reconcile(claim, state, stopped=False, unlaunched=True)
                     self.journal.update(claim.job_id, done=1)
@@ -594,26 +602,38 @@ class RemoteClient:
 
         The service re-offers an active job on every poll until it is
         reconciled, so the outcome is reported as uncertain (``interrupted``
-        with nothing proven) first. Only an unreachable service defers that to
-        the next tick; any definitive answer ends the binding, and the local
-        journal records a ``remote_sync_conflict`` diagnostic.
+        with nothing proven) first. An unreachable service, an acknowledgement
+        for anything but exactly that, or a ``stale_epoch`` defers it to the next
+        tick; any other definitive answer ends the binding, and the local journal
+        records a ``remote_sync_conflict`` diagnostic. A superseded worker epoch
+        is left to the next heartbeat to detect and re-register: the same error
+        can mean only this claim's epoch is stale, which re-registering would not fix.
         """
         try:
-            self.transport.request("reconcile", {**self._fence(claim), "state": "interrupted",
-                                                 "execution_stopped": False, "unlaunched": False})
+            self._reconcile(claim, "interrupted", stopped=False, unlaunched=False)
         except ProtocolError as exc:
-            if exc.code in {"service_unavailable", "invalid_response"}:
+            if exc.code in {"service_unavailable", "invalid_response", "stale_epoch"}:
                 raise
         self._diagnose(self.runtime.get(local_id), "remote_sync_conflict")
         self.journal.update(claim.job_id, done=1)
 
-    def _diagnose(self, local, code):
+    def _diagnose(self, local, code, *, required=False):
+        """Journal a diagnostic for ``local``. A terminal job takes it whichever epoch
+        ended it (a restart leaves the old one on the row). ``required`` lets a
+        failed write propagate, so the binding stays pending instead of retiring
+        without the diagnostic."""
         try:
-            self.runtime.store.append_event(
-                local.job_id, kind=SafeEventKind.DIAGNOSTIC, diagnostic_code=code,
-                worker_epoch=self.runtime.worker_epoch, expected_generation=local.generation)
+            if local.state.value in TERMINAL:
+                self.runtime.store.append_terminal_diagnostic(
+                    local.job_id, diagnostic_code=code, worker_epoch=self.runtime.worker_epoch,
+                    expected_generation=local.generation)
+            else:
+                self.runtime.store.append_event(
+                    local.job_id, kind=SafeEventKind.DIAGNOSTIC, diagnostic_code=code,
+                    worker_epoch=self.runtime.worker_epoch, expected_generation=local.generation)
         except JournalError:
-            pass  # a job from an earlier worker epoch cannot take new events
+            if required:
+                raise
 
     def _proof_pending(self, local):
         """Whether stop proof for an uncertain run may still arrive: its account lease is
@@ -651,7 +671,9 @@ class RemoteClient:
         per-job limit, or conflicting with a stored copy) would be refused on
         every retry, so it is skipped and journaled as ``artifact_rejected``
         rather than holding the claim, and every other claim, pending forever.
-        Transport, lease and authorization failures still propagate for retry.
+        Transport, lease and authorization failures still propagate for retry, as
+        does a failure to journal the diagnostic, so the claim never completes
+        without either the artifact or its ``artifact_rejected`` record.
         """
         rejected = False
         for name in self.artifact_names:  # explicit list; never discover files
@@ -664,8 +686,20 @@ class RemoteClient:
                 if exc.code not in ARTIFACT_REJECTIONS:
                     raise
                 rejected = True
-                self._diagnose(local, "artifact_rejected")
+                # One record per job: a pass retried after a later failure must not repeat it.
+                if not self._has_diagnostic(local.job_id, "artifact_rejected"):
+                    self._diagnose(local, "artifact_rejected", required=True)
         return rejected
+
+    def _has_diagnostic(self, local_id, code):
+        cursor = 0
+        while True:
+            page = self.runtime.events(local_id, after_cursor=cursor, limit=200)
+            if not page.events:
+                return False
+            if any(e.diagnostic_code == code for e in page.events):
+                return True
+            cursor = page.next_cursor
 
     def _upload_artifact(self, claim, local, name):
         policy = load_worker_settings(self.runtime.backup_root)

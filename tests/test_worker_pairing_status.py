@@ -333,7 +333,7 @@ def test_configured_run_heartbeats_and_synchronizes_on_two_threads(remote_setup,
     thread = threading.Thread(target=configured.run, args=(stop,), daemon=True)  # a failure must not hang pytest
     thread.start()
     try:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 15
         while time.monotonic() < deadline and not runtime.store.queue():
             time.sleep(0.02)
         assert runtime.store.queue(), "the synchronization thread never claimed the job"
@@ -349,12 +349,14 @@ def test_configured_run_heartbeats_and_synchronizes_on_two_threads(remote_setup,
         assert by_thread("register") == {thread.name} and thread.name in by_thread("heartbeat")
         assert by_thread("poll") == {"openswap-worker-remote-sync"}
         assert runtime.reconcile_once().state.value == "succeeded"
+        deadline = time.monotonic() + 15  # each phase gets its own bound on a slow runner
         while time.monotonic() < deadline and clients[0].journal.pending():
             time.sleep(0.02)
         assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "succeeded"
         assert len(clients) == 1 and configured.client is clients[0]
         # Unpairing (the URL is cleared first) ends the client from the heartbeat thread.
         configure_worker_service(runtime.backup_root, None)
+        deadline = time.monotonic() + 15
         while time.monotonic() < deadline and configured.client is not None:
             time.sleep(0.02)
         assert configured.client is None and read_status(runtime.backup_root)[0] == RemoteConnectivity.DISABLED
@@ -630,3 +632,19 @@ def test_renewal_pairing_drops_the_old_keys_status(tmp_path, keychain):
     pairing.unpair(tmp_path)
     pairing.pair(tmp_path, "https://control.example", "one-use", transport=PairTransport())  # same worker ID
     assert read_status(tmp_path, now=seen) == (RemoteConnectivity.OFFLINE, None)
+
+
+def test_pairing_that_changes_nothing_keeps_the_configured_status(tmp_path, keychain):
+    pairing.pair(tmp_path, "https://control.example", "one-use", transport=PairTransport())
+    update_worker_settings(tmp_path, enabled=True)
+    seen = datetime.now(timezone.utc)
+    save_status(tmp_path, "https://control.example", "revoked", seen, "worker")
+    with pytest.raises(ProtocolError, match="unpair_before_pairing"):
+        pairing.pair(tmp_path, "https://control.example", "one-use", transport=PairTransport())
+    assert read_status(tmp_path, now=seen) == (RemoteConnectivity.REVOKED, seen)
+    keychain[("openswap", pairing.account_name("https://old.example"))] = "orphan"
+    assert pairing.unpair(tmp_path, "https://old.example") is False  # an unrelated orphan only
+    assert read_status(tmp_path, now=seen) == (RemoteConnectivity.REVOKED, seen)
+    pairing.unpair(tmp_path)
+    assert not (tmp_path / "worker" / "remote-status.json").exists()
+

@@ -60,17 +60,19 @@ def _pairing_lock(root: Path) -> FileLock:
 def _locked(root: Path, operation, *args, **kwargs):
     try:
         with _pairing_lock(root):
-            try:
-                return operation(root, *args, **kwargs)
-            finally:
-                # Any pairing change (including a renewal that keeps the URL and worker
-                # ID) starts the new enrollment without the old one's saved status.
-                try:
-                    (Path(root) / "worker" / "remote-status.json").unlink(missing_ok=True)
-                except OSError:
-                    pass
+            return operation(root, *args, **kwargs)
     except LockError:
         raise ProtocolError("pairing_in_progress") from None
+
+
+def _drop_status(root: Path):
+    """Called once the configured enrollment has changed: a new enrollment (including
+    a renewal that keeps the URL and worker ID) starts without the old one's saved
+    status. A refused or failed command, or one that only removed an orphan, keeps it."""
+    try:
+        (Path(root) / "worker" / "remote-status.json").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def pair(root: Path, url: str, code: str, *, transport=None) -> str:
@@ -107,6 +109,7 @@ def _pair(root: Path, url: str, code: str, *, transport=None) -> str:
         except macos_keychain.KEYCHAIN_ERRORS:
             pass
         raise ProtocolError("pairing_settings_unavailable") from None
+    _drop_status(root)
     return enrollment.worker_id
 
 
@@ -138,6 +141,7 @@ def _unpair(root: Path, url: str | None = None) -> bool:
     removed = configured is not None and account_name(configured) == account_name(target)
     if removed:
         configure_worker_service(root, None)
+        _drop_status(root)
     try:
         macos_keychain.delete_password(SERVICE, account_name(target))
     except macos_keychain.KEYCHAIN_ERRORS:

@@ -99,6 +99,11 @@ def make_server(store, host="127.0.0.1", port=8765, *, behind_owner_controlled_t
     class Server(ThreadingHTTPServer):
         address_family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
         daemon_threads = True
+        # The default backlog of 5 is too small: Windows refuses connections past the
+        # backlog instead of queueing them, and one worker's heartbeat, renewal and
+        # synchronization threads plus a CLI can exceed it. Each refusal reads as an
+        # outage, so a launch fence that lands on one fails the job.
+        request_queue_size = 64
     server = Server((str(address), port), Handler)
     server.store = store
     return server
