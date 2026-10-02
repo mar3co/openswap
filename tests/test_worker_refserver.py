@@ -7,6 +7,7 @@ import os
 import socket
 import sqlite3
 import threading
+import time
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -168,6 +169,43 @@ def test_cli_operator_commands(tmp_path, capsys):
 def test_bind_policy(service):
     with pytest.raises(ValueError, match="TLS"):
         make_server(service[0], "0.0.0.0", 0)
+
+
+def test_concurrent_requests_queue_in_process_not_in_sqlite(service):
+    """SQLite's busy handler can starve one writer for its whole timeout under steady
+    load from several threads; requests in one process must queue on a lock instead."""
+    store, _, _, key, epoch = service
+    original, active, peak, guard = store.connect, [0], [0], threading.Lock()
+
+    class Tracked:
+        def __init__(self, db):
+            self.db = db
+
+        def __getattr__(self, name):
+            return getattr(self.db, name)
+
+        def close(self):
+            with guard:
+                active[0] -= 1
+            self.db.close()
+
+    def connect():
+        with guard:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        return Tracked(original())
+    store.connect = connect
+    deadline = time.monotonic() + 0.5
+
+    def hammer():
+        while time.monotonic() < deadline:
+            store.request("heartbeat", {"worker_epoch": epoch}, key)
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert peak[0] == 1
 
 
 def test_server_backlog_absorbs_a_burst_of_connections(service):
