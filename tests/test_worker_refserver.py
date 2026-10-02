@@ -208,6 +208,19 @@ def test_concurrent_requests_queue_in_process_not_in_sqlite(service):
     assert peak[0] == 1
 
 
+def test_a_request_that_cannot_get_its_turn_is_refused_without_running(service):
+    """A queue longer than the client's timeout must not run requests for callers that
+    have already given up: a late pair would consume a code nobody receives."""
+    store = service[0]
+    store.request_wait_seconds = 0.05
+    code = store.issue_code()
+    with store._requests:  # another request is holding the store
+        with pytest.raises(ProtocolError) as refused:
+            store.request("pair", {"code": code})
+    assert (refused.value.code, refused.value.status) == ("service_unavailable", 503)
+    assert store.request("pair", {"code": code})["device_key"]  # the code was not consumed
+
+
 def test_server_backlog_absorbs_a_burst_of_connections(service):
     """A worker's threads and a CLI connect together; past the backlog Windows refuses
     connections outright, and each refusal looks like an outage to the client."""

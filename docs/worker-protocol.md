@@ -259,6 +259,8 @@ idempotency keys. Treat 401/403 as no new admission.
 
 Enrollment, codes, epochs, jobs, events and artifact bytes are durable in
 SQLite. Reference queue limit: 20 queued jobs per worker. The reference service
+runs one request at a time; a request that cannot start within 2.5 seconds is
+refused with 503 `service_unavailable` before it touches any state. The reference service
 retains data until its operator deletes the stopped service's private database
 and backups; there is no automatic retention or network deletion API in v1.
 Revocation removes access, not data. Operators own retention, deletion, backups

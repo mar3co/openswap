@@ -35,6 +35,10 @@ def digest(secret: str) -> str:
 
 
 class ControlStore:
+    # How long a request waits for its turn. Shorter than the client's 5 s request
+    # timeout, so a request whose caller has given up is refused, not run late.
+    request_wait_seconds = 2.5
+
     def __init__(self, path: Path, *, clock=time.time):
         self.path, self.clock = Path(path), clock
         # Requests from this process queue here instead of in SQLite's busy handler,
@@ -136,8 +140,13 @@ class ControlStore:
         return device
 
     def request(self, operation: str, value: object, key: str | None = None) -> dict:
-        with self._requests:
+        # A refused request has not touched the database, so a retry is safe.
+        if not self._requests.acquire(timeout=self.request_wait_seconds):
+            raise ProtocolError("service_unavailable", 503)
+        try:
             return self._request(operation, value, key)
+        finally:
+            self._requests.release()
 
     def _request(self, operation: str, value: object, key: str | None = None) -> dict:
         db = self.connect()
