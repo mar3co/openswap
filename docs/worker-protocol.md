@@ -171,9 +171,11 @@ confirmed stopped result, while `unlaunched: true` establishes pre-launch
 failure/cancellation/expiry. `reconcile` accepts only a terminal `state`;
 `succeeded` always requires stopped proof, so `succeeded` with
 `unlaunched: true` (or without `execution_stopped: true`) returns
-`invalid_state`, as does any other terminal state carrying neither proof. An
-uncertain outcome stays `interrupted` and remains provisional: it can still be
-reconciled to the true outcome later. Reconciliation and event/result uploads
+`invalid_state`, as does any other terminal state carrying neither proof, except
+`interrupted` with both proof flags false. That exception explicitly reports an
+uncertain provisional outcome (including the cursor-conflict path below), releases
+the service-side admission slot without requeueing or proving local termination,
+and remains eligible for later reconciliation with the true stopped outcome. Reconciliation and event/result uploads
 are allowed after lease loss for the same worker/job epoch, but never after
 revocation or device expiry. Confirmed terminal reconciliation is idempotent;
 conflicting terminal outcomes return `invalid_state`. This includes

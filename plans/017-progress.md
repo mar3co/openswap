@@ -20,7 +20,7 @@ access remains default-off and live Codex execution stays disabled. Phase 3
 credential-free scaffolding is implemented in the five-PR stack
 #63–#67 under the owner's explicit authorization to overlap the open Phase 1
 gates. On 2026-09-30 the stack was fully reviewed (six sub-reviews) and the
-fixes were pushed to every branch; the PRs are pending merge. Its local
+fixes were pushed to every branch. PRs #63–#67 are now merged; main reached `ab737eb`. Five P2 Codex threads were deliberately left open by the owner. Its local
 protocol/service/client evidence does not pass Phase 1 or the Phase 3 network
 exit gate. The production Codex adapter remains disabled.
 
@@ -637,7 +637,7 @@ using a lock-free read so it adds no contention with switching.
 
 ## Phase 3: private remote pilot scaffolding
 
-**Implementation reviewed and fixed, merge pending; exit gate remains OPEN.** The owner
+**Implementation merged (#63–#67, main `ab737eb`); network exit gate remains OPEN.** The owner
 explicitly authorized credential-free Phase 3 work to overlap the still-open
 Phase 1 gates. This is a sequencing deviation, not a provider-safety waiver.
 The five branches target the branch immediately below them:
@@ -710,8 +710,7 @@ round answered the next Codex re-review (3a `6c1b5ed`, 3b `eb13955`, 3c
 fifth after that (3a unchanged with a clean Codex review, 3b `f35892e`, 3c
 `c435f8a`, 3d `cb4dc6b`, 3e `b5bd3b6`). Codex then approved 3a, 3b and 3e; a
 sixth round closed the last 3c/3d findings (3c `1f5f1c9`, 3d `18ea392`, 3e
-this PR's head). All five PRs are pending merge;
-nothing below is on `main` yet.
+the final PR head). All five PRs are now merged to `main`; the network and live-provider evidence gates below remain open.
 
 HIGH bugs fixed:
 
@@ -871,3 +870,52 @@ unsupported outside macOS, while HTTP/SQLite/fake-adapter tests are portable.
 No third-party backend internals or connector implementation enter this stack.
 The cancellation/process-tree gates and strict `execution_stopped is True`
 lease-release checks remain intact.
+
+
+## Phase 4: OpenTag connector (2026-10-02)
+
+**In progress; credential-free overlap authorized; not a live-provider signoff.**
+The owner explicitly authorized implementing the OpenTag connector while Phase 1
+remains open, using the fake adapter for all execution evidence. The production
+adapter stays `UnavailableCodexAdapter`. No provider authentication files, real
+Keychain entries or launchctl state are accessed. Local database services are
+not used; database validation runs in OpenTag PR CI.
+
+OpenTag implementation and review stack:
+
+- [Protocol server #137](https://github.com/mar3co/opentag/pull/137): durable v1
+  operations, strict validation, owner-private audit and bounded retention.
+- [Dispatch #138](https://github.com/mar3co/opentag/pull/138): dedicated capability,
+  immutable private preview, atomic owner approval and idempotent submission.
+- [Slack flow #139](https://github.com/mar3co/opentag/pull/139): owner-only command,
+  private preview, redacted shared updates and durable two-tier notifications.
+- [Owner portal #140](https://github.com/mar3co/opentag/pull/140): pairing, private
+  approvals, job status/Stop and authenticated results.
+- [Conformance #141](https://github.com/mar3co/opentag/pull/141): expanded fake-client
+  outage/reconnect, approval races, renewal/revocation and backend-switch evidence.
+
+The first two slices passed CI database regressions and a real pinned OpenSwap
+client roundtrip against the independent server, using an inert injected adapter
+and temporary settings/journals. This is synthetic loopback evidence, not staging
+TLS, another-network operation, provider isolation or live research. OpenTag
+imports the pinned OpenSwap Git package only as a test dependency; its server
+implementation consumes the published protocol specification and does not vendor
+OpenSwap source.
+
+The owner chose host-owned device display labels and provider-usage annotations.
+No v1 wire fields were added. The protocol also does not advertise approved local
+workspace IDs; host-configured hints must not claim verified local availability.
+
+One specification clarification arose from implementing a second server:
+`interrupted` with both proof flags false is the provisional reconciliation already
+required by the cursor-conflict path. Other terminal outcomes require stopped or
+unlaunched proof, and success always requires stopped proof. This is a text
+clarification, not a new operation or field.
+
+Phase 3 exit evidence closed by this work so far: **none of the real-network
+items**. The independent implementation adds cross-server synthetic conformance;
+real HTTPS/truststore, another-network submission without an inbound Mac listener,
+outage/reconnect on that network and backend switching against independent HTTPS
+origins remain owner-controlled pilot work. Phase 4 exit also remains open until
+the staging Slack scenario succeeds, including non-owner refusal, cited private
+results and state-only shared updates. All PRs remain for owner review and merge.
