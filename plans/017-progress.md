@@ -895,12 +895,15 @@ sending heartbeats on macOS, the slowest request drops from 1.1–2.5 s to
 `test_run_loop_survives_a_journal_error_and_keeps_ticking`, which now waits
 for the retried cancel instead of a fixed number of sync passes.
 
-Still open after this pass (design gaps, not regressions):
+[mar3co/openswap#72](https://github.com/mar3co/openswap/pull/72) bounds the
+wait for that lock, closing #71's remaining Codex P2. A request that cannot
+start within 2.5 s, half the client's 5 s deadline, is refused with 503
+`service_unavailable` before it touches the database. Before this, a late
+request ran for a client that had already given up; a late `pair` consumed a
+code nobody received. The same PR widens the remaining 2 s launch-readiness
+waits in the worker tests to 15 s, after one failed on Windows.
 
-- The reference store's in-process request lock has no timeout. A queue longer
-  than the client's 5 s deadline makes handlers wait and then run operations
-  for clients that have already disconnected. The Codex P2 thread on
-  [mar3co/openswap#71](https://github.com/mar3co/openswap/pull/71) that reports this is still unresolved.
+Still open after this pass (design gaps, not regressions):
 
 - The reference service has no retention/purge or audit trail although the
   plan requires both; the PR bodies do not claim them.
