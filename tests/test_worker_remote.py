@@ -377,44 +377,47 @@ def test_run_loop_survives_a_journal_error_and_keeps_ticking(remote_setup, monke
     job_id = submit(remote_setup)
     remote.tick()
     store.request("cancel", {"job_id": job_id}, paired["device_key"])
-    original_cancel, failures = runtime.cancel, []
+    original_cancel, failures, cancelled = runtime.cancel, [], threading.Event()
 
     def flaky_cancel(local_id):
         if not failures:
             failures.append(local_id)
             raise StaleWriteError("cancel lost its fence")  # RuntimeError: outside tick's own allowlist
-        return original_cancel(local_id)
+        result = original_cancel(local_id)
+        cancelled.set()
+        return result
 
     monkeypatch.setattr(runtime, "cancel", flaky_cancel)
     monkeypatch.setattr(remote, "enforce_cancellations", lambda: None)  # exercise the sync thread's path
     monkeypatch.setattr(remote_mod, "HEARTBEAT_SECONDS", 0.01)
-    passes, enough = [], threading.Event()
+    passes, recovered = [], threading.Event()
     original_sync = remote.sync_tick
 
     def counted_sync(policy=None):
         try:
             original_sync(policy)
             passes.append(("returned", remote.state))
+            # Wait for the outcome, not a pass count: passes that land before the
+            # next heartbeat restores ``online`` return early, more so on a coarse timer.
+            if cancelled.is_set():
+                recovered.set()
         except Exception:
             passes.append(("raised", remote.state))
             raise
-        finally:
-            if len(passes) >= 3:
-                enough.set()
 
     monkeypatch.setattr(remote, "sync_tick", counted_sync)
     stop = threading.Event()
     thread = threading.Thread(target=remote.run, args=(stop,), daemon=True)  # a failure must not hang pytest
     thread.start()
     try:
-        assert enough.wait(5), "the synchronization thread died"
+        assert recovered.wait(15), ("the synchronization thread died", passes)
     finally:
         stop.set()
         thread.join(2)
     assert not thread.is_alive()
     # The fault escaped sync_tick's own allowlist, was folded into connectivity by the
     # loop, and the next pass (admitted again by a fresh heartbeat) completed the cancel.
-    assert failures and passes[0] == ("raised", "online") and passes[-1] == ("returned", "online")
+    assert failures and passes[0] == ("raised", "online")
     assert remote.state == "online"
     assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "cancelled"
 

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import threading
 import time
 from uuid import uuid4
 from datetime import datetime, timezone
@@ -36,6 +37,11 @@ def digest(secret: str) -> str:
 class ControlStore:
     def __init__(self, path: Path, *, clock=time.time):
         self.path, self.clock = Path(path), clock
+        # Requests from this process queue here instead of in SQLite's busy handler,
+        # which polls with growing sleeps: under steady writes from several threads
+        # one waiter can lose the lock for its whole busy timeout, and a client whose
+        # socket timeout is just as long then gives up first.
+        self._requests = threading.Lock()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.path.is_symlink() or self.path.parent.is_symlink():
             raise ValueError("unsafe database path")
@@ -130,6 +136,10 @@ class ControlStore:
         return device
 
     def request(self, operation: str, value: object, key: str | None = None) -> dict:
+        with self._requests:
+            return self._request(operation, value, key)
+
+    def _request(self, operation: str, value: object, key: str | None = None) -> dict:
         db = self.connect()
         try:
             now = self.clock()
