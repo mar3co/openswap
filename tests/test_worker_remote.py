@@ -1099,18 +1099,75 @@ def test_abandonment_needs_an_exact_reconcile_acknowledgement(remote_setup, monk
     assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "interrupted"
 
 
-def test_abandonment_that_loses_its_epoch_is_retried_after_reregistration(remote_setup):
+def test_abandonment_that_loses_its_epoch_is_retried_after_reregistration(remote_setup, monkeypatch):
     remote, runtime, _, store, _, paired, transport = remote_setup
     job_id = submit(remote_setup)
+    remote.tick()
+    local = runtime.reconcile_once()
+    key, original, superseded = paired["device_key"], transport.request, []
+
+    def supersede_before_reconcile(op, data):
+        if op == "reconcile" and not superseded:  # another registration lands mid-abandonment
+            superseded.append(store.request("register", {}, key)["worker_epoch"])
+        return original(op, data)
+    monkeypatch.setattr(transport, "request", supersede_before_reconcile)
+    transport.reject["events"] = ProtocolError("cursor_conflict", 409)
+    remote.tick()
+    assert superseded and remote.journal.binding(local.job_id)["done"] == 0
+    assert not any(e.diagnostic_code == "remote_sync_conflict"
+                   for e in runtime.events(local.job_id, after_cursor=0, limit=200).events)
+    remote.tick()  # the heartbeat finds the superseded epoch and drops it
+    remote.tick()  # re-registers, then the binding syncs and the local outcome is reported
+    assert remote.worker_epoch == superseded[0] + 1 and remote.journal.pending() == []
+    assert store.request("job", {"job_id": job_id}, key)["state"] == "succeeded"
+
+
+def test_a_stale_claim_epoch_during_abandonment_never_reregisters(remote_setup):
+    remote, runtime, _, _, _, _, transport = remote_setup
+    submit(remote_setup)
     remote.tick()
     local = runtime.reconcile_once()
     epoch = remote.worker_epoch
     transport.reject["events"] = ProtocolError("cursor_conflict", 409)
     transport.reject["reconcile"] = ProtocolError("stale_epoch", 409)
     remote.tick()
-    assert remote.journal.binding(local.job_id)["done"] == 0 and remote.worker_epoch is None
-    assert not any(e.diagnostic_code == "remote_sync_conflict"
-                   for e in runtime.events(local.job_id, after_cursor=0, limit=200).events)
-    remote.tick()  # re-registers, then the binding syncs and the local outcome is reported
-    assert remote.worker_epoch == epoch + 1 and remote.journal.pending() == []
-    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "succeeded"
+    assert remote.journal.binding(local.job_id)["done"] == 0
+    assert remote.worker_epoch == epoch  # the heartbeat, not the job fence, decides re-registration
+    remote.tick()
+    assert remote.worker_epoch == epoch and "register" not in transport.calls[-8:]
+
+
+def test_unadmitted_claim_the_service_already_succeeded_is_retired(remote_setup, monkeypatch):
+    remote, runtime, adapter, _, _, _, transport = remote_setup
+    submit(remote_setup)
+    original = transport.request
+    monkeypatch.setattr(transport, "request", lambda op, data: (
+        {**original(op, data), "state": "succeeded"} if op == "job" else original(op, data)))
+    remote.tick()
+    assert remote.journal.pending() == [] and "reconcile" not in transport.calls
+    assert not runtime.store.queue() and adapter.starts == 0
+
+
+def test_a_retried_rejection_is_recorded_once(remote_setup):
+    remote, runtime, _, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    local = runtime.reconcile_once()
+    transport.reject["upload"] = ProtocolError("artifact_conflict", 409)
+    original_forward = remote._forward_events
+    calls = []
+
+    def forward(*args):
+        calls.append(args)
+        if len(calls) == 2:  # the relay of the rejection diagnostic
+            raise ProtocolError("service_unavailable", 503)
+        return original_forward(*args)
+    remote._forward_events = forward
+    remote.tick()
+    assert remote.journal.binding(local.job_id)["done"] == 0
+    del remote._forward_events
+    transport.reject["upload"] = ProtocolError("artifact_conflict", 409)
+    remote.tick()
+    assert remote.journal.pending() == []
+    events = store.request("events", {"job_id": job_id, "after_cursor": 0}, paired["device_key"])["events"]
+    assert [e["diagnostic_code"] for e in events if e["diagnostic_code"] == "artifact_rejected"] == ["artifact_rejected"]

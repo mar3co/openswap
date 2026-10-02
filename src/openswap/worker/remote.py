@@ -482,6 +482,11 @@ class RemoteClient:
             if local is None:
                 if (remote["state"] in TERMINAL or remote["state"] == APPROVAL or remote["cancel_requested"]
                         or claim.submission.job.expires_at <= self._server_now()):
+                    if remote["state"] == "succeeded":
+                        # Only a worker holding stop proof can confirm a success, and the
+                        # service has one: there is nothing to restate, so the binding ends.
+                        self.journal.update(claim.job_id, done=1)
+                        return
                     # Nothing was ever admitted locally, so nothing launched. An outcome the
                     # service already holds (say, a ``failed`` whose acknowledgement was lost)
                     # is replayed as is, so the retry cannot conflict with it. An owner's cancel
@@ -598,17 +603,15 @@ class RemoteClient:
         The service re-offers an active job on every poll until it is
         reconciled, so the outcome is reported as uncertain (``interrupted``
         with nothing proven) first. An unreachable service, an acknowledgement
-        for anything but exactly that, or a superseded worker epoch (which is
-        reset to re-register) defers it to the next tick; any other definitive
-        answer ends the binding, and the local journal records a
-        ``remote_sync_conflict`` diagnostic.
+        for anything but exactly that, or a ``stale_epoch`` defers it to the next
+        tick; any other definitive answer ends the binding, and the local journal
+        records a ``remote_sync_conflict`` diagnostic. A superseded worker epoch
+        is left to the next heartbeat to detect and re-register: the same error
+        can mean only this claim's epoch is stale, which re-registering would not fix.
         """
         try:
             self._reconcile(claim, "interrupted", stopped=False, unlaunched=False)
         except ProtocolError as exc:
-            if exc.code == "stale_epoch":
-                with self._lock:
-                    self.worker_epoch = None
             if exc.code in {"service_unavailable", "invalid_response", "stale_epoch"}:
                 raise
         self._diagnose(self.runtime.get(local_id), "remote_sync_conflict")
@@ -683,8 +686,20 @@ class RemoteClient:
                 if exc.code not in ARTIFACT_REJECTIONS:
                     raise
                 rejected = True
-                self._diagnose(local, "artifact_rejected", required=True)
+                # One record per job: a pass retried after a later failure must not repeat it.
+                if not self._has_diagnostic(local.job_id, "artifact_rejected"):
+                    self._diagnose(local, "artifact_rejected", required=True)
         return rejected
+
+    def _has_diagnostic(self, local_id, code):
+        cursor = 0
+        while True:
+            page = self.runtime.events(local_id, after_cursor=cursor, limit=200)
+            if not page.events:
+                return False
+            if any(e.diagnostic_code == code for e in page.events):
+                return True
+            cursor = page.next_cursor
 
     def _upload_artifact(self, claim, local, name):
         policy = load_worker_settings(self.runtime.backup_root)

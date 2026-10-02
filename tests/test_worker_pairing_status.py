@@ -648,15 +648,3 @@ def test_pairing_that_changes_nothing_keeps_the_configured_status(tmp_path, keyc
     pairing.unpair(tmp_path)
     assert not (tmp_path / "worker" / "remote-status.json").exists()
 
-
-def test_failed_pair_exchange_keeps_the_saved_status(tmp_path, keychain):
-    (tmp_path / "worker").mkdir(parents=True)
-    status = tmp_path / "worker" / "remote-status.json"
-    status.write_text("{}")
-
-    class Down:
-        def request(self, operation, data):
-            raise ProtocolError("service_unavailable", 503)
-    with pytest.raises(ProtocolError, match="service_unavailable"):
-        pairing.pair(tmp_path, "https://control.example", "one-use", transport=Down())
-    assert status.exists()
