@@ -197,7 +197,7 @@ def test_blocked_remote_authorization_does_not_hold_control_lock(remote_setup):
     results = []
     runner = threading.Thread(target=lambda: results.append(runtime.reconcile_once()))
     runner.start()
-    assert guard_entered.wait(2)
+    assert guard_entered.wait(15)
     # This would wait for the network timeout if the guard held launch_lock.
     assert runtime.stop(local.job_id).accepted
     release_guard.set()

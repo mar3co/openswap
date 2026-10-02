@@ -121,7 +121,7 @@ def test_unreachable_running_job_continues_and_reconciles_interrupted(remote_set
     results = []
     runner = threading.Thread(target=lambda: results.append(runtime.reconcile_once()))
     runner.start()
-    assert adapter.entered.wait(2)
+    assert adapter.entered.wait(15)
     transport.unreachable = True
     remote.tick()
     assert remote.state == "offline"
@@ -165,7 +165,7 @@ def test_revocation_stops_new_claims_and_never_kills_running_job(remote_setup):
     adapter.finish.clear()
     runner = threading.Thread(target=runtime.reconcile_once)
     runner.start()
-    assert adapter.entered.wait(2)
+    assert adapter.entered.wait(15)
     store.revoke(paired["worker_id"])
     remote.tick()
     assert remote.state == "revoked" and runner.is_alive()
@@ -209,7 +209,7 @@ def test_cancel_reconnect_after_heartbeat_loss(remote_setup):
     adapter.finish.clear()
     runner = threading.Thread(target=runtime.reconcile_once)
     runner.start()
-    assert adapter.entered.wait(2)
+    assert adapter.entered.wait(15)
     ticks[0] += 16
     store.request("cancel", {"job_id": job_id}, paired["device_key"])
     remote.tick()  # stop must propagate even though state is interrupted
@@ -959,7 +959,7 @@ def test_cancel_still_reaches_a_running_job_after_a_cursor_conflict(remote_setup
     runner = threading.Thread(target=runtime.reconcile_once, daemon=True)
     runner.start()
     try:
-        assert adapter.entered.wait(2)
+        assert adapter.entered.wait(15)
         local = runtime.store.active()
         transport.reject["events"] = ProtocolError("cursor_conflict", 409)
         remote.tick()

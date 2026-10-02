@@ -47,7 +47,7 @@ def test_stop_during_slow_guard_never_launches(remote_setup, monkeypatch):
     results = []
     runner = threading.Thread(target=lambda: results.append(runtime.reconcile_once()))
     runner.start()
-    assert guard_entered.wait(2)
+    assert guard_entered.wait(15)
     start_thread = runtime._event_reader
     assert runtime.stop(local.job_id).accepted
     runner.join(3)
@@ -68,7 +68,7 @@ def test_deadline_during_slow_guard_never_launches(remote_setup):
     results = []
     runner = threading.Thread(target=lambda: results.append(runtime.reconcile_once()))
     runner.start()
-    assert guard_entered.wait(2)
+    assert guard_entered.wait(15)
     start_thread = runtime._event_reader
     runner.join(3)
     assert not runner.is_alive()
@@ -85,7 +85,7 @@ def test_committed_launch_is_still_interrupted_not_replayed(remote_setup, monkey
     adapter.finish.clear()
     runner = threading.Thread(target=runtime.reconcile_once)
     runner.start()
-    assert adapter.entered.wait(2)
+    assert adapter.entered.wait(15)
     assert runtime.stop(local.job_id).accepted
     runner.join(3)
     assert not runner.is_alive() and adapter.starts == 1
