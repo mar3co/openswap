@@ -24,8 +24,10 @@ from openswap.worker.runtime import WorkerRuntime
 from openswap.worker.submit_test import resolve_expiry, submit_test
 
 # Longer than the transport's 5 s socket timeout, so a blocked request cannot
-# leave a thread alive at join time and mask the real failure.
-WAIT = 6
+# leave a thread alive at join time and mask the real failure, and generous
+# enough for a loaded Windows runner: every use waits on an event or a join,
+# so a passing run never spends it.
+WAIT = 20
 
 
 def test_loopback_pair_cli_submit_fake_run_events_and_artifact(tmp_path, keychain, capsys):
@@ -119,6 +121,7 @@ def test_configured_background_polling_loop(tmp_path, keychain, capsys, monkeypa
     monkeypatch.setattr(state_module, "HEARTBEAT_SECONDS", 0.01)
     store = ControlStore(tmp_path / "service" / "db")
     ready, bound, admitted, uploaded, stop = (threading.Event() for _ in range(5))
+    failures = []  # every failed request, so a failure below names its cause
     with make_server(store, port=0) as server:
         serving = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
         serving.start()
@@ -133,7 +136,11 @@ def test_configured_background_polling_loop(tmp_path, keychain, capsys, monkeypa
                                     account_identity=stable_account_identity("codex", "synthetic-background"))
             class ObservedTransport(Transport):
                 def request(self, operation, data):
-                    response = super().request(operation, data)
+                    try:
+                        response = super().request(operation, data)
+                    except ProtocolError as exc:
+                        failures.append((operation, exc.code))
+                        raise
                     if operation == "heartbeat":
                         ready.set()
                     if operation == "renew" and bound.is_set():
@@ -158,9 +165,10 @@ def test_configured_background_polling_loop(tmp_path, keychain, capsys, monkeypa
             assert cli.main(["submit-test", "--url", url, "--task", "Background synthetic test",
                              "--workspace-id", "research", "--runtime-limit", "60", "--expires-in", "600",
                              "--i-understand-this-is-a-test-tool"], backup_root=root) == 0
-            assert admitted.wait(WAIT)
-            assert runtime.reconcile_once().state == JobState.SUCCEEDED
-            assert uploaded.wait(WAIT)
+            assert admitted.wait(WAIT), failures
+            result = runtime.reconcile_once()
+            assert result.state == JobState.SUCCEEDED, (result.diagnostic_code, failures)
+            assert uploaded.wait(WAIT), failures
         finally:
             stop.set()
             if polling is not None:

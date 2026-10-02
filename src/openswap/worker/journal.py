@@ -469,6 +469,40 @@ class LocalJobStore:
         finally:
             db.close()
 
+    def append_terminal_diagnostic(
+        self, job_id: str, *, worker_epoch: int, expected_generation: int, diagnostic_code: str,
+    ) -> SafeEvent:
+        """Record a diagnostic on a terminal job, whichever epoch ended it.
+
+        A terminal row is never written again, so a job recovered from an earlier
+        epoch keeps that epoch. The writer must still hold the current epoch (which
+        fences every prior process) and see the generation it read.
+        """
+        diagnostic_code = validate_event_fields(
+            kind=SafeEventKind.DIAGNOSTIC, state=None, diagnostic_code=diagnostic_code,
+            execution_stopped=False,
+        )
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            self._assert_epoch_tx(db, worker_epoch)
+            row = db.execute("SELECT state,generation FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if (row is None or JobState(row["state"]) not in _TERMINAL_STATES
+                    or row["generation"] != expected_generation):
+                raise StaleWriteError("event write lost its generation fence")
+            timestamp = _stamp(_now())
+            cursor = self._append_event_tx(
+                db, job_id, SafeEventKind.DIAGNOSTIC, None, diagnostic_code, timestamp, False,
+            )
+            db.commit()
+            return SafeEvent(job_id, cursor, _parse_stamp(timestamp), SafeEventKind.DIAGNOSTIC, None,
+                             diagnostic_code, False)
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
     def cancel(self, job_id: str, *, worker_epoch: int, expected_generation: int) -> JobRecord:
         record = self.get(job_id)
         if record.state in _TERMINAL_STATES:

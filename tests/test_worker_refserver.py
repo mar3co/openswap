@@ -170,6 +170,21 @@ def test_bind_policy(service):
         make_server(service[0], "0.0.0.0", 0)
 
 
+def test_server_backlog_absorbs_a_burst_of_connections(service):
+    """A worker's threads and a CLI connect together; past the backlog Windows refuses
+    connections outright, and each refusal looks like an outage to the client."""
+    with make_server(service[0], port=0) as server:  # listening, but nothing accepts yet
+        clients = []
+        try:
+            for _ in range(32):
+                client = socket.create_connection(("127.0.0.1", server.server_port), timeout=2)
+                clients.append(client)
+        finally:
+            for client in clients:
+                client.close()
+    assert len(clients) == 32
+
+
 def test_http_strict_parsing_and_pairing(service):
     store = service[0]
     with make_server(store, port=0) as server:
