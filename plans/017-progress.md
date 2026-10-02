@@ -22,7 +22,9 @@ credential-free scaffolding is implemented in the five-PR stack
 gates. On 2026-09-30 the stack was fully reviewed (six sub-reviews) and the
 fixes were pushed to every branch. PRs #63–#67 merged on 2026-10-01 (main
 `ab737eb`) with five P2 Codex threads left open; PR #68 fixed all five and
-the Windows/macOS timing flakes, merging on 2026-10-02 (`2e714a3`). Its local
+most of the Windows/macOS timing flakes, merging on 2026-10-02 (`2e714a3`).
+#71 fixes the reference-store starvation behind the Windows failures that
+remained. Its local
 protocol/service/client evidence does not pass Phase 1 or the Phase 3 network
 exit gate. The production Codex adapter remains disabled.
 
@@ -148,7 +150,7 @@ until the owner records a permitted path or exclusion.
 | --- | --- | --- |
 | 1. Feasibility spike and authentication gate | SIGNOFF MERGED (#59) / EVIDENCE BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction showed the wrapper could return success while a detached helper remained alive; the harness now detects and terminates tracked escaped descendants and reports `interrupted`, but cannot close the fork/reparent race. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 merged 2026-09-30 (`39438ca`) as review signoff; merging does not satisfy the remaining technical exit gates. Next step: an owner-authorized account context and an authenticated `codex exec` run. |
 | 2. Local worker, remote access off | MERGED (#60) — local-only | Owner authorized local infrastructure to overlap Phase 1; no Phase 1 gate is waived. PR #60 merged 2026-09-30 (`225211d`); CI green on macOS, Linux and Windows; Codex review clean on `556ca11`. Fake-only validation is recorded below. Remote access stays off, the production Codex adapter still refuses, and live Codex stays disabled. Open follow-up before any real adapter: lease release must also prove the provider process tree has stopped. |
-| 3. Private remote pilot | MERGED (#63–#67, follow-ups #68) / EXIT OPEN | Owner explicitly authorized credential-free Phase 3 overlap. The protocol, reference server, polling/heartbeats, enrollment/status and guarded test CLI have loopback fake-adapter evidence. Reviewed in full on 2026-09-30; three HIGH bugs (launch after abandon, artifact-failure wedge, dying remote thread) and the MEDIUM findings were fixed before #63–#67 merged on 2026-10-01 (`ab737eb`). #68 (2026-10-02, `2e714a3`) fixed the five P2 Codex threads left open at merge and the CI timing flakes. Real owner-controlled HTTPS deployment, submission from another network, backend replacement, and retention/purge plus an audit trail in the reference server still need the owner. Production Codex remains disabled pending Phase 1. |
+| 3. Private remote pilot | MERGED (#63–#67, follow-ups #68) / EXIT OPEN | Owner explicitly authorized credential-free Phase 3 overlap. The protocol, reference server, polling/heartbeats, enrollment/status and guarded test CLI have loopback fake-adapter evidence. Reviewed in full on 2026-09-30; three HIGH bugs (launch after abandon, artifact-failure wedge, dying remote thread) and the MEDIUM findings were fixed before #63–#67 merged on 2026-10-01 (`ab737eb`). #68 (2026-10-02, `2e714a3`) fixed the five P2 Codex threads left open at merge and most CI timing flakes; #71 fixes the reference-store starvation behind the rest. Real owner-controlled HTTPS deployment, submission from another network, backend replacement, and retention/purge plus an audit trail in the reference server still need the owner. Production Codex remains disabled pending Phase 1. |
 | 4. OpenTag connector | IN REVIEW (mar3co/opentag#137–#141) / EXIT OPEN | Credential-free overlap authorized by the owner; fake-adapter evidence only. Scope tracked in mar3co/opentag#135. Exit needs the staging Slack scenario, including non-owner refusal, cited private results and state-only shared updates. See the Phase 4 section below. |
 | 5–6 | NOT STARTED | Require phase 4. |
 
@@ -642,7 +644,8 @@ using a lock-free read so it adds no contention with switching.
 **Implementation merged (#63–#67, main `ab737eb`); network exit gate remains OPEN.** The owner
 explicitly authorized credential-free Phase 3 work to overlap the still-open
 Phase 1 gates. This is a sequencing deviation, not a provider-safety waiver.
-The five branches target the branch immediately below them:
+The five branches were stacked, each on the one below, and retargeted to
+`main` before merging bottom-up on 2026-10-01:
 
 | Slice | Pull request | Scope |
 | --- | --- | --- |
@@ -682,7 +685,8 @@ requirements. Production execution still uses `UnavailableCodexAdapter`.
 | 3e round-three head (`9153334`) | 3482 passed, 5 skipped | not re-run serially |
 | 3e round-four head (`ffe0994`) | 3502 passed, 5 skipped | not re-run serially |
 | 3e round-five head (`b5bd3b6`) | 3509 passed, 5 skipped | not re-run serially |
-| 3e round-six head (this PR's head) | 3516 passed, 5 skipped | not re-run serially |
+| 3e round-six head (`ad612d1`, merged as `ab737eb`) | 3516 passed, 5 skipped | not re-run serially |
+| #68 follow-ups (`95b3bc3`) | 3527 passed, 5 skipped | not re-run serially |
 
 Full suites use `uv run pytest -q`; serial Phase 3 runs use `-n0` with the
 six Phase 3 test modules (the review pass added
@@ -690,9 +694,10 @@ six Phase 3 test modules (the review pass added
 is removed for test isolation and the uv cache stays under `/private/tmp`.
 Each completed full run has the same three existing pytest fixture warnings.
 Socket and synthetic-process tests require local execution permission. These
-are macOS results; only 3a receives CI while stacked PR bases remain branches.
-Linux/Windows behavior is designed/tested with portable HTTP/SQLite paths and
-mocked macOS enrollment; CI on upper slices runs after reviewer retargeting.
+are macOS results. While stacked, only 3a received CI; each slice then ran CI
+(`test`, `test-windows`, `macos-keychain`) after retargeting to `main`, and
+#68 passed all three on its final head. Linux/Windows behavior uses portable
+HTTP/SQLite paths and mocked macOS enrollment.
 
 ### Review and fix pass (2026-09-30)
 
@@ -712,7 +717,7 @@ round answered the next Codex re-review (3a `6c1b5ed`, 3b `eb13955`, 3c
 fifth after that (3a unchanged with a clean Codex review, 3b `f35892e`, 3c
 `c435f8a`, 3d `cb4dc6b`, 3e `b5bd3b6`). Codex then approved 3a, 3b and 3e; a
 sixth round closed the last 3c/3d findings (3c `1f5f1c9`, 3d `18ea392`, 3e
-the final PR head). All five PRs are now merged to `main`; the network and live-provider evidence gates below remain open.
+`ad612d1`). All five PRs are now merged to `main`; the network and live-provider evidence gates below remain open.
 
 HIGH bugs fixed:
 
@@ -835,19 +840,59 @@ Round six closed: a binding retires only on a reconcile acknowledgement that
 names the same job and state, and an upload only on one that echoes the sent
 artifact's name, size and digest; saved connectivity status is judged fresh on
 the Mac's receipt time (the service timestamp stays for display), and every
-pairing change, including a renewal, deletes the old status.
+pairing change, including a renewal, deletes the old status (#68 later
+narrowed this to changes of the configured enrollment).
 
 ### Follow-ups after merge (#68, 2026-10-02)
 
-PR #68 (`2e714a3`) fixed the five P2 Codex threads left open when #63–#67
-merged, each with a regression test: an artifact-rejection diagnostic is kept
-across a restart and recorded once; an unadmitted claim whose reconcile
-response was lost replays the service's confirmed state; pairing that changes
-nothing keeps the saved status; and abandonment needs an exact reconcile
-acknowledgement and keeps its binding on `stale_epoch` until re-registration.
-It also steadied the worker timing tests and raised the reference server's
-listen backlog from 5 to 64, which caused the Windows e2e failures. Full suite
-on macOS: 3527 passed, 5 skipped.
+Five Codex P2 threads were unresolved when the stack merged. PR #68
+(`2e714a3`) fixed each with a regression test, replied on the thread and
+resolved it:
+
+- **Rejection diagnostic after a restart (#65).** A job that ended under an
+  earlier runtime epoch could not take the `artifact_rejected` diagnostic, so
+  the binding retired with neither the artifact nor the record.
+  `LocalJobStore.append_terminal_diagnostic` now records it on any terminal
+  row, fenced by the current epoch and the row generation. If the write
+  fails, the binding stays pending. The diagnostic is recorded once per job.
+- **Lost reconcile response for an unadmitted claim (#65).** A terminal
+  remote state other than a provisional `interrupted` is replayed as is, so
+  the retry no longer conflicts with the confirmed `failed`. A `succeeded`
+  held by the service is retired without a reconcile.
+- **Saved status (#66).** `remote-status.json` is deleted only after the
+  configured enrollment changes (a successful pair, or an unpair of the
+  configured URL). A refused pair, a failed exchange or an unpair of an
+  orphan keeps it.
+- **Abandonment acknowledgement (#67).** The `cursor_conflict` abandonment
+  reconcile goes through `_reconcile()`; an empty or mismatched
+  acknowledgement keeps the binding pending.
+- **`stale_epoch` during abandonment (#67).** It propagates and the binding
+  stays pending. The next heartbeat detects a superseded worker epoch and
+  re-registers. `_abandon` does not reset the epoch itself: the same error
+  can mean only the claim's epoch is stale, and re-registering every tick
+  would interrupt the device's other jobs.
+
+#68 also steadied the Windows CI timing flakes. The expiry-during-launch test
+moves the deadline inside `probe()` instead of racing a 0.3 s clock. The
+launch-readiness waits are longer, the heartbeat cadence test checks that
+heartbeats keep coming while poll is hung, and each wait phase has its own
+deadline. It also raised the reference server's listen backlog from 5 to 64:
+a real limit (a burst past 5 connections is reset even on macOS), but not the
+cause of the Windows e2e failures, as first thought. Full suite on macOS:
+3527 passed, 5 skipped.
+
+The cause was found after #68 merged and is fixed in #71. The e2e test kept
+failing on Windows with the launch guard's `renew` timing out, and the
+server log showed WinError 10053 when the server wrote its reply: the client
+had already given up. `ControlStore` makes two SQLite write transactions
+per request. Under steady writes from several threads, SQLite's busy
+handler, which polls with growing sleeps, can starve one waiter for its whole
+5 s busy timeout, and the client's 5 s socket timeout expires first. Requests
+in the server process now queue on an in-process lock. With eight threads
+sending heartbeats on macOS, the slowest request drops from 1.1–2.5 s to
+5 ms at the same throughput. #71 also fixes
+`test_run_loop_survives_a_journal_error_and_keeps_ticking`, which now waits
+for the retried cancel instead of a fixed number of sync passes.
 
 Still open after this pass (design gaps, not regressions):
 
