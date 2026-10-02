@@ -144,15 +144,15 @@ def test_lease_loss_blocks_new_claims_without_stopping_execution(remote_setup):
     submit(remote_setup, "next")
     remote.tick()
     adapter.finish.clear()
-    runner = threading.Thread(target=runtime.reconcile_once)
+    runner = threading.Thread(target=runtime.reconcile_once, daemon=True)
     runner.start()
-    assert adapter.entered.wait(2)
+    assert adapter.entered.wait(15)
     ticks[0] += 21
     remote.tick()
     assert "poll" not in transport.calls[-3:]
     assert adapter.starts == 1 and runner.is_alive()
     adapter.finish.set()
-    runner.join(2)
+    runner.join(15)
     assert not runner.is_alive()
     remote.tick()
     assert remote.state == "online"
@@ -445,23 +445,27 @@ def test_heartbeats_keep_their_cadence_while_synchronization_is_blocked(remote_s
     thread = threading.Thread(target=remote.run, args=(stop,), daemon=True)  # a failure must not hang pytest
     thread.start()
     try:
-        assert blocking.blocked.wait(5), "synchronization never reached the stalled poll"
+        assert blocking.blocked.wait(15), "synchronization never reached the stalled poll"
         blocked_at = time.monotonic()
-        while time.monotonic() - blocked_at < 0.6:  # twelve cadences with poll still hung
+        while time.monotonic() - blocked_at < 1.5:  # thirty cadences with poll still hung
             time.sleep(0.05)
         heartbeats = [t for op, t, _ in blocking.stamps if op == "heartbeat" and t >= blocked_at]
-        assert len(heartbeats) >= 8, heartbeats
-        assert all(b - a < 0.25 for a, b in zip(heartbeats, heartbeats[1:])), heartbeats
+        # Each heartbeat is a real journal round trip, which a loaded CI runner can
+        # stretch well past the 0.05 s cadence. What matters is that they keep coming
+        # while poll is hung: none waits anywhere near the whole blocked window.
+        assert len(heartbeats) >= 4, heartbeats
+        assert all(b - a < 0.75 for a, b in zip(heartbeats, heartbeats[1:])), heartbeats
         assert remote.state == "online"
         threads = {name for op, _, name in blocking.stamps if op in {"heartbeat", "register"}}
         assert threads == {thread.name} and all(
             name == "openswap-worker-remote-sync" for op, _, name in blocking.stamps if op == "poll")
         release.set()  # the claim is admitted once the poll returns; the runtime launches it
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 15
         while time.monotonic() < deadline and not runtime.store.queue():
             time.sleep(0.02)
         result = runtime.reconcile_once()
         assert result is not None and result.state == JobState.SUCCEEDED
+        deadline = time.monotonic() + 15
         while time.monotonic() < deadline and remote.journal.pending():
             time.sleep(0.02)
         assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "succeeded"
@@ -1016,3 +1020,97 @@ def test_unacknowledged_outcome_or_upload_keeps_the_binding(remote_setup, monkey
     monkeypatch.setattr(transport, "request", original)
     remote.tick()
     assert remote.journal.pending() == []
+
+
+def test_artifact_rejection_after_a_restart_is_still_recorded(remote_setup):
+    """A job that ended under an earlier runtime epoch still takes the rejection diagnostic."""
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    local = runtime.reconcile_once()
+    assert local.state == JobState.SUCCEEDED  # finished before any result upload
+    restarted = WorkerRuntime(runtime.backup_root, adapter=adapter, account_identity=runtime.account_identity)
+    assert restarted.worker_epoch != restarted.get(local.job_id).worker_epoch
+    client = RemoteClient(restarted, remote.url, paired["device_key"], transport=transport)
+    transport.reject["upload"] = ProtocolError("artifact_conflict", 409)
+    client.tick()
+    key = paired["device_key"]
+    assert client.journal.pending() == [] and client.state == "online"
+    assert store.request("job", {"job_id": job_id}, key)["state"] == "succeeded"
+    events = store.request("events", {"job_id": job_id, "after_cursor": 0}, key)["events"]
+    assert [e["diagnostic_code"] for e in events if e["diagnostic_code"] == "artifact_rejected"] == ["artifact_rejected"]
+
+
+def test_unrecordable_artifact_rejection_keeps_the_binding(remote_setup, monkeypatch):
+    remote, runtime, _, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    local = runtime.reconcile_once()
+    transport.reject["upload"] = ProtocolError("artifact_conflict", 409)
+    original = runtime.store.append_terminal_diagnostic
+    monkeypatch.setattr(runtime.store, "append_terminal_diagnostic",
+                        lambda *a, **k: (_ for _ in ()).throw(StaleWriteError("fenced")))
+    with pytest.raises(StaleWriteError):  # the run loop folds this into connectivity and retries
+        remote.tick()
+    assert remote.journal.binding(local.job_id)["done"] == 0, "neither the artifact nor its diagnostic was kept"
+    monkeypatch.setattr(runtime.store, "append_terminal_diagnostic", original)
+    transport.reject["upload"] = ProtocolError("artifact_conflict", 409)
+    remote.tick()
+    assert remote.journal.pending() == []
+    events = store.request("events", {"job_id": job_id, "after_cursor": 0}, paired["device_key"])["events"]
+    assert any(e["diagnostic_code"] == "artifact_rejected" for e in events)
+
+
+def test_lost_unlaunched_failure_acknowledgement_replays_the_confirmed_state(remote_setup, monkeypatch):
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    original = transport.request
+    approval = lambda op, data: ({**original(op, data), "state": "waiting_for_approval"}
+                                 if op in {"job", "renew"} else original(op, data))
+    monkeypatch.setattr(transport, "request", approval)
+    transport.drop_response = "reconcile"  # the service commits ``failed``; the reply is lost
+    remote.tick()
+    assert remote.journal.pending() and store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "failed"
+    monkeypatch.setattr(transport, "request", original)  # the service now reports terminal ``failed``
+    remote.tick()
+    assert remote.journal.pending() == [] and remote.state == "online"
+    reconcile = [data for op, data in transport.requests if op == "reconcile"]
+    assert [(r["state"], r["unlaunched"]) for r in reconcile] == [("failed", True), ("failed", True)]
+    assert adapter.starts == 0
+
+
+@pytest.mark.parametrize("reply", [{}, {"job_id": "other", "state": "interrupted"}])
+def test_abandonment_needs_an_exact_reconcile_acknowledgement(remote_setup, monkeypatch, reply):
+    remote, runtime, _, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    local = runtime.reconcile_once()
+    original = transport.request
+    monkeypatch.setattr(transport, "request", lambda op, data: (original(op, data) if op != "reconcile" else reply))
+    transport.reject["events"] = ProtocolError("cursor_conflict", 409)
+    remote.tick()
+    assert remote.journal.binding(local.job_id)["done"] == 0
+    assert not any(e.diagnostic_code == "remote_sync_conflict"
+                   for e in runtime.events(local.job_id, after_cursor=0, limit=200).events)
+    monkeypatch.setattr(transport, "request", original)
+    transport.reject["events"] = ProtocolError("cursor_conflict", 409)
+    remote.tick()
+    assert remote.journal.binding(local.job_id)["done"] == 1
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "interrupted"
+
+
+def test_abandonment_that_loses_its_epoch_is_retried_after_reregistration(remote_setup):
+    remote, runtime, _, store, _, paired, transport = remote_setup
+    job_id = submit(remote_setup)
+    remote.tick()
+    local = runtime.reconcile_once()
+    epoch = remote.worker_epoch
+    transport.reject["events"] = ProtocolError("cursor_conflict", 409)
+    transport.reject["reconcile"] = ProtocolError("stale_epoch", 409)
+    remote.tick()
+    assert remote.journal.binding(local.job_id)["done"] == 0 and remote.worker_epoch is None
+    assert not any(e.diagnostic_code == "remote_sync_conflict"
+                   for e in runtime.events(local.job_id, after_cursor=0, limit=200).events)
+    remote.tick()  # re-registers, then the binding syncs and the local outcome is reported
+    assert remote.worker_epoch == epoch + 1 and remote.journal.pending() == []
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "succeeded"

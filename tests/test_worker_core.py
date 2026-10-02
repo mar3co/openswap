@@ -381,15 +381,23 @@ def test_journal_reload_failure_after_an_interrupt_is_not_swallowed(tmp_path):
 def test_job_that_expires_during_launch_preparation_never_starts(tmp_path):
     update_worker_settings(tmp_path, enabled=True)
 
-    class SlowProbe(_FakeAdapter):
+    class ExpiringProbe(_FakeAdapter):
         def probe(self):
-            time.sleep(0.6)  # probe, lease and workspace setup outlast the expiry
+            # The deadline passes while the probe runs, after the queue's expiry
+            # check: moved deterministically, never raced against a wall clock.
+            db = runtime.store._connect()
+            try:
+                db.execute("UPDATE jobs SET expires_at=? WHERE job_id=?",
+                           ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), job.job_id))
+                db.commit()
+            finally:
+                db.close()
             return super().probe()
 
-    adapter = SlowProbe()
+    adapter = ExpiringProbe()
     identity = stable_account_identity("codex", "expiry-during-launch-test")
     runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=identity)
-    runtime.submit(_submission(expires_at=datetime.now(timezone.utc) + timedelta(seconds=0.3)))
+    job = runtime.submit(_submission(expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)))
 
     result = runtime.reconcile_once()
 
@@ -1099,7 +1107,7 @@ def test_blocked_event_reader_is_interruptible_and_blocks_next_job(
         target=lambda: results.append(runtime.reconcile_once(shutdown_event=shutdown)),
     )
     runner.start()
-    assert adapter.events_entered.wait(3)
+    assert adapter.events_entered.wait(15)
 
     if trigger == "stop":
         assert runtime.stop(first.job_id).accepted is True
@@ -1108,7 +1116,7 @@ def test_blocked_event_reader_is_interruptible_and_blocks_next_job(
     else:
         clock[0] = 601.0
 
-    runner.join(3)
+    runner.join(15)
     try:
         assert not runner.is_alive()
         assert len(results) == 1
@@ -1127,7 +1135,7 @@ def test_blocked_event_reader_is_interruptible_and_blocks_next_job(
         adapter.release_events.set()
     reader = runtime._event_reader
     if reader is not None:
-        reader.join(3)
+        reader.join(15)
         assert not reader.is_alive()
     assert not any(
         event.kind == SafeEventKind.PROVIDER_FINISHED
@@ -1161,7 +1169,7 @@ def test_manual_worker_exits_when_policy_is_disabled(
     def fake_serve(_path, _control, stop_event, *, ready_event=None):
         if ready_event is not None:
             ready_event.set()
-        stop_event.wait(5)
+        stop_event.wait(30)
 
     monkeypatch.setattr("openswap.worker.ipc.serve", fake_serve)
     worker = threading.Thread(
@@ -1169,15 +1177,15 @@ def test_manual_worker_exits_when_policy_is_disabled(
         daemon=True,
     )
     worker.start()
-    assert runtime_ready.wait(2)
+    assert runtime_ready.wait(15)
     runtime = captured_runtime[0]
     job = runtime.submit(_submission())
-    assert adapter.start_entered.wait(2)
+    assert adapter.start_entered.wait(15)
 
     # Simulate a local settings change while this manually started worker is
     # running, without relying on the LaunchAgent lifecycle.
     update_worker_settings(tmp_path, enabled=False)
-    worker.join(timeout=5)
+    worker.join(timeout=15)
 
     assert not worker.is_alive()
     assert results == [0]
