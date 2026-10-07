@@ -1,6 +1,6 @@
 # OpenSwap feature proposal: Remote Agent Host
 
-Status: accepted; phase 1 signoff (#59) and the local-only phase 2 worker (#60) are merged; phase 1's live-evidence gates remain open, remote execution is not implemented and live Codex execution stays disabled (see the [progress log](017-progress.md)). Research date: September 27, 2026; control-service decision recorded September 28, 2026.
+Status: accepted; phase 1 signoff (#59), the local-only phase 2 worker (#60), the phase 3 private remote pilot (#63–#68, #71–#72) and the phase 4 OpenTag connector (mar3co/opentag#137–#141, #143–#144) are merged, the last deployed 2026-10-03; phase 1's live-evidence gates and the phase 3 and 4 exit evidence remain open, and live Codex execution stays disabled (see the [progress log](017-progress.md)). Research date: September 27, 2026; control-service decision recorded September 28, 2026.
 
 ## Recommendation
 

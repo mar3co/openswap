@@ -26,7 +26,9 @@ most of the Windows/macOS timing flakes, merging on 2026-10-02 (`2e714a3`).
 [mar3co/openswap#71](https://github.com/mar3co/openswap/pull/71) (merged 2026-10-02 as `c9eccfb`) fixed the reference-store starvation
 behind the Windows failures that remained. Its local
 protocol/service/client evidence does not pass Phase 1 or the Phase 3 network
-exit gate. The production Codex adapter remains disabled.
+exit gate. The production Codex adapter remains disabled. The Phase 4 OpenTag
+connector merged to OpenTag `main` on 2026-10-03 (mar3co/opentag#137–#141,
+follow-ups #143–#144) and is deployed; its exit is still open (see Phase 4).
 
 The next unblocking step is Phase 1 live evidence: the owner names a Codex
 account context (a dedicated roster slot or disposable account) and is present
@@ -151,8 +153,8 @@ until the owner records a permitted path or exclusion.
 | 1. Feasibility spike and authentication gate | SIGNOFF MERGED (#59) / EVIDENCE BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction showed the wrapper could return success while a detached helper remained alive; the harness now detects and terminates tracked escaped descendants and reports `interrupted`, but cannot close the fork/reparent race. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 merged 2026-09-30 (`39438ca`) as review signoff; merging does not satisfy the remaining technical exit gates. Next step: an owner-authorized account context and an authenticated `codex exec` run. |
 | 2. Local worker, remote access off | MERGED (#60) — local-only | Owner authorized local infrastructure to overlap Phase 1; no Phase 1 gate is waived. PR #60 merged 2026-09-30 (`225211d`); CI green on macOS, Linux and Windows; Codex review clean on `556ca11`. Fake-only validation is recorded below. Remote access stays off, the production Codex adapter still refuses, and live Codex stays disabled. Open follow-up before any real adapter: lease release must also prove the provider process tree has stopped. |
 | 3. Private remote pilot | MERGED (#63–#67, follow-ups #68) / EXIT OPEN | Owner explicitly authorized credential-free Phase 3 overlap. The protocol, reference server, polling/heartbeats, enrollment/status and guarded test CLI have loopback fake-adapter evidence. Reviewed in full on 2026-09-30; three HIGH bugs (launch after abandon, artifact-failure wedge, dying remote thread) and the MEDIUM findings were fixed before #63–#67 merged on 2026-10-01 (`ab737eb`). #68 (2026-10-02, `2e714a3`) fixed the five P2 Codex threads left open at merge and most CI timing flakes; [mar3co/openswap#71](https://github.com/mar3co/openswap/pull/71) (2026-10-02, `c9eccfb`) fixed the reference-store starvation behind the rest. Real owner-controlled HTTPS deployment, submission from another network, backend replacement, and retention/purge plus an audit trail in the reference server still need the owner. Production Codex remains disabled pending Phase 1. |
-| 4. OpenTag connector | IN REVIEW (mar3co/opentag#137–#141) / EXIT OPEN | Credential-free overlap authorized by the owner; fake-adapter evidence only. Scope tracked in mar3co/opentag#135. Exit needs both an authorized OpenTag request that completes live research on the owner's Mac and returns citations/artifacts through a short initial tool call (blocked on Phase 1's live-adapter gates; fake-adapter runs do not count) and the staging Slack scenario, including non-owner refusal, cited private results and state-only shared updates. See the Phase 4 section below. |
-| 5–6 | NOT STARTED | Require phase 4. |
+| 4. OpenTag connector | MERGED (mar3co/opentag#137–#141, follow-ups #143–#144) / DEPLOYED / EXIT OPEN | Credential-free overlap authorized by the owner; fake-adapter evidence only. Merged 2026-10-03; production migrations applied and agent/portal deployed the same day; worker dispatch stays off unless a workspace grants the `worker-dispatch` scope. Scope tracked in mar3co/opentag#135. Exit needs both an authorized OpenTag request that completes live research on the owner's Mac and returns citations/artifacts through a short initial tool call (blocked on Phase 1's live-adapter gates; fake-adapter runs do not count) and the staging Slack scenario, including non-owner refusal, cited private results and state-only shared updates. See the Phase 4 section below. |
+| 5–6 | NOT STARTED | Require phase 4; its code is merged but its exit is still open. |
 
 ## Phase 2 local-worker plan (owner-authorized overlap)
 
@@ -942,7 +944,7 @@ lease-release checks remain intact.
 
 ## Phase 4: OpenTag connector (2026-10-02)
 
-**In progress; credential-free overlap authorized; not a live-provider signoff.**
+**Merged and deployed 2026-10-03; exit open; not a live-provider signoff.**
 The owner explicitly authorized implementing the OpenTag connector while Phase 1
 remains open, using the fake adapter for all execution evidence. The production
 adapter stays `UnavailableCodexAdapter`. No provider authentication files, real
@@ -989,5 +991,41 @@ an authorized OpenTag request completes live research on the owner's Mac and
 returns citations/artifacts through a short initial tool call, which needs Phase
 1's live-adapter gates and the production adapter; fake-adapter evidence cannot
 close it. The staging Slack scenario must also succeed, including non-owner
-refusal, cited private results and state-only shared updates. All PRs remain for
-owner review and merge.
+refusal, cited private results and state-only shared updates.
+
+### Merge and production rollout (2026-10-03)
+
+The stack merged to OpenTag `main` by squash after about ten Codex review rounds:
+#137 `53b1bd4`, #138 `e91ef8b`, #139 `912ba1f`, #140 `42f482c`, #141 `3f2f0d9`.
+The review fixed, among others, a Slack-to-portal identity link that nothing
+populated (every Slack dispatch would have been refused), an admin path to map
+their Slack ID onto another member, a replayed Slack event that could start two
+jobs, and the conformance harness never launching its second job. Once a lower
+PR merged, later SQL changes shipped as forward migrations
+(`20261003010000_remote_worker_approval_owner_idempotency`,
+`20261003020000_remote_worker_jobs_get_confirmed`). Late findings were deferred
+to follow-ups: mar3co/opentag#142 (closed by #143), #145 and #146.
+
+Follow-ups merged on 2026-10-03:
+
+- [#143](https://github.com/mar3co/opentag/pull/143) `842b9ac`: worker links
+  return through sign-in, artifact sign-in redirect, approved-payload checks in
+  the conformance harness, and a fix for a pre-existing `/login?next=/\host`
+  open redirect in the shared `safeNextPath`.
+- [#144](https://github.com/mar3co/opentag/pull/144) `4d84bbf`: an outbound HTTPS
+  fake-adapter pilot runner and checklist for the owner-controlled network
+  pilot; it refuses `opentag.me` origins unless `--allow-production` is passed.
+
+The shared Supabase project's ledger was behind both OpenTag (7 migrations) and
+OpenTicket (20 desk migrations), so neither existing push path could run.
+OpenTicket mar3co/openticket#61 moved its OpenTag pin to `3f2f0d9` and #62 added
+a guarded `db:catchup` that applies a missing suffix of both ledgers in version
+order. `db:catchup` applied all 27 migrations; the ledger is now current and the
+worker and Slack-link functions execute only as `service_role`. The OpenTag
+agent was deployed to `api.opentag.me` and the portal deployed from `main`.
+Worker dispatch remains off unless a workspace grants an agent the
+`worker-dispatch` scope.
+
+Still open for the Phase 4 exit: the live cited research run (blocked on Phase 1)
+and the staging Slack scenario. Open issues: mar3co/opentag#145 (transient auth
+errors in the `/app` guards) and #146 (pilot runner shutdown and switch edges).
