@@ -653,9 +653,27 @@ def run(switcher, codex=None) -> int:
                     policy = load_worker_settings(self.switcher.backup_dir)
                 except Exception:
                     pass
+            snapshot = self._with_account_picker(snapshot)
             with self._worker_result_lock:
                 if generation == self._worker_generation:
                     self._worker_result = (generation, snapshot, policy, None)
+
+        def _with_account_picker(self, snapshot):
+            """Attach roster metadata for the Remote tasks account popup.
+
+            Runs on the worker thread: slot numbers, emails, aliases and the
+            opaque account references only, never credentials.
+            """
+            snapshot = dict(snapshot)
+            try:
+                from openswap.worker.cli import worker_account_choices
+
+                snapshot["account_picker"] = worker_account_choices(
+                    self.switcher.backup_dir
+                ).to_dict()
+            except Exception:
+                snapshot.pop("account_picker", None)
+            return snapshot
 
         def _worker_action(self, row_id, value):
             if self._worker_operation is not None:
@@ -664,6 +682,7 @@ def run(switcher, codex=None) -> int:
                 "remote_tasks_enabled": "worker_enable_or_disable",
                 "remote_tasks_paused": "worker_admission_update",
                 "remote_tasks_stop": "worker_stop_requested",
+                "remote_tasks_account": "worker_account_update",
             }.get(row_id)
             if self._worker_operation is None:
                 return
@@ -709,6 +728,8 @@ def run(switcher, codex=None) -> int:
                         result = request_stop(root, value)
                         if result.get("accepted") is not True:
                             diagnostic = result.get("diagnostic_code") or "stop_refused"
+                elif row_id == "remote_tasks_account":
+                    diagnostic = self._pin_worker_account(root, value)
                 policy = load_worker_settings(root)
                 snapshot = read_status(root)
             except Exception:
@@ -726,9 +747,37 @@ def run(switcher, codex=None) -> int:
                     policy = load_worker_settings(self.switcher.backup_dir)
                 except Exception:
                     pass
+            snapshot = self._with_account_picker(snapshot)
             with self._worker_result_lock:
                 if generation == self._worker_generation:
                     self._worker_result = (generation, snapshot, policy, diagnostic)
+
+        def _pin_worker_account(self, root, value):
+            """Pin (or clear) through the CLI's own function; returns a diagnostic.
+
+            Only ``""`` (None) and an opaque ``codex:`` reference are accepted:
+            the popup's Claude and ineligible entries are disabled, and a
+            stray value is refused rather than guessed at.
+            """
+            from openswap.exceptions import ClaudeSwitchError
+            from openswap.worker.accounts import AccountPinError
+            from openswap.worker.cli import set_worker_account
+
+            if value == "":
+                selector = None
+            elif isinstance(value, str) and value.startswith("codex:"):
+                selector = str(value)
+            elif isinstance(value, str) and value.startswith("claude:"):
+                return "claude_not_supported"
+            else:
+                return "account_not_eligible"
+            try:
+                set_worker_account(root, selector)
+            except AccountPinError as exc:
+                return exc.code
+            except ClaudeSwitchError as exc:
+                return "worker_lifecycle_busy" if str(exc) == "worker_lifecycle_busy" else "settings_unavailable"
+            return None
 
         def _drain_worker_result(self):
             with self._worker_result_lock:
@@ -1413,6 +1462,7 @@ def run(switcher, codex=None) -> int:
         def _on_setting(self, row_id, value):
             if row_id in {
                 "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_stop",
+                "remote_tasks_account",
             }:
                 self._worker_action(row_id, value)
             elif row_id == "menu_bar_provider":
