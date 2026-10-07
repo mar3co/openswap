@@ -1058,26 +1058,29 @@ class WorkerRuntime:
                 expected_generation=current.generation,
                 diagnostic_code=availability.diagnostic_code or "provider_unavailable",
             )
-        # Re-read the owner's pin for this launch, so a pin changed since the
-        # worker started applies now; the job records the one it started with.
-        identity = self.account_identity
-        if identity is None:
-            return self.store.transition(
-                current.job_id, expected_states=(JobState.CLAIMED,),
-                new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
-                expected_generation=current.generation, diagnostic_code="provider_unavailable",
-            )
-        starting = self.store.transition(
-            current.job_id, expected_states=(JobState.CLAIMED,),
-            new_state=JobState.STARTING, worker_epoch=self.worker_epoch,
-            expected_generation=current.generation,
-            pinned_account_ref=identity,
-        )
+        # The pin is read, recorded on the job and leased under the Codex
+        # mutation guard that `openswap worker account` also holds, so a pin
+        # change either lands before this launch (which then uses it) or waits
+        # until the lease is taken; a job never starts on a replaced pin. The
+        # roster check shares the guard so `codex remove` cannot drop the
+        # pinned slot in between.
+        starting = None
         try:
-            # The roster check and the lease share the Codex mutation lock, so
-            # `codex remove` cannot drop the pinned slot between them.
             with self.leases.mutation_guard() as guard:
                 guard.assert_available()
+                identity = self.account_identity
+                if identity is None:
+                    return self.store.transition(
+                        current.job_id, expected_states=(JobState.CLAIMED,),
+                        new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
+                        expected_generation=current.generation, diagnostic_code="provider_unavailable",
+                    )
+                starting = self.store.transition(
+                    current.job_id, expected_states=(JobState.CLAIMED,),
+                    new_state=JobState.STARTING, worker_epoch=self.worker_epoch,
+                    expected_generation=current.generation,
+                    pinned_account_ref=identity,
+                )
                 if self._fixed_account_identity is None and not codex_account_in_roster(
                     self.backup_root, identity,
                 ):
@@ -1088,17 +1091,14 @@ class WorkerRuntime:
                         worker_pid=self.worker_pid, worker_epoch=self.worker_epoch,
                         ttl_s=starting.runtime_limit_s + 60,
                     )
-        except LeaseConflictError:
+        except (LeaseConflictError, LeaseStateError) as error:
+            conflict = isinstance(error, LeaseConflictError)
+            record = starting if starting is not None else current
             return self.store.transition(
-                starting.job_id, expected_states=(JobState.STARTING,),
-                new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
-                expected_generation=starting.generation, diagnostic_code="lease_conflict",
-            )
-        except LeaseStateError:
-            return self.store.transition(
-                starting.job_id, expected_states=(JobState.STARTING,),
-                new_state=JobState.INTERRUPTED, worker_epoch=self.worker_epoch,
-                expected_generation=starting.generation, diagnostic_code="execution_uncertain",
+                record.job_id, expected_states=(record.state,),
+                new_state=JobState.FAILED if conflict else JobState.INTERRUPTED,
+                worker_epoch=self.worker_epoch, expected_generation=record.generation,
+                diagnostic_code="lease_conflict" if conflict else "execution_uncertain",
             )
         if token is None:
             # The pinned account was removed from the roster (or the roster is

@@ -351,6 +351,34 @@ def test_a_changed_pin_applies_to_the_next_job_without_a_restart(root):
     assert adapter.leased == [ALICE, BOB]
 
 
+def test_a_pin_change_just_before_the_launch_takes_the_guard_is_honoured(root, monkeypatch):
+    """The pin is read under the Codex mutation guard: a change that completes
+    right before the launch takes the guard is the account the job uses."""
+    from contextlib import contextmanager
+
+    update_worker_settings(root, enabled=True)
+    cli.set_worker_account(root, "1")
+    adapter = _FinishingAdapter(root)
+    runtime = WorkerRuntime(root, adapter=adapter)
+    real_guard = runtime.leases.mutation_guard
+    raced = []
+
+    @contextmanager
+    def racing_guard(*args, **kwargs):
+        if not raced:
+            raced.append(True)
+            cli.set_worker_account(root, "2")  # the owner's change lands first
+        with real_guard(*args, **kwargs) as guard:
+            yield guard
+
+    monkeypatch.setattr(runtime.leases, "mutation_guard", racing_guard)
+    job = runtime.submit(_submission())
+    assert runtime.reconcile_once().state == JobState.SUCCEEDED
+    assert raced == [True]
+    assert runtime.get(job.job_id).pinned_account_ref == BOB
+    assert adapter.leased == [BOB]
+
+
 def test_clearing_the_pin_fails_the_next_job_as_before(root):
     update_worker_settings(root, enabled=True)
     cli.set_worker_account(root, "1")
