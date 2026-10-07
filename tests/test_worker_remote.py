@@ -628,6 +628,33 @@ def test_lease_conflict_failure_reconciles_as_failed_unlaunched(remote_setup):
     assert adapter.starts == 0
 
 
+def test_pinned_account_removed_after_admission_reconciles_as_failed_unlaunched(remote_setup, monkeypatch):
+    """The pin was in the roster when the claim was admitted and gone at launch:
+    the job fails before anything is leased or started, and the service is told so."""
+    import openswap.worker.runtime as runtime_module
+    from openswap.settings import configure_worker_local_policy, load_worker_settings
+
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    identity = runtime.account_identity
+    configure_worker_local_policy(
+        runtime.backup_root, pinned_account_ref=identity,
+        workspaces=load_worker_settings(runtime.backup_root).workspaces,
+    )
+    runtime._fixed_account_identity = None  # use the real pin and roster check
+    in_roster = [True]
+    monkeypatch.setattr(runtime_module, "codex_account_in_roster", lambda _root, _identity: in_roster[0])
+    job_id = submit(remote_setup)
+    remote.tick()
+    in_roster[0] = False  # the owner removed the pinned Codex slot before launch
+    result = runtime.reconcile_once()
+    assert (result.state, result.diagnostic_code) == (JobState.FAILED, "provider_auth_unavailable")
+    remote.tick()
+    reconcile = [data for op, data in transport.requests if op == "reconcile"][-1]
+    assert (reconcile["state"], reconcile["unlaunched"], reconcile["execution_stopped"]) == ("failed", True, False)
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "failed"
+    assert adapter.starts == 0
+
+
 def test_remembered_but_never_admitted_claim_reconciles_unlaunched_after_restart(remote_setup, monkeypatch):
     remote, runtime, adapter, store, _, paired, transport = remote_setup
     job_id = submit(remote_setup)
