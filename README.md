@@ -70,11 +70,16 @@ The command-line executable is `openswap`.
 | `openswap codex move` | Assign a Codex account to a slot |
 | `openswap codex desktop` | Experimental ChatGPT preflight, switch, and recovery (`switch` and `recover` need `--confirm-restart --confirm-idle`) |
 | `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
+| `openswap worker pair <url> <code>` | Remote tasks (opt-in): pair with a control service, then pick an account |
+| `openswap worker account [slot]` | List or pin the Codex account remote jobs run on (Claude not supported yet) |
+| `openswap worker workspace add <id> <folder>` | Approve a research folder under the portal's workspace ID (`list`, `remove`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |
 | `openswap upgrade` | Pull the checkout and reinstall |
 | `openswap statusline --install` | Opt-in: wrap Claude Code status line |
 | `openswap statusline --codex` | Paint the live Codex account label (no config.toml wrap) |
+
+Remote tasks are off by default and do not execute provider jobs yet; the pairing, account and folder setup is described in [the worker protocol doc](docs/worker-protocol.md#choosing-the-account-and-research-folders).
 
 `openswap help` lists the main commands. Full list: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
 
