@@ -91,7 +91,8 @@ is a finite JSON number greater than zero and at most 14,400 seconds. Expiry
 must be in the future and no more than 24 hours away at first admission. A
 submission names **no account, model, path, environment, executable or
 argv**. The Mac resolves the opaque workspace ID and pins the locally approved
-account. `worker_id` must be the authenticated key's own worker; any other
+account. A backend implementing the optional account choice extension (below)
+may add an `account_ref` the worker itself advertised; nothing else changes. `worker_id` must be the authenticated key's own worker; any other
 value returns `forbidden`. Reusing an idempotency key with the identical
 normalized payload returns the same job even if the worker later goes
 offline; changing its payload returns `idempotency_conflict`. Normalization
@@ -239,6 +240,57 @@ reconciled outcome is unaffected and the claim completes without it. Only
 transport, lease and authorization failures defer the upload for retry.
 Operator and owner must ensure selected results contain no provider secrets.
 The service supplies metadata lists and bounded authenticated downloads.
+
+## Optional per-job account choice (v1 extension)
+
+By default a submission names no account and the Mac uses the account its owner
+pinned locally. An owner may also approve a short local **allowlist** of
+eligible accounts so a backend can offer a per-job choice among them. The Mac
+stays the authority: it advertises only allowlisted accounts, validates every
+choice again before launch, and never falls back to another account. In this
+release only Codex roster accounts are eligible.
+
+The extension is additive. A worker that never sends `accounts` sees no
+change, and a backend that does not implement it rejects the operation like any
+unknown operation (404 `unsupported_version`).
+
+| Operation | Request fields | Success response |
+| --- | --- | --- |
+| `accounts` | `worker_epoch`, `accounts` (array below) | `account_count` |
+
+`accounts` holds 0–20 entries, each a closed object with exactly `account_ref`
+(opaque ID, 1–200 characters), `label` (1–100 characters, no control
+characters) and `default` (JSON boolean). References are unique within the
+request and at most one entry is the default. The request atomically replaces
+the worker's whole advertised set; an empty array withdraws it. It carries the
+current worker epoch like any other mutation and returns `stale_epoch` from a
+superseded registration. The worker sends it after each new registration and
+whenever its allowlist, labels or default change. A worker that receives 404
+`unsupported_version` records that the backend offers no account choice and
+keeps working without it; no other response disables the feature.
+
+`account_ref` is a random value the Mac generates once per allowlist entry and
+stores locally. It is never derived from a provider account ID, email or token,
+so a backend cannot correlate it across workers or owners. `label` is chosen by
+the owner (by default the OpenSwap alias or "Codex account N"); an email is
+sent only if the owner explicitly makes it the label. No credential, token,
+account ID or usage data is advertised.
+
+A backend that implements the extension accepts one more optional submission
+field, `account_ref`. It must equal an `account_ref` the target worker
+currently advertises; otherwise submission returns 400 `invalid_request`.
+When present, it is part of the normalized idempotency payload and appears in
+the claim's `submission` exactly as submitted. A backend never sends
+`account_ref` to a worker that has not advertised accounts, so a worker without
+the extension never receives the field.
+
+On a claim, a worker resolves `account_ref` against its **current** local
+allowlist under its launch lock. An absent field selects the local default. A
+reference that is no longer allowlisted (the owner removed it after the backend
+recorded the choice) or an absent field with no default pinned fails the job
+before launch: the worker reconciles it `failed` with `unlaunched=true` and
+never substitutes another account. The resolved local account is recorded on
+the job when it starts and never changes for that run.
 
 ## Errors, persistence, and operating the reference service
 
