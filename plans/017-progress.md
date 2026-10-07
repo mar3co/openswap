@@ -1027,5 +1027,7 @@ Worker dispatch remains off unless a workspace grants an agent the
 `worker-dispatch` scope.
 
 Still open for the Phase 4 exit: the live cited research run (blocked on Phase 1)
-and the staging Slack scenario. Open issues: mar3co/opentag#145 (transient auth
-errors in the `/app` guards) and #146 (pilot runner shutdown and switch edges).
+and the staging Slack scenario. The review follow-ups are closed:
+mar3co/opentag#146 (pilot runner shutdown and switch edges) by #147 (`d88fe44`)
+and #145 (transient auth errors in the `/app` guards) by #148 (`f7b4b63`), both
+merged 2026-10-06.
