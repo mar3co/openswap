@@ -15,7 +15,7 @@ import pytest
 from openswap.worker import cli
 from openswap.worker.journal import LocalJobStore
 from openswap.worker.leases import AccountLeaseStore, ReleaseEvidence, stable_account_identity
-from openswap.worker.models import JobState
+from openswap.worker.models import JobState, SafeEventKind
 from openswap.settings import load_worker_settings, update_worker_settings
 from tests.test_worker_core import _submission
 
@@ -566,6 +566,146 @@ def test_release_lease_needs_confirmation_for_an_interrupted_job(tmp_path: Path)
 
     assert cli.release_lease(tmp_path) == (False, {}, "stop_unproven_confirm_required")
     assert cli.release_lease(tmp_path, confirm_stopped=True) == (True, {"lease_state": "released"}, None)
+
+
+def _lease_for(root: Path, job_id: str, *, epoch: int) -> None:
+    AccountLeaseStore(root, "codex").acquire(
+        job_id=job_id,
+        account_identity=stable_account_identity("codex", "acct-a"),
+        worker_pid=_dead_pid(),
+        worker_epoch=epoch,
+        ttl_s=60,
+    )
+
+
+def _finish_running_job(
+    store: LocalJobStore, job_id: str, *, epoch: int, state: JobState, execution_stopped: bool | None,
+) -> None:
+    """Record a provider-finished event (``None``: no event) and the terminal state."""
+    running = store.get(job_id)
+    if execution_stopped is not None:
+        store.append_event(
+            job_id, kind=SafeEventKind.PROVIDER_FINISHED, state=state,
+            worker_epoch=epoch, expected_generation=running.generation,
+            execution_stopped=execution_stopped,
+        )
+    store.transition(
+        job_id, expected_states=(JobState.RUNNING,), new_state=state,
+        worker_epoch=epoch, expected_generation=store.get(job_id).generation,
+    )
+
+
+@pytest.mark.parametrize("state", [JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED])
+def test_release_lease_accepts_the_providers_journaled_stop_proof(tmp_path: Path, state: JobState):
+    """The worker died after the provider proved its tree stopped but before
+    it released the lease: the journaled proof is enough on its own."""
+    job_store = LocalJobStore(tmp_path)
+    epoch = job_store.current_epoch()
+    job_id = _running_job(job_store, epoch=epoch)
+    _lease_for(tmp_path, job_id, epoch=epoch)
+    _finish_running_job(job_store, job_id, epoch=epoch, state=state, execution_stopped=True)
+
+    assert cli.release_lease(tmp_path) == (True, {"lease_state": "released"}, None)
+    lease = AccountLeaseStore(tmp_path, "codex").current()
+    assert lease.state == "released" and lease.reason == ReleaseEvidence.OWNER_RELEASED.value
+
+
+@pytest.mark.parametrize(
+    ("state", "execution_stopped"),
+    [
+        (JobState.SUCCEEDED, None),
+        (JobState.FAILED, None),
+        (JobState.CANCELLED, None),
+        (JobState.SUCCEEDED, False),
+    ],
+)
+def test_release_lease_needs_confirmation_when_a_terminal_job_lacks_stop_proof(
+    tmp_path: Path, state: JobState, execution_stopped: bool | None,
+):
+    """A terminal state is not proof that the provider's process tree stopped."""
+    job_store = LocalJobStore(tmp_path)
+    epoch = job_store.current_epoch()
+    job_id = _running_job(job_store, epoch=epoch)
+    _lease_for(tmp_path, job_id, epoch=epoch)
+    _finish_running_job(
+        job_store, job_id, epoch=epoch, state=state, execution_stopped=execution_stopped,
+    )
+
+    assert cli.release_lease(tmp_path) == (False, {}, "stop_unproven_confirm_required")
+    assert AccountLeaseStore(tmp_path, "codex").current().state == "active"
+    assert cli.release_lease(tmp_path, confirm_stopped=True) == (
+        True, {"lease_state": "released"}, None
+    )
+
+
+def test_release_lease_needs_confirmation_for_an_expired_job_with_a_stranded_lease(tmp_path: Path):
+    """EXPIRED is recorded only before launch, and that path releases its own
+    lease first; a lease left behind is unexplained, so the owner confirms."""
+    job_store = LocalJobStore(tmp_path)
+    epoch = job_store.current_epoch()
+    created = job_store.create(_submission(), owner_ref="local-user", worker_epoch=epoch)
+    claimed = job_store.claim(created.job_id, worker_epoch=epoch, expected_generation=created.generation)
+    starting = job_store.transition(
+        claimed.job_id, expected_states=(JobState.CLAIMED,), new_state=JobState.STARTING,
+        worker_epoch=epoch, expected_generation=claimed.generation,
+    )
+    _lease_for(tmp_path, starting.job_id, epoch=epoch)
+    job_store.transition(
+        starting.job_id, expected_states=(JobState.STARTING,), new_state=JobState.EXPIRED,
+        worker_epoch=epoch, expected_generation=starting.generation, diagnostic_code="job_expired",
+    )
+
+    assert cli.release_lease(tmp_path) == (False, {}, "stop_unproven_confirm_required")
+    assert cli.release_lease(tmp_path, confirm_stopped=True)[0] is True
+
+
+def test_release_lease_after_a_crash_between_provider_proof_and_lease_release(
+    tmp_path: Path, monkeypatch,
+):
+    """End to end through the runtime: the fake provider reports its run
+    stopped, the lease write fails before release, and a replacement worker
+    starts. The journaled proof lets the owner release without confirming."""
+    from openswap.worker.models import ProviderAvailability, ProviderRun, SafeEvent
+    from openswap.worker.runtime import WorkerRuntime
+    from datetime import datetime, timezone
+
+    class _FinishesWithProofAdapter:
+        def probe(self):
+            return ProviderAvailability(True, None, "fake-test")
+
+        def start(self, job, workspace, *, worker_epoch):
+            return ProviderRun(None, "synthetic-session", worker_epoch, job.generation, 0)
+
+        def events(self, run, *, after_cursor):
+            if after_cursor >= 1:
+                return ()
+            return (SafeEvent(
+                job.job_id, 1, datetime.now(timezone.utc), SafeEventKind.PROVIDER_FINISHED,
+                JobState.SUCCEEDED, None, True,
+            ),)
+
+        def interrupt(self, run):
+            raise AssertionError("a run that proved its stop is never interrupted")
+
+    identity = stable_account_identity("codex", "acct-a")
+    update_worker_settings(tmp_path, enabled=True)
+    runtime = WorkerRuntime(tmp_path, adapter=_FinishesWithProofAdapter(), account_identity=identity)
+    job = runtime.submit(_submission())
+
+    def crash_before_release(token, evidence):
+        raise OSError("simulated crash before the lease release")
+
+    monkeypatch.setattr(runtime.leases, "release", crash_before_release)
+    with pytest.raises(OSError):
+        runtime.reconcile_once()
+    monkeypatch.undo()
+
+    assert runtime.store.get(job.job_id).state == JobState.SUCCEEDED
+    assert AccountLeaseStore(tmp_path, "codex").current().state == "active"
+
+    # A replacement worker fences the crashed one; the job is already terminal.
+    WorkerRuntime(tmp_path, adapter=_FinishesWithProofAdapter(), account_identity=identity)
+    assert cli.release_lease(tmp_path) == (True, {"lease_state": "released"}, None)
 
 
 def test_release_lease_from_a_live_worker_needs_a_terminal_job_and_confirmation(tmp_path: Path):

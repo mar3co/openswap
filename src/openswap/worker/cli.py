@@ -17,22 +17,23 @@ from openswap.paths import get_backup_root
 from openswap.settings import load_worker_settings, update_worker_settings
 from openswap.worker.client import WorkerClient
 from openswap.worker.ipc import IpcError, socket_path
-from openswap.worker.journal import LocalJobStore
+from openswap.worker.journal import MAX_EVENT_PAGE, LocalJobStore
 from openswap.worker.launch_agent import install, uninstall
 from openswap.worker.launch_agent import status as worker_service_status
 from openswap.worker.leases import START_PENDING_REASON, AccountLeaseStore, ReleaseEvidence
-from openswap.worker.models import JobState
+from openswap.worker.models import JobState, SafeEventKind
 from openswap.worker.runtime import _pid_exists, read_worker_snapshot
 
 _DISABLE_WAIT_SECONDS = 3.0
 _DISABLE_POLL_SECONDS = 0.1
 _DISABLE_EXIT_WAIT_SECONDS = 3.0
 _LIFECYCLE_LOCK_TIMEOUT_SECONDS = 5.0
-# Terminal states that carry stop evidence. INTERRUPTED is terminal but records
-# uncertainty (the provider may have survived), so it needs owner confirmation.
+# Terminal states a lease release may follow. None of them proves on its own
+# that the provider's process tree stopped (see _journal_proves_provider_stop).
+# INTERRUPTED is terminal but records uncertainty, so it is not listed here.
 # Journaled worker jobs have 32-hex ids; kickoff-* and usage-* probe leases do not.
 _WORKER_JOB_ID = re.compile(r"[a-f0-9]{32}")
-_LEASE_STOP_PROVEN_JOB_STATES = {
+_LEASE_TERMINAL_JOB_STATES = {
     JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED, JobState.EXPIRED,
 }
 
@@ -380,8 +381,12 @@ def release_lease(
     releases only after this proves the holder is gone:
 
     - a worker job lease needs its recording worker gone (a newer epoch has
-      started, or its pid is no longer alive) and its job in a terminal state
-      that proves a stop;
+      started, or its pid is no longer alive), its job terminal, and the
+      provider's own proof that its process tree stopped: a journaled
+      ``provider_finished`` event with ``execution_stopped``. A terminal state
+      alone is not that proof (the worker can die between the provider
+      finishing and the lease release), so without the event it also needs
+      ``confirm_stopped``;
     - a worker lease whose job is ``interrupted`` or missing from the journal
       also needs ``confirm_stopped``: neither is stop evidence;
     - while the recording worker is still running, its lease can be released
@@ -432,7 +437,7 @@ def release_lease(
                     job_state = None
                 if not owner_gone:
                     job_terminal = job_state == JobState.INTERRUPTED or (
-                        job_state in _LEASE_STOP_PROVEN_JOB_STATES
+                        job_state in _LEASE_TERMINAL_JOB_STATES
                     )
                     if not job_terminal:
                         return False, {}, "worker_owner_may_be_alive"
@@ -445,10 +450,36 @@ def release_lease(
                 elif job_state is None or job_state == JobState.INTERRUPTED:
                     if not confirm_stopped:
                         return False, {}, "stop_unproven_confirm_required"
-                elif job_state not in _LEASE_STOP_PROVEN_JOB_STATES:
+                elif job_state not in _LEASE_TERMINAL_JOB_STATES:
                     return False, {}, "job_not_terminal"
+                elif not confirm_stopped and not _journal_proves_provider_stop(
+                    job_store, lease.job_id
+                ):
+                    return False, {}, "stop_unproven_confirm_required"
             guard.release(lease.token(), ReleaseEvidence.OWNER_RELEASED)
             return True, {"lease_state": "released"}, None
+
+
+def _journal_proves_provider_stop(job_store: LocalJobStore, job_id: str) -> bool:
+    """Whether the journal holds the provider's proof that its process tree stopped.
+
+    The runtime accepts a ``provider_finished`` event with ``execution_stopped``
+    only from the adapter's own report that the run and its descendants have
+    ended, and journals it before the job turns terminal. Every other path to
+    a terminal state either releases the lease itself first or quarantines
+    it, so a lease left behind without this event has no stop evidence.
+    """
+    after = 0
+    while True:
+        page = job_store.list_events(job_id, after_cursor=after, limit=MAX_EVENT_PAGE)
+        if any(
+            event.kind == SafeEventKind.PROVIDER_FINISHED and event.execution_stopped is True
+            for event in page.events
+        ):
+            return True
+        if not page.events:
+            return False
+        after = page.next_cursor
 
 
 def _run(backup_root: Path, *, managed: bool = False) -> int:
