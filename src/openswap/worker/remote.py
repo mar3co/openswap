@@ -452,7 +452,7 @@ class RemoteClient:
                 availability = self.runtime.adapter.probe()
             except Exception:
                 return  # an unavailable provider claims nothing; the heartbeat still counts
-            if not availability.available or self.runtime.account_identity is None:
+            if not availability.available or not self.runtime.account_ready():
                 return
             response = self._worker_request("poll")
             if response["claim"] is not None:
