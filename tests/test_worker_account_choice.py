@@ -509,6 +509,33 @@ def test_refserver_accepts_only_an_advertised_account_ref(service):
     assert plain["state"] == "queued"
 
 
+def test_refserver_registration_clears_accounts_and_gates_chosen_jobs(service):
+    """A new registration forgets the advertised set; a job carrying account_ref
+    waits until that registration sends `accounts`, while plain jobs still flow."""
+    store, worker_id, key, epoch, _ = service
+    store.request("accounts", {"worker_epoch": epoch, "accounts": _accounts(("ref-a", "Main", True))}, key)
+    chosen = _service_submit(service, account_ref="ref-a")
+    epoch = store.request("register", {}, key)["worker_epoch"]
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
+    assert store.advertised_accounts(worker_id) == []
+    plain = _service_submit(service, idem="plain")
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    assert claim["job_id"] == plain["job_id"] and "account_ref" not in claim["submission"]
+    store.request("reconcile", {"worker_epoch": epoch, "job_id": plain["job_id"], "epoch": claim["epoch"],
+                                "state": "failed", "execution_stopped": False, "unlaunched": True}, key)
+    assert store.request("poll", {"worker_epoch": epoch}, key)["claim"] is None
+    store.request("accounts", {"worker_epoch": epoch, "accounts": _accounts(("ref-a", "Main", True))}, key)
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    assert claim["job_id"] == chosen["job_id"] and claim["submission"]["account_ref"] == "ref-a"
+
+
+def test_refserver_revocation_clears_advertised_accounts(service):
+    store, worker_id, key, epoch, _ = service
+    store.request("accounts", {"worker_epoch": epoch, "accounts": _accounts(("ref-a", "Main", True))}, key)
+    store.revoke(worker_id)
+    assert store.advertised_accounts(worker_id) == []
+
+
 def test_refserver_unknown_operations_are_unsupported_version(service):
     store, _, key, _, _ = service
     with pytest.raises(ProtocolError) as refused:

@@ -265,7 +265,11 @@ request and at most one entry is the default. The request atomically replaces
 the worker's whole advertised set; an empty array withdraws it. It carries the
 current worker epoch like any other mutation and returns `stale_epoch` from a
 superseded registration. The worker sends it after each new registration and
-whenever its allowlist, labels or default change. A worker that receives 404
+whenever its allowlist, labels or default change. A new registration and a
+revocation clear the worker's advertised set on the backend. A job carrying
+`account_ref` is offered by `poll` only after the current registration has sent
+`accounts` (an empty set counts); until then it stays queued and later jobs
+without the field may be claimed first. A worker that receives 404
 `unsupported_version` records that the backend offers no account choice and
 keeps working without it; no other response disables the feature.
 

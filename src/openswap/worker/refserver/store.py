@@ -82,6 +82,8 @@ class ControlStore:
                     device TEXT NOT NULL, account_ref TEXT NOT NULL, label TEXT NOT NULL,
                     is_default INTEGER NOT NULL, position INTEGER NOT NULL,
                     PRIMARY KEY(device,account_ref));
+                CREATE TABLE IF NOT EXISTS account_choice_epochs (
+                    device TEXT PRIMARY KEY, epoch INTEGER NOT NULL);
             ''')
             if "confirmed" not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
@@ -126,6 +128,8 @@ class ControlStore:
             db.execute("BEGIN IMMEDIATE")
             if not db.execute("UPDATE devices SET revoked=1 WHERE id=?", (worker_id,)).rowcount:
                 raise ProtocolError("not_found", 404)
+            db.execute("DELETE FROM advertised_accounts WHERE device=?", (worker_id,))
+            db.execute("DELETE FROM account_choice_epochs WHERE device=?", (worker_id,))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state NOT IN "
                        "('queued','succeeded','failed','cancelled','interrupted','expired')", (worker_id,))
 
@@ -227,6 +231,9 @@ class ControlStore:
             # Only heartbeat counts as liveness; a registration alone leaves the worker offline,
             # even when the previous incarnation's heartbeat is still fresh.
             db.execute("UPDATE devices SET epoch=?,seen=NULL WHERE id=?", (epoch, device["id"]))
+            # A new registration starts with no advertised accounts; the worker resends them.
+            db.execute("DELETE FROM advertised_accounts WHERE device=?", (device["id"],))
+            db.execute("DELETE FROM account_choice_epochs WHERE device=?", (device["id"],))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state IN "
                        "('claimed','starting','running','cancel_requested')", (device["id"],))
             return {"worker_id": device["id"], "worker_epoch": epoch,
@@ -249,8 +256,13 @@ class ControlStore:
                     raise ProtocolError("lease_lost", 409)
                 job = active
             else:
-                job = db.execute("SELECT * FROM jobs WHERE device=? AND state='queued' ORDER BY rowid LIMIT 1",
-                                 (device["id"],)).fetchone()
+                # A job carrying account_ref is offered only once this registration has
+                # sent `accounts`, so a worker without the extension never receives it.
+                sent = db.execute("SELECT 1 FROM account_choice_epochs WHERE device=? AND epoch=?",
+                                  (device["id"], device["epoch"])).fetchone() is not None
+                job = db.execute("SELECT * FROM jobs WHERE device=? AND state='queued'"
+                                 + ("" if sent else " AND json_extract(payload,'$.account_ref') IS NULL")
+                                 + " ORDER BY rowid LIMIT 1", (device["id"],)).fetchone()
                 if job is None:
                     return {"claim": None}
                 db.execute("UPDATE jobs SET state='claimed',epoch=epoch+1,lease=? WHERE id=?",
@@ -266,6 +278,7 @@ class ControlStore:
             db.execute("DELETE FROM advertised_accounts WHERE device=?", (device["id"],))
             db.executemany("INSERT INTO advertised_accounts VALUES (?,?,?,?,?)",
                            [(device["id"], e.account_ref, e.label, int(e.default), i) for i, e in enumerate(entries)])
+            db.execute("INSERT OR REPLACE INTO account_choice_epochs VALUES (?,?)", (device["id"], device["epoch"]))
             return {"account_count": len(entries)}
         if op == "submit":
             submission = Submission.from_dict(value, allow_account_ref=True)
