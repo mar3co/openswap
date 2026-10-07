@@ -273,10 +273,15 @@ def _overlaps_credentials(root: Path, folder: Path, *, writable: bool) -> bool:
     for path in [*protected, *([home] if home else [])]:
         if path == folder or path.is_relative_to(folder):
             return True
-    worker_dir = (Path(root).resolve() / "worker")
+    try:
+        backup = Path(root).expanduser().resolve()
+    except (OSError, RuntimeError):
+        backup = None
     for path in protected:
         if folder.is_relative_to(path):
-            if writable and folder.is_relative_to(worker_dir):
+            # Only the backup root itself has the `worker` exception: a Codex or
+            # Claude home configured beneath that directory stays off limits.
+            if writable and backup is not None and path == backup and folder.is_relative_to(backup / "worker"):
                 continue
             return True
     return False

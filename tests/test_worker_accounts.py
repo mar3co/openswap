@@ -278,6 +278,22 @@ def test_workspace_add_refusals(root, tmp_path, capsys, args, code):
     assert load_worker_settings(root).workspaces == before
 
 
+def test_workspace_add_refuses_a_credential_home_inside_the_worker_directory(root, monkeypatch, capsys):
+    """The `worker` exception belongs to the backup root alone: a Codex home
+    configured beneath it is still refused, while a plain folder there is fine."""
+    import openswap.codex.auth as codex_auth
+
+    (root / "worker").mkdir(mode=0o700, exist_ok=True)
+    codex = root / "worker" / "codex-home"
+    for path in (codex, codex / "slots", codex / "slots" / "1"):
+        path.mkdir(mode=0o700)
+    monkeypatch.setattr(codex_auth, "codex_home", lambda: codex)
+    assert _run(root, "workspace", "add", "slot", str(codex / "slots" / "1"), "--json") == 1
+    assert json.loads(capsys.readouterr().out)["diagnostic_code"] == "folder_exposes_credentials"
+    assert _run(root, "workspace", "add", "plain", str(root / "worker" / "plain"), "--json") == 0
+    capsys.readouterr()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits only")
 def test_workspace_add_refuses_folders_others_can_access(root, tmp_path, capsys):
     shared = tmp_path / "shared"
