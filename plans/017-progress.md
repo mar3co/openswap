@@ -1077,3 +1077,33 @@ folder" step now exists; until now only tests called
 Execution is still disabled: the production adapter remains
 `UnavailableCodexAdapter` until Phase 1's live-evidence gates clear, so this
 step lets the owner finish setup but does not run any provider job.
+
+## Optional per-job account choice, OpenSwap side (2026-10-07)
+
+The "Optional per-job account choice (v1 extension)" section of
+`docs/worker-protocol.md` is implemented in OpenSwap; the OpenTag side is in
+progress.
+
+- Settings hold a local allowlist (at most 20 Codex accounts): a random
+  `account_ref` per entry (`secrets.token_hex(16)`), the local `codex:`
+  identity and an owner label (default: slot alias or "Codex account N"). The
+  pin is the default and is always allowlisted; a pre-allowlist pin migrates
+  to a one-entry allowlist on the next write.
+- `openswap worker account allow|disallow|label` (with `--json`, and
+  `--clear-default` to withdraw the default), the list view and a menu bar
+  **Web choice** popup manage it under the same locks as the pin.
+- The remote client sends `accounts` after each registration and on a local
+  fingerprint change; a 404 `unsupported_version` disables it until the next
+  registration. A claim's `account_ref` is accepted only once the enrollment
+  advertised accounts, and the runtime resolves it against the current
+  allowlist under the launch lock. A reference no longer allowed fails
+  `provider_auth_unavailable` (no pin: `provider_unavailable`) before any
+  lease, reconciled `failed` with `unlaunched=true`; nothing is substituted.
+  No journal schema change: the choice is read from the durable claim in the
+  remote journal.
+- The reference service implements `accounts`, accepts an advertised
+  `account_ref` on submission (part of the idempotency payload) and now
+  answers unknown operations 404 `unsupported_version`, as the spec says;
+  `submit-test` takes `--account-ref`.
+
+Execution is still disabled until Phase 1's live-evidence gates clear.

@@ -380,6 +380,9 @@ successful whether or not this step completes.
 openswap worker account                    # list Codex slots; * marks the pin
 openswap worker account 2                  # pin by slot, email or alias (or --json)
 openswap worker account --clear            # remove the pin
+openswap worker account allow 3 [--label "Team research"]   # allow for a per-job choice
+openswap worker account label 3 "Team research"             # rename (slot, email, alias or ref)
+openswap worker account disallow 3 [--clear-default]        # withdraw (slot, email, alias or ref)
 openswap worker workspace list             # approved research folders
 openswap worker workspace add tag-research ~/Research/opentag \
   [--readonly-source ~/src/project]        # ID must match the portal's Local workspace ID
@@ -403,6 +406,39 @@ keeps the account recorded on it at `starting`. If the pinned account is no
 longer in the Codex roster at launch, the job fails with
 `provider_auth_unavailable` before any lease or launch, and the remote client
 does not claim new work until a present account is pinned.
+
+**Per-job account choice.** The `allow`, `disallow` and `label` subcommands
+manage the local allowlist behind the [optional account choice
+extension](#optional-per-job-account-choice-v1-extension): at most 20 Codex
+accounts, each stored as a random `account_ref` (generated once, never
+derived from the account), its local `codex:` identity and a label (by default
+the slot alias or "Codex account N", never the email unless you pass it). The
+pin is the default and is always allowlisted: pinning adds the account if
+needed, `--clear` keeps it allowed without a default, and disallowing the
+default is refused unless `--clear-default` is passed. A pin saved before the
+allowlist existed becomes a one-entry allowlist on the next settings write.
+The list view shows the allowed accounts with their references and labels and
+marks the default. The changes take the same locks as pinning. The menu bar's
+**Web choice** popup, under **Account**, toggles each eligible Codex account
+(the default is shown checked and cannot be withdrawn there).
+
+After each registration, and whenever the allowlist, a label or the default
+changes (detected locally by fingerprint, never by polling), the worker sends
+`accounts` with only the references, labels and default flag. A 404
+`unsupported_version` records that the backend offers no account choice until
+the next registration; other failures are retried on the next pass and never
+hold back heartbeats or claims. A claim's `account_ref` is accepted only once
+this enrollment has advertised a non-empty set (recorded durably in the remote
+journal); before that it is a malformed claim. Under the launch lock the
+runtime resolves it against the current allowlist: no field means the pin, a
+reference that is no longer allowed fails the job `provider_auth_unavailable`
+and an absent field with no pin fails it `provider_unavailable`, in both cases
+before any lease, reconciled `failed` with `unlaunched=true`; another account
+is never substituted. With no pin, the remote client still claims work while
+the backend acknowledged a non-empty set and an allowed account is in the
+roster. The reference service implements `accounts`, accepts `account_ref`
+only when the worker currently advertises it, and `submit-test` takes
+`--account-ref`.
 
 `workspace add` creates a missing folder owner-only (0700) and applies the
 launch-time checks up front: a real directory owned by you with no group or
@@ -429,7 +465,8 @@ openswap worker submit-test --url https://control.example \
   --runtime-limit 600 --expires-in 3600 --i-understand-this-is-a-test-tool
 ```
 
-It sends only the canonical submission and prints the validated JSON job ID
+It sends only the canonical submission (plus `account_ref` when
+`--account-ref` names an account the worker advertised) and prints the validated JSON job ID
 and state (any other response shape, unknown state or extra field is refused
 as `invalid_response` with exit status 1 and nothing echoed). It never supplies
 an adapter, model, account, path or command. A new submission requires the
