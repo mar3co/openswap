@@ -2410,12 +2410,13 @@ def test_plan_relogin_click_captures_only_on_email_and_org_match():
     assert wrong_org.kind == "confirm_open_login"
     assert wrong_org.kind != "capture"
     title = menubar.relogin_wrong_account_title(wrong_org)
-    assert title == "Sign in as personal?"
+    assert title == "personal needs a new sign-in"
     msg = menubar.relogin_wrong_account_message(wrong_org)
     assert msg == (
-        "Claude Code is using adsonline right now. "
-        "Your saved adsonline account is not removed. "
-        "Continue to sign in as personal?"
+        "personal's saved login has expired, so OpenSwap can't switch to it. "
+        "Sign in as personal in the login window that opens.\n\n"
+        "Claude Code is on adsonline right now and will sign out of it. "
+        "adsonline stays saved in OpenSwap, so you can switch back later."
     )
 
     signed_out = menubar.plan_relogin_click(

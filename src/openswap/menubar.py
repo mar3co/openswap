@@ -2148,7 +2148,7 @@ def run(switcher, codex=None) -> int:
             if plan.kind == "confirm_open_login" and self._alert(
                 title=relogin_wrong_account_title(plan),
                 message=relogin_wrong_account_message(plan),
-                ok="Open login",
+                ok=f"Sign in as {plan.slot_name}",
                 cancel="Cancel",
             ) != 1:
                 return

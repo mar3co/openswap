@@ -1396,17 +1396,23 @@ def plan_relogin_click(
 
 
 def relogin_wrong_account_title(plan: ReloginClickPlan) -> str:
-    """Alert title: name the slot they clicked, not the live login."""
-    return f"Sign in as {plan.slot_name}?"
+    """Alert title: say why a click can't just switch."""
+    return f"{plan.slot_name} needs a new sign-in"
 
 
 def relogin_wrong_account_message(plan: ReloginClickPlan) -> str:
-    """Alert body: Claude Code's current login changes; the saved slot stays."""
+    """Alert body: the problem, the fix, and what happens to the live login.
+
+    Lead with the expired saved login, since that is the only reason a
+    click opens the Claude login instead of switching.
+    """
     live_name = plan.live_name or "another account"
     return (
-        f"Claude Code is using {live_name} right now. "
-        f"Your saved {live_name} account is not removed. "
-        f"Continue to sign in as {plan.slot_name}?"
+        f"{plan.slot_name}'s saved login has expired, so OpenSwap can't "
+        f"switch to it. Sign in as {plan.slot_name} in the login window "
+        "that opens.\n\n"
+        f"Claude Code is on {live_name} right now and will sign out of it. "
+        f"{live_name} stays saved in OpenSwap, so you can switch back later."
     )
 
 
@@ -1467,8 +1473,9 @@ def reconcile_dialog_copy(
 
 def relogin_login_opened_message(slot_name: str) -> str:
     return (
-        f"Sign in as {slot_name} in the Terminal window. After that, click this "
-        "card again, or wait and the extra will capture it."
+        f"Sign in as {slot_name} in the Terminal window that opened. "
+        f"OpenSwap saves the new login on its own; click {slot_name} again "
+        "if it doesn't show up."
     )
 
 
