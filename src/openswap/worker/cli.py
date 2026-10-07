@@ -16,11 +16,17 @@ from openswap.exceptions import ClaudeSwitchError, LockError
 from openswap.locking import FileLock
 from openswap.paths import get_backup_root
 from openswap.settings import (
+    AccountAllowlistFullError,
+    MAX_ACCOUNT_ALLOWLIST,
+    AllowlistedAccount,
     WorkerWorkspace,
     load_worker_settings,
+    new_allowlist_ref,
     set_worker_pinned_account,
     set_worker_workspaces,
+    update_worker_account_allowlist,
     update_worker_settings,
+    valid_account_label,
 )
 from openswap.worker.accounts import (
     AccountChoices,
@@ -52,6 +58,7 @@ _LIFECYCLE_LOCK_TIMEOUT_SECONDS = 5.0
 # INTERRUPTED is terminal but records uncertainty, so it is not listed here.
 # Journaled worker jobs have 32-hex ids; kickoff-* and usage-* probe leases do not.
 _WORKER_JOB_ID = re.compile(r"[a-f0-9]{32}")
+_ALLOWLIST_REF = re.compile(r"[0-9a-f]{32}")
 _LEASE_TERMINAL_JOB_STATES = {
     JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED, JobState.EXPIRED,
 }
@@ -202,9 +209,10 @@ def enable_worker(backup_root: Path) -> dict:
 
 
 def worker_account_choices(backup_root: Path) -> AccountChoices:
-    """Roster metadata for the account picker; reads no credentials."""
+    """Roster metadata and the allowlist for the account picker; reads no credentials."""
     root = Path(backup_root)
-    return account_choices(root, load_worker_settings(root).pinned_account_ref)
+    policy = load_worker_settings(root)
+    return account_choices(root, policy.pinned_account_ref, policy.account_allowlist)
 
 
 def set_worker_account(backup_root: Path, selector: str | None) -> CodexAccountChoice | None:
@@ -220,21 +228,155 @@ def set_worker_account(backup_root: Path, selector: str | None) -> CodexAccountC
     worker reads the new pin for the next launch.
     """
     root = Path(backup_root)
+
+    def change():
+        choice = None if selector is None else resolve_codex_selector(root, selector)
+        # A newly pinned account joins the allowlist (default label); clearing
+        # the pin keeps the allowlist, so the account stays a per-job choice.
+        set_worker_pinned_account(root, None if choice is None else choice.account_ref)
+        return choice
+
+    return _account_policy_change(root, change)
+
+
+def _account_policy_change(root: Path, change):
+    """Run one pin/allowlist change under the same locks as the pin.
+
+    The worker lifecycle lock, then the Codex mutation guard, so a roster
+    slot cannot be removed, swapped or moved while it is resolved and saved.
+    Failures surface as ``AccountPinError`` with a stable code.
+    """
     _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
         try:
             with AccountLeaseStore(root, "codex").mutation_guard(
                 timeout=_LIFECYCLE_LOCK_TIMEOUT_SECONDS,
             ):
-                choice = None if selector is None else resolve_codex_selector(root, selector)
-                set_worker_pinned_account(root, None if choice is None else choice.account_ref)
+                return change()
         except AccountPinError:
             raise
         except LockError:
             raise AccountPinError("account_roster_busy") from None
+        except AccountAllowlistFullError:
+            raise AccountPinError("too_many_accounts") from None
         except (OSError, RuntimeError, ValueError):
             raise AccountPinError("settings_unavailable") from None
-        return choice
+
+
+def _clean_label(label: str | None) -> str | None:
+    if label is None:
+        return None
+    label = label.strip() if isinstance(label, str) else label
+    if not valid_account_label(label):
+        raise AccountPinError("label_invalid")
+    return label
+
+
+def _find_allowlisted(root: Path, entries, target: str) -> AllowlistedAccount:
+    """An allowlist entry by its reference, its ``codex:`` identity, or a roster selector.
+
+    The reference and identity forms also reach an entry whose account has
+    left the Codex roster, so it can still be disallowed.
+    """
+    target = target.strip() if isinstance(target, str) else ""
+    for entry in entries:
+        if target in {entry.account_ref, entry.identity}:
+            return entry
+    if not target or _ALLOWLIST_REF.fullmatch(target):
+        raise AccountPinError("account_not_allowlisted")
+    identity = resolve_codex_selector(root, target).account_ref
+    match = next((entry for entry in entries if entry.identity == identity), None)
+    if match is None:
+        raise AccountPinError("account_not_allowlisted")
+    return match
+
+
+def allow_worker_account(backup_root: Path, selector: str, label: str | None = None) -> AllowlistedAccount:
+    """Allowlist a Codex account so a control service may choose it per job.
+
+    The account gets a fresh random reference (never derived from it) the
+    first time; allowing it again keeps that reference and only changes the
+    label when one is given. Codex roster slots with a ChatGPT account ID
+    only (Claude waits on its authentication gate); at most 20 accounts.
+    """
+    root = Path(backup_root)
+    label = _clean_label(label)
+
+    def change():
+        choice = resolve_codex_selector(root, selector)
+        result = {}
+
+        def update(pin, entries):
+            entries = list(entries)
+            index = next((i for i, e in enumerate(entries) if e.identity == choice.account_ref), None)
+            if index is None:
+                if len(entries) >= MAX_ACCOUNT_ALLOWLIST:
+                    raise AccountPinError("too_many_accounts")
+                from openswap.worker.accounts import default_account_label
+
+                entries.append(AllowlistedAccount(
+                    new_allowlist_ref(), choice.account_ref,
+                    label or default_account_label(root, choice.account_ref),
+                ))
+                index = len(entries) - 1
+            elif label is not None:
+                entries[index] = AllowlistedAccount(entries[index].account_ref, entries[index].identity, label)
+            result["entry"] = entries[index]
+            return pin, entries
+
+        update_worker_account_allowlist(root, update)
+        return result["entry"]
+
+    return _account_policy_change(root, change)
+
+
+def disallow_worker_account(
+    backup_root: Path, target: str, *, clear_default: bool = False,
+) -> AllowlistedAccount:
+    """Withdraw an account from the allowlist (by selector, reference or identity).
+
+    The default (pinned) account is refused unless ``clear_default``, which
+    also clears the pin. A job already recorded with this account's reference
+    then fails before launch; the worker never substitutes another account.
+    """
+    root = Path(backup_root)
+
+    def change():
+        result = {}
+
+        def update(pin, entries):
+            entry = _find_allowlisted(root, entries, target)
+            if entry.identity == pin:
+                if not clear_default:
+                    raise AccountPinError("account_is_default")
+                pin = None
+            result["entry"] = entry
+            return pin, [e for e in entries if e.account_ref != entry.account_ref]
+
+        update_worker_account_allowlist(root, update)
+        return result["entry"]
+
+    return _account_policy_change(root, change)
+
+
+def label_worker_account(backup_root: Path, target: str, label: str) -> AllowlistedAccount:
+    """Rename an allowlisted account's owner-chosen label; its reference is kept."""
+    root = Path(backup_root)
+    label = _clean_label(label)
+
+    def change():
+        result = {}
+
+        def update(pin, entries):
+            entry = _find_allowlisted(root, entries, target)
+            renamed = AllowlistedAccount(entry.account_ref, entry.identity, label)
+            result["entry"] = renamed
+            return pin, [renamed if e.account_ref == entry.account_ref else e for e in entries]
+
+        update_worker_account_allowlist(root, update)
+        return result["entry"]
+
+    return _account_policy_change(root, change)
 
 
 class WorkspaceError(ClaudeSwitchError):
@@ -753,6 +895,9 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     if arguments and arguments[0] == "refserver":
         from openswap.worker.refserver.cli import main as refserver_main
         return refserver_main(arguments[1:])
+    if arguments[:1] == ["account"] and len(arguments) > 1 and arguments[1] in _ALLOWLIST_COMMANDS:
+        root = Path(backup_root) if backup_root is not None else get_backup_root()
+        return _allowlist_command(root, arguments[1:])
     parser = argparse.ArgumentParser(
         prog="openswap worker",
         description="Control the opt-in Remote Agent Host worker.",
@@ -780,6 +925,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     expiry.add_argument("--expires-at", help="absolute RFC 3339 expiry; a retry must repeat the one it printed")
     submit_parser.add_argument("--idempotency-key", default=None,
                                help="reuse the key printed by a failed attempt so a retry cannot admit a second job")
+    submit_parser.add_argument("--account-ref", default=None,
+                               help="optional: an account reference the worker advertised (account choice extension)")
     submit_parser.add_argument("--i-understand-this-is-a-test-tool", action="store_true")
     status_parser = commands.add_parser("status", help="show local worker status")
     status_parser.add_argument("--json", action="store_true")
@@ -807,8 +954,10 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     account_parser = commands.add_parser(
         "account",
         help="list or pin the Codex account remote jobs run on (Claude is not supported yet)",
-        description="With no argument, list Codex roster slots and mark the pinned one. "
-                    "Pass a slot, email or alias to pin that Codex account for the next job.",
+        description="With no argument, list Codex roster slots, the accounts allowed for a "
+                    "per-job choice, and mark the pinned default. Pass a slot, email or alias to "
+                    "pin that Codex account for the next job. `account allow|disallow|label` manage "
+                    "the accounts a control service may choose per job (see `account allow --help`).",
     )
     account_parser.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
     account_parser.add_argument("--clear", action="store_true", help="remove the pin")
@@ -849,7 +998,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                                         allow_past=args.idempotency_key is not None and args.expires_at is not None)
             result = submit_test(root, url=args.url, task=args.task, workspace_id=args.workspace_id,
                                  runtime_limit=args.runtime_limit, expires_at=expires_at,
-                                 acknowledged=args.i_understand_this_is_a_test_tool, idempotency_key=key)
+                                 acknowledged=args.i_understand_this_is_a_test_tool, idempotency_key=key,
+                                 account_ref=args.account_ref)
         except ProtocolError as exc:
             print(f"Test submission refused: {exc.code}.", file=sys.stderr)
         except (OSError, RuntimeError, ValueError):
@@ -864,6 +1014,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         retry = f"--idempotency-key={shlex.quote(key)}"
         if expires_at is not None:
             retry += f" --expires-at={shlex.quote(stamp(expires_at))}"
+        if args.account_ref is not None:
+            retry += f" --account-ref={shlex.quote(args.account_ref)}"
         print(f"Retry with {retry} to reuse the same submission.", file=sys.stderr)
         return 1
 
@@ -1041,6 +1193,15 @@ _ACCOUNT_MESSAGES = {
     "account_roster_busy": "Codex accounts are being changed; try again shortly.",
     "worker_lifecycle_busy": "Worker settings are being changed; try again shortly.",
     "settings_unavailable": "Could not save the worker settings.",
+    "too_many_accounts": "At most 20 accounts can be allowed; disallow one first.",
+    "account_not_allowlisted": (
+        "That account is not allowed for a per-job choice. Run `openswap worker account` to list them."
+    ),
+    "account_is_default": (
+        "That account is the pinned default. Pin another first, or pass --clear-default "
+        "to disallow it and leave no default."
+    ),
+    "label_invalid": "Labels are 1-100 characters with no control characters.",
 }
 
 _WORKSPACE_MESSAGES = {
@@ -1080,7 +1241,8 @@ _WORKSPACE_MESSAGES = {
 
 
 def _format_accounts(choices: AccountChoices) -> str:
-    lines = ["Remote tasks account (Codex only; every remote job uses this local pin):"]
+    lines = ["Remote tasks account (Codex only; a remote job uses this pin unless the "
+             "service picks an allowed account):"]
     if not choices.codex:
         lines.append("  No Codex accounts saved. Add one with `openswap codex add`.")
     for choice in choices.codex:
@@ -1103,9 +1265,88 @@ def _format_accounts(choices: AccountChoices) -> str:
             "(provider_auth_unavailable) until you pin another."
         )
     elif choices.pinned_ref is None:
-        lines.append("No account pinned: remote jobs fail until you pin one.")
+        lines.append("No account pinned: remote jobs that do not pick an allowed account fail until you pin one.")
     lines.append("Pin one with `openswap worker account <slot|email|alias>`; clear with `--clear`.")
+    lines.append("Allowed for a per-job choice by the control service (* = default; the service "
+                 "sees only the reference and label):")
+    if not choices.allowlist:
+        lines.append("  None. Allow one with `openswap worker account allow <slot|email|alias>`.")
+    for entry in choices.allowlist:
+        lines.append("  " + _format_allowlist_entry(entry, choices))
+    lines.append("Manage with `openswap worker account allow|disallow|label`.")
     return "\n".join(lines)
+
+
+def _format_allowlist_entry(entry: AllowlistedAccount, choices: AccountChoices) -> str:
+    marker = "*" if entry.identity == choices.pinned_ref else " "
+    slot = choices.slot_for(entry.identity)
+    where = f"slot {slot.number}" if slot is not None else "no longer in the Codex roster"
+    return f"{marker} {entry.account_ref}  {json.dumps(entry.label, ensure_ascii=False)}  [{where}]"
+
+
+def _allowlist_payload(entry: AllowlistedAccount, pinned_ref: str | None) -> dict:
+    return {
+        "account_ref": entry.account_ref, "identity": entry.identity,
+        "label": entry.label, "default": entry.identity == pinned_ref,
+    }
+
+
+_ALLOWLIST_COMMANDS = {"allow", "disallow", "label"}
+
+
+def _allowlist_command(root: Path, arguments: list[str]) -> int:
+    """``openswap worker account allow|disallow|label``: the per-job choice allowlist."""
+    parser = argparse.ArgumentParser(
+        prog="openswap worker account",
+        description="Manage the Codex accounts a control service may choose per job. Each "
+                    "allowed account is advertised only as a random reference and a label you "
+                    "choose (by default the slot alias or 'Codex account N', never the email).",
+    )
+    commands = parser.add_subparsers(dest="allowlist_command", required=True)
+    allow = commands.add_parser("allow", help="allow a Codex account for a per-job choice")
+    allow.add_argument("selector", metavar="SLOT|EMAIL|ALIAS")
+    allow.add_argument("--label", default=None, help="label the control service shows (1-100 characters)")
+    allow.add_argument("--json", action="store_true")
+    disallow = commands.add_parser("disallow", help="withdraw an allowed account")
+    disallow.add_argument("target", metavar="SLOT|EMAIL|ALIAS|REF")
+    disallow.add_argument("--clear-default", action="store_true",
+                          help="also clear the pin when the account is the pinned default")
+    disallow.add_argument("--json", action="store_true")
+    label = commands.add_parser("label", help="rename an allowed account's label")
+    label.add_argument("target", metavar="SLOT|EMAIL|ALIAS|REF")
+    label.add_argument("label", metavar="TEXT")
+    label.add_argument("--json", action="store_true")
+    args = parser.parse_args(arguments)
+    try:
+        if args.allowlist_command == "allow":
+            entry = allow_worker_account(root, args.selector, args.label)
+            human = f"Allowed {json.dumps(entry.label, ensure_ascii=False)} ({entry.account_ref}) for a per-job choice."
+        elif args.allowlist_command == "disallow":
+            entry = disallow_worker_account(root, args.target, clear_default=args.clear_default)
+            human = f"Disallowed {json.dumps(entry.label, ensure_ascii=False)} ({entry.account_ref})."
+        else:
+            entry = label_worker_account(root, args.target, args.label)
+            human = f"Relabelled {entry.account_ref} as {json.dumps(entry.label, ensure_ascii=False)}."
+        pinned = load_worker_settings(root).pinned_account_ref
+    except AccountPinError as exc:
+        code = exc.code
+    except ClaudeSwitchError as exc:
+        code = str(exc) if str(exc) == "worker_lifecycle_busy" else "settings_unavailable"
+    else:
+        if args.allowlist_command == "disallow" and args.clear_default and pinned is None:
+            human += " No default account is pinned now."
+        payload = {"accepted": True, "account": _allowlist_payload(entry, pinned),
+                   "pinned_account_ref": pinned}
+        if args.allowlist_command == "disallow":
+            payload["removed"] = True
+            payload["account"]["default"] = False
+        _write(payload, as_json=args.json, human=human)
+        return 0
+    if args.json:
+        _write({"accepted": False, "diagnostic_code": code}, as_json=True)
+    else:
+        print(_ACCOUNT_MESSAGES.get(code, f"Could not change the allowed accounts ({code})."), file=sys.stderr)
+    return 1
 
 
 def _format_workspaces(workspaces) -> str:
@@ -1221,7 +1462,8 @@ def _account_command(root: Path, args) -> int:
     else:
         payload = {"accepted": True, "pinned": _choice_payload(choice)}
         human = (
-            "Cleared the Remote tasks account; remote jobs fail until you pin one."
+            "Cleared the Remote tasks account; remote jobs that do not pick an allowed account "
+            "fail until you pin one."
             if choice is None
             else f"Remote tasks will use Codex account {choice.label()} from the next job."
         )

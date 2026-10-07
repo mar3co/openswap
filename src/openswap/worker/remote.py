@@ -21,8 +21,8 @@ from openswap.settings import load_worker_settings
 from openswap.worker.journal import AdmissionError, JournalError
 from openswap.worker.models import JobState, RemoteAuthorization, SafeEventKind
 from openswap.worker.protocol import (
-    Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, ProtocolError,
-    TERMINAL, integer, timestamp, validate_url,
+    AdvertisedAccount, Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, ProtocolError,
+    TERMINAL, fields, integer, timestamp, validate_url,
 )
 
 STATES = frozenset(state.value for state in JobState)
@@ -171,11 +171,25 @@ class RemoteJournal:
             db.execute("CREATE TABLE IF NOT EXISTS bindings (service TEXT, remote_id TEXT, claim TEXT NOT NULL, "
                        "local_id TEXT, cursor INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, "
                        "PRIMARY KEY(service,remote_id))")
+            # Account choice extension: whether this enrollment ever advertised a
+            # non-empty account set. Claims may carry account_ref only after that.
+            db.execute("CREATE TABLE IF NOT EXISTS account_choice (service TEXT PRIMARY KEY, "
+                       "advertised INTEGER NOT NULL DEFAULT 0)")
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=5)
         db.row_factory = sqlite3.Row
         return db
+
+    def accounts_advertised(self) -> bool:
+        with closing(self.connect()) as db:
+            row = db.execute("SELECT advertised FROM account_choice WHERE service=?", (self.service,)).fetchone()
+        return bool(row and row["advertised"])
+
+    def mark_accounts_advertised(self):
+        with closing(self.connect()) as db, db:
+            db.execute("INSERT INTO account_choice(service,advertised) VALUES (?,1) "
+                       "ON CONFLICT(service) DO UPDATE SET advertised=1", (self.service,))
 
     def remember(self, claim):
         with closing(self.connect()) as db, db:
@@ -239,7 +253,16 @@ class RemoteClient:
             raise ValueError("too many explicit artifacts")
         for name in self.artifact_names:
             Artifact.from_dict(Artifact(name, b"").to_dict())
+        # Optional account choice extension. ``_accounts_sent`` is the (worker
+        # epoch, fingerprint) the service last acknowledged, so a change is
+        # detected locally without polling the service; a 404
+        # ``unsupported_version`` stops sending until the next registration.
+        self._accounts_sent = None
+        self._accounts_offered = False  # the acknowledged set was non-empty
+        self._accounts_unsupported_epoch = None
+        self._accounts_advertised = self.journal.accounts_advertised()
         self.runtime.remote_launch_guard = self.launch_allowed
+        self.runtime.remote_account_ref = self.requested_account_ref
 
     def _fence(self, claim):
         return {"job_id": claim.job_id, "epoch": claim.epoch, "worker_epoch": self.worker_epoch}
@@ -320,7 +343,7 @@ class RemoteClient:
         if (binding is None or binding["done"] or self.state != "online" or not self.worker_epoch
                 or policy.control_service_url != self.url or not policy.enabled or policy.paused):
             return False
-        claim = Claim.from_dict(json.loads(binding["claim"]))
+        claim = self._stored_claim(binding)
         if local.expires_at <= datetime.now(timezone.utc) or claim.submission.job.expires_at <= self._server_now():
             return False
         try:
@@ -330,6 +353,82 @@ class RemoteClient:
             return RemoteAuthorization(self.url, self.worker_id)
         except (ProtocolError, KeyError, ValueError, TypeError):
             return False
+
+    @staticmethod
+    def _stored_claim(binding):
+        """A claim already validated when it was received (with or without account_ref)."""
+        return Claim.from_dict(json.loads(binding["claim"]), allow_account_ref=True)
+
+    def requested_account_ref(self, local_id: str) -> str | None:
+        """The ``account_ref`` the claim behind a local job carried, or None when absent.
+
+        The runtime resolves it against the current allowlist under its launch
+        lock. Raises ``LookupError`` when no claim is bound to the job, so the
+        runtime fails it rather than guessing an account.
+        """
+        binding = self.journal.binding(local_id)
+        if binding is None:
+            raise LookupError("no claim is bound to this job")
+        return self._stored_claim(binding).submission.account_ref
+
+    def _advertisement(self, policy) -> tuple[AdvertisedAccount, ...]:
+        """The allowlist as advertised: opaque references, labels and the default flag only."""
+        return tuple(
+            AdvertisedAccount(entry.account_ref, entry.label, entry.identity == policy.pinned_account_ref)
+            for entry in policy.account_allowlist
+        )
+
+    def sync_accounts(self, policy=None) -> None:
+        """Send ``accounts`` after a new registration and whenever the allowlist changed.
+
+        Change is detected by comparing a local fingerprint with the one the
+        service last acknowledged for this worker epoch. Never raises: a
+        failure is retried on the next synchronization pass, and claims and
+        heartbeats go on meanwhile. Only a 404 ``unsupported_version`` records
+        that the backend offers no account choice, until the next registration.
+        """
+        try:
+            epoch = self.worker_epoch
+            if epoch is None or self._accounts_unsupported_epoch == epoch:
+                return
+            policy = policy or load_worker_settings(self.runtime.backup_root)
+            entries = self._advertisement(policy)
+            body = [entry.to_dict() for entry in entries]
+            fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+            if self._accounts_sent == (epoch, fingerprint):
+                return
+            try:
+                response = self.transport.request("accounts", {"worker_epoch": epoch, "accounts": body})
+            except ProtocolError as exc:
+                if exc.code == "unsupported_version" and exc.status == 404:
+                    self._accounts_unsupported_epoch = epoch
+                    self._accounts_offered = False
+                elif exc.code in {"revoked", "unauthorized", "device_expired"}:
+                    self._connectivity(exc)
+                return
+            try:
+                if integer(fields(response, {"account_count"})["account_count"]) != len(entries):
+                    return  # malformed acknowledgement: resend on the next pass
+            except ProtocolError:
+                return
+            if entries and not self._accounts_advertised:
+                self.journal.mark_accounts_advertised()
+                self._accounts_advertised = True
+            self._accounts_sent = (epoch, fingerprint)
+            self._accounts_offered = bool(entries)
+        except Exception:
+            return
+
+    def accounts_offered(self) -> bool:
+        """Whether the service acknowledged a non-empty account set for this registration."""
+        sent = self._accounts_sent
+        return self._accounts_offered and sent is not None and sent[0] == self.worker_epoch
+
+    def account_ready(self) -> bool:
+        """Claim new work only when a job could resolve an account: the pin is
+        present, or the service offers a choice among allowlisted accounts and
+        one of them is present."""
+        return self.runtime.account_ready() or (self.accounts_offered() and self.runtime.allowlist_ready())
 
     def tick(self):
         """One bounded synchronous pass: heartbeat, then synchronization. No sleeping; tests control time."""
@@ -436,6 +535,8 @@ class RemoteClient:
         with self._lock:
             if self.state != "online" or self.worker_epoch is None or policy.control_service_url != self.url:
                 return
+        # Optional account choice: bounded, never raises, never blocks claims.
+        self.sync_accounts(policy)
         try:
             for binding in self.journal.pending():
                 self._sync(binding)
@@ -452,11 +553,13 @@ class RemoteClient:
                 availability = self.runtime.adapter.probe()
             except Exception:
                 return  # an unavailable provider claims nothing; the heartbeat still counts
-            if not availability.available or not self.runtime.account_ready():
+            if not availability.available or not self.account_ready():
                 return
             response = self._worker_request("poll")
             if response["claim"] is not None:
-                claim = Claim.from_dict(response["claim"])
+                # account_ref is accepted only once this enrollment advertised accounts;
+                # otherwise it is a malformed claim, as before the extension.
+                claim = Claim.from_dict(response["claim"], allow_account_ref=self._accounts_advertised)
                 self.journal.remember(claim)  # persist before local admission
                 pending = self.journal.pending()
                 if pending:  # a re-offered claim that already ended here has nothing to sync
@@ -465,7 +568,7 @@ class RemoteClient:
             self._connectivity(exc)
 
     def _sync(self, binding):
-        claim = Claim.from_dict(json.loads(binding["claim"]))
+        claim = self._stored_claim(binding)
         remote = self._job_response("job", claim)
         local_id = binding["local_id"]
         local = None
@@ -591,7 +694,7 @@ class RemoteClient:
         stopped, unlaunched = self._proof(local)
         if not (stopped or unlaunched):
             return
-        claim = Claim.from_dict(json.loads(binding["claim"]))
+        claim = self._stored_claim(binding)
         try:
             self._reconcile(claim, local.state.value, stopped=stopped, unlaunched=unlaunched)
         except ProtocolError:

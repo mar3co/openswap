@@ -17,7 +17,7 @@ import time
 from urllib.parse import quote
 
 from openswap.settings import load_worker_settings, update_worker_settings
-from openswap.worker.accounts import codex_account_in_roster
+from openswap.worker.accounts import codex_account_in_roster, codex_accounts
 from openswap.worker.adapter import ProviderAdapter, production_adapter
 from openswap.locking import FileLock
 from openswap.worker.journal import (
@@ -341,6 +341,10 @@ class WorkerRuntime:
         self._active_run = None
         self._active_lease = None
         self.remote_launch_guard = None
+        # Installed by the remote client: the ``account_ref`` a remote job's
+        # claim carried (None when absent). It reads the durable claim, so a
+        # choice survives a restart; it raises when the claim is unknown.
+        self.remote_account_ref = None
 
     @property
     def account_identity(self) -> str | None:
@@ -363,6 +367,48 @@ class WorkerRuntime:
         if self._fixed_account_identity is not None:
             return True
         return codex_account_in_roster(self.backup_root, identity)
+
+    def allowlist_ready(self) -> bool:
+        """Whether any account allowlisted for a per-job choice is in the Codex roster."""
+        allowlist = load_worker_settings(self.backup_root).account_allowlist
+        if not allowlist:
+            return False
+        if self._fixed_account_identity is not None:
+            return True
+        roster = {choice.account_ref for choice in codex_accounts(self.backup_root) or ()}
+        return any(entry.identity in roster for entry in allowlist)
+
+    def _resolve_launch_account(self, job: JobRecord) -> tuple[str | None, str | None]:
+        """``(identity, None)`` for this launch, or ``(None, diagnostic)``; under the launch lock.
+
+        A remote job whose claim named an ``account_ref`` runs on that
+        allowlist entry as the allowlist reads now; any other job runs on the
+        current pin. A reference no longer allowlisted, an unreadable choice,
+        or no pin when one is needed fails the job: another account is never
+        substituted. The roster is checked here too, before anything is
+        journaled, so a missing account is reported as never launched; the
+        check under the lease's mutation guard still closes the race.
+        """
+        requested = None
+        if job.idempotency_key.startswith("remote:") and self.remote_account_ref is not None:
+            try:
+                requested = self.remote_account_ref(job.job_id)
+            except Exception:
+                return None, "provider_auth_unavailable"
+            if requested is not None and not isinstance(requested, str):
+                return None, "provider_auth_unavailable"
+        if requested is None:
+            identity = self.account_identity
+            if identity is None:
+                return None, "provider_unavailable"
+        else:
+            entry = load_worker_settings(self.backup_root).allowlisted(requested)
+            if entry is None:
+                return None, "provider_auth_unavailable"
+            identity = entry.identity
+        if self._fixed_account_identity is None and not codex_account_in_roster(self.backup_root, identity):
+            return None, "provider_auth_unavailable"
+        return identity, None
 
     def _quarantine_lease_for_recovered_jobs(self) -> None:
         """Stop trusting a still-``active`` lease left by a crashed worker.
@@ -1058,22 +1104,24 @@ class WorkerRuntime:
                 expected_generation=current.generation,
                 diagnostic_code=availability.diagnostic_code or "provider_unavailable",
             )
-        # The pin is read, recorded on the job and leased under the Codex
-        # mutation guard that `openswap worker account` also holds, so a pin
-        # change either lands before this launch (which then uses it) or waits
-        # until the lease is taken; a job never starts on a replaced pin. The
-        # roster check shares the guard so `codex remove` cannot drop the
-        # pinned slot in between.
+        # The account is resolved, recorded on the job and leased under the
+        # Codex mutation guard that `openswap worker account` also holds, so a
+        # pin or allowlist change either lands before this launch (which then
+        # uses it) or waits until the lease is taken; a job never starts on a
+        # replaced account. The roster check shares the guard so `codex remove`
+        # cannot drop the account in between.
         starting = None
         try:
             with self.leases.mutation_guard() as guard:
                 guard.assert_available()
-                identity = self.account_identity
+                # The owner's pin, or the job's allowlisted choice, as it reads
+                # now; a refusal fails the job before STARTING (never launched).
+                identity, refusal = self._resolve_launch_account(current)
                 if identity is None:
                     return self.store.transition(
                         current.job_id, expected_states=(JobState.CLAIMED,),
                         new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
-                        expected_generation=current.generation, diagnostic_code="provider_unavailable",
+                        expected_generation=current.generation, diagnostic_code=refusal,
                     )
                 starting = self.store.transition(
                     current.job_id, expected_states=(JobState.CLAIMED,),

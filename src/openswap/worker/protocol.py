@@ -127,29 +127,41 @@ def runtime_limit(value: object) -> int | float:
     return int(value) if isinstance(value, float) and value.is_integer() else value
 
 
+MAX_ADVERTISED_ACCOUNTS = 20
+MAX_ACCOUNT_LABEL = 100
+
+
 @dataclass(frozen=True)
 class Submission:
     worker_id: str
     job: JobSubmission
+    # Optional account choice extension: an ``account_ref`` the target worker
+    # advertised. Accepted only where the caller says the extension applies.
+    account_ref: str | None = None
 
     @classmethod
-    def from_dict(cls, value: object) -> Submission:
+    def from_dict(cls, value: object, *, allow_account_ref: bool = False) -> Submission:
         data = fields(value, {"worker_id", "idempotency_key", "provider", "task", "capability_profile",
-                              "workspace_id", "expires_at", "runtime_limit_s"})
+                              "workspace_id", "expires_at", "runtime_limit_s"},
+                      {"account_ref"} if allow_account_ref else frozenset())
         try:
             job = JobSubmission(text(data["idempotency_key"]), text(data["provider"]),
                                 text(data["task"], 32_000, allow_multiline=True), text(data["capability_profile"], 80),
                                 text(data["workspace_id"]), timestamp(data["expires_at"]),
                                 runtime_limit(data["runtime_limit_s"]))
-            return cls(text(data["worker_id"]), job)
+            account_ref = text(data["account_ref"]) if "account_ref" in data else None
+            return cls(text(data["worker_id"]), job, account_ref)
         except (ValueError, TypeError):
             raise ProtocolError("invalid_request") from None
 
     def to_dict(self) -> dict:
-        return {"worker_id": self.worker_id, "idempotency_key": self.job.idempotency_key,
-                "provider": self.job.provider, "task": self.job.task,
-                "capability_profile": self.job.capability_profile, "workspace_id": self.job.workspace_id,
-                "expires_at": stamp(self.job.expires_at), "runtime_limit_s": runtime_limit(self.job.runtime_limit_s)}
+        value = {"worker_id": self.worker_id, "idempotency_key": self.job.idempotency_key,
+                 "provider": self.job.provider, "task": self.job.task,
+                 "capability_profile": self.job.capability_profile, "workspace_id": self.job.workspace_id,
+                 "expires_at": stamp(self.job.expires_at), "runtime_limit_s": runtime_limit(self.job.runtime_limit_s)}
+        if self.account_ref is not None:
+            value["account_ref"] = self.account_ref
+        return value
 
 
 @dataclass(frozen=True)
@@ -160,10 +172,12 @@ class Claim:
     submission: Submission
 
     @classmethod
-    def from_dict(cls, value: object) -> Claim:
+    def from_dict(cls, value: object, *, allow_account_ref: bool = False) -> Claim:
+        """``allow_account_ref`` only for a worker that advertised accounts: any other
+        worker treats a submission carrying ``account_ref`` as a malformed claim."""
         data = fields(value, {"job_id", "epoch", "lease_until", "submission"})
         return cls(text(data["job_id"]), integer(data["epoch"], 1), timestamp(data["lease_until"]),
-                   Submission.from_dict(data["submission"]))
+                   Submission.from_dict(data["submission"], allow_account_ref=allow_account_ref))
 
     def to_dict(self) -> dict:
         return {"job_id": self.job_id, "epoch": self.epoch, "lease_until": stamp(self.lease_until),
@@ -217,3 +231,31 @@ class Artifact:
         if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
             raise ProtocolError("hash_mismatch")
         return cls(name, content)
+
+
+@dataclass(frozen=True)
+class AdvertisedAccount:
+    """One entry of the optional ``accounts`` operation: an opaque reference,
+    an owner-chosen label and whether it is the worker's default."""
+    account_ref: str
+    label: str
+    default: bool
+
+    def to_dict(self) -> dict:
+        return {"account_ref": self.account_ref, "label": self.label, "default": self.default}
+
+
+def advertised_accounts(value: object) -> tuple[AdvertisedAccount, ...]:
+    """Validate an ``accounts`` array: 0-20 closed entries, unique references, at most one default."""
+    if not isinstance(value, list) or len(value) > MAX_ADVERTISED_ACCOUNTS:
+        raise ProtocolError("invalid_request")
+    entries = []
+    for item in value:
+        data = fields(item, {"account_ref", "label", "default"})
+        if type(data["default"]) is not bool:
+            raise ProtocolError("invalid_request")
+        entries.append(AdvertisedAccount(text(data["account_ref"]), text(data["label"], MAX_ACCOUNT_LABEL),
+                                         data["default"]))
+    if len({entry.account_ref for entry in entries}) != len(entries) or sum(e.default for e in entries) > 1:
+        raise ProtocolError("invalid_request")
+    return tuple(entries)
