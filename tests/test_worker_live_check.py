@@ -916,6 +916,14 @@ def test_helpers_are_killed_even_if_the_stop_job_fails(tmp_path, monkeypatch):
     cont.ensure_private_dir(check.check_root)
     killed = []
     check._marker_pids = lambda *markers: [424242]
+    check._list_processes = lambda: [(424242, f"{marker} 1800") for marker in check._last_markers]
+    real_helper = check._helper_script
+
+    def helper(ws):
+        check._last_markers = real_helper(ws)
+        return check._last_markers
+
+    check._helper_script = helper
     monkeypatch.setattr(live_check.os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
     def broken_job(*args, **kwargs):
@@ -1047,7 +1055,7 @@ def test_a_curl_that_cannot_run_in_the_sandbox_proves_no_network_denial(tmp_path
 
 
 
-@pytest.mark.parametrize("code", [60, 77, 23, 1])
+@pytest.mark.parametrize("code", [60, 77, 23, 1, 28])
 def test_a_curl_failure_that_is_not_the_network_proves_nothing(tmp_path, code):
     root = setup_root(tmp_path)
     mac = SimulatedMac()
@@ -1073,3 +1081,15 @@ def test_a_blocked_resolver_alone_does_not_prove_socket_egress_is_denied(tmp_pat
     gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
     assert gate["shell_network_denied"] is True  # the name probe alone would pass...
     assert gate["shell_socket_egress_denied"] is False and gate["passed"] is False  # ...this does not
+
+
+
+def test_helper_cleanup_never_kills_a_recycled_pid(tmp_path, monkeypatch):
+    root = setup_root(tmp_path)
+    check = make_check(root, SimulatedMac())
+    listings = iter([[(4242, "openswap-live-check-x-child 60")], [(4242, "/usr/bin/some-other-app")]])
+    check._list_processes = lambda: next(listings)
+    sent = []
+    monkeypatch.setattr(live_check.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    check._kill_markers("openswap-live-check-x-child")
+    assert sent == [(4242, signal.SIGSTOP), (4242, signal.SIGCONT)]  # resumed, not killed

@@ -313,10 +313,12 @@ def command_matches(command: str, expected: str) -> bool:
 
 NETWORK_PROBE_URL = "http://example.com/"
 NETWORK_PROBE_TOKEN = "Example Domain"
-NETWORK_DENIED_EXIT_CODES = frozenset({6, 7, 28})  # curl: resolve, connect, timeout
+# A timeout (28) is not denial: `-m` bounds the whole transfer, so a request
+# that was sent and then stalled also times out.
+NETWORK_DENIED_EXIT_CODES = frozenset({6, 7})  # curl: could not resolve, could not connect
 NETWORK_IP = "1.1.1.1"
 NETWORK_IP_PROBE_URL = f"http://{NETWORK_IP}/"
-SOCKET_DENIED_EXIT_CODES = frozenset({7, 28})  # curl: connect, timeout (no name to resolve)
+SOCKET_DENIED_EXIT_CODES = frozenset({7})  # curl: could not connect (no name to resolve)
 
 
 def _new_sentinel(folder: Path, tag: str, content: str) -> Path:
@@ -843,8 +845,8 @@ class LiveCheck:
             "api_keys_absent": environment_seen and "OPENAI_API_KEY" not in everything
             and "CODEX_API_KEY" not in everything,
             "curl_runs_in_sandbox": curl_runs,
-            # Only a network-level failure counts (6 resolve, 7 connect, 28
-            # timeout): curl failing for any other reason proves nothing.
+            # Only a network-level failure counts (6 resolve, 7 connect):
+            # curl failing for any other reason proves nothing.
             "network_reachable_by_ip_outside_sandbox": outside_ip_ok,
             "shell_network_denied": outside_ok and curl_runs and bool(network) and all(
                 i["exit_code"] in NETWORK_DENIED_EXIT_CODES and NETWORK_PROBE_TOKEN not in i["output"]
@@ -931,14 +933,31 @@ class LiveCheck:
                    "Do not run anything else.")
 
     def _kill_markers(self, *markers: str) -> None:
-        """Kill this check's own helper processes (by their unique markers)."""
+        """Kill this check's own helper processes (by their unique markers).
+
+        A listed helper may exit and its pid be reused before the signal, so
+        each pid is stopped first (a stopped process cannot exit by itself,
+        so its pid cannot be recycled), its marker is checked again, and only
+        then is it killed; anything else is resumed.
+        """
+        wanted = set(markers)
         try:
             pids = self._marker_pids(*markers)
         except Exception:
             return
         for pid in pids:
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:
+                continue
+            try:
+                still = any(listed == pid and command.split(None, 1)[:1]
+                            and command.split(None, 1)[0] in wanted
+                            for listed, command in self._list_processes())
+            except Exception:
+                still = False
+            try:
+                os.kill(pid, signal.SIGKILL if still else signal.SIGCONT)
             except OSError:
                 pass
 
@@ -971,11 +990,7 @@ class LiveCheck:
             "label_loaded": self.containment.label_loaded(handle) if handle else None,
             "seconds": round(self._monotonic() - started, 1),
         }
-        for pid in left:  # never leave the check's own helpers behind
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        self._kill_markers(child, detached)  # never leave the check's own helpers behind
         gate.detail = detail
         gate.passed = (detail["detached_helper_observed"] and outcome.stopped and not left
                        and detail["coalition_members_left"] == 0 and detail["label_loaded"] is False)
@@ -1028,11 +1043,7 @@ class LiveCheck:
         detail["recovery_stopped"] = result is not None and result.execution_stopped is True
         left = self._marker_pids(child, detached)
         detail["helpers_left"] = len(left)
-        for pid in left:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        self._kill_markers(child, detached)
         if detail["recovery_stopped"]:
             self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
             detail["lease_released_on_proof"] = True
