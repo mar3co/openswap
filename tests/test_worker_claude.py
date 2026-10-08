@@ -44,6 +44,12 @@ SHA = "cd" * 32
 
 
 @pytest.fixture(autouse=True)
+def this_mac(monkeypatch):
+    # The evidence binding to this Mac (hardware UUID + install), fixed in tests.
+    monkeypatch.setattr(live, "host_binding", lambda root, **kw: "4e" * 32)
+
+
+@pytest.fixture(autouse=True)
 def apple_silicon(monkeypatch):
     monkeypatch.setattr(codex_cli, "platform_supported", lambda *a, **k: True)
     monkeypatch.setattr(claude_cli, "platform_supported", lambda *a, **k: True)
@@ -427,7 +433,7 @@ def _claude_evidence(**overrides):
     data = {"kind": live.EVIDENCE_KIND, "schema": live.EVIDENCE_SCHEMA, "passed": True, "provider": "claude",
             "cli": {"version": "2.1.285 (Claude Code)", "binary_sha256": SHA},
             "gates": {name: {"passed": True} for name in live.REQUIRED_GATES},
-            "account": {"identity": IDENTITY, "slot": "4"}}
+            "account": {"identity": IDENTITY, "slot": "4"}, "host_binding": "4e" * 32}
     data.update(overrides)
     return data
 

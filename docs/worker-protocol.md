@@ -568,7 +568,8 @@ unpaused (or its state cannot be read), a job is active or a lease is held, and
 holds the worker lifecycle lock until it finishes, so `pause --off`, `enable`,
 a worker start or a pin change waits instead of reopening admission mid-check. The evidence file (mode 0600,
 under the worker directory's `live-evidence/`) holds pass/fail booleans and
-counts only, never model output or secrets; each job's folder (with its
+counts only, never model output or secrets, plus a hash binding it to this
+Mac and install (evidence from another Mac is refused when enabling); each job's folder (with its
 `result.md`) stays under the backup root's `live-check/<UTC time>/` for
 inspection. The network probes need `http://example.com/` and
 `http://1.1.1.1/` reachable from this Mac outside the sandbox (plain HTTP, so

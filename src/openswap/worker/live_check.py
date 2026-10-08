@@ -79,6 +79,7 @@ from openswap.worker.containment import (
     write_private,
 )
 from openswap.worker.leases import AccountLeaseError, AccountLeaseStore, ProviderLeases, ReleaseEvidence
+from openswap.worker import live as _live_module
 from openswap.worker.live import (
     EVIDENCE_KIND,
     EVIDENCE_SCHEMA,
@@ -1182,6 +1183,8 @@ class LiveCheck:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "host": {"macos": platform.mac_ver()[0], "machine": platform.machine()},
             "provider": self.provider,
+            # Enabling accepts this evidence only on this Mac and install.
+            "host_binding": _live_module.host_binding(self.root),
             **self._cli_evidence(pinned),
             "account": {"identity": identity, "slot": choice.number},
             "gates": {name: gate.to_dict() for name, gate in self.gates.items()},
