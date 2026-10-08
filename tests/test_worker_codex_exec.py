@@ -1116,3 +1116,22 @@ def test_a_wrong_account_that_will_not_sign_out_is_reported(tmp_path):
     with pytest.raises(live_cli.AccountPinError) as error:
         live_cli.login(tmp_path, "1", run=run, verify=pinned)
     assert error.value.code == "login_account_mismatch_still_signed_in"
+
+
+
+def test_recent_proven_runs_beyond_the_count_cap_are_pruned(tmp_path, monkeypatch):
+    import time as _time
+
+    monkeypatch.setattr(codex_exec, "RUNS_KEPT", 2)
+    sign_in(tmp_path)
+    runs = codex_exec.runs_root(tmp_path)
+    runs.mkdir(mode=0o700)
+    now = _time.time()
+    for index in range(4):
+        (runs / f"recent-{index}").mkdir()
+        summary = runs / f"recent-{index}" / "summary.json"
+        summary.write_text(json.dumps({"stop_proof": {"stopped": True}}))
+        os.utime(summary, (now - index, now - index))
+    make_adapter(tmp_path, FakeContainment(SUCCESS_SCRIPT)).start(job_record(), workspace(tmp_path), worker_epoch=1)
+    left = {entry.name for entry in runs.iterdir()}
+    assert {"recent-0", "recent-1"} <= left and not {"recent-2", "recent-3"} & left
