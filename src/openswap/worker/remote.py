@@ -22,7 +22,7 @@ from openswap.worker.journal import AdmissionError, JournalError
 from openswap.worker.models import JobState, RemoteAuthorization, SafeEventKind
 from openswap.worker.protocol import (
     AdvertisedAccount, Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, ProtocolError,
-    TERMINAL, fields, integer, timestamp, validate_url,
+    ReportedFolder, TERMINAL, fields, integer, timestamp, validate_url,
 )
 
 STATES = frozenset(state.value for state in JobState)
@@ -261,6 +261,9 @@ class RemoteClient:
         self._accounts_offered = False  # the acknowledged set was non-empty
         self._accounts_unsupported_epoch = None
         self._accounts_advertised = self.journal.accounts_advertised()
+        # Optional readiness report extension, tracked the same way.
+        self._readiness_sent = None
+        self._readiness_unsupported_epoch = None
         self.runtime.remote_launch_guard = self.launch_allowed
         self.runtime.remote_account_ref = self.requested_account_ref
 
@@ -423,6 +426,46 @@ class RemoteClient:
         except Exception:
             return
 
+    def _readiness(self, policy) -> dict:
+        """The readiness report: approved folder IDs with their labels, and the execution mode."""
+        from openswap.worker.adapter import execution_mode
+
+        folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict() for w in policy.workspaces]
+        return {"folders": folders, "execution": execution_mode(getattr(self.runtime, "adapter", None))}
+
+    def sync_readiness(self, policy=None) -> None:
+        """Send ``readiness`` after a new registration and whenever folders or the mode changed.
+
+        Like ``sync_accounts``: a local fingerprint per worker epoch, never
+        raises, retried on the next pass, and a 404 (``unsupported_version``
+        or a legacy ``not_found``) stops it until the next registration.
+        """
+        try:
+            epoch = self.worker_epoch
+            if epoch is None or self._readiness_unsupported_epoch == epoch:
+                return
+            policy = policy or load_worker_settings(self.runtime.backup_root)
+            body = self._readiness(policy)
+            fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+            if self._readiness_sent == (epoch, fingerprint):
+                return
+            try:
+                response = self.transport.request("readiness", {"worker_epoch": epoch, **body})
+            except ProtocolError as exc:
+                if exc.status == 404 and exc.code in {"unsupported_version", "not_found"}:
+                    self._readiness_unsupported_epoch = epoch
+                elif exc.code in {"revoked", "unauthorized", "device_expired"}:
+                    self._connectivity(exc)
+                return
+            try:
+                if integer(fields(response, {"folder_count"})["folder_count"]) != len(body["folders"]):
+                    return  # malformed acknowledgement: resend on the next pass
+            except ProtocolError:
+                return
+            self._readiness_sent = (epoch, fingerprint)
+        except Exception:
+            return
+
     def accounts_offered(self) -> bool:
         """Whether the service acknowledged a non-empty account set for this registration."""
         sent = self._accounts_sent
@@ -548,8 +591,10 @@ class RemoteClient:
         with self._lock:
             if self.state != "online" or self.worker_epoch is None or policy.control_service_url != self.url:
                 return
-        # Optional account choice: bounded, never raises, never blocks claims.
+        # Optional account choice and readiness report: bounded, never raise,
+        # never block claims.
         self.sync_accounts(policy)
+        self.sync_readiness(policy)
         try:
             for binding in self.journal.pending():
                 self._sync(binding)

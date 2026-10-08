@@ -675,6 +675,31 @@ def run(switcher, codex=None) -> int:
                 snapshot.pop("account_picker", None)
             return snapshot
 
+        def _run_guided_setup(self):
+            """Set up Remote tasks…: the steps of `openswap worker pair`, in dialogs.
+
+            Pair from the pasted pairing command when this Mac is not paired,
+            then start the worker, confirm the account, approve a research
+            folder and show the summary, through the same functions as the
+            CLI. Each step is a short local call between modal dialogs (the
+            pairing request is bounded by the protocol's 5-second timeout).
+            """
+            if self._worker_operation is not None:
+                return
+            from openswap.settings import load_worker_settings
+            from openswap.worker import guided_setup
+
+            root = self.switcher.backup_dir
+            ui = guided_setup.DialogPrompts(self._alert, self._prompt)
+            try:
+                paired = load_worker_settings(root).control_service_url is not None
+                if paired or guided_setup.pair_interactively(root, ui):
+                    guided_setup.run(root, ui)
+            except Exception:
+                ui.say("Setup stopped unexpectedly. Run `openswap worker setup` in Terminal to finish.")
+            ui.flush()
+            self._worker_view_active()
+
         def _worker_action(self, row_id, value):
             if self._worker_operation is not None:
                 return
@@ -1490,7 +1515,9 @@ def run(switcher, codex=None) -> int:
         def _on_setting(self, row_id, value):
             if row_id == "remote_tasks_web_choice" and not value:
                 return  # the summary item: nothing to toggle
-            if row_id in {
+            if row_id == "remote_tasks_setup":
+                self._run_guided_setup()
+            elif row_id in {
                 "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_stop",
                 "remote_tasks_account", "remote_tasks_web_choice",
             }:

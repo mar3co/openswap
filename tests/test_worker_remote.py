@@ -610,8 +610,9 @@ def test_stale_worker_epoch_reports_offline_and_reregisters(remote_setup):
     assert remote.state == "offline" and remote.worker_epoch is None
     remote.tick()
     assert remote.state == "online" and remote.worker_epoch == superseded + 1
-    # A new registration re-advertises the account set before the next poll.
-    assert transport.calls[-4:-1] == ["register", "heartbeat", "accounts"]
+    # A new registration re-advertises the account set and re-sends the
+    # readiness report before the next poll.
+    assert transport.calls[-5:-1] == ["register", "heartbeat", "accounts", "readiness"]
 
 
 def test_lease_conflict_failure_reconciles_as_failed_unlaunched(remote_setup):
