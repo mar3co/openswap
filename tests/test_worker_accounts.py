@@ -360,6 +360,14 @@ def test_workspace_removal_waits_for_jobs_that_still_need_the_folder(root, tmp_p
     assert _run(root, "workspace", "remove", "research", "--json") == 1
     assert json.loads(capsys.readouterr().out)["diagnostic_code"] == "workspace_in_use"
 
+    # A claim remembered but not yet admitted (no local job yet) still holds its folder.
+    db.execute("UPDATE bindings SET done=1")
+    db.execute("INSERT INTO bindings(service,remote_id,claim) VALUES ('s','r2',?)",
+               (json.dumps({"job_id": "r2", "submission": {"workspace_id": "research"}}),))
+    db.commit()
+    assert _run(root, "workspace", "remove", "research", "--json") == 1
+    assert json.loads(capsys.readouterr().out)["diagnostic_code"] == "workspace_in_use"
+
     db.execute("UPDATE bindings SET done=1")
     db.commit()
     db.close()

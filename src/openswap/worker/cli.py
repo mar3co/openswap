@@ -358,22 +358,38 @@ def add_worker_workspace(
         return workspace
 
 
-def _unsynced_remote_job_ids(root: Path) -> tuple[str, ...]:
-    """Local job IDs whose remote results are not yet synchronized, at any service."""
+def _unsynced_remote_work(root: Path) -> tuple[tuple[str, ...], frozenset[str]]:
+    """Remote claims whose results are not yet synchronized, at any service.
+
+    Returns the local job IDs of admitted ones and the workspace IDs named by
+    claims remembered but not yet admitted (a restart admits them later).
+    """
     path = LocalJobStore(root).state_dir / "remote.sqlite3"
     if not path.exists():
-        return ()
+        return (), frozenset()
     if path.is_symlink():
         raise ValueError("unsafe remote journal")
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
     try:
         exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bindings'").fetchone()
         if exists is None:
-            return ()
-        rows = db.execute("SELECT local_id FROM bindings WHERE done=0 AND local_id IS NOT NULL").fetchall()
-        return tuple(row[0] for row in rows)
+            return (), frozenset()
+        rows = db.execute("SELECT local_id, claim FROM bindings WHERE done=0").fetchall()
     finally:
         db.close()
+    local_ids, workspaces = [], set()
+    for local_id, claim in rows:
+        if local_id is not None:
+            local_ids.append(local_id)
+            continue
+        try:
+            workspace = json.loads(claim)["submission"]["workspace_id"]
+        except (ValueError, TypeError, KeyError):
+            raise ValueError("unreadable remote claim") from None
+        if not isinstance(workspace, str):
+            raise ValueError("unreadable remote claim")
+        workspaces.add(workspace)
+    return tuple(local_ids), frozenset(workspaces)
 
 
 def remove_worker_workspace(backup_root: Path, workspace_id: str) -> None:
@@ -396,7 +412,8 @@ def remove_worker_workspace(backup_root: Path, workspace_id: str) -> None:
         # that resolves the folder in the moment before this write still runs
         # there; its upload then needs the ID added back to the same folder.)
         try:
-            in_use = LocalJobStore(root).workspace_in_use(workspace_id, _unsynced_remote_job_ids(root))
+            unsynced, unadmitted = _unsynced_remote_work(root)
+            in_use = workspace_id in unadmitted or LocalJobStore(root).workspace_in_use(workspace_id, unsynced)
         except (OSError, sqlite3.Error, ValueError):
             raise WorkspaceError("settings_unavailable") from None
         if in_use:
