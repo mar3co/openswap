@@ -1400,3 +1400,18 @@ def test_an_opt_in_from_another_mac_or_install_never_applies(tmp_path, monkeypat
     assert containment.launches == []
     settings = json.loads((tmp_path / "settings.json").read_text())
     assert settings["worker"]["liveExecution"]["hostBinding"] == HOST
+
+
+
+def test_a_copied_opt_in_never_lends_its_accounts_to_a_new_check(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "platform_supported", lambda: True)
+    other = stable_account_identity("codex", "acct-other")
+    # An opt-in restored from another Mac: same binary, other host binding, another account.
+    write_live_execution(tmp_path, LiveExecutionSettings(True, "cd" * 32, BINARY_SHA, "now", (other,), "00" * 32))
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text(json.dumps(passing_evidence()))
+    assert live.enable_live(tmp_path, evidence, pinned()).accounts == (IDENTITY,)
+    # On the same Mac, a second check adds its account to the first.
+    second = tmp_path / "second.json"
+    second.write_text(json.dumps(passing_evidence(account={"identity": other, "slot": "2"})))
+    assert live.enable_live(tmp_path, second, pinned()).accounts == (IDENTITY, other)
