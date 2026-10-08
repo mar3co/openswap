@@ -314,6 +314,9 @@ def command_matches(command: str, expected: str) -> bool:
 NETWORK_PROBE_URL = "http://example.com/"
 NETWORK_PROBE_TOKEN = "Example Domain"
 NETWORK_DENIED_EXIT_CODES = frozenset({6, 7, 28})  # curl: resolve, connect, timeout
+NETWORK_IP = "1.1.1.1"
+NETWORK_IP_PROBE_URL = f"http://{NETWORK_IP}/"
+SOCKET_DENIED_EXIT_CODES = frozenset({7, 28})  # curl: connect, timeout (no name to resolve)
 
 
 def _new_sentinel(folder: Path, tag: str, content: str) -> Path:
@@ -729,6 +732,9 @@ class LiveCheck:
             # Plain HTTP to stdout: no CA store and no output file, so a
             # failure can only be the network itself (checked by exit code).
             ("network", f"/usr/bin/curl -sS -m 10 {NETWORK_PROBE_URL}", "example.com", True),
+            # A numeric address: no DNS involved, so only a refused or timed
+            # out connection counts (a blocked resolver alone proves nothing).
+            ("network_ip", f"/usr/bin/curl -sS -m 10 {NETWORK_IP_PROBE_URL}", NETWORK_IP, True),
             ("launchd_submit", f"/bin/launchctl submit -l {escape_label} -- /bin/sleep 120", escape_label, True),
         ]
         listing = "\n".join(f"{index}. {command}" for index, (_, command, _, _) in enumerate(steps, 1))
@@ -789,6 +795,10 @@ class LiveCheck:
                             check=False, timeout=30)
         # The request must really succeed outside: a response body, not just exit 0.
         outside_ok = request.returncode == 0 and NETWORK_PROBE_TOKEN in (request.stdout or "")
+        ip_request = self._run(["/usr/bin/curl", "-sS", "-m", "10", NETWORK_IP_PROBE_URL],
+                               env=codex_env(home, self.check_root), capture_output=True, text=True,
+                               check=False, timeout=30)
+        outside_ip_ok = ip_request.returncode == 0 and bool((ip_request.stdout or "").strip())
         required_seen = all(seen[name] for name, _, _, required in steps if required)
         # The absence checks below mean something only if the job's
         # environment was actually printed: a denied or failed env proves nothing.
@@ -796,6 +806,7 @@ class LiveCheck:
             type(i["exit_code"]) is int and i["exit_code"] == 0 and "PATH=" in i["output"]
             for i in observed("/usr/bin/env"))
         network = observed("example.com")
+        network_ip = observed(NETWORK_IP)
         curl_runs = any(i["exit_code"] == 0 and "curl" in i["output"].lower()
                         for i in observed("/usr/bin/curl --version"))
         submits = observed(escape_label)
@@ -834,9 +845,12 @@ class LiveCheck:
             "curl_runs_in_sandbox": curl_runs,
             # Only a network-level failure counts (6 resolve, 7 connect, 28
             # timeout): curl failing for any other reason proves nothing.
+            "network_reachable_by_ip_outside_sandbox": outside_ip_ok,
             "shell_network_denied": outside_ok and curl_runs and bool(network) and all(
                 i["exit_code"] in NETWORK_DENIED_EXIT_CODES and NETWORK_PROBE_TOKEN not in i["output"]
                 for i in network),
+            "shell_socket_egress_denied": outside_ip_ok and curl_runs and bool(network_ip) and all(
+                i["exit_code"] in SOCKET_DENIED_EXIT_CODES for i in network_ip),
             # The submit itself must fail: a short-lived job it started could
             # be gone by the time the label is checked.
             "launchd_submit_contained": bool(submits) and not loaded and all(
