@@ -1371,3 +1371,17 @@ def test_auth_commands_run_from_the_isolated_home(tmp_path, action):
 
     getattr(live_cli, action)(tmp_path, "1", run=run, verify=pinned)
     assert cwds and all(cwd == str(home) for cwd in cwds)
+
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks")
+def test_a_root_that_no_longer_resolves_is_an_unlaunched_refusal(tmp_path):
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    adapter = make_adapter(tmp_path, containment)
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)  # a symlink loop where an approved source used to be
+    ws = ResolvedWorkspace("research", workspace(tmp_path).output_root, (loop,))
+    with pytest.raises(ProviderLaunchRefused) as error:
+        adapter.start(job_record(), ws, worker_epoch=1)
+    assert error.value.diagnostic_code == "provider_unavailable" and containment.launches == []
