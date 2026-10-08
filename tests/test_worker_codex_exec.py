@@ -1191,3 +1191,24 @@ def test_login_and_logout_refuse_while_a_managed_layer_exists(tmp_path, action):
     assert run.calls == []  # Codex never ran
     assert (home / "auth.json").exists()
     assert AccountLeaseStore(tmp_path, "codex").read_current().state == "released"
+
+
+
+@pytest.mark.parametrize("action", ["login", "logout"])
+def test_the_slot_is_resolved_under_the_codex_mutation_guard(tmp_path, monkeypatch, action):
+    _roster(tmp_path, {"1": ACCOUNT_ID})
+    original = live_cli._resolve
+    held = []
+
+    def spy(root, selector):
+        probe = live_cli.AccountLeaseStore(tmp_path, "codex")
+        try:
+            with probe.mutation_guard(timeout=0):
+                held.append(False)  # nobody held it
+        except Exception:
+            held.append(True)
+        return original(root, selector)
+
+    monkeypatch.setattr(live_cli, "_resolve", spy)
+    getattr(live_cli, action)(tmp_path, "1", run=_login_run(ACCOUNT_ID), verify=pinned)
+    assert held == [True]
