@@ -277,7 +277,16 @@ def publish_result(run_dir: Path, output_root: Path) -> bool:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size == 0 or info.st_size > MAX_RESULT_BYTES:
             return False
-        data = os.read(fd, MAX_RESULT_BYTES)
+        chunks, remaining = [], info.st_size
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                return False  # EOF before the size fstat reported
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    except OSError:
+        return False
     finally:
         os.close(fd)
     target = output_root / RESULT_FILE
@@ -311,6 +320,48 @@ def publish_result(run_dir: Path, output_root: Path) -> bool:
 def build_prompt(task: str, workspace: ResolvedWorkspace) -> str:
     sources = ", ".join(str(path) for path in workspace.readonly_sources) or "none"
     return PROMPT_PREAMBLE.format(sources=sources) + task + "\n"
+
+
+MANAGED_PREFERENCE_KEYS = ("config_toml_base64", "requirements_toml_base64")
+
+
+def managed_codex_config(home: Path, *, run=None) -> list[str]:
+    """Managed or system Codex configuration that could override ours (empty when none).
+
+    Existence only; nothing is read from these. The same layers
+    ``openswap.codex.desktop`` refuses to reason about: requirement and managed
+    files in the isolated home, ``/etc/codex``, the machine and per-user managed
+    preference files, and the managed-preference payload keys.
+    """
+    import subprocess
+
+    try:
+        import pwd
+
+        username = pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError):
+        username = Path.home().name
+    paths = (
+        home / "requirements.toml", home / "managed_config.toml",
+        Path("/etc/codex/config.toml"), Path("/etc/codex/requirements.toml"),
+        Path("/etc/codex/managed_config.toml"), Path("/etc/codex/hooks.json"),
+        Path("/Library/Managed Preferences/com.openai.codex.plist"),
+        Path("/Library/Managed Preferences") / username / "com.openai.codex.plist",
+    )
+    found = [str(path) for path in paths if os.path.lexists(path)]
+    run = run or subprocess.run
+    for key in MANAGED_PREFERENCE_KEYS:
+        try:
+            result = run(["/usr/bin/defaults", "read-type", "com.openai.codex", key],
+                         capture_output=True, text=True, check=False, timeout=10)
+        except FileNotFoundError:
+            continue  # not macOS: no preference system to consult
+        except (OSError, subprocess.SubprocessError):
+            found.append(f"defaults:{key}:unreadable")
+            continue
+        if result.returncode == 0:
+            found.append(f"defaults:{key}")
+    return found
 
 
 def classify_failure(message: str) -> str:
@@ -355,6 +406,7 @@ class CodexExecAdapter:
         containment: LaunchdContainment | None = None,
         verify=None,
         mode=None,
+        managed=None,
         monotonic=time.monotonic,
         sleep=time.sleep,
     ):
@@ -362,6 +414,7 @@ class CodexExecAdapter:
         self._containment = containment
         self._verify = verify or (lambda **kw: codex_cli.verify(self.backup_root, **kw))
         self._mode = mode or (lambda: execution_mode(self.backup_root))
+        self._managed = managed or managed_codex_config
         self._monotonic = monotonic
         self._sleep = sleep
         self._runs: dict[int, _Run] = {}
@@ -429,6 +482,9 @@ class CodexExecAdapter:
             # Not signed in, or signed in to a different account than the
             # leased one: never run on whatever is there.
             raise ProviderLaunchRefused("provider_auth_unavailable")
+        if self._managed(home):
+            # A managed or system layer could override the research profile.
+            raise ProviderLaunchRefused("provider_unavailable")
         output_root = Path(workspace.output_root)
         private = (self.backup_root / "worker").resolve()
         granted = [output_root.resolve(), *(Path(p).resolve() for p in workspace.readonly_sources)]

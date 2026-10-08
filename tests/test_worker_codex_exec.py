@@ -122,7 +122,7 @@ SUCCESS_SCRIPT = [
 def make_adapter(tmp_path, containment, *, mode="live"):
     return CodexExecAdapter(
         tmp_path, containment=containment, verify=lambda **kw: pinned(),
-        mode=lambda: mode, sleep=lambda s: None,
+        mode=lambda: mode, sleep=lambda s: None, managed=lambda home: [],
     )
 
 
@@ -474,7 +474,8 @@ def test_execution_mode_hook(tmp_path, monkeypatch):
     runtime = WorkerRuntime(tmp_path, adapter=UnavailableCodexAdapter())
     assert runtime.execution_mode() == "disabled"
     monkeypatch.setattr(live, "platform_supported", lambda: True)
-    adapter = CodexExecAdapter(tmp_path, containment=FakeContainment(), verify=lambda **kw: pinned())
+    adapter = CodexExecAdapter(tmp_path, containment=FakeContainment(), verify=lambda **kw: pinned(),
+                               managed=lambda home: [])
     runtime = WorkerRuntime(tmp_path, adapter=adapter)
     assert runtime.execution_mode() == "disabled" and adapter.execution_mode == "disabled"
     assert UnavailableCodexAdapter.execution_mode == "disabled"
@@ -868,3 +869,44 @@ def test_short_writes_are_completed(tmp_path, monkeypatch):
     assert codex_exec.publish_result(run_dir, out) is True
     monkeypatch.setattr(codex_exec.os, "write", real_write)
     assert (out / "result.md").read_text() == "abcdefghij"
+
+
+def test_a_short_read_never_publishes_a_truncated_result(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    out = tmp_path / "out"
+    run_dir.mkdir()
+    out.mkdir()
+    (run_dir / codex_exec.LAST_MESSAGE_FILE).write_text("abcdefghij")
+    real_read = os.read
+    monkeypatch.setattr(codex_exec.os, "read", lambda fd, n: real_read(fd, min(n, 3)))
+    assert codex_exec.publish_result(run_dir, out) is True
+    monkeypatch.setattr(codex_exec.os, "read", real_read)
+    assert (out / "result.md").read_text() == "abcdefghij"
+    (out / "result.md").unlink()
+    reads = iter([b"abc", b""])
+    monkeypatch.setattr(codex_exec.os, "read", lambda fd, n: next(reads))
+    assert codex_exec.publish_result(run_dir, out) is False
+    monkeypatch.setattr(codex_exec.os, "read", real_read)
+    assert not (out / "result.md").exists()
+
+
+def test_managed_configuration_is_detected_and_refuses_launch(tmp_path):
+    home = codex_exec.prepare_home(tmp_path, IDENTITY)
+    absent = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "")  # noqa: E731
+    present = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "string", "")  # noqa: E731
+    assert codex_exec.managed_codex_config(home, run=absent) == [] or all(
+        not p.startswith(str(home)) and not p.startswith("defaults:")
+        for p in codex_exec.managed_codex_config(home, run=absent))
+    (home / "requirements.toml").write_text("")
+    found = codex_exec.managed_codex_config(home, run=absent)
+    assert str(home / "requirements.toml") in found
+    assert "defaults:config_toml_base64" in codex_exec.managed_codex_config(home, run=present)
+
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    adapter = CodexExecAdapter(tmp_path, containment=containment, verify=lambda **kw: pinned(),
+                               mode=lambda: "live", managed=lambda h: ["/etc/codex/config.toml"])
+    with pytest.raises(ProviderLaunchRefused) as error:
+        adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    assert error.value.diagnostic_code == "provider_unavailable"
+    assert containment.launches == []
