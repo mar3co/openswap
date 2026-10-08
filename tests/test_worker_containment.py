@@ -697,12 +697,35 @@ def test_the_wrapper_environment_is_fixed_and_the_provider_gets_its_own(tmp_path
 def test_a_wrapper_that_gave_up_before_go_is_unlaunched(tmp_path):
     containment, procs, launchd = make(tmp_path)
     launchd.ack = False
-    original = containment.leader_alive
-    containment.leader_alive = lambda handle: False  # exited 125 before seeing go
+    procs.is_dead = lambda pid: True  # exited 125 before seeing go
     with pytest.raises(ContainmentError) as error:
         launch(containment, private_dir(tmp_path))
-    containment.leader_alive = original
     assert error.value.code == "job_release_expired" and error.value.launched is False
+
+
+def test_an_unreadable_leader_is_never_taken_for_an_exit(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    launchd.ack = False
+    containment.leader_alive = lambda handle: False  # unreadable, not confirmed dead
+    with pytest.raises(ContainmentError) as error:
+        launch(containment, private_dir(tmp_path))
+    assert error.value.launched is True
+
+
+def test_two_launches_cannot_share_a_run_directory(tmp_path):
+    from openswap.locking import FileLock
+
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    holder = FileLock(tmp_path / "locks" / f"rundir-{c._run_dir_key(root / 'shared')}.lock", timeout=0)
+    assert holder.acquire(timeout=0)
+    try:
+        with pytest.raises(ContainmentError) as error:
+            containment.launch(job_id="b" * 32, run_dir=root / "shared", argv=["/bin/echo"], env={},
+                               cwd=root, stdin_text="")
+    finally:
+        holder.release()
+    assert error.value.code == "run_dir_in_use" and error.value.launched is False
 
 
 def test_an_unacknowledged_release_is_uncertain(tmp_path):
