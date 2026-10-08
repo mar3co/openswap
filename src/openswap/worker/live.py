@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -100,7 +101,29 @@ def evidence_dir(backup_root: Path) -> Path:
     return Path(backup_root) / "worker" / "live-evidence"
 
 
-def evidence_problems(data: object, *, pinned: PinnedCodex | None = None) -> tuple[str, ...]:
+def host_binding(backup_root: Path, *, run=None) -> str | None:
+    """A stable, non-identifying binding of evidence to this Mac and this install.
+
+    SHA-256 of the hardware UUID (``IOPlatformUUID``) and the backup root's
+    real path, so evidence gathered on another Mac, or for another OpenSwap
+    install on this one, is never accepted. None when it cannot be read.
+    """
+    import subprocess
+
+    try:
+        result = (run or subprocess.run)(["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                                         capture_output=True, text=True, check=False, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r'"IOPlatformUUID"\s*=\s*"([0-9A-Fa-f-]{36})"', result.stdout or "")
+    if result.returncode != 0 or found is None:
+        return None
+    material = f"openswap-live-check:{found.group(1).upper()}:{os.path.realpath(backup_root)}"
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def evidence_problems(data: object, *, pinned: PinnedCodex | None = None,
+                      host: str | None = None) -> tuple[str, ...]:
     """Why ``data`` is not passing phase-1 evidence for this binary (empty when it is)."""
     if not isinstance(data, dict):
         return ("evidence_invalid",)
@@ -124,6 +147,10 @@ def evidence_problems(data: object, *, pinned: PinnedCodex | None = None) -> tup
         problems.append("evidence_not_passed")
     if evidence_account(data) is None:
         problems.append("evidence_account_missing")
+    if host is not None and data.get("host_binding") != host:
+        # Gathered on another Mac (or for another install): this one's
+        # sandbox, containment and managed configuration were never tested.
+        problems.append("evidence_from_another_mac")
     return tuple(dict.fromkeys(problems))
 
 
@@ -166,7 +193,10 @@ def enable_live(backup_root: Path, evidence_path: Path, pinned: PinnedCodex) -> 
     if not platform_supported():
         raise LiveModeError("unsupported_platform")
     data, digest = read_evidence(Path(evidence_path))
-    problems = evidence_problems(data, pinned=pinned)
+    host = host_binding(Path(backup_root))
+    if host is None:
+        raise LiveModeError("host_unverifiable")
+    problems = evidence_problems(data, pinned=pinned, host=host)
     if problems:
         raise LiveModeError("evidence_not_passing", problems)
     account = evidence_account(data)
