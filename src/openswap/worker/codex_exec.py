@@ -541,12 +541,19 @@ class CodexExecAdapter:
             # A managed or system layer could override the research profile.
             raise ProviderLaunchRefused("provider_unavailable")
         output_root = Path(workspace.output_root)
-        granted = [output_root.resolve(), *(Path(p).resolve() for p in workspace.readonly_sources)]
+        try:
+            granted = [output_root.resolve(strict=True),
+                       *(Path(p).resolve(strict=True) for p in workspace.readonly_sources)]
+            exists_codex_layer = os.path.lexists(output_root / ".codex")
+        except (OSError, RuntimeError):
+            # Replaced, inaccessible or looping since it was validated: nothing
+            # has been launched, so this is a plain refusal.
+            raise ProviderLaunchRefused("provider_unavailable") from None
         if any(not granted_root_allowed(self.backup_root, path) for path in granted):
             # The model would reach CODEX_HOME, run directories, leases or the
             # journal through this root.
             raise ProviderLaunchRefused("provider_unavailable")
-        if os.path.lexists(output_root / ".codex"):
+        if exists_codex_layer:
             # A project-local Codex layer in the job's working directory could
             # add MCP servers or override the research profile, and the live
             # check never measured it: refuse rather than load it.
