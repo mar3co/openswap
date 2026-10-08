@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from dataclasses import replace
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import signal
@@ -18,7 +19,7 @@ from urllib.parse import quote
 
 from openswap.settings import load_worker_settings, update_worker_settings
 from openswap.worker.accounts import codex_account_in_roster, codex_accounts
-from openswap.worker.adapter import ProviderAdapter, production_adapter
+from openswap.worker.adapter import ProviderAdapter, ProviderLaunchRefused, production_adapter
 from openswap.locking import FileLock
 from openswap.worker.journal import (
     AdmissionError,
@@ -53,6 +54,7 @@ from openswap.worker.models import (
 )
 
 HEALTH_STALE_AFTER_SECONDS = 30.0
+_WORKER_JOB_ID = re.compile(r"^[a-f0-9]{32}$")
 # After a stop arrives while the provider is still starting, how long start()
 # may take to return a handle (so the stop can be enforced with proof) before
 # the launch is abandoned as uncertain.
@@ -62,6 +64,21 @@ LOCAL_OWNER_REF = "local-user"
 
 def _unavailable_provider() -> ProviderAvailability:
     return ProviderAvailability(False, "live_adapter_disabled", None)
+
+
+def _provider_status(backup_root: Path) -> ProviderAvailability:
+    """Provider line for status: available only once the owner enabled live mode.
+
+    A pure settings read. The binary and account are re-verified by the
+    adapter before each launch, which fails that job closed if they changed.
+    """
+    from openswap.worker.live import LIVE, execution_mode
+
+    if execution_mode(backup_root) == LIVE:
+        from openswap.worker.codex_cli import CODEX_VERSION_OUTPUT
+
+        return ProviderAvailability(True, None, CODEX_VERSION_OUTPUT)
+    return _unavailable_provider()
 
 
 def _lease_is_quarantined(backup_root: Path) -> bool:
@@ -111,7 +128,7 @@ def _local_snapshot_from_store(
         paused=paused,
         process_state=process_state,
         remote_connectivity=RemoteConnectivity.DISABLED,
-        provider=_unavailable_provider(),
+        provider=_provider_status(backup_root),
         active_job=active_job,
         queue_depth=queue_depth,
         last_seen_at=last_seen_at,
@@ -232,7 +249,7 @@ def _read_local_worker_snapshot(backup_root: Path, *, now: datetime | None = Non
             paused=policy.paused,
             process_state=state,
             remote_connectivity=RemoteConnectivity.DISABLED,
-            provider=_unavailable_provider(),
+            provider=_provider_status(backup_root),
             active_job=active_job,
             queue_depth=queue_depth,
             last_seen_at=seen,
@@ -318,7 +335,7 @@ class WorkerRuntime:
     ):
         self.backup_root = Path(backup_root)
         self.store = LocalJobStore(self.backup_root, max_pending=max_pending)
-        self.adapter = adapter if adapter is not None else production_adapter()
+        self.adapter = adapter if adapter is not None else production_adapter(self.backup_root)
         self.owner_ref = owner_ref
         # A fixed identity is a test seam: it bypasses the owner's local pin
         # and its roster check. Production reads the pin for every launch.
@@ -330,6 +347,7 @@ class WorkerRuntime:
         self.worker_pid = os.getpid()
         self.worker_epoch, self.recovered_job_ids = self.store.start_epoch(self.worker_pid)
         self._quarantine_lease_for_recovered_jobs()
+        self._recover_provider_runs()
         self._admission_lock = threading.RLock()
         self._launch_lock = threading.RLock()
         # Set under _launch_lock when the final fence passes and start() is
@@ -436,6 +454,60 @@ class WorkerRuntime:
                 self.leases.mark_uncertain(lease.token(), "worker_restarted")
             except AccountLeaseError:
                 pass
+
+    def _recover_provider_runs(self) -> None:
+        """Stop what a lost worker left running, and free the lease on proof.
+
+        A job runs as its own launchd job, so a worker crash does not end it.
+        Every job this start recovered as INTERRUPTED (and the job behind a
+        still-unreleased worker lease) is handed to the adapter's ``recover``,
+        which unloads its label and sweeps its coalition. The lease is released
+        only when that returns explicit stop proof for a job the journal already
+        shows terminal; otherwise it stays quarantined for ``worker lease
+        release``. Nothing is ever relaunched.
+        """
+        recover = getattr(self.adapter, "recover", None)
+        if recover is None:
+            return
+        try:
+            lease = self.leases.current()
+        except AccountLeaseError:
+            lease = None
+        job_ids = set(self.recovered_job_ids)
+        lease_job = None
+        if (lease is not None and lease.state in {"active", "uncertain"}
+                and _WORKER_JOB_ID.fullmatch(lease.job_id)):
+            lease_job = lease.job_id
+            job_ids.add(lease_job)
+        terminal = {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED,
+                    JobState.INTERRUPTED, JobState.EXPIRED}
+        for job_id in sorted(job_ids):
+            try:
+                result = recover(job_id)
+            except Exception:
+                continue
+            if (job_id != lease_job or not isinstance(result, InterruptResult)
+                    or result.execution_stopped is not True):
+                continue
+            try:
+                if self.store.get(job_id).state not in terminal:
+                    continue
+                self.leases.release(lease.token(), ReleaseEvidence.CONFIRMED_STOPPED)
+            except (AccountLeaseError, KeyError, RuntimeError):
+                continue
+
+    def execution_mode(self) -> str:
+        """``"live"`` when this worker would run real provider jobs, else ``"disabled"``.
+
+        The single hook a control-service report should use. It is "live" only
+        for the live-capable production adapter with the owner's explicit
+        opt-in recorded (see :mod:`openswap.worker.live`).
+        """
+        if not getattr(self.adapter, "live_capable", False):
+            return "disabled"
+        from openswap.worker.live import execution_mode
+
+        return execution_mode(self.backup_root)
 
     def submit(self, submission: JobSubmission, *, job_id: str | None = None, remote: bool = False) -> JobRecord:
         """Admit a job; ``job_id`` lets a caller publish the ID before the row exists.
@@ -849,7 +921,9 @@ class WorkerRuntime:
                 and not isinstance(run, ProviderRun)
             ):
                 raise RuntimeError("invalid_provider_run")
-        except Exception:
+        except Exception as error:
+            if isinstance(error, ProviderLaunchRefused):
+                return self._finish_refused(starting, token, error.diagnostic_code)
             self.leases.mark_uncertain(token, "launch_uncertain")
             self._clear_active()
             with self._launch_lock:
@@ -932,6 +1006,27 @@ class WorkerRuntime:
             ):
                 return "unpaired"
         return None
+
+    def _finish_refused(self, starting: JobRecord, token, diagnostic: str) -> JobRecord:
+        """Record a launch the adapter refused before anything ran."""
+        self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
+        self._clear_active()
+        try:
+            validate_event_fields(
+                kind=SafeEventKind.DIAGNOSTIC, state=None, diagnostic_code=diagnostic,
+                execution_stopped=False,
+            )
+        except ValueError:
+            diagnostic = "provider_unavailable"
+        with self._launch_lock:
+            latest = self.store.get(starting.job_id)
+            if latest.state == JobState.CANCEL_REQUESTED:
+                return self._cancel_before_launch(latest)
+            return self.store.transition(
+                latest.job_id, expected_states=(JobState.STARTING,),
+                new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
+                expected_generation=latest.generation, diagnostic_code=diagnostic,
+            )
 
     def _finish_unlaunched(self, starting: JobRecord, token, reason: str) -> JobRecord:
         """Record a launch the start thread declined: nothing was started."""

@@ -507,6 +507,73 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
     )
 
 
+@dataclass(frozen=True)
+class LiveExecutionSettings:
+    """The owner's explicit opt-in to run real provider jobs (default off).
+
+    Bound to the passing live-check evidence it was enabled from (its
+    SHA-256) and to the pinned Codex binary that evidence measured, so a
+    different binary is never run under an old opt-in. Read leniently: any
+    malformed value reads as disabled and leaves the rest of the worker
+    policy alone.
+    """
+
+    enabled: bool = False
+    evidence_sha256: str | None = None
+    codex_sha256: str | None = None
+    enabled_at: str | None = None
+
+
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _live_from_raw(raw: dict) -> LiveExecutionSettings:
+    section = raw.get("worker")
+    live = section.get("liveExecution") if isinstance(section, dict) else None
+    if not isinstance(live, dict) or live.get("enabled") is not True:
+        return LiveExecutionSettings()
+    evidence = live.get("evidenceSha256")
+    codex = live.get("codexSha256")
+    enabled_at = live.get("enabledAt")
+    if (not isinstance(evidence, str) or not _HEX64_RE.fullmatch(evidence)
+            or not isinstance(codex, str) or not _HEX64_RE.fullmatch(codex)
+            or not isinstance(enabled_at, str) or len(enabled_at) > 64):
+        _logger.warning("settings.json live execution opt-in is invalid; live execution stays off")
+        return LiveExecutionSettings()
+    return LiveExecutionSettings(True, evidence, codex, enabled_at)
+
+
+def load_live_execution(backup_root: Path) -> LiveExecutionSettings:
+    """Read the live-execution opt-in without creating files."""
+    return _live_from_raw(_read_raw(settings_path(Path(backup_root))))
+
+
+def write_live_execution(backup_root: Path, value: LiveExecutionSettings) -> LiveExecutionSettings:
+    """Atomically set (or clear, with a disabled value) the live-execution opt-in."""
+    if not isinstance(value, LiveExecutionSettings):
+        raise ValueError("live execution settings are required")
+    path = settings_path(Path(backup_root))
+    with _settings_write_lock(Path(backup_root)):
+        raw = _read_raw_for_write(path)
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        section = raw.get("worker")
+        if not isinstance(section, dict):
+            section = {}
+        if value.enabled:
+            section["liveExecution"] = {
+                "enabled": True, "evidenceSha256": value.evidence_sha256,
+                "codexSha256": value.codex_sha256, "enabledAt": value.enabled_at,
+            }
+        else:
+            section.pop("liveExecution", None)
+        raw["worker"] = section
+        parsed = _live_from_raw(raw)
+        if parsed != (value if value.enabled else LiveExecutionSettings()):
+            raise ValueError("live execution settings failed validation")
+        atomic_write_json(path, raw)
+        return parsed
+
+
 def load_worker_settings(backup_root: Path) -> WorkerSettings:
     """Read default-off worker policy without creating directories or files."""
     return _worker_from_raw(_read_raw(settings_path(backup_root)), Path(backup_root))
