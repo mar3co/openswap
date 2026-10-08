@@ -879,6 +879,8 @@ class LaunchdContainment:
         never = not handle.released and not (handle.run_dir / GO_FILE).exists()
         return StopProof(never and loaded is False, loaded, 0, killed, never_released=never)
 
+    RECOVER_LOCK_WAIT = 30.0  # longer than a launch holds the run directory
+
     def recover(self, run_dir: Path) -> StopProof | None:
         """Stop whatever a lost worker left behind; None when nothing was launched.
 
@@ -886,8 +888,21 @@ class LaunchdContainment:
         both exist and disagree, nothing is trusted and nothing is touched.
         """
         run_dir = canonical_dir(run_dir)
-        primary = load_handle(run_dir)
-        mirror = self._load_mirror(run_dir)
+        # A launch into this directory holds its lock until the handle is
+        # complete (coalition recorded, provider released or not): read the
+        # handles only after it, never a snapshot taken mid-launch.
+        try:
+            dir_lock = self._run_dir_lock(run_dir, self.RECOVER_LOCK_WAIT)
+            held = dir_lock.acquire(timeout=self.RECOVER_LOCK_WAIT)
+        except (OSError, ContainmentError):
+            held = False
+        if not held:
+            return StopProof(False, None, 0)
+        try:
+            primary = load_handle(run_dir)
+            mirror = self._load_mirror(run_dir)
+        finally:
+            dir_lock.release()
         if primary is None and mirror is None:
             return None
         handle = reconcile_handles(primary, mirror)
