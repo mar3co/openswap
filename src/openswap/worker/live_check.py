@@ -311,6 +311,15 @@ def command_matches(command: str, expected: str) -> bool:
     return len(inner) == 1 and inner[0].strip() == want
 
 
+def lease_release_hint(lease) -> str:
+    """The refusal text for a held lease, naming the store it is in."""
+    provider = str(getattr(lease, "account_identity", "") or "").split(":", 1)[0]
+    flag = " --provider claude" if provider == "claude" else ""
+    name = "A Claude" if provider == "claude" else "A Codex"
+    return (f"{name} account lease is held. Resolve it first "
+            f"(`openswap worker lease release{flag}`).")
+
+
 def _new_sentinel(folder: Path, tag: str, content: str) -> Path:
     """Create a uniquely named 0600 file in ``folder``, never touching an existing one."""
     path = Path(folder) / f"openswap-live-check-{tag}-{secrets.token_hex(8)}.txt"
@@ -531,8 +540,7 @@ class LiveCheck:
                                                  "(reopen with `--off`).")
         lease = self.leases.read_current()
         if lease is not None and lease.state != "released":
-            raise CheckRefused("lease_held", "A Codex account lease is held. Resolve it first "
-                                             "(`openswap worker lease release`).")
+            raise CheckRefused("lease_held", lease_release_hint(lease))
         try:
             pinned = self._verify(check_version=True)
         except codex_cli.CodexCliError as error:

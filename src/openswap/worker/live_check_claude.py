@@ -53,7 +53,9 @@ from openswap.worker.codex_cli import platform_supported
 from openswap.worker.codex_exec import runs_root
 from openswap.worker.containment import STDERR_FILE, STDOUT_FILE, load_handle, write_private
 from openswap.worker.leases import ReleaseEvidence
-from openswap.worker.live_check import CheckRefused, LiveCheck, _new_sentinel, _texts, login_snapshot
+from openswap.worker.live_check import (
+    CheckRefused, LiveCheck, _new_sentinel, _texts, lease_release_hint, login_snapshot,
+)
 
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell"})
 LONG_TASK = (
@@ -143,8 +145,7 @@ class ClaudeLiveCheck(LiveCheck):
                                                  "(reopen with `--off`).")
         lease = self.leases.read_current()
         if lease is not None and lease.state != "released":
-            raise CheckRefused("lease_held", "An account lease is held. Resolve it first "
-                                             "(`openswap worker lease release`).")
+            raise CheckRefused("lease_held", lease_release_hint(lease))
         try:
             pinned = self._verify(check_version=True)
         except claude_cli.ClaudeCliError as error:

@@ -760,3 +760,19 @@ def test_the_built_in_research_area_stays_grantable(tmp_path):
     assert adapter._grant_allowed(root / "worker" / "research" / "x") is True
     assert adapter._grant_allowed(root / "live-check" / "t" / "sandbox") is True
     assert adapter._grant_allowed(root / "sessions" / "4-carol") is False
+
+
+
+def test_a_held_claude_lease_points_at_the_claude_store(tmp_path):
+    from openswap.worker.live_check_claude import ClaudeLiveCheck
+
+    root = setup_root(tmp_path)
+    configure_worker_local_policy(root, pinned_account_ref=IDENTITY,
+                                  workspaces=(WorkerWorkspace("research", (root / "research").resolve()),))
+    AccountLeaseStore(root, "claude").acquire(job_id="b" * 32, account_identity=IDENTITY, worker_pid=os.getpid(),
+                                              worker_epoch=1, ttl_s=60)
+    check = ClaudeLiveCheck(root, out=lambda *a: None, home=tmp_path / "home", verify=lambda **kw: pinned())
+    with pytest.raises(live_check.CheckRefused) as error:
+        check.run()
+    assert error.value.code == "lease_held"
+    assert "`openswap worker lease release --provider claude`" in str(error.value)
