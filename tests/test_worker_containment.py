@@ -1175,3 +1175,86 @@ def test_a_clock_step_during_a_scan_makes_it_incomplete(tmp_path):
     containment._wall = lambda: next(times)
     scan = containment._scan(JOB_COALITION)
     assert scan.get(0) == "gone" and containment._complete(scan, scan) is False
+
+
+def test_a_member_resumed_during_the_kills_is_refrozen_before_any_proof(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    parent = procs.new(JOB_COALITION)
+    child = procs.new(JOB_COALITION)
+    original = procs.signal
+    state = {"resumed": False}
+
+    def signal_(pid, signum):
+        original(pid, signum)
+        if pid == parent and signum == signal.SIGKILL and not state["resumed"]:
+            # Killing the parent orphans the child's stopped process group:
+            # SIGHUP (ignored) and SIGCONT resume it, and it forks while running.
+            state["resumed"] = True
+            procs.table[child][1] = 2
+            procs.spawn_on_scan = 2
+
+    procs.signal = signal_
+    freezes = []
+    real_freeze = containment._freeze
+
+    def counting_freeze(coalition_id, **kwargs):
+        freezes.append(coalition_id)
+        return real_freeze(coalition_id, **kwargs)
+
+    containment._freeze = counting_freeze
+    proof = containment.stop(handle)
+    assert state["resumed"] is True
+    assert proof.stopped is True and containment.members(handle) == []
+    assert not any(cid == JOB_COALITION for cid, _ in procs.table.values())
+    # The resumed child was stopped again (a new freeze) before it was killed.
+    after = procs.signals[procs.signals.index((parent, signal.SIGKILL)) + 1:]
+    assert after.index((child, signal.SIGSTOP)) < after.index((child, signal.SIGKILL))
+    assert len(freezes) >= 3  # the first sweep froze twice, plus the sweep after bootout
+
+
+def test_kill_phase_drops_a_freeze_when_a_member_runs_again(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    member = procs.new(JOB_COALITION, status=2)
+    assert containment._kill_frozen(JOB_COALITION, deadline=1e9, known=set(), killed=set(),
+                                    frozen=True) is None
+    assert (member, signal.SIGSTOP) in procs.signals and (member, signal.SIGKILL) not in procs.signals
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or os.environ.get("OPENSWAP_LAUNCHD_TESTS") != "1",
+    reason="real launchd containment; set OPENSWAP_LAUNCHD_TESTS=1 on a Mac",
+)
+def test_real_launchd_contains_a_sighup_ignoring_child_of_an_orphaned_group(tmp_path):
+    root = tmp_path / "runs"
+    root.mkdir(mode=0o700)
+    started = tmp_path / "started"
+    # The child gets its own process group under the job's leader, ignores
+    # SIGHUP and keeps forking: killing the parent orphans that stopped group,
+    # so macOS sends it SIGHUP and SIGCONT and it runs (and forks) again.
+    script = (
+        "use POSIX;"
+        "if (fork()==0) { setpgid(0,0); $SIG{HUP}='IGNORE';"
+        " while (1) { if (fork()==0) { exec '/bin/sleep','293'; } select(undef,undef,undef,0.02); } }"
+        f"open(my $f, '>', '{started}'); close $f; sleep 300;"
+    )
+    containment = LaunchdContainment()
+    handle = containment.launch(
+        job_id=uuid.uuid4().hex, run_dir=root / "job", argv=["/usr/bin/perl", "-e", script],
+        env={"PATH": "/usr/bin:/bin"}, cwd=tmp_path, stdin_text="",
+    )
+    try:
+        for _ in range(200):
+            if started.exists():
+                break
+            time.sleep(0.05)
+        time.sleep(0.3)  # let the child fork a few sleeps
+        assert len(containment.members(handle)) >= 3
+        proof = containment.stop(handle)
+        assert proof.stopped is True
+        assert containment.members(handle) == []
+        left = subprocess.run(["/usr/bin/pgrep", "-f", "sleep 293"], capture_output=True, text=True)
+        assert left.stdout.strip() == ""
+    finally:
+        containment.stop(handle)
+        subprocess.run(["/usr/bin/pkill", "-f", "sleep 293"], capture_output=True)
