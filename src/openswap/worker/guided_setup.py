@@ -39,6 +39,9 @@ class Prompts(Protocol):
     def ask(self, question: str, *, default: str = "") -> str | None:
         """Free text, stripped; ``None`` when the owner gave no answer."""
 
+    def choose_folder(self, question: str) -> str | None:
+        """A folder path; "" or ``None`` when the owner is done choosing."""
+
 
 def _section(ui, title: str) -> None:
     section = getattr(ui, "section", None)
@@ -87,6 +90,13 @@ class TerminalPrompts:
         if answer is None:
             return None
         return answer.strip() or default
+
+    def choose_folder(self, question: str) -> str | None:
+        if self.read_line is not None:
+            return self.ask(question)
+        from openswap.folder_picker import pick_folder
+
+        return pick_folder(f"{question}: ")
 
 
 # Copy shared by the steps and their fallbacks.
@@ -330,7 +340,7 @@ def approve_folders(root: Path, ui: Prompts) -> None:
     else:
         _say_folders(ui, policy.workspaces)
     for _extra in range(_MAX_EXTRA_FOLDERS):
-        answer = ui.ask("Another folder to approve (path; Enter to finish)")
+        answer = ui.choose_folder("Another folder to approve (path; Enter to finish)")
         if not answer:
             return
         try:
@@ -529,8 +539,11 @@ class DialogPrompts:
 
     interactive = True
 
-    def __init__(self, alert, prompt, title: str = "Set up Remote tasks"):
+    def __init__(self, alert, prompt, title: str = "Set up Remote tasks", *, choose_folder=None):
         self._alert, self._prompt, self.title = alert, prompt, title
+        # ``choose_folder(title=, message=)`` opens the native folder chooser and
+        # returns a path or None; without one, folders are typed into a prompt.
+        self._choose_folder = choose_folder
         self._lines: list[str] = []
 
     def say(self, text: str) -> None:
@@ -554,6 +567,11 @@ class DialogPrompts:
         if getattr(response, "clicked", 0) != 1:
             return None
         return str(getattr(response, "text", "")).strip() or default
+
+    def choose_folder(self, question: str) -> str | None:
+        if self._choose_folder is None:
+            return self.ask(question)
+        return self._choose_folder(title=self.title, message=self._message(question))
 
     def flush(self) -> None:
         if self._lines:
@@ -604,6 +622,9 @@ class ThreadedPrompts:
 
     def ask(self, question: str, *, default: str = "") -> str | None:
         return self._call("ask", question, default=default)
+
+    def choose_folder(self, question: str) -> str | None:
+        return self._call("choose_folder", question)
 
     def flush(self) -> None:
         self._call("flush")
