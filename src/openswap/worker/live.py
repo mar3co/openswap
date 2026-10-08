@@ -94,7 +94,24 @@ def execution_mode(backup_root: Path) -> str:
         live = load_live_execution(Path(backup_root))
     except Exception:
         return DISABLED
-    return LIVE if live.enabled and platform_supported() else DISABLED
+    if not live.enabled or not platform_supported():
+        return DISABLED
+    # An opt-in restored or copied from another Mac or install never applies.
+    return LIVE if live.host_binding == current_host_binding(backup_root) else DISABLED
+
+
+_HOST_CACHE: dict = {}
+
+
+def current_host_binding(backup_root: Path) -> str | None:
+    """:func:`host_binding` for this process, cached (it does not change while running)."""
+    key = (id(host_binding), os.path.realpath(backup_root))
+    if key not in _HOST_CACHE:
+        value = host_binding(Path(backup_root))
+        if value is None:
+            return None  # not cached: try again next time
+        _HOST_CACHE[key] = value
+    return _HOST_CACHE[key]
 
 
 def evidence_dir(backup_root: Path) -> Path:
@@ -207,7 +224,7 @@ def enable_live(backup_root: Path, evidence_path: Path, pinned: PinnedCodex) -> 
         return write_live_execution(Path(backup_root), LiveExecutionSettings(
             enabled=True, evidence_sha256=digest, codex_sha256=pinned.binary_sha256,
             enabled_at=datetime.now(timezone.utc).isoformat(),
-            accounts=tuple(dict.fromkeys((*accounts, account))),
+            accounts=tuple(dict.fromkeys((*accounts, account))), host_binding=host,
         ))
 
 

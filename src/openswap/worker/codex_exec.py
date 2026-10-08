@@ -58,7 +58,7 @@ from openswap.worker.containment import (
     write_private,
 )
 from openswap.worker.leases import LeaseStateError, stable_account_identity
-from openswap.worker.live import LIVE, LiveModeError, execution_mode, live_lock
+from openswap.worker.live import LIVE, LiveModeError, current_host_binding, execution_mode, live_lock
 from openswap.worker.models import (
     InterruptResult,
     JobRecord,
@@ -480,7 +480,8 @@ class CodexExecAdapter:
         # binary it was recorded for (an unreadable or replaced settings file
         # reads as disabled, with no binding).
         binding = load_live_execution(self.backup_root)
-        if not binding.enabled or binding.codex_sha256 is None or pinned.binary_sha256 != binding.codex_sha256:
+        if (not binding.enabled or binding.codex_sha256 is None or pinned.binary_sha256 != binding.codex_sha256
+                or binding.host_binding != current_host_binding(self.backup_root)):
             raise codex_cli.CodexCliError("binary_not_the_checked_one")
         return pinned
 
@@ -536,11 +537,12 @@ class CodexExecAdapter:
             granted = [output_root.resolve(strict=True),
                        *(Path(p).resolve(strict=True) for p in workspace.readonly_sources)]
             exists_codex_layer = os.path.lexists(output_root / ".codex")
+            grants_ok = all(granted_root_allowed(self.backup_root, path) for path in granted)
         except (OSError, RuntimeError):
             # Replaced, inaccessible or looping since it was validated: nothing
             # has been launched, so this is a plain refusal.
             raise ProviderLaunchRefused("provider_unavailable") from None
-        if any(not granted_root_allowed(self.backup_root, path) for path in granted):
+        if not grants_ok:
             # The model would reach CODEX_HOME, run directories, leases or the
             # journal through this root.
             raise ProviderLaunchRefused("provider_unavailable")
