@@ -1130,3 +1130,26 @@ def test_the_mirror_is_found_by_another_spelling_after_the_directory_is_gone(tmp
 
 def test_directories_differing_only_in_case_never_share_a_key():
     assert c._run_dir_key(Path("/runs/Job")) != c._run_dir_key(Path("/runs/job"))
+
+
+
+def test_a_mixed_case_run_directory_name_never_launches(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    with pytest.raises(ContainmentError) as error:
+        containment.launch(job_id="a" * 32, run_dir=root / "Job", argv=["/bin/echo"], env={}, cwd=root,
+                           stdin_text="")
+    assert error.value.code == "run_dir_unsafe" and launchd.loaded == {}
+
+
+def test_a_deleted_run_directory_is_found_from_an_uppercase_spelling(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    import shutil
+
+    shutil.rmtree(handle.run_dir)
+    upper = handle.run_dir.parent / handle.run_dir.name.upper()
+    if not c._case_insensitive(str(handle.run_dir.parent)):
+        pytest.skip("case-sensitive file system")
+    assert c.canonical_dir(upper) == handle.run_dir
+    assert containment.recover(upper) is not None
