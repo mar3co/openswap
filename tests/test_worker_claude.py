@@ -753,6 +753,22 @@ def test_the_built_in_research_area_stays_grantable(tmp_path):
     assert adapter._grant_allowed(root / "sessions" / "4-carol") is False
 
 
+def test_claude_never_grants_a_hidden_folder_in_another_case(tmp_path):
+    from tests.test_pathid import case_insensitive
+
+    if not case_insensitive(tmp_path):
+        pytest.skip("the temp filesystem is case-sensitive")
+    root = setup_root(tmp_path)
+    home = root.parent / "home"
+    for name in (".claude", ".codex"):
+        (home / name).mkdir(parents=True, exist_ok=True)
+    adapter = make_adapter(root, FakeLaunch(SUCCESS), home=home)
+    assert adapter._grant_allowed(home / ".CLAUDE") is False
+    assert adapter._grant_allowed(home / ".Codex" / "sessions") is False
+    assert adapter._grant_allowed(root.parent / root.name.upper() / "sessions") is False
+    assert adapter._grant_allowed(root.parent / "HOME") is False
+
+
 
 def test_a_held_claude_lease_points_at_the_claude_store(tmp_path):
     from openswap.worker.live_check_claude import ClaudeLiveCheck

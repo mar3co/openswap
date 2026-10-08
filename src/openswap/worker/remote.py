@@ -30,6 +30,10 @@ STATES = frozenset(state.value for state in JobState)
 MAX_CANCEL_IDS = 100
 # Reserved by the protocol: v1 has no approval/resume operation, so it fails closed.
 APPROVAL = "waiting_for_approval"
+# Local diagnostics the protocol does not list, and the listed code each is
+# sent as: the service's diagnostic list is closed. `worker status` and the
+# local journal keep the specific code.
+WIRE_DIAGNOSTICS = {"workspace_refused": "provider_unavailable"}
 # Validation failures the service (or the local export check) reports for one
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
@@ -217,6 +221,22 @@ class RemoteJournal:
             names = list(changes)
             db.execute("UPDATE bindings SET " + ",".join(name + "=?" for name in names)
                        + " WHERE service=? AND remote_id=?", (*[changes[n] for n in names], self.service, remote_id))
+
+
+def offerable(backup_root, workspace, workspaces) -> bool:
+    """Whether to advertise ``workspace``: the worker would not refuse its jobs at launch.
+
+    A workspace that breaks the folder rules (see ``cli.workspace_refusal``)
+    is left out of the readiness report, so the service stops offering a
+    folder every job would fail in; once it is fixed the report changes and
+    is sent again. A check that fails leaves out only that workspace.
+    """
+    try:
+        from openswap.worker.cli import workspace_refusal
+
+        return workspace_refusal(backup_root, workspace, workspaces) is None
+    except Exception:
+        return False
 
 
 class RemoteClient:
@@ -430,7 +450,8 @@ class RemoteClient:
         """The readiness report: approved folder IDs with their labels, and the execution mode."""
         from openswap.worker.adapter import execution_mode
 
-        folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict() for w in policy.workspaces]
+        folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict()
+                   for w in policy.workspaces if offerable(self.runtime.backup_root, w, policy.workspaces)]
         # The pinned account's provider decides (a Claude pin reports Claude's opt-in).
         mode_of = getattr(self.runtime, "execution_mode", None)
         if callable(mode_of):
@@ -742,7 +763,9 @@ class RemoteClient:
             if self.stop_event.is_set():
                 raise ProtocolError("service_unavailable", 503)
             self._worker_request("heartbeat")
-            events = [replace(event, job_id=claim.job_id).to_dict() for event in page.events]
+            events = [replace(event, job_id=claim.job_id,
+                              diagnostic_code=WIRE_DIAGNOSTICS.get(event.diagnostic_code, event.diagnostic_code)
+                              ).to_dict() for event in page.events]
             try:
                 response = self.transport.request("events", {**self._fence(claim), "after_cursor": cursor, "events": events})
             except ProtocolError as exc:

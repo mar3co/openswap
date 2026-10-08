@@ -47,8 +47,9 @@ def _hidden_from_jobs(binary: Path, backup_root: Path | None = None) -> bool:
     except (ImportError, KeyError, AttributeError):
         home = Path.home()
     hidden = [home / ".claude", home / ".codex"] + ([Path(backup_root)] if backup_root is not None else [])
-    target = Path(os.path.realpath(binary))
-    return any(target.is_relative_to(Path(os.path.realpath(folder))) for folder in hidden)
+    from openswap import pathid
+
+    return any(pathid.inside(binary, folder) for folder in hidden)
 
 
 class ClaudeCliError(RuntimeError):

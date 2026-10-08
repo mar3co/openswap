@@ -205,7 +205,9 @@ allowed on `provider_finished`. Diagnostics: `live_adapter_disabled`,
 the size, hash, limit, conflict or export-safety checks and was skipped; the
 job outcome stands), `remote_sync_conflict` (local only: the service refused
 this job's event history with `cursor_conflict`, so the worker stopped
-syncing it; see below).
+syncing it; see below), `workspace_refused` (local only: the job's workspace
+breaks the folder rules at launch; it is uploaded as `provider_unavailable`,
+because the service's diagnostic list is closed).
 No free-form provider payloads, local paths or account/session identifiers are
 accepted. Upload with `events`, `worker_epoch`, `epoch` together; read by
 omitting all three. Upload at most 200 events; identical cursor replay is
@@ -320,7 +322,11 @@ unknown operation (404 `unsupported_version`).
 `label`. `id` is the workspace ID a submission's `workspace_id` names for that
 folder: 1–200 characters, ASCII letters, digits, `_`, `.` and `-` only (the
 reference client's IDs are narrower: 1–64 lowercase letters, digits, `_` and
-`-`). IDs are unique within the request. `label` is 1–100 characters with no
+`-`). IDs are unique within the request. The reference client leaves out a
+workspace whose jobs it would refuse at launch (`workspace_refused`, see
+[Choosing the folders tasks read](#choosing-the-folders-tasks-read)), and one
+it cannot check; the report changes, and is sent again, once that is fixed.
+`label` is 1–100 characters with no
 Unicode control characters (U+0000–U+001F or U+007F–U+009F); the owner chooses
 it, and by default it is the folder's own name. No path, read-only source,
 account, credential or usage data is reported.
@@ -457,15 +463,14 @@ runs.
    with the pin as the default, or "(1-N; Enter to skip)" without one. A
    number picks by menu position (the two providers may share slot numbers);
    an email, alias or `claude:<slot>` still works.
-3. **Approve a research folder.** While the registry is still only the
-   built-in `research` folder inside the OpenSwap backup root, it offers to
-   create `~/OpenSwap Research` (owner-only, 0700) and approve it as `research`
-   in place of the built-in one; an existing folder that others can access is
-   refused, never re-permissioned. It then offers to approve other folders: a
-   path, then an ID (suggested from the folder's name). Folders are approved
-   with `workspace add`'s own checks.
+3. **Choose the folders tasks may read.** One question: which folders remote
+   tasks may read. Tasks read them but never change them, and their results
+   are saved under `~/OpenSwap Research`; see
+   [Choosing the folders tasks read](#choosing-the-folders-tasks-read). Enter
+   takes the recommended GitHub folder (or the first folder found), or keeps
+   the current folders when some are readable already.
 4. **Summary.** A checklist (`✓`/`✗`/`•`, each with its words) of the service,
-   worker state, account, approved folders (ID and label) and the execution
+   worker state, account, readable folders (ID and label) and the execution
    mode, then either "Ready for Slack" or the numbered list of what is still
    missing, and a note that execution stays off
    (`live_adapter_disabled`) while the execution mode is `disabled`, with the
@@ -484,6 +489,92 @@ disabled or not running, human `worker status` adds "Next: paired with
 unchanged), and the menu bar's Remote tasks section shows "Paired, worker
 off" under **Enable local worker**.
 
+### Choosing the folders tasks read
+
+Most owners keep their code in one folder, so the setup step starts there. It
+looks for likely code folders in the home folder: `~/GitHub`,
+`~/Documents/GitHub`, `~/Developer`, `~/Code`, `~/Projects`, `~/src`,
+`~/repos` and `~/dev`. It keeps only existing folders that pass the read-only
+checks below, once each (a symlink to a listed folder is not listed twice).
+A folder that holds three git repos or fewer is followed by those repos, so
+the owner can offer just one. A GitHub folder (any found folder named
+GitHub) is listed first and marked "recommended"; folders already readable
+are marked `✓`:
+
+```text
+Remote tasks can read the folders you choose here, but never change them.
+Results are saved under ~/OpenSwap Research. The control service sees only each folder's ID and name, never its path.
+  • 1  ~/GitHub            (recommended)
+  • 2  ~/GitHub/openswap   (git repo)
+  • 3  ~/GitHub/opentag    (git repo)
+  • 4  ~/Projects
+Folders tasks may read (numbers like 1 3, or a path; Enter for 1) [1]:
+```
+
+The answer is one or more numbers (`1 3` or `1,3`), or one folder path (a
+path dragged into Terminal may be shell-escaped). Enter takes the default: the
+recommended GitHub folder, else the first folder found, or, when a folder is
+readable already, keeps the current ones. With nothing found it asks "Type
+the path to your code folder, for example ~/GitHub" through the terminal's
+folder search or the menu bar's native folder chooser, and Enter (or Cancel)
+skips. Choosing adds folders; it never removes one (`openswap worker workspace
+remove <id>` does). In the menu bar the list and the question are one dialog.
+A typed path that exists is used exactly as typed (apostrophes included);
+otherwise a path that starts with a quote or holds a backslash is read as one
+shell word, as Terminal writes a dragged-in path.
+
+Each chosen folder becomes a workspace of its own:
+
+- **ID:** the folder's name, lowercased, with anything other than letters,
+  digits, `-` and `_` turned into `-` (`site.io` → `site-io`), made unique
+  with `-2`, `-3`, …. It is one of the service's `[A-Za-z0-9_.-]` folder IDs.
+  The label the service shows is the folder's own name.
+- **Read-only source:** the folder itself, read by the Codex or Claude
+  sandbox and never written.
+- **Results:** `~/OpenSwap Research/<id>`, created owner-only (0700) without
+  asking, as is `~/OpenSwap Research`. The worker writes each job into its own
+  `<id>/<job_id>` folder there. An existing results folder that others can
+  access is refused, never re-permissioned.
+- **The built-in folder:** the first chosen folder replaces the built-in
+  `research` workspace in the OpenSwap backup root, unless a job may still run
+  or upload its results in it; then `research` stays beside the new one until
+  `openswap worker workspace remove research`. Without a chosen folder,
+  `research` stays as a results-only workspace.
+
+A folder may not be read if it is, or contains, the home folder; is a system
+folder (`/System`, `/Library`, `/usr`, `/etc`, `/Applications`, …) or contains
+one; is `~/Library` or a hidden folder in the home folder (or inside one),
+except a synced cloud drive there: a provider's folder in
+`~/Library/CloudStorage` (Dropbox, Google Drive, OneDrive, …) or iCloud Drive
+(`~/Library/Mobile Documents/com~apple~CloudDocs`), and the folders inside
+them, but never `CloudStorage` or `Mobile Documents` themselves, and never
+when one of those bases is a symlink (the folder's own resolved path must
+run through the real `CloudStorage` or `Mobile Documents/com~apple~CloudDocs`);
+is, contains or sits inside the OpenSwap backup root, Codex home or Claude
+config home; or overlaps `~/OpenSwap Research`. Like every read-only source it
+must be a real directory owned by the owner and not writable by group or
+others. A folder tasks read may not overlap any workspace's results folder,
+and a results folder may not overlap any folder tasks read, so no job ever
+writes where another only reads. The same policy applies to every
+`--readonly-source` of `workspace add <id> <folder>`. The worker checks both
+rules again for every job before it creates the job's folder, so settings
+saved earlier (or edited by hand) that break them still load and can be
+listed and fixed, but a job in such a workspace fails as `workspace_refused`
+and never reaches the sandbox. `openswap worker status` (and `--json`, as
+`refused_workspaces`) and the setup summary name each refused workspace ID
+and the reason. `openswap worker workspace add --read <folder>
+[--label TEXT]` makes the same workspace from the command line and prints
+(or, with `--json`, returns) it; a folder that a workspace already reads is
+left as it is.
+
+Paths are compared by their on-disk spelling and by filesystem identity
+(device and inode along the ancestors), never by the typed string: on a
+case-insensitive volume (APFS by default) `~/library` is `~/Library`, and a
+firmlink or other alias is the folder it names. Settings store the on-disk
+spelling. The same comparison guards what the Codex and Claude sandboxes may
+be granted at launch (the private worker directory, the default Claude and
+Codex homes and the backup root).
+
 ### Choosing the account and research folders
 
 Pairing never selects an account or a folder; the submission names neither.
@@ -501,6 +592,7 @@ openswap worker account allow 3 [--label "Team research"]   # allow for a per-jo
 openswap worker account label 3 "Team research"             # rename (slot, email, alias or ref)
 openswap worker account disallow 3 [--clear-default]        # withdraw (slot, email, alias or ref)
 openswap worker workspace list             # approved research folders
+openswap worker workspace add --read ~/GitHub  # tasks read ~/GitHub; results in ~/OpenSwap Research/github
 openswap worker workspace add tag-research ~/Research/opentag \
   [--readonly-source ~/src/project] [--label "Tag research"]   # label default: the folder's name
 openswap worker workspace label tag-research "Tag research"   # or --reset to the folder's name

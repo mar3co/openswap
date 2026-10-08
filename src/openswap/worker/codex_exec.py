@@ -284,12 +284,15 @@ def granted_root_allowed(backup_root: Path, path: Path) -> bool:
     it only the built-in research area (``worker/research``, the default
     workspace) is allowed; everything else there (isolated Codex homes, run
     directories, leases, the journal) stays out of the model's reach.
+    Compared by on-disk spelling and identity (``pathid``): a case variant
+    of the worker directory on a case-insensitive volume is the same folder.
     """
-    worker = (Path(backup_root) / "worker").resolve()
-    path = Path(path).resolve()
-    if worker == path or worker.is_relative_to(path):
+    from openswap import pathid
+
+    worker = pathid.canonical(Path(backup_root) / "worker")
+    if pathid.inside(worker, path):
         return False
-    return not path.is_relative_to(worker) or path.is_relative_to(worker / "research")
+    return not pathid.inside(path, worker) or pathid.inside(path, worker / "research")
 
 
 def publish_result(run_dir: Path, output_root: Path) -> bool:

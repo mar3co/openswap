@@ -1380,13 +1380,14 @@ class WorkerRuntime:
         self._active_lease = token
         try:
             workspace = self._resolve_workspace(starting.workspace_id, starting.job_id)
-        except Exception:
+        except Exception as exc:
             self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
             self._clear_active()
             return self.store.transition(
                 starting.job_id, expected_states=(JobState.STARTING,),
                 new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
-                expected_generation=starting.generation, diagnostic_code="provider_unavailable",
+                expected_generation=starting.generation,
+                diagnostic_code="workspace_refused" if isinstance(exc, WorkspaceRefused) else "provider_unavailable",
             )
         # Probe, lease and workspace setup take time: re-check expiry right
         # before launch so an expired job never starts.
@@ -1550,26 +1551,43 @@ class WorkerRuntime:
         workspace = next((item for item in settings.workspaces if item.workspace_id == workspace_id), None)
         if workspace is None:
             raise ValueError("workspace is not registered")
+        # The folder rules `workspace add` applies, checked again before any
+        # folder is created: a source saved before them (or edited into
+        # settings, or a case variant on a case-insensitive volume) never
+        # reaches the sandbox, and no job writes where another only reads.
+        from openswap.worker.cli import workspace_refusal
+
+        code = workspace_refusal(self.backup_root, workspace, settings.workspaces)
+        if code is not None:
+            raise WorkspaceRefused(_REFUSED_TEXT.get(code, "approved read-only source is not allowed"), code)
         base_root = workspace.output_root
         base_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         _raise_for_output_problem(output_dir_problem(base_root))
         output_root = base_root / job_id
         output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         _raise_for_output_problem(output_dir_problem(output_root))
-        for source in workspace.readonly_roots:
-            problem = readonly_source_problem(source)
-            if problem == "unavailable":
-                raise ValueError("approved read-only source is unavailable")
-            if problem == "unsafe":
-                raise ValueError("approved read-only source is unsafe")
-            if problem == "not_owned":
-                raise ValueError("approved read-only source is not locally owned")
-            if problem == "permissions":
-                raise ValueError("approved read-only source permissions are unsafe")
         return ResolvedWorkspace(
             workspace_id=workspace_id, output_root=output_root,
             readonly_sources=workspace.readonly_roots,
         )
+
+
+class WorkspaceRefused(ValueError):
+    """A job's workspace breaks the folder rules; the job fails as ``workspace_refused``."""
+
+    def __init__(self, message: str, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+_REFUSED_TEXT = {
+    "readonly_source_unavailable": "approved read-only source is unavailable",
+    "readonly_source_unsafe": "approved read-only source is unsafe",
+    "readonly_source_not_owned": "approved read-only source is not locally owned",
+    "readonly_source_permissions": "approved read-only source permissions are unsafe",
+    "readonly_source_overlaps_results": "approved read-only source overlaps another workspace's results",
+    "folder_overlaps_readable": "approved results folder overlaps another workspace's read-only source",
+}
 
 
 def output_dir_problem(path: Path) -> str | None:

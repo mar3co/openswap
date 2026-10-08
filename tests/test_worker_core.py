@@ -580,24 +580,30 @@ def test_group_or_world_writable_readonly_root_fails_the_job(tmp_path):
     result = runtime.reconcile_once()
 
     assert result.state == JobState.FAILED
-    assert result.diagnostic_code == "provider_unavailable"
+    # A specific local code (sent to the service as provider_unavailable), and
+    # the refusal comes before any results folder is created.
+    assert result.diagnostic_code == "workspace_refused"
     assert adapter.start_count == 0
+    assert not output.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
 @pytest.mark.parametrize("mode, accepted", [(0o755, True), (0o750, True), (0o775, False), (0o757, False)])
 def test_readonly_root_may_be_readable_but_not_writable_by_others(tmp_path, mode, accepted):
+    # The source sits outside the backup root: one inside it is never readable.
+    root = tmp_path / "backup"
+    root.mkdir(mode=0o700)
     output = tmp_path / "approved-output"
     source = tmp_path / "approved-source"
     source.mkdir()
     os.chmod(source, mode)
     account_ref = stable_account_identity("codex", "locally-pinned-reference")
     configure_worker_local_policy(
-        tmp_path,
+        root,
         pinned_account_ref=account_ref,
         workspaces=(WorkerWorkspace("research", output, (source,)),),
     )
-    runtime = WorkerRuntime(tmp_path, adapter=_FakeAdapter(), account_identity=account_ref)
+    runtime = WorkerRuntime(root, adapter=_FakeAdapter(), account_identity=account_ref)
     if accepted:
         resolved = runtime._resolve_workspace("research", "a" * 32)
         assert resolved.readonly_sources == (source,)

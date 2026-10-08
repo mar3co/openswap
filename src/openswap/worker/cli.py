@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 import json
 import re
 import sqlite3
@@ -11,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from openswap import paths, printer
+from openswap import paths, pathid, printer
 from openswap.exceptions import ClaudeSwitchError, LockError
 from openswap.locking import FileLock
 from openswap.paths import get_backup_root
@@ -400,9 +401,21 @@ def _protected_dirs(root: Path) -> list[Path]:
     out = []
     for path in (root, codex_home(), get_claude_config_home()):
         try:
-            out.append(Path(path).expanduser().resolve())
+            out.append(pathid.canonical(Path(path).expanduser()))
         except (OSError, RuntimeError):
             continue
+    return out
+
+
+def _homes() -> list[Path]:
+    out = []
+    for home in (Path.home(), home_folder()):
+        try:
+            home = pathid.canonical(Path(home).expanduser())
+        except (OSError, RuntimeError):
+            continue
+        if home not in out:
+            out.append(home)
     return out
 
 
@@ -412,25 +425,24 @@ def _overlaps_credentials(root: Path, folder: Path, *, writable: bool) -> bool:
     No approved folder may be the home directory, or contain the backup root,
     Codex home or Claude config home. A read-only source may not sit inside
     one either. A writable root may sit inside the backup root's ``worker``
-    directory only (where the default ``research`` workspace lives).
+    directory only (where the default ``research`` workspace lives). Paths
+    are compared by on-disk spelling and identity (``pathid``), so a case
+    variant on a case-insensitive volume is the same folder.
     """
     protected = _protected_dirs(root)
-    try:
-        home = Path.home().resolve()
-    except (OSError, RuntimeError):
-        home = None
-    for path in [*protected, *([home] if home else [])]:
-        if path == folder or path.is_relative_to(folder):
+    for path in [*protected, *_homes()]:
+        if pathid.inside(path, folder):
             return True
     try:
-        backup = Path(root).expanduser().resolve()
+        backup = pathid.canonical(Path(root).expanduser())
     except (OSError, RuntimeError):
         backup = None
     for path in protected:
-        if folder.is_relative_to(path):
+        if pathid.inside(folder, path):
             # Only the backup root itself has the `worker` exception: a Codex or
             # Claude home configured beneath that directory stays off limits.
-            if writable and backup is not None and path == backup and folder.is_relative_to(backup / "worker"):
+            if (writable and backup is not None and pathid.same(path, backup)
+                    and pathid.inside(folder, backup / "worker")):
                 continue
             return True
     return False
@@ -448,11 +460,32 @@ def _absolute_folder(folder: str | Path) -> Path:
 
 DEFAULT_RESEARCH_ID = "research"
 DEFAULT_RESEARCH_FOLDER_NAME = "OpenSwap Research"
+# Where people usually keep code, relative to the home folder. A GitHub folder
+# is listed (and offered) first; the rest keep this order.
+CODE_FOLDER_NAMES = ("GitHub", "Documents/GitHub", "Developer", "Code", "Projects", "src", "repos", "dev")
+# A detected folder with this many git repos or fewer also offers each repo.
+_FEW_REPOS = 3
+_MAX_SCANNED_CHILDREN = 200
+MAX_SUGGESTED_FOLDERS = 12
+# Never readable: system trees (and anything inside them), and these top
+# folders themselves or anything that contains them.
+_SYSTEM_TREES = tuple(Path(p) for p in (
+    "/System", "/Library", "/usr", "/bin", "/sbin", "/etc", "/private/etc", "/dev", "/Applications",
+    "/cores", "/Network",
+))
+_SYSTEM_TOPS = tuple(Path(p) for p in (
+    "/", "/private", "/var", "/private/var", "/tmp", "/private/tmp", "/Users", "/Volumes", "/opt", "/home",
+))
+
+
+def home_folder() -> Path:
+    """The owner's home folder (a seam for tests)."""
+    return Path.home()
 
 
 def default_research_folder() -> Path:
-    """The folder the guided setup offers: ``~/OpenSwap Research``."""
-    return Path.home() / DEFAULT_RESEARCH_FOLDER_NAME
+    """Where task results are saved: ``~/OpenSwap Research``, one folder per workspace ID."""
+    return home_folder() / DEFAULT_RESEARCH_FOLDER_NAME
 
 
 def is_builtin_default_registry(backup_root: Path, workspaces) -> bool:
@@ -460,7 +493,7 @@ def is_builtin_default_registry(backup_root: Path, workspaces) -> bool:
 
     Settings without an approved folder fall back to ``research`` inside the
     OpenSwap backup root (and the first ``worker enable`` writes that down).
-    The guided setup may replace it with a folder the owner can find.
+    The guided setup replaces it with the first folder the owner chooses.
     """
     from openswap.settings import _default_worker_workspace
 
@@ -473,6 +506,207 @@ def _valid_workspace_label(label: str | None) -> str | None:
     if not valid_account_label(label):
         raise WorkspaceError("label_invalid")
     return label
+
+
+def suggested_folder_id(folder: Path, taken: set[str]) -> str:
+    """A free workspace ID from a folder's name: lowercase letters, digits, '-' and '_'.
+
+    Anything else (a dot, a space, an accented letter) becomes '-', so the ID
+    is also one of the control service's ``[A-Za-z0-9_.-]`` folder IDs.
+    """
+    base = re.sub(r"[^a-z0-9_-]+", "-", Path(folder).name.lower()).strip("-_")[:56] or "folder"
+    candidate, number = base, 2
+    while candidate in taken:
+        candidate, number = f"{base}-{number}", number + 1
+    return candidate
+
+
+def _resolved(path: Path) -> Path | None:
+    try:
+        return pathid.canonical(Path(path).expanduser())
+    except (OSError, RuntimeError):
+        return None
+
+
+def readable_folder_problem(backup_root: Path, folder: Path) -> str | None:
+    """Why remote tasks may not read ``folder`` (absolute), or ``None``.
+
+    ``system`` (a system folder, or one containing them), ``home`` (the home
+    folder or a folder containing it), ``private`` (``~/Library`` or a hidden
+    folder in home), ``exposes_credentials`` (overlaps the OpenSwap backup
+    root, Codex home or Claude config home), ``results`` (overlaps
+    ``~/OpenSwap Research``, where results are written), then the read-only
+    source checks the worker repeats at launch: ``unavailable``, ``unsafe``,
+    ``not_owned`` or ``permissions``.
+
+    Every comparison goes through ``pathid`` (on-disk spelling and identity),
+    so ``~/library`` on a case-insensitive volume is ``~/Library``.
+    """
+    folder = pathid.canonical(folder)
+    if (any(pathid.inside(top, folder) for top in _SYSTEM_TOPS)
+            or any(pathid.inside(folder, tree) for tree in _SYSTEM_TREES)):
+        return "system"
+    for home in _homes():
+        if pathid.inside(home, folder):
+            return "home"
+        first = pathid.top_component(folder, home)
+        if first is not None and first.startswith("."):
+            return "private"
+        if first is not None and first.casefold() == "library" and not _in_cloud_drive(folder, home / first):
+            return "private"
+    if _overlaps_credentials(backup_root, folder, writable=False):
+        return "exposes_credentials"
+    results = _resolved(default_research_folder())
+    if results is not None and pathid.overlap(folder, results):
+        return "results"
+    return readonly_source_problem(folder)
+
+
+def _in_cloud_drive(folder: Path, library: Path) -> bool:
+    """Whether ``folder`` is a synced cloud drive inside ``~/Library`` (or a folder in one).
+
+    A provider's folder in ``~/Library/CloudStorage`` (Dropbox, Google Drive,
+    OneDrive, ...) and iCloud Drive (``~/Library/Mobile Documents/com~apple~CloudDocs``)
+    hold the owner's own files. Never the ``CloudStorage`` or ``Mobile
+    Documents`` folders themselves, nor anything else in ``~/Library``.
+    ``folder`` is canonical (symlinks resolved, on-disk spelling), so its own
+    components are compared with the exact on-disk names below the canonical
+    ``~/Library``: the bases are never canonicalised themselves, so a
+    ``CloudStorage`` that is a symlink to ``~/Library`` (or anywhere else)
+    widens nothing, and a base that is a symlink is refused outright.
+    """
+    library = pathid.canonical(library)
+    try:
+        parts = Path(folder).relative_to(library).parts
+    except ValueError:
+        return False
+
+    def real_dirs(*names: str) -> bool:
+        base = library
+        for name in names:
+            base = base / name
+            if base.is_symlink() or not base.is_dir():
+                return False
+        return True
+
+    if len(parts) >= 2 and parts[0] == "CloudStorage" and not parts[1].startswith("."):
+        return real_dirs("CloudStorage")
+    if parts[:2] == ("Mobile Documents", "com~apple~CloudDocs"):
+        return real_dirs("Mobile Documents", "com~apple~CloudDocs")
+    return False
+
+
+def _source_problem_code(problem: str) -> str:
+    """The workspace error code for a read-only source refused by ``readable_folder_problem``."""
+    if problem in {"unavailable", "unsafe", "not_owned", "permissions", "exposes_credentials"}:
+        return f"readonly_source_{problem}"
+    return f"readable_{problem}"
+
+
+def workspace_refusal(backup_root: Path, workspace, workspaces) -> str | None:
+    """Why the worker refuses jobs in ``workspace`` at launch, as a workspace error code, or ``None``.
+
+    The rules ``workspace add`` applies at approval, checked again for what
+    settings hold now (saved before a rule existed, or edited by hand): every
+    read-only source must pass ``readable_folder_problem``, and no workspace
+    may read a folder another one writes to, or write inside a folder another
+    one reads.
+    """
+    root = Path(backup_root)
+    for source in workspace.readonly_roots:
+        problem = readable_folder_problem(root, source)
+        if problem is not None:
+            return _source_problem_code(problem)
+    for other in workspaces:
+        if other.workspace_id == workspace.workspace_id:
+            continue
+        if any(pathid.overlap(source, other.output_root) for source in workspace.readonly_roots):
+            return "readonly_source_overlaps_results"
+        if any(pathid.overlap(workspace.output_root, source) for source in other.readonly_roots):
+            return "folder_overlaps_readable"
+    return None
+
+
+def refused_workspaces(backup_root: Path, workspaces=None) -> list[tuple[str, str]]:
+    """``(workspace ID, code)`` for each approved workspace whose jobs are refused at launch."""
+    if workspaces is None:
+        workspaces = load_worker_settings(Path(backup_root)).workspaces
+    out = []
+    for workspace in workspaces:
+        try:
+            code = workspace_refusal(backup_root, workspace, workspaces)
+        except Exception:
+            code = "settings_unavailable"
+        if code is not None:
+            out.append((workspace.workspace_id, code))
+    return out
+
+
+def refusal_line(workspace_id: str, code: str) -> str:
+    """One path-free line saying which workspace is refused at launch and why."""
+    reason = _WORKSPACE_MESSAGES.get(code, "It breaks the folder rules.")
+    return f'{printer.MARK_BAD} Jobs in workspace "{workspace_id}" are refused at launch ({code}). {reason}'
+
+
+def is_github_folder(folder: Path) -> bool:
+    return Path(folder).name.lower() == "github"
+
+
+def _few_git_repos(parent: Path) -> list[Path]:
+    """The git repos directly inside ``parent`` when there are only a few, else none."""
+    repos = []
+    try:
+        children = sorted(parent.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return []
+    if len(children) > _MAX_SCANNED_CHILDREN:
+        return []
+    for child in children:
+        try:
+            if child.name.startswith(".") or child.is_symlink() or not child.is_dir():
+                continue
+            if not (child / ".git").exists():
+                continue
+        except OSError:
+            continue
+        repos.append(child)
+        if len(repos) > _FEW_REPOS:
+            return []
+    return repos
+
+
+def detect_code_folders(backup_root: Path) -> list[Path]:
+    """Likely code folders in the home folder that tasks may read, GitHub first.
+
+    Only existing folders that pass ``readable_folder_problem`` are kept,
+    resolved and without duplicates. A folder holding only a few git repos
+    is followed by those repos, so the owner can pick just one.
+    """
+    home = home_folder()
+    found: list[Path] = []
+    for name in CODE_FOLDER_NAMES:
+        candidate = home / name
+        try:
+            if not candidate.is_dir():
+                continue
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        resolved = pathid.canonical(resolved)
+        if (not any(pathid.same(resolved, other) for other in found)
+                and readable_folder_problem(backup_root, resolved) is None):
+            found.append(resolved)
+    found.sort(key=lambda folder: not is_github_folder(folder))  # stable: GitHub first
+    out: list[Path] = []
+    for parent in found:
+        if parent not in out:
+            out.append(parent)
+        for repo in _few_git_repos(parent):
+            repo = _resolved(repo)
+            if (repo is not None and not any(pathid.same(repo, other) for other in out)
+                    and readable_folder_problem(backup_root, repo) is None):
+                out.append(repo)
+    return out[:MAX_SUGGESTED_FOLDERS]
 
 
 def add_worker_workspace(
@@ -496,9 +730,8 @@ def add_worker_workspace(
 
     With ``replace_builtin_default``, a registry that is still only the
     built-in ``research`` folder (see ``is_builtin_default_registry``) is
-    replaced instead of extended, so the guided setup can approve
-    ``~/OpenSwap Research`` under the same ``research`` ID. That folder is
-    replaced only while no job may still run or upload in it.
+    replaced instead of extended, only while no job may still run or upload
+    in it.
     """
     from openswap.settings import _WORKSPACE_ID_RE
 
@@ -518,37 +751,112 @@ def add_worker_workspace(
             if _workspace_in_use(root, current.workspaces[0].workspace_id):
                 raise WorkspaceError("workspace_in_use")
             kept = ()
-        if any(item.workspace_id == workspace_id for item in kept):
-            raise WorkspaceError("workspace_exists")
-        if len(kept) >= 16:
-            raise WorkspaceError("too_many_workspaces")
-        try:
-            output.mkdir(mode=0o700, parents=True, exist_ok=True)
-            output = output.resolve()
-            sources = tuple(source.resolve() for source in sources)
-        except (OSError, RuntimeError):
-            raise WorkspaceError("folder_unavailable") from None
-        if _overlaps_credentials(root, output, writable=True):
-            raise WorkspaceError("folder_exposes_credentials")
-        problem = output_dir_problem(output)
+        return _approve_locked(root, kept, workspace_id, output, sources, label)
+
+
+def _approve_locked(root: Path, kept, workspace_id: str, output: Path, sources, label) -> WorkerWorkspace:
+    """Check and save one more workspace after ``kept``; call under the lifecycle lock."""
+    if any(item.workspace_id == workspace_id for item in kept):
+        raise WorkspaceError("workspace_exists")
+    if len(kept) >= 16:
+        raise WorkspaceError("too_many_workspaces")
+    try:
+        output.mkdir(mode=0o700, parents=True, exist_ok=True)
+        output = pathid.canonical(output)
+        sources = tuple(pathid.canonical(source) for source in sources)
+    except (OSError, RuntimeError):
+        raise WorkspaceError("folder_unavailable") from None
+    if _overlaps_credentials(root, output, writable=True):
+        raise WorkspaceError("folder_exposes_credentials")
+    problem = output_dir_problem(output)
+    if problem is not None:
+        raise WorkspaceError(f"folder_{problem}")
+    for source in sources:
+        # The same policy as a folder chosen in the guided setup: never the
+        # home folder, a system folder, ~/Library, a hidden folder or a
+        # credential home.
+        problem = readable_folder_problem(root, source)
         if problem is not None:
-            raise WorkspaceError(f"folder_{problem}")
-        for source in sources:
-            if _overlaps_credentials(root, source, writable=False):
-                raise WorkspaceError("readonly_source_exposes_credentials")
-            problem = readonly_source_problem(source)
-            if problem is not None:
-                raise WorkspaceError(f"readonly_source_{problem}")
-        workspace = WorkerWorkspace(workspace_id, output, sources, label)
+            raise WorkspaceError(_source_problem_code(problem))
+        if pathid.overlap(source, output):
+            raise WorkspaceError("readonly_source_overlaps_folder")
+    # Across workspaces too: no job may write where another one only reads.
+    for other in kept:
+        if any(pathid.overlap(source, other.output_root) for source in sources):
+            raise WorkspaceError("readonly_source_overlaps_results")
+        if any(pathid.overlap(output, source) for source in other.readonly_roots):
+            raise WorkspaceError("folder_overlaps_readable")
+    workspace = WorkerWorkspace(workspace_id, output, sources, label)
+    try:
+        set_worker_workspaces(root, (*kept, workspace))
+    except ValueError as exc:
+        if "disjoint" in str(exc):
+            raise WorkspaceError("readonly_source_overlaps_folder") from None
+        raise WorkspaceError("settings_unavailable") from None
+    except (OSError, RuntimeError):
+        raise WorkspaceError("settings_unavailable") from None
+    return workspace
+
+
+@dataclass(frozen=True)
+class ReadableFolder:
+    """What ``add_readable_folder`` did."""
+
+    workspace: WorkerWorkspace
+    added: bool  # False: a workspace of its own already reads this folder
+    kept_builtin: bool = False  # the built-in folder stayed beside it: a job may still use it
+
+
+def readable_workspace(workspaces, folder: Path) -> WorkerWorkspace | None:
+    """The approved workspace whose only read-only source is ``folder`` (by identity), if any."""
+    return next((w for w in workspaces
+                 if len(w.readonly_roots) == 1 and pathid.same(w.readonly_roots[0], folder)), None)
+
+
+def add_readable_folder(backup_root: Path, folder: str | Path, *, label: str | None = None) -> ReadableFolder:
+    """Let remote tasks read ``folder`` but never change it, as the guided setup does.
+
+    The workspace ID comes from the folder's name (made free), the label is
+    the folder's name, the folder is the only read-only source, and results
+    go to ``~/OpenSwap Research/<id>``, created owner-only (0700). The first
+    one replaces the built-in ``research`` folder, unless a job may still run
+    or upload in it (then that stays beside it). A folder already read by a
+    workspace of its own is left as it is.
+    """
+    root = Path(backup_root)
+    text = str(folder)
+    if text == "~" or text.startswith("~/"):
+        folder = home_folder() / text[2:].lstrip("/")
+    try:
+        source = pathid.canonical(_absolute_folder(folder).resolve(strict=True))
+    except (OSError, RuntimeError):
+        raise WorkspaceError("readable_unavailable") from None
+    problem = readable_folder_problem(root, source)
+    if problem is not None:
+        raise WorkspaceError(f"readable_{problem}")
+    if label is None and valid_account_label(source.name):
+        label = source.name
+    label = _valid_workspace_label(label)
+    _migrate_legacy_before_worker_state_change(root)
+    with lifecycle_lock(root):
+        current = load_worker_settings(root)
+        existing = readable_workspace(current.workspaces, source)
+        if existing is not None:
+            return ReadableFolder(existing, added=False)
+        kept, kept_builtin = current.workspaces, False
+        if is_builtin_default_registry(root, kept):
+            if _workspace_in_use(root, kept[0].workspace_id):
+                kept_builtin = True
+            else:
+                kept = ()
+        workspace_id = suggested_folder_id(source, {w.workspace_id for w in kept})
+        results = default_research_folder()
         try:
-            set_worker_workspaces(root, (*kept, workspace))
-        except ValueError as exc:
-            if "disjoint" in str(exc):
-                raise WorkspaceError("readonly_source_overlaps_folder") from None
-            raise WorkspaceError("settings_unavailable") from None
-        except (OSError, RuntimeError):
-            raise WorkspaceError("settings_unavailable") from None
-        return workspace
+            results.mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            raise WorkspaceError("folder_unavailable") from None
+        workspace = _approve_locked(root, kept, workspace_id, results / workspace_id, (source,), label)
+        return ReadableFolder(workspace, added=True, kept_builtin=kept_builtin)
 
 
 def _unsynced_remote_work(root: Path) -> tuple[tuple[str, ...], frozenset[str]]:
@@ -1021,10 +1329,11 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     pair_parser.add_argument("url")
     pair_parser.add_argument("code")
     commands.add_parser(
-        "setup", help="walk through starting the worker, the account and research folders on a paired Mac",
+        "setup", help="walk through starting the worker, the account and the folders tasks may read",
         description="The guided steps `pair` runs after pairing: start the worker, confirm the "
-                    "Codex or Claude account, approve a research folder (~/OpenSwap Research by default), "
-                    "then show what is still missing before Slack can start tasks on this Mac.",
+                    "Codex or Claude account, choose the folders remote tasks may read (never change; "
+                    "~/GitHub is suggested when it exists), then show what is still missing before Slack "
+                    "can start tasks on this Mac. Results are saved under ~/OpenSwap Research.",
     )
     unpair_parser = commands.add_parser(
         "unpair", help="remove the device key and configured service URL; pass a URL to remove an enrollment "
@@ -1086,10 +1395,19 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     workspace_list = workspace_commands.add_parser("list", help="list approved research folders")
     workspace_list.add_argument("--json", action="store_true")
     workspace_add = workspace_commands.add_parser(
-        "add", help="approve a research folder under an ID the control service will send",
+        "add", help="let tasks read a folder (--read DIR), or approve a results folder under an ID",
+        usage="%(prog)s ID FOLDER [--readonly-source DIR] [--label TEXT] [--json]\n"
+              "       %(prog)s --read DIR [--label TEXT] [--json]",
+        description="`add ID FOLDER` approves FOLDER as the folder tasks write their results in. "
+                    "`add --read DIR` lets tasks read DIR but never change it, as `openswap worker setup` "
+                    "does: the ID comes from the folder's name and results go to ~/OpenSwap Research/<ID>.",
     )
-    workspace_add.add_argument("workspace_id", metavar="ID")
-    workspace_add.add_argument("folder", metavar="FOLDER")
+    workspace_add.add_argument("workspace_id", metavar="ID", nargs="?")
+    workspace_add.add_argument("folder", metavar="FOLDER", nargs="?")
+    workspace_add.add_argument(
+        "--read", metavar="DIR", default=None,
+        help="a folder tasks may read but never change; ID and results folder are chosen for you",
+    )
     workspace_add.add_argument(
         "--readonly-source", action="append", metavar="DIR",
         help="a source checkout the job may read but never write (repeatable)",
@@ -1167,7 +1485,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                     _guided_setup(root)
                 except Exception:
                     print("Next: `openswap worker setup` to start the worker, pin an account and "
-                          "approve a research folder.")
+                          "choose the folders tasks may read.")
             else:
                 if unpair(root, args.url):
                     print("Worker unpaired; remote access disabled.")
@@ -1220,9 +1538,22 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         except Exception:
             print("Worker status unavailable.", file=sys.stderr)
             return 1
+        try:
+            refused = refused_workspaces(root)
+        except Exception:
+            refused = []
+        if refused:
+            snapshot = {**snapshot, "refused_workspaces": [
+                {"workspace_id": workspace_id, "diagnostic_code": code} for workspace_id, code in refused]}
         human = None
         if not args.json:
             human = _format_status(snapshot)
+            for workspace_id, code in refused:
+                human = f"{human}\n{refusal_line(workspace_id, code)}"
+            if refused:
+                human = f"{human}\n" + printer.next_step(
+                    "fix or remove those workspaces: `openswap worker workspace list`, "
+                    "`openswap worker workspace remove <id>`.")
             hint = _worker_off_hint(root, snapshot)
             if hint is not None:
                 human = f"{human}\n{hint}"
@@ -1380,6 +1711,35 @@ _WORKSPACE_MESSAGES = {
     "readonly_source_not_owned": "A read-only source must be owned by you.",
     "readonly_source_permissions": "A read-only source must not be writable by group or others.",
     "readonly_source_overlaps_folder": "The research folder and its read-only sources must not overlap.",
+    "readable_system": "That is a system folder. Choose a folder with your own files, such as ~/GitHub.",
+    "readable_home": (
+        "Tasks cannot read your whole home folder. Choose a folder inside it, such as ~/GitHub."
+    ),
+    "readable_private": (
+        "That folder holds app data or private settings (~/Library or a hidden folder). "
+        "Choose a folder with your code or documents."
+    ),
+    "readable_exposes_credentials": (
+        "That folder is, contains or sits inside an OpenSwap, Codex or Claude credential folder."
+    ),
+    "readable_results": (
+        "That folder overlaps ~/OpenSwap Research, where task results are saved. "
+        "Choose a folder with your own files."
+    ),
+    "readable_unavailable": "That folder does not exist or cannot be read.",
+    "readable_unsafe": "That is not a folder.",
+    "readable_not_owned": "Tasks can read only folders you own.",
+    "readonly_source_overlaps_results": (
+        "That folder overlaps another workspace's results folder, where tasks write. "
+        "Choose a folder that holds no task results."
+    ),
+    "folder_overlaps_readable": (
+        "That folder overlaps a folder tasks may only read. Choose a results folder outside it."
+    ),
+    "readable_permissions": (
+        "Other users can change that folder, so it could change while a task reads it. "
+        "Run `chmod go-w` on it, then try again."
+    ),
     "label_invalid": "Labels are 1-100 characters with no control characters.",
     "worker_lifecycle_busy": "Worker settings are being changed; try again shortly.",
     "settings_unavailable": "Could not save the worker settings.",
@@ -1527,16 +1887,17 @@ def _allowlist_command(root: Path, arguments: list[str]) -> int:
 
 def _format_workspaces(workspaces) -> str:
     lines = [printer.heading("Approved research folders"),
-             "The control service sees only the ID and the label; the path never leaves this Mac."]
+             "The control service sees only the ID and the label; paths never leave this Mac. "
+             "Tasks read the folders under \"reads\" but never change them."]
     rows = []
     for workspace in workspaces:
         rows.append((f"{printer.MARK_OK} {workspace.workspace_id}",
-                     json.dumps(workspace.display_label, ensure_ascii=False), str(workspace.output_root)))
+                     json.dumps(workspace.display_label, ensure_ascii=False), "results:", str(workspace.output_root)))
         for source in workspace.readonly_roots:
-            rows.append(("", "read-only source:", str(source)))
+            rows.append(("", "", "reads:", str(source)))
     lines.extend(printer.columns(rows))
     lines.append(printer.next_step(
-        "add one with `openswap worker workspace add <id> <folder> [--label TEXT]`; "
+        "let tasks read a folder with `openswap worker workspace add --read <folder>`; "
         "`openswap worker workspace remove <id>` withdraws one."))
     return "\n".join(lines)
 
@@ -1570,7 +1931,7 @@ def _interactive_terminal() -> bool:
 def _guided_setup(root: Path, *, interactive: bool | None = None, read_line=None) -> None:
     """The guided steps after pairing (and `openswap worker setup`), on this terminal.
 
-    Start the worker, confirm the account, approve a research folder, then a
+    Start the worker, confirm the account, choose the folders tasks may read, then a
     summary. Without a terminal it prints each step's command instead.
     """
     from openswap.worker import guided_setup
@@ -1642,7 +2003,27 @@ def _workspace_command(root: Path, args) -> int:
                 as_json=args.json, human=_format_workspaces(workspaces),
             )
             return 0
+        if args.workspace_command == "add" and args.read is not None:
+            if args.workspace_id is not None or args.folder is not None or args.readonly_source:
+                print("Pass either `--read DIR` or `ID FOLDER`, not both.", file=sys.stderr)
+                return 2
+            result = add_readable_folder(root, args.read, label=args.label)
+            workspace = result.workspace
+            (source,) = workspace.readonly_roots
+            if result.added:
+                human = (f"{printer.MARK_OK} Remote tasks can read {source} as workspace "
+                         f"'{workspace.workspace_id}' (the control service shows "
+                         f"{json.dumps(workspace.display_label, ensure_ascii=False)}). They never change it; "
+                         f"results are saved in {workspace.output_root}.")
+            else:
+                human = f"{source} is already readable as workspace '{workspace.workspace_id}'."
+            _write({"accepted": True, "added": result.added, "workspace": _workspace_payload(workspace)},
+                   as_json=args.json, human=human)
+            return 0
         if args.workspace_command == "add":
+            if args.workspace_id is None or args.folder is None:
+                print("Pass `ID FOLDER`, or `--read DIR` for a folder tasks may read.", file=sys.stderr)
+                return 2
             workspace = add_worker_workspace(
                 root, args.workspace_id, args.folder, tuple(args.readonly_source or ()), label=args.label,
             )

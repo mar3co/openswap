@@ -129,7 +129,9 @@ def profile_shared(profile: Path, home: Path | None = None) -> bool:
     profile = Path(profile)
     if os.path.lexists(profile / SHARE_MANIFEST):
         return True
-    default = Path(os.path.realpath((Path(home) if home is not None else Path.home()) / ".claude"))
+    from openswap import pathid
+
+    default = pathid.canonical((Path(home) if home is not None else Path.home()) / ".claude")
     try:
         entries = list(profile.iterdir())
     except OSError:
@@ -140,7 +142,7 @@ def profile_shared(profile: Path, home: Path | None = None) -> bool:
                 target = Path(os.path.realpath(entry))
             except OSError:
                 return True
-            if target == default or target.is_relative_to(default):
+            if pathid.inside(target, default):
                 return True
     return False
 
@@ -271,20 +273,23 @@ class ClaudeCodeAdapter(CodexExecAdapter):
         Codex logins and the backup root (other accounts' profiles). The only
         exceptions are OpenSwap's own job folders (below).
         """
+        from openswap import pathid
+
         if not super()._grant_allowed(path):
             return False
-        path = Path(os.path.realpath(path))
-        home = Path(os.path.realpath(self._home))
-        backup = Path(os.path.realpath(self.backup_root))
+        # On-disk spelling and identity: a case variant is the same folder.
+        path = pathid.canonical(path)
+        home = pathid.canonical(self._home)
+        backup = pathid.canonical(self.backup_root)
         # OpenSwap's own job folders inside the backup root stay grantable:
         # the built-in research area and the live check's folders.
         for own in (backup / "worker" / "research", backup / "live-check"):
-            if path.is_relative_to(own):
+            if pathid.inside(path, own):
                 return True
         for hidden in (home / ".claude", home / ".codex", backup):
-            if path == hidden or path.is_relative_to(hidden) or hidden.is_relative_to(path):
+            if pathid.overlap(path, hidden):
                 return False
-        return not (home / ".claude.json").is_relative_to(path)
+        return not pathid.inside(home / ".claude.json", path)
 
     def _prepare_account(self, identity: str, workspace: ResolvedWorkspace) -> Path:
         profile = profile_for(self.backup_root, identity)

@@ -24,6 +24,7 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
+from openswap import pathid
 from openswap.exceptions import ConfigError
 from openswap.fsutil import replace_with_retry
 from openswap.locking import FileLock
@@ -435,7 +436,7 @@ def _migrate_account_allowlist(section: dict, backup_root: Path) -> None:
 def _default_worker_workspace(backup_root: Path) -> WorkerWorkspace:
     return WorkerWorkspace(
         workspace_id="research",
-        output_root=(Path(backup_root) / "worker" / "research").resolve(),
+        output_root=pathid.canonical(Path(backup_root) / "worker" / "research"),
     )
 
 
@@ -488,12 +489,11 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
                         or any(not isinstance(item, str) or len(item) > 2048
                                or not Path(item).is_absolute() for item in readonly_text)):
                     raise ValueError
-                output = Path(root_text).resolve()
-                readonly = tuple(Path(item).resolve() for item in readonly_text)
-                if any(
-                    output == root or output.is_relative_to(root) or root.is_relative_to(output)
-                    for root in readonly
-                ):
+                # On-disk spelling: a case variant on a case-insensitive
+                # volume is the same folder, and is compared as one.
+                output = pathid.canonical(root_text)
+                readonly = tuple(pathid.canonical(item) for item in readonly_text)
+                if any(pathid.overlap(output, root) for root in readonly):
                     raise ValueError
                 workspaces.append(WorkerWorkspace(workspace_id, output, readonly, label))
         except (TypeError, ValueError, OSError):
@@ -677,14 +677,9 @@ def _encode_worker_workspaces(workspaces: tuple[WorkerWorkspace, ...]) -> dict[s
             raise ValueError("workspace output root must be an absolute local path")
         if len(readonly) > 16 or any(not path.is_absolute() or len(str(path)) > 2048 for path in readonly):
             raise ValueError("read-only roots must be bounded absolute paths")
-        resolved_output = output.resolve()
-        resolved_readonly = tuple(path.resolve() for path in readonly)
-        if any(
-            resolved_output == path
-            or resolved_output.is_relative_to(path)
-            or path.is_relative_to(resolved_output)
-            for path in resolved_readonly
-        ):
+        resolved_output = pathid.canonical(output)
+        resolved_readonly = tuple(pathid.canonical(path) for path in readonly)
+        if any(pathid.overlap(resolved_output, path) for path in resolved_readonly):
             raise ValueError("writable output and read-only roots must be disjoint")
         if workspace.label is not None and not valid_account_label(workspace.label):
             raise ValueError("workspace labels are 1-100 characters with no control characters")

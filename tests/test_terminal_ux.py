@@ -101,19 +101,21 @@ def test_step_headers_are_bold_on_a_colour_terminal_only(monkeypatch):
     monkeypatch.delenv("NO_COLOR")
     monkeypatch.setenv("FORCE_COLOR", "1")
     printer._colors_enabled = None
-    ui.section("Step 3 of 4 · Research folder")
-    assert lines[-1] == f"{BOLD}Step 3 of 4 · Research folder\x1b[0m"
+    ui.section("Step 3 of 4 · Folders")
+    assert lines[-1] == f"{BOLD}Step 3 of 4 · Folders\x1b[0m"
 
 
 def test_prompts_render_the_default_and_a_colon(monkeypatch):
     seen = []
     ui = guided_setup.TerminalPrompts(interactive=True, read_line=lambda prompt: seen.append(prompt) or "")
     assert ui.ask("Account number (1-6; Enter keeps the current one)", default="2") == "2"
-    assert ui.ask("Folder ID", default="team-docs") == "team-docs"
-    assert ui.ask("Another folder to approve (path; Enter to finish)") == ""
+    assert ui.ask("Folders tasks may read (numbers like 1 3, or a path; Enter for 1)", default="1") == "1"
+    assert ui.ask("Type the path to your code folder, for example ~/GitHub (Enter to skip)") == ""
     assert ui.confirm("Keep going?") is True
-    assert seen == ["Account number (1-6; Enter keeps the current one) [2]: ", "Folder ID [team-docs]: ",
-                    "Another folder to approve (path; Enter to finish): ", "Keep going? [Y/n] "]
+    assert seen == ["Account number (1-6; Enter keeps the current one) [2]: ",
+                    "Folders tasks may read (numbers like 1 3, or a path; Enter for 1) [1]: ",
+                    "Type the path to your code folder, for example ~/GitHub (Enter to skip): ",
+                    "Keep going? [Y/n] "]
 
 
 def test_setup_without_a_tty_prints_headers_and_commands_but_asks_nothing(root, capsys, monkeypatch):
@@ -125,11 +127,11 @@ def test_setup_without_a_tty_prints_headers_and_commands_but_asks_nothing(root, 
     monkeypatch.setattr("builtins.input", lambda *_: pytest.fail("no prompt without a terminal"))
     assert _run(root, "setup") == 0
     out = capsys.readouterr().out
-    for title in ("Step 1 of 4 · Worker", "Step 2 of 4 · Account", "Step 3 of 4 · Research folder",
+    for title in ("Step 1 of 4 · Worker", "Step 2 of 4 · Account", "Step 3 of 4 · Folders",
                   "Step 4 of 4 · Summary"):
         assert title in out
     assert guided_setup.ACCOUNT_NEXT in out and "Account number" not in out
-    assert "  ✗ Account    none pinned" in out and "\x1b[" not in out and SECRET not in out
+    assert "  ✗ Account           none pinned" in out and "\x1b[" not in out and SECRET not in out
 
 
 # --- the account menu --------------------------------------------------------------------------

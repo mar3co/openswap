@@ -1406,3 +1406,60 @@ whether it executes for real.
   listing and feeds the reported IDs to the Slack/agent workspace list.
 
 Execution is still disabled until Phase 1's live-evidence gates clear.
+
+
+## Setup asks which folders tasks may read (2026-10-08)
+
+Owner feedback on `openswap worker setup`: offering to "create and approve
+~/OpenSwap Research as research folder" made no sense, because most owners
+already keep their code in a repo or a GitHub folder.
+
+- The folder step now asks one question: which folders remote tasks may read.
+  It lists likely code folders in the home folder (`~/GitHub`,
+  `~/Documents/GitHub`, `~/Developer`, `~/Code`, `~/Projects`, `~/src`,
+  `~/repos`, `~/dev`, plus the repos of a folder holding three or fewer),
+  with a GitHub folder first and marked "recommended" as the Enter default.
+  The answer is numbers (`1 3`, `1,3`) or a path; with nothing found it asks
+  for the path to the code folder.
+- Each chosen folder becomes its own workspace: ID from the folder's name
+  (unique), label the folder's name, the folder as its only read-only
+  source, and results in `~/OpenSwap Research/<id>`, created 0700 without
+  asking. The first replaces the built-in `research` workspace unless a job
+  may still run or upload in it. The owner never approves a results folder.
+- Readable folders refuse the home folder, system folders, `~/Library` and
+  hidden folders, credential homes and the results folder, and must pass the
+  read-only source checks the worker repeats at launch.
+- `openswap worker workspace add --read <folder>` makes the same workspace;
+  `add <id> <folder>` is unchanged. The summary lists "Readable folders" by
+  ID and label; the readiness report is still IDs and labels only, so
+  OpenTag's Slack folder hints follow the new IDs without a protocol or
+  OpenTag change.
+
+Review fixes (same PR): every folder comparison in the workspace policy,
+the settings disjointness check and the Codex/Claude launch-time grant checks
+now goes through `openswap.pathid`, which compares the on-disk spelling
+(`F_GETPATH` on macOS) and filesystem identity along the ancestors. Before
+this, a case variant on APFS (`~/library`, `~/LIBRARY/Application Support`,
+the home folder in capitals) passed every refusal, and Seatbelt honours such
+a grant. Settings store the on-disk spelling. Read-only sources may not
+overlap another workspace's results folder (and results may not overlap a
+readable folder); `--readonly-source` follows the readable-folder policy; and
+the worker applies that policy again at launch.
+
+Second review (same PR): a typed path that exists is used as typed, so
+apostrophes in real names are never shell syntax; shell-splitting applies only
+to text that starts with a quote or holds a backslash. Synced cloud drives in
+`~/Library` (a `CloudStorage` provider folder, iCloud Drive) are readable,
+compared by identity; the rest of `~/Library` is not. The worker checks the
+folder rules, including the cross-workspace overlap, for every job before it
+creates any folder; a refusal fails the job as the local `workspace_refused`
+diagnostic (uploaded as `provider_unavailable`, since OpenTag's list is
+closed), and `worker status` and the setup summary name the workspace and the
+reason. Settings that break the rules still load, so they can be fixed.
+
+Third review (same PR): the cloud-drive exemption compares the folder's own
+resolved components with the real `CloudStorage` and `Mobile
+Documents/com~apple~CloudDocs` under the canonical `~/Library`, and refuses a
+base that is a symlink, so a base linked to `~/Library` opens nothing. The
+readiness report leaves out workspaces the worker would refuse (or cannot
+check), and reports them again once fixed.
