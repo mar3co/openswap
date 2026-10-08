@@ -614,11 +614,23 @@ def workspace_refusal(backup_root: Path, workspace, workspaces) -> str | None:
     one reads.
     """
     root = Path(backup_root)
+    # The results folder (created at launch when missing): an existing one
+    # that became reachable by others, or was replaced by a file or a link,
+    # refuses every job, so it is diagnosed and withheld here too.
+    problem = _results_problem(root, workspace.output_root)
+    if problem is not None:
+        return problem
     for source in workspace.readonly_roots:
         problem = readable_folder_problem(root, source)
         if problem is not None:
             return _source_problem_code(problem)
     work = getattr(workspace, "work_root", None)
+    if work is not None and workspace.mode == "worktree" and not workspace.repos:
+        # Where the task's worktree goes: owner-only too.
+        base = default_research_folder() / ".worktrees"
+        problem = _results_problem(root, base) or _results_problem(root, base / workspace.workspace_id)
+        if problem is not None:
+            return problem
     if work is not None:
         problem = work_folder_problem(root, work, workspace.mode, workspace.repos)
         if problem is not None:
@@ -636,6 +648,16 @@ def workspace_refusal(backup_root: Path, workspace, workspaces) -> str | None:
         if other_work is not None and pathid.overlap(workspace.output_root, other_work):
             return "folder_overlaps_work"
     return None
+
+
+def _results_problem(root: Path, folder: Path) -> str | None:
+    """Why an existing results (or worktree) folder cannot take a task, as a workspace error code."""
+    if not os.path.lexists(folder):
+        return None
+    if _overlaps_credentials(root, pathid.canonical(folder), writable=True):
+        return "folder_exposes_credentials"
+    problem = output_dir_problem(Path(folder))
+    return None if problem is None else f"folder_{problem}"
 
 
 def work_folder_problem(backup_root: Path, folder: Path, mode: str = "worktree", repos: bool = False) -> str | None:

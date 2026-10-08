@@ -517,3 +517,31 @@ def test_claude_work_tasks_get_no_shell_and_codex_shells_get_the_git_settings(ro
     text = codex_config((), resolved.write_paths, resolved.read_paths, dict(resolved.env))
     assert f"GIT_OBJECT_DIRECTORY = {_toml_string(str(resolved.worktree.objects))}" in text
     assert "gc.auto" in text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits only")
+def test_a_results_folder_that_turned_unsafe_is_refused_and_not_advertised(root, home):
+    from openswap.worker.remote import offerable
+
+    repo = _repo(home / "GitHub" / "openswap")
+    workspace = cli.add_work_folder(root, repo).workspace
+    workspaces = cli.launchable_workspaces(root, load_worker_settings(root).workspaces)
+    assert cli.workspace_refusal(root, workspace, workspaces) is None
+    os.chmod(workspace.output_root, 0o755)  # others can now reach the results folder
+    assert cli.workspace_refusal(root, workspace, workspaces) == "folder_permissions"
+    assert not offerable(root, workspace, workspaces)
+    assert cli.refused_workspaces(root) == [("openswap", "folder_permissions")]
+    with pytest.raises(WorkspaceRefused) as refused:
+        _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    assert refused.value.code == "folder_permissions"
+    assert not (workspace.output_root / ("a" * 32)).exists()
+    os.chmod(workspace.output_root, 0o700)
+    worktrees.remove_tree(workspace.output_root)
+    workspace.output_root.write_text("not a folder")  # replaced by a file
+    assert cli.workspace_refusal(root, workspace, workspaces) == "folder_unsafe"
+    workspace.output_root.unlink()
+    assert cli.workspace_refusal(root, workspace, workspaces) is None  # missing: made at launch
+    base = home / "OpenSwap Research" / ".worktrees"
+    base.mkdir(mode=0o755, exist_ok=True)
+    os.chmod(base, 0o755)
+    assert cli.workspace_refusal(root, workspace, workspaces) == "folder_permissions"

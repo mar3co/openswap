@@ -1626,6 +1626,10 @@ _REFUSED_TEXT = {
     "readonly_source_permissions": "approved read-only source permissions are unsafe",
     "readonly_source_overlaps_results": "approved read-only source overlaps another workspace's results",
     "folder_overlaps_readable": "approved results folder overlaps another workspace's read-only source",
+    "folder_permissions": "registered workspace permissions are unsafe",
+    "folder_unsafe": "registered workspace is unsafe",
+    "folder_unavailable": "registered workspace is unsafe",
+    "folder_exposes_credentials": "registered workspace is unsafe",
 }
 
 
