@@ -562,7 +562,9 @@ private. The execution mode comes from one hook,
 `openswap.worker.adapter.execution_mode()`: it is `live` only when the adapter
 in use declares `execution_mode = "live"`, and the production adapter
 (`UnavailableCodexAdapter`) declares `disabled`. A 404 `unsupported_version`
-(or `not_found`) stops the report until the next registration. The reference
+(or `not_found`) stops the report until the next registration. The report is
+sent at the end of a synchronization pass, after results are delivered and new
+work is claimed, so a slow `readiness` route never delays either. The reference
 service implements `readiness` and keeps the latest report per worker.
 
 `worker status --json` includes `remote_connectivity` and

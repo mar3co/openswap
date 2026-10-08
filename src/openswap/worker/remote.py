@@ -591,10 +591,20 @@ class RemoteClient:
         with self._lock:
             if self.state != "online" or self.worker_epoch is None or policy.control_service_url != self.url:
                 return
-        # Optional account choice and readiness report: bounded, never raise,
-        # never block claims.
+        # Optional account choice: bounded and never raises. It precedes the
+        # claim because account_ready() gates polling on it.
         self.sync_accounts(policy)
-        self.sync_readiness(policy)
+        try:
+            self._sync_jobs(policy)
+        finally:
+            # The optional readiness report goes last, so a slow or stalled
+            # readiness route never delays result delivery or task pickup.
+            with self._lock:
+                online = self.state == "online"
+            if online and not self.stop_event.is_set():
+                self.sync_readiness(policy)
+
+    def _sync_jobs(self, policy):
         try:
             for binding in self.journal.pending():
                 self._sync(binding)

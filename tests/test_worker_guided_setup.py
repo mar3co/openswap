@@ -633,6 +633,28 @@ def test_registration_reports_folder_ids_labels_and_mode_only(root, reporting):
     assert store.readiness(paired["worker_id"]) == {"folders": body["folders"], "execution": "disabled"}
 
 
+def test_the_report_follows_job_sync_and_a_stalled_route_never_delays_pickup(root, reporting, tmp_path, monkeypatch):
+    remote, runtime, store, paired, transport = reporting
+    cli.add_worker_workspace(root, "docs", tmp_path / "docs", label="Docs")
+    transport.requests.clear()
+    remote.tick()
+    ops = [op for op, _data in transport.requests]
+    assert "poll" in ops and "readiness" in ops and ops.index("poll") < ops.index("readiness")
+    # A stalled readiness route times out after the claim pass, not before it.
+    real = transport.request
+
+    def stalling(op, data):
+        if op == "readiness":
+            raise ProtocolError("service_unavailable", 503)
+        return real(op, data)
+
+    monkeypatch.setattr(transport, "request", stalling)
+    cli.label_worker_workspace(root, "docs", "Documents")
+    transport.requests.clear()
+    remote.tick()
+    assert remote.state == "online" and "poll" in [op for op, _data in transport.requests]
+
+
 def test_report_is_resent_only_on_change_and_after_registration(root, reporting, tmp_path, monkeypatch):
     remote, runtime, store, paired, transport = reporting
     for _ in range(3):
