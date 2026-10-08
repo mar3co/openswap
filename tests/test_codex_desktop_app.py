@@ -21,7 +21,11 @@ from openswap.codex.desktop_app import (
 from openswap.exceptions import ClaudeSwitchError
 
 
-def _app(tmp_path: Path) -> Path:
+_LEGACY_CLI = "Contents/Resources/codex"
+_NESTED_CLI = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+
+
+def _app(tmp_path: Path, cli: str = _LEGACY_CLI) -> Path:
     app = tmp_path / "ChatGPT.app"
     (app / "Contents/MacOS").mkdir(parents=True)
     (app / "Contents/Resources").mkdir()
@@ -32,7 +36,8 @@ def _app(tmp_path: Path) -> Path:
             "CFBundleShortVersionString": "26.908.70816",
             "CFBundleVersion": "9275",
         }, stream)
-    for path in (app / "Contents/MacOS/ChatGPT", app / "Contents/Resources/codex"):
+    (app / cli).parent.mkdir(parents=True, exist_ok=True)
+    for path in (app / "Contents/MacOS/ChatGPT", app / cli):
         path.write_text("binary")
         path.chmod(0o700)
     return app
@@ -88,6 +93,37 @@ def test_preflight_rejects_wrong_bundle_and_missing_cli(desktop, tmp_path):
         plistlib.dump({"CFBundleIdentifier": "evil.app", "CFBundleExecutable": "ChatGPT"}, stream)
     with pytest.raises(DesktopAppError, match="not the supported"):
         desktop.preflight(_home())
+
+
+def test_preflight_finds_cli_in_nested_app_layout(desktop, tmp_path):
+    (desktop.app_path / _LEGACY_CLI).unlink()
+    nested = desktop.app_path / _NESTED_CLI
+    nested.parent.mkdir(parents=True)
+    nested.write_text("binary")
+    nested.chmod(0o700)
+    data = desktop.preflight(_home())
+    assert data["bundled_cli"] == str(nested)
+
+
+def test_nested_cli_layout_wins_over_legacy_path(tmp_path):
+    app = DesktopApp(_app(tmp_path, cli=_NESTED_CLI))
+    assert app._bundled_cli == app.app_path / _NESTED_CLI
+    legacy = app.app_path / _LEGACY_CLI
+    legacy.write_text("binary")
+    assert app._bundled_cli == app.app_path / _NESTED_CLI
+
+
+def test_preflight_names_legacy_chat_app_and_missing_cli(desktop, tmp_path):
+    (desktop.app_path / _LEGACY_CLI).unlink()
+    with pytest.raises(DesktopAppError) as missing:
+        desktop.preflight(_home())
+    assert missing.value.reason == "helper_missing"
+
+    with desktop._plist_path.open("wb") as stream:
+        plistlib.dump({"CFBundleIdentifier": "com.openai.chat", "CFBundleExecutable": "ChatGPT"}, stream)
+    with pytest.raises(DesktopAppError) as legacy:
+        desktop.preflight(_home())
+    assert legacy.value.reason == "legacy_chat_app"
 
 
 def test_preflight_rejects_custom_backend_override(desktop, tmp_path, monkeypatch):

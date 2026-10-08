@@ -91,8 +91,16 @@ def capability_is_fresh(capability: DesktopCapability, *, now: float) -> bool:
 
 
 _BUNDLE_ID = "com.openai.codex"
+# The pre-merger chat-only app, sometimes left behind as "ChatGPT Classic.app".
+_LEGACY_CHAT_BUNDLE_ID = "com.openai.chat"
 _DEFAULT_APP = Path("/Applications/ChatGPT.app")
-_BUNDLED_CLI = Path("Contents/Resources/codex")
+# Newest layout first. Builds from 26.930 ship the CLI as a nested app whose
+# binary ``codex-cli/bin/codex`` (a shell wrapper) execs; earlier builds put
+# it directly in Resources.
+_BUNDLED_CLI_LAYOUTS = (
+    Path("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"),
+    Path("Contents/Resources/codex"),
+)
 _OPENAI_TEAM_ID = "2DC432GLL2"
 _TESTED_BASELINE_BUILDS = frozenset({("26.908.70816", "9275")})
 _BLOCKED_BUILDS: frozenset[tuple[str, str]] = frozenset()
@@ -324,7 +332,11 @@ class DesktopApp:
 
     @property
     def _bundled_cli(self) -> Path:
-        return self.app_path / _BUNDLED_CLI
+        candidates = [self.app_path / layout for layout in _BUNDLED_CLI_LAYOUTS]
+        for candidate in candidates:
+            if os.path.lexists(candidate):
+                return candidate
+        return candidates[0]
 
     @staticmethod
     def _build_key(info: dict) -> tuple[str, str]:
@@ -481,6 +493,11 @@ class DesktopApp:
             raise DesktopAppError(
                 "The ChatGPT application bundle is missing or invalid.",
                 reason="app_invalid",
+            )
+        if info.get("CFBundleIdentifier") == _LEGACY_CHAT_BUNDLE_ID:
+            raise DesktopAppError(
+                "This is the older ChatGPT app, which does not include Codex.",
+                reason="legacy_chat_app",
             )
         if info.get("CFBundleIdentifier") != _BUNDLE_ID:
             raise DesktopAppError(
