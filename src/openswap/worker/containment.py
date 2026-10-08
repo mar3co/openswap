@@ -110,14 +110,9 @@ def _fresh(run_dir: Path) -> bool:
 
 
 def _run_dir_key(run_dir: Path) -> str:
-    """Lock and mirror key of a run directory, the same for every letter case.
-
-    The key must still match after the directory is gone (recovery reads the
-    mirror then), when the on-disk spelling can no longer be asked for: so it
-    folds case. Two directories differing only in case (possible on a
-    case-sensitive volume) merely share a lock.
-    """
-    return hashlib.sha256(str(Path(run_dir)).casefold().encode()).hexdigest()[:32]
+    """Lock and mirror key of a run directory: its exact canonical spelling
+    (see :func:`canonical_dir`), so distinct directories never share one."""
+    return hashlib.sha256(str(Path(run_dir)).encode()).hexdigest()[:32]
 
 
 def default_lock_dir() -> Path:
@@ -343,34 +338,46 @@ def job_label(job_id: str) -> str:
     return label
 
 
+def _on_disk_spelling(path: str) -> str | None:
+    """The kernel's spelling of an existing directory (``F_GETPATH``), or None."""
+    try:
+        import fcntl
+
+        getpath = fcntl.F_GETPATH
+    except (ImportError, AttributeError):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return None
+    try:
+        raw = fcntl.fcntl(fd, getpath, bytes(1024))
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    found = raw.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+    return found or None
+
+
 def canonical_dir(path: Path | str) -> Path:
     """One spelling per physical directory, for its locks, handle and mirror.
 
     ``realpath`` resolves links and ``..`` but keeps the caller's letter case,
     and the default macOS volume is case-insensitive, so ``Runs/job`` and
     ``runs/job`` would get different locks. ``F_GETPATH`` on an open
-    descriptor returns the on-disk spelling. A directory that cannot be opened
-    (gone, or not macOS) falls back to ``realpath``.
+    descriptor returns the on-disk spelling. A directory that is gone (as at
+    some recoveries) is spelled through its parent, which still exists (run
+    directories are named by lowercase job ids); otherwise ``realpath``.
     """
     resolved = os.path.realpath(path)
-    try:
-        import fcntl
-
-        getpath = fcntl.F_GETPATH
-    except (ImportError, AttributeError):
-        return Path(resolved)
-    try:
-        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return Path(resolved)
-    try:
-        raw = fcntl.fcntl(fd, getpath, bytes(1024))
-    except OSError:
-        return Path(resolved)
-    finally:
-        os.close(fd)
-    found = raw.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
-    return Path(found) if found else Path(resolved)
+    found = _on_disk_spelling(resolved)
+    if found is not None:
+        return Path(found)
+    parent = _on_disk_spelling(os.path.dirname(resolved))
+    if parent is not None:
+        return Path(parent) / os.path.basename(resolved)
+    return Path(resolved)
 
 
 def _printable_path(path: Path) -> bool:
@@ -806,12 +813,9 @@ class LaunchdContainment:
             raw = json.loads(text)
         except ValueError:
             return None
-        recorded = raw.get("run_dir") if isinstance(raw, dict) else None
-        # Matched like its key (any letter case), then trusted in the spelling
-        # the launch recorded.
-        if not isinstance(recorded, str) or recorded.casefold() != str(Path(run_dir)).casefold():
+        if not isinstance(raw, dict) or raw.get("run_dir") != str(Path(run_dir)):
             return None
-        return _handle_from(raw, Path(recorded))
+        return _handle_from(raw, Path(run_dir))
 
     def _forget_mirror(self, run_dir: Path) -> None:
         try:

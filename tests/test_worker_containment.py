@@ -1120,6 +1120,13 @@ def test_the_mirror_is_found_by_another_spelling_after_the_directory_is_gone(tmp
     import shutil
 
     shutil.rmtree(handle.run_dir)  # the whole run directory was deleted
-    other_spelling = Path(str(handle.run_dir).swapcase())
-    assert containment._load_mirror(other_spelling) is not None
+    # Another spelling of its (still existing) parent: canonicalized through the parent.
+    other_spelling = Path(str(handle.run_dir.parent).swapcase()) / handle.run_dir.name
+    if not other_spelling.parent.exists():
+        pytest.skip("case-sensitive file system")
+    assert c.canonical_dir(other_spelling) == handle.run_dir
     assert containment.recover(other_spelling) is not None
+
+
+def test_directories_differing_only_in_case_never_share_a_key():
+    assert c._run_dir_key(Path("/runs/Job")) != c._run_dir_key(Path("/runs/job"))
