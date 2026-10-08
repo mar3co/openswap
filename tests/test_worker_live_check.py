@@ -1106,3 +1106,22 @@ def test_evidence_records_the_binding_to_this_mac(tmp_path):
     root = setup_root(tmp_path)
     evidence = make_check(root, SimulatedMac()).run()
     assert evidence["host_binding"] == "4e" * 32
+
+
+
+def test_a_readable_auth_file_fails_the_gate_without_any_redirect(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    original = mac._simulate
+    seen = []
+
+    def auth_readable(command, cwd):
+        if "auth.json" in command:
+            seen.append(command)
+            return "     312 auth.json", 0  # readable: only a byte count is printed
+        return original(command, cwd)
+
+    mac._simulate = auth_readable
+    gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
+    assert seen and all(c.startswith("/usr/bin/wc -c ") and ">" not in c for c in seen)
+    assert gate["auth_read_denied"] is False and gate["passed"] is False
