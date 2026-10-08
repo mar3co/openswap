@@ -136,6 +136,7 @@ def test_pinning_adds_the_account_to_the_allowlist_once(root, capsys):
     lambda entries: entries[0].pop("label"),
     lambda entries: entries.clear() or entries.append(
         {"accountRef": "0" * 32, "identity": BOB, "label": "pin is missing"}),
+    lambda entries: entries.clear(),  # explicitly empty while a default is pinned
     lambda entries: entries.extend(
         {"accountRef": f"{i:032x}", "identity": "codex:" + f"{i:064x}", "label": f"n{i}"}
         for i in range(1, 21)),

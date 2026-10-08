@@ -370,9 +370,10 @@ def _allowlist_from_raw(value: object, pinned: str | None) -> tuple[AllowlistedA
     if (len({entry.account_ref for entry in entries}) != len(entries)
             or len({entry.identity for entry in entries}) != len(entries)):
         raise ValueError
-    # The pinned default is always allowlisted, except in settings written
-    # before the allowlist existed (no list at all), which migrate on write.
-    if pinned is not None and entries and pinned not in {entry.identity for entry in entries}:
+    # The pinned default is always allowlisted, an explicitly empty list
+    # included; only settings written before the allowlist existed (no key at
+    # all, handled above) are exempt, and they migrate on write.
+    if pinned is not None and pinned not in {entry.identity for entry in entries}:
         raise ValueError
     return tuple(entries)
 
