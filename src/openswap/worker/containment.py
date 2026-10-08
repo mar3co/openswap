@@ -351,6 +351,32 @@ def load_handle(run_dir: Path) -> JobHandle | None:
     return _handle_from(raw, Path(run_dir))
 
 
+def reconcile_handles(primary: JobHandle | None, mirror: JobHandle | None) -> JobHandle | None:
+    """One handle from the run directory's copy and its mirror, or ``None`` to refuse.
+
+    A launch writes both copies at each step, and a crash between the two
+    writes leaves one a step behind: the same launch, with a field still
+    unset that the other has. That is merged (taking what either recorded,
+    and "released" if either says so). Copies that name different launches, or
+    record different values for the same field, are not a partial update and
+    are refused.
+    """
+    if primary is None or mirror is None:
+        return primary or mirror
+    if primary == mirror:
+        return primary
+    fixed = ("label", "domain", "run_dir", "boot_session", "launch_id")
+    if any(getattr(primary, name) != getattr(mirror, name) for name in fixed):
+        return None
+    merged = {}
+    for name in ("leader_pid", "coalition_id"):
+        a, b = getattr(primary, name), getattr(mirror, name)
+        if a is not None and b is not None and a != b:
+            return None
+        merged[name] = a if a is not None else b
+    return replace(primary, released=primary.released or mirror.released, **merged)
+
+
 def _handle_from(raw, run_dir: Path) -> JobHandle | None:
     try:
         label = raw["label"]
@@ -468,12 +494,13 @@ class LaunchdContainment:
         provider program cannot have run: it is gated on the ``go`` file, which
         is created only after the full handle is durable.
         """
-        run_dir = Path(run_dir)
         label = job_label(job_id)
         try:
-            ensure_private_dir(run_dir)
+            ensure_private_dir(Path(run_dir))
         except OSError:
             raise ContainmentError("run_dir_unavailable") from None
+        # One spelling per physical directory, for its locks, handle and mirror.
+        run_dir = Path(os.path.realpath(run_dir))
         # One launch or stop per label at a time: the label check, bootstrap
         # and any cleanup run under this lock, so a label loaded after a failed
         # bootstrap can only be this launch's own.
@@ -703,7 +730,10 @@ class LaunchdContainment:
         finally:
             lock.release()
         if proof.stopped:
-            self._forget_mirror(handle.run_dir)
+            mirror = self._load_mirror(handle.run_dir)
+            # Only this launch's mirror: a later launch may have reused the path.
+            if mirror is not None and mirror.launch_id == handle.launch_id and mirror.label == handle.label:
+                self._forget_mirror(handle.run_dir)
         return proof
 
     def _stop_locked(self, handle: JobHandle, *, timeout: float) -> StopProof:
@@ -752,13 +782,14 @@ class LaunchdContainment:
         Uses the run directory's handle or, if that is gone, its mirror; when
         both exist and disagree, nothing is trusted and nothing is touched.
         """
-        primary = load_handle(Path(run_dir))
-        mirror = self._load_mirror(Path(run_dir))
-        if primary is not None and mirror is not None and primary != mirror:
-            return StopProof(False, None, 0)
-        handle = primary or mirror
-        if handle is None:
+        run_dir = Path(os.path.realpath(run_dir))
+        primary = load_handle(run_dir)
+        mirror = self._load_mirror(run_dir)
+        if primary is None and mirror is None:
             return None
+        handle = reconcile_handles(primary, mirror)
+        if handle is None:
+            return StopProof(False, None, 0)
         return self.stop(handle)
 
     def _scan(self, coalition_id: int) -> dict[int, str]:

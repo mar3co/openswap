@@ -753,3 +753,48 @@ def test_recovery_uses_the_mirror_and_refuses_disagreement(tmp_path):
     procs.signals.clear()
     proof = containment.recover(handle.run_dir)
     assert proof.stopped is False and procs.signals == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks")
+def test_two_spellings_of_one_run_directory_share_its_lock(tmp_path):
+    from openswap.locking import FileLock
+
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    (root / "shared").mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(root)
+    canonical = Path(os.path.realpath(root / "shared"))
+    holder = FileLock(tmp_path / "locks" / f"rundir-{c._run_dir_key(canonical)}.lock", timeout=0)
+    assert holder.acquire(timeout=0)
+    try:
+        with pytest.raises(ContainmentError) as error:
+            containment.launch(job_id="b" * 32, run_dir=alias / "shared", argv=["/bin/echo"], env={},
+                               cwd=root, stdin_text="")
+    finally:
+        holder.release()
+    assert error.value.code == "run_dir_in_use"
+
+
+def test_a_partial_persistence_update_is_merged_not_refused(tmp_path):
+    base = JobHandle(c.job_label("a" * 32), "gui/501", tmp_path, "boot-a", launch_id="0" * 16)
+    later = replace(base, leader_pid=50, coalition_id=900, released=True)
+    assert c.reconcile_handles(base, later) == later
+    assert c.reconcile_handles(later, base) == later
+    assert c.reconcile_handles(later, replace(later, coalition_id=901)) is None
+    assert c.reconcile_handles(later, replace(later, launch_id="1" * 16)) is None
+    assert c.reconcile_handles(None, base) == base
+
+
+def test_a_stale_stop_keeps_a_replacement_launchs_mirror(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    old = launch(containment, root)
+    assert containment.stop(old).stopped is True
+    for name in os.listdir(old.run_dir):
+        path = old.run_dir / name
+        path.unlink() if not path.is_dir() else None
+    new = containment.launch(job_id="c" * 32, run_dir=old.run_dir, argv=["/bin/echo"], env={},
+                             cwd=root, stdin_text="")
+    containment.stop(old)
+    assert containment._load_mirror(new.run_dir) is not None
