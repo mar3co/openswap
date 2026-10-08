@@ -241,6 +241,16 @@ def claude_prepare(backup_root: Path, selector: str | None, *, prepare=None) -> 
 
         SessionManager(ClaudeAccountSwitcher()).setup_session(number, share=False)
 
+    store = AccountLeaseStore(root, "claude")
+    with store.mutation_guard() as guard:
+        # Under the guard every Claude lease change takes: refuse while a job
+        # (or anything else) holds a Claude lease, and leave a profile that is
+        # already signed in as this account exactly as it is.
+        guard.assert_available()
+        existing = profile_for(root, identity)
+        if existing is not None and profile_identity(existing) == identity:
+            return {"slot": choice.number, "account_ref": identity, "profile_ready": True}
+    # Not ready: setup_session takes the same guard itself and re-checks.
     (prepare or default_prepare)(choice.number)
     profile = profile_for(root, identity)
     ready = profile is not None and profile_identity(profile) == identity

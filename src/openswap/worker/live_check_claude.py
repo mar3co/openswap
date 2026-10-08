@@ -53,7 +53,7 @@ from openswap.worker.codex_cli import platform_supported
 from openswap.worker.codex_exec import runs_root
 from openswap.worker.containment import STDERR_FILE, STDOUT_FILE, load_handle, write_private
 from openswap.worker.leases import ReleaseEvidence
-from openswap.worker.live_check import CheckRefused, LiveCheck, _texts
+from openswap.worker.live_check import CheckRefused, LiveCheck, _new_sentinel, _texts
 
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell"})
 LONG_TASK = (
@@ -295,11 +295,10 @@ class ClaudeLiveCheck(LiveCheck):
         outside = self._workspace("sandbox-outside")
         tokens = {name: secrets.token_hex(16) for name in ("inside", "outside", "profile")}
         inside_file, outside_file = ws / "inside.txt", outside / "read-me.txt"
-        sentinel = profile / "openswap-live-check-sentinel.txt"
         default_config = self._home / ".claude.json"
         inside_file.write_text(tokens["inside"] + "\n")
         outside_file.write_text(tokens["outside"] + "\n")
-        write_private(sentinel, (tokens["profile"] + "\n").encode())
+        sentinel = _new_sentinel(profile, "sentinel", tokens["profile"] + "\n")
         paths = {"inside": str(inside_file), "outside": str(outside_file), "profile": str(sentinel),
                  "default": str(default_config)}
         task = (

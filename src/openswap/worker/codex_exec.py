@@ -495,7 +495,9 @@ class CodexExecAdapter:
             return pinned
         expected = load_live_execution(self.backup_root, self.provider).codex_sha256
         if expected is not None and pinned.binary_sha256 != expected:
-            raise codex_cli.CodexCliError("binary_not_the_checked_one")
+            # The active adapter's own error type, so its start/probe turn it
+            # into an unlaunched refusal.
+            raise self._cli_errors[0]("binary_not_the_checked_one")
         return pinned
 
     def probe(self) -> ProviderAvailability:

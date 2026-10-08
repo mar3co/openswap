@@ -633,3 +633,29 @@ def test_prepare_refuses_while_a_claude_job_holds_the_lease(tmp_path):
 
     with pytest.raises(LeaseConflictError):
         live_cli.claude_prepare(root, "claude:4", prepare=prepare)
+
+
+
+def test_prepare_leaves_a_ready_profile_alone_and_refuses_during_a_job(tmp_path):
+    root = setup_root(tmp_path, prepared=True)
+    calls = []
+    result = live_cli.claude_prepare(root, "claude:4", prepare=lambda number: calls.append(number))
+    assert result["profile_ready"] is True and calls == []  # nothing rewritten
+    AccountLeaseStore(root, "claude").acquire(job_id="b" * 32, account_identity=IDENTITY, worker_pid=os.getpid(),
+                                              worker_epoch=1, ttl_s=60)
+    with pytest.raises(LeaseConflictError):
+        live_cli.claude_prepare(root, "claude:4", prepare=lambda number: calls.append(number))
+    assert calls == []
+
+
+def test_a_replaced_pin_between_probe_and_start_is_an_unlaunched_refusal(tmp_path):
+    root = setup_root(tmp_path)
+    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, "00" * 32, "now"), "claude")
+    launcher = FakeLaunch(SUCCESS)
+    adapter = ClaudeCodeAdapter(
+        root, containment=launcher, verify=lambda **kw: pinned(), mode=lambda: "live", sleep=lambda s: None,
+        managed=lambda p: [], live_sessions=lambda p: False, home=tmp_path / "home", bind_to_opt_in=True,
+    )
+    with pytest.raises(ProviderLaunchRefused):
+        adapter.start(job_record(), workspace(root), worker_epoch=1)
+    assert launcher.launches == []
