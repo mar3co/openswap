@@ -399,13 +399,14 @@ Remote tasks section shows "Paired, worker off" under **Enable local worker**.
 
 Pairing never selects an account or a folder; the submission names neither.
 On an interactive terminal with no account pinned yet, `pair` lists the
-eligible Codex accounts and asks for one (Enter skips), then points at the
-folder step. Without a terminal it prints the same next steps. Pairing stays
+eligible Codex and Claude accounts and asks for one (Enter skips), then points
+at the folder step. Without a terminal it prints the same next steps. Pairing stays
 successful whether or not this step completes.
 
 ```sh
-openswap worker account                    # list Codex slots; * marks the pin
+openswap worker account                    # list Codex and Claude slots; * marks the pin
 openswap worker account 2                  # pin by slot, email or alias (or --json)
+openswap worker account claude:4           # a Claude slot (codex:2 names a Codex slot)
 openswap worker account --clear            # remove the pin
 openswap worker account allow 3 [--label "Team research"]   # allow for a per-job choice
 openswap worker account label 3 "Team research"             # rename (slot, email, alias or ref)
@@ -416,37 +417,42 @@ openswap worker workspace add tag-research ~/Research/opentag \
 openswap worker workspace remove tag-research
 ```
 
-Only Codex roster slots with a ChatGPT account ID are eligible; the pin is
-stored as the opaque `codex:` identity of that account, so moving or swapping
-slots does not change it. Claude accounts are listed as not eligible yet
-(Claude authentication gate) and a Claude selector is refused. The commands
-read roster metadata only (slot, email, alias, account ID), never auth files
-or tokens. Pin and workspace changes take the worker lifecycle lock; pinning
-also resolves the slot under the Codex account lock, so `codex remove`,
-`swap` and `move` cannot interleave. The menu bar's Settings → General →
-Remote tasks → **Account** popup uses the same function (Claude entries are
-shown disabled).
+Eligible accounts are Codex roster slots with a ChatGPT account ID and Claude
+roster slots with an email (owner decision 2026-10-07, see
+[decision-claude-auth.md](../plans/research/remote-agent-host/decision-claude-auth.md#owners-decision)).
+The pin is stored as the opaque, typed identity of that account (`codex:` from
+the account ID, `claude:` from the email and organization), so moving or
+swapping slots does not change it, and a job runs on the provider of its
+account. A bare slot number means the Codex slot when one exists, otherwise
+the Claude slot; `claude:N` and `codex:N` are explicit. The commands read
+roster metadata only (slot, email, alias, account or organization ID), never
+auth files or tokens. Pin and workspace changes take the worker lifecycle
+lock; pinning also resolves the slot under both providers' account locks, so
+`remove`, `swap` and `move` cannot interleave. The menu bar's Settings →
+General → Remote tasks → **Account** popup uses the same function and lists
+both providers ("Codex N · …", "Claude N · …").
 
 The worker re-reads the pin for every launch, before it takes the account
 lease, so a new pin applies to the next job without a restart; a running job
 keeps the account recorded on it at `starting`. If the pinned account is no
-longer in the Codex roster at launch, the job fails with
+longer in its provider's roster at launch, the job fails with
 `provider_auth_unavailable` before any lease or launch, and the remote client
 does not claim new work until a present account is pinned.
 
 **Per-job account choice.** The `allow`, `disallow` and `label` subcommands
 manage the local allowlist behind the [optional account choice
-extension](#optional-per-job-account-choice-v1-extension): at most 20 Codex
-accounts, each stored as a random `account_ref` (generated once, never
+extension](#optional-per-job-account-choice-v1-extension): at most 20 Codex or
+Claude accounts, each stored as a random `account_ref` (generated once, never
 derived from the account), its local `codex:` identity and a label (by default
-the slot alias or "Codex account N", never the email unless you pass it). The
+the slot alias or "Codex account N" / "Claude account N", never the email
+unless you pass it). The
 pin is the default and is always allowlisted: pinning adds the account if
 needed, `--clear` keeps it allowed without a default, and disallowing the
 default is refused unless `--clear-default` is passed. A pin saved before the
 allowlist existed becomes a one-entry allowlist on the next settings write.
 The list view shows the allowed accounts with their references and labels and
 marks the default. The changes take the same locks as pinning. The menu bar's
-**Web choice** popup, under **Account**, toggles each eligible Codex account
+**Web choice** popup, under **Account**, toggles each eligible account
 (the default is shown checked and cannot be withdrawn there).
 
 After each registration, and whenever the allowlist, a label or the default
@@ -530,7 +536,7 @@ managed or system Codex layer that could override this exists (requirement or
 managed files in the isolated home, `/etc/codex`, the machine or per-user
 managed preferences, or their payload keys). The job's argv is fixed:
 `codex --strict-config --disable … exec --json --ephemeral
---skip-git-repo-check --cd <output> --output-last-message <output>/result.md -`,
+--skip-git-repo-check --ignore-rules --cd <output> --output-last-message <output>/result.md -`,
 with the task on stdin.
 
 **Containment and Stop.** Each job runs as its own launchd job
@@ -561,6 +567,65 @@ counts only, never model output or secrets; each job's folder (with its
 inspection. Only when every gate passes does
 it offer to enable live execution (`--enable` does so without asking,
 `--no-enable` never). It uses some of the account's quota.
+
+### Running jobs live (Claude)
+
+The owner decided on 2026-10-07 that Remote tasks may run on their own Claude
+accounts with the unmodified Claude Code binary and its native login, on their
+own paired Macs, for tasks they start
+([decision](../plans/research/remote-agent-host/decision-claude-auth.md#owners-decision)).
+Live execution for Claude is a separate opt-in from Codex's, off by default.
+
+```sh
+openswap worker pause                          # if the worker is running
+openswap worker account claude:4               # pin the Claude account (or allow it for a per-job choice)
+openswap worker claude pin                     # record the installed claude binary's version and SHA-256
+openswap worker claude prepare                 # set up that account's OpenSwap profile
+openswap worker live-check --provider claude   # short real jobs, evidence file, then offers to enable
+openswap worker pause --off
+```
+
+`openswap worker claude status` re-verifies the binary and lists which Claude
+accounts have a prepared profile; `openswap worker live status --provider
+claude` (and `enable`/`disable`) manage the opt-in.
+
+**Binary.** Jobs run the `claude` the owner installed (Homebrew cask or the
+native installer), never a copy. `claude pin` records its path, `--version`
+and SHA-256; before every job the worker re-hashes it and refuses a changed
+file. Anthropic publishes no digest to verify against, so the first pin is
+trust-on-first-use. Jobs run with the auto-updater off; after an update, re-pin
+and re-run the live check, since the opt-in is bound to the measured binary.
+
+**Account.** Each Claude account runs from its OpenSwap session profile
+(`CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`, the same profiles live
+Claude sessions use), which `claude prepare` sets up under the Claude account
+lease. Your default Claude login (`~/.claude`, `~/.claude.json` and its
+Keychain item) is never changed; after preparation only Claude Code signs in,
+stores and refreshes tokens in that profile, and the worker never reads,
+uploads, proxies or logs a credential. A launch refuses without starting
+anything (`provider_auth_unavailable`, `unlaunched=true`) unless the profile
+is signed in as the job's account, and (`provider_unavailable`) while an
+interactive session is using that profile.
+
+**Tools and sandbox.** The argv is fixed: `sandbox-exec -f <profile.sb> claude
+-p --output-format stream-json --verbose --restricted --tools
+Read,Grep,Glob,WebSearch,WebFetch --allowedTools (same) --permission-mode
+dontAsk --permission-prompts none --strict-mcp-config --disable-slash-commands
+--no-session-persistence`, plus `--add-dir` for each approved read-only
+source, with the task on stdin and an allowlisted environment (no API keys).
+The Seatbelt profile allows writes only to the job's output folder, the
+account's profile, the run's temporary folder and this user's cache and
+temporary folders, and makes the default login, `~/.codex` and the rest of
+the backup root (other accounts, worker state) unreadable and unwritable.
+Containment, Stop, recovery, `result.md` and failure codes are the same as for
+Codex.
+
+**The Claude live check** records the same gates as the Codex one, with Read
+probes instead of shell commands (a read in the job folder must work; reads
+outside it, of a sentinel in the profile and of `~/.claude.json` must fail),
+the tool list from Claude Code's `init` event (only the five research tools,
+no MCP server, no API key), and the same stop and kill-recovery jobs. Its
+evidence file is `live-check-claude-<UTC>.json`.
 
 `worker status --json` includes `remote_connectivity` and
 `remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.

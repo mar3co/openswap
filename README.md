@@ -72,12 +72,13 @@ The command-line executable is `openswap`.
 | `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
 | `openswap worker pair <url> <code>` | Remote tasks (opt-in): pair with a control service, pick an account, then offer to start the worker |
 | `openswap worker enable` | Start the Remote tasks worker (LaunchAgent) so a paired Mac heartbeats and shows online |
-| `openswap worker account [slot]` | List or pin the Codex account remote jobs run on (Claude not supported yet) |
-| `openswap worker account allow <slot>` | Allow a Codex account for a per-job choice by the control service (`disallow`, `label`) |
+| `openswap worker account [slot]` | List or pin the Codex or Claude account remote jobs run on (`claude:4`, `codex:2`) |
+| `openswap worker account allow <slot>` | Allow an account for a per-job choice by the control service (`disallow`, `label`) |
 | `openswap worker workspace add <id> <folder>` | Approve a research folder under the portal's workspace ID (`list`, `remove`) |
 | `openswap worker codex install` | Install the pinned official Codex CLI 0.157.1 for Remote tasks (SHA-256 verified) |
 | `openswap worker codex login [slot]` | Sign an account in to its own isolated Codex home (your default login is untouched) |
-| `openswap worker live-check` | Run short real jobs on this Mac, record phase-1 evidence, then offer to enable live execution |
+| `openswap worker claude pin` / `prepare` | Pin the installed Claude Code binary and prepare an account's OpenSwap profile (your default login is untouched) |
+| `openswap worker live-check` | Run short real jobs on this Mac, record phase-1 evidence, then offer to enable live execution (`--provider claude`) |
 | `openswap worker live status` | Show whether remote jobs really run (`enable --evidence FILE`, `disable`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |

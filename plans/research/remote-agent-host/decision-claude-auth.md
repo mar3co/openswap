@@ -1,8 +1,42 @@
 # Decision memo: Claude authentication for remote-triggered runs
 
-**Status: PENDING OWNER DECISION.** This memo records options for plan 017; it
-does not grant provider clearance or authorize credential use. Claude support
-and Claude adapter code remain out of scope until the owner records a path.
+**Status: DECIDED by the owner (2026-10-07).** The options and evidence below
+are kept as they were written before the decision.
+
+## Owner's decision
+
+The owner chose **"Unmodified Claude Code with the owner's native login"**,
+limited to **the owner's own paired Macs** and **tasks the owner starts
+themselves**. In the owner's words, using their own login "is the whole point
+of remote agents". This is the owner's product decision; it is not provider or
+legal clearance, and the evidence section below still applies as recorded risk.
+
+What the implementation does under this decision (plan 017, phase 1):
+
+- Runs the unmodified `claude` binary the owner installed (`claude -p`,
+  stream-json). OpenSwap pins its SHA-256 on first use
+  (`openswap worker claude pin`) and refuses to launch if the file changes;
+  there is no published digest to verify against, so the pin is
+  trust-on-first-use. Auto-update is disabled for jobs; after an owner-side
+  update the owner re-pins and re-runs the live check.
+- Selects the account through its OpenSwap-managed Claude profile (plan 003
+  session profiles: `CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`),
+  prepared by the owner with `openswap worker claude prepare`. The owner's
+  default Claude login (`~/.claude`, `~/.claude.json` and its Keychain item)
+  is never changed; the live check records its metadata before and after
+  and fails if it moved.
+- After preparation, the CLI alone signs in, stores and refreshes tokens in
+  that profile. The worker never reads, uploads, proxies or logs a
+  credential, and the job environment is an allowlist without API keys.
+- Restricts each job to research tools (`Read`, `Grep`, `Glob`, `WebSearch`,
+  `WebFetch`; `--restricted`, `dontAsk`, no MCP, no slash commands, no
+  session persistence) inside a Seatbelt profile that only allows writes to
+  the approved folder, the profile, the run's temporary folder and this
+  user's cache folders, and hides the owner's default login, the other
+  accounts and OpenSwap's own state.
+- Runs live only after `openswap worker live-check --provider claude` passes
+  on that Mac and the owner opts in; the opt-in is separate from Codex's and
+  bound to the pinned binary.
 
 ## Decision needed
 
@@ -50,7 +84,7 @@ ownership has been authorized for credentialed work.
 | Anthropic API key or supported cloud-provider credentials | Uses the documented programmatic integration path, with billing under the selected key/provider agreement. Requires a separate product/billing choice and owner-supplied authorized credentials; no silent conversion from subscription auth. | Possible later expansion; not selected |
 | Exclude Claude from Remote Agent Host | Explicitly disables Claude dispatch, regardless of a local Claude install. | Available owner decision |
 
-## Recommendation and gate
+## Recommendation and gate (before the decision)
 
 Keep Claude disabled and implement Codex only. Before adding Claude code, record
 one of: (1) provider confirmation that the exact user-local, unmodified-binary,
