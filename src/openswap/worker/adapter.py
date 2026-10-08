@@ -98,3 +98,36 @@ def production_claude_adapter(backup_root: Path | None = None) -> ProviderAdapte
     from openswap.worker.claude_exec import ClaudeCodeAdapter
 
     return ClaudeCodeAdapter(Path(backup_root))
+
+
+def pinned_adapter(backup_root: Path | None = None) -> ProviderAdapter:
+    """The production adapter for the pinned account's provider (Codex when none is pinned)."""
+    if backup_root is None:
+        from openswap.paths import get_backup_root
+
+        backup_root = get_backup_root()
+    from openswap.worker.live import pinned_provider
+
+    if pinned_provider(Path(backup_root)) == "claude":
+        return production_claude_adapter(backup_root)
+    return production_adapter(backup_root)
+
+
+EXECUTION_DISABLED = "disabled"
+EXECUTION_LIVE = "live"
+
+
+def execution_mode(adapter: object | None = None) -> str:
+    """Whether this Mac runs remote jobs for real: ``"disabled"`` or ``"live"``.
+
+    The one hook behind the readiness report sent to the control service and
+    the setup summary. It reads ``adapter.execution_mode`` (the production
+    adapter when ``adapter`` is None), and anything other than an explicit
+    ``"live"`` is ``"disabled"``. The live Codex adapter declares ``"live"``
+    only while the owner's opt-in is recorded (see ``openswap.worker.live``);
+    test adapters declare nothing and so report ``"disabled"``.
+    """
+    if adapter is None:
+        adapter = production_adapter()
+    mode = getattr(adapter, "execution_mode", None)
+    return EXECUTION_LIVE if mode == EXECUTION_LIVE else EXECUTION_DISABLED

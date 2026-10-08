@@ -22,6 +22,7 @@ from openswap.settings import (
     WorkerWorkspace,
     configure_worker_local_policy,
     load_live_execution,
+    load_worker_settings,
     update_worker_settings,
     write_live_execution,
 )
@@ -954,3 +955,19 @@ def test_prepare_does_not_call_a_profile_under_managed_policy_ready(tmp_path):
         live_cli.claude_prepare(root, "claude:4", run=_native_login(root), verify=lambda: pinned(),
                                 unshare=lambda p: None)
     assert error.value.code == "claude_profile_not_ready"
+
+
+def test_the_readiness_report_follows_the_pinned_provider(tmp_path):
+    from types import SimpleNamespace
+
+    from openswap.worker.remote import RemoteClient
+
+    root = setup_root(tmp_path)
+    runtime, codex, claude = _runtime(root, IDENTITY)
+    claude.execution_mode = "live"
+    report = RemoteClient._readiness(SimpleNamespace(runtime=runtime), load_worker_settings(root))
+    assert report["execution"] == "live"
+    claude.execution_mode = "disabled"
+    codex.execution_mode = "live"
+    assert RemoteClient._readiness(SimpleNamespace(runtime=runtime), load_worker_settings(root))["execution"] == \
+        "disabled"

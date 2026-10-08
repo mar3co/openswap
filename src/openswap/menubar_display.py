@@ -456,6 +456,16 @@ def settings_page_rows(
             "label": "Remote tasks",
         },
         {
+            # The guided steps of `openswap worker pair`/`setup`, in dialogs.
+            "kind": "button",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_setup",
+            "label": "Set up Remote tasks…",
+            "title": "Set Up",
+            "value": None,
+            "disabled": (worker_status or {}).get("operation") is not None,
+        },
+        {
             "kind": "toggle",
             "section": SETTINGS_SECTION_GENERAL,
             "id": "remote_tasks_enabled",
