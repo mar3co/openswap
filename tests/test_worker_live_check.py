@@ -79,7 +79,8 @@ def test_parse_features_and_command_items(tmp_path):
                                             "aggregated_output": "x", "exit_code": 1}},
         {"type": "item.completed", "item": {"id": "2", "type": "mcp_tool_call"}},
     ]) + "\nnot json\n")
-    assert live_check.command_items(stdout) == [{"command": "cat a", "output": "x", "exit_code": 1}]
+    assert live_check.command_items(stdout) == [
+        {"command": "cat a", "output": "x", "exit_code": 1, "completed": True}]
     assert live_check.item_types(stdout) == {"command_execution", "mcp_tool_call"}
 
 
@@ -92,7 +93,8 @@ class SimulatedMac:
     ``sandboxed`` decides what the simulated research sandbox allows.
     """
 
-    def __init__(self, *, sandboxed=True, contain=True):
+    def __init__(self, *, sandboxed=True, contain=True, links=True):
+        self.links = links
         self.sandboxed = sandboxed
         self.contain = contain
         self.jobs: dict[str, dict] = {}
@@ -142,6 +144,11 @@ class SimulatedMac:
             return "", 0
         if command == "/usr/bin/env":
             return "PATH=/usr/bin:/bin\nHOME=/x\n", 0
+        if "ln -s" in command and self.links:
+            target = re.search(r"ln -s '?(/[^ ']+link-target\.txt)", command).group(1)
+            (cwd / "link.txt").symlink_to(target)  # writing the link inside the folder works
+            if not self.sandboxed:
+                return Path(target).read_text(), 0
         if "launchctl submit" in command:
             if not self.sandboxed:
                 self.submitted_labels.add(command.split()[3])
@@ -782,3 +789,35 @@ def test_a_denied_environment_probe_proves_no_absence(tmp_path):
     assert gate["environment_printed"] is False
     assert gate["worker_environment_absent"] is False and gate["api_keys_absent"] is False
     assert gate["passed"] is False
+
+
+
+def test_a_symlink_probe_whose_link_was_never_made_proves_nothing(tmp_path):
+    root = setup_root(tmp_path)
+    gate = make_check(root, SimulatedMac(links=False)).run()["gates"]["sandbox_exec"]
+    assert gate["symlink_created"] is False and gate["symlink_read_denied"] is False
+    assert gate["passed"] is False
+
+
+def test_a_probe_that_only_started_proves_no_denial(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    original = mac.launch
+
+    def launch(**kwargs):
+        handle = original(**kwargs)
+        stdout = Path(kwargs["run_dir"]) / "stdout.jsonl"
+        records = [json.loads(line) for line in stdout.read_text().splitlines()]
+        for record in records:
+            item = record.get("item") or {}
+            if item.get("type") == "command_execution" and "read-me.txt" in item.get("command", ""):
+                # Started, never completed: no output, no exit code.
+                record["type"] = "item.started"
+                item.pop("exit_code", None)
+                item.pop("aggregated_output", None)
+        stdout.write_text("".join(json.dumps(r) + "\n" for r in records))
+        return handle
+
+    mac.launch = launch
+    gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
+    assert gate["outside_read_denied"] is False and gate["passed"] is False

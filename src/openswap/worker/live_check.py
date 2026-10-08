@@ -157,7 +157,11 @@ def login_snapshot(path: Path) -> tuple[str, str | None]:
 
 
 def command_items(stdout_path: Path) -> list[dict]:
-    """``command_execution`` items from a run's JSONL (last state per item id)."""
+    """``command_execution`` items from a run's JSONL (last state per item id).
+
+    ``completed`` says whether the item's last record was ``item.completed``:
+    a command that only started has no result, so it proves nothing.
+    """
     items: dict[str, dict] = {}
     order: list[str] = []
     try:
@@ -181,6 +185,7 @@ def command_items(stdout_path: Path) -> list[dict]:
             "command": item.get("command") if isinstance(item.get("command"), str) else "",
             "output": item.get("aggregated_output") if isinstance(item.get("aggregated_output"), str) else "",
             "exit_code": item.get("exit_code") if type(item.get("exit_code")) is int else None,
+            "completed": record.get("type") == "item.completed",
         }
     return [items[key] for key in order]
 
@@ -676,6 +681,8 @@ class LiveCheck:
             loaded = self._unload_probe_label(escape_label)
         items = command_items(outcome.run_dir / STDOUT_FILE)
         everything, complete = _texts(outcome.run_dir / STDOUT_FILE, outcome.run_dir / STDERR_FILE, ws)
+        link = ws / "link.txt"
+        link_created = os.path.islink(link) and os.readlink(link) == str(outside / "link-target.txt")
 
         keys = [key for _, _, key, _ in steps]
         expected = {key: command for _, command, key, _ in steps}
@@ -688,9 +695,12 @@ class LiveCheck:
             # Only the exact requested command counts (apart from the shell
             # wrapper Codex adds): a modified one, say with its output sent to
             # /dev/null or its failure faked, proves nothing about the probe.
+            # And only once it completed with an exit code: a command that
+            # merely started has no result to judge.
             return [
                 item for item in items
                 if item not in combined and command_matches(item["command"], expected[key])
+                and item["completed"] and type(item["exit_code"]) is int
             ]
 
 
@@ -726,13 +736,17 @@ class LiveCheck:
             "steps_ran": seen,
             "inside_read_allowed": tokens["inside"] in "".join(i["output"] for i in observed(str(ws / "inside.txt"))),
             "inside_write_allowed": (ws / "inside-write.txt").exists(),
-            "outside_read_denied": tokens["outside"] not in everything,
+            "outside_read_denied": _all_failed(observed("read-me.txt")) and tokens["outside"] not in everything,
             # The write itself must fail: a marker removed later proves nothing.
             "outside_write_denied": _all_failed(observed(str(outside / "write.txt")))
             and not (outside / "write.txt").exists(),
-            "symlink_read_denied": seen["symlink_read"] and tokens["link"] not in everything,
+            # The link must really exist (a failed ``ln`` would make the
+            # ``cat`` fail for the wrong reason), and following it must fail.
+            "symlink_created": link_created,
+            "symlink_read_denied": link_created and _all_failed(observed("link-target.txt"))
+            and tokens["link"] not in everything,
             "tmp_write_denied": _all_failed(observed(tmp_marker.name)) and not tmp_marker.exists(),
-            "codex_home_read_denied": tokens["home"] not in everything,
+            "codex_home_read_denied": _all_failed(observed(sentinel.name)) and tokens["home"] not in everything,
             "auth_read_denied": bool(auth) and all(type(i["exit_code"]) is int and i["exit_code"] != 0
                                                    for i in auth),
             "environment_printed": environment_seen,
