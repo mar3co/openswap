@@ -97,6 +97,9 @@ class FakeProcs:
             return False
         return pid not in self.table or pid in self.zombies or pid in self.dead_unreadable
 
+    def zombie_identity(self, pid):
+        return f"100.{pid:06d}" if pid in self.zombies else None
+
 
 
 class FakeLaunchd:
@@ -806,9 +809,14 @@ def test_a_stale_stop_keeps_a_replacement_launchs_mirror(tmp_path):
 
 def test_a_pid_seen_alive_before_and_gone_now_is_not_harmless(tmp_path):
     containment, procs, launchd = make(tmp_path)
-    assert containment._complete({5: "gone"}, {5: "gone"}) is True
+    # An exited pid has no identity left: never harmless, even if seen before.
+    assert containment._complete({5: "gone"}, {5: "gone"}) is False
     assert containment._complete({5: "gone"}, {5: "other"}) is False
-    assert containment._complete({5: "gone"}, {}) is False
+    # A zombie is harmless only if the very same zombie was seen last time.
+    assert containment._complete({5: "zombie@1.000001"}, {5: "zombie@1.000001"}) is True
+    assert containment._complete({5: "zombie@2.000001"}, {5: "zombie@1.000001"}) is False
+    assert containment._complete({5: "zombie@1.000001"}, {5: "gone"}) is False
+    assert containment._complete({5: "zombie@1.000001"}, {}) is False
 
 
 def test_exit_status_belongs_to_its_own_launch(tmp_path):
@@ -819,3 +827,39 @@ def test_exit_status_belongs_to_its_own_launch(tmp_path):
     assert containment.exit_status(old) == 0
     c._save_handle(replace(old, launch_id="f" * 16))  # the directory now belongs to another launch
     assert containment.exit_status(old) is None
+
+
+
+def test_exit_status_is_unknown_while_a_launch_holds_the_run_directory(tmp_path):
+    from openswap.locking import FileLock
+
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    (handle.run_dir / "exit").write_text("0\n")
+    held = FileLock(containment._lock_dir / f"rundir-{c._run_dir_key(handle.run_dir)}.lock", timeout=0)
+    assert held.acquire(timeout=0)
+    try:
+        assert containment.exit_status(handle) is None
+    finally:
+        held.release()
+    assert containment.exit_status(handle) == 0
+    (handle.run_dir / "handle.json").unlink()  # cleaned away: no longer provably this launch's
+    assert containment.exit_status(handle) is None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="kern.proc.pid")
+def test_a_real_zombie_has_a_stable_identity_and_an_exited_pid_none():
+    procs = c.DarwinProcessTable()
+    child = subprocess.Popen(["/usr/bin/true"])  # not reaped until wait(): a zombie
+    pid = child.pid
+    try:
+        deadline = time.monotonic() + 5
+        identity = procs.zombie_identity(pid)
+        while identity is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+            identity = procs.zombie_identity(pid)
+        assert identity is not None and procs.zombie_identity(pid) == identity
+        assert procs.zombie_identity(os.getpid()) is None  # alive: not a zombie
+    finally:
+        child.wait()
+    assert procs.zombie_identity(pid) is None
