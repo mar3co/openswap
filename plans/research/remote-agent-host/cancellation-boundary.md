@@ -42,3 +42,56 @@ Until a supported mechanism is proven to stop detached descendants—or the owne
 - Apple Foundation [`Process.interrupt()`](https://developer.apple.com/documentation/foundation/process/interrupt%28%29) and [`Process.terminate()`](https://developer.apple.com/documentation/foundation/process/terminate%28%29)
 - Apple [Managing ongoing background processes in your Mac](https://developer.apple.com/documentation/appkit/managing-ongoing-background-processes-in-your-mac)
 - Apple [Creating Launch Daemons and Agents](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
+
+## Per-job launchd job plus resource-coalition sweep (measured 2026-10-07)
+
+Measured on a development Mac (Darwin 27.0, Apple silicon) with synthetic
+processes only: no provider, account or credential was involved. Each
+experiment bootstrapped a uniquely labelled job into `gui/<uid>`, used
+`proc_pidinfo(PROC_PIDCOALITIONINFO)` (unprivileged for same-user processes)
+to read resource-coalition IDs, and booted the label out afterwards.
+
+| Experiment | Result |
+| --- | --- |
+| Coalition of a bootstrapped job | launchd gave the job its own resource coalition, distinct from the launching process's |
+| Job forks a same-group child and a `setsid()` double-forked daemon with closed stdio | All three stayed in the job's coalition; the daemon had `ppid 1` and its own pgid |
+| `launchctl bootout` of that job | Killed the leader and the same-group child; **the `setsid()` daemon survived** |
+| Sweep: `SIGSTOP` every coalition member until a full scan finds none running, then `SIGKILL` all | A job that forks `setsid()` children continuously (60 members at sweep time) was emptied in 0.07 s; no member left |
+| Normal exit that leaves a `setsid()` daemon behind | Exit status captured by the wrapper; the leftover daemon was found by coalition and swept |
+| The launching process is `SIGKILL`ed after launch | The job kept running (label loaded, 2 members); a later recovery from the saved handle swept it and proved the coalition empty |
+
+Conclusions:
+
+- `bootout` alone is not containment, and neither is a process group: both
+  miss `setsid()` descendants, as the earlier fake reproduction predicted.
+- The coalition is the boundary that holds: membership is inherited through
+  `fork`/`exec` and is not changed by `setsid()`, reparenting or closing pipes.
+  A stopped process cannot fork, so a freeze is final once it is confirmed;
+  because `SIGSTOP` is delivered asynchronously and the process listing is not
+  atomic, a freeze counts only when two consecutive scans list the same
+  members, all observed stopped, and the second scan is complete: every pid
+  it listed was either queried or already listed by the first (a coalition
+  query fails only for zombies and processes that exited after the listing;
+  measured on this Mac, every live process of every user was queryable, while
+  the BSD status of about 335 root-owned processes was not, so a member whose
+  status cannot be read counts as running and never as frozen). Only then is
+  an empty scan after the kills a stop proof. This closes the fork/reparent
+  race that blocked the parent-pid tracker. A recovery never sweeps or boots
+  out anything unless the saved and current boot sessions are both known and
+  equal.
+- Running each job as its own launchd job also decouples it from the worker:
+  a worker crash leaves a findable, sweepable job rather than an orphan.
+
+`src/openswap/worker/containment.py` implements this: the job's main program
+is a small `/bin/sh` wrapper that records its pid and waits for a `go` file;
+the worker records the label, coalition ID and boot session in `handle.json`
+before creating `go`, so the provider never runs unless the worker can sweep
+it. The stop proof is "label unloaded and no live coalition member"; a reboot
+(different `kern.bootsessionuuid`) is proof on its own. An opt-in test
+(`OPENSWAP_LAUNCHD_TESTS=1`) repeats the `setsid()` case against real launchd.
+
+Residual limit: work that a member asks launchd or another system service to
+start runs in that service's coalition, not the job's. The research sandbox is
+expected to deny that; the live check measures it from inside `codex exec` with
+a `launchctl submit` attempt. This remains synthetic evidence until the live
+check runs a real provider job.
