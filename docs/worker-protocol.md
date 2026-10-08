@@ -603,12 +603,15 @@ openswap worker pause --off
 accounts have a prepared profile; `openswap worker live status --provider
 claude` (and `enable`/`disable`) manage the opt-in.
 
-**Binary.** Jobs run the `claude` the owner installed (Homebrew cask or the
-native installer), never a copy. `claude pin` records its path, `--version`
-and SHA-256; before every job the worker re-hashes it and refuses a changed
-file. Anthropic publishes no digest to verify against, so the first pin is
-trust-on-first-use. Jobs run with the auto-updater off; after an update, re-pin
-and re-run the live check, since the opt-in is bound to the measured binary.
+**Binary.** `claude pin` takes the `claude` the owner installed (Homebrew cask
+or the native installer), hashes it and keeps a byte-identical, read-only copy
+under `~/Library/Application Support/com.opensoft.openswap/claude-cli/`. Jobs
+run that copy, so an update or replacement of the installed binary can never
+run unverified. Before every job the worker re-hashes the copy, checks
+`--version`, and refuses a changed file. Anthropic publishes no digest to
+verify against, so the first pin is trust-on-first-use. Jobs run with the
+auto-updater off. To adopt an update, re-pin and re-run the live check, since
+the opt-in is bound to the measured binary.
 A `claude` installed inside `~/.claude` (the old npm-local layout) is refused,
 because jobs cannot read that folder.
 

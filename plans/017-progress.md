@@ -1314,8 +1314,9 @@ Stacked on the live-check PR:
   across providers (`ProviderLeases` spans the Codex and Claude lease
   stores).
 - **Binary (`worker/claude_cli.py`).** The owner's installed `claude`
-  (Homebrew cask or the native installer) is pinned by SHA-256 with
-  `openswap worker claude pin`; every launch re-hashes it and checks
+  (Homebrew cask or the native installer) is pinned with `openswap worker
+  claude pin`. It is hashed, and jobs run a byte-identical read-only copy kept
+  under Application Support, which every launch re-hashes and checks with
   `--version`. No published digest exists to verify against, so this is
   trust-on-first-use; jobs run with the auto-updater off, and an update needs a
   re-pin and a new live check (the opt-in is bound to the binary).

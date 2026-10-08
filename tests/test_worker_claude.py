@@ -50,6 +50,12 @@ def this_mac(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def private_copies(monkeypatch, tmp_path):
+    # Pinned Claude copies go to a test folder, never the real Application Support.
+    monkeypatch.setattr(claude_cli, "pinned_copies_dir", lambda: tmp_path / "pinned-copies")
+
+
+@pytest.fixture(autouse=True)
 def apple_silicon(monkeypatch):
     monkeypatch.setattr(codex_cli, "platform_supported", lambda *a, **k: True)
     monkeypatch.setattr(claude_cli, "platform_supported", lambda *a, **k: True)
@@ -96,11 +102,18 @@ def test_pin_records_the_installed_binary_and_verify_rechecks_it(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     pin = claude_cli.pin(root, binary=binary)
-    assert pin.version == "2.1.285 (Claude Code)" and pin.binary == binary.resolve()
+    assert pin.version == "2.1.285 (Claude Code)"
+    # Jobs run a private, read-only copy, identical to the installed binary.
+    assert pin.binary != binary.resolve() and pin.binary.read_bytes() == binary.read_bytes()
+    assert pin.binary.parent == claude_cli.pinned_copies_dir()
     assert claude_cli.verify(root) == pin
     if os.name == "posix":
         assert (claude_cli.pin_path(root).stat().st_mode & 0o777) == 0o600
-    binary.write_text("#!/bin/sh\necho '2.1.286 (Claude Code)'\n")  # an update
+        assert (pin.binary.stat().st_mode & 0o777) == 0o500
+    binary.write_text("#!/bin/sh\necho '2.1.286 (Claude Code)'\n")  # an update of the installed binary
+    assert claude_cli.verify(root) == pin  # never picked up until re-pinned
+    pin.binary.chmod(0o700)
+    pin.binary.write_text("#!/bin/sh\necho tampered\n")  # the copy itself changed
     with pytest.raises(claude_cli.ClaudeCliError) as error:
         claude_cli.verify(root)
     assert error.value.code == "binary_changed"
@@ -894,3 +907,25 @@ def test_a_symlinked_profile_is_never_prepared(tmp_path):
     with pytest.raises(live_cli.AccountPinError) as error:
         live_cli.claude_prepare(root, "claude:4", run=run, verify=lambda: pinned())
     assert error.value.code == "claude_profile_unsafe" and run.calls == []
+
+
+
+@pytest.mark.parametrize("code, state", [(44, "absent"), (51, "unreadable"), (36, "unreadable")])
+def test_a_keychain_query_failure_is_unreadable_not_absent(tmp_path, code, state):
+    from openswap.worker.live_check_claude import ClaudeLiveCheck
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = setup_root(tmp_path)
+    check = ClaudeLiveCheck(root, out=lambda *a: None, home=home,
+                            run=lambda argv, **kw: subprocess.CompletedProcess(argv, code, "", ""))
+    assert check._default_login_snapshot()[0] == state
+
+
+def test_status_does_not_call_a_profile_under_managed_policy_ready(tmp_path):
+    root = setup_root(tmp_path)
+    claude_cli.pin(root, binary=fake_claude(tmp_path))
+    profile = claude_exec.profile_for(root, IDENTITY)
+    (profile / "remote-settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash"]}}))
+    ready = {a["slot"]: a["profile_ready"] for a in live_cli.claude_status(root)["accounts"]}
+    assert ready == {"4": False}

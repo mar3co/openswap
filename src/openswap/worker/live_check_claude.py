@@ -186,8 +186,13 @@ class ClaudeLiveCheck(LiveCheck):
             # Attributes only (no -g/-w): the secret is never read and no prompt appears.
             result = self._run(["/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials"],
                                capture_output=True, text=True, check=False, timeout=20)
-            parts.append(hashlib.sha256((result.stdout or "").encode()).hexdigest()
-                         if result.returncode == 0 else "absent")
+            if result.returncode == 0:
+                parts.append(hashlib.sha256((result.stdout or "").encode()).hexdigest())
+            elif result.returncode == 44:  # errSecItemNotFound: there is no such item
+                parts.append("absent")
+            else:
+                # Locked or inaccessible Keychain: the item was never observed.
+                return ("unreadable", None)
         except (OSError, subprocess.SubprocessError):
             return ("unreadable", None)
         state = "absent" if all(part == "absent" for part in parts) else "present"

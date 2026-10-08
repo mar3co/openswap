@@ -127,24 +127,76 @@ def _check_binary(binary: Path, backup_root: Path | None = None) -> None:
         raise ClaudeCliError("binary_permissions")
 
 
+def pinned_copies_dir() -> Path:
+    """Where pinned Claude Code binaries are kept: private, and outside every folder
+    the job sandbox hides (Application Support, next to the job locks)."""
+    from openswap.worker.containment import default_lock_dir
+
+    return default_lock_dir().parent / "claude-cli"
+
+
+def _private_copy(source: Path, digest: str) -> Path:
+    """Copy ``source`` to a read-only file in :func:`pinned_copies_dir` named by its digest.
+
+    Jobs execute this copy, so an update or replacement of the installed
+    binary between the hash and the launch can never run unverified.
+    """
+    from openswap.worker.containment import ensure_private_dir
+
+    store = pinned_copies_dir()
+    store.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        ensure_private_dir(store)
+    except Exception:
+        raise ClaudeCliError("binary_unsafe") from None
+    dest = store / f"claude-{digest[:32]}"
+    try:
+        if dest.exists() and not dest.is_symlink() and sha256_file(dest) == digest:
+            return dest
+    except (OSError, CodexCliError):
+        pass
+    fd, tmp = tempfile.mkstemp(dir=str(store), prefix=".claude.")
+    try:
+        with os.fdopen(fd, "wb") as out, open(source, "rb") as src:
+            shutil.copyfileobj(src, out, 1024 * 1024)
+        os.chmod(tmp, 0o500)
+        os.replace(tmp, dest)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise ClaudeCliError("binary_unsafe") from None
+    return dest
+
+
 def pin(backup_root: Path, *, binary: Path | None = None, run=subprocess.run, which=shutil.which,
         supported: bool | None = None) -> PinnedClaude:
-    """Record the installed binary's path, version and SHA-256 (replacing an older pin)."""
+    """Pin the installed Claude Code: a private, read-only copy of it, with its version
+    and SHA-256 (replacing an older pin). Jobs run that copy, never the installed path."""
     if not (platform_supported() if supported is None else supported):
         raise ClaudeCliError("unsupported_platform")
-    binary = Path(os.path.realpath(binary)) if binary is not None else find_installed(which)
-    if binary is None:
+    source = Path(os.path.realpath(binary)) if binary is not None else find_installed(which)
+    if source is None:
         raise ClaudeCliError("not_installed")
+    _check_binary(source, backup_root)
+    try:
+        source_digest = sha256_file(source)
+    except (OSError, CodexCliError):
+        raise ClaudeCliError("binary_unsafe") from None
+    binary = _private_copy(source, source_digest)
     _check_binary(binary, backup_root)
-    version = _version(binary, run)
     try:
         digest = sha256_file(binary)
     except (OSError, CodexCliError):
         raise ClaudeCliError("binary_unsafe") from None
+    if digest != source_digest:
+        raise ClaudeCliError("binary_changed")  # replaced while it was being copied
+    version = _version(binary, run)
     target = pin_path(backup_root)
     target.parent.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     target.parent.mkdir(mode=0o700, exist_ok=True)
-    document = {"binary": str(binary), "version": version, "binary_sha256": digest,
+    document = {"binary": str(binary), "source": str(source), "version": version, "binary_sha256": digest,
                 "pinned_at": datetime.now(timezone.utc).isoformat()}
     fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".pin.")
     with os.fdopen(fd, "w", encoding="utf-8") as handle:

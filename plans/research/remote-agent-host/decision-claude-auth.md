@@ -14,9 +14,9 @@ legal clearance, and the evidence section below still applies as recorded risk.
 What the implementation does under this decision (plan 017, phase 1):
 
 - Runs the unmodified `claude` binary the owner installed (`claude -p`,
-  stream-json). OpenSwap pins its SHA-256 on first use
-  (`openswap worker claude pin`) and refuses to launch if the file changes;
-  there is no published digest to verify against, so the pin is
+  stream-json). `openswap worker claude pin` hashes it and keeps a
+  byte-identical read-only copy that jobs execute; a launch is refused if the
+  copy changes. There is no published digest to verify against, so the pin is
   trust-on-first-use. Auto-update is disabled for jobs; after an owner-side
   update the owner re-pins and re-runs the live check.
 - Selects the account through its OpenSwap-managed Claude profile (plan 003

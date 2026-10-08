@@ -316,7 +316,7 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
 def claude_status(backup_root: Path) -> dict:
     from openswap.worker import claude_cli
     from openswap.worker.accounts import claude_accounts
-    from openswap.worker.claude_exec import profile_for, profile_identity, profile_shared
+    from openswap.worker.claude_exec import managed_claude_config, profile_for, profile_identity, profile_shared
 
     root = Path(backup_root)
     try:
@@ -338,7 +338,7 @@ def claude_status(backup_root: Path) -> dict:
             # Exactly what a launch requires: signed in as the account and
             # not mirroring the default profile's customizations.
             "profile_ready": profile is not None and profile_identity(profile) == choice.account_ref
-            and not profile_shared(profile),
+            and not profile_shared(profile) and not managed_claude_config(profile),
         })
     return {"cli": cli, "accounts": accounts, **live_status(root, "claude")}
 
