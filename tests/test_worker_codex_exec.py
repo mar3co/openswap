@@ -1085,3 +1085,34 @@ def test_a_late_run_interrupted_with_proof_releases_the_lease(tmp_path):
         _time.sleep(0.05)
     assert lease.state == "released" and lease.reason == "confirmed_stopped"
     assert containment.stops == 1
+
+
+def test_live_lock_io_errors_are_controlled_refusals(tmp_path, monkeypatch):
+    from openswap import locking
+
+    def broken(self, timeout=None):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(locking.FileLock, "acquire", broken)
+    with pytest.raises(live.LiveModeError) as error:
+        with live.live_lock(tmp_path):
+            pass
+    assert error.value.code == "live_lock_unavailable"
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    with pytest.raises(ProviderLaunchRefused):
+        make_adapter(tmp_path, containment).start(job_record(), workspace(tmp_path), worker_epoch=1)
+    assert containment.launches == []
+
+
+def test_a_wrong_account_that_will_not_sign_out_is_reported(tmp_path):
+    _roster(tmp_path, {"1": ACCOUNT_ID})
+
+    def run(argv, env, check=False, **kwargs):
+        if argv[1] == "login":
+            (Path(env["CODEX_HOME"]) / "auth.json").write_text(auth_json("acct-other"))
+        return subprocess.CompletedProcess(argv, 1 if argv[1] == "logout" else 0, "", "")
+
+    with pytest.raises(live_cli.AccountPinError) as error:
+        live_cli.login(tmp_path, "1", run=run, verify=pinned)
+    assert error.value.code == "login_account_mismatch_still_signed_in"

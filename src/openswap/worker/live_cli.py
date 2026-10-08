@@ -110,7 +110,10 @@ def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
         result = run(argv, env=env, check=False)
         signed_in = home_identity(home)
         if signed_in is not None and signed_in != identity:
-            run([str(pinned.binary), "logout"], env=env, check=False, capture_output=True)
+            cleanup = run([str(pinned.binary), "logout"], env=env, check=False, capture_output=True)
+            if cleanup.returncode != 0 or os.path.lexists(home / "auth.json"):
+                # The other account's credentials are still there: say so.
+                raise AccountPinError("login_account_mismatch_still_signed_in")
             raise AccountPinError("login_account_mismatch")
     if signed_in != identity:
         raise AccountPinError("login_not_completed" if result.returncode == 0 else "login_failed")

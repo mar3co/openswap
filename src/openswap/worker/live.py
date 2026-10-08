@@ -66,9 +66,15 @@ def live_lock(backup_root: Path, *, timeout: float = LIVE_LOCK_TIMEOUT_SECONDS):
     from openswap.worker.containment import ensure_private_dir
 
     worker_dir = Path(backup_root) / "worker"
-    ensure_private_dir(worker_dir)
-    lock = FileLock(worker_dir / "live.lock", timeout=timeout)
-    if not lock.acquire():
+    try:
+        ensure_private_dir(worker_dir)
+        lock = FileLock(worker_dir / "live.lock", timeout=timeout)
+        acquired = lock.acquire()
+    except Exception:
+        # Unwritable, read-only or exhausted: a controlled refusal, never a
+        # traceback, and to the adapter proof that nothing was launched.
+        raise LiveModeError("live_lock_unavailable") from None
+    if not acquired:
         raise LiveModeError("live_lock_busy")
     try:
         yield
