@@ -318,6 +318,36 @@ def job_label(job_id: str) -> str:
     return label
 
 
+def canonical_dir(path: Path | str) -> Path:
+    """One spelling per physical directory, for its locks, handle and mirror.
+
+    ``realpath`` resolves links and ``..`` but keeps the caller's letter case,
+    and the default macOS volume is case-insensitive, so ``Runs/job`` and
+    ``runs/job`` would get different locks. ``F_GETPATH`` on an open
+    descriptor returns the on-disk spelling. A directory that cannot be opened
+    (gone, or not macOS) falls back to ``realpath``.
+    """
+    resolved = os.path.realpath(path)
+    try:
+        import fcntl
+
+        getpath = fcntl.F_GETPATH
+    except (ImportError, AttributeError):
+        return Path(resolved)
+    try:
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return Path(resolved)
+    try:
+        raw = fcntl.fcntl(fd, getpath, bytes(1024))
+    except OSError:
+        return Path(resolved)
+    finally:
+        os.close(fd)
+    found = raw.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+    return Path(found) if found else Path(resolved)
+
+
 def _printable_path(path: Path) -> bool:
     return not any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in str(path))
 
@@ -531,7 +561,7 @@ class LaunchdContainment:
         except OSError:
             raise ContainmentError("run_dir_unavailable") from None
         # One spelling per physical directory, for its locks, handle and mirror.
-        run_dir = Path(os.path.realpath(run_dir))
+        run_dir = canonical_dir(run_dir)
         if not _printable_path(run_dir):
             # Ownership is proven by matching the plist path that
             # `launchctl print` shows on one line; a path with a line break or
@@ -855,7 +885,7 @@ class LaunchdContainment:
         Uses the run directory's handle or, if that is gone, its mirror; when
         both exist and disagree, nothing is trusted and nothing is touched.
         """
-        run_dir = Path(os.path.realpath(run_dir))
+        run_dir = canonical_dir(run_dir)
         primary = load_handle(run_dir)
         mirror = self._load_mirror(run_dir)
         if primary is None and mirror is None:
