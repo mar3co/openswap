@@ -589,6 +589,26 @@ def test_a_network_failure_counts_only_if_the_network_works_outside(tmp_path):
     assert gate["shell_network_denied"] is False and gate["passed"] is False
 
 
+class PatchingMac(SimulatedMac):
+    """The model edits the workspace with a file_change item before the probes."""
+
+    def launch(self, *, job_id, run_dir, argv, env, cwd, stdin_text, ready_timeout=15.0):
+        handle = super().launch(job_id=job_id, run_dir=run_dir, argv=argv, env=env, cwd=cwd,
+                                stdin_text=stdin_text, ready_timeout=ready_timeout)
+        if re.search(r"^\d+\. ", stdin_text, flags=re.M):
+            stdout = Path(run_dir) / "stdout.jsonl"
+            lines = stdout.read_text().splitlines()
+            patch = json.dumps({"type": "item.completed", "item": {"id": "p", "type": "file_change"}})
+            stdout.write_text("\n".join([lines[0], patch, *lines[1:]]) + "\n")
+        return handle
+
+
+def test_a_file_change_in_the_probe_run_fails_the_gate(tmp_path):
+    root = setup_root(tmp_path)
+    gate = make_check(root, PatchingMac()).run()["gates"]["sandbox_exec"]
+    assert gate["no_other_tool_items"] is False and gate["passed"] is False
+
+
 class ShortLivedEscapeMac(SimulatedMac):
     """launchctl submit succeeds, but its job is gone before the label check."""
 

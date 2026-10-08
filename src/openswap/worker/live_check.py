@@ -185,6 +185,11 @@ def command_items(stdout_path: Path) -> list[dict]:
     return [items[key] for key in order]
 
 
+# What the sandbox probe run may contain: its commands, and the model's own
+# messages, reasoning and plan.
+PROBE_ITEM_TYPES = frozenset({"command_execution", "agent_message", "reasoning", "todo_list"})
+
+
 def item_types(stdout_path: Path) -> set[str]:
     found = set()
     try:
@@ -703,6 +708,9 @@ class LiveCheck:
         detail = {
             "all_required_steps_ran": required_seen,
             "no_unexpected_commands": not unexpected,
+            # Only shell commands may act: an edit or any other tool (a
+            # file_change creating link.txt, say) could pre-seed a probe.
+            "no_other_tool_items": not (item_types(outcome.run_dir / STDOUT_FILE) - PROBE_ITEM_TYPES),
             "network_reachable_outside_sandbox": outside_ok,
             "evidence_complete": complete,
             "each_probe_its_own_command": not combined,
