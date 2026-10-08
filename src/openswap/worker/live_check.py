@@ -240,10 +240,32 @@ def command_tokens(command: str) -> list[str] | None:
         if len(inner) != 1:
             break
         text = inner[0].strip()
+    # Keep shell syntax: operators are their own tokens, so a quoted
+    # "link.txt;" never equals an unquoted "link.txt" followed by ";".
     try:
-        return shlex.split(text)
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = []
+        for token in lexer:
+            tokens.append(token)
+        return _with_quote_marks(text, tokens)
     except ValueError:
         return None
+
+
+def _with_quote_marks(text: str, tokens: list[str]) -> list[str]:
+    """Mark tokens that came from quotes, so ``'a;'`` and ``a ;`` stay different."""
+    marked = []
+    for token in tokens:
+        if any(ch in token for ch in ";&|<>()") and token.strip(";&|<>()"):
+            marked.append(f"quoted:{token}")
+        else:
+            marked.append(token)
+    return marked
+
+
+def _all_failed(items: list[dict]) -> bool:
+    return bool(items) and all(type(item["exit_code"]) is int and item["exit_code"] != 0 for item in items)
 
 
 def parse_features(text: str) -> dict[str, bool]:
@@ -318,9 +340,11 @@ class LiveCheck:
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
 
-    def _marker_pids(self, *commands: str) -> list[int]:
-        wanted = set(commands)
-        return [pid for pid, command in self._list_processes() if command.strip() in wanted]
+    def _marker_pids(self, *markers: str) -> list[int]:
+        """Pids of this check's own helpers: their argv[0] is a random per-run marker."""
+        wanted = set(markers)
+        return [pid for pid, command in self._list_processes()
+                if command.split(None, 1)[:1] and command.split(None, 1)[0] in wanted]
 
     def _codex(self, pinned, home: Path, *args: str, cwd: Path, timeout: float = 60) -> subprocess.CompletedProcess:
         env = codex_env(home, self.check_root)
@@ -665,9 +689,11 @@ class LiveCheck:
             "inside_read_allowed": tokens["inside"] in "".join(i["output"] for i in observed(str(ws / "inside.txt"))),
             "inside_write_allowed": (ws / "inside-write.txt").exists(),
             "outside_read_denied": tokens["outside"] not in everything,
-            "outside_write_denied": not (outside / "write.txt").exists(),
+            # The write itself must fail: a marker removed later proves nothing.
+            "outside_write_denied": _all_failed(observed(str(outside / "write.txt")))
+            and not (outside / "write.txt").exists(),
             "symlink_read_denied": seen["symlink_read"] and tokens["link"] not in everything,
-            "tmp_write_denied": not tmp_marker.exists(),
+            "tmp_write_denied": _all_failed(observed(tmp_marker.name)) and not tmp_marker.exists(),
             "codex_home_read_denied": tokens["home"] not in everything,
             "auth_read_denied": bool(auth) and all(type(i["exit_code"]) is int and i["exit_code"] != 0
                                                    for i in auth),
@@ -689,13 +715,18 @@ class LiveCheck:
         gate.passed = all(value for key, value in detail.items() if key != "steps_ran")
 
     def _helper_script(self, ws: Path) -> tuple[str, str]:
-        child = f"/bin/sleep {1200 + secrets.randbelow(500)}"
-        detached = f"/bin/sleep {1800 + secrets.randbelow(500)}"
+        """Write the helper; returns the argv[0] markers of its child and detached sleeps.
+
+        Each sleep runs with a random 128-bit argv[0], so only this check's own
+        helpers can ever match (and be killed), never an unrelated process.
+        """
+        token = secrets.token_hex(16)
+        child, detached = f"openswap-live-check-{token}-child", f"openswap-live-check-{token}-detached"
         script = (
             "#!/bin/sh\n"
             f"/usr/bin/perl -e 'use POSIX; if (fork() == 0) {{ setsid(); close STDIN; close STDOUT; "
-            f"close STDERR; exec \"/bin/sleep\", \"{detached.split()[1]}\"; }} exit 0;'\n"
-            f"exec {child}\n"
+            f"close STDERR; exec {{\"/bin/sleep\"}} \"{detached}\", \"1800\"; }} exit 0;'\n"
+            f"exec /usr/bin/perl -e 'exec {{\"/bin/sleep\"}} \"{child}\", \"1200\";'\n"
         )
         (ws / "helper.sh").write_text(script)
         return child, detached

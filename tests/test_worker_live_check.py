@@ -112,8 +112,8 @@ class SimulatedMac:
         cwd = Path(cwd)
         if "sh ./helper.sh" in stdin_text:
             script = (cwd / "helper.sh").read_text()
-            sleeps = re.findall(r"(?:sleep\"?, \"|/bin/sleep )(\d+)", script)
-            job.update(running=True, exit=None, helpers=[f"/bin/sleep {n}" for n in sleeps])
+            markers = re.findall(r'"(openswap-live-check-[0-9a-f]+-(?:child|detached))", "(\d+)"', script)
+            job.update(running=True, exit=None, helpers=[f"{name} {n}" for name, n in markers])
             self.processes += [(7000 + i, cmd) for i, cmd in enumerate(job["helpers"])]
         else:
             commands = re.findall(r"^\d+\. (.+)$", stdin_text, flags=re.M)
@@ -404,6 +404,10 @@ def test_chained_probes_prove_nothing(tmp_path):
 def test_command_tokens_unwrap_shells_and_compare_exactly():
     probe = "/bin/sh -c 'printf x > /tmp/a b.txt'"
     assert live_check.command_tokens(probe) == ["printf", "x", ">", "/tmp/a", "b.txt"]
+    symlink = "ln -s /o/link-target.txt link.txt; cat link.txt"
+    assert live_check.command_tokens(symlink) == ["ln", "-s", "/o/link-target.txt", "link.txt", ";", "cat", "link.txt"]
+    assert live_check.command_tokens("ln -s /o/link-target.txt 'link.txt;' cat link.txt") != \
+        live_check.command_tokens(symlink)
     assert live_check.command_tokens(f"bash -lc {shlex.quote(probe)}") == live_check.command_tokens(probe)
     assert live_check.command_tokens("/bin/zsh -lc 'cat /x/read-me.txt'") == ["cat", "/x/read-me.txt"]
     assert live_check.command_tokens("cat /x/read-me.txt >/dev/null") != ["cat", "/x/read-me.txt"]
@@ -467,6 +471,38 @@ def test_prompts_go_to_stderr(monkeypatch, capsys):
     assert live_check._ask("Run it now?") is True
     out, err = capsys.readouterr()
     assert out == "" and "Run it now? [y/N]" in err
+
+
+class SelfCleaningMac(SimulatedMac):
+    """A leaky sandbox where the writes succeed, then another command removes the markers."""
+
+    def _simulate(self, command, cwd):
+        if "write.txt" in command or "openswap-live-check-" in command and "/tmp/" in command:
+            target = re.search(r"> (\S+?)'?$", command)
+            if target:
+                Path(target.group(1).strip("'")).unlink(missing_ok=True)
+            return "", 0
+        return super()._simulate(command, cwd)
+
+
+def test_a_write_that_succeeded_fails_even_if_its_marker_is_gone(tmp_path):
+    root = setup_root(tmp_path)
+    evidence = make_check(root, SelfCleaningMac()).run()
+    gate = evidence["gates"]["sandbox_exec"]
+    assert gate["outside_write_denied"] is False and gate["tmp_write_denied"] is False
+    assert gate["passed"] is False
+
+
+def test_helpers_are_matched_only_by_their_random_marker(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    check = make_check(root, mac)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    child, detached = check._helper_script(ws)
+    assert child != detached and len(child) > 40
+    mac.processes = [(10, "/bin/sleep 1200"), (11, f"{detached} 1800"), (12, f"{child}-other 1")]
+    assert check._marker_pids(child, detached) == [11]
 
 
 class ShortLivedEscapeMac(SimulatedMac):
