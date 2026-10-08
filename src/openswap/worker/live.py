@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+from openswap.locking import FileLock
 
 from openswap.settings import LiveExecutionSettings, load_live_execution, write_live_execution
 from openswap.worker.codex_cli import CODEX_VERSION_OUTPUT, PinnedCodex, platform_supported
@@ -46,6 +49,31 @@ class LiveModeError(RuntimeError):
         super().__init__(code)
         self.code = code
         self.problems = problems
+
+
+LIVE_LOCK_TIMEOUT_SECONDS = 60.0
+
+
+@contextmanager
+def live_lock(backup_root: Path, *, timeout: float = LIVE_LOCK_TIMEOUT_SECONDS):
+    """Serialize the opt-in with launch commitment across processes.
+
+    ``enable``/``disable`` write the opt-in while holding it, and the adapter
+    holds it from its last mode check until the provider is released, so once
+    ``live disable`` returns no job that has not already been released can
+    start. Raises :class:`LiveModeError` when it cannot be taken in time.
+    """
+    from openswap.worker.containment import ensure_private_dir
+
+    worker_dir = Path(backup_root) / "worker"
+    ensure_private_dir(worker_dir)
+    lock = FileLock(worker_dir / "live.lock", timeout=timeout)
+    if not lock.acquire():
+        raise LiveModeError("live_lock_busy")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def execution_mode(backup_root: Path) -> str:
@@ -123,14 +151,19 @@ def enable_live(backup_root: Path, evidence_path: Path, pinned: PinnedCodex) -> 
     problems = evidence_problems(data, pinned=pinned)
     if problems:
         raise LiveModeError("evidence_not_passing", problems)
-    return write_live_execution(Path(backup_root), LiveExecutionSettings(
-        enabled=True, evidence_sha256=digest, codex_sha256=pinned.binary_sha256,
-        enabled_at=datetime.now(timezone.utc).isoformat(),
-    ))
+    with live_lock(backup_root):
+        return write_live_execution(Path(backup_root), LiveExecutionSettings(
+            enabled=True, evidence_sha256=digest, codex_sha256=pinned.binary_sha256,
+            enabled_at=datetime.now(timezone.utc).isoformat(),
+        ))
 
 
 def disable_live(backup_root: Path) -> LiveExecutionSettings:
-    return write_live_execution(Path(backup_root), LiveExecutionSettings())
+    """Turn live execution off. Waits for a launch in progress to commit or
+    refuse; once this returns, no further job starts. A job already running
+    is not stopped (``openswap worker stop`` does that)."""
+    with live_lock(backup_root):
+        return write_live_execution(Path(backup_root), LiveExecutionSettings())
 
 
 def live_status(backup_root: Path) -> dict:

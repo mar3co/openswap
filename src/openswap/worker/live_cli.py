@@ -102,10 +102,11 @@ def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
     choice = _resolve(root, selector)
     identity = choice.account_ref
     pinned = (verify or (lambda: codex_cli.verify(root)))()
-    home = prepare_home(root, identity)
-    env = _login_env(home)
     argv = [str(pinned.binary), "login"] + (["--device-auth"] if device_auth else [])
     with account_session_lease(root, identity, "login"):
+        # Under the lease: a job running on this account owns its home's config.
+        home = prepare_home(root, identity)
+        env = _login_env(home)
         result = run(argv, env=env, check=False)
         signed_in = home_identity(home)
         if signed_in is not None and signed_in != identity:
@@ -125,8 +126,12 @@ def logout(backup_root: Path, selector: str | None, *, run=subprocess.run, verif
         return {"slot": choice.number, "account_ref": identity, "signed_in": False}
     pinned = (verify or (lambda: codex_cli.verify(root)))()
     with account_session_lease(root, identity, "logout"):
-        run([str(pinned.binary), "logout"], env=_login_env(home), check=False)
-    return {"slot": choice.number, "account_ref": identity, "signed_in": home_identity(home) == identity}
+        result = run([str(pinned.binary), "logout"], env=_login_env(home), check=False)
+        still = home_identity(home)
+    if result.returncode != 0 or still is not None:
+        # Jobs could keep using a sign-in that is still there: never report it gone.
+        raise AccountPinError("logout_failed")
+    return {"slot": choice.number, "account_ref": identity, "signed_in": False}
 
 
 def codex_status(backup_root: Path) -> dict:
