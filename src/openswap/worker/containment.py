@@ -110,7 +110,14 @@ def _fresh(run_dir: Path) -> bool:
 
 
 def _run_dir_key(run_dir: Path) -> str:
-    return hashlib.sha256(str(Path(run_dir)).encode()).hexdigest()[:32]
+    """Lock and mirror key of a run directory, the same for every letter case.
+
+    The key must still match after the directory is gone (recovery reads the
+    mirror then), when the on-disk spelling can no longer be asked for: so it
+    folds case. Two directories differing only in case (possible on a
+    case-sensitive volume) merely share a lock.
+    """
+    return hashlib.sha256(str(Path(run_dir)).casefold().encode()).hexdigest()[:32]
 
 
 def default_lock_dir() -> Path:
@@ -799,9 +806,12 @@ class LaunchdContainment:
             raw = json.loads(text)
         except ValueError:
             return None
-        if not isinstance(raw, dict) or raw.get("run_dir") != str(Path(run_dir)):
+        recorded = raw.get("run_dir") if isinstance(raw, dict) else None
+        # Matched like its key (any letter case), then trusted in the spelling
+        # the launch recorded.
+        if not isinstance(recorded, str) or recorded.casefold() != str(Path(run_dir)).casefold():
             return None
-        return _handle_from(raw, Path(run_dir))
+        return _handle_from(raw, Path(recorded))
 
     def _forget_mirror(self, run_dir: Path) -> None:
         try:
