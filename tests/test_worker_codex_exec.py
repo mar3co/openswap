@@ -776,3 +776,62 @@ def test_roots_overlapping_the_private_worker_dir_are_refused(tmp_path):
             adapter.start(job_record(), ResolvedWorkspace("research", out, sources), worker_epoch=1)
         assert error.value.diagnostic_code == "provider_unavailable"
     assert containment.launches == []
+
+
+def test_finished_runs_leave_the_registry_but_keep_their_proof(tmp_path):
+    sign_in(tmp_path)
+    adapter = make_adapter(tmp_path, FakeContainment(SUCCESS_SCRIPT))
+    run = adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    drain(adapter, run)
+    assert adapter._runs == {}
+    assert adapter.interrupt(run) == InterruptResult(False, True, None)
+    for index in range(codex_exec.FINISHED_RUNS_KEPT + 5):
+        adapter._forget(10_000 + index, True)
+    assert len(adapter._finished) == codex_exec.FINISHED_RUNS_KEPT
+
+
+def test_launch_refuses_while_the_live_lock_is_held(tmp_path, monkeypatch):
+    from openswap.locking import FileLock
+
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    adapter = make_adapter(tmp_path, containment)
+    original = codex_exec.live_lock
+    monkeypatch.setattr(codex_exec, "live_lock", lambda root: original(root, timeout=0.2))
+    holder = FileLock(tmp_path / "worker" / "live.lock", timeout=1)
+    assert holder.acquire()
+    try:
+        with pytest.raises(ProviderLaunchRefused) as error:
+            adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+        assert error.value.diagnostic_code == "provider_unavailable"
+    finally:
+        holder.release()
+    assert containment.launches == []
+    adapter.start(job_record("e" * 32), workspace(tmp_path), worker_epoch=1)
+    assert len(containment.launches) == 1
+
+
+def test_enable_and_disable_take_the_live_lock(tmp_path, monkeypatch):
+    taken = []
+    original = live.live_lock
+
+    def spy(root, **kwargs):
+        taken.append(root)
+        return original(root, **kwargs)
+
+    monkeypatch.setattr(live, "live_lock", spy)
+    live.disable_live(tmp_path)
+    assert taken == [tmp_path]
+
+
+def test_logout_fails_while_the_sign_in_remains(tmp_path):
+    _roster(tmp_path, {"1": ACCOUNT_ID})
+    sign_in(tmp_path)
+
+    def stubborn(argv, env, check=False, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    with pytest.raises(live_cli.AccountPinError) as error:
+        live_cli.logout(tmp_path, "1", run=stubborn, verify=pinned)
+    assert error.value.code == "logout_failed"
+    assert live_cli.logout(tmp_path, "1", run=_login_run(ACCOUNT_ID), verify=pinned)["signed_in"] is False

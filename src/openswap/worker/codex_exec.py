@@ -38,6 +38,7 @@ import json
 import os
 import stat
 import threading
+from collections import OrderedDict
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -56,7 +57,7 @@ from openswap.worker.containment import (
     write_private,
 )
 from openswap.worker.leases import LeaseStateError, stable_account_identity
-from openswap.worker.live import LIVE, execution_mode
+from openswap.worker.live import LIVE, LiveModeError, execution_mode, live_lock
 from openswap.worker.models import (
     InterruptResult,
     JobRecord,
@@ -81,6 +82,7 @@ MAX_LINE_BYTES = 1024 * 1024
 READ_CHUNK_BYTES = 256 * 1024
 MAX_AUTH_BYTES = 1024 * 1024
 EVENT_WAIT_SECONDS = 0.25
+FINISHED_RUNS_KEPT = 32
 
 # Global feature switches, exactly the set the credential-free 0.157.1
 # tool-surface probe accepted under --strict-config, minus shell_tool: the
@@ -351,6 +353,9 @@ class CodexExecAdapter:
         self._monotonic = monotonic
         self._sleep = sleep
         self._runs: dict[int, _Run] = {}
+        # Stop proof of runs that already finished, so a late interrupt()
+        # still reports it; bounded, oldest dropped first.
+        self._finished: OrderedDict[int, bool] = OrderedDict()
         self._runs_lock = threading.Lock()
 
     @property
@@ -386,6 +391,15 @@ class CodexExecAdapter:
         return ProviderAvailability(True, None, pinned.version)
 
     def start(self, job: JobRecord, workspace: ResolvedWorkspace, *, worker_epoch: int) -> ProviderRun:
+        # The opt-in check and the provider's release are one step under the
+        # live lock, so a `live disable` that returned cannot be overtaken.
+        try:
+            with live_lock(self.backup_root):
+                return self._start_locked(job, workspace, worker_epoch=worker_epoch)
+        except (LiveModeError, ContainmentError):
+            raise ProviderLaunchRefused("provider_unavailable") from None
+
+    def _start_locked(self, job: JobRecord, workspace: ResolvedWorkspace, *, worker_epoch: int) -> ProviderRun:
         if self._mode() != LIVE:
             raise ProviderLaunchRefused("live_adapter_disabled")
         identity = job.pinned_account_ref
@@ -434,6 +448,7 @@ class CodexExecAdapter:
         run = _Run(job.job_id, handle, run_dir, output_root)
         with self._runs_lock:
             self._runs[handle.leader_pid] = run
+            self._finished.pop(handle.leader_pid, None)
         return ProviderRun(
             process_id=handle.leader_pid, session_id=None, worker_epoch=worker_epoch,
             generation=job.generation, provider_event_cursor=0,
@@ -462,7 +477,9 @@ class CodexExecAdapter:
                 if exited or not containment.leader_alive(state.handle):
                     # Drain whatever the provider wrote before it ended.
                     events = self._read_new(state, drain=True)
-                    events.append(self._finish(state))
+                    finished = self._finish(state)
+                    events.append(finished)
+                    self._forget(run.process_id, finished.execution_stopped)
                     return tuple(events)
             if self._monotonic() >= deadline:
                 return ()
@@ -601,11 +618,23 @@ class CodexExecAdapter:
         except OSError:
             pass
 
+    def _forget(self, process_id: int, stopped: bool) -> None:
+        with self._runs_lock:
+            self._runs.pop(process_id, None)
+            self._finished[process_id] = stopped is True
+            while len(self._finished) > FINISHED_RUNS_KEPT:
+                self._finished.popitem(last=False)
+
     # -- interrupt / recover ----------------------------------------------------
 
     def interrupt(self, run: ProviderRun) -> InterruptResult:
         state = self._run_for(run)
         if state is None:
+            with self._runs_lock:
+                stopped = self._finished.get(run.process_id)
+            if stopped is not None:
+                return InterruptResult(requested=False, execution_stopped=stopped,
+                                       diagnostic_code=None if stopped else "execution_uncertain")
             return InterruptResult(requested=False, execution_stopped=False, diagnostic_code="execution_uncertain")
         with state.lock:
             if state.finished:
@@ -617,8 +646,7 @@ class CodexExecAdapter:
                 stopped = proof.stopped is True
                 self._write_summary(state, self.containment.exit_status(state.handle), proof.to_dict(),
                                     "interrupted", None)
-        with self._runs_lock:
-            self._runs.pop(run.process_id, None)
+        self._forget(run.process_id, stopped)
         return InterruptResult(
             requested=True, execution_stopped=stopped,
             diagnostic_code=None if stopped else "execution_uncertain",
