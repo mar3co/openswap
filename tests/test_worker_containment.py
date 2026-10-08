@@ -21,6 +21,8 @@ from openswap.worker.containment import (
     load_handle,
 )
 
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="launchd containment is macOS-only")
+
 WORKER_PID = 4242
 WORKER_COALITION = 7
 JOB_COALITION = 900
