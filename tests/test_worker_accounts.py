@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -423,32 +424,70 @@ def test_a_changed_pin_applies_to_the_next_job_without_a_restart(root):
     assert adapter.leased == [ALICE, BOB]
 
 
-def test_a_pin_change_just_before_the_launch_takes_the_guard_is_honoured(root, monkeypatch):
-    """The pin is read under the Codex mutation guard: a change that completes
-    right before the launch takes the guard is the account the job uses."""
-    from contextlib import contextmanager
-
+def test_a_pin_change_just_before_the_launch_takes_its_locks_is_honoured(root, monkeypatch):
+    """The pin is read under the lifecycle lock and the Codex mutation guard:
+    a change that completes right before the launch takes them is the account
+    the job uses (one that arrives later waits for the lease to be taken)."""
     update_worker_settings(root, enabled=True)
     cli.set_worker_account(root, "1")
     adapter = _FinishingAdapter(root)
     runtime = WorkerRuntime(root, adapter=adapter)
-    real_guard = runtime.leases.mutation_guard
+    real_probe = adapter.probe
     raced = []
 
-    @contextmanager
-    def racing_guard(*args, **kwargs):
+    def racing_probe(*args, **kwargs):
         if not raced:
             raced.append(True)
             cli.set_worker_account(root, "2")  # the owner's change lands first
-        with real_guard(*args, **kwargs) as guard:
-            yield guard
+        return real_probe(*args, **kwargs)
 
-    monkeypatch.setattr(runtime.leases, "mutation_guard", racing_guard)
+    monkeypatch.setattr(adapter, "probe", racing_probe)
     job = runtime.submit(_submission())
     assert runtime.reconcile_once().state == JobState.SUCCEEDED
     assert raced == [True]
     assert runtime.get(job.job_id).pinned_account_ref == BOB
     assert adapter.leased == [BOB]
+
+
+def test_an_owner_command_holding_the_lifecycle_lock_waits_out_the_launch(root, monkeypatch):
+    """Lock order: the launch takes the lifecycle lock before _launch_lock, so
+    a stop arriving over IPC while an owner command holds the lifecycle lock
+    still gets _launch_lock, and the launch waits instead of deadlocking."""
+    import threading as _threading
+
+    update_worker_settings(root, enabled=True)
+    cli.set_worker_account(root, "1")
+    adapter = _FinishingAdapter(root)
+    runtime = WorkerRuntime(root, adapter=adapter)
+    holding, release = _threading.Event(), _threading.Event()
+    got_launch_lock = []
+
+    def owner_command():
+        with cli.lifecycle_lock(root):
+            holding.set()
+            release.wait(5)
+            time.sleep(0.3)  # the launch is now waiting for the lifecycle lock
+            # What a disable's IPC stop handler does in the worker process.
+            acquired = runtime._launch_lock.acquire(timeout=2)
+            got_launch_lock.append(acquired)
+            if acquired:
+                runtime._launch_lock.release()
+
+    real_probe = adapter.probe
+
+    def probe_then_let_owner_in(*args, **kwargs):
+        result = real_probe(*args, **kwargs)
+        command.start()
+        holding.wait(5)
+        release.set()
+        return result
+
+    command = _threading.Thread(target=owner_command)
+    monkeypatch.setattr(adapter, "probe", probe_then_let_owner_in)
+    runtime.submit(_submission())
+    assert runtime.reconcile_once().state == JobState.SUCCEEDED
+    command.join(5)
+    assert got_launch_lock == [True]
 
 
 def test_clearing_the_pin_fails_the_next_job_as_before(root):
@@ -502,205 +541,6 @@ def test_an_unreadable_roster_fails_closed(root):
     result = runtime.reconcile_once()
     assert result.diagnostic_code == "provider_auth_unavailable"
     assert adapter.start_count == 0
-
-
-# --- after pairing ----------------------------------------------------------------
-
-
-def _pair(root, monkeypatch, *, interactive, answers=()):
-    monkeypatch.setattr(pairing, "Transport", lambda *_: PairTransport())
-    monkeypatch.setattr(cli, "_interactive_terminal", lambda: interactive)
-    replies = iter(answers)
-
-    def fake_input(prompt=""):
-        print(prompt, end="")
-        try:
-            return next(replies)
-        except StopIteration:
-            raise EOFError from None
-
-    monkeypatch.setattr("builtins.input", fake_input)
-    return cli.main(["pair", "http://localhost", "one-use"], backup_root=root)
-
-
-def test_pair_on_a_tty_offers_eligible_codex_accounts(root, keychain, monkeypatch, capsys):
-    assert _pair(root, monkeypatch, interactive=True, answers=["claudey", "2"]) == 0
-    out = capsys.readouterr().out
-    assert "Paired worker worker." in out
-    assert "  1 · alice@example.com (work)" in out
-    assert "  3 · " not in out  # an API-key slot is not offered
-    assert "carol@example.com" not in out  # Claude is not offered
-    assert cli._ACCOUNT_MESSAGES["claude_not_supported"] in out
-    assert "Pinned Codex account 2 · bob@example.com" in out
-    assert "openswap worker workspace add <id> <folder>" in out
-    assert SECRET not in out
-    assert load_worker_settings(root).pinned_account_ref == BOB
-
-
-def test_pair_on_a_tty_enter_skips(root, keychain, monkeypatch, capsys):
-    assert _pair(root, monkeypatch, interactive=True, answers=[""]) == 0
-    out = capsys.readouterr().out
-    assert "Skipped." in out and "openswap worker workspace add" in out
-    policy = load_worker_settings(root)
-    assert policy.pinned_account_ref is None
-    assert policy.control_service_url == "http://localhost"
-
-
-def test_pair_on_a_tty_with_a_pin_does_not_prompt(root, keychain, monkeypatch, capsys):
-    cli.set_worker_account(root, "1")
-    assert _pair(root, monkeypatch, interactive=True, answers=[]) == 0
-    out = capsys.readouterr().out
-    assert "Remote tasks uses Codex account 1 · alice@example.com (work)." in out
-    assert "Account (slot" not in out
-    assert "openswap worker workspace add" in out
-
-
-def test_pair_without_a_tty_prints_next_steps(root, keychain, monkeypatch, capsys):
-    assert _pair(root, monkeypatch, interactive=False,
-                 answers=["1"]) == 0  # an answer is never read without a TTY
-    out = capsys.readouterr().out
-    assert "Account (slot" not in out
-    assert "Next: pin the Codex account" in out
-    assert "openswap worker workspace add <id> <folder>" in out
-    assert load_worker_settings(root).pinned_account_ref is None
-
-
-def test_pairing_succeeds_even_if_the_follow_up_fails(root, keychain, monkeypatch, capsys):
-    def broken(*_args, **_kwargs):
-        raise RuntimeError("synthetic failure")
-
-    monkeypatch.setattr(cli, "_post_pair_setup", broken)
-    assert _pair(root, monkeypatch, interactive=True) == 0
-    assert "openswap worker account" in capsys.readouterr().out
-    assert load_worker_settings(root).control_service_url == "http://localhost"
-
-
-def test_pair_prompt_survives_a_failing_pin(root, keychain, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "set_worker_account",
-                        lambda *_: (_ for _ in ()).throw(OSError("disk")))
-    assert _pair(root, monkeypatch, interactive=True, answers=["1"]) == 0
-    assert "Could not pin that account" in capsys.readouterr().out
-
-
-# --- after pairing: offer to start the worker ---------------------------------------
-
-OFFER = "Start the Remote tasks worker now so this Mac can accept approved tasks? [Y/n] "
-ONLINE = "Remote tasks worker enabled. The portal shows this Mac online within about 15 seconds."
-
-
-@pytest.fixture
-def enable_calls(monkeypatch):
-    """Stub `worker enable`'s function: no launchctl, no settings change."""
-    calls = []
-    monkeypatch.setattr(cli, "enable_worker", lambda backup_root: calls.append(backup_root) or {"enabled": True})
-    return calls
-
-
-@pytest.mark.parametrize("answer", ["y", "Yes", ""])
-def test_pair_offer_yes_starts_the_worker_through_the_enable_function(
-    root, keychain, monkeypatch, capsys, enable_calls, answer,
-):
-    cli.set_worker_account(root, "1")  # no account prompt: the first answer is the offer's
-    assert _pair(root, monkeypatch, interactive=True, answers=[answer]) == 0
-    out = capsys.readouterr().out
-    assert enable_calls == [root]
-    assert OFFER in out and ONLINE in out
-    assert out.index(cli._WORKSPACE_HINT) < out.index(OFFER)  # after the account and folder steps
-    assert cli._EXECUTION_OFF_NOTE in out
-
-
-def test_pair_offer_follows_the_account_prompt(root, keychain, monkeypatch, capsys, enable_calls):
-    assert _pair(root, monkeypatch, interactive=True, answers=["1", "n"]) == 0
-    out = capsys.readouterr().out
-    assert out.index("Pinned Codex account 1") < out.index(OFFER)
-    assert enable_calls == []
-
-
-@pytest.mark.parametrize("answers", [["n"], ["no"], ["later"], []], ids=["n", "no", "other", "eof"])
-def test_pair_offer_no_or_eof_points_at_worker_enable(
-    root, keychain, monkeypatch, capsys, enable_calls, answers,
-):
-    cli.set_worker_account(root, "1")
-    assert _pair(root, monkeypatch, interactive=True, answers=answers) == 0
-    out = capsys.readouterr().out
-    assert enable_calls == []
-    assert OFFER in out
-    assert "Not started. Start it later with `openswap worker enable`." in out
-    assert cli._EXECUTION_OFF_NOTE in out
-    assert load_worker_settings(root).enabled is False
-
-
-def test_pair_offer_without_a_tty_prints_the_next_step(root, keychain, monkeypatch, capsys, enable_calls):
-    assert _pair(root, monkeypatch, interactive=False, answers=["y"]) == 0  # never read
-    out = capsys.readouterr().out
-    assert enable_calls == []
-    assert OFFER not in out
-    assert cli._START_WORKER_NEXT in out and "`openswap worker enable`" in out
-    assert cli._EXECUTION_OFF_NOTE in out
-
-
-@pytest.mark.parametrize("process, expected", [
-    ("running", "The Remote tasks worker is already running on this Mac."),
-    ("stopped", "The Remote tasks worker is enabled but not running. Run `openswap worker enable` "
-                "to start it again, or `openswap worker status` to check."),
-])
-def test_pair_offer_when_already_enabled_toggles_nothing(
-    root, keychain, monkeypatch, capsys, enable_calls, process, expected,
-):
-    cli.set_worker_account(root, "1")
-    update_worker_settings(root, enabled=True)
-    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": process})
-    assert _pair(root, monkeypatch, interactive=True, answers=["n"]) == 0
-    out = capsys.readouterr().out
-    assert OFFER not in out
-    assert expected in out
-    assert enable_calls == []
-    assert load_worker_settings(root).enabled is True
-
-
-@pytest.mark.parametrize("error, expected", [
-    (cli.ClaudeSwitchError("kickoff_in_progress"), "Could not enable worker (kickoff_in_progress)."),
-    (cli.ClaudeSwitchError("worker_stop_unconfirmed"),
-     "Worker is still stopping; wait for it to exit before enabling (worker_stop_unconfirmed)."),
-    # Detail that is not one of enable_worker's codes (paths, launchctl text) is not echoed.
-    (cli.ClaudeSwitchError("Could not write the worker LaunchAgent: /Users/someone/secret"),
-     "Could not enable worker."),
-    (OSError("disk"), "Could not enable worker."),
-])
-def test_pair_offer_reports_a_refused_enable_and_the_manual_command(
-    root, keychain, monkeypatch, capsys, error, expected,
-):
-    def refuse(_root):
-        raise error
-
-    monkeypatch.setattr(cli, "enable_worker", refuse)
-    cli.set_worker_account(root, "1")
-    assert _pair(root, monkeypatch, interactive=True, answers=["y"]) == 0
-    out = capsys.readouterr().out
-    assert expected in out
-    assert "Start it later with `openswap worker enable`." in out
-    assert ONLINE not in out
-    assert "/Users/someone/secret" not in out
-    assert load_worker_settings(root).control_service_url == "http://localhost"
-
-
-def test_pairing_succeeds_even_if_the_worker_offer_fails(root, keychain, monkeypatch, capsys, enable_calls):
-    def broken(*_args, **_kwargs):
-        raise RuntimeError("synthetic failure")
-
-    monkeypatch.setattr(cli, "_post_pair_worker_offer", broken)
-    assert _pair(root, monkeypatch, interactive=True) == 0
-    assert "`openswap worker enable`" in capsys.readouterr().out
-    assert enable_calls == []
-    assert load_worker_settings(root).control_service_url == "http://localhost"
-
-
-def test_worker_offer_survives_a_failing_account_step(root, keychain, monkeypatch, capsys, enable_calls):
-    monkeypatch.setattr(cli, "_post_pair_setup", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("x")))
-    assert _pair(root, monkeypatch, interactive=True, answers=["y"]) == 0
-    out = capsys.readouterr().out
-    assert "Next: `openswap worker account`" in out
-    assert enable_calls == [root]
 
 
 # --- worker status: paired but off -----------------------------------------------------

@@ -33,6 +33,7 @@ class UnavailableCodexAdapter:
     """Fail-closed production adapter; never inspects auth or launches Codex."""
 
     diagnostic_code = "live_adapter_disabled"
+    execution_mode = "disabled"
 
     def probe(self) -> ProviderAvailability:
         return ProviderAvailability(False, self.diagnostic_code, None)
@@ -50,3 +51,24 @@ class UnavailableCodexAdapter:
 def production_adapter() -> ProviderAdapter:
     """Return the only application adapter enabled in Phase 2."""
     return UnavailableCodexAdapter()
+
+
+EXECUTION_DISABLED = "disabled"
+EXECUTION_LIVE = "live"
+
+
+def execution_mode(adapter: object | None = None) -> str:
+    """Whether this Mac runs remote jobs for real: ``"disabled"`` or ``"live"``.
+
+    The one hook behind the readiness report sent to the control service and
+    the setup summary. It reads ``adapter.execution_mode`` (the production
+    adapter when ``adapter`` is None), and anything other than an explicit
+    ``"live"`` is ``"disabled"``. The production adapter is
+    UnavailableCodexAdapter today, which declares ``"disabled"``; an adapter
+    that really launches the provider declares ``execution_mode = "live"``.
+    Test adapters declare nothing and so report ``"disabled"``.
+    """
+    if adapter is None:
+        adapter = production_adapter()
+    mode = getattr(adapter, "execution_mode", None)
+    return EXECUTION_LIVE if mode == EXECUTION_LIVE else EXECUTION_DISABLED

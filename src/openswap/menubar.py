@@ -440,6 +440,7 @@ def run(switcher, codex=None) -> int:
             self._poll_login()
             self._drain_desktop_result()
             self._drain_worker_result()
+            self._drain_guided_setup()
             panel = self._panel
             if (
                 panel is not None
@@ -674,6 +675,50 @@ def run(switcher, codex=None) -> int:
             except Exception:
                 snapshot.pop("account_picker", None)
             return snapshot
+
+        def _run_guided_setup(self):
+            """Set up Remote tasks…: the steps of `openswap worker pair`, in dialogs.
+
+            Pair from the pasted pairing command when this Mac is not paired,
+            then start the worker, confirm the account, approve a research
+            folder and show the summary, through the same functions as the
+            CLI. The steps run on a worker thread (pairing, launchctl, locks);
+            ``on_sync_tick`` shows each dialog on the UI thread as it is asked.
+            """
+            if self._worker_operation is not None or getattr(self, "_guided_setup", None) is not None:
+                return
+            from openswap.worker import guided_setup
+
+            root = self.switcher.backup_dir
+            ui = guided_setup.ThreadedPrompts(guided_setup.DialogPrompts(self._alert, self._prompt))
+            self._guided_setup = ui
+
+            def steps():
+                from openswap.settings import load_worker_settings
+
+                try:
+                    paired = load_worker_settings(root).control_service_url is not None
+                    if paired or guided_setup.pair_interactively(root, ui):
+                        guided_setup.run(root, ui)
+                except Exception:
+                    ui.say("Setup stopped unexpectedly. Run `openswap worker setup` in Terminal to finish.")
+                finally:
+                    try:
+                        ui.flush()
+                    finally:
+                        ui.finished = True
+
+            threading.Thread(target=steps, name="openswap-guided-setup", daemon=True).start()
+
+        def _drain_guided_setup(self):
+            """On the UI thread: show the setup's pending dialog; refresh when it ends."""
+            ui = getattr(self, "_guided_setup", None)
+            if ui is None:
+                return
+            ui.serve()
+            if ui.finished:
+                self._guided_setup = None
+                self._worker_view_active()
 
         def _worker_action(self, row_id, value):
             if self._worker_operation is not None:
@@ -1490,7 +1535,9 @@ def run(switcher, codex=None) -> int:
         def _on_setting(self, row_id, value):
             if row_id == "remote_tasks_web_choice" and not value:
                 return  # the summary item: nothing to toggle
-            if row_id in {
+            if row_id == "remote_tasks_setup":
+                self._run_guided_setup()
+            elif row_id in {
                 "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_stop",
                 "remote_tasks_account", "remote_tasks_web_choice",
             }:
