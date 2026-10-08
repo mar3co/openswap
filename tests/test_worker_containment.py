@@ -43,6 +43,7 @@ class FakeProcs:
         self.dead_unreadable: set[int] = set()
         self.live_unreadable: set[int] = set()  # listed, alive, coalition unreadable
         self.table_fails = 0  # pids() raises this many more times
+        self.started: dict[int, float] = {}  # pid -> start time (wall clock)
         self._next = 5000
 
     def new(self, coalition, status=2):
@@ -102,6 +103,11 @@ class FakeProcs:
     def zombie_identity(self, pid):
         entry = self.table.get(pid)
         return f"100.{pid:06d}" if pid in self.zombies or (entry and entry[1] == 5) else None
+
+    def start_time(self, pid):
+        if pid not in self.table and pid not in self.zombies:
+            return None
+        return self.started.get(pid, 0.0)  # long ago unless a test says otherwise
 
 
 
@@ -1085,3 +1091,22 @@ def test_an_unreadable_worker_coalition_refuses_the_launch(tmp_path):
         containment.launch(job_id="a" * 32, run_dir=root / ("a" * 32), argv=["/bin/echo"], env={}, cwd=root,
                            stdin_text="")
     assert error.value.code == "job_coalition_unavailable" and error.value.launched is False
+
+
+
+def test_a_listed_pid_now_held_by_a_newer_process_makes_the_scan_incomplete(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    other = procs.new(333)
+    containment._wall = lambda: 1000.0
+    procs.started[other] = 999.0  # started before the listing: the listed process
+    assert containment._scan(JOB_COALITION)[other] == "other"
+    procs.started[other] = 1000.5  # started after the listing began: the pid was reused
+    scan = containment._scan(JOB_COALITION)
+    assert scan[other] == "gone" and containment._complete(scan, scan) is False
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="kern.proc.pid")
+def test_real_start_times_are_wall_clock():
+    procs = c.DarwinProcessTable()
+    started = procs.start_time(os.getpid())
+    assert started is not None and started <= time.time()
