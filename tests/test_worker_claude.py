@@ -627,6 +627,8 @@ def test_a_profile_sharing_the_default_customizations_is_refused_and_prepare_cle
     calls = []
 
     def unshare(path):  # removes the mirrored links and the manifest
+        # Under the Claude lease: no job can launch on the profile meanwhile.
+        assert AccountLeaseStore(root, "claude").read_current().state == "active"
         calls.append(path)
         (path / SHARE_MANIFEST).unlink()
 

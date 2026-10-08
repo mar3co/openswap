@@ -269,23 +269,23 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
 
     store = AccountLeaseStore(root, "claude")
     with store.mutation_guard() as guard:
-        # Refuse while a job (or anything else) holds a Claude lease.
+        # Refuse while a job (or anything else) holds a Claude lease; if the
+        # profile needs any change, take the lease before letting go of the
+        # guard, so no launch can interleave with the cleanup or the login.
         guard.assert_available()
         if ready():
             return {"slot": choice.number, "account_ref": identity, "profile_ready": True, "signed_in_now": False}
-    pinned = (verify or (lambda: claude_cli.verify(root)))()
-    if profile.is_dir() and profile_shared(profile):
-        (unshare or _unshare_profile)(profile)
+        token = guard.acquire(job_id=f"prepare-{uuid.uuid4().hex}", account_identity=identity,
+                              worker_pid=os.getpid(), worker_epoch=time.time_ns(), ttl_s=LOGIN_LEASE_SECONDS)
     signed_in_now = False
-    if not (profile.is_dir() and profile_identity(profile) == identity):
-        profile.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        profile.mkdir(mode=0o700, exist_ok=True)
-        env = _claude_login_env(profile)
-        with store.mutation_guard() as guard:
-            guard.assert_available()
-            token = guard.acquire(job_id=f"prepare-{uuid.uuid4().hex}", account_identity=identity,
-                                  worker_pid=os.getpid(), worker_epoch=time.time_ns(), ttl_s=LOGIN_LEASE_SECONDS)
-        try:
+    try:
+        pinned = (verify or (lambda: claude_cli.verify(root)))()
+        if profile.is_dir() and profile_shared(profile):
+            (unshare or _unshare_profile)(profile)
+        if not (profile.is_dir() and profile_identity(profile) == identity):
+            profile.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            profile.mkdir(mode=0o700, exist_ok=True)
+            env = _claude_login_env(profile)
             result = run([str(pinned.binary), "auth", "login", "--claudeai", "--email", choice.email],
                          env=env, check=False)
             signed = profile_identity(profile)
@@ -295,11 +295,11 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
                 if cleanup.returncode != 0 or profile_identity(profile) is not None:
                     raise AccountPinError("login_account_mismatch_still_signed_in")
                 raise AccountPinError("login_account_mismatch")
-        finally:
-            store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
-        if result.returncode != 0:
-            raise AccountPinError("login_failed")
-        signed_in_now = True
+            if result.returncode != 0:
+                raise AccountPinError("login_failed")
+            signed_in_now = True
+    finally:
+        store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
     if not ready():
         raise AccountPinError("claude_profile_not_ready")
     return {"slot": choice.number, "account_ref": identity, "profile_ready": True, "signed_in_now": signed_in_now}
