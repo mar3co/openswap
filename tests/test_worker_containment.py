@@ -1035,3 +1035,41 @@ def test_a_failed_bootstrap_never_boots_out_someone_elses_service(tmp_path):
                            stdin_text="")
     assert error.value.code == "launchd_bootstrap_failed"
     assert not any(call[0] == "bootout" for call in calls)
+
+
+
+def test_unparseable_print_output_proves_no_ownership(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    real = containment._launchctl
+
+    def launchctl(args):
+        if args[0] == "print":
+            return subprocess.CompletedProcess(args, 0, "{ a new format without a path line }\n", "")
+        return real(args)
+
+    containment._launchctl = launchctl
+    assert containment._owns_label(handle) == c.OWNERSHIP_UNKNOWN
+    proof = containment.stop(handle)
+    assert proof.stopped is False and proof.label_loaded is None
+
+
+def test_a_leader_pid_recycled_before_the_coalition_lookup_is_refused(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    real = containment._launchctl
+    prints = {"n": 0}
+
+    def launchctl(args):
+        result = real(args)
+        if args[0] == "print" and result.returncode == 0:
+            prints["n"] += 1
+            if prints["n"] == 2:  # the re-check after the coalition lookup
+                return subprocess.CompletedProcess(args, 0, result.stdout.replace("pid = ", "pid = 9"), "")
+        return result
+
+    containment._launchctl = launchctl
+    with pytest.raises(ContainmentError) as error:
+        containment.launch(job_id="a" * 32, run_dir=root / ("a" * 32), argv=["/bin/echo"], env={}, cwd=root,
+                           stdin_text="")
+    assert error.value.code == "job_leader_unverified" and error.value.launched is False

@@ -132,6 +132,8 @@ def default_lock_dir() -> Path:
     # recovery mirrors next to it.
     return home / "Library" / "Application Support" / "com.opensoft.openswap" / "job-locks"
 
+OWNERSHIP_UNKNOWN = "unknown"
+
 _SZOMB = 5
 _SSTOP = 4
 
@@ -647,6 +649,12 @@ class LaunchdContainment:
             if coalition is None or coalition == own:
                 # Without a coalition of its own the job cannot be swept.
                 raise ContainmentError("job_coalition_unavailable")
+            # The pid could have been recycled between the print and the
+            # lookup: launchd must still report it as this service's process
+            # (the wrapper waits for `go`, so it cannot have exited on its own).
+            again = self._launchctl(["print", f"{self.domain}/{label}"])
+            if again.returncode != 0 or _printed_pid(again.stdout) != pid or procs.coalition_of(pid) != coalition:
+                raise ContainmentError("job_leader_unverified")
             handle = replace(handle, leader_pid=pid, coalition_id=coalition)
             self._persist(handle)
             handle = replace(handle, released=True)
@@ -798,21 +806,27 @@ class LaunchdContainment:
     def _run_dir_lock(self, run_dir: Path, timeout: float) -> FileLock:
         return self._private_lock(f"rundir-{_run_dir_key(run_dir)}.lock", timeout)
 
-    def _owns_label(self, handle: JobHandle) -> bool | None:
-        """Whether the loaded label is this handle's job: ``None`` when nothing is loaded.
+    def _owns_label(self, handle: JobHandle) -> bool | str | None:
+        """Whether the loaded label is this handle's job.
 
-        launchd prints the plist a service was bootstrapped from as its
-        top-level ``path``; each launch writes its own plist in its own run
-        directory, so an exact match identifies the service.
+        ``True``: its top-level ``path`` is this launch's own plist. ``False``:
+        it shows another plist. ``None``: launchd reports nothing loaded.
+        ``OWNERSHIP_UNKNOWN``: any other failure or output this cannot parse
+        (``launchctl print`` output is not an API), which proves nothing.
         """
         printed = self._launchctl(["print", f"{handle.domain}/{handle.label}"])
         if printed.returncode != 0:
-            return None
-        expected = f"path = {handle.plist_path}"
-        return any(
-            line.startswith("\t") and not line.startswith("\t\t") and line.strip() == expected
+            if printed.returncode in (113, 3) or "could not find" in (printed.stderr or "").lower():
+                return None
+            return OWNERSHIP_UNKNOWN
+        paths = [
+            line.strip()[len("path = "):]
             for line in (printed.stdout or "").splitlines()
-        )
+            if line.startswith("\t") and not line.startswith("\t\t") and line.strip().startswith("path = ")
+        ]
+        if len(paths) != 1:
+            return OWNERSHIP_UNKNOWN
+        return paths[0] == str(handle.plist_path)
 
     def stop(self, handle: JobHandle, *, timeout: float = 15.0) -> StopProof:
         """Stop every member of the job and report proof, never a guess.
@@ -863,16 +877,20 @@ class LaunchdContainment:
         if handle.coalition_id is not None:
             frozen, killed = self._sweep(handle.coalition_id, deadline=deadline)
         owned = self._owns_label(handle)
-        if owned:
+        if owned is True:
             self._launchctl(["bootout", f"{handle.domain}/{handle.label}"])
             loaded = self.label_loaded(handle)
             while loaded and self._monotonic() < deadline:
                 self._sleep(0.1)
                 loaded = self.label_loaded(handle)
-        else:
+        elif owned is False or owned is None:
             # Not loaded, or loaded by another launch: this job's service is
             # gone either way, and someone else's is never booted out.
-            loaded = False if owned is False or self.label_loaded(handle) is False else None
+            loaded = False
+        else:
+            # Ownership unknown: never boot out what may be someone else's,
+            # and never claim this job's service is gone.
+            loaded = None
         if handle.coalition_id is not None:
             # Sweep again: anything the bootout left behind is still a member.
             again_frozen, again_killed = self._sweep(handle.coalition_id, deadline=deadline)
