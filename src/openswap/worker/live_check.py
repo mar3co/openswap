@@ -686,12 +686,22 @@ class LiveCheck:
             self._run(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{escape_label}"],
                       capture_output=True, text=True, check=False, timeout=20)
         seen = {name: bool(observed(key)) for name, _, key, _ in steps}
+        # Only the requested probes may run: an extra command could pre-seed a
+        # probe (a regular link.txt, say) and make it pass without testing.
+        unexpected = [item for item in items
+                      if not any(command_matches(item["command"], command) for _, command, _, _ in steps)]
+        # A failing curl only shows confinement if the same request works from
+        # this Mac outside the sandbox.
+        outside_ok = self._run(["/usr/bin/curl", "-sS", "-m", "10", "-o", "/dev/null", "https://example.com"],
+                               capture_output=True, text=True, check=False, timeout=30).returncode == 0
         required_seen = all(seen[name] for name, _, _, required in steps if required)
         network = observed("example.com")
         submits = observed(escape_label)
         auth = observed("auth.json")
         detail = {
             "all_required_steps_ran": required_seen,
+            "no_unexpected_commands": not unexpected,
+            "network_reachable_outside_sandbox": outside_ok,
             "evidence_complete": complete,
             "each_probe_its_own_command": not combined,
             "steps_ran": seen,
@@ -708,8 +718,8 @@ class LiveCheck:
                                                    for i in auth),
             "worker_environment_absent": tokens["env"] not in everything and ENV_SENTINEL not in everything,
             "api_keys_absent": "OPENAI_API_KEY" not in everything and "CODEX_API_KEY" not in everything,
-            "shell_network_denied": bool(network) and all(type(i["exit_code"]) is int and i["exit_code"] != 0
-                                                          for i in network),
+            "shell_network_denied": outside_ok and bool(network) and all(
+                type(i["exit_code"]) is int and i["exit_code"] != 0 for i in network),
             # The submit itself must fail: a short-lived job it started could
             # be gone by the time the label is checked.
             "launchd_submit_contained": bool(submits) and not loaded and all(

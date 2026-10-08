@@ -99,6 +99,7 @@ class SimulatedMac:
         self.processes: list[tuple[int, str]] = []
         self.submitted_labels: set[str] = set()
         self.managed_key = False
+        self.network_outside = True
         self.features_text = None
 
     # containment
@@ -186,6 +187,8 @@ class SimulatedMac:
         while "--disable" in args:
             i = args.index("--disable")
             del args[i:i + 2]
+        if argv[0] == "/usr/bin/curl":
+            return subprocess.CompletedProcess(argv, 0 if self.network_outside else 6, "", "")
         if argv[0] == "/usr/bin/defaults":
             return subprocess.CompletedProcess(argv, 0 if self.managed_key else 1, "", "")
         if argv[0] == "/bin/launchctl":
@@ -533,6 +536,35 @@ def test_helpers_are_matched_only_by_their_random_marker(tmp_path):
     assert child != detached and len(child) > 40
     mac.processes = [(10, "/bin/sleep 1200"), (11, f"{detached} 1800"), (12, f"{child}-other 1")]
     assert check._marker_pids(child, detached) == [11]
+
+
+class PreseedingMac(SimulatedMac):
+    """The model runs an extra command first that plants a regular link.txt."""
+
+    def launch(self, *, job_id, run_dir, argv, env, cwd, stdin_text, ready_timeout=15.0):
+        stdin_text = stdin_text.replace("\n1. ", "\n1. /usr/bin/touch link.txt\n2. ", 1) if "\n1. " in stdin_text else stdin_text
+        return super().launch(job_id=job_id, run_dir=run_dir, argv=argv, env=env, cwd=cwd,
+                              stdin_text=stdin_text, ready_timeout=ready_timeout)
+
+    def _simulate(self, command, cwd):
+        if command == "/usr/bin/touch link.txt":
+            return "", 0
+        return super()._simulate(command, cwd)
+
+
+def test_extra_commands_fail_the_sandbox_gate(tmp_path):
+    root = setup_root(tmp_path)
+    gate = make_check(root, PreseedingMac()).run()["gates"]["sandbox_exec"]
+    assert gate["no_unexpected_commands"] is False and gate["passed"] is False
+
+
+def test_a_network_failure_counts_only_if_the_network_works_outside(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    mac.network_outside = False
+    gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
+    assert gate["network_reachable_outside_sandbox"] is False
+    assert gate["shell_network_denied"] is False and gate["passed"] is False
 
 
 class ShortLivedEscapeMac(SimulatedMac):
