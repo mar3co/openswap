@@ -82,6 +82,23 @@ def live_lock(backup_root: Path, *, timeout: float = LIVE_LOCK_TIMEOUT_SECONDS):
         lock.release()
 
 
+def pinned_provider(backup_root: Path) -> str:
+    """The provider of the pinned account (Codex when nothing valid is pinned)."""
+    from openswap.settings import load_worker_settings
+    from openswap.worker.accounts import provider_of
+
+    try:
+        pin = load_worker_settings(Path(backup_root)).pinned_account_ref
+    except Exception:
+        pin = None
+    return provider_of(pin) or "codex"
+
+
+def pinned_execution_mode(backup_root: Path) -> str:
+    """``execution_mode`` for the pinned account's provider: what status reports."""
+    return execution_mode(backup_root, pinned_provider(backup_root))
+
+
 def execution_mode(backup_root: Path, provider: str = "codex") -> str:
     """``"live"`` when the owner's opt-in for ``provider`` is recorded on a supported Mac.
 

@@ -595,6 +595,8 @@ and SHA-256; before every job the worker re-hashes it and refuses a changed
 file. Anthropic publishes no digest to verify against, so the first pin is
 trust-on-first-use. Jobs run with the auto-updater off; after an update, re-pin
 and re-run the live check, since the opt-in is bound to the measured binary.
+A `claude` installed inside `~/.claude` (the old npm-local layout) is refused,
+because jobs cannot read that folder.
 
 **Account.** Each Claude account runs from its OpenSwap session profile
 (`CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`, the same profiles live

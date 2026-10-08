@@ -554,3 +554,66 @@ def test_a_simulated_claude_live_check_passes_and_enables_claude_only(tmp_path):
     assert live.latest_evidence(root, "claude") == path and live.latest_evidence(root, "codex") is None
     live.enable_live(root, path, pinned(), "claude")
     assert live.execution_mode(root, "claude") == "live" and live.execution_mode(root, "codex") == "disabled"
+
+
+
+def test_a_binary_inside_the_hidden_claude_folder_is_never_pinned(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    local = home / ".claude" / "local"
+    local.mkdir(parents=True)
+    binary = local / "claude"
+    binary.write_text("#!/bin/sh\necho '2.1.285 (Claude Code)'\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(claude_cli, "_hidden_from_jobs",
+                        lambda path: Path(os.path.realpath(path)).is_relative_to(os.path.realpath(home / ".claude")))
+    root = tmp_path / "root"
+    root.mkdir()
+    with pytest.raises(claude_cli.ClaudeCliError) as error:
+        claude_cli.pin(root, binary=binary)
+    assert error.value.code == "binary_in_claude_config"
+    monkeypatch.setattr(claude_cli, "CANDIDATES", (str(binary),))
+    assert claude_cli.find_installed(which=lambda name: None) is None
+
+
+def test_status_reports_the_pinned_providers_mode(tmp_path):
+    from openswap.worker.runtime import read_worker_snapshot
+
+    root = setup_root(tmp_path)
+    configure_worker_local_policy(root, pinned_account_ref=IDENTITY,
+                                  workspaces=(WorkerWorkspace("research", (root / "research").resolve()),))
+    assert read_worker_snapshot(root).provider.available is False
+    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now"), "claude")
+    claude_cli.pin(root, binary=fake_claude(tmp_path))
+    provider = read_worker_snapshot(root).provider
+    assert provider.available is True and provider.version == "2.1.285 (Claude Code)"
+    assert live.pinned_execution_mode(root) == "live"
+    # Codex pinned, only Claude opted in: not available.
+    configure_worker_local_policy(root, pinned_account_ref=CODEX_IDENTITY,
+                                  workspaces=(WorkerWorkspace("research", (root / "research").resolve()),))
+    assert read_worker_snapshot(root).provider.available is False
+    assert live.pinned_execution_mode(root) == "disabled"
+
+
+
+def test_enabling_from_a_claude_check_names_claude_in_the_opt_out(tmp_path, monkeypatch, capsys):
+    from openswap.worker.live_check_claude import ClaudeLiveCheck
+
+    root = setup_root(tmp_path)
+    configure_worker_local_policy(root, pinned_account_ref=IDENTITY,
+                                  workspaces=(WorkerWorkspace("research", (root / "research").resolve()),))
+    home = tmp_path / "home"
+    home.mkdir()
+    mac = SimulatedClaudeMac(home)
+    real_init = ClaudeLiveCheck.__init__
+
+    def init(self, backup_root, **kwargs):
+        kwargs.update(containment=mac, verify=lambda **kw: pinned(), run=mac.run, sleep=lambda s: None,
+                      spawn_child=lambda payload: Child(self, payload), home=home, live_sessions=lambda p: False)
+        real_init(self, backup_root, **kwargs)
+
+    monkeypatch.setattr(ClaudeLiveCheck, "__init__", init)
+    monkeypatch.setattr(claude_cli, "verify", lambda root, **kw: pinned())
+    assert live_check.main(["live-check", "--yes", "--enable"], root) == 0
+    out = capsys.readouterr().out
+    assert "`openswap worker live disable --provider claude`" in out
+    assert live.execution_mode(root, "claude") == "live" and live.execution_mode(root, "codex") == "disabled"

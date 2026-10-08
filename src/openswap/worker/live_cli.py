@@ -363,6 +363,8 @@ _CLAUDE_MESSAGES = {
     "binary_changed": ("Claude Code changed since it was pinned (an update). Run `openswap worker claude pin` "
                        "and `openswap worker live-check --provider claude` again."),
     "binary_permissions": "The Claude Code binary is writable by others; it can't be pinned.",
+    "binary_in_claude_config": ("That Claude Code is installed inside ~/.claude, which remote jobs can't read. "
+                                "Install it with Homebrew or the native installer, then pin again."),
 }
 
 

@@ -98,6 +98,10 @@ def claude_tool_items(stdout_path: Path) -> list[dict]:
     return [calls[key] for key in order]
 
 
+def _all_errors(items: list[dict]) -> bool:
+    return bool(items) and all(item["is_error"] is True for item in items)
+
+
 class ClaudeLiveCheck(LiveCheck):
     provider = "claude"
 
@@ -322,8 +326,10 @@ class ClaudeLiveCheck(LiveCheck):
             "all_reads_attempted": all(reads(path) for path in paths.values()),
             "only_requested_reads": all(item["tool"] == "Read" and item["path"] in paths.values() for item in items),
             "inside_read_allowed": any(tokens["inside"] in item["output"] for item in reads(paths["inside"])),
-            "outside_read_denied": bool(reads(paths["outside"])) and tokens["outside"] not in everything,
-            "profile_read_denied": bool(reads(paths["profile"])) and tokens["profile"] not in everything,
+            # A denial counts only from a completed call whose result is an
+            # error: a call with no result yet proves nothing.
+            "outside_read_denied": _all_errors(reads(paths["outside"])) and tokens["outside"] not in everything,
+            "profile_read_denied": _all_errors(reads(paths["profile"])) and tokens["profile"] not in everything,
             "default_login_read_denied": bool(reads(paths["default"])) and all(
                 item["is_error"] is True for item in reads(paths["default"])),
             "execution_stopped": outcome.stopped,

@@ -73,9 +73,14 @@ def _provider_status(backup_root: Path) -> ProviderAvailability:
     A pure settings read. The binary and account are re-verified by the
     adapter before each launch, which fails that job closed if they changed.
     """
-    from openswap.worker.live import LIVE, execution_mode
+    from openswap.worker.live import LIVE, execution_mode, pinned_provider
 
-    if execution_mode(backup_root) == LIVE:
+    provider = pinned_provider(backup_root)
+    if execution_mode(backup_root, provider) == LIVE:
+        if provider == "claude":
+            from openswap.worker.claude_cli import pinned_version
+
+            return ProviderAvailability(True, None, pinned_version(backup_root) or "Claude Code")
         from openswap.worker.codex_cli import CODEX_VERSION_OUTPUT
 
         return ProviderAvailability(True, None, CODEX_VERSION_OUTPUT)

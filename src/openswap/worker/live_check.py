@@ -1066,7 +1066,7 @@ def _format(evidence: dict) -> str:
 def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     parser = argparse.ArgumentParser(
         prog="openswap worker live-check",
-        description="Run four short real Codex jobs on the pinned account and record phase-1 live evidence.",
+        description="Run short real Codex or Claude jobs on the pinned account and record phase-1 live evidence.",
     )
     parser.add_argument("--account", metavar="SLOT|EMAIL|ALIAS", help="check this account (default: the pin)")
     parser.add_argument("--provider", choices=("codex", "claude"),
@@ -1089,7 +1089,7 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     # With --json, stdout carries only the evidence object; everything else is stderr.
     say = (lambda message: print(message, file=sys.stderr)) if args.json else print
     if not args.yes:
-        say("The live check runs four short, real Codex jobs on the selected account (they use some of its "
+        say("The live check runs short, real Codex or Claude jobs on the selected account (they use some of its "
             "quota), checks the sandbox and Stop, and writes an evidence file. It takes about 5 to 15 minutes.")
         if not interactive or not _ask("Run it now?"):
             say("Not run. Pass --yes to run without asking.")
@@ -1136,17 +1136,22 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         say("Live execution stays off.")
         return 1
     if args.no_enable or not (args.enable or (interactive and not args.json and _ask("Enable live execution now?"))):
-        say(f"Live execution stays off. Enable it later with `openswap worker live enable --evidence {path}`.")
+        flag = " --provider claude" if evidence.get("provider") == "claude" else ""
+        say(f"Live execution stays off. Enable it later with "
+            f"`openswap worker live enable{flag} --evidence {path}`.")
         return 0
+    from openswap.worker import claude_cli
+
     try:
         if evidence.get("provider") == "claude":
-            from openswap.worker import claude_cli
-
             enable_live(root, path, claude_cli.verify(root), "claude")
         else:
             enable_live(root, path, codex_cli.verify(root))
-    except (LiveModeError, codex_cli.CodexCliError) as error:
+    except (LiveModeError, codex_cli.CodexCliError, claude_cli.ClaudeCliError) as error:
         print(f"Could not enable live execution: {error}", file=sys.stderr)
         return 1
-    say("Live execution is on. `openswap worker live disable` turns it off.")
+    if evidence.get("provider") == "claude":
+        say("Live execution is on for Claude. `openswap worker live disable --provider claude` turns it off.")
+    else:
+        say("Live execution is on. `openswap worker live disable` turns it off.")
     return 0

@@ -29,9 +29,21 @@ from openswap.worker.codex_cli import CodexCliError, platform_supported, sha256_
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)? \(Claude Code\)$")
-CANDIDATES = (
-    "~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "~/.claude/local/claude",
-)
+# ``~/.claude/local`` (the old npm-local install) is deliberately absent: jobs
+# run with ``~/.claude`` hidden by Seatbelt, so a binary there could not start.
+CANDIDATES = ("~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude")
+
+
+def _hidden_from_jobs(binary: Path) -> bool:
+    """Whether the job sandbox hides this path (the default Claude config folder)."""
+    try:
+        import pwd
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, AttributeError):
+        home = Path.home()
+    hidden = Path(os.path.realpath(home / ".claude"))
+    return Path(os.path.realpath(binary)).is_relative_to(hidden)
 
 
 class ClaudeCliError(RuntimeError):
@@ -52,6 +64,16 @@ class PinnedClaude:
         return {"version": self.version, "binary_sha256": self.binary_sha256}
 
 
+def pinned_version(backup_root: Path) -> str | None:
+    """The pinned version string, from the pin file only (no hashing); None if unreadable."""
+    try:
+        raw = json.loads(pin_path(backup_root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    version = raw.get("version") if isinstance(raw, dict) else None
+    return version if isinstance(version, str) and _VERSION_RE.fullmatch(version) else None
+
+
 def pin_path(backup_root: Path) -> Path:
     return Path(backup_root) / "worker" / "claude-cli" / "pin.json"
 
@@ -62,7 +84,7 @@ def find_installed(which=shutil.which) -> Path | None:
     candidates = [found] if found else []
     candidates += [os.path.expanduser(path) for path in CANDIDATES]
     for candidate in candidates:
-        if candidate and os.path.isfile(candidate):
+        if candidate and os.path.isfile(candidate) and not _hidden_from_jobs(Path(candidate)):
             return Path(os.path.realpath(candidate))
     return None
 
@@ -87,6 +109,8 @@ def _version(binary: Path, run) -> str:
 
 
 def _check_binary(binary: Path) -> None:
+    if _hidden_from_jobs(binary):
+        raise ClaudeCliError("binary_in_claude_config")
     try:
         info = binary.lstat()
     except OSError:
