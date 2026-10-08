@@ -105,7 +105,7 @@ class FakeLaunchd:
                 pid = self.print_pid_override or self.loaded[label]
                 owner = self.run_dirs.get(label, "")
                 return subprocess.CompletedProcess(
-                    args, 0, f"{label} = {{\n\tstate = running\n\tpid = {pid}\n\targuments = {{ {owner} }}\n}}\n", "")
+                    args, 0, f"{label} = {{\n\tpath = {owner}/job.plist\n\tstate = running\n\tpid = {pid}\n}}\n", "")
             return subprocess.CompletedProcess(args, 113, "", "Could not find service")
         if verb == "bootstrap":
             if self.bootstrap_rc:
@@ -131,6 +131,7 @@ class FakeLaunchd:
 
 
 def make(tmp_path, **kwargs):
+    (tmp_path / "locks").mkdir(mode=0o700, parents=True, exist_ok=True)
     procs = FakeProcs()
     launchd = FakeLaunchd(procs, **kwargs)
     clock = [0.0]
@@ -140,7 +141,7 @@ def make(tmp_path, **kwargs):
 
     containment = LaunchdContainment(
         uid=501, procs=procs, launchctl=launchd, sleep=sleep,
-        monotonic=lambda: clock[0], self_pid=WORKER_PID,
+        monotonic=lambda: clock[0], self_pid=WORKER_PID, lock_dir=tmp_path / "locks",
     )
     return containment, procs, launchd
 
@@ -263,7 +264,6 @@ def test_unkillable_member_or_loaded_label_is_not_proof(tmp_path):
     assert proof.stopped is False and proof.survivors == 1
 
     containment, procs, launchd = make(tmp_path / "second")
-    (tmp_path / "second").mkdir()
     handle = launch(containment, private_dir(tmp_path / "second"))
     launchd.keep_loaded = True
     proof = containment.stop(handle, timeout=1.0)
@@ -476,7 +476,7 @@ def test_concurrent_launches_of_one_label_cannot_both_proceed(tmp_path):
 
     containment, procs, launchd = make(tmp_path)
     root = private_dir(tmp_path)
-    holder = FileLock(root / f".{c.job_label('a' * 32)}.lock", timeout=0)
+    holder = FileLock(tmp_path / "locks" / f"{c.job_label('a' * 32)}.lock", timeout=0)
     assert holder.acquire(timeout=0)
     try:
         with pytest.raises(ContainmentError) as error:
@@ -556,10 +556,36 @@ def test_stop_waits_for_the_label_lock(tmp_path):
     containment, procs, launchd = make(tmp_path)
     root = private_dir(tmp_path)
     handle = launch(containment, root)
-    holder = FileLock(root / f".{handle.label}.lock", timeout=0)
+    holder = FileLock(tmp_path / "locks" / f"{handle.label}.lock", timeout=0)
     assert holder.acquire(timeout=0)
     try:
         assert containment.stop(handle, timeout=0.2).stopped is False
     finally:
         holder.release()
     assert containment.stop(handle).stopped is True
+
+
+def test_label_locks_are_shared_across_run_roots(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    from openswap.locking import FileLock
+
+    holder = FileLock(tmp_path / "locks" / f"{c.job_label('a' * 32)}.lock", timeout=0)
+    assert holder.acquire(timeout=0)
+    try:
+        for name in ("runs-a", "runs-b"):
+            with pytest.raises(ContainmentError) as error:
+                launch(containment, private_dir(tmp_path, name))
+            assert error.value.code == "job_label_in_use"
+    finally:
+        holder.release()
+
+
+def test_ownership_needs_the_exact_plist_path(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    nested = root / ("a" * 32)
+    handle = launch(containment, root)
+    assert containment._owns_label(handle) is True
+    # A service whose plist lives under a path that merely starts with this one.
+    launchd.run_dirs[handle.label] = str(nested / "retry")
+    assert containment._owns_label(handle) is False
