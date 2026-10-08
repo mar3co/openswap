@@ -468,24 +468,25 @@ class LaunchdContainment:
         if handle.boot_session is not None and current_boot is not None and current_boot != handle.boot_session:
             # Every process of an earlier boot is gone, its label with it.
             return StopProof(True, False, 0, rebooted=True)
-        # A saved coalition ID is meaningful only in the boot that recorded it.
-        same_boot = handle.boot_session is not None and current_boot == handle.boot_session
+        if handle.boot_session is None or current_boot != handle.boot_session:
+            # Neither the saved coalition ID nor the label can be trusted to be
+            # this job's without a boot-session match: touch nothing.
+            return StopProof(False, None, 0)
         deadline = self._monotonic() + timeout
-        killed = 0
-        if handle.coalition_id is not None and same_boot:
-            killed += self._sweep(handle.coalition_id, deadline=deadline)
+        frozen, killed = True, 0
+        if handle.coalition_id is not None:
+            frozen, killed = self._sweep(handle.coalition_id, deadline=deadline)
         self._launchctl(["bootout", f"{handle.domain}/{handle.label}"])
         loaded = self.label_loaded(handle)
         while loaded and self._monotonic() < deadline:
             self._sleep(0.1)
             loaded = self.label_loaded(handle)
-        survivors = 0
         if handle.coalition_id is not None:
-            if not same_boot:
-                return StopProof(False, loaded, 0, killed)
-            killed += self._sweep(handle.coalition_id, deadline=deadline)
+            # Sweep again: anything the bootout left behind is still a member.
+            again_frozen, again_killed = self._sweep(handle.coalition_id, deadline=deadline)
+            killed += again_killed
             survivors = len(self._live_members(handle.coalition_id))
-            stopped = survivors == 0 and loaded is False
+            stopped = frozen and again_frozen and survivors == 0 and loaded is False
             return StopProof(stopped, loaded, survivors, killed)
         # No coalition was ever recorded, so the provider was never released:
         # the wrapper only waits for ``go``. An unloaded label is then proof.
@@ -499,52 +500,95 @@ class LaunchdContainment:
             return None
         return self.stop(handle)
 
-    def _live_members(self, coalition_id: int) -> list[int]:
+    def _scan(self, coalition_id: int) -> dict[int, str]:
+        """Classify every listed pid: ``stopped``/``running`` member, ``other``, or ``gone``.
+
+        ``gone`` is a pid whose coalition could not be read: on macOS that is
+        a zombie or a process that exited after the listing (measured: live
+        processes of every user are readable). A member whose status cannot be
+        read counts as ``running``, so it can never be mistaken for frozen.
+        """
         procs = self.procs
-        members = []
+        kinds: dict[int, str] = {}
         for pid in procs.pids():
             if pid == self._self_pid or pid <= 1:
                 continue
-            if procs.coalition_of(pid) == coalition_id and procs.status_of(pid) not in (None, _SZOMB):
-                members.append(pid)
-        return members
+            coalition = procs.coalition_of(pid)
+            if coalition is None:
+                kinds[pid] = "gone"
+            elif coalition != coalition_id:
+                kinds[pid] = "other"
+            else:
+                status = procs.status_of(pid)
+                kinds[pid] = "other" if status == _SZOMB else "stopped" if status == _SSTOP else "running"
+        return kinds
 
-    def _sweep(self, coalition_id: int, *, deadline: float) -> int:
-        """Freeze every member, then kill them all; returns how many were killed.
+    @staticmethod
+    def _complete(scan: dict[int, str], previous: dict[int, str] | None) -> bool:
+        """Whether every live process at this scan's listing was seen.
 
-        A stopped process cannot fork, so once a full scan finds every member
-        already stopped the membership is final. Each pid's coalition is
-        re-read immediately before it is signalled.
+        A pid that was listed but is ``gone`` by its query could have forked
+        just before dying, so the scan is complete only if every such pid was
+        already listed by the previous scan (a lingering zombie, say).
+        """
+        if previous is None:
+            return False
+        return all(pid in previous for pid, kind in scan.items() if kind == "gone")
+
+    def _live_members(self, coalition_id: int) -> list[int]:
+        return [pid for pid, kind in self._scan(coalition_id).items() if kind in {"running", "stopped"}]
+
+    def _sweep(self, coalition_id: int, *, deadline: float) -> tuple[bool, int]:
+        """Freeze every member, then kill them all; returns ``(proven, killed)``.
+
+        ``SIGSTOP`` is delivered asynchronously and a process listing is not
+        atomic, so a freeze counts only when two consecutive scans list the
+        same members, all observed stopped, and the second is complete (see
+        :meth:`_complete`). Every member alive at the second listing was
+        already stopped before it, and a stopped process cannot fork, so no
+        member can appear afterwards. Only then is the empty scan after the
+        kills proof; otherwise the sweep still kills what it finds but proves
+        nothing. Each pid's coalition is re-read right before it is signalled.
         """
         procs = self.procs
+        frozen = False
+        previous: dict[int, str] | None = None
         while True:
-            members = self._live_members(coalition_id)
-            if not members:
-                return 0
-            running = [pid for pid in members if procs.status_of(pid) != _SSTOP]
-            if not running:
+            scan = self._scan(coalition_id)
+            running = [pid for pid, kind in scan.items() if kind == "running"]
+            stopped = {pid for pid, kind in scan.items() if kind == "stopped"}
+            if (
+                not running and previous is not None and self._complete(scan, previous)
+                and "running" not in previous.values()
+                and stopped == {pid for pid, kind in previous.items() if kind == "stopped"}
+            ):
+                frozen = True
                 break
             for pid in running:
                 if procs.coalition_of(pid) == coalition_id:
                     try:
                         procs.signal(pid, signal.SIGSTOP)
-                    except ProcessLookupError:
+                    except (ProcessLookupError, PermissionError):
                         pass
+            previous = scan
             if self._monotonic() >= deadline:
                 break
             self._sleep(0.002)
         killed: set[int] = set()
+        previous = None
         while True:
-            members = self._live_members(coalition_id)
-            if not members:
-                return len(killed)
+            scan = self._scan(coalition_id)
+            members = [pid for pid, kind in scan.items() if kind in {"running", "stopped"}]
+            if not members and (previous is None or self._complete(scan, previous)):
+                return frozen, len(killed)
             for pid in members:
                 if procs.coalition_of(pid) == coalition_id:
                     try:
                         procs.signal(pid, signal.SIGKILL)
                         killed.add(pid)
-                    except ProcessLookupError:
+                    except (ProcessLookupError, PermissionError):
                         pass
+            previous = scan
             if self._monotonic() >= deadline:
-                return len(killed)
+                return False, len(killed)
             self._sleep(0.02)
