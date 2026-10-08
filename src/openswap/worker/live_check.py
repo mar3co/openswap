@@ -146,11 +146,14 @@ def _stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _sha256_file(path: Path) -> str | None:
+def login_snapshot(path: Path) -> tuple[str, str | None]:
+    """``("absent", None)``, ``("present", sha256)`` or ``("unreadable", None)``."""
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        return "present", hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return "absent", None
     except OSError:
-        return None
+        return "unreadable", None
 
 
 def command_items(stdout_path: Path) -> list[dict]:
@@ -199,19 +202,37 @@ def item_types(stdout_path: Path) -> set[str]:
     return found
 
 
-def _texts(*paths: Path, limit: int = 8 * 1024 * 1024) -> str:
-    out = []
+EVIDENCE_FILE_LIMIT = 128 * 1024 * 1024
+EVIDENCE_DIR_FILES = 200
+
+
+def _texts(*paths: Path, limit: int = EVIDENCE_FILE_LIMIT) -> tuple[str, bool]:
+    """All text of ``paths`` (files, or a directory's files), and whether it is complete.
+
+    Incomplete (a file over ``limit``, too many files, an unreadable file)
+    means a denial cannot be shown by a token's absence.
+    """
+    out, complete = [], True
     for path in paths:
         try:
             if path.is_dir():
-                for child in sorted(path.iterdir())[:200]:
-                    if child.is_file() and not child.is_symlink():
-                        out.append(child.read_bytes()[:limit].decode("utf-8", "replace"))
+                children = sorted(path.iterdir())
+                if len(children) > EVIDENCE_DIR_FILES:
+                    complete = False
+                files = [child for child in children[:EVIDENCE_DIR_FILES]
+                         if child.is_file() and not child.is_symlink()]
             elif path.is_file():
-                out.append(path.read_bytes()[:limit].decode("utf-8", "replace"))
+                files = [path]
+            else:
+                continue
+            for item in files:
+                data = item.read_bytes()[:limit + 1]
+                if len(data) > limit:
+                    complete = False
+                out.append(data[:limit].decode("utf-8", "replace"))
         except OSError:
-            continue
-    return "\n".join(out)
+            complete = False
+    return "\n".join(out), complete
 
 
 _SHELL_WRAPPER = re.compile(
@@ -220,48 +241,31 @@ _SHELL_WRAPPER = re.compile(
 )
 
 
-def command_tokens(command: str) -> list[str] | None:
-    """A probe command's tokens with any ``sh``/``bash``/``zsh -c`` wrappers removed.
+def _squash(text: str) -> str:
+    return " ".join(text.split())
 
-    Codex runs a model's command through the user's shell (``bash -lc '…'``
-    and the like), and several probes are themselves ``/bin/sh -c '…'``;
-    unwrapping both sides lets the exact requested command be compared
-    regardless of quoting. ``None`` when the text cannot be tokenized.
+
+def command_matches(command: str, expected: str) -> bool:
+    """Whether a reported command is exactly the requested one.
+
+    Codex reports a command either as run or wrapped in the user's shell
+    (``bash -lc '…'``, ``/bin/zsh -lc "…"``). Only that one outer wrapper is
+    removed, by unquoting its single argument; the rest is compared as shell
+    text (whitespace aside), so a quoted operator, an added redirection or a
+    faked failure never matches.
     """
+    want = _squash(expected)
     text = command.strip()
-    for _ in range(5):
-        match = _SHELL_WRAPPER.match(text)
-        if not match:
-            break
-        try:
-            inner = shlex.split(match.group(1))
-        except ValueError:
-            return None
-        if len(inner) != 1:
-            break
-        text = inner[0].strip()
-    # Keep shell syntax: operators are their own tokens, so a quoted
-    # "link.txt;" never equals an unquoted "link.txt" followed by ";".
+    if _squash(text) == want:
+        return True
+    match = _SHELL_WRAPPER.match(text)
+    if not match:
+        return False
     try:
-        lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        tokens = []
-        for token in lexer:
-            tokens.append(token)
-        return _with_quote_marks(text, tokens)
+        inner = shlex.split(match.group(1))
     except ValueError:
-        return None
-
-
-def _with_quote_marks(text: str, tokens: list[str]) -> list[str]:
-    """Mark tokens that came from quotes, so ``'a;'`` and ``a ;`` stay different."""
-    marked = []
-    for token in tokens:
-        if any(ch in token for ch in ";&|<>()") and token.strip(";&|<>()"):
-            marked.append(f"quoted:{token}")
-        else:
-            marked.append(token)
-    return marked
+        return False
+    return len(inner) == 1 and _squash(inner[0]) == want
 
 
 def _all_failed(items: list[dict]) -> bool:
@@ -584,7 +588,7 @@ class LiveCheck:
         gate = self.gates["research_run"]
         outcome = self._job("research", identity, RESEARCH_TASK, timeout=self.research_timeout)
         summary = outcome.summary
-        result_text = _texts(outcome.workspace / RESULT_FILE)
+        result_text, _ = _texts(outcome.workspace / RESULT_FILE)
         kinds = [event.kind.value for event in outcome.events]
         usage = summary.get("usage") if isinstance(summary.get("usage"), dict) else {}
         detail = {
@@ -653,10 +657,10 @@ class LiveCheck:
             except OSError:
                 pass
         items = command_items(outcome.run_dir / STDOUT_FILE)
-        everything = _texts(outcome.run_dir / STDOUT_FILE, outcome.run_dir / STDERR_FILE, ws)
+        everything, complete = _texts(outcome.run_dir / STDOUT_FILE, outcome.run_dir / STDERR_FILE, ws)
 
         keys = [key for _, _, key, _ in steps]
-        expected = {key: command_tokens(command) for _, command, key, _ in steps}
+        expected = {key: command for _, command, key, _ in steps}
         # Each probe must run as its own command: an item that matches several
         # probes (the model chained them) proves none of them, since its exit
         # code and output belong to the whole chain.
@@ -668,8 +672,7 @@ class LiveCheck:
             # /dev/null or its failure faked, proves nothing about the probe.
             return [
                 item for item in items
-                if item not in combined and expected[key] is not None
-                and command_tokens(item["command"]) == expected[key]
+                if item not in combined and command_matches(item["command"], expected[key])
             ]
 
         loaded = self._run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{escape_label}"],
@@ -684,6 +687,7 @@ class LiveCheck:
         auth = observed("auth.json")
         detail = {
             "all_required_steps_ran": required_seen,
+            "evidence_complete": complete,
             "each_probe_its_own_command": not combined,
             "steps_ran": seen,
             "inside_read_allowed": tokens["inside"] in "".join(i["output"] for i in observed(str(ws / "inside.txt"))),
@@ -828,7 +832,7 @@ class LiveCheck:
     def run(self, *, install=None, login=None) -> dict:
         pinned, choice, identity, home = self._preflight(install=install, login=login)
         default_auth = auth_path(codex_home())
-        default_before = _sha256_file(default_auth)
+        default_before = login_snapshot(default_auth)
         # Outside the private worker directory: the adapter refuses any job
         # folder that overlaps it, since that would expose CODEX_HOME.
         self.check_root = self.root / "live-check" / _stamp()
@@ -870,11 +874,14 @@ class LiveCheck:
             and static.get("shell_tool_on") is True and static.get("managed_config_present") == []
             and not unexpected_items
         )
-        default_after = _sha256_file(default_auth)
+        default_after = login_snapshot(default_auth)
         login_gate = self.gates["default_login_unchanged"]
-        login_gate.detail = {"default_login_present": default_before is not None,
-                             "byte_identical": default_before == default_after}
-        login_gate.passed = default_before == default_after
+        readable = "unreadable" not in (default_before[0], default_after[0])
+        login_gate.detail = {"default_login_present": default_before[0] == "present",
+                             "readable": readable,
+                             "byte_identical": readable and default_before == default_after}
+        # An unreadable login cannot be shown unchanged: fail closed.
+        login_gate.passed = readable and default_before == default_after
         account = self.gates["account_identity"]
         account.detail = {
             "isolated_home_matches_pin": home_identity(home) == identity,

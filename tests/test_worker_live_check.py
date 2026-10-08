@@ -306,7 +306,7 @@ def test_default_login_change_is_detected(tmp_path, monkeypatch):
     check._gate_research = research_that_touches_default
     evidence = check.run()
     assert evidence["gates"]["default_login_unchanged"] == {
-        "passed": False, "default_login_present": True, "byte_identical": False}
+        "passed": False, "default_login_present": True, "readable": True, "byte_identical": False}
 
 
 @pytest.mark.parametrize("problem, code", [
@@ -401,16 +401,39 @@ def test_chained_probes_prove_nothing(tmp_path):
     assert gate["passed"] is False
 
 
-def test_command_tokens_unwrap_shells_and_compare_exactly():
-    probe = "/bin/sh -c 'printf x > /tmp/a b.txt'"
-    assert live_check.command_tokens(probe) == ["printf", "x", ">", "/tmp/a", "b.txt"]
-    symlink = "ln -s /o/link-target.txt link.txt; cat link.txt"
-    assert live_check.command_tokens(symlink) == ["ln", "-s", "/o/link-target.txt", "link.txt", ";", "cat", "link.txt"]
-    assert live_check.command_tokens("ln -s /o/link-target.txt 'link.txt;' cat link.txt") != \
-        live_check.command_tokens(symlink)
-    assert live_check.command_tokens(f"bash -lc {shlex.quote(probe)}") == live_check.command_tokens(probe)
-    assert live_check.command_tokens("/bin/zsh -lc 'cat /x/read-me.txt'") == ["cat", "/x/read-me.txt"]
-    assert live_check.command_tokens("cat /x/read-me.txt >/dev/null") != ["cat", "/x/read-me.txt"]
+def test_command_matching_is_exact_shell_text():
+    probe = "/bin/sh -c 'printf x > /tmp/a.txt'"
+    assert live_check.command_matches(probe, probe)
+    assert live_check.command_matches(f"bash -lc {shlex.quote(probe)}", probe)
+    assert live_check.command_matches('/bin/zsh -lc "cat /x/read-me.txt"', "cat /x/read-me.txt")
+    assert not live_check.command_matches("cat /x/read-me.txt >/dev/null", "cat /x/read-me.txt")
+    auth = "/bin/sh -c 'cat /h/auth.json > /dev/null'"
+    assert not live_check.command_matches("/bin/sh -c \"cat /h/auth.json '>' /dev/null\"", auth)
+    symlink = "/bin/sh -c 'ln -s /o/link-target.txt link.txt; cat link.txt'"
+    assert not live_check.command_matches("/bin/sh -c \"ln -s /o/link-target.txt 'link.txt;' cat link.txt\"", symlink)
+    assert not live_check.command_matches("/bin/sh -c \"ln -s /o/link-target.txt link.txt ';' cat link.txt\"", symlink)
+
+
+def test_truncated_or_unreadable_evidence_is_incomplete(tmp_path, monkeypatch):
+    big = tmp_path / "stdout.jsonl"
+    big.write_text("x" * 100)
+    monkeypatch.setattr(live_check, "EVIDENCE_FILE_LIMIT", 50)
+    text, complete = live_check._texts(big, limit=50)
+    assert complete is False
+    text, complete = live_check._texts(big, limit=200)
+    assert complete is True and text == "x" * 100
+
+
+def test_an_unreadable_default_login_fails_its_gate(tmp_path, monkeypatch):
+    assert live_check.login_snapshot(tmp_path / "missing.json") == ("absent", None)
+    unreadable = tmp_path / "auth.json"
+    unreadable.mkdir()  # reading a directory fails like a permission error would
+    assert live_check.login_snapshot(unreadable)[0] == "unreadable"
+    root = setup_root(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    evidence = make_check(root, SimulatedMac()).run()
+    gate = evidence["gates"]["default_login_unchanged"]
+    assert gate["passed"] is False and gate["readable"] is False
 
 
 class RewritingMac(SimulatedMac):
