@@ -228,7 +228,7 @@ def test_a_repo_without_commits_or_gone_is_refused(root, home):
     assert refused.value.code == "work_not_a_repo"
     moved = _repo(home / "GitHub" / "moved")
     cli.add_work_folder(root, moved)
-    shutil.rmtree(moved)
+    worktrees.remove_tree(moved)
     with pytest.raises(WorkspaceRefused) as refused:
         _runtime(root)._resolve_workspace("moved", "a" * 32)
     assert refused.value.code == "readable_unavailable"
@@ -277,7 +277,7 @@ def test_a_locked_worktree_or_a_deleted_repo(root, home):
     other = _repo(home / "GitHub" / "other")
     cli.add_work_folder(root, other)
     orphan = runtime._resolve_workspace("other", "b" * 32)
-    shutil.rmtree(other)
+    worktrees.remove_tree(other)
     removed = worktrees.sweep(results, _finish(runtime, "b" * 32))
     assert [item.job_id for item in removed] == ["b" * 32] and not orphan.work_dir.exists()
 
@@ -307,14 +307,14 @@ def test_worktrees_command_lists_and_prunes(root, home, capsys):
 
 
 def test_the_codex_config_grants_exactly_the_git_paths(root, home):
-    from openswap.worker.codex_exec import codex_config
+    from openswap.worker.codex_exec import _toml_string, codex_config
 
     cli.add_work_folder(root, _repo(home / "GitHub" / "openswap"))
     resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
     text = codex_config((), resolved.write_paths, resolved.read_paths)
     for path in resolved.write_paths:
-        assert f'"{path}" = "write"' in text
-    assert f'"{resolved.read_paths[0]}" = "read"' in text
+        assert f'{_toml_string(str(path))} = "write"' in text
+    assert f'{_toml_string(str(resolved.read_paths[0]))} = "read"' in text
     assert '":root" = "deny"' in text
 
 

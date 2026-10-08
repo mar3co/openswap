@@ -139,6 +139,23 @@ class Worktree:
         return (self.common_dir,)
 
 
+def remove_tree(path: Path) -> None:
+    """``shutil.rmtree`` that also removes read-only files (git's objects on Windows)."""
+    import shutil
+    import stat
+
+    def retry(function, target, _info):
+        try:
+            os.chmod(target, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+            function(target)
+        except OSError:
+            pass
+
+    import sys
+
+    shutil.rmtree(path, **({"onexc": retry} if sys.version_info >= (3, 12) else {"onerror": retry}))
+
+
 def _private_dirs(path: Path, stop: Path) -> None:
     """Create ``path`` and its parents below ``stop`` owner-only (0700)."""
     missing = []
@@ -261,9 +278,7 @@ def remove(path: Path, *, force: bool = False) -> bool:
             if not force:
                 return False
     if force and path.exists():
-        import shutil
-
-        shutil.rmtree(path, ignore_errors=True)
+        remove_tree(path)
     if repo is not None and repo.exists():
         try:
             git(["worktree", "prune"], repo, timeout=60, check=False)
