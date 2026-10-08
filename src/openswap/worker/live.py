@@ -255,7 +255,11 @@ def enable_live(backup_root: Path, evidence_path: Path, pinned, provider: str = 
     with live_lock(backup_root):
         # Each passing check adds its account; a new binary starts over.
         current = load_live_execution(Path(backup_root), provider)
-        accounts = current.accounts if current.enabled and current.codex_sha256 == pinned.binary_sha256 else ()
+        # Keep earlier accounts only from an opt-in made on this Mac and install
+        # with this binary; a restored or copied one starts over.
+        keep = (current.enabled and current.codex_sha256 == pinned.binary_sha256
+                and current.host_binding == host)
+        accounts = current.accounts if keep else ()
         return write_live_execution(Path(backup_root), LiveExecutionSettings(
             enabled=True, evidence_sha256=digest, codex_sha256=pinned.binary_sha256,
             enabled_at=datetime.now(timezone.utc).isoformat(),
