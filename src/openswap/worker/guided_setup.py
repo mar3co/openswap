@@ -86,8 +86,8 @@ FOLDER_NEXT = (
     "and a label reach the control service; the folder path never leaves this Mac."
 )
 EXECUTION_OFF_NOTE = (
-    "Task execution itself stays off until the production adapter is enabled "
-    "(provider: live_adapter_disabled), so jobs are refused for now."
+    "Task execution itself stays off (provider: live_adapter_disabled) until you run "
+    "`openswap worker live-check` on this Mac and enable live execution, so jobs are refused for now."
 )
 EXECUTION_LIVE_NOTE = "Task execution is live: approved tasks run on this Mac with the chosen Codex account."
 WORKER_OFFER = "Start the Remote tasks worker now so this Mac can accept approved tasks?"
@@ -309,7 +309,7 @@ class Readiness:
 
 
 def readiness(root: Path) -> Readiness:
-    from openswap.worker.adapter import execution_mode
+    from openswap.worker.adapter import execution_mode, production_adapter
 
     cli = _cli()
     policy = load_worker_settings(root)
@@ -347,7 +347,7 @@ def readiness(root: Path) -> Readiness:
         worker=worker,
         account=account,
         folders=tuple(_describe(w) for w in policy.workspaces),
-        execution=execution_mode(),
+        execution=execution_mode(production_adapter(root)),
         paused=policy.paused is True,
         connection=connection if isinstance(connection, str) else None,
     )

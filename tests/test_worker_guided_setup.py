@@ -499,9 +499,10 @@ def test_display_label_defaults_to_the_folder_name():
 # --- the execution-mode hook ---------------------------------------------------------------------
 
 
-def test_execution_mode_is_disabled_until_a_live_adapter_declares_itself():
-    assert execution_mode() == "disabled"
-    assert isinstance(production_adapter(), UnavailableCodexAdapter)
+def test_execution_mode_is_disabled_until_a_live_adapter_declares_itself(tmp_path):
+    # The production adapter on a Mac is the live Codex adapter, which reports
+    # "disabled" until the owner's opt-in is recorded.
+    assert execution_mode(production_adapter(tmp_path)) == "disabled"
     assert execution_mode(UnavailableCodexAdapter()) == "disabled"
     assert execution_mode(FakeAdapter()) == "disabled"  # a test adapter is not live execution
     assert execution_mode(SimpleNamespace(execution_mode="live")) == "live"
@@ -912,3 +913,12 @@ def test_menu_setup_runs_every_step_off_the_ui_thread(root, keychain, monkeypatc
 ])
 def test_parse_pairing_command(text, expected):
     assert guided_setup.parse_pairing_command(text) == expected
+
+
+
+def test_the_summary_reports_live_execution_from_the_adapter(root, monkeypatch, capsys, research_home):
+    from openswap.worker import adapter
+
+    monkeypatch.setattr(adapter, "production_adapter",
+                        lambda backup_root=None: SimpleNamespace(execution_mode="live"))
+    assert guided_setup.readiness(root).execution == "live"

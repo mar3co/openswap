@@ -967,6 +967,10 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     if arguments and arguments[0] == "refserver":
         from openswap.worker.refserver.cli import main as refserver_main
         return refserver_main(arguments[1:])
+    if arguments[:1] in (["codex"], ["live"]):
+        from openswap.worker.live_cli import main as live_main
+        root = Path(backup_root) if backup_root is not None else get_backup_root()
+        return live_main(arguments, root, migrate=_migrate_legacy_before_worker_state_change)
     if arguments[:1] == ["account"] and len(arguments) > 1 and arguments[1] in _ALLOWLIST_COMMANDS:
         root = Path(backup_root) if backup_root is not None else get_backup_root()
         return _allowlist_command(root, arguments[1:])
@@ -976,6 +980,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("refserver", help="serve the reference protocol or manage pairing/revocation")
+    commands.add_parser("codex", help="install, verify and sign in the pinned Codex CLI that remote jobs run")
+    commands.add_parser("live", help="show or change the explicit live-execution opt-in")
     run = commands.add_parser("run", help="run the background worker process")
     # Passed only by the LaunchAgent: a manual run refuses while it is loaded.
     run.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)

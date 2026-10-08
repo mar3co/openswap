@@ -1,12 +1,16 @@
 """Provider boundary for local worker jobs.
 
-The production factory is intentionally unavailable while Plan 017 Phase 1 is
-blocked. Tests can implement the protocol directly; no CLI flag or executable
-override installs a fake adapter in the application.
+On a supported Mac the production factory returns the live Codex adapter,
+which still runs nothing until the owner enables live execution from passing
+``openswap worker live-check`` evidence (``openswap.worker.live``). Elsewhere
+it returns the fail-closed unavailable adapter. Tests can implement the
+protocol directly; no CLI flag or executable override installs a fake adapter
+in the application.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol
 
 from openswap.worker.models import (
@@ -17,6 +21,19 @@ from openswap.worker.models import (
     ResolvedWorkspace,
     SafeEvent,
 )
+
+
+class ProviderLaunchRefused(RuntimeError):
+    """``start()`` refused before anything could run: nothing was launched.
+
+    The runtime releases the account lease as unlaunched and fails the job with
+    ``diagnostic_code`` (an allowlisted journal code). Any other exception from
+    ``start()`` leaves the launch uncertain.
+    """
+
+    def __init__(self, diagnostic_code: str):
+        super().__init__(diagnostic_code)
+        self.diagnostic_code = diagnostic_code
 
 
 class ProviderAdapter(Protocol):
@@ -48,9 +65,24 @@ class UnavailableCodexAdapter:
         return InterruptResult(requested=False, execution_stopped=False, diagnostic_code=self.diagnostic_code)
 
 
-def production_adapter() -> ProviderAdapter:
-    """Return the only application adapter enabled in Phase 2."""
-    return UnavailableCodexAdapter()
+def production_adapter(backup_root: Path | None = None) -> ProviderAdapter:
+    """The application adapter: live-capable Codex on Apple silicon Macs, else unavailable.
+
+    ``backup_root`` defaults to OpenSwap's backup root. Either adapter exposes
+    ``execution_mode`` ("live" only once the owner opted in), so callers that
+    report the mode can read it from whichever adapter they hold.
+    """
+    from openswap.worker.codex_cli import platform_supported
+
+    if not platform_supported():
+        return UnavailableCodexAdapter()
+    if backup_root is None:
+        from openswap.paths import get_backup_root
+
+        backup_root = get_backup_root()
+    from openswap.worker.codex_exec import CodexExecAdapter
+
+    return CodexExecAdapter(Path(backup_root))
 
 
 EXECUTION_DISABLED = "disabled"
@@ -63,10 +95,9 @@ def execution_mode(adapter: object | None = None) -> str:
     The one hook behind the readiness report sent to the control service and
     the setup summary. It reads ``adapter.execution_mode`` (the production
     adapter when ``adapter`` is None), and anything other than an explicit
-    ``"live"`` is ``"disabled"``. The production adapter is
-    UnavailableCodexAdapter today, which declares ``"disabled"``; an adapter
-    that really launches the provider declares ``execution_mode = "live"``.
-    Test adapters declare nothing and so report ``"disabled"``.
+    ``"live"`` is ``"disabled"``. The live Codex adapter declares ``"live"``
+    only while the owner's opt-in is recorded (see ``openswap.worker.live``);
+    test adapters declare nothing and so report ``"disabled"``.
     """
     if adapter is None:
         adapter = production_adapter()

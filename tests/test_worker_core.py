@@ -918,13 +918,15 @@ def test_hung_provider_start_is_abandoned_as_uncertain_and_blocks_admission(
     adapter.release_start.set()
     deadline = time.monotonic() + 3
     while (
-        AccountLeaseStore(tmp_path).current().reason != "launch_uncertain"
+        AccountLeaseStore(tmp_path).current().state != "released"
         and time.monotonic() < deadline
     ):
         time.sleep(0.01)
     assert adapter.interrupt_count == 1  # the late handle is interrupted
+    # Its interrupt proved the run stopped, so the lease is released on that proof.
+    assert AccountLeaseStore(tmp_path).current().reason == "confirmed_stopped"
     assert worker_cli.release_lease(tmp_path, confirm_stopped=True) == (
-        True, {"lease_state": "released"}, None
+        True, {"lease_state": "released"}, "already_released"
     )
 
 
