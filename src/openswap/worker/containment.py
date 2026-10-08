@@ -39,6 +39,7 @@ import json
 import os
 import plistlib
 import re
+import secrets
 import signal
 import stat
 import struct
@@ -103,8 +104,15 @@ def default_lock_dir() -> Path:
     launchd labels are domain-wide (``gui/<uid>``), so their locks must not
     depend on where a caller keeps its run directories.
     """
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    return Path(tempfile.gettempdir()) / f"openswap-job-locks-{uid}"
+    try:
+        import pwd
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, AttributeError):
+        home = Path.home()
+    # From the account database, not $HOME or $TMPDIR, so every process of
+    # this user agrees whatever its environment.
+    return home / "Library" / "Caches" / "com.opensoft.openswap" / "job-locks"
 
 _SZOMB = 5
 _SSTOP = 4
@@ -130,6 +138,8 @@ class ProcessTable(Protocol):
     def signal(self, pid: int, signum: int) -> None: ...
 
     def boot_session(self) -> str | None: ...
+
+    def is_dead(self, pid: int) -> bool: ...
 
 
 class DarwinProcessTable:
@@ -185,6 +195,31 @@ class DarwinProcessTable:
     def signal(self, pid: int, signum: int) -> None:
         os.kill(pid, signum)
 
+    def is_dead(self, pid: int) -> bool:
+        """Confirmed exited or a zombie; anything unclear is not dead."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        if self.status_of(pid) == _SZOMB:
+            return True
+        try:
+            result = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                                    text=True, timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if result.returncode != 0 and not result.stdout.strip():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                return False
+            return False
+        return result.stdout.strip().startswith("Z")
+
     def boot_session(self) -> str | None:
         size = ctypes.c_size_t(128)
         buf = ctypes.create_string_buffer(128)
@@ -205,12 +240,19 @@ class JobHandle:
     leader_pid: int | None = None
     coalition_id: int | None = None
     released: bool = False  # the ``go`` file was created: the provider may run
+    # Unique per launch: names this launch's plist, which launchd reports as
+    # the service path, so a later launch at the same run directory differs.
+    launch_id: str | None = None
+
+    @property
+    def plist_path(self) -> Path:
+        return self.run_dir / (f"job-{self.launch_id}.plist" if self.launch_id else "job.plist")
 
     def to_dict(self) -> dict:
         return {
             "label": self.label, "domain": self.domain, "boot_session": self.boot_session,
             "leader_pid": self.leader_pid, "coalition_id": self.coalition_id,
-            "released": self.released,
+            "released": self.released, "launch_id": self.launch_id,
         }
 
 
@@ -300,6 +342,9 @@ def load_handle(run_dir: Path) -> JobHandle | None:
         pid = raw.get("leader_pid")
         cid = raw.get("coalition_id")
         released = raw.get("released", False)
+        launch_id = raw.get("launch_id")
+        if launch_id is not None and (not isinstance(launch_id, str) or not re.fullmatch(r"[0-9a-f]{16}", launch_id)):
+            return None
         if boot is not None and not isinstance(boot, str):
             return None
         if pid is not None and (type(pid) is not int or pid <= 1):
@@ -310,7 +355,7 @@ def load_handle(run_dir: Path) -> JobHandle | None:
             return None
     except (KeyError, TypeError, ValueError):
         return None
-    return JobHandle(label, domain, Path(run_dir), boot, pid, cid, released)
+    return JobHandle(label, domain, Path(run_dir), boot, pid, cid, released, launch_id)
 
 
 def _save_handle(handle: JobHandle) -> None:
@@ -435,8 +480,8 @@ class LaunchdContainment:
             # In use, or launchd could not say: never bootstrap over (or later
             # boot out) a service this launch did not create.
             raise ContainmentError("job_label_in_use" if loaded else "launchd_unavailable")
-        plist_path = run_dir / "job.plist"
-        handle = JobHandle(label, self.domain, run_dir, boot)
+        handle = JobHandle(label, self.domain, run_dir, boot, launch_id=secrets.token_hex(8))
+        plist_path = handle.plist_path
         try:
             # Claim the directory atomically with the plist, then write the
             # rest. Nothing has been handed to launchd yet, so a failure here
@@ -531,6 +576,7 @@ class LaunchdContainment:
     # -- stop -----------------------------------------------------------------
 
     def _label_lock(self, label: str) -> FileLock:
+        self._lock_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         ensure_private_dir(self._lock_dir)
         return FileLock(self._lock_dir / f"{label}.lock", timeout=0)
 
@@ -544,7 +590,7 @@ class LaunchdContainment:
         printed = self._launchctl(["print", f"{handle.domain}/{handle.label}"])
         if printed.returncode != 0:
             return None
-        expected = f"path = {handle.run_dir / 'job.plist'}"
+        expected = f"path = {handle.plist_path}"
         return any(
             line.startswith("\t") and not line.startswith("\t\t") and line.strip() == expected
             for line in (printed.stdout or "").splitlines()
@@ -597,7 +643,10 @@ class LaunchdContainment:
             # Sweep again: anything the bootout left behind is still a member.
             again_frozen, again_killed = self._sweep(handle.coalition_id, deadline=deadline)
             killed += again_killed
-            survivors = len(self._live_members(handle.coalition_id))
+            try:
+                survivors = len(self._live_members(handle.coalition_id))
+            except ContainmentError:
+                return StopProof(False, loaded, 1, killed)
             stopped = frozen and again_frozen and survivors == 0 and loaded is False
             return StopProof(stopped, loaded, survivors, killed)
         # No coalition was ever recorded, so the provider was never released:
@@ -627,7 +676,9 @@ class LaunchdContainment:
                 continue
             coalition = procs.coalition_of(pid)
             if coalition is None:
-                kinds[pid] = "gone"
+                # Unreadable: only a confirmed exit or zombie is harmless; a
+                # live process we cannot place blocks any proof.
+                kinds[pid] = "gone" if procs.is_dead(pid) else "unknown"
             elif coalition != coalition_id:
                 kinds[pid] = "other"
             else:
@@ -648,7 +699,19 @@ class LaunchdContainment:
         return all(pid in previous for pid, kind in scan.items() if kind == "gone")
 
     def _live_members(self, coalition_id: int) -> list[int]:
-        return [pid for pid, kind in self._scan(coalition_id).items() if kind in {"running", "stopped"}]
+        """Members, plus live processes whose coalition cannot be read (they may be members)."""
+        return [pid for pid, kind in self._scan(coalition_id).items() if kind in {"running", "stopped", "unknown"}]
+
+    def _kill_known(self, coalition_id: int, pids) -> int:
+        killed = 0
+        for pid in pids:
+            try:
+                if self.procs.coalition_of(pid) == coalition_id:
+                    self.procs.signal(pid, signal.SIGKILL)
+                    killed += 1
+            except (ProcessLookupError, PermissionError, ContainmentError):
+                pass
+        return killed
 
     def _sweep(self, coalition_id: int, *, deadline: float) -> tuple[bool, int]:
         """Freeze every member, then kill them all; returns ``(proven, killed)``.
@@ -665,12 +728,19 @@ class LaunchdContainment:
         procs = self.procs
         frozen = False
         previous: dict[int, str] | None = None
+        known: set[int] = set()
         while True:
-            scan = self._scan(coalition_id)
+            try:
+                scan = self._scan(coalition_id)
+            except ContainmentError:
+                # No trustworthy listing: kill what is known, prove nothing.
+                return False, self._kill_known(coalition_id, known)
+            known |= {pid for pid, kind in scan.items() if kind in {"running", "stopped"}}
             running = [pid for pid, kind in scan.items() if kind == "running"]
             stopped = {pid for pid, kind in scan.items() if kind == "stopped"}
             if (
-                not running and previous is not None and self._complete(scan, previous)
+                not running and "unknown" not in scan.values()
+                and previous is not None and self._complete(scan, previous)
                 and "running" not in previous.values()
                 and stopped == {pid for pid, kind in previous.items() if kind == "stopped"}
             ):
@@ -689,9 +759,14 @@ class LaunchdContainment:
         killed: set[int] = set()
         previous = None
         while True:
-            scan = self._scan(coalition_id)
+            try:
+                scan = self._scan(coalition_id)
+            except ContainmentError:
+                return False, len(killed) + self._kill_known(coalition_id, known - killed)
+            known |= {pid for pid, kind in scan.items() if kind in {"running", "stopped"}}
             members = [pid for pid, kind in scan.items() if kind in {"running", "stopped"}]
-            if not members and (previous is None or self._complete(scan, previous)):
+            if not members and "unknown" not in scan.values() and (
+                    previous is None or self._complete(scan, previous)):
                 return frozen, len(killed)
             for pid in members:
                 if procs.coalition_of(pid) == coalition_id:
