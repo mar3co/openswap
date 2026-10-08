@@ -233,6 +233,21 @@ def test_pairing_succeeds_even_if_the_whole_setup_fails(root, keychain, monkeypa
     assert load_worker_settings(root).control_service_url == "http://localhost"
 
 
+def test_summary_is_ready_only_when_admission_is_open(root, monkeypatch, capsys, enable_calls, research_home):
+    cli.set_worker_account(root, "1")
+    update_worker_settings(root, enabled=True, paused=True)
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": "running"})
+    assert _setup(root, monkeypatch, ["", "y", ""]) == 0
+    out = capsys.readouterr().out
+    assert "  Worker: running (admission paused)" in out
+    assert "Before Slack can start tasks on this Mac: reopen admission (`openswap worker pause --off`)." in out
+    assert "Ready for Slack" not in out
+    update_worker_settings(root, paused=False)
+    assert _setup(root, monkeypatch, ["", ""]) == 0
+    out = capsys.readouterr().out
+    assert "  Worker: running\n" in out and "Ready for Slack" in out
+
+
 def test_a_failing_pin_keeps_the_setup_going(root, keychain, monkeypatch, capsys, enable_calls):
     monkeypatch.setattr(cli, "set_worker_account", lambda *_: (_ for _ in ()).throw(OSError("disk")))
     assert _pair(root, monkeypatch, interactive=True, answers=["n", "1", "y"]) == 0

@@ -272,6 +272,7 @@ class Readiness:
     account: str | None
     folders: tuple[str, ...]
     execution: str
+    paused: bool = False  # admission paused: the worker claims no new task
 
     @property
     def missing(self) -> tuple[str, ...]:
@@ -280,6 +281,8 @@ class Readiness:
             out.append("pair this Mac (`openswap worker pair <url> <code>`)")
         if self.worker not in {"running", "starting"}:
             out.append("start the worker (`openswap worker enable`)")
+        if self.paused:
+            out.append("reopen admission (`openswap worker pause --off`)")
         if self.account is None:
             out.append("pin a Codex account (`openswap worker account <slot>`)")
         if not self.folders:
@@ -319,6 +322,7 @@ def readiness(root: Path) -> Readiness:
         account=account,
         folders=tuple(_describe(w) for w in policy.workspaces),
         execution=execution_mode(),
+        paused=policy.paused is True,
     )
 
 
@@ -328,7 +332,7 @@ def summary(root: Path, ui: Prompts) -> None:
               "off": "off"}[state.worker]
     ui.say("Remote tasks setup:")
     ui.say(f"  Service: {state.paired_url or 'not paired'}")
-    ui.say(f"  Worker: {worker}")
+    ui.say(f"  Worker: {worker}{' (admission paused)' if state.paused else ''}")
     ui.say(f"  Account: {state.account or 'none pinned'}")
     ui.say(f"  Research folders: {', '.join(state.folders) or 'none'}")
     ui.say(f"  Execution: {state.execution}")
