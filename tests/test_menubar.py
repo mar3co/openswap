@@ -2410,12 +2410,46 @@ def test_plan_relogin_click_captures_only_on_email_and_org_match():
     assert wrong_org.kind == "confirm_open_login"
     assert wrong_org.kind != "capture"
     title = menubar.relogin_wrong_account_title(wrong_org)
-    assert title == "Sign in as personal?"
+    assert title == "personal needs a new sign-in"
     msg = menubar.relogin_wrong_account_message(wrong_org)
     assert msg == (
-        "Claude Code is using adsonline right now. "
-        "Your saved adsonline account is not removed. "
-        "Continue to sign in as personal?"
+        "personal's saved login has expired, so OpenSwap can't switch to it. "
+        "Sign in as personal in the login window that opens.\n\n"
+        "Claude Code is on adsonline right now and will sign out of it. "
+        "adsonline stays saved in OpenSwap, so you can switch back later."
+    )
+
+    assert wrong_org.reason == "expired"
+
+    no_saved_login = menubar.plan_relogin_click(
+        live=("a@x.com", "org-ads"),
+        slot=slot,
+        slot_name="personal",
+        live_name="adsonline",
+        reason="missing",
+    )
+    assert no_saved_login is not None
+    assert no_saved_login.kind == "confirm_open_login"
+    assert (
+        menubar.relogin_wrong_account_title(no_saved_login)
+        == "personal needs a sign-in"
+    )
+    assert menubar.relogin_wrong_account_message(no_saved_login).startswith(
+        "OpenSwap has no saved login for personal, so it can't switch to it. "
+        "Sign in as personal in the login window that opens."
+    )
+
+    unverified = menubar.plan_relogin_click(
+        live=("a@x.com", "org-ads"),
+        slot=slot,
+        slot_name="personal",
+        live_name="adsonline",
+        reason="unverified",
+    )
+    assert unverified is not None
+    assert menubar.relogin_wrong_account_message(unverified).startswith(
+        "OpenSwap couldn't confirm personal's saved login, so it can't "
+        "switch to it."
     )
 
     signed_out = menubar.plan_relogin_click(

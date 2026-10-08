@@ -2118,7 +2118,8 @@ def run(switcher, codex=None) -> int:
                 return
             if self._slot_missing_login(num):
                 self._repair_relogin(
-                    num, close_panel=close_panel, force_login=True
+                    num, close_panel=close_panel, force_login=True,
+                    reason="missing",
                 )
                 return
             if self._slot_needs_reconcile(num):
@@ -2206,20 +2207,24 @@ def run(switcher, codex=None) -> int:
             )
             return self._alert(title=title, message=message, ok="Switch", cancel="Cancel") == 1
 
-        def _repair_relogin(self, num, *, close_panel, force_login=False):
+        def _repair_relogin(
+            self, num, *, close_panel, force_login=False, reason="expired"
+        ):
             slot = self._slot_identity(num)
             slot_name = self._name_for_num(num)
             live = self.switcher.live_identity()
             live_name = self._name_for_identity(live)
             plan = plan_relogin_click(
-                live=live, slot=slot, slot_name=slot_name, live_name=live_name
+                live=live, slot=slot, slot_name=slot_name, live_name=live_name,
+                reason=reason,
             )
             if plan is None:
                 self._show_error(f"Couldn't find {slot_name} in the account list.")
                 return
             if force_login and plan.kind == "capture":
                 plan = ReloginClickPlan(
-                    "open_login", plan.slot_name, plan.login_email, plan.live_name
+                    "open_login", plan.slot_name, plan.login_email,
+                    plan.live_name, plan.reason,
                 )
             if plan.kind == "capture":
                 self._capture_relogin(num, close_panel=close_panel)
@@ -2227,7 +2232,7 @@ def run(switcher, codex=None) -> int:
             if plan.kind == "confirm_open_login" and self._alert(
                 title=relogin_wrong_account_title(plan),
                 message=relogin_wrong_account_message(plan),
-                ok="Open login",
+                ok=f"Sign in as {plan.slot_name}",
                 cancel="Cancel",
             ) != 1:
                 return
@@ -2275,7 +2280,8 @@ def run(switcher, codex=None) -> int:
                 return
             if owner["state"] == "unknown":
                 self._repair_relogin(
-                    num, close_panel=close_panel, force_login=True
+                    num, close_panel=close_panel, force_login=True,
+                    reason="unverified",
                 )
                 return
             result = self._run_switch(
