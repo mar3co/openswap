@@ -123,8 +123,7 @@ def test_cli_and_menu_show_service_connectivity_and_last_seen():
     seen = "2026-09-30T00:00:00Z"
     snapshot = {"enabled": True, "paused": False, "process_state": "running", "provider": {"available": False},
                 "remote_connectivity": "revoked", "remote_last_seen_at": seen}
-    assert "service: revoked" in cli._format_status(snapshot)
-    assert seen in cli._format_status(snapshot)
+    assert f"  ✗ Service       revoked (last seen {seen})" in cli._format_status(snapshot)
     menu = _remote_tasks_status_copy(snapshot, enabled=True, paused=False)
     assert "service revoked" in menu and "last seen" in menu
 
@@ -280,7 +279,7 @@ def test_locally_expired_enrollment_shows_expired_not_revoked(remote_setup):
     assert read_worker_snapshot(runtime.backup_root).remote_connectivity == RemoteConnectivity.EXPIRED
     snapshot = {"enabled": True, "paused": False, "process_state": "running", "provider": {"available": False},
                 "remote_connectivity": "expired", "remote_last_seen_at": None}
-    assert "service: expired" in cli._format_status(snapshot)
+    assert "  ✗ Service       expired (last seen never)" in cli._format_status(snapshot)
     assert "service expired" in _remote_tasks_status_copy(snapshot, enabled=True, paused=False)
 
 

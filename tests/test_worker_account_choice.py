@@ -200,8 +200,8 @@ def test_allow_label_and_list(root, capsys):
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
     alice = _entry(root, ALICE)
-    assert f"* {alice.account_ref}  \"Main\"  [Codex slot 1]" in out
-    assert f"  {bob.account_ref}  \"Second\"  [Codex slot 2]" in out
+    assert f"  ✓ {alice.account_ref}  \"Main\"    Codex slot 1  default" in out
+    assert f"  • {bob.account_ref}  \"Second\"  Codex slot 2" in out
     assert SECRET not in out
 
     assert _run(root, "account", "--json") == 0
@@ -265,7 +265,7 @@ def test_an_account_gone_from_the_roster_can_be_disallowed_by_reference(root, ca
     bob = _entry(root, BOB)
     _write_codex_roster(root, {"1": {"email": "alice@example.com", "accountId": "acct-alice", "alias": "work"}})
     assert _run(root, "account") == 0
-    assert f"{bob.account_ref}  \"Codex account 2\"  [no longer in the Codex roster]" in capsys.readouterr().out
+    assert f"  ✗ {bob.account_ref}  \"Codex account 2\"  no longer in the Codex roster" in capsys.readouterr().out
     assert _run(root, "account", "disallow", "2", "--json") == 1  # the slot is gone
     assert json.loads(capsys.readouterr().out)["diagnostic_code"] == "account_not_found"
     assert _run(root, "account", "disallow", bob.account_ref) == 0

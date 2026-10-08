@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
 
+from openswap import printer
 from openswap.exceptions import ClaudeSwitchError
 from openswap.settings import load_worker_settings
 
@@ -29,6 +30,9 @@ class Prompts(Protocol):
 
     def say(self, text: str) -> None: ...
 
+    def section(self, title: str) -> None:
+        """A step header (``Step 2 of 4 · Account``); plain ``say`` when a front end has nothing better."""
+
     def confirm(self, question: str, *, default: bool = True) -> bool | None:
         """Yes/no; ``None`` when the owner gave no answer (EOF, closed dialog)."""
 
@@ -39,9 +43,19 @@ class Prompts(Protocol):
         """A folder path; "" or ``None`` when the owner is done choosing."""
 
 
+def _section(ui, title: str) -> None:
+    section = getattr(ui, "section", None)
+    (section or ui.say)(title)
+
+
 @dataclass
 class TerminalPrompts:
-    """``input()``/``print`` prompts for the CLI; ``read_line`` is injectable for tests."""
+    """``input()``/``print`` prompts for the CLI; ``read_line`` is injectable for tests.
+
+    Only this front end styles anything (a bold step header when colours are
+    on): the step text itself stays plain, because the menu bar shows the same
+    lines in dialogs.
+    """
 
     interactive: bool
     read_line: Callable[[str], str] | None = None
@@ -49,6 +63,10 @@ class TerminalPrompts:
 
     def say(self, text: str) -> None:
         self.write(text)
+
+    def section(self, title: str) -> None:
+        self.write("")
+        self.write(printer.heading(title))
 
     def _read(self, prompt: str) -> str | None:
         try:
@@ -68,7 +86,7 @@ class TerminalPrompts:
         return answer in {"y", "yes"}
 
     def ask(self, question: str, *, default: str = "") -> str | None:
-        answer = self._read(f"{question} [{default}] " if default else question)
+        answer = self._read(f"{question} [{default}]: " if default else f"{question}: ")
         if answer is None:
             return None
         return answer.strip() or default
@@ -78,7 +96,7 @@ class TerminalPrompts:
             return self.ask(question)
         from openswap.folder_picker import pick_folder
 
-        return pick_folder(question)
+        return pick_folder(f"{question}: ")
 
 
 # Copy shared by the steps and their fallbacks.
@@ -166,26 +184,46 @@ def offer_worker(root: Path, ui: Prompts) -> None:
         ui.say(WORKER_ONLINE)
 
 
+def account_menu(choices, pinned=None) -> tuple[list, list[str]]:
+    """The numbered account menu: the eligible slots (Codex first) and their lines.
+
+    The number is the menu position, not the slot: both providers may use
+    the same slot numbers, and only one of them could keep its own. The slot
+    stays visible in its own column, next to the provider.
+    """
+    menu = [c for c in choices.codex if c.eligible] + [c for c in choices.claude if c.eligible]
+    rows = []
+    for number, choice in enumerate(menu, start=1):
+        current = pinned is not None and choice.account_ref == pinned.account_ref
+        notes = []
+        if current:
+            notes.append("current")
+        if choice.disabled:
+            notes.append("out of rotation")
+        rows.append((f"{printer.mark(True if current else None)} {number}", _provider_name(choice),
+                     choice.email or "(no email)", f"({choice.alias})" if choice.alias else "",
+                     f"slot {choice.number}", ", ".join(notes)))
+    return menu, printer.columns(rows)
+
+
 def confirm_account(root: Path, ui: Prompts) -> None:
-    """Show the pinned account (Codex or Claude) and offer to keep it, or pick one."""
+    """Show the eligible accounts as a numbered menu; Enter keeps the pinned one."""
     cli = _cli()
     try:
         choices = cli.worker_account_choices(root)
     except Exception:
         choices = None
     pinned = choices.pinned if choices is not None and not choices.pinned_missing else None
-    if pinned is not None:
+    if pinned is not None and not ui.interactive:
         ui.say(f"Remote tasks uses {_provider_name(pinned)} account {pinned.label()}.")
-        if not ui.interactive or ui.confirm("Keep this account?") is not False:
-            return
-    elif not ui.interactive or choices is None:
+        return
+    if not ui.interactive or choices is None:
         ui.say(ACCOUNT_NEXT)
         return
-    elif choices.pinned_missing:
+    if choices.pinned_missing:
         ui.say("The pinned account is no longer in the roster; choose another.")
-    eligible = [choice for choice in choices.codex if choice.eligible]
-    eligible_claude = [choice for choice in choices.claude if choice.eligible]
-    if not eligible and not eligible_claude:
+    menu, lines = account_menu(choices, pinned)
+    if not menu:
         ui.say("No eligible account is saved. Add one with `openswap codex add` or `openswap add`, then "
                "`openswap worker account <slot>`.")
         return
@@ -194,18 +232,31 @@ def confirm_account(root: Path, ui: Prompts) -> None:
     later = (f"{pinned.label()} stays selected. Change it later with "
              "`openswap worker account <slot|email|alias>`." if pinned is not None
              else "Pin one later with `openswap worker account <slot|email|alias>`.")
-    ui.say("Choose the account remote jobs run on:")
-    for choice in eligible:
-        ui.say(f"  {choice.label()}  (Codex)")
-    for choice in eligible_claude:
-        ui.say(f"  claude:{choice.label()}  (Claude)")
+    ui.say("Choose the account remote jobs run on. Type its number (an email, alias or "
+           "`claude:<slot>` works too).")
+    for line in lines:
+        ui.say(line)
+    current = next((str(n) for n, c in enumerate(menu, start=1)
+                    if pinned is not None and c.account_ref == pinned.account_ref), "")
+    question = (f"Account number (1-{len(menu)}; Enter keeps the current one)" if current
+                else f"Account number (1-{len(menu)}; Enter to skip)")
     for _attempt in range(_MAX_ATTEMPTS):
-        answer = ui.ask("Account (slot, email or alias; claude:<slot> for Claude; Enter to skip): ")
+        answer = ui.ask(question, default=current)
         if not answer:
             ui.say(f"Skipped. {later}")
             return
+        if answer == current:
+            ui.say(f"Kept {_provider_name(pinned)} account {pinned.label()}.")
+            return
+        selector = answer
+        # ASCII only: str.isdigit() also accepts digits such as "²" that int() rejects.
+        if answer.isascii() and answer.isdigit():
+            if not 1 <= int(answer) <= len(menu):
+                ui.say(f"Type a number from 1 to {len(menu)}.")
+                continue
+            selector = menu[int(answer) - 1].account_ref
         try:
-            chosen = cli.set_worker_account(root, answer)
+            chosen = cli.set_worker_account(root, selector)
         except cli.AccountPinError as exc:
             ui.say(cli._ACCOUNT_MESSAGES.get(exc.code, f"Could not pin that account ({exc.code})."))
             continue
@@ -226,6 +277,21 @@ def _display_path(path: Path) -> str:
 
 def _describe(workspace) -> str:
     return f"{workspace.workspace_id} ({workspace.display_label})"
+
+
+def folder_lines(workspaces) -> list[str]:
+    """One numbered, aligned line per approved folder: ID, label, then the path (local only)."""
+    return printer.columns([
+        (f"{printer.MARK_OK} {number}", workspace.workspace_id, f'"{workspace.display_label}"',
+         _display_path(workspace.output_root))
+        for number, workspace in enumerate(workspaces, start=1)
+    ])
+
+
+def _say_folders(ui, workspaces) -> None:
+    ui.say("Approved research folders (the control service sees only the ID and label):")
+    for line in folder_lines(workspaces):
+        ui.say(line)
 
 
 def suggested_folder_id(folder: Path, taken: set[str]) -> str:
@@ -250,7 +316,7 @@ def approve_folders(root: Path, ui: Prompts) -> None:
         if cli.is_builtin_default_registry(root, policy.workspaces):
             ui.say(FOLDER_NEXT)
         else:
-            ui.say("Approved research folders: " + ", ".join(_describe(w) for w in policy.workspaces) + ".")
+            _say_folders(ui, policy.workspaces)
         return
     if cli.is_builtin_default_registry(root, policy.workspaces):
         folder = cli.default_research_folder()
@@ -272,9 +338,9 @@ def approve_folders(root: Path, ui: Prompts) -> None:
         else:
             ui.say(FOLDER_NEXT)
     else:
-        ui.say("Approved research folders: " + ", ".join(_describe(w) for w in policy.workspaces) + ".")
+        _say_folders(ui, policy.workspaces)
     for _extra in range(_MAX_EXTRA_FOLDERS):
-        answer = ui.choose_folder("Another folder to approve (path; Enter to finish): ")
+        answer = ui.choose_folder("Another folder to approve (path; Enter to finish)")
         if not answer:
             return
         try:
@@ -406,34 +472,56 @@ def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> No
     while _settling(state) and time.monotonic() < deadline:
         time.sleep(0.25)
         state = readiness(root)
-    worker = {"running": "running", "starting": "starting", "stopped": "enabled but not running",
-              "off": "off"}[state.worker]
-    ui.say("Remote tasks setup:")
-    link = f" ({state.connection})" if state.paired_url and state.worker == "running" and state.connection else ""
-    ui.say(f"  Service: {state.paired_url or 'not paired'}{link}")
-    ui.say(f"  Worker: {worker}{' (admission paused)' if state.paused else ''}")
-    ui.say(f"  Account: {state.account or 'none pinned'}")
-    ui.say(f"  Research folders: {', '.join(state.folders) or 'none'}")
-    ui.say(f"  Execution: {state.execution}")
+    for line in checklist(state):
+        ui.say(line)
     if state.missing:
-        ui.say("Before Slack can start tasks on this Mac: " + "; ".join(state.missing) + ".")
+        ui.say("Before Slack can start tasks on this Mac:")
+        for number, step in enumerate(state.missing, start=1):
+            ui.say(f"  {number}. {step}")
     else:
         ui.say("Ready for Slack: approved tasks from your Slack workspace can reach this Mac.")
     ui.say(EXECUTION_LIVE_NOTE if state.execution == "live" else execution_off_note(state.provider))
 
 
-# Steps run in order (looked up by name), each with the line shown if it fails unexpectedly.
+def checklist(state: Readiness) -> list[str]:
+    """The readiness report as aligned ``✓``/``✗``/``•`` rows, each with its words."""
+    worker = {"running": "running", "starting": "starting", "stopped": "enabled but not running",
+              "off": "off"}[state.worker]
+    if state.paused:
+        worker += " (admission paused)"
+    online = state.worker == "running" and state.connection
+    service = f"{state.paired_url} ({state.connection})" if state.paired_url and online else (
+        state.paired_url or "not paired")
+    service_ok = None if state.paired_url is None else (
+        True if not online or state.connection == "online"
+        else False if state.connection in {"revoked", "expired"} else None)
+    worker_ok = (True if state.worker == "running" and not state.paused
+                 else None if state.worker == "starting" else False)
+    rows = [
+        (f"{printer.mark(service_ok)} Service", service),
+        (f"{printer.mark(worker_ok)} Worker", worker),
+        (f"{printer.mark(state.account is not None)} Account", state.account or "none pinned"),
+        (f"{printer.mark(bool(state.folders))} Folders", ", ".join(state.folders) or "none"),
+        # Execution stays off until the live check passes; the note below says how.
+        (f"{printer.mark(True if state.execution == 'live' else None)} Execution", state.execution),
+    ]
+    return printer.columns(rows)
+
+
+# Steps run in order (looked up by name), each with its header and the line
+# shown if it fails unexpectedly.
 STEPS = (
-    ("offer_worker", START_WORKER_NEXT),
-    ("confirm_account", ACCOUNT_NEXT),
-    ("approve_folders", FOLDER_NEXT),
-    ("summary", None),
+    ("offer_worker", "Step 1 of 4 · Worker", START_WORKER_NEXT),
+    ("confirm_account", "Step 2 of 4 · Account", ACCOUNT_NEXT),
+    ("approve_folders", "Step 3 of 4 · Research folder", FOLDER_NEXT),
+    ("summary", "Step 4 of 4 · Summary", None),
 )
 
 
 def run(root: Path, ui: Prompts) -> None:
     """Every step after pairing; a failing step prints its manual command and the rest still run."""
-    for name, fallback in STEPS:
+    for name, title, fallback in STEPS:
+        _section(ui, title)
         try:
             globals()[name](Path(root), ui)
         except Exception:
@@ -460,6 +548,9 @@ class DialogPrompts:
 
     def say(self, text: str) -> None:
         self._lines.append(text)
+
+    def section(self, title: str) -> None:
+        self.say(title)
 
     def _message(self, question: str) -> str:
         message = "\n".join([*self._lines, question]).strip()
@@ -514,6 +605,10 @@ class ThreadedPrompts:
     def say(self, text: str) -> None:
         with self._lock:
             self._dialogs.say(text)
+
+    def section(self, title: str) -> None:
+        with self._lock:
+            self._dialogs.section(title)
 
     def _call(self, name: str, *args, **kwargs):
         request = {"call": (name, args, kwargs), "done": threading.Event(), "result": None}

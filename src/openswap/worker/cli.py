@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from openswap import paths
+from openswap import paths, printer
 from openswap.exceptions import ClaudeSwitchError, LockError
 from openswap.locking import FileLock
 from openswap.paths import get_backup_root
@@ -968,6 +968,23 @@ def _run(backup_root: Path, *, managed: bool = False) -> int:
     return result
 
 
+_WORKER_COMMANDS = (
+    "setup", "pair", "unpair", "status", "enable", "disable", "pause", "stop", "account", "workspace",
+    "codex", "claude", "live", "live-check", "lease", "run", "submit-test", "refserver",
+)
+
+
+def unknown_command_message(prog: str, word: str, commands) -> str:
+    """``unknown command`` plus a "did you mean" for a close mistype, else the help hint."""
+    import difflib
+
+    close = difflib.get_close_matches(word, list(commands), n=3, cutoff=0.6)
+    if close:
+        suggestion = " or ".join(f"`{prog} {name}`" for name in close)
+        return f"{prog}: unknown command '{word}'. Did you mean {suggestion}?"
+    return f"{prog}: unknown command '{word}'. Run `{prog} --help` to list the commands."
+
+
 def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] == "refserver":
@@ -984,6 +1001,9 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     if arguments[:1] == ["account"] and len(arguments) > 1 and arguments[1] in _ALLOWLIST_COMMANDS:
         root = Path(backup_root) if backup_root is not None else get_backup_root()
         return _allowlist_command(root, arguments[1:])
+    if arguments and not arguments[0].startswith("-") and arguments[0] not in _WORKER_COMMANDS:
+        print(unknown_command_message("openswap worker", arguments[0], _WORKER_COMMANDS), file=sys.stderr)
+        return 2
     parser = argparse.ArgumentParser(
         prog="openswap worker",
         description="Control the opt-in Remote Agent Host worker.",
@@ -1366,58 +1386,76 @@ _WORKSPACE_MESSAGES = {
 }
 
 
-def _format_accounts(choices: AccountChoices) -> str:
-    lines = ["Remote tasks account (a remote job runs on this pin's provider unless the "
-             "service picks an allowed account):", "Codex:"]
-    if not choices.codex:
-        lines.append("  No Codex accounts saved. Add one with `openswap codex add`.")
-    for choice in choices.codex:
-        marker = "*" if choice.account_ref is not None and choice.account_ref == choices.pinned_ref else " "
+def _account_rows(choices: AccountChoices, accounts) -> list[tuple[str, ...]]:
+    rows = []
+    for choice in accounts:
+        pinned = choice.account_ref is not None and choice.account_ref == choices.pinned_ref
         notes = []
-        if choice.account_ref is not None and choice.account_ref == choices.pinned_ref:
+        if pinned:
             notes.append("pinned")
         if not choice.eligible:
-            notes.append("not eligible: no ChatGPT account ID (API key)")
+            notes.append("not eligible: no ChatGPT account ID (API key)" if choice.provider == "codex"
+                         else "not eligible: no email")
         if choice.disabled:
             notes.append("out of rotation")
-        suffix = f"  [{'; '.join(notes)}]" if notes else ""
-        lines.append(f"  {marker} {choice.label()}{suffix}")
-    lines.append("Claude (pin with `claude:<slot>`):")
+        rows.append((f"{printer.mark(True if pinned else False if not choice.eligible else None)} "
+                     f"{choice.number}", choice.email or "(no email)",
+                     f"({choice.alias})" if choice.alias else "", "; ".join(notes)))
+    return rows
+
+
+def _format_accounts(choices: AccountChoices) -> str:
+    """The human ``openswap worker account`` listing: roster, allowed accounts, one next step."""
+    lines = [printer.heading("Remote tasks account"),
+             "Remote jobs run on the pinned account unless the control service picks an allowed one.",
+             "", printer.heading("Codex accounts (pin with the slot number, email or alias)")]
+    if not choices.codex:
+        lines.append("  No Codex accounts saved. Add one with `openswap codex add`.")
+    lines.extend(printer.columns(_account_rows(choices, choices.codex)))
+    lines.append(printer.heading("Claude accounts (pin with `claude:<slot>`)"))
     if not choices.claude:
-        lines.append("  No Claude accounts saved.")
-    for entry in choices.claude:
-        pinned = entry.account_ref is not None and entry.account_ref == choices.pinned_ref
-        notes = ["pinned"] if pinned else []
-        if not entry.eligible:
-            notes.append("not eligible: no email")
-        if entry.disabled:
-            notes.append("out of rotation")
-        suffix = f"  [{'; '.join(notes)}]" if notes else ""
-        lines.append(f"  {'*' if pinned else ' '} {entry.label()}{suffix}")
-    if choices.pinned_missing:
-        lines.append(
-            "The pinned account is no longer in its roster; jobs fail "
-            "(provider_auth_unavailable) until you pin another."
-        )
-    elif choices.pinned_ref is None:
-        lines.append("No account pinned: remote jobs that do not pick an allowed account fail until you pin one.")
-    lines.append("Pin one with `openswap worker account <slot|email|alias>`; clear with `--clear`.")
-    lines.append("Allowed for a per-job choice by the control service (* = default; the service "
-                 "sees only the reference and label):")
+        lines.append("  No Claude accounts saved. Add one with `openswap add`.")
+    lines.extend(printer.columns(_account_rows(choices, choices.claude)))
+    lines.append("")
+    lines.append(printer.heading("Allowed for a per-job choice by the control service"))
+    lines.append("The service sees only the reference and the label; the pinned account is its default.")
     if not choices.allowlist:
         lines.append("  None. Allow one with `openswap worker account allow <slot|email|alias>`.")
-    for entry in choices.allowlist:
-        lines.append("  " + _format_allowlist_entry(entry, choices))
-    lines.append("Manage with `openswap worker account allow|disallow|label`.")
+    lines.extend(printer.columns([_allowlist_row(entry, choices) for entry in choices.allowlist]))
+    lines.append("")
+    if choices.pinned_missing:
+        lines.append("The pinned account is no longer in its roster; jobs fail "
+                     "(provider_auth_unavailable) until you pin another.")
+        lines.append(printer.next_step("pin another account: `openswap worker account <slot|email|alias>`"))
+    elif choices.pinned_ref is None:
+        lines.append("No account pinned: remote jobs that do not pick an allowed account fail until you pin one.")
+        lines.append(printer.next_step(f"pin an account, for example `openswap worker account {_example(choices)}`"))
+    else:
+        pinned = choices.pinned
+        lines.append(f"Pinned: {'Claude' if pinned.provider == 'claude' else 'Codex'} {pinned.label()}. "
+                     "Change it with `openswap worker account <slot|email|alias>`; `--clear` removes the pin.")
+    lines.append(printer.dimmed("Manage the per-job choices with `openswap worker account allow|disallow|label`."))
     return "\n".join(lines)
 
 
-def _format_allowlist_entry(entry: AllowlistedAccount, choices: AccountChoices) -> str:
-    marker = "*" if entry.identity == choices.pinned_ref else " "
+def _example(choices: AccountChoices) -> str:
+    """A selector for the first eligible account, so the next step is a command that works."""
+    for choice in choices.codex:
+        if choice.eligible:
+            return choice.number
+    for choice in choices.claude:
+        if choice.eligible:
+            return f"claude:{choice.number}"
+    return "<slot|email|alias>"
+
+
+def _allowlist_row(entry: AllowlistedAccount, choices: AccountChoices) -> tuple[str, ...]:
+    default = entry.identity == choices.pinned_ref
     slot = choices.slot_for(entry.identity)
     provider = "Claude" if entry.identity.startswith("claude:") else "Codex"
     where = f"{provider} slot {slot.number}" if slot is not None else f"no longer in the {provider} roster"
-    return f"{marker} {entry.account_ref}  {json.dumps(entry.label, ensure_ascii=False)}  [{where}]"
+    return (f"{printer.mark(True if default else None if slot is not None else False)} {entry.account_ref}",
+            json.dumps(entry.label, ensure_ascii=False), where, "default" if default else "")
 
 
 def _allowlist_payload(entry: AllowlistedAccount, pinned_ref: str | None) -> dict:
@@ -1457,7 +1495,8 @@ def _allowlist_command(root: Path, arguments: list[str]) -> int:
     try:
         if args.allowlist_command == "allow":
             entry = allow_worker_account(root, args.selector, args.label)
-            human = f"Allowed {json.dumps(entry.label, ensure_ascii=False)} ({entry.account_ref}) for a per-job choice."
+            human = (f"{printer.MARK_OK} Allowed {json.dumps(entry.label, ensure_ascii=False)} "
+                     f"({entry.account_ref}) for a per-job choice.")
         elif args.allowlist_command == "disallow":
             entry = disallow_worker_account(root, args.target, clear_default=args.clear_default)
             human = f"Disallowed {json.dumps(entry.label, ensure_ascii=False)} ({entry.account_ref})."
@@ -1487,16 +1526,18 @@ def _allowlist_command(root: Path, arguments: list[str]) -> int:
 
 
 def _format_workspaces(workspaces) -> str:
-    lines = ["Approved research folders (the control service sees only the ID and the label):"]
+    lines = [printer.heading("Approved research folders"),
+             "The control service sees only the ID and the label; the path never leaves this Mac."]
+    rows = []
     for workspace in workspaces:
-        label = json.dumps(workspace.display_label, ensure_ascii=False)
-        lines.append(f"  {workspace.workspace_id} {label}: {workspace.output_root}")
+        rows.append((f"{printer.MARK_OK} {workspace.workspace_id}",
+                     json.dumps(workspace.display_label, ensure_ascii=False), str(workspace.output_root)))
         for source in workspace.readonly_roots:
-            lines.append(f"      read-only source: {source}")
-    lines.append(
-        "Add one with `openswap worker workspace add <id> <folder> [--label TEXT]`; this Mac "
-        "reports its folders to a control service that supports it (OpenTag does)."
-    )
+            rows.append(("", "read-only source:", str(source)))
+    lines.extend(printer.columns(rows))
+    lines.append(printer.next_step(
+        "add one with `openswap worker workspace add <id> <folder> [--label TEXT]`; "
+        "`openswap worker workspace remove <id>` withdraws one."))
     return "\n".join(lines)
 
 
@@ -1559,13 +1600,14 @@ def _account_command(root: Path, args) -> int:
         code = str(exc) if str(exc) == "worker_lifecycle_busy" else "settings_unavailable"
     else:
         payload = {"accepted": True, "pinned": _choice_payload(choice)}
-        human = (
-            "Cleared the Remote tasks account; remote jobs that do not pick an allowed account "
-            "fail until you pin one."
-            if choice is None
-            else f"Remote tasks will use {'Claude' if choice.provider == 'claude' else 'Codex'} "
-                 f"account {choice.label()} from the next job."
-        )
+        if choice is None:
+            human = ("Cleared the Remote tasks account; remote jobs that do not pick an allowed account "
+                     "fail until you pin one.\n" + printer.next_step(
+                         "pin one again with `openswap worker account <slot|email|alias>`."))
+        else:
+            provider = "Claude" if choice.provider == "claude" else "Codex"
+            human = (f"{printer.MARK_OK} Remote tasks will use {provider} account {choice.label()} "
+                     f"from the next job.\n" + printer.next_step(_after_pin(root, provider)))
         _write(payload, as_json=args.json, human=human)
         return 0
     if args.json:
@@ -1573,6 +1615,22 @@ def _account_command(root: Path, args) -> int:
     else:
         print(_ACCOUNT_MESSAGES.get(code, f"Could not pin that account ({code})."), file=sys.stderr)
     return 1
+
+
+def _after_pin(root: Path, provider: str) -> str:
+    """What comes after pinning: the provider's live-check path while its live execution is off."""
+    try:
+        from openswap.worker.live import execution_mode
+
+        live = execution_mode(root, provider.lower()) == "live"
+    except Exception:
+        live = False
+    if live:
+        return f"nothing more: live execution for {provider} is on. `openswap worker status` shows the worker."
+    if provider == "Claude":
+        return ("`openswap worker claude pin`, `openswap worker claude prepare`, then "
+                "`openswap worker live-check --provider claude` before jobs run.")
+    return "`openswap worker codex install` and `openswap worker live-check` before jobs run."
 
 
 def _workspace_command(root: Path, args) -> int:
@@ -1657,23 +1715,29 @@ def _worker_off_hint(root: Path, snapshot: dict) -> str | None:
         return None
     if snapshot.get("enabled") is True and snapshot.get("process_state") in _RUNNING_STATES:
         return None
-    return f"Paired with {url} but the worker is off; run `openswap worker enable`."
+    return printer.next_step(f"paired with {url} but the worker is off; run `openswap worker enable`.")
 
 
 def _format_status(snapshot: dict) -> str:
-    enabled = "enabled" if snapshot.get("enabled") is True else "disabled"
+    """The human ``openswap worker status``: one aligned row per fact, each marked and worded."""
+    enabled = snapshot.get("enabled") is True
     process = snapshot.get("process_state", "unavailable")
-    admission = "paused" if snapshot.get("paused") is True else "open"
+    paused = snapshot.get("paused") is True
     provider = snapshot.get("provider") or {}
-    provider_state = (
-        "available" if provider.get("available") is True
-        else provider.get("diagnostic_code") or "unavailable"
-    )
+    available = provider.get("available") is True
+    provider_state = "available" if available else provider.get("diagnostic_code") or "unavailable"
     remote = snapshot.get("remote_connectivity", "disabled")
     seen = snapshot.get("remote_last_seen_at") or "never"
     active = snapshot.get("active_job")
-    job = f"; job {active.get('job_id')} ({active.get('state')})" if active else ""
-    return (
-        f"Remote tasks: {enabled}; worker: {process}; admission: {admission}; "
-        f"provider: {provider_state}; service: {remote}; service last seen: {seen}{job}"
-    )
+    job = f"{active.get('job_id')} ({active.get('state')})" if active else "none"
+    worker_ok = True if process == "running" else None if process in {"starting", "stopped"} else False
+    service_ok = True if remote == "online" else None if remote in {"disabled", "offline"} else False
+    rows = [
+        (f"{printer.mark(enabled)} Remote tasks", "enabled" if enabled else "disabled"),
+        (f"{printer.mark(worker_ok)} Worker", process),
+        (f"{printer.mark(not paused)} Admission", "paused" if paused else "open"),
+        (f"{printer.mark(available)} Provider", provider_state),
+        (f"{printer.mark(service_ok)} Service", f"{remote} (last seen {seen})"),
+        (f"{printer.mark(None)} Job", job),
+    ]
+    return "\n".join([printer.heading("Remote tasks worker"), *printer.columns(rows)])

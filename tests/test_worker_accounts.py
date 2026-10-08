@@ -82,18 +82,23 @@ def _run(root: Path, *argv: str) -> int:
 def test_account_list_marks_the_pin_and_lists_claude_accounts(root, capsys):
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
-    assert "1 · alice@example.com (work)" in out
-    assert "3 · (no email)  [not eligible: no ChatGPT account ID (API key)]" in out
-    assert "Claude (pin with `claude:<slot>`):" in out
-    assert "4 · carol@example.com (claudey)" in out
+    assert "Codex accounts (pin with the slot number, email or alias)" in out
+    assert "  • 1  alice@example.com   (work)" in out
+    assert "  ✗ 3  (no email)                  not eligible: no ChatGPT account ID (API key)" in out
+    assert "Claude accounts (pin with `claude:<slot>`)" in out
+    assert "  • 4  carol@example.com  (claudey)" in out
     assert "No account pinned" in out
+    assert "Next: pin an account, for example `openswap worker account 1`" in out
     assert SECRET not in out
 
     assert _run(root, "account", "2") == 0
-    capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "✓ Remote tasks will use Codex account 2 · bob@example.com from the next job." in out
+    assert "Next: `openswap worker codex install` and `openswap worker live-check` before jobs run." in out
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
-    assert "* 2 · bob@example.com  [pinned; out of rotation]" in out
+    assert "  ✓ 2  bob@example.com             pinned; out of rotation" in out
+    assert "Pinned: Codex 2 · bob@example.com. Change it with" in out and "Next:" not in out
 
 
 def test_account_list_json_is_metadata_only(root, capsys):
@@ -572,7 +577,7 @@ def test_status_hints_at_enable_when_paired_but_off(root, monkeypatch, capsys, s
     configure_worker_service(root, "https://tag.example.com", "worker-1")
     out = _status(root, monkeypatch, capsys, snapshot)
     assert out.splitlines()[-1] == (
-        "Paired with https://tag.example.com but the worker is off; run `openswap worker enable`."
+        "Next: paired with https://tag.example.com but the worker is off; run `openswap worker enable`."
     )
 
 
@@ -584,7 +589,8 @@ def test_status_has_no_hint_when_unpaired_or_running(root, monkeypatch, capsys, 
     if paired:
         configure_worker_service(root, "https://tag.example.com", "worker-1")
     out = _status(root, monkeypatch, capsys, snapshot)
-    assert "Paired with" not in out and len(out.splitlines()) == 1
+    assert "paired with" not in out and len(out.splitlines()) == 7
+    assert out.splitlines()[0] == "Remote tasks worker"
 
 
 def test_status_json_is_unchanged_when_paired_but_off(root, monkeypatch, capsys):
