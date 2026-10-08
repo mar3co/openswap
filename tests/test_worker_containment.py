@@ -37,6 +37,8 @@ class FakeProcs:
         self.signals: list[tuple[int, int]] = []
         self.unkillable: set[int] = set()
         self.spawn_on_scan = 0  # running members fork this many times while racing
+        self.vanishing = 0  # this many scans list one pid that is gone by its query
+        self.zombies: list[int] = []  # listed every scan, never queryable
         self._next = 5000
 
     def new(self, coalition, status=2):
@@ -45,6 +47,13 @@ class FakeProcs:
         return self._next
 
     def pids(self):
+        if self.vanishing:
+            # Listed, then gone before it can be queried (or a zombie).
+            self._next += 1
+            self.vanishing -= 1
+            return [*self.table, self._next, *self.zombies]
+        if self.zombies:
+            return [*self.table, *self.zombies]
         if self.spawn_on_scan:
             racers = [pid for pid, (cid, st) in self.table.items() if cid == JOB_COALITION and st != 4]
             if racers:
@@ -387,3 +396,38 @@ def test_a_saved_coalition_is_never_swept_without_a_boot_session_match(tmp_path,
     proof = containment.stop(JobHandle(c.job_label("c" * 32), "gui/501", run_dir, saved, 77, JOB_COALITION, True))
     assert proof.stopped is False
     assert bystander in procs.table and procs.signals == []
+
+
+def test_a_pid_that_vanishes_mid_scan_delays_the_proof_but_not_forever(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    procs.new(JOB_COALITION)
+    procs.vanishing = 3
+    proof = containment.stop(handle)
+    assert proof.stopped is True and procs.vanishing == 0
+
+
+def test_a_lingering_zombie_does_not_block_the_proof(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    procs.zombies = [88888]
+    assert containment.stop(handle).stopped is True
+
+
+def test_a_member_whose_status_cannot_be_read_is_never_proven_stopped(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    root_helper = procs.new(JOB_COALITION, status=None)  # e.g. a setuid-root child
+    procs.unkillable.add(root_helper)
+    proof = containment.stop(handle, timeout=1.0)
+    assert proof.stopped is False and proof.survivors == 1
+
+
+def test_no_bootout_without_a_boot_session_match(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    procs.boot = None
+    launchd.calls.clear()
+    proof = containment.stop(handle)
+    assert proof.stopped is False
+    assert not any(call[0] == "bootout" for call in launchd.calls)

@@ -66,9 +66,19 @@ Conclusions:
   miss `setsid()` descendants, as the earlier fake reproduction predicted.
 - The coalition is the boundary that holds: membership is inherited through
   `fork`/`exec` and is not changed by `setsid()`, reparenting or closing pipes.
-  Because a stopped process cannot fork, the stop-then-kill sweep is final once
-  one full scan sees only stopped members, which closes the fork/reparent race
-  that blocked the parent-pid tracker.
+  A stopped process cannot fork, so a freeze is final once it is confirmed;
+  because `SIGSTOP` is delivered asynchronously and the process listing is not
+  atomic, a freeze counts only when two consecutive scans list the same
+  members, all observed stopped, and the second scan is complete: every pid
+  it listed was either queried or already listed by the first (a coalition
+  query fails only for zombies and processes that exited after the listing;
+  measured on this Mac, every live process of every user was queryable, while
+  the BSD status of about 335 root-owned processes was not, so a member whose
+  status cannot be read counts as running and never as frozen). Only then is
+  an empty scan after the kills a stop proof. This closes the fork/reparent
+  race that blocked the parent-pid tracker. A recovery never sweeps or boots
+  out anything unless the saved and current boot sessions are both known and
+  equal.
 - Running each job as its own launchd job also decouples it from the worker:
   a worker crash leaves a findable, sweepable job rather than an orphan.
 

@@ -835,3 +835,36 @@ def test_logout_fails_while_the_sign_in_remains(tmp_path):
         live_cli.logout(tmp_path, "1", run=stubborn, verify=pinned)
     assert error.value.code == "logout_failed"
     assert live_cli.logout(tmp_path, "1", run=_login_run(ACCOUNT_ID), verify=pinned)["signed_in"] is False
+
+
+def test_a_short_or_failed_result_write_fails_the_job_without_a_partial_file(tmp_path, monkeypatch):
+    sign_in(tmp_path)
+    adapter = make_adapter(tmp_path, FakeContainment(SUCCESS_SCRIPT))
+    run = adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    real_write = os.write
+    calls = []
+
+    def flaky_write(fd, data):
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real_write(fd, bytes(data[:3]))  # a short write
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(codex_exec.os, "write", flaky_write)
+    finished = drain(adapter, run)[-1]
+    monkeypatch.setattr(codex_exec.os, "write", real_write)
+    assert finished.state == JobState.FAILED and finished.execution_stopped is True
+    assert not (workspace(tmp_path).output_root / "result.md").exists()
+
+
+def test_short_writes_are_completed(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    out = tmp_path / "out"
+    run_dir.mkdir()
+    out.mkdir()
+    (run_dir / codex_exec.LAST_MESSAGE_FILE).write_text("abcdefghij")
+    real_write = os.write
+    monkeypatch.setattr(codex_exec.os, "write", lambda fd, data: real_write(fd, bytes(data[:4])))
+    assert codex_exec.publish_result(run_dir, out) is True
+    monkeypatch.setattr(codex_exec.os, "write", real_write)
+    assert (out / "result.md").read_text() == "abcdefghij"
