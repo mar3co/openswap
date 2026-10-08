@@ -162,13 +162,18 @@ def confirm_account(root: Path, ui: Prompts) -> None:
         ui.say("No eligible Codex account is saved. Add one with `openswap codex add`, then "
                "`openswap worker account <slot>`.")
         return
+    # Skipping after declining the current pin cancels the change: say the
+    # previous account stays selected rather than implying none is pinned.
+    later = (f"{pinned.label()} stays selected. Change it later with "
+             "`openswap worker account <slot|email|alias>`." if pinned is not None
+             else "Pin one later with `openswap worker account <slot|email|alias>`.")
     ui.say("Choose the Codex account remote jobs run on (Claude accounts aren't supported yet):")
     for choice in eligible:
         ui.say(f"  {choice.label()}")
     for _attempt in range(_MAX_ATTEMPTS):
         answer = ui.ask("Account (slot, email or alias; Enter to skip): ")
         if not answer:
-            ui.say("Skipped. Pin one later with `openswap worker account <slot|email|alias>`.")
+            ui.say(f"Skipped. {later}")
             return
         try:
             chosen = cli.set_worker_account(root, answer)
@@ -176,11 +181,11 @@ def confirm_account(root: Path, ui: Prompts) -> None:
             ui.say(cli._ACCOUNT_MESSAGES.get(exc.code, f"Could not pin that account ({exc.code})."))
             continue
         except Exception:
-            ui.say("Could not pin that account. Try `openswap worker account <slot>` later.")
+            ui.say(f"Could not pin that account. {later}")
             return
         ui.say(f"Pinned Codex account {chosen.label()} for Remote tasks.")
         return
-    ui.say("Pin one later with `openswap worker account <slot|email|alias>`.")
+    ui.say(later)
 
 
 def _display_path(path: Path) -> str:

@@ -161,6 +161,16 @@ def test_pair_with_a_pin_can_switch_account(root, keychain, monkeypatch, capsys,
     assert load_worker_settings(root).pinned_account_ref == BOB
 
 
+def test_declining_the_pin_then_skipping_keeps_it_and_says_so(root, keychain, monkeypatch, capsys, enable_calls):
+    cli.set_worker_account(root, "1")
+    assert _pair(root, monkeypatch, interactive=True, answers=["n", "n", ""]) == 0
+    out = capsys.readouterr().out
+    assert ("Skipped. 1 · alice@example.com (work) stays selected. Change it later with "
+            "`openswap worker account <slot|email|alias>`.") in out
+    assert "Pin one later" not in out
+    assert load_worker_settings(root).pinned_account_ref == ALICE
+
+
 def test_pair_without_a_tty_prints_each_next_step(root, keychain, monkeypatch, capsys, enable_calls):
     assert _pair(root, monkeypatch, interactive=False, answers=["y", "1", "y"]) == 0  # never read
     out = capsys.readouterr().out
