@@ -412,6 +412,8 @@ def test_command_matching_is_exact_shell_text():
     symlink = "/bin/sh -c 'ln -s /o/link-target.txt link.txt; cat link.txt'"
     assert not live_check.command_matches("/bin/sh -c \"ln -s /o/link-target.txt 'link.txt;' cat link.txt\"", symlink)
     assert not live_check.command_matches("/bin/sh -c \"ln -s /o/link-target.txt link.txt ';' cat link.txt\"", symlink)
+    newline = "/bin/sh -c 'cat\n/h/auth.json > /dev/null'"
+    assert not live_check.command_matches(newline, auth)
 
 
 def test_truncated_or_unreadable_evidence_is_incomplete(tmp_path, monkeypatch):
@@ -422,6 +424,11 @@ def test_truncated_or_unreadable_evidence_is_incomplete(tmp_path, monkeypatch):
     assert complete is False
     text, complete = live_check._texts(big, limit=200)
     assert complete is True and text == "x" * 100
+    monkeypatch.setattr(live_check, "EVIDENCE_TOTAL_LIMIT", 150)
+    other = tmp_path / "stderr.log"
+    other.write_text("y" * 100)
+    text, complete = live_check._texts(big, other, limit=200)
+    assert complete is False and len(text) <= 151
 
 
 def test_an_unreadable_default_login_fails_its_gate(tmp_path, monkeypatch):

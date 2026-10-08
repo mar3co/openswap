@@ -203,6 +203,7 @@ def item_types(stdout_path: Path) -> set[str]:
 
 
 EVIDENCE_FILE_LIMIT = 128 * 1024 * 1024
+EVIDENCE_TOTAL_LIMIT = 256 * 1024 * 1024
 EVIDENCE_DIR_FILES = 200
 
 
@@ -212,7 +213,7 @@ def _texts(*paths: Path, limit: int = EVIDENCE_FILE_LIMIT) -> tuple[str, bool]:
     Incomplete (a file over ``limit``, too many files, an unreadable file)
     means a denial cannot be shown by a token's absence.
     """
-    out, complete = [], True
+    out, complete, total = [], True, 0
     for path in paths:
         try:
             if path.is_dir():
@@ -226,10 +227,17 @@ def _texts(*paths: Path, limit: int = EVIDENCE_FILE_LIMIT) -> tuple[str, bool]:
             else:
                 continue
             for item in files:
-                data = item.read_bytes()[:limit + 1]
-                if len(data) > limit:
+                budget = min(limit, EVIDENCE_TOTAL_LIMIT - total)
+                if budget <= 0:
                     complete = False
-                out.append(data[:limit].decode("utf-8", "replace"))
+                    break
+                with open(item, "rb") as handle:  # never more than the budget in memory
+                    data = handle.read(budget + 1)
+                if len(data) > budget:
+                    complete = False
+                    data = data[:budget]
+                total += len(data)
+                out.append(data.decode("utf-8", "replace"))
         except OSError:
             complete = False
     return "\n".join(out), complete
@@ -241,22 +249,19 @@ _SHELL_WRAPPER = re.compile(
 )
 
 
-def _squash(text: str) -> str:
-    return " ".join(text.split())
-
-
 def command_matches(command: str, expected: str) -> bool:
     """Whether a reported command is exactly the requested one.
 
     Codex reports a command either as run or wrapped in the user's shell
     (``bash -lc '…'``, ``/bin/zsh -lc "…"``). Only that one outer wrapper is
-    removed, by unquoting its single argument; the rest is compared as shell
-    text (whitespace aside), so a quoted operator, an added redirection or a
-    faked failure never matches.
+    removed, by unquoting its single argument; the rest must equal the
+    requested shell text exactly (only surrounding whitespace is ignored), so a
+    quoted operator, an inserted newline, an added redirection or a faked
+    failure never matches.
     """
-    want = _squash(expected)
+    want = expected.strip()
     text = command.strip()
-    if _squash(text) == want:
+    if text == want:
         return True
     match = _SHELL_WRAPPER.match(text)
     if not match:
@@ -265,7 +270,7 @@ def command_matches(command: str, expected: str) -> bool:
         inner = shlex.split(match.group(1))
     except ValueError:
         return False
-    return len(inner) == 1 and _squash(inner[0]) == want
+    return len(inner) == 1 and inner[0].strip() == want
 
 
 def _all_failed(items: list[dict]) -> bool:
