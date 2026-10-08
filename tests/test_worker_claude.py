@@ -194,7 +194,7 @@ def workspace(root, *sources):
 def make_adapter(root, launcher, *, mode="live", live_sessions=False, home=None):
     if mode == "live":
         # The owner's Claude opt-in, bound to the pinned binary.
-        write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now"), "claude")
+        write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now", (IDENTITY,)), "claude")
     return ClaudeCodeAdapter(
         root, containment=launcher, verify=lambda **kw: pinned(), mode=lambda: mode, sleep=lambda s: None,
         managed=lambda p: [], live_sessions=lambda p: live_sessions, home=home or root.parent / "home",
@@ -426,7 +426,8 @@ def test_each_provider_has_its_own_opt_in(tmp_path):
 def _claude_evidence(**overrides):
     data = {"kind": live.EVIDENCE_KIND, "schema": live.EVIDENCE_SCHEMA, "passed": True, "provider": "claude",
             "cli": {"version": "2.1.285 (Claude Code)", "binary_sha256": SHA},
-            "gates": {name: {"passed": True} for name in live.REQUIRED_GATES}}
+            "gates": {name: {"passed": True} for name in live.REQUIRED_GATES},
+            "account": {"identity": IDENTITY, "slot": "4"}}
     data.update(overrides)
     return data
 

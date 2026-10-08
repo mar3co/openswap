@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -154,7 +155,18 @@ def evidence_problems(data: object, *, pinned=None, provider: str = "codex") -> 
                 problems.append(f"gate_failed:{name}")
     if data.get("passed") is not True:
         problems.append("evidence_not_passed")
+    if evidence_account(data) is None:
+        problems.append("evidence_account_missing")
     return tuple(dict.fromkeys(problems))
+
+
+def evidence_account(data: object) -> str | None:
+    """The account identity the evidence was gathered on, if well-formed."""
+    account = data.get("account") if isinstance(data, dict) else None
+    identity = account.get("identity") if isinstance(account, dict) else None
+    if isinstance(identity, str) and re.fullmatch(r"(?:codex|claude):[0-9a-f]{64}", identity):
+        return identity
+    return None
 
 
 def read_evidence(path: Path) -> tuple[dict, str]:
@@ -192,10 +204,15 @@ def enable_live(backup_root: Path, evidence_path: Path, pinned, provider: str = 
     problems = evidence_problems(data, pinned=pinned, provider=provider)
     if problems:
         raise LiveModeError("evidence_not_passing", problems)
+    account = evidence_account(data)
     with live_lock(backup_root):
+        # Each passing check adds its account; a new binary starts over.
+        current = load_live_execution(Path(backup_root), provider)
+        accounts = current.accounts if current.enabled and current.codex_sha256 == pinned.binary_sha256 else ()
         return write_live_execution(Path(backup_root), LiveExecutionSettings(
             enabled=True, evidence_sha256=digest, codex_sha256=pinned.binary_sha256,
             enabled_at=datetime.now(timezone.utc).isoformat(),
+            accounts=tuple(dict.fromkeys((*accounts, account))),
         ), provider)
 
 
@@ -218,4 +235,5 @@ def live_status(backup_root: Path, provider: str = "codex") -> dict:
         "binary_sha256": live.codex_sha256,
         "codex_sha256": live.codex_sha256,
         "enabled_at": live.enabled_at,
+        "checked_accounts": list(live.accounts),
     }

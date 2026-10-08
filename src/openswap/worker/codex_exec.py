@@ -507,6 +507,12 @@ class CodexExecAdapter:
         """Whether the job may be granted ``path`` (output folder or read-only source)."""
         return granted_root_allowed(self.backup_root, path)
 
+    def _account_checked(self, identity: str) -> bool:
+        """Whether a passing live check (recorded in the opt-in) ran on this account."""
+        if not self._bind_to_opt_in:
+            return True  # the live check itself, which produces that evidence
+        return identity in load_live_execution(self.backup_root, self.provider).accounts
+
     def probe(self) -> ProviderAvailability:
         if self._mode() != LIVE:
             return ProviderAvailability(False, "live_adapter_disabled", None)
@@ -553,6 +559,10 @@ class CodexExecAdapter:
         if not isinstance(identity, str) or not identity.startswith(f"{self.provider}:"):
             # A job only ever runs on its own account's provider.
             raise ProviderLaunchRefused("provider_auth_unavailable")
+        if not self._account_checked(identity):
+            # Live execution was enabled from a check on other accounts: this
+            # one's sign-in and refresh were never measured.
+            raise ProviderLaunchRefused("live_adapter_disabled")
         try:
             pinned = self._pinned(check_version=False)
         except self._cli_errors:
@@ -911,7 +921,12 @@ class CodexExecAdapter:
         try:
             write_private(run_dir / SUMMARY_FILE, json.dumps(summary).encode())
         except OSError:
-            pass
+            if proof.stopped is True:
+                # Without a summary pruning would never remove it; its
+                # processes are proven gone, so remove it now.
+                import shutil
+
+                shutil.rmtree(run_dir, ignore_errors=True)
         return InterruptResult(
             requested=True, execution_stopped=proof.stopped is True,
             diagnostic_code=None if proof.stopped else "execution_uncertain",
