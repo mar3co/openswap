@@ -982,30 +982,42 @@ class WorkerRuntime:
                 return self._cancel_before_launch(current)
         # The job runs on the provider of the account it will use; probe that
         # one. The account is resolved again, under the guard, before launch.
-        planned, _ = self._resolve_launch_account(claimed)
-        self._run_adapter = self.adapter_for(planned)
-        try:
-            availability = self._run_adapter.probe()
-        except Exception:
-            availability = ProviderAvailability(False, "provider_unavailable", None)
-        # The lease and the job's folder are settled under the lifecycle lock
-        # that owner commands hold (workspace changes, account pins, enable,
-        # pause, disable). It is taken before _launch_lock, the same order as
-        # those commands, whose stop/pause requests reach this process over IPC
-        # and need _launch_lock: a folder change then either sees this job as
-        # in use or completes first and the job resolves the new folder.
-        lifecycle = FileLock(self.backup_root / "worker" / "lifecycle.lock", timeout=5)
-        locked = lifecycle.acquire()
-        try:
-            with self._launch_lock:
+        # With no account yet (no pin, say) the Codex adapter is probed, so
+        # the probed provider is always known and fenced: if a pin made
+        # meanwhile names the other provider, plan once more with it instead
+        # of leasing an account on an adapter that was never probed for it.
+        for attempt in range(2):
+            planned, _ = self._resolve_launch_account(claimed)
+            probed_provider = provider_of(planned) or "codex"
+            self._run_adapter = self.adapters.get(probed_provider, self.adapter)
+            try:
+                availability = self._run_adapter.probe()
+            except Exception:
+                availability = ProviderAvailability(False, "provider_unavailable", None)
+            # The lease and the job's folder are settled under the lifecycle lock
+            # that owner commands hold (workspace changes, account pins, enable,
+            # pause, disable). It is taken before _launch_lock, the same order as
+            # those commands, whose stop/pause requests reach this process over IPC
+            # and need _launch_lock: a folder change then either sees this job as
+            # in use or completes first and the job resolves the new folder.
+            lifecycle = FileLock(self.backup_root / "worker" / "lifecycle.lock", timeout=5)
+            locked = lifecycle.acquire()
+            replan = False
+            try:
+                with self._launch_lock:
+                    if not locked:
+                        prepared = self._fail_claimed(claimed, "provider_unavailable")
+                    else:
+                        now, _ = self._resolve_launch_account(claimed)
+                        replan = attempt == 0 and now is not None and provider_of(now) != probed_provider
+                        if not replan:
+                            prepared = self._prepare_launch(claimed, availability, shutdown_event,
+                                                            planned_provider=probed_provider)
+            finally:
                 if locked:
-                    prepared = self._prepare_launch(claimed, availability, shutdown_event,
-                                                    planned_provider=provider_of(planned))
-                else:
-                    prepared = self._fail_claimed(claimed, "provider_unavailable")
-        finally:
-            if locked:
-                lifecycle.release()
+                    lifecycle.release()
+            if not replan:
+                break
         if isinstance(prepared, JobRecord):
             return prepared
         starting, token, workspace = prepared
@@ -1333,7 +1345,8 @@ class WorkerRuntime:
                 # The owner's pin, or the job's allowlisted choice, as it reads
                 # now; a refusal fails the job before STARTING (never launched).
                 identity, refusal = self._resolve_launch_account(current)
-                if identity is not None and planned_provider is not None and provider_of(identity) != planned_provider:
+                if identity is not None and planned_provider is not None and \
+                        (provider_of(identity) or "codex") != planned_provider:
                     # The pin moved to the other provider after that provider
                     # was probed: never launch on an unprobed adapter.
                     identity, refusal = None, "provider_unavailable"

@@ -1026,3 +1026,32 @@ def test_claude_status_picks_pin_and_prepare_before_the_live_check():
     assert "--account claude:5" in live_cli._claude_next_step(status)
     status["checked_accounts"] = [IDENTITY, "claude:" + "5" * 64]
     assert live_cli._claude_next_step(status).startswith("nothing")
+
+
+
+def test_a_claude_pin_made_during_an_unpinned_probe_is_replanned_not_failed(tmp_path):
+    from openswap.worker.models import ProviderAvailability
+
+    root = setup_root(tmp_path)
+    runtime, codex, claude = _runtime(root, None)
+    probes = []
+
+    def codex_probe():
+        probes.append("codex")
+        # The owner pins a Claude account while the (unpinned) Codex probe runs.
+        configure_worker_local_policy(root, pinned_account_ref=IDENTITY,
+                                      workspaces=(WorkerWorkspace("research", (root.parent / "research").resolve()),))
+        return ProviderAvailability(True, None, "v")
+
+    def claude_probe():
+        probes.append("claude")
+        return ProviderAvailability(True, None, "v")
+
+    codex.probe, claude.probe = codex_probe, claude_probe
+    _submit(runtime)
+    final = runtime.reconcile_once()
+    assert probes == ["codex", "claude"]
+    # Planned again on Claude: the job reached Claude's adapter (which refuses
+    # in this test), instead of failing on the unprobed provider.
+    assert claude.started == [IDENTITY] and codex.started == []
+    assert final.pinned_account_ref == IDENTITY
