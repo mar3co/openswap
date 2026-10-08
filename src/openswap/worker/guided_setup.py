@@ -274,6 +274,9 @@ class Readiness:
     folders: tuple[str, ...]
     execution: str
     paused: bool = False  # admission paused: the worker claims no new task
+    # The running worker's link to the control service: "online", "offline",
+    # "revoked", "expired" or "disabled"; None when unknown.
+    connection: str | None = None
 
     @property
     def missing(self) -> tuple[str, ...]:
@@ -284,6 +287,12 @@ class Readiness:
             out.append("wait for the worker to finish starting (`openswap worker status`)")
         elif self.worker != "running":
             out.append("start the worker (`openswap worker enable`)")
+        elif self.paired_url is not None and self.connection != "online":
+            # Only an online worker can receive tasks from the service.
+            out.append({
+                "revoked": "pair this Mac again: the service revoked it (`openswap worker pair <url> <code>`)",
+                "expired": "pair this Mac again: its pairing expired (`openswap worker pair <url> <code>`)",
+            }.get(self.connection, "wait for the worker to connect to the service (`openswap worker status`)"))
         if self.paused:
             out.append("reopen admission (`openswap worker pause --off`)")
         if self.account is None:
@@ -299,9 +308,12 @@ def readiness(root: Path) -> Readiness:
     cli = _cli()
     policy = load_worker_settings(root)
     worker = "off"
+    connection = None
     if policy.enabled is True:
         try:
-            process = cli.read_status(root).get("process_state")
+            status = cli.read_status(root)
+            process = status.get("process_state")
+            connection = status.get("remote_connectivity")
         except Exception:
             process = None
         if process == "running":
@@ -330,6 +342,15 @@ def readiness(root: Path) -> Readiness:
         folders=tuple(_describe(w) for w in policy.workspaces),
         execution=execution_mode(),
         paused=policy.paused is True,
+        connection=connection if isinstance(connection, str) else None,
+    )
+
+
+def _settling(state: Readiness) -> bool:
+    """A just-enabled worker that has not yet started or reached the service."""
+    return state.worker == "starting" or (
+        state.worker == "running" and state.paired_url is not None
+        and state.connection in {None, "offline", "disabled"}
     )
 
 
@@ -337,13 +358,14 @@ def summary(root: Path, ui: Prompts, *, start_wait_s: float = 5.0) -> None:
     state = readiness(root)
     # Give a worker that `enable` just started a moment to report running.
     deadline = time.monotonic() + start_wait_s
-    while state.worker == "starting" and time.monotonic() < deadline:
+    while _settling(state) and time.monotonic() < deadline:
         time.sleep(0.25)
         state = readiness(root)
     worker = {"running": "running", "starting": "starting", "stopped": "enabled but not running",
               "off": "off"}[state.worker]
     ui.say("Remote tasks setup:")
-    ui.say(f"  Service: {state.paired_url or 'not paired'}")
+    link = f" ({state.connection})" if state.paired_url and state.worker == "running" and state.connection else ""
+    ui.say(f"  Service: {state.paired_url or 'not paired'}{link}")
     ui.say(f"  Worker: {worker}{' (admission paused)' if state.paused else ''}")
     ui.say(f"  Account: {state.account or 'none pinned'}")
     ui.say(f"  Research folders: {', '.join(state.folders) or 'none'}")

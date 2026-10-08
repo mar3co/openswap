@@ -236,7 +236,7 @@ def test_pairing_succeeds_even_if_the_whole_setup_fails(root, keychain, monkeypa
 def test_summary_is_ready_only_when_admission_is_open(root, monkeypatch, capsys, enable_calls, research_home):
     cli.set_worker_account(root, "1")
     update_worker_settings(root, enabled=True, paused=True)
-    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": "running"})
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": "running", "remote_connectivity": "online"})
     assert _setup(root, monkeypatch, ["", "y", ""]) == 0
     out = capsys.readouterr().out
     assert "  Worker: running (admission paused)" in out
@@ -297,6 +297,42 @@ def test_summary_never_calls_a_stuck_starting_worker_ready(root, monkeypatch, ca
     out = capsys.readouterr().out
     assert "  Worker: starting" in out and "Ready for Slack" not in out
     assert "wait for the worker to finish starting" in out
+
+
+@pytest.mark.parametrize(("connection", "step"), [
+    ("online", None),
+    ("offline", "wait for the worker to connect to the service (`openswap worker status`)"),
+    (None, "wait for the worker to connect to the service (`openswap worker status`)"),
+    ("revoked", "pair this Mac again: the service revoked it (`openswap worker pair <url> <code>`)"),
+    ("expired", "pair this Mac again: its pairing expired (`openswap worker pair <url> <code>`)"),
+])
+def test_a_paired_worker_is_ready_only_while_online(root, monkeypatch, capsys, research_home, connection, step):
+    configure_worker_service(root, URL, "worker-1")
+    cli.set_worker_account(root, "1")
+    cli.add_worker_workspace(root, "research", research_home, replace_builtin_default=True)
+    update_worker_settings(root, enabled=True)
+    status = {"enabled": True, "process_state": "running"}
+    if connection is not None:
+        status["remote_connectivity"] = connection
+    monkeypatch.setattr(cli, "read_status", lambda _root: status)
+    assert guided_setup.readiness(root).missing == ((step,) if step else ())
+    guided_setup.summary(root, _Say(), start_wait_s=0)
+    out = capsys.readouterr().out
+    assert ("Ready for Slack" in out) is (step is None)
+
+
+def test_summary_waits_briefly_for_the_service_connection(root, monkeypatch, capsys, research_home):
+    configure_worker_service(root, URL, "worker-1")
+    cli.set_worker_account(root, "1")
+    cli.add_worker_workspace(root, "research", research_home, replace_builtin_default=True)
+    update_worker_settings(root, enabled=True)
+    links = iter(["offline", "offline", "online"])
+    monkeypatch.setattr(cli, "read_status", lambda _root: {
+        "enabled": True, "process_state": "running", "remote_connectivity": next(links, "online")})
+    monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: None)
+    guided_setup.summary(root, _Say())
+    out = capsys.readouterr().out
+    assert f"  Service: {URL} (online)" in out and "Ready for Slack" in out
 
 
 class _Say:
