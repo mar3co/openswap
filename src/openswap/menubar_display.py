@@ -463,6 +463,7 @@ def settings_page_rows(
             "value": bool(worker_enabled),
         },
         _remote_tasks_account_row((worker_status or {}).get("account_picker")),
+        _remote_tasks_web_choice_row((worker_status or {}).get("account_picker")),
         {
             "kind": "status",
             "section": SETTINGS_SECTION_GENERAL,
@@ -761,6 +762,68 @@ def _remote_tasks_account_row(picker) -> dict:
         name = _bounded_text(entry.get("email")) or "(no email)"
         options.append((f"claude:{number}", f"Claude {number} · {name} — not supported yet", {"disabled": True}))
     return {**row, "options": options, "value": pinned or ""}
+
+
+def _remote_tasks_web_choice_row(picker) -> dict:
+    """Popup of allow/disallow toggles for the accounts a control service may
+    choose per job; no AppKit.
+
+    The selected item is a summary (``""``, a no-op); every other item names
+    its action, ``allow:<codex ref>`` or ``disallow:<codex ref>``, so a stale
+    menu can never flip an account the wrong way. Allowed accounts carry a
+    check mark; the pinned default is shown checked but disabled (pin another
+    account, or use ``openswap worker account disallow --clear-default``).
+    Claude and API-key slots are not offered.
+    """
+    row = {
+        "kind": "popup",
+        "section": SETTINGS_SECTION_GENERAL,
+        "id": "remote_tasks_web_choice",
+        "label": "Web choice",
+        "wide": True,
+    }
+    if not isinstance(picker, dict):
+        return {**row, "options": [("", "Loading accounts…")], "value": "", "disabled": True}
+    pinned = picker.get("pinned_account_ref")
+    allowlist = [entry for entry in picker.get("allowlist") or [] if isinstance(entry, dict)]
+    allowed = {
+        entry.get("identity") for entry in allowlist
+        if isinstance(entry.get("identity"), str) and entry["identity"].startswith("codex:")
+    }
+    count = len(allowed)
+    summary = (
+        "No accounts allowed for web choice" if count == 0
+        else f"{count} account{'s' if count != 1 else ''} allowed for web choice"
+    )
+    options: list[tuple] = [("", summary)]
+    listed = set()
+    for entry in picker.get("codex") or []:
+        if not isinstance(entry, dict) or entry.get("eligible") is not True:
+            continue
+        ref = entry.get("account_ref")
+        if not isinstance(ref, str) or not ref.startswith("codex:"):
+            continue
+        number = _bounded_text(entry.get("number"), 8)
+        name = _bounded_text(entry.get("email")) or "(no email)"
+        alias = _bounded_text(entry.get("alias"), 40)
+        label = f"{number} · {name}" + (f" ({alias})" if alias else "")
+        listed.add(ref)
+        if ref == pinned:
+            options.append((f"default:{ref}", f"✓ {label} — default", {"disabled": True}))
+        elif ref in allowed:
+            options.append((f"disallow:{ref}", f"✓ {label}"))
+        else:
+            options.append((f"allow:{ref}", f"   {label}"))
+    for entry in allowlist:
+        identity = entry.get("identity")
+        if identity in listed or not isinstance(identity, str) or not identity.startswith("codex:"):
+            continue
+        name = _bounded_text(entry.get("label"), 60) or "account"
+        if identity == pinned:
+            options.append((f"default:{identity}", f"✓ {name} — removed, default", {"disabled": True}))
+        else:
+            options.append((f"disallow:{identity}", f"✓ {name} — removed from roster"))
+    return {**row, "options": options, "value": ""}
 
 
 def _worker_active_job_id(snapshot: dict) -> str | None:

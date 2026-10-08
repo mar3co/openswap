@@ -91,7 +91,8 @@ is a finite JSON number greater than zero and at most 14,400 seconds. Expiry
 must be in the future and no more than 24 hours away at first admission. A
 submission names **no account, model, path, environment, executable or
 argv**. The Mac resolves the opaque workspace ID and pins the locally approved
-account. `worker_id` must be the authenticated key's own worker; any other
+account. A backend implementing the optional account choice extension (below)
+may add an `account_ref` the worker itself advertised; nothing else changes. `worker_id` must be the authenticated key's own worker; any other
 value returns `forbidden`. Reusing an idempotency key with the identical
 normalized payload returns the same job even if the worker later goes
 offline; changing its payload returns `idempotency_conflict`. Normalization
@@ -240,6 +241,64 @@ transport, lease and authorization failures defer the upload for retry.
 Operator and owner must ensure selected results contain no provider secrets.
 The service supplies metadata lists and bounded authenticated downloads.
 
+## Optional per-job account choice (v1 extension)
+
+By default a submission names no account and the Mac uses the account its owner
+pinned locally. An owner may also approve a short local **allowlist** of
+eligible accounts so a backend can offer a per-job choice among them. The Mac
+stays the authority: it advertises only allowlisted accounts, validates every
+choice again before launch, and never falls back to another account. In this
+release only Codex roster accounts are eligible.
+
+The extension is additive. A worker that never sends `accounts` sees no
+change, and a backend that does not implement it rejects the operation like any
+unknown operation (404 `unsupported_version`).
+
+| Operation | Request fields | Success response |
+| --- | --- | --- |
+| `accounts` | `worker_epoch`, `accounts` (array below) | `account_count` |
+
+`accounts` holds 0–20 entries, each a closed object with exactly `account_ref`
+(opaque ID, 1–200 characters), `label` (1–100 characters, no Unicode control
+characters: U+0000–U+001F or U+007F–U+009F) and `default` (JSON boolean).
+References are unique within the
+request and at most one entry is the default. The request atomically replaces
+the worker's whole advertised set; an empty array withdraws it. It carries the
+current worker epoch like any other mutation and returns `stale_epoch` from a
+superseded registration. The worker sends it after each new registration and
+whenever its allowlist, labels or default change. A new registration and a
+revocation clear the worker's advertised set on the backend. A job carrying
+`account_ref` is offered by `poll` only after the current registration has sent
+`accounts` (an empty set counts); until then it stays queued and later jobs
+without the field may be claimed first. A worker that receives 404
+`unsupported_version` (or 404 `not_found`, which reference servers predating
+this extension return for an unknown operation) records that the backend
+offers no account choice and keeps working without it; no other response
+disables the feature.
+
+`account_ref` is a random value the Mac generates once per allowlist entry and
+stores locally. It is never derived from a provider account ID, email or token,
+so a backend cannot correlate it across workers or owners. `label` is chosen by
+the owner (by default the OpenSwap alias or "Codex account N"); an email is
+sent only if the owner explicitly makes it the label. No credential, token,
+account ID or usage data is advertised.
+
+A backend that implements the extension accepts one more optional submission
+field, `account_ref`. It must equal an `account_ref` the target worker
+currently advertises; otherwise submission returns 400 `invalid_request`.
+When present, it is part of the normalized idempotency payload and appears in
+the claim's `submission` exactly as submitted. A backend never sends
+`account_ref` to a worker that has not advertised accounts, so a worker without
+the extension never receives the field.
+
+On a claim, a worker resolves `account_ref` against its **current** local
+allowlist under its launch lock. An absent field selects the local default. A
+reference that is no longer allowlisted (the owner removed it after the backend
+recorded the choice) or an absent field with no default pinned fails the job
+before launch: the worker reconciles it `failed` with `unlaunched=true` and
+never substitutes another account. The resolved local account is recorded on
+the job when it starts and never changes for that run.
+
 ## Errors, persistence, and operating the reference service
 
 Errors are JSON `{"error":"code"}` without exception details. HTTP 400:
@@ -346,6 +405,9 @@ successful whether or not this step completes.
 openswap worker account                    # list Codex slots; * marks the pin
 openswap worker account 2                  # pin by slot, email or alias (or --json)
 openswap worker account --clear            # remove the pin
+openswap worker account allow 3 [--label "Team research"]   # allow for a per-job choice
+openswap worker account label 3 "Team research"             # rename (slot, email, alias or ref)
+openswap worker account disallow 3 [--clear-default]        # withdraw (slot, email, alias or ref)
 openswap worker workspace list             # approved research folders
 openswap worker workspace add tag-research ~/Research/opentag \
   [--readonly-source ~/src/project]        # ID must match the portal's Local workspace ID
@@ -369,6 +431,39 @@ keeps the account recorded on it at `starting`. If the pinned account is no
 longer in the Codex roster at launch, the job fails with
 `provider_auth_unavailable` before any lease or launch, and the remote client
 does not claim new work until a present account is pinned.
+
+**Per-job account choice.** The `allow`, `disallow` and `label` subcommands
+manage the local allowlist behind the [optional account choice
+extension](#optional-per-job-account-choice-v1-extension): at most 20 Codex
+accounts, each stored as a random `account_ref` (generated once, never
+derived from the account), its local `codex:` identity and a label (by default
+the slot alias or "Codex account N", never the email unless you pass it). The
+pin is the default and is always allowlisted: pinning adds the account if
+needed, `--clear` keeps it allowed without a default, and disallowing the
+default is refused unless `--clear-default` is passed. A pin saved before the
+allowlist existed becomes a one-entry allowlist on the next settings write.
+The list view shows the allowed accounts with their references and labels and
+marks the default. The changes take the same locks as pinning. The menu bar's
+**Web choice** popup, under **Account**, toggles each eligible Codex account
+(the default is shown checked and cannot be withdrawn there).
+
+After each registration, and whenever the allowlist, a label or the default
+changes (detected locally by fingerprint, never by polling), the worker sends
+`accounts` with only the references, labels and default flag. A 404
+`unsupported_version` records that the backend offers no account choice until
+the next registration; other failures are retried on the next pass and never
+hold back heartbeats or claims. A claim's `account_ref` is accepted only once
+this enrollment has advertised a non-empty set (recorded durably in the remote
+journal); before that it is a malformed claim. Under the launch lock the
+runtime resolves it against the current allowlist: no field means the pin, a
+reference that is no longer allowed fails the job `provider_auth_unavailable`
+and an absent field with no pin fails it `provider_unavailable`, in both cases
+before any lease, reconciled `failed` with `unlaunched=true`; another account
+is never substituted. With no pin, the remote client still claims work while
+the backend acknowledged a non-empty set and an allowed account is in the
+roster. The reference service implements `accounts`, accepts `account_ref`
+only when the worker currently advertises it, and `submit-test` takes
+`--account-ref`.
 
 `workspace add` creates a missing folder owner-only (0700) and applies the
 launch-time checks up front: a real directory owned by you with no group or
@@ -395,7 +490,8 @@ openswap worker submit-test --url https://control.example \
   --runtime-limit 600 --expires-in 3600 --i-understand-this-is-a-test-tool
 ```
 
-It sends only the canonical submission and prints the validated JSON job ID
+It sends only the canonical submission (plus `account_ref` when
+`--account-ref` names an account the worker advertised) and prints the validated JSON job ID
 and state (any other response shape, unknown state or extra field is refused
 as `invalid_response` with exit status 1 and nothing echoed). It never supplies
 an adapter, model, account, path or command. A new submission requires the

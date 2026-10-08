@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openswap.exceptions import ClaudeSwitchError
+from openswap.settings import AllowlistedAccount
 from openswap.worker.leases import LeaseStateError, stable_account_identity
 
 _ACCOUNT_REF_RE = re.compile(r"^codex:[0-9a-f]{64}$")
@@ -71,6 +72,11 @@ class AccountChoices:
     pinned_ref: str | None
     codex: tuple[CodexAccountChoice, ...]
     claude: tuple[ClaudeAccountEntry, ...]
+    # Accounts a control service may choose per job; the pin is the default.
+    allowlist: tuple[AllowlistedAccount, ...] = ()
+
+    def slot_for(self, identity: str) -> CodexAccountChoice | None:
+        return next((c for c in self.codex if c.account_ref == identity), None)
 
     @property
     def pinned(self) -> CodexAccountChoice | None:
@@ -85,6 +91,7 @@ class AccountChoices:
 
     def to_dict(self) -> dict:
         pinned = self.pinned
+        allowed = {entry.identity for entry in self.allowlist}
         return {
             "pinned_account_ref": self.pinned_ref,
             "pinned_slot": pinned.number if pinned else None,
@@ -95,8 +102,20 @@ class AccountChoices:
                     "account_ref": c.account_ref, "eligible": c.eligible,
                     "disabled": c.disabled,
                     "pinned": c.account_ref is not None and c.account_ref == self.pinned_ref,
+                    "allowed": c.account_ref is not None and c.account_ref in allowed,
                 }
                 for c in self.codex
+            ],
+            # ``account_ref`` here is the random reference a control service
+            # sees; ``identity`` is the local ``codex:`` identity it maps to.
+            "allowlist": [
+                {
+                    "account_ref": entry.account_ref, "identity": entry.identity,
+                    "label": entry.label, "default": entry.identity == self.pinned_ref,
+                    "slot": slot.number if (slot := self.slot_for(entry.identity)) else None,
+                    "in_roster": slot is not None,
+                }
+                for entry in self.allowlist
             ],
             "claude": [
                 {
@@ -174,12 +193,29 @@ def claude_accounts(backup_root: Path) -> tuple[ClaudeAccountEntry, ...]:
     return tuple(sorted(out, key=lambda c: _slot_order(c.number)))
 
 
-def account_choices(backup_root: Path, pinned_ref: str | None) -> AccountChoices:
+def account_choices(
+    backup_root: Path, pinned_ref: str | None, allowlist: tuple[AllowlistedAccount, ...] = (),
+) -> AccountChoices:
     return AccountChoices(
         pinned_ref=pinned_ref,
         codex=codex_accounts(backup_root) or (),
         claude=claude_accounts(backup_root),
+        allowlist=tuple(allowlist),
     )
+
+
+def default_account_label(backup_root: Path, identity: str) -> str:
+    """The label an allowlisted account gets unless the owner names it.
+
+    The slot alias, else "Codex account N"; never the email, which is sent to
+    the control service only if the owner explicitly makes it the label.
+    """
+    accounts = codex_accounts(Path(backup_root)) or ()
+    slot = next((c for c in accounts if c.account_ref == identity), None)
+    if slot is None:
+        return "Codex account"
+    alias = "".join(ch for ch in (slot.alias or "") if ch.isprintable()).strip()[:100]
+    return alias or f"Codex account {slot.number}"[:100]
 
 
 def codex_account_in_roster(backup_root: Path, account_ref: str) -> bool:

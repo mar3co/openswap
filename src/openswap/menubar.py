@@ -683,6 +683,7 @@ def run(switcher, codex=None) -> int:
                 "remote_tasks_paused": "worker_admission_update",
                 "remote_tasks_stop": "worker_stop_requested",
                 "remote_tasks_account": "worker_account_update",
+                "remote_tasks_web_choice": "worker_account_update",
             }.get(row_id)
             if self._worker_operation is None:
                 return
@@ -730,6 +731,8 @@ def run(switcher, codex=None) -> int:
                             diagnostic = result.get("diagnostic_code") or "stop_refused"
                 elif row_id == "remote_tasks_account":
                     diagnostic = self._pin_worker_account(root, value)
+                elif row_id == "remote_tasks_web_choice":
+                    diagnostic = self._toggle_web_choice(root, value)
                 policy = load_worker_settings(root)
                 snapshot = read_status(root)
             except Exception:
@@ -773,6 +776,30 @@ def run(switcher, codex=None) -> int:
                 return "account_not_eligible"
             try:
                 set_worker_account(root, selector)
+            except AccountPinError as exc:
+                return exc.code
+            except ClaudeSwitchError as exc:
+                return "worker_lifecycle_busy" if str(exc) == "worker_lifecycle_busy" else "settings_unavailable"
+            return None
+
+        def _toggle_web_choice(self, root, value):
+            """Allow or disallow one account for a per-job choice; returns a diagnostic.
+
+            Only ``allow:codex:…`` and ``disallow:codex:…`` act, through the
+            CLI's own functions; the pinned default is never disallowed here.
+            """
+            from openswap.exceptions import ClaudeSwitchError
+            from openswap.worker.accounts import AccountPinError
+            from openswap.worker.cli import allow_worker_account, disallow_worker_account
+
+            action, _, ref = value.partition(":") if isinstance(value, str) else ("", "", "")
+            if action not in {"allow", "disallow"} or not ref.startswith("codex:"):
+                return "account_not_eligible"
+            try:
+                if action == "allow":
+                    allow_worker_account(root, ref)
+                else:
+                    disallow_worker_account(root, ref)
             except AccountPinError as exc:
                 return exc.code
             except ClaudeSwitchError as exc:
@@ -1461,9 +1488,11 @@ def run(switcher, codex=None) -> int:
             return self._guard(lambda: self.codex.set_account_disabled(number, False))
 
         def _on_setting(self, row_id, value):
+            if row_id == "remote_tasks_web_choice" and not value:
+                return  # the summary item: nothing to toggle
             if row_id in {
                 "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_stop",
-                "remote_tasks_account",
+                "remote_tasks_account", "remote_tasks_web_choice",
             }:
                 self._worker_action(row_id, value)
             elif row_id == "menu_bar_provider":

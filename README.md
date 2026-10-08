@@ -73,6 +73,7 @@ The command-line executable is `openswap`.
 | `openswap worker pair <url> <code>` | Remote tasks (opt-in): pair with a control service, pick an account, then offer to start the worker |
 | `openswap worker enable` | Start the Remote tasks worker (LaunchAgent) so a paired Mac heartbeats and shows online |
 | `openswap worker account [slot]` | List or pin the Codex account remote jobs run on (Claude not supported yet) |
+| `openswap worker account allow <slot>` | Allow a Codex account for a per-job choice by the control service (`disallow`, `label`) |
 | `openswap worker workspace add <id> <folder>` | Approve a research folder under the portal's workspace ID (`list`, `remove`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |

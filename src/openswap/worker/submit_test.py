@@ -45,12 +45,14 @@ def resolve_expiry(*, expires_in: float | None = None, expires_at: datetime | st
 def submit_test(root: Path, *, url: str, task: str, workspace_id: str,
                 runtime_limit: float, acknowledged: bool, expires_in: float | None = None,
                 expires_at: datetime | str | None = None, idempotency_key: str | None = None,
-                transport=None) -> dict:
+                account_ref: str | None = None, transport=None) -> dict:
     """Submit one canonical test job; a retry with the same key returns the same job.
 
     The key defaults to a fresh random value. Callers that may retry after a
     lost response must reuse the key and the absolute expiry they sent, or the
     service admits a second job (new key) or refuses the changed payload.
+    ``account_ref`` (optional account choice extension) names an account the
+    worker advertised; it is part of the payload, so a retry repeats it too.
     """
     if acknowledged is not True:
         raise ProtocolError("test_tool_acknowledgement_required")
@@ -67,7 +69,8 @@ def submit_test(root: Path, *, url: str, task: str, workspace_id: str,
                             allow_past=idempotency_key is not None and expires_at is not None)
     try:
         job = JobSubmission(key, "codex", task, "research", workspace_id, expiry, runtime_limit)
-        request = Submission.from_dict(Submission(enrollment.worker_id, job).to_dict())
+        request = Submission.from_dict(Submission(enrollment.worker_id, job, account_ref).to_dict(),
+                                       allow_account_ref=True)
     except (TypeError, ValueError, OverflowError):
         raise ProtocolError("invalid_request") from None
     result = (transport or Transport(url, enrollment.device_key)).request("submit", request.to_dict())
