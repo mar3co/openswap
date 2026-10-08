@@ -156,6 +156,8 @@ class ProcessTable(Protocol):
 
     def is_dead(self, pid: int) -> bool: ...
 
+    def zombie_identity(self, pid: int) -> str | None: ...
+
 
 class DarwinProcessTable:
     """libproc-backed process table; same-user queries need no privilege."""
@@ -234,6 +236,27 @@ class DarwinProcessTable:
                 return False
             return False
         return result.stdout.strip().startswith("Z")
+
+    _KINFO_PROC_SIZE = 648  # struct kinfo_proc on 64-bit macOS
+
+    def zombie_identity(self, pid: int) -> str | None:
+        """``"<start sec>.<usec>"`` if ``pid`` is a zombie right now, else None.
+
+        libproc cannot read a zombie at all (measured: ESRCH, like an exited
+        pid), but ``sysctl kern.proc.pid`` still returns its ``kinfo_proc``,
+        whose start time binds the pid to one process across scans.
+        """
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+        size = ctypes.c_size_t(self._KINFO_PROC_SIZE)
+        buf = ctypes.create_string_buffer(self._KINFO_PROC_SIZE)
+        if self._libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value < 48:
+            return None
+        start_sec, start_usec = struct.unpack_from("<qi", buf.raw, 0)  # p_starttime
+        stat = buf.raw[36]  # p_stat
+        listed_pid = struct.unpack_from("<i", buf.raw, 40)[0]  # p_pid
+        if stat != _SZOMB or listed_pid != pid:
+            return None
+        return f"{start_sec}.{start_usec:06d}"
 
     def boot_session(self) -> str | None:
         size = ctypes.c_size_t(128)
@@ -634,11 +657,26 @@ class LaunchdContainment:
     # -- observation ----------------------------------------------------------
 
     def exit_status(self, handle: JobHandle) -> int | None:
-        # The directory may since hold another launch: its exit is not ours.
-        current = load_handle(handle.run_dir)
-        if current is not None and current.launch_id != handle.launch_id:
+        """The job's exit status, or None if unknown or no longer this launch's.
+
+        The identity check and the read happen under the run directory's
+        lock, which every launch into it holds while it writes its handle, so
+        a replacement launch can never slip its own ``exit`` in between.
+        """
+        try:
+            dir_lock = FileLock(self._lock_dir / f"rundir-{_run_dir_key(handle.run_dir)}.lock", timeout=0)
+            held = dir_lock.acquire(timeout=0)
+        except OSError:
             return None
-        text = read_private_text(handle.run_dir / EXIT_FILE, limit=32)
+        if not held:
+            return None  # a launch into this directory is in progress: not ours
+        try:
+            current = load_handle(handle.run_dir)
+            if current is None or current.launch_id != handle.launch_id:
+                return None
+            text = read_private_text(handle.run_dir / EXIT_FILE, limit=32)
+        finally:
+            dir_lock.release()
         if text is None or not text.strip().lstrip("-").isdigit():
             return None
         return int(text.strip())
@@ -811,12 +849,15 @@ class LaunchdContainment:
         return self.stop(handle)
 
     def _scan(self, coalition_id: int) -> dict[int, str]:
-        """Classify every listed pid: ``stopped``/``running`` member, ``other``, or ``gone``.
+        """Classify every listed pid: ``stopped``/``running`` member, ``other``,
+        ``zombie@<start time>``, ``gone`` or ``unknown``.
 
-        ``gone`` is a pid whose coalition could not be read: on macOS that is
-        a zombie or a process that exited after the listing (measured: live
-        processes of every user are readable). A member whose status cannot be
-        read counts as ``running``, so it can never be mistaken for frozen.
+        A pid whose coalition cannot be read is, on macOS, a zombie or a
+        process that exited after the listing (measured: live processes of
+        every user are readable). A zombie keeps its start time, so it is
+        recorded with it; a pid that is simply gone has no identity left.
+        A member whose status cannot be read counts as ``running``, so it can
+        never be mistaken for frozen.
         """
         procs = self.procs
         kinds: dict[int, str] = {}
@@ -827,7 +868,11 @@ class LaunchdContainment:
             if coalition is None:
                 # Unreadable: only a confirmed exit or zombie is harmless; a
                 # live process we cannot place blocks any proof.
-                kinds[pid] = "gone" if procs.is_dead(pid) else "unknown"
+                zombie = procs.zombie_identity(pid)
+                if zombie is not None:
+                    kinds[pid] = f"zombie@{zombie}"
+                else:
+                    kinds[pid] = "gone" if procs.is_dead(pid) else "unknown"
             elif coalition != coalition_id:
                 kinds[pid] = "other"
             else:
@@ -839,15 +884,21 @@ class LaunchdContainment:
     def _complete(scan: dict[int, str], previous: dict[int, str] | None) -> bool:
         """Whether every live process at this scan's listing was seen.
 
-        A pid that was listed but is ``gone`` by its query could have forked
-        just before dying, so the scan is complete only if every such pid was
-        already listed by the previous scan (a lingering zombie, say).
+        A pid that was listed but had exited by its query could have forked
+        just before dying, so any ``gone`` pid makes the scan incomplete. A
+        zombie is harmless only if the previous scan already saw the same
+        zombie (same pid and start time): it was dead before this listing
+        began, so it cannot have forked during it. A pid number alone proves
+        nothing, since it may have been reused in between.
         """
         if previous is None:
             return False
-        # Only a pid already unqueryable last time (a lingering zombie) is
-        # harmless: a pid seen alive before may have been reused since.
-        return all(previous.get(pid) == "gone" for pid, kind in scan.items() if kind == "gone")
+        for pid, kind in scan.items():
+            if kind == "gone":
+                return False
+            if kind.startswith("zombie@") and previous.get(pid) != kind:
+                return False
+        return True
 
     def _live_members(self, coalition_id: int) -> list[int]:
         """Members, plus live processes whose coalition cannot be read (they may be members)."""
