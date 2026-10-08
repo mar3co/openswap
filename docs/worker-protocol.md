@@ -299,6 +299,59 @@ before launch: the worker reconciles it `failed` with `unlaunched=true` and
 never substitutes another account. The resolved local account is recorded on
 the job when it starts and never changes for that run.
 
+## Optional readiness report (v1 extension)
+
+Without this extension a backend cannot know which research folders a Mac
+approved or whether it runs jobs for real, so owners type workspace IDs into
+the backend by hand. With it, the Mac reports both. The report is
+informational: it never authorizes anything, and the Mac still checks every
+claim's `workspace_id` against its own registry, under its launch lock, before
+launch.
+
+The extension is additive. A worker that never sends `readiness` sees no
+change, and a backend that does not implement it rejects the operation like any
+unknown operation (404 `unsupported_version`).
+
+| Operation | Request fields | Success response |
+| --- | --- | --- |
+| `readiness` | `worker_epoch`, `folders` (array below), `execution` (string below) | `folder_count` |
+
+`folders` holds 0–20 entries, each a closed object with exactly `id` and
+`label`. `id` is the workspace ID a submission's `workspace_id` names for that
+folder: 1–200 characters, ASCII letters, digits, `_`, `.` and `-` only (the
+reference client's IDs are narrower: 1–64 lowercase letters, digits, `_` and
+`-`). IDs are unique within the request. `label` is 1–100 characters with no
+Unicode control characters (U+0000–U+001F or U+007F–U+009F); the owner chooses
+it, and by default it is the folder's own name. No path, read-only source,
+account, credential or usage data is reported.
+
+`execution` is `"disabled"` or `"live"`. `"disabled"` means the Mac refuses
+every job before launch, whatever else is configured; this release always
+reports it, because the production adapter is still disabled
+(`live_adapter_disabled`). `"live"` means the Mac runs approved jobs with its
+local provider. The value describes how the Mac is built and configured, not a
+moment's availability: a paused worker, a missing account or a signed-out
+provider is not reported here.
+
+The request atomically replaces the worker's whole report; an empty `folders`
+array reports that no folder is approved. It carries the current worker epoch
+like any other mutation and returns `stale_epoch` from a superseded
+registration. The worker sends it after each new registration and whenever an
+approved folder, a label or the execution mode changes (detected locally by
+fingerprint, never by polling). A new registration and a revocation clear the
+report on the backend, which then shows it as not reported (distinct from an
+empty list) until the worker sends it again. A worker that receives 404
+`unsupported_version` (or 404 `not_found`, from reference servers predating
+this extension) stops sending it until its next registration; other failures
+are retried on the next pass and never hold back heartbeats or claims.
+
+A backend may offer the reported folder IDs wherever it offered owner-entered
+workspace IDs, and fall back to those entries for a worker that has not
+reported. It must not treat a report as approval of a job or as proof that a
+folder still exists: a job naming an ID the Mac no longer approves fails before
+launch (`provider_unavailable`, `unlaunched=true`), exactly as without the
+extension.
+
 ## Errors, persistence, and operating the reference service
 
 Errors are JSON `{"error":"code"}` without exception details. HTTP 400:
@@ -376,32 +429,57 @@ performs no network or Keychain access. The production adapter refuses jobs
 (`live_adapter_disabled`) until the owner enables live execution; see
 [Running jobs live](#running-jobs-live-codex).
 
-Pairing does not start the worker, so a freshly paired Mac stays offline in the
-service until the worker runs. After the account and folder steps, `pair` on an
-interactive terminal asks "Start the Remote tasks worker now so this Mac can
-accept approved tasks? [Y/n]". Yes (or Enter) runs the same function as
-`openswap worker enable` and reports its result: on success the service shows
-the Mac online within about 15 seconds; a refusal prints `enable`'s message,
-its diagnostic code when it is one of `enable`'s own, and the manual command.
-No, any other answer, or EOF leaves the worker off and prints
-`openswap worker enable`; without a terminal `pair` prints that next step and
-asks nothing. An already enabled worker is never toggled: `pair` says it is
-running, or that it is enabled but not running (for example its LaunchAgent was
-unloaded) and points at `worker enable` and `worker status`. A final line notes
-that execution stays off (`live_adapter_disabled`) until live execution is
-enabled. Nothing in this
-step can fail pairing. While a URL is configured and the worker is disabled or
-not running, human `worker status` adds "Paired with <origin> but the worker is
-off; run `openswap worker enable`" (`--json` is unchanged), and the menu bar's
-Remote tasks section shows "Paired, worker off" under **Enable local worker**.
+### Guided setup after pairing
+
+Pairing does not start the worker or choose an account or folder, so right
+after pairing `openswap worker pair` walks the owner through the remaining
+steps, in this order; `openswap worker setup` runs the same steps again on a
+paired Mac, and the menu bar's Settings → General → Remote tasks → **Set up
+Remote tasks…** button runs them in dialogs (pairing first, from the pasted
+`openswap worker pair <url> <code>` command, when the Mac is not paired yet).
+Every step calls the same function as its own command, and nothing in them can
+fail pairing: a step that fails prints its command and the next step still
+runs.
+
+1. **Start the worker.** "Start the Remote tasks worker now so this Mac can
+   accept approved tasks? [Y/n]". Yes (or Enter) runs the same function as
+   `openswap worker enable` and reports its result: on success the service shows
+   the Mac online within about 15 seconds; a refusal prints `enable`'s message,
+   its diagnostic code when it is one of `enable`'s own, and the manual command.
+   No, any other answer, or EOF leaves the worker off and prints
+   `openswap worker enable`. An already enabled worker is never toggled: the
+   step says it is running, or that it is enabled but not running (for example
+   its LaunchAgent was unloaded) and points at `worker enable` and
+   `worker status`.
+2. **Confirm the account.** With an account pinned it shows it and asks "Keep
+   this account? [Y/n]"; otherwise (or on No) it lists the eligible Codex
+   accounts and asks for one (Enter skips).
+3. **Approve a research folder.** While the registry is still only the
+   built-in `research` folder inside the OpenSwap backup root, it offers to
+   create `~/OpenSwap Research` (owner-only, 0700) and approve it as `research`
+   in place of the built-in one; an existing folder that others can access is
+   refused, never re-permissioned. It then offers to approve other folders: a
+   path, then an ID (suggested from the folder's name). Folders are approved
+   with `workspace add`'s own checks.
+4. **Summary.** The service, worker state, account, approved folders (ID and
+   label) and the execution mode, then either "Ready for Slack" or the list of
+   what is still missing, and a note that execution stays off
+   (`live_adapter_disabled`) while the execution mode is `disabled`, pointing
+   at `openswap worker live-check` (see [Running jobs live](#running-jobs-live-codex)).
+
+Without a terminal, `pair` asks nothing and prints each step's command. While
+a URL is configured and the worker is disabled or not running, human
+`worker status` adds "Paired with <origin> but the worker is off; run
+`openswap worker enable`" (`--json` is unchanged), and the menu bar's Remote
+tasks section shows "Paired, worker off" under **Enable local worker**.
 
 ### Choosing the account and research folders
 
 Pairing never selects an account or a folder; the submission names neither.
-On an interactive terminal with no account pinned yet, `pair` lists the
-eligible Codex accounts and asks for one (Enter skips), then points at the
-folder step. Without a terminal it prints the same next steps. Pairing stays
-successful whether or not this step completes.
+The guided setup above, or these commands, choose them. A control service that
+implements the [readiness report](#optional-readiness-report-v1-extension)
+learns each approved folder's ID and label (never its path) and offers those
+IDs, so the owner no longer types them into the service.
 
 ```sh
 openswap worker account                    # list Codex slots; * marks the pin
@@ -412,7 +490,8 @@ openswap worker account label 3 "Team research"             # rename (slot, emai
 openswap worker account disallow 3 [--clear-default]        # withdraw (slot, email, alias or ref)
 openswap worker workspace list             # approved research folders
 openswap worker workspace add tag-research ~/Research/opentag \
-  [--readonly-source ~/src/project]        # ID must match the portal's Local workspace ID
+  [--readonly-source ~/src/project] [--label "Tag research"]   # label default: the folder's name
+openswap worker workspace label tag-research "Tag research"   # or --reset to the folder's name
 openswap worker workspace remove tag-research
 ```
 
@@ -568,6 +647,21 @@ inspection. The network probes need `http://example.com/` and
 the result does not depend on certificates). Only when every gate passes does
 it offer to enable live execution (`--enable` does so without asking,
 `--no-enable` never). It uses some of the account's quota.
+
+**Readiness report.** After each registration, and whenever an approved
+folder, its label or the execution mode changes (by local fingerprint, like
+`accounts`), the worker sends `readiness` with each approved workspace's ID
+and label and the execution mode. A label is the owner's (`--label` or
+`workspace label`) or, by default, the folder's own name, which is the only
+part of the path that leaves the Mac; set a label if the folder's name is
+private. The execution mode comes from one hook,
+`openswap.worker.adapter.execution_mode()`: it is `live` only when the adapter
+in use declares `execution_mode = "live"`, and the production adapter
+(`UnavailableCodexAdapter`) declares `disabled`. A 404 `unsupported_version`
+(or `not_found`) stops the report until the next registration. The report is
+sent at the end of a synchronization pass, after results are delivered and new
+work is claimed, so a slow `readiness` route never delays either. The reference
+service implements `readiness` and keeps the latest report per worker.
 
 `worker status --json` includes `remote_connectivity` and
 `remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.

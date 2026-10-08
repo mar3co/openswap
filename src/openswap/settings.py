@@ -81,6 +81,17 @@ class WorkerWorkspace:
     workspace_id: str
     output_root: Path
     readonly_roots: tuple[Path, ...] = ()
+    # Owner-chosen display name reported to the control service with the ID
+    # (readiness extension); None reports the folder's own name.
+    label: str | None = None
+
+    @property
+    def display_label(self) -> str:
+        """The label the control service sees: the owner's, else the folder name, else the ID."""
+        if self.label is not None:
+            return self.label
+        name = "".join(c for c in Path(self.output_root).name if unicodedata.category(c) != "Cc")
+        return name[:MAX_ACCOUNT_LABEL] or self.workspace_id
 
 
 @dataclass(frozen=True)
@@ -468,6 +479,9 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
                     raise ValueError
                 root_text = config.get("outputRoot")
                 readonly_text = config.get("readonlyRoots", [])
+                label = config.get("label")
+                if label is not None and not valid_account_label(label):
+                    raise ValueError
                 if (not isinstance(root_text, str) or len(root_text) > 2048
                         or not Path(root_text).is_absolute()
                         or not isinstance(readonly_text, list) or len(readonly_text) > 16
@@ -481,7 +495,7 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
                     for root in readonly
                 ):
                     raise ValueError
-                workspaces.append(WorkerWorkspace(workspace_id, output, readonly))
+                workspaces.append(WorkerWorkspace(workspace_id, output, readonly, label))
         except (TypeError, ValueError, OSError):
             _logger.warning("settings.json worker workspace registry is invalid; disabling the worker")
             return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
@@ -613,10 +627,9 @@ def update_worker_settings(
         current = _worker_from_raw(raw, Path(backup_root))
         if not isinstance(section.get("workspaces"), dict):
             section["workspaces"] = {
-                workspace.workspace_id: {
-                    "outputRoot": str(workspace.output_root),
-                    "readonlyRoots": [str(root) for root in workspace.readonly_roots],
-                }
+                workspace.workspace_id: _encode_workspace_config(
+                    workspace.output_root, workspace.readonly_roots, workspace.label,
+                )
                 for workspace in current.workspaces
             }
         section.setdefault("pinnedAccountRef", current.pinned_account_ref)
@@ -656,11 +669,23 @@ def _encode_worker_workspaces(workspaces: tuple[WorkerWorkspace, ...]) -> dict[s
             for path in resolved_readonly
         ):
             raise ValueError("writable output and read-only roots must be disjoint")
-        encoded[workspace.workspace_id] = {
-            "outputRoot": str(resolved_output),
-            "readonlyRoots": [str(path) for path in resolved_readonly],
-        }
+        if workspace.label is not None and not valid_account_label(workspace.label):
+            raise ValueError("workspace labels are 1-100 characters with no control characters")
+        encoded[workspace.workspace_id] = _encode_workspace_config(
+            resolved_output, resolved_readonly, workspace.label,
+        )
     return encoded
+
+
+def _encode_workspace_config(output_root, readonly_roots, label: str | None) -> dict[str, object]:
+    config: dict[str, object] = {
+        "outputRoot": str(output_root),
+        "readonlyRoots": [str(path) for path in readonly_roots],
+    }
+    if label is not None:
+        # Older releases ignore the key, so a downgrade keeps the folder.
+        config["label"] = label
+    return config
 
 
 def _validate_pinned_account_ref(pinned_account_ref: str | None) -> None:
@@ -674,7 +699,7 @@ def _validate_pinned_account_ref(pinned_account_ref: str | None) -> None:
 def _decoded_workspaces(encoded: dict[str, dict[str, object]]) -> tuple[WorkerWorkspace, ...]:
     return tuple(
         WorkerWorkspace(workspace_id, Path(config["outputRoot"]),
-                        tuple(Path(item) for item in config["readonlyRoots"]))
+                        tuple(Path(item) for item in config["readonlyRoots"]), config.get("label"))
         for workspace_id, config in encoded.items()
     )
 

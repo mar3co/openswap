@@ -440,26 +440,66 @@ def _absolute_folder(folder: str | Path) -> Path:
         raise WorkspaceError("folder_invalid") from None
 
 
+DEFAULT_RESEARCH_ID = "research"
+DEFAULT_RESEARCH_FOLDER_NAME = "OpenSwap Research"
+
+
+def default_research_folder() -> Path:
+    """The folder the guided setup offers: ``~/OpenSwap Research``."""
+    return Path.home() / DEFAULT_RESEARCH_FOLDER_NAME
+
+
+def is_builtin_default_registry(backup_root: Path, workspaces) -> bool:
+    """Whether the registry is still only the built-in ``research`` folder.
+
+    Settings without an approved folder fall back to ``research`` inside the
+    OpenSwap backup root (and the first ``worker enable`` writes that down).
+    The guided setup may replace it with a folder the owner can find.
+    """
+    from openswap.settings import _default_worker_workspace
+
+    return tuple(workspaces) == (_default_worker_workspace(Path(backup_root)),)
+
+
+def _valid_workspace_label(label: str | None) -> str | None:
+    if label is None:
+        return None
+    if not valid_account_label(label):
+        raise WorkspaceError("label_invalid")
+    return label
+
+
 def add_worker_workspace(
     backup_root: Path,
     workspace_id: str,
     folder: str | Path,
     readonly_sources: tuple[str | Path, ...] = (),
+    *,
+    label: str | None = None,
+    replace_builtin_default: bool = False,
 ) -> WorkerWorkspace:
     """Approve ``folder`` as the writable research root for ``workspace_id``.
 
-    The ID is the opaque name a remote submission uses (OpenTag's "Local
-    workspace IDs"); the path never leaves this Mac. A missing folder is
+    The ID is the opaque name a remote submission uses; with the label (by
+    default the folder's name) it is all the control service learns, through
+    the readiness report. The path never leaves this Mac. A missing folder is
     created owner-only (0700). The folder must pass the same checks the
     worker applies at launch: a real directory owned by this user with no
     group or other access. Read-only sources must exist, be owned by this
     user and not be writable by others.
+
+    With ``replace_builtin_default``, a registry that is still only the
+    built-in ``research`` folder (see ``is_builtin_default_registry``) is
+    replaced instead of extended, so the guided setup can approve
+    ``~/OpenSwap Research`` under the same ``research`` ID. That folder is
+    replaced only while no job may still run or upload in it.
     """
     from openswap.settings import _WORKSPACE_ID_RE
 
     root = Path(backup_root)
     if not isinstance(workspace_id, str) or not _WORKSPACE_ID_RE.fullmatch(workspace_id):
         raise WorkspaceError("workspace_id_invalid")
+    label = _valid_workspace_label(label)
     output = _absolute_folder(folder)
     sources = tuple(_absolute_folder(item) for item in readonly_sources)
     if len(sources) > 16:
@@ -467,9 +507,14 @@ def add_worker_workspace(
     _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
         current = load_worker_settings(root)
-        if any(item.workspace_id == workspace_id for item in current.workspaces):
+        kept = current.workspaces
+        if replace_builtin_default and is_builtin_default_registry(root, current.workspaces):
+            if _workspace_in_use(root, current.workspaces[0].workspace_id):
+                raise WorkspaceError("workspace_in_use")
+            kept = ()
+        if any(item.workspace_id == workspace_id for item in kept):
             raise WorkspaceError("workspace_exists")
-        if len(current.workspaces) >= 16:
+        if len(kept) >= 16:
             raise WorkspaceError("too_many_workspaces")
         try:
             output.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -488,9 +533,9 @@ def add_worker_workspace(
             problem = readonly_source_problem(source)
             if problem is not None:
                 raise WorkspaceError(f"readonly_source_{problem}")
-        workspace = WorkerWorkspace(workspace_id, output, sources)
+        workspace = WorkerWorkspace(workspace_id, output, sources, label)
         try:
-            set_worker_workspaces(root, (*current.workspaces, workspace))
+            set_worker_workspaces(root, (*kept, workspace))
         except ValueError as exc:
             if "disjoint" in str(exc):
                 raise WorkspaceError("readonly_source_overlaps_folder") from None
@@ -549,21 +594,48 @@ def remove_worker_workspace(backup_root: Path, workspace_id: str) -> None:
             raise WorkspaceError("workspace_not_found")
         if not remaining:
             raise WorkspaceError("last_workspace")
-        # Artifact upload re-reads the registry for the job's folder, so a
-        # mapping stays while any job using it may still run or upload. (A job
-        # that resolves the folder in the moment before this write still runs
-        # there; its upload then needs the ID added back to the same folder.)
-        try:
-            unsynced, unadmitted = _unsynced_remote_work(root)
-            in_use = workspace_id in unadmitted or LocalJobStore(root).workspace_in_use(workspace_id, unsynced)
-        except (OSError, sqlite3.Error, ValueError):
-            raise WorkspaceError("settings_unavailable") from None
-        if in_use:
+        if _workspace_in_use(root, workspace_id):
             raise WorkspaceError("workspace_in_use")
         try:
             set_worker_workspaces(root, remaining)
         except (OSError, RuntimeError, ValueError):
             raise WorkspaceError("settings_unavailable") from None
+
+
+def _workspace_in_use(root: Path, workspace_id: str) -> bool:
+    """Whether a job using ``workspace_id`` may still run or upload its results.
+
+    Artifact upload re-reads the registry for the job's folder, so a mapping
+    stays while any job using it may still run or upload. The runtime resolves
+    a job's folder under the same lifecycle lock while the job is STARTING, so
+    a job either counts as in use here or resolves the changed registry. Call
+    under the lifecycle lock.
+    """
+    try:
+        unsynced, unadmitted = _unsynced_remote_work(root)
+        return workspace_id in unadmitted or LocalJobStore(root).workspace_in_use(workspace_id, unsynced)
+    except (OSError, sqlite3.Error, ValueError):
+        raise WorkspaceError("settings_unavailable") from None
+
+
+def label_worker_workspace(backup_root: Path, workspace_id: str, label: str | None) -> WorkerWorkspace:
+    """Set (or, with None, reset to the folder's name) the label the control service sees."""
+    root = Path(backup_root)
+    label = _valid_workspace_label(label)
+    _migrate_legacy_before_worker_state_change(root)
+    with lifecycle_lock(root):
+        current = load_worker_settings(root)
+        target = next((item for item in current.workspaces if item.workspace_id == workspace_id), None)
+        if target is None:
+            raise WorkspaceError("workspace_not_found")
+        updated = WorkerWorkspace(target.workspace_id, target.output_root, target.readonly_roots, label)
+        try:
+            set_worker_workspaces(root, tuple(
+                updated if item.workspace_id == workspace_id else item for item in current.workspaces
+            ))
+        except (OSError, RuntimeError, ValueError):
+            raise WorkspaceError("settings_unavailable") from None
+        return updated
 
 
 def _write(payload: dict, *, as_json: bool, human: str | None = None) -> None:
@@ -921,6 +993,12 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     pair_parser = commands.add_parser("pair", help="approve enrollment locally and store its device key in login Keychain")
     pair_parser.add_argument("url")
     pair_parser.add_argument("code")
+    commands.add_parser(
+        "setup", help="walk through starting the worker, the account and research folders on a paired Mac",
+        description="The guided steps `pair` runs after pairing: start the worker, confirm the "
+                    "Codex account, approve a research folder (~/OpenSwap Research by default), "
+                    "then show what is still missing before Slack can start tasks on this Mac.",
+    )
     unpair_parser = commands.add_parser(
         "unpair", help="remove the device key and configured service URL; pass a URL to remove an enrollment "
                        "that settings no longer reference",
@@ -988,7 +1066,18 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         "--readonly-source", action="append", metavar="DIR",
         help="a source checkout the job may read but never write (repeatable)",
     )
+    workspace_add.add_argument(
+        "--label", default=None,
+        help="name the control service shows for this folder (1-100 characters; default: the folder's name)",
+    )
     workspace_add.add_argument("--json", action="store_true")
+    workspace_label = workspace_commands.add_parser(
+        "label", help="rename the label the control service shows for a workspace ID",
+    )
+    workspace_label.add_argument("workspace_id", metavar="ID")
+    workspace_label.add_argument("label", metavar="TEXT", nargs="?", default=None)
+    workspace_label.add_argument("--reset", action="store_true", help="show the folder's own name again")
+    workspace_label.add_argument("--json", action="store_true")
     workspace_remove = workspace_commands.add_parser("remove", help="withdraw approval for a workspace ID")
     workspace_remove.add_argument("workspace_id", metavar="ID")
     workspace_remove.add_argument("--json", action="store_true")
@@ -1044,17 +1133,13 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             if args.command == "pair":
                 worker_id = pair(root, args.url, args.code)
                 print(f"Paired worker {worker_id}. Local execution policy is still controlled on this Mac.")
-                interactive = _interactive_terminal()
+                # Pairing already succeeded; the guided steps are optional and
+                # print the manual command for any step that fails.
                 try:
-                    _post_pair_setup(root, interactive=interactive)
+                    _guided_setup(root)
                 except Exception:
-                    # Pairing already succeeded; the follow-up is optional.
-                    print("Next: `openswap worker account` and `openswap worker workspace add <id> <folder>`.")
-                try:
-                    _post_pair_worker_offer(root, interactive=interactive)
-                except Exception:
-                    # Same rule: the offer can never fail pairing.
-                    print(_START_WORKER_NEXT)
+                    print("Next: `openswap worker setup` to start the worker, pin an account and "
+                          "approve a research folder.")
             else:
                 if unpair(root, args.url):
                     print("Worker unpaired; remote access disabled.")
@@ -1079,6 +1164,22 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             print(f"Error: {exc}", file=sys.stderr)
             return 1
 
+    if args.command == "setup":
+        try:
+            _migrate_legacy_before_worker_state_change(root)
+            paired = load_worker_settings(root).control_service_url is not None
+        except ClaudeSwitchError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except (OSError, RuntimeError, ValueError):
+            print("Worker settings unavailable.", file=sys.stderr)
+            return 1
+        if not paired:
+            print("This Mac is not paired yet. Copy the pairing command from the control service "
+                  "(OpenTag: Workers page) and run it: `openswap worker pair <url> <code>`.", file=sys.stderr)
+            return 1
+        _guided_setup(root)
+        return 0
     if args.command == "run":
         return _run(root, managed=args.managed)
     if args.command == "account":
@@ -1251,6 +1352,7 @@ _WORKSPACE_MESSAGES = {
     "readonly_source_not_owned": "A read-only source must be owned by you.",
     "readonly_source_permissions": "A read-only source must not be writable by group or others.",
     "readonly_source_overlaps_folder": "The research folder and its read-only sources must not overlap.",
+    "label_invalid": "Labels are 1-100 characters with no control characters.",
     "worker_lifecycle_busy": "Worker settings are being changed; try again shortly.",
     "settings_unavailable": "Could not save the worker settings.",
 }
@@ -1366,14 +1468,15 @@ def _allowlist_command(root: Path, arguments: list[str]) -> int:
 
 
 def _format_workspaces(workspaces) -> str:
-    lines = ["Approved research folders (the ID is what the control service sends):"]
+    lines = ["Approved research folders (the control service sees only the ID and the label):"]
     for workspace in workspaces:
-        lines.append(f"  {workspace.workspace_id}: {workspace.output_root}")
+        label = json.dumps(workspace.display_label, ensure_ascii=False)
+        lines.append(f"  {workspace.workspace_id} {label}: {workspace.output_root}")
         for source in workspace.readonly_roots:
             lines.append(f"      read-only source: {source}")
     lines.append(
-        "Add one with `openswap worker workspace add <id> <folder>`; the ID must match "
-        "a Local workspace ID in the control service (OpenTag portal)."
+        "Add one with `openswap worker workspace add <id> <folder> [--label TEXT]`; this Mac "
+        "reports its folders to a control service that supports it (OpenTag does)."
     )
     return "\n".join(lines)
 
@@ -1381,6 +1484,7 @@ def _format_workspaces(workspaces) -> str:
 def _workspace_payload(workspace) -> dict:
     return {
         "workspace_id": workspace.workspace_id,
+        "label": workspace.display_label,
         "output_root": str(workspace.output_root),
         "readonly_roots": [str(root) for root in workspace.readonly_roots],
     }
@@ -1402,59 +1506,17 @@ def _interactive_terminal() -> bool:
         return False
 
 
-_WORKSPACE_HINT = (
-    "Then approve a research folder: `openswap worker workspace add <id> <folder>`. "
-    "Use the same ID you enter as a Local workspace ID in the control service "
-    "(the OpenTag portal); the folder path never leaves this Mac."
-)
+def _guided_setup(root: Path, *, interactive: bool | None = None, read_line=None) -> None:
+    """The guided steps after pairing (and `openswap worker setup`), on this terminal.
 
-
-def _post_pair_setup(root: Path, *, interactive: bool, read_line=None) -> None:
-    """After pairing: offer the account pin, then point at the folder step.
-
-    Pairing has already succeeded; nothing here can undo or fail it.
+    Start the worker, confirm the account, approve a research folder, then a
+    summary. Without a terminal it prints each step's command instead.
     """
-    read_line = read_line or input
-    try:
-        choices = worker_account_choices(root)
-    except Exception:
-        choices = None
-    if choices is not None and choices.pinned_ref is not None and not choices.pinned_missing:
-        print(f"Remote tasks uses Codex account {choices.pinned.label()}.")
-    elif not interactive or choices is None:
-        print("Next: pin the Codex account remote jobs run on: `openswap worker account <slot|email|alias>` "
-              "(`openswap worker account` lists them).")
-    else:
-        eligible = [choice for choice in choices.codex if choice.eligible]
-        if not eligible:
-            print("No eligible Codex account is saved. Add one with `openswap codex add`, then "
-                  "`openswap worker account <slot>`.")
-        else:
-            print("Choose the Codex account remote jobs run on (Claude accounts aren't supported yet):")
-            for choice in eligible:
-                print(f"  {choice.label()}")
-            for _attempt in range(3):
-                try:
-                    answer = read_line("Account (slot, email or alias; Enter to skip): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    answer = ""
-                if not answer:
-                    print("Skipped. Pin one later with `openswap worker account <slot|email|alias>`.")
-                    break
-                try:
-                    pinned = set_worker_account(root, answer)
-                except AccountPinError as exc:
-                    print(_ACCOUNT_MESSAGES.get(exc.code, f"Could not pin that account ({exc.code})."))
-                    continue
-                except Exception:
-                    print("Could not pin that account. Try `openswap worker account <slot>` later.")
-                    break
-                print(f"Pinned Codex account {pinned.label()} for Remote tasks.")
-                break
-            else:
-                print("Pin one later with `openswap worker account <slot|email|alias>`.")
-    print(_WORKSPACE_HINT)
+    from openswap.worker import guided_setup
+
+    if interactive is None:
+        interactive = _interactive_terminal()
+    guided_setup.run(root, guided_setup.TerminalPrompts(interactive=interactive, read_line=read_line))
 
 
 def _account_command(root: Path, args) -> int:
@@ -1503,13 +1565,26 @@ def _workspace_command(root: Path, args) -> int:
             return 0
         if args.workspace_command == "add":
             workspace = add_worker_workspace(
-                root, args.workspace_id, args.folder, tuple(args.readonly_source or ()),
+                root, args.workspace_id, args.folder, tuple(args.readonly_source or ()), label=args.label,
             )
             _write(
                 {"accepted": True, "workspace": _workspace_payload(workspace)},
                 as_json=args.json,
                 human=f"Approved research folder {workspace.output_root} as workspace "
-                      f"'{workspace.workspace_id}'.",
+                      f"'{workspace.workspace_id}' (the control service shows "
+                      f"{json.dumps(workspace.display_label, ensure_ascii=False)}).",
+            )
+            return 0
+        if args.workspace_command == "label":
+            if (args.label is None) == (not args.reset):
+                print("Pass a label or --reset, not both.", file=sys.stderr)
+                return 2
+            workspace = label_worker_workspace(root, args.workspace_id, None if args.reset else args.label)
+            _write(
+                {"accepted": True, "workspace": _workspace_payload(workspace)},
+                as_json=args.json,
+                human=f"Workspace '{workspace.workspace_id}' is shown as "
+                      f"{json.dumps(workspace.display_label, ensure_ascii=False)}.",
             )
             return 0
         remove_worker_workspace(root, args.workspace_id)
@@ -1548,67 +1623,7 @@ _ENABLE_DIAGNOSTICS = frozenset({
     "kickoff_in_progress", "worker_lifecycle_busy", "worker_state_unavailable",
 })
 
-_START_WORKER_NEXT = (
-    "Next: start the Remote tasks worker so this Mac can accept approved tasks: "
-    "`openswap worker enable`."
-)
-_EXECUTION_OFF_NOTE = (
-    "Task execution itself stays off (provider: live_adapter_disabled) until you run "
-    "`openswap worker live-check` on this Mac and enable live execution, so jobs are refused for now."
-)
 _RUNNING_STATES = frozenset({"starting", "running"})
-
-
-def _post_pair_worker_offer(root: Path, *, interactive: bool, read_line=None) -> None:
-    """After pairing: offer to start the worker, through `worker enable`'s own path.
-
-    Enrollment never enables local execution by itself: the worker starts only
-    when the owner answers yes on a terminal. Pairing has already succeeded;
-    nothing here can undo or fail it.
-    """
-    read_line = read_line or input
-    enabled = load_worker_settings(root).enabled is True
-    if enabled:
-        try:
-            process = read_status(root).get("process_state")
-        except Exception:
-            process = None
-        if process in _RUNNING_STATES:
-            print("The Remote tasks worker is already running on this Mac.")
-        else:
-            # Enabled but not running (for example its LaunchAgent was
-            # unloaded). Report it; never toggle anything from here.
-            print("The Remote tasks worker is enabled but not running. Run `openswap worker enable` "
-                  "to start it again, or `openswap worker status` to check.")
-    elif not interactive:
-        print(_START_WORKER_NEXT)
-    else:
-        try:
-            answer = read_line(
-                "Start the Remote tasks worker now so this Mac can accept approved tasks? [Y/n] "
-            ).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            answer = None
-        if answer not in {"", "y", "yes"}:
-            print("Not started. Start it later with `openswap worker enable`.")
-        else:
-            try:
-                enable_worker(root)
-            except ClaudeSwitchError as exc:
-                code = str(exc)
-                message = _enable_failure_message(exc)
-                if code in _ENABLE_DIAGNOSTICS:
-                    message = f"{message.rstrip('.')} ({code})."
-                print(f"{message} Start it later with `openswap worker enable`.")
-            except Exception:
-                print("Could not enable worker. Start it later with `openswap worker enable`.")
-            else:
-                print("Remote tasks worker enabled. The portal shows this Mac online within about 15 seconds.")
-    from openswap.worker.live import LIVE, execution_mode
-
-    if execution_mode(root) != LIVE:
-        print(_EXECUTION_OFF_NOTE)
 
 
 def _worker_off_hint(root: Path, snapshot: dict) -> str | None:

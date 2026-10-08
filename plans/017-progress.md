@@ -1241,3 +1241,31 @@ not exercised); a default login held in the Keychain rather than
 launchd-mediated escape when the model does not run that step. Phase 4's
 exit still needs the staging Slack run after this.
 
+
+## Guided Mac setup and readiness report (2026-10-08)
+
+The pilot owner found setup confusing: opaque workspace IDs typed into the
+portal, and no way for the portal to know which folders the Mac approved or
+whether it executes for real.
+
+- `openswap worker pair` now runs a guided setup in a fixed order: start the
+  worker, confirm (or pick) the Codex account, approve a research folder, then
+  a summary of what is still missing before Slack can start tasks. The folder
+  step offers `~/OpenSwap Research` (created 0700) as `research` in place of
+  the built-in folder inside the backup root, and then other folders with a
+  suggested ID. `openswap worker setup` reruns the steps on a paired Mac, and
+  the menu bar's **Set up Remote tasks…** button runs them in dialogs, pairing
+  first from the pasted pairing command. All three share
+  `openswap.worker.guided_setup` and the CLI's own functions.
+- Approved folders gain an optional owner label (`workspace add --label`,
+  `workspace label`); the default is the folder's name.
+- New optional protocol extension "Optional readiness report (v1 extension)":
+  the worker sends `readiness` (folder IDs and labels, and execution mode
+  `disabled`/`live`) after each registration and on change; registration and
+  revocation clear it on the backend. The mode comes from one hook,
+  `openswap.worker.adapter.execution_mode()`, which reports `disabled` while
+  the production adapter is `UnavailableCodexAdapter`. The reference service
+  implements it. The OpenTag side stores the report, shows it in the owner
+  listing and feeds the reported IDs to the Slack/agent workspace list.
+
+Execution is still disabled until Phase 1's live-evidence gates clear.
