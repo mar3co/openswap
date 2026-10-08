@@ -47,6 +47,8 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, replace
+
+from openswap.locking import FileLock
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -126,14 +128,24 @@ class DarwinProcessTable:
             raise ContainmentError("containment_unavailable") from None
 
     def pids(self) -> list[int]:
-        count = self._libproc.proc_listallpids(None, 0)
-        if count <= 0:
-            raise ContainmentError("process_table_unavailable")
-        buf = (ctypes.c_int * (count + 1024))()
-        count = self._libproc.proc_listallpids(buf, ctypes.sizeof(buf))
-        if count <= 0:
-            raise ContainmentError("process_table_unavailable")
-        return [buf[i] for i in range(count) if buf[i] > 0]
+        """Every pid, from a listing that provably fit its buffer.
+
+        The kernel clamps the listing to the buffer and stops walking when it
+        is full, so a result that fills the buffer may be truncated: retry
+        with more room, and give up (no proof) rather than return it.
+        """
+        for _ in range(5):
+            estimate = self._libproc.proc_listallpids(None, 0)
+            if estimate <= 0:
+                raise ContainmentError("process_table_unavailable")
+            capacity = estimate * 2 + 1024
+            buf = (ctypes.c_int * capacity)()
+            count = self._libproc.proc_listallpids(buf, ctypes.sizeof(buf))
+            if count <= 0:
+                raise ContainmentError("process_table_unavailable")
+            if count < capacity:
+                return [buf[i] for i in range(count) if buf[i] > 0]
+        raise ContainmentError("process_table_unavailable")
 
     def coalition_of(self, pid: int) -> int | None:
         buf = ctypes.create_string_buffer(64)
@@ -363,7 +375,26 @@ class LaunchdContainment:
         """
         run_dir = Path(run_dir)
         label = job_label(job_id)
-        ensure_private_dir(run_dir)
+        try:
+            ensure_private_dir(run_dir)
+        except OSError:
+            raise ContainmentError("run_dir_unavailable") from None
+        # One launch per label at a time: the label check, bootstrap and any
+        # cleanup below run under this lock, so a label loaded after a failed
+        # bootstrap can only be this launch's own.
+        lock = FileLock(run_dir.parent / f".{label}.lock", timeout=0)
+        try:
+            acquired = lock.acquire(timeout=0)
+        except OSError:
+            raise ContainmentError("run_dir_unavailable") from None
+        if not acquired:
+            raise ContainmentError("job_label_in_use")
+        try:
+            return self._launch_locked(label, run_dir, argv, env, cwd, stdin_text, ready_timeout)
+        finally:
+            lock.release()
+
+    def _launch_locked(self, label, run_dir, argv, env, cwd, stdin_text, ready_timeout) -> JobHandle:
         if any(os.path.lexists(run_dir / name) for name in _WRAPPER_STATE):
             # A stale ``go`` would let the new wrapper start the provider
             # before its coalition is recorded: only a fresh directory runs.
@@ -379,11 +410,21 @@ class LaunchdContainment:
             # In use, or launchd could not say: never bootstrap over (or later
             # boot out) a service this launch did not create.
             raise ContainmentError("job_label_in_use" if loaded else "launchd_unavailable")
-        write_private(run_dir / STDIN_FILE, stdin_text.encode("utf-8"))
         plist_path = run_dir / "job.plist"
-        write_private(plist_path, self.build_plist(label, run_dir, argv, env, cwd))
         handle = JobHandle(label, self.domain, run_dir, boot)
-        _save_handle(handle)
+        try:
+            # Claim the directory atomically with the plist, then write the
+            # rest. Nothing has been handed to launchd yet, so a failure here
+            # (a full disk, say) provably launched nothing.
+            fd = os.open(plist_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "wb") as out:
+                out.write(self.build_plist(label, run_dir, argv, env, cwd))
+            write_private(run_dir / STDIN_FILE, stdin_text.encode("utf-8"))
+            _save_handle(handle)
+        except FileExistsError:
+            raise ContainmentError("run_dir_not_fresh") from None
+        except OSError:
+            raise ContainmentError("run_dir_unwritable") from None
         booted = self._launchctl(["bootstrap", self.domain, str(plist_path)])
         if booted.returncode != 0:
             # The label was confirmed absent above, so a loaded one now is ours.
@@ -404,9 +445,12 @@ class LaunchdContainment:
             _save_handle(handle)
             handle = replace(handle, released=True)
             _save_handle(handle)
-        except BaseException:
+        except BaseException as error:
+            # ``go`` was never created, so the provider never ran.
             self._abort_unreleased(handle)
-            raise
+            if isinstance(error, ContainmentError) or not isinstance(error, Exception):
+                raise
+            raise ContainmentError("job_handle_unwritable") from None
         try:
             write_private(run_dir / GO_FILE, b"")
         except BaseException:
