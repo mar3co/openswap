@@ -355,9 +355,13 @@ def _settling(state: Readiness) -> bool:
     )
 
 
-def summary(root: Path, ui: Prompts, *, start_wait_s: float = 5.0) -> None:
+def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> None:
     state = readiness(root)
-    # Give a worker that `enable` just started a moment to report running.
+    # Give a worker that `enable` just started a moment to report running and
+    # reach the service. Front ends that must not block (the menu bar's UI
+    # thread) set ``settle_wait_s = 0`` and show the current state instead.
+    if start_wait_s is None:
+        start_wait_s = getattr(ui, "settle_wait_s", 5.0)
     deadline = time.monotonic() + start_wait_s
     while _settling(state) and time.monotonic() < deadline:
         time.sleep(0.25)
@@ -406,6 +410,8 @@ class DialogPrompts:
     """
 
     interactive = True
+    # The dialogs run on the menu bar's UI thread: never wait for the worker.
+    settle_wait_s = 0.0
 
     def __init__(self, alert, prompt, title: str = "Set up Remote tasks"):
         self._alert, self._prompt, self.title = alert, prompt, title

@@ -342,6 +342,19 @@ def test_allowed_accounts_without_a_pinned_default_are_not_ready(root, monkeypat
     assert "pin a Codex account (`openswap worker account <slot>`)" in guided_setup.readiness(root).missing
 
 
+def test_the_dialog_summary_never_waits_on_the_ui_thread(root, monkeypatch, research_home):
+    cli.set_worker_account(root, "1")
+    cli.add_worker_workspace(root, "research", research_home, replace_builtin_default=True)
+    update_worker_settings(root, enabled=True)
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": "starting"})
+    monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: pytest.fail("the dialog summary slept"))
+    alerts = []
+    ui = guided_setup.DialogPrompts(lambda *args, **kwargs: alerts.append(kwargs.get("message", "")), lambda *a, **k: None)
+    guided_setup.summary(root, ui)
+    ui.flush()
+    assert any("wait for the worker to finish starting" in message for message in alerts)
+
+
 class _Say:
     def say(self, text):
         print(text)
