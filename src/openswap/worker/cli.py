@@ -298,7 +298,7 @@ def _find_allowlisted(root: Path, entries, target: str) -> AllowlistedAccount:
 
 
 def allow_worker_account(backup_root: Path, selector: str, label: str | None = None) -> AllowlistedAccount:
-    """Allowlist a Codex account so a control service may choose it per job.
+    """Allowlist a Codex or Claude account so a control service may choose it per job.
 
     The account gets a fresh random reference (never derived from it) the
     first time; allowing it again keeps that reference and only changes the
@@ -1003,7 +1003,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     commands.add_parser(
         "setup", help="walk through starting the worker, the account and research folders on a paired Mac",
         description="The guided steps `pair` runs after pairing: start the worker, confirm the "
-                    "Codex account, approve a research folder (~/OpenSwap Research by default), "
+                    "Codex or Claude account, approve a research folder (~/OpenSwap Research by default), "
                     "then show what is still missing before Slack can start tasks on this Mac.",
     )
     unpair_parser = commands.add_parser(
