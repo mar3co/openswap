@@ -7,8 +7,9 @@ pass/fail evidence for every phase-1 live gate to a private JSON file:
 - ``pinned_cli``: the installed binary is the hash-pinned official 0.157.1.
 - ``account_identity``: the job's isolated ``CODEX_HOME`` is signed in to the
   pinned account before and after, and an authenticated model turn ran there.
-- ``default_login_unchanged``: the default Codex login's ``auth.json`` is
-  byte-identical before and after (only a comparison result is recorded).
+- ``default_login_unchanged``: the default Codex login's ``auth.json`` has the
+  same inode, size and modification/change times before and after (metadata
+  only: the file is never opened; only a comparison result is recorded).
 - ``tool_surface``: no MCP servers, the disabled features read as disabled, no
   managed/system Codex config overrides, and no MCP/app tool use in any run.
 - ``sandbox_wrapper``: ``codex sandbox`` with the research profile allows the
@@ -34,7 +35,6 @@ secret.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -42,6 +42,7 @@ import re
 import secrets
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -147,13 +148,40 @@ def _stamp() -> str:
 
 
 def login_snapshot(path: Path) -> tuple[str, str | None]:
-    """``("absent", None)``, ``("present", sha256)`` or ``("unreadable", None)``."""
+    """``("absent", None)``, ``("present", fingerprint)`` or ``("unreadable", None)``.
+
+    Metadata only (inode, size, modification and change times): the
+    credential file is never opened, so its secret never enters this process.
+    Any rewrite changes the change time.
+    """
     try:
-        return "present", hashlib.sha256(path.read_bytes()).hexdigest()
+        info = os.lstat(path)
     except FileNotFoundError:
         return "absent", None
     except OSError:
         return "unreadable", None
+    if not stat.S_ISREG(info.st_mode):
+        return "unreadable", None  # not a plain file: nothing comparable
+    return "present", f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}"
+
+
+def _writable_outside(folder: Path) -> bool:
+    """Positive control: a fresh file can be created in ``folder`` outside any sandbox.
+
+    A denied probe write proves confinement only if the same write works
+    unsandboxed (a read-only or broken ``/tmp`` would otherwise pass).
+    """
+    path = Path(folder) / f"openswap-live-check-control-{secrets.token_hex(8)}"
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return False
+    os.close(fd)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return True
 
 
 def command_items(stdout_path: Path) -> list[dict]:
@@ -608,8 +636,10 @@ class LiveCheck:
                 "outside_write_denied": codes.get("outside_write", 0) != 0 and not (outside / "write.txt").exists(),
                 "codex_home_read_denied": codes.get("codex_home_read", 0) != 0,
                 "auth_read_denied": codes.get("auth_read", 0) != 0,
-                "tmp_write_denied": codes.get("tmp_write", 0) != 0 and not tmp_marker.exists(),
-                "tmpdir_write_denied": codes.get("tmpdir_write", 0) != 0 and not tmpdir_marker.exists(),
+                "tmp_write_denied": codes.get("tmp_write", 0) != 0 and not tmp_marker.exists()
+                and _writable_outside(tmp_marker.parent),
+                "tmpdir_write_denied": codes.get("tmpdir_write", 0) != 0 and not tmpdir_marker.exists()
+                and _writable_outside(tmpdir_marker.parent),
             }
         finally:
             for path in (sentinel, tmp_marker):
@@ -777,7 +807,8 @@ class LiveCheck:
             "symlink_created": link_created,
             "symlink_read_denied": link_created and _all_failed(observed("link-target.txt"))
             and tokens["link"] not in everything,
-            "tmp_write_denied": _all_failed(observed(tmp_marker.name)) and not tmp_marker.exists(),
+            "tmp_write_denied": _all_failed(observed(tmp_marker.name)) and not tmp_marker.exists()
+            and _writable_outside(tmp_marker.parent),
             "codex_home_read_denied": _all_failed(observed(sentinel.name)) and tokens["home"] not in everything,
             "auth_read_denied": bool(auth) and all(type(i["exit_code"]) is int and i["exit_code"] != 0
                                                    for i in auth),
@@ -799,6 +830,7 @@ class LiveCheck:
             "source_symlink_read_denied": _all_failed(observed("outside-link.txt"))
             and tokens["source_link"] not in everything,
             "job_tmpdir_write_denied": _all_failed(observed("openswap-tmpdir-probe.txt"))
+            and _writable_outside(outcome.run_dir / "tmp")
             and not os.path.lexists(outcome.run_dir / "tmp" / "openswap-tmpdir-probe.txt"),
             "execution_stopped": outcome.stopped,
         }

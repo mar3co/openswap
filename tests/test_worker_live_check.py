@@ -942,3 +942,31 @@ def test_a_mirror_only_leftover_is_recovered_too(tmp_path):
     with pytest.raises(CheckRefused):
         make_check(root, mac).run()
     assert seen == ["livecheck-mirror-only"]
+
+
+
+def test_a_denied_tmp_write_counts_only_if_tmp_is_writable_outside(tmp_path, monkeypatch):
+    root = setup_root(tmp_path)
+    real = live_check._writable_outside
+    monkeypatch.setattr(live_check, "_writable_outside",
+                        lambda folder: False if str(folder) == "/tmp" else real(folder))
+    gates = make_check(root, SimulatedMac()).run()["gates"]
+    assert gates["sandbox_exec"]["tmp_write_denied"] is False
+    assert gates["sandbox_wrapper"]["tmp_write_denied"] is False
+
+
+def test_the_default_login_snapshot_never_opens_the_file(tmp_path, monkeypatch):
+    auth = tmp_path / "auth.json"
+    auth.write_text("secret")
+    opened = []
+    real_open = open
+
+    def spy(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", spy)
+    state, fingerprint = live_check.login_snapshot(auth)
+    assert state == "present" and "secret" not in fingerprint and str(auth) not in opened
+    auth.write_text("changed")
+    assert live_check.login_snapshot(auth)[1] != fingerprint
