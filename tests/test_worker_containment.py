@@ -958,3 +958,19 @@ def test_a_stopped_pid_whose_coalition_becomes_unreadable_is_resumed(tmp_path):
     procs.signal = recycle_unreadable
     containment._stop_member(JOB_COALITION, member)
     assert (member, signal.SIGCONT) in procs.signals and procs.table[member][1] == 2
+
+
+
+def test_recover_waits_for_an_in_progress_launch_before_reading_its_handle(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    held = containment._run_dir_lock(handle.run_dir, 0)
+    assert held.acquire(timeout=0)
+    containment.RECOVER_LOCK_WAIT = 0
+    try:
+        # A launch still holds the directory: no snapshot, no proof, nothing touched.
+        assert containment.recover(handle.run_dir) == c.StopProof(False, None, 0)
+        assert handle.label in launchd.loaded
+    finally:
+        held.release()
+    assert containment.recover(handle.run_dir).stopped is True
