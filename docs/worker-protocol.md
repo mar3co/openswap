@@ -316,6 +316,50 @@ service-side jobs of the registration it replaces. With no configured URL it
 performs no network or Keychain access. The production adapter still refuses
 jobs in this phase.
 
+### Choosing the account and research folders
+
+Pairing never selects an account or a folder; the submission names neither.
+On an interactive terminal with no account pinned yet, `pair` lists the
+eligible Codex accounts and asks for one (Enter skips), then points at the
+folder step. Without a terminal it prints the same next steps. Pairing stays
+successful whether or not this step completes.
+
+```sh
+openswap worker account                    # list Codex slots; * marks the pin
+openswap worker account 2                  # pin by slot, email or alias (or --json)
+openswap worker account --clear            # remove the pin
+openswap worker workspace list             # approved research folders
+openswap worker workspace add tag-research ~/Research/opentag \
+  [--readonly-source ~/src/project]        # ID must match the portal's Local workspace ID
+openswap worker workspace remove tag-research
+```
+
+Only Codex roster slots with a ChatGPT account ID are eligible; the pin is
+stored as the opaque `codex:` identity of that account, so moving or swapping
+slots does not change it. Claude accounts are listed as not eligible yet
+(Claude authentication gate) and a Claude selector is refused. The commands
+read roster metadata only (slot, email, alias, account ID), never auth files
+or tokens. Pin and workspace changes take the worker lifecycle lock; pinning
+also resolves the slot under the Codex account lock, so `codex remove`,
+`swap` and `move` cannot interleave. The menu bar's Settings → General →
+Remote tasks → **Account** popup uses the same function (Claude entries are
+shown disabled).
+
+The worker re-reads the pin for every launch, before it takes the account
+lease, so a new pin applies to the next job without a restart; a running job
+keeps the account recorded on it at `starting`. If the pinned account is no
+longer in the Codex roster at launch, the job fails with
+`provider_auth_unavailable` before any lease or launch, and the remote client
+does not claim new work until a present account is pinned.
+
+`workspace add` creates a missing folder owner-only (0700) and applies the
+launch-time checks up front: a real directory owned by you with no group or
+other access, and read-only sources owned by you and not writable by others.
+It refuses a folder that is, or contains, your home folder, the OpenSwap
+backup root, Codex home or the Claude config folder. At least one workspace
+must stay approved. Execution remains disabled: the production Codex adapter
+refuses every job until the Phase 1 live-evidence gates clear.
+
 `worker status --json` includes `remote_connectivity` and
 `remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.
 CLI and menu-bar status expose connectivity and service last seen without

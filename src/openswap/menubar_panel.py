@@ -177,6 +177,8 @@ SETTINGS_BTN_GAP_X = 6.0
 SETTINGS_BTN_GAP_Y = 4.0
 SETTINGS_ROW_GAP = 6.0
 SETTINGS_POPUP_H = 24.0
+# Room left for a short label ("Account") beside a full-width popup.
+SETTINGS_WIDE_POPUP_LABEL_W = 72.0
 SETTINGS_BACK_W = 64.0
 SETTINGS_BACK_H = 22.0
 SETTINGS_TABS_H = 40.0
@@ -1224,11 +1226,17 @@ class MenuBarPanel:
         btn.setFont_(font)
         btn.removeAllItems()
         selected = 0
-        for i, (value, lab) in enumerate(options or []):
+        # Options are (value, label) or (value, label, {"disabled": True}).
+        if any(len(option) > 2 for option in options or []):
+            btn.setAutoenablesItems_(False)
+        for i, option in enumerate(options or []):
+            value, lab = option[0], option[1]
             btn.addItemWithTitle_(lab)
             item = btn.lastItem()
             if item is not None:
                 item.setRepresentedObject_(value)
+                if len(option) > 2 and (option[2] or {}).get("disabled"):
+                    item.setEnabled_(False)
             if value == current:
                 selected = i
         if btn.numberOfItems() > 0:
@@ -1904,27 +1912,32 @@ class MenuBarPanel:
                 )
                 root.addSubview_(sw)
             elif kind == "popup":
+                popup_w = (
+                    max(SETTINGS_POPUP_W, inner_w - SETTINGS_WIDE_POPUP_LABEL_W)
+                    if row.get("wide") else SETTINGS_POPUP_W
+                )
                 root.addSubview_(
                     _label(
                         row.get("label") or "",
                         font_body,
                         pal["fg"],
-                        NSMakeRect(PAD, y + 5, inner_w - SETTINGS_POPUP_W - 8, 20),
+                        NSMakeRect(PAD, y + 5, inner_w - popup_w - 8, 20),
                     )
                 )
-                self._add_popup(
+                popup = self._add_popup(
                     root,
                     row.get("options") or [],
                     row.get("value"),
                     NSMakeRect(
-                        PANEL_WIDTH - PAD - SETTINGS_POPUP_W,
+                        PANEL_WIDTH - PAD - popup_w,
                         y + (h - SETTINGS_POPUP_H) / 2,
-                        SETTINGS_POPUP_W,
+                        popup_w,
                         SETTINGS_POPUP_H,
                     ),
                     row["id"],
                     font_small,
                 )
+                popup.setEnabled_(not bool(row.get("disabled")))
             elif kind == "status":
                 root.addSubview_(
                     _label(

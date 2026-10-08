@@ -1041,3 +1041,39 @@ and the staging Slack scenario. The review follow-ups are closed:
 mar3co/opentag#146 (pilot runner shutdown and switch edges) by #147 (`d88fe44`)
 and #145 (transient auth errors in the `/app` guards) by #148 (`f7b4b63`), both
 merged 2026-10-06.
+
+## First-use account and folder step (2026-10-07)
+
+The first-use flow's "choose an eligible local account and approved research
+folder" step now exists; until now only tests called
+`configure_worker_local_policy`, so a paired worker failed every job
+`provider_unavailable` with no supported way to pin an account.
+
+- `openswap worker account [slot|email|alias] [--clear] [--json]` lists Codex
+  roster slots and pins one through the Codex engine's own `resolve_account`.
+  The pin is `stable_account_identity("codex", accountId)`. It is **Codex
+  only**: Claude accounts are listed as not eligible yet (Claude
+  authentication gate) and a Claude selector is refused, as are API-key slots
+  (no account ID) and accounts no longer in the roster. Only roster metadata is
+  read, never auth files or tokens.
+- `openswap worker workspace list|add <id> <folder> [--readonly-source DIR]|remove <id>`
+  manages the approved research folders under the opaque IDs the owner enters
+  as Local workspace IDs in the OpenTag portal, applying the launch-time folder
+  checks when the folder is added.
+- After `openswap worker pair` succeeds, an interactive terminal with no pin
+  offers the eligible Codex accounts (Enter skips) and then the folder step;
+  without a terminal it prints both next steps. Pairing succeeds either way.
+- The menu bar's Remote tasks section gains an **Account** popup (eligible
+  Codex slots with the pin checked, None, Claude entries disabled) that pins
+  off the UI thread through the same function as the CLI.
+- Pin and workspace changes take the worker lifecycle lock; pinning also holds
+  the Codex mutation guard. The worker re-reads the pin for every launch,
+  before the lease, so a change applies to the next job without a restart; a
+  running job keeps the account recorded at `starting`. A pinned account
+  missing from the roster at launch fails the job `provider_auth_unavailable`
+  (already on the journal and protocol allowlist) before any lease or launch,
+  and the remote client does not claim new work in that state.
+
+Execution is still disabled: the production adapter remains
+`UnavailableCodexAdapter` until Phase 1's live-evidence gates clear, so this
+step lets the owner finish setup but does not run any provider job.

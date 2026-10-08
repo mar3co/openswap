@@ -17,6 +17,7 @@ import time
 from urllib.parse import quote
 
 from openswap.settings import load_worker_settings, update_worker_settings
+from openswap.worker.accounts import codex_account_in_roster
 from openswap.worker.adapter import ProviderAdapter, production_adapter
 from openswap.locking import FileLock
 from openswap.worker.journal import (
@@ -319,7 +320,9 @@ class WorkerRuntime:
         self.store = LocalJobStore(self.backup_root, max_pending=max_pending)
         self.adapter = adapter if adapter is not None else production_adapter()
         self.owner_ref = owner_ref
-        self.account_identity = account_identity or load_worker_settings(self.backup_root).pinned_account_ref
+        # A fixed identity is a test seam: it bypasses the owner's local pin
+        # and its roster check. Production reads the pin for every launch.
+        self._fixed_account_identity = account_identity
         self.clock = clock
         self.monotonic = monotonic
         self.sleeper = sleeper
@@ -338,6 +341,28 @@ class WorkerRuntime:
         self._active_run = None
         self._active_lease = None
         self.remote_launch_guard = None
+
+    @property
+    def account_identity(self) -> str | None:
+        """The account the next launch would use: the owner's current local pin.
+
+        Re-read from settings on every call, so ``openswap worker account``
+        (or the menu bar picker) takes effect for the next job without a
+        worker restart. A running job keeps the identity recorded on it at
+        STARTING and held by its lease.
+        """
+        if self._fixed_account_identity is not None:
+            return self._fixed_account_identity
+        return load_worker_settings(self.backup_root).pinned_account_ref
+
+    def account_ready(self) -> bool:
+        """Whether a pin exists and its account is still in the Codex roster."""
+        identity = self.account_identity
+        if identity is None:
+            return False
+        if self._fixed_account_identity is not None:
+            return True
+        return codex_account_in_roster(self.backup_root, identity)
 
     def _quarantine_lease_for_recovered_jobs(self) -> None:
         """Stop trusting a still-``active`` lease left by a crashed worker.
@@ -1033,35 +1058,56 @@ class WorkerRuntime:
                 expected_generation=current.generation,
                 diagnostic_code=availability.diagnostic_code or "provider_unavailable",
             )
-        if self.account_identity is None:
-            return self.store.transition(
-                current.job_id, expected_states=(JobState.CLAIMED,),
-                new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
-                expected_generation=current.generation, diagnostic_code="provider_unavailable",
-            )
-        starting = self.store.transition(
-            current.job_id, expected_states=(JobState.CLAIMED,),
-            new_state=JobState.STARTING, worker_epoch=self.worker_epoch,
-            expected_generation=current.generation,
-            pinned_account_ref=self.account_identity,
-        )
+        # The pin is read, recorded on the job and leased under the Codex
+        # mutation guard that `openswap worker account` also holds, so a pin
+        # change either lands before this launch (which then uses it) or waits
+        # until the lease is taken; a job never starts on a replaced pin. The
+        # roster check shares the guard so `codex remove` cannot drop the
+        # pinned slot in between.
+        starting = None
         try:
-            token = self.leases.acquire(
-                job_id=starting.job_id, account_identity=self.account_identity,
-                worker_pid=self.worker_pid, worker_epoch=self.worker_epoch,
-                ttl_s=starting.runtime_limit_s + 60,
+            with self.leases.mutation_guard() as guard:
+                guard.assert_available()
+                identity = self.account_identity
+                if identity is None:
+                    return self.store.transition(
+                        current.job_id, expected_states=(JobState.CLAIMED,),
+                        new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
+                        expected_generation=current.generation, diagnostic_code="provider_unavailable",
+                    )
+                starting = self.store.transition(
+                    current.job_id, expected_states=(JobState.CLAIMED,),
+                    new_state=JobState.STARTING, worker_epoch=self.worker_epoch,
+                    expected_generation=current.generation,
+                    pinned_account_ref=identity,
+                )
+                if self._fixed_account_identity is None and not codex_account_in_roster(
+                    self.backup_root, identity,
+                ):
+                    token = None
+                else:
+                    token = guard.acquire(
+                        job_id=starting.job_id, account_identity=identity,
+                        worker_pid=self.worker_pid, worker_epoch=self.worker_epoch,
+                        ttl_s=starting.runtime_limit_s + 60,
+                    )
+        except (LeaseConflictError, LeaseStateError) as error:
+            conflict = isinstance(error, LeaseConflictError)
+            record = starting if starting is not None else current
+            return self.store.transition(
+                record.job_id, expected_states=(record.state,),
+                new_state=JobState.FAILED if conflict else JobState.INTERRUPTED,
+                worker_epoch=self.worker_epoch, expected_generation=record.generation,
+                diagnostic_code="lease_conflict" if conflict else "execution_uncertain",
             )
-        except LeaseConflictError:
+        if token is None:
+            # The pinned account was removed from the roster (or the roster is
+            # unreadable): nothing was leased or launched.
             return self.store.transition(
                 starting.job_id, expected_states=(JobState.STARTING,),
                 new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
-                expected_generation=starting.generation, diagnostic_code="lease_conflict",
-            )
-        except LeaseStateError:
-            return self.store.transition(
-                starting.job_id, expected_states=(JobState.STARTING,),
-                new_state=JobState.INTERRUPTED, worker_epoch=self.worker_epoch,
-                expected_generation=starting.generation, diagnostic_code="execution_uncertain",
+                expected_generation=starting.generation,
+                diagnostic_code="provider_auth_unavailable",
             )
         self._active_lease = token
         try:
@@ -1238,35 +1284,70 @@ class WorkerRuntime:
             raise ValueError("workspace is not registered")
         base_root = workspace.output_root
         base_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        base_info = base_root.lstat()
-        if base_root.is_symlink() or not base_root.is_dir():
-            raise ValueError("registered workspace is unsafe")
-        if os.name != "nt" and (base_info.st_uid != os.getuid() or base_info.st_mode & 0o077):
-            raise ValueError("registered workspace permissions are unsafe")
+        _raise_for_output_problem(output_dir_problem(base_root))
         output_root = base_root / job_id
         output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        info = output_root.lstat()
-        if output_root.is_symlink() or not output_root.is_dir():
-            raise ValueError("registered workspace is unsafe")
-        if os.name != "nt" and (info.st_uid != os.getuid() or info.st_mode & 0o077):
-            raise ValueError("registered workspace permissions are unsafe")
+        _raise_for_output_problem(output_dir_problem(output_root))
         for source in workspace.readonly_roots:
-            try:
-                info = source.lstat()
-            except OSError:
-                raise ValueError("approved read-only source is unavailable") from None
-            if source.is_symlink() or not source.is_dir():
+            problem = readonly_source_problem(source)
+            if problem == "unavailable":
+                raise ValueError("approved read-only source is unavailable")
+            if problem == "unsafe":
                 raise ValueError("approved read-only source is unsafe")
-            if os.name != "nt" and info.st_uid != os.getuid():
+            if problem == "not_owned":
                 raise ValueError("approved read-only source is not locally owned")
-            # Readable by others is normal for a source checkout; writable by
-            # others is not, since the source could change during the run.
-            if os.name != "nt" and info.st_mode & 0o022:
+            if problem == "permissions":
                 raise ValueError("approved read-only source permissions are unsafe")
         return ResolvedWorkspace(
             workspace_id=workspace_id, output_root=output_root,
             readonly_sources=workspace.readonly_roots,
         )
+
+
+def output_dir_problem(path: Path) -> str | None:
+    """Why ``path`` cannot be a writable research root, or ``None``.
+
+    It must be a real directory (not a symlink) owned by this user with no
+    group or other access: ``unavailable``, ``unsafe`` or ``permissions``.
+    Shared by launch-time resolution and ``openswap worker workspace add``.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return "unavailable"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return "unsafe"
+    if os.name != "nt" and (info.st_uid != os.getuid() or info.st_mode & 0o077):
+        return "permissions"
+    return None
+
+
+def readonly_source_problem(path: Path) -> str | None:
+    """Why ``path`` cannot be an approved read-only source, or ``None``.
+
+    Readable by others is normal for a source checkout; writable by others is
+    not, since the source could change during the run: ``unavailable``,
+    ``unsafe``, ``not_owned`` or ``permissions``.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return "unavailable"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return "unsafe"
+    if os.name != "nt" and info.st_uid != os.getuid():
+        return "not_owned"
+    if os.name != "nt" and info.st_mode & 0o022:
+        return "permissions"
+    return None
+
+
+def _raise_for_output_problem(problem: str | None) -> None:
+    if problem == "permissions":
+        raise ValueError("registered workspace permissions are unsafe")
+    if problem is not None:
+        raise ValueError("registered workspace is unsafe")
+
 
 WORKER_REFUSED_MANAGED = 2
 

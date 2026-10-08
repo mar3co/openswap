@@ -452,7 +452,7 @@ class RemoteClient:
                 availability = self.runtime.adapter.probe()
             except Exception:
                 return  # an unavailable provider claims nothing; the heartbeat still counts
-            if not availability.available or self.runtime.account_identity is None:
+            if not availability.available or not self.runtime.account_ready():
                 return
             response = self._worker_request("poll")
             if response["claim"] is not None:
@@ -662,7 +662,13 @@ class RemoteClient:
         lease = self.runtime.leases.read_current()
         if lease is not None and lease.job_id == local.job_id and lease.state == "released":
             return stopped or lease.reason == "confirmed_stopped", lease.reason == "unlaunched"
-        return stopped, not launched and local.pinned_account_ref is None
+        # A pinned account missing from the roster at launch fails the job from
+        # STARTING with no lease: nothing ran. The same code reported after a
+        # launch (a RUNNING event exists) is not unlaunched.
+        account_missing = (
+            local.state.value == "failed" and local.diagnostic_code == "provider_auth_unavailable"
+        )
+        return stopped, not launched and (local.pinned_account_ref is None or account_missing)
 
     def upload_results(self, claim, local) -> bool:
         """Upload the explicit artifact list; returns whether any artifact was refused.

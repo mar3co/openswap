@@ -577,6 +577,19 @@ class LocalJobStore:
         finally:
             db.close()
 
+    def workspace_in_use(self, workspace_id: str, job_ids: Iterable[str] = ()) -> bool:
+        """Whether a queued or active job uses ``workspace_id``, or one of
+        ``job_ids`` (jobs whose results are still being synchronized) does."""
+        ids = tuple(job_ids)
+        db = self._connect()
+        try:
+            states = (JobState.QUEUED, *_ACTIVE_STATES)
+            sql = (f"SELECT 1 FROM jobs WHERE workspace_id=? AND (state IN ({','.join('?' for _ in states)})"
+                   + (f" OR job_id IN ({','.join('?' for _ in ids)})" if ids else "") + ") LIMIT 1")
+            return db.execute(sql, (workspace_id, *(s.value for s in states), *ids)).fetchone() is not None
+        finally:
+            db.close()
+
     def active(self) -> JobRecord | None:
         db = self._connect()
         try:

@@ -419,22 +419,8 @@ def update_worker_settings(
         return _worker_from_raw(raw, Path(backup_root))
 
 
-def configure_worker_local_policy(
-    backup_root: Path,
-    *,
-    pinned_account_ref: str | None,
-    workspaces: tuple[WorkerWorkspace, ...],
-) -> WorkerSettings:
-    """Persist locally approved opaque account/workspace references.
-
-    This is a local configuration API only. Job submissions and IPC cannot
-    override the pinned account or supply paths.
-    """
-    if pinned_account_ref is not None and (
-        not isinstance(pinned_account_ref, str)
-        or not _PINNED_ACCOUNT_RE.fullmatch(pinned_account_ref)
-    ):
-        raise ValueError("pinned account reference is invalid")
+def _encode_worker_workspaces(workspaces: tuple[WorkerWorkspace, ...]) -> dict[str, dict[str, object]]:
+    """Validate an approved workspace registry and return its settings encoding."""
     if not isinstance(workspaces, tuple) or not 1 <= len(workspaces) <= 16:
         raise ValueError("one to sixteen approved workspaces are required")
     ids: set[str] = set()
@@ -465,27 +451,94 @@ def configure_worker_local_policy(
             "outputRoot": str(resolved_output),
             "readonlyRoots": [str(path) for path in resolved_readonly],
         }
+    return encoded
+
+
+def _validate_pinned_account_ref(pinned_account_ref: str | None) -> None:
+    if pinned_account_ref is not None and (
+        not isinstance(pinned_account_ref, str)
+        or not _PINNED_ACCOUNT_RE.fullmatch(pinned_account_ref)
+    ):
+        raise ValueError("pinned account reference is invalid")
+
+
+def _decoded_workspaces(encoded: dict[str, dict[str, object]]) -> tuple[WorkerWorkspace, ...]:
+    return tuple(
+        WorkerWorkspace(workspace_id, Path(config["outputRoot"]),
+                        tuple(Path(item) for item in config["readonlyRoots"]))
+        for workspace_id, config in encoded.items()
+    )
+
+
+def _write_worker_local_policy(
+    backup_root: Path, *, pinned_account_ref=None, encoded_workspaces=None,
+    set_pin: bool, set_workspaces: bool,
+) -> WorkerSettings:
+    """Read-modify-write the pin and/or registry under the settings lock.
+
+    A field not being set keeps its current value. The result is parsed back
+    before it is written: a section that would fail closed (for example a
+    malformed field this call does not touch) is refused, never written.
+    """
     path = settings_path(backup_root)
     with _settings_write_lock(backup_root):
         raw = _read_raw_for_write(path)
         section = raw.get("worker")
         if not isinstance(section, dict):
             section = {}
-        section["pinnedAccountRef"] = pinned_account_ref
-        section["workspaces"] = encoded
+        if set_pin:
+            section["pinnedAccountRef"] = pinned_account_ref
+        if set_workspaces:
+            section["workspaces"] = encoded_workspaces
         section.setdefault("enabled", False)
         section.setdefault("paused", False)
         raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
         raw["worker"] = section
         parsed = _worker_from_raw(raw, Path(backup_root))
-        if parsed.workspaces != tuple(
-            WorkerWorkspace(workspace_id, Path(config["outputRoot"]),
-                            tuple(Path(item) for item in config["readonlyRoots"]))
-            for workspace_id, config in encoded.items()
-        ) or parsed.pinned_account_ref != pinned_account_ref:
+        if (set_workspaces and parsed.workspaces != _decoded_workspaces(encoded_workspaces)) or (
+            parsed.pinned_account_ref != section.get("pinnedAccountRef")
+        ):
             raise ValueError("worker local policy failed validation")
         atomic_write_json(path, raw)
         return parsed
+
+
+def configure_worker_local_policy(
+    backup_root: Path,
+    *,
+    pinned_account_ref: str | None,
+    workspaces: tuple[WorkerWorkspace, ...],
+) -> WorkerSettings:
+    """Persist locally approved opaque account/workspace references.
+
+    This is a local configuration API only. Job submissions and IPC cannot
+    override the pinned account or supply paths.
+    """
+    _validate_pinned_account_ref(pinned_account_ref)
+    encoded = _encode_worker_workspaces(workspaces)
+    return _write_worker_local_policy(
+        backup_root, pinned_account_ref=pinned_account_ref, encoded_workspaces=encoded,
+        set_pin=True, set_workspaces=True,
+    )
+
+
+def set_worker_pinned_account(backup_root: Path, pinned_account_ref: str | None) -> WorkerSettings:
+    """Pin (or clear, with ``None``) the owner's local account; workspaces are kept.
+
+    Callers own eligibility: this checks only the opaque reference's shape.
+    """
+    _validate_pinned_account_ref(pinned_account_ref)
+    return _write_worker_local_policy(
+        backup_root, pinned_account_ref=pinned_account_ref, set_pin=True, set_workspaces=False,
+    )
+
+
+def set_worker_workspaces(backup_root: Path, workspaces: tuple[WorkerWorkspace, ...]) -> WorkerSettings:
+    """Replace the approved workspace registry; the pinned account is kept."""
+    encoded = _encode_worker_workspaces(workspaces)
+    return _write_worker_local_policy(
+        backup_root, encoded_workspaces=encoded, set_pin=False, set_workspaces=True,
+    )
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

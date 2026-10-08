@@ -198,7 +198,7 @@ def _remote_tasks_status_copy(
     operation = snapshot.get("operation")
     if not isinstance(operation, str) or operation not in {
         "worker_enable_or_disable", "worker_admission_update", "worker_stop_requested",
-        "worker_control_busy", "worker_status_checking",
+        "worker_account_update", "worker_control_busy", "worker_status_checking",
     }:
         operation = None
     notice = snapshot.get("diagnostic_notice")
@@ -458,6 +458,7 @@ def settings_page_rows(
             "label": "Enable local worker",
             "value": bool(worker_enabled),
         },
+        _remote_tasks_account_row((worker_status or {}).get("account_picker")),
         {
             "kind": "status",
             "section": SETTINGS_SECTION_GENERAL,
@@ -691,6 +692,59 @@ def settings_page_rows(
             section = SETTINGS_SECTION_GENERAL
         rows = [row for row in rows if row["section"] == section]
     return rows
+
+
+def _bounded_text(value, limit: int = 120) -> str:
+    if not isinstance(value, str):
+        return ""
+    return "".join(c for c in value if c.isprintable())[:limit]
+
+
+def _remote_tasks_account_row(picker) -> dict:
+    """Popup row for the Remote tasks account pin; no AppKit.
+
+    Options are ``(value, label)`` or ``(value, label, {"disabled": True})``.
+    Eligible Codex roster slots carry their opaque ``codex:`` reference (the
+    pinned one is the selected, checkmarked item), ``""`` is "None", and
+    Claude accounts are listed disabled: they wait on a separate Claude
+    authentication gate. Built from roster metadata the controller read off
+    the UI thread; until it arrives the row is a disabled placeholder.
+    """
+    row = {
+        "kind": "popup",
+        "section": SETTINGS_SECTION_GENERAL,
+        "id": "remote_tasks_account",
+        "label": "Account",
+        "wide": True,
+    }
+    if not isinstance(picker, dict):
+        return {**row, "options": [("", "Loading accounts…")], "value": "", "disabled": True}
+    pinned = picker.get("pinned_account_ref")
+    pinned = pinned if isinstance(pinned, str) and pinned.startswith("codex:") else None
+    options: list[tuple] = [("", "None")]
+    listed = set()
+    for entry in picker.get("codex") or []:
+        if not isinstance(entry, dict):
+            continue
+        number = _bounded_text(entry.get("number"), 8)
+        name = _bounded_text(entry.get("email")) or "(no email)"
+        alias = _bounded_text(entry.get("alias"), 40)
+        label = f"{number} · {name}" + (f" ({alias})" if alias else "")
+        ref = entry.get("account_ref")
+        if entry.get("eligible") is True and isinstance(ref, str) and ref.startswith("codex:"):
+            options.append((ref, label))
+            listed.add(ref)
+        else:
+            options.append((f"ineligible:{number}", f"{label} — API key, not eligible", {"disabled": True}))
+    if pinned is not None and pinned not in listed:
+        options.append((pinned, "Pinned account was removed", {"disabled": True}))
+    for entry in picker.get("claude") or []:
+        if not isinstance(entry, dict):
+            continue
+        number = _bounded_text(entry.get("number"), 8)
+        name = _bounded_text(entry.get("email")) or "(no email)"
+        options.append((f"claude:{number}", f"Claude {number} · {name} — not supported yet", {"disabled": True}))
+    return {**row, "options": options, "value": pinned or ""}
 
 
 def _worker_active_job_id(snapshot: dict) -> str | None:
