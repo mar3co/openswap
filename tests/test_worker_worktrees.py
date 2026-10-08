@@ -600,6 +600,7 @@ def test_a_huge_expanding_object_is_never_inflated(root, home, monkeypatch):
     assert seen and max(seen) <= 1 << 20 and sum(seen) <= (1 << 20) + (1 << 20)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="the worker runs on macOS; repack with alternates differs on Windows")
 def test_packs_the_task_made_are_imported(root, home):
     repo = _repo(home / "GitHub" / "openswap")
     cli.add_work_folder(root, repo)
@@ -621,3 +622,39 @@ def test_work_folders_never_overlap_read_only_ones(root, home):
     with pytest.raises(cli.WorkspaceError) as refused:
         cli.add_work_folder(root, repo)
     assert refused.value.code == "work_overlaps_readable"
+
+
+def test_a_driver_name_with_an_equals_sign_is_disabled_too(root, home, tmp_path):
+    repo = _repo(home / "GitHub" / "openswap")
+    marker = tmp_path / "filter-ran"
+    _git(repo, "config", "filter.evil=x.smudge", f"sh -c 'touch {marker}; cat'")
+    (repo / ".gitattributes").write_text("*.txt filter=evil=x\n")
+    (repo / "data.txt").write_text("data\n")
+    _git(repo, "-c", "core.attributesFile=/dev/null", "add", ".gitattributes", "data.txt")
+    _git(repo, "commit", "-q", "-m", "filtered")
+    marker.unlink(missing_ok=True)
+    cli.add_work_folder(root, repo)
+    _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    assert not marker.exists()
+
+
+def test_a_failed_setup_leaves_nothing_behind(root, home, monkeypatch):
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    real_open = os.open
+
+    def failing_open(path, *args, **kwargs):
+        if str(path).endswith(".json") and ".worktrees" in str(path):
+            raise OSError("disk full")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(worktrees.os, "open", failing_open)
+    with pytest.raises(WorkspaceRefused):
+        _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    monkeypatch.setattr(worktrees.os, "open", real_open)
+    folder = home / "OpenSwap Research" / ".worktrees" / "openswap"
+    assert not (folder / ("a" * 32)).exists() and not (folder / f"{'a' * 32}.objects").exists()
+    assert "openswap/aaaaaaaa" not in _git(repo, "branch", "--list")
+    assert _git(repo, "worktree", "list").count("\n") == 0
+    # The same task can be set up again.
+    assert _runtime(root)._resolve_workspace("openswap", "a" * 32).work_dir.exists()

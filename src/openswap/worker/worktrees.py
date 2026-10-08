@@ -42,6 +42,7 @@ BRANCH_PREFIX = "openswap"
 _GIT_TIMEOUT_S = 300
 _MAX_CHILD_REPOS = 64
 _MAX_OBJECT_BYTES = 512 * 1024 * 1024
+_MAX_PACK_BYTES = 2 * 1024 * 1024 * 1024
 # The task's own git must never start background maintenance that rewrites
 # packs or refs outside the paths it may write.
 GIT_TASK_CONFIG = (("gc.auto", "0"), ("maintenance.auto", "false"))
@@ -82,27 +83,43 @@ def _run(command: list[str], cwd: Path, env: dict[str, str], timeout: float) -> 
         raise WorktreeError("git_unavailable") from None
 
 
-def _filter_overrides(cwd: Path, env: dict[str, str]) -> tuple[str, ...]:
-    """``-c`` settings that turn every configured filter driver into a no-op.
+def _filter_overrides(cwd: Path, env: dict[str, str]) -> list[tuple[str, str]]:
+    """Settings that turn every configured filter driver into a no-op.
 
     Reading configuration runs nothing, so the driver names are read first
     (again for every command: the owner may add one at any time) and each
     driver's ``smudge``, ``clean`` and ``process`` are emptied. A driver name
-    may itself contain dots: it is everything between ``filter.`` and the
-    last dot.
+    may contain dots or ``=``: it is everything between ``filter.`` and the
+    last dot, and the settings travel as ``GIT_CONFIG_KEY_n``/``VALUE_n``
+    pairs, never as ``-c name=value`` (which splits at the first ``=``).
     """
     base = ["git", *(arg for item in _SAFE_CONFIG for arg in ("-c", item))]
-    result = _run([*base, "config", "--name-only", "--get-regexp", r"^filter\."], cwd, env, 30)
-    drivers = sorted({line[len("filter."):].rpartition(".")[0] for line in result.stdout.splitlines()
-                      if line.startswith("filter.") and "." in line[len("filter."):]})
+    result = _run([*base, "config", "--null", "--name-only", "--get-regexp", r"^filter\."], cwd, env, 30)
+    drivers = sorted({name[len("filter."):].rpartition(".")[0] for name in result.stdout.split("\0")
+                      if name.startswith("filter.") and "." in name[len("filter."):]})
     out = []
     for driver in drivers:
-        if not driver or "\n" in driver:
+        if not driver:
             continue
         for part in ("smudge", "clean", "process"):
-            out += ["-c", f"filter.{driver}.{part}="]
-        out += ["-c", f"filter.{driver}.required=false"]
-    return tuple(out)
+            out.append((f"filter.{driver}.{part}", ""))
+        out.append((f"filter.{driver}.required", "false"))
+    return out
+
+
+def _with_config(env: dict[str, str], settings: list[tuple[str, str]]) -> dict[str, str]:
+    """``env`` with ``settings`` appended to its ``GIT_CONFIG_COUNT`` entries."""
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        count = 0
+    out = dict(env)
+    for key, value in settings:
+        out[f"GIT_CONFIG_KEY_{count}"] = key
+        out[f"GIT_CONFIG_VALUE_{count}"] = value
+        count += 1
+    out["GIT_CONFIG_COUNT"] = str(count)
+    return out
 
 
 def git(args: list[str], cwd: Path, *, timeout: float = _GIT_TIMEOUT_S, check: bool = True,
@@ -112,8 +129,8 @@ def git(args: list[str], cwd: Path, *, timeout: float = _GIT_TIMEOUT_S, check: b
     Raises ``WorktreeError("git_failed")`` when ``check`` and git fails.
     """
     full_env = _git_env(env)
-    command = ["git", *(arg for item in _SAFE_CONFIG for arg in ("-c", item)),
-               *_filter_overrides(Path(cwd), full_env), *args]
+    full_env = _with_config(full_env, _filter_overrides(Path(cwd), full_env))
+    command = ["git", *(arg for item in _SAFE_CONFIG for arg in ("-c", item)), *args]
     try:
         result = subprocess.run(command, cwd=str(cwd), env=full_env, capture_output=True, text=True,
                                 timeout=timeout, check=False, input=stdin)
@@ -300,10 +317,27 @@ def create(repo: Path, results_root: Path, workspace_id: str, job_id: str) -> Wo
         fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(tree.to_dict(), stream)
-    except (WorktreeError, OSError):
-        remove(dest, force=True)
+    except (WorktreeError, OSError, ValueError):
+        _undo_create(repo, dest, objects, branch)
         raise WorktreeError("worktree_unavailable") from None
     return tree
+
+
+def _undo_create(repo: Path, dest: Path, objects: Path, branch: str) -> None:
+    """Remove a worktree whose setup failed, from the paths already known (no record yet)."""
+    for args in (["worktree", "remove", "--force", "--force", str(dest)], ["worktree", "prune"],
+                 ["branch", "-D", branch]):
+        try:
+            git(args, repo, timeout=60, check=False)
+        except WorktreeError:
+            pass
+    for leftover in (dest, objects):
+        if os.path.lexists(leftover):
+            remove_tree(leftover)
+    try:
+        _record_path(dest).unlink()
+    except OSError:
+        pass
 
 
 def identity(repo: Path) -> dict[str, str]:
@@ -403,13 +437,16 @@ def _import_packs(tree: Worktree) -> bool:
         return False
     for pack in packs:
         try:
-            with open(pack, "rb") as stream:
-                data = stream.read()
+            if pack.stat().st_size > _MAX_PACK_BYTES:
+                ok = False  # never fed to git; the worktree is kept for the owner
+                continue
             command = ["git", *(arg for item in _SAFE_CONFIG for arg in ("-c", item)),
-                       "index-pack", "--stdin", "--fix-thin"]
-            result = subprocess.run(command, cwd=str(tree.common_dir), input=data, capture_output=True,
-                                    timeout=_GIT_TIMEOUT_S, check=False,
-                                    env=_git_env({"GIT_DIR": str(tree.common_dir)}))
+                       "index-pack", "--stdin", "--fix-thin", f"--max-input-size={_MAX_PACK_BYTES}"]
+            # Streamed from the file: never read into the worker's memory.
+            with open(pack, "rb") as stream:
+                result = subprocess.run(command, cwd=str(tree.common_dir), stdin=stream, capture_output=True,
+                                        timeout=_GIT_TIMEOUT_S, check=False,
+                                        env=_git_env({"GIT_DIR": str(tree.common_dir)}))
             ok = ok and result.returncode == 0
         except (OSError, subprocess.SubprocessError):
             ok = False
