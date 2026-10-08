@@ -28,7 +28,7 @@ from openswap.exceptions import ClaudeSwitchError
 from openswap.settings import load_worker_settings
 from openswap.worker import codex_cli
 from openswap.worker.accounts import AccountPinError, codex_accounts, resolve_codex_selector
-from openswap.worker.codex_exec import codex_env, home_identity, isolated_home, prepare_home
+from openswap.worker.codex_exec import codex_env, home_identity, isolated_home, managed_codex_config, prepare_home
 from openswap.worker.leases import AccountLeaseError, AccountLeaseStore, ReleaseEvidence
 from openswap.worker.live import (
     LiveModeError,
@@ -47,6 +47,11 @@ _CLI_MESSAGES = {
     "download_failed": "Could not download the Codex release asset.",
     "binary_hash_mismatch": "The installed Codex binary changed since it was verified. Reinstall it.",
     "version_mismatch": "The installed binary does not report codex-cli 0.157.1. Reinstall it.",
+}
+
+_PIN_MESSAGES = {
+    "managed_codex_config": ("A managed or system Codex configuration on this Mac could override where Codex "
+                             "stores sign-ins, so OpenSwap won't sign accounts in or out (remote jobs refuse too)."),
 }
 
 
@@ -95,8 +100,15 @@ def _login_env(home: Path) -> dict[str, str]:
     return env
 
 
+def _refuse_managed(home: Path, managed) -> None:
+    """A managed or system Codex layer could override ``cli_auth_credentials_store``
+    (and so put credentials outside the isolated home): never log in or out then."""
+    if (managed or managed_codex_config)(home):
+        raise AccountPinError("managed_codex_config")
+
+
 def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
-          run=subprocess.run, verify=None) -> dict:
+          run=subprocess.run, verify=None, managed=None) -> dict:
     """Sign one roster account in to its isolated home with Codex's own login."""
     root = Path(backup_root)
     choice = _resolve(root, selector)
@@ -106,6 +118,7 @@ def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
     with account_session_lease(root, identity, "login"):
         # Under the lease: a job running on this account owns its home's config.
         home = prepare_home(root, identity)
+        _refuse_managed(home, managed)
         env = _login_env(home)
         result = run(argv, env=env, check=False)
         signed_in = home_identity(home)
@@ -124,7 +137,7 @@ def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
     return {"slot": choice.number, "account_ref": identity, "signed_in": True}
 
 
-def logout(backup_root: Path, selector: str | None, *, run=subprocess.run, verify=None) -> dict:
+def logout(backup_root: Path, selector: str | None, *, run=subprocess.run, verify=None, managed=None) -> dict:
     root = Path(backup_root)
     choice = _resolve(root, selector)
     identity = choice.account_ref
@@ -132,6 +145,7 @@ def logout(backup_root: Path, selector: str | None, *, run=subprocess.run, verif
     pinned = (verify or (lambda: codex_cli.verify(root)))()
     with account_session_lease(root, identity, "logout"):
         # Under the lease, so a login in progress finishes (or fails) first.
+        _refuse_managed(home, managed)
         if not os.path.lexists(home / "auth.json"):
             return {"slot": choice.number, "account_ref": identity, "signed_in": False}
         result = run([str(pinned.binary), "logout"], env=_login_env(home), check=False)
@@ -234,7 +248,7 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         print(_message(error.code), file=sys.stderr)
         return 1
     except AccountPinError as error:
-        print(f"Refused: {error.code}.", file=sys.stderr)
+        print(_PIN_MESSAGES.get(error.code, f"Refused: {error.code}."), file=sys.stderr)
         return 1
     except LiveModeError as error:
         detail = f" ({', '.join(error.problems)})" if error.problems else ""

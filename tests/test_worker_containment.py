@@ -86,6 +86,8 @@ class FakeProcs:
             raise ProcessLookupError(pid)
         if signum == signal.SIGSTOP:
             self.table[pid][1] = 4
+        elif signum == signal.SIGCONT:
+            self.table[pid][1] = 2
         elif signum in (signal.SIGKILL, signal.SIGTERM) and pid not in self.unkillable:
             del self.table[pid]
 
@@ -877,3 +879,40 @@ def test_polling_exit_status_recreates_the_lock_directory_privately(tmp_path):
     if os.name == "posix":
         assert (containment._lock_dir.stat().st_mode & 0o777) == 0o700
     assert containment.stop(handle).stopped is True  # later operations still work
+
+
+
+def test_a_stop_that_hit_a_recycled_pid_is_undone(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    member = procs.new(JOB_COALITION)
+    original = procs.signal
+
+    def recycle_then_signal(pid, signum):
+        if pid == member and signum == signal.SIGSTOP and procs.table[pid][0] == JOB_COALITION:
+            procs.table[pid] = [333, 2]  # exited; the pid now belongs to someone else
+        original(pid, signum)
+
+    procs.signal = recycle_then_signal
+    containment._stop_member(JOB_COALITION, member)
+    assert procs.table[member] == [333, 2]  # resumed, not left stopped
+    assert (member, signal.SIGCONT) in procs.signals
+
+
+def test_sigkill_only_reaches_stopped_members(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    running = procs.new(JOB_COALITION)
+    assert containment._kill_stopped_member(JOB_COALITION, running) is False
+    assert (running, signal.SIGKILL) not in procs.signals
+    procs.signal(running, signal.SIGSTOP)
+    assert containment._kill_stopped_member(JOB_COALITION, running) is True
+    assert running not in procs.table
+
+
+def test_a_run_directory_with_a_line_break_never_launches(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    with pytest.raises(ContainmentError) as error:
+        containment.launch(job_id="a" * 32, run_dir=root / "bad\nname", argv=["/bin/echo"], env={}, cwd=root,
+                           stdin_text="")
+    assert error.value.code == "run_dir_unsafe" and error.value.launched is False
+    assert launchd.loaded == {}
