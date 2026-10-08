@@ -17,7 +17,7 @@ from openswap.worker.models import SafeEventKind
 from openswap.worker.protocol import (
     Artifact, DEVICE_TTL_SECONDS, HEARTBEAT_SECONDS, LEASE_SECONDS, MAX_ARTIFACTS,
     MISSED_HEARTBEATS, ProtocolError, Submission, TERMINAL, advertised_accounts, event_from_dict,
-    fields, integer, text, stamp as wire_stamp,
+    execution_mode, fields, integer, reported_folders, text, stamp as wire_stamp,
 )
 
 # Jobs whose cancel flag a reconnecting worker must still enforce.
@@ -84,6 +84,8 @@ class ControlStore:
                     PRIMARY KEY(device,account_ref));
                 CREATE TABLE IF NOT EXISTS account_choice_epochs (
                     device TEXT PRIMARY KEY, epoch INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS readiness (
+                    device TEXT PRIMARY KEY, folders TEXT NOT NULL, execution TEXT NOT NULL);
             ''')
             if "confirmed" not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
@@ -123,6 +125,13 @@ class ControlStore:
                               "ORDER BY position", (worker_id,)).fetchall()
         return [{"account_ref": r[0], "label": r[1], "default": bool(r[2])} for r in rows]
 
+    def readiness(self, worker_id: str) -> dict | None:
+        """The worker's readiness report (folders in sent order and execution mode), or None
+        when its current registration has not reported (for the operator and tests)."""
+        with closing(self.connect()) as db:
+            row = db.execute("SELECT folders,execution FROM readiness WHERE device=?", (worker_id,)).fetchone()
+        return None if row is None else {"folders": json.loads(row[0]), "execution": row[1]}
+
     def revoke(self, worker_id: str) -> None:
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
@@ -130,6 +139,7 @@ class ControlStore:
                 raise ProtocolError("not_found", 404)
             db.execute("DELETE FROM advertised_accounts WHERE device=?", (worker_id,))
             db.execute("DELETE FROM account_choice_epochs WHERE device=?", (worker_id,))
+            db.execute("DELETE FROM readiness WHERE device=?", (worker_id,))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state NOT IN "
                        "('queued','succeeded','failed','cancelled','interrupted','expired')", (worker_id,))
 
@@ -234,6 +244,8 @@ class ControlStore:
             # A new registration starts with no advertised accounts; the worker resends them.
             db.execute("DELETE FROM advertised_accounts WHERE device=?", (device["id"],))
             db.execute("DELETE FROM account_choice_epochs WHERE device=?", (device["id"],))
+            # ...and has not reported its folders or execution mode either.
+            db.execute("DELETE FROM readiness WHERE device=?", (device["id"],))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state IN "
                        "('claimed','starting','running','cancel_requested')", (device["id"],))
             return {"worker_id": device["id"], "worker_epoch": epoch,
@@ -280,6 +292,15 @@ class ControlStore:
                            [(device["id"], e.account_ref, e.label, int(e.default), i) for i, e in enumerate(entries)])
             db.execute("INSERT OR REPLACE INTO account_choice_epochs VALUES (?,?)", (device["id"], device["epoch"]))
             return {"account_count": len(entries)}
+        if op == "readiness":
+            # Optional readiness report extension: atomically replace the report.
+            data = fields(value, {"worker_epoch", "folders", "execution"})
+            self._epoch(data, device)
+            folders = reported_folders(data["folders"])
+            mode = execution_mode(data["execution"])
+            db.execute("INSERT OR REPLACE INTO readiness VALUES (?,?,?)",
+                       (device["id"], json.dumps([f.to_dict() for f in folders]), mode))
+            return {"folder_count": len(folders)}
         if op == "submit":
             submission = Submission.from_dict(value, allow_account_ref=True)
             if submission.worker_id != device["id"]:
