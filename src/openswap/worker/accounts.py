@@ -235,6 +235,10 @@ def resolve_codex_selector(backup_root: Path, selector: str) -> CodexAccountChoi
         raise AccountPinError("account_not_found") from None
     except ConfigError:
         raise AccountPinError("account_ambiguous") from None
+    except (AttributeError, KeyError, TypeError, ValueError, OSError):
+        # The engine reads raw roster records; a malformed one (say, a
+        # non-object entry) is an unreadable roster, never a traceback.
+        raise AccountPinError("roster_unavailable") from None
     match = next((c for c in accounts if c.number == str(number)), None)
     if match is None:
         raise AccountPinError("account_not_found")

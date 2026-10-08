@@ -162,6 +162,19 @@ def test_account_refusals_never_change_the_pin(root, capsys, selector, code):
     assert load_worker_settings(root).pinned_account_ref == ALICE
 
 
+@pytest.mark.parametrize("selector", ["alice@example.com", "work"])
+def test_a_malformed_roster_record_refuses_cleanly(root, capsys, selector):
+    """Email and alias lookups read every roster record: one non-object record
+    gives a clean refusal, never a traceback, and the pin is unchanged."""
+    roster = json.loads((root / "codex" / "sequence.json").read_text(encoding="utf-8"))
+    roster["accounts"]["7"] = "not an object"
+    (root / "codex" / "sequence.json").write_text(json.dumps(roster), encoding="utf-8")
+    before = load_worker_settings(root).pinned_account_ref
+    assert _run(root, "account", selector, "--json") == 1
+    assert json.loads(capsys.readouterr().out)["diagnostic_code"] == "roster_unavailable"
+    assert load_worker_settings(root).pinned_account_ref == before
+
+
 def test_a_claude_account_can_never_be_pinned_even_by_reference(root):
     claude_ref = stable_account_identity("claude", "carol@example.com", "")
     with pytest.raises(AccountPinError) as refused:
