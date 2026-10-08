@@ -570,7 +570,9 @@ a worker start or a pin change waits instead of reopening admission mid-check. T
 under the worker directory's `live-evidence/`) holds pass/fail booleans and
 counts only, never model output or secrets; each job's folder (with its
 `result.md`) stays under the backup root's `live-check/<UTC time>/` for
-inspection. Only when every gate passes does
+inspection. The network probes need `http://example.com/` and
+`http://1.1.1.1/` reachable from this Mac outside the sandbox (plain HTTP, so
+the result does not depend on certificates). Only when every gate passes does
 it offer to enable live execution (`--enable` does so without asking,
 `--no-enable` never). It uses some of the account's quota.
 

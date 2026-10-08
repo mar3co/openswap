@@ -163,6 +163,8 @@ class ProcessTable(Protocol):
 
     def zombie_identity(self, pid: int) -> str | None: ...
 
+    def start_time(self, pid: int) -> float | None: ...
+
 
 class DarwinProcessTable:
     """libproc-backed process table; same-user queries need no privilege."""
@@ -244,6 +246,19 @@ class DarwinProcessTable:
 
     _KINFO_PROC_SIZE = 648  # struct kinfo_proc on 64-bit macOS
 
+    def _kinfo(self, pid: int) -> tuple[int, int, int] | None:
+        """``(p_stat, start sec, start usec)`` from ``sysctl kern.proc.pid``, or None."""
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+        size = ctypes.c_size_t(self._KINFO_PROC_SIZE)
+        buf = ctypes.create_string_buffer(self._KINFO_PROC_SIZE)
+        if self._libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value < 48:
+            return None
+        start_sec, start_usec = struct.unpack_from("<qi", buf.raw, 0)  # p_starttime
+        listed_pid = struct.unpack_from("<i", buf.raw, 40)[0]  # p_pid
+        if listed_pid != pid:
+            return None
+        return buf.raw[36], start_sec, start_usec  # p_stat
+
     def zombie_identity(self, pid: int) -> str | None:
         """``"<start sec>.<usec>"`` if ``pid`` is a zombie right now, else None.
 
@@ -251,17 +266,15 @@ class DarwinProcessTable:
         pid), but ``sysctl kern.proc.pid`` still returns its ``kinfo_proc``,
         whose start time binds the pid to one process across scans.
         """
-        mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
-        size = ctypes.c_size_t(self._KINFO_PROC_SIZE)
-        buf = ctypes.create_string_buffer(self._KINFO_PROC_SIZE)
-        if self._libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value < 48:
+        info = self._kinfo(pid)
+        if info is None or info[0] != _SZOMB:
             return None
-        start_sec, start_usec = struct.unpack_from("<qi", buf.raw, 0)  # p_starttime
-        stat = buf.raw[36]  # p_stat
-        listed_pid = struct.unpack_from("<i", buf.raw, 40)[0]  # p_pid
-        if stat != _SZOMB or listed_pid != pid:
-            return None
-        return f"{start_sec}.{start_usec:06d}"
+        return f"{info[1]}.{info[2]:06d}"
+
+    def start_time(self, pid: int) -> float | None:
+        """When the process now holding ``pid`` started (wall-clock seconds), or None."""
+        info = self._kinfo(pid)
+        return None if info is None else info[1] + info[2] / 1_000_000
 
     def boot_session(self) -> str | None:
         size = ctypes.c_size_t(128)
@@ -507,6 +520,7 @@ class LaunchdContainment:
         monotonic: Callable[[], float] = time.monotonic,
         self_pid: int | None = None,
         lock_dir: Path | None = None,
+        wall: Callable[[], float] = time.time,
     ):
         self._lock_dir = Path(lock_dir) if lock_dir is not None else default_lock_dir()
         self.domain = f"gui/{os.getuid() if uid is None else uid}"
@@ -514,6 +528,7 @@ class LaunchdContainment:
         self._launchctl = launchctl or _default_launchctl
         self._sleep = sleep
         self._monotonic = monotonic
+        self._wall = wall  # comparable with process start times
         self._self_pid = os.getpid() if self_pid is None else self_pid
 
     @property
@@ -951,6 +966,7 @@ class LaunchdContainment:
         """
         procs = self.procs
         kinds: dict[int, str] = {}
+        listed_at = self._wall()
         for pid in procs.pids():
             if pid == self._self_pid or pid <= 1:
                 continue
@@ -964,7 +980,12 @@ class LaunchdContainment:
                 else:
                     kinds[pid] = "gone" if procs.is_dead(pid) else "unknown"
             elif coalition != coalition_id:
-                kinds[pid] = "other"
+                # The listed process may have been a member that forked and
+                # exited, its pid since reused: a process started after the
+                # listing began is not the one listed, so this pid proves
+                # nothing (like a pid gone by its query).
+                started = procs.start_time(pid)
+                kinds[pid] = "gone" if started is None or started >= listed_at else "other"
             else:
                 status = procs.status_of(pid)
                 if status == _SZOMB:

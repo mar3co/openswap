@@ -1054,3 +1054,22 @@ def test_a_curl_failure_that_is_not_the_network_proves_nothing(tmp_path, code):
     mac.curl_request_code = code  # TLS, CA store, write error, other
     gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
     assert gate["shell_network_denied"] is False and gate["passed"] is False
+
+
+
+def test_a_blocked_resolver_alone_does_not_prove_socket_egress_is_denied(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    original = mac._simulate
+
+    def dns_only(command, cwd):
+        if command.endswith("http://1.1.1.1/"):
+            return "<html>301 Moved</html>", 0  # numeric addresses still connect
+        if command.endswith("http://example.com/"):
+            return "curl: (6) Could not resolve host: example.com", 6
+        return original(command, cwd)
+
+    mac._simulate = dns_only
+    gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
+    assert gate["shell_network_denied"] is True  # the name probe alone would pass...
+    assert gate["shell_socket_egress_denied"] is False and gate["passed"] is False  # ...this does not

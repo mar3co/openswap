@@ -192,6 +192,9 @@ def workspace(root, *sources):
 
 
 def make_adapter(root, launcher, *, mode="live", live_sessions=False, home=None):
+    if mode == "live":
+        # The owner's Claude opt-in, bound to the pinned binary.
+        write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now"), "claude")
     return ClaudeCodeAdapter(
         root, containment=launcher, verify=lambda **kw: pinned(), mode=lambda: mode, sleep=lambda s: None,
         managed=lambda p: [], live_sessions=lambda p: live_sessions, home=home or root.parent / "home",
