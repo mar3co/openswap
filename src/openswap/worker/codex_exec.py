@@ -500,6 +500,10 @@ class CodexExecAdapter:
             raise self._cli_errors[0]("binary_not_the_checked_one")
         return pinned
 
+    def _grant_allowed(self, path: Path) -> bool:
+        """Whether the job may be granted ``path`` (output folder or read-only source)."""
+        return granted_root_allowed(self.backup_root, path)
+
     def probe(self) -> ProviderAvailability:
         if self._mode() != LIVE:
             return ProviderAvailability(False, "live_adapter_disabled", None)
@@ -553,7 +557,7 @@ class CodexExecAdapter:
         home = self._prepare_account(identity, workspace)
         output_root = Path(workspace.output_root)
         granted = [output_root.resolve(), *(Path(p).resolve() for p in workspace.readonly_sources)]
-        if any(not granted_root_allowed(self.backup_root, path) for path in granted):
+        if any(not self._grant_allowed(path) for path in granted):
             # The model would reach CODEX_HOME, run directories, leases or the
             # journal through this root.
             raise ProviderLaunchRefused("provider_unavailable")

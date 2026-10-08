@@ -738,3 +738,25 @@ def test_the_claude_default_login_snapshot_never_opens_the_credentials(tmp_path,
     monkeypatch.setattr(Path, "read_bytes", lambda self: (_ for _ in ()).throw(AssertionError(f"read {self}")))
     state, fingerprint = check._default_login_snapshot()
     assert state == "present" and "secret" not in fingerprint and str(creds) not in opened
+
+
+
+@pytest.mark.parametrize("where", ["claude", "codex", "sessions", "home"])
+def test_claude_never_grants_a_hidden_folder(tmp_path, where):
+    root = setup_root(tmp_path)
+    home = root.parent / "home"
+    target = {"claude": home / ".claude", "codex": home / ".codex",
+              "sessions": root / "sessions", "home": home}[where]
+    target.mkdir(parents=True, exist_ok=True)
+    launcher = FakeLaunch(SUCCESS)
+    with pytest.raises(ProviderLaunchRefused) as error:
+        make_adapter(root, launcher, home=home).start(job_record(), workspace(root, target), worker_epoch=1)
+    assert error.value.diagnostic_code == "provider_unavailable" and launcher.launches == []
+
+
+def test_the_built_in_research_area_stays_grantable(tmp_path):
+    root = setup_root(tmp_path)
+    adapter = make_adapter(root, FakeLaunch(SUCCESS), home=root.parent / "home")
+    assert adapter._grant_allowed(root / "worker" / "research" / "x") is True
+    assert adapter._grant_allowed(root / "live-check" / "t" / "sandbox") is True
+    assert adapter._grant_allowed(root / "sessions" / "4-carol") is False
