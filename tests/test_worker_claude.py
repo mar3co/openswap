@@ -1055,3 +1055,27 @@ def test_a_claude_pin_made_during_an_unpinned_probe_is_replanned_not_failed(tmp_
     # in this test), instead of failing on the unprobed provider.
     assert claude.started == [IDENTITY] and codex.started == []
     assert final.pinned_account_ref == IDENTITY
+
+
+
+def test_every_path_takes_provider_locks_in_one_order(tmp_path, monkeypatch):
+    from openswap.worker import leases as leases_module
+
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    taken = []
+    real = leases_module.AccountLeaseStore.mutation_guard
+
+    def recording(self, *args, **kwargs):
+        taken.append(self.provider)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(leases_module.AccountLeaseStore, "mutation_guard", recording)
+    with ProviderLeases(root).mutation_guard():
+        pass
+    assert taken == list(leases_module.PROVIDER_LOCK_ORDER) == ["codex", "claude"]
+    stores = [AccountLeaseStore(root, "claude"), AccountLeaseStore(root, "codex")]
+    stores.sort(key=leases_module.provider_lock_rank)  # what the purge does
+    assert [store.provider for store in stores] == ["codex", "claude"]
+    # Sorting by lock path (the old purge order) would have put Claude first.
+    assert sorted(str(store.provider_lock) for store in stores)[0].endswith(f"{root.name}/.lock")
