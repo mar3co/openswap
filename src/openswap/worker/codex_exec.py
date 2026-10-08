@@ -266,9 +266,13 @@ def global_args() -> list[str]:
 
 
 def codex_argv(binary: Path, output_root: Path, run_dir: Path) -> list[str]:
-    """Fixed launcher arguments; nothing comes from the remote caller."""
+    """Fixed launcher arguments; nothing comes from the remote caller.
+
+    ``--ignore-rules`` keeps exec-policy ``.rules`` files (in the isolated
+    home or the job folder) from changing what the research policy allows.
+    """
     return [
-        str(binary), *global_args(), "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+        str(binary), *global_args(), "exec", "--json", "--ephemeral", "--skip-git-repo-check", "--ignore-rules",
         "--cd", str(output_root), "--output-last-message", str(run_dir / LAST_MESSAGE_FILE), "-",
     ]
 
