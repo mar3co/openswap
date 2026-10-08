@@ -537,10 +537,23 @@ one; is `~/Library` or a hidden folder in the home folder (or inside one);
 is, contains or sits inside the OpenSwap backup root, Codex home or Claude
 config home; or overlaps `~/OpenSwap Research`. Like every read-only source it
 must be a real directory owned by the owner and not writable by group or
-others; the worker repeats those checks at launch. `openswap worker workspace
-add --read <folder> [--label TEXT]` makes the same workspace from the command
-line and prints (or, with `--json`, returns) it; a folder that a workspace
-already reads is left as it is.
+others. A folder tasks read may not overlap any workspace's results folder,
+and a results folder may not overlap any folder tasks read, so no job ever
+writes where another only reads. The same policy applies to every
+`--readonly-source` of `workspace add <id> <folder>`, and the worker repeats
+it at launch, so a source saved earlier (or edited into settings) that breaks
+it never reaches the sandbox. `openswap worker workspace add --read <folder>
+[--label TEXT]` makes the same workspace from the command line and prints
+(or, with `--json`, returns) it; a folder that a workspace already reads is
+left as it is.
+
+Paths are compared by their on-disk spelling and by filesystem identity
+(device and inode along the ancestors), never by the typed string: on a
+case-insensitive volume (APFS by default) `~/library` is `~/Library`, and a
+firmlink or other alias is the folder it names. Settings store the on-disk
+spelling. The same comparison guards what the Codex and Claude sandboxes may
+be granted at launch (the private worker directory, the default Claude and
+Codex homes and the backup root).
 
 ### Choosing the account and research folders
 

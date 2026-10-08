@@ -578,6 +578,7 @@ def test_several_numbers_make_one_workspace_each(root, monkeypatch, capsys, enab
     ("0", None), ("5", None), ("", None), ("1 x", "1 x"),
     ("²", "²"),  # not an ASCII number: read as a path, never int()
     ("~/My Code", "~/My Code"), ("/a/My\\ Code", "/a/My Code"), ("'/a/b c'", "/a/b c"), ("Bob's", "Bob's"),
+    ("'/x/Bob'\\''s'", "/x/Bob's"), ('"/x/a b"', "/x/a b"),
 ])
 def test_parse_folder_choice(answer, expected):
     if os.name == "nt" and "\\" in answer:
@@ -685,6 +686,119 @@ def test_a_readable_folder_never_overlaps_its_results(root, research_home):
     workspace = cli.add_readable_folder(root, _code(research_home.parent, "GitHub")).workspace
     (source,) = workspace.readonly_roots
     assert not workspace.output_root.is_relative_to(source) and not source.is_relative_to(workspace.output_root)
+
+
+def test_a_doubled_slash_after_the_tilde_stays_in_home(root, research_home):
+    code = _code(research_home.parent, "Code")
+    assert cli.add_readable_folder(root, "~//Code").workspace.readonly_roots == (code.resolve(),)
+
+
+# --- one folder, two names --------------------------------------------------------------------
+
+
+@pytest.fixture
+def case_insensitive(tmp_path):
+    from tests.test_pathid import case_insensitive as probe
+
+    if not probe(tmp_path):
+        pytest.skip("the temp filesystem is case-sensitive")
+
+
+def test_case_variants_never_dodge_a_refusal(root, research_home, case_insensitive):
+    home = research_home.parent
+    _code(home, "Library/Application Support", "GitHub")
+    research_home.mkdir()
+    assert _refusal(root, home / "library") == "readable_private"
+    assert _refusal(root, home / "LIBRARY" / "Application Support") == "readable_private"
+    assert _refusal(root, home.parent / "HOME") == "readable_home"
+    assert _refusal(root, home / "openswap research") == "readable_results"
+    assert _refusal(root, root.parent / "BACKUP") == "readable_exposes_credentials"
+    assert _builtin(root)
+    # The same folder in another case is the same workspace, not `github-2`.
+    first = cli.add_readable_folder(root, home / "GitHub")
+    again = cli.add_readable_folder(root, home / "github")
+    assert again.added is False and again.workspace == first.workspace
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github"]
+
+
+def test_a_case_variant_is_stored_as_spelled_on_disk(root, research_home, case_insensitive):
+    github = _code(research_home.parent, "GitHub")
+    workspace = cli.add_readable_folder(root, research_home.parent / "GITHUB").workspace
+    assert workspace.readonly_roots == (github.resolve(),) and workspace.display_label == "GitHub"
+    assert workspace.workspace_id == "github"
+
+
+def test_a_credential_home_in_another_case_is_refused(root, research_home, monkeypatch, case_insensitive):
+    from openswap.codex import auth
+
+    work = _code(research_home.parent, "Work/.codex")
+    monkeypatch.setattr(auth, "codex_home", lambda: work)
+    assert _refusal(root, research_home.parent / "WORK") == "readable_exposes_credentials"
+
+
+def test_launch_refuses_a_stored_source_the_policy_forbids(root, research_home):
+    """A source saved before the policy (or edited into settings) never reaches the sandbox."""
+    from openswap.settings import configure_worker_local_policy
+    from openswap.worker.runtime import WorkerRuntime as Runtime
+
+    library = _code(research_home.parent, "Library/Code")
+    out = research_home / "lib"
+    configure_worker_local_policy(root, pinned_account_ref=None,
+                                  workspaces=(WorkerWorkspace("lib", out, (library,)),))
+    with pytest.raises(ValueError, match="not allowed"):
+        Runtime(root, adapter=FakeAdapter())._resolve_workspace("lib", "a" * 32)
+
+
+def test_launch_refuses_a_case_variant_source(root, research_home, case_insensitive):
+    from openswap.settings import configure_worker_local_policy
+    from openswap.worker.runtime import WorkerRuntime as Runtime
+
+    _code(research_home.parent, "Library/Code")
+    configure_worker_local_policy(
+        root, pinned_account_ref=None,
+        workspaces=(WorkerWorkspace("lib", research_home / "lib", (research_home.parent / "LIBRARY",)),))
+    with pytest.raises(ValueError, match="not allowed"):
+        Runtime(root, adapter=FakeAdapter())._resolve_workspace("lib", "a" * 32)
+
+
+# --- reading and writing never meet across workspaces -----------------------------------------
+
+
+def test_a_folder_holding_another_workspaces_results_is_refused(root, research_home, tmp_path):
+    home = research_home.parent
+    docs = _code(home, "Documents")
+    cli.add_worker_workspace(root, "notes", docs / "Research")
+    assert _refusal(root, docs) == "readonly_source_overlaps_results"
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["research", "notes"]
+
+
+def test_results_inside_a_readable_folder_are_refused(root, research_home):
+    github = _code(research_home.parent, "GitHub")
+    cli.add_readable_folder(root, github)
+    with pytest.raises(cli.WorkspaceError) as refused:
+        cli.add_worker_workspace(root, "out", github / "out")
+    assert refused.value.code == "folder_overlaps_readable"
+    with pytest.raises(cli.WorkspaceError) as refused:
+        cli.add_worker_workspace(root, "up", research_home.parent)
+    assert refused.value.code in {"folder_exposes_credentials", "folder_overlaps_readable"}
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github"]
+    for code in ("readonly_source_overlaps_results", "folder_overlaps_readable"):
+        assert code in cli._WORKSPACE_MESSAGES
+
+
+def test_a_positional_read_only_source_follows_the_folder_policy(root, research_home, tmp_path, capsys):
+    home = research_home.parent
+    ssh = _code(home, ".ssh")
+    library = _code(home, "Library/Mail")
+    out = tmp_path / "out"
+    for source, code in ((ssh, "readable_private"), (library, "readable_private"),
+                         (home, "readable_home"),
+                         (root, "readonly_source_exposes_credentials")):
+        assert _run(root, "workspace", "add", "x", str(out), "--readonly-source", str(source), "--json") == 1
+        assert json.loads(capsys.readouterr().out)["diagnostic_code"] == code
+    assert _builtin(root)
+    code = _code(home, "GitHub")
+    assert _run(root, "workspace", "add", "x", str(out), "--readonly-source", str(code)) == 0
 
 
 # --- `workspace add --read` -------------------------------------------------------------------

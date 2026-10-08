@@ -1566,6 +1566,15 @@ class WorkerRuntime:
                 raise ValueError("approved read-only source is not locally owned")
             if problem == "permissions":
                 raise ValueError("approved read-only source permissions are unsafe")
+            # The folder policy `workspace add` applies, again at launch: a
+            # source saved before it (or edited into settings, or a case
+            # variant on a case-insensitive volume) never reaches the sandbox
+            # if it is the home folder, a system or private folder, a
+            # credential home or the results folder.
+            from openswap.worker.cli import readable_folder_problem
+
+            if readable_folder_problem(self.backup_root, source) is not None:
+                raise ValueError("approved read-only source is not allowed")
         return ResolvedWorkspace(
             workspace_id=workspace_id, output_root=output_root,
             readonly_sources=workspace.readonly_roots,

@@ -1434,3 +1434,14 @@ already keep their code in a repo or a GitHub folder.
   ID and label; the readiness report is still IDs and labels only, so
   OpenTag's Slack folder hints follow the new IDs without a protocol or
   OpenTag change.
+
+Review fixes (same PR): every folder comparison in the workspace policy,
+the settings disjointness check and the Codex/Claude launch-time grant checks
+now goes through `openswap.pathid`, which compares the on-disk spelling
+(`F_GETPATH` on macOS) and filesystem identity along the ancestors. Before
+this, a case variant on APFS (`~/library`, `~/LIBRARY/Application Support`,
+the home folder in capitals) passed every refusal, and Seatbelt honours such
+a grant. Settings store the on-disk spelling. Read-only sources may not
+overlap another workspace's results folder (and results may not overlap a
+readable folder); `--readonly-source` follows the readable-folder policy; and
+the worker applies that policy again at launch.

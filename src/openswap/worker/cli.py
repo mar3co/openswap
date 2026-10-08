@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from openswap import paths, printer
+from openswap import paths, pathid, printer
 from openswap.exceptions import ClaudeSwitchError, LockError
 from openswap.locking import FileLock
 from openswap.paths import get_backup_root
@@ -401,9 +401,21 @@ def _protected_dirs(root: Path) -> list[Path]:
     out = []
     for path in (root, codex_home(), get_claude_config_home()):
         try:
-            out.append(Path(path).expanduser().resolve())
+            out.append(pathid.canonical(Path(path).expanduser()))
         except (OSError, RuntimeError):
             continue
+    return out
+
+
+def _homes() -> list[Path]:
+    out = []
+    for home in (Path.home(), home_folder()):
+        try:
+            home = pathid.canonical(Path(home).expanduser())
+        except (OSError, RuntimeError):
+            continue
+        if home not in out:
+            out.append(home)
     return out
 
 
@@ -413,25 +425,24 @@ def _overlaps_credentials(root: Path, folder: Path, *, writable: bool) -> bool:
     No approved folder may be the home directory, or contain the backup root,
     Codex home or Claude config home. A read-only source may not sit inside
     one either. A writable root may sit inside the backup root's ``worker``
-    directory only (where the default ``research`` workspace lives).
+    directory only (where the default ``research`` workspace lives). Paths
+    are compared by on-disk spelling and identity (``pathid``), so a case
+    variant on a case-insensitive volume is the same folder.
     """
     protected = _protected_dirs(root)
-    try:
-        home = Path.home().resolve()
-    except (OSError, RuntimeError):
-        home = None
-    for path in [*protected, *([home] if home else [])]:
-        if path == folder or path.is_relative_to(folder):
+    for path in [*protected, *_homes()]:
+        if pathid.inside(path, folder):
             return True
     try:
-        backup = Path(root).expanduser().resolve()
+        backup = pathid.canonical(Path(root).expanduser())
     except (OSError, RuntimeError):
         backup = None
     for path in protected:
-        if folder.is_relative_to(path):
+        if pathid.inside(folder, path):
             # Only the backup root itself has the `worker` exception: a Codex or
             # Claude home configured beneath that directory stays off limits.
-            if writable and backup is not None and path == backup and folder.is_relative_to(backup / "worker"):
+            if (writable and backup is not None and pathid.same(path, backup)
+                    and pathid.inside(folder, backup / "worker")):
                 continue
             return True
     return False
@@ -512,13 +523,13 @@ def suggested_folder_id(folder: Path, taken: set[str]) -> str:
 
 def _resolved(path: Path) -> Path | None:
     try:
-        return Path(path).expanduser().resolve()
+        return pathid.canonical(Path(path).expanduser())
     except (OSError, RuntimeError):
         return None
 
 
 def readable_folder_problem(backup_root: Path, folder: Path) -> str | None:
-    """Why remote tasks may not read ``folder`` (absolute, resolved), or ``None``.
+    """Why remote tasks may not read ``folder`` (absolute), or ``None``.
 
     ``system`` (a system folder, or one containing them), ``home`` (the home
     folder or a folder containing it), ``private`` (``~/Library`` or a hidden
@@ -527,25 +538,33 @@ def readable_folder_problem(backup_root: Path, folder: Path) -> str | None:
     ``~/OpenSwap Research``, where results are written), then the read-only
     source checks the worker repeats at launch: ``unavailable``, ``unsafe``,
     ``not_owned`` or ``permissions``.
+
+    Every comparison goes through ``pathid`` (on-disk spelling and identity),
+    so ``~/library`` on a case-insensitive volume is ``~/Library``.
     """
-    folder = Path(folder)
-    if (any(folder == top or top.is_relative_to(folder) for top in _SYSTEM_TOPS)
-            or any(folder.is_relative_to(tree) for tree in _SYSTEM_TREES)):
+    folder = pathid.canonical(folder)
+    if (any(pathid.inside(top, folder) for top in _SYSTEM_TOPS)
+            or any(pathid.inside(folder, tree) for tree in _SYSTEM_TREES)):
         return "system"
-    home = _resolved(home_folder())
-    if home is not None:
-        if home.is_relative_to(folder):
+    for home in _homes():
+        if pathid.inside(home, folder):
             return "home"
-        if folder.is_relative_to(home):
-            first = folder.relative_to(home).parts[0]
-            if first == "Library" or first.startswith("."):
-                return "private"
+        first = pathid.top_component(folder, home)
+        if first is not None and (first.casefold() == "library" or first.startswith(".")):
+            return "private"
     if _overlaps_credentials(backup_root, folder, writable=False):
         return "exposes_credentials"
     results = _resolved(default_research_folder())
-    if results is not None and (folder.is_relative_to(results) or results.is_relative_to(folder)):
+    if results is not None and pathid.overlap(folder, results):
         return "results"
     return readonly_source_problem(folder)
+
+
+def _source_problem_code(problem: str) -> str:
+    """The workspace error code for a read-only source refused by ``readable_folder_problem``."""
+    if problem in {"unavailable", "unsafe", "not_owned", "permissions", "exposes_credentials"}:
+        return f"readonly_source_{problem}"
+    return f"readable_{problem}"
 
 
 def is_github_folder(folder: Path) -> bool:
@@ -592,7 +611,9 @@ def detect_code_folders(backup_root: Path) -> list[Path]:
             resolved = candidate.resolve(strict=True)
         except (OSError, RuntimeError):
             continue
-        if resolved not in found and readable_folder_problem(backup_root, resolved) is None:
+        resolved = pathid.canonical(resolved)
+        if (not any(pathid.same(resolved, other) for other in found)
+                and readable_folder_problem(backup_root, resolved) is None):
             found.append(resolved)
     found.sort(key=lambda folder: not is_github_folder(folder))  # stable: GitHub first
     out: list[Path] = []
@@ -601,7 +622,8 @@ def detect_code_folders(backup_root: Path) -> list[Path]:
             out.append(parent)
         for repo in _few_git_repos(parent):
             repo = _resolved(repo)
-            if repo is not None and repo not in out and readable_folder_problem(backup_root, repo) is None:
+            if (repo is not None and not any(pathid.same(repo, other) for other in out)
+                    and readable_folder_problem(backup_root, repo) is None):
                 out.append(repo)
     return out[:MAX_SUGGESTED_FOLDERS]
 
@@ -659,8 +681,8 @@ def _approve_locked(root: Path, kept, workspace_id: str, output: Path, sources, 
         raise WorkspaceError("too_many_workspaces")
     try:
         output.mkdir(mode=0o700, parents=True, exist_ok=True)
-        output = output.resolve()
-        sources = tuple(source.resolve() for source in sources)
+        output = pathid.canonical(output)
+        sources = tuple(pathid.canonical(source) for source in sources)
     except (OSError, RuntimeError):
         raise WorkspaceError("folder_unavailable") from None
     if _overlaps_credentials(root, output, writable=True):
@@ -669,11 +691,20 @@ def _approve_locked(root: Path, kept, workspace_id: str, output: Path, sources, 
     if problem is not None:
         raise WorkspaceError(f"folder_{problem}")
     for source in sources:
-        if _overlaps_credentials(root, source, writable=False):
-            raise WorkspaceError("readonly_source_exposes_credentials")
-        problem = readonly_source_problem(source)
+        # The same policy as a folder chosen in the guided setup: never the
+        # home folder, a system folder, ~/Library, a hidden folder or a
+        # credential home.
+        problem = readable_folder_problem(root, source)
         if problem is not None:
-            raise WorkspaceError(f"readonly_source_{problem}")
+            raise WorkspaceError(_source_problem_code(problem))
+        if pathid.overlap(source, output):
+            raise WorkspaceError("readonly_source_overlaps_folder")
+    # Across workspaces too: no job may write where another one only reads.
+    for other in kept:
+        if any(pathid.overlap(source, other.output_root) for source in sources):
+            raise WorkspaceError("readonly_source_overlaps_results")
+        if any(pathid.overlap(output, source) for source in other.readonly_roots):
+            raise WorkspaceError("folder_overlaps_readable")
     workspace = WorkerWorkspace(workspace_id, output, sources, label)
     try:
         set_worker_workspaces(root, (*kept, workspace))
@@ -696,8 +727,9 @@ class ReadableFolder:
 
 
 def readable_workspace(workspaces, folder: Path) -> WorkerWorkspace | None:
-    """The approved workspace whose only read-only source is ``folder``, if any."""
-    return next((w for w in workspaces if tuple(w.readonly_roots) == (Path(folder),)), None)
+    """The approved workspace whose only read-only source is ``folder`` (by identity), if any."""
+    return next((w for w in workspaces
+                 if len(w.readonly_roots) == 1 and pathid.same(w.readonly_roots[0], folder)), None)
 
 
 def add_readable_folder(backup_root: Path, folder: str | Path, *, label: str | None = None) -> ReadableFolder:
@@ -713,9 +745,9 @@ def add_readable_folder(backup_root: Path, folder: str | Path, *, label: str | N
     root = Path(backup_root)
     text = str(folder)
     if text == "~" or text.startswith("~/"):
-        folder = home_folder() / text[2:]
+        folder = home_folder() / text[2:].lstrip("/")
     try:
-        source = _absolute_folder(folder).resolve(strict=True)
+        source = pathid.canonical(_absolute_folder(folder).resolve(strict=True))
     except (OSError, RuntimeError):
         raise WorkspaceError("readable_unavailable") from None
     problem = readable_folder_problem(root, source)
@@ -1603,6 +1635,13 @@ _WORKSPACE_MESSAGES = {
     "readable_unavailable": "That folder does not exist or cannot be read.",
     "readable_unsafe": "That is not a folder.",
     "readable_not_owned": "Tasks can read only folders you own.",
+    "readonly_source_overlaps_results": (
+        "That folder overlaps another workspace's results folder, where tasks write. "
+        "Choose a folder that holds no task results."
+    ),
+    "folder_overlaps_readable": (
+        "That folder overlaps a folder tasks may only read. Choose a results folder outside it."
+    ),
     "readable_permissions": (
         "Other users can change that folder, so it could change while a task reads it. "
         "Run `chmod go-w` on it, then try again."

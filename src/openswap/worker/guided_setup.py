@@ -371,17 +371,19 @@ def parse_folder_choice(answer: str, count: int) -> list[int] | str | None:
             if number - 1 not in picks:
                 picks.append(number - 1)
         return picks
-    if len(text) > 1 and text[0] == text[-1] and text[0] in "'\"":
-        return text[1:-1]
-    # Terminal escapes a dropped path's spaces with backslashes; on Windows a
-    # backslash is the path separator.
-    if "\\" in text and os.name != "nt":
+    # A path dragged into Terminal comes shell-quoted or backslash-escaped
+    # ('/x/Bob'\''s', /x/My\ Code): when it is one shell word, that word is
+    # the path. On Windows a backslash is the path separator, so only plain
+    # surrounding quotes are removed there.
+    if os.name != "nt" and any(c in text for c in "'\"\\"):
         try:
             words = shlex.split(text)
         except ValueError:
             words = []
         if len(words) == 1:
             return words[0]
+    if len(text) > 1 and text[0] == text[-1] and text[0] in "'\"":
+        return text[1:-1]
     return text
 
 
