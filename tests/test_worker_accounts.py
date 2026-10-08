@@ -333,6 +333,40 @@ def test_workspace_remove_unknown_and_lock(root, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["diagnostic_code"] == "worker_lifecycle_busy"
 
 
+def test_workspace_removal_waits_for_jobs_that_still_need_the_folder(root, tmp_path, capsys):
+    """Artifact upload reads the job's folder from the registry, so a workspace
+    a queued, running or not-yet-synchronized job uses cannot be removed."""
+    import sqlite3
+
+    from openswap.worker.journal import LocalJobStore
+
+    assert _run(root, "workspace", "add", "alt", str(tmp_path / "alt")) == 0
+    store = LocalJobStore(root)
+    epoch = store.current_epoch()
+    job = store.create(_submission(), owner_ref="local-user", worker_epoch=epoch)
+    assert job.workspace_id == "research"
+    capsys.readouterr()
+    assert _run(root, "workspace", "remove", "research", "--json") == 1
+    assert json.loads(capsys.readouterr().out)["diagnostic_code"] == "workspace_in_use"
+
+    store.transition(job.job_id, expected_states=(JobState.QUEUED,), new_state=JobState.CANCELLED,
+                     worker_epoch=epoch, expected_generation=job.generation)
+    remote = store.state_dir / "remote.sqlite3"
+    db = sqlite3.connect(remote)
+    db.execute("CREATE TABLE bindings (service TEXT, remote_id TEXT, claim TEXT NOT NULL, local_id TEXT, "
+               "cursor INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(service,remote_id))")
+    db.execute("INSERT INTO bindings(service,remote_id,claim,local_id) VALUES ('s','r','{}',?)", (job.job_id,))
+    db.commit()
+    assert _run(root, "workspace", "remove", "research", "--json") == 1
+    assert json.loads(capsys.readouterr().out)["diagnostic_code"] == "workspace_in_use"
+
+    db.execute("UPDATE bindings SET done=1")
+    db.commit()
+    db.close()
+    assert _run(root, "workspace", "remove", "research", "--json") == 0
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["alt"]
+
+
 def test_workspace_changes_keep_the_pin(root, tmp_path):
     cli.set_worker_account(root, "1")
     cli.add_worker_workspace(root, "tag-research", tmp_path / "a")

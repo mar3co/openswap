@@ -6,6 +6,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 import json
 import re
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -357,6 +358,24 @@ def add_worker_workspace(
         return workspace
 
 
+def _unsynced_remote_job_ids(root: Path) -> tuple[str, ...]:
+    """Local job IDs whose remote results are not yet synchronized, at any service."""
+    path = LocalJobStore(root).state_dir / "remote.sqlite3"
+    if not path.exists():
+        return ()
+    if path.is_symlink():
+        raise ValueError("unsafe remote journal")
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    try:
+        exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bindings'").fetchone()
+        if exists is None:
+            return ()
+        rows = db.execute("SELECT local_id FROM bindings WHERE done=0 AND local_id IS NOT NULL").fetchall()
+        return tuple(row[0] for row in rows)
+    finally:
+        db.close()
+
+
 def remove_worker_workspace(backup_root: Path, workspace_id: str) -> None:
     """Withdraw approval for a workspace ID; its folder and files are kept.
 
@@ -372,6 +391,16 @@ def remove_worker_workspace(backup_root: Path, workspace_id: str) -> None:
             raise WorkspaceError("workspace_not_found")
         if not remaining:
             raise WorkspaceError("last_workspace")
+        # Artifact upload re-reads the registry for the job's folder, so a
+        # mapping stays while any job using it may still run or upload. (A job
+        # that resolves the folder in the moment before this write still runs
+        # there; its upload then needs the ID added back to the same folder.)
+        try:
+            in_use = LocalJobStore(root).workspace_in_use(workspace_id, _unsynced_remote_job_ids(root))
+        except (OSError, sqlite3.Error, ValueError):
+            raise WorkspaceError("settings_unavailable") from None
+        if in_use:
+            raise WorkspaceError("workspace_in_use")
         try:
             set_worker_workspaces(root, remaining)
         except (OSError, RuntimeError, ValueError):
@@ -1005,6 +1034,7 @@ _WORKSPACE_MESSAGES = {
     "workspace_exists": "That workspace ID is already approved; remove it first to change its folder.",
     "workspace_not_found": "No approved workspace has that ID.",
     "last_workspace": "At least one research folder must stay approved; add another before removing this one.",
+    "workspace_in_use": "A job using this research folder is still running or uploading its results; try again once it has finished.",
     "too_many_workspaces": "At most 16 research folders can be approved.",
     "too_many_readonly_sources": "At most 16 read-only sources can be approved per workspace.",
     "folder_invalid": "That folder path is not valid.",
