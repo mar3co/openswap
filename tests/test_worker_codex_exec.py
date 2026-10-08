@@ -1040,3 +1040,48 @@ def test_a_late_refusal_after_an_abandoned_start_releases_the_lease(tmp_path):
         _time.sleep(0.05)
     assert lease.state == "released" and lease.reason == "unlaunched"
     assert runtime.get(job.job_id).state == JobState.INTERRUPTED
+
+
+def test_a_recovered_run_records_its_proof_for_retention(tmp_path):
+    sign_in(tmp_path)
+    containment = FakeContainment([], exit_status=None, result=None)
+    adapter = make_adapter(tmp_path, containment)
+    adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    make_adapter(tmp_path, containment).recover("a" * 32)
+    summary = json.loads((codex_exec.runs_root(tmp_path) / ("a" * 32) / "summary.json").read_text())
+    assert summary["outcome"] == "recovered" and summary["stop_proof"]["stopped"] is True
+
+
+def test_a_late_run_interrupted_with_proof_releases_the_lease(tmp_path):
+    import threading
+    import time as _time
+
+    sign_in(tmp_path)
+    gate = threading.Event()
+    containment = FakeContainment([], exit_status=None, result=None)
+
+    class SlowStart(CodexExecAdapter):
+        def start(self, job, workspace, *, worker_epoch):
+            gate.wait(5)
+            return super().start(job, workspace, worker_epoch=worker_epoch)
+
+    update_worker_settings(tmp_path, enabled=True)
+    configure_worker_local_policy(
+        tmp_path, pinned_account_ref=IDENTITY,
+        workspaces=(WorkerWorkspace("research", (tmp_path / "research").resolve()),),
+    )
+    adapter = SlowStart(tmp_path, containment=containment, verify=lambda **kw: pinned(),
+                        mode=lambda: "live", managed=lambda h: [])
+    ticks = iter(range(10_000))
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=IDENTITY,
+                            monotonic=lambda: next(ticks) * 1000.0)
+    _submit(runtime)
+    assert runtime.reconcile_once().state == JobState.INTERRUPTED
+    gate.set()
+    for _ in range(100):
+        lease = AccountLeaseStore(tmp_path, "codex").read_current()
+        if lease.state == "released":
+            break
+        _time.sleep(0.05)
+    assert lease.state == "released" and lease.reason == "confirmed_stopped"
+    assert containment.stops == 1
