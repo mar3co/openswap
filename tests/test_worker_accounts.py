@@ -891,3 +891,11 @@ def test_menu_status_copy_names_the_account_operation():
 
     text = _remote_tasks_status_copy({"operation": "worker_account_update"}, enabled=True, paused=False)
     assert text.endswith("· worker_account_update")
+
+
+def test_pair_does_not_claim_execution_is_off_while_live(root, keychain, monkeypatch, capsys, enable_calls):
+    from openswap.worker import live
+
+    monkeypatch.setattr(live, "execution_mode", lambda backup_root: live.LIVE)
+    assert _pair(root, monkeypatch, interactive=False, answers=[]) == 0
+    assert cli._EXECUTION_OFF_NOTE not in capsys.readouterr().out

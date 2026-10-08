@@ -952,3 +952,70 @@ def test_logout_waits_for_the_lease_before_checking(tmp_path):
     )
     with pytest.raises(Exception):
         live_cli.logout(tmp_path, "1", run=_login_run(ACCOUNT_ID), verify=pinned)
+
+
+def test_a_refused_containment_launch_leaves_no_run_directory(tmp_path):
+    sign_in(tmp_path)
+    containment = FakeContainment()
+    containment.launch_error = ContainmentError("launchd_bootstrap_failed")
+    adapter = make_adapter(tmp_path, containment)
+    with pytest.raises(ProviderLaunchRefused):
+        adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    assert not (codex_exec.runs_root(tmp_path) / ("a" * 32)).exists()
+
+
+def test_a_partly_read_auth_file_vouches_for_nothing(tmp_path, monkeypatch):
+    home = sign_in(tmp_path)
+    real_read = os.read
+    reads = iter([b'{"tokens"', b""])
+    monkeypatch.setattr(codex_exec.os, "read", lambda fd, n: next(reads))
+    assert codex_exec.home_identity(home) is None
+    monkeypatch.setattr(codex_exec.os, "read", lambda fd, n: real_read(fd, min(n, 7)))
+    assert codex_exec.home_identity(home) == IDENTITY
+
+
+def test_logout_fails_while_any_credentials_file_remains(tmp_path):
+    _roster(tmp_path, {"1": ACCOUNT_ID})
+    home = sign_in(tmp_path)
+    (home / "auth.json").write_text("{not parseable but present")
+
+    def ok(argv, env, check=False, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    with pytest.raises(live_cli.AccountPinError):
+        live_cli.logout(tmp_path, "1", run=ok, verify=pinned)
+
+
+def test_a_late_refusal_after_an_abandoned_start_releases_the_lease(tmp_path):
+    import threading
+
+    sign_in(tmp_path)
+    gate = threading.Event()
+
+    class SlowRefusal(CodexExecAdapter):
+        def start(self, job, workspace, *, worker_epoch):
+            gate.wait(5)
+            raise ProviderLaunchRefused("provider_unavailable")
+
+    update_worker_settings(tmp_path, enabled=True)
+    configure_worker_local_policy(
+        tmp_path, pinned_account_ref=IDENTITY,
+        workspaces=(WorkerWorkspace("research", (tmp_path / "research").resolve()),),
+    )
+    adapter = SlowRefusal(tmp_path, containment=FakeContainment(), verify=lambda **kw: pinned(),
+                          mode=lambda: "live", managed=lambda h: [])
+    ticks = iter(range(10_000))
+    runtime = WorkerRuntime(tmp_path, adapter=adapter, account_identity=IDENTITY,
+                            monotonic=lambda: next(ticks) * 1000.0)
+    job = _submit(runtime)
+    final = runtime.reconcile_once()  # the runtime limit abandons the blocked start
+    assert final.state == JobState.INTERRUPTED
+    gate.set()
+    import time as _time
+    for _ in range(100):
+        lease = AccountLeaseStore(tmp_path, "codex").read_current()
+        if lease.state == "released":
+            break
+        _time.sleep(0.05)
+    assert lease.state == "released" and lease.reason == "unlaunched"
+    assert runtime.get(job.job_id).state == JobState.INTERRUPTED

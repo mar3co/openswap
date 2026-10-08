@@ -1600,7 +1600,10 @@ def _post_pair_worker_offer(root: Path, *, interactive: bool, read_line=None) ->
                 print("Could not enable worker. Start it later with `openswap worker enable`.")
             else:
                 print("Remote tasks worker enabled. The portal shows this Mac online within about 15 seconds.")
-    print(_EXECUTION_OFF_NOTE)
+    from openswap.worker.live import LIVE, execution_mode
+
+    if execution_mode(root) != LIVE:
+        print(_EXECUTION_OFF_NOTE)
 
 
 def _worker_off_hint(root: Path, snapshot: dict) -> str | None:

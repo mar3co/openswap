@@ -216,7 +216,16 @@ def home_identity(home: Path) -> str | None:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_AUTH_BYTES:
             return None
-        text = os.read(fd, MAX_AUTH_BYTES).decode("utf-8", "replace")
+        chunks, remaining = [], info.st_size
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                return None  # changed under us: no identity can be vouched for
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        text = b"".join(chunks).decode("utf-8", "replace")
+    except OSError:
+        return None
     finally:
         os.close(fd)
     identity = parse_auth(text)
@@ -519,6 +528,11 @@ class CodexExecAdapter:
             )
         except ContainmentError as error:
             if not error.launched:
+                # Nothing ran, and nothing can (the wrapper waits for a ``go``
+                # that will never exist): drop the directory and its task text.
+                import shutil
+
+                shutil.rmtree(run_dir, ignore_errors=True)
                 raise ProviderLaunchRefused("provider_unavailable") from None
             raise RuntimeError("execution_uncertain") from None
         run = _Run(job.job_id, handle, run_dir, output_root)
