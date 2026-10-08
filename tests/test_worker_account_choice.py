@@ -151,6 +151,21 @@ def test_an_invalid_allowlist_fails_closed(root, mutate):
     assert policy.enabled is False and policy.pinned_account_ref is None and policy.account_allowlist == ()
 
 
+def test_an_explicit_null_allowlist_fails_closed_unlike_a_missing_key(root):
+    """Only a missing key gets the legacy exemption; JSON null is malformed."""
+    update_worker_settings(root, enabled=True)
+    cli.set_worker_account(root, "1")
+    raw = json.loads(settings_path(root).read_text())
+    raw["worker"]["accountAllowlist"] = None
+    settings_path(root).write_text(json.dumps(raw))
+    policy = load_worker_settings(root)
+    assert policy.enabled is False and policy.pinned_account_ref is None
+    del raw["worker"]["accountAllowlist"]
+    settings_path(root).write_text(json.dumps(raw))
+    policy = load_worker_settings(root)
+    assert policy.enabled is True and policy.pinned_account_ref == ALICE
+
+
 def test_the_settings_layer_refuses_a_twenty_first_account(root):
     accounts = {str(n): {"email": f"u{n}@example.com", "accountId": f"acct-{n}"} for n in range(1, 22)}
     _write_codex_roster(root, accounts)

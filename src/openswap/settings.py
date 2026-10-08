@@ -351,9 +351,21 @@ def new_allowlist_ref() -> str:
     return secrets.token_hex(16)
 
 
+# Marks a worker section with no ``accountAllowlist`` key at all (settings
+# written before the allowlist existed), as distinct from an explicit JSON null.
+_ALLOWLIST_ABSENT = object()
+
+
+def _raw_allowlist(section: dict) -> object:
+    return section.get("accountAllowlist", _ALLOWLIST_ABSENT)
+
+
 def _allowlist_from_raw(value: object, pinned: str | None) -> tuple[AllowlistedAccount, ...]:
-    """Parse ``accountAllowlist``; ``ValueError`` when anything is off."""
-    if value is None:
+    """Parse ``accountAllowlist``; ``ValueError`` when anything is off.
+
+    Only a missing key is the legacy exemption; an explicit null is malformed.
+    """
+    if value is _ALLOWLIST_ABSENT:
         return ()
     if not isinstance(value, list) or len(value) > MAX_ACCOUNT_ALLOWLIST:
         raise ValueError
@@ -401,7 +413,7 @@ def _migrate_account_allowlist(section: dict, backup_root: Path) -> None:
     reference and the default label (slot alias or "Codex account N").
     """
     pinned = section.get("pinnedAccountRef")
-    if (section.get("accountAllowlist") is not None or not isinstance(pinned, str)
+    if ("accountAllowlist" in section or not isinstance(pinned, str)
             or not _PINNED_ACCOUNT_RE.fullmatch(pinned)):
         return
     section["accountAllowlist"] = _encode_allowlist(
@@ -480,7 +492,7 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
         _logger.warning("settings.json worker workspace registry is empty; disabling the worker")
         return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
     try:
-        allowlist = _allowlist_from_raw(section.get("accountAllowlist"), pinned)
+        allowlist = _allowlist_from_raw(_raw_allowlist(section), pinned)
     except (TypeError, ValueError):
         _logger.warning("settings.json worker account allowlist is invalid; disabling the worker")
         return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
@@ -614,7 +626,7 @@ def _write_worker_local_policy(
         if set_pin and pinned_account_ref is not None:
             _allowlist_pin(section, Path(backup_root), pinned_account_ref)
         if update_allowlist is not None:
-            current = _allowlist_from_raw(section.get("accountAllowlist"), None)
+            current = _allowlist_from_raw(_raw_allowlist(section), None)
             pin, entries = update_allowlist(section.get("pinnedAccountRef"), current)
             _validate_pinned_account_ref(pin)
             entries = tuple(entries)
@@ -645,7 +657,7 @@ def _write_worker_local_policy(
 
 def _allowlist_pin(section: dict, backup_root: Path, pinned_account_ref: str) -> None:
     """Add a newly pinned account to the allowlist when it is not there yet."""
-    entries = _allowlist_from_raw(section.get("accountAllowlist"), None)
+    entries = _allowlist_from_raw(_raw_allowlist(section), None)
     if any(entry.identity == pinned_account_ref for entry in entries):
         return
     if len(entries) >= MAX_ACCOUNT_ALLOWLIST:
