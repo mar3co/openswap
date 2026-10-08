@@ -1292,6 +1292,9 @@ class ReloginClickPlan:
     slot_name: str
     login_email: str
     live_name: str | None = None
+    # Why a click can't just switch: expired (saved login is dead), missing
+    # (no saved login at all), unverified (saved login couldn't be checked).
+    reason: str = "expired"
 
 
 def display_needs_relogin(display) -> bool:
@@ -1383,34 +1386,50 @@ def plan_relogin_click(
     slot: tuple[str, str] | None,
     slot_name: str,
     live_name: str | None,
+    reason: str = "expired",
 ) -> ReloginClickPlan | None:
     """Decide capture vs open-login. Capture only when email and org both match."""
     if slot is None:
         return None
     email = slot[0]
     if live is not None and live == slot:
-        return ReloginClickPlan("capture", slot_name, email, live_name)
+        return ReloginClickPlan("capture", slot_name, email, live_name, reason)
     if live is None:
-        return ReloginClickPlan("open_login", slot_name, email, None)
-    return ReloginClickPlan("confirm_open_login", slot_name, email, live_name)
+        return ReloginClickPlan("open_login", slot_name, email, None, reason)
+    return ReloginClickPlan(
+        "confirm_open_login", slot_name, email, live_name, reason
+    )
 
 
 def relogin_wrong_account_title(plan: ReloginClickPlan) -> str:
     """Alert title: say why a click can't just switch."""
-    return f"{plan.slot_name} needs a new sign-in"
+    if plan.reason == "expired":
+        return f"{plan.slot_name} needs a new sign-in"
+    return f"{plan.slot_name} needs a sign-in"
+
+
+def _relogin_reason_sentence(plan: ReloginClickPlan) -> str:
+    name = plan.slot_name
+    if plan.reason == "missing":
+        return f"OpenSwap has no saved login for {name}, so it can't switch to it."
+    if plan.reason == "unverified":
+        return (
+            f"OpenSwap couldn't confirm {name}'s saved login, so it can't "
+            "switch to it."
+        )
+    return f"{name}'s saved login has expired, so OpenSwap can't switch to it."
 
 
 def relogin_wrong_account_message(plan: ReloginClickPlan) -> str:
     """Alert body: the problem, the fix, and what happens to the live login.
 
-    Lead with the expired saved login, since that is the only reason a
-    click opens the Claude login instead of switching.
+    Lead with the reason a click can't just switch (``plan.reason``), then
+    the fix, then what happens to the account Claude Code is on now.
     """
     live_name = plan.live_name or "another account"
     return (
-        f"{plan.slot_name}'s saved login has expired, so OpenSwap can't "
-        f"switch to it. Sign in as {plan.slot_name} in the login window "
-        "that opens.\n\n"
+        f"{_relogin_reason_sentence(plan)} "
+        f"Sign in as {plan.slot_name} in the login window that opens.\n\n"
         f"Claude Code is on {live_name} right now and will sign out of it. "
         f"{live_name} stays saved in OpenSwap, so you can switch back later."
     )
