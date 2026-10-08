@@ -1004,22 +1004,33 @@ class LiveCheck:
         ws = self._workspace("kill")
         child, detached = self._helper_script(ws)
         job_id = f"livecheck-{uuid.uuid4().hex}"
-        token = self.leases.acquire(job_id=job_id, account_identity=identity, worker_pid=os.getpid(),
-                                    worker_epoch=time.time_ns(), ttl_s=self.helper_wait + 300)
         settled = False
         try:
-            self._kill_and_recover(gate, ws, job_id, identity, token, child, detached)
+            self._kill_and_recover(gate, ws, job_id, identity, child, detached)
             settled = True
         finally:
             if not settled:
-                self._settle_uncertain(token, job_id)
+                lease = self._lease_for(job_id)
+                if lease is not None:
+                    self._settle_uncertain(lease.token(), job_id)
             self._kill_markers(child, detached)
 
-    def _kill_and_recover(self, gate, ws, job_id, identity, token, child, detached) -> None:
+    def _lease_for(self, job_id: str):
+        try:
+            lease = self.leases.read_current()
+        except AccountLeaseError:
+            return None
+        return lease if lease is not None and lease.job_id == job_id and lease.state != "released" else None
+
+    def _kill_and_recover(self, gate, ws, job_id, identity, child, detached) -> None:
+        # The stand-in worker takes the account lease itself, as a real worker
+        # does, so its death leaves the same abandoned lease behind.
         process = self._spawn_child({"root": str(self.root), "job_id": job_id, "identity": identity,
-                                     "workspace": str(ws), "task": self.HELPER_TASK})
+                                     "workspace": str(ws), "task": self.HELPER_TASK,
+                                     "lease_ttl": self.helper_wait + 300})
         detail = {"worker_started_job": False, "detached_helper_observed": False, "job_outlived_worker": False,
-                  "recovery_stopped": False, "helpers_left": None, "lease_released_on_proof": False}
+                  "lease_left_by_worker": False, "recovery_stopped": False, "helpers_left": None,
+                  "lease_released_on_proof": False}
         try:
             line = process.stdout.readline() if process.stdout is not None else ""
             detail["worker_started_job"] = line.strip() == "STARTED"
@@ -1036,6 +1047,15 @@ class LiveCheck:
         handle = load_handle(run_dir)
         if handle is not None:
             detail["job_outlived_worker"] = bool(self.containment.members(handle))
+        # Like a restarted worker: find the dead worker's lease, quarantine it,
+        # and release it only on stop proof.
+        lease = self._lease_for(job_id)
+        detail["lease_left_by_worker"] = lease is not None and lease.state == "active"
+        if lease is None:
+            gate.detail = detail
+            gate.passed = False
+            return
+        token = lease.token()
         self.leases.mark_uncertain(token, "worker_restarted")
         if handle is None:
             # The stand-in worker never got as far as asking launchd for the job.
@@ -1175,11 +1195,19 @@ def write_evidence(backup_root: Path, evidence: dict, output: Path | None = None
     return path
 
 
+def child_acquire_lease(root: Path, payload: dict):
+    """The stand-in worker's own account lease (its pid, like a real worker's)."""
+    store = AccountLeaseStore(Path(root), str(payload["identity"]).split(":", 1)[0])
+    return store.acquire(job_id=payload["job_id"], account_identity=payload["identity"], worker_pid=os.getpid(),
+                         worker_epoch=time.time_ns(), ttl_s=float(payload.get("lease_ttl", 900)))
+
+
 def child_main(raw: str) -> None:
     """The stand-in worker process for ``kill_recovery``: start one job, then wait to be killed."""
     payload = json.loads(raw)
     root = Path(payload["root"])
     adapter = CodexExecAdapter(root, mode=lambda: "live", bind_to_opt_in=False)
+    child_acquire_lease(root, payload)
     now = datetime.now(timezone.utc)
     record = JobRecord(
         job_id=payload["job_id"], idempotency_key="live-check-child", owner_ref="local-user",

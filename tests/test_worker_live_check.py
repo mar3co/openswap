@@ -255,6 +255,7 @@ class FakeChild:
     def __init__(self, check: LiveCheck, payload: dict):
         from openswap.worker.models import ResolvedWorkspace
 
+        live_check.child_acquire_lease(check.root, payload)  # as the real child does
         record = check._job_record(payload["job_id"], payload["identity"], payload["task"])
         check.adapter().start(record, ResolvedWorkspace("live-check", Path(payload["workspace"]), ()),
                               worker_epoch=0)
@@ -744,6 +745,8 @@ def test_real_launchd_harness_with_an_unsandboxed_fake_codex(tmp_path):
         "p = json.loads(sys.argv[1])\n"
         "pin = PinnedCodex(Path(p['binary']), CODEX_VERSION_OUTPUT, ASSET_SHA256, 'ab' * 32)\n"
         "check = LiveCheck(Path(p['root']), verify=lambda **kw: pin)\n"
+        "from openswap.worker.live_check import child_acquire_lease\n"
+        "child_acquire_lease(Path(p['root']), p)\n"
         "record = check._job_record(p['job_id'], p['identity'], p['task'])\n"
         "check.adapter().start(record, ResolvedWorkspace('live-check', Path(p['workspace']), ()), worker_epoch=0)\n"
         "print('STARTED', flush=True)\n"
@@ -1125,3 +1128,12 @@ def test_a_readable_auth_file_fails_the_gate_without_any_redirect(tmp_path):
     gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
     assert seen and all(c.startswith("/usr/bin/wc -c ") and ">" not in c for c in seen)
     assert gate["auth_read_denied"] is False and gate["passed"] is False
+
+
+
+def test_the_killed_worker_leaves_its_own_lease_and_recovery_releases_it_on_proof(tmp_path):
+    root = setup_root(tmp_path)
+    evidence = make_check(root, SimulatedMac()).run()
+    gate = evidence["gates"]["kill_recovery"]
+    assert gate["lease_left_by_worker"] is True and gate["lease_released_on_proof"] is True
+    assert AccountLeaseStore(root, "codex").read_current().state == "released"
