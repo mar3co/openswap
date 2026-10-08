@@ -916,3 +916,28 @@ def test_a_run_directory_with_a_line_break_never_launches(tmp_path):
                            stdin_text="")
     assert error.value.code == "run_dir_unsafe" and error.value.launched is False
     assert launchd.loaded == {}
+
+
+
+def test_two_spellings_of_one_directory_share_its_locks(tmp_path):
+    folder = tmp_path / "Runs" / "Job"
+    folder.mkdir(parents=True)
+    other = tmp_path / "runs" / "job"
+    if not other.exists():
+        pytest.skip("case-sensitive file system")
+    assert c.canonical_dir(other) == c.canonical_dir(folder)
+    assert c._run_dir_key(c.canonical_dir(other)) == c._run_dir_key(c.canonical_dir(folder))
+    assert c.canonical_dir(other).name == "Job"
+
+
+def test_a_second_spelling_cannot_launch_into_a_running_directory(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    first = launch(containment, root)
+    lower = Path(str(first.run_dir).swapcase()) if sys.platform == "darwin" else None
+    if lower is None or not lower.exists():
+        pytest.skip("case-sensitive file system")
+    held = containment._run_dir_lock(c.canonical_dir(lower), 0)
+    assert held.acquire(timeout=0) is True  # same lock file as the first launch's, now free
+    held.release()
+    assert c.canonical_dir(lower) == first.run_dir

@@ -283,6 +283,15 @@ def command_matches(command: str, expected: str) -> bool:
     return len(inner) == 1 and inner[0].strip() == want
 
 
+def _new_sentinel(folder: Path, tag: str, content: str) -> Path:
+    """Create a uniquely named 0600 file in ``folder``, never touching an existing one."""
+    path = Path(folder) / f"openswap-live-check-{tag}-{secrets.token_hex(8)}.txt"
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return path
+
+
 def _all_failed(items: list[dict]) -> bool:
     return bool(items) and all(type(item["exit_code"]) is int and item["exit_code"] != 0 for item in items)
 
@@ -532,7 +541,14 @@ class LiveCheck:
             entries = []
         for entry in entries:
             if entry.name.startswith("livecheck-") and load_handle(entry) is not None:
-                self.containment.recover(entry)
+                proof = self.containment.recover(entry)
+                if proof is not None and proof.stopped is not True:
+                    # Something from an earlier check may still be running:
+                    # evidence gathered next to it would prove nothing.
+                    raise CheckRefused(
+                        "leftover_not_stopped",
+                        "A job from an earlier live check could not be proven stopped. Restart this Mac "
+                        "(a reboot is proof), then run the check again.")
 
     def _gate_tool_surface_static(self, pinned, home: Path) -> dict:
         cwd = self._workspace("static")
@@ -558,8 +574,7 @@ class LiveCheck:
         outside = self._workspace("wrapper-outside")
         (ws / "inside.txt").write_text("inside\n")
         (outside / "secret.txt").write_text(secrets.token_hex(16) + "\n")
-        sentinel = home / "openswap-live-check-wrapper.txt"
-        write_private(sentinel, secrets.token_hex(16).encode())
+        sentinel = _new_sentinel(home, "wrapper", secrets.token_hex(16))
         tmp_marker = Path(f"/tmp/openswap-live-check-{secrets.token_hex(6)}.txt")
         tmpdir_marker = self.check_root / "tmp" / f"wrapper-{secrets.token_hex(6)}.txt"
         q = shlex.quote
@@ -637,8 +652,7 @@ class LiveCheck:
         (ws / "inside.txt").write_text(tokens["inside"] + "\n")
         (outside / "read-me.txt").write_text(tokens["outside"] + "\n")
         (outside / "link-target.txt").write_text(tokens["link"] + "\n")
-        sentinel = home / "openswap-live-check-sentinel.txt"
-        write_private(sentinel, (tokens["home"] + "\n").encode())
+        sentinel = _new_sentinel(home, "sentinel", tokens["home"] + "\n")
         os.environ[ENV_SENTINEL] = tokens["env"]
         tmp_marker = Path(f"/tmp/openswap-live-check-{secrets.token_hex(6)}.txt")
         escape_label = f"com.opensoft.openswap.livecheck.probe.{secrets.token_hex(6)}"
@@ -801,10 +815,30 @@ class LiveCheck:
     HELPER_TASK = ("Run exactly this shell command and wait for it to finish: sh ./helper.sh\n"
                    "Do not run anything else.")
 
+    def _kill_markers(self, *markers: str) -> None:
+        """Kill this check's own helper processes (by their unique markers)."""
+        try:
+            pids = self._marker_pids(*markers)
+        except Exception:
+            return
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
     def _gate_stop(self, identity: str) -> None:
-        gate = self.gates["stop"]
         ws = self._workspace("stop")
         child, detached = self._helper_script(ws)
+        try:
+            self._stop_with_helpers(identity, ws, child, detached)
+        finally:
+            # Also when the job or the check failed midway: an escaped
+            # setsid() helper would otherwise sleep on for half an hour.
+            self._kill_markers(child, detached)
+
+    def _stop_with_helpers(self, identity: str, ws: Path, child: str, detached: str) -> None:
+        gate = self.gates["stop"]
         started = self._monotonic()
 
         def helper_running(job_id):
@@ -845,6 +879,7 @@ class LiveCheck:
         finally:
             if not settled:
                 self._settle_uncertain(token, job_id)
+            self._kill_markers(child, detached)
 
     def _kill_and_recover(self, gate, ws, job_id, identity, token, child, detached) -> None:
         process = self._spawn_child({"root": str(self.root), "job_id": job_id, "identity": identity,
