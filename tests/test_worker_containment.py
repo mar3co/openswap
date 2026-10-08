@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import plistlib
 import signal
+from dataclasses import replace
 import subprocess
 import sys
 import time
@@ -112,6 +113,7 @@ class FakeLaunchd:
         self.run_dirs: dict[str, str] = {}
         self.plists: dict[str, str] = {}
         self.bootstraps = 0
+        self.ack = True
 
     def __call__(self, args):
         self.calls.append(list(args))
@@ -137,6 +139,9 @@ class FakeLaunchd:
             self.plists[plist["Label"]] = args[2]
             if self.write_pid:
                 (run_dir / "leader.pid").write_text(f"{leader}\n")
+            if self.ack:
+                # Stands in for the wrapper acknowledging ``go``.
+                (run_dir / "started").write_text("")
             return subprocess.CompletedProcess(args, 0, "", "")
         if verb == "bootout":
             label = args[1].split("/", 2)[2]
@@ -189,9 +194,9 @@ def test_launch_records_coalition_before_releasing_the_provider(tmp_path):
     assert load_handle(root / ("a" * 32)) == handle
     plist = plistlib.loads(handle.plist_path.read_bytes())
     assert plist["ProgramArguments"][:2] == ["/bin/sh", "-c"]
-    assert plist["ProgramArguments"][5:] == ["/bin/echo", "hi"]
+    assert plist["ProgramArguments"][5:] == ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/bin/echo", "hi"]
     assert plist["KeepAlive"] is False and plist["AbandonProcessGroup"] is False
-    assert plist["EnvironmentVariables"] == {"PATH": "/usr/bin:/bin"}
+    assert plist["EnvironmentVariables"] == {"PATH": "/usr/bin:/bin"}  # the wrapper's own, fixed
     assert plist["Umask"] == 0o077
     assert (root / ("a" * 32) / "stdin.txt").read_text() == "task"
     assert oct((root / ("a" * 32) / "stdin.txt").stat().st_mode & 0o777) == "0o600"
@@ -211,9 +216,10 @@ def test_wrapper_runs_the_provider_only_after_go(tmp_path):
         time.sleep(0.01)
     assert int((run_dir / "leader.pid").read_text()) == proc.pid
     time.sleep(0.2)
-    assert not (run_dir / "stdout.jsonl").exists()
+    assert not (run_dir / "stdout.jsonl").exists() and not (run_dir / "started").exists()
     (run_dir / "go").write_text("")
     assert proc.wait(timeout=10) == 0
+    assert (run_dir / "started").exists()
     assert (run_dir / "stdout.jsonl").read_text() == "ran\n"
     assert (run_dir / "exit").read_text().strip() == "0"
 
@@ -667,3 +673,60 @@ def test_an_unknown_in_the_previous_scan_prevents_a_freeze(tmp_path):
     frozen, _ = containment._sweep(JOB_COALITION, deadline=1e9)
     # The scan right after the unknown one must not complete the freeze on its own.
     assert calls["n"] >= 3
+
+
+def test_the_wrapper_environment_is_fixed_and_the_provider_gets_its_own(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    handle = containment.launch(
+        job_id="a" * 32, run_dir=root / ("a" * 32), argv=["/bin/echo"],
+        env={"PATH": "/x", "HOME": "/h"},
+        cwd=root, stdin_text="",
+    )
+    plist = plistlib.loads(handle.plist_path.read_bytes())
+    assert plist["EnvironmentVariables"] == {"PATH": "/usr/bin:/bin"}
+    assert plist["ProgramArguments"][5:9] == ["/usr/bin/env", "-i", "PATH=/x", "HOME=/h"]
+    containment, procs, launchd = make(tmp_path / "other")
+    with pytest.raises(ContainmentError) as error:
+        containment.launch(job_id="b" * 32, run_dir=private_dir(tmp_path / "other") / ("b" * 32),
+                           argv=["/bin/echo"], env={"BASH_FUNC_echo%%": "() { evil; }"},
+                           cwd=tmp_path, stdin_text="")
+    assert error.value.code == "environment_invalid" and error.value.launched is False
+
+
+def test_a_wrapper_that_gave_up_before_go_is_unlaunched(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    launchd.ack = False
+    original = containment.leader_alive
+    containment.leader_alive = lambda handle: False  # exited 125 before seeing go
+    with pytest.raises(ContainmentError) as error:
+        launch(containment, private_dir(tmp_path))
+    containment.leader_alive = original
+    assert error.value.code == "job_release_expired" and error.value.launched is False
+
+
+def test_an_unacknowledged_release_is_uncertain(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    launchd.ack = False
+    with pytest.raises(ContainmentError) as error:
+        launch(containment, private_dir(tmp_path))
+    assert error.value.code == "job_release_unacknowledged" and error.value.launched is True
+
+
+def test_recovery_uses_the_mirror_and_refuses_disagreement(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    handle = launch(containment, root)
+    escaped = procs.new(JOB_COALITION)
+    (handle.run_dir / "handle.json").unlink()  # the run directory's copy is gone
+    proof = containment.recover(handle.run_dir)
+    assert proof is not None and proof.stopped is True and escaped not in procs.table
+
+    containment, procs, launchd = make(tmp_path / "second")
+    root = private_dir(tmp_path / "second")
+    handle = launch(containment, root)
+    tampered = replace(handle, coalition_id=12345)
+    c._save_handle(tampered)
+    procs.signals.clear()
+    proof = containment.recover(handle.run_dir)
+    assert proof.stopped is False and procs.signals == []
