@@ -119,7 +119,16 @@ SUCCESS_SCRIPT = [
 ]
 
 
+def bind_opt_in(tmp_path):
+    """The owner's opt-in, bound to the binary the live check measured."""
+    from openswap.settings import LiveExecutionSettings, write_live_execution
+
+    write_live_execution(tmp_path, LiveExecutionSettings(True, "ab" * 32, pinned().binary_sha256, "now"))
+
+
 def make_adapter(tmp_path, containment, *, mode="live"):
+    if mode == "live":
+        bind_opt_in(tmp_path)
     return CodexExecAdapter(
         tmp_path, containment=containment, verify=lambda **kw: pinned(),
         mode=lambda: mode, sleep=lambda s: None, managed=lambda home: [],
@@ -256,8 +265,8 @@ def test_probe_is_disabled_until_live_mode_and_unavailable_when_binary_fails(tmp
 
 
 def test_probe_refuses_a_binary_other_than_the_checked_one(tmp_path):
-    write_live_execution(tmp_path, LiveExecutionSettings(True, "cd" * 32, "ef" * 32, "now"))
     adapter = make_adapter(tmp_path, FakeContainment())
+    write_live_execution(tmp_path, LiveExecutionSettings(True, "cd" * 32, "ef" * 32, "now"))
     assert adapter.probe().diagnostic_code == "provider_unavailable"
 
 
@@ -1018,6 +1027,7 @@ def test_a_late_refusal_after_an_abandoned_start_releases_the_lease(tmp_path):
     import threading
 
     sign_in(tmp_path)
+    bind_opt_in(tmp_path)
     gate = threading.Event()
 
     class SlowRefusal(CodexExecAdapter):
@@ -1064,6 +1074,7 @@ def test_a_late_run_interrupted_with_proof_releases_the_lease(tmp_path):
     import time as _time
 
     sign_in(tmp_path)
+    bind_opt_in(tmp_path)
     gate = threading.Event()
     containment = FakeContainment([], exit_status=None, result=None)
 
@@ -1100,15 +1111,16 @@ def test_live_lock_io_errors_are_controlled_refusals(tmp_path, monkeypatch):
     def broken(self, timeout=None):
         raise OSError(30, "Read-only file system")
 
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    adapter = make_adapter(tmp_path, containment)
     monkeypatch.setattr(locking.FileLock, "acquire", broken)
     with pytest.raises(live.LiveModeError) as error:
         with live.live_lock(tmp_path):
             pass
     assert error.value.code == "live_lock_unavailable"
-    sign_in(tmp_path)
-    containment = FakeContainment(SUCCESS_SCRIPT)
     with pytest.raises(ProviderLaunchRefused):
-        make_adapter(tmp_path, containment).start(job_record(), workspace(tmp_path), worker_epoch=1)
+        adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
     assert containment.launches == []
 
 
@@ -1225,3 +1237,41 @@ def test_a_project_local_codex_layer_in_the_folder_refuses_the_launch(tmp_path):
         make_adapter(tmp_path, containment).start(job_record(), ws, worker_epoch=1)
     assert error.value.diagnostic_code == "provider_unavailable"
     assert containment.launches == []
+
+
+
+@pytest.mark.parametrize("binding", ["missing", "disabled", "other_binary"])
+def test_the_last_check_before_launch_needs_a_readable_binding(tmp_path, binding):
+    from openswap.settings import LiveExecutionSettings, write_live_execution
+
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    adapter = make_adapter(tmp_path, containment)
+    value = {"missing": None,
+             "disabled": LiveExecutionSettings(False, "ab" * 32, pinned().binary_sha256, "now"),
+             "other_binary": LiveExecutionSettings(True, "ab" * 32, "00" * 32, "now")}[binding]
+    if value is None:
+        (tmp_path / "settings.json").write_text("{not json")
+    else:
+        write_live_execution(tmp_path, value)
+    with pytest.raises(ProviderLaunchRefused):
+        adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    assert containment.launches == []
+
+
+def test_a_proven_run_whose_summary_cannot_be_written_is_removed(tmp_path, monkeypatch):
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    adapter = make_adapter(tmp_path, containment)
+    run = adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    real = codex_exec.write_private
+
+    def failing(path, data):
+        if Path(path).name == codex_exec.SUMMARY_FILE:
+            raise OSError(28, "No space left on device")
+        return real(path, data)
+
+    monkeypatch.setattr(codex_exec, "write_private", failing)
+    finished = drain(adapter, run)[-1]
+    assert finished.execution_stopped is True
+    assert not (codex_exec.runs_root(tmp_path) / ("a" * 32)).exists()

@@ -476,8 +476,11 @@ class CodexExecAdapter:
 
     def _pinned(self, *, check_version: bool):
         pinned = self._verify(check_version=check_version)
-        expected = load_live_execution(self.backup_root).codex_sha256
-        if expected is not None and pinned.binary_sha256 != expected:
+        # Fail closed: this last read must itself prove the opt-in and the
+        # binary it was recorded for (an unreadable or replaced settings file
+        # reads as disabled, with no binding).
+        binding = load_live_execution(self.backup_root)
+        if not binding.enabled or binding.codex_sha256 is None or pinned.binary_sha256 != binding.codex_sha256:
             raise codex_cli.CodexCliError("binary_not_the_checked_one")
         return pinned
 
@@ -764,7 +767,13 @@ class CodexExecAdapter:
         try:
             write_private(state.run_dir / SUMMARY_FILE, json.dumps(summary).encode())
         except OSError:
-            pass
+            if proof.get("stopped") is True:
+                # Pruning only removes directories whose summary records a
+                # proven stop; without one this run would be kept forever.
+                # Its processes are proven gone, so remove it now instead.
+                import shutil
+
+                shutil.rmtree(state.run_dir, ignore_errors=True)
 
     def _prune_runs(self) -> None:
         """Remove old finished run directories whose stop was proven.
