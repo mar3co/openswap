@@ -41,13 +41,13 @@ from tests.test_worker_pairing_status import PairTransport, keychain  # noqa: F4
 from tests.test_worker_remote import FakeAdapter, StoreTransport
 
 URL = "http://127.0.0.1:8765"
-OFFER = "Start the Remote tasks worker now so this Mac can accept approved tasks? [Y/n] "
+OFFER = "Start the worker now? [Y/n] "
 # The fixture roster has six eligible accounts: Codex 1, 2, 5, 6 and Claude 1, 4.
-ACCOUNT = "Account number (1-6; Enter to skip): "
-KEEP = "Account number (1-6; Enter keeps the current one) [1]: "
-PICK = "Folders tasks may read (numbers like 1 3, or a path; Enter for 1) [1]: "
-KEEP_FOLDERS = "Folders tasks may read (numbers like 1 3, or a path; Enter keeps the current ones): "
-TYPE_PATH = "Type the path to your code folder, for example ~/GitHub (Enter to skip): "
+ACCOUNT = "Account (1-6, Enter skips): "
+KEEP = "Account [1]: "
+PICK = "Folders (numbers or a path) [1]: "
+KEEP_FOLDERS = "Folders (Enter keeps current): "
+TYPE_PATH = "Type the path to your code folder, for example ~/GitHub (Enter skips): "
 SUMMARY = "Step 4 of 4 · Summary"
 
 
@@ -130,7 +130,7 @@ def test_pair_walks_worker_account_then_folder_then_summary(root, keychain, monk
     assert guided_setup.WORKER_ONLINE in out
     # Worker first, then the account, then the folder, then the summary.
     assert (out.index("Step 1 of 4 · Worker") < out.index(OFFER) < out.index("Step 2 of 4 · Account")
-            < out.index("Choose the account remote jobs run on") < out.index("Step 3 of 4 · Folders")
+            < out.index("Tasks run on the account you pick.") < out.index("Step 3 of 4 · Folders")
             < out.index(PICK) < out.index(SUMMARY))
     # Codex and Claude accounts are both offered, numbered by menu position with
     # the slot beside them; the API-key Codex slot is not.
@@ -139,13 +139,12 @@ def test_pair_walks_worker_account_then_folder_then_summary(root, keychain, monk
     assert "  • 6  Claude  carol@example.com   (claudey)  slot 4" in out
     assert "slot 3" not in out and "aren't supported" not in out
     assert ACCOUNT in out
-    assert "Pinned Codex account 2 · bob@example.com" in out
+    assert "✓ Codex 2 · bob@example.com" in out
     policy = load_worker_settings(root)
     assert policy.pinned_account_ref == BOB
     # The built-in `research` folder is replaced: tasks read ~/GitHub and never
     # change it; results go to ~/OpenSwap Research/github, created owner-only.
-    assert "Remote tasks can read the folders you choose here, but never change them." in out
-    assert "Results are saved under ~/OpenSwap Research." in out
+    assert f"{guided_setup.FOLDER_USE}. Results go to ~/OpenSwap Research." in out
     assert "  • 1  ~/GitHub  (recommended)" in out
     (workspace,) = policy.workspaces
     assert workspace.workspace_id == "github" and workspace.display_label == "GitHub"
@@ -155,26 +154,26 @@ def test_pair_walks_worker_account_then_folder_then_summary(root, keychain, monk
         assert stat.S_IMODE(research_home.stat().st_mode) == 0o700
         assert stat.S_IMODE(workspace.output_root.stat().st_mode) == 0o700
         assert stat.S_IMODE(github.stat().st_mode) == 0o755  # never changed
-    assert ('✓ Tasks can read ~/GitHub as "github" (the portal shows "GitHub"); results go to '
-            '~/OpenSwap Research/github.') in out
-    assert "  ✓ Readable folders  github (GitHub)" in out
-    assert "  • Execution         disabled" in out and guided_setup.EXECUTION_OFF_NOTE in out
+    assert "✓ ~/GitHub (github)" in out
+    assert "  ✓ Folders     github (GitHub)" in out
+    assert "  • Live tasks  off" in out
     assert SECRET not in out
 
 
 def test_pair_on_a_tty_can_skip_every_step(root, keychain, monkeypatch, capsys, enable_calls):
     assert _pair(root, monkeypatch, interactive=True, answers=["n", "", ""]) == 0
     out = capsys.readouterr().out
-    assert "Not started. Start it later with `openswap worker enable`." in out
-    assert "Skipped. Pin one later" in out
-    assert "No folder chosen. Choose one later with `openswap worker workspace add --read <folder>`" in out
+    assert f"Not started. {guided_setup.START_WORKER_NEXT}" in out
+    assert f"Skipped. {guided_setup.ACCOUNT_NEXT}" in out
+    assert f"No folder added. {guided_setup.FOLDER_NEXT}" in out
     assert enable_calls == []
     policy = load_worker_settings(root)
     assert policy.pinned_account_ref is None and policy.enabled is False
     assert policy.control_service_url == "http://localhost"
     assert _builtin(root)
-    assert "Before Slack can start tasks on this Mac:\n  1. start the worker (`openswap worker enable`)" in out
-    assert "  2. pin an account" in out
+    # The checklist shows each gap; one Next names the first.
+    assert "Next: `openswap worker enable` to start the worker." in out
+    assert "  ✗ Account     none" in out and out.count("Next:") == 4
 
 
 @pytest.mark.parametrize("answers", [["n"], ["no"], ["later"], []], ids=["n", "no", "other", "eof"])
@@ -182,7 +181,7 @@ def test_pair_offer_no_or_eof_leaves_the_worker_off(root, keychain, monkeypatch,
     cli.set_worker_account(root, "1")
     assert _pair(root, monkeypatch, interactive=True, answers=answers) == 0
     out = capsys.readouterr().out
-    assert OFFER in out and "Not started. Start it later with `openswap worker enable`." in out
+    assert OFFER in out and f"Not started. {guided_setup.START_WORKER_NEXT}" in out
     assert enable_calls == [] and load_worker_settings(root).enabled is False
 
 
@@ -193,31 +192,31 @@ def test_pair_with_a_pin_keeps_it_on_enter(root, keychain, monkeypatch, capsys, 
     # The current pin is marked in the menu and is the prompt's default.
     assert "  ✓ 1  Codex   alice@example.com   (work)     slot 1  current" in out
     assert KEEP in out and ACCOUNT not in out
-    assert "Kept Codex account 1 · alice@example.com (work)." in out
+    assert "✓ Kept Codex 1 · alice@example.com (work)" in out
     assert load_worker_settings(root).pinned_account_ref == ALICE
 
 
 def test_pair_with_a_pin_can_switch_account_by_number(root, keychain, monkeypatch, capsys, enable_calls):
     cli.set_worker_account(root, "1")
     assert _pair(root, monkeypatch, interactive=True, answers=["n", "2"]) == 0
-    assert "Pinned Codex account 2 · bob@example.com" in capsys.readouterr().out
+    assert "✓ Codex 2 · bob@example.com" in capsys.readouterr().out
     assert load_worker_settings(root).pinned_account_ref == BOB
 
 
 def test_menu_numbers_are_positions_not_slots(root, keychain, monkeypatch, capsys, enable_calls):
     # Menu 6 is Claude slot 4 (carol); menu 3 is Codex slot 5. Neither equals its slot.
     assert _pair(root, monkeypatch, interactive=True, answers=["n", "6"]) == 0
-    assert "Pinned Claude account 4 · carol@example.com (claudey)" in capsys.readouterr().out
+    assert "✓ Claude 4 · carol@example.com (claudey)" in capsys.readouterr().out
     assert load_worker_settings(root).pinned_account_ref.startswith("claude:")
     assert _setup(root, monkeypatch, ["n", "3", ""]) == 0
-    assert "Pinned Codex account 5 · shared@example.com" in capsys.readouterr().out
+    assert "✓ Codex 5 · shared@example.com" in capsys.readouterr().out
 
 
 def test_a_non_ascii_digit_is_asked_again_not_a_crash(root, keychain, monkeypatch, capsys, enable_calls):
     # "²".isdigit() is True but int("²") raises; it must not end the account step.
     assert _pair(root, monkeypatch, interactive=True, answers=["n", "²", "6"]) == 0
     out = capsys.readouterr().out
-    assert "Pinned Claude account 4 · carol@example.com (claudey)" in out
+    assert "✓ Claude 4 · carol@example.com (claudey)" in out
     assert load_worker_settings(root).pinned_account_ref.startswith("claude:")
 
 
@@ -226,7 +225,7 @@ def test_a_number_outside_the_menu_is_asked_again(root, keychain, monkeypatch, c
     out = capsys.readouterr().out
     assert out.count("Type a number from 1 to 6.") == 2
     # Email, alias and claude:<slot> still work beside the number.
-    assert "Pinned Codex account 1 · alice@example.com (work)" in out
+    assert "✓ Codex 1 · alice@example.com (work)" in out
     assert load_worker_settings(root).pinned_account_ref == ALICE
 
 
@@ -234,29 +233,28 @@ def test_eof_at_the_menu_keeps_the_pin_and_says_so(root, keychain, monkeypatch, 
     cli.set_worker_account(root, "1")
     assert _pair(root, monkeypatch, interactive=True, answers=["n"]) == 0
     out = capsys.readouterr().out
-    assert ("Skipped. 1 · alice@example.com (work) stays selected. Change it later with "
-            "`openswap worker account <slot|email|alias>`.") in out
-    assert "Pin one later" not in out
+    assert "Kept Codex 1 · alice@example.com (work)." in out
+    assert "Skipped." not in out
     assert load_worker_settings(root).pinned_account_ref == ALICE
 
 
 def test_pair_without_a_tty_prints_each_next_step(root, keychain, monkeypatch, capsys, enable_calls):
     assert _pair(root, monkeypatch, interactive=False, answers=["y", "1", "y"]) == 0  # never read
     out = capsys.readouterr().out
-    assert OFFER not in out and ACCOUNT not in out and "Folders tasks may read" not in out
-    for line in (guided_setup.START_WORKER_NEXT, guided_setup.ACCOUNT_NEXT, guided_setup.FOLDER_NEXT,
-                 guided_setup.EXECUTION_OFF_NOTE):
+    assert OFFER not in out and ACCOUNT not in out and "Folders (" not in out
+    for line in (guided_setup.START_WORKER_NEXT, guided_setup.ACCOUNT_NEXT, guided_setup.FOLDER_NEXT):
         assert line in out
+    # The summary ends with one Next: the first gap (the worker), not the live check.
+    assert out.rstrip().endswith("Next: `openswap worker enable` to start the worker.")
     assert "openswap worker workspace add --read <folder>" in out
-    assert "  • Readable folders  none (tasks read no folder on this Mac)" in out
+    assert "  • Folders     none" in out
     assert enable_calls == [] and _builtin(root)
     assert load_worker_settings(root).pinned_account_ref is None
 
 
 @pytest.mark.parametrize("process, expected", [
-    ("running", "The Remote tasks worker is already running on this Mac."),
-    ("stopped", "The Remote tasks worker is enabled but not running. Run `openswap worker enable` "
-                "to start it again, or `openswap worker status` to check."),
+    ("running", "✓ Worker running."),
+    ("stopped", "The worker is on but not running. Next: `openswap worker enable`."),
 ])
 def test_pair_when_already_enabled_toggles_nothing(root, keychain, monkeypatch, capsys, enable_calls,
                                                    process, expected):
@@ -267,7 +265,7 @@ def test_pair_when_already_enabled_toggles_nothing(root, keychain, monkeypatch, 
     out = capsys.readouterr().out
     assert OFFER not in out and expected in out
     assert enable_calls == [] and load_worker_settings(root).enabled is True
-    assert ("  ✓ Worker            running" if process == "running" else "  ✗ Worker            enabled but not running") in out
+    assert ("  ✓ Worker      running" if process == "running" else "  ✗ Worker      enabled but not running") in out
 
 
 @pytest.mark.parametrize("error, expected", [
@@ -286,7 +284,7 @@ def test_pair_reports_a_refused_enable_and_the_manual_command(root, keychain, mo
     monkeypatch.setattr(cli, "enable_worker", refuse)
     assert _pair(root, monkeypatch, interactive=True, answers=["y"]) == 0
     out = capsys.readouterr().out
-    assert expected in out and "Start it later with `openswap worker enable`." in out
+    assert f"{expected} {guided_setup.START_WORKER_NEXT}" in out
     assert guided_setup.WORKER_ONLINE not in out and "/Users/someone/secret" not in out
     assert load_worker_settings(root).control_service_url == "http://localhost"
 
@@ -309,7 +307,7 @@ def test_pairing_succeeds_even_if_the_whole_setup_fails(root, keychain, monkeypa
     monkeypatch.setattr(guided_setup, "run", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("x")))
     assert _pair(root, monkeypatch, interactive=True) == 0
     out = capsys.readouterr().out
-    assert "Paired worker worker." in out and "`openswap worker setup`" in out
+    assert "✓ Paired this Mac (worker)." in out and "`openswap worker setup`" in out
     assert load_worker_settings(root).control_service_url == "http://localhost"
 
 
@@ -319,13 +317,13 @@ def test_summary_is_ready_only_when_admission_is_open(root, monkeypatch, capsys,
     monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": "running", "remote_connectivity": "online"})
     assert _setup(root, monkeypatch, ["", "y", ""]) == 0
     out = capsys.readouterr().out
-    assert "  ✗ Worker            running (admission paused)" in out
-    assert "Before Slack can start tasks on this Mac:\n  1. reopen admission (`openswap worker pause --off`)" in out
-    assert "Ready for Slack" not in out
+    assert "  ✗ Worker      running (paused)" in out
+    assert "Next: `openswap worker pause --off` to resume." in out
+    assert guided_setup.EXECUTION_OFF_NOTE not in out
     update_worker_settings(root, paused=False)
     assert _setup(root, monkeypatch, ["", ""]) == 0
     out = capsys.readouterr().out
-    assert "  ✓ Worker            running\n" in out and "Ready for Slack" in out
+    assert "  ✓ Worker      running\n" in out and guided_setup.EXECUTION_OFF_NOTE in out
 
 
 @pytest.mark.parametrize(("process", "loaded", "worker"), [
@@ -347,11 +345,11 @@ def test_only_a_running_worker_counts_as_ready(root, monkeypatch, process, loade
     assert state.worker == worker
     expected = {
         "running": None,
-        "starting": "wait for the worker to finish starting (`openswap worker status`)",
-        "stopped": "start the worker (`openswap worker enable`)",
+        "starting": "wait a moment, then `openswap worker status`",
+        "stopped": "`openswap worker enable` to start the worker",
     }[worker]
-    worker_steps = {"wait for the worker to finish starting (`openswap worker status`)",
-                    "start the worker (`openswap worker enable`)"}
+    worker_steps = {"wait a moment, then `openswap worker status`",
+                    "`openswap worker enable` to start the worker"}
     assert worker_steps & set(state.missing) == ({expected} if expected else set())
 
 
@@ -364,7 +362,7 @@ def test_summary_waits_briefly_for_a_starting_worker(root, monkeypatch, capsys, 
     monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: None)
     guided_setup.summary(root, _Say())
     out = capsys.readouterr().out
-    assert "  ✓ Worker            running\n" in out and "wait for the worker" not in out
+    assert "  ✓ Worker      running\n" in out and "wait a moment" not in out
 
 
 def test_summary_never_calls_a_stuck_starting_worker_ready(root, monkeypatch, capsys, research_home):
@@ -375,16 +373,16 @@ def test_summary_never_calls_a_stuck_starting_worker_ready(root, monkeypatch, ca
     guided_setup.summary(root, _Say(),
                          start_wait_s=0)
     out = capsys.readouterr().out
-    assert "  • Worker            starting" in out and "Ready for Slack" not in out
-    assert "wait for the worker to finish starting" in out
+    assert "  • Worker      starting" in out and guided_setup.EXECUTION_OFF_NOTE not in out
+    assert "wait a moment, then `openswap worker status`" in guided_setup.readiness(root).missing
 
 
 @pytest.mark.parametrize(("connection", "step"), [
     ("online", None),
-    ("offline", "wait for the worker to connect to the service (`openswap worker status`)"),
-    (None, "wait for the worker to connect to the service (`openswap worker status`)"),
-    ("revoked", "pair this Mac again: the service revoked it (`openswap worker pair <url> <code>`)"),
-    ("expired", "pair this Mac again: its pairing expired (`openswap worker pair <url> <code>`)"),
+    ("offline", "wait a moment, then `openswap worker status`"),
+    (None, "wait a moment, then `openswap worker status`"),
+    ("revoked", "`openswap worker pair <url> <code>` to pair again (this Mac was removed)"),
+    ("expired", "`openswap worker pair <url> <code>` to pair again (the pairing expired)"),
 ])
 def test_a_paired_worker_is_ready_only_while_online(root, monkeypatch, capsys, research_home, connection, step):
     configure_worker_service(root, URL, "worker-1")
@@ -398,7 +396,7 @@ def test_a_paired_worker_is_ready_only_while_online(root, monkeypatch, capsys, r
     assert guided_setup.readiness(root).missing == ((step,) if step else ())
     guided_setup.summary(root, _Say(), start_wait_s=0)
     out = capsys.readouterr().out
-    assert ("Ready for Slack" in out) is (step is None)
+    assert (guided_setup.EXECUTION_OFF_NOTE in out) is (step is None)
 
 
 def test_summary_waits_briefly_for_the_service_connection(root, monkeypatch, capsys, research_home):
@@ -412,14 +410,14 @@ def test_summary_waits_briefly_for_the_service_connection(root, monkeypatch, cap
     monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: None)
     guided_setup.summary(root, _Say())
     out = capsys.readouterr().out
-    assert f"  ✓ Service           {URL} (online)" in out and "Ready for Slack" in out
+    assert f"  ✓ Paired      {URL} (online)" in out and guided_setup.EXECUTION_OFF_NOTE in out
 
 
 def test_allowed_accounts_without_a_pinned_default_are_not_ready(root, monkeypatch):
     cli.allow_worker_account(root, "1")
     cli.set_worker_account(root, None)
     assert guided_setup.readiness(root).account is None
-    assert "pin an account (`openswap worker account <slot>`, or `claude:<slot>`)" in \
+    assert "`openswap worker account <slot>` to pick an account" in \
         guided_setup.readiness(root).missing
 
 
@@ -432,7 +430,7 @@ def test_a_failing_pin_keeps_the_setup_going(root, keychain, monkeypatch, capsys
     monkeypatch.setattr(cli, "set_worker_account", lambda *_: (_ for _ in ()).throw(OSError("disk")))
     assert _pair(root, monkeypatch, interactive=True, answers=["n", "1", ""]) == 0
     out = capsys.readouterr().out
-    assert "Could not pin that account" in out
+    assert "Could not pick that account" in out
     assert load_worker_settings(root).workspaces[0].workspace_id == "github" and not _builtin(root)
 
 
@@ -460,13 +458,13 @@ def test_setup_reruns_the_steps_on_a_paired_mac(root, monkeypatch, capsys, enabl
     # Run again: ~/GitHub is readable now (✓); Enter keeps the current folders.
     assert _setup(root, monkeypatch, ["n", "", ""]) == 0
     out = capsys.readouterr().out
-    assert "  ✓ 1  ~/GitHub  (recommended, readable as github)" in out
+    assert "  ✓ 1  ~/GitHub  (recommended, added as github)" in out
     assert KEEP_FOLDERS in out and PICK not in out
     assert "Kept the current folders." in out
     assert load_worker_settings(root).workspaces == (workspace,)
     # Choosing it again changes nothing either.
     assert _setup(root, monkeypatch, ["n", "", "1"]) == 0
-    assert '✓ ~/GitHub is already readable as "github".' in capsys.readouterr().out
+    assert "✓ ~/GitHub (github, already added)" in capsys.readouterr().out
     assert load_worker_settings(root).workspaces == (workspace,)
 
 
@@ -476,9 +474,9 @@ def test_setup_without_a_tty_lists_the_readable_folders(root, monkeypatch, capsy
     _answers(monkeypatch, [], interactive=False)
     assert _run(root, "setup") == 0
     out = capsys.readouterr().out
-    assert "Folders remote tasks may read, never change (the control service sees only the ID and label):" in out
+    assert "Folders:" in out
     assert '  ✓ 1  github  "GitHub"  ~/GitHub' in out
-    assert "  ✓ Readable folders  github (GitHub)" in out
+    assert "  ✓ Folders     github (GitHub)" in out
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits only")
@@ -545,7 +543,7 @@ def test_with_nothing_found_the_step_asks_for_a_path(root, monkeypatch, capsys, 
     work = _code(tmp_path, "My Code.v2")
     assert _setup(root, monkeypatch, ["n", "", "1", str(work)]) == 0
     out = capsys.readouterr().out
-    assert TYPE_PATH in out and "Type one folder path." in out
+    assert TYPE_PATH in out and "Type a folder path." in out
     (workspace,) = load_worker_settings(root).workspaces
     assert workspace.workspace_id == "my-code-v2" and workspace.display_label == "My Code.v2"
     assert workspace.readonly_roots == (work.resolve(),)
@@ -554,10 +552,10 @@ def test_with_nothing_found_the_step_asks_for_a_path(root, monkeypatch, capsys, 
 def test_enter_with_nothing_found_keeps_the_builtin_results_folder(root, monkeypatch, capsys, enable_calls):
     assert _setup(root, monkeypatch, ["n", "", ""]) == 0
     out = capsys.readouterr().out
-    assert TYPE_PATH in out and "No folder chosen." in out
+    assert TYPE_PATH in out and "No folder added." in out
     assert "`openswap worker workspace add --read <folder>`" in out
     assert _builtin(root)
-    assert "  • Readable folders  none (tasks read no folder on this Mac)" in out
+    assert "  • Folders     none" in out
 
 
 def test_several_numbers_make_one_workspace_each(root, monkeypatch, capsys, enable_calls, research_home):
@@ -565,12 +563,12 @@ def test_several_numbers_make_one_workspace_each(root, monkeypatch, capsys, enab
     _code(home, "GitHub/site.io/.git", "GitHub/api/.git", "Projects")
     assert _setup(root, monkeypatch, ["n", "", "9", "3, 2 3"]) == 0
     out = capsys.readouterr().out
-    assert "Type numbers from 1 to 4 (like 1 3), or one folder path." in out
+    assert "Type numbers from 1 to 4, or a folder path." in out
     workspaces = load_worker_settings(root).workspaces
     assert [(w.workspace_id, w.display_label) for w in workspaces] == [("site-io", "site.io"), ("api", "api")]
     assert [w.output_root for w in workspaces] == [(research_home / "site-io").resolve(),
                                                    (research_home / "api").resolve()]
-    assert "  ✓ Readable folders  site-io (site.io), api (api)" in out
+    assert "  ✓ Folders     site-io (site.io), api (api)" in out
 
 
 @pytest.mark.parametrize(("answer", "expected"), [
@@ -666,8 +664,8 @@ def test_the_step_says_when_the_builtin_folder_stays(root, monkeypatch, capsys, 
     store.create(_submission(), owner_ref="local-user", worker_epoch=store.current_epoch())
     assert _setup(root, monkeypatch, ["n", "", ""]) == 0
     out = capsys.readouterr().out
-    assert 'The built-in "research" folder stays approved while a task still uses it' in out
-    assert "  ✓ Readable folders  github (GitHub)" in out
+    assert '"research" stays until its running task ends.' in out
+    assert "  ✓ Folders     github (GitHub)" in out
 
 
 def test_folder_ids_never_collide(root, research_home, tmp_path):
@@ -882,9 +880,9 @@ def test_status_and_summary_name_the_refused_workspaces(root, research_home, mon
     monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": False})
     assert _run(root, "status") == 0
     out = capsys.readouterr().out
-    assert ('✗ Jobs in workspace "a" are refused at launch (folder_overlaps_readable). '
+    assert ('✗ "a" is blocked (folder_overlaps_readable). '
             + cli._WORKSPACE_MESSAGES["folder_overlaps_readable"]) in out
-    assert 'workspace "b" are refused at launch (readonly_source_overlaps_results)' in out
+    assert '"b" is blocked (readonly_source_overlaps_results)' in out
     assert "Next: fix or remove those workspaces" in out
     assert _run(root, "status", "--json") == 0
     assert json.loads(capsys.readouterr().out)["refused_workspaces"] == [
@@ -893,10 +891,10 @@ def test_status_and_summary_name_the_refused_workspaces(root, research_home, mon
     assert str(research_home) not in out
     assert _setup(root, monkeypatch, ["n", "", ""]) == 0
     out = capsys.readouterr().out
-    assert "  ✗ Readable folders  b (b)" in out
-    assert 'Jobs in workspace "a" are refused at launch' in out
-    assert 'fix or remove workspaces "a", "b": jobs there are refused' in out
-    assert "Ready for Slack" not in out
+    assert "  ✗ Folders     b (b)" in out
+    assert '"a" is blocked' in out
+    assert '`openswap worker workspace list` to fix "a", "b"' in guided_setup.readiness(root).missing
+    assert guided_setup.EXECUTION_OFF_NOTE not in out
 
 
 def test_status_without_refusals_adds_nothing(root, monkeypatch, capsys):
@@ -1460,12 +1458,12 @@ def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root,
     # The numbered list and the question share one dialog; Enter's default is prefilled.
     folders = dialogs.shown[4][1]
     assert "Step 3 of 4 · Folders" in folders["message"]
-    assert "Remote tasks can read the folders you choose here, but never change them." in folders["message"]
+    assert f"{guided_setup.FOLDER_USE}. Results go to ~/OpenSwap Research." in folders["message"]
     assert "  • 1  ~/GitHub  (recommended)" in folders["message"]
-    assert folders["message"].endswith("Folders tasks may read (numbers like 1 3, or a path; Enter for 1)")
+    assert folders["message"].endswith("Folders (numbers or a path)")
     assert folders["default_text"] == "1" and folders["ok"] == "Continue"
     assert "That is not a pairing command" in messages[1]
-    assert "Paired worker worker." in messages[2] and "Start the Remote tasks worker now" in messages[2]
+    assert "✓ Paired this Mac (worker)." in messages[2] and "Start the worker now?" in messages[2]
     assert dialogs.shown[-1][1]["ok"] == "Done" and SUMMARY in messages[-1]
     # The dialogs carry the same step headers and plain menu rows: no ANSI codes.
     assert "Step 1 of 4 · Worker" in messages[2] and "Step 2 of 4 · Account" in messages[3]
@@ -1487,9 +1485,9 @@ def test_menu_setup_on_a_paired_mac_skips_pairing(root, enable_calls):
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
-    assert "Start the Remote tasks worker now" in dialogs.shown[0][1]["message"]
+    assert "Start the worker now?" in dialogs.shown[0][1]["message"]
     assert "Type the path to your code folder, for example ~/GitHub" in dialogs.shown[2][1]["message"]
-    assert "No folder chosen." in dialogs.shown[3][1]["message"]
+    assert "No folder added." in dialogs.shown[3][1]["message"]
     assert enable_calls == [] and _builtin(root)
 
 
@@ -1501,7 +1499,7 @@ def test_menu_setup_reads_several_folders_by_number(root, enable_calls, research
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
     assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github", "projects"]
-    assert "Readable folders  github (GitHub), projects (Projects)" in dialogs.shown[-1][1]["message"]
+    assert "Folders     github (GitHub), projects (Projects)" in dialogs.shown[-1][1]["message"]
 
 
 def test_menu_setup_reports_a_refused_code(root, keychain, monkeypatch):
@@ -1514,7 +1512,7 @@ def test_menu_setup_reports_a_refused_code(root, keychain, monkeypatch):
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
-    assert "Could not pair: invalid_code." in dialogs.shown[1][1]["message"]
+    assert "Could not pair (invalid_code)." in dialogs.shown[1][1]["message"]
     assert load_worker_settings(root).control_service_url is None
 
 
@@ -1566,10 +1564,17 @@ def test_setup_pins_a_claude_account_and_points_at_the_claude_live_check(root, k
                                                                        enable_calls, research_home):
     assert _pair(root, monkeypatch, interactive=True, answers=["y", "claude:4", "y", ""]) == 0
     out = capsys.readouterr().out
-    assert "Pinned Claude account 4 · carol@example.com (claudey)" in out
+    assert "✓ Claude 4 · carol@example.com (claudey)" in out
     assert load_worker_settings(root).pinned_account_ref.startswith("claude:")
-    assert "  ✓ Account           Claude 4 · carol@example.com (claudey)" in out
-    assert guided_setup.CLAUDE_EXECUTION_OFF_NOTE in out and guided_setup.EXECUTION_OFF_NOTE not in out
+    assert "  ✓ Account     Claude 4 · carol@example.com (claudey)" in out
+    # Once nothing else is missing, the one Next is the Claude live check.
+    update_worker_settings(root, enabled=True)
+    monkeypatch.setattr(cli, "read_status", lambda _root: {
+        "enabled": True, "process_state": "running", "remote_connectivity": "online"})
+    guided_setup.summary(root, _Say(), start_wait_s=0)
+    out = capsys.readouterr().out
+    assert out.rstrip().endswith(guided_setup.CLAUDE_EXECUTION_OFF_NOTE)
+    assert guided_setup.EXECUTION_OFF_NOTE not in out
     for command in ("openswap worker claude pin", "openswap worker claude prepare",
                     "openswap worker live-check --provider claude"):
         assert command in out
@@ -1625,3 +1630,93 @@ def test_dialog_prompts_type_the_folder_without_a_chooser():
     ui = guided_setup.DialogPrompts(dialogs.alert, dialogs.prompt)
     assert ui.choose_folder("Folder?") == "/tmp/x"
     assert dialogs.shown[0][0] == "prompt"
+
+
+# --- the terminal folder search ------------------------------------------------------------------
+
+
+class _Searching(guided_setup.TerminalPrompts):
+    """A terminal whose folder search is scripted: each answer is what the picker returns."""
+
+    def __init__(self, answers):
+        super().__init__(interactive=True, read_line=lambda prompt: pytest.fail(f"asked {prompt!r}"))
+        self.answers, self.calls = list(answers), []
+
+    def can_search_folders(self):
+        return True
+
+    def search_folders(self, question, *, pinned=(), highlight=None):
+        self.calls.append((question, list(pinned), highlight))
+        return self.answers.pop(0) if self.answers else ""
+
+
+def test_the_terminal_folder_step_searches_then_offers_another(root, research_home, capsys):
+    home = research_home.parent
+    github = _code(home, "GitHub/openswap/.git", "GitHub/opentag/.git").parents[1]
+    ui = _Searching([str(github), "9", "2 3", ""])
+    guided_setup.choose_folders(root, ui)
+    out = capsys.readouterr().out
+    # No numbered list or plain question: the picker shows the suggestions.
+    assert "  • 1  ~/GitHub" not in out and "Folders (" not in out
+    (question, pinned, highlight), *later = ui.calls
+    assert question == "Folders" and highlight == 0
+    assert [(guided_setup._display_path(s.path), s.note, s.checked) for s in pinned] == [
+        ("~/GitHub", "(recommended)", False), ("~/GitHub/openswap", "(git repo)", False),
+        ("~/GitHub/opentag", "(git repo)", False)]
+    # After a pick the same search opens again, nothing highlighted, the pick ticked.
+    assert all(call[0] == "Add another (Enter to finish)" and call[2] is None for call in later)
+    assert [s.checked for s in later[0][1]] == [True, False, False]
+    assert "✓ ~/GitHub (github)" in out and "Type numbers from 1 to 3, or a folder path." in out
+    assert "✓ ~/GitHub/openswap (openswap)" in out and "✓ ~/GitHub/opentag (opentag)" in out
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github", "openswap", "opentag"]
+
+
+def test_the_terminal_folder_search_refuses_like_any_answer(root, research_home, capsys):
+    home = research_home.parent
+    _code(home, "GitHub")
+    ui = _Searching([str(home), "~/GitHub", ""])
+    guided_setup.choose_folders(root, ui)
+    out = capsys.readouterr().out
+    assert f"~: {cli._WORKSPACE_MESSAGES['readable_home']}" in out
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github"]
+    assert len(ui.calls) == 3 and ui.calls[1][0] == "Folders"  # a refusal asks the same question again
+
+
+def test_escape_at_the_first_search_adds_nothing(root, research_home, capsys):
+    _code(research_home.parent, "GitHub")
+    ui = _Searching([""])
+    guided_setup.choose_folders(root, ui)
+    assert f"No folder added. {guided_setup.FOLDER_NEXT}" in capsys.readouterr().out
+    assert _builtin(root)
+
+
+def test_with_folders_already_added_nothing_is_highlighted(root, research_home, capsys, github):
+    cli.add_readable_folder(root, github)
+    ui = _Searching([""])
+    guided_setup.choose_folders(root, ui)
+    assert ui.calls[0][2] is None and ui.calls[0][1][0].checked
+    assert "Kept the current folders." in capsys.readouterr().out
+
+
+def test_the_live_search_runs_only_on_a_real_terminal(monkeypatch):
+    from openswap import folder_picker
+
+    assert not guided_setup.TerminalPrompts(interactive=True, read_line=lambda _p: "").can_search_folders()
+    monkeypatch.setattr(folder_picker, "_tty_available", lambda: False)
+    assert not guided_setup.TerminalPrompts(interactive=True).can_search_folders()  # piped, or Windows
+    monkeypatch.setattr(folder_picker, "_tty_available", lambda: True)
+    ui = guided_setup.TerminalPrompts(interactive=True)
+    assert ui.can_search_folders()
+    seen = []
+    monkeypatch.setattr(folder_picker, "pick_folder", lambda question, **kw: seen.append((question, kw)) or "")
+    monkeypatch.setattr(folder_picker.FolderIndex, "start", lambda self: self)
+    assert ui.search_folders("Folders", pinned=["p"], highlight=0) == ""
+    ui.search_folders("Add another (Enter to finish)")
+    (first, kw1), (second, kw2) = seen
+    assert first == "Folders: " and kw1["pinned"] == ["p"] and kw1["highlight"] == 0
+    assert second == "Add another (Enter to finish): " and kw2["index"] is kw1["index"]  # one scan per run
+
+
+def test_the_menu_bar_keeps_the_numbered_dialog():
+    for front_end in (guided_setup.DialogPrompts, guided_setup.ThreadedPrompts):
+        assert not hasattr(front_end, "search_folders") and not hasattr(front_end, "can_search_folders")

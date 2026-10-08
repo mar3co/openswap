@@ -108,13 +108,13 @@ def test_step_headers_are_bold_on_a_colour_terminal_only(monkeypatch):
 def test_prompts_render_the_default_and_a_colon(monkeypatch):
     seen = []
     ui = guided_setup.TerminalPrompts(interactive=True, read_line=lambda prompt: seen.append(prompt) or "")
-    assert ui.ask("Account number (1-6; Enter keeps the current one)", default="2") == "2"
-    assert ui.ask("Folders tasks may read (numbers like 1 3, or a path; Enter for 1)", default="1") == "1"
-    assert ui.ask("Type the path to your code folder, for example ~/GitHub (Enter to skip)") == ""
+    assert ui.ask("Account", default="2") == "2"
+    assert ui.ask("Folders (numbers or a path)", default="1") == "1"
+    assert ui.ask("Type the path to your code folder, for example ~/GitHub (Enter skips)") == ""
     assert ui.confirm("Keep going?") is True
-    assert seen == ["Account number (1-6; Enter keeps the current one) [2]: ",
-                    "Folders tasks may read (numbers like 1 3, or a path; Enter for 1) [1]: ",
-                    "Type the path to your code folder, for example ~/GitHub (Enter to skip): ",
+    assert seen == ["Account [2]: ",
+                    "Folders (numbers or a path) [1]: ",
+                    "Type the path to your code folder, for example ~/GitHub (Enter skips): ",
                     "Keep going? [Y/n] "]
 
 
@@ -130,8 +130,8 @@ def test_setup_without_a_tty_prints_headers_and_commands_but_asks_nothing(root, 
     for title in ("Step 1 of 4 · Worker", "Step 2 of 4 · Account", "Step 3 of 4 · Folders",
                   "Step 4 of 4 · Summary"):
         assert title in out
-    assert guided_setup.ACCOUNT_NEXT in out and "Account number" not in out
-    assert "  ✗ Account           none pinned" in out and "\x1b[" not in out and SECRET not in out
+    assert guided_setup.ACCOUNT_NEXT in out and "Account (" not in out
+    assert "  ✗ Account     none" in out and "\x1b[" not in out and SECRET not in out
 
 
 # --- the account menu --------------------------------------------------------------------------

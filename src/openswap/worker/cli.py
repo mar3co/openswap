@@ -645,7 +645,7 @@ def refused_workspaces(backup_root: Path, workspaces=None) -> list[tuple[str, st
 def refusal_line(workspace_id: str, code: str) -> str:
     """One path-free line saying which workspace is refused at launch and why."""
     reason = _WORKSPACE_MESSAGES.get(code, "It breaks the folder rules.")
-    return f'{printer.MARK_BAD} Jobs in workspace "{workspace_id}" are refused at launch ({code}). {reason}'
+    return f'{printer.MARK_BAD} "{workspace_id}" is blocked ({code}). {reason}'
 
 
 def is_github_folder(folder: Path) -> bool:
@@ -1329,11 +1329,12 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     pair_parser.add_argument("url")
     pair_parser.add_argument("code")
     commands.add_parser(
-        "setup", help="walk through starting the worker, the account and the folders tasks may read",
-        description="The guided steps `pair` runs after pairing: start the worker, confirm the "
-                    "Codex or Claude account, choose the folders remote tasks may read (never change; "
-                    "~/GitHub is suggested when it exists), then show what is still missing before Slack "
-                    "can start tasks on this Mac. Results are saved under ~/OpenSwap Research.",
+        "setup", help="walk through starting the worker, the account and the folders tasks use",
+        description="The guided steps `pair` runs after pairing: start the worker, pick the Codex "
+                    "or Claude account, pick the folders tasks use (~/GitHub is suggested when it "
+                    "exists; on a terminal, type to search, or numbers like 1 3), then a checklist "
+                    "with one next step. Results are saved under ~/OpenSwap Research. Only each "
+                    "folder's ID and name reach the control service; paths never leave this Mac.",
     )
     unpair_parser = commands.add_parser(
         "unpair", help="remove the device key and configured service URL; pass a URL to remove an enrollment "
@@ -1478,14 +1479,13 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         try:
             if args.command == "pair":
                 worker_id = pair(root, args.url, args.code)
-                print(f"Paired worker {worker_id}. Local execution policy is still controlled on this Mac.")
+                print(f"{printer.MARK_OK} Paired this Mac ({worker_id}).")
                 # Pairing already succeeded; the guided steps are optional and
                 # print the manual command for any step that fails.
                 try:
                     _guided_setup(root)
                 except Exception:
-                    print("Next: `openswap worker setup` to start the worker, pin an account and "
-                          "choose the folders tasks may read.")
+                    print("Next: `openswap worker setup` to finish setting up.")
             else:
                 if unpair(root, args.url):
                     print("Worker unpaired; remote access disabled.")
@@ -1694,10 +1694,7 @@ _WORKSPACE_MESSAGES = {
     "folder_invalid": "That folder path is not valid.",
     "folder_unavailable": "The folder could not be created or read.",
     "folder_unsafe": "The folder must be a real directory, not a symlink or a file.",
-    "folder_permissions": (
-        "The folder must be owned by you with no group or other access. "
-        "Run `chmod 700` on it, then try again."
-    ),
+    "folder_permissions": "Only you may open a results folder. Run `chmod 700` on it, then try again.",
     "folder_exposes_credentials": (
         "That folder is, or contains, your home folder or an OpenSwap, Codex or Claude "
         "credential folder. Choose a dedicated research folder."
@@ -1711,35 +1708,17 @@ _WORKSPACE_MESSAGES = {
     "readonly_source_not_owned": "A read-only source must be owned by you.",
     "readonly_source_permissions": "A read-only source must not be writable by group or others.",
     "readonly_source_overlaps_folder": "The research folder and its read-only sources must not overlap.",
-    "readable_system": "That is a system folder. Choose a folder with your own files, such as ~/GitHub.",
-    "readable_home": (
-        "Tasks cannot read your whole home folder. Choose a folder inside it, such as ~/GitHub."
-    ),
-    "readable_private": (
-        "That folder holds app data or private settings (~/Library or a hidden folder). "
-        "Choose a folder with your code or documents."
-    ),
-    "readable_exposes_credentials": (
-        "That folder is, contains or sits inside an OpenSwap, Codex or Claude credential folder."
-    ),
-    "readable_results": (
-        "That folder overlaps ~/OpenSwap Research, where task results are saved. "
-        "Choose a folder with your own files."
-    ),
-    "readable_unavailable": "That folder does not exist or cannot be read.",
-    "readable_unsafe": "That is not a folder.",
-    "readable_not_owned": "Tasks can read only folders you own.",
-    "readonly_source_overlaps_results": (
-        "That folder overlaps another workspace's results folder, where tasks write. "
-        "Choose a folder that holds no task results."
-    ),
-    "folder_overlaps_readable": (
-        "That folder overlaps a folder tasks may only read. Choose a results folder outside it."
-    ),
-    "readable_permissions": (
-        "Other users can change that folder, so it could change while a task reads it. "
-        "Run `chmod go-w` on it, then try again."
-    ),
+    "readable_system": "That's a system folder. Pick one with your own files, like ~/GitHub.",
+    "readable_home": "That's your whole home folder. Pick a folder inside it, like ~/GitHub.",
+    "readable_private": "That's app data or a hidden folder. Pick one with your own files.",
+    "readable_exposes_credentials": "That folder holds OpenSwap, Codex or Claude sign-ins. Pick another.",
+    "readable_results": "That's where results are saved. Pick a folder with your own files.",
+    "readable_unavailable": "That folder doesn't exist or can't be opened.",
+    "readable_unsafe": "That's not a folder.",
+    "readable_not_owned": "That folder isn't yours. Pick one you own.",
+    "readonly_source_overlaps_results": "That folder holds another folder's task results. Pick another.",
+    "folder_overlaps_readable": "That results folder is inside a folder tasks use. Pick another place.",
+    "readable_permissions": "Other users can change that folder. Run `chmod go-w` on it, then try again.",
     "label_invalid": "Labels are 1-100 characters with no control characters.",
     "worker_lifecycle_busy": "Worker settings are being changed; try again shortly.",
     "settings_unavailable": "Could not save the worker settings.",
