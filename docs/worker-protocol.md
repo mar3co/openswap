@@ -316,6 +316,24 @@ service-side jobs of the registration it replaces. With no configured URL it
 performs no network or Keychain access. The production adapter still refuses
 jobs in this phase.
 
+Pairing does not start the worker, so a freshly paired Mac stays offline in the
+service until the worker runs. After the account and folder steps, `pair` on an
+interactive terminal asks "Start the Remote tasks worker now so this Mac can
+accept approved tasks? [Y/n]". Yes (or Enter) runs the same function as
+`openswap worker enable` and reports its result: on success the service shows
+the Mac online within about 15 seconds; a refusal prints `enable`'s message,
+its diagnostic code when it is one of `enable`'s own, and the manual command.
+No, any other answer, or EOF leaves the worker off and prints
+`openswap worker enable`; without a terminal `pair` prints that next step and
+asks nothing. An already enabled worker is never toggled: `pair` says it is
+running, or that it is enabled but not running (for example its LaunchAgent was
+unloaded) and points at `worker enable` and `worker status`. A final line notes
+that execution stays off (`live_adapter_disabled`) for now. Nothing in this
+step can fail pairing. While a URL is configured and the worker is disabled or
+not running, human `worker status` adds "Paired with <origin> but the worker is
+off; run `openswap worker enable`" (`--json` is unchanged), and the menu bar's
+Remote tasks section shows "Paired, worker off" under **Enable local worker**.
+
 ### Choosing the account and research folders
 
 Pairing never selects an account or a folder; the submission names neither.

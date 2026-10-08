@@ -857,6 +857,7 @@ class MenuBarPanel:
         worker_paused=None,
         worker_status=None,
         on_worker_view_active=None,
+        worker_paired=None,
     ):
         self._on_switch = on_switch
         self._on_rotate = on_rotate
@@ -884,6 +885,7 @@ class MenuBarPanel:
         self._worker_enabled = worker_enabled or (lambda: False)
         self._worker_paused = worker_paused or (lambda: False)
         self._worker_status = worker_status or (lambda: {})
+        self._worker_paired = worker_paired or (lambda: False)
         self._on_worker_view_active = on_worker_view_active
         self._login_alias = ""
         self._login_alias_field = None
@@ -1786,6 +1788,10 @@ class MenuBarPanel:
                 worker_status = {}
         except Exception:
             worker_enabled, worker_paused, worker_status = False, False, {}
+        try:
+            worker_paired = bool(self._worker_paired())
+        except Exception:
+            worker_paired = False
         rows = settings_page_rows(
             settings,
             strategy=strategy,
@@ -1795,6 +1801,7 @@ class MenuBarPanel:
             worker_enabled=worker_enabled,
             worker_paused=worker_paused,
             worker_status=worker_status,
+            worker_paired=worker_paired,
             section=self._settings_section,
         )
 

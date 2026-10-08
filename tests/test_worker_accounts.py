@@ -21,6 +21,7 @@ from openswap.settings import (
     WorkerSettings,
     WorkerWorkspace,
     configure_worker_local_policy,
+    configure_worker_service,
     load_worker_settings,
     update_worker_settings,
 )
@@ -579,6 +580,197 @@ def test_pair_prompt_survives_a_failing_pin(root, keychain, monkeypatch, capsys)
                         lambda *_: (_ for _ in ()).throw(OSError("disk")))
     assert _pair(root, monkeypatch, interactive=True, answers=["1"]) == 0
     assert "Could not pin that account" in capsys.readouterr().out
+
+
+# --- after pairing: offer to start the worker ---------------------------------------
+
+OFFER = "Start the Remote tasks worker now so this Mac can accept approved tasks? [Y/n] "
+ONLINE = "Remote tasks worker enabled. The portal shows this Mac online within about 15 seconds."
+
+
+@pytest.fixture
+def enable_calls(monkeypatch):
+    """Stub `worker enable`'s function: no launchctl, no settings change."""
+    calls = []
+    monkeypatch.setattr(cli, "enable_worker", lambda backup_root: calls.append(backup_root) or {"enabled": True})
+    return calls
+
+
+@pytest.mark.parametrize("answer", ["y", "Yes", ""])
+def test_pair_offer_yes_starts_the_worker_through_the_enable_function(
+    root, keychain, monkeypatch, capsys, enable_calls, answer,
+):
+    cli.set_worker_account(root, "1")  # no account prompt: the first answer is the offer's
+    assert _pair(root, monkeypatch, interactive=True, answers=[answer]) == 0
+    out = capsys.readouterr().out
+    assert enable_calls == [root]
+    assert OFFER in out and ONLINE in out
+    assert out.index(cli._WORKSPACE_HINT) < out.index(OFFER)  # after the account and folder steps
+    assert cli._EXECUTION_OFF_NOTE in out
+
+
+def test_pair_offer_follows_the_account_prompt(root, keychain, monkeypatch, capsys, enable_calls):
+    assert _pair(root, monkeypatch, interactive=True, answers=["1", "n"]) == 0
+    out = capsys.readouterr().out
+    assert out.index("Pinned Codex account 1") < out.index(OFFER)
+    assert enable_calls == []
+
+
+@pytest.mark.parametrize("answers", [["n"], ["no"], ["later"], []], ids=["n", "no", "other", "eof"])
+def test_pair_offer_no_or_eof_points_at_worker_enable(
+    root, keychain, monkeypatch, capsys, enable_calls, answers,
+):
+    cli.set_worker_account(root, "1")
+    assert _pair(root, monkeypatch, interactive=True, answers=answers) == 0
+    out = capsys.readouterr().out
+    assert enable_calls == []
+    assert OFFER in out
+    assert "Not started. Start it later with `openswap worker enable`." in out
+    assert cli._EXECUTION_OFF_NOTE in out
+    assert load_worker_settings(root).enabled is False
+
+
+def test_pair_offer_without_a_tty_prints_the_next_step(root, keychain, monkeypatch, capsys, enable_calls):
+    assert _pair(root, monkeypatch, interactive=False, answers=["y"]) == 0  # never read
+    out = capsys.readouterr().out
+    assert enable_calls == []
+    assert OFFER not in out
+    assert cli._START_WORKER_NEXT in out and "`openswap worker enable`" in out
+    assert cli._EXECUTION_OFF_NOTE in out
+
+
+@pytest.mark.parametrize("process, expected", [
+    ("running", "The Remote tasks worker is already running on this Mac."),
+    ("stopped", "The Remote tasks worker is enabled but not running. Run `openswap worker enable` "
+                "to start it again, or `openswap worker status` to check."),
+])
+def test_pair_offer_when_already_enabled_toggles_nothing(
+    root, keychain, monkeypatch, capsys, enable_calls, process, expected,
+):
+    cli.set_worker_account(root, "1")
+    update_worker_settings(root, enabled=True)
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": process})
+    assert _pair(root, monkeypatch, interactive=True, answers=["n"]) == 0
+    out = capsys.readouterr().out
+    assert OFFER not in out
+    assert expected in out
+    assert enable_calls == []
+    assert load_worker_settings(root).enabled is True
+
+
+@pytest.mark.parametrize("error, expected", [
+    (cli.ClaudeSwitchError("kickoff_in_progress"), "Could not enable worker (kickoff_in_progress)."),
+    (cli.ClaudeSwitchError("worker_stop_unconfirmed"),
+     "Worker is still stopping; wait for it to exit before enabling (worker_stop_unconfirmed)."),
+    # Detail that is not one of enable_worker's codes (paths, launchctl text) is not echoed.
+    (cli.ClaudeSwitchError("Could not write the worker LaunchAgent: /Users/someone/secret"),
+     "Could not enable worker."),
+    (OSError("disk"), "Could not enable worker."),
+])
+def test_pair_offer_reports_a_refused_enable_and_the_manual_command(
+    root, keychain, monkeypatch, capsys, error, expected,
+):
+    def refuse(_root):
+        raise error
+
+    monkeypatch.setattr(cli, "enable_worker", refuse)
+    cli.set_worker_account(root, "1")
+    assert _pair(root, monkeypatch, interactive=True, answers=["y"]) == 0
+    out = capsys.readouterr().out
+    assert expected in out
+    assert "Start it later with `openswap worker enable`." in out
+    assert ONLINE not in out
+    assert "/Users/someone/secret" not in out
+    assert load_worker_settings(root).control_service_url == "http://localhost"
+
+
+def test_pairing_succeeds_even_if_the_worker_offer_fails(root, keychain, monkeypatch, capsys, enable_calls):
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr(cli, "_post_pair_worker_offer", broken)
+    assert _pair(root, monkeypatch, interactive=True) == 0
+    assert "`openswap worker enable`" in capsys.readouterr().out
+    assert enable_calls == []
+    assert load_worker_settings(root).control_service_url == "http://localhost"
+
+
+def test_worker_offer_survives_a_failing_account_step(root, keychain, monkeypatch, capsys, enable_calls):
+    monkeypatch.setattr(cli, "_post_pair_setup", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("x")))
+    assert _pair(root, monkeypatch, interactive=True, answers=["y"]) == 0
+    out = capsys.readouterr().out
+    assert "Next: `openswap worker account`" in out
+    assert enable_calls == [root]
+
+
+# --- worker status: paired but off -----------------------------------------------------
+
+
+def _status(root, monkeypatch, capsys, snapshot, *extra):
+    monkeypatch.setattr(cli, "read_status", lambda _root: snapshot)
+    assert _run(root, "status", *extra) == 0
+    return capsys.readouterr().out
+
+
+@pytest.mark.parametrize("snapshot", [
+    {"enabled": False, "process_state": "stopped"},
+    {"enabled": True, "process_state": "stopped"},
+    {"enabled": True, "process_state": "stale"},
+])
+def test_status_hints_at_enable_when_paired_but_off(root, monkeypatch, capsys, snapshot):
+    configure_worker_service(root, "https://tag.example.com", "worker-1")
+    out = _status(root, monkeypatch, capsys, snapshot)
+    assert out.splitlines()[-1] == (
+        "Paired with https://tag.example.com but the worker is off; run `openswap worker enable`."
+    )
+
+
+@pytest.mark.parametrize("paired, snapshot", [
+    (False, {"enabled": False, "process_state": "stopped"}),
+    (True, {"enabled": True, "process_state": "running"}),
+])
+def test_status_has_no_hint_when_unpaired_or_running(root, monkeypatch, capsys, paired, snapshot):
+    if paired:
+        configure_worker_service(root, "https://tag.example.com", "worker-1")
+    out = _status(root, monkeypatch, capsys, snapshot)
+    assert "Paired with" not in out and len(out.splitlines()) == 1
+
+
+def test_status_json_is_unchanged_when_paired_but_off(root, monkeypatch, capsys):
+    configure_worker_service(root, "https://tag.example.com", "worker-1")
+    snapshot = {"enabled": False, "process_state": "stopped"}
+    out = _status(root, monkeypatch, capsys, snapshot, "--json")
+    assert json.loads(out) == snapshot
+
+
+# --- menu bar: paired, worker off ------------------------------------------------------
+
+
+def _general_rows(**kwargs):
+    return menubar.settings_page_rows(
+        menubar.MenuBarSettings(), strategy="best", threshold=90,
+        section=menubar.SETTINGS_SECTION_GENERAL, **kwargs,
+    )
+
+
+def test_menu_says_paired_worker_off_right_under_the_enable_switch():
+    rows = _general_rows(worker_paired=True, worker_enabled=False)
+    ids = [row["id"] for row in rows]
+    assert ids.index("remote_tasks_paired_off") == ids.index("remote_tasks_enabled") + 1
+    hint = rows[ids.index("remote_tasks_paired_off")]
+    assert hint["kind"] == "group" and hint["style"] == "hint"
+    assert hint["label"].startswith("Paired, worker off")
+    assert [row["id"] for row in rows if row.get("kind") == "toggle"].count("remote_tasks_enabled") == 1
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"worker_paired": False, "worker_enabled": False},
+    {"worker_paired": True, "worker_enabled": True},
+    {"worker_paired": True, "worker_enabled": False,
+     "worker_status": {"operation": "worker_enable_or_disable"}},
+])
+def test_menu_has_no_paired_off_line_otherwise(kwargs):
+    assert "remote_tasks_paired_off" not in [row["id"] for row in _general_rows(**kwargs)]
 
 
 # --- menu bar account picker ---------------------------------------------------------

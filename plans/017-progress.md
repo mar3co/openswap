@@ -1077,3 +1077,17 @@ folder" step now exists; until now only tests called
 Execution is still disabled: the production adapter remains
 `UnavailableCodexAdapter` until Phase 1's live-evidence gates clear, so this
 step lets the owner finish setup but does not run any provider job.
+
+## Post-pair worker offer (2026-10-07)
+
+An owner paired a Mac and the portal kept it Offline ("No heartbeat yet"):
+pairing never starts the worker and nothing said `openswap worker enable` was
+the next step. Enrollment still does not enable execution on its own. After the
+account and folder steps, `worker pair` on a terminal now asks to start the
+worker and, on yes, calls `enable_worker` (the function behind `worker enable`
+and the menu toggle); no, EOF and non-terminal runs print the command; an
+enabled worker is reported, never toggled, and pairing cannot fail here.
+Human `worker status` adds a one-line "Paired with <origin> but the worker is
+off" hint, and the menu bar shows "Paired, worker off" under **Enable local
+worker**. A conftest guard keeps pairing tests non-interactive so `pytest -s`
+on a terminal cannot reach the real launchctl.
