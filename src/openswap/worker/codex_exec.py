@@ -82,6 +82,13 @@ MAX_LINE_BYTES = 1024 * 1024
 READ_CHUNK_BYTES = 256 * 1024
 MAX_AUTH_BYTES = 1024 * 1024
 EVENT_WAIT_SECONDS = 0.25
+# A run whose streams outgrow these is stopped and failed, so one verbose job
+# cannot fill the disk.
+MAX_STDOUT_BYTES = 64 * 1024 * 1024
+MAX_STDERR_BYTES = 8 * 1024 * 1024
+# Finished runs whose stop is proven are pruned after this long, newest kept.
+RUN_RETENTION_SECONDS = 14 * 24 * 3600
+RUNS_KEPT = 50
 FINISHED_RUNS_KEPT = 32
 
 # Global feature switches, exactly the set the credential-free 0.157.1
@@ -501,6 +508,7 @@ class CodexExecAdapter:
             raise ProviderLaunchRefused("provider_unavailable")
         try:
             ensure_private_dir(runs_root(self.backup_root))
+            self._prune_runs()
             run_dir = runs_root(self.backup_root) / job.job_id
             if os.path.lexists(run_dir):
                 # A run directory means this job already had a launch attempt;
@@ -545,6 +553,10 @@ class CodexExecAdapter:
                 if state.finished:
                     return ()
                 events = self._read_new(state)
+                if self._streams_too_large(state):
+                    finished = self._finish(state, failure="provider_unavailable")
+                    self._forget(run.process_id, finished.execution_stopped)
+                    return (*events, finished)
                 if events:
                     return tuple(events)
                 containment = self.containment
@@ -651,11 +663,23 @@ class CodexExecAdapter:
             return False
         return stat.S_ISREG(info.st_mode) and 0 < info.st_size <= MAX_RESULT_BYTES
 
-    def _finish(self, state: _Run) -> SafeEvent:
+    @staticmethod
+    def _streams_too_large(state: _Run) -> bool:
+        for name, limit in ((STDOUT_FILE, MAX_STDOUT_BYTES), (STDERR_FILE, MAX_STDERR_BYTES)):
+            try:
+                if (state.run_dir / name).lstat().st_size > limit:
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _finish(self, state: _Run, *, failure: str | None = None) -> SafeEvent:
         """Sweep the job, then report its outcome with the sweep's proof."""
         exit_status = self.containment.exit_status(state.handle)
         proof = self.containment.stop(state.handle)
         state.finished = True
+        if failure is not None:
+            state.failure = failure
         if (exit_status == 0 and state.turn_completed and state.failure is None and self._result_ok(state)
                 and proof.stopped is True and publish_result(state.run_dir, state.output_root)):
             outcome, diagnostic = JobState.SUCCEEDED, None
@@ -692,6 +716,40 @@ class CodexExecAdapter:
             write_private(state.run_dir / SUMMARY_FILE, json.dumps(summary).encode())
         except OSError:
             pass
+
+    def _prune_runs(self) -> None:
+        """Remove old finished run directories whose stop was proven.
+
+        Only a directory with a summary recording a proven stop is ever
+        removed (an unproven one keeps its handle for recovery), and never one
+        of a run this adapter is still tracking. The newest ``RUNS_KEPT`` stay;
+        beyond them, those older than ``RUN_RETENTION_SECONDS`` go.
+        """
+        import shutil
+
+        with self._runs_lock:
+            active = {run.job_id for run in self._runs.values()}
+        finished = []
+        try:
+            entries = list(runs_root(self.backup_root).iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            if entry.name in active or entry.is_symlink() or not entry.is_dir():
+                continue
+            try:
+                summary = json.loads((entry / SUMMARY_FILE).read_text(encoding="utf-8"))
+                mtime = (entry / SUMMARY_FILE).stat().st_mtime
+            except (OSError, ValueError):
+                continue
+            proof = summary.get("stop_proof") if isinstance(summary, dict) else None
+            if isinstance(proof, dict) and proof.get("stopped") is True:
+                finished.append((mtime, entry))
+        finished.sort(reverse=True)
+        cutoff = time.time() - RUN_RETENTION_SECONDS
+        for mtime, entry in finished[RUNS_KEPT:]:
+            if mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
 
     def _forget(self, process_id: int, stopped: bool) -> None:
         with self._runs_lock:

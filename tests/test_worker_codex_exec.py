@@ -910,3 +910,45 @@ def test_managed_configuration_is_detected_and_refuses_launch(tmp_path):
         adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
     assert error.value.diagnostic_code == "provider_unavailable"
     assert containment.launches == []
+
+
+def test_a_run_whose_output_outgrows_its_cap_is_stopped_and_failed(tmp_path, monkeypatch):
+    sign_in(tmp_path)
+    monkeypatch.setattr(codex_exec, "MAX_STDOUT_BYTES", 50)
+    containment = FakeContainment([{"type": "thread.started", "pad": "x" * 100}], exit_status=None, result=None)
+    adapter = make_adapter(tmp_path, containment)
+    run = adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    finished = drain(adapter, run)[-1]
+    assert finished.kind == SafeEventKind.PROVIDER_FINISHED
+    assert finished.state == JobState.FAILED and finished.diagnostic_code == "provider_unavailable"
+    assert finished.execution_stopped is True and containment.stops == 1
+
+
+def test_old_proven_runs_are_pruned_and_unproven_ones_kept(tmp_path, monkeypatch):
+    import time as _time
+
+    monkeypatch.setattr(codex_exec, "RUNS_KEPT", 1)
+    sign_in(tmp_path)  # creates the private worker directory
+    runs = codex_exec.runs_root(tmp_path)
+    runs.mkdir(mode=0o700)
+    old = _time.time() - codex_exec.RUN_RETENTION_SECONDS - 10
+    for name, stopped, age in (("old-proven-1", True, old), ("old-proven-2", True, old - 5),
+                               ("old-unproven", False, old), ("new-proven", True, _time.time())):
+        (runs / name).mkdir()
+        summary = runs / name / "summary.json"
+        summary.write_text(json.dumps({"stop_proof": {"stopped": stopped}}))
+        os.utime(summary, (age, age))
+    adapter = make_adapter(tmp_path, FakeContainment(SUCCESS_SCRIPT))
+    adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    left = {entry.name for entry in runs.iterdir()}
+    assert "old-unproven" in left and "new-proven" in left
+    assert "old-proven-1" not in left and "old-proven-2" not in left
+
+
+def test_logout_waits_for_the_lease_before_checking(tmp_path):
+    _roster(tmp_path, {"1": ACCOUNT_ID})
+    AccountLeaseStore(tmp_path, "codex").acquire(
+        job_id="login-x", account_identity=IDENTITY, worker_pid=os.getpid(), worker_epoch=1, ttl_s=60,
+    )
+    with pytest.raises(Exception):
+        live_cli.logout(tmp_path, "1", run=_login_run(ACCOUNT_ID), verify=pinned)

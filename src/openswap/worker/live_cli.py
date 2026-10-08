@@ -122,10 +122,11 @@ def logout(backup_root: Path, selector: str | None, *, run=subprocess.run, verif
     choice = _resolve(root, selector)
     identity = choice.account_ref
     home = isolated_home(root, identity)
-    if not (home / "auth.json").exists():
-        return {"slot": choice.number, "account_ref": identity, "signed_in": False}
     pinned = (verify or (lambda: codex_cli.verify(root)))()
     with account_session_lease(root, identity, "logout"):
+        # Under the lease, so a login in progress finishes (or fails) first.
+        if not os.path.lexists(home / "auth.json"):
+            return {"slot": choice.number, "account_ref": identity, "signed_in": False}
         result = run([str(pinned.binary), "logout"], env=_login_env(home), check=False)
         still = home_identity(home)
     if result.returncode != 0 or still is not None:
@@ -207,7 +208,9 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     enable = live_commands.add_parser("enable", help="run real jobs (needs passing live-check evidence)")
     enable.add_argument("--evidence", type=Path, help="evidence file (default: the latest live-check)")
     enable.add_argument("--json", action="store_true")
-    disable = live_commands.add_parser("disable", help="stop running real jobs")
+    disable = live_commands.add_parser(
+        "disable", help="stop launching real jobs (a running job continues; `openswap worker stop` ends it)",
+    )
     disable.add_argument("--json", action="store_true")
     args = parser.parse_args(arguments)
     root = Path(backup_root)
@@ -262,7 +265,9 @@ def _live_command(root: Path, args) -> int:
     if args.live_command == "disable":
         disable_live(root)
         status = live_status(root)
-        _emit(status, args.json, "Live execution is off. Jobs fail with live_adapter_disabled.")
+        _emit(status, args.json, "Live execution is off: no new job will launch (they fail with "
+                                 "live_adapter_disabled). A job already running continues; "
+                                 "`openswap worker stop` ends it.")
         return 0
     evidence = args.evidence or latest_evidence(root)
     if evidence is None:

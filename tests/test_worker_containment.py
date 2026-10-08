@@ -93,6 +93,8 @@ class FakeLaunchd:
         self.write_pid = True
         self.keep_loaded = False
         self.escaped: list[int] = []
+        self.run_dirs: dict[str, str] = {}
+        self.bootstraps = 0
 
     def __call__(self, args):
         self.calls.append(list(args))
@@ -101,15 +103,20 @@ class FakeLaunchd:
             label = args[1].split("/", 2)[2]
             if label in self.loaded:
                 pid = self.print_pid_override or self.loaded[label]
-                return subprocess.CompletedProcess(args, 0, f"{label} = {{\n\tstate = running\n\tpid = {pid}\n}}\n", "")
+                owner = self.run_dirs.get(label, "")
+                return subprocess.CompletedProcess(
+                    args, 0, f"{label} = {{\n\tstate = running\n\tpid = {pid}\n\targuments = {{ {owner} }}\n}}\n", "")
             return subprocess.CompletedProcess(args, 113, "", "Could not find service")
         if verb == "bootstrap":
             if self.bootstrap_rc:
                 return subprocess.CompletedProcess(args, self.bootstrap_rc, "", "error")
             plist = plistlib.loads(Path(args[2]).read_bytes())
             run_dir = Path(plist["ProgramArguments"][4])
-            leader = self.procs.new(self.coalition)
+            # launchd gives every bootstrapped job a new coalition.
+            leader = self.procs.new(self.coalition + self.bootstraps)
+            self.bootstraps += 1
             self.loaded[plist["Label"]] = leader
+            self.run_dirs[plist["Label"]] = str(run_dir)
             if self.write_pid:
                 (run_dir / "leader.pid").write_text(f"{leader}\n")
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -348,7 +355,8 @@ def test_real_launchd_contains_a_setsid_daemon(tmp_path):
         containment.stop(handle)
 
 
-@pytest.mark.parametrize("stale", ["go", "leader.pid", "exit", "handle.json", "stdout.jsonl", "job.plist"])
+@pytest.mark.parametrize("stale", ["go", "leader.pid", "exit", "handle.json", "stdout.jsonl", "job.plist",
+                                   "leader.pid.tmp", "exit.tmp", "stderr.log", "launchd.out", "anything"])
 def test_a_run_directory_with_wrapper_state_is_refused(tmp_path, stale):
     containment, procs, launchd = make(tmp_path)
     root = private_dir(tmp_path)
@@ -508,3 +516,50 @@ def test_a_handle_write_failure_after_bootstrap_is_unlaunched_and_unloaded(tmp_p
         launch(containment, private_dir(tmp_path))
     assert error.value.launched is False
     assert launchd.loaded == {}
+
+
+def test_a_symlink_in_the_run_dir_is_refused_and_tmp_is_allowed(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    run_dir = root / ("a" * 32)
+    run_dir.mkdir(mode=0o700)
+    (run_dir / "tmp").mkdir(mode=0o700)
+    handle = launch(containment, root)
+    assert handle.released
+    containment, procs, launchd = make(tmp_path)
+    run_dir = root / ("b" * 32)
+    run_dir.mkdir(mode=0o700)
+    (run_dir / "stderr.log").symlink_to(tmp_path / "victim")
+    with pytest.raises(ContainmentError) as error:
+        launch(containment, root, job_id="b" * 32)
+    assert error.value.code == "run_dir_not_fresh"
+
+
+def test_a_stale_stop_never_boots_out_a_replacement_service(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    old = launch(containment, root)
+    assert containment.stop(old).stopped is True
+    # A replacement launch of the same label from another run directory.
+    other_root = private_dir(tmp_path, "runs2")
+    new = launch(containment, other_root)
+    launchd.calls.clear()
+    proof = containment.stop(old)
+    assert proof.stopped is True  # the old job's coalition is empty and its service gone
+    assert not any(call[0] == "bootout" for call in launchd.calls)
+    assert c.job_label("a" * 32) in launchd.loaded and new.leader_pid in procs.table
+
+
+def test_stop_waits_for_the_label_lock(tmp_path):
+    from openswap.locking import FileLock
+
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    handle = launch(containment, root)
+    holder = FileLock(root / f".{handle.label}.lock", timeout=0)
+    assert holder.acquire(timeout=0)
+    try:
+        assert containment.stop(handle, timeout=0.2).stopped is False
+    finally:
+        holder.release()
+    assert containment.stop(handle).stopped is True
