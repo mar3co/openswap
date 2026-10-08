@@ -270,8 +270,10 @@ revocation clear the worker's advertised set on the backend. A job carrying
 `account_ref` is offered by `poll` only after the current registration has sent
 `accounts` (an empty set counts); until then it stays queued and later jobs
 without the field may be claimed first. A worker that receives 404
-`unsupported_version` records that the backend offers no account choice and
-keeps working without it; no other response disables the feature.
+`unsupported_version` (or 404 `not_found`, which reference servers predating
+this extension return for an unknown operation) records that the backend
+offers no account choice and keeps working without it; no other response
+disables the feature.
 
 `account_ref` is a random value the Mac generates once per allowlist entry and
 stores locally. It is never derived from a provider account ID, email or token,

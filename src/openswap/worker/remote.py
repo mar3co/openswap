@@ -256,7 +256,7 @@ class RemoteClient:
         # Optional account choice extension. ``_accounts_sent`` is the (worker
         # epoch, fingerprint) the service last acknowledged, so a change is
         # detected locally without polling the service; a 404
-        # ``unsupported_version`` stops sending until the next registration.
+        # 404 ``unsupported_version`` (or a legacy ``not_found``) stops sending until the next registration.
         self._accounts_sent = None
         self._accounts_offered = False  # the acknowledged set was non-empty
         self._accounts_unsupported_epoch = None
@@ -384,8 +384,9 @@ class RemoteClient:
         Change is detected by comparing a local fingerprint with the one the
         service last acknowledged for this worker epoch. Never raises: a
         failure is retried on the next synchronization pass, and claims and
-        heartbeats go on meanwhile. Only a 404 ``unsupported_version`` records
-        that the backend offers no account choice, until the next registration.
+        heartbeats go on meanwhile. Only a 404 (``unsupported_version``, or
+        ``not_found`` from older reference servers) records that the backend
+        offers no account choice, until the next registration.
         """
         try:
             epoch = self.worker_epoch
@@ -400,7 +401,10 @@ class RemoteClient:
             try:
                 response = self.transport.request("accounts", {"worker_epoch": epoch, "accounts": body})
             except ProtocolError as exc:
-                if exc.code == "unsupported_version" and exc.status == 404:
+                # Backends without the extension refuse an unknown operation with
+                # 404: `unsupported_version` per the spec, or `not_found` from the
+                # reference server releases that predate it.
+                if exc.status == 404 and exc.code in {"unsupported_version", "not_found"}:
                     self._accounts_unsupported_epoch = epoch
                     self._accounts_offered = False
                 elif exc.code in {"revoked", "unauthorized", "device_expired"}:

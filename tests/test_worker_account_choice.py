@@ -562,10 +562,12 @@ class _ChoiceAdapter(FakeAdapter):
 class _NoAccountsTransport(StoreTransport):
     """A backend without the extension: ``accounts`` is an unknown operation."""
 
+    code = "unsupported_version"
+
     def request(self, operation, data):
         if operation == "accounts":
             self.calls.append(operation)
-            raise ProtocolError("unsupported_version", 404)
+            raise ProtocolError(self.code, 404)
         return super().request(operation, data)
 
 
@@ -638,9 +640,13 @@ def test_no_resend_without_a_change_and_resend_on_each_change(choice):
     assert store.advertised_accounts(paired["worker_id"]) == _sent(transport)[-1]["accounts"]
 
 
-def test_unsupported_backend_is_recorded_until_the_next_registration(choice):
+@pytest.mark.parametrize("code", ["unsupported_version", "not_found"])
+def test_unsupported_backend_is_recorded_until_the_next_registration(choice, code):
+    """Spec servers answer 404 `unsupported_version`; reference servers that
+    predate the extension answer 404 `not_found`. Both turn the feature off."""
     remote, runtime, adapter, store, _, paired, _, root = choice
     transport = _NoAccountsTransport(store, paired["device_key"])
+    transport.code = code
     client = RemoteClient(runtime, URL, paired["device_key"], worker_id="other-binding", transport=transport)
     client.tick()
     client.tick()
