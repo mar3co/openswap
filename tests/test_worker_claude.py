@@ -443,12 +443,15 @@ def test_claude_evidence_enables_only_claude_and_only_for_its_binary(tmp_path):
 # -- profile preparation ----------------------------------------------------------------------
 
 
-def test_prepare_uses_the_session_profile_mechanism_under_the_claude_lease(tmp_path):
+def test_prepare_uses_the_session_profile_mechanism_without_a_conflicting_lease(tmp_path):
     root = setup_root(tmp_path, prepared=False)
     seen = []
 
     def prepare(number):
-        seen.append((number, AccountLeaseStore(root, "claude").read_current().state))
+        # setup_session asserts that no Claude lease is active: prepare must not hold one.
+        with AccountLeaseStore(root, "claude").mutation_guard() as guard:
+            guard.assert_available()
+        seen.append((number, AccountLeaseStore(root, "claude").read_current()))
         profile = claude_exec.profile_for(root, IDENTITY)
         profile.mkdir(parents=True, mode=0o700)
         (profile / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": EMAIL,
@@ -456,8 +459,7 @@ def test_prepare_uses_the_session_profile_mechanism_under_the_claude_lease(tmp_p
 
     result = live_cli.claude_prepare(root, "claude:4", prepare=prepare)
     assert result == {"slot": "4", "account_ref": IDENTITY, "profile_ready": True}
-    assert seen == [("4", "active")]
-    assert AccountLeaseStore(root, "claude").read_current().state == "released"
+    assert seen == [("4", None)]
 
 
 def test_prepare_refuses_a_profile_logged_in_elsewhere(tmp_path):
@@ -617,3 +619,17 @@ def test_enabling_from_a_claude_check_names_claude_in_the_opt_out(tmp_path, monk
     out = capsys.readouterr().out
     assert "`openswap worker live disable --provider claude`" in out
     assert live.execution_mode(root, "claude") == "live" and live.execution_mode(root, "codex") == "disabled"
+
+
+
+def test_prepare_refuses_while_a_claude_job_holds_the_lease(tmp_path):
+    root = setup_root(tmp_path, prepared=False)
+    AccountLeaseStore(root, "claude").acquire(job_id="b" * 32, account_identity=IDENTITY, worker_pid=os.getpid(),
+                                              worker_epoch=1, ttl_s=60)
+
+    def prepare(number):  # what SessionManager.setup_session does first
+        with AccountLeaseStore(root, "claude").mutation_guard() as guard:
+            guard.assert_available()
+
+    with pytest.raises(LeaseConflictError):
+        live_cli.claude_prepare(root, "claude:4", prepare=prepare)

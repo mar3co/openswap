@@ -196,9 +196,12 @@ def claude_prepare(backup_root: Path, selector: str | None, *, prepare=None) -> 
     """Prepare (or refresh) a Claude account's OpenSwap session profile for remote jobs.
 
     Uses the same session-profile mechanism scheduled kickoff uses, with
-    nothing shared from ``~/.claude`` (``share=False``), while holding that
-    account's lease. Remote jobs then run with ``CLAUDE_CONFIG_DIR`` pointing at
-    it; the owner's default login is untouched.
+    nothing shared from ``~/.claude`` (``share=False``). No lease is taken
+    here: ``setup_session`` itself holds the Claude mutation guard and refuses
+    while any Claude lease is active, which is also what serializes it with a
+    worker launch (whose lease acquisition takes the same guard). Remote jobs
+    then run with ``CLAUDE_CONFIG_DIR`` pointing at it; the owner's default
+    login is untouched.
     """
     from openswap.worker.accounts import resolve_account_selector, resolve_claude_selector
     from openswap.worker.claude_exec import profile_for, profile_identity
@@ -224,8 +227,7 @@ def claude_prepare(backup_root: Path, selector: str | None, *, prepare=None) -> 
 
         SessionManager(ClaudeAccountSwitcher()).setup_session(number, share=False)
 
-    with account_session_lease(root, identity, "prepare"):
-        (prepare or default_prepare)(choice.number)
+    (prepare or default_prepare)(choice.number)
     profile = profile_for(root, identity)
     ready = profile is not None and profile_identity(profile) == identity
     if not ready:
