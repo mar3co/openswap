@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -863,3 +864,46 @@ def test_the_check_refuses_while_a_lifecycle_change_holds_the_lock(tmp_path):
         assert error.value.code == "worker_busy"
     finally:
         holder.release()
+
+
+
+def test_a_leftover_without_stop_proof_refuses_the_check(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    leftover = live_check.runs_root(root) / "livecheck-old"
+    leftover.mkdir(parents=True)
+    cont._save_handle(JobHandle(cont.job_label("old"), "gui/501", leftover, "boot", 4000, 900, True))
+    mac.recover = lambda run_dir: StopProof(False, None, 1)
+    with pytest.raises(CheckRefused) as error:
+        make_check(root, mac).run()
+    assert error.value.code == "leftover_not_stopped"
+
+
+def test_sentinels_never_touch_an_existing_file(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    first = live_check._new_sentinel(home, "wrapper", "a")
+    second = live_check._new_sentinel(home, "wrapper", "b")
+    assert first != second and first.read_text() == "a" and second.read_text() == "b"
+    if os.name == "posix":
+        assert stat.S_IMODE(first.stat().st_mode) == 0o600
+
+
+def test_helpers_are_killed_even_if_the_stop_job_fails(tmp_path, monkeypatch):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    check = make_check(root, mac)
+    check.check_root = root / "live-check" / "t"
+    cont.ensure_private_dir(check.check_root.parent)
+    cont.ensure_private_dir(check.check_root)
+    killed = []
+    check._marker_pids = lambda *markers: [424242]
+    monkeypatch.setattr(live_check.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    def broken_job(*args, **kwargs):
+        raise RuntimeError("containment broke")
+
+    check._job = broken_job
+    with pytest.raises(RuntimeError):
+        check._gate_stop(IDENTITY)
+    assert (424242, signal.SIGKILL) in killed
