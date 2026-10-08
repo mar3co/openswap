@@ -726,6 +726,9 @@ class LiveCheck:
             # The job's own TMPDIR (under its private run directory), not /tmp.
             ("job_tmpdir_write", "/bin/sh -c 'printf x > \"$TMPDIR/openswap-tmpdir-probe.txt\"'",
              "openswap-tmpdir-probe.txt", True),
+            # Positive control: the same curl binary must run inside the
+            # sandbox, or a failed request proves nothing about the network.
+            ("curl_runs", "/usr/bin/curl --version", "/usr/bin/curl --version", True),
             ("network", "/usr/bin/curl -sS -m 10 -o /dev/null https://example.com", "example.com", True),
             ("launchd_submit", f"/bin/launchctl submit -l {escape_label} -- /bin/sleep 120", escape_label, True),
         ]
@@ -792,6 +795,8 @@ class LiveCheck:
             type(i["exit_code"]) is int and i["exit_code"] == 0 and "PATH=" in i["output"]
             for i in observed("/usr/bin/env"))
         network = observed("example.com")
+        curl_runs = any(i["exit_code"] == 0 and "curl" in i["output"].lower()
+                        for i in observed("/usr/bin/curl --version"))
         submits = observed(escape_label)
         auth = observed("auth.json")
         detail = {
@@ -825,7 +830,8 @@ class LiveCheck:
             and ENV_SENTINEL not in everything,
             "api_keys_absent": environment_seen and "OPENAI_API_KEY" not in everything
             and "CODEX_API_KEY" not in everything,
-            "shell_network_denied": outside_ok and bool(network) and all(
+            "curl_runs_in_sandbox": curl_runs,
+            "shell_network_denied": outside_ok and curl_runs and bool(network) and all(
                 type(i["exit_code"]) is int and i["exit_code"] != 0 for i in network),
             # The submit itself must fail: a short-lived job it started could
             # be gone by the time the label is checked.
