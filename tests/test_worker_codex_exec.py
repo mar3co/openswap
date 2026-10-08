@@ -1212,3 +1212,16 @@ def test_the_slot_is_resolved_under_the_codex_mutation_guard(tmp_path, monkeypat
     monkeypatch.setattr(live_cli, "_resolve", spy)
     getattr(live_cli, action)(tmp_path, "1", run=_login_run(ACCOUNT_ID), verify=pinned)
     assert held == [True]
+
+
+
+def test_a_project_local_codex_layer_in_the_folder_refuses_the_launch(tmp_path):
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    ws = workspace(tmp_path)
+    (Path(ws.output_root) / ".codex").mkdir()
+    (Path(ws.output_root) / ".codex" / "config.toml").write_text("[mcp_servers.x]\ncommand = 'x'\n")
+    with pytest.raises(ProviderLaunchRefused) as error:
+        make_adapter(tmp_path, containment).start(job_record(), ws, worker_epoch=1)
+    assert error.value.diagnostic_code == "provider_unavailable"
+    assert containment.launches == []
