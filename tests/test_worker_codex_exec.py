@@ -123,7 +123,8 @@ def bind_opt_in(tmp_path):
     """The owner's opt-in, bound to the binary the live check measured."""
     from openswap.settings import LiveExecutionSettings, write_live_execution
 
-    write_live_execution(tmp_path, LiveExecutionSettings(True, "ab" * 32, pinned().binary_sha256, "now"))
+    write_live_execution(tmp_path, LiveExecutionSettings(True, "ab" * 32, pinned().binary_sha256, "now",
+                                                         (IDENTITY,)))
 
 
 def make_adapter(tmp_path, containment, *, mode="live"):
@@ -611,6 +612,7 @@ def passing_evidence(binary_sha=BINARY_SHA, **overrides):
         "kind": live.EVIDENCE_KIND, "schema": live.EVIDENCE_SCHEMA, "passed": True,
         "codex": {"version": codex_cli.CODEX_VERSION_OUTPUT, "binary_sha256": binary_sha},
         "gates": {name: {"passed": True} for name in live.REQUIRED_GATES},
+        "account": {"identity": IDENTITY, "slot": "1"},
     }
     data.update(overrides)
     return data
@@ -940,6 +942,7 @@ def test_managed_configuration_is_detected_and_refuses_launch(tmp_path):
     assert "defaults:config_toml_base64" in codex_exec.managed_codex_config(home, run=present)
 
     sign_in(tmp_path)
+    bind_opt_in(tmp_path)
     containment = FakeContainment(SUCCESS_SCRIPT)
     adapter = CodexExecAdapter(tmp_path, containment=containment, verify=lambda **kw: pinned(),
                                mode=lambda: "live", managed=lambda h: ["/etc/codex/config.toml"])
@@ -1275,3 +1278,44 @@ def test_a_proven_run_whose_summary_cannot_be_written_is_removed(tmp_path, monke
     finished = drain(adapter, run)[-1]
     assert finished.execution_stopped is True
     assert not (codex_exec.runs_root(tmp_path) / ("a" * 32)).exists()
+
+
+
+def test_live_execution_is_bound_to_the_accounts_that_passed_the_check(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "platform_supported", lambda: True)
+    other = stable_account_identity("codex", "acct-other")
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text(json.dumps(passing_evidence()))
+    assert live.enable_live(tmp_path, evidence, pinned()).accounts == (IDENTITY,)
+    second = tmp_path / "second.json"
+    second.write_text(json.dumps(passing_evidence(account={"identity": other, "slot": "2"})))
+    assert live.enable_live(tmp_path, second, pinned()).accounts == (IDENTITY, other)
+    no_account = tmp_path / "none.json"
+    data = passing_evidence()
+    del data["account"]
+    no_account.write_text(json.dumps(data))
+    with pytest.raises(live.LiveModeError) as error:
+        live.enable_live(tmp_path, no_account, pinned())
+    assert "evidence_account_missing" in error.value.problems
+
+
+def test_a_job_on_an_account_the_check_never_ran_on_is_refused(tmp_path):
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    adapter = make_adapter(tmp_path, containment)
+    write_live_execution(tmp_path, LiveExecutionSettings(True, "ab" * 32, pinned().binary_sha256, "now",
+                                                         (stable_account_identity("codex", "acct-other"),)))
+    with pytest.raises(ProviderLaunchRefused) as error:
+        adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    assert error.value.diagnostic_code == "live_adapter_disabled" and containment.launches == []
+
+
+def test_a_proven_recovery_whose_summary_cannot_be_written_is_removed(tmp_path, monkeypatch):
+    run_dir = codex_exec.runs_root(tmp_path) / ("b" * 32)
+    run_dir.mkdir(parents=True)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    containment.recover = lambda path: StopProof(True, False, 0)
+    adapter = make_adapter(tmp_path, containment)
+    monkeypatch.setattr(codex_exec, "write_private", lambda path, data: (_ for _ in ()).throw(OSError(28, "full")))
+    assert adapter.recover("b" * 32).execution_stopped is True
+    assert not run_dir.exists()
