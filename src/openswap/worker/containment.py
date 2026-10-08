@@ -1114,24 +1114,46 @@ class LaunchdContainment:
 
         ``SIGSTOP`` is delivered asynchronously and a process listing is not
         atomic, so a freeze counts only when two consecutive scans list the
-        same members, all observed stopped, and the second is complete (see
+        same members, all observed stopped, and both are complete (see
         :meth:`_complete`). Every member alive at the second listing was
         already stopped before it, and a stopped process cannot fork, so no
         member can appear afterwards. Only then is the empty scan after the
         kills proof; otherwise the sweep still kills what it finds but proves
         nothing. Each pid's coalition is re-read right before it is signalled.
+
+        A member can run again during the kills: killing a parent can orphan
+        a stopped process group, and macOS then sends that group ``SIGHUP``
+        and ``SIGCONT``, which a child ignoring ``SIGHUP`` survives. A
+        resumed member could fork between the non-atomic scans, so the kill
+        phase never keeps a freeze across a running (or unreadable) member:
+        it drops the proof and establishes a new two-scan freeze first.
         """
-        procs = self.procs
-        frozen = False
-        previous: dict[int, str] | None = None
-        previous_complete = False  # whether ``previous`` was itself a complete scan
         known: set[int] = set()
+        killed: set[int] = set()
         while True:
             try:
-                scan = self._scan(coalition_id)
+                frozen, last = self._freeze(coalition_id, deadline=deadline, known=known)
             except ContainmentError:
                 # No trustworthy listing: kill what is known, prove nothing.
-                return False, self._kill_known(coalition_id, known)
+                return False, len(killed) + self._kill_known(coalition_id, known - killed)
+            outcome = self._kill_frozen(coalition_id, deadline=deadline, known=known, killed=killed,
+                                        frozen=frozen, previous=last)
+            if outcome is not None:
+                return outcome[0], len(killed) + outcome[1]
+            # A member ran again: re-establish the freeze (if time remains).
+            if self._monotonic() >= deadline:
+                return False, len(killed)
+
+    def _freeze(self, coalition_id: int, *, deadline: float,
+                known: set[int]) -> tuple[bool, dict[int, str] | None]:
+        """Stop members until two consecutive complete scans agree.
+
+        Returns ``(frozen, last scan)``; ``frozen`` is False at the deadline.
+        """
+        previous: dict[int, str] | None = None
+        previous_complete = False  # whether ``previous`` was itself a complete scan
+        while True:
+            scan = self._scan(coalition_id)
             known |= {pid for pid, kind in scan.items() if kind in {"running", "stopped"}}
             running = [pid for pid, kind in scan.items() if kind == "running"]
             stopped = {pid for pid, kind in scan.items() if kind == "stopped"}
@@ -1144,26 +1166,40 @@ class LaunchdContainment:
             ):
                 # Both scans complete on their own: an incomplete first scan
                 # (a pid gone by its query may have forked) cannot anchor it.
-                frozen = True
-                break
+                return True, scan
             for pid in running:
                 self._stop_member(coalition_id, pid)
             previous, previous_complete = scan, complete
             if self._monotonic() >= deadline:
-                break
+                return False, scan
             self._sleep(0.002)
-        killed: set[int] = set()
-        previous = None
+
+    def _kill_frozen(self, coalition_id: int, *, deadline: float, known: set[int], killed: set[int],
+                     frozen: bool, previous: dict[int, str] | None = None) -> tuple[bool, int] | None:
+        """Kill stopped members until the coalition is empty.
+
+        Returns ``(proven, 0)`` when it is empty (``proven`` only if the
+        freeze held throughout), ``(False, extra)`` on an unreadable table or
+        at the deadline, and None when a frozen sweep sees a member running
+        again (the caller re-freezes). ``previous`` is the freeze's last scan:
+        even the first scan here must be complete against it, so an empty
+        scan holding a pid gone (or a new zombie) since then is never proof.
+        """
         while True:
             try:
                 scan = self._scan(coalition_id)
             except ContainmentError:
-                return False, len(killed) + self._kill_known(coalition_id, known - killed)
+                return False, self._kill_known(coalition_id, known - killed)
             known |= {pid for pid, kind in scan.items() if kind in {"running", "stopped"}}
             members = [pid for pid, kind in scan.items() if kind in {"running", "stopped"}]
-            if not members and "unknown" not in scan.values() and (
-                    previous is None or self._complete(scan, previous)):
-                return frozen, len(killed)
+            if not members and "unknown" not in scan.values() and self._complete(scan, previous):
+                return frozen, 0
+            if frozen and any(kind in {"running", "unknown"} for kind in scan.values()):
+                # The freeze no longer holds (an orphaned group got SIGCONT,
+                # say): the proof is void until a new freeze is established.
+                for pid in (pid for pid, kind in scan.items() if kind == "running"):
+                    self._stop_member(coalition_id, pid)
+                return None
             for pid in members:
                 # A member still running (no proven freeze) is stopped first
                 # and killed on a later pass, once it is seen stopped.
@@ -1173,5 +1209,5 @@ class LaunchdContainment:
                     killed.add(pid)
             previous = scan
             if self._monotonic() >= deadline:
-                return False, len(killed)
+                return False, 0
             self._sleep(0.02)

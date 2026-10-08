@@ -525,9 +525,21 @@ class ProviderLeases:
 
     @contextmanager
     def mutation_guard(self, *, timeout: float | None = None) -> Iterator["ProviderLeaseGuard"]:
-        with self.stores["codex"].mutation_guard(timeout=timeout) as codex, \
-                self.stores["claude"].mutation_guard(timeout=timeout) as claude:
-            yield ProviderLeaseGuard({"codex": codex, "claude": claude})
+        first, second = PROVIDER_LOCK_ORDER
+        with self.stores[first].mutation_guard(timeout=timeout) as one, \
+                self.stores[second].mutation_guard(timeout=timeout) as two:
+            yield ProviderLeaseGuard({first: one, second: two})
+
+
+# The one order in which code holding both providers' mutation guards takes
+# them (Codex, then Claude): ProviderLeases, the account-policy commands and
+# the purge all follow it, so they can never deadlock against each other.
+PROVIDER_LOCK_ORDER = ("codex", "claude")
+
+
+def provider_lock_rank(store: "AccountLeaseStore") -> int:
+    """Sort key putting lease stores in :data:`PROVIDER_LOCK_ORDER`."""
+    return PROVIDER_LOCK_ORDER.index(store.provider)
 
 
 class ProviderLeaseGuard:

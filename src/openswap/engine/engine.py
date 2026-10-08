@@ -408,7 +408,13 @@ class Engine(
             # removed, so a waiting writer cannot proceed through an unlinked
             # lock and race a replacement lock.
             with _settings_write_lock(self.backup_dir):
-                stores.sort(key=lambda store: str(store.provider_lock))
+                # The global provider-lock order (Codex, then Claude) that
+                # the worker and the account commands also use; sorting by
+                # lock path put Claude's <backup>/.lock first and could
+                # deadlock against them.
+                from openswap.worker.leases import provider_lock_rank
+
+                stores.sort(key=provider_lock_rank)
                 # Refuse active/uncertain leases before worker checks; release
                 # provider locks before status IPC, then recheck before delete.
                 with ExitStack() as stack:

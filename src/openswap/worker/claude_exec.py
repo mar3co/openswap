@@ -121,6 +121,18 @@ def profile_for(backup_root: Path, identity: str) -> Path | None:
     return None
 
 
+def profile_symlinked(backup_root: Path, profile: Path) -> bool:
+    """Whether the profile, or any ancestor inside the backup root, is a symlink.
+
+    Jobs refuse such a layout: the Seatbelt allowance for the profile would
+    then apply to wherever the link points.
+    """
+    profile = Path(profile)
+    backup_root = Path(backup_root)
+    return profile.is_symlink() or any(parent.is_symlink() for parent in profile.parents
+                                       if parent.is_relative_to(backup_root))
+
+
 def profile_shared(profile: Path, home: Path | None = None) -> bool:
     """Whether the profile mirrors anything from the owner's default ``~/.claude``.
 
@@ -302,8 +314,7 @@ class ClaudeCodeAdapter(CodexExecAdapter):
 
     def _prepare_account(self, identity: str, workspace: ResolvedWorkspace) -> Path:
         profile = profile_for(self.backup_root, identity)
-        if profile is None or not profile.is_dir() or profile.is_symlink() or any(
-                parent.is_symlink() for parent in profile.parents if parent.is_relative_to(self.backup_root)):
+        if profile is None or not profile.is_dir() or profile_symlinked(self.backup_root, profile):
             # A symlinked profile (or ancestor) would turn the Seatbelt
             # allowance for it into one for wherever the link points.
             raise ProviderLaunchRefused("provider_auth_unavailable")

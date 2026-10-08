@@ -116,6 +116,7 @@ class SimulatedMac:
     def __init__(self, *, sandboxed=True, contain=True, links=True, curl_blocked=False):
         self.links = links
         self.curl_blocked = curl_blocked
+        self.wc_blocked = False
         self.curl_request_code = 7
         self.booted_out = set()
         self.tmpdir_writes = 0
@@ -174,6 +175,11 @@ class SimulatedMac:
             return "PATH=/usr/bin:/bin\nHOME=/x\n", 0
         if command.startswith("/usr/bin/curl -sS") and self.sandboxed:
             return "curl: (7) Failed to connect to example.com port 80", self.curl_request_code
+        if "wc-control.txt" in command:  # the wc positive control: a readable file in the folder
+            if self.wc_blocked:
+                return "", 126
+            path = re.search(r"(/[^ ']+wc-control\.txt)", command).group(1)
+            return f"      {len(Path(path).read_text())} {path}", 0
         if command == "/usr/bin/curl --version":
             return ("", 126) if self.curl_blocked else ("curl 8.7.1 (x86_64-apple-darwin25.0)\n", 0)
         if "ln -s" in command and self.links:
@@ -1173,3 +1179,16 @@ def test_a_writable_owner_copy_fails_the_worktree_gate(tmp_path):
     gate = make_check(root, SimulatedMac(sandboxed=False)).run()["gates"]["worktree"]
     assert gate["passed"] is False
     assert gate["owner_copy_write_denied"] is False and gate["git_config_unchanged"] is False
+
+
+def test_a_blocked_wc_proves_nothing_about_the_auth_file(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    mac.wc_blocked = True  # wc cannot run in the sandbox; the auth probe then also "fails"
+    gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
+    assert gate["wc_runs_in_sandbox"] is False and gate["auth_read_denied"] is False
+    assert gate["passed"] is False
+    other = tmp_path / "ok"
+    other.mkdir()
+    passing = make_check(setup_root(other), SimulatedMac()).run()["gates"]["sandbox_exec"]
+    assert passing["wc_runs_in_sandbox"] is True and passing["auth_read_denied"] is True
