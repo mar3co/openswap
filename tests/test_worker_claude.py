@@ -702,3 +702,39 @@ def test_polling_follows_the_pinned_provider_only(tmp_path):
     claude.probe = lambda: ProviderAvailability(True, None, "2.1.285 (Claude Code)")
     assert runtime._candidate_providers() == ["codex"]
     assert runtime.provider_availability().available is False
+
+
+
+def test_status_does_not_call_a_shared_profile_ready(tmp_path):
+    from openswap.session import SHARE_MANIFEST
+
+    root = setup_root(tmp_path)
+    claude_cli.pin(root, binary=fake_claude(tmp_path))
+    ready = {a["slot"]: a["profile_ready"] for a in live_cli.claude_status(root)["accounts"]}
+    assert ready == {"4": True}
+    (claude_exec.profile_for(root, IDENTITY) / SHARE_MANIFEST).write_text("[]")
+    ready = {a["slot"]: a["profile_ready"] for a in live_cli.claude_status(root)["accounts"]}
+    assert ready == {"4": False}
+
+
+def test_the_claude_default_login_snapshot_never_opens_the_credentials(tmp_path, monkeypatch):
+    from openswap.worker.live_check_claude import ClaudeLiveCheck
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    creds = home / ".claude" / ".credentials.json"
+    creds.write_text("secret-token")
+    root = setup_root(tmp_path)
+    check = ClaudeLiveCheck(root, out=lambda *a: None, home=home,
+                            run=lambda argv, **kw: subprocess.CompletedProcess(argv, 44, "", ""))
+    opened = []
+    real_open = open
+
+    def spy(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", spy)
+    monkeypatch.setattr(Path, "read_bytes", lambda self: (_ for _ in ()).throw(AssertionError(f"read {self}")))
+    state, fingerprint = check._default_login_snapshot()
+    assert state == "present" and "secret" not in fingerprint and str(creds) not in opened

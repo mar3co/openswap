@@ -53,7 +53,7 @@ from openswap.worker.codex_cli import platform_supported
 from openswap.worker.codex_exec import runs_root
 from openswap.worker.containment import STDERR_FILE, STDOUT_FILE, load_handle, write_private
 from openswap.worker.leases import ReleaseEvidence
-from openswap.worker.live_check import CheckRefused, LiveCheck, _new_sentinel, _texts
+from openswap.worker.live_check import CheckRefused, LiveCheck, _new_sentinel, _texts, login_snapshot
 
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell"})
 LONG_TASK = (
@@ -170,15 +170,17 @@ class ClaudeLiveCheck(LiveCheck):
         return pinned, choice, identity, profile
 
     def _default_login_snapshot(self):
-        """Hashes of the default login's files and its Keychain item's attributes (no secrets)."""
+        """Metadata of the default login's files and a hash of its Keychain item's attributes.
+
+        The files are never opened (``login_snapshot`` is lstat-only), and the
+        Keychain query asks for attributes only, so no secret is read.
+        """
         parts = []
         for path in (self._home / ".claude" / ".credentials.json", self._home / ".claude.json"):
-            try:
-                parts.append(hashlib.sha256(path.read_bytes()).hexdigest())
-            except FileNotFoundError:
-                parts.append("absent")
-            except OSError:
+            state, fingerprint = login_snapshot(path)
+            if state == "unreadable":
                 return ("unreadable", None)
+            parts.append(fingerprint if state == "present" else "absent")
         try:
             # Attributes only (no -g/-w): the secret is never read and no prompt appears.
             result = self._run(["/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials"],
