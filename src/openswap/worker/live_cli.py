@@ -24,6 +24,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from openswap import printer
 from openswap.exceptions import ClaudeSwitchError
 from openswap.settings import load_worker_settings
 from openswap.worker import codex_cli
@@ -183,24 +184,38 @@ def codex_status(backup_root: Path) -> dict:
     return {"cli": cli, "accounts": accounts, **live_status(root)}
 
 
+def _account_status_rows(accounts, ready_key: str, ready: str, not_ready: str) -> list[tuple[str, ...]]:
+    rows = []
+    for account in accounts:
+        roles = [m for m, on in (("default", account["pinned"]), ("allowed", account["allowed"])) if on]
+        rows.append((f"{printer.mark(account[ready_key])} {account['slot']}",
+                     f"({account['alias']})" if account["alias"] else "",
+                     ready if account[ready_key] else not_ready, ", ".join(roles)))
+    return rows
+
+
 def _format_codex_status(status: dict) -> str:
+    """``codex status``: the pinned CLI, the opt-in, one row per account, then the next step."""
     cli = status["cli"]
-    lines = [
-        f"Pinned Codex CLI: {cli['version']} (verified)" if cli["installed"]
-        else f"Pinned Codex CLI: not ready ({cli['problem']})",
-        f"Live execution: {status['execution_mode']}",
-    ]
-    for account in status["accounts"]:
-        marks = []
-        if account["pinned"]:
-            marks.append("default")
-        if account["allowed"]:
-            marks.append("allowed")
-        signed = "signed in" if account["isolated_sign_in"] else "not signed in"
-        name = f"{account['slot']}" + (f" ({account['alias']})" if account["alias"] else "")
-        lines.append(f"  {name}: {signed}" + (f" [{', '.join(marks)}]" if marks else ""))
+    live = status["execution_mode"] == "live"
+    lines = [printer.heading("Codex for Remote tasks"), *printer.columns([
+        (f"{printer.mark(cli['installed'])} Pinned CLI",
+         f"{cli['version']} (verified)" if cli["installed"] else f"not ready ({cli['problem']})"),
+        (f"{printer.mark(True if live else None)} Live execution", status["execution_mode"]),
+    ]), printer.heading("Accounts (isolated sign-in; slot and alias)")]
     if not status["accounts"]:
-        lines.append("  No eligible Codex accounts in the roster.")
+        lines.append("  No eligible Codex accounts in the roster. Add one with `openswap codex add`.")
+    lines.extend(printer.columns(_account_status_rows(status["accounts"], "isolated_sign_in",
+                                                      "signed in", "not signed in")))
+    if not cli["installed"]:
+        lines.append(printer.next_step("install the pinned CLI: `openswap worker codex install`."))
+    elif any(a["pinned"] and not a["isolated_sign_in"] for a in status["accounts"]):
+        lines.append(printer.next_step("sign the default account in: `openswap worker codex login`."))
+    elif not live:
+        lines.append(printer.next_step("run the live check and enable live execution: "
+                                       "`openswap worker live-check`."))
+    else:
+        lines.append(printer.next_step("nothing: live execution is on. `openswap worker live disable` turns it off."))
     return "\n".join(lines)
 
 
@@ -426,7 +441,8 @@ def _codex_command(root: Path, args) -> int:
     if args.codex_command == "install":
         pinned = codex_cli.install(root, archive_path=args.archive)
         _emit(pinned.to_dict(), args.json,
-              f"Installed {pinned.version}; archive SHA-256 matches the published digest.")
+              f"{printer.MARK_OK} Installed {pinned.version}; archive SHA-256 matches the published digest.\n"
+              + printer.next_step("sign the pinned account in: `openswap worker codex login`."))
         return 0
     if args.codex_command == "status":
         status = codex_status(root)
@@ -434,11 +450,12 @@ def _codex_command(root: Path, args) -> int:
         return 0 if status["cli"]["installed"] else 1
     if args.codex_command == "login":
         result = login(root, args.selector, device_auth=args.device_auth)
-        _emit(result, args.json, f"Codex account {result['slot']} is signed in to its isolated home. "
-                                 "Your default Codex login was not changed.")
+        _emit(result, args.json, f"{printer.MARK_OK} Codex account {result['slot']} is signed in to its "
+                                 "isolated home. Your default Codex login was not changed.\n"
+                                 + printer.next_step("run the live check: `openswap worker live-check`."))
         return 0
     result = logout(root, args.selector)
-    _emit(result, args.json, f"Codex account {result['slot']} is signed out of its isolated home.")
+    _emit(result, args.json, f"{printer.MARK_OK} Codex account {result['slot']} is signed out of its isolated home.")
     return 0
 
 
@@ -459,41 +476,67 @@ def _claude_command(root: Path, args) -> int:
 
     if args.claude_command == "pin":
         pinned = claude_cli.pin(root, binary=args.binary)
-        _emit(pinned.to_dict(), args.json, f"Pinned Claude Code {pinned.version} ({pinned.binary_sha256[:12]}…). "
-                                          "Run `openswap worker live-check --provider claude` to check it.")
+        _emit(pinned.to_dict(), args.json,
+              f"{printer.MARK_OK} Pinned Claude Code {pinned.version} ({pinned.binary_sha256[:12]}…).\n"
+              + printer.next_step("prepare the account's profile: `openswap worker claude prepare`, then "
+                                  "`openswap worker live-check --provider claude`."))
         return 0
     if args.claude_command == "status":
         status = claude_status(root)
-        cli = status["cli"]
-        lines = [f"Pinned Claude Code: {cli['version']} (verified)" if cli["pinned"]
-                 else f"Pinned Claude Code: not ready ({cli['problem']})",
-                 f"Live execution (Claude): {status['execution_mode']}"]
-        for account in status["accounts"]:
-            marks = [m for m, on in (("default", account["pinned"]), ("allowed", account["allowed"])) if on]
-            ready = "profile ready" if account["profile_ready"] else "profile not prepared"
-            name = account["slot"] + (f" ({account['alias']})" if account["alias"] else "")
-            lines.append(f"  claude:{name}: {ready}" + (f" [{', '.join(marks)}]" if marks else ""))
-        _emit(status, args.json, "\n".join(lines))
-        return 0 if cli["pinned"] else 1
+        _emit(status, args.json, _format_claude_status(status))
+        return 0 if status["cli"]["pinned"] else 1
     if not args.json:
         print("If that account is not signed in to its OpenSwap profile yet, Claude Code opens its own "
               "sign-in in your browser.")
     result = claude_prepare(root, args.selector)
-    _emit(result, args.json, f"Claude account {result['slot']}'s OpenSwap profile is ready for remote jobs. "
-                             "Your default Claude login was not changed.")
+    _emit(result, args.json, f"{printer.MARK_OK} Claude account {result['slot']}'s OpenSwap profile is ready "
+                             "for remote jobs. Your default Claude login was not changed.\n"
+                             + printer.next_step("run the live check: `openswap worker live-check --provider claude`."))
     return 0
+
+
+def _format_claude_status(status: dict) -> str:
+    """``claude status``: the pinned binary, the opt-in, one row per account, then the next step."""
+    cli = status["cli"]
+    live = status["execution_mode"] == "live"
+    lines = [printer.heading("Claude Code for Remote tasks"), *printer.columns([
+        (f"{printer.mark(cli['pinned'])} Pinned binary",
+         f"{cli['version']} (verified)" if cli["pinned"] else f"not ready ({cli['problem']})"),
+        (f"{printer.mark(True if live else None)} Live execution", status["execution_mode"]),
+    ]), printer.heading("Accounts (OpenSwap profile; pin with `claude:<slot>`)")]
+    if not status["accounts"]:
+        lines.append("  No eligible Claude accounts in the roster. Add one with `openswap add`.")
+    lines.extend(printer.columns(_account_status_rows(status["accounts"], "profile_ready",
+                                                      "profile ready", "profile not prepared")))
+    if not cli["pinned"]:
+        lines.append(printer.next_step("pin the installed Claude Code: `openswap worker claude pin`."))
+    elif any(a["pinned"] and not a["profile_ready"] for a in status["accounts"]):
+        lines.append(printer.next_step("prepare the default account's profile: `openswap worker claude prepare`."))
+    elif not live:
+        lines.append(printer.next_step("run the live check and enable live execution: "
+                                       "`openswap worker live-check --provider claude`."))
+    else:
+        lines.append(printer.next_step("nothing: live execution is on. "
+                                       "`openswap worker live disable --provider claude` turns it off."))
+    return "\n".join(lines)
 
 
 def _live_command(root: Path, args) -> int:
     provider = args.provider
+    flag = " --provider claude" if provider == "claude" else ""
     if args.live_command == "status":
         status = live_status(root, provider)
-        _emit(status, args.json, f"Live execution ({provider}): {status['execution_mode']}")
+        live = status["execution_mode"] == "live"
+        human = f"{printer.mark(True if live else None)} Live execution ({provider}): {status['execution_mode']}"
+        if not live:
+            human += "\n" + printer.next_step(f"run the live check and enable live execution: "
+                                               f"`openswap worker live-check{flag}`.")
+        _emit(status, args.json, human)
         return 0
     if args.live_command == "disable":
         disable_live(root, provider)
         status = live_status(root, provider)
-        _emit(status, args.json, "Live execution is off: no new job will launch (they fail with "
+        _emit(status, args.json, f"{printer.MARK_OK} Live execution is off: no new job will launch (they fail with "
                                  "live_adapter_disabled). A job already running continues; "
                                  "`openswap worker stop` ends it.")
         return 0
@@ -513,5 +556,6 @@ def _live_command(root: Path, args) -> int:
     text = ("Live execution is on for Claude: remote jobs on Claude accounts run the pinned Claude Code on "
             "their OpenSwap profile." if provider == "claude" else
             "Live execution is on: remote jobs run with the pinned Codex CLI on the isolated sign-in of their account.")
-    _emit(status, args.json, f"{text} `openswap worker live disable --provider {provider}` turns it off.")
+    _emit(status, args.json, f"{printer.MARK_OK} {text} `openswap worker live disable --provider {provider}` "
+                             "turns it off.")
     return 0

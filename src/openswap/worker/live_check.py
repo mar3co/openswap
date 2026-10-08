@@ -1284,15 +1284,17 @@ def _ask(question: str) -> bool:
 
 
 def _format(evidence: dict) -> str:
+    from openswap import printer
+
     lines = []
     for name in REQUIRED_GATES:
         gate = evidence["gates"][name]
-        mark = "PASS" if gate.get("passed") else "FAIL"
-        lines.append(f"  {mark}  {name}")
-        if not gate.get("passed"):
+        passed = gate.get("passed") is True
+        lines.append(f"  {printer.mark(passed)} {'PASS' if passed else 'FAIL'}  {name}")
+        if not passed:
             for key, value in gate.items():
                 if key != "passed" and value not in (True, None) and key != "steps_ran":
-                    lines.append(f"          {key}: {value}")
+                    lines.append(f"            {key}: {value}")
     return "\n".join(lines)
 
 

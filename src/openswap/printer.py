@@ -165,6 +165,56 @@ def yellowed(text: str) -> str:
     return _style(text, _pal("yellow"))
 
 
+# --- Status marks and layout (plain text; style whole lines afterwards) ---
+
+# Every mark is paired with a word by its caller, so the meaning never rests on
+# the glyph (or a colour) alone. The glyphs are the ones ``openswap list``
+# already prints; ``force_utf8_output`` keeps them from crashing a legacy
+# console, where ``errors="replace"`` degrades them to ``?``.
+MARK_OK = "✓"   # ✓ done, pinned, passing
+MARK_BAD = "✗"  # ✗ missing, refused, failing
+MARK_DOT = "•"  # • neutral: listed, not chosen, nothing to do
+
+
+def mark(state: bool | None) -> str:
+    """``✓`` for True, ``✗`` for False, ``•`` for None (neutral)."""
+    if state is None:
+        return MARK_DOT
+    return MARK_OK if state else MARK_BAD
+
+
+def heading(text: str) -> str:
+    """A section title: bold when colours are on, plain otherwise."""
+    return bolded(text)
+
+
+def next_step(text: str) -> str:
+    """The one line that says what to do now, always prefixed ``Next:``."""
+    return f"{bolded('Next:')} {text}"
+
+
+def columns(rows, *, indent: int = 2, gap: int = 2) -> list[str]:
+    """Pad plain-text cells so each column lines up; trailing cells may be empty.
+
+    Cells are plain strings (no ANSI codes), so widths are counted correctly;
+    callers style a whole line afterwards. Empty trailing cells and trailing
+    spaces are dropped, so a line never ends in padding.
+    """
+    rows = [tuple(str(cell) for cell in row) for row in rows]
+    if not rows:
+        return []
+    width = max(len(row) for row in rows)
+    widths = [0] * width
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+    lines = []
+    for row in rows:
+        cells = [cell.ljust(widths[index]) for index, cell in enumerate(row)]
+        lines.append((" " * indent + (" " * gap).join(cells)).rstrip())
+    return lines
+
+
 # --- Line printers (call print() internally) ---
 
 

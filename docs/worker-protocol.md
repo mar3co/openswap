@@ -451,10 +451,12 @@ runs.
    step says it is running, or that it is enabled but not running (for example
    its LaunchAgent was unloaded) and points at `worker enable` and
    `worker status`.
-2. **Confirm the account.** With an account pinned it shows it and asks "Keep
-   this account? [Y/n]"; otherwise (or on No) it lists the eligible Codex and
-   Claude accounts (Claude ones as `claude:<slot>`) and asks for one (Enter
-   skips).
+2. **Confirm the account.** A numbered menu of the eligible Codex and Claude
+   accounts (menu number, provider, email, alias, slot; the pinned one marked
+   `✓ … current`), then "Account number (1-N; Enter keeps the current one)"
+   with the pin as the default, or "(1-N; Enter to skip)" without one. A
+   number picks by menu position (the two providers may share slot numbers);
+   an email, alias or `claude:<slot>` still works.
 3. **Approve a research folder.** While the registry is still only the
    built-in `research` folder inside the OpenSwap backup root, it offers to
    create `~/OpenSwap Research` (owner-only, 0700) and approve it as `research`
@@ -462,9 +464,10 @@ runs.
    refused, never re-permissioned. It then offers to approve other folders: a
    path, then an ID (suggested from the folder's name). Folders are approved
    with `workspace add`'s own checks.
-4. **Summary.** The service, worker state, account, approved folders (ID and
-   label) and the execution mode, then either "Ready for Slack" or the list of
-   what is still missing, and a note that execution stays off
+4. **Summary.** A checklist (`✓`/`✗`/`•`, each with its words) of the service,
+   worker state, account, approved folders (ID and label) and the execution
+   mode, then either "Ready for Slack" or the numbered list of what is still
+   missing, and a note that execution stays off
    (`live_adapter_disabled`) while the execution mode is `disabled`, with the
    live-check steps for the pinned account's provider (`openswap worker
    live-check`; for a Claude account `openswap worker claude pin`, `openswap
@@ -472,11 +475,14 @@ runs.
    [Running jobs live](#running-jobs-live-codex)). The execution mode, here and
    in the readiness report, is that of the pinned account's provider.
 
-Without a terminal, `pair` asks nothing and prints each step's command. While
-a URL is configured and the worker is disabled or not running, human
-`worker status` adds "Paired with <origin> but the worker is off; run
-`openswap worker enable`" (`--json` is unchanged), and the menu bar's Remote
-tasks section shows "Paired, worker off" under **Enable local worker**.
+Each step is headed `Step N of 4 · <name>`; on a terminal the headers are
+bold unless `NO_COLOR` is set or stdout is not a terminal, and the menu bar
+shows the same lines in its dialogs. Without a terminal, `pair` asks nothing
+and prints each step's command. While a URL is configured and the worker is
+disabled or not running, human `worker status` adds "Next: paired with
+<origin> but the worker is off; run `openswap worker enable`" (`--json` is
+unchanged), and the menu bar's Remote tasks section shows "Paired, worker
+off" under **Enable local worker**.
 
 ### Choosing the account and research folders
 
@@ -487,7 +493,7 @@ learns each approved folder's ID and label (never its path) and offers those
 IDs, so the owner no longer types them into the service.
 
 ```sh
-openswap worker account                    # list Codex and Claude slots; * marks the pin
+openswap worker account                    # list Codex and Claude slots; ✓ marks the pin
 openswap worker account 2                  # pin by slot, email or alias (or --json)
 openswap worker account claude:4           # a Claude slot (codex:2 names a Codex slot)
 openswap worker account --clear            # remove the pin
