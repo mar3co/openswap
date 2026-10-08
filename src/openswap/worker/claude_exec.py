@@ -59,9 +59,50 @@ MANAGED_CLAUDE_PATHS = (
 )
 
 
-def managed_claude_config(profile: Path, *, run=None) -> list[str]:
-    """Managed/enterprise Claude Code configuration that would override ours (existence only)."""
-    return [path for path in MANAGED_CLAUDE_PATHS if os.path.lexists(path)]
+MANAGED_SETTINGS_DIR = "/Library/Application Support/ClaudeCode/managed-settings.d"
+REMOTE_SETTINGS_FILE = "remote-settings.json"  # server-managed policy, cached in the config dir
+
+
+def managed_claude_config(profile: Path, *, run=None, user: str | None = None) -> list[str]:
+    """Managed Claude Code policy that would apply to a job (empty when none).
+
+    ``--restricted`` still loads managed settings, which can add hooks,
+    environment values or permissions the live check never measured. So any
+    source refuses a launch: the system files, any fragment in
+    ``managed-settings.d``, the machine or per-user managed preferences, and
+    the server-managed policy Claude Code caches in the profile
+    (``remote-settings.json``) unless that cache is an empty object.
+    """
+    found = [path for path in MANAGED_CLAUDE_PATHS if os.path.lexists(path)]
+    try:
+        if any(True for _ in os.scandir(MANAGED_SETTINGS_DIR)):
+            found.append(MANAGED_SETTINGS_DIR)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        found.append(MANAGED_SETTINGS_DIR)  # unreadable: never treated as empty
+    if user is None:
+        try:
+            import pwd
+
+            user = pwd.getpwuid(os.getuid()).pw_name
+        except (ImportError, KeyError, AttributeError):
+            user = None
+    if user:
+        per_user = f"/Library/Managed Preferences/{user}/com.anthropic.claudecode.plist"
+        if os.path.lexists(per_user):
+            found.append(per_user)
+    remote = Path(profile) / REMOTE_SETTINGS_FILE
+    if os.path.lexists(remote):
+        try:
+            if remote.is_symlink() or remote.stat().st_size > 2 * 1024 * 1024:
+                raise ValueError
+            cached = json.loads(remote.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cached = None
+        if cached != {}:
+            found.append(str(remote))
+    return found
 
 
 def profile_for(backup_root: Path, identity: str) -> Path | None:

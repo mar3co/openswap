@@ -574,7 +574,12 @@ inspection. The network probes need `http://example.com/` and
 `http://1.1.1.1/` reachable from this Mac outside the sandbox (plain HTTP, so
 the result does not depend on certificates). Only when every gate passes does
 it offer to enable live execution (`--enable` does so without asking,
-`--no-enable` never). It uses some of the account's quota.
+`--no-enable` never). It uses some of the account's quota. Enabling records
+the account the check ran on: jobs on any other account (another pin, or an
+allowed account a per-job choice selects) are refused `live_adapter_disabled`
+until a check passes on that account too (`live-check --account <slot>`), and
+the worker does not claim work while any selectable account is unchecked. A
+new binary starts the list over.
 
 ### Running jobs live (Claude)
 
@@ -635,7 +640,10 @@ account's profile, the run's temporary folder and this user's cache and
 temporary folders, and makes the default login, `~/.codex` and the rest of
 the backup root (other accounts, worker state) unreadable and unwritable.
 Containment, Stop, recovery, `result.md` and failure codes are the same as for
-Codex.
+Codex. A job also refuses while any managed Claude Code policy applies (the
+system `managed-settings.json` or `managed-settings.d/`, managed preferences,
+or server-managed policy cached in the profile as a non-empty
+`remote-settings.json`).
 
 **The Claude live check** records the same gates as the Codex one, with Read
 probes instead of shell commands (a read in the job folder must work; reads

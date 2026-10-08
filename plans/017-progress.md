@@ -1282,6 +1282,17 @@ None of this changes the owner steps.
     stopped.
   - Helpers and the escaped probe job are always cleaned up, and sentinel
     files get fresh, exclusive names.
+- **Opt-in per account.** Enabling records the account the passing check ran
+  on, and a later check with the same binary adds its own. A job on an
+  unchecked account is refused before launch, and the worker does not poll
+  while any selectable account is unchecked.
+- **Claude.**
+  - Any managed policy refuses a launch: `managed-settings.d`, per-user
+    managed preferences, or a non-empty server-managed `remote-settings.json`
+    cached in the profile.
+  - Profiles are signed in with Claude Code's own `claude auth login`, under
+    the lease.
+  - Grants overlapping the logins or the backup root are refused.
 
 ## Claude accounts (2026-10-08)
 

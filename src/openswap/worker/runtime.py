@@ -445,7 +445,26 @@ class WorkerRuntime:
             if not availability.available:
                 return availability
             found = found or availability
+        # Each account a claim could select must also be one a live check ran
+        # on (the adapter refuses any other before launch).
+        for identity in self._candidate_identities():
+            adapter = self.adapters.get(provider_of(identity) or "")
+            checked = getattr(adapter, "_account_checked", None)
+            try:
+                ok = checked(identity) if callable(checked) else True
+            except Exception:
+                ok = False
+            if not ok:
+                return ProviderAvailability(False, "live_adapter_disabled", None)
         return found or ProviderAvailability(False, "provider_unavailable", None)
+
+    def _candidate_identities(self) -> list[str]:
+        policy = load_worker_settings(self.backup_root)
+        identities = []
+        for identity in (self.account_identity, *(entry.identity for entry in policy.account_allowlist)):
+            if isinstance(identity, str) and identity not in identities:
+                identities.append(identity)
+        return identities
 
     def _resolve_launch_account(self, job: JobRecord) -> tuple[str | None, str | None]:
         """``(identity, None)`` for this launch, or ``(None, diagnostic)``; under the launch lock.

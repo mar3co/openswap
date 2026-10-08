@@ -811,3 +811,47 @@ def test_prepare_leaves_a_ready_profile_alone_and_refuses_during_a_job(tmp_path)
         live_cli.claude_prepare(root, "claude:4", run=run, verify=lambda: pinned())
     assert run.calls == []
 
+
+
+
+def test_server_managed_policy_cached_in_the_profile_refuses_the_launch(tmp_path):
+    root = setup_root(tmp_path)
+    profile = claude_exec.profile_for(root, IDENTITY)
+    assert str(profile / "remote-settings.json") not in claude_exec.managed_claude_config(profile, user="nobody")
+    (profile / "remote-settings.json").write_text("{}")  # fetched, but no policy
+    assert str(profile / "remote-settings.json") not in claude_exec.managed_claude_config(profile, user="nobody")
+    (profile / "remote-settings.json").write_text(json.dumps({"hooks": {"PreToolUse": []}}))
+    assert str(profile / "remote-settings.json") in claude_exec.managed_claude_config(profile, user="nobody")
+    launcher = FakeLaunch(SUCCESS)
+    adapter = ClaudeCodeAdapter(
+        root, containment=launcher, verify=lambda **kw: pinned(), mode=lambda: "live", sleep=lambda s: None,
+        live_sessions=lambda p: False, home=root.parent / "home",
+    )
+    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now", (IDENTITY,)), "claude")
+    with pytest.raises(ProviderLaunchRefused) as error:
+        adapter.start(job_record(), workspace(root), worker_epoch=1)
+    assert error.value.diagnostic_code == "provider_unavailable" and launcher.launches == []
+
+
+def test_a_managed_settings_fragment_directory_counts(tmp_path, monkeypatch):
+    fragments = tmp_path / "managed-settings.d"
+    fragments.mkdir()
+    monkeypatch.setattr(claude_exec, "MANAGED_SETTINGS_DIR", str(fragments))
+    monkeypatch.setattr(claude_exec, "MANAGED_CLAUDE_PATHS", ())
+    assert claude_exec.managed_claude_config(tmp_path, user="nobody") == []
+    (fragments / "10-policy.json").write_text("{}")
+    assert claude_exec.managed_claude_config(tmp_path, user="nobody") == [str(fragments)]
+
+
+
+def test_polling_waits_until_every_selectable_account_passed_a_check(tmp_path):
+    from openswap.worker.models import ProviderAvailability
+
+    root = setup_root(tmp_path)
+    runtime, codex, claude = _runtime(root, IDENTITY)
+    claude.probe = lambda: ProviderAvailability(True, None, "v")
+    checked = set()
+    claude._account_checked = lambda identity: identity in checked
+    assert runtime.provider_availability().diagnostic_code == "live_adapter_disabled"
+    checked.add(IDENTITY)
+    assert runtime.provider_availability().available is True
