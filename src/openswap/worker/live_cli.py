@@ -128,8 +128,9 @@ def logout(backup_root: Path, selector: str | None, *, run=subprocess.run, verif
         if not os.path.lexists(home / "auth.json"):
             return {"slot": choice.number, "account_ref": identity, "signed_in": False}
         result = run([str(pinned.binary), "logout"], env=_login_env(home), check=False)
-        still = home_identity(home)
-    if result.returncode != 0 or still is not None:
+        # Signed out means the credentials file is gone, not merely unreadable.
+        still = os.path.lexists(home / "auth.json")
+    if result.returncode != 0 or still:
         # Jobs could keep using a sign-in that is still there: never report it gone.
         raise AccountPinError("logout_failed")
     return {"slot": choice.number, "account_ref": identity, "signed_in": False}

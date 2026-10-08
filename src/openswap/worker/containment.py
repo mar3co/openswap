@@ -97,8 +97,14 @@ def _fresh(run_dir: Path) -> bool:
     return True
 
 
-def _label_lock(run_dir: Path, label: str) -> FileLock:
-    return FileLock(Path(run_dir).parent / f".{label}.lock", timeout=0)
+def default_lock_dir() -> Path:
+    """Per-user directory for label locks, shared by every run root of this user.
+
+    launchd labels are domain-wide (``gui/<uid>``), so their locks must not
+    depend on where a caller keeps its run directories.
+    """
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return Path(tempfile.gettempdir()) / f"openswap-job-locks-{uid}"
 
 _SZOMB = 5
 _SSTOP = 4
@@ -345,7 +351,9 @@ class LaunchdContainment:
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         self_pid: int | None = None,
+        lock_dir: Path | None = None,
     ):
+        self._lock_dir = Path(lock_dir) if lock_dir is not None else default_lock_dir()
         self.domain = f"gui/{os.getuid() if uid is None else uid}"
         self._procs = procs
         self._launchctl = launchctl or _default_launchctl
@@ -397,11 +405,11 @@ class LaunchdContainment:
         # One launch or stop per label at a time: the label check, bootstrap
         # and any cleanup run under this lock, so a label loaded after a failed
         # bootstrap can only be this launch's own.
-        lock = _label_lock(run_dir, label)
         try:
+            lock = self._label_lock(label)
             acquired = lock.acquire(timeout=0)
-        except OSError:
-            raise ContainmentError("run_dir_unavailable") from None
+        except (OSError, ContainmentError):
+            raise ContainmentError("label_lock_unavailable") from None
         if not acquired:
             raise ContainmentError("job_label_in_use")
         try:
@@ -522,16 +530,25 @@ class LaunchdContainment:
 
     # -- stop -----------------------------------------------------------------
 
+    def _label_lock(self, label: str) -> FileLock:
+        ensure_private_dir(self._lock_dir)
+        return FileLock(self._lock_dir / f"{label}.lock", timeout=0)
+
     def _owns_label(self, handle: JobHandle) -> bool | None:
         """Whether the loaded label is this handle's job: ``None`` when nothing is loaded.
 
-        A launched job's arguments name its own run directory, so a service
-        another launch loaded under the same label is never mistaken for it.
+        launchd prints the plist a service was bootstrapped from as its
+        top-level ``path``; each launch writes its own plist in its own run
+        directory, so an exact match identifies the service.
         """
         printed = self._launchctl(["print", f"{handle.domain}/{handle.label}"])
         if printed.returncode != 0:
             return None
-        return str(handle.run_dir) in (printed.stdout or "")
+        expected = f"path = {handle.run_dir / 'job.plist'}"
+        return any(
+            line.startswith("\t") and not line.startswith("\t\t") and line.strip() == expected
+            for line in (printed.stdout or "").splitlines()
+        )
 
     def stop(self, handle: JobHandle, *, timeout: float = 15.0) -> StopProof:
         """Stop every member of the job and report proof, never a guess.
@@ -539,10 +556,10 @@ class LaunchdContainment:
         Takes the label's lock (shared with :meth:`launch`) so it can never
         interleave with a launch of the same label.
         """
-        lock = _label_lock(handle.run_dir, handle.label)
         try:
+            lock = self._label_lock(handle.label)
             acquired = lock.acquire(timeout=timeout)
-        except OSError:
+        except (OSError, ContainmentError):
             acquired = False
         if not acquired:
             return StopProof(False, None, 0)

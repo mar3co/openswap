@@ -1115,10 +1115,15 @@ class WorkerRuntime:
                     late = outcome.get("abandoned", False)
             finally:
                 if late:
-                    # The abandoned call has now returned: the lease stays
-                    # uncertain, but it may be released on confirmation.
+                    refused = isinstance(outcome.get("error"), ProviderLaunchRefused)
                     try:
-                        self.leases.mark_uncertain(token, "launch_uncertain")
+                        if refused:
+                            # The adapter proved nothing launched: no quarantine.
+                            self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
+                        else:
+                            # The abandoned call has now returned: the lease stays
+                            # uncertain, but it may be released on confirmation.
+                            self.leases.mark_uncertain(token, "launch_uncertain")
                     except Exception:
                         pass
                 completed.set()
