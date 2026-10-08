@@ -78,7 +78,7 @@ from openswap.worker.containment import (
     load_handle,
     write_private,
 )
-from openswap.worker.leases import AccountLeaseError, AccountLeaseStore, ReleaseEvidence
+from openswap.worker.leases import AccountLeaseError, AccountLeaseStore, ProviderLeases, ReleaseEvidence
 from openswap.worker import live as _live_module
 from openswap.worker.live import (
     EVIDENCE_KIND,
@@ -312,6 +312,15 @@ def command_matches(command: str, expected: str) -> bool:
     return len(inner) == 1 and inner[0].strip() == want
 
 
+def lease_release_hint(lease) -> str:
+    """The refusal text for a held lease, naming the store it is in."""
+    provider = str(getattr(lease, "account_identity", "") or "").split(":", 1)[0]
+    flag = " --provider claude" if provider == "claude" else ""
+    name = "A Claude" if provider == "claude" else "A Codex"
+    return (f"{name} account lease is held. Resolve it first "
+            f"(`openswap worker lease release{flag}`).")
+
+
 NETWORK_PROBE_URL = "http://example.com/"
 NETWORK_PROBE_TOKEN = "Example Domain"
 # A timeout (28) is not denial: `-m` bounds the whole transfer, so a request
@@ -376,7 +385,7 @@ class LiveCheck:
         self.probe_timeout = probe_timeout
         self.helper_wait = helper_wait
         self.gates: dict[str, Gate] = {name: Gate(name) for name in REQUIRED_GATES}
-        self.leases = AccountLeaseStore(self.root, "codex")
+        self.leases = ProviderLeases(self.root)
         self.item_types_seen: set[str] = set()
         self.check_root: Path | None = None
 
@@ -542,8 +551,7 @@ class LiveCheck:
                                                  "(reopen with `--off`).")
         lease = self.leases.read_current()
         if lease is not None and lease.state != "released":
-            raise CheckRefused("lease_held", "A Codex account lease is held. Resolve it first "
-                                             "(`openswap worker lease release`).")
+            raise CheckRefused("lease_held", lease_release_hint(lease))
         try:
             pinned = self._verify(check_version=True)
         except codex_cli.CodexCliError as error:
@@ -674,7 +682,7 @@ class LiveCheck:
             "provider_finished_event": "provider_finished" in kinds,
             "turn_completed": summary.get("turn_completed") is True,
             "web_searches": sum(int(count) for kind, count in (summary.get("item_counts") or {}).items()
-                                if "search" in kind and type(count) is int),
+                                if "search" in kind.lower() and type(count) is int),
             "output_tokens": int(usage.get("output_tokens", 0) or 0),
             "result_has_url": "https://" in result_text or "http://" in result_text,
             "execution_stopped": outcome.stopped,
@@ -1026,7 +1034,7 @@ class LiveCheck:
         # The stand-in worker takes the account lease itself, as a real worker
         # does, so its death leaves the same abandoned lease behind.
         process = self._spawn_child({"root": str(self.root), "job_id": job_id, "identity": identity,
-                                     "workspace": str(ws), "task": self.HELPER_TASK,
+                                     "provider": self.provider, "workspace": str(ws), "task": self.HELPER_TASK,
                                      "lease_ttl": self.helper_wait + 300})
         detail = {"worker_started_job": False, "detached_helper_observed": False, "job_outlived_worker": False,
                   "lease_left_by_worker": False, "recovery_stopped": False, "helpers_left": None,
@@ -1077,6 +1085,49 @@ class LiveCheck:
 
     # -- the whole check -------------------------------------------------------------
 
+    # -- provider hooks (the Claude check overrides these) ----------------------
+
+    provider = "codex"
+
+    def _default_login_snapshot(self):
+        return login_snapshot(auth_path(codex_home()))
+
+    def _prepare_account_home(self, identity: str) -> None:
+        prepare_home(self.root, identity)
+
+    def _steps(self, pinned, home: Path, identity: str):
+        return (
+            ("tool surface", lambda: self._static.update(self._gate_tool_surface_static(pinned, home))),
+            ("sandbox (codex sandbox)", lambda: self._gate_sandbox_wrapper(pinned, home)),
+            ("research job", lambda: self._gate_research(identity)),
+            ("sandbox (codex exec)", lambda: self._gate_sandbox_exec(identity, home)),
+            ("stop", lambda: self._gate_stop(identity)),
+            ("kill and recovery", lambda: self._gate_kill_recovery(identity)),
+        )
+
+    def _evaluate_tool_surface(self, static: dict, unexpected_items: list[str]) -> tuple[dict, bool]:
+        detail = {**static, "unexpected_item_types": unexpected_items}
+        passed = bool(static) and (
+            static.get("mcp_servers_none") is True and static.get("features_listed") is True
+            and static.get("disabled_features_missing") == [] and static.get("disabled_features_still_on") == []
+            and static.get("shell_tool_on") is True and static.get("managed_config_present") == []
+            and not unexpected_items
+        )
+        return detail, passed
+
+    def _account_detail(self, home: Path, identity: str) -> dict:
+        return {
+            "isolated_home_matches_pin": home_identity(home) == identity,
+            "account_still_in_roster": codex_account_in_roster(self.root, identity),
+            "authenticated_turn": self.research_tokens > 0,
+        }
+
+    def _cli_evidence(self, pinned) -> dict:
+        return {"codex": {"version": pinned.version, "binary_sha256": pinned.binary_sha256,
+                          "archive_sha256": pinned.archive_sha256, "release": codex_cli.RELEASE_TAG}}
+
+    # -- the whole check -------------------------------------------------------------
+
     LIFECYCLE_WAIT = 5.0  # seconds to wait for a concurrent lifecycle change
 
     def run(self, *, install=None, login=None) -> dict:
@@ -1108,8 +1159,7 @@ class LiveCheck:
     def _run_gates(self, *, install=None, login=None) -> dict:
         # Before the preflight: its install and sign-in prompts run the pinned
         # CLI, and a default login they changed must not become the baseline.
-        default_auth = auth_path(codex_home())
-        default_before = login_snapshot(default_auth)
+        default_before = self._default_login_snapshot()
         pinned, choice, identity, home = self._preflight(install=install, login=login)
         # Outside the private worker directory: the adapter refuses any job
         # folder that overlaps it, since that would expose CODEX_HOME.
@@ -1118,17 +1168,10 @@ class LiveCheck:
         ensure_private_dir(self.check_root)
         ensure_private_dir(self.check_root / "tmp")
         self._recover_leftovers()
-        prepare_home(self.root, identity)
+        self._prepare_account_home(identity)
         self.research_tokens = 0
         self._static: dict = {}
-        steps = (
-            ("tool surface", lambda: self._static.update(self._gate_tool_surface_static(pinned, home))),
-            ("sandbox (codex sandbox)", lambda: self._gate_sandbox_wrapper(pinned, home)),
-            ("research job", lambda: self._gate_research(identity)),
-            ("sandbox (codex exec)", lambda: self._gate_sandbox_exec(identity, home)),
-            ("stop", lambda: self._gate_stop(identity)),
-            ("kill and recovery", lambda: self._gate_kill_recovery(identity)),
-        )
+        steps = self._steps(pinned, home, identity)
         errors = {}
         for label, step in steps:
             self.out(f"… {label}")
@@ -1145,14 +1188,8 @@ class LiveCheck:
         unexpected_items = sorted(kind for kind in self.item_types_seen
                                   if any(marker in kind for marker in FORBIDDEN_ITEM_MARKERS))
         tool = self.gates["tool_surface"]
-        tool.detail = {**static, "unexpected_item_types": unexpected_items}
-        tool.passed = bool(static) and (
-            static.get("mcp_servers_none") is True and static.get("features_listed") is True
-            and static.get("disabled_features_missing") == [] and static.get("disabled_features_still_on") == []
-            and static.get("shell_tool_on") is True and static.get("managed_config_present") == []
-            and not unexpected_items
-        )
-        default_after = login_snapshot(default_auth)
+        tool.detail, tool.passed = self._evaluate_tool_surface(static, unexpected_items)
+        default_after = self._default_login_snapshot()
         login_gate = self.gates["default_login_unchanged"]
         readable = "unreadable" not in (default_before[0], default_after[0])
         login_gate.detail = {"default_login_present": default_before[0] == "present",
@@ -1161,21 +1198,17 @@ class LiveCheck:
         # An unreadable login cannot be shown unchanged: fail closed.
         login_gate.passed = readable and default_before == default_after
         account = self.gates["account_identity"]
-        account.detail = {
-            "isolated_home_matches_pin": home_identity(home) == identity,
-            "account_still_in_roster": codex_account_in_roster(self.root, identity),
-            "authenticated_turn": self.research_tokens > 0,
-        }
+        account.detail = self._account_detail(home, identity)
         account.passed = all(account.detail.values())
         passed = all(gate.passed for gate in self.gates.values()) and not errors
         return {
             "kind": EVIDENCE_KIND, "schema": EVIDENCE_SCHEMA, "passed": passed,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "host": {"macos": platform.mac_ver()[0], "machine": platform.machine()},
+            "provider": self.provider,
             # Enabling accepts this evidence only on this Mac and install.
             "host_binding": _live_module.host_binding(self.root),
-            "codex": {"version": pinned.version, "binary_sha256": pinned.binary_sha256,
-                      "archive_sha256": pinned.archive_sha256, "release": codex_cli.RELEASE_TAG},
+            **self._cli_evidence(pinned),
             "account": {"identity": identity, "slot": choice.number},
             "gates": {name: gate.to_dict() for name, gate in self.gates.items()},
             "errors": errors,
@@ -1187,7 +1220,8 @@ def write_evidence(backup_root: Path, evidence: dict, output: Path | None = None
     directory = evidence_dir(backup_root)
     ensure_private_dir(directory.parent)
     ensure_private_dir(directory)
-    path = directory / f"live-check-{_stamp()}.json"
+    prefix = "live-check-claude-" if evidence.get("provider") == "claude" else "live-check-"
+    path = directory / f"{prefix}{_stamp()}.json"
     data = json.dumps(evidence, indent=2, sort_keys=True).encode()
     write_private(path, data)
     if output is not None:
@@ -1206,7 +1240,12 @@ def child_main(raw: str) -> None:
     """The stand-in worker process for ``kill_recovery``: start one job, then wait to be killed."""
     payload = json.loads(raw)
     root = Path(payload["root"])
-    adapter = CodexExecAdapter(root, mode=lambda: "live", bind_to_opt_in=False)
+    if payload.get("provider") == "claude":
+        from openswap.worker.claude_exec import ClaudeCodeAdapter
+
+        adapter = ClaudeCodeAdapter(root, mode=lambda: "live", bind_to_opt_in=False)
+    else:
+        adapter = CodexExecAdapter(root, mode=lambda: "live", bind_to_opt_in=False)
     child_acquire_lease(root, payload)
     now = datetime.now(timezone.utc)
     record = JobRecord(
@@ -1220,6 +1259,18 @@ def child_main(raw: str) -> None:
     print("STARTED", flush=True)
     while True:
         time.sleep(60)
+
+
+def _provider_for(root: Path, selector: str | None) -> str:
+    """The provider of the account the check would use (Codex when unclear)."""
+    from openswap.worker.accounts import provider_of, resolve_account_selector
+
+    if selector:
+        try:
+            return resolve_account_selector(root, selector).provider
+        except Exception:
+            return "codex"
+    return provider_of(load_worker_settings(root).pinned_account_ref) or "codex"
 
 
 def _ask(question: str) -> bool:
@@ -1248,9 +1299,11 @@ def _format(evidence: dict) -> str:
 def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     parser = argparse.ArgumentParser(
         prog="openswap worker live-check",
-        description="Run four short real Codex jobs on the pinned account and record phase-1 live evidence.",
+        description="Run short real Codex or Claude jobs on the pinned account and record phase-1 live evidence.",
     )
     parser.add_argument("--account", metavar="SLOT|EMAIL|ALIAS", help="check this account (default: the pin)")
+    parser.add_argument("--provider", choices=("codex", "claude"),
+                        help="which provider to check (default: the account's)")
     parser.add_argument("--output", type=Path, help="also copy the evidence file here")
     parser.add_argument("--yes", action="store_true", help="do not ask before running the real jobs")
     choice = parser.add_mutually_exclusive_group()
@@ -1269,7 +1322,7 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     # With --json, stdout carries only the evidence object; everything else is stderr.
     say = (lambda message: print(message, file=sys.stderr)) if args.json else print
     if not args.yes:
-        say("The live check runs four short, real Codex jobs on the selected account (they use some of its "
+        say("The live check runs short, real Codex or Claude jobs on the selected account (they use some of its "
             "quota), checks the sandbox and Stop, and writes an evidence file. It takes about 5 to 15 minutes.")
         if not interactive or not _ask("Run it now?"):
             say("Not run. Pass --yes to run without asking.")
@@ -1288,7 +1341,13 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         do_login(root, account.number)
         return True
 
-    check = LiveCheck(root, selector=args.account, out=say)
+    provider = args.provider or _provider_for(root, args.account)
+    if provider == "claude":
+        from openswap.worker.live_check_claude import ClaudeLiveCheck
+
+        check = ClaudeLiveCheck(root, selector=args.account, out=say)
+    else:
+        check = LiveCheck(root, selector=args.account, out=say)
     try:
         evidence = check.run(install=install, login=login)
     except CheckRefused as error:
@@ -1310,12 +1369,22 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         say("Live execution stays off.")
         return 1
     if args.no_enable or not (args.enable or (interactive and not args.json and _ask("Enable live execution now?"))):
-        say(f"Live execution stays off. Enable it later with `openswap worker live enable --evidence {path}`.")
+        flag = " --provider claude" if evidence.get("provider") == "claude" else ""
+        say(f"Live execution stays off. Enable it later with "
+            f"`openswap worker live enable{flag} --evidence {path}`.")
         return 0
+    from openswap.worker import claude_cli
+
     try:
-        enable_live(root, path, codex_cli.verify(root))
-    except (LiveModeError, codex_cli.CodexCliError) as error:
+        if evidence.get("provider") == "claude":
+            enable_live(root, path, claude_cli.verify(root), "claude")
+        else:
+            enable_live(root, path, codex_cli.verify(root))
+    except (LiveModeError, codex_cli.CodexCliError, claude_cli.ClaudeCliError) as error:
         print(f"Could not enable live execution: {error}", file=sys.stderr)
         return 1
-    say("Live execution is on. `openswap worker live disable` turns it off.")
+    if evidence.get("provider") == "claude":
+        say("Live execution is on for Claude. `openswap worker live disable --provider claude` turns it off.")
+    else:
+        say("Live execution is on. `openswap worker live disable` turns it off.")
     return 0

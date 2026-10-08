@@ -811,12 +811,12 @@ def run(switcher, codex=None) -> int:
             from openswap.worker.accounts import AccountPinError
             from openswap.worker.cli import set_worker_account
 
+            from openswap.worker.accounts import provider_of
+
             if value == "":
                 selector = None
-            elif isinstance(value, str) and value.startswith("codex:"):
+            elif provider_of(value) is not None:
                 selector = str(value)
-            elif isinstance(value, str) and value.startswith("claude:"):
-                return "claude_not_supported"
             else:
                 return "account_not_eligible"
             try:
@@ -837,8 +837,10 @@ def run(switcher, codex=None) -> int:
             from openswap.worker.accounts import AccountPinError
             from openswap.worker.cli import allow_worker_account, disallow_worker_account
 
+            from openswap.worker.accounts import provider_of
+
             action, _, ref = value.partition(":") if isinstance(value, str) else ("", "", "")
-            if action not in {"allow", "disallow"} or not ref.startswith("codex:"):
+            if action not in {"allow", "disallow"} or provider_of(ref) is None:
                 return "account_not_eligible"
             try:
                 if action == "allow":

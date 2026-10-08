@@ -33,6 +33,7 @@ from openswap.worker.accounts import (
     AccountPinError,
     CodexAccountChoice,
     account_choices,
+    resolve_account_selector,
     resolve_codex_selector,
 )
 from openswap.worker.client import WorkerClient
@@ -215,22 +216,24 @@ def worker_account_choices(backup_root: Path) -> AccountChoices:
     return account_choices(root, policy.pinned_account_ref, policy.account_allowlist)
 
 
-def set_worker_account(backup_root: Path, selector: str | None) -> CodexAccountChoice | None:
-    """Pin the Codex account Remote tasks uses (``None`` clears the pin).
+def set_worker_account(backup_root: Path, selector: str | None):
+    """Pin the account Remote tasks uses (``None`` clears the pin).
 
     The one function behind ``openswap worker account`` and the menu bar
     picker. It holds the lifecycle lock like every other worker settings
-    change, and resolves the slot and writes the pin under the Codex mutation
-    guard, so the slot cannot be removed, swapped or moved in between. Only
-    a Codex roster slot with a ChatGPT account ID is eligible; a Claude
-    selector is refused (Claude authentication gate). A running job is
-    unaffected: it keeps the account recorded on it at STARTING, and the
-    worker reads the new pin for the next launch.
+    change, and resolves the slot and writes the pin under both providers'
+    mutation guards, so the slot cannot be removed, swapped or moved in
+    between. Eligible: a Codex slot with a ChatGPT account ID, or a Claude
+    slot (``claude:<slot>`` names one explicitly; a bare selector is a Codex
+    slot first). The pin is typed (``codex:``/``claude:``), and the job runs
+    on that provider. A running job is unaffected: it keeps the account
+    recorded on it at STARTING, and the worker reads the new pin for the
+    next launch.
     """
     root = Path(backup_root)
 
     def change():
-        choice = None if selector is None else resolve_codex_selector(root, selector)
+        choice = None if selector is None else resolve_account_selector(root, selector)
         # A newly pinned account joins the allowlist (default label); clearing
         # the pin keeps the allowlist, so the account stays a per-job choice.
         set_worker_pinned_account(root, None if choice is None else choice.account_ref)
@@ -249,7 +252,10 @@ def _account_policy_change(root: Path, change):
     _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
         try:
+            # Codex then Claude, the order every multi-provider holder uses.
             with AccountLeaseStore(root, "codex").mutation_guard(
+                timeout=_LIFECYCLE_LOCK_TIMEOUT_SECONDS,
+            ), AccountLeaseStore(root, "claude").mutation_guard(
                 timeout=_LIFECYCLE_LOCK_TIMEOUT_SECONDS,
             ):
                 return change()
@@ -284,7 +290,7 @@ def _find_allowlisted(root: Path, entries, target: str) -> AllowlistedAccount:
             return entry
     if not target or _ALLOWLIST_REF.fullmatch(target):
         raise AccountPinError("account_not_allowlisted")
-    identity = resolve_codex_selector(root, target).account_ref
+    identity = resolve_account_selector(root, target).account_ref
     match = next((entry for entry in entries if entry.identity == identity), None)
     if match is None:
         raise AccountPinError("account_not_allowlisted")
@@ -292,18 +298,18 @@ def _find_allowlisted(root: Path, entries, target: str) -> AllowlistedAccount:
 
 
 def allow_worker_account(backup_root: Path, selector: str, label: str | None = None) -> AllowlistedAccount:
-    """Allowlist a Codex account so a control service may choose it per job.
+    """Allowlist a Codex or Claude account so a control service may choose it per job.
 
     The account gets a fresh random reference (never derived from it) the
     first time; allowing it again keeps that reference and only changes the
-    label when one is given. Codex roster slots with a ChatGPT account ID
-    only (Claude waits on its authentication gate); at most 20 accounts.
+    label when one is given. Codex slots with a ChatGPT account ID and Claude
+    slots; at most 20 accounts.
     """
     root = Path(backup_root)
     label = _clean_label(label)
 
     def change():
-        choice = resolve_codex_selector(root, selector)
+        choice = resolve_account_selector(root, selector)
         result = {}
 
         def update(pin, entries):
@@ -971,7 +977,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         from openswap.worker.live_check import main as live_check_main
         root = Path(backup_root) if backup_root is not None else get_backup_root()
         return live_check_main(arguments, root, migrate=_migrate_legacy_before_worker_state_change)
-    if arguments[:1] in (["codex"], ["live"]):
+    if arguments[:1] in (["codex"], ["live"], ["claude"]):
         from openswap.worker.live_cli import main as live_main
         root = Path(backup_root) if backup_root is not None else get_backup_root()
         return live_main(arguments, root, migrate=_migrate_legacy_before_worker_state_change)
@@ -986,7 +992,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     commands.add_parser("refserver", help="serve the reference protocol or manage pairing/revocation")
     commands.add_parser("codex", help="install, verify and sign in the pinned Codex CLI that remote jobs run")
     commands.add_parser("live", help="show or change the explicit live-execution opt-in")
-    commands.add_parser("live-check", help="run real Codex jobs on this Mac and record phase-1 live evidence")
+    commands.add_parser("claude", help="pin the Claude Code CLI and prepare account profiles for Remote tasks")
+    commands.add_parser("live-check", help="run real Codex or Claude jobs on this Mac and record phase-1 live evidence")
     run = commands.add_parser("run", help="run the background worker process")
     # Passed only by the LaunchAgent: a manual run refuses while it is loaded.
     run.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)
@@ -996,7 +1003,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     commands.add_parser(
         "setup", help="walk through starting the worker, the account and research folders on a paired Mac",
         description="The guided steps `pair` runs after pairing: start the worker, confirm the "
-                    "Codex account, approve a research folder (~/OpenSwap Research by default), "
+                    "Codex or Claude account, approve a research folder (~/OpenSwap Research by default), "
                     "then show what is still missing before Slack can start tasks on this Mac.",
     )
     unpair_parser = commands.add_parser(
@@ -1042,10 +1049,11 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     lease_release_parser.add_argument("--json", action="store_true")
     account_parser = commands.add_parser(
         "account",
-        help="list or pin the Codex account remote jobs run on (Claude is not supported yet)",
-        description="With no argument, list Codex roster slots, the accounts allowed for a "
+        help="list or pin the Codex or Claude account remote jobs run on",
+        description="With no argument, list Codex and Claude roster slots, the accounts allowed for a "
                     "per-job choice, and mark the pinned default. Pass a slot, email or alias to "
-                    "pin that Codex account for the next job. `account allow|disallow|label` manage "
+                    "pin that account for the next job (`claude:4` or `codex:2` names the provider; "
+                    "a bare slot means Codex first). `account allow|disallow|label` manage "
                     "the accounts a control service may choose per job (see `account allow --help`).",
     )
     account_parser.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
@@ -1298,16 +1306,16 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
 
 _ACCOUNT_MESSAGES = {
     "claude_not_supported": (
-        "Claude accounts can't be used for Remote tasks yet (they wait on a separate "
-        "Claude authentication gate). Pin a Codex account instead."
+        "That names a Claude account. Use `claude:<slot>` to pick a Claude account explicitly."
     ),
-    "account_not_found": "No Codex account matches that. Run `openswap worker account` to list them.",
-    "account_ambiguous": "That email matches several Codex accounts; use the slot number instead.",
+    "account_not_found": "No account matches that. Run `openswap worker account` to list them.",
+    "account_ambiguous": "That matches several accounts; use the slot number (claude:<slot> for Claude).",
     "account_not_eligible": (
-        "That Codex slot has no ChatGPT account ID (an API-key login), so it can't be pinned."
+        "That slot can't be pinned: a Codex API-key login has no ChatGPT account ID, "
+        "and a Claude slot needs an email."
     ),
-    "roster_unavailable": "The Codex account roster could not be read.",
-    "account_roster_busy": "Codex accounts are being changed; try again shortly.",
+    "roster_unavailable": "The account roster could not be read.",
+    "account_roster_busy": "Accounts are being changed; try again shortly.",
     "worker_lifecycle_busy": "Worker settings are being changed; try again shortly.",
     "settings_unavailable": "Could not save the worker settings.",
     "too_many_accounts": "At most 20 accounts can be allowed; disallow one first.",
@@ -1359,8 +1367,8 @@ _WORKSPACE_MESSAGES = {
 
 
 def _format_accounts(choices: AccountChoices) -> str:
-    lines = ["Remote tasks account (Codex only; a remote job uses this pin unless the "
-             "service picks an allowed account):"]
+    lines = ["Remote tasks account (a remote job runs on this pin's provider unless the "
+             "service picks an allowed account):", "Codex:"]
     if not choices.codex:
         lines.append("  No Codex accounts saved. Add one with `openswap codex add`.")
     for choice in choices.codex:
@@ -1374,12 +1382,21 @@ def _format_accounts(choices: AccountChoices) -> str:
             notes.append("out of rotation")
         suffix = f"  [{'; '.join(notes)}]" if notes else ""
         lines.append(f"  {marker} {choice.label()}{suffix}")
-    if choices.claude:
-        lines.append("Claude accounts (not eligible yet: Claude authentication gate):")
-        lines.extend(f"    {entry.label()}" for entry in choices.claude)
+    lines.append("Claude (pin with `claude:<slot>`):")
+    if not choices.claude:
+        lines.append("  No Claude accounts saved.")
+    for entry in choices.claude:
+        pinned = entry.account_ref is not None and entry.account_ref == choices.pinned_ref
+        notes = ["pinned"] if pinned else []
+        if not entry.eligible:
+            notes.append("not eligible: no email")
+        if entry.disabled:
+            notes.append("out of rotation")
+        suffix = f"  [{'; '.join(notes)}]" if notes else ""
+        lines.append(f"  {'*' if pinned else ' '} {entry.label()}{suffix}")
     if choices.pinned_missing:
         lines.append(
-            "The pinned account is no longer in the Codex roster; jobs fail "
+            "The pinned account is no longer in its roster; jobs fail "
             "(provider_auth_unavailable) until you pin another."
         )
     elif choices.pinned_ref is None:
@@ -1398,7 +1415,8 @@ def _format_accounts(choices: AccountChoices) -> str:
 def _format_allowlist_entry(entry: AllowlistedAccount, choices: AccountChoices) -> str:
     marker = "*" if entry.identity == choices.pinned_ref else " "
     slot = choices.slot_for(entry.identity)
-    where = f"slot {slot.number}" if slot is not None else "no longer in the Codex roster"
+    provider = "Claude" if entry.identity.startswith("claude:") else "Codex"
+    where = f"{provider} slot {slot.number}" if slot is not None else f"no longer in the {provider} roster"
     return f"{marker} {entry.account_ref}  {json.dumps(entry.label, ensure_ascii=False)}  [{where}]"
 
 
@@ -1416,12 +1434,13 @@ def _allowlist_command(root: Path, arguments: list[str]) -> int:
     """``openswap worker account allow|disallow|label``: the per-job choice allowlist."""
     parser = argparse.ArgumentParser(
         prog="openswap worker account",
-        description="Manage the Codex accounts a control service may choose per job. Each "
+        description="Manage the Codex and Claude accounts a control service may choose per job. Each "
                     "allowed account is advertised only as a random reference and a label you "
-                    "choose (by default the slot alias or 'Codex account N', never the email).",
+                    "choose (by default the slot alias or 'Codex account N' / 'Claude account N', "
+                    "never the email).",
     )
     commands = parser.add_subparsers(dest="allowlist_command", required=True)
-    allow = commands.add_parser("allow", help="allow a Codex account for a per-job choice")
+    allow = commands.add_parser("allow", help="allow a Codex or Claude account for a per-job choice")
     allow.add_argument("selector", metavar="SLOT|EMAIL|ALIAS")
     allow.add_argument("--label", default=None, help="label the control service shows (1-100 characters)")
     allow.add_argument("--json", action="store_true")
@@ -1490,10 +1509,11 @@ def _workspace_payload(workspace) -> dict:
     }
 
 
-def _choice_payload(choice: CodexAccountChoice | None) -> dict | None:
+def _choice_payload(choice) -> dict | None:
     if choice is None:
         return None
     return {
+        "provider": choice.provider,
         "number": choice.number, "email": choice.email, "alias": choice.alias,
         "account_ref": choice.account_ref,
     }
@@ -1543,7 +1563,8 @@ def _account_command(root: Path, args) -> int:
             "Cleared the Remote tasks account; remote jobs that do not pick an allowed account "
             "fail until you pin one."
             if choice is None
-            else f"Remote tasks will use Codex account {choice.label()} from the next job."
+            else f"Remote tasks will use {'Claude' if choice.provider == 'claude' else 'Codex'} "
+                 f"account {choice.label()} from the next job."
         )
         _write(payload, as_json=args.json, human=human)
         return 0

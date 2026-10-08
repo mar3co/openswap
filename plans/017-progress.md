@@ -134,7 +134,8 @@ Phase 1 exit requires all of the following:
   MIT reference server in this repository, or any server implementing the
   published protocol. See the
   [decision memo](research/remote-agent-host/decision-control-service.md).
-- [x] Both decision memos delivered; control service decided, Claude path pending.
+- [x] Both decision memos delivered; control service decided. Claude path
+  decided by the owner on 2026-10-07 (see "Claude accounts" below).
 - [x] The phase-one evidence, adapter contract and reproducible harness are
   reviewed and PR #59 is merged as Phase 1 signoff (2026-09-30, `39438ca`;
   Codex review clean on `7d1f9c8`, 78 resolved threads). Signoff is not
@@ -146,9 +147,10 @@ The control-service decision is recorded: the protocol specification, worker
 client and MIT reference server live in this repository, OpenTag implements
 the same protocol in its own repository, and the worker selects a backend by
 URL. The phase-3 reference server is therefore a product deliverable, not a
-movable placeholder. The Claude memo is delivered and its auth-path answer is
-still pending, but that does not block Codex-only work; no Claude code starts
-until the owner records a permitted path or exclusion.
+movable placeholder. The Claude memo's auth-path answer was recorded by the
+owner on 2026-10-07: unmodified Claude Code with the owner's native login, on
+the owner's own paired Macs, for tasks the owner starts (see "Claude accounts"
+below).
 
 ## Phase status
 
@@ -1240,6 +1242,141 @@ not exercised); a default login held in the Keychain rather than
 `~/.codex/auth.json` (recorded as absent, not compared); and the
 launchd-mediated escape when the model does not run that step. Phase 4's
 exit still needs the staging Slack run after this.
+
+### Review hardening (2026-10-08)
+
+Codex review rounds 13 to 21 on #81 to #84 tightened the live path further.
+None of this changes the owner steps.
+
+- **Stop proof.** Pids are bound to a stable identity:
+  - A harmless zombie is identified by its start time from `kern.proc.pid`.
+  - A freeze needs two consecutive complete scans.
+  - A `SIGSTOP` that may have hit a recycled pid is undone, and `SIGKILL`
+    only reaches members already observed stopped.
+  - The leader pid is re-verified with launchd after the coalition lookup.
+  - Ownership of a loaded label comes only from exactly one parsed plist
+    path; anything else is unknown, and stop then proves nothing.
+  - Run directories are keyed by their on-disk spelling (`F_GETPATH`), and
+    paths with control characters are refused.
+  - Recovery reads handles only after an in-progress launch releases them.
+  - Locks and recovery mirrors moved from `~/Library/Caches` to
+    `~/Library/Application Support/com.opensoft.openswap/`.
+- **Codex adapter.**
+  - `--ignore-rules` is passed.
+  - A launch is refused while the job folder holds a `.codex` layer.
+  - `codex login` and `logout` are refused under a managed Codex layer.
+  - A failed login counts as failed even with the account's old credentials
+    still in the home.
+  - Login and logout resolve the slot and take the lease under one guard.
+- **Live check.**
+  - It holds the worker lifecycle lock throughout, and refuses a stale,
+    unreadable or running worker.
+  - The default login is fingerprinted by metadata only and is never
+    opened. The baseline is taken before any sign-in prompt.
+  - Denials count only from completed commands, and each has a positive
+    control: an exit-0 `env`, a created symlink, writable `/tmp` and
+    `$TMPDIR` outside the sandbox, and a curl that runs inside it.
+  - The exec probe also covers an approved read-only source and the job's
+    own `$TMPDIR`.
+  - Leftovers from earlier checks, mirror-only ones included, must be proven
+    stopped.
+  - Helpers and the escaped probe job are always cleaned up, and sentinel
+    files get fresh, exclusive names.
+- **Opt-in per account.** Enabling records the account the passing check ran
+  on, and a later check with the same binary adds its own. A job on an
+  unchecked account is refused before launch, and the worker does not poll
+  while any selectable account is unchecked.
+- **Claude.**
+  - Any managed policy refuses a launch: `managed-settings.d`, per-user
+    managed preferences, or a non-empty server-managed `remote-settings.json`
+    cached in the profile.
+  - Profiles are signed in with Claude Code's own `claude auth login`, under
+    the lease.
+  - Grants overlapping the logins or the backup root are refused.
+
+## Claude accounts (2026-10-08)
+
+**Owner decision (2026-10-07).** Remote tasks may run on the owner's Claude
+accounts: option "Unmodified Claude Code with the owner's native login",
+limited to the owner's own paired Macs and tasks they start themselves.
+Recorded in [decision-claude-auth.md](research/remote-agent-host/decision-claude-auth.md#owners-decision).
+This lifts the "Claude authentication gate" in the account step above.
+
+Stacked on the live-check PR:
+
+- **Accounts and pins.** `openswap worker account`, `allow`, the post-pair
+  offer and the menu-bar picker list and accept Claude slots. Pins stay typed:
+  `stable_account_identity("claude", email, organizationUuid)` versus
+  `("codex", accountId)`; `claude:<slot>` and `codex:<slot>` select a
+  provider, and a bare slot means Codex first, then Claude. A job runs on the
+  provider of its pinned or chosen account (`WorkerRuntime.adapters`), and
+  claim gating asks that provider's adapter. One job per host still holds
+  across providers (`ProviderLeases` spans the Codex and Claude lease
+  stores).
+- **Binary (`worker/claude_cli.py`).** The owner's installed `claude`
+  (Homebrew cask or the native installer) is pinned with `openswap worker
+  claude pin`. It is hashed, and jobs run a byte-identical read-only copy kept
+  under Application Support, which every launch re-hashes and checks with
+  `--version`. No published digest exists to verify against, so this is
+  trust-on-first-use; jobs run with the auto-updater off, and an update needs a
+  re-pin and a new live check (the opt-in is bound to the binary).
+- **Profile.** The account's OpenSwap-managed session profile (plan 003,
+  `CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`), signed in once by the
+  owner with `openswap worker claude prepare`, which runs the pinned Claude
+  Code's own `claude auth login` into that profile under the Claude lease
+  (OpenSwap seeds no credential). A launch refuses unlaunched
+  (`provider_auth_unavailable`) unless the profile is signed in as the leased
+  identity, and (`provider_unavailable`) while an interactive live session
+  uses that profile or while it mirrors the default profile's customizations
+  (scheduled kickoff's sharing). The worker never reads, uploads,
+  proxies or logs a credential, and never changes the default login; the CLI
+  owns refresh.
+- **Adapter (`worker/claude_exec.py`).** `claude -p --output-format
+  stream-json --verbose --restricted --tools Read,Grep,Glob,WebSearch,WebFetch
+  --allowedTools (same) --permission-mode dontAsk --permission-prompts none
+  --strict-mcp-config --disable-slash-commands --no-session-persistence`,
+  plus `--add-dir` per approved read-only source, inside `sandbox-exec` with a
+  generated Seatbelt profile: writes only to the job folder, the profile, the
+  run's temporary folder and this user's cache/temporary folders; the default
+  login (`~/.claude`, `~/.claude.json`), `~/.codex` and the whole backup root
+  (other accounts, worker state) unreadable and unwritable apart from this
+  profile. Same launchd containment, stop proof, result publishing and
+  allowlisted failure codes as Codex (`result` events map to
+  `provider_rate_limited`, `provider_auth_unavailable` or
+  `provider_unavailable`).
+- **Opt-in and evidence.** `openswap worker live-check --provider claude`
+  records `live-check-claude-<UTC>.json` with the same gate names (Read-tool
+  probes in place of shell probes: inside read allowed, outside read, profile
+  sentinel and `~/.claude.json` denied; stop and kill recovery against a long
+  research task). `worker.liveExecutionClaude` is a separate opt-in;
+  `execution_mode()` answers for the pinned account's provider.
+
+Validation (no Claude login, no model call): new
+`tests/test_worker_claude.py` (pin and verify, argv/env/Seatbelt, refusals,
+stream-json mapping, provider routing and leases, per-provider opt-in, profile
+preparation, a simulated Claude live check) plus a real `sandbox-exec` run of
+the generated profile on this Mac (outside and backup-root reads and writes
+denied; job folder and profile allowed); full suite green.
+
+**Owner steps on the MacBook Pro** (after the Codex steps, or on their own):
+
+```sh
+openswap worker pause
+openswap worker account claude:<slot>    # pin the Claude account
+openswap worker claude pin               # pin the installed claude binary
+openswap worker claude prepare           # Claude's own sign-in into that account's profile (browser)
+openswap worker live-check --provider claude   # answer y to enable if all gates pass
+openswap worker pause --off
+```
+
+**Still unproven until that run:** that `--restricted` with `--tools` leaves
+only those five tools and no MCP servers (the check reads the `init` event
+and fails otherwise); that Claude Code works under the generated Seatbelt
+profile (any extra path it needs shows up as a failed research run, never a
+silent widening); that the model performs the Read probes (a refusal fails
+the gate); Keychain behaviour of a profile-scoped login when the token
+refreshes during a long job; and that WebFetch/WebSearch reach the network
+from inside the sandbox.
 
 
 ## Guided Mac setup and readiness report (2026-10-08)

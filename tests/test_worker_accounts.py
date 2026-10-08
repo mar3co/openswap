@@ -38,6 +38,8 @@ from tests.test_worker_pairing_status import PairTransport, keychain  # noqa: F4
 SECRET = "synthetic-refresh-token-never-printed"
 ALICE = stable_account_identity("codex", "acct-alice")
 BOB = stable_account_identity("codex", "acct-bob")
+CAROL = stable_account_identity("claude", "carol@example.com", "")
+CLAUDE_ALICE = stable_account_identity("claude", "alice@example.com", "")
 
 
 @pytest.fixture
@@ -77,12 +79,12 @@ def _run(root: Path, *argv: str) -> int:
 # --- openswap worker account ----------------------------------------------------
 
 
-def test_account_list_marks_the_pin_and_lists_claude_as_not_eligible(root, capsys):
+def test_account_list_marks_the_pin_and_lists_claude_accounts(root, capsys):
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
     assert "1 · alice@example.com (work)" in out
     assert "3 · (no email)  [not eligible: no ChatGPT account ID (API key)]" in out
-    assert "Claude accounts (not eligible yet: Claude authentication gate):" in out
+    assert "Claude (pin with `claude:<slot>`):" in out
     assert "4 · carol@example.com (claudey)" in out
     assert "No account pinned" in out
     assert SECRET not in out
@@ -106,8 +108,9 @@ def test_account_list_json_is_metadata_only(root, capsys):
     by_number = {row["number"]: row for row in payload["codex"]}
     assert by_number["1"]["pinned"] is True and by_number["1"]["account_ref"] == ALICE
     assert by_number["3"]["eligible"] is False and by_number["3"]["account_ref"] is None
-    assert all(row["eligible"] is False for row in payload["claude"])
+    assert all(row["eligible"] is True and row["provider"] == "claude" for row in payload["claude"])
     assert {row["number"] for row in payload["claude"]} == {"1", "4"}
+    assert {row["account_ref"] for row in payload["claude"]} == {CLAUDE_ALICE, CAROL}
 
 
 @pytest.mark.parametrize("selector", ["1", "alice@example.com", "work", ALICE])
@@ -137,7 +140,7 @@ def test_account_clear_and_json_pin(root, capsys):
     assert _run(root, "account", "2", "--json") == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"accepted": True, "pinned": {
-        "number": "2", "email": "bob@example.com", "alias": None, "account_ref": BOB,
+        "provider": "codex", "number": "2", "email": "bob@example.com", "alias": None, "account_ref": BOB,
     }}
     assert _run(root, "account", "--clear") == 0
     assert "Cleared" in capsys.readouterr().out
@@ -145,10 +148,7 @@ def test_account_clear_and_json_pin(root, capsys):
 
 
 @pytest.mark.parametrize(("selector", "code"), [
-    ("claudey", "claude_not_supported"),
-    ("4", "claude_not_supported"),
-    ("carol@example.com", "claude_not_supported"),
-    ("claude:1", "claude_not_supported"),
+    ("claude:9", "account_not_found"),
     ("nobody@example.com", "account_not_found"),
     ("9", "account_not_found"),
     ("3", "account_not_eligible"),
@@ -177,16 +177,27 @@ def test_a_malformed_roster_record_refuses_cleanly(root, capsys, selector):
     assert load_worker_settings(root).pinned_account_ref == before
 
 
-def test_a_claude_account_can_never_be_pinned_even_by_reference(root):
-    claude_ref = stable_account_identity("claude", "carol@example.com", "")
-    with pytest.raises(AccountPinError) as refused:
-        cli.set_worker_account(root, claude_ref)
-    assert refused.value.code == "claude_not_supported"
+@pytest.mark.parametrize(("selector", "expected"), [
+    ("claudey", CAROL), ("4", CAROL), ("carol@example.com", CAROL), ("claude:4", CAROL),
+    ("claude:1", CLAUDE_ALICE), (CAROL, CAROL),
+])
+def test_a_claude_account_pins_as_a_typed_claude_reference(root, capsys, selector, expected):
+    """Owner decision 2026-10-07: Claude accounts are eligible. A bare selector is
+    a Codex slot first, so slot 1 needs ``claude:1``; the pin is ``claude:``-typed."""
+    assert _run(root, "account", selector) == 0
+    assert "Remote tasks will use Claude account" in capsys.readouterr().out
+    assert load_worker_settings(root).pinned_account_ref == expected
+
+
+def test_a_bare_selector_still_means_the_codex_slot_first(root):
+    cli.set_worker_account(root, "1")
+    assert load_worker_settings(root).pinned_account_ref == ALICE
+
+
+def test_settings_store_only_typed_references(root):
     with pytest.raises(ValueError):
-        # The settings layer itself only stores codex: references.
-        configure_worker_local_policy(root, pinned_account_ref=claude_ref,
+        configure_worker_local_policy(root, pinned_account_ref="openai:" + "0" * 64,
                                       workspaces=load_worker_settings(root).workspaces)
-    assert load_worker_settings(root).pinned_account_ref is None
 
 
 def test_account_selector_and_clear_together_is_a_usage_error(root, capsys):
@@ -620,7 +631,7 @@ def _picker(root):
     return cli.worker_account_choices(root).to_dict()
 
 
-def test_menu_account_row_marks_pin_and_disables_claude(root):
+def test_menu_account_row_marks_pin_and_offers_claude(root):
     cli.set_worker_account(root, "1")
     rows = menubar.settings_page_rows(
         menubar.MenuBarSettings(), strategy="best", threshold=90,
@@ -633,15 +644,15 @@ def test_menu_account_row_marks_pin_and_disables_claude(root):
     assert row["kind"] == "popup" and row["value"] == ALICE
     options = {option[0]: option for option in row["options"]}
     assert options[""][1] == "None" and len(options[""]) == 2
-    assert options[ALICE][1] == "1 · alice@example.com (work)" and len(options[ALICE]) == 2
-    assert options[BOB][1] == "2 · bob@example.com"
+    assert options[ALICE][1] == "Codex 1 · alice@example.com (work)" and len(options[ALICE]) == 2
+    assert options[BOB][1] == "Codex 2 · bob@example.com"
     assert options["ineligible:3"][2] == {"disabled": True}
     claude = [option for option in row["options"] if str(option[0]).startswith("claude:")]
     assert [option[1] for option in claude] == [
-        "Claude 1 · alice@example.com — not supported yet",
-        "Claude 4 · carol@example.com — not supported yet",
+        "Claude 1 · alice@example.com",
+        "Claude 4 · carol@example.com (claudey)",
     ]
-    assert all(option[2] == {"disabled": True} for option in claude)
+    assert all(len(option) == 2 for option in claude)  # enabled
     assert SECRET not in json.dumps(row)
 
 
@@ -714,10 +725,12 @@ def test_menu_selection_pins_off_the_ui_thread_through_the_cli_function(root, mo
     assert app._worker_status_cache["diagnostic_notice"] is None
 
 
-def test_menu_refuses_claude_and_stray_values_and_clears_with_none(root):
+def test_menu_pins_claude_refuses_stray_values_and_clears_with_none(root):
     app = _menu_app(root)
+    assert app._pin_worker_account(root, CAROL) is None
+    assert load_worker_settings(root).pinned_account_ref == CAROL
     cli.set_worker_account(root, "1")
-    assert app._pin_worker_account(root, "claude:4") == "claude_not_supported"
+    assert app._pin_worker_account(root, "claude:4") == "account_not_eligible"  # not a reference
     assert app._pin_worker_account(root, "ineligible:3") == "account_not_eligible"
     assert app._pin_worker_account(root, None) == "account_not_eligible"
     assert app._pin_worker_account(root, stable_account_identity("codex", "gone")) == "account_not_found"

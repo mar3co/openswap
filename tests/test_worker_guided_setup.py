@@ -99,15 +99,17 @@ def _builtin(root):
 
 def test_pair_walks_worker_account_then_folder_then_summary(root, keychain, monkeypatch, capsys,
                                                            enable_calls, research_home):
-    assert _pair(root, monkeypatch, interactive=True, answers=["y", "claudey", "2", "y", ""]) == 0
+    assert _pair(root, monkeypatch, interactive=True, answers=["y", "2", "y", ""]) == 0
     out = capsys.readouterr().out
     assert enable_calls == [root]
     assert guided_setup.WORKER_ONLINE in out
     # Worker first, then the account, then the folder, then the summary.
-    assert (out.index(OFFER) < out.index("Choose the Codex account") < out.index("Create and approve")
+    assert (out.index(OFFER) < out.index("Choose the account remote jobs run on") < out.index("Create and approve")
             < out.index("Remote tasks setup:"))
-    assert "  1 · alice@example.com (work)" in out and "  3 · " not in out and "carol@example.com" not in out
-    assert cli._ACCOUNT_MESSAGES["claude_not_supported"] in out
+    # Codex and Claude accounts are both offered; the API-key Codex slot is not.
+    assert "  1 · alice@example.com (work)  (Codex)" in out and "  3 · " not in out
+    assert "  claude:4 · carol@example.com (claudey)  (Claude)" in out
+    assert "aren't supported" not in out
     assert "Pinned Codex account 2 · bob@example.com" in out
     policy = load_worker_settings(root)
     assert policy.pinned_account_ref == BOB
@@ -134,7 +136,7 @@ def test_pair_on_a_tty_can_skip_every_step(root, keychain, monkeypatch, capsys, 
     assert policy.control_service_url == "http://localhost"
     assert _builtin(root)
     assert "Before Slack can start tasks on this Mac: start the worker" in out
-    assert "pin a Codex account" in out
+    assert "pin an account" in out
 
 
 @pytest.mark.parametrize("answers", [["n"], ["no"], ["later"], []], ids=["n", "no", "other", "eof"])
@@ -350,7 +352,8 @@ def test_allowed_accounts_without_a_pinned_default_are_not_ready(root, monkeypat
     cli.allow_worker_account(root, "1")
     cli.set_worker_account(root, None)
     assert guided_setup.readiness(root).account is None
-    assert "pin a Codex account (`openswap worker account <slot>`)" in guided_setup.readiness(root).missing
+    assert "pin an account (`openswap worker account <slot>`, or `claude:<slot>`)" in \
+        guided_setup.readiness(root).missing
 
 
 class _Say:
@@ -922,3 +925,34 @@ def test_the_summary_reports_live_execution_from_the_adapter(root, monkeypatch, 
     monkeypatch.setattr(adapter, "production_adapter",
                         lambda backup_root=None: SimpleNamespace(execution_mode="live"))
     assert guided_setup.readiness(root).execution == "live"
+
+
+
+def test_setup_pins_a_claude_account_and_points_at_the_claude_live_check(root, keychain, monkeypatch, capsys,
+                                                                       enable_calls, research_home):
+    assert _pair(root, monkeypatch, interactive=True, answers=["y", "claude:4", "y", ""]) == 0
+    out = capsys.readouterr().out
+    assert "Pinned Claude account 4 · carol@example.com (claudey)" in out
+    assert load_worker_settings(root).pinned_account_ref.startswith("claude:")
+    assert "  Account: Claude 4 · carol@example.com (claudey)" in out
+    assert guided_setup.CLAUDE_EXECUTION_OFF_NOTE in out and guided_setup.EXECUTION_OFF_NOTE not in out
+    for command in ("openswap worker claude pin", "openswap worker claude prepare",
+                    "openswap worker live-check --provider claude"):
+        assert command in out
+
+
+def test_a_claude_pin_with_a_passing_claude_check_reports_live(root, monkeypatch):
+    from openswap.worker import adapter
+
+    cli.set_worker_account(root, "claude:4")
+    picked = []
+
+    def claude_adapter(backup_root=None):
+        picked.append("claude")
+        return SimpleNamespace(execution_mode="live")
+
+    monkeypatch.setattr(adapter, "production_claude_adapter", claude_adapter)
+    monkeypatch.setattr(adapter, "production_adapter",
+                        lambda backup_root=None: SimpleNamespace(execution_mode="disabled"))
+    state = guided_setup.readiness(root)
+    assert state.execution == "live" and state.provider == "claude" and picked == ["claude"]

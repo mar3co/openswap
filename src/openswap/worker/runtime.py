@@ -18,7 +18,7 @@ import time
 from urllib.parse import quote
 
 from openswap.settings import load_worker_settings, update_worker_settings
-from openswap.worker.accounts import codex_account_in_roster, codex_accounts
+from openswap.worker.accounts import account_in_roster, provider_of
 from openswap.worker.adapter import ProviderAdapter, ProviderLaunchRefused, production_adapter
 from openswap.locking import FileLock
 from openswap.worker.journal import (
@@ -30,6 +30,7 @@ from openswap.worker.journal import (
 from openswap.worker.leases import (
     AccountLeaseError,
     AccountLeaseStore,
+    ProviderLeases,
     LeaseConflictError,
     LeaseStateError,
     ReleaseEvidence,
@@ -72,9 +73,14 @@ def _provider_status(backup_root: Path) -> ProviderAvailability:
     A pure settings read. The binary and account are re-verified by the
     adapter before each launch, which fails that job closed if they changed.
     """
-    from openswap.worker.live import LIVE, execution_mode
+    from openswap.worker.live import LIVE, execution_mode, pinned_provider
 
-    if execution_mode(backup_root) == LIVE:
+    provider = pinned_provider(backup_root)
+    if execution_mode(backup_root, provider) == LIVE:
+        if provider == "claude":
+            from openswap.worker.claude_cli import pinned_version
+
+            return ProviderAvailability(True, None, pinned_version(backup_root) or "Claude Code")
         from openswap.worker.codex_cli import CODEX_VERSION_OUTPUT
 
         return ProviderAvailability(True, None, CODEX_VERSION_OUTPUT)
@@ -335,7 +341,19 @@ class WorkerRuntime:
     ):
         self.backup_root = Path(backup_root)
         self.store = LocalJobStore(self.backup_root, max_pending=max_pending)
-        self.adapter = adapter if adapter is not None else production_adapter(self.backup_root)
+        if adapter is not None:
+            # One injected adapter serves every provider (tests).
+            self.adapters = {"codex": adapter, "claude": adapter}
+        else:
+            from openswap.worker.adapter import production_claude_adapter
+
+            self.adapters = {
+                "codex": production_adapter(self.backup_root),
+                "claude": production_claude_adapter(self.backup_root),
+            }
+        self.adapter = self.adapters["codex"]
+        # The adapter of the job being launched or run (set per launch).
+        self._run_adapter = self.adapter
         self.owner_ref = owner_ref
         # A fixed identity is a test seam: it bypasses the owner's local pin
         # and its roster check. Production reads the pin for every launch.
@@ -343,7 +361,8 @@ class WorkerRuntime:
         self.clock = clock
         self.monotonic = monotonic
         self.sleeper = sleeper
-        self.leases = AccountLeaseStore(self.backup_root, "codex")
+        # Codex and Claude leases as one: one job per host, either provider.
+        self.leases = ProviderLeases(self.backup_root)
         self.worker_pid = os.getpid()
         self.worker_epoch, self.recovered_job_ids = self.store.start_epoch(self.worker_pid)
         self._quarantine_lease_for_recovered_jobs()
@@ -378,23 +397,74 @@ class WorkerRuntime:
         return load_worker_settings(self.backup_root).pinned_account_ref
 
     def account_ready(self) -> bool:
-        """Whether a pin exists and its account is still in the Codex roster."""
+        """Whether a pin exists and its account is still in its provider's roster."""
         identity = self.account_identity
         if identity is None:
             return False
         if self._fixed_account_identity is not None:
             return True
-        return codex_account_in_roster(self.backup_root, identity)
+        return account_in_roster(self.backup_root, identity)
 
     def allowlist_ready(self) -> bool:
-        """Whether any account allowlisted for a per-job choice is in the Codex roster."""
+        """Whether any account allowlisted for a per-job choice is in its roster."""
         allowlist = load_worker_settings(self.backup_root).account_allowlist
         if not allowlist:
             return False
         if self._fixed_account_identity is not None:
             return True
-        roster = {choice.account_ref for choice in codex_accounts(self.backup_root) or ()}
-        return any(entry.identity in roster for entry in allowlist)
+        return any(account_in_roster(self.backup_root, entry.identity) for entry in allowlist)
+
+    def adapter_for(self, identity: str | None):
+        """The adapter of an account's provider (Codex when it has none)."""
+        return self.adapters.get(provider_of(identity) or "codex", self.adapter)
+
+    def _candidate_providers(self) -> list[str]:
+        """Every provider the next claim could run on: the pin's and each allowlisted account's."""
+        policy = load_worker_settings(self.backup_root)
+        providers = []
+        for identity in (self.account_identity, *(entry.identity for entry in policy.account_allowlist)):
+            provider = provider_of(identity)
+            if provider is not None and provider not in providers:
+                providers.append(provider)
+        return providers or ["codex"]
+
+    def provider_availability(self) -> ProviderAvailability:
+        """Whether any claim could launch now: every provider it might need is available.
+
+        Polling cannot ask for claims on one provider only: the service may
+        hand out a claim for the pin (no ``account_ref``) or for any advertised
+        account. So the worker polls only while all of those providers can
+        run, or such a claim would be taken just to fail.
+        """
+        found = None
+        for provider in self._candidate_providers():
+            try:
+                availability = self.adapters[provider].probe()
+            except Exception:
+                availability = ProviderAvailability(False, "provider_unavailable", None)
+            if not availability.available:
+                return availability
+            found = found or availability
+        # Each account a claim could select must also be one a live check ran
+        # on (the adapter refuses any other before launch).
+        for identity in self._candidate_identities():
+            adapter = self.adapters.get(provider_of(identity) or "")
+            checked = getattr(adapter, "_account_checked", None)
+            try:
+                ok = checked(identity) if callable(checked) else True
+            except Exception:
+                ok = False
+            if not ok:
+                return ProviderAvailability(False, "live_adapter_disabled", None)
+        return found or ProviderAvailability(False, "provider_unavailable", None)
+
+    def _candidate_identities(self) -> list[str]:
+        policy = load_worker_settings(self.backup_root)
+        identities = []
+        for identity in (self.account_identity, *(entry.identity for entry in policy.account_allowlist)):
+            if isinstance(identity, str) and identity not in identities:
+                identities.append(identity)
+        return identities
 
     def _resolve_launch_account(self, job: JobRecord) -> tuple[str | None, str | None]:
         """``(identity, None)`` for this launch, or ``(None, diagnostic)``; under the launch lock.
@@ -424,7 +494,7 @@ class WorkerRuntime:
             if entry is None:
                 return None, "provider_auth_unavailable"
             identity = entry.identity
-        if self._fixed_account_identity is None and not codex_account_in_roster(self.backup_root, identity):
+        if self._fixed_account_identity is None and not account_in_roster(self.backup_root, identity):
             return None, "provider_auth_unavailable"
         return identity, None
 
@@ -466,8 +536,12 @@ class WorkerRuntime:
         shows terminal; otherwise it stays quarantined for ``worker lease
         release``. Nothing is ever relaunched.
         """
-        recover = getattr(self.adapter, "recover", None)
-        if recover is None:
+        recoverers = []
+        for adapter in self.adapters.values():
+            recover = getattr(adapter, "recover", None)
+            if recover is not None and recover not in recoverers:
+                recoverers.append(recover)
+        if not recoverers:
             return
         try:
             lease = self.leases.current()
@@ -482,10 +556,14 @@ class WorkerRuntime:
         terminal = {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED,
                     JobState.INTERRUPTED, JobState.EXPIRED}
         for job_id in sorted(job_ids):
-            try:
-                result = recover(job_id)
-            except Exception:
-                continue
+            result = None
+            for recover in recoverers:
+                try:
+                    result = recover(job_id)
+                except Exception:
+                    result = None
+                if result is not None:
+                    break
             if (job_id != lease_job or not isinstance(result, InterruptResult)
                     or result.execution_stopped is not True):
                 continue
@@ -499,11 +577,14 @@ class WorkerRuntime:
     def execution_mode(self) -> str:
         """``"live"`` when this worker would run real provider jobs, else ``"disabled"``.
 
-        It reads the adapter's ``execution_mode``: the live Codex adapter
-        reports "live" only while the owner's explicit opt-in is recorded (see
-        :mod:`openswap.worker.live`); every other adapter reports "disabled".
+        It reads the ``execution_mode`` of the adapter for the pinned account's
+        provider (Codex when nothing is pinned): a live adapter reports "live"
+        only while the owner's explicit opt-in for that provider is recorded
+        (see :mod:`openswap.worker.live`); every other adapter reports
+        "disabled".
         """
-        return "live" if getattr(self.adapter, "execution_mode", None) == "live" else "disabled"
+        adapter = self.adapter_for(self.account_identity)
+        return "live" if getattr(adapter, "execution_mode", None) == "live" else "disabled"
 
     def submit(self, submission: JobSubmission, *, job_id: str | None = None, remote: bool = False) -> JobRecord:
         """Admit a job; ``job_id`` lets a caller publish the ID before the row exists.
@@ -771,10 +852,11 @@ class WorkerRuntime:
         """
         completed = threading.Event()
         result: dict[str, object] = {}
+        adapter = self._run_adapter
 
         def read() -> None:
             try:
-                result["events"] = self.adapter.events(run, after_cursor=provider_cursor)
+                result["events"] = adapter.events(run, after_cursor=provider_cursor)
             except BaseException as error:
                 result["error"] = error
             finally:
@@ -898,8 +980,12 @@ class WorkerRuntime:
             current = self.store.get(claimed.job_id)
             if current.state == JobState.CANCEL_REQUESTED:
                 return self._cancel_before_launch(current)
+        # The job runs on the provider of the account it will use; probe that
+        # one. The account is resolved again, under the guard, before launch.
+        planned, _ = self._resolve_launch_account(claimed)
+        self._run_adapter = self.adapter_for(planned)
         try:
-            availability = self.adapter.probe()
+            availability = self._run_adapter.probe()
         except Exception:
             availability = ProviderAvailability(False, "provider_unavailable", None)
         # The lease and the job's folder are settled under the lifecycle lock
@@ -913,7 +999,8 @@ class WorkerRuntime:
         try:
             with self._launch_lock:
                 if locked:
-                    prepared = self._prepare_launch(claimed, availability, shutdown_event)
+                    prepared = self._prepare_launch(claimed, availability, shutdown_event,
+                                                    planned_provider=provider_of(planned))
                 else:
                     prepared = self._fail_claimed(claimed, "provider_unavailable")
         finally:
@@ -1115,13 +1202,13 @@ class WorkerRuntime:
                         except Exception:
                             pass
                     return
-                run = self.adapter.start(starting, workspace, worker_epoch=self.worker_epoch)
+                run = self._run_adapter.start(starting, workspace, worker_epoch=self.worker_epoch)
                 with outcome_lock:
                     outcome["run"] = run
                     late = outcome.get("abandoned", False)
                 if late and isinstance(run, ProviderRun):
                     try:
-                        late_stop = self.adapter.interrupt(run)
+                        late_stop = self._run_adapter.interrupt(run)
                     except BaseException:
                         late_stop = None
                     with outcome_lock:
@@ -1209,7 +1296,7 @@ class WorkerRuntime:
 
     def _prepare_launch(
         self, claimed: JobRecord, availability: ProviderAvailability,
-        shutdown_event: threading.Event | None = None,
+        shutdown_event: threading.Event | None = None, planned_provider: str | None = None,
     ):
         """Journal and lease steps before launch; runs under the control lock."""
         current = self.store.get(claimed.job_id)
@@ -1246,6 +1333,10 @@ class WorkerRuntime:
                 # The owner's pin, or the job's allowlisted choice, as it reads
                 # now; a refusal fails the job before STARTING (never launched).
                 identity, refusal = self._resolve_launch_account(current)
+                if identity is not None and planned_provider is not None and provider_of(identity) != planned_provider:
+                    # The pin moved to the other provider after that provider
+                    # was probed: never launch on an unprobed adapter.
+                    identity, refusal = None, "provider_unavailable"
                 if identity is None:
                     return self.store.transition(
                         current.job_id, expected_states=(JobState.CLAIMED,),
@@ -1258,7 +1349,7 @@ class WorkerRuntime:
                     expected_generation=current.generation,
                     pinned_account_ref=identity,
                 )
-                if self._fixed_account_identity is None and not codex_account_in_roster(
+                if self._fixed_account_identity is None and not account_in_roster(
                     self.backup_root, identity,
                 ):
                     token = None
@@ -1440,7 +1531,7 @@ class WorkerRuntime:
     def _interrupt_execution(self, token, run) -> bool:
         """Attempt to stop an owned run and persist only explicit stop proof."""
         try:
-            result = self.adapter.interrupt(run)
+            result = self._run_adapter.interrupt(run)
         except Exception:
             result = None
         if isinstance(result, InterruptResult) and result.execution_stopped is True:

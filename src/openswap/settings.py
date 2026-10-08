@@ -339,7 +339,7 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
 
 
 _WORKSPACE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-_PINNED_ACCOUNT_RE = re.compile(r"^codex:[0-9a-f]{64}$")
+_PINNED_ACCOUNT_RE = re.compile(r"^(?:codex|claude):[0-9a-f]{64}$")
 _ALLOWLIST_REF_RE = re.compile(r"^[0-9a-f]{32}$")
 MAX_ACCOUNT_ALLOWLIST = 20
 MAX_ACCOUNT_LABEL = 100
@@ -534,6 +534,8 @@ class LiveExecutionSettings:
 
     enabled: bool = False
     evidence_sha256: str | None = None
+    # The SHA-256 of the provider binary the evidence measured (Codex or
+    # Claude Code, by which opt-in this is).
     codex_sha256: str | None = None
     enabled_at: str | None = None
     # The accounts a passing live check ran on with this binary; a job on any
@@ -543,14 +545,26 @@ class LiveExecutionSettings:
     # a restored or copied opt-in never applies anywhere else.
     host_binding: str | None = None
 
+    @property
+    def binary_sha256(self) -> str | None:
+        return self.codex_sha256
+
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+# One opt-in per provider; Codex keeps the original key.
+_LIVE_KEYS = {"codex": "liveExecution", "claude": "liveExecutionClaude"}
 _LIVE_ACCOUNT_RE = re.compile(r"^(?:codex|claude):[0-9a-f]{64}$")
 
 
-def _live_from_raw(raw: dict) -> LiveExecutionSettings:
+def _live_key(provider: str) -> str:
+    if provider not in _LIVE_KEYS:
+        raise ValueError("unknown provider")
+    return _LIVE_KEYS[provider]
+
+
+def _live_from_raw(raw: dict, provider: str = "codex") -> LiveExecutionSettings:
     section = raw.get("worker")
-    live = section.get("liveExecution") if isinstance(section, dict) else None
+    live = section.get(_live_key(provider)) if isinstance(section, dict) else None
     if not isinstance(live, dict) or live.get("enabled") is not True:
         return LiveExecutionSettings()
     evidence = live.get("evidenceSha256")
@@ -569,13 +583,16 @@ def _live_from_raw(raw: dict) -> LiveExecutionSettings:
     return LiveExecutionSettings(True, evidence, codex, enabled_at, tuple(dict.fromkeys(accounts)), host)
 
 
-def load_live_execution(backup_root: Path) -> LiveExecutionSettings:
-    """Read the live-execution opt-in without creating files."""
-    return _live_from_raw(_read_raw(settings_path(Path(backup_root))))
+def load_live_execution(backup_root: Path, provider: str = "codex") -> LiveExecutionSettings:
+    """Read a provider's live-execution opt-in without creating files."""
+    return _live_from_raw(_read_raw(settings_path(Path(backup_root))), provider)
 
 
-def write_live_execution(backup_root: Path, value: LiveExecutionSettings) -> LiveExecutionSettings:
-    """Atomically set (or clear, with a disabled value) the live-execution opt-in."""
+def write_live_execution(
+    backup_root: Path, value: LiveExecutionSettings, provider: str = "codex",
+) -> LiveExecutionSettings:
+    """Atomically set (or clear, with a disabled value) a provider's live-execution opt-in."""
+    key = _live_key(provider)
     if not isinstance(value, LiveExecutionSettings):
         raise ValueError("live execution settings are required")
     path = settings_path(Path(backup_root))
@@ -586,15 +603,15 @@ def write_live_execution(backup_root: Path, value: LiveExecutionSettings) -> Liv
         if not isinstance(section, dict):
             section = {}
         if value.enabled:
-            section["liveExecution"] = {
+            section[key] = {
                 "enabled": True, "evidenceSha256": value.evidence_sha256,
                 "codexSha256": value.codex_sha256, "enabledAt": value.enabled_at,
                 "accounts": list(value.accounts), "hostBinding": value.host_binding,
             }
         else:
-            section.pop("liveExecution", None)
+            section.pop(key, None)
         raw["worker"] = section
-        parsed = _live_from_raw(raw)
+        parsed = _live_from_raw(raw, provider)
         if parsed != (value if value.enabled else LiveExecutionSettings()):
             raise ValueError("live execution settings failed validation")
         atomic_write_json(path, raw)

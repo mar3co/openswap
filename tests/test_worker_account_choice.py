@@ -200,17 +200,17 @@ def test_allow_label_and_list(root, capsys):
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
     alice = _entry(root, ALICE)
-    assert f"* {alice.account_ref}  \"Main\"  [slot 1]" in out
-    assert f"  {bob.account_ref}  \"Second\"  [slot 2]" in out
+    assert f"* {alice.account_ref}  \"Main\"  [Codex slot 1]" in out
+    assert f"  {bob.account_ref}  \"Second\"  [Codex slot 2]" in out
     assert SECRET not in out
 
     assert _run(root, "account", "--json") == 0
     listed = json.loads(capsys.readouterr().out)
     assert listed["allowlist"] == [
         {"account_ref": alice.account_ref, "identity": ALICE, "label": "Main", "default": True,
-         "slot": "1", "in_roster": True},
+         "provider": "codex", "slot": "1", "in_roster": True},
         {"account_ref": bob.account_ref, "identity": BOB, "label": "Second", "default": False,
-         "slot": "2", "in_roster": True},
+         "provider": "codex", "slot": "2", "in_roster": True},
     ]
     assert {row["number"]: row["allowed"] for row in listed["codex"]} == {
         "1": True, "2": True, "3": False, "5": False, "6": False,
@@ -225,8 +225,7 @@ def test_the_email_is_a_label_only_when_the_owner_passes_it(root):
 
 
 @pytest.mark.parametrize(("argv", "code"), [
-    (("allow", "claudey"), "claude_not_supported"),
-    (("allow", "4"), "claude_not_supported"),
+    (("allow", "claude:9"), "account_not_found"),
     (("allow", "3"), "account_not_eligible"),
     (("allow", "9"), "account_not_found"),
     (("allow", "2", "--label", ""), "label_invalid"),
@@ -321,14 +320,16 @@ def test_menu_web_choice_row_marks_allowed_and_default(root):
     assert row["kind"] == "popup" and row["value"] == ""
     options = {option[0]: option for option in row["options"]}
     assert options[""][1] == "2 accounts allowed for web choice"
-    assert options[f"default:{ALICE}"] == (f"default:{ALICE}", "✓ 1 · alice@example.com (work) — default",
+    assert options[f"default:{ALICE}"] == (f"default:{ALICE}", "✓ Codex 1 · alice@example.com (work) — default",
                                            {"disabled": True})
     five = stable_account_identity("codex", "acct-s1")
-    assert options[f"disallow:{five}"][1] == "✓ 5 · shared@example.com"
-    assert options[f"allow:{BOB}"][1] == "   2 · bob@example.com"
-    # Claude and API-key slots are not offered at all.
-    assert len(row["options"]) == 5  # the summary and Codex slots 1, 2, 5 and 6
-    assert not any("claude" in str(value) or "3 · " in option[1] for value, option in options.items())
+    assert options[f"disallow:{five}"][1] == "✓ Codex 5 · shared@example.com"
+    assert options[f"allow:{BOB}"][1] == "   Codex 2 · bob@example.com"
+    # Claude slots are offered too (owner decision 2026-10-07); API-key slots are not.
+    claude = [option for value, option in options.items() if "claude:" in str(value)]
+    assert [option[1] for option in claude] == ["   Claude 1 · alice@example.com", "   Claude 4 · carol@example.com (claudey)"]
+    assert len(row["options"]) == 7  # the summary, Codex slots 1, 2, 5 and 6, Claude slots 1 and 4
+    assert not any("3 · " in option[1] for option in options.values())
     assert SECRET not in json.dumps(row)
 
 
@@ -929,3 +930,11 @@ def test_loopback_allowlist_advertise_submit_test_and_run(root, keychain, capsys
             server.shutdown()
             serving.join(WAIT)
     assert not serving.is_alive()
+
+
+
+def test_a_claude_account_can_be_allowed_for_a_per_job_choice(root):
+    carol = stable_account_identity("claude", "carol@example.com", "")
+    entry = cli.allow_worker_account(root, "claude:4")
+    assert entry.identity == carol and entry.label == "claudey"
+    assert _entry(root, carol).account_ref == entry.account_ref

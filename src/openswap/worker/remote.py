@@ -431,6 +431,14 @@ class RemoteClient:
         from openswap.worker.adapter import execution_mode
 
         folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict() for w in policy.workspaces]
+        # The pinned account's provider decides (a Claude pin reports Claude's opt-in).
+        mode_of = getattr(self.runtime, "execution_mode", None)
+        if callable(mode_of):
+            try:
+                mode = mode_of()
+            except Exception:
+                mode = "disabled"
+            return {"folders": folders, "execution": "live" if mode == "live" else "disabled"}
         return {"folders": folders, "execution": execution_mode(getattr(self.runtime, "adapter", None))}
 
     def sync_readiness(self, policy=None) -> None:
@@ -618,7 +626,7 @@ class RemoteClient:
             if lease is not None and lease.state != "released":
                 return
             try:
-                availability = self.runtime.adapter.probe()
+                availability = self.runtime.provider_availability()
             except Exception:
                 return  # an unavailable provider claims nothing; the heartbeat still counts
             if not availability.available or not self.account_ready():
@@ -810,14 +818,14 @@ class RemoteClient:
         """Whether stop proof for an uncertain run may still arrive: its account lease is
         still held or quarantined. That lease also blocks new claims, so a retained
         provisional binding never holds back work that could otherwise run."""
-        lease = self.runtime.leases.read_current()
-        return lease is not None and lease.job_id == local.job_id and lease.state != "released"
+        lease = self.runtime.leases.for_job(local.job_id)
+        return lease is not None and lease.state != "released"
 
     def _proof(self, local):
         if local.state.value == "interrupted":
             # Only the lease can later establish what happened to an uncertain run.
-            lease = self.runtime.leases.read_current()
-            if lease is not None and lease.job_id == local.job_id and lease.state == "released":
+            lease = self.runtime.leases.for_job(local.job_id)
+            if lease is not None and lease.state == "released":
                 return lease.reason == "confirmed_stopped", lease.reason == "unlaunched"
             return False, False
         if local.state.value == "failed" and local.diagnostic_code == "lease_conflict":
@@ -830,8 +838,8 @@ class RemoteClient:
             launched |= any(e.state and e.state.value == "running" for e in page.events)
             stopped |= any(e.execution_stopped is True for e in page.events)
             cursor = page.next_cursor
-        lease = self.runtime.leases.read_current()
-        if lease is not None and lease.job_id == local.job_id and lease.state == "released":
+        lease = self.runtime.leases.for_job(local.job_id)
+        if lease is not None and lease.state == "released":
             return stopped or lease.reason == "confirmed_stopped", lease.reason == "unlaunched"
         # A pinned account missing from the roster at launch fails the job from
         # STARTING with no lease: nothing ran. The same code reported after a

@@ -1,7 +1,7 @@
 """The guided Remote tasks setup shared by ``openswap worker pair`` and the menu bar.
 
 After pairing, the owner is walked through the same steps everywhere: start the
-worker, confirm the Codex account, approve a research folder, then a summary
+worker, confirm the Codex or Claude account, approve a research folder, then a summary
 of what is still missing before Slack can start tasks on this Mac. Each step
 uses the same functions as the matching ``openswap worker`` command; the
 front end only supplies prompts (``Prompts``). Pairing has already succeeded
@@ -77,8 +77,8 @@ START_WORKER_NEXT = (
     "`openswap worker enable`."
 )
 ACCOUNT_NEXT = (
-    "Next: pin the Codex account remote jobs run on: `openswap worker account <slot|email|alias>` "
-    "(`openswap worker account` lists them)."
+    "Next: pin the account remote jobs run on: `openswap worker account <slot|email|alias>` "
+    "(`claude:<slot>` for a Claude account; `openswap worker account` lists them)."
 )
 FOLDER_NEXT = (
     "Next: approve a research folder: `openswap worker workspace add <id> <folder>` "
@@ -89,7 +89,22 @@ EXECUTION_OFF_NOTE = (
     "Task execution itself stays off (provider: live_adapter_disabled) until you run "
     "`openswap worker live-check` on this Mac and enable live execution, so jobs are refused for now."
 )
-EXECUTION_LIVE_NOTE = "Task execution is live: approved tasks run on this Mac with the chosen Codex account."
+CLAUDE_EXECUTION_OFF_NOTE = (
+    "Task execution itself stays off (provider: live_adapter_disabled) until the Claude live check "
+    "passes on this Mac, so jobs are refused for now. Run `openswap worker claude pin`, then "
+    "`openswap worker claude prepare`, then `openswap worker live-check --provider claude` "
+    "and enable live execution."
+)
+EXECUTION_LIVE_NOTE = "Task execution is live: approved tasks run on this Mac with the chosen account."
+
+
+def execution_off_note(provider: str | None) -> str:
+    """The off-note with the live-check steps for the pinned account's provider."""
+    return CLAUDE_EXECUTION_OFF_NOTE if provider == "claude" else EXECUTION_OFF_NOTE
+
+
+def _provider_name(choice) -> str:
+    return "Claude" if getattr(choice, "provider", "codex") == "claude" else "Codex"
 WORKER_OFFER = "Start the Remote tasks worker now so this Mac can accept approved tasks?"
 WORKER_ONLINE = "Remote tasks worker enabled. The portal shows this Mac online within about 15 seconds."
 _RUNNING_STATES = frozenset({"starting", "running"})
@@ -142,7 +157,7 @@ def offer_worker(root: Path, ui: Prompts) -> None:
 
 
 def confirm_account(root: Path, ui: Prompts) -> None:
-    """Show the pinned Codex account and offer to keep it, or pick one."""
+    """Show the pinned account (Codex or Claude) and offer to keep it, or pick one."""
     cli = _cli()
     try:
         choices = cli.worker_account_choices(root)
@@ -150,17 +165,18 @@ def confirm_account(root: Path, ui: Prompts) -> None:
         choices = None
     pinned = choices.pinned if choices is not None and not choices.pinned_missing else None
     if pinned is not None:
-        ui.say(f"Remote tasks uses Codex account {pinned.label()}.")
+        ui.say(f"Remote tasks uses {_provider_name(pinned)} account {pinned.label()}.")
         if not ui.interactive or ui.confirm("Keep this account?") is not False:
             return
     elif not ui.interactive or choices is None:
         ui.say(ACCOUNT_NEXT)
         return
     elif choices.pinned_missing:
-        ui.say("The pinned Codex account is no longer in the roster; choose another.")
+        ui.say("The pinned account is no longer in the roster; choose another.")
     eligible = [choice for choice in choices.codex if choice.eligible]
-    if not eligible:
-        ui.say("No eligible Codex account is saved. Add one with `openswap codex add`, then "
+    eligible_claude = [choice for choice in choices.claude if choice.eligible]
+    if not eligible and not eligible_claude:
+        ui.say("No eligible account is saved. Add one with `openswap codex add` or `openswap add`, then "
                "`openswap worker account <slot>`.")
         return
     # Skipping after declining the current pin cancels the change: say the
@@ -168,11 +184,13 @@ def confirm_account(root: Path, ui: Prompts) -> None:
     later = (f"{pinned.label()} stays selected. Change it later with "
              "`openswap worker account <slot|email|alias>`." if pinned is not None
              else "Pin one later with `openswap worker account <slot|email|alias>`.")
-    ui.say("Choose the Codex account remote jobs run on (Claude accounts aren't supported yet):")
+    ui.say("Choose the account remote jobs run on:")
     for choice in eligible:
-        ui.say(f"  {choice.label()}")
+        ui.say(f"  {choice.label()}  (Codex)")
+    for choice in eligible_claude:
+        ui.say(f"  claude:{choice.label()}  (Claude)")
     for _attempt in range(_MAX_ATTEMPTS):
-        answer = ui.ask("Account (slot, email or alias; Enter to skip): ")
+        answer = ui.ask("Account (slot, email or alias; claude:<slot> for Claude; Enter to skip): ")
         if not answer:
             ui.say(f"Skipped. {later}")
             return
@@ -184,7 +202,7 @@ def confirm_account(root: Path, ui: Prompts) -> None:
         except Exception:
             ui.say(f"Could not pin that account. {later}")
             return
-        ui.say(f"Pinned Codex account {chosen.label()} for Remote tasks.")
+        ui.say(f"Pinned {_provider_name(chosen)} account {chosen.label()} for Remote tasks.")
         return
     ui.say(later)
 
@@ -279,7 +297,9 @@ class Readiness:
     account: str | None
     folders: tuple[str, ...]
     execution: str
-    paused: bool = False  # admission paused: the worker claims no new task
+    paused: bool = False
+    # The pinned account's provider ("codex" or "claude"; None when nothing is pinned).
+    provider: str | None = None  # admission paused: the worker claims no new task
     # The running worker's link to the control service: "online", "offline",
     # "revoked", "expired" or "disabled"; None when unknown.
     connection: str | None = None
@@ -302,14 +322,14 @@ class Readiness:
         if self.paused:
             out.append("reopen admission (`openswap worker pause --off`)")
         if self.account is None:
-            out.append("pin a Codex account (`openswap worker account <slot>`)")
+            out.append("pin an account (`openswap worker account <slot>`, or `claude:<slot>`)")
         if not self.folders:
             out.append("approve a research folder (`openswap worker workspace add <id> <folder>`)")
         return tuple(out)
 
 
 def readiness(root: Path) -> Readiness:
-    from openswap.worker.adapter import execution_mode, production_adapter
+    from openswap.worker.adapter import execution_mode, pinned_adapter
 
     cli = _cli()
     policy = load_worker_settings(root)
@@ -333,13 +353,15 @@ def readiness(root: Path) -> Readiness:
             # Stale, stopping or unreadable health is reported as not running.
             worker = "stopped"
     account = None
+    provider = None
     try:
         choices = cli.worker_account_choices(root)
         # Only a pinned default counts: a task without a per-task choice
         # needs it, and the allowed accounts reach the service only once it
         # acknowledges them, which the local settings cannot show.
         if choices.pinned is not None and not choices.pinned_missing:
-            account = choices.pinned.label()
+            provider = getattr(choices.pinned, "provider", "codex")
+            account = f"{_provider_name(choices.pinned)} {choices.pinned.label()}"
     except Exception:
         pass
     return Readiness(
@@ -347,7 +369,10 @@ def readiness(root: Path) -> Readiness:
         worker=worker,
         account=account,
         folders=tuple(_describe(w) for w in policy.workspaces),
-        execution=execution_mode(production_adapter(root)),
+        # The live mode of the pinned account's provider: a Claude pin with a
+        # passing Claude live check is live, whatever the Codex opt-in says.
+        execution=execution_mode(pinned_adapter(root)),
+        provider=provider,
         paused=policy.paused is True,
         connection=connection if isinstance(connection, str) else None,
     )
@@ -384,7 +409,7 @@ def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> No
         ui.say("Before Slack can start tasks on this Mac: " + "; ".join(state.missing) + ".")
     else:
         ui.say("Ready for Slack: approved tasks from your Slack workspace can reach this Mac.")
-    ui.say(EXECUTION_LIVE_NOTE if state.execution == "live" else EXECUTION_OFF_NOTE)
+    ui.say(EXECUTION_LIVE_NOTE if state.execution == "live" else execution_off_note(state.provider))
 
 
 # Steps run in order (looked up by name), each with the line shown if it fails unexpectedly.

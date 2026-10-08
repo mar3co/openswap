@@ -747,7 +747,7 @@ def _remote_tasks_account_row(picker) -> dict:
     if not isinstance(picker, dict):
         return {**row, "options": [("", "Loading accounts…")], "value": "", "disabled": True}
     pinned = picker.get("pinned_account_ref")
-    pinned = pinned if isinstance(pinned, str) and pinned.startswith("codex:") else None
+    pinned = pinned if isinstance(pinned, str) and pinned.startswith(("codex:", "claude:")) else None
     options: list[tuple] = [("", "None")]
     listed = set()
     for entry in picker.get("codex") or []:
@@ -756,21 +756,28 @@ def _remote_tasks_account_row(picker) -> dict:
         number = _bounded_text(entry.get("number"), 8)
         name = _bounded_text(entry.get("email")) or "(no email)"
         alias = _bounded_text(entry.get("alias"), 40)
-        label = f"{number} · {name}" + (f" ({alias})" if alias else "")
+        label = f"Codex {number} · {name}" + (f" ({alias})" if alias else "")
         ref = entry.get("account_ref")
         if entry.get("eligible") is True and isinstance(ref, str) and ref.startswith("codex:"):
             options.append((ref, label))
             listed.add(ref)
         else:
             options.append((f"ineligible:{number}", f"{label} — API key, not eligible", {"disabled": True}))
-    if pinned is not None and pinned not in listed:
-        options.append((pinned, "Pinned account was removed", {"disabled": True}))
     for entry in picker.get("claude") or []:
         if not isinstance(entry, dict):
             continue
         number = _bounded_text(entry.get("number"), 8)
         name = _bounded_text(entry.get("email")) or "(no email)"
-        options.append((f"claude:{number}", f"Claude {number} · {name} — not supported yet", {"disabled": True}))
+        alias = _bounded_text(entry.get("alias"), 40)
+        label = f"Claude {number} · {name}" + (f" ({alias})" if alias else "")
+        ref = entry.get("account_ref")
+        if entry.get("eligible") is True and isinstance(ref, str) and ref.startswith("claude:"):
+            options.append((ref, label))
+            listed.add(ref)
+        else:
+            options.append((f"ineligible-claude:{number}", f"{label} — not eligible", {"disabled": True}))
+    if pinned is not None and pinned not in listed:
+        options.append((pinned, "Pinned account was removed", {"disabled": True}))
     return {**row, "options": options, "value": pinned or ""}
 
 
@@ -798,7 +805,7 @@ def _remote_tasks_web_choice_row(picker) -> dict:
     allowlist = [entry for entry in picker.get("allowlist") or [] if isinstance(entry, dict)]
     allowed = {
         entry.get("identity") for entry in allowlist
-        if isinstance(entry.get("identity"), str) and entry["identity"].startswith("codex:")
+        if isinstance(entry.get("identity"), str) and entry["identity"].startswith(("codex:", "claude:"))
     }
     count = len(allowed)
     summary = (
@@ -807,16 +814,18 @@ def _remote_tasks_web_choice_row(picker) -> dict:
     )
     options: list[tuple] = [("", summary)]
     listed = set()
-    for entry in picker.get("codex") or []:
+    entries = [("Codex", "codex:", e) for e in picker.get("codex") or []] + [
+        ("Claude", "claude:", e) for e in picker.get("claude") or []]
+    for provider_name, prefix, entry in entries:
         if not isinstance(entry, dict) or entry.get("eligible") is not True:
             continue
         ref = entry.get("account_ref")
-        if not isinstance(ref, str) or not ref.startswith("codex:"):
+        if not isinstance(ref, str) or not ref.startswith(prefix):
             continue
         number = _bounded_text(entry.get("number"), 8)
         name = _bounded_text(entry.get("email")) or "(no email)"
         alias = _bounded_text(entry.get("alias"), 40)
-        label = f"{number} · {name}" + (f" ({alias})" if alias else "")
+        label = f"{provider_name} {number} · {name}" + (f" ({alias})" if alias else "")
         listed.add(ref)
         if ref == pinned:
             options.append((f"default:{ref}", f"✓ {label} — default", {"disabled": True}))
@@ -826,7 +835,7 @@ def _remote_tasks_web_choice_row(picker) -> dict:
             options.append((f"allow:{ref}", f"   {label}"))
     for entry in allowlist:
         identity = entry.get("identity")
-        if identity in listed or not isinstance(identity, str) or not identity.startswith("codex:"):
+        if identity in listed or not isinstance(identity, str) or not identity.startswith(("codex:", "claude:")):
             continue
         name = _bounded_text(entry.get("label"), 60) or "account"
         if identity == pinned:
