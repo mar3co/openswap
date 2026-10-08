@@ -618,7 +618,7 @@ def test_lease_conflict_failure_reconciles_as_failed_unlaunched(remote_setup):
     remote, runtime, adapter, store, _, paired, transport = remote_setup
     job_id = submit(remote_setup)
     remote.tick()
-    runtime.leases.acquire(job_id="f" * 32, account_identity=runtime.account_identity,
+    runtime.leases.store_for("codex").acquire(job_id="f" * 32, account_identity=runtime.account_identity,
                            worker_pid=runtime.worker_pid, worker_epoch=runtime.worker_epoch, ttl_s=120)
     result = runtime.reconcile_once()
     assert (result.state, result.diagnostic_code) == (JobState.FAILED, "lease_conflict")
@@ -643,7 +643,7 @@ def test_pinned_account_removed_after_admission_reconciles_as_failed_unlaunched(
     )
     runtime._fixed_account_identity = None  # use the real pin and roster check
     in_roster = [True]
-    monkeypatch.setattr(runtime_module, "codex_account_in_roster", lambda _root, _identity: in_roster[0])
+    monkeypatch.setattr(runtime_module, "account_in_roster", lambda _root, _identity: in_roster[0])
     job_id = submit(remote_setup)
     remote.tick()
     in_roster[0] = False  # the owner removed the pinned Codex slot before launch

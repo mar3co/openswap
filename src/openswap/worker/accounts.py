@@ -1,14 +1,18 @@
 """Which local accounts Remote tasks may pin, read from roster metadata only.
 
-Plan 017: for Codex an eligible account is a roster slot, identified by the
-stable opaque reference ``stable_account_identity("codex", accountId)``.
-Claude accounts sit behind a separate authentication gate, and roster-backed
-Claude profiles are presumptively excluded, so they are listed only to say
-they are not supported yet; nothing here can pin one.
+Plan 017: an eligible account is a roster slot of either provider, pinned by
+a typed opaque reference. A Codex slot is
+``stable_account_identity("codex", accountId)``; a Claude slot (the owner's
+decision of 2026-10-07: their own native login, on their own paired Macs, for
+tasks they start themselves) is
+``stable_account_identity("claude", email, organizationUuid)``, the identity
+the Claude engine and kickoff already lease. The prefix decides which
+provider runs the job.
 
 Everything here reads ``sequence.json`` metadata (slot number, email, alias,
-``accountId``) and nothing else: no auth files, tokens or Keychain items.
-The reads create no files, so the worker can check its pin at launch.
+``accountId``/``organizationUuid``) and nothing else: no auth files, tokens or
+Keychain items. The reads create no files, so the worker can check its pin at
+launch.
 """
 
 from __future__ import annotations
@@ -23,6 +27,17 @@ from openswap.settings import AllowlistedAccount
 from openswap.worker.leases import LeaseStateError, stable_account_identity
 
 _ACCOUNT_REF_RE = re.compile(r"^codex:[0-9a-f]{64}$")
+_CLAUDE_REF_RE = re.compile(r"^claude:[0-9a-f]{64}$")
+PROVIDERS = ("codex", "claude")
+
+
+def provider_of(identity: str | None) -> str | None:
+    """``"codex"`` or ``"claude"`` from a typed account identity, else ``None``."""
+    if isinstance(identity, str):
+        prefix = identity.split(":", 1)[0]
+        if prefix in PROVIDERS and (_ACCOUNT_REF_RE.fullmatch(identity) or _CLAUDE_REF_RE.fullmatch(identity)):
+            return prefix
+    return None
 
 
 class AccountPinError(ClaudeSwitchError):
@@ -42,6 +57,7 @@ class CodexAccountChoice:
     # stable identity, so it cannot be pinned.
     account_ref: str | None
     disabled: bool = False
+    provider = "codex"
 
     @property
     def eligible(self) -> bool:
@@ -59,6 +75,15 @@ class ClaudeAccountEntry:
     number: str
     email: str
     alias: str | None
+    organization_uuid: str = ""
+    # None for a slot with no email (its identity cannot be checked).
+    account_ref: str | None = None
+    disabled: bool = False
+    provider = "claude"
+
+    @property
+    def eligible(self) -> bool:
+        return self.account_ref is not None
 
     def label(self) -> str:
         name = self.email or "(no email)"
@@ -75,14 +100,14 @@ class AccountChoices:
     # Accounts a control service may choose per job; the pin is the default.
     allowlist: tuple[AllowlistedAccount, ...] = ()
 
-    def slot_for(self, identity: str) -> CodexAccountChoice | None:
-        return next((c for c in self.codex if c.account_ref == identity), None)
+    def slot_for(self, identity: str):
+        return next((c for c in (*self.codex, *self.claude) if c.account_ref == identity), None)
 
     @property
-    def pinned(self) -> CodexAccountChoice | None:
+    def pinned(self):
         if self.pinned_ref is None:
             return None
-        return next((c for c in self.codex if c.account_ref == self.pinned_ref), None)
+        return self.slot_for(self.pinned_ref)
 
     @property
     def pinned_missing(self) -> bool:
@@ -96,8 +121,10 @@ class AccountChoices:
             "pinned_account_ref": self.pinned_ref,
             "pinned_slot": pinned.number if pinned else None,
             "pinned_missing": self.pinned_missing,
+            "pinned_provider": provider_of(self.pinned_ref),
             "codex": [
                 {
+                    "provider": "codex",
                     "number": c.number, "email": c.email, "alias": c.alias,
                     "account_ref": c.account_ref, "eligible": c.eligible,
                     "disabled": c.disabled,
@@ -112,6 +139,7 @@ class AccountChoices:
                 {
                     "account_ref": entry.account_ref, "identity": entry.identity,
                     "label": entry.label, "default": entry.identity == self.pinned_ref,
+                    "provider": provider_of(entry.identity),
                     "slot": slot.number if (slot := self.slot_for(entry.identity)) else None,
                     "in_roster": slot is not None,
                 }
@@ -119,8 +147,12 @@ class AccountChoices:
             ],
             "claude": [
                 {
+                    "provider": "claude",
                     "number": c.number, "email": c.email, "alias": c.alias,
-                    "eligible": False, "reason": "claude_auth_gate",
+                    "account_ref": c.account_ref, "eligible": c.eligible,
+                    "disabled": c.disabled,
+                    "pinned": c.account_ref is not None and c.account_ref == self.pinned_ref,
+                    "allowed": c.account_ref is not None and c.account_ref in allowed,
                 }
                 for c in self.claude
             ],
@@ -178,14 +210,29 @@ def codex_accounts(backup_root: Path) -> tuple[CodexAccountChoice, ...] | None:
     return tuple(sorted(out, key=lambda c: _slot_order(c.number)))
 
 
-def claude_accounts(backup_root: Path) -> tuple[ClaudeAccountEntry, ...]:
-    """Claude roster slots, for display only; never eligible here."""
-    accounts = _roster_accounts(Path(backup_root) / "sequence.json") or {}
+def _claude_ref(email, organization) -> str | None:
+    if not isinstance(email, str) or not email:
+        return None
+    organization = organization if isinstance(organization, str) else ""
+    try:
+        return stable_account_identity("claude", email, organization)
+    except LeaseStateError:
+        return None
+
+
+def claude_accounts(backup_root: Path) -> tuple[ClaudeAccountEntry, ...] | None:
+    """Claude roster slots in slot order; ``None`` when the roster is unreadable."""
+    accounts = _roster_accounts(Path(backup_root) / "sequence.json")
+    if accounts is None:
+        return None
     out = [
         ClaudeAccountEntry(
             number=str(number),
             email=_text(record.get("email")),
             alias=_text(record.get("alias")) or None,
+            organization_uuid=_text(record.get("organizationUuid")),
+            account_ref=_claude_ref(record.get("email"), record.get("organizationUuid") or ""),
+            disabled=record.get("disabled") is True,
         )
         for number, record in accounts.items()
         if isinstance(record, dict)
@@ -199,7 +246,7 @@ def account_choices(
     return AccountChoices(
         pinned_ref=pinned_ref,
         codex=codex_accounts(backup_root) or (),
-        claude=claude_accounts(backup_root),
+        claude=claude_accounts(backup_root) or (),
         allowlist=tuple(allowlist),
     )
 
@@ -207,15 +254,28 @@ def account_choices(
 def default_account_label(backup_root: Path, identity: str) -> str:
     """The label an allowlisted account gets unless the owner names it.
 
-    The slot alias, else "Codex account N"; never the email, which is sent to
+    The slot alias, else "Codex account N" or "Claude account N"; never the email, which is sent to
     the control service only if the owner explicitly makes it the label.
     """
-    accounts = codex_accounts(Path(backup_root)) or ()
+    provider = provider_of(identity)
+    name = "Claude account" if provider == "claude" else "Codex account"
+    accounts = (claude_accounts(Path(backup_root)) if provider == "claude" else codex_accounts(Path(backup_root))) or ()
     slot = next((c for c in accounts if c.account_ref == identity), None)
     if slot is None:
-        return "Codex account"
+        return name
     alias = "".join(ch for ch in (slot.alias or "") if ch.isprintable()).strip()[:100]
-    return alias or f"Codex account {slot.number}"[:100]
+    return alias or f"{name} {slot.number}"[:100]
+
+
+def account_in_roster(backup_root: Path, account_ref: str) -> bool:
+    """Whether the roster of the identity's provider still carries it (fails closed)."""
+    provider = provider_of(account_ref)
+    if provider == "codex":
+        return codex_account_in_roster(backup_root, account_ref)
+    if provider == "claude":
+        accounts = claude_accounts(backup_root)
+        return bool(accounts) and any(choice.account_ref == account_ref for choice in accounts)
+    return False
 
 
 def codex_account_in_roster(backup_root: Path, account_ref: str) -> bool:
@@ -226,6 +286,62 @@ def codex_account_in_roster(backup_root: Path, account_ref: str) -> bool:
     return any(choice.account_ref == account_ref for choice in accounts)
 
 
+def resolve_claude_selector(backup_root: Path, selector: str) -> ClaudeAccountEntry:
+    """Resolve a Claude roster slot by number, alias, email or opaque ``claude:`` reference."""
+    selector = selector.strip() if isinstance(selector, str) else ""
+    if not selector:
+        raise AccountPinError("account_not_found")
+    accounts = claude_accounts(Path(backup_root))
+    if accounts is None:
+        raise AccountPinError("roster_unavailable")
+    if _CLAUDE_REF_RE.fullmatch(selector):
+        match = next((c for c in accounts if c.account_ref == selector), None)
+        if match is None:
+            raise AccountPinError("account_not_found")
+        return match
+    matches = [c for c in accounts if c.number == selector] or [
+        c for c in accounts if c.alias and c.alias == selector
+    ] or [c for c in accounts if c.email and c.email.lower() == selector.lower()]
+    if not matches:
+        raise AccountPinError("account_not_found")
+    if len(matches) > 1:
+        raise AccountPinError("account_ambiguous")
+    if not matches[0].eligible:
+        raise AccountPinError("account_not_eligible")
+    return matches[0]
+
+
+def resolve_account_selector(backup_root: Path, selector: str):
+    """Resolve a selector to an eligible Codex or Claude slot.
+
+    ``codex:<slot|email|alias>`` and ``claude:<slot|email|alias>`` (or the
+    opaque references) name the provider explicitly. A bare selector keeps its
+    old meaning, a Codex slot, and falls back to the Claude roster only when
+    no Codex slot matches it.
+    """
+    selector = selector.strip() if isinstance(selector, str) else ""
+    if _CLAUDE_REF_RE.fullmatch(selector):
+        return resolve_claude_selector(backup_root, selector)
+    if _ACCOUNT_REF_RE.fullmatch(selector):
+        return resolve_codex_selector(backup_root, selector)
+    lowered = selector.lower()
+    if lowered.startswith("claude:"):
+        return resolve_claude_selector(backup_root, selector[len("claude:"):])
+    if lowered.startswith("codex:"):
+        return resolve_codex_selector(backup_root, selector[len("codex:"):])
+    try:
+        return resolve_codex_selector(backup_root, selector)
+    except AccountPinError as error:
+        if error.code not in {"account_not_found", "claude_not_supported"}:
+            raise
+        try:
+            return resolve_claude_selector(backup_root, selector)
+        except AccountPinError as claude_error:
+            if claude_error.code == "account_not_found":
+                raise error from None
+            raise
+
+
 def _names_claude_account(backup_root: Path, selector: str) -> bool:
     """Whether a selector Codex could not resolve names a Claude roster slot.
 
@@ -234,7 +350,7 @@ def _names_claude_account(backup_root: Path, selector: str) -> bool:
     """
     return any(
         selector in {entry.number, entry.email, entry.alias}
-        for entry in claude_accounts(backup_root)
+        for entry in claude_accounts(backup_root) or ()
     )
 
 

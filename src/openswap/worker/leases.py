@@ -463,3 +463,94 @@ class AccountLeaseStore:
             info.st_uid != os.getuid() or info.st_mode & 0o077
         ):
             raise LeaseStateError("Private account lease directory permissions are unsafe.")
+
+
+class ProviderLeases:
+    """The Codex and Claude lease stores seen as one, for the worker.
+
+    The worker runs one job per host whatever its provider, so acquiring
+    checks both stores; a token's ``provider`` routes release, renewal and
+    quarantine to its own store. Guards are taken Codex first, then Claude,
+    the order every holder of both uses.
+    """
+
+    PROVIDERS = ("codex", "claude")
+
+    def __init__(self, backup_root: Path, *, clock=time.time):
+        self.stores = {name: AccountLeaseStore(backup_root, name, clock=clock) for name in self.PROVIDERS}
+
+    def store_for(self, provider: str) -> AccountLeaseStore:
+        return self.stores[provider]
+
+    def acquire(self, *, job_id: str, account_identity: str, worker_pid: int, worker_epoch: int,
+                ttl_s: float) -> LeaseToken:
+        """Acquire on the identity's provider while neither store holds a lease."""
+        with self.mutation_guard() as guard:
+            return guard.acquire(job_id=job_id, account_identity=account_identity, worker_pid=worker_pid,
+                                 worker_epoch=worker_epoch, ttl_s=ttl_s)
+
+    def release(self, token: LeaseToken, evidence: ReleaseEvidence) -> None:
+        self.stores[token.provider].release(token, evidence)
+
+    def mark_uncertain(self, token: LeaseToken, reason: str) -> None:
+        self.stores[token.provider].mark_uncertain(token, reason)
+
+    def renew(self, token: LeaseToken, ttl_s: float) -> LeaseToken:
+        return self.stores[token.provider].renew(token, ttl_s)
+
+    @staticmethod
+    def _pick(leases: list[AccountLease | None]) -> AccountLease | None:
+        unresolved = [lease for lease in leases if lease is not None and lease.state != "released"]
+        if unresolved:
+            return unresolved[0]
+        return next((lease for lease in leases if lease is not None), None)
+
+    def current(self) -> AccountLease | None:
+        """The unresolved lease of either store, else any lease (Codex first)."""
+        return self._pick([store.current() for store in self.stores.values()])
+
+    def read_current(self) -> AccountLease | None:
+        return self._pick([store.read_current() for store in self.stores.values()])
+
+    def all_current(self) -> list[AccountLease]:
+        return [lease for lease in (store.current() for store in self.stores.values()) if lease is not None]
+
+    def for_job(self, job_id: str) -> AccountLease | None:
+        """The lease (either store, any state) recorded for ``job_id``."""
+        for store in self.stores.values():
+            lease = store.read_current()
+            if lease is not None and lease.job_id == job_id:
+                return lease
+        return None
+
+    @contextmanager
+    def mutation_guard(self, *, timeout: float | None = None) -> Iterator["ProviderLeaseGuard"]:
+        with self.stores["codex"].mutation_guard(timeout=timeout) as codex, \
+                self.stores["claude"].mutation_guard(timeout=timeout) as claude:
+            yield ProviderLeaseGuard({"codex": codex, "claude": claude})
+
+
+class ProviderLeaseGuard:
+    """Both providers' mutation guards, held together."""
+
+    def __init__(self, guards: dict[str, LeaseMutationGuard]):
+        self._guards = guards
+
+    def assert_available(self) -> None:
+        for guard in self._guards.values():
+            guard.assert_available()
+
+    def current(self) -> AccountLease | None:
+        return ProviderLeases._pick([guard.current() for guard in self._guards.values()])
+
+    def acquire(self, *, job_id: str, account_identity: str, worker_pid: int, worker_epoch: int,
+                ttl_s: float) -> LeaseToken:
+        provider = account_identity.split(":", 1)[0] if isinstance(account_identity, str) else ""
+        if provider not in self._guards:
+            raise LeaseStateError("Lease job and stable account identity are required.")
+        # One job per host, whatever the provider.
+        self.assert_available()
+        return self._guards[provider].acquire(
+            job_id=job_id, account_identity=account_identity, worker_pid=worker_pid,
+            worker_epoch=worker_epoch, ttl_s=ttl_s,
+        )

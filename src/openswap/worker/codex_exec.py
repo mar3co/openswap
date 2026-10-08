@@ -426,13 +426,23 @@ class _Run:
     item_counts: dict = field(default_factory=dict)
     usage: dict = field(default_factory=dict)
     unparsed_lines: int = 0
+    extra: dict = field(default_factory=dict)  # provider-specific counts for the summary
 
 
 _NO_PROOF = StopProof(False, None, 0)
 
 
 class CodexExecAdapter:
-    """Production adapter; runs nothing unless live mode is on (see :mod:`live`)."""
+    """Production adapter; runs nothing unless live mode is on (see :mod:`live`).
+
+    Launch is split into provider hooks (``_launch_binary``,
+    ``_prepare_account``, ``_command``, ``_line``) so the Claude Code adapter
+    shares everything else: the live-lock fence, granted-root checks, run
+    directories, containment, event draining, stop proof, recovery and
+    retention.
+    """
+
+    provider = "codex"
 
     def __init__(
         self,
@@ -483,7 +493,7 @@ class CodexExecAdapter:
         pinned = self._verify(check_version=check_version)
         if not self._bind_to_opt_in:
             return pinned
-        expected = load_live_execution(self.backup_root).codex_sha256
+        expected = load_live_execution(self.backup_root, self.provider).codex_sha256
         if expected is not None and pinned.binary_sha256 != expected:
             raise codex_cli.CodexCliError("binary_not_the_checked_one")
         return pinned
@@ -493,9 +503,30 @@ class CodexExecAdapter:
             return ProviderAvailability(False, "live_adapter_disabled", None)
         try:
             pinned = self._pinned(check_version=True)
-        except codex_cli.CodexCliError:
+        except self._cli_errors:
             return ProviderAvailability(False, "provider_unavailable", None)
         return ProviderAvailability(True, None, pinned.version)
+
+    _cli_errors = (codex_cli.CodexCliError,)
+
+    def _prepare_account(self, identity: str, workspace: ResolvedWorkspace) -> Path:
+        """The account's isolated home, signed in to exactly ``identity``; refuses otherwise."""
+        try:
+            home = prepare_home(self.backup_root, identity, tuple(workspace.readonly_sources))
+        except (OSError, ValueError, ContainmentError):
+            raise ProviderLaunchRefused("provider_unavailable") from None
+        if home_identity(home) != identity:
+            # Not signed in, or signed in to a different account than the
+            # leased one: never run on whatever is there.
+            raise ProviderLaunchRefused("provider_auth_unavailable")
+        if self._managed(home):
+            # A managed or system layer could override the research profile.
+            raise ProviderLaunchRefused("provider_unavailable")
+        return home
+
+    def _command(self, pinned, home: Path, output_root: Path, run_dir: Path,
+                 workspace: ResolvedWorkspace) -> tuple[list[str], dict[str, str]]:
+        return codex_argv(pinned.binary, output_root, run_dir), codex_env(home, run_dir)
 
     def start(self, job: JobRecord, workspace: ResolvedWorkspace, *, worker_epoch: int) -> ProviderRun:
         # The opt-in check and the provider's release are one step under the
@@ -510,23 +541,14 @@ class CodexExecAdapter:
         if self._mode() != LIVE:
             raise ProviderLaunchRefused("live_adapter_disabled")
         identity = job.pinned_account_ref
-        if not isinstance(identity, str):
+        if not isinstance(identity, str) or not identity.startswith(f"{self.provider}:"):
+            # A job only ever runs on its own account's provider.
             raise ProviderLaunchRefused("provider_auth_unavailable")
         try:
             pinned = self._pinned(check_version=False)
-        except codex_cli.CodexCliError:
+        except self._cli_errors:
             raise ProviderLaunchRefused("provider_unavailable") from None
-        try:
-            home = prepare_home(self.backup_root, identity, tuple(workspace.readonly_sources))
-        except (OSError, ValueError, ContainmentError):
-            raise ProviderLaunchRefused("provider_unavailable") from None
-        if home_identity(home) != identity:
-            # Not signed in, or signed in to a different account than the
-            # leased one: never run on whatever is there.
-            raise ProviderLaunchRefused("provider_auth_unavailable")
-        if self._managed(home):
-            # A managed or system layer could override the research profile.
-            raise ProviderLaunchRefused("provider_unavailable")
+        home = self._prepare_account(identity, workspace)
         output_root = Path(workspace.output_root)
         granted = [output_root.resolve(), *(Path(p).resolve() for p in workspace.readonly_sources)]
         if any(not granted_root_allowed(self.backup_root, path) for path in granted):
@@ -546,9 +568,9 @@ class CodexExecAdapter:
         except (OSError, ContainmentError):
             raise ProviderLaunchRefused("provider_unavailable") from None
         try:
+            argv, env = self._command(pinned, home, output_root, run_dir, workspace)
             handle = self.containment.launch(
-                job_id=job.job_id, run_dir=run_dir, argv=codex_argv(pinned.binary, output_root, run_dir),
-                env=codex_env(home, run_dir), cwd=output_root,
+                job_id=job.job_id, run_dir=run_dir, argv=argv, env=env, cwd=output_root,
                 stdin_text=build_prompt(job.task, workspace),
             )
         except ContainmentError as error:
@@ -761,6 +783,7 @@ class CodexExecAdapter:
             "diagnostic_code": diagnostic, "thread_started": state.started,
             "turn_completed": state.turn_completed, "item_counts": state.item_counts,
             "usage": state.usage, "unparsed_lines": state.unparsed_lines, "stop_proof": proof,
+            "provider": self.provider, **state.extra,
             "result_present": self._result_ok(state),
         }
         try:

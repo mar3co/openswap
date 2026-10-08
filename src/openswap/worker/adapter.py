@@ -83,3 +83,18 @@ def production_adapter(backup_root: Path | None = None) -> ProviderAdapter:
     from openswap.worker.codex_exec import CodexExecAdapter
 
     return CodexExecAdapter(Path(backup_root))
+
+
+def production_claude_adapter(backup_root: Path | None = None) -> ProviderAdapter:
+    """The Claude Code adapter on Apple silicon Macs (runs nothing until its own opt-in), else unavailable."""
+    from openswap.worker.codex_cli import platform_supported
+
+    if not platform_supported():
+        return UnavailableCodexAdapter()
+    if backup_root is None:
+        from openswap.paths import get_backup_root
+
+        backup_root = get_backup_root()
+    from openswap.worker.claude_exec import ClaudeCodeAdapter
+
+    return ClaudeCodeAdapter(Path(backup_root))
