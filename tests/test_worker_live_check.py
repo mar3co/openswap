@@ -96,6 +96,7 @@ class SimulatedMac:
 
     def __init__(self, *, sandboxed=True, contain=True, links=True):
         self.links = links
+        self.tmpdir_writes = 0
         self.sandboxed = sandboxed
         self.contain = contain
         self.jobs: dict[str, dict] = {}
@@ -140,6 +141,10 @@ class SimulatedMac:
     def _simulate(self, command, cwd):
         if "inside.txt" in command:
             return (cwd / "inside.txt").read_text(), 0
+        if "notes.txt" in command:  # the approved read-only source is readable
+            return Path(re.search(r"(/[^ ']+notes\.txt)", command).group(1)).read_text(), 0
+        if "TMPDIR" in command and not self.sandboxed:
+            self.tmpdir_writes += 1
         if "inside-write.txt" in command:
             (cwd / "inside-write.txt").write_text("ok")
             return "", 0
@@ -907,3 +912,33 @@ def test_helpers_are_killed_even_if_the_stop_job_fails(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         check._gate_stop(IDENTITY)
     assert (424242, signal.SIGKILL) in killed
+
+
+
+def test_the_exec_probe_covers_a_read_only_source_and_the_job_tmpdir(tmp_path):
+    root = setup_root(tmp_path)
+    gate = make_check(root, SimulatedMac()).run()["gates"]["sandbox_exec"]
+    for key in ("source_read_allowed", "source_write_denied", "source_symlink_read_denied",
+                "job_tmpdir_write_denied"):
+        assert gate[key] is True, key
+    other = tmp_path / "leaky"
+    other.mkdir()
+    leaky = make_check(setup_root(other), SimulatedMac(sandboxed=False)).run()["gates"]["sandbox_exec"]
+    assert leaky["source_write_denied"] is False and leaky["job_tmpdir_write_denied"] is False
+
+
+def test_a_mirror_only_leftover_is_recovered_too(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    leftover = live_check.runs_root(root) / "livecheck-mirror-only"
+    leftover.mkdir(parents=True)  # no handle.json: only the containment mirror knows it
+    seen = []
+
+    def recover(run_dir):
+        seen.append(Path(run_dir).name)
+        return StopProof(False, None, 1)
+
+    mac.recover = recover
+    with pytest.raises(CheckRefused):
+        make_check(root, mac).run()
+    assert seen == ["livecheck-mirror-only"]

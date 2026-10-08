@@ -550,7 +550,8 @@ run directory and in `result.md`.
 exactly as jobs use it: the static tool-surface checks, a `codex sandbox`
 probe, one web-research job, one adversarial `codex exec` job that is asked to
 read and write outside its folder, read `CODEX_HOME`, print its environment,
-use the network and submit a launchd job (each outcome checked on disk and in
+read an approved read-only source (and try to write it and follow a link out
+of it), write its own `$TMPDIR`, use the network and submit a launchd job (each outcome checked on disk and in
 the event stream, with positive controls so a refusal cannot pass), one job
 stopped while a `setsid()` helper runs, and one job whose launching worker
 process is killed and then recovered. It refuses while the worker is running

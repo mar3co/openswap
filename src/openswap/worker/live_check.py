@@ -400,7 +400,7 @@ class LiveCheck:
     # -- the job driver -------------------------------------------------------------
 
     def _job(self, name: str, identity: str, task: str, *, timeout: float, until=None,
-             workspace: Path | None = None) -> JobOutcome:
+             workspace: Path | None = None, sources: tuple[Path, ...] = ()) -> JobOutcome:
         """Run one real job under its own lease; Stop it if ``until()`` turns true."""
         job_id = f"livecheck-{uuid.uuid4().hex}"
         workspace = workspace or self._workspace(name)
@@ -409,7 +409,7 @@ class LiveCheck:
         adapter = self.adapter()
         record = self._job_record(job_id, identity, task)
         try:
-            run = adapter.start(record, ResolvedWorkspace("live-check", workspace, ()), worker_epoch=0)
+            run = adapter.start(record, ResolvedWorkspace("live-check", workspace, tuple(sources)), worker_epoch=0)
         except ProviderLaunchRefused:
             self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
             raise
@@ -540,7 +540,9 @@ class LiveCheck:
         except OSError:
             entries = []
         for entry in entries:
-            if entry.name.startswith("livecheck-") and load_handle(entry) is not None:
+            if entry.name.startswith("livecheck-"):
+                # recover() falls back to the containment mirror when the
+                # directory's own handle is missing or corrupt.
                 proof = self.containment.recover(entry)
                 if proof is not None and proof.stopped is not True:
                     # Something from an earlier check may still be running:
@@ -648,10 +650,18 @@ class LiveCheck:
         gate = self.gates["sandbox_exec"]
         ws = self._workspace("sandbox")
         outside = self._workspace("sandbox-outside")
-        tokens = {name: secrets.token_hex(16) for name in ("inside", "outside", "link", "home", "env")}
+        source = self._workspace("sandbox-source")
+        tokens = {name: secrets.token_hex(16)
+                  for name in ("inside", "outside", "link", "home", "env", "source", "source_link")}
         (ws / "inside.txt").write_text(tokens["inside"] + "\n")
         (outside / "read-me.txt").write_text(tokens["outside"] + "\n")
         (outside / "link-target.txt").write_text(tokens["link"] + "\n")
+        # An approved read-only source, as `workspace add --readonly-source`
+        # grants it: readable, not writable, and a link in it to outside the
+        # grant must not be followed.
+        (source / "notes.txt").write_text(tokens["source"] + "\n")
+        (outside / "source-secret.txt").write_text(tokens["source_link"] + "\n")
+        os.symlink(outside / "source-secret.txt", source / "outside-link.txt")
         sentinel = _new_sentinel(home, "sentinel", tokens["home"] + "\n")
         os.environ[ENV_SENTINEL] = tokens["env"]
         tmp_marker = Path(f"/tmp/openswap-live-check-{secrets.token_hex(6)}.txt")
@@ -671,6 +681,13 @@ class LiveCheck:
             ("symlink_read", f"/bin/sh -c {q('ln -s ' + q(str(outside / 'link-target.txt')) + ' link.txt; cat link.txt')}",
              "link-target.txt", True),
             ("environment", "/usr/bin/env", "/usr/bin/env", True),
+            ("source_read", f"cat {q(str(source / 'notes.txt'))}", str(source / "notes.txt"), True),
+            ("source_write", f"/bin/sh -c {q('printf x > ' + q(str(source / 'write.txt')))}",
+             str(source / "write.txt"), True),
+            ("source_symlink_read", f"cat {q(str(source / 'outside-link.txt'))}", "outside-link.txt", True),
+            # The job's own TMPDIR (under its private run directory), not /tmp.
+            ("job_tmpdir_write", "/bin/sh -c 'printf x > \"$TMPDIR/openswap-tmpdir-probe.txt\"'",
+             "openswap-tmpdir-probe.txt", True),
             ("network", "/usr/bin/curl -sS -m 10 -o /dev/null https://example.com", "example.com", True),
             ("launchd_submit", f"/bin/launchctl submit -l {escape_label} -- /bin/sleep 120", escape_label, True),
         ]
@@ -683,7 +700,8 @@ class LiveCheck:
         )
         loaded = False
         try:
-            outcome = self._job("sandbox", identity, task, timeout=self.probe_timeout, workspace=ws)
+            outcome = self._job("sandbox", identity, task, timeout=self.probe_timeout, workspace=ws,
+                                sources=(source,))
         finally:
             os.environ.pop(ENV_SENTINEL, None)
             try:
@@ -774,6 +792,14 @@ class LiveCheck:
             # be gone by the time the label is checked.
             "launchd_submit_contained": bool(submits) and not loaded and all(
                 type(i["exit_code"]) is int and i["exit_code"] != 0 for i in submits),
+            "source_read_allowed": tokens["source"] in "".join(
+                i["output"] for i in observed(str(source / "notes.txt")) if i["exit_code"] == 0),
+            "source_write_denied": _all_failed(observed(str(source / "write.txt")))
+            and not os.path.lexists(source / "write.txt"),
+            "source_symlink_read_denied": _all_failed(observed("outside-link.txt"))
+            and tokens["source_link"] not in everything,
+            "job_tmpdir_write_denied": _all_failed(observed("openswap-tmpdir-probe.txt"))
+            and not os.path.lexists(outcome.run_dir / "tmp" / "openswap-tmpdir-probe.txt"),
             "execution_stopped": outcome.stopped,
         }
         try:
