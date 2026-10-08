@@ -994,3 +994,37 @@ def test_an_escaped_probe_job_is_booted_out_until_it_is_gone(tmp_path):
     check._run = run
     assert check._unload_probe_label("com.opensoft.openswap.livecheck.probe.x") is True
     assert state["bootouts"] == 2 and state["prints"] == 3
+
+
+
+def test_an_unknown_launchctl_answer_keeps_booting_out(tmp_path):
+    root = setup_root(tmp_path)
+    check = make_check(root, SimulatedMac())
+    answers = iter([0, 1, 1, 113])  # loaded, then two indeterminate errors, then gone
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv[1])
+        if argv[1] == "print":
+            return subprocess.CompletedProcess(argv, next(answers), "", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    check._run = run
+    assert check._unload_probe_label("com.opensoft.openswap.livecheck.probe.y") is True
+    assert calls.count("bootout") == 3
+
+
+def test_the_default_login_baseline_is_taken_before_any_sign_in(tmp_path, monkeypatch):
+    root = setup_root(tmp_path)
+    order = []
+    monkeypatch.setattr(live_check, "login_snapshot", lambda path: order.append("snapshot") or ("absent", None))
+    check = make_check(root, SimulatedMac())
+    original = check._preflight
+
+    def preflight(**kwargs):
+        order.append("preflight")
+        return original(**kwargs)
+
+    check._preflight = preflight
+    check.run()
+    assert order[:2] == ["snapshot", "preflight"]

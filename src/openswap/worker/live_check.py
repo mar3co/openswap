@@ -848,18 +848,26 @@ class LiveCheck:
         out and polled until gone (the owner is told if it would not go)."""
         target = f"gui/{os.getuid()}/{label}"
 
-        def present() -> bool:
-            return self._run(["/bin/launchctl", "print", target], capture_output=True, text=True,
-                             check=False, timeout=20).returncode == 0
+        def present() -> bool | None:
+            # Tri-state like LaunchdContainment.label_loaded: only a known
+            # not-found result is absence; any other failure is unknown.
+            result = self._run(["/bin/launchctl", "print", target], capture_output=True, text=True,
+                               check=False, timeout=20)
+            if result.returncode == 0:
+                return True
+            if result.returncode in (113, 3) or "could not find" in (result.stderr or "").lower():
+                return False
+            return None
 
         try:
-            loaded = present()
+            state = present()
+            loaded = state is not False  # unknown counts as an escape
             if loaded:
                 deadline = self._monotonic() + self.PROBE_UNLOAD_WAIT
                 while True:
                     self._run(["/bin/launchctl", "bootout", target], capture_output=True, text=True,
                               check=False, timeout=20)
-                    if not present():
+                    if present() is False:
                         break
                     if self._monotonic() >= deadline:
                         self.out(f"  warning: the escaped probe job {label} is still loaded; "
@@ -1031,9 +1039,11 @@ class LiveCheck:
             barrier.release()
 
     def _run_gates(self, *, install=None, login=None) -> dict:
-        pinned, choice, identity, home = self._preflight(install=install, login=login)
+        # Before the preflight: its install and sign-in prompts run the pinned
+        # CLI, and a default login they changed must not become the baseline.
         default_auth = auth_path(codex_home())
         default_before = login_snapshot(default_auth)
+        pinned, choice, identity, home = self._preflight(install=install, login=login)
         # Outside the private worker directory: the adapter refuses any job
         # folder that overlaps it, since that would expose CODEX_HOME.
         self.check_root = self.root / "live-check" / _stamp()
