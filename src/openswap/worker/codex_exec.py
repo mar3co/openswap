@@ -71,6 +71,11 @@ from openswap.settings import load_live_execution
 
 PROFILE_NAME = "openswap-research"
 RESULT_FILE = "result.md"
+# Codex writes its final message here, in the private run directory: never in
+# the model-writable folder, where a planted symlink could redirect that
+# unsandboxed write. The adapter publishes it as result.md after the sweep.
+LAST_MESSAGE_FILE = "last-message.md"
+MAX_RESULT_BYTES = 1024 * 1024
 SUMMARY_FILE = "summary.json"
 MAX_LINE_BYTES = 1024 * 1024
 READ_CHUNK_BYTES = 256 * 1024
@@ -241,12 +246,52 @@ def global_args() -> list[str]:
     return args
 
 
-def codex_argv(binary: Path, output_root: Path) -> list[str]:
+def codex_argv(binary: Path, output_root: Path, run_dir: Path) -> list[str]:
     """Fixed launcher arguments; nothing comes from the remote caller."""
     return [
         str(binary), *global_args(), "exec", "--json", "--ephemeral", "--skip-git-repo-check",
-        "--cd", str(output_root), "--output-last-message", str(output_root / RESULT_FILE), "-",
+        "--cd", str(output_root), "--output-last-message", str(run_dir / LAST_MESSAGE_FILE), "-",
     ]
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    return a == b or a.is_relative_to(b) or b.is_relative_to(a)
+
+
+def publish_result(run_dir: Path, output_root: Path) -> bool:
+    """Copy Codex's final message to ``output_root/result.md`` without following links.
+
+    Runs only after the job's processes are proven gone, so nothing can race
+    it. Whatever the model left at that name is removed first (a directory
+    there fails the job); the new file is created exclusively, never through
+    a symlink.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(run_dir / LAST_MESSAGE_FILE, flags)
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size == 0 or info.st_size > MAX_RESULT_BYTES:
+            return False
+        data = os.read(fd, MAX_RESULT_BYTES)
+    finally:
+        os.close(fd)
+    target = output_root / RESULT_FILE
+    try:
+        if os.path.lexists(target):
+            if os.path.isdir(target) and not os.path.islink(target):
+                return False
+            os.unlink(target)
+        out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return False
+    try:
+        os.write(out, data)
+    finally:
+        os.close(out)
+    return True
 
 
 def build_prompt(task: str, workspace: ResolvedWorkspace) -> str:
@@ -353,6 +398,12 @@ class CodexExecAdapter:
             # leased one: never run on whatever is there.
             raise ProviderLaunchRefused("provider_auth_unavailable")
         output_root = Path(workspace.output_root)
+        private = (self.backup_root / "worker").resolve()
+        granted = [output_root.resolve(), *(Path(p).resolve() for p in workspace.readonly_sources)]
+        if any(_overlaps(private, path) for path in granted):
+            # A writable or readable root that contains (or is inside) the
+            # worker's private directory would expose CODEX_HOME to the model.
+            raise ProviderLaunchRefused("provider_unavailable")
         try:
             ensure_private_dir(runs_root(self.backup_root))
             run_dir = runs_root(self.backup_root) / job.job_id
@@ -366,7 +417,7 @@ class CodexExecAdapter:
             raise ProviderLaunchRefused("provider_unavailable") from None
         try:
             handle = self.containment.launch(
-                job_id=job.job_id, run_dir=run_dir, argv=codex_argv(pinned.binary, output_root),
+                job_id=job.job_id, run_dir=run_dir, argv=codex_argv(pinned.binary, output_root, run_dir),
                 env=codex_env(home, run_dir), cwd=output_root,
                 stdin_text=build_prompt(job.task, workspace),
             )
@@ -497,17 +548,18 @@ class CodexExecAdapter:
 
     def _result_ok(self, state: _Run) -> bool:
         try:
-            info = (state.output_root / RESULT_FILE).lstat()
+            info = (state.run_dir / LAST_MESSAGE_FILE).lstat()
         except OSError:
             return False
-        return stat.S_ISREG(info.st_mode) and info.st_size > 0
+        return stat.S_ISREG(info.st_mode) and 0 < info.st_size <= MAX_RESULT_BYTES
 
     def _finish(self, state: _Run) -> SafeEvent:
         """Sweep the job, then report its outcome with the sweep's proof."""
         exit_status = self.containment.exit_status(state.handle)
         proof = self.containment.stop(state.handle)
         state.finished = True
-        if exit_status == 0 and state.turn_completed and state.failure is None and self._result_ok(state):
+        if (exit_status == 0 and state.turn_completed and state.failure is None and self._result_ok(state)
+                and proof.stopped is True and publish_result(state.run_dir, state.output_root)):
             outcome, diagnostic = JobState.SUCCEEDED, None
         else:
             outcome = JobState.FAILED

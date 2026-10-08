@@ -15,6 +15,8 @@ import subprocess
 
 import pytest
 
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="the live Codex adapter is macOS-only")
+
 from openswap.settings import (
     LiveExecutionSettings,
     WorkerWorkspace,
@@ -86,7 +88,7 @@ class FakeContainment:
         cont._save_handle(handle)
         (Path(run_dir) / "stdout.jsonl").write_text("".join(json.dumps(line) + "\n" for line in self.script))
         if self.result is not None:
-            (Path(cwd) / "result.md").write_text(self.result)
+            (Path(run_dir) / "last-message.md").write_text(self.result)
         if self.exit is not None:
             (Path(run_dir) / "exit").write_text(f"{self.exit}\n")
         else:
@@ -180,7 +182,7 @@ def test_config_selects_the_research_profile_and_never_a_sandbox_mode(tmp_path):
 
 
 def test_argv_is_fixed_and_has_no_override_surfaces(tmp_path):
-    argv = codex_exec.codex_argv(Path("/x/codex"), tmp_path / "out")
+    argv = codex_exec.codex_argv(Path("/x/codex"), tmp_path / "out", tmp_path / "run")
     assert argv[0] == "/x/codex" and argv[-1] == "-"
     assert "exec" in argv and "--json" in argv and "--skip-git-repo-check" in argv
     for forbidden in ("--sandbox", "-s", "--add-dir", "-m", "--model", "-c", "--config", "resume", "fork",
@@ -189,7 +191,8 @@ def test_argv_is_fixed_and_has_no_override_surfaces(tmp_path):
     disabled = [argv[i + 1] for i, value in enumerate(argv) if value == "--disable"]
     assert "shell_tool" not in disabled
     assert {"apps", "hooks", "plugins", "browser_use", "computer_use", "multi_agent"} <= set(disabled)
-    assert argv[argv.index("--output-last-message") + 1] == str(tmp_path / "out" / "result.md")
+    # The unsandboxed final-message write goes to the private run directory.
+    assert argv[argv.index("--output-last-message") + 1] == str(tmp_path / "run" / "last-message.md")
 
 
 def test_environment_is_an_allowlist(tmp_path, monkeypatch):
@@ -298,6 +301,7 @@ def test_successful_run_maps_to_started_then_succeeded_with_stop_proof(tmp_path)
     assert summary["usage"] == {"input_tokens": 10, "output_tokens": 5}
     assert "done" not in json.dumps(summary)  # no model text
     assert adapter.events(run, after_cursor=finished.cursor) == ()
+    assert (workspace(tmp_path).output_root / "result.md").read_text() == "# Result\nhttps://example.com\n"
 
 
 def test_unproven_stop_is_reported_without_execution_stopped(tmp_path):
@@ -731,3 +735,41 @@ def test_codex_status_lists_isolated_sign_ins(tmp_path):
     signed = {a["slot"]: a["isolated_sign_in"] for a in status["accounts"]}
     assert signed == {"1": True, "2": False}
     assert status["execution_mode"] == "disabled"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks")
+def test_a_planted_result_symlink_is_replaced_not_followed(tmp_path):
+    sign_in(tmp_path)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("owner data")
+    ws = workspace(tmp_path)
+    (ws.output_root / "result.md").symlink_to(victim)
+    adapter = make_adapter(tmp_path, FakeContainment(SUCCESS_SCRIPT))
+    run = adapter.start(job_record(), ws, worker_epoch=1)
+    assert drain(adapter, run)[-1].state == JobState.SUCCEEDED
+    assert victim.read_text() == "owner data"
+    result = ws.output_root / "result.md"
+    assert not result.is_symlink() and result.read_text().startswith("# Result")
+
+
+def test_result_is_not_published_without_stop_proof(tmp_path):
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    containment.proof = StopProof(False, False, 1)
+    adapter = make_adapter(tmp_path, containment)
+    run = adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    finished = drain(adapter, run)[-1]
+    assert finished.state == JobState.FAILED and finished.execution_stopped is False
+    assert not (workspace(tmp_path).output_root / "result.md").exists()
+
+
+def test_roots_overlapping_the_private_worker_dir_are_refused(tmp_path):
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    adapter = make_adapter(tmp_path, containment)
+    out = workspace(tmp_path).output_root
+    for sources in ((tmp_path,), (tmp_path / "worker" / "codex-homes",)):
+        with pytest.raises(ProviderLaunchRefused) as error:
+            adapter.start(job_record(), ResolvedWorkspace("research", out, sources), worker_epoch=1)
+        assert error.value.diagnostic_code == "provider_unavailable"
+    assert containment.launches == []
