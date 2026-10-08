@@ -35,6 +35,8 @@ APPROVAL = "waiting_for_approval"
 # sent as: the service's diagnostic list is closed. `worker status` and the
 # local journal keep the specific code.
 WIRE_DIAGNOSTICS = {"workspace_refused": "provider_unavailable"}
+# How often the readiness report rescans folders of repos when nothing changed.
+FOLDER_RESCAN_SECONDS = 30.0
 # Validation failures the service (or the local export check) reports for one
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
@@ -453,11 +455,20 @@ class RemoteClient:
 
         from openswap.worker.cli import launchable_workspaces
 
-        # A folder of repos is reported as its repos, scanned again for each
-        # report; at most the protocol's 20 folders.
-        launchable = launchable_workspaces(self.runtime.backup_root, policy.workspaces)
-        folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict()
-                   for w in launchable if offerable(self.runtime.backup_root, w, launchable)][:MAX_REPORTED_FOLDERS]
+        # A folder of repos is reported as its repos, scanned again when the
+        # settings change and at least every FOLDER_RESCAN_SECONDS (the scan
+        # runs git for each repo, so not on every tick); at most the
+        # protocol's 20 folders.
+        cached = getattr(self, "_folders_cache", None)
+        now = time.monotonic()
+        if cached is not None and cached[0] == policy.workspaces and now - cached[1] < FOLDER_RESCAN_SECONDS:
+            folders = cached[2]
+        else:
+            launchable = launchable_workspaces(self.runtime.backup_root, policy.workspaces)
+            folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict()
+                       for w in launchable
+                       if offerable(self.runtime.backup_root, w, launchable)][:MAX_REPORTED_FOLDERS]
+            self._folders_cache = (policy.workspaces, now, folders)
         # The pinned account's provider decides (a Claude pin reports Claude's opt-in).
         mode_of = getattr(self.runtime, "execution_mode", None)
         if callable(mode_of):

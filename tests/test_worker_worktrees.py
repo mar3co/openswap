@@ -446,7 +446,8 @@ def test_a_tampered_worktree_is_never_finished_or_run_by_the_worker(root, home):
     (tree.git_dir / "commondir").write_text("/somewhere/else/.git\n")
     assert worktrees.finish(tree, "left over") is False
     # A rewritten .git file in the worktree is never followed: the worker uses its own record.
-    (resolved.work_dir / ".git").write_text(f"gitdir: {repo / '.git'}\n")
+    if os.name == "posix":  # Windows keeps the .git file hidden and read-only
+        (resolved.work_dir / ".git").write_text(f"gitdir: {repo / '.git'}\n")
     assert worktrees.load_record(resolved.work_dir) == tree
     listed = {item.job_id: item for item in worktrees.list_all(home / "OpenSwap Research")}
     assert listed["a" * 32].intact is False
