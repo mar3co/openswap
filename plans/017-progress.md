@@ -1406,3 +1406,31 @@ whether it executes for real.
   listing and feeds the reported IDs to the Slack/agent workspace list.
 
 Execution is still disabled until Phase 1's live-evidence gates clear.
+
+
+## Setup asks which folders tasks may read (2026-10-08)
+
+Owner feedback on `openswap worker setup`: offering to "create and approve
+~/OpenSwap Research as research folder" made no sense, because most owners
+already keep their code in a repo or a GitHub folder.
+
+- The folder step now asks one question: which folders remote tasks may read.
+  It lists likely code folders in the home folder (`~/GitHub`,
+  `~/Documents/GitHub`, `~/Developer`, `~/Code`, `~/Projects`, `~/src`,
+  `~/repos`, `~/dev`, plus the repos of a folder holding three or fewer),
+  with a GitHub folder first and marked "recommended" as the Enter default.
+  The answer is numbers (`1 3`, `1,3`) or a path; with nothing found it asks
+  for the path to the code folder.
+- Each chosen folder becomes its own workspace: ID from the folder's name
+  (unique), label the folder's name, the folder as its only read-only
+  source, and results in `~/OpenSwap Research/<id>`, created 0700 without
+  asking. The first replaces the built-in `research` workspace unless a job
+  may still run or upload in it. The owner never approves a results folder.
+- Readable folders refuse the home folder, system folders, `~/Library` and
+  hidden folders, credential homes and the results folder, and must pass the
+  read-only source checks the worker repeats at launch.
+- `openswap worker workspace add --read <folder>` makes the same workspace;
+  `add <id> <folder>` is unchanged. The summary lists "Readable folders" by
+  ID and label; the readiness report is still IDs and labels only, so
+  OpenTag's Slack folder hints follow the new IDs without a protocol or
+  OpenTag change.

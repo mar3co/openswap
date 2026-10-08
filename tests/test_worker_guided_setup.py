@@ -2,11 +2,11 @@
 
 ``openswap worker pair``/``setup`` and the menu bar's "Set up Remote tasks…"
 walk the owner through the same steps: start the worker, confirm the Codex
-account, approve a research folder (``~/OpenSwap Research`` as ``research``
-by default), then a summary. The worker then reports its approved folders
-(ID and label, never a path) and its execution mode to the control service
-through the ``readiness`` extension. No Keychain, launchctl or provider auth
-is touched: the research folder default points into the test's temp dir.
+account, choose the folders tasks may read (a GitHub folder is recommended;
+results go to ``~/OpenSwap Research/<id>``), then a summary. The worker then
+reports its approved folders (ID and label, never a path) and its execution
+mode to the control service through the ``readiness`` extension. No Keychain,
+launchctl or provider auth is touched: the home folder is the test's temp dir.
 """
 
 from __future__ import annotations
@@ -45,15 +45,18 @@ OFFER = "Start the Remote tasks worker now so this Mac can accept approved tasks
 # The fixture roster has six eligible accounts: Codex 1, 2, 5, 6 and Claude 1, 4.
 ACCOUNT = "Account number (1-6; Enter to skip): "
 KEEP = "Account number (1-6; Enter keeps the current one) [1]: "
-ANOTHER = "Another folder to approve (path; Enter to finish): "
+PICK = "Folders tasks may read (numbers like 1 3, or a path; Enter for 1) [1]: "
+KEEP_FOLDERS = "Folders tasks may read (numbers like 1 3, or a path; Enter keeps the current ones): "
+TYPE_PATH = "Type the path to your code folder, for example ~/GitHub (Enter to skip): "
 SUMMARY = "Step 4 of 4 · Summary"
 
 
 @pytest.fixture(autouse=True)
 def research_home(tmp_path, monkeypatch):
-    """The default folder lives in the test's temp dir, never the real home."""
+    """The home folder (and ~/OpenSwap Research in it) is the test's temp dir, never the real home."""
     folder = tmp_path / "home" / "OpenSwap Research"
     folder.parent.mkdir()
+    monkeypatch.setattr(cli, "home_folder", lambda: folder.parent)
     monkeypatch.setattr(cli, "default_research_folder", lambda: folder)
     # The summary checks whether the LaunchAgent is loaded; never ask launchctl.
     monkeypatch.setattr(cli, "_managed_worker_loaded", lambda: False)
@@ -96,19 +99,39 @@ def _builtin(root):
     return cli.is_builtin_default_registry(root, load_worker_settings(root).workspaces)
 
 
+def _code(home, *names, mode=0o755):
+    """Folders (and ``.git`` dirs for repos) in the fake home; returns the first one."""
+    made = []
+    for name in names:
+        folder = home / name
+        folder.mkdir(parents=True, exist_ok=True)
+        for path in [folder, *folder.parents]:
+            if path == home:
+                break
+            os.chmod(path, mode)
+        made.append(folder)
+    return made[0]
+
+
+@pytest.fixture
+def github(research_home):
+    """``~/GitHub`` in the fake home, as most owners have it."""
+    return _code(research_home.parent, "GitHub")
+
+
 # --- pair: the guided steps, in order -------------------------------------------------------
 
 
 def test_pair_walks_worker_account_then_folder_then_summary(root, keychain, monkeypatch, capsys,
-                                                           enable_calls, research_home):
-    assert _pair(root, monkeypatch, interactive=True, answers=["y", "2", "y", ""]) == 0
+                                                           enable_calls, research_home, github):
+    assert _pair(root, monkeypatch, interactive=True, answers=["y", "2", ""]) == 0
     out = capsys.readouterr().out
     assert enable_calls == [root]
     assert guided_setup.WORKER_ONLINE in out
     # Worker first, then the account, then the folder, then the summary.
     assert (out.index("Step 1 of 4 · Worker") < out.index(OFFER) < out.index("Step 2 of 4 · Account")
-            < out.index("Choose the account remote jobs run on") < out.index("Step 3 of 4 · Research folder")
-            < out.index("Create and approve") < out.index(SUMMARY))
+            < out.index("Choose the account remote jobs run on") < out.index("Step 3 of 4 · Folders")
+            < out.index(PICK) < out.index(SUMMARY))
     # Codex and Claude accounts are both offered, numbered by menu position with
     # the slot beside them; the API-key Codex slot is not.
     assert "  • 1  Codex   alice@example.com   (work)     slot 1" in out
@@ -119,23 +142,32 @@ def test_pair_walks_worker_account_then_folder_then_summary(root, keychain, monk
     assert "Pinned Codex account 2 · bob@example.com" in out
     policy = load_worker_settings(root)
     assert policy.pinned_account_ref == BOB
+    # The built-in `research` folder is replaced: tasks read ~/GitHub and never
+    # change it; results go to ~/OpenSwap Research/github, created owner-only.
+    assert "Remote tasks can read the folders you choose here, but never change them." in out
+    assert "Results are saved under ~/OpenSwap Research." in out
+    assert "  • 1  ~/GitHub  (recommended)" in out
     (workspace,) = policy.workspaces
-    assert workspace.workspace_id == "research" and workspace.output_root == research_home.resolve()
-    assert workspace.display_label == "OpenSwap Research"
+    assert workspace.workspace_id == "github" and workspace.display_label == "GitHub"
+    assert workspace.readonly_roots == (github.resolve(),)
+    assert workspace.output_root == (research_home / "github").resolve()
     if os.name == "posix":
         assert stat.S_IMODE(research_home.stat().st_mode) == 0o700
-    assert '(the portal shows "OpenSwap Research")' in out
-    assert "  ✓ Folders    research (OpenSwap Research)" in out
-    assert "  • Execution  disabled" in out and guided_setup.EXECUTION_OFF_NOTE in out
+        assert stat.S_IMODE(workspace.output_root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(github.stat().st_mode) == 0o755  # never changed
+    assert ('✓ Tasks can read ~/GitHub as "github" (the portal shows "GitHub"); results go to '
+            '~/OpenSwap Research/github.') in out
+    assert "  ✓ Readable folders  github (GitHub)" in out
+    assert "  • Execution         disabled" in out and guided_setup.EXECUTION_OFF_NOTE in out
     assert SECRET not in out
 
 
 def test_pair_on_a_tty_can_skip_every_step(root, keychain, monkeypatch, capsys, enable_calls):
-    assert _pair(root, monkeypatch, interactive=True, answers=["n", "", "n", ""]) == 0
+    assert _pair(root, monkeypatch, interactive=True, answers=["n", "", ""]) == 0
     out = capsys.readouterr().out
     assert "Not started. Start it later with `openswap worker enable`." in out
     assert "Skipped. Pin one later" in out
-    assert guided_setup.FOLDER_NEXT in out
+    assert "No folder chosen. Choose one later with `openswap worker workspace add --read <folder>`" in out
     assert enable_calls == []
     policy = load_worker_settings(root)
     assert policy.pinned_account_ref is None and policy.enabled is False
@@ -211,11 +243,12 @@ def test_eof_at_the_menu_keeps_the_pin_and_says_so(root, keychain, monkeypatch, 
 def test_pair_without_a_tty_prints_each_next_step(root, keychain, monkeypatch, capsys, enable_calls):
     assert _pair(root, monkeypatch, interactive=False, answers=["y", "1", "y"]) == 0  # never read
     out = capsys.readouterr().out
-    assert OFFER not in out and ACCOUNT not in out and "Create and approve" not in out
+    assert OFFER not in out and ACCOUNT not in out and "Folders tasks may read" not in out
     for line in (guided_setup.START_WORKER_NEXT, guided_setup.ACCOUNT_NEXT, guided_setup.FOLDER_NEXT,
                  guided_setup.EXECUTION_OFF_NOTE):
         assert line in out
-    assert "openswap worker workspace add <id> <folder>" in out
+    assert "openswap worker workspace add --read <folder>" in out
+    assert "  • Readable folders  none (tasks read no folder on this Mac)" in out
     assert enable_calls == [] and _builtin(root)
     assert load_worker_settings(root).pinned_account_ref is None
 
@@ -234,7 +267,7 @@ def test_pair_when_already_enabled_toggles_nothing(root, keychain, monkeypatch, 
     out = capsys.readouterr().out
     assert OFFER not in out and expected in out
     assert enable_calls == [] and load_worker_settings(root).enabled is True
-    assert ("  ✓ Worker     running" if process == "running" else "  ✗ Worker     enabled but not running") in out
+    assert ("  ✓ Worker            running" if process == "running" else "  ✗ Worker            enabled but not running") in out
 
 
 @pytest.mark.parametrize("error, expected", [
@@ -261,7 +294,7 @@ def test_pair_reports_a_refused_enable_and_the_manual_command(root, keychain, mo
 @pytest.mark.parametrize("step, fallback", [
     ("offer_worker", guided_setup.START_WORKER_NEXT),
     ("confirm_account", guided_setup.ACCOUNT_NEXT),
-    ("approve_folders", guided_setup.FOLDER_NEXT),
+    ("choose_folders", guided_setup.FOLDER_NEXT),
 ])
 def test_a_failing_step_prints_its_command_and_the_rest_still_run(root, keychain, monkeypatch, capsys,
                                                                   enable_calls, step, fallback):
@@ -286,13 +319,13 @@ def test_summary_is_ready_only_when_admission_is_open(root, monkeypatch, capsys,
     monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": "running", "remote_connectivity": "online"})
     assert _setup(root, monkeypatch, ["", "y", ""]) == 0
     out = capsys.readouterr().out
-    assert "  ✗ Worker     running (admission paused)" in out
+    assert "  ✗ Worker            running (admission paused)" in out
     assert "Before Slack can start tasks on this Mac:\n  1. reopen admission (`openswap worker pause --off`)" in out
     assert "Ready for Slack" not in out
     update_worker_settings(root, paused=False)
     assert _setup(root, monkeypatch, ["", ""]) == 0
     out = capsys.readouterr().out
-    assert "  ✓ Worker     running\n" in out and "Ready for Slack" in out
+    assert "  ✓ Worker            running\n" in out and "Ready for Slack" in out
 
 
 @pytest.mark.parametrize(("process", "loaded", "worker"), [
@@ -331,7 +364,7 @@ def test_summary_waits_briefly_for_a_starting_worker(root, monkeypatch, capsys, 
     monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: None)
     guided_setup.summary(root, _Say())
     out = capsys.readouterr().out
-    assert "  ✓ Worker     running\n" in out and "wait for the worker" not in out
+    assert "  ✓ Worker            running\n" in out and "wait for the worker" not in out
 
 
 def test_summary_never_calls_a_stuck_starting_worker_ready(root, monkeypatch, capsys, research_home):
@@ -342,7 +375,7 @@ def test_summary_never_calls_a_stuck_starting_worker_ready(root, monkeypatch, ca
     guided_setup.summary(root, _Say(),
                          start_wait_s=0)
     out = capsys.readouterr().out
-    assert "  • Worker     starting" in out and "Ready for Slack" not in out
+    assert "  • Worker            starting" in out and "Ready for Slack" not in out
     assert "wait for the worker to finish starting" in out
 
 
@@ -379,7 +412,7 @@ def test_summary_waits_briefly_for_the_service_connection(root, monkeypatch, cap
     monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: None)
     guided_setup.summary(root, _Say())
     out = capsys.readouterr().out
-    assert f"  ✓ Service    {URL} (online)" in out and "Ready for Slack" in out
+    assert f"  ✓ Service           {URL} (online)" in out and "Ready for Slack" in out
 
 
 def test_allowed_accounts_without_a_pinned_default_are_not_ready(root, monkeypatch):
@@ -395,12 +428,12 @@ class _Say:
         print(text)
 
 
-def test_a_failing_pin_keeps_the_setup_going(root, keychain, monkeypatch, capsys, enable_calls):
+def test_a_failing_pin_keeps_the_setup_going(root, keychain, monkeypatch, capsys, enable_calls, github):
     monkeypatch.setattr(cli, "set_worker_account", lambda *_: (_ for _ in ()).throw(OSError("disk")))
-    assert _pair(root, monkeypatch, interactive=True, answers=["n", "1", "y"]) == 0
+    assert _pair(root, monkeypatch, interactive=True, answers=["n", "1", ""]) == 0
     out = capsys.readouterr().out
     assert "Could not pin that account" in out
-    assert load_worker_settings(root).workspaces[0].workspace_id == "research" and not _builtin(root)
+    assert load_worker_settings(root).workspaces[0].workspace_id == "github" and not _builtin(root)
 
 
 # --- the folder step ------------------------------------------------------------------------
@@ -417,48 +450,270 @@ def test_setup_needs_a_pairing(root, capsys):
     assert "`openswap worker pair <url> <code>`" in capsys.readouterr().err
 
 
-def test_setup_reruns_the_steps_on_a_paired_mac(root, monkeypatch, capsys, enable_calls, research_home):
+def test_setup_reruns_the_steps_on_a_paired_mac(root, monkeypatch, capsys, enable_calls, research_home, github):
     cli.set_worker_account(root, "1")
-    assert _setup(root, monkeypatch, ["y", "", "y", ""]) == 0
+    assert _setup(root, monkeypatch, ["y", "", ""]) == 0
     out = capsys.readouterr().out
-    assert enable_calls == [root] and "Create and approve" in out
-    assert load_worker_settings(root).workspaces[0].output_root == research_home.resolve()
-    # Run again: the default is approved now, so it lists folders and offers others.
+    assert enable_calls == [root] and PICK in out
+    (workspace,) = load_worker_settings(root).workspaces
+    assert workspace.workspace_id == "github"
+    # Run again: ~/GitHub is readable now (✓); Enter keeps the current folders.
     assert _setup(root, monkeypatch, ["n", "", ""]) == 0
     out = capsys.readouterr().out
-    assert "Create and approve" not in out
-    assert "Approved research folders (the control service sees only the ID and label):" in out
-    assert '  ✓ 1  research  "OpenSwap Research"  ' in out and ANOTHER in out
+    assert "  ✓ 1  ~/GitHub  (recommended, readable as github)" in out
+    assert KEEP_FOLDERS in out and PICK not in out
+    assert "Kept the current folders." in out
+    assert load_worker_settings(root).workspaces == (workspace,)
+    # Choosing it again changes nothing either.
+    assert _setup(root, monkeypatch, ["n", "", "1"]) == 0
+    assert '✓ ~/GitHub is already readable as "github".' in capsys.readouterr().out
+    assert load_worker_settings(root).workspaces == (workspace,)
+
+
+def test_setup_without_a_tty_lists_the_readable_folders(root, monkeypatch, capsys, enable_calls, github):
+    cli.add_readable_folder(root, github)
+    configure_worker_service(root, URL, "worker-1")
+    _answers(monkeypatch, [], interactive=False)
+    assert _run(root, "setup") == 0
+    out = capsys.readouterr().out
+    assert "Folders remote tasks may read, never change (the control service sees only the ID and label):" in out
+    assert '  ✓ 1  github  "GitHub"  ~/GitHub' in out
+    assert "  ✓ Readable folders  github (GitHub)" in out
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits only")
-def test_folder_step_refuses_an_existing_folder_others_can_read(root, monkeypatch, capsys, enable_calls,
-                                                                research_home):
-    research_home.mkdir()
-    os.chmod(research_home, 0o755)
-    assert _setup(root, monkeypatch, ["n", "", "y", ""]) == 0
+def test_folder_step_refuses_a_results_folder_others_can_read(root, monkeypatch, capsys, enable_calls,
+                                                              research_home, github):
+    results = research_home / "github"
+    results.mkdir(parents=True)
+    os.chmod(results, 0o755)
+    assert _setup(root, monkeypatch, ["n", "", ""]) == 0
     assert "chmod 700" in capsys.readouterr().out
     assert _builtin(root)
-    assert stat.S_IMODE(research_home.stat().st_mode) == 0o755  # never changed for the owner
+    assert stat.S_IMODE(results.stat().st_mode) == 0o755  # never changed for the owner
 
 
-def test_folder_step_adds_other_folders_with_a_suggested_id(root, monkeypatch, capsys, enable_calls, tmp_path):
-    docs = tmp_path / "Team Docs!"
-    assert _setup(root, monkeypatch, ["n", "", "y", str(docs), "", str(tmp_path / "bad"), "Bad ID",
-                                      ""]) == 0
+# --- finding the folders ----------------------------------------------------------------------
+
+
+def _menu_paths(root):
+    return [guided_setup._display_path(folder) for folder in cli.detect_code_folders(root)]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlinks and POSIX permission bits")
+def test_detection_lists_a_github_folder_first_with_its_few_repos(root, research_home):
+    home = research_home.parent
+    _code(home, "Developer", "Projects", "GitHub/openswap/.git", "GitHub/opentag/.git", "GitHub/notes",
+          "Documents/GitHub")
+    for number in range(4):  # more than a few repos: Projects is offered only as a whole
+        _code(home, f"Projects/repo{number}/.git")
+    (home / "Code").write_text("not a folder")
+    (home / "src").symlink_to(home / "GitHub")  # the same folder twice is listed once
+    _code(home, "dev", mode=0o777)  # others can change it: refused
+    _code(home, "repos/.hidden/.git")
+    assert _menu_paths(root) == ["~/GitHub", "~/GitHub/openswap", "~/GitHub/opentag", "~/Documents/GitHub",
+                                 "~/Developer", "~/Projects", "~/repos"]
+    menu = guided_setup.folder_menu(root, load_worker_settings(root).workspaces)
+    assert menu.recommended == 0
+    assert menu.lines[:3] == ("  • 1  ~/GitHub            (recommended)",
+                              "  • 2  ~/GitHub/openswap   (git repo)",
+                              "  • 3  ~/GitHub/opentag    (git repo)")
+    assert "recommended" not in "".join(menu.lines[1:])
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlinks and POSIX permission bits")
+def test_a_folder_named_github_anywhere_is_recommended(root, research_home):
+    home = research_home.parent
+    _code(home, "Code", "work/github")
+    (home / "src").symlink_to(home / "work" / "github")  # found after ~/Code, listed before it
+    assert _menu_paths(root) == ["~/work/github", "~/Code"]
+    assert guided_setup.folder_menu(root, ()).recommended == 0
+
+
+def test_without_a_github_folder_the_first_other_one_is_the_default(root, monkeypatch, capsys, enable_calls,
+                                                                     research_home):
+    _code(research_home.parent, "Projects", "src")
+    assert _setup(root, monkeypatch, ["n", "", ""]) == 0
     out = capsys.readouterr().out
-    assert "Folder ID [team-docs]: " in out
-    assert cli._WORKSPACE_MESSAGES["workspace_id_invalid"] in out
-    ids = [(w.workspace_id, w.display_label) for w in load_worker_settings(root).workspaces]
-    assert ids == [("research", "OpenSwap Research"), ("team-docs", "Team Docs!")]
+    assert "  • 1  ~/Projects\n  • 2  ~/src\n" in out and "recommended" not in out
+    assert PICK in out
+    (workspace,) = load_worker_settings(root).workspaces
+    assert (workspace.workspace_id, workspace.display_label) == ("projects", "Projects")
 
 
-def test_suggested_ids_are_valid_and_free():
-    taken = {"research", "notes"}
-    assert guided_setup.suggested_folder_id(Path("/x/Notes"), taken) == "notes-2"
-    assert guided_setup.suggested_folder_id(Path("/x/Résumé 2026"), taken) == "r-sum-2026"
-    assert guided_setup.suggested_folder_id(Path("/x/___"), taken) == "folder"
-    assert len(guided_setup.suggested_folder_id(Path("/x/" + "a" * 90), set())) <= 64
+def test_with_nothing_found_the_step_asks_for_a_path(root, monkeypatch, capsys, enable_calls, tmp_path):
+    work = _code(tmp_path, "My Code.v2")
+    assert _setup(root, monkeypatch, ["n", "", "1", str(work)]) == 0
+    out = capsys.readouterr().out
+    assert TYPE_PATH in out and "Type one folder path." in out
+    (workspace,) = load_worker_settings(root).workspaces
+    assert workspace.workspace_id == "my-code-v2" and workspace.display_label == "My Code.v2"
+    assert workspace.readonly_roots == (work.resolve(),)
+
+
+def test_enter_with_nothing_found_keeps_the_builtin_results_folder(root, monkeypatch, capsys, enable_calls):
+    assert _setup(root, monkeypatch, ["n", "", ""]) == 0
+    out = capsys.readouterr().out
+    assert TYPE_PATH in out and "No folder chosen." in out
+    assert "`openswap worker workspace add --read <folder>`" in out
+    assert _builtin(root)
+    assert "  • Readable folders  none (tasks read no folder on this Mac)" in out
+
+
+def test_several_numbers_make_one_workspace_each(root, monkeypatch, capsys, enable_calls, research_home):
+    home = research_home.parent
+    _code(home, "GitHub/site.io/.git", "GitHub/api/.git", "Projects")
+    assert _setup(root, monkeypatch, ["n", "", "9", "3, 2 3"]) == 0
+    out = capsys.readouterr().out
+    assert "Type numbers from 1 to 4 (like 1 3), or one folder path." in out
+    workspaces = load_worker_settings(root).workspaces
+    assert [(w.workspace_id, w.display_label) for w in workspaces] == [("site-io", "site.io"), ("api", "api")]
+    assert [w.output_root for w in workspaces] == [(research_home / "site-io").resolve(),
+                                                   (research_home / "api").resolve()]
+    assert "  ✓ Readable folders  site-io (site.io), api (api)" in out
+
+
+@pytest.mark.parametrize(("answer", "expected"), [
+    ("1 3", [0, 2]), ("1,3", [0, 2]), (" 3, 1 ,3 ", [2, 0]), ("4", [3]),
+    ("0", None), ("5", None), ("", None), ("1 x", "1 x"),
+    ("²", "²"),  # not an ASCII number: read as a path, never int()
+    ("~/My Code", "~/My Code"), ("/a/My\\ Code", "/a/My Code"), ("'/a/b c'", "/a/b c"), ("Bob's", "Bob's"),
+])
+def test_parse_folder_choice(answer, expected):
+    if os.name == "nt" and "\\" in answer:
+        pytest.skip("a backslash is the Windows path separator")
+    assert guided_setup.parse_folder_choice(answer, 4) == expected
+
+
+# --- what may be read, and the workspace each folder becomes ----------------------------------
+
+
+def _refusal(root, folder):
+    with pytest.raises(cli.WorkspaceError) as refused:
+        cli.add_readable_folder(root, folder)
+    return refused.value.code
+
+
+def test_refused_folders_change_nothing(root, research_home, tmp_path):
+    home = research_home.parent
+    _code(home, "Library/Code", ".config/repo", "Shared", "open")
+    os.chmod(home / "Shared", 0o777)
+    (home / "notes.txt").write_text("x")
+    research_home.mkdir()
+    (root / "worker").mkdir(mode=0o700, exist_ok=True)
+    assert _refusal(root, home) == "readable_home"
+    assert _refusal(root, tmp_path) == "readable_home"  # contains the home folder
+    assert _refusal(root, home / "Library" / "Code") == "readable_private"
+    assert _refusal(root, home / ".config" / "repo") == "readable_private"
+    assert _refusal(root, root) == "readable_exposes_credentials"
+    assert _refusal(root, root / "worker") == "readable_exposes_credentials"
+    assert _refusal(root, research_home) == "readable_results"
+    assert _refusal(root, home / "missing") == "readable_unavailable"
+    assert _refusal(root, home / "notes.txt") == "readable_unsafe"
+    if os.name == "posix":
+        assert _refusal(root, "/") == "readable_system"
+        assert _refusal(root, "/usr/bin") == "readable_system"
+        assert _refusal(root, home / "Shared") == "readable_permissions"
+    assert _builtin(root)
+    for code in ("readable_home", "readable_system", "readable_private", "readable_exposes_credentials",
+                 "readable_results", "readable_unavailable", "readable_unsafe", "readable_permissions",
+                 "readable_not_owned"):
+        assert code in cli._WORKSPACE_MESSAGES
+
+
+def test_a_credential_home_inside_a_folder_is_refused(root, research_home, monkeypatch):
+    home = research_home.parent
+    code = _code(home, "GitHub")
+    codex = _code(home, "GitHub/.codex-home")
+    from openswap.codex import auth
+
+    monkeypatch.setattr(auth, "codex_home", lambda: codex)
+    assert _refusal(root, code) == "readable_exposes_credentials"
+    assert _menu_paths(root) == []
+
+
+def test_the_step_says_why_a_folder_is_refused_and_asks_again(root, monkeypatch, capsys, enable_calls,
+                                                              research_home, github):
+    assert _setup(root, monkeypatch, ["n", "", "~", "~/GitHub"]) == 0
+    out = capsys.readouterr().out
+    assert f"~: {cli._WORKSPACE_MESSAGES['readable_home']}" in out
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github"]
+
+
+def test_the_first_folder_replaces_the_builtin_one_only_when_unused(root, research_home):
+    from openswap.worker.journal import LocalJobStore
+    from tests.test_worker_core import _submission
+
+    home = research_home.parent
+    first, second = _code(home, "GitHub"), _code(home, "Projects")
+    store = LocalJobStore(root)
+    store.create(_submission(), owner_ref="local-user", worker_epoch=store.current_epoch())
+    # A job may still run or upload in the built-in folder: it stays beside the new one.
+    result = cli.add_readable_folder(root, first)
+    assert result.added and result.kept_builtin
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["research", "github"]
+    result = cli.add_readable_folder(root, second)
+    assert result.added and not result.kept_builtin
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["research", "github", "projects"]
+
+
+def test_the_step_says_when_the_builtin_folder_stays(root, monkeypatch, capsys, enable_calls, github):
+    from openswap.worker.journal import LocalJobStore
+    from tests.test_worker_core import _submission
+
+    store = LocalJobStore(root)
+    store.create(_submission(), owner_ref="local-user", worker_epoch=store.current_epoch())
+    assert _setup(root, monkeypatch, ["n", "", ""]) == 0
+    out = capsys.readouterr().out
+    assert 'The built-in "research" folder stays approved while a task still uses it' in out
+    assert "  ✓ Readable folders  github (GitHub)" in out
+
+
+def test_folder_ids_never_collide(root, research_home, tmp_path):
+    home = research_home.parent
+    cli.add_worker_workspace(root, "notes", tmp_path / "results-only")
+    one, two = _code(home, "a/Notes"), _code(home, "b/notes")
+    first, second = cli.add_readable_folder(root, one), cli.add_readable_folder(root, two)
+    assert first.workspace.workspace_id == "notes-2" and first.workspace.display_label == "Notes"
+    assert second.workspace.workspace_id == "notes-3" and second.workspace.display_label == "notes"
+    assert first.workspace.output_root == (research_home / "notes-2").resolve()
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["research", "notes", "notes-2",
+                                                                               "notes-3"]
+
+
+def test_a_readable_folder_never_overlaps_its_results(root, research_home):
+    workspace = cli.add_readable_folder(root, _code(research_home.parent, "GitHub")).workspace
+    (source,) = workspace.readonly_roots
+    assert not workspace.output_root.is_relative_to(source) and not source.is_relative_to(workspace.output_root)
+
+
+# --- `workspace add --read` -------------------------------------------------------------------
+
+
+def test_workspace_add_read_makes_the_same_workspace_as_the_setup(root, capsys, research_home, github):
+    assert _run(root, "workspace", "add", "--read", str(github), "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["accepted"] is True and payload["added"] is True
+    assert payload["workspace"] == {
+        "workspace_id": "github", "label": "GitHub", "output_root": str((research_home / "github").resolve()),
+        "readonly_roots": [str(github.resolve())],
+    }
+    assert _run(root, "workspace", "add", "--read", str(github)) == 0
+    assert "is already readable as workspace 'github'." in capsys.readouterr().out
+    assert len(load_worker_settings(root).workspaces) == 1
+    assert _run(root, "workspace", "add", "--read", str(research_home.parent), "--json") == 1
+    assert json.loads(capsys.readouterr().out) == {"accepted": False, "diagnostic_code": "readable_home"}
+
+
+def test_workspace_add_read_and_the_positional_form_are_exclusive(root, capsys, tmp_path, github):
+    assert _run(root, "workspace", "add", "docs", str(tmp_path / "docs"), "--read", str(github)) == 2
+    assert "not both" in capsys.readouterr().err
+    assert _run(root, "workspace", "add", "docs") == 2
+    assert "`--read DIR`" in capsys.readouterr().err
+    assert _builtin(root)
+    # The positional form is unchanged: the folder is where results are written.
+    assert _run(root, "workspace", "add", "docs", str(tmp_path / "docs")) == 0
+    assert "Approved research folder" in capsys.readouterr().out
 
 
 def test_the_default_replaces_only_the_builtin_folder_and_not_while_in_use(root, monkeypatch, research_home):
@@ -672,6 +927,19 @@ def test_registration_reports_folder_ids_labels_and_mode_only(root, reporting):
     assert store.readiness(paired["worker_id"]) == {"folders": body["folders"], "execution": "disabled"}
 
 
+def test_the_report_follows_the_readable_folder_ids(root, reporting, research_home):
+    remote, _, store, paired, transport = reporting
+    cli.add_readable_folder(root, _code(research_home.parent, "GitHub"))
+    transport.requests.clear()
+    remote.tick()
+    (body,) = _sent(transport)
+    assert body["folders"] == [{"id": "github", "label": "GitHub"}]
+    assert "/" not in json.dumps(body["folders"])
+    assert store.readiness(paired["worker_id"])["folders"] == [{"id": "github", "label": "GitHub"}]
+    state = guided_setup.readiness(root)
+    assert state.folders == state.readable == ("github (GitHub)",)
+
+
 def test_the_report_follows_job_sync_and_a_stalled_route_never_delays_pickup(root, reporting, tmp_path, monkeypatch):
     remote, runtime, store, paired, transport = reporting
     cli.add_worker_workspace(root, "docs", tmp_path / "docs", label="Docs")
@@ -768,7 +1036,8 @@ def test_revocation_seen_while_reporting_is_final(root, reporting):
 # --- end to end over loopback --------------------------------------------------------------------
 
 
-def test_loopback_pair_setup_and_report(root, keychain, monkeypatch, capsys, research_home):  # noqa: F811
+def test_loopback_pair_setup_and_report(root, keychain, monkeypatch, capsys, research_home,  # noqa: F811
+                                        github):
     store = ControlStore(root.parent / "service" / "db")
     monkeypatch.setattr(cli, "enable_worker", lambda _root: update_worker_settings(_root, enabled=True))
     with make_server(store, port=0) as server:
@@ -776,7 +1045,7 @@ def test_loopback_pair_setup_and_report(root, keychain, monkeypatch, capsys, res
         serving.start()
         url = f"http://127.0.0.1:{server.server_port}"
         try:
-            _answers(monkeypatch, ["y", "1", "y", ""])
+            _answers(monkeypatch, ["y", "1", ""])
             assert _run(root, "pair", url, store.issue_code()) == 0
             from openswap.worker.pairing import load_enrollment
 
@@ -786,7 +1055,7 @@ def test_loopback_pair_setup_and_report(root, keychain, monkeypatch, capsys, res
             remote.tick()
             assert remote.state == "online"
             assert store.readiness(enrollment.worker_id) == {
-                "folders": [{"id": "research", "label": "OpenSwap Research"}], "execution": "disabled",
+                "folders": [{"id": "github", "label": "GitHub"}], "execution": "disabled",
             }
             # Over HTTP the same closed shape is enforced.
             with pytest.raises(ProtocolError) as refused:
@@ -862,15 +1131,14 @@ def _settle(app):
 
 
 def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root, keychain, monkeypatch,
-                                                                          enable_calls, research_home):
+                                                                          enable_calls, research_home, github):
     monkeypatch.setattr(pairing, "Transport", lambda *_: PairTransport())
     dialogs = _Dialogs([
         (1, "not a command"),
         (1, "openswap worker pair http://localhost one-use"),
         1,              # start the worker
         (1, "1"),       # account
-        1,              # approve ~/OpenSwap Research
-        (0, ""),        # no other folder
+        (1, "1"),       # folders tasks may read: ~/GitHub
         1,              # Done
     ])
     app = _menu(root, dialogs)
@@ -879,8 +1147,17 @@ def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root,
     assert enable_calls == [root]
     policy = load_worker_settings(root)
     assert policy.control_service_url == "http://localhost" and policy.pinned_account_ref == ALICE
-    assert policy.workspaces[0].output_root == research_home.resolve()
+    (workspace,) = policy.workspaces
+    assert workspace.workspace_id == "github" and workspace.readonly_roots == (github.resolve(),)
+    assert workspace.output_root == (research_home / "github").resolve()
     messages = [kwargs["message"] for _kind, kwargs in dialogs.shown]
+    # The numbered list and the question share one dialog; Enter's default is prefilled.
+    folders = dialogs.shown[4][1]
+    assert "Step 3 of 4 · Folders" in folders["message"]
+    assert "Remote tasks can read the folders you choose here, but never change them." in folders["message"]
+    assert "  • 1  ~/GitHub  (recommended)" in folders["message"]
+    assert folders["message"].endswith("Folders tasks may read (numbers like 1 3, or a path; Enter for 1)")
+    assert folders["default_text"] == "1" and folders["ok"] == "Continue"
     assert "That is not a pairing command" in messages[1]
     assert "Paired worker worker." in messages[2] and "Start the Remote tasks worker now" in messages[2]
     assert dialogs.shown[-1][1]["ok"] == "Done" and SUMMARY in messages[-1]
@@ -900,12 +1177,25 @@ def test_menu_setup_cancelled_at_pairing_does_nothing(root, keychain):
 
 def test_menu_setup_on_a_paired_mac_skips_pairing(root, enable_calls):
     configure_worker_service(root, URL, "worker-1")
-    dialogs = _Dialogs([0, (0, ""), 0, (0, ""), 1])
+    dialogs = _Dialogs([0, (0, ""), (0, ""), 1])
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
     assert "Start the Remote tasks worker now" in dialogs.shown[0][1]["message"]
+    assert "Type the path to your code folder, for example ~/GitHub" in dialogs.shown[2][1]["message"]
+    assert "No folder chosen." in dialogs.shown[3][1]["message"]
     assert enable_calls == [] and _builtin(root)
+
+
+def test_menu_setup_reads_several_folders_by_number(root, enable_calls, research_home):
+    configure_worker_service(root, URL, "worker-1")
+    _code(research_home.parent, "GitHub", "Projects")
+    dialogs = _Dialogs([0, (0, ""), (1, "1, 2"), 1])
+    app = _menu(root, dialogs)
+    app._on_setting("remote_tasks_setup", None)
+    _settle(app)
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github", "projects"]
+    assert "Readable folders  github (GitHub), projects (Projects)" in dialogs.shown[-1][1]["message"]
 
 
 def test_menu_setup_reports_a_refused_code(root, keychain, monkeypatch):
@@ -972,7 +1262,7 @@ def test_setup_pins_a_claude_account_and_points_at_the_claude_live_check(root, k
     out = capsys.readouterr().out
     assert "Pinned Claude account 4 · carol@example.com (claudey)" in out
     assert load_worker_settings(root).pinned_account_ref.startswith("claude:")
-    assert "  ✓ Account    Claude 4 · carol@example.com (claudey)" in out
+    assert "  ✓ Account           Claude 4 · carol@example.com (claudey)" in out
     assert guided_setup.CLAUDE_EXECUTION_OFF_NOTE in out and guided_setup.EXECUTION_OFF_NOTE not in out
     for command in ("openswap worker claude pin", "openswap worker claude prepare",
                     "openswap worker live-check --provider claude"):

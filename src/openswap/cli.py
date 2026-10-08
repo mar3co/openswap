@@ -1539,7 +1539,7 @@ Codex accounts:
   %(prog)s codex add|list|switch|remove|disable|enable|alias|export|import|swap|move|desktop
 
 Remote tasks (tasks from Slack on this Mac):
-  %(prog)s worker setup               guided setup: worker, account, research folder
+  %(prog)s worker setup               guided setup: worker, account, readable folders
   %(prog)s worker status              worker, service and job state
   %(prog)s worker account [slot]      list or pin the account remote jobs use
   %(prog)s worker enable|disable      start or stop the local worker

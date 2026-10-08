@@ -1,8 +1,8 @@
 """The guided Remote tasks setup shared by ``openswap worker pair`` and the menu bar.
 
 After pairing, the owner is walked through the same steps everywhere: start the
-worker, confirm the Codex or Claude account, approve a research folder, then a summary
-of what is still missing before Slack can start tasks on this Mac. Each step
+worker, confirm the Codex or Claude account, choose the folders tasks may read, then a
+summary of what is still missing before Slack can start tasks on this Mac. Each step
 uses the same functions as the matching ``openswap worker`` command; the
 front end only supplies prompts (``Prompts``). Pairing has already succeeded
 when these run, and nothing here can undo or fail it.
@@ -10,6 +10,7 @@ when these run, and nothing here can undo or fail it.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import threading
@@ -99,9 +100,10 @@ ACCOUNT_NEXT = (
     "(`claude:<slot>` for a Claude account; `openswap worker account` lists them)."
 )
 FOLDER_NEXT = (
-    "Next: approve a research folder: `openswap worker workspace add <id> <folder>` "
-    "(or run `openswap worker setup` again to approve ~/OpenSwap Research). Only the ID "
-    "and a label reach the control service; the folder path never leaves this Mac."
+    "Next: choose a folder remote tasks may read, such as ~/GitHub: "
+    "`openswap worker workspace add --read <folder>` (or run `openswap worker setup` again). "
+    "Tasks never change it, and results are saved under ~/OpenSwap Research. Only an ID and "
+    "the folder's name reach the control service; the path never leaves this Mac."
 )
 EXECUTION_OFF_NOTE = (
     "Task execution itself stays off (provider: live_adapter_disabled) until you run "
@@ -127,7 +129,6 @@ WORKER_OFFER = "Start the Remote tasks worker now so this Mac can accept approve
 WORKER_ONLINE = "Remote tasks worker enabled. The portal shows this Mac online within about 15 seconds."
 _RUNNING_STATES = frozenset({"starting", "running"})
 _MAX_ATTEMPTS = 3
-_MAX_EXTRA_FOLDERS = 8
 
 
 def _cli():
@@ -259,10 +260,24 @@ def confirm_account(root: Path, ui: Prompts) -> None:
 
 
 def _display_path(path: Path) -> str:
+    path = Path(path)
+    home = _cli().home_folder()
+    for base in (home, _resolved(home)):
+        if base is None:
+            continue
+        try:
+            relative = path.relative_to(base)
+        except ValueError:
+            continue
+        return "~/" + relative.as_posix() if relative.parts else "~"
+    return str(path)
+
+
+def _resolved(path: Path) -> Path | None:
     try:
-        return "~/" + str(Path(path).relative_to(Path.home()))
-    except ValueError:
-        return str(path)
+        return Path(path).resolve()
+    except (OSError, RuntimeError):
+        return None
 
 
 def _describe(workspace) -> str:
@@ -270,27 +285,27 @@ def _describe(workspace) -> str:
 
 
 def folder_lines(workspaces) -> list[str]:
-    """One numbered, aligned line per approved folder: ID, label, then the path (local only)."""
+    """One numbered, aligned line per readable folder: ID, label, then the path (local only)."""
     return printer.columns([
         (f"{printer.MARK_OK} {number}", workspace.workspace_id, f'"{workspace.display_label}"',
-         _display_path(workspace.output_root))
+         ", ".join(_display_path(source) for source in workspace.readonly_roots))
         for number, workspace in enumerate(workspaces, start=1)
     ])
 
 
+def _readable(workspaces) -> list:
+    return [w for w in workspaces if w.readonly_roots]
+
+
 def _say_folders(ui, workspaces) -> None:
-    ui.say("Approved research folders (the control service sees only the ID and label):")
+    ui.say("Folders remote tasks may read, never change (the control service sees only the ID and label):")
     for line in folder_lines(workspaces):
         ui.say(line)
 
 
 def suggested_folder_id(folder: Path, taken: set[str]) -> str:
-    """A free workspace ID from a folder's name: lowercase letters, digits, '-' and '_'."""
-    base = re.sub(r"[^a-z0-9_-]+", "-", Path(folder).name.lower()).strip("-_")[:56] or "folder"
-    candidate, number = base, 2
-    while candidate in taken:
-        candidate, number = f"{base}-{number}", number + 1
-    return candidate
+    """A free workspace ID from a folder's name (see ``cli.suggested_folder_id``)."""
+    return _cli().suggested_folder_id(folder, taken)
 
 
 def _workspace_message(code: str) -> str:
@@ -298,60 +313,157 @@ def _workspace_message(code: str) -> str:
     return cli._WORKSPACE_MESSAGES.get(code, f"Could not approve that folder ({code}).")
 
 
-def approve_folders(root: Path, ui: Prompts) -> None:
-    """Approve ~/OpenSwap Research as ``research`` (created owner-only), then others."""
+@dataclass(frozen=True)
+class FolderMenu:
+    """The folder step's numbered list: detected code folders, then ones already readable."""
+
+    folders: tuple[Path, ...]
+    lines: tuple[str, ...]
+    recommended: int | None  # menu index of the recommended GitHub folder
+    readable: frozenset[Path]  # folders a workspace already reads
+
+
+def folder_menu(root: Path, workspaces) -> FolderMenu:
+    """Number the detected folders (a GitHub folder first, "recommended"); ✓ marks readable ones."""
+    cli = _cli()
+    try:
+        detected = cli.detect_code_folders(root)
+    except Exception:
+        detected = []
+    reads = {}
+    for workspace in _readable(workspaces):
+        for source in workspace.readonly_roots:
+            reads.setdefault(Path(source), workspace.workspace_id)
+    folders = list(detected) + [source for source in reads if source not in detected]
+    recommended = 0 if detected and cli.is_github_folder(detected[0]) else None
+    parents = set(detected)
+    rows = []
+    for index, folder in enumerate(folders):
+        notes = []
+        if index == recommended:
+            notes.append("recommended")
+        if folder.parent in parents and folder in detected:
+            notes.append("git repo")
+        if folder in reads:
+            notes.append(f"readable as {reads[folder]}")
+        rows.append((f"{printer.mark(True if folder in reads else None)} {index + 1}", _display_path(folder),
+                     f"({', '.join(notes)})" if notes else ""))
+    return FolderMenu(tuple(folders), tuple(printer.columns(rows)), recommended, frozenset(reads))
+
+
+def parse_folder_choice(answer: str, count: int) -> list[int] | str | None:
+    """Menu numbers (``1 3`` or ``1,3``; 0-based, in order, once each), a path, or ``None`` if invalid.
+
+    An answer of numbers only is a selection; anything else is one folder
+    path (a path dragged into Terminal may come shell-escaped).
+    """
+    text = answer.strip()
+    if not text:
+        return None
+    tokens = [token for token in re.split(r"[\s,]+", text) if token]
+    # ASCII only: str.isdigit() also accepts digits such as "²" that int() rejects.
+    if all(token.isascii() and token.isdigit() for token in tokens):
+        picks = []
+        for token in tokens:
+            number = int(token)
+            if not 1 <= number <= count:
+                return None
+            if number - 1 not in picks:
+                picks.append(number - 1)
+        return picks
+    if len(text) > 1 and text[0] == text[-1] and text[0] in "'\"":
+        return text[1:-1]
+    # Terminal escapes a dropped path's spaces with backslashes; on Windows a
+    # backslash is the path separator.
+    if "\\" in text and os.name != "nt":
+        try:
+            words = shlex.split(text)
+        except ValueError:
+            words = []
+        if len(words) == 1:
+            return words[0]
+    return text
+
+
+def choose_folders(root: Path, ui: Prompts) -> None:
+    """Ask which folders remote tasks may read; each becomes a read-only workspace.
+
+    Results go to ``~/OpenSwap Research/<id>``, created owner-only without
+    asking. Enter takes the recommended GitHub folder (else the first one
+    found), or keeps the current folders when some are readable already.
+    """
     cli = _cli()
     policy = load_worker_settings(root)
+    current = _readable(policy.workspaces)
     if not ui.interactive:
-        if cli.is_builtin_default_registry(root, policy.workspaces):
-            ui.say(FOLDER_NEXT)
+        if current:
+            _say_folders(ui, current)
         else:
-            _say_folders(ui, policy.workspaces)
+            ui.say(FOLDER_NEXT)
         return
-    if cli.is_builtin_default_registry(root, policy.workspaces):
-        folder = cli.default_research_folder()
-        ui.say("Remote tasks write only inside research folders you approve. The control service "
-               "sees each folder's ID and label, never its path.")
-        if ui.confirm(f"Create and approve {_display_path(folder)} as research folder "
-                      f"\"{cli.DEFAULT_RESEARCH_ID}\"?") is True:
-            try:
-                workspace = cli.add_worker_workspace(
-                    root, cli.DEFAULT_RESEARCH_ID, folder, replace_builtin_default=True,
-                )
-            except cli.WorkspaceError as exc:
-                ui.say(_workspace_message(exc.code))
-            except Exception:
-                ui.say(_workspace_message("settings_unavailable"))
-            else:
-                ui.say(f"Approved {_display_path(workspace.output_root)} as \"{workspace.workspace_id}\" "
-                       f"(the portal shows \"{workspace.display_label}\").")
+    menu = folder_menu(root, policy.workspaces)
+    ui.say("Remote tasks can read the folders you choose here, but never change them.")
+    ui.say(f"Results are saved under {_display_path(cli.default_research_folder())}. The control "
+           "service sees only each folder's ID and name, never its path.")
+    if menu.folders:
+        for line in menu.lines:
+            ui.say(line)
+        if current:
+            default, enter = "", "Enter keeps the current ones"
         else:
-            ui.say(FOLDER_NEXT)
+            default = str((menu.recommended or 0) + 1)
+            enter = f"Enter for {default}"
+        question = f"Folders tasks may read (numbers like 1 3, or a path; {enter})"
     else:
-        _say_folders(ui, policy.workspaces)
-    for _extra in range(_MAX_EXTRA_FOLDERS):
-        answer = ui.ask("Another folder to approve (path; Enter to finish)")
+        default = ""
+        question = ("Type the path to your code folder, for example ~/GitHub "
+                    f"(Enter {'keeps the current ones' if current else 'to skip'})")
+    later = ("Change them later with `openswap worker workspace add --read <folder>`." if current
+             else "Choose one later with `openswap worker workspace add --read <folder>`, or run "
+                  "`openswap worker setup` again.")
+    for _attempt in range(_MAX_ATTEMPTS):
+        answer = ui.ask(question, default=default)
         if not answer:
+            ui.say(f"Kept the current folders. {later}" if current else f"No folder chosen. {later}")
             return
-        try:
-            folder = cli._absolute_folder(answer)
-        except cli.WorkspaceError as exc:
-            ui.say(_workspace_message(exc.code))
+        choice = parse_folder_choice(answer, len(menu.folders))
+        if choice is None:
+            ui.say(f"Type numbers from 1 to {len(menu.folders)} (like 1 3), or one folder path."
+                   if menu.folders else "Type one folder path.")
             continue
-        taken = {w.workspace_id for w in load_worker_settings(root).workspaces}
-        workspace_id = ui.ask("Folder ID", default=suggested_folder_id(folder, taken))
-        if not workspace_id:
-            continue
+        picked = [menu.folders[index] for index in choice] if isinstance(choice, list) else [choice]
+        if _add_folders(root, ui, picked):
+            return
+    ui.say(later)
+
+
+def _add_folders(root: Path, ui, folders) -> bool:
+    """Make each folder readable and say what happened; whether any is readable now."""
+    cli = _cli()
+    any_ok = False
+    for folder in folders:
+        shown = _display_path(folder) if isinstance(folder, Path) else folder
         try:
-            workspace = cli.add_worker_workspace(root, workspace_id, folder)
+            result = cli.add_readable_folder(root, folder)
         except cli.WorkspaceError as exc:
-            ui.say(_workspace_message(exc.code))
+            ui.say(f"{shown}: {_workspace_message(exc.code)}")
             continue
         except Exception:
-            ui.say(_workspace_message("settings_unavailable"))
+            ui.say(f"{shown}: {_workspace_message('settings_unavailable')}")
             continue
-        ui.say(f"Approved {_display_path(workspace.output_root)} as \"{workspace.workspace_id}\" "
-               f"(the portal shows \"{workspace.display_label}\").")
+        any_ok = True
+        workspace = result.workspace
+        (source,) = workspace.readonly_roots
+        if not result.added:
+            ui.say(f"{printer.MARK_OK} {_display_path(source)} is already readable as \"{workspace.workspace_id}\".")
+            continue
+        ui.say(f"{printer.MARK_OK} Tasks can read {_display_path(source)} as \"{workspace.workspace_id}\" "
+               f"(the portal shows \"{workspace.display_label}\"); results go to "
+               f"{_display_path(workspace.output_root)}.")
+        if result.kept_builtin:
+            ui.say(f"The built-in \"{cli.DEFAULT_RESEARCH_ID}\" folder stays approved while a task still uses "
+                   f"it; remove it later with `openswap worker workspace remove {cli.DEFAULT_RESEARCH_ID}`.")
+    return any_ok
 
 
 @dataclass(frozen=True)
@@ -363,6 +475,8 @@ class Readiness:
     account: str | None
     folders: tuple[str, ...]
     execution: str
+    # The approved workspaces that read a folder of this Mac ("id (label)").
+    readable: tuple[str, ...] = ()
     paused: bool = False
     # The pinned account's provider ("codex" or "claude"; None when nothing is pinned).
     provider: str | None = None  # admission paused: the worker claims no new task
@@ -390,7 +504,7 @@ class Readiness:
         if self.account is None:
             out.append("pin an account (`openswap worker account <slot>`, or `claude:<slot>`)")
         if not self.folders:
-            out.append("approve a research folder (`openswap worker workspace add <id> <folder>`)")
+            out.append("choose a folder tasks may read (`openswap worker workspace add --read <folder>`)")
         return tuple(out)
 
 
@@ -435,6 +549,7 @@ def readiness(root: Path) -> Readiness:
         worker=worker,
         account=account,
         folders=tuple(_describe(w) for w in policy.workspaces),
+        readable=tuple(_describe(w) for w in _readable(policy.workspaces)),
         # The live mode of the pinned account's provider: a Claude pin with a
         # passing Claude live check is live, whatever the Codex opt-in says.
         execution=execution_mode(pinned_adapter(root)),
@@ -491,7 +606,9 @@ def checklist(state: Readiness) -> list[str]:
         (f"{printer.mark(service_ok)} Service", service),
         (f"{printer.mark(worker_ok)} Worker", worker),
         (f"{printer.mark(state.account is not None)} Account", state.account or "none pinned"),
-        (f"{printer.mark(bool(state.folders))} Folders", ", ".join(state.folders) or "none"),
+        # Reading no folder is allowed (tasks still run), so it is neutral, not missing.
+        (f"{printer.mark(True if state.readable else None)} Readable folders",
+         ", ".join(state.readable) or "none (tasks read no folder on this Mac)"),
         # Execution stays off until the live check passes; the note below says how.
         (f"{printer.mark(True if state.execution == 'live' else None)} Execution", state.execution),
     ]
@@ -503,7 +620,7 @@ def checklist(state: Readiness) -> list[str]:
 STEPS = (
     ("offer_worker", "Step 1 of 4 · Worker", START_WORKER_NEXT),
     ("confirm_account", "Step 2 of 4 · Account", ACCOUNT_NEXT),
-    ("approve_folders", "Step 3 of 4 · Research folder", FOLDER_NEXT),
+    ("choose_folders", "Step 3 of 4 · Folders", FOLDER_NEXT),
     ("summary", "Step 4 of 4 · Summary", None),
 )
 
