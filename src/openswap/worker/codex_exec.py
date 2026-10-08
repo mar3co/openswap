@@ -272,8 +272,19 @@ def codex_argv(binary: Path, output_root: Path, run_dir: Path) -> list[str]:
     ]
 
 
-def _overlaps(a: Path, b: Path) -> bool:
-    return a == b or a.is_relative_to(b) or b.is_relative_to(a)
+def granted_root_allowed(backup_root: Path, path: Path) -> bool:
+    """Whether the sandbox may grant ``path`` without exposing worker state.
+
+    A granted root must not contain the private worker directory, and inside
+    it only the built-in research area (``worker/research``, the default
+    workspace) is allowed; everything else there (isolated Codex homes, run
+    directories, leases, the journal) stays out of the model's reach.
+    """
+    worker = (Path(backup_root) / "worker").resolve()
+    path = Path(path).resolve()
+    if worker == path or worker.is_relative_to(path):
+        return False
+    return not path.is_relative_to(worker) or path.is_relative_to(worker / "research")
 
 
 def publish_result(run_dir: Path, output_root: Path) -> bool:
@@ -502,11 +513,10 @@ class CodexExecAdapter:
             # A managed or system layer could override the research profile.
             raise ProviderLaunchRefused("provider_unavailable")
         output_root = Path(workspace.output_root)
-        private = (self.backup_root / "worker").resolve()
         granted = [output_root.resolve(), *(Path(p).resolve() for p in workspace.readonly_sources)]
-        if any(_overlaps(private, path) for path in granted):
-            # A writable or readable root that contains (or is inside) the
-            # worker's private directory would expose CODEX_HOME to the model.
+        if any(not granted_root_allowed(self.backup_root, path) for path in granted):
+            # The model would reach CODEX_HOME, run directories, leases or the
+            # journal through this root.
             raise ProviderLaunchRefused("provider_unavailable")
         try:
             ensure_private_dir(runs_root(self.backup_root))

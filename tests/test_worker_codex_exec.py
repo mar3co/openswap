@@ -767,6 +767,27 @@ def test_result_is_not_published_without_stop_proof(tmp_path):
     assert not (workspace(tmp_path).output_root / "result.md").exists()
 
 
+def test_the_default_research_workspace_may_launch(tmp_path):
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    adapter = make_adapter(tmp_path, containment)
+    out = tmp_path / "worker" / "research" / ("a" * 32)
+    out.mkdir(parents=True)
+    adapter.start(job_record(), ResolvedWorkspace("research", out, ()), worker_epoch=1)
+    assert len(containment.launches) == 1
+
+
+def test_granted_root_rules(tmp_path):
+    allowed = codex_exec.granted_root_allowed
+    assert allowed(tmp_path, tmp_path / "worker" / "research" / "job")
+    assert allowed(tmp_path, tmp_path.parent / "elsewhere")
+    assert not allowed(tmp_path, tmp_path)
+    assert not allowed(tmp_path, tmp_path / "worker")
+    assert not allowed(tmp_path, tmp_path / "worker" / "codex-homes")
+    assert not allowed(tmp_path, tmp_path / "worker" / "runs" / "x")
+    assert not allowed(tmp_path, tmp_path / "worker" / "leases")
+
+
 def test_roots_overlapping_the_private_worker_dir_are_refused(tmp_path):
     sign_in(tmp_path)
     containment = FakeContainment(SUCCESS_SCRIPT)
