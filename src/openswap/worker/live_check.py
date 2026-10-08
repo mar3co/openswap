@@ -692,8 +692,10 @@ class LiveCheck:
                       if not any(command_matches(item["command"], command) for _, command, _, _ in steps)]
         # A failing curl only shows confinement if the same request works from
         # this Mac outside the sandbox.
+        # Same environment as the job (no proxy variables), only unsandboxed.
         outside_ok = self._run(["/usr/bin/curl", "-sS", "-m", "10", "-o", "/dev/null", "https://example.com"],
-                               capture_output=True, text=True, check=False, timeout=30).returncode == 0
+                               env=codex_env(home, self.check_root), capture_output=True, text=True,
+                               check=False, timeout=30).returncode == 0
         required_seen = all(seen[name] for name, _, _, required in steps if required)
         network = observed("example.com")
         submits = observed(escape_label)
@@ -1020,6 +1022,11 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         evidence = check.run(install=install, login=login)
     except CheckRefused as error:
         print(f"Live check not run: {error}", file=sys.stderr)
+        return 1
+    except (codex_cli.CodexCliError, AccountPinError, AccountLeaseError) as error:
+        # A prerequisite the owner accepted (install, sign-in) failed.
+        code = getattr(error, "code", None) or str(error)
+        print(f"Live check not run: {code}.", file=sys.stderr)
         return 1
     path = write_evidence(root, evidence, args.output)
     if args.json:

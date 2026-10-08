@@ -100,6 +100,7 @@ class SimulatedMac:
         self.submitted_labels: set[str] = set()
         self.managed_key = False
         self.network_outside = True
+        self.curl_envs: list[dict] = []
         self.features_text = None
 
     # containment
@@ -188,6 +189,8 @@ class SimulatedMac:
             i = args.index("--disable")
             del args[i:i + 2]
         if argv[0] == "/usr/bin/curl":
+            env = kwargs.get("env") or {}
+            self.curl_envs.append(env)
             return subprocess.CompletedProcess(argv, 0 if self.network_outside else 6, "", "")
         if argv[0] == "/usr/bin/defaults":
             return subprocess.CompletedProcess(argv, 0 if self.managed_key else 1, "", "")
@@ -556,6 +559,25 @@ def test_extra_commands_fail_the_sandbox_gate(tmp_path):
     root = setup_root(tmp_path)
     gate = make_check(root, PreseedingMac()).run()["gates"]["sandbox_exec"]
     assert gate["no_unexpected_commands"] is False and gate["passed"] is False
+
+
+def test_the_network_control_uses_the_job_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    make_check(root, mac).run()
+    assert mac.curl_envs and all("HTTPS_PROXY" not in env and "CODEX_HOME" in env for env in mac.curl_envs)
+
+
+def test_prerequisite_failures_are_controlled_refusals(tmp_path, monkeypatch, capsys):
+    root = setup_root(tmp_path)
+
+    def failing_run(self, **kwargs):
+        raise codex_cli.CodexCliError("archive_hash_mismatch")
+
+    monkeypatch.setattr(LiveCheck, "run", failing_run)
+    assert live_check.main(["live-check", "--yes"], root) == 1
+    assert "archive_hash_mismatch" in capsys.readouterr().err
 
 
 def test_a_network_failure_counts_only_if_the_network_works_outside(tmp_path):
