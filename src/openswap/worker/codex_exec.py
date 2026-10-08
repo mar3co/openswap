@@ -493,6 +493,8 @@ class CodexExecAdapter:
 
     def _account_checked(self, identity: str) -> bool:
         """Whether a passing live check (recorded in the opt-in) ran on this account."""
+        if not self._bind_to_opt_in:
+            return True  # the live check itself, which produces that evidence
         return identity in load_live_execution(self.backup_root).accounts
 
     def probe(self) -> ProviderAvailability:
