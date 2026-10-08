@@ -1314,6 +1314,7 @@ def run(switcher, codex=None) -> int:
                 worker_paused=lambda: self._worker_policy.paused,
                 worker_status=lambda: self._worker_status_cache,
                 on_worker_view_active=self._worker_view_active,
+                worker_paired=lambda: self._worker_policy.control_service_url is not None,
             )
             self._panel.attach(nsitem)
 

@@ -747,6 +747,21 @@ def sample_sequence_data_with_org():
 
 
 @pytest.fixture(autouse=True)
+def _no_interactive_worker_pairing(monkeypatch):
+    """Safety net: `openswap worker pair` never prompts from the test suite.
+
+    On a terminal, pairing offers to start the Remote tasks worker, and Enter
+    accepts, which would bootstrap a real LaunchAgent through launchctl.
+    Under ``pytest -s`` stdin and stdout are the developer's terminal, so a
+    pairing test that does not choose its own answer would block on that
+    prompt. Default every test to the non-interactive branch; tests that
+    exercise the prompt patch ``_interactive_terminal`` themselves (a test's
+    own monkeypatch runs after this one and wins) and stub ``enable_worker``.
+    """
+    monkeypatch.setattr("openswap.worker.cli._interactive_terminal", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""
