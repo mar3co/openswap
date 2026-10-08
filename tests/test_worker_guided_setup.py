@@ -1331,6 +1331,11 @@ class _Dialogs:
         clicked, text = self.answers.pop(0) if self.answers else (0, "")
         return SimpleNamespace(clicked=clicked, text=text)
 
+    def choose_folder(self, **kwargs):
+        self.shown.append(("choose_folder", kwargs))
+        clicked, text = self.answers.pop(0) if self.answers else (0, "")
+        return text if clicked == 1 else None
+
 
 def _menu(root, dialogs):
     from tests.menubar_harness import extract_class
@@ -1343,6 +1348,7 @@ def _menu(root, dialogs):
     app._worker_operation = None
     app._panel = None
     app._alert, app._prompt = dialogs.alert, dialogs.prompt
+    app._choose_folder = dialogs.choose_folder
     app.refreshed = 0
     app._worker_view_active = lambda: setattr(app, "refreshed", app.refreshed + 1)
     return app
@@ -1511,3 +1517,38 @@ def test_a_claude_pin_with_a_passing_claude_check_reports_live(root, monkeypatch
                         lambda backup_root=None: SimpleNamespace(execution_mode="disabled"))
     state = guided_setup.readiness(root)
     assert state.execution == "live" and state.provider == "claude" and picked == ["claude"]
+
+
+def test_menu_setup_approves_a_folder_from_the_native_chooser(root, enable_calls, tmp_path):
+    """With no code folder found, the native chooser picks the folder tasks may read."""
+    configure_worker_service(root, URL, "worker-1")
+    notes = _code(tmp_path, "Notes")
+    dialogs = _Dialogs([0, (0, ""), (1, str(notes)), 1])
+    app = _menu(root, dialogs)
+    app._on_setting("remote_tasks_setup", None)
+    _settle(app)
+    kinds = [kind for kind, _kwargs in dialogs.shown]
+    assert kinds.count("choose_folder") == 1
+    chooser = dialogs.shown[kinds.index("choose_folder")][1]
+    assert chooser["title"] == "Set up Remote tasks"
+    assert "Type the path to your code folder, for example ~/GitHub" in chooser["message"]
+    (workspace,) = load_worker_settings(root).workspaces
+    assert workspace.workspace_id == "notes" and workspace.readonly_roots == (notes.resolve(),)
+
+
+def test_with_folders_found_the_menu_bar_asks_for_numbers_not_the_chooser(root, enable_calls, research_home):
+    configure_worker_service(root, URL, "worker-1")
+    _code(research_home.parent, "GitHub")
+    dialogs = _Dialogs([0, (0, ""), (1, "1"), 1])
+    app = _menu(root, dialogs)
+    app._on_setting("remote_tasks_setup", None)
+    _settle(app)
+    assert "choose_folder" not in [kind for kind, _kwargs in dialogs.shown]
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github"]
+
+
+def test_dialog_prompts_type_the_folder_without_a_chooser():
+    dialogs = _Dialogs([(1, "/tmp/x")])
+    ui = guided_setup.DialogPrompts(dialogs.alert, dialogs.prompt)
+    assert ui.choose_folder("Folder?") == "/tmp/x"
+    assert dialogs.shown[0][0] == "prompt"

@@ -511,9 +511,13 @@ The answer is one or more numbers (`1 3` or `1,3`), or one folder path (a
 path dragged into Terminal may be shell-escaped). Enter takes the default: the
 recommended GitHub folder, else the first folder found, or, when a folder is
 readable already, keeps the current ones. With nothing found it asks "Type
-the path to your code folder, for example ~/GitHub", and Enter skips. Choosing
-adds folders; it never removes one (`openswap worker workspace remove <id>`
-does). In the menu bar the list and the question are one dialog.
+the path to your code folder, for example ~/GitHub" through the terminal's
+folder search or the menu bar's native folder chooser, and Enter (or Cancel)
+skips. Choosing adds folders; it never removes one (`openswap worker workspace
+remove <id>` does). In the menu bar the list and the question are one dialog.
+A typed path that exists is used exactly as typed (apostrophes included);
+otherwise a path that starts with a quote or holds a backslash is read as one
+shell word, as Terminal writes a dragged-in path.
 
 Each chosen folder becomes a workspace of its own:
 

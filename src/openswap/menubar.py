@@ -690,7 +690,9 @@ def run(switcher, codex=None) -> int:
             from openswap.worker import guided_setup
 
             root = self.switcher.backup_dir
-            ui = guided_setup.ThreadedPrompts(guided_setup.DialogPrompts(self._alert, self._prompt))
+            ui = guided_setup.ThreadedPrompts(guided_setup.DialogPrompts(
+                self._alert, self._prompt, choose_folder=self._choose_folder,
+            ))
             self._guided_setup = ui
 
             def steps():
@@ -1981,6 +1983,24 @@ def run(switcher, codex=None) -> int:
 
             prompt = make_dialog_prompt(**kwargs)
             return self._dialog(prompt.run)
+
+        def _choose_folder(self, *, title: str, message: str) -> str | None:
+            """The native folder chooser (Finder-style browse and search); None on Cancel."""
+            import AppKit
+
+            panel = AppKit.NSOpenPanel.openPanel()
+            panel.setTitle_(title)
+            panel.setMessage_(message)
+            panel.setPrompt_("Approve")
+            panel.setCanChooseDirectories_(True)
+            panel.setCanChooseFiles_(False)
+            panel.setCanCreateDirectories_(True)
+            panel.setAllowsMultipleSelection_(False)
+            panel.setDirectoryURL_(AppKit.NSURL.fileURLWithPath_(AppKit.NSHomeDirectory()))
+            if self._dialog(panel.runModal) != AppKit.NSModalResponseOK:
+                return None
+            urls = panel.URLs()
+            return str(urls[0].path()) if urls and len(urls) else None
 
         def _show_error(self, message: str):
             self._alert(title="openswap", message=message)
