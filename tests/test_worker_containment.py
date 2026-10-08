@@ -130,7 +130,7 @@ class FakeLaunchd:
             if self.bootstrap_rc:
                 return subprocess.CompletedProcess(args, self.bootstrap_rc, "", "error")
             plist = plistlib.loads(Path(args[2]).read_bytes())
-            run_dir = Path(plist["ProgramArguments"][4])
+            run_dir = Path(plist["ProgramArguments"][len(c.WRAPPER_PREFIX)])
             # launchd gives every bootstrapped job a new coalition.
             leader = self.procs.new(self.coalition + self.bootstraps)
             self.bootstraps += 1
@@ -193,8 +193,10 @@ def test_launch_records_coalition_before_releasing_the_provider(tmp_path):
     assert (root / ("a" * 32) / "go").exists()
     assert load_handle(root / ("a" * 32)) == handle
     plist = plistlib.loads(handle.plist_path.read_bytes())
-    assert plist["ProgramArguments"][:2] == ["/bin/sh", "-c"]
-    assert plist["ProgramArguments"][5:] == ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/bin/echo", "hi"]
+    # The shell itself starts from a clean environment.
+    assert plist["ProgramArguments"][:5] == ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/bin/sh", "-c"]
+    n = len(c.WRAPPER_PREFIX) + 1
+    assert plist["ProgramArguments"][n:] == ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/bin/echo", "hi"]
     assert plist["KeepAlive"] is False and plist["AbandonProcessGroup"] is False
     assert plist["EnvironmentVariables"] == {"PATH": "/usr/bin:/bin"}  # the wrapper's own, fixed
     assert plist["Umask"] == 0o077
@@ -685,7 +687,8 @@ def test_the_wrapper_environment_is_fixed_and_the_provider_gets_its_own(tmp_path
     )
     plist = plistlib.loads(handle.plist_path.read_bytes())
     assert plist["EnvironmentVariables"] == {"PATH": "/usr/bin:/bin"}
-    assert plist["ProgramArguments"][5:9] == ["/usr/bin/env", "-i", "PATH=/x", "HOME=/h"]
+    n = len(c.WRAPPER_PREFIX) + 1
+    assert plist["ProgramArguments"][n:n + 4] == ["/usr/bin/env", "-i", "PATH=/x", "HOME=/h"]
     containment, procs, launchd = make(tmp_path / "other")
     with pytest.raises(ContainmentError) as error:
         containment.launch(job_id="b" * 32, run_dir=private_dir(tmp_path / "other") / ("b" * 32),
