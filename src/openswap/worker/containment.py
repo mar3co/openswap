@@ -632,9 +632,10 @@ class LaunchdContainment:
             raise ContainmentError("run_dir_unwritable") from None
         booted = self._launchctl(["bootstrap", self.domain, str(plist_path)])
         if booted.returncode != 0:
-            # The label was confirmed absent above, so a loaded one now is ours.
-            if self.label_loaded(handle):
-                self._abort_unreleased(handle)
+            # Something may still have loaded under this label: unload it only
+            # if it is provably this launch's (another same-user process that
+            # does not take our lock could have bootstrapped the label).
+            self._abort_unreleased(handle)
             raise ContainmentError("launchd_bootstrap_failed")
         try:
             pid = self._wait_for_leader(run_dir, ready_timeout)
@@ -691,8 +692,13 @@ class LaunchdContainment:
             self._sleep(0.02)
 
     def _abort_unreleased(self, handle: JobHandle) -> None:
-        """Unload a job whose provider never ran; its wrapper is still waiting."""
-        self._launchctl(["bootout", f"{handle.domain}/{handle.label}"])
+        """Unload a job whose provider never ran; its wrapper is still waiting.
+
+        Only a service whose printed plist path is this launch's own is booted
+        out: launchd labels are shared by every process of this user.
+        """
+        if self._owns_label(handle) is True:
+            self._launchctl(["bootout", f"{handle.domain}/{handle.label}"])
         if handle.coalition_id is not None:
             self._sweep(handle.coalition_id, deadline=self._monotonic() + 5.0)
 
@@ -942,7 +948,13 @@ class LaunchdContainment:
                 kinds[pid] = "other"
             else:
                 status = procs.status_of(pid)
-                kinds[pid] = "other" if status == _SZOMB else "stopped" if status == _SSTOP else "running"
+                if status == _SZOMB:
+                    # A member that died after the listing may have forked
+                    # first: harmless only as a zombie the previous scan saw.
+                    zombie = procs.zombie_identity(pid)
+                    kinds[pid] = f"zombie@{zombie}" if zombie is not None else "gone"
+                else:
+                    kinds[pid] = "stopped" if status == _SSTOP else "running"
         return kinds
 
     @staticmethod
