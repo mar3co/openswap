@@ -1354,3 +1354,20 @@ def test_host_binding_hashes_the_hardware_uuid_and_install(tmp_path):
     assert first is not None and len(first) == 64 and "12345678" not in first
     assert real(tmp_path / "b", run=run) != first  # another install
     assert real(tmp_path / "a", run=lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "")) is None
+
+
+
+@pytest.mark.parametrize("action", ["login", "logout"])
+def test_auth_commands_run_from_the_isolated_home(tmp_path, action):
+    _roster(tmp_path, {"1": ACCOUNT_ID})
+    home = codex_exec.prepare_home(tmp_path, IDENTITY)
+    (home / "auth.json").write_text(auth_json(ACCOUNT_ID))
+    cwds = []
+    inner = _login_run(ACCOUNT_ID)
+
+    def run(argv, env, check=False, **kwargs):
+        cwds.append(kwargs.get("cwd"))
+        return inner(argv, env, check=check, **kwargs)
+
+    getattr(live_cli, action)(tmp_path, "1", run=run, verify=pinned)
+    assert cwds and all(cwd == str(home) for cwd in cwds)
