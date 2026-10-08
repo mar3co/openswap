@@ -345,6 +345,68 @@ def test_main_does_nothing_without_consent(tmp_path, capsys, monkeypatch):
     assert not live.evidence_dir(root).exists()
 
 
+class SkippingMac(SimulatedMac):
+    """A model that skips some probe commands."""
+
+    def __init__(self, skip):
+        super().__init__()
+        self.skip = skip
+
+    def launch(self, *, job_id, run_dir, argv, env, cwd, stdin_text, ready_timeout=15.0):
+        lines = [line for line in stdin_text.splitlines() if not any(key in line for key in self.skip)]
+        return super().launch(job_id=job_id, run_dir=run_dir, argv=argv, env=env, cwd=cwd,
+                              stdin_text="\n".join(lines), ready_timeout=ready_timeout)
+
+
+@pytest.mark.parametrize("skip", ["auth.json", "link-target.txt", "launchctl submit"])
+def test_a_skipped_isolation_probe_fails_the_gate(tmp_path, skip):
+    root = setup_root(tmp_path)
+    evidence = make_check(root, SkippingMac([skip])).run()
+    gate = evidence["gates"]["sandbox_exec"]
+    assert gate["passed"] is False and gate["all_required_steps_ran"] is False
+    assert evidence["passed"] is False
+
+
+def test_an_interrupted_check_stops_the_running_job_and_settles_the_lease(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    check = make_check(root, mac)
+    check.check_root = root / "live-check" / "t"
+    cont.ensure_private_dir(check.check_root.parent)
+    cont.ensure_private_dir(check.check_root)
+
+    def interrupted(job_id):
+        raise KeyboardInterrupt
+
+    ws = check._workspace("stop")
+    check._helper_script(ws)
+    with pytest.raises(KeyboardInterrupt):
+        check._job("stop", IDENTITY, LiveCheck.HELPER_TASK, timeout=60, until=interrupted, workspace=ws)
+    assert all(not job["running"] for job in mac.jobs.values())
+    assert AccountLeaseStore(root, "codex").read_current().state == "released"
+
+
+def test_json_mode_prints_only_the_evidence_on_stdout(tmp_path, capsys, monkeypatch):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    real_init = LiveCheck.__init__
+
+    def init(self, backup_root, **kwargs):
+        holder = {}
+        kwargs.update(containment=mac, verify=lambda **kw: pinned(), run=mac.run,
+                      list_processes=mac.list_processes, sleep=lambda s: None,
+                      spawn_child=lambda payload: FakeChild(holder["check"], payload))
+        real_init(self, backup_root, **kwargs)
+        holder["check"] = self
+
+    monkeypatch.setattr(LiveCheck, "__init__", init)
+    monkeypatch.setattr(live_check.codex_cli, "verify", lambda root, **kw: pinned())
+    assert live_check.main(["live-check", "--yes", "--json", "--no-enable"], root) == 0
+    out, err = capsys.readouterr()
+    assert json.loads(out)["passed"] is True
+    assert "Evidence:" in err
+
+
 # -- opt-in: the harness end to end through real launchd with a fake codex ---------------
 
 

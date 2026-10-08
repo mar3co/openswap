@@ -334,32 +334,53 @@ class LiveCheck:
             self._settle_uncertain(token, job_id)
             raise
         events, finished, reason = [], None, "timeout"
-        deadline = self._monotonic() + timeout
-        cursor = 0
-        while self._monotonic() < deadline:
-            for event in adapter.events(run, after_cursor=cursor):
-                cursor = event.cursor
-                events.append(event)
-                if event.kind == SafeEventKind.PROVIDER_FINISHED:
-                    finished = event
+        stopped = settled = False
+        try:
+            deadline = self._monotonic() + timeout
+            cursor = 0
+            while self._monotonic() < deadline:
+                for event in adapter.events(run, after_cursor=cursor):
+                    cursor = event.cursor
+                    events.append(event)
+                    if event.kind == SafeEventKind.PROVIDER_FINISHED:
+                        finished = event
+                if finished is not None:
+                    reason = "finished"
+                    break
+                if until is not None and until(job_id):
+                    reason = "condition"
+                    break
             if finished is not None:
-                reason = "finished"
-                break
-            if until is not None and until(job_id):
-                reason = "condition"
-                break
-        if finished is not None:
-            stopped = finished.execution_stopped is True
-        else:
-            stopped = adapter.interrupt(run).execution_stopped is True
-        if stopped:
-            self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
-        else:
-            self.leases.mark_uncertain(token, "execution_uncertain")
+                stopped = finished.execution_stopped is True
+            else:
+                stopped = adapter.interrupt(run).execution_stopped is True
+            if stopped:
+                self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+            else:
+                self.leases.mark_uncertain(token, "execution_uncertain")
+            settled = True
+        finally:
+            if not settled:
+                # Ctrl-C or an error while the job ran: it is its own launchd
+                # job, so stop it before leaving, and free the lease only on proof.
+                self._abandon(adapter, run, token)
         run_dir = runs_root(self.root) / job_id
         types = item_types(run_dir / STDOUT_FILE)
         self.item_types_seen |= types
         return JobOutcome(job_id, run_dir, workspace, events, finished, reason, stopped, stopped)
+
+    def _abandon(self, adapter, run, token) -> None:
+        try:
+            proof = adapter.interrupt(run).execution_stopped is True
+        except BaseException:
+            proof = False
+        try:
+            if proof:
+                self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+            else:
+                self.leases.mark_uncertain(token, "execution_uncertain")
+        except Exception:
+            pass
 
     def _settle_uncertain(self, token, job_id: str) -> bool:
         """A launch whose outcome is unknown: sweep it, and free the lease only on proof."""
@@ -549,12 +570,12 @@ class LiveCheck:
             ("tmp_write", f"/bin/sh -c {q('printf x > ' + str(tmp_marker))}", tmp_marker.name, True),
             ("codex_home_read", f"cat {q(str(sentinel))}", sentinel.name, True),
             ("auth_read", f"/bin/sh -c {q('cat ' + q(str(home / 'auth.json')) + ' > /dev/null')}",
-             "auth.json", False),
+             "auth.json", True),
             ("symlink_read", f"/bin/sh -c {q('ln -s ' + q(str(outside / 'link-target.txt')) + ' link.txt; cat link.txt')}",
-             "link-target.txt", False),
+             "link-target.txt", True),
             ("environment", "/usr/bin/env", "/usr/bin/env", True),
             ("network", "/usr/bin/curl -sS -m 10 -o /dev/null https://example.com", "example.com", True),
-            ("launchd_submit", f"/bin/launchctl submit -l {escape_label} -- /bin/sleep 120", escape_label, False),
+            ("launchd_submit", f"/bin/launchctl submit -l {escape_label} -- /bin/sleep 120", escape_label, True),
         ]
         listing = "\n".join(f"{index}. {command}" for index, (_, command, _, _) in enumerate(steps, 1))
         task = (
@@ -593,14 +614,16 @@ class LiveCheck:
             "inside_write_allowed": (ws / "inside-write.txt").exists(),
             "outside_read_denied": tokens["outside"] not in everything,
             "outside_write_denied": not (outside / "write.txt").exists(),
-            "symlink_read_denied": tokens["link"] not in everything,
+            "symlink_read_denied": seen["symlink_read"] and tokens["link"] not in everything,
             "tmp_write_denied": not tmp_marker.exists(),
             "codex_home_read_denied": tokens["home"] not in everything,
-            "auth_read_denied": all(i["exit_code"] not in (0,) for i in auth),
+            "auth_read_denied": bool(auth) and all(type(i["exit_code"]) is int and i["exit_code"] != 0
+                                                   for i in auth),
             "worker_environment_absent": tokens["env"] not in everything and ENV_SENTINEL not in everything,
             "api_keys_absent": "OPENAI_API_KEY" not in everything and "CODEX_API_KEY" not in everything,
-            "shell_network_denied": bool(network) and all(i["exit_code"] != 0 for i in network),
-            "launchd_submit_contained": not loaded,
+            "shell_network_denied": bool(network) and all(type(i["exit_code"]) is int and i["exit_code"] != 0
+                                                          for i in network),
+            "launchd_submit_contained": seen["launchd_submit"] and not loaded,
             "execution_stopped": outcome.stopped,
         }
         try:
@@ -662,6 +685,15 @@ class LiveCheck:
         job_id = f"livecheck-{uuid.uuid4().hex}"
         token = self.leases.acquire(job_id=job_id, account_identity=identity, worker_pid=os.getpid(),
                                     worker_epoch=time.time_ns(), ttl_s=self.helper_wait + 300)
+        settled = False
+        try:
+            self._kill_and_recover(gate, ws, job_id, identity, token, child, detached)
+            settled = True
+        finally:
+            if not settled:
+                self._settle_uncertain(token, job_id)
+
+    def _kill_and_recover(self, gate, ws, job_id, identity, token, child, detached) -> None:
         process = self._spawn_child({"root": str(self.root), "job_id": job_id, "identity": identity,
                                      "workspace": str(ws), "task": self.HELPER_TASK})
         detail = {"worker_started_job": False, "detached_helper_observed": False, "job_outlived_worker": False,
@@ -849,11 +881,13 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     if migrate is not None:
         migrate(root)
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    # With --json, stdout carries only the evidence object; everything else is stderr.
+    say = (lambda message: print(message, file=sys.stderr)) if args.json else print
     if not args.yes:
-        print("The live check runs four short, real Codex jobs on the selected account (they use some of its "
-              "quota), checks the sandbox and Stop, and writes an evidence file. It takes about 5 to 15 minutes.")
+        say("The live check runs four short, real Codex jobs on the selected account (they use some of its "
+            "quota), checks the sandbox and Stop, and writes an evidence file. It takes about 5 to 15 minutes.")
         if not interactive or not _ask("Run it now?"):
-            print("Not run. Pass --yes to run without asking.")
+            say("Not run. Pass --yes to run without asking.")
             return 1
 
     def install():
@@ -869,7 +903,7 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         do_login(root, account.number)
         return True
 
-    check = LiveCheck(root, selector=args.account)
+    check = LiveCheck(root, selector=args.account, out=say)
     try:
         evidence = check.run(install=install, login=login)
     except CheckRefused as error:
@@ -881,17 +915,17 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     else:
         print(("All phase-1 live gates passed." if evidence["passed"] else "Some gates failed.") + "\n"
               + _format(evidence))
-        print(f"Evidence: {path}")
+    say(f"Evidence: {path}")
     if not evidence["passed"]:
-        print("Live execution stays off.")
+        say("Live execution stays off.")
         return 1
-    if args.no_enable or not (args.enable or (interactive and _ask("Enable live execution now?"))):
-        print(f"Live execution stays off. Enable it later with `openswap worker live enable --evidence {path}`.")
+    if args.no_enable or not (args.enable or (interactive and not args.json and _ask("Enable live execution now?"))):
+        say(f"Live execution stays off. Enable it later with `openswap worker live enable --evidence {path}`.")
         return 0
     try:
         enable_live(root, path, codex_cli.verify(root))
     except (LiveModeError, codex_cli.CodexCliError) as error:
         print(f"Could not enable live execution: {error}", file=sys.stderr)
         return 1
-    print("Live execution is on. `openswap worker live disable` turns it off.")
+    say("Live execution is on. `openswap worker live disable` turns it off.")
     return 0
