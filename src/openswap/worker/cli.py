@@ -569,12 +569,31 @@ def _in_cloud_drive(folder: Path, library: Path) -> bool:
     OneDrive, ...) and iCloud Drive (``~/Library/Mobile Documents/com~apple~CloudDocs``)
     hold the owner's own files. Never the ``CloudStorage`` or ``Mobile
     Documents`` folders themselves, nor anything else in ``~/Library``.
-    Compared by identity, so a case variant cannot widen it.
+    ``folder`` is canonical (symlinks resolved, on-disk spelling), so its own
+    components are compared with the exact on-disk names below the canonical
+    ``~/Library``: the bases are never canonicalised themselves, so a
+    ``CloudStorage`` that is a symlink to ``~/Library`` (or anywhere else)
+    widens nothing, and a base that is a symlink is refused outright.
     """
-    provider = pathid.top_component(folder, library / "CloudStorage")
-    if provider is not None and not provider.startswith("."):
+    library = pathid.canonical(library)
+    try:
+        parts = Path(folder).relative_to(library).parts
+    except ValueError:
+        return False
+
+    def real_dirs(*names: str) -> bool:
+        base = library
+        for name in names:
+            base = base / name
+            if base.is_symlink() or not base.is_dir():
+                return False
         return True
-    return pathid.inside(folder, library / "Mobile Documents" / "com~apple~CloudDocs")
+
+    if len(parts) >= 2 and parts[0] == "CloudStorage" and not parts[1].startswith("."):
+        return real_dirs("CloudStorage")
+    if parts[:2] == ("Mobile Documents", "com~apple~CloudDocs"):
+        return real_dirs("Mobile Documents", "com~apple~CloudDocs")
+    return False
 
 
 def _source_problem_code(problem: str) -> str:

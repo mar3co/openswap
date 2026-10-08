@@ -809,6 +809,34 @@ def test_a_case_variant_never_widens_the_cloud_exemption(root, research_home, ca
     assert _refusal(root, home / "Library" / "MOBILE DOCUMENTS" / "OTHER") == "readable_private"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+@pytest.mark.parametrize("base", ["Library/CloudStorage", "Library/Mobile Documents",
+                                  "Library/Mobile Documents/com~apple~CloudDocs"])
+def test_a_cloud_base_symlinked_to_library_opens_nothing(root, research_home, base):
+    """A cloud base that is a symlink to ~/Library must not turn ~/Library/Keychains readable."""
+    home = research_home.parent
+    library = home / "Library"
+    _code(home, "Library/Keychains", "Library/com~apple~CloudDocs/Keychains")
+    link = home / base
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(library, target_is_directory=True)
+    for folder in (link / "Keychains", link / "com~apple~CloudDocs" / "Keychains"):
+        if folder.exists():
+            assert _refusal(root, folder) == "readable_private", folder
+    # Handed the uncanonical path, the check still refuses a symlinked base.
+    assert not cli._in_cloud_drive(link / "Dropbox" / "x", library)
+    assert not cli._in_cloud_drive(library / "Mobile Documents" / "com~apple~CloudDocs" / "x", library)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_a_symlinked_cloud_base_in_another_case_opens_nothing(root, research_home, case_insensitive):
+    home = research_home.parent
+    library = _code(home, "Library/Keychains").parent
+    (library / "CloudStorage").symlink_to(library, target_is_directory=True)
+    assert _refusal(root, home / "LIBRARY" / "cloudstorage" / "KEYCHAINS") == "readable_private"
+    assert _refusal(root, home / "library" / "CLOUDSTORAGE" / "keychains") == "readable_private"
+
+
 def test_a_cloud_folder_approved_earlier_still_launches(root, research_home):
     from openswap.settings import configure_worker_local_policy
     from openswap.worker.runtime import WorkerRuntime as Runtime
@@ -1152,6 +1180,51 @@ def test_registration_reports_folder_ids_labels_and_mode_only(root, reporting):
                     "execution": "disabled"}
     assert str(root) not in json.dumps(body) and "/" not in json.dumps(body)
     assert store.readiness(paired["worker_id"]) == {"folders": body["folders"], "execution": "disabled"}
+
+
+def test_a_refused_workspace_is_not_advertised_until_it_is_fixed(root, reporting, research_home):
+    from openswap.settings import configure_worker_local_policy
+
+    remote, _, store, paired, transport = reporting
+    github = _code(research_home.parent, "GitHub")
+    pinned = load_worker_settings(root).pinned_account_ref
+    good = WorkerWorkspace("good", research_home / "good", (github,), "GitHub")
+    # `bad` writes inside the folder `good` reads: every job in either is refused.
+    bad = WorkerWorkspace("bad", github / "out", ())
+    configure_worker_local_policy(root, pinned_account_ref=pinned, workspaces=(good, bad))
+    transport.requests.clear()
+    remote.tick()
+    (body,) = _sent(transport)
+    assert body["folders"] == []
+    # Fixed: `bad` now writes elsewhere, and both are offered again.
+    configure_worker_local_policy(root, pinned_account_ref=pinned,
+                                  workspaces=(good, WorkerWorkspace("bad", research_home / "bad", ())))
+    transport.requests.clear()
+    remote.tick()
+    (body,) = _sent(transport)
+    assert body["folders"] == [{"id": "good", "label": "GitHub"}, {"id": "bad", "label": "bad"}]
+    assert store.readiness(paired["worker_id"])["folders"] == body["folders"]
+
+
+def test_a_failing_refusal_check_leaves_out_only_that_workspace(root, reporting, research_home, monkeypatch):
+    from openswap.settings import configure_worker_local_policy
+
+    remote, _, _store, _paired, transport = reporting
+    pinned = load_worker_settings(root).pinned_account_ref
+    configure_worker_local_policy(root, pinned_account_ref=pinned, workspaces=(
+        WorkerWorkspace("one", research_home / "one", ()), WorkerWorkspace("two", research_home / "two", ())))
+    real = cli.workspace_refusal
+
+    def flaky(backup_root, workspace, workspaces):
+        if workspace.workspace_id == "one":
+            raise OSError("unreadable")
+        return real(backup_root, workspace, workspaces)
+
+    monkeypatch.setattr(cli, "workspace_refusal", flaky)
+    transport.requests.clear()
+    remote.tick()
+    (body,) = _sent(transport)
+    assert body["folders"] == [{"id": "two", "label": "two"}]
 
 
 def test_the_report_follows_the_readable_folder_ids(root, reporting, research_home):

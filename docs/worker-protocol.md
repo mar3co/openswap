@@ -322,7 +322,11 @@ unknown operation (404 `unsupported_version`).
 `label`. `id` is the workspace ID a submission's `workspace_id` names for that
 folder: 1–200 characters, ASCII letters, digits, `_`, `.` and `-` only (the
 reference client's IDs are narrower: 1–64 lowercase letters, digits, `_` and
-`-`). IDs are unique within the request. `label` is 1–100 characters with no
+`-`). IDs are unique within the request. The reference client leaves out a
+workspace whose jobs it would refuse at launch (`workspace_refused`, see
+[Choosing the folders tasks read](#choosing-the-folders-tasks-read)), and one
+it cannot check; the report changes, and is sent again, once that is fixed.
+`label` is 1–100 characters with no
 Unicode control characters (U+0000–U+001F or U+007F–U+009F); the owner chooses
 it, and by default it is the folder's own name. No path, read-only source,
 account, credential or usage data is reported.
@@ -543,7 +547,9 @@ one; is `~/Library` or a hidden folder in the home folder (or inside one),
 except a synced cloud drive there: a provider's folder in
 `~/Library/CloudStorage` (Dropbox, Google Drive, OneDrive, …) or iCloud Drive
 (`~/Library/Mobile Documents/com~apple~CloudDocs`), and the folders inside
-them, but never `CloudStorage` or `Mobile Documents` themselves;
+them, but never `CloudStorage` or `Mobile Documents` themselves, and never
+when one of those bases is a symlink (the folder's own resolved path must
+run through the real `CloudStorage` or `Mobile Documents/com~apple~CloudDocs`);
 is, contains or sits inside the OpenSwap backup root, Codex home or Claude
 config home; or overlaps `~/OpenSwap Research`. Like every read-only source it
 must be a real directory owned by the owner and not writable by group or

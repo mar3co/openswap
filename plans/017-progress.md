@@ -1456,3 +1456,10 @@ creates any folder; a refusal fails the job as the local `workspace_refused`
 diagnostic (uploaded as `provider_unavailable`, since OpenTag's list is
 closed), and `worker status` and the setup summary name the workspace and the
 reason. Settings that break the rules still load, so they can be fixed.
+
+Third review (same PR): the cloud-drive exemption compares the folder's own
+resolved components with the real `CloudStorage` and `Mobile
+Documents/com~apple~CloudDocs` under the canonical `~/Library`, and refuses a
+base that is a symlink, so a base linked to `~/Library` opens nothing. The
+readiness report leaves out workspaces the worker would refuse (or cannot
+check), and reports them again once fixed.

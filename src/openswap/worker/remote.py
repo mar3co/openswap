@@ -223,6 +223,22 @@ class RemoteJournal:
                        + " WHERE service=? AND remote_id=?", (*[changes[n] for n in names], self.service, remote_id))
 
 
+def offerable(backup_root, workspace, workspaces) -> bool:
+    """Whether to advertise ``workspace``: the worker would not refuse its jobs at launch.
+
+    A workspace that breaks the folder rules (see ``cli.workspace_refusal``)
+    is left out of the readiness report, so the service stops offering a
+    folder every job would fail in; once it is fixed the report changes and
+    is sent again. A check that fails leaves out only that workspace.
+    """
+    try:
+        from openswap.worker.cli import workspace_refusal
+
+        return workspace_refusal(backup_root, workspace, workspaces) is None
+    except Exception:
+        return False
+
+
 class RemoteClient:
     """Heartbeats on one thread; admission and durable upload replay on another.
 
@@ -434,7 +450,8 @@ class RemoteClient:
         """The readiness report: approved folder IDs with their labels, and the execution mode."""
         from openswap.worker.adapter import execution_mode
 
-        folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict() for w in policy.workspaces]
+        folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict()
+                   for w in policy.workspaces if offerable(self.runtime.backup_root, w, policy.workspaces)]
         # The pinned account's provider decides (a Claude pin reports Claude's opt-in).
         mode_of = getattr(self.runtime, "execution_mode", None)
         if callable(mode_of):
