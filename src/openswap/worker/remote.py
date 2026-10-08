@@ -429,10 +429,19 @@ class RemoteClient:
         return self._accounts_offered and sent is not None and sent[0] == self.worker_epoch
 
     def account_ready(self) -> bool:
-        """Claim new work only when a job could resolve an account: the pin is
-        present, or the service offers a choice among allowlisted accounts and
-        one of them is present."""
-        return self.runtime.account_ready() or (self.accounts_offered() and self.runtime.allowlist_ready())
+        """Whether to claim new work.
+
+        Claim when a job could resolve an account (the pin is present), or once
+        this enrollment has advertised account choices and the service has
+        acknowledged the current set. In that second case the service may hold
+        jobs carrying a choice the owner has since withdrawn; claiming them
+        lets the runtime fail them before launch (``unlaunched=true``) instead
+        of leaving them queued until they expire. Nothing is ever substituted.
+        """
+        if self.runtime.account_ready():
+            return True
+        sent = self._accounts_sent
+        return self._accounts_advertised and sent is not None and sent[0] == self.worker_epoch
 
     def tick(self):
         """One bounded synchronous pass: heartbeat, then synchronization. No sleeping; tests control time."""

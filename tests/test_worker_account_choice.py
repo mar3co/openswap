@@ -820,14 +820,39 @@ def test_no_default_still_runs_a_chosen_account(choice):
     assert _run_job(choice).state == JobState.SUCCEEDED and adapter.leased == [ALICE]
 
 
-def test_without_an_offered_choice_a_missing_default_claims_nothing(choice):
-    remote, runtime, _, _, _, _, transport, root = choice
+def test_withdrawing_every_account_still_reconciles_a_queued_choice(choice):
+    """The owner clears the default and withdraws every allowlisted account
+    after the service queued a job for one of them: the worker keeps polling,
+    claims it and fails it before launch instead of leaving it to expire."""
+    remote, runtime, adapter, store, _, paired, transport, root = choice
+    job_id = _submit(choice, account_ref=_entry(root, BOB).account_ref)
     cli.set_worker_account(root, None)
     cli.disallow_worker_account(root, "1")
     cli.disallow_worker_account(root, "2")
-    _submit(choice)
+    remote.tick()  # acknowledges the empty set, then polls
+    assert _sent(transport)[-1]["accounts"] == [] and "poll" in transport.calls
+    result = runtime.reconcile_once()
+    assert result.state == JobState.FAILED and result.diagnostic_code == "provider_auth_unavailable"
+    assert adapter.starts == 0 and result.pinned_account_ref is None
     remote.tick()
-    assert not runtime.store.queue() and transport.calls[-1] != "poll"
+    assert _reconciled(transport) == [("failed", False, True)]
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "failed"
+
+
+def test_an_enrollment_that_never_advertised_and_has_no_pin_claims_nothing(root, tmp_path):
+    """Without a pin and without ever advertising, there is nothing to resolve
+    or reconcile, so the worker does not poll."""
+    ticks = [datetime.now(timezone.utc).timestamp()]
+    store = ControlStore(tmp_path / "service" / "db", clock=lambda: ticks[0])
+    paired = store.request("pair", {"code": store.issue_code()})
+    update_worker_settings(root, enabled=True)
+    configure_worker_service(root, URL)
+    runtime = WorkerRuntime(root, adapter=_ChoiceAdapter(root))
+    transport = _NoAccountsTransport(store, paired["device_key"])
+    remote = RemoteClient(runtime, URL, paired["device_key"], worker_id=paired["worker_id"], transport=transport)
+    remote.tick()
+    remote.tick()
+    assert "poll" not in transport.calls and not runtime.store.queue()
 
 
 def test_an_unreadable_choice_fails_closed(choice, monkeypatch):
