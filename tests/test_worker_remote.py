@@ -1203,3 +1203,28 @@ def test_a_retried_rejection_is_recorded_once(remote_setup):
     assert remote.journal.pending() == []
     events = store.request("events", {"job_id": job_id, "after_cursor": 0}, paired["device_key"])["events"]
     assert [e["diagnostic_code"] for e in events if e["diagnostic_code"] == "artifact_rejected"] == ["artifact_rejected"]
+
+
+def test_a_refused_workspace_reaches_the_service_as_a_listed_code(remote_setup, tmp_path):
+    """`workspace_refused` stays local: the service's diagnostic list is closed, so it hears
+    `provider_unavailable`, and the job reconciles as failed and unlaunched."""
+    from openswap.settings import WorkerWorkspace, configure_worker_local_policy
+
+    remote, runtime, adapter, store, _, paired, transport = remote_setup
+    # A read-only source inside the backup root is never readable.
+    sessions = runtime.backup_root / "sessions"
+    sessions.mkdir(mode=0o700, exist_ok=True)
+    configure_worker_local_policy(runtime.backup_root, pinned_account_ref=None, workspaces=(
+        WorkerWorkspace("research", tmp_path / "out", (sessions,)),))
+    job_id = submit(remote_setup)
+    remote.tick()
+    result = runtime.reconcile_once()
+    assert (result.state, result.diagnostic_code) == (JobState.FAILED, "workspace_refused")
+    remote.tick()
+    sent = [event for op, data in transport.requests if op == "events" for event in data["events"]]
+    codes = {event["diagnostic_code"] for event in sent}
+    assert "provider_unavailable" in codes and "workspace_refused" not in codes
+    reconcile = [data for op, data in transport.requests if op == "reconcile"][-1]
+    assert (reconcile["state"], reconcile["unlaunched"]) == ("failed", True)
+    assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "failed"
+    assert adapter.starts == 0 and not (tmp_path / "out").exists()

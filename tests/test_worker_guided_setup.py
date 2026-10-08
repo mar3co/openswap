@@ -688,6 +688,24 @@ def test_a_readable_folder_never_overlaps_its_results(root, research_home):
     assert not workspace.output_root.is_relative_to(source) and not source.is_relative_to(workspace.output_root)
 
 
+def test_apostrophes_in_an_existing_path_are_never_shell_syntax(root, monkeypatch, capsys, enable_calls,
+                                                                 research_home, tmp_path):
+    home = research_home.parent
+    oneil = _code(tmp_path, "O'Neil's")
+    moms = _code(home, "Kid's Stuff/Mom's")
+    assert guided_setup.parse_folder_choice(str(oneil), 0) == str(oneil)
+    assert guided_setup.parse_folder_choice("~/Kid's Stuff/Mom's", 0) == "~/Kid's Stuff/Mom's"
+    # Not there as typed: an apostrophe that does not start the text is still literal.
+    assert guided_setup.parse_folder_choice("/x/O'Neil's", 0) == "/x/O'Neil's"
+    # A quoted name is shell syntax, and its own apostrophe survives.
+    assert guided_setup.parse_folder_choice('"/x/Kid\'s Stuff"', 0) == "/x/Kid's Stuff"
+    assert guided_setup.parse_folder_choice(f'"{oneil}"', 0) == str(oneil)
+    assert _setup(root, monkeypatch, ["n", "", "~/Kid's Stuff/Mom's"]) == 0
+    (workspace,) = load_worker_settings(root).workspaces
+    assert workspace.readonly_roots == (moms.resolve(),) and workspace.display_label == "Mom's"
+    assert workspace.workspace_id == "mom-s"
+
+
 def test_a_doubled_slash_after_the_tilde_stays_in_home(root, research_home):
     code = _code(research_home.parent, "Code")
     assert cli.add_readable_folder(root, "~//Code").workspace.readonly_roots == (code.resolve(),)
@@ -761,7 +779,102 @@ def test_launch_refuses_a_case_variant_source(root, research_home, case_insensit
         Runtime(root, adapter=FakeAdapter())._resolve_workspace("lib", "a" * 32)
 
 
+# --- cloud drives in ~/Library -----------------------------------------------------------------
+
+
+def test_cloud_drives_are_readable_but_not_the_rest_of_library(root, research_home):
+    home = research_home.parent
+    _code(home, "Library/CloudStorage/Dropbox/Work", "Library/CloudStorage/GoogleDrive-a@b.c/My Drive",
+          "Library/CloudStorage/.hidden", "Library/Mobile Documents/com~apple~CloudDocs/Notes",
+          "Library/Mobile Documents/iCloud~com~example~app", "Library/Application Support")
+    cloud = home / "Library" / "CloudStorage"
+    icloud = home / "Library" / "Mobile Documents"
+    for allowed in (cloud / "Dropbox", cloud / "Dropbox" / "Work", cloud / "GoogleDrive-a@b.c" / "My Drive",
+                    icloud / "com~apple~CloudDocs", icloud / "com~apple~CloudDocs" / "Notes"):
+        assert cli.readable_folder_problem(root, allowed.resolve()) is None, allowed
+    for refused in (home / "Library", cloud, cloud / ".hidden", icloud, icloud / "iCloud~com~example~app",
+                    home / "Library" / "Application Support"):
+        assert _refusal(root, refused) == "readable_private", refused
+    workspace = cli.add_readable_folder(root, cloud / "Dropbox" / "Work").workspace
+    assert (workspace.workspace_id, workspace.display_label) == ("work", "Work")
+
+
+def test_a_case_variant_never_widens_the_cloud_exemption(root, research_home, case_insensitive):
+    home = research_home.parent
+    _code(home, "Library/CloudStorage/Dropbox/Work", "Library/Mobile Documents/com~apple~CloudDocs",
+          "Library/Mobile Documents/other")
+    assert cli.readable_folder_problem(root, home / "library" / "cloudstorage" / "DROPBOX" / "work") is None
+    assert _refusal(root, home / "LIBRARY" / "CLOUDSTORAGE") == "readable_private"
+    assert _refusal(root, home / "library" / "mobile documents") == "readable_private"
+    assert _refusal(root, home / "Library" / "MOBILE DOCUMENTS" / "OTHER") == "readable_private"
+
+
+def test_a_cloud_folder_approved_earlier_still_launches(root, research_home):
+    from openswap.settings import configure_worker_local_policy
+    from openswap.worker.runtime import WorkerRuntime as Runtime
+
+    work = _code(research_home.parent, "Library/CloudStorage/Dropbox/Work")
+    configure_worker_local_policy(root, pinned_account_ref=None,
+                                  workspaces=(WorkerWorkspace("work", research_home / "work", (work,)),))
+    resolved = Runtime(root, adapter=FakeAdapter())._resolve_workspace("work", "a" * 32)
+    assert resolved.readonly_sources == (work.resolve(),)
+
+
 # --- reading and writing never meet across workspaces -----------------------------------------
+
+
+def _overlapping(root, research_home):
+    """Settings main allowed: `a` writes inside ~/GitHub while `b` reads ~/GitHub."""
+    from openswap.settings import configure_worker_local_policy
+
+    github = _code(research_home.parent, "GitHub")
+    configure_worker_local_policy(root, pinned_account_ref=None, workspaces=(
+        WorkerWorkspace("a", github / "out", ()), WorkerWorkspace("b", research_home / "b", (github,))))
+    return github
+
+
+def test_overlapping_workspaces_still_load_but_never_launch(root, research_home):
+    from openswap.worker.runtime import WorkerRuntime as Runtime, WorkspaceRefused
+
+    github = _overlapping(root, research_home)
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["a", "b"]  # listable, fixable
+    runtime = Runtime(root, adapter=FakeAdapter())
+    for workspace_id, code in (("a", "folder_overlaps_readable"), ("b", "readonly_source_overlaps_results")):
+        with pytest.raises(WorkspaceRefused) as refused:
+            runtime._resolve_workspace(workspace_id, "a" * 32)
+        assert refused.value.code == code
+    # Refused before any folder is made.
+    assert not (github / "out").exists() and not (research_home / "b").exists()
+    assert cli.refused_workspaces(root) == [("a", "folder_overlaps_readable"),
+                                            ("b", "readonly_source_overlaps_results")]
+
+
+def test_status_and_summary_name_the_refused_workspaces(root, research_home, monkeypatch, capsys, enable_calls):
+    _overlapping(root, research_home)
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": False})
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert ('✗ Jobs in workspace "a" are refused at launch (folder_overlaps_readable). '
+            + cli._WORKSPACE_MESSAGES["folder_overlaps_readable"]) in out
+    assert 'workspace "b" are refused at launch (readonly_source_overlaps_results)' in out
+    assert "Next: fix or remove those workspaces" in out
+    assert _run(root, "status", "--json") == 0
+    assert json.loads(capsys.readouterr().out)["refused_workspaces"] == [
+        {"workspace_id": "a", "diagnostic_code": "folder_overlaps_readable"},
+        {"workspace_id": "b", "diagnostic_code": "readonly_source_overlaps_results"}]
+    assert str(research_home) not in out
+    assert _setup(root, monkeypatch, ["n", "", ""]) == 0
+    out = capsys.readouterr().out
+    assert "  ✗ Readable folders  b (b)" in out
+    assert 'Jobs in workspace "a" are refused at launch' in out
+    assert 'fix or remove workspaces "a", "b": jobs there are refused' in out
+    assert "Ready for Slack" not in out
+
+
+def test_status_without_refusals_adds_nothing(root, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": False})
+    assert _run(root, "status", "--json") == 0
+    assert "refused_workspaces" not in json.loads(capsys.readouterr().out)
 
 
 def test_a_folder_holding_another_workspaces_results_is_refused(root, research_home, tmp_path):

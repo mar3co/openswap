@@ -205,7 +205,9 @@ allowed on `provider_finished`. Diagnostics: `live_adapter_disabled`,
 the size, hash, limit, conflict or export-safety checks and was skipped; the
 job outcome stands), `remote_sync_conflict` (local only: the service refused
 this job's event history with `cursor_conflict`, so the worker stopped
-syncing it; see below).
+syncing it; see below), `workspace_refused` (local only: the job's workspace
+breaks the folder rules at launch; it is uploaded as `provider_unavailable`,
+because the service's diagnostic list is closed).
 No free-form provider payloads, local paths or account/session identifiers are
 accepted. Upload with `events`, `worker_epoch`, `epoch` together; read by
 omitting all three. Upload at most 200 events; identical cursor replay is
@@ -533,16 +535,24 @@ Each chosen folder becomes a workspace of its own:
 
 A folder may not be read if it is, or contains, the home folder; is a system
 folder (`/System`, `/Library`, `/usr`, `/etc`, `/Applications`, …) or contains
-one; is `~/Library` or a hidden folder in the home folder (or inside one);
+one; is `~/Library` or a hidden folder in the home folder (or inside one),
+except a synced cloud drive there: a provider's folder in
+`~/Library/CloudStorage` (Dropbox, Google Drive, OneDrive, …) or iCloud Drive
+(`~/Library/Mobile Documents/com~apple~CloudDocs`), and the folders inside
+them, but never `CloudStorage` or `Mobile Documents` themselves;
 is, contains or sits inside the OpenSwap backup root, Codex home or Claude
 config home; or overlaps `~/OpenSwap Research`. Like every read-only source it
 must be a real directory owned by the owner and not writable by group or
 others. A folder tasks read may not overlap any workspace's results folder,
 and a results folder may not overlap any folder tasks read, so no job ever
 writes where another only reads. The same policy applies to every
-`--readonly-source` of `workspace add <id> <folder>`, and the worker repeats
-it at launch, so a source saved earlier (or edited into settings) that breaks
-it never reaches the sandbox. `openswap worker workspace add --read <folder>
+`--readonly-source` of `workspace add <id> <folder>`. The worker checks both
+rules again for every job before it creates the job's folder, so settings
+saved earlier (or edited by hand) that break them still load and can be
+listed and fixed, but a job in such a workspace fails as `workspace_refused`
+and never reaches the sandbox. `openswap worker status` (and `--json`, as
+`refused_workspaces`) and the setup summary name each refused workspace ID
+and the reason. `openswap worker workspace add --read <folder>
 [--label TEXT]` makes the same workspace from the command line and prints
 (or, with `--json`, returns) it; a folder that a workspace already reads is
 left as it is.

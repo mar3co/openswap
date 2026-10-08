@@ -580,8 +580,11 @@ def test_group_or_world_writable_readonly_root_fails_the_job(tmp_path):
     result = runtime.reconcile_once()
 
     assert result.state == JobState.FAILED
-    assert result.diagnostic_code == "provider_unavailable"
+    # A specific local code (sent to the service as provider_unavailable), and
+    # the refusal comes before any results folder is created.
+    assert result.diagnostic_code == "workspace_refused"
     assert adapter.start_count == 0
+    assert not output.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")

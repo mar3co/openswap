@@ -1445,3 +1445,14 @@ a grant. Settings store the on-disk spelling. Read-only sources may not
 overlap another workspace's results folder (and results may not overlap a
 readable folder); `--readonly-source` follows the readable-folder policy; and
 the worker applies that policy again at launch.
+
+Second review (same PR): a typed path that exists is used as typed, so
+apostrophes in real names are never shell syntax; shell-splitting applies only
+to text that starts with a quote or holds a backslash. Synced cloud drives in
+`~/Library` (a `CloudStorage` provider folder, iCloud Drive) are readable,
+compared by identity; the rest of `~/Library` is not. The worker checks the
+folder rules, including the cross-workspace overlap, for every job before it
+creates any folder; a refusal fails the job as the local `workspace_refused`
+diagnostic (uploaded as `provider_unavailable`, since OpenTag's list is
+closed), and `worker status` and the setup summary name the workspace and the
+reason. Settings that break the rules still load, so they can be fixed.

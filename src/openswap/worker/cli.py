@@ -550,7 +550,9 @@ def readable_folder_problem(backup_root: Path, folder: Path) -> str | None:
         if pathid.inside(home, folder):
             return "home"
         first = pathid.top_component(folder, home)
-        if first is not None and (first.casefold() == "library" or first.startswith(".")):
+        if first is not None and first.startswith("."):
+            return "private"
+        if first is not None and first.casefold() == "library" and not _in_cloud_drive(folder, home / first):
             return "private"
     if _overlaps_credentials(backup_root, folder, writable=False):
         return "exposes_credentials"
@@ -560,11 +562,71 @@ def readable_folder_problem(backup_root: Path, folder: Path) -> str | None:
     return readonly_source_problem(folder)
 
 
+def _in_cloud_drive(folder: Path, library: Path) -> bool:
+    """Whether ``folder`` is a synced cloud drive inside ``~/Library`` (or a folder in one).
+
+    A provider's folder in ``~/Library/CloudStorage`` (Dropbox, Google Drive,
+    OneDrive, ...) and iCloud Drive (``~/Library/Mobile Documents/com~apple~CloudDocs``)
+    hold the owner's own files. Never the ``CloudStorage`` or ``Mobile
+    Documents`` folders themselves, nor anything else in ``~/Library``.
+    Compared by identity, so a case variant cannot widen it.
+    """
+    provider = pathid.top_component(folder, library / "CloudStorage")
+    if provider is not None and not provider.startswith("."):
+        return True
+    return pathid.inside(folder, library / "Mobile Documents" / "com~apple~CloudDocs")
+
+
 def _source_problem_code(problem: str) -> str:
     """The workspace error code for a read-only source refused by ``readable_folder_problem``."""
     if problem in {"unavailable", "unsafe", "not_owned", "permissions", "exposes_credentials"}:
         return f"readonly_source_{problem}"
     return f"readable_{problem}"
+
+
+def workspace_refusal(backup_root: Path, workspace, workspaces) -> str | None:
+    """Why the worker refuses jobs in ``workspace`` at launch, as a workspace error code, or ``None``.
+
+    The rules ``workspace add`` applies at approval, checked again for what
+    settings hold now (saved before a rule existed, or edited by hand): every
+    read-only source must pass ``readable_folder_problem``, and no workspace
+    may read a folder another one writes to, or write inside a folder another
+    one reads.
+    """
+    root = Path(backup_root)
+    for source in workspace.readonly_roots:
+        problem = readable_folder_problem(root, source)
+        if problem is not None:
+            return _source_problem_code(problem)
+    for other in workspaces:
+        if other.workspace_id == workspace.workspace_id:
+            continue
+        if any(pathid.overlap(source, other.output_root) for source in workspace.readonly_roots):
+            return "readonly_source_overlaps_results"
+        if any(pathid.overlap(workspace.output_root, source) for source in other.readonly_roots):
+            return "folder_overlaps_readable"
+    return None
+
+
+def refused_workspaces(backup_root: Path, workspaces=None) -> list[tuple[str, str]]:
+    """``(workspace ID, code)`` for each approved workspace whose jobs are refused at launch."""
+    if workspaces is None:
+        workspaces = load_worker_settings(Path(backup_root)).workspaces
+    out = []
+    for workspace in workspaces:
+        try:
+            code = workspace_refusal(backup_root, workspace, workspaces)
+        except Exception:
+            code = "settings_unavailable"
+        if code is not None:
+            out.append((workspace.workspace_id, code))
+    return out
+
+
+def refusal_line(workspace_id: str, code: str) -> str:
+    """One path-free line saying which workspace is refused at launch and why."""
+    reason = _WORKSPACE_MESSAGES.get(code, "It breaks the folder rules.")
+    return f'{printer.MARK_BAD} Jobs in workspace "{workspace_id}" are refused at launch ({code}). {reason}'
 
 
 def is_github_folder(folder: Path) -> bool:
@@ -1457,9 +1519,22 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         except Exception:
             print("Worker status unavailable.", file=sys.stderr)
             return 1
+        try:
+            refused = refused_workspaces(root)
+        except Exception:
+            refused = []
+        if refused:
+            snapshot = {**snapshot, "refused_workspaces": [
+                {"workspace_id": workspace_id, "diagnostic_code": code} for workspace_id, code in refused]}
         human = None
         if not args.json:
             human = _format_status(snapshot)
+            for workspace_id, code in refused:
+                human = f"{human}\n{refusal_line(workspace_id, code)}"
+            if refused:
+                human = f"{human}\n" + printer.next_step(
+                    "fix or remove those workspaces: `openswap worker workspace list`, "
+                    "`openswap worker workspace remove <id>`.")
             hint = _worker_off_hint(root, snapshot)
             if hint is not None:
                 human = f"{human}\n{hint}"

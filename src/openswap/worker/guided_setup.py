@@ -351,6 +351,18 @@ def folder_menu(root: Path, workspaces) -> FolderMenu:
     return FolderMenu(tuple(folders), tuple(printer.columns(rows)), recommended, frozenset(reads))
 
 
+def _names_a_path(text: str) -> bool:
+    """Whether ``text``, with a leading ``~`` for the home folder, names an existing path."""
+    if text == "~" or text.startswith("~/"):
+        candidate = _cli().home_folder() / text[2:].lstrip("/")
+    else:
+        candidate = Path(text)
+    try:
+        return candidate.exists()
+    except (OSError, ValueError):
+        return False
+
+
 def parse_folder_choice(answer: str, count: int) -> list[int] | str | None:
     """Menu numbers (``1 3`` or ``1,3``; 0-based, in order, once each), a path, or ``None`` if invalid.
 
@@ -371,11 +383,15 @@ def parse_folder_choice(answer: str, count: int) -> list[int] | str | None:
             if number - 1 not in picks:
                 picks.append(number - 1)
         return picks
+    # A folder that exists as typed is that folder: apostrophes in real names
+    # (O'Neil's, Kid's Stuff) are never shell syntax.
+    if _names_a_path(text):
+        return text
     # A path dragged into Terminal comes shell-quoted or backslash-escaped
     # ('/x/Bob'\''s', /x/My\ Code): when it is one shell word, that word is
     # the path. On Windows a backslash is the path separator, so only plain
     # surrounding quotes are removed there.
-    if os.name != "nt" and any(c in text for c in "'\"\\"):
+    if os.name != "nt" and (text[0] in "'\"" or "\\" in text):
         try:
             words = shlex.split(text)
         except ValueError:
@@ -479,6 +495,8 @@ class Readiness:
     execution: str
     # The approved workspaces that read a folder of this Mac ("id (label)").
     readable: tuple[str, ...] = ()
+    # (workspace ID, code) for each workspace whose jobs the worker refuses at launch.
+    refused: tuple[tuple[str, str], ...] = ()
     paused: bool = False
     # The pinned account's provider ("codex" or "claude"; None when nothing is pinned).
     provider: str | None = None  # admission paused: the worker claims no new task
@@ -507,7 +525,19 @@ class Readiness:
             out.append("pin an account (`openswap worker account <slot>`, or `claude:<slot>`)")
         if not self.folders:
             out.append("choose a folder tasks may read (`openswap worker workspace add --read <folder>`)")
+        if self.refused:
+            names = ", ".join(f'"{workspace_id}"' for workspace_id, _code in self.refused)
+            noun = "workspaces" if len(self.refused) > 1 else "workspace"
+            out.append(f"fix or remove {noun} {names}: jobs there are refused "
+                       "(`openswap worker workspace list`, `openswap worker workspace remove <id>`)")
         return tuple(out)
+
+
+def _refused(root: Path, workspaces) -> tuple[tuple[str, str], ...]:
+    try:
+        return tuple(_cli().refused_workspaces(root, workspaces))
+    except Exception:
+        return ()
 
 
 def readiness(root: Path) -> Readiness:
@@ -552,6 +582,7 @@ def readiness(root: Path) -> Readiness:
         account=account,
         folders=tuple(_describe(w) for w in policy.workspaces),
         readable=tuple(_describe(w) for w in _readable(policy.workspaces)),
+        refused=_refused(root, policy.workspaces),
         # The live mode of the pinned account's provider: a Claude pin with a
         # passing Claude live check is live, whatever the Codex opt-in says.
         execution=execution_mode(pinned_adapter(root)),
@@ -581,6 +612,8 @@ def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> No
         state = readiness(root)
     for line in checklist(state):
         ui.say(line)
+    for workspace_id, code in state.refused:
+        ui.say(_cli().refusal_line(workspace_id, code))
     if state.missing:
         ui.say("Before Slack can start tasks on this Mac:")
         for number, step in enumerate(state.missing, start=1):
@@ -609,7 +642,7 @@ def checklist(state: Readiness) -> list[str]:
         (f"{printer.mark(worker_ok)} Worker", worker),
         (f"{printer.mark(state.account is not None)} Account", state.account or "none pinned"),
         # Reading no folder is allowed (tasks still run), so it is neutral, not missing.
-        (f"{printer.mark(True if state.readable else None)} Readable folders",
+        (f"{printer.mark(False if state.refused else True if state.readable else None)} Readable folders",
          ", ".join(state.readable) or "none (tasks read no folder on this Mac)"),
         # Execution stays off until the live check passes; the note below says how.
         (f"{printer.mark(True if state.execution == 'live' else None)} Execution", state.execution),

@@ -49,6 +49,9 @@ _SAFE_DIAGNOSTICS = {
     "runtime_limit_reached",
     "provider_auth_unavailable", "provider_rate_limited",
     "artifact_rejected", "remote_sync_conflict",
+    # Local only: sent to the control service as `provider_unavailable`
+    # (remote.WIRE_DIAGNOSTICS), whose diagnostic list is closed.
+    "workspace_refused",
 }
 
 

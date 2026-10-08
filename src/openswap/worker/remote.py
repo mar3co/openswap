@@ -30,6 +30,10 @@ STATES = frozenset(state.value for state in JobState)
 MAX_CANCEL_IDS = 100
 # Reserved by the protocol: v1 has no approval/resume operation, so it fails closed.
 APPROVAL = "waiting_for_approval"
+# Local diagnostics the protocol does not list, and the listed code each is
+# sent as: the service's diagnostic list is closed. `worker status` and the
+# local journal keep the specific code.
+WIRE_DIAGNOSTICS = {"workspace_refused": "provider_unavailable"}
 # Validation failures the service (or the local export check) reports for one
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
@@ -742,7 +746,9 @@ class RemoteClient:
             if self.stop_event.is_set():
                 raise ProtocolError("service_unavailable", 503)
             self._worker_request("heartbeat")
-            events = [replace(event, job_id=claim.job_id).to_dict() for event in page.events]
+            events = [replace(event, job_id=claim.job_id,
+                              diagnostic_code=WIRE_DIAGNOSTICS.get(event.diagnostic_code, event.diagnostic_code)
+                              ).to_dict() for event in page.events]
             try:
                 response = self.transport.request("events", {**self._fence(claim), "after_cursor": cursor, "events": events})
             except ProtocolError as exc:
