@@ -374,14 +374,15 @@ class ClaudeLiveCheck(LiveCheck):
         gate = self.gates["kill_recovery"]
         ws = self._workspace("kill")
         job_id = f"livecheck-{uuid.uuid4().hex}"
-        token = self.leases.acquire(job_id=job_id, account_identity=identity, worker_pid=os.getpid(),
-                                    worker_epoch=time.time_ns(), ttl_s=self.helper_wait + 300)
-        detail = {"worker_started_job": False, "job_outlived_worker": False, "recovery_stopped": False,
-                  "lease_released_on_proof": False}
+        detail = {"worker_started_job": False, "job_outlived_worker": False, "lease_left_by_worker": False,
+                  "recovery_stopped": False, "lease_released_on_proof": False}
         settled = False
+        token = None
         try:
+            # The stand-in worker takes the account lease itself, as a real worker does.
             process = self._spawn_child({"root": str(self.root), "job_id": job_id, "identity": identity,
-                                         "provider": "claude", "workspace": str(ws), "task": LONG_TASK})
+                                         "provider": "claude", "workspace": str(ws), "task": LONG_TASK,
+                                         "lease_ttl": self.helper_wait + 300})
             try:
                 line = process.stdout.readline() if process.stdout is not None else ""
                 detail["worker_started_job"] = line.strip() == "STARTED"
@@ -398,6 +399,13 @@ class ClaudeLiveCheck(LiveCheck):
             handle = load_handle(run_dir)
             if handle is not None:
                 detail["job_outlived_worker"] = bool(self.containment.members(handle))
+            lease = self._lease_for(job_id)
+            detail["lease_left_by_worker"] = lease is not None and lease.state == "active"
+            if lease is None:
+                settled = True
+                gate.detail, gate.passed = detail, False
+                return
+            token = lease.token()
             self.leases.mark_uncertain(token, "worker_restarted")
             if handle is None:
                 self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
@@ -412,6 +420,8 @@ class ClaudeLiveCheck(LiveCheck):
             settled = True
         finally:
             if not settled:
-                self._settle_uncertain(token, job_id)
+                lease = self._lease_for(job_id)
+                if lease is not None:
+                    self._settle_uncertain(lease.token(), job_id)
         gate.detail = detail
         gate.passed = all(value is True for value in detail.values())

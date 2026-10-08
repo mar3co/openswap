@@ -246,7 +246,9 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
     """
     from openswap.worker import claude_cli
     from openswap.worker.accounts import resolve_account_selector, resolve_claude_selector
-    from openswap.worker.claude_exec import profile_for, profile_identity, profile_shared
+    from openswap.worker.claude_exec import (
+        managed_claude_config, profile_for, profile_identity, profile_shared,
+    )
 
     root = Path(backup_root)
     if selector is None:
@@ -273,7 +275,8 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
         raise AccountPinError("claude_profile_unsafe")
 
     def ready() -> bool:
-        return profile.is_dir() and profile_identity(profile) == identity and not profile_shared(profile)
+        return (profile.is_dir() and profile_identity(profile) == identity and not profile_shared(profile)
+                and not managed_claude_config(profile))
 
     store = AccountLeaseStore(root, "claude")
     with store.mutation_guard() as guard:

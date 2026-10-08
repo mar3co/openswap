@@ -288,7 +288,10 @@ class ClaudeCodeAdapter(CodexExecAdapter):
 
     def _prepare_account(self, identity: str, workspace: ResolvedWorkspace) -> Path:
         profile = profile_for(self.backup_root, identity)
-        if profile is None or not profile.is_dir() or profile.is_symlink():
+        if profile is None or not profile.is_dir() or profile.is_symlink() or any(
+                parent.is_symlink() for parent in profile.parents if parent.is_relative_to(self.backup_root)):
+            # A symlinked profile (or ancestor) would turn the Seatbelt
+            # allowance for it into one for wherever the link points.
             raise ProviderLaunchRefused("provider_auth_unavailable")
         if profile_identity(profile) != identity:
             # Not prepared, or logged in as another account: never run on it.

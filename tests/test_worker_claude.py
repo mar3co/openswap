@@ -213,7 +213,7 @@ def workspace(root, *sources):
 def make_adapter(root, launcher, *, mode="live", live_sessions=False, home=None):
     if mode == "live":
         # The owner's Claude opt-in, bound to the pinned binary.
-        write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now", (IDENTITY,)), "claude")
+        write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now", (IDENTITY,), "4e" * 32), "claude")
     return ClaudeCodeAdapter(
         root, containment=launcher, verify=lambda **kw: pinned(), mode=lambda: mode, sleep=lambda s: None,
         managed=lambda p: [], live_sessions=lambda p: live_sessions, home=home or root.parent / "home",
@@ -435,7 +435,7 @@ def test_one_job_per_host_across_providers(tmp_path):
 def test_each_provider_has_its_own_opt_in(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
-    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now"), "claude")
+    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now", (), "4e" * 32), "claude")
     assert live.execution_mode(root, "claude") == "live" and live.execution_mode(root, "codex") == "disabled"
     assert load_live_execution(root, "claude").binary_sha256 == SHA
     live.disable_live(root, "claude")
@@ -518,6 +518,7 @@ class SimulatedClaudeMac(FakeLaunch):
 
 class Child:
     def __init__(self, check, payload):
+        live_check.child_acquire_lease(check.root, payload)  # as the real child does
         record = check._job_record(payload["job_id"], payload["identity"], payload["task"])
         check.adapter().start(record, ResolvedWorkspace("live-check", Path(payload["workspace"]), ()), worker_epoch=0)
         self.stdout = io.StringIO("STARTED\n")
@@ -582,7 +583,7 @@ def test_status_reports_the_pinned_providers_mode(tmp_path):
     configure_worker_local_policy(root, pinned_account_ref=IDENTITY,
                                   workspaces=(WorkerWorkspace("research", (root / "research").resolve()),))
     assert read_worker_snapshot(root).provider.available is False
-    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now"), "claude")
+    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now", (), "4e" * 32), "claude")
     claude_cli.pin(root, binary=fake_claude(tmp_path))
     provider = read_worker_snapshot(root).provider
     assert provider.available is True and provider.version == "2.1.285 (Claude Code)"
@@ -622,7 +623,7 @@ def test_enabling_from_a_claude_check_names_claude_in_the_opt_out(tmp_path, monk
 
 def test_a_replaced_pin_between_probe_and_start_is_an_unlaunched_refusal(tmp_path):
     root = setup_root(tmp_path)
-    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, "00" * 32, "now"), "claude")
+    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, "00" * 32, "now", (), "4e" * 32), "claude")
     launcher = FakeLaunch(SUCCESS)
     adapter = ClaudeCodeAdapter(
         root, containment=launcher, verify=lambda **kw: pinned(), mode=lambda: "live", sleep=lambda s: None,
@@ -847,7 +848,7 @@ def test_server_managed_policy_cached_in_the_profile_refuses_the_launch(tmp_path
         root, containment=launcher, verify=lambda **kw: pinned(), mode=lambda: "live", sleep=lambda s: None,
         live_sessions=lambda p: False, home=root.parent / "home",
     )
-    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now", (IDENTITY,)), "claude")
+    write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, SHA, "now", (IDENTITY,), "4e" * 32), "claude")
     with pytest.raises(ProviderLaunchRefused) as error:
         adapter.start(job_record(), workspace(root), worker_epoch=1)
     assert error.value.diagnostic_code == "provider_unavailable" and launcher.launches == []
@@ -929,3 +930,27 @@ def test_status_does_not_call_a_profile_under_managed_policy_ready(tmp_path):
     (profile / "remote-settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash"]}}))
     ready = {a["slot"]: a["profile_ready"] for a in live_cli.claude_status(root)["accounts"]}
     assert ready == {"4": False}
+
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks")
+def test_a_symlinked_profile_ancestor_refuses_the_launch(tmp_path):
+    root = setup_root(tmp_path)
+    sessions = root / "sessions"
+    moved = tmp_path / "moved-sessions"
+    sessions.rename(moved)
+    sessions.symlink_to(moved)  # the profile itself is a plain directory, its parent a link
+    launcher = FakeLaunch(SUCCESS)
+    with pytest.raises(ProviderLaunchRefused):
+        make_adapter(root, launcher).start(job_record(), workspace(root), worker_epoch=1)
+    assert launcher.launches == []
+
+
+def test_prepare_does_not_call_a_profile_under_managed_policy_ready(tmp_path):
+    root = setup_root(tmp_path)
+    profile = claude_exec.profile_for(root, IDENTITY)
+    (profile / "remote-settings.json").write_text(json.dumps({"env": {"X": "1"}}))
+    with pytest.raises(live_cli.AccountPinError) as error:
+        live_cli.claude_prepare(root, "claude:4", run=_native_login(root), verify=lambda: pinned(),
+                                unshare=lambda p: None)
+    assert error.value.code == "claude_profile_not_ready"
