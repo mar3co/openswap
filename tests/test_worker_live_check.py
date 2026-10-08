@@ -96,6 +96,7 @@ class SimulatedMac:
 
     def __init__(self, *, sandboxed=True, contain=True, links=True):
         self.links = links
+        self.booted_out = set()
         self.tmpdir_writes = 0
         self.sandboxed = sandboxed
         self.contain = contain
@@ -209,6 +210,10 @@ class SimulatedMac:
             return subprocess.CompletedProcess(argv, 0 if self.managed_key else 1, "", "")
         if argv[0] == "/bin/launchctl":
             label = argv[2].rsplit("/", 1)[-1]
+            if argv[1] == "bootout" and label in self.submitted_labels:
+                self.submitted_labels.discard(label)
+                self.booted_out.add(label)
+                return subprocess.CompletedProcess(argv, 0, "", "")
             return subprocess.CompletedProcess(argv, 0 if label in self.submitted_labels else 113, "", "")
         if args[:2] == ["mcp", "list"]:
             return subprocess.CompletedProcess(argv, 0, "No MCP servers configured yet.\n", "")
@@ -970,3 +975,22 @@ def test_the_default_login_snapshot_never_opens_the_file(tmp_path, monkeypatch):
     assert state == "present" and "secret" not in fingerprint and str(auth) not in opened
     auth.write_text("changed")
     assert live_check.login_snapshot(auth)[1] != fingerprint
+
+
+
+def test_an_escaped_probe_job_is_booted_out_until_it_is_gone(tmp_path):
+    root = setup_root(tmp_path)
+    check = make_check(root, SimulatedMac())
+    state = {"prints": 0, "bootouts": 0}
+
+    def run(argv, **kwargs):
+        if argv[1] == "print":
+            state["prints"] += 1
+            # Loaded at first, and still after the first (failed) bootout.
+            return subprocess.CompletedProcess(argv, 0 if state["bootouts"] < 2 else 113, "", "")
+        state["bootouts"] += 1
+        return subprocess.CompletedProcess(argv, 1 if state["bootouts"] == 1 else 0, "", "")
+
+    check._run = run
+    assert check._unload_probe_label("com.opensoft.openswap.livecheck.probe.x") is True
+    assert state["bootouts"] == 2 and state["prints"] == 3
