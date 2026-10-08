@@ -647,6 +647,11 @@ def workspace_refusal(backup_root: Path, workspace, workspaces) -> str | None:
         other_work = getattr(other, "work_root", None)
         if other_work is not None and pathid.overlap(workspace.output_root, other_work):
             return "folder_overlaps_work"
+        # A folder sessions may change is never one another workspace only reads.
+        if work is not None and any(pathid.overlap(work, source) for source in other.readonly_roots):
+            return "work_overlaps_readable"
+        if other_work is not None and any(pathid.overlap(source, other_work) for source in workspace.readonly_roots):
+            return "work_overlaps_readable"
     return None
 
 
@@ -971,6 +976,10 @@ def _approve_locked(root: Path, kept, workspace_id: str, output: Path, sources, 
             raise WorkspaceError("work_overlaps_results")
         if other.work_root is not None and pathid.overlap(output, other.work_root):
             raise WorkspaceError("folder_overlaps_work")
+        if work_root is not None and any(pathid.overlap(work_root, source) for source in other.readonly_roots):
+            raise WorkspaceError("work_overlaps_readable")
+        if other.work_root is not None and any(pathid.overlap(source, other.work_root) for source in sources):
+            raise WorkspaceError("work_overlaps_readable")
     workspace = WorkerWorkspace(workspace_id, output, sources, label, work_root, mode, repos)
     try:
         set_worker_workspaces(root, (*before, workspace, *after) if replacing is not None else (*kept, workspace))
@@ -2090,6 +2099,10 @@ _WORKSPACE_MESSAGES = {
     "work_no_repos": "That folder holds no git repos anymore. Pick a repo instead.",
     "work_overlaps_results": "That folder overlaps where task results are saved. Pick another.",
     "folder_overlaps_work": "That results folder is inside a folder where sessions work. Pick another place.",
+    "work_overlaps_readable": (
+        "That folder overlaps one that research tasks only read. Remove that one first "
+        "(`openswap worker workspace remove <id>`)."
+    ),
     "mode_invalid": "The mode is `worktree` or `direct`.",
     "mode_not_work": "Only folders where sessions work have a mode (add one with `--work`).",
     "mode_on_parent": "That repo comes from a folder of repos: set the mode on that folder's ID.",

@@ -82,28 +82,27 @@ def _run(command: list[str], cwd: Path, env: dict[str, str], timeout: float) -> 
         raise WorktreeError("git_unavailable") from None
 
 
-_FILTERS: dict[str, tuple[str, ...]] = {}
-
-
 def _filter_overrides(cwd: Path, env: dict[str, str]) -> tuple[str, ...]:
     """``-c`` settings that turn every configured filter driver into a no-op.
 
-    Reading configuration runs nothing, so the driver names are read first and
-    each driver's ``smudge``, ``clean`` and ``process`` are emptied.
+    Reading configuration runs nothing, so the driver names are read first
+    (again for every command: the owner may add one at any time) and each
+    driver's ``smudge``, ``clean`` and ``process`` are emptied. A driver name
+    may itself contain dots: it is everything between ``filter.`` and the
+    last dot.
     """
-    key = f"{cwd}|{env.get('GIT_DIR', '')}"
-    if key not in _FILTERS:
-        base = ["git", *(arg for item in _SAFE_CONFIG for arg in ("-c", item))]
-        result = _run([*base, "config", "--name-only", "--get-regexp", r"^filter\."], cwd, env, 30)
-        drivers = sorted({line.split(".")[1] for line in result.stdout.splitlines()
-                          if line.count(".") >= 2 and line.startswith("filter.")})
-        out = []
-        for driver in drivers:
-            for part in ("smudge", "clean", "process"):
-                out += ["-c", f"filter.{driver}.{part}="]
-            out += ["-c", f"filter.{driver}.required=false"]
-        _FILTERS[key] = tuple(out)
-    return _FILTERS[key]
+    base = ["git", *(arg for item in _SAFE_CONFIG for arg in ("-c", item))]
+    result = _run([*base, "config", "--name-only", "--get-regexp", r"^filter\."], cwd, env, 30)
+    drivers = sorted({line[len("filter."):].rpartition(".")[0] for line in result.stdout.splitlines()
+                      if line.startswith("filter.") and "." in line[len("filter."):]})
+    out = []
+    for driver in drivers:
+        if not driver or "\n" in driver:
+            continue
+        for part in ("smudge", "clean", "process"):
+            out += ["-c", f"filter.{driver}.{part}="]
+        out += ["-c", f"filter.{driver}.required=false"]
+    return tuple(out)
 
 
 def git(args: list[str], cwd: Path, *, timeout: float = _GIT_TIMEOUT_S, check: bool = True,
@@ -185,13 +184,11 @@ class Worktree:
 
     @property
     def write_paths(self) -> tuple[Path, ...]:
-        """Write grants: the worktree, its own object folder, its admin folder and the
-        ``openswap/`` branch namespace (refs and their logs; git writes a sibling
-        ``.lock`` file to update a ref, so the namespace folder, not the ref file).
-        Never the repo's shared object store, config, hooks or other refs."""
-        namespace = Path("refs") / "heads" / BRANCH_PREFIX
-        return (self.path, self.objects, self.git_dir,
-                self.common_dir / namespace, self.common_dir / "logs" / namespace)
+        """Write grants: the worktree, its own object folder and its admin folder (index,
+        HEAD). No ref at all: the task cannot commit, move or delete any branch, its own
+        or another task's; the worker commits its work to its branch when it ends.
+        Never the repo's shared object store, config, hooks or refs."""
+        return (self.path, self.objects, self.git_dir)
 
     @property
     def read_paths(self) -> tuple[Path, ...]:
@@ -293,10 +290,7 @@ def create(repo: Path, results_root: Path, workspace_id: str, job_id: str) -> Wo
         remove_tree(objects)
         raise
     try:
-        # The branch namespace's log folder exists even where reflogs are off,
-        # so the sandbox grant names a real folder.
         common = common_dir(repo)
-        (common / "logs" / "refs" / "heads" / BRANCH_PREFIX).mkdir(parents=True, exist_ok=True)
         git_dir_text = git(["rev-parse", "--git-dir"], dest, timeout=30)
         git_dir = Path(git_dir_text)
         git_dir = pathid.canonical(git_dir if git_dir.is_absolute() else dest / git_dir)
@@ -374,15 +368,65 @@ def _object_format(tree: Worktree) -> str:
         return "sha1"
 
 
+def _verified(data: bytes, name: str, algorithm: str) -> bool:
+    """Whether a loose object's compressed ``data`` hashes to ``name``, decompressing
+    in bounded steps (a tiny file may expand to gigabytes)."""
+    digest = hashlib.new(algorithm)
+    stream = zlib.decompressobj()
+    total = 0
+    chunk = stream.decompress(data, 1 << 20)
+    while True:
+        total += len(chunk)
+        if total > _MAX_OBJECT_BYTES:
+            return False
+        digest.update(chunk)
+        if not stream.unconsumed_tail:
+            break
+        chunk = stream.decompress(stream.unconsumed_tail, 1 << 20)
+    tail = stream.flush()
+    if total + len(tail) > _MAX_OBJECT_BYTES or not stream.eof:
+        return False
+    digest.update(tail)
+    return digest.hexdigest() == name
+
+
+def _import_packs(tree: Worktree) -> bool:
+    """Index each pack the task made (a ``git repack`` or ``gc``) into the repo's store.
+
+    ``git index-pack`` checks every object as it would a fetched pack.
+    Returns whether every pack was imported.
+    """
+    ok = True
+    try:
+        packs = sorted(p for p in (Path(tree.objects) / "pack").glob("*.pack") if p.is_file() and not p.is_symlink())
+    except OSError:
+        return False
+    for pack in packs:
+        try:
+            with open(pack, "rb") as stream:
+                data = stream.read()
+            command = ["git", *(arg for item in _SAFE_CONFIG for arg in ("-c", item)),
+                       "index-pack", "--stdin", "--fix-thin"]
+            result = subprocess.run(command, cwd=str(tree.common_dir), input=data, capture_output=True,
+                                    timeout=_GIT_TIMEOUT_S, check=False,
+                                    env=_git_env({"GIT_DIR": str(tree.common_dir)}))
+            ok = ok and result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            ok = False
+    return ok
+
+
 def import_objects(tree: Worktree) -> int:
     """Copy the task's new loose objects into the repo's store; each verified against its name.
 
     A file whose content does not hash to its name is skipped, and nothing
     already in the store is overwritten, so a task can never plant a bad
-    copy of an object the owner will need. Returns how many were imported.
+    copy of an object the owner will need. Packs go through ``git
+    index-pack``. Returns how many loose objects were imported.
     """
     algorithm = "sha256" if _object_format(tree) == "sha256" else "sha1"
     target_root = Path(tree.common_dir) / "objects"
+    _import_packs(tree)
     imported = 0
     try:
         folders = [p for p in Path(tree.objects).iterdir() if len(p.name) == 2 and p.is_dir() and not p.is_symlink()]
@@ -402,7 +446,7 @@ def import_objects(tree: Worktree) -> int:
                 if path.stat().st_size > _MAX_OBJECT_BYTES:
                     continue
                 data = path.read_bytes()
-                if hashlib.new(algorithm, zlib.decompress(data)).hexdigest() != name:
+                if not _verified(data, name, algorithm):
                     continue
                 target.parent.mkdir(exist_ok=True)
                 temporary = target.parent / f".openswap-import-{path.name}"
@@ -435,9 +479,17 @@ def finish(tree: Worktree, message: str) -> bool:
         # Everything the branch needs must now be in the repo's own store.
         git(["rev-list", "--objects", "--quiet", tree.branch], tree.repo, timeout=120,
             env={"GIT_DIR": str(tree.common_dir)})
-        return not git(["status", "--porcelain", "--ignore-submodules=all"], tree.path, env=env, timeout=120)
+        if git(["status", "--porcelain", "--ignore-submodules=all"], tree.path, env=env, timeout=120):
+            return False
     except WorktreeError:
         return False
+    # Finished: a later sweep may remove it.
+    try:
+        (Path(tree.path).parent / f"{Path(tree.path).name}.finished").touch()
+    except OSError:
+        return False
+    return True
+
 
 
 def remove(path: Path, *, force: bool = False) -> bool:
@@ -470,10 +522,11 @@ def remove(path: Path, *, force: bool = False) -> bool:
                 git(["worktree", "prune"], tree.repo, timeout=60, check=False)
             except WorktreeError:
                 pass
-    try:
-        _record_path(path).unlink()
-    except OSError:
-        pass
+    for leftover in (_record_path(path), path.parent / f"{path.name}.finished"):
+        try:
+            leftover.unlink()
+        except OSError:
+            pass
     return not path.exists()
 
 
@@ -548,8 +601,16 @@ def sweep(results_root: Path, finished, *, force: bool = False) -> list[TaskWork
         if not finished(item.job_id):
             continue
         repo_gone = item.repo is None or not item.repo.exists()
-        if not force and not repo_gone and (item.dirty is not False or item.locked or not item.intact):
-            continue
+        tree = load_record(item.path)
+        if not repo_gone and tree is not None:
+            # A task stopped by Stop, a timeout or a restart never reached the
+            # adapter's own finish: import and commit its work first.
+            done = (Path(item.path).parent / f"{item.job_id}.finished").exists() or finish(
+                tree, f"OpenSwap task {item.job_id[:8]}: work left uncommitted")
+            if force:
+                import_objects(tree)  # never leave the branch pointing at deleted objects
+            elif not done or item.locked:
+                continue
         if remove(item.path, force=force or repo_gone):
             removed.append(item)
             try:

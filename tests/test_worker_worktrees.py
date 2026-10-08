@@ -203,10 +203,9 @@ def test_each_task_gets_its_own_worktree_and_branch(root, home):
     assert (repo / "README.md").read_text() == "owner's uncommitted edit\n"  # never touched
     common = (repo / ".git").resolve()
     objects = results / ".worktrees" / "openswap" / f"{'a' * 32}.objects"
-    # Never the repo's shared object store: the task writes its own objects.
-    assert set(one.write_paths) == {one.work_dir, objects, common / "worktrees" / ("a" * 32),
-                                    common / "refs" / "heads" / "openswap",
-                                    common / "logs" / "refs" / "heads" / "openswap"}
+    # Never the repo's shared object store (the task writes its own objects), and
+    # no ref at all: the worker commits the task's work to its branch.
+    assert set(one.write_paths) == {one.work_dir, objects, common / "worktrees" / ("a" * 32)}
     assert one.read_paths == (common,)
     assert dict(one.env)["GIT_OBJECT_DIRECTORY"] == str(objects)
     assert dict(one.env)["GIT_ALTERNATE_OBJECT_DIRECTORIES"] == str(common / "objects")
@@ -258,15 +257,16 @@ def test_finished_clean_worktrees_go_and_branches_stay(root, home):
     _git(clean.work_dir, "commit", "-q", "-m", "task work")
     (dirty.work_dir / "scratch.txt").write_text("uncommitted")
     results = home / "OpenSwap Research"
-    removed = worktrees.sweep(results, _finish(runtime, "a" * 32, "b" * 32))
-    assert [item.job_id for item in removed] == ["a" * 32]
-    assert not clean.work_dir.exists() and dirty.work_dir.exists() and running.work_dir.exists()
-    assert "openswap/aaaaaaaa" in _git(repo, "branch", "--list", "openswap/*")
-    assert _git(repo, "log", "-1", "--format=%s", "openswap/aaaaaaaa") == "task work"
     listed = {item.job_id: item for item in worktrees.list_all(results)}
     assert listed["b" * 32].dirty is True and listed["c" * 32].dirty is False
-    worktrees.sweep(results, _finish(runtime, "b" * 32), force=True)
-    assert not dirty.work_dir.exists() and "openswap/bbbbbbbb" in _git(repo, "branch", "--list")
+    # A finished task's leftovers are committed to its branch first (a task stopped
+    # by Stop, a timeout or a restart never reached the adapter's own finish).
+    removed = worktrees.sweep(results, _finish(runtime, "a" * 32, "b" * 32))
+    assert [item.job_id for item in removed] == ["a" * 32, "b" * 32]
+    assert not clean.work_dir.exists() and not dirty.work_dir.exists() and running.work_dir.exists()
+    assert "openswap/aaaaaaaa" in _git(repo, "branch", "--list", "openswap/*")
+    assert _git(repo, "log", "-1", "--format=%s", "openswap/aaaaaaaa") == "task work"
+    assert _git(repo, "show", "openswap/bbbbbbbb:scratch.txt") == "uncommitted"
 
 
 def test_a_locked_worktree_or_a_deleted_repo(root, home):
@@ -345,10 +345,12 @@ def test_under_seatbelt_a_commit_works_and_writes_outside_are_denied(root, home,
         return subprocess.run(["/usr/bin/sandbox-exec", "-f", str(sb), "/bin/sh", "-c", script],
                               cwd=resolved.work_dir, env=env, capture_output=True).returncode
 
-    assert sandboxed("echo change > work.txt && git add work.txt && git commit -q -m 'task work'") == 0
+    assert sandboxed("echo change > work.txt && git add work.txt") == 0
+    assert sandboxed("git commit -q -m 'task work'") != 0  # no ref is writable, not even its own
     # The commit's objects are in the task's own folder until the worker imports them.
     assert worktrees.finish(resolved.worktree, "left over") is True
-    assert _git(repo, "log", "-1", "--format=%s", resolved.branch) == "task work"
+    assert _git(repo, "log", "-1", "--format=%s", resolved.branch) == "left over"
+    assert _git(repo, "show", f"{resolved.branch}:work.txt") == "change"
     assert sandboxed(f"echo x > '{repo}/.git/objects/planted'") != 0  # the shared object store
     assert sandboxed(f"rm -rf '{repo}/.git/objects/pack'") != 0 or (repo / ".git" / "objects" / "pack").exists()
     assert sandboxed(f"echo x > '{repo}/README.md'") != 0  # the owner's copy
@@ -545,3 +547,77 @@ def test_a_results_folder_that_turned_unsafe_is_refused_and_not_advertised(root,
     base.mkdir(mode=0o755, exist_ok=True)
     os.chmod(base, 0o755)
     assert cli.workspace_refusal(root, workspace, workspaces) == "folder_permissions"
+
+
+def test_filter_driver_names_with_dots_are_disabled_too(root, home, tmp_path):
+    repo = _repo(home / "GitHub" / "openswap")
+    marker = tmp_path / "filter-ran"
+    _git(repo, "config", "filter.evil.dot.smudge", f"sh -c 'touch {marker}; cat'")
+    (repo / ".gitattributes").write_text("*.txt filter=evil.dot\n")
+    (repo / "data.txt").write_text("data\n")
+    _git(repo, "-c", "filter.evil.dot.smudge=cat", "add", ".gitattributes", "data.txt")
+    _git(repo, "-c", "filter.evil.dot.smudge=cat", "commit", "-q", "-m", "filtered")
+    cli.add_work_folder(root, repo)
+    _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    assert not marker.exists()
+    # A driver added later is read again, never served from a stale list.
+    _git(repo, "config", "filter.late.smudge", f"sh -c 'touch {marker}; cat'")
+    (repo / ".gitattributes").write_text("*.txt filter=late\n")
+    _git(repo, "-c", "filter.late.smudge=cat", "commit", "-q", "-am", "late")
+    _runtime(root)._resolve_workspace("openswap", "b" * 32)
+    assert not marker.exists()
+
+
+def test_a_huge_expanding_object_is_never_inflated(root, home, monkeypatch):
+    import zlib
+
+    monkeypatch.setattr(worktrees, "_MAX_OBJECT_BYTES", 1 << 20)
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    tree = _runtime(root)._resolve_workspace("openswap", "a" * 32).worktree
+    bomb = zlib.compress(b"blob 99999999\0" + b"\0" * (8 << 20), 9)  # 8 MB from a few KB
+    assert len(bomb) < (1 << 20)
+    seen = []
+    real = zlib.decompressobj
+
+    class Recording:
+        def __init__(self):
+            self.inner = real()
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def decompress(self, data, max_length=0):
+            out = self.inner.decompress(data, max_length)
+            seen.append(len(out))
+            return out
+
+    monkeypatch.setattr(worktrees.zlib, "decompressobj", Recording)
+    (tree.objects / "aa").mkdir()
+    (tree.objects / "aa" / ("b" * 38)).write_bytes(bomb)
+    assert worktrees.import_objects(tree) == 0
+    # Decompressed in bounded steps, and given up past the limit.
+    assert seen and max(seen) <= 1 << 20 and sum(seen) <= (1 << 20) + (1 << 20)
+
+
+def test_packs_the_task_made_are_imported(root, home):
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    env = {**os.environ, **dict(resolved.env)}
+    (resolved.work_dir / "packed.txt").write_text("packed")
+    subprocess.run(["git", "add", "packed.txt"], cwd=resolved.work_dir, env=env, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "packed"], cwd=resolved.work_dir, env=env, check=True)
+    subprocess.run(["git", "repack", "-adq"], cwd=resolved.work_dir, env=env, check=True)
+    assert list((resolved.worktree.objects / "pack").glob("*.pack"))
+    assert worktrees.finish(resolved.worktree, "left over") is True
+    assert worktrees.remove(resolved.work_dir) is True
+    assert _git(repo, "show", f"{resolved.branch}:packed.txt") == "packed"
+
+
+def test_work_folders_never_overlap_read_only_ones(root, home):
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_readable_folder(root, home / "GitHub")
+    with pytest.raises(cli.WorkspaceError) as refused:
+        cli.add_work_folder(root, repo)
+    assert refused.value.code == "work_overlaps_readable"

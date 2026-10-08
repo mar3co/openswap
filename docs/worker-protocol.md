@@ -534,13 +534,16 @@ store as a read-only alternate), so a task can never delete or rewrite the
 objects the owner's checkout and other tasks use; it also gets `gc.auto=0`,
 `maintenance.auto=false` and the repo's `user.name` and `user.email` (read by
 the worker; the sandbox may not read `~/.gitconfig`). Codex passes these to
-its shell commands through the profile's `shell_environment_policy`. Codex
-may commit on its branch; a Claude work task has file tools only (Read,
-Grep, Glob, Edit, Write and web tools, no Bash: a shell would share the
-Claude process's sandbox, which must read the account's credential profile).
-When a task ends, the worker imports its objects (each verified against its
-name, nothing existing overwritten), commits anything left uncommitted to the
-task's branch and keeps the branch. Submodules are not checked out in the
+its shell commands through the profile's `shell_environment_policy`. A task
+never writes a ref, not even its own branch: it edits (Codex with its shell,
+Claude with file tools only: Read, Grep, Glob, Edit, Write and web tools, no
+Bash, since a shell would share the Claude process's sandbox, which must read
+the account's credential profile), and when it ends, by finishing, Stop, a
+timeout or a worker restart, the worker imports its objects (loose ones each
+verified against their name in bounded steps, packs through `git
+index-pack`; nothing existing overwritten), commits what it left to the
+task's branch and keeps the branch. A worktree whose work could not be
+committed is kept. Submodules are not checked out in the
 task's copy.
 
 **Direct mode** (advanced, this Mac only): the session works in the folder
@@ -561,23 +564,23 @@ profile) a worktree task may write only:
 - the worktree;
 - its own object folder `<task id>.objects`;
 - this worktree's admin folder `<repo>/.git/worktrees/<name>` (its HEAD,
-  index and logs);
-- the `openswap/` branch namespace, `<repo>/.git/refs/heads/openswap/` and
-  `<repo>/.git/logs/refs/heads/openswap/` (git updates a ref by writing a
-  sibling `.lock` file and renaming it, so the grant is the namespace folder,
-  never the owner's own branches).
+  index and logs).
+
+No ref is writable, so a task can neither move the owner's branches nor
+delete or rewrite another task's.
 
 It may also read `<repo>/.git`, never the owner's working copy. A direct-mode
 task may write the folder. The owner's working copy, the repo's shared
-object store, `.git/config`, hooks, other refs and `packed-refs` stay
-unwritable. The protections below
+object store, `.git/config`, hooks and every ref stay unwritable. Every git
+command the worker runs re-reads the configured filter drivers (a name may
+contain dots) before emptying them. The protections below
 (credential homes, `~/Library`, the home folder, path identity) apply to
 every work folder and every grant.
 
 **When a task ends** its branch is always kept. Its worktree (and object
-folder) is removed once the worker has committed what it left, and kept for
-inspection when that could not be done: it is locked, or the task repointed
-its admin folder or switched branches; finished tasks are swept before each new worktree launch. `openswap
+folder) is removed as soon as the worker has committed what it left, and kept
+for inspection when that could not be done: it is locked, or the task
+repointed its admin folder or switched branches; finished tasks are swept before each new worktree launch. `openswap
 worker worktrees` lists them (folder, branch, state, path); `openswap worker
 worktrees prune` removes finished tasks' clean worktrees (`--force`: every
 finished one), then runs `git worktree prune`. A repo moved or deleted
@@ -656,7 +659,10 @@ Documents/com~apple~CloudDocs`), and the folders inside them, but never
 `CloudStorage` or `Mobile Documents` themselves, and never when one of those
 bases is a symlink; be, contain or sit inside the OpenSwap backup root, Codex
 home or Claude config home; or overlap `~/OpenSwap Research`. It must be a
-real directory owned by the owner and not writable by group or others. No
+real directory owned by the owner and not writable by group or others. A
+work folder never overlaps a folder another workspace only reads, and an
+existing results or worktree folder that became reachable by others (or was
+replaced by a file or a link) refuses its workspace too. No
 work folder or read-only source may overlap any workspace's results folder,
 and no results folder may sit inside one. The worker checks these rules
 again for every job before it creates any folder, so settings saved earlier
