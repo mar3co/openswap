@@ -816,9 +816,11 @@ class CodexExecAdapter:
         carries proof only when nothing of it is left.
         """
         run_dir = runs_root(self.backup_root) / job_id
-        if not os.path.isdir(run_dir) or os.path.islink(run_dir):
+        if os.path.islink(run_dir):
             return None
         try:
+            # Even with the run directory gone, containment may hold a mirror
+            # of its handle.
             proof = self.containment.recover(run_dir)
         except ContainmentError:
             return InterruptResult(requested=True, execution_stopped=False, diagnostic_code="execution_uncertain")
