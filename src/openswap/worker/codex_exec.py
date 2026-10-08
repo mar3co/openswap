@@ -290,9 +290,21 @@ def publish_result(run_dir: Path, output_root: Path) -> bool:
     except OSError:
         return False
     try:
-        os.write(out, data)
-    finally:
+        view = memoryview(data)
+        while view:
+            written = os.write(out, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+        os.fsync(out)
+    except OSError:
         os.close(out)
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        return False
+    os.close(out)
     return True
 
 
