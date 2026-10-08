@@ -658,6 +658,7 @@ class LiveCheck:
             "once, in order, as its own shell command, without changing it, and continue after failures. "
             "Then reply with the single word DONE.\n\n" + listing
         )
+        loaded = False
         try:
             outcome = self._job("sandbox", identity, task, timeout=self.probe_timeout, workspace=ws)
         finally:
@@ -666,6 +667,9 @@ class LiveCheck:
                 sentinel.unlink()
             except OSError:
                 pass
+            # On every exit path: a submitted probe job runs outside the
+            # provider's coalition, so stopping the provider cannot stop it.
+            loaded = self._unload_probe_label(escape_label)
         items = command_items(outcome.run_dir / STDOUT_FILE)
         everything, complete = _texts(outcome.run_dir / STDOUT_FILE, outcome.run_dir / STDERR_FILE, ws)
 
@@ -685,11 +689,7 @@ class LiveCheck:
                 if item not in combined and command_matches(item["command"], expected[key])
             ]
 
-        loaded = self._run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{escape_label}"],
-                           capture_output=True, text=True, check=False, timeout=20).returncode == 0
-        if loaded:
-            self._run(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{escape_label}"],
-                      capture_output=True, text=True, check=False, timeout=20)
+
         seen = {name: bool(observed(key)) for name, _, key, _ in steps}
         # Only the requested probes may run: an extra command could pre-seed a
         # probe (a regular link.txt, say) and make it pass without testing.
@@ -742,6 +742,18 @@ class LiveCheck:
             pass
         gate.detail = detail
         gate.passed = all(value for key, value in detail.items() if key != "steps_ran")
+
+    def _unload_probe_label(self, label: str) -> bool:
+        """Whether the probe's launchd submission loaded a job (which is then unloaded)."""
+        try:
+            loaded = self._run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                               capture_output=True, text=True, check=False, timeout=20).returncode == 0
+            if loaded:
+                self._run(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
+                          capture_output=True, text=True, check=False, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return True  # unknown: treat as an escape
+        return loaded
 
     def _helper_script(self, ws: Path) -> tuple[str, str]:
         """Write the helper; returns the argv[0] markers of its child and detached sleeps.

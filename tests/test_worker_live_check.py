@@ -734,3 +734,31 @@ def test_real_launchd_harness_with_an_unsandboxed_fake_codex(tmp_path):
     assert gates["sandbox_exec"]["outside_read_denied"] is False
     assert evidence["passed"] is False
     assert AccountLeaseStore(root, "codex").read_current().state == "released"
+
+
+
+def test_a_submitted_probe_job_is_unloaded_even_if_the_check_is_interrupted(tmp_path, monkeypatch):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac(sandboxed=False)
+    check = make_check(root, mac)
+    original = check._job
+    calls = []
+
+    def interrupted_job(name, *args, **kwargs):
+        if name == "sandbox":
+            original(name, *args, **kwargs)  # the submit runs, then the check is interrupted
+            raise KeyboardInterrupt
+        return original(name, *args, **kwargs)
+
+    check._job = interrupted_job
+    real_run = mac.run
+
+    def run(argv, **kwargs):
+        if argv[0] == "/bin/launchctl":
+            calls.append(argv[1])
+        return real_run(argv, **kwargs)
+
+    check._run = run
+    with pytest.raises(KeyboardInterrupt):
+        check.run()
+    assert "print" in calls and "bootout" in calls
