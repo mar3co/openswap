@@ -491,6 +491,10 @@ class CodexExecAdapter:
             raise codex_cli.CodexCliError("binary_not_the_checked_one")
         return pinned
 
+    def _account_checked(self, identity: str) -> bool:
+        """Whether a passing live check (recorded in the opt-in) ran on this account."""
+        return identity in load_live_execution(self.backup_root).accounts
+
     def probe(self) -> ProviderAvailability:
         if self._mode() != LIVE:
             return ProviderAvailability(False, "live_adapter_disabled", None)
@@ -515,6 +519,10 @@ class CodexExecAdapter:
         identity = job.pinned_account_ref
         if not isinstance(identity, str):
             raise ProviderLaunchRefused("provider_auth_unavailable")
+        if not self._account_checked(identity):
+            # Live execution was enabled from a check on other accounts: this
+            # one's sign-in and refresh were never measured.
+            raise ProviderLaunchRefused("live_adapter_disabled")
         try:
             pinned = self._pinned(check_version=False)
         except codex_cli.CodexCliError:
@@ -882,7 +890,12 @@ class CodexExecAdapter:
         try:
             write_private(run_dir / SUMMARY_FILE, json.dumps(summary).encode())
         except OSError:
-            pass
+            if proof.stopped is True:
+                # Without a summary pruning would never remove it; its
+                # processes are proven gone, so remove it now.
+                import shutil
+
+                shutil.rmtree(run_dir, ignore_errors=True)
         return InterruptResult(
             requested=True, execution_stopped=proof.stopped is True,
             diagnostic_code=None if proof.stopped else "execution_uncertain",

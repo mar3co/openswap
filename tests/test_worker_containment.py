@@ -1110,3 +1110,16 @@ def test_real_start_times_are_wall_clock():
     procs = c.DarwinProcessTable()
     started = procs.start_time(os.getpid())
     assert started is not None and started <= time.time()
+
+
+
+def test_the_mirror_is_found_by_another_spelling_after_the_directory_is_gone(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    handle = launch(containment, root)
+    import shutil
+
+    shutil.rmtree(handle.run_dir)  # the whole run directory was deleted
+    other_spelling = Path(str(handle.run_dir).swapcase())
+    assert containment._load_mirror(other_spelling) is not None
+    assert containment.recover(other_spelling) is not None
