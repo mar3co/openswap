@@ -16,6 +16,7 @@ import json
 import os
 import stat
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -350,19 +351,6 @@ def test_allowed_accounts_without_a_pinned_default_are_not_ready(root, monkeypat
     cli.set_worker_account(root, None)
     assert guided_setup.readiness(root).account is None
     assert "pin a Codex account (`openswap worker account <slot>`)" in guided_setup.readiness(root).missing
-
-
-def test_the_dialog_summary_never_waits_on_the_ui_thread(root, monkeypatch, research_home):
-    cli.set_worker_account(root, "1")
-    cli.add_worker_workspace(root, "research", research_home, replace_builtin_default=True)
-    update_worker_settings(root, enabled=True)
-    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": "starting"})
-    monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: pytest.fail("the dialog summary slept"))
-    alerts = []
-    ui = guided_setup.DialogPrompts(lambda *args, **kwargs: alerts.append(kwargs.get("message", "")), lambda *a, **k: None)
-    guided_setup.summary(root, ui)
-    ui.flush()
-    assert any("wait for the worker to finish starting" in message for message in alerts)
 
 
 class _Say:
@@ -791,8 +779,7 @@ def _menu(root, dialogs):
     from tests.menubar_harness import extract_class
 
     app_type = extract_class(menubar.__file__, "MenuBarApp",
-                             {"_run_guided_setup", "_on_setting", "_ask_guided_pairing", "_drain_guided_pairing",
-                              "_finish_guided_setup", "_end_guided_setup"},
+                             {"_run_guided_setup", "_on_setting", "_drain_guided_setup"},
                              {"threading": threading})
     app = app_type()
     app.switcher = SimpleNamespace(backup_dir=root)
@@ -805,10 +792,12 @@ def _menu(root, dialogs):
 
 
 def _settle(app):
-    """What on_sync_tick does: wait for each pairing request, then resume on this thread."""
-    while getattr(app, "_guided_pairing", None) is not None:
-        app._guided_pairing["thread"].join(10)
-        app._drain_guided_pairing()
+    """What on_sync_tick does: serve each dialog the setup thread asks for until it ends."""
+    deadline = time.monotonic() + 20
+    while getattr(app, "_guided_setup", None) is not None:
+        assert time.monotonic() < deadline, "guided setup did not finish"
+        app._drain_guided_setup()
+        time.sleep(0.005)
 
 
 def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root, keychain, monkeypatch,
@@ -869,21 +858,24 @@ def test_menu_setup_reports_a_refused_code(root, keychain, monkeypatch):
     assert load_worker_settings(root).control_service_url is None
 
 
-def test_menu_setup_pairs_off_the_ui_thread(root, keychain, monkeypatch, enable_calls):
+def test_menu_setup_runs_every_step_off_the_ui_thread(root, keychain, monkeypatch):
     threads = []
 
     class Recording(PairTransport):
         def request(self, *args, **kwargs):
-            threads.append(threading.current_thread())
+            threads.append(("pair", threading.current_thread()))
             return super().request(*args, **kwargs)
 
     monkeypatch.setattr(pairing, "Transport", lambda *_: Recording())
-    dialogs = _Dialogs([(1, "openswap worker pair http://localhost one-use"), 0, (0, ""), 0, (0, ""), 1])
+    monkeypatch.setattr(cli, "enable_worker",
+                        lambda backup_root: threads.append(("enable", threading.current_thread())) or {"enabled": True})
+    dialogs = _Dialogs([(1, "openswap worker pair http://localhost one-use"), 1, (0, ""), 0, (0, ""), 1])
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
-    assert app._guided_pairing is not None and app.refreshed == 0  # the UI thread returned at once
+    assert app._guided_setup is not None and app.refreshed == 0  # the UI thread returned at once
     _settle(app)
-    assert threads and all(thread is not threading.current_thread() for thread in threads)
+    assert [name for name, _thread in threads] == ["pair", "enable"]
+    assert all(thread is not threading.current_thread() for _name, thread in threads)
     assert load_worker_settings(root).control_service_url == "http://localhost" and app.refreshed == 1
 
 

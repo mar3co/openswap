@@ -440,7 +440,7 @@ def run(switcher, codex=None) -> int:
             self._poll_login()
             self._drain_desktop_result()
             self._drain_worker_result()
-            self._drain_guided_pairing()
+            self._drain_guided_setup()
             panel = self._panel
             if (
                 panel is not None
@@ -682,80 +682,43 @@ def run(switcher, codex=None) -> int:
             Pair from the pasted pairing command when this Mac is not paired,
             then start the worker, confirm the account, approve a research
             folder and show the summary, through the same functions as the
-            CLI. Dialogs stay on this (UI) thread; the pairing request runs on
-            a worker thread and ``on_sync_tick`` resumes the steps when it
-            returns, so a slow service never freezes the menu bar.
+            CLI. The steps run on a worker thread (pairing, launchctl, locks);
+            ``on_sync_tick`` shows each dialog on the UI thread as it is asked.
             """
-            if self._worker_operation is not None or getattr(self, "_guided_pairing", None) is not None:
+            if self._worker_operation is not None or getattr(self, "_guided_setup", None) is not None:
                 return
-            from openswap.settings import load_worker_settings
             from openswap.worker import guided_setup
 
-            ui = guided_setup.DialogPrompts(self._alert, self._prompt)
-            try:
-                paired = load_worker_settings(self.switcher.backup_dir).control_service_url is not None
-            except Exception:
-                ui.say("Setup stopped unexpectedly. Run `openswap worker setup` in Terminal to finish.")
-                self._end_guided_setup(ui)
-                return
-            if paired:
-                self._finish_guided_setup(ui)
-            else:
-                self._ask_guided_pairing(ui, 0)
+            root = self.switcher.backup_dir
+            ui = guided_setup.ThreadedPrompts(guided_setup.DialogPrompts(self._alert, self._prompt))
+            self._guided_setup = ui
 
-        def _ask_guided_pairing(self, ui, attempts):
-            from openswap.worker import guided_setup
+            def steps():
+                from openswap.settings import load_worker_settings
 
-            parsed = None
-            if attempts < guided_setup._MAX_ATTEMPTS:
                 try:
-                    parsed = guided_setup.ask_pairing_command(ui)
+                    paired = load_worker_settings(root).control_service_url is not None
+                    if paired or guided_setup.pair_interactively(root, ui):
+                        guided_setup.run(root, ui)
                 except Exception:
                     ui.say("Setup stopped unexpectedly. Run `openswap worker setup` in Terminal to finish.")
-            if parsed is None:
-                self._end_guided_setup(ui)
+                finally:
+                    try:
+                        ui.flush()
+                    finally:
+                        ui.finished = True
+
+            threading.Thread(target=steps, name="openswap-guided-setup", daemon=True).start()
+
+        def _drain_guided_setup(self):
+            """On the UI thread: show the setup's pending dialog; refresh when it ends."""
+            ui = getattr(self, "_guided_setup", None)
+            if ui is None:
                 return
-            root = self.switcher.backup_dir
-            pending = {"ui": ui, "attempts": attempts + 1, "result": None}
-
-            def work():
-                try:
-                    pending["result"] = guided_setup.pair_once(root, *parsed)
-                except Exception:
-                    pending["result"] = ("failed", "Could not pair: local settings unavailable.")
-
-            pending["thread"] = threading.Thread(target=work, name="openswap-guided-pair", daemon=True)
-            self._guided_pairing = pending
-            pending["thread"].start()
-
-        def _drain_guided_pairing(self):
-            """On the UI thread: continue setup once the pairing request returns."""
-            pending = getattr(self, "_guided_pairing", None)
-            if pending is None or pending["result"] is None:
-                return
-            self._guided_pairing = None
-            ui = pending["ui"]
-            outcome, message = pending["result"]
-            ui.say(message)
-            if outcome == "paired":
-                self._finish_guided_setup(ui)
-            elif outcome == "retry":
-                self._ask_guided_pairing(ui, pending["attempts"])
-            else:
-                self._end_guided_setup(ui)
-
-        def _finish_guided_setup(self, ui):
-            from openswap.worker import guided_setup
-
-            try:
-                guided_setup.run(self.switcher.backup_dir, ui)
-            except Exception:
-                ui.say("Setup stopped unexpectedly. Run `openswap worker setup` in Terminal to finish.")
-            self._end_guided_setup(ui)
-
-        def _end_guided_setup(self, ui):
-            ui.flush()
-            self._worker_view_active()
+            ui.serve()
+            if ui.finished:
+                self._guided_setup = None
+                self._worker_view_active()
 
         def _worker_action(self, row_id, value):
             if self._worker_operation is not None:

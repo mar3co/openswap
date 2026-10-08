@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -363,8 +364,7 @@ def _settling(state: Readiness) -> bool:
 def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> None:
     state = readiness(root)
     # Give a worker that `enable` just started a moment to report running and
-    # reach the service. Front ends that must not block (the menu bar's UI
-    # thread) set ``settle_wait_s = 0`` and show the current state instead.
+    # reach the service. A front end may set ``settle_wait_s`` to change it.
     if start_wait_s is None:
         start_wait_s = getattr(ui, "settle_wait_s", 5.0)
     deadline = time.monotonic() + start_wait_s
@@ -415,8 +415,6 @@ class DialogPrompts:
     """
 
     interactive = True
-    # The dialogs run on the menu bar's UI thread: never wait for the worker.
-    settle_wait_s = 0.0
 
     def __init__(self, alert, prompt, title: str = "Set up Remote tasks"):
         self._alert, self._prompt, self.title = alert, prompt, title
@@ -450,6 +448,59 @@ PAIRING_QUESTION = (
     "Paste the pairing command from your control service (in OpenTag: Workers page, "
     "Pair a Mac). It looks like: openswap worker pair https://opentag.me CODE"
 )
+
+
+class ThreadedPrompts:
+    """Run the setup on a worker thread while dialogs stay on the UI thread.
+
+    The worker thread calls ``confirm``/``ask``/``flush`` as usual; each call
+    is handed to the UI thread, which shows it from ``serve()`` (the menu
+    bar's timer) and wakes the worker with the answer. Lines said in between
+    are only collected, so pairing, ``enable``, pins and folder changes (which
+    may wait on launchctl, the network or locks) never block the UI thread.
+    """
+
+    interactive = True
+
+    def __init__(self, dialogs: DialogPrompts):
+        self._dialogs = dialogs
+        self._lock = threading.Lock()
+        self._pending: dict | None = None
+        self.finished = False
+
+    def say(self, text: str) -> None:
+        with self._lock:
+            self._dialogs.say(text)
+
+    def _call(self, name: str, *args, **kwargs):
+        request = {"call": (name, args, kwargs), "done": threading.Event(), "result": None}
+        with self._lock:
+            self._pending = request
+        request["done"].wait()
+        return request["result"]
+
+    def confirm(self, question: str, *, default: bool = True) -> bool | None:
+        return self._call("confirm", question, default=default)
+
+    def ask(self, question: str, *, default: str = "") -> str | None:
+        return self._call("ask", question, default=default)
+
+    def flush(self) -> None:
+        self._call("flush")
+
+    def serve(self) -> None:
+        """On the UI thread: show the dialog the worker thread is waiting on, if any."""
+        with self._lock:
+            request, self._pending = self._pending, None
+        if request is None:
+            return
+        name, args, kwargs = request["call"]
+        try:
+            request["result"] = getattr(self._dialogs, name)(*args, **kwargs)
+        except Exception:
+            request["result"] = None
+        finally:
+            request["done"].set()
 
 
 def ask_pairing_command(ui: Prompts) -> tuple[str, str] | None:
