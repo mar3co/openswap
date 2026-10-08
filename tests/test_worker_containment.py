@@ -941,3 +941,20 @@ def test_a_second_spelling_cannot_launch_into_a_running_directory(tmp_path):
     assert held.acquire(timeout=0) is True  # same lock file as the first launch's, now free
     held.release()
     assert c.canonical_dir(lower) == first.run_dir
+
+
+
+def test_a_stopped_pid_whose_coalition_becomes_unreadable_is_resumed(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    member = procs.new(JOB_COALITION)
+    original = procs.signal
+
+    def recycle_unreadable(pid, signum):
+        if pid == member and signum == signal.SIGSTOP and procs.table[pid][0] == JOB_COALITION:
+            procs.table[pid] = [333, 2]
+            procs.live_unreadable.add(pid)  # a live process whose coalition cannot be read
+        original(pid, signum)
+
+    procs.signal = recycle_unreadable
+    containment._stop_member(JOB_COALITION, member)
+    assert (member, signal.SIGCONT) in procs.signals and procs.table[member][1] == 2
