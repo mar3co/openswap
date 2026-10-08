@@ -35,6 +35,7 @@ table and ``launchctl`` runner; the real backend is macOS-only.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import plistlib
@@ -62,6 +63,13 @@ EXIT_FILE = "exit"
 STDOUT_FILE = "stdout.jsonl"
 STDERR_FILE = "stderr.log"
 STDIN_FILE = "stdin.txt"
+STARTED_FILE = "started"
+RELEASE_ACK_SECONDS = 10.0
+# The wrapper itself runs with only this; the provider's environment is
+# applied by ``env -i`` after the gate, so nothing in it (an exported shell
+# function, say) can run before the coalition is recorded.
+WRAPPER_ENV = {"PATH": "/usr/bin:/bin"}
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LAUNCHCTL_TIMEOUT_SECONDS = 20.0
 # launchd sends SIGKILL this long after the SIGTERM of a bootout.
 EXIT_TIMEOUT_SECONDS = 5
@@ -79,6 +87,7 @@ WRAPPER_SCRIPT = (
     '  i=$((i+1)); [ "$i" -gt 600 ] && exit 125\n'
     '  /bin/sleep 0.05\n'
     'done\n'
+    ': > "$d/started" || exit 126\n'
     '"$@" < "$d/stdin.txt" > "$d/stdout.jsonl" 2> "$d/stderr.log"\n'
     'rc=$?\n'
     'echo "$rc" > "$d/exit.tmp" && /bin/mv "$d/exit.tmp" "$d/exit"\n'
@@ -333,6 +342,13 @@ def load_handle(run_dir: Path) -> JobHandle | None:
         return None
     try:
         raw = json.loads(text)
+    except ValueError:
+        return None
+    return _handle_from(raw, Path(run_dir))
+
+
+def _handle_from(raw, run_dir: Path) -> JobHandle | None:
+    try:
         label = raw["label"]
         domain = raw["domain"]
         if not isinstance(label, str) or not _LABEL_RE.fullmatch(label):
@@ -416,11 +432,17 @@ class LaunchdContainment:
     # -- launch -------------------------------------------------------------
 
     def build_plist(self, label: str, run_dir: Path, argv: list[str], env: dict[str, str], cwd: Path) -> bytes:
+        for key, value in env.items():
+            if not _ENV_KEY_RE.fullmatch(key) or "\0" in value:
+                raise ContainmentError("environment_invalid")
+        if not argv or "=" in argv[0]:
+            raise ContainmentError("program_invalid")
+        provider = ["/usr/bin/env", "-i", *(f"{key}={value}" for key, value in env.items()), *argv]
         return plistlib.dumps({
             "Label": label,
-            "ProgramArguments": ["/bin/sh", "-c", WRAPPER_SCRIPT, "openswap-job", str(run_dir), *argv],
+            "ProgramArguments": ["/bin/sh", "-c", WRAPPER_SCRIPT, "openswap-job", str(run_dir), *provider],
             "WorkingDirectory": str(cwd),
-            "EnvironmentVariables": dict(env),
+            "EnvironmentVariables": dict(WRAPPER_ENV),
             "RunAtLoad": True,
             "KeepAlive": False,
             "AbandonProcessGroup": False,
@@ -491,7 +513,7 @@ class LaunchdContainment:
             with os.fdopen(fd, "wb") as out:
                 out.write(self.build_plist(label, run_dir, argv, env, cwd))
             write_private(run_dir / STDIN_FILE, stdin_text.encode("utf-8"))
-            _save_handle(handle)
+            self._persist(handle)
         except FileExistsError:
             raise ContainmentError("run_dir_not_fresh") from None
         except OSError:
@@ -513,9 +535,9 @@ class LaunchdContainment:
                 # Without a coalition of its own the job cannot be swept.
                 raise ContainmentError("job_coalition_unavailable")
             handle = replace(handle, leader_pid=pid, coalition_id=coalition)
-            _save_handle(handle)
+            self._persist(handle)
             handle = replace(handle, released=True)
-            _save_handle(handle)
+            self._persist(handle)
         except BaseException as error:
             # ``go`` was never created, so the provider never ran.
             self._abort_unreleased(handle)
@@ -528,6 +550,20 @@ class LaunchdContainment:
             # The handle already says released, so recovery sweeps it either way.
             self._stop_locked(handle, timeout=15.0)
             raise ContainmentError("job_release_failed", launched=True) from None
+        # The wrapper acknowledges ``go`` before it runs the provider. If it
+        # gave up waiting first (its bounded wait expired), it has exited
+        # without the acknowledgement and the provider never ran.
+        deadline = self._monotonic() + RELEASE_ACK_SECONDS
+        while not os.path.lexists(run_dir / STARTED_FILE):
+            if not self.leader_alive(handle):
+                if os.path.lexists(run_dir / STARTED_FILE):
+                    break
+                self._stop_locked(handle, timeout=15.0)
+                raise ContainmentError("job_release_expired", launched=False)
+            if self._monotonic() >= deadline:
+                self._stop_locked(handle, timeout=15.0)
+                raise ContainmentError("job_release_unacknowledged", launched=True)
+            self._sleep(0.02)
         return handle
 
     def _wait_for_leader(self, run_dir: Path, timeout: float) -> int:
@@ -576,6 +612,40 @@ class LaunchdContainment:
 
     # -- stop -----------------------------------------------------------------
 
+    def _mirror_path(self, run_dir: Path) -> Path:
+        digest = hashlib.sha256(str(Path(run_dir)).encode()).hexdigest()[:32]
+        return self._lock_dir.parent / "job-handles" / f"{digest}.json"
+
+    def _persist(self, handle: JobHandle) -> None:
+        """Write the handle in the run directory and a mirror outside it.
+
+        Recovery uses the mirror when the run directory's copy is gone, and
+        refuses to act when the two disagree.
+        """
+        _save_handle(handle)
+        mirror = self._mirror_path(handle.run_dir)
+        mirror.parent.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_private_dir(mirror.parent)
+        write_private(mirror, json.dumps({"run_dir": str(handle.run_dir), **handle.to_dict()}).encode())
+
+    def _load_mirror(self, run_dir: Path) -> JobHandle | None:
+        text = read_private_text(self._mirror_path(run_dir))
+        if text is None:
+            return None
+        try:
+            raw = json.loads(text)
+        except ValueError:
+            return None
+        if not isinstance(raw, dict) or raw.get("run_dir") != str(Path(run_dir)):
+            return None
+        return _handle_from(raw, Path(run_dir))
+
+    def _forget_mirror(self, run_dir: Path) -> None:
+        try:
+            self._mirror_path(run_dir).unlink()
+        except OSError:
+            pass
+
     def _label_lock(self, label: str) -> FileLock:
         self._lock_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         ensure_private_dir(self._lock_dir)
@@ -611,9 +681,12 @@ class LaunchdContainment:
         if not acquired:
             return StopProof(False, None, 0)
         try:
-            return self._stop_locked(handle, timeout=timeout)
+            proof = self._stop_locked(handle, timeout=timeout)
         finally:
             lock.release()
+        if proof.stopped:
+            self._forget_mirror(handle.run_dir)
+        return proof
 
     def _stop_locked(self, handle: JobHandle, *, timeout: float) -> StopProof:
         procs = self.procs
@@ -656,8 +729,16 @@ class LaunchdContainment:
         return StopProof(never and loaded is False, loaded, 0, killed, never_released=never)
 
     def recover(self, run_dir: Path) -> StopProof | None:
-        """Stop whatever a lost worker left behind; None when nothing was launched."""
-        handle = load_handle(Path(run_dir))
+        """Stop whatever a lost worker left behind; None when nothing was launched.
+
+        Uses the run directory's handle or, if that is gone, its mirror; when
+        both exist and disagree, nothing is trusted and nothing is touched.
+        """
+        primary = load_handle(Path(run_dir))
+        mirror = self._load_mirror(Path(run_dir))
+        if primary is not None and mirror is not None and primary != mirror:
+            return StopProof(False, None, 0)
+        handle = primary or mirror
         if handle is None:
             return None
         return self.stop(handle)
