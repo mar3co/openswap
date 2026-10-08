@@ -596,8 +596,14 @@ class LiveCheck:
         items = command_items(outcome.run_dir / STDOUT_FILE)
         everything = _texts(outcome.run_dir / STDOUT_FILE, outcome.run_dir / STDERR_FILE, ws)
 
+        keys = [key for _, _, key, _ in steps]
+        # Each probe must run as its own command: an item that matches several
+        # probes (the model chained them) proves none of them, since its exit
+        # code and output belong to the whole chain.
+        combined = [item for item in items if sum(key in item["command"] for key in keys) > 1]
+
         def observed(key):
-            return [item for item in items if key in item["command"]]
+            return [item for item in items if key in item["command"] and item not in combined]
 
         loaded = self._run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{escape_label}"],
                            capture_output=True, text=True, check=False, timeout=20).returncode == 0
@@ -611,6 +617,7 @@ class LiveCheck:
         auth = observed("auth.json")
         detail = {
             "all_required_steps_ran": required_seen,
+            "each_probe_its_own_command": not combined,
             "steps_ran": seen,
             "inside_read_allowed": tokens["inside"] in "".join(i["output"] for i in observed(str(ws / "inside.txt"))),
             "inside_write_allowed": (ws / "inside-write.txt").exists(),

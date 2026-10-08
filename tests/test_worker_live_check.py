@@ -370,6 +370,36 @@ def test_tool_surface_needs_every_feature_off_and_no_managed_layer(tmp_path, pro
     assert evidence["passed"] is False
 
 
+class ChainingMac(SimulatedMac):
+    """The model chains every probe into one shell command, ending in a failing submit."""
+
+    def launch(self, *, job_id, run_dir, argv, env, cwd, stdin_text, ready_timeout=15.0):
+        commands = re.findall(r"^\d+\. (.+)$", stdin_text, flags=re.M)
+        if not commands:
+            return super().launch(job_id=job_id, run_dir=run_dir, argv=argv, env=env, cwd=cwd,
+                                  stdin_text=stdin_text, ready_timeout=ready_timeout)
+        chained = " ; ".join(commands)
+        return super().launch(job_id=job_id, run_dir=run_dir, argv=argv, env=env, cwd=cwd,
+                              stdin_text=f"1. {chained}\n", ready_timeout=ready_timeout)
+
+    def _simulate(self, command, cwd):
+        if " ; " in command:
+            for part in command.split(" ; "):
+                super()._simulate(part, cwd)
+            inside = (cwd / "inside.txt").read_text()
+            return inside, 1  # last command (the submit) failed
+        return super()._simulate(command, cwd)
+
+
+def test_chained_probes_prove_nothing(tmp_path):
+    root = setup_root(tmp_path)
+    evidence = make_check(root, ChainingMac()).run()
+    gate = evidence["gates"]["sandbox_exec"]
+    assert gate["each_probe_its_own_command"] is False
+    assert gate["auth_read_denied"] is False and gate["shell_network_denied"] is False
+    assert gate["passed"] is False
+
+
 class ShortLivedEscapeMac(SimulatedMac):
     """launchctl submit succeeds, but its job is gone before the label check."""
 
