@@ -444,8 +444,13 @@ class CodexExecAdapter:
         managed=None,
         monotonic=time.monotonic,
         sleep=time.sleep,
+        bind_to_opt_in: bool = True,
     ):
         self.backup_root = Path(backup_root)
+        # The live check runs before (or to renew) the opt-in, so it checks
+        # the binary it verified itself rather than the one an older opt-in
+        # recorded.
+        self._bind_to_opt_in = bind_to_opt_in
         self._containment = containment
         self._verify = verify or (lambda **kw: codex_cli.verify(self.backup_root, **kw))
         self._mode = mode or (lambda: execution_mode(self.backup_root))
@@ -476,6 +481,8 @@ class CodexExecAdapter:
 
     def _pinned(self, *, check_version: bool):
         pinned = self._verify(check_version=check_version)
+        if not self._bind_to_opt_in:
+            return pinned
         # Fail closed: this last read must itself prove the opt-in and the
         # binary it was recorded for (an unreadable or replaced settings file
         # reads as disabled, with no binding).
@@ -487,6 +494,8 @@ class CodexExecAdapter:
 
     def _account_checked(self, identity: str) -> bool:
         """Whether a passing live check (recorded in the opt-in) ran on this account."""
+        if not self._bind_to_opt_in:
+            return True  # the live check itself, which produces that evidence
         return identity in load_live_execution(self.backup_root).accounts
 
     def probe(self) -> ProviderAvailability:

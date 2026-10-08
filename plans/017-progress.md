@@ -30,10 +30,14 @@ exit gate. The production Codex adapter remains disabled. The Phase 4 OpenTag
 connector merged to OpenTag `main` on 2026-10-03 (mar3co/opentag#137–#141,
 follow-ups #143–#144) and is deployed; its exit is still open (see Phase 4).
 
-The next unblocking step is Phase 1 live evidence: the owner names a Codex
-account context (a dedicated roster slot or disposable account) and is present
-while the merged harness runs a real `codex exec --json` research task in a
-disposable workspace. Until then every result recorded here is synthetic.
+The next unblocking step is Phase 1 live evidence, and the code for it is now
+in review (see [Live path prepared](#live-path-prepared-2026-10-07)): the
+owner pins a Codex account, installs the pinned CLI, signs that account in to
+its isolated Codex home and runs `openswap worker live-check` on their
+MacBook Pro. That command runs real `codex exec --json` jobs, records
+pass/fail evidence for every Phase 1 gate and, only if all pass and the owner
+says yes, enables live execution. Until it has run, every result recorded here
+is synthetic.
 
 The baseline `uv run pytest` completed before this branch's changes: 2870
 passed, 4 skipped, 1 failed, 3 warnings (15.15s). The failure is
@@ -150,7 +154,7 @@ until the owner records a permitted path or exclusion.
 
 | Phase | Status | Exit evidence / blocker |
 | --- | --- | --- |
-| 1. Feasibility spike and authentication gate | SIGNOFF MERGED (#59) / EVIDENCE BLOCKED | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction showed the wrapper could return success while a detached helper remained alive; the harness now detects and terminates tracked escaped descendants and reports `interrupted`, but cannot close the fork/reparent race. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 merged 2026-09-30 (`39438ca`) as review signoff; merging does not satisfy the remaining technical exit gates. Next step: an owner-authorized account context and an authenticated `codex exec` run. |
+| 1. Feasibility spike and authentication gate | SIGNOFF MERGED (#59) / LIVE PATH IN REVIEW / EVIDENCE PENDING OWNER RUN | A hash-verified stable 0.157.1 passes the synthetic low-level Seatbelt wrapper probe, but no authenticated `codex exec` proves account selection, refresh behavior, structured provider events, complete process-tree cancellation/recovery, or model/tool enforcement integration. The fake `setsid()` reproduction showed the wrapper could return success while a detached helper remained alive; the harness now detects and terminates tracked escaped descendants and reports `interrupted`, but cannot close the fork/reparent race. No owner-authorized Codex slot or exclusive live-auth ownership is established. Control-service decision is recorded. PR #59 merged 2026-09-30 (`39438ca`) as review signoff; merging does not satisfy the remaining technical exit gates. Next step: an owner-authorized account context and an authenticated `codex exec` run. The live adapter, per-job launchd containment with a coalition stop proof, and the `live-check` evidence harness are in review (2026-10-07); the owner's `live-check` run is what clears these gates. |
 | 2. Local worker, remote access off | MERGED (#60) — local-only | Owner authorized local infrastructure to overlap Phase 1; no Phase 1 gate is waived. PR #60 merged 2026-09-30 (`225211d`); CI green on macOS, Linux and Windows; Codex review clean on `556ca11`. Fake-only validation is recorded below. Remote access stays off, the production Codex adapter still refuses, and live Codex stays disabled. The follow-up that lease release must also prove the provider process tree has stopped was closed on 2026-10-07 (see the lease release paragraph below). |
 | 3. Private remote pilot | MERGED (#63–#67, follow-ups #68) / EXIT OPEN | Owner explicitly authorized credential-free Phase 3 overlap. The protocol, reference server, polling/heartbeats, enrollment/status and guarded test CLI have loopback fake-adapter evidence. Reviewed in full on 2026-09-30; three HIGH bugs (launch after abandon, artifact-failure wedge, dying remote thread) and the MEDIUM findings were fixed before #63–#67 merged on 2026-10-01 (`ab737eb`). #68 (2026-10-02, `2e714a3`) fixed the five P2 Codex threads left open at merge and most CI timing flakes; [mar3co/openswap#71](https://github.com/mar3co/openswap/pull/71) (2026-10-02, `c9eccfb`) fixed the reference-store starvation behind the rest. Real owner-controlled HTTPS deployment, submission from another network, backend replacement, and retention/purge plus an audit trail in the reference server still need the owner. Production Codex remains disabled pending Phase 1. |
 | 4. OpenTag connector | MERGED (mar3co/opentag#137–#141, follow-ups #143–#144) / DEPLOYED / EXIT OPEN | Credential-free overlap authorized by the owner; fake-adapter evidence only. Merged 2026-10-03; production migrations applied and agent/portal deployed the same day; worker dispatch stays off unless a workspace grants the `worker-dispatch` scope. Scope tracked in mar3co/opentag#135. Exit needs both an authorized OpenTag request that completes live research on the owner's Mac and returns citations/artifacts through a short initial tool call (blocked on Phase 1's live-adapter gates; fake-adapter runs do not count) and the staging Slack scenario, including non-owner refusal, cited private results and state-only shared updates. See the Phase 4 section below. |
@@ -1122,6 +1126,121 @@ progress.
   `submit-test` takes `--account-ref`.
 
 Execution is still disabled until Phase 1's live-evidence gates clear.
+
+## Live path prepared (2026-10-07)
+
+Everything up to the owner's first real run is implemented, in three stacked
+PRs: containment, the live Codex adapter, and the evidence harness. Live
+execution stays **off by default**; nothing here has run real Codex. The
+Phase 1 gates above remain unchecked until the owner's `live-check` passes.
+
+**Containment (cancellation gate).** Measured on a development Mac with
+synthetic processes ([cancellation-boundary.md](research/remote-agent-host/cancellation-boundary.md#per-job-launchd-job-plus-resource-coalition-sweep-measured-2026-10-07)):
+launchd gives each bootstrapped job its own resource coalition, a
+`setsid()`-daemonised descendant stays in it, and `launchctl bootout` alone
+left that descendant running. `worker/containment.py` therefore runs each job
+as its own launchd label whose `/bin/sh` wrapper waits for a `go` file until
+the worker has recorded the label, coalition ID and boot session; Stop freezes
+every coalition member until a full scan finds none running (a stopped
+process cannot fork, which closes the fork/reparent race), kills them, and
+unloads the label. Proof is "label unloaded and no live member"; a different
+`kern.bootsessionuuid` is proof on its own. A 60-process forking `setsid()`
+job was emptied in 0.07 s; a job whose launching process was `SIGKILL`ed kept
+running and was later recovered with proof. Residual limit: work a job asks
+launchd or another system service to start runs outside its coalition; the
+live check measures a `launchctl submit` attempt from inside the sandbox.
+
+**Live adapter (`worker/codex_exec.py`).**
+
+- Pinned CLI: `openswap worker codex install` fetches the official
+  `rust-v0.157.1` `codex-aarch64-apple-darwin.tar.gz`, refuses it unless its
+  SHA-256 is the published digest, unpacks the single member into the private
+  worker directory and records the binary's own SHA-256; every probe re-hashes
+  it and checks `--version`. Apple silicon only (the only published digest we
+  pin).
+- Account isolation: one `CODEX_HOME` per account under the worker directory,
+  signed in with `openswap worker codex login` (the pinned CLI's own login,
+  `cli_auth_credentials_store = "file"`, under the Codex lease). Jobs never
+  read, copy or write the default `~/.codex` login or roster snapshots; only
+  that Codex process refreshes the isolated home. A launch refuses
+  (`provider_auth_unavailable`, unlaunched) unless the home's signed-in
+  account hashes to the leased identity.
+- Sandbox: a named permission profile (deny `:root`, read `:minimal` and the
+  approved read-only sources, write only the job folder, deny `$TMPDIR` and
+  `/tmp`, no shell network) selected by `default_permissions`; no `--sandbox`
+  flag, because the permissions doc says it makes Codex ignore the profile.
+  Live web search on; apps, hooks, plugins, multi-agent, browser/computer use,
+  code mode, unified exec and skill search disabled; `project_root_markers =
+  []`, `project_doc_max_bytes = 0`. A launch refuses while any managed or system
+  Codex layer exists that could override the profile. The job's environment is a fixed
+  allowlist supplied by launchd.
+- Events: `thread.started` becomes `provider_started`; the end of the run
+  becomes one `provider_finished` (`succeeded` only for exit 0, a
+  `turn.completed`, no error and a non-empty `result.md`; otherwise `failed`
+  with `provider_rate_limited`, `provider_auth_unavailable` or
+  `provider_unavailable`) whose `execution_stopped` is the coalition sweep's
+  proof. No journal or protocol code was added.
+- Runtime: `ProviderLaunchRefused` fails a job before anything ran and
+  releases the lease as unlaunched; a restarted worker hands every recovered
+  job (and the job behind an unreleased lease) to `adapter.recover`, and
+  releases the lease `confirmed_stopped` only on proof.
+- Switch: `openswap.worker.live.execution_mode(backup_root)` is the one place
+  that answers `disabled` or `live`. The live adapter's `execution_mode`
+  attribute (what the readiness report in
+  [#80](https://github.com/mar3co/openswap/pull/80) reads from the adapter)
+  and `WorkerRuntime.execution_mode()` both derive from it. The opt-in (`worker.liveExecution` in
+  settings.json) records the passing evidence's SHA-256 and the measured
+  binary's SHA-256; a different binary fails jobs `provider_unavailable`.
+  `openswap worker live status|enable|disable` manage it.
+
+**Evidence harness.** `openswap worker live-check` refuses while the worker is
+running unpaused, a job is active or a lease is held, then records, for the
+pinned (or `--account`) account: `pinned_cli`, `account_identity`,
+`default_login_unchanged`, `tool_surface` (every disabled feature listed
+and off, no MCP servers, no managed layer), `sandbox_wrapper`,
+`research_run`, `sandbox_exec`, `stop` and `kill_recovery`. The adversarial
+`codex exec` job is asked to read and write outside its folder, read a
+sentinel in `CODEX_HOME`, read `auth.json` into `/dev/null`, follow a symlink
+out, print its environment, use `curl` and `launchctl submit`; results are
+checked on disk and in the JSONL with positive controls (it must read and
+write inside its folder), so a refusal is a failure, not a pass. The stop and
+kill jobs run a helper that daemonises a `setsid()` `sleep`. The evidence
+file (0600, `live-evidence/live-check-<UTC>.json`) holds booleans and counts
+only. It offers to enable live execution only when every gate passes.
+
+Validation (no real Codex, no credentials): the full suite, plus opt-in tests
+against real launchd (`OPENSWAP_LAUNCHD_TESTS=1`): the containment
+`setsid()` test, and the whole harness driven through real launchd with a
+fake, unsandboxed `codex` script. In that run `stop` and `kill_recovery`
+passed with a real detached helper, `research_run`, `tool_surface` and the
+identity gates passed, and both sandbox gates failed as they must against an
+unsandboxed binary (outside reads and writes, `/tmp`, network and the
+`launchctl submit` escape were all detected; the worker's environment
+sentinel was absent because launchd supplies the allowlist).
+
+**Owner steps on the MacBook Pro** (Apple silicon):
+
+```sh
+openswap worker pause                 # if the worker is running
+openswap worker codex install
+openswap worker account <slot>        # if no account is pinned yet
+openswap worker codex login           # browser sign-in to the isolated home
+openswap worker live-check            # ~5-15 min; answer y to enable if all gates pass
+openswap worker pause --off
+```
+
+**Still unproven until that run:** that 0.157.1 `codex exec` honours
+`default_permissions` and the disabled features under `--strict-config` (the
+check fails closed if a key is rejected or a boundary leaks); the exact text
+of `codex mcp list` and `features list` on 0.157.1 (parsed leniently, a format
+change fails `tool_surface`); that the model runs the probe commands (a
+refusal fails the gate); refresh-race behaviour of the isolated home during
+a long run (only one Codex process uses it, but a token refresh under load is
+not exercised); a default login held in the Keychain rather than
+`~/.codex/auth.json` (recorded as absent, not compared); and the
+launchd-mediated escape when the model does not run that step. Phase 4's
+exit still needs the staging Slack run after this.
+
 
 ## Guided Mac setup and readiness report (2026-10-08)
 
