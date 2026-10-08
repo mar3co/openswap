@@ -1133,11 +1133,12 @@ def test_directories_differing_only_in_case_never_share_a_key():
 
 
 
-def test_a_mixed_case_run_directory_name_never_launches(tmp_path):
+@pytest.mark.parametrize("name", ["Job", "caf\u00e9", "cafe\u0301", ".hidden", "a b"])
+def test_a_run_directory_name_with_more_than_one_spelling_never_launches(tmp_path, name):
     containment, procs, launchd = make(tmp_path)
     root = private_dir(tmp_path)
     with pytest.raises(ContainmentError) as error:
-        containment.launch(job_id="a" * 32, run_dir=root / "Job", argv=["/bin/echo"], env={}, cwd=root,
+        containment.launch(job_id="a" * 32, run_dir=root / name, argv=["/bin/echo"], env={}, cwd=root,
                            stdin_text="")
     assert error.value.code == "run_dir_unsafe" and launchd.loaded == {}
 

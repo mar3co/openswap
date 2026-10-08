@@ -383,6 +383,9 @@ def canonical_dir(path: Path | str) -> Path:
     return Path(resolved)
 
 
+_RUN_DIR_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
+
+
 def _case_insensitive(directory: str) -> bool:
     """Whether ``directory``'s volume ignores case (``_PC_CASE_SENSITIVE`` is 0)."""
     try:
@@ -607,9 +610,11 @@ class LaunchdContainment:
             raise ContainmentError("run_dir_unavailable") from None
         # One spelling per physical directory, for its locks, handle and mirror.
         run_dir = canonical_dir(run_dir)
-        if run_dir.name != run_dir.name.lower():
-            # A deleted run directory is later found again through its
-            # lowercase name (see canonical_dir); job ids are lowercase.
+        if not _RUN_DIR_NAME.fullmatch(run_dir.name):
+            # A deleted run directory is later found again through its name
+            # alone (see canonical_dir), so it must have one spelling only:
+            # lowercase ASCII, like job ids (no case or Unicode-normalization
+            # variants).
             raise ContainmentError("run_dir_unsafe")
         if not _printable_path(run_dir):
             # Ownership is proven by matching the plist path that

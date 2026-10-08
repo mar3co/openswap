@@ -525,6 +525,9 @@ class LiveExecutionSettings:
     # The accounts a passing live check ran on with this binary; a job on any
     # other account is refused (its sign-in and refresh were never measured).
     accounts: tuple[str, ...] = ()
+    # The Mac and install the passing check ran on (see live.host_binding):
+    # a restored or copied opt-in never applies anywhere else.
+    host_binding: str | None = None
 
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -540,14 +543,16 @@ def _live_from_raw(raw: dict) -> LiveExecutionSettings:
     codex = live.get("codexSha256")
     enabled_at = live.get("enabledAt")
     accounts = live.get("accounts", [])
-    if (not isinstance(evidence, str) or not _HEX64_RE.fullmatch(evidence)
+    host = live.get("hostBinding")
+    if (not isinstance(host, str) or not _HEX64_RE.fullmatch(host)
+            or not isinstance(evidence, str) or not _HEX64_RE.fullmatch(evidence)
             or not isinstance(codex, str) or not _HEX64_RE.fullmatch(codex)
             or not isinstance(enabled_at, str) or len(enabled_at) > 64
             or not isinstance(accounts, list) or len(accounts) > 64
             or not all(isinstance(a, str) and _LIVE_ACCOUNT_RE.fullmatch(a) for a in accounts)):
         _logger.warning("settings.json live execution opt-in is invalid; live execution stays off")
         return LiveExecutionSettings()
-    return LiveExecutionSettings(True, evidence, codex, enabled_at, tuple(dict.fromkeys(accounts)))
+    return LiveExecutionSettings(True, evidence, codex, enabled_at, tuple(dict.fromkeys(accounts)), host)
 
 
 def load_live_execution(backup_root: Path) -> LiveExecutionSettings:
@@ -570,7 +575,7 @@ def write_live_execution(backup_root: Path, value: LiveExecutionSettings) -> Liv
             section["liveExecution"] = {
                 "enabled": True, "evidenceSha256": value.evidence_sha256,
                 "codexSha256": value.codex_sha256, "enabledAt": value.enabled_at,
-                "accounts": list(value.accounts),
+                "accounts": list(value.accounts), "hostBinding": value.host_binding,
             }
         else:
             section.pop("liveExecution", None)

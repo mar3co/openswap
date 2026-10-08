@@ -124,7 +124,7 @@ def bind_opt_in(tmp_path):
     from openswap.settings import LiveExecutionSettings, write_live_execution
 
     write_live_execution(tmp_path, LiveExecutionSettings(True, "ab" * 32, pinned().binary_sha256, "now",
-                                                         (IDENTITY,)))
+                                                         (IDENTITY,), HOST))
 
 
 def make_adapter(tmp_path, containment, *, mode="live"):
@@ -267,7 +267,7 @@ def test_probe_is_disabled_until_live_mode_and_unavailable_when_binary_fails(tmp
 
 def test_probe_refuses_a_binary_other_than_the_checked_one(tmp_path):
     adapter = make_adapter(tmp_path, FakeContainment())
-    write_live_execution(tmp_path, LiveExecutionSettings(True, "cd" * 32, "ef" * 32, "now"))
+    write_live_execution(tmp_path, LiveExecutionSettings(True, "cd" * 32, "ef" * 32, "now", host_binding=HOST))
     assert adapter.probe().diagnostic_code == "provider_unavailable"
 
 
@@ -490,7 +490,7 @@ def test_execution_mode_hook(tmp_path, monkeypatch):
     runtime = WorkerRuntime(tmp_path, adapter=adapter)
     assert runtime.execution_mode() == "disabled" and adapter.execution_mode == "disabled"
     assert UnavailableCodexAdapter.execution_mode == "disabled"
-    write_live_execution(tmp_path, LiveExecutionSettings(True, "cd" * 32, BINARY_SHA, "now"))
+    write_live_execution(tmp_path, LiveExecutionSettings(True, "cd" * 32, BINARY_SHA, "now", host_binding=HOST))
     assert runtime.execution_mode() == "live"
     assert adapter.execution_mode == "live"
     assert runtime.status().provider.available is True
@@ -673,7 +673,7 @@ def test_malformed_live_setting_reads_disabled_and_keeps_worker_policy(tmp_path,
 
 
 def test_worker_policy_writes_keep_the_live_opt_in(tmp_path):
-    write_live_execution(tmp_path, LiveExecutionSettings(True, "cd" * 32, BINARY_SHA, "now"))
+    write_live_execution(tmp_path, LiveExecutionSettings(True, "cd" * 32, BINARY_SHA, "now", host_binding=HOST))
     update_worker_settings(tmp_path, enabled=True, paused=True)
     configure_worker_local_policy(tmp_path, pinned_account_ref=IDENTITY,
                                   workspaces=(WorkerWorkspace("research", (tmp_path / "r").resolve()),))
@@ -1263,7 +1263,7 @@ def test_the_last_check_before_launch_needs_a_readable_binding(tmp_path, binding
     adapter = make_adapter(tmp_path, containment)
     value = {"missing": None,
              "disabled": LiveExecutionSettings(False, "ab" * 32, pinned().binary_sha256, "now"),
-             "other_binary": LiveExecutionSettings(True, "ab" * 32, "00" * 32, "now")}[binding]
+             "other_binary": LiveExecutionSettings(True, "ab" * 32, "00" * 32, "now", host_binding=HOST)}[binding]
     if value is None:
         (tmp_path / "settings.json").write_text("{not json")
     else:
@@ -1315,7 +1315,7 @@ def test_a_job_on_an_account_the_check_never_ran_on_is_refused(tmp_path):
     containment = FakeContainment(SUCCESS_SCRIPT)
     adapter = make_adapter(tmp_path, containment)
     write_live_execution(tmp_path, LiveExecutionSettings(True, "ab" * 32, pinned().binary_sha256, "now",
-                                                         (stable_account_identity("codex", "acct-other"),)))
+                                                         (stable_account_identity("codex", "acct-other"),), HOST))
     with pytest.raises(ProviderLaunchRefused) as error:
         adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
     assert error.value.diagnostic_code == "live_adapter_disabled" and containment.launches == []
@@ -1385,3 +1385,18 @@ def test_a_root_that_no_longer_resolves_is_an_unlaunched_refusal(tmp_path):
     with pytest.raises(ProviderLaunchRefused) as error:
         adapter.start(job_record(), ws, worker_epoch=1)
     assert error.value.diagnostic_code == "provider_unavailable" and containment.launches == []
+
+
+def test_an_opt_in_from_another_mac_or_install_never_applies(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "platform_supported", lambda: True)
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    adapter = make_adapter(tmp_path, containment)
+    assert live.execution_mode(tmp_path) == "live"
+    monkeypatch.setattr(live, "host_binding", lambda root, **kw: "00" * 32)  # restored elsewhere
+    assert live.execution_mode(tmp_path) == "disabled"
+    with pytest.raises(ProviderLaunchRefused):
+        adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    assert containment.launches == []
+    settings = json.loads((tmp_path / "settings.json").read_text())
+    assert settings["worker"]["liveExecution"]["hostBinding"] == HOST
