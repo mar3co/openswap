@@ -1073,3 +1073,15 @@ def test_a_leader_pid_recycled_before_the_coalition_lookup_is_refused(tmp_path):
         containment.launch(job_id="a" * 32, run_dir=root / ("a" * 32), argv=["/bin/echo"], env={}, cwd=root,
                            stdin_text="")
     assert error.value.code == "job_leader_unverified" and error.value.launched is False
+
+
+
+def test_an_unreadable_worker_coalition_refuses_the_launch(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    procs.live_unreadable.add(WORKER_PID)  # the worker's own coalition cannot be read
+    procs.table[WORKER_PID] = [WORKER_COALITION, 2]
+    with pytest.raises(ContainmentError) as error:
+        containment.launch(job_id="a" * 32, run_dir=root / ("a" * 32), argv=["/bin/echo"], env={}, cwd=root,
+                           stdin_text="")
+    assert error.value.code == "job_coalition_unavailable" and error.value.launched is False
