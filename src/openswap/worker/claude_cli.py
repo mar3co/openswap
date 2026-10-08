@@ -34,16 +34,21 @@ _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)? \(Claude Code\)
 CANDIDATES = ("~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude")
 
 
-def _hidden_from_jobs(binary: Path) -> bool:
-    """Whether the job sandbox hides this path (the default Claude config folder)."""
+def _hidden_from_jobs(binary: Path, backup_root: Path | None = None) -> bool:
+    """Whether the job's Seatbelt profile hides this path (so the binary could not start).
+
+    The profile hides the default Claude and Codex folders and the backup
+    root (see ``claude_exec.seatbelt_profile``).
+    """
     try:
         import pwd
 
         home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     except (ImportError, KeyError, AttributeError):
         home = Path.home()
-    hidden = Path(os.path.realpath(home / ".claude"))
-    return Path(os.path.realpath(binary)).is_relative_to(hidden)
+    hidden = [home / ".claude", home / ".codex"] + ([Path(backup_root)] if backup_root is not None else [])
+    target = Path(os.path.realpath(binary))
+    return any(target.is_relative_to(Path(os.path.realpath(folder))) for folder in hidden)
 
 
 class ClaudeCliError(RuntimeError):
@@ -108,8 +113,8 @@ def _version(binary: Path, run) -> str:
     return version
 
 
-def _check_binary(binary: Path) -> None:
-    if _hidden_from_jobs(binary):
+def _check_binary(binary: Path, backup_root: Path | None = None) -> None:
+    if _hidden_from_jobs(binary, backup_root):
         raise ClaudeCliError("binary_in_claude_config")
     try:
         info = binary.lstat()
@@ -130,7 +135,7 @@ def pin(backup_root: Path, *, binary: Path | None = None, run=subprocess.run, wh
     binary = Path(os.path.realpath(binary)) if binary is not None else find_installed(which)
     if binary is None:
         raise ClaudeCliError("not_installed")
-    _check_binary(binary)
+    _check_binary(binary, backup_root)
     version = _version(binary, run)
     try:
         digest = sha256_file(binary)
@@ -165,7 +170,7 @@ def verify(backup_root: Path, *, run=subprocess.run, supported: bool | None = No
             or not isinstance(raw.get("binary_sha256"), str) or not _HEX64.fullmatch(raw["binary_sha256"])):
         raise ClaudeCliError("pin_invalid")
     binary = Path(raw["binary"])
-    _check_binary(binary)
+    _check_binary(binary, backup_root)
     try:
         actual = sha256_file(binary)
     except (OSError, CodexCliError):

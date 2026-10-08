@@ -551,7 +551,8 @@ def test_a_binary_inside_the_hidden_claude_folder_is_never_pinned(tmp_path, monk
     binary.write_text("#!/bin/sh\necho '2.1.285 (Claude Code)'\n")
     binary.chmod(0o755)
     monkeypatch.setattr(claude_cli, "_hidden_from_jobs",
-                        lambda path: Path(os.path.realpath(path)).is_relative_to(os.path.realpath(home / ".claude")))
+                        lambda path, backup_root=None: Path(os.path.realpath(path)).is_relative_to(
+                            os.path.realpath(home / ".claude")))
     root = tmp_path / "root"
     root.mkdir()
     with pytest.raises(claude_cli.ClaudeCliError) as error:
@@ -861,3 +862,35 @@ def test_polling_waits_until_every_selectable_account_passed_a_check(tmp_path):
     assert runtime.provider_availability().diagnostic_code == "live_adapter_disabled"
     checked.add(IDENTITY)
     assert runtime.provider_availability().available is True
+
+
+
+def test_a_binary_in_any_hidden_folder_is_never_pinned(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    root = tmp_path / "root"
+    root.mkdir()
+    for folder in (home / ".codex" / "bin", root / "bin"):
+        folder.mkdir(parents=True)
+        binary = folder / "claude"
+        binary.write_text("#!/bin/sh\necho '2.1.285 (Claude Code)'\n")
+        binary.chmod(0o755)
+        monkeypatch.setattr(claude_cli.Path, "home", classmethod(lambda cls: home))
+        import pwd
+
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)))
+        with pytest.raises(claude_cli.ClaudeCliError) as error:
+            claude_cli.pin(root, binary=binary)
+        assert error.value.code == "binary_in_claude_config"
+
+
+def test_a_symlinked_profile_is_never_prepared(tmp_path):
+    root = setup_root(tmp_path, prepared=False)
+    profile = claude_exec.profile_for(root, IDENTITY)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.symlink_to(elsewhere)
+    run = _native_login(root)
+    with pytest.raises(live_cli.AccountPinError) as error:
+        live_cli.claude_prepare(root, "claude:4", run=run, verify=lambda: pinned())
+    assert error.value.code == "claude_profile_unsafe" and run.calls == []

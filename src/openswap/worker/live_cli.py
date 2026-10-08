@@ -267,6 +267,11 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
     if profile is None:
         raise AccountPinError("account_not_found")
 
+    if profile.is_symlink() or any(parent.is_symlink() for parent in profile.parents
+                                   if parent.is_relative_to(root)):
+        # Jobs refuse a symlinked profile; never prepare (or log in to) one.
+        raise AccountPinError("claude_profile_unsafe")
+
     def ready() -> bool:
         return profile.is_dir() and profile_identity(profile) == identity and not profile_shared(profile)
 
