@@ -113,7 +113,8 @@ def test_pair_walks_worker_account_then_folder_then_summary(root, keychain, monk
     (workspace,) = policy.workspaces
     assert workspace.workspace_id == "research" and workspace.output_root == research_home.resolve()
     assert workspace.display_label == "OpenSwap Research"
-    assert stat.S_IMODE(research_home.stat().st_mode) == 0o700
+    if os.name == "posix":
+        assert stat.S_IMODE(research_home.stat().st_mode) == 0o700
     assert '(the portal shows "OpenSwap Research")' in out
     assert "  Research folders: research (OpenSwap Research)" in out
     assert "  Execution: disabled" in out and guided_setup.EXECUTION_OFF_NOTE in out
@@ -267,6 +268,7 @@ def test_setup_reruns_the_steps_on_a_paired_mac(root, monkeypatch, capsys, enabl
     assert "Approved research folders: research (OpenSwap Research)." in out and ANOTHER in out
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits only")
 def test_folder_step_refuses_an_existing_folder_others_can_read(root, monkeypatch, capsys, enable_calls,
                                                                 research_home):
     research_home.mkdir()
