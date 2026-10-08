@@ -50,6 +50,7 @@ class UnavailableCodexAdapter:
     """Fail-closed production adapter; never inspects auth or launches Codex."""
 
     diagnostic_code = "live_adapter_disabled"
+    execution_mode = "disabled"
 
     def probe(self) -> ProviderAvailability:
         return ProviderAvailability(False, self.diagnostic_code, None)
@@ -65,11 +66,20 @@ class UnavailableCodexAdapter:
 
 
 def production_adapter(backup_root: Path | None = None) -> ProviderAdapter:
-    """The application adapter: live-capable Codex on Apple silicon Macs, else unavailable."""
+    """The application adapter: live-capable Codex on Apple silicon Macs, else unavailable.
+
+    ``backup_root`` defaults to OpenSwap's backup root. Either adapter exposes
+    ``execution_mode`` ("live" only once the owner opted in), so callers that
+    report the mode can read it from whichever adapter they hold.
+    """
     from openswap.worker.codex_cli import platform_supported
 
-    if backup_root is None or not platform_supported():
+    if not platform_supported():
         return UnavailableCodexAdapter()
+    if backup_root is None:
+        from openswap.paths import get_backup_root
+
+        backup_root = get_backup_root()
     from openswap.worker.codex_exec import CodexExecAdapter
 
     return CodexExecAdapter(Path(backup_root))

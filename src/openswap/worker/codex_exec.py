@@ -334,8 +334,6 @@ class _Run:
 class CodexExecAdapter:
     """Production adapter; runs nothing unless live mode is on (see :mod:`live`)."""
 
-    live_capable = True
-
     def __init__(
         self,
         backup_root: Path,
@@ -354,6 +352,14 @@ class CodexExecAdapter:
         self._sleep = sleep
         self._runs: dict[int, _Run] = {}
         self._runs_lock = threading.Lock()
+
+    @property
+    def execution_mode(self) -> str:
+        """``"live"`` once the owner opted in (re-read on every access), else ``"disabled"``."""
+        try:
+            return LIVE if self._mode() == LIVE else "disabled"
+        except Exception:
+            return "disabled"
 
     @property
     def containment(self) -> LaunchdContainment:

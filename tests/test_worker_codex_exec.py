@@ -474,11 +474,13 @@ def test_execution_mode_hook(tmp_path, monkeypatch):
     runtime = WorkerRuntime(tmp_path, adapter=UnavailableCodexAdapter())
     assert runtime.execution_mode() == "disabled"
     monkeypatch.setattr(live, "platform_supported", lambda: True)
-    adapter = make_adapter(tmp_path, FakeContainment())
+    adapter = CodexExecAdapter(tmp_path, containment=FakeContainment(), verify=lambda **kw: pinned())
     runtime = WorkerRuntime(tmp_path, adapter=adapter)
-    assert runtime.execution_mode() == "disabled"
+    assert runtime.execution_mode() == "disabled" and adapter.execution_mode == "disabled"
+    assert UnavailableCodexAdapter.execution_mode == "disabled"
     write_live_execution(tmp_path, LiveExecutionSettings(True, "cd" * 32, BINARY_SHA, "now"))
     assert runtime.execution_mode() == "live"
+    assert adapter.execution_mode == "live"
     assert runtime.status().provider.available is True
 
 
@@ -488,6 +490,7 @@ def test_production_adapter_is_unavailable_off_apple_silicon(tmp_path, monkeypat
     assert isinstance(production_adapter(), UnavailableCodexAdapter)
     monkeypatch.setattr(codex_cli, "platform_supported", lambda *a, **k: True)
     assert isinstance(production_adapter(tmp_path), CodexExecAdapter)
+    assert isinstance(production_adapter(), CodexExecAdapter)  # default backup root
 
 
 # -- pinned CLI install --------------------------------------------------------------

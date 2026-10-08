@@ -499,15 +499,11 @@ class WorkerRuntime:
     def execution_mode(self) -> str:
         """``"live"`` when this worker would run real provider jobs, else ``"disabled"``.
 
-        The single hook a control-service report should use. It is "live" only
-        for the live-capable production adapter with the owner's explicit
-        opt-in recorded (see :mod:`openswap.worker.live`).
+        It reads the adapter's ``execution_mode``: the live Codex adapter
+        reports "live" only while the owner's explicit opt-in is recorded (see
+        :mod:`openswap.worker.live`); every other adapter reports "disabled".
         """
-        if not getattr(self.adapter, "live_capable", False):
-            return "disabled"
-        from openswap.worker.live import execution_mode
-
-        return execution_mode(self.backup_root)
+        return "live" if getattr(self.adapter, "execution_mode", None) == "live" else "disabled"
 
     def submit(self, submission: JobSubmission, *, job_id: str | None = None, remote: bool = False) -> JobRecord:
         """Admit a job; ``job_id`` lets a caller publish the ID before the row exists.
