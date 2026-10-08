@@ -469,7 +469,8 @@ and an absent field with no pin fails it `provider_unavailable`, in both cases
 before any lease, reconciled `failed` with `unlaunched=true`; another account
 is never substituted. With no pin, the remote client still claims work while
 the backend acknowledged a non-empty set and an allowed account is in the
-roster. The reference service implements `accounts`, accepts `account_ref`
+roster. With a pin, it claims work only while the pinned account's
+provider can run, since a claim without `account_ref` runs on the pin. The reference service implements `accounts`, accepts `account_ref`
 only when the worker currently advertises it, and `submit-test` takes
 `--account-ref`.
 
@@ -610,7 +611,9 @@ stores and refreshes tokens in that profile, and the worker never reads,
 uploads, proxies or logs a credential. A launch refuses without starting
 anything (`provider_auth_unavailable`, `unlaunched=true`) unless the profile
 is signed in as the job's account, and (`provider_unavailable`) while an
-interactive session is using that profile.
+interactive session is using that profile or while the profile mirrors
+customizations from your default profile (scheduled kickoff's sharing);
+`claude prepare` removes those mirrored items.
 
 **Tools and sandbox.** The argv is fixed: `sandbox-exec -f <profile.sb> claude
 -p --output-format stream-json --verbose --restricted --tools

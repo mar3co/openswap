@@ -217,7 +217,7 @@ def claude_prepare(backup_root: Path, selector: str | None, *, prepare=None) -> 
     login is untouched.
     """
     from openswap.worker.accounts import resolve_account_selector, resolve_claude_selector
-    from openswap.worker.claude_exec import profile_for, profile_identity
+    from openswap.worker.claude_exec import profile_for, profile_identity, profile_shared
 
     root = Path(backup_root)
     if selector is None:
@@ -247,12 +247,14 @@ def claude_prepare(backup_root: Path, selector: str | None, *, prepare=None) -> 
         # already signed in as this account exactly as it is.
         guard.assert_available()
         existing = profile_for(root, identity)
-        if existing is not None and profile_identity(existing) == identity:
+        if existing is not None and profile_identity(existing) == identity and not profile_shared(existing):
             return {"slot": choice.number, "account_ref": identity, "profile_ready": True}
-    # Not ready: setup_session takes the same guard itself and re-checks.
+    # Not ready, or sharing the default profile's customizations: setup_session
+    # (share=False) takes the same guard itself on a fresh setup, and on reuse
+    # removes the mirrored items; a job launch refuses a shared profile meanwhile.
     (prepare or default_prepare)(choice.number)
     profile = profile_for(root, identity)
-    ready = profile is not None and profile_identity(profile) == identity
+    ready = profile is not None and profile_identity(profile) == identity and not profile_shared(profile)
     if not ready:
         raise AccountPinError("claude_profile_not_ready")
     return {"slot": choice.number, "account_ref": identity, "profile_ready": True}

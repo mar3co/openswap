@@ -419,16 +419,22 @@ class WorkerRuntime:
         return self.adapters.get(provider_of(identity) or "codex", self.adapter)
 
     def _candidate_providers(self) -> list[str]:
+        pinned = provider_of(self.account_identity)
+        if pinned is not None:
+            # A claim without an account_ref runs on the pin, and polling
+            # cannot ask for scoped claims only: poll only while the pin's
+            # provider can run, or such a claim would be taken just to fail.
+            return [pinned]
         policy = load_worker_settings(self.backup_root)
         providers = []
-        for identity in (self.account_identity, *(entry.identity for entry in policy.account_allowlist)):
+        for identity in (entry.identity for entry in policy.account_allowlist):
             provider = provider_of(identity)
             if provider is not None and provider not in providers:
                 providers.append(provider)
         return providers or ["codex"]
 
     def provider_availability(self) -> ProviderAvailability:
-        """Whether a job could launch now: the pinned (or an allowlisted) account's provider is available."""
+        """Whether a job could launch now: the pinned account's provider (with no pin, an allowlisted one's)."""
         first = None
         for provider in self._candidate_providers():
             try:

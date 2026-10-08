@@ -75,6 +75,35 @@ def profile_for(backup_root: Path, identity: str) -> Path | None:
     return None
 
 
+def profile_shared(profile: Path, home: Path | None = None) -> bool:
+    """Whether the profile mirrors anything from the owner's default ``~/.claude``.
+
+    Scheduled kickoff prepares profiles with ``share=True``, which links
+    settings, CLAUDE.md, skills, commands and agents from the default
+    profile and records them in OpenSwap's share manifest. A remote research
+    job must not inherit any of that.
+    """
+    from openswap.session import SHARE_MANIFEST
+
+    profile = Path(profile)
+    if os.path.lexists(profile / SHARE_MANIFEST):
+        return True
+    default = Path(os.path.realpath((Path(home) if home is not None else Path.home()) / ".claude"))
+    try:
+        entries = list(profile.iterdir())
+    except OSError:
+        return True  # unreadable: never treated as clean
+    for entry in entries:
+        if entry.is_symlink():
+            try:
+                target = Path(os.path.realpath(entry))
+            except OSError:
+                return True
+            if target == default or target.is_relative_to(default):
+                return True
+    return False
+
+
 def profile_identity(profile: Path) -> str | None:
     """The stable identity of the account the profile is logged in as (public metadata only)."""
     from openswap.session import read_session_identity
@@ -202,6 +231,10 @@ class ClaudeCodeAdapter(CodexExecAdapter):
             raise ProviderLaunchRefused("provider_auth_unavailable")
         if self._live_sessions(profile):
             # An interactive Claude session owns this profile's refresh now.
+            raise ProviderLaunchRefused("provider_unavailable")
+        if profile_shared(profile, self._home):
+            # Customizations mirrored from the default profile (kickoff's
+            # share=True): `openswap worker claude prepare` removes them.
             raise ProviderLaunchRefused("provider_unavailable")
         if self._managed(profile):
             raise ProviderLaunchRefused("provider_unavailable")

@@ -659,3 +659,46 @@ def test_a_replaced_pin_between_probe_and_start_is_an_unlaunched_refusal(tmp_pat
     with pytest.raises(ProviderLaunchRefused):
         adapter.start(job_record(), workspace(root), worker_epoch=1)
     assert launcher.launches == []
+
+
+
+def test_a_profile_sharing_the_default_customizations_is_refused_and_prepare_cleans_it(tmp_path):
+    from openswap.session import SHARE_MANIFEST
+
+    root = setup_root(tmp_path)
+    profile = claude_exec.profile_for(root, IDENTITY)
+    (profile / SHARE_MANIFEST).write_text(json.dumps(["settings.json"]))
+    launcher = FakeLaunch(SUCCESS)
+    with pytest.raises(ProviderLaunchRefused) as error:
+        make_adapter(root, launcher).start(job_record(), workspace(root), worker_epoch=1)
+    assert error.value.diagnostic_code == "provider_unavailable" and launcher.launches == []
+
+    calls = []
+
+    def unshare(number):  # what setup_session(share=False) does on reuse
+        calls.append(number)
+        (profile / SHARE_MANIFEST).unlink()
+
+    assert live_cli.claude_prepare(root, "claude:4", prepare=unshare)["profile_ready"] is True
+    assert calls == ["4"]
+
+
+def test_a_link_into_the_default_profile_counts_as_shared(tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude" / "skills").mkdir(parents=True)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    assert claude_exec.profile_shared(profile, home) is False
+    (profile / "skills").symlink_to(home / ".claude" / "skills")
+    assert claude_exec.profile_shared(profile, home) is True
+
+
+def test_polling_follows_the_pinned_provider_only(tmp_path):
+    root = setup_root(tmp_path)
+    runtime, codex, claude = _runtime(root, CODEX_IDENTITY)
+    from openswap.worker.models import ProviderAvailability
+
+    codex.probe = lambda: ProviderAvailability(False, "live_adapter_disabled", None)
+    claude.probe = lambda: ProviderAvailability(True, None, "2.1.285 (Claude Code)")
+    assert runtime._candidate_providers() == ["codex"]
+    assert runtime.provider_availability().available is False
