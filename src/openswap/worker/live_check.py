@@ -725,7 +725,10 @@ class LiveCheck:
              str(outside / "write.txt"), True),
             ("tmp_write", f"/bin/sh -c {q('printf x > ' + str(tmp_marker))}", tmp_marker.name, True),
             ("codex_home_read", f"cat {q(str(sentinel))}", sentinel.name, True),
-            ("auth_read", f"/bin/sh -c {q('cat ' + q(str(home / 'auth.json')) + ' > /dev/null')}",
+            # wc prints only a byte count, so no redirect is needed (a denied
+            # /dev/null would fail a redirected read for the wrong reason) and
+            # the credential never reaches the event stream.
+            ("auth_read", f"/usr/bin/wc -c {q(str(home / 'auth.json'))}",
              "auth.json", True),
             ("symlink_read", f"/bin/sh -c {q('ln -s ' + q(str(outside / 'link-target.txt')) + ' link.txt; cat link.txt')}",
              "link-target.txt", True),

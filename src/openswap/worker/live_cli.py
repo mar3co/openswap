@@ -121,10 +121,13 @@ def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
         home = prepare_home(root, identity)
         _refuse_managed(home, managed)
         env = _login_env(home)
-        result = run(argv, env=env, check=False)
+        # From the isolated home, never the caller's directory: a project
+        # `.codex` layer there could override the file-backed credential store.
+        result = run(argv, env=env, check=False, cwd=str(home))
         signed_in = home_identity(home)
         if signed_in is not None and signed_in != identity:
-            cleanup = run([str(pinned.binary), "logout"], env=env, check=False, capture_output=True)
+            cleanup = run([str(pinned.binary), "logout"], env=env, check=False, capture_output=True,
+                          cwd=str(home))
             if cleanup.returncode != 0 or os.path.lexists(home / "auth.json"):
                 # The other account's credentials are still there: say so.
                 raise AccountPinError("login_account_mismatch_still_signed_in")
@@ -148,7 +151,7 @@ def logout(backup_root: Path, selector: str | None, *, run=subprocess.run, verif
         _refuse_managed(home, managed)
         if not os.path.lexists(home / "auth.json"):
             return {"slot": choice.number, "account_ref": identity, "signed_in": False}
-        result = run([str(pinned.binary), "logout"], env=_login_env(home), check=False)
+        result = run([str(pinned.binary), "logout"], env=_login_env(home), check=False, cwd=str(home))
         # Signed out means the credentials file is gone, not merely unreadable.
         still = os.path.lexists(home / "auth.json")
     if result.returncode != 0 or still:

@@ -376,8 +376,19 @@ def canonical_dir(path: Path | str) -> Path:
         return Path(found)
     parent = _on_disk_spelling(os.path.dirname(resolved))
     if parent is not None:
-        return Path(parent) / os.path.basename(resolved)
+        leaf = os.path.basename(resolved)
+        # Launch only accepts lowercase final components, so on a
+        # case-insensitive volume the lowercase spelling is the one recorded.
+        return Path(parent) / (leaf.lower() if _case_insensitive(parent) else leaf)
     return Path(resolved)
+
+
+def _case_insensitive(directory: str) -> bool:
+    """Whether ``directory``'s volume ignores case (``_PC_CASE_SENSITIVE`` is 0)."""
+    try:
+        return os.pathconf(directory, 11) == 0  # _PC_CASE_SENSITIVE on macOS
+    except (OSError, ValueError):
+        return False
 
 
 def _printable_path(path: Path) -> bool:
@@ -596,6 +607,10 @@ class LaunchdContainment:
             raise ContainmentError("run_dir_unavailable") from None
         # One spelling per physical directory, for its locks, handle and mirror.
         run_dir = canonical_dir(run_dir)
+        if run_dir.name != run_dir.name.lower():
+            # A deleted run directory is later found again through its
+            # lowercase name (see canonical_dir); job ids are lowercase.
+            raise ContainmentError("run_dir_unsafe")
         if not _printable_path(run_dir):
             # Ownership is proven by matching the plist path that
             # `launchctl print` shows on one line; a path with a line break or
