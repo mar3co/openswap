@@ -1153,3 +1153,24 @@ def test_a_deleted_run_directory_is_found_from_an_uppercase_spelling(tmp_path):
         pytest.skip("case-sensitive file system")
     assert c.canonical_dir(upper) == handle.run_dir
     assert containment.recover(upper) is not None
+
+
+
+def test_an_emptied_directory_of_an_unrecovered_job_is_not_reused(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    first = launch(containment, root)
+    for entry in first.run_dir.iterdir():  # someone emptied it; the job still runs
+        entry.unlink()
+    with pytest.raises(ContainmentError) as error:
+        containment.launch(job_id="b" * 32, run_dir=first.run_dir, argv=["/bin/echo"], env={}, cwd=root,
+                           stdin_text="")
+    assert error.value.code == "run_dir_has_unrecovered_job" and error.value.launched is False
+
+
+def test_a_clock_step_during_a_scan_makes_it_incomplete(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    times = iter([1000.0, 990.0])  # stepped back ten seconds mid-scan
+    containment._wall = lambda: next(times)
+    scan = containment._scan(JOB_COALITION)
+    assert scan.get(0) == "gone" and containment._complete(scan, scan) is False
