@@ -639,3 +639,31 @@ def test_a_failing_process_table_still_cleans_up_and_proves_nothing(tmp_path):
     assert proof.stopped is False
     assert escaped not in procs.table  # killed from the last good scan
     assert launchd.loaded == {}  # the label was still booted out
+
+
+def test_the_wrapper_uses_no_path_lookup_before_release(tmp_path):
+    pre_release = c.WRAPPER_SCRIPT.split('"$@"')[0]
+    for word in ("mv ", "sleep "):
+        assert f"/bin/{word}" in pre_release
+        assert pre_release.count(word) == pre_release.count(f"/bin/{word}")
+
+
+def test_an_unknown_in_the_previous_scan_prevents_a_freeze(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    procs.live_unreadable = {66666}
+    calls = {"n": 0}
+    original = procs.pids
+
+    def unknown_once():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            procs.live_unreadable = set()
+            procs.dead_unreadable = {66666}
+            procs.zombies = [66666]  # listed, now confirmed dead
+        return original()
+
+    procs.pids = unknown_once
+    frozen, _ = containment._sweep(JOB_COALITION, deadline=1e9)
+    # The scan right after the unknown one must not complete the freeze on its own.
+    assert calls["n"] >= 3

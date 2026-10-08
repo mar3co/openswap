@@ -69,18 +69,19 @@ EXIT_TIMEOUT_SECONDS = 5
 # The job's main program. It records its own pid, then waits (bounded) for the
 # worker to record the coalition before it runs the provider, so a provider
 # never runs unless the worker can sweep it. Its exit file is written only by
-# a normal return of the provider.
+# a normal return of the provider. Only shell builtins and absolute system
+# utilities run before the provider, whatever PATH the job's environment sets.
 WRAPPER_SCRIPT = (
     'd="$1"; shift\n'
-    'echo $$ > "$d/leader.pid.tmp" && mv "$d/leader.pid.tmp" "$d/leader.pid" || exit 124\n'
+    'echo $$ > "$d/leader.pid.tmp" && /bin/mv "$d/leader.pid.tmp" "$d/leader.pid" || exit 124\n'
     'i=0\n'
     'while [ ! -e "$d/go" ]; do\n'
     '  i=$((i+1)); [ "$i" -gt 600 ] && exit 125\n'
-    '  sleep 0.05\n'
+    '  /bin/sleep 0.05\n'
     'done\n'
     '"$@" < "$d/stdin.txt" > "$d/stdout.jsonl" 2> "$d/stderr.log"\n'
     'rc=$?\n'
-    'echo "$rc" > "$d/exit.tmp" && mv "$d/exit.tmp" "$d/exit"\n'
+    'echo "$rc" > "$d/exit.tmp" && /bin/mv "$d/exit.tmp" "$d/exit"\n'
 )
 
 def _fresh(run_dir: Path) -> bool:
@@ -741,7 +742,7 @@ class LaunchdContainment:
             if (
                 not running and "unknown" not in scan.values()
                 and previous is not None and self._complete(scan, previous)
-                and "running" not in previous.values()
+                and "running" not in previous.values() and "unknown" not in previous.values()
                 and stopped == {pid for pid, kind in previous.items() if kind == "stopped"}
             ):
                 frozen = True
