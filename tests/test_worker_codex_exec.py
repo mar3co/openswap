@@ -185,6 +185,7 @@ def test_argv_is_fixed_and_has_no_override_surfaces(tmp_path):
     argv = codex_exec.codex_argv(Path("/x/codex"), tmp_path / "out", tmp_path / "run")
     assert argv[0] == "/x/codex" and argv[-1] == "-"
     assert "exec" in argv and "--json" in argv and "--skip-git-repo-check" in argv
+    assert argv.index("--ignore-rules") > argv.index("exec")  # no user/project exec-policy rules
     for forbidden in ("--sandbox", "-s", "--add-dir", "-m", "--model", "-c", "--config", "resume", "fork",
                       "--dangerously-bypass-approvals-and-sandbox", "--yolo", "--search"):
         assert forbidden not in argv
