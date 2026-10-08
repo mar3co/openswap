@@ -149,7 +149,7 @@ def _toml_string(value: str) -> str:
 
 
 def codex_config(readonly_sources: tuple[Path, ...] = (), write_paths: tuple[Path, ...] = (),
-                 read_paths: tuple[Path, ...] = ()) -> str:
+                 read_paths: tuple[Path, ...] = (), env: dict[str, str] | None = None) -> str:
     """The isolated home's whole ``config.toml``; nothing else is configured."""
     lines = [
         "# Managed by OpenSwap Remote tasks and rewritten before every run. Do not edit.",
@@ -178,6 +178,8 @@ def codex_config(readonly_sources: tuple[Path, ...] = (), write_paths: tuple[Pat
         "[shell_environment_policy]",
         'inherit = "core"',
         "ignore_default_excludes = false",
+        *([f"set = {{ {', '.join(f'{key} = {_toml_string(value)}' for key, value in sorted(env.items()))} }}"]
+          if env else []),
         "",
         f"[permissions.{PROFILE_NAME}]",
         'extends = ":workspace"',
@@ -206,7 +208,8 @@ def codex_config(readonly_sources: tuple[Path, ...] = (), write_paths: tuple[Pat
 
 
 def prepare_home(backup_root: Path, identity: str, readonly_sources: tuple[Path, ...] = (),
-                 write_paths: tuple[Path, ...] = (), read_paths: tuple[Path, ...] = ()) -> Path:
+                 write_paths: tuple[Path, ...] = (), read_paths: tuple[Path, ...] = (),
+                 env: dict[str, str] | None = None) -> Path:
     """Create the isolated home (0700) and write its managed config."""
     root = Path(backup_root)
     ensure_private_dir(root / "worker")
@@ -214,7 +217,8 @@ def prepare_home(backup_root: Path, identity: str, readonly_sources: tuple[Path,
     home = isolated_home(root, identity)
     ensure_private_dir(home)
     ensure_private_dir(home / "home")
-    write_private(home / "config.toml", codex_config(readonly_sources, write_paths, read_paths).encode("utf-8"))
+    write_private(home / "config.toml",
+                  codex_config(readonly_sources, write_paths, read_paths, env).encode("utf-8"))
     return home
 
 
@@ -372,8 +376,8 @@ def build_prompt(task: str, workspace: ResolvedWorkspace) -> str:
     if workspace.work_dir is not None:
         if workspace.branch is not None:
             where = f"a git worktree made for this task, on branch {workspace.branch}"
-            commit = ("Commit your changes on the current branch when you are done; do not switch "
-                      "branches, push, or rewrite other branches.")
+            commit = ("You may commit on this branch; anything you leave uncommitted is committed to it "
+                      "for you when you finish. Do not switch branches, push, or rewrite other branches.")
             note = ", and the branch name"
         else:
             where = "the owner's folder itself"
@@ -444,6 +448,7 @@ class _Run:
     handle: JobHandle
     run_dir: Path
     output_root: Path
+    worktree: object | None = None  # finished by the worker once the run is proven stopped
     lock: threading.Lock = field(default_factory=threading.Lock)
     offset: int = 0
     pending: bytes = b""
@@ -558,8 +563,10 @@ class CodexExecAdapter:
     def _prepare_account(self, identity: str, workspace: ResolvedWorkspace) -> Path:
         """The account's isolated home, signed in to exactly ``identity``; refuses otherwise."""
         try:
+            # The task's git settings reach its shell commands too (Codex
+            # passes only a core environment to them otherwise).
             home = prepare_home(self.backup_root, identity, tuple(workspace.readonly_sources),
-                                tuple(workspace.write_paths), tuple(workspace.read_paths))
+                                tuple(workspace.write_paths), tuple(workspace.read_paths), dict(workspace.env))
         except (OSError, ValueError, ContainmentError):
             raise ProviderLaunchRefused("provider_unavailable") from None
         if home_identity(home) != identity:
@@ -651,7 +658,7 @@ class CodexExecAdapter:
                 shutil.rmtree(run_dir, ignore_errors=True)
                 raise ProviderLaunchRefused("provider_unavailable") from None
             raise RuntimeError("execution_uncertain") from None
-        run = _Run(job.job_id, handle, run_dir, output_root)
+        run = _Run(job.job_id, handle, run_dir, output_root, worktree=workspace.worktree)
         with self._runs_lock:
             self._runs[handle.leader_pid] = run
             self._finished.pop(handle.leader_pid, None)
@@ -803,6 +810,15 @@ class CodexExecAdapter:
         exit_status = self.containment.exit_status(state.handle)
         proof = self._stop_with_retries(state)
         state.finished = True
+        if proof.stopped is True and state.worktree is not None:
+            # Nothing of the task runs any more: import its objects and commit
+            # what it left on its branch. Never fails the job.
+            try:
+                from openswap.worker import worktrees
+
+                worktrees.finish(state.worktree, f"OpenSwap task {state.job_id[:8]}: work left uncommitted")
+            except Exception:
+                pass
         if failure is not None:
             state.failure = failure
         if (exit_status == 0 and state.turn_completed and state.failure is None and self._result_ok(state)

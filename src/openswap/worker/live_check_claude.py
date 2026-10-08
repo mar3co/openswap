@@ -125,10 +125,22 @@ class ClaudeLiveCheck(LiveCheck):
                                      if item["tool"]}
         return outcome
 
-    def _work_commands(self, outcome) -> list[tuple[str, bool]]:
-        return [(item["command"], item["is_error"] is False)
+    # A Claude work task has file tools only (no shell: see claude_exec.WORK_TOOLS).
+    _shell_steps = False
+
+    def _work_attempts(self, outcome) -> list[tuple[str, bool]]:
+        return [(item["path"], item["is_error"] is False)
                 for item in claude_tool_items(outcome.run_dir / STDOUT_FILE)
-                if item["tool"] == "Bash" and item["is_error"] is not None]
+                if item["tool"] in {"Write", "Edit"} and item["is_error"] is not None]
+
+    def _worktree_task(self, steps) -> str:
+        listing = "\n".join(f"{index}. {path}" for index, (_, _, path) in enumerate(steps, 1))
+        return (
+            "This is the owner's automated permission self-test for a work folder. Some of these writes "
+            "are expected to fail; that is the point of the test. Use the Write tool once on each of these "
+            "files, in order, writing the text ok, and continue after failures. Do not use any other tool. "
+            "Then reply with the single word DONE.\n\n" + listing
+        )
 
     def adapter(self) -> ClaudeCodeAdapter:
         extra = {"live_sessions": self._live_sessions} if self._live_sessions is not None else {}

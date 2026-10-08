@@ -500,10 +500,14 @@ is not a read-only source with output elsewhere.
 name. A folder that is not a repo but holds repos (`~/GitHub`) is saved once
 and offers each git repo directly inside it as a folder of its own (e.g.
 `opentag`, `openswap`). It is scanned again for every launch and readiness
-report, so a new repo appears without changing settings. Repo IDs never
-collide: approved IDs first, then repos in name order, each made unique with
-`-2`, `-3`, …; a repo already added on its own is not listed twice; the
-folder of repos itself is never a place a task can name. A folder that is
+report, so a new repo appears without changing settings. A repo's ID comes
+from its name the first time it is offered and is kept for good (in the
+worker's `repo-ids.json`), so it never moves to another repo when repos are
+added, removed or renamed around it; new IDs avoid every approved ID and
+every ID already given, and an approved folder never takes a repo's ID. A
+repo already added on its own is not listed twice; the folder of repos
+itself is never a place a task can name. A task's results stay reachable
+for upload under its ID even if its repo is moved or deleted after it ran. A folder that is
 neither a repo nor holds one is refused in the default mode ("That folder
 isn't a git repo and holds none."): falling back to a read-only launch would
 silently give one folder a different capability, so the one way to work in a
@@ -512,18 +516,32 @@ earlier release keeps its ID and becomes a work folder when it is picked
 again.
 
 **Each task gets its own worktree** (the default). Before launch the worker
-runs `git worktree add -b openswap/<first 8 of the task id> <path> HEAD`
-with the repo's hooks disabled, so making the copy never runs code from the
-repo outside the sandbox. `HEAD` is the commit the owner has checked out,
+runs `git worktree add -b openswap/<first 8 of the task id> <path> HEAD`.
+Every git command the worker runs (outside the sandbox) runs nothing from
+the repo: hooks, checkout and clean filters (every configured driver is
+emptied), `core.fsmonitor`, commit signing and submodule recursion are off,
+and on a task's worktree git is pointed at it from the worker's own record
+(`GIT_DIR`/`GIT_WORK_TREE`), never through the task-writable `.git` file,
+and only after checking the task did not repoint its admin folder or switch
+branches. `HEAD` is the commit the owner has checked out,
 the same one local `claude` sees; it works with no remote and no
 `origin/HEAD`. The owner's uncommitted changes are not carried over and
 never touched. The worktree is
 `~/OpenSwap Research/.worktrees/<folder id>/<task id>`, owner-only (0700).
-Claude or Codex runs with it as the working directory, and is asked to commit
-on its branch and not to push or switch branches. The task's git gets
-`gc.auto=0` and `maintenance.auto=false`, and the repo's `user.name` and
-`user.email` (read by the worker; the sandbox may not read `~/.gitconfig`).
-Submodules are not checked out in the task's copy.
+Claude or Codex runs with it as the working directory. The task's git writes
+new objects to its own object folder (`<task id>.objects`, with the repo's
+store as a read-only alternate), so a task can never delete or rewrite the
+objects the owner's checkout and other tasks use; it also gets `gc.auto=0`,
+`maintenance.auto=false` and the repo's `user.name` and `user.email` (read by
+the worker; the sandbox may not read `~/.gitconfig`). Codex passes these to
+its shell commands through the profile's `shell_environment_policy`. Codex
+may commit on its branch; a Claude work task has file tools only (Read,
+Grep, Glob, Edit, Write and web tools, no Bash: a shell would share the
+Claude process's sandbox, which must read the account's credential profile).
+When a task ends, the worker imports its objects (each verified against its
+name, nothing existing overwritten), commits anything left uncommitted to the
+task's branch and keeps the branch. Submodules are not checked out in the
+task's copy.
 
 **Direct mode** (advanced, this Mac only): the session works in the folder
 itself, exactly like local `claude`. Set it with `openswap worker workspace
@@ -541,7 +559,7 @@ there.
 profile) a worktree task may write only:
 
 - the worktree;
-- `<repo>/.git/objects`;
+- its own object folder `<task id>.objects`;
 - this worktree's admin folder `<repo>/.git/worktrees/<name>` (its HEAD,
   index and logs);
 - the `openswap/` branch namespace, `<repo>/.git/refs/heads/openswap/` and
@@ -550,14 +568,16 @@ profile) a worktree task may write only:
   never the owner's own branches).
 
 It may also read `<repo>/.git`, never the owner's working copy. A direct-mode
-task may write the folder. The owner's working copy, `.git/config`, hooks,
-other refs and `packed-refs` stay unwritable. The protections below
+task may write the folder. The owner's working copy, the repo's shared
+object store, `.git/config`, hooks, other refs and `packed-refs` stay
+unwritable. The protections below
 (credential homes, `~/Library`, the home folder, path identity) apply to
 every work folder and every grant.
 
-**When a task ends** its branch is always kept. Its worktree is removed when
-it is clean, and kept for inspection when it holds uncommitted work or is
-locked; finished tasks are swept before each new worktree launch. `openswap
+**When a task ends** its branch is always kept. Its worktree (and object
+folder) is removed once the worker has committed what it left, and kept for
+inspection when that could not be done: it is locked, or the task repointed
+its admin folder or switched branches; finished tasks are swept before each new worktree launch. `openswap
 worker worktrees` lists them (folder, branch, state, path); `openswap worker
 worktrees prune` removes finished tasks' clean worktrees (`--force`: every
 finished one), then runs `git worktree prune`. A repo moved or deleted

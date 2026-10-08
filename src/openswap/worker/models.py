@@ -273,6 +273,7 @@ class ResolvedWorkspace:
     # Extra environment for the task's own git (identity, no auto-gc).
     env: tuple[tuple[str, str], ...] = ()
     branch: str | None = None  # the task's own branch, for a worktree
+    worktree: object | None = None  # worktrees.Worktree: the worker finishes it after the run
 
     @property
     def cwd(self) -> Path:

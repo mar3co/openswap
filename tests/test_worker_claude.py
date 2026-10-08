@@ -496,13 +496,17 @@ class SimulatedClaudeMac(FakeLaunch):
         lines = [INIT]
         running = "thoroughly" in stdin_text
         if "work folder" in stdin_text:
-            for index, command in enumerate(re.findall(r"^\d+\. (.+)$", stdin_text, flags=re.M)):
-                output, code = run_for_real(command, cwd) if "git commit" in command else ("denied", 1)
+            # File tools only: a write inside the task's worktree works, any other is refused.
+            for index, path in enumerate(re.findall(r"^\d+\. (/.+)$", stdin_text, flags=re.M)):
+                allowed = path.startswith(str(cwd) + "/")
+                if allowed:
+                    Path(path).write_text("ok")
                 lines.append({"type": "assistant", "message": {"content": [
-                    {"type": "tool_use", "id": f"b{index}", "name": "Bash", "input": {"command": command}}]}})
+                    {"type": "tool_use", "id": f"w{index}", "name": "Write",
+                     "input": {"file_path": path, "content": "ok"}}]}})
                 lines.append({"type": "user", "message": {"content": [
-                    {"type": "tool_result", "tool_use_id": f"b{index}", "is_error": code != 0,
-                     "content": output}]}})
+                    {"type": "tool_result", "tool_use_id": f"w{index}", "is_error": not allowed,
+                     "content": "written" if allowed else "Permission denied"}]}})
             lines.append({"type": "result", "subtype": "success", "is_error": False, "result": "DONE",
                           "usage": {"output_tokens": 3}})
         elif reads:

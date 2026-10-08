@@ -184,8 +184,8 @@ class SimulatedMac:
         # A work folder's self-test: the commit in the task's worktree works;
         # writes to the owner's copy, branch or git config are denied (or, on
         # a leaky Mac, really happen).
-        if "git commit" in command or (not self.sandboxed and any(
-                key in command for key in ("owner-write.txt", "update-ref", ".git/config"))):
+        if "task.txt" in command or (not self.sandboxed and any(
+                key in command for key in ("owner-write.txt", "update-ref", ".git/config", "openswap-planted"))):
             return run_for_real(command, cwd)
         if "launchctl submit" in command:
             if not self.sandboxed:
@@ -1162,8 +1162,8 @@ def test_the_worktree_gate_commits_in_the_task_copy_and_nothing_else(tmp_path):
     root = setup_root(tmp_path)
     gate = make_check(root, SimulatedMac()).run()["gates"]["worktree"]
     assert gate["passed"] is True
-    assert gate["commit_in_worktree_works"] and gate["owner_copy_write_denied"]
-    assert gate["owner_branch_unchanged"] and gate["git_config_unchanged"]
+    assert gate["task_work_on_its_branch"] and gate["owner_copy_write_denied"]
+    assert gate["owner_branch_unchanged"] and gate["git_config_unchanged"] and gate["shared_objects_write_denied"]
     # The task's worktree is removed after the check.
     assert not any((root / "live-check").glob("*/worktree-results/.worktrees/live-check/*"))
 

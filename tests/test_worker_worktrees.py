@@ -202,10 +202,14 @@ def test_each_task_gets_its_own_worktree_and_branch(root, home):
     assert (one.work_dir / "README.md").read_text() == "hello\n"  # from HEAD, not the owner's edit
     assert (repo / "README.md").read_text() == "owner's uncommitted edit\n"  # never touched
     common = (repo / ".git").resolve()
-    assert set(one.write_paths) == {one.work_dir, common / "objects", common / "worktrees" / ("a" * 32),
+    objects = results / ".worktrees" / "openswap" / f"{'a' * 32}.objects"
+    # Never the repo's shared object store: the task writes its own objects.
+    assert set(one.write_paths) == {one.work_dir, objects, common / "worktrees" / ("a" * 32),
                                     common / "refs" / "heads" / "openswap",
                                     common / "logs" / "refs" / "heads" / "openswap"}
     assert one.read_paths == (common,)
+    assert dict(one.env)["GIT_OBJECT_DIRECTORY"] == str(objects)
+    assert dict(one.env)["GIT_ALTERNATE_OBJECT_DIRECTORIES"] == str(common / "objects")
     env = dict(one.env)
     assert env["GIT_CONFIG_KEY_0"] == "gc.auto" and env["GIT_AUTHOR_EMAIL"] == "openswap-task@localhost"
     if os.name == "posix":
@@ -342,7 +346,11 @@ def test_under_seatbelt_a_commit_works_and_writes_outside_are_denied(root, home,
                               cwd=resolved.work_dir, env=env, capture_output=True).returncode
 
     assert sandboxed("echo change > work.txt && git add work.txt && git commit -q -m 'task work'") == 0
+    # The commit's objects are in the task's own folder until the worker imports them.
+    assert worktrees.finish(resolved.worktree, "left over") is True
     assert _git(repo, "log", "-1", "--format=%s", resolved.branch) == "task work"
+    assert sandboxed(f"echo x > '{repo}/.git/objects/planted'") != 0  # the shared object store
+    assert sandboxed(f"rm -rf '{repo}/.git/objects/pack'") != 0 or (repo / ".git" / "objects" / "pack").exists()
     assert sandboxed(f"echo x > '{repo}/README.md'") != 0  # the owner's copy
     assert (repo / "README.md").read_text() == "hello\n"
     assert sandboxed(f"echo x > '{home}/outside.txt'") != 0
@@ -381,3 +389,130 @@ def test_setup_advanced_offers_the_direct_mode(root, home, monkeypatch, capsys):
     assert "✓ github works in the folder itself." in out
     assert load_worker_settings(root).workspaces[0].mode == "direct"
     assert "  ✓ Folders     github (GitHub, direct)" in out
+
+
+# --- review fixes: nothing of the repo runs as the worker; stable IDs; own objects ---------------
+
+
+def test_checkout_and_status_never_run_the_repos_filters(root, home, tmp_path):
+    repo = _repo(home / "GitHub" / "openswap")
+    marker = tmp_path / "filter-ran"
+    _git(repo, "config", "filter.evil.smudge", f"sh -c 'touch {marker}; cat'")
+    _git(repo, "config", "filter.evil.clean", f"sh -c 'touch {marker}; cat'")
+    _git(repo, "config", "core.fsmonitor", f"sh -c 'touch {marker}'")
+    (repo / ".gitattributes").write_text("*.txt filter=evil\n")
+    (repo / "data.txt").write_text("data\n")
+    _git(repo, "-c", "filter.evil.clean=cat", "-c", "core.fsmonitor=false", "add", ".gitattributes", "data.txt")
+    _git(repo, "-c", "filter.evil.clean=cat", "-c", "core.fsmonitor=false", "commit", "-q", "-m", "filtered")
+    marker.unlink(missing_ok=True)
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    assert (resolved.work_dir / "data.txt").read_text() == "data\n"
+    (resolved.work_dir / "data.txt").write_text("changed\n")
+    assert worktrees.finish(resolved.worktree, "left over") is True
+    assert not marker.exists()
+
+
+def test_finish_imports_objects_and_commits_what_was_left(root, home):
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    env = {**os.environ, **dict(resolved.env)}
+    (resolved.work_dir / "one.txt").write_text("1")
+    subprocess.run(["git", "add", "one.txt"], cwd=resolved.work_dir, env=env, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "by the task"], cwd=resolved.work_dir, env=env, check=True)
+    (resolved.work_dir / "two.txt").write_text("2")  # left uncommitted
+    assert worktrees.finish(resolved.worktree, "left over") is True
+    assert _git(repo, "log", "--format=%s", resolved.branch).splitlines()[:2] == ["left over", "by the task"]
+    assert _git(repo, "show", f"{resolved.branch}:two.txt") == "2"
+    assert worktrees.is_dirty(resolved.worktree) is False
+    assert worktrees.remove(resolved.work_dir) is True
+    assert not resolved.worktree.objects.exists()
+    assert _git(repo, "show", f"{resolved.branch}:one.txt") == "1"  # still readable from the repo itself
+
+
+def test_a_tampered_worktree_is_never_finished_or_run_by_the_worker(root, home):
+    repo = _repo(home / "GitHub" / "openswap")
+    _git(repo, "branch", "dev")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    (tree.git_dir / "HEAD").write_text("ref: refs/heads/dev\n")  # the task switched branches
+    (resolved.work_dir / "x.txt").write_text("x")
+    dev = _git(repo, "rev-parse", "dev")
+    assert worktrees.intact(tree) is False and worktrees.finish(tree, "left over") is False
+    assert _git(repo, "rev-parse", "dev") == dev
+    (tree.git_dir / "HEAD").write_text(f"ref: refs/heads/{tree.branch}\n")
+    (tree.git_dir / "commondir").write_text("/somewhere/else/.git\n")
+    assert worktrees.finish(tree, "left over") is False
+    # A rewritten .git file in the worktree is never followed: the worker uses its own record.
+    (resolved.work_dir / ".git").write_text(f"gitdir: {repo / '.git'}\n")
+    assert worktrees.load_record(resolved.work_dir) == tree
+    listed = {item.job_id: item for item in worktrees.list_all(home / "OpenSwap Research")}
+    assert listed["a" * 32].intact is False
+    assert worktrees.sweep(home / "OpenSwap Research", lambda _job: True) == []  # kept for inspection
+
+
+def test_import_never_takes_a_bad_or_existing_object(root, home):
+    import zlib
+
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    head_blob = _git(repo, "rev-parse", "HEAD:README.md")
+    planted = tree.objects / head_blob[:2]
+    planted.mkdir()
+    (planted / head_blob[2:]).write_bytes(zlib.compress(b"blob 4\0evil"))  # an existing name, wrong content
+    bad = "ab" * 20
+    (tree.objects / bad[:2]).mkdir(exist_ok=True)
+    (tree.objects / bad[:2] / bad[2:]).write_bytes(zlib.compress(b"blob 3\0bad"))
+    assert worktrees.import_objects(tree) == 0
+    assert _git(repo, "cat-file", "-p", head_blob) == "hello"
+    assert not (repo / ".git" / "objects" / bad[:2] / bad[2:]).exists()
+
+
+def test_repo_ids_stay_with_their_repo(root, home):
+    github = home / "GitHub"
+    _repo(github / "foo.bar")
+    cli.add_work_folder(root, github)
+    assert _ids(root) == ["foo-bar"]
+    _repo(github / "foo bar")  # sorts first and would take foo-bar if IDs were recomputed
+    _repo(github / "abc")
+    assert dict((w.work_root.name, w.workspace_id) for w in cli.launchable_workspaces(
+        root, load_worker_settings(root).workspaces) if w.work_root is not None) == {
+        "abc": "abc", "foo bar": "foo-bar-2", "foo.bar": "foo-bar"}
+    # Gone and back: the same ID; and an approved folder never takes a repo's ID.
+    worktrees.remove_tree(github / "foo.bar")
+    assert "foo-bar" not in _ids(root)
+    _repo(github / "foo.bar")
+    assert "foo-bar" in _ids(root)
+    other = _repo(home / "Code" / "foo-bar")
+    assert cli.add_work_folder(root, other).workspace.workspace_id == "foo-bar-3"
+    with pytest.raises(cli.WorkspaceError) as refused:
+        cli.add_worker_workspace(root, "abc", home / "results-abc")
+    assert refused.value.code == "workspace_exists"
+
+
+def test_results_are_found_after_the_repo_is_gone(root, home):
+    github = home / "GitHub"
+    repo = _repo(github / "openswap")
+    cli.add_work_folder(root, github)
+    assert _ids(root) == ["openswap"]
+    worktrees.remove_tree(repo)
+    workspaces = load_worker_settings(root).workspaces
+    assert cli.results_folder(root, "openswap", workspaces) == home / "OpenSwap Research" / "openswap"
+    assert cli.results_folder(root, "missing", workspaces) is None
+    assert cli.results_folder(root, "../x", workspaces) is None
+
+
+def test_claude_work_tasks_get_no_shell_and_codex_shells_get_the_git_settings(root, home):
+    from openswap.worker.claude_exec import WORK_TOOLS
+    from openswap.worker.codex_exec import _toml_string, codex_config
+
+    assert "Bash" not in WORK_TOOLS and {"Edit", "Write"} <= set(WORK_TOOLS)
+    cli.add_work_folder(root, _repo(home / "GitHub" / "openswap"))
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    text = codex_config((), resolved.write_paths, resolved.read_paths, dict(resolved.env))
+    assert f"GIT_OBJECT_DIRECTORY = {_toml_string(str(resolved.worktree.objects))}" in text
+    assert "gc.auto" in text

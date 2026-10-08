@@ -6,6 +6,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -663,35 +664,103 @@ def _work_problem_code(problem: str) -> str:
     return f"work_{problem}" if problem in {"not_a_repo", "no_repos"} else f"readable_{problem}"
 
 
+def _repo_ids_file(root: Path) -> Path:
+    return Path(root) / "worker" / "repo-ids.json"
+
+
+def repo_ids(backup_root: Path) -> dict[str, str]:
+    """Repo path -> ID for every repo ever offered from a folder of repos (never reassigned)."""
+    try:
+        data = json.loads(_repo_ids_file(backup_root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    ids = data.get("ids") if isinstance(data, dict) else None
+    if not isinstance(ids, dict):
+        return {}
+    from openswap.settings import _WORKSPACE_ID_RE
+
+    return {path: workspace_id for path, workspace_id in ids.items()
+            if isinstance(path, str) and isinstance(workspace_id, str) and _WORKSPACE_ID_RE.fullmatch(workspace_id)}
+
+
+def _assign_repo_ids(root: Path, repos: list[Path], static_ids: set[str]) -> dict[str, str]:
+    """IDs for ``repos``: the one each was first given, or a new free one, saved for good.
+
+    A repo keeps its ID however repos are later added, removed or renamed
+    around it, so a task already sent for ``foo-bar`` can never land in a
+    different repo. New IDs avoid every approved ID and every ID ever given.
+    Returns only the repos whose IDs are saved (a repo whose ID cannot be
+    saved is not offered).
+    """
+    from openswap.worker.journal import LocalJobStore
+
+    known = repo_ids(root)
+    wanted = [repo for repo in repos if str(repo) not in known]
+    if wanted:
+        try:
+            LocalJobStore(root)._ensure_private_dir()
+            with FileLock(Path(root) / "worker" / "repo-ids.lock", timeout=_LIFECYCLE_LOCK_TIMEOUT_SECONDS):
+                known = repo_ids(root)
+                taken = set(static_ids) | set(known.values())
+                for repo in wanted:
+                    if str(repo) not in known:
+                        known[str(repo)] = suggested_folder_id(repo, taken)
+                        taken.add(known[str(repo)])
+                path = _repo_ids_file(root)
+                temporary = path.with_name(path.name + ".tmp")
+                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump({"version": 1, "ids": known}, stream, sort_keys=True)
+                os.replace(temporary, path)
+        except Exception:
+            known = repo_ids(root)
+    return {str(repo): known[str(repo)] for repo in repos if str(repo) in known}
+
+
 def launchable_workspaces(backup_root: Path, workspaces) -> tuple:
     """The workspaces a task may name: each approved one, with a folder of repos
     replaced by one work folder per git repo directly inside it.
 
     Scanned again on every call (each launch and readiness report), so a new
     repo appears without changing settings. A repo that is already a work
-    folder of its own is not listed twice. IDs come from the repo's name and
-    never collide: approved IDs first, then repos in name order.
+    folder of its own is not listed twice. A repo's ID comes from its name
+    the first time it is seen and is kept for good (``repo-ids.json``), so it
+    never moves to another repo; an approved ID always wins over it.
     """
     from dataclasses import replace
 
     from openswap.worker import worktrees
 
     static = [w for w in workspaces if not getattr(w, "repos", False)]
-    taken = {w.workspace_id for w in workspaces}
+    static_ids = {w.workspace_id for w in workspaces}
     out = list(static)
     results = default_research_folder()
     for parent in workspaces:
         if not getattr(parent, "repos", False) or parent.work_root is None:
             continue
-        for repo in worktrees.child_repos(parent.work_root):
-            if any(w.work_root is not None and pathid.same(w.work_root, repo) for w in out):
+        repos = [repo for repo in worktrees.child_repos(parent.work_root)
+                 if not any(w.work_root is not None and pathid.same(w.work_root, repo) for w in out)]
+        assigned = _assign_repo_ids(Path(backup_root), repos, static_ids)
+        for repo in repos:
+            workspace_id = assigned.get(str(repo))
+            if workspace_id is None or workspace_id in static_ids or any(w.workspace_id == workspace_id for w in out):
                 continue
-            workspace_id = suggested_folder_id(repo, taken)
-            taken.add(workspace_id)
             label = repo.name if valid_account_label(repo.name) else None
             out.append(replace(parent, workspace_id=workspace_id, output_root=results / workspace_id,
                                readonly_roots=(), label=label, work_root=repo, repos=False))
     return tuple(out)
+
+
+def results_folder(backup_root: Path, workspace_id: str, workspaces) -> Path | None:
+    """Where a workspace's task results live, even if its repo is gone since the task ran."""
+    from openswap.settings import _WORKSPACE_ID_RE
+
+    static = next((w for w in workspaces if w.workspace_id == workspace_id and not w.repos), None)
+    if static is not None:
+        return static.output_root
+    if _WORKSPACE_ID_RE.fullmatch(workspace_id) and workspace_id in set(repo_ids(backup_root).values()):
+        return default_research_folder() / workspace_id
+    return None
 
 
 def refused_workspaces(backup_root: Path, workspaces=None) -> list[tuple[str, str]]:
@@ -826,6 +895,8 @@ def _approve_locked(root: Path, kept, workspace_id: str, output: Path, sources, 
                     replacing: str | None = None) -> WorkerWorkspace:
     """Check and save one more workspace after ``kept``; call under the lifecycle lock.
 
+    An ID already given to a repo in a folder of repos is taken.
+
     ``replacing`` names a workspace in ``kept`` this one takes the place of
     (same ID, same position), as when a read-only folder becomes a work folder.
     """
@@ -835,7 +906,8 @@ def _approve_locked(root: Path, kept, workspace_id: str, output: Path, sources, 
         kept = (*before, *after)
     else:
         before, after = kept, ()
-    if any(item.workspace_id == workspace_id for item in kept):
+    if any(item.workspace_id == workspace_id for item in kept) or (
+            replacing is None and workspace_id in set(repo_ids(root).values())):
         raise WorkspaceError("workspace_exists")
     if len(kept) >= 16:
         raise WorkspaceError("too_many_workspaces")
@@ -940,7 +1012,7 @@ def add_readable_folder(backup_root: Path, folder: str | Path, *, label: str | N
                 kept_builtin = True
             else:
                 kept = ()
-        workspace_id = suggested_folder_id(source, {w.workspace_id for w in kept})
+        workspace_id = suggested_folder_id(source, {w.workspace_id for w in kept} | set(repo_ids(root).values()))
         results = default_research_folder()
         try:
             results.mkdir(mode=0o700, exist_ok=True)
@@ -1028,7 +1100,8 @@ def add_work_folder(backup_root: Path, folder: str | Path, *, mode: str = "workt
             workspace = _approve_locked(root, kept, legacy.workspace_id, legacy.output_root, (), label,
                                         work_root=work, mode=mode, repos=repos, replacing=legacy.workspace_id)
         else:
-            workspace_id = suggested_folder_id(work, {w.workspace_id for w in kept})
+            taken = {w.workspace_id for w in kept} | set(repo_ids(root).values())
+            workspace_id = suggested_folder_id(work, taken)
             workspace = _approve_locked(root, kept, workspace_id, results / workspace_id, (), label,
                                         work_root=work, mode=mode, repos=repos)
         saved = load_worker_settings(root).workspaces

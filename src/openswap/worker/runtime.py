@@ -1596,7 +1596,8 @@ class WorkerRuntime:
         return ResolvedWorkspace(
             workspace_id=workspace_id, output_root=output_root, work_dir=tree.path,
             write_paths=tree.write_paths, read_paths=tree.read_paths,
-            env=tuple(sorted(worktrees.task_env(workspace.work_root).items())), branch=tree.branch,
+            env=tuple(sorted(worktrees.task_env(workspace.work_root, tree).items())), branch=tree.branch,
+            worktree=tree,
         )
 
     def _job_finished(self, job_id: str) -> bool:

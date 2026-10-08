@@ -916,14 +916,15 @@ class RemoteClient:
             cursor = page.next_cursor
 
     def _upload_artifact(self, claim, local, name):
-        from openswap.worker.cli import launchable_workspaces
+        from openswap.worker.cli import results_folder
 
+        # The results folder, even if the task's repo is gone since it ran:
+        # a repo from a folder of repos keeps its ID for good.
         policy = load_worker_settings(self.runtime.backup_root)
-        launchable = launchable_workspaces(self.runtime.backup_root, policy.workspaces)
-        workspace = next((w for w in launchable if w.workspace_id == local.workspace_id), None)
-        if workspace is None:
+        folder = results_folder(self.runtime.backup_root, local.workspace_id, policy.workspaces)
+        if folder is None:
             raise ProtocolError("invalid_request")
-        directory = workspace.output_root / local.job_id
+        directory = folder / local.job_id
         if directory.is_symlink() or directory.resolve() != directory:
             raise ProtocolError("invalid_request")
         opened = _open_artifact(directory, name)

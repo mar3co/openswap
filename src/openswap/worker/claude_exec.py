@@ -50,9 +50,11 @@ from openswap.worker.live import execution_mode
 from openswap.worker.models import ResolvedWorkspace, SafeEventKind
 
 RESEARCH_TOOLS = ("Read", "Grep", "Glob", "WebSearch", "WebFetch")
-# A work folder task edits and runs commands in its worktree (or, in direct
-# mode, the folder), still under the Seatbelt profile's write limits.
-WORK_TOOLS = (*RESEARCH_TOOLS, "Edit", "Write", "Bash")
+# A work folder task edits files in its worktree (or, in direct mode, the
+# folder). No Bash: a shell would run with the Claude process's own sandbox,
+# which must read and write the account's profile (its credentials). What it
+# leaves is committed to its branch by the worker when it finishes.
+WORK_TOOLS = (*RESEARCH_TOOLS, "Edit", "Write")
 SANDBOX_PROFILE_FILE = "claude.sb"
 MANAGED_CLAUDE_PATHS = (
     "/Library/Application Support/ClaudeCode/managed-settings.json",

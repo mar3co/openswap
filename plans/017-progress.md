@@ -1515,3 +1515,12 @@ worktrees removed, `openswap worker worktrees [prune]`), and the setup copy
 Edit, Write and Bash tools and a work prompt; research workspaces keep the
 research profile. Existing live opt-ins stay enabled; the next live check
 must pass the new gate.
+
+Codex review of that PR (fixed in it): repo IDs are kept for good in
+`repo-ids.json` (a new repo can never take an older one's ID); every git
+command the worker runs disables filters, fsmonitor, signing and hooks and
+targets a worktree from the worker's own record; a task writes objects to
+its own folder (the shared store is a read-only alternate) and the worker
+imports them verified; Claude work tasks get no Bash (it would share the
+sandbox that reads the account's credentials), so the worker commits what a
+task leaves; and results upload still works after a repo is removed.

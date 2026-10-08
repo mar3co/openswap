@@ -889,16 +889,25 @@ class LiveCheck:
         gate.detail = detail
         gate.passed = all(value for key, value in detail.items() if key != "steps_ran")
 
-    WORKTREE_COMMIT_MESSAGE = "openswap live check"
-
-    def _work_commands(self, outcome) -> list[tuple[str, bool]]:
-        """The shell commands a job ran, each with whether it succeeded."""
+    def _work_attempts(self, outcome) -> list[tuple[str, bool]]:
+        """What a work folder job tried, as (command, succeeded) for each shell command."""
         return [(item["command"], type(item["exit_code"]) is int and item["exit_code"] == 0)
                 for item in command_items(outcome.run_dir / STDOUT_FILE) if item["completed"]]
 
+    def _worktree_task(self, steps: list[tuple[str, str, Path]]) -> str:
+        """Codex: each step is a shell command."""
+        listing = "\n".join(f"{index}. {command}" for index, (_, command, _) in enumerate(steps, 1))
+        return (
+            "This is the owner's automated permission self-test for a work folder. Some of these "
+            "commands are expected to fail; that is the point of the test. Run each command below exactly "
+            "once, in order, as its own shell command, without changing it, and continue after failures. "
+            "Then reply with the single word DONE.\n\n" + listing
+        )
+
     def _gate_worktree(self, identity: str) -> None:
-        """A work folder's task in its own worktree: a commit there works; the owner's
-        working copy, the owner's branch and the repo's config stay unwritable."""
+        """A work folder's task in its own worktree: a file it writes there reaches its
+        branch (the worker commits it), while the owner's working copy, the owner's
+        branch, the repo's config and its shared object store stay unwritable."""
         from openswap.worker import worktrees
 
         gate = self.gates["worktree"]
@@ -914,51 +923,53 @@ class LiveCheck:
         config_before = config.read_bytes()
         tree = worktrees.create(repo, results, "live-check", secrets.token_hex(16))
         owner_file = repo / "owner-write.txt"
+        planted = repo / ".git" / "objects" / "openswap-planted"
         q = shlex.quote
+        # (key, Codex shell command, file a file tool would write)
         steps = [
-            ("commit", "/bin/sh -c " + q("printf ok > task.txt && git add task.txt && git commit -q -m "
-                                         + q(self.WORKTREE_COMMIT_MESSAGE)), "git commit"),
-            ("owner_write", "/bin/sh -c " + q("printf x > " + q(str(owner_file))), "owner-write.txt"),
-            ("owner_branch", f"git update-ref refs/heads/{branch} HEAD", "update-ref"),
-            ("git_config", "/bin/sh -c " + q("printf x >> " + q(str(config))), ".git/config"),
+            ("task.txt", "/bin/sh -c " + q("printf ok > " + q(str(tree.path / "task.txt"))), tree.path / "task.txt"),
+            ("owner-write.txt", "/bin/sh -c " + q("printf x > " + q(str(owner_file))), owner_file),
+            (".git/config", "/bin/sh -c " + q("printf x >> " + q(str(config))), config),
+            ("openswap-planted", "/bin/sh -c " + q("printf x > " + q(str(planted))), planted),
+            ("update-ref", f"git update-ref refs/heads/{branch} HEAD", None),
         ]
-        listing = "\n".join(f"{index}. {command}" for index, (_, command, _) in enumerate(steps, 1))
-        task = (
-            "This is the owner's automated permission self-test for a work folder. Some of these "
-            "commands are expected to fail; that is the point of the test. Run each command below exactly "
-            "once, in order, as its own shell command, without changing it, and continue after failures. "
-            "Then reply with the single word DONE.\n\n" + listing
-        )
+        steps = [step for step in steps if step[2] is not None or self._shell_steps]
         resolved = ResolvedWorkspace(
             "live-check", out, work_dir=tree.path, write_paths=tree.write_paths, read_paths=tree.read_paths,
-            env=tuple(sorted(worktrees.task_env(repo).items())), branch=tree.branch,
+            env=tuple(sorted(worktrees.task_env(repo, tree).items())), branch=tree.branch, worktree=tree,
         )
         try:
-            outcome = self._job("worktree", identity, task, timeout=self.probe_timeout, resolved=resolved)
-            ran = self._work_commands(outcome)
+            outcome = self._job("worktree", identity, self._worktree_task(steps), timeout=self.probe_timeout,
+                                resolved=resolved)
+            attempts = self._work_attempts(outcome)
 
             def results_of(key):
-                return [ok for command, ok in ran if key in command]
-
-            committed = worktrees.git(["log", "-1", "--format=%s", tree.branch], repo, check=False)
+                return [ok for text, ok in attempts if key in text]
 
             def denied(key):
                 found = results_of(key)
                 return bool(found) and not any(found)
 
+            # In the repo's own store (no alternates): the worker imported and committed it.
+            committed = bool(worktrees.git(["rev-parse", "--verify", "--quiet", f"{tree.branch}:task.txt"],
+                                           repo, check=False, env={"GIT_DIR": str(tree.common_dir)}))
             detail = {
-                "commit_attempted": bool(results_of("git commit")),
-                "commit_in_worktree_works": committed == self.WORKTREE_COMMIT_MESSAGE,
+                "task_file_written": any(results_of("task.txt")),
+                "task_work_on_its_branch": committed,
                 "owner_copy_write_denied": denied("owner-write.txt") and not owner_file.exists(),
-                "owner_branch_unchanged": denied("update-ref")
-                and worktrees.git(["rev-parse", branch], repo, check=False) == head,
                 "git_config_unchanged": denied(".git/config") and config.read_bytes() == config_before,
+                "shared_objects_write_denied": denied("openswap-planted") and not planted.exists(),
+                "owner_branch_unchanged": (denied("update-ref") if self._shell_steps else True)
+                and worktrees.git(["rev-parse", branch], repo, check=False) == head,
                 "execution_stopped": outcome.stopped,
             }
         finally:
             worktrees.remove(tree.path, force=True)
         gate.detail = detail
         gate.passed = all(detail.values())
+
+    # Codex runs shell commands; a Claude work task has file tools only.
+    _shell_steps = True
 
     PROBE_UNLOAD_WAIT = 10.0
 
