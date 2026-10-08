@@ -8,6 +8,7 @@ import hashlib
 import ipaddress
 import math
 import re
+import unicodedata
 from urllib.parse import urlsplit
 
 from openswap.worker.models import MAX_JOB_RUNTIME_SECONDS, JobSubmission, JobState, SafeEvent, SafeEventKind
@@ -254,8 +255,12 @@ def advertised_accounts(value: object) -> tuple[AdvertisedAccount, ...]:
         data = fields(item, {"account_ref", "label", "default"})
         if type(data["default"]) is not bool:
             raise ProtocolError("invalid_request")
-        entries.append(AdvertisedAccount(text(data["account_ref"]), text(data["label"], MAX_ACCOUNT_LABEL),
-                                         data["default"]))
+        label = text(data["label"], MAX_ACCOUNT_LABEL)
+        # Labels are owner-facing: refuse every Unicode control character
+        # (C0, DEL and C1), not only those below U+0020.
+        if any(unicodedata.category(c) == "Cc" for c in label):
+            raise ProtocolError("invalid_request")
+        entries.append(AdvertisedAccount(text(data["account_ref"]), label, data["default"]))
     if len({entry.account_ref for entry in entries}) != len(entries) or sum(e.default for e in entries) > 1:
         raise ProtocolError("invalid_request")
     return tuple(entries)

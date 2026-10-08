@@ -259,8 +259,9 @@ unknown operation (404 `unsupported_version`).
 | `accounts` | `worker_epoch`, `accounts` (array below) | `account_count` |
 
 `accounts` holds 0–20 entries, each a closed object with exactly `account_ref`
-(opaque ID, 1–200 characters), `label` (1–100 characters, no control
-characters) and `default` (JSON boolean). References are unique within the
+(opaque ID, 1–200 characters), `label` (1–100 characters, no Unicode control
+characters: U+0000–U+001F or U+007F–U+009F) and `default` (JSON boolean).
+References are unique within the
 request and at most one entry is the default. The request atomically replaces
 the worker's whole advertised set; an empty array withdraws it. It carries the
 current worker epoch like any other mutation and returns `stale_epoch` from a

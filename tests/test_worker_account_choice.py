@@ -431,6 +431,8 @@ def test_accounts_validation_accepts_bounded_closed_entries():
     _accounts(("a", "", False)),
     _accounts(("a", "x" * 101, False)),
     _accounts(("a", "new\nline", False)),
+    _accounts(("a", "del\x7fhere", False)),  # DEL
+    _accounts(("a", "next\x85line", False)),  # C1 control (NEL)
     [{"account_ref": "a", "label": "One"}],
     [{"account_ref": "a", "label": "One", "default": False, "email": "x@example.com"}],
     ["a"],
