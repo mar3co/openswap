@@ -330,17 +330,36 @@ def row_text(state: PickerState, path: Path, width: int) -> str:
     return _fit(text.rstrip(), width)
 
 
+def visible_window(count: int, selected: int, rows: int) -> tuple[int, int]:
+    """The ``[start, end)`` slice of ``count`` results to draw in ``rows`` lines, keeping
+    the highlighted one in view (the top of the list when nothing is highlighted)."""
+    rows = max(1, rows)
+    if count <= rows:
+        return 0, count
+    start = 0 if selected < 0 else min(max(0, selected - rows // 2), count - rows)
+    return start, start + rows
+
+
 def _render(out, question: str, state: PickerState) -> None:
     try:
-        columns = os.get_terminal_size(out.fileno()).columns
+        size = os.get_terminal_size(out.fileno())
+        columns, height = size.columns, size.lines
     except (OSError, ValueError):
-        columns = 80
+        columns, height = 80, 24
     width = max(20, (columns or 80) - 1)  # a terminal with no size set reports 0
+    # Never taller than the screen (the prompt, the list, one note and the
+    # hint), or the redraw would scroll the prompt away.
+    rows = min(_VISIBLE, max(1, (height or 24) - 3))
+    start, end = visible_window(len(state.results), state.selected, rows)
     lines = []
-    for row, path in enumerate(state.results):
+    for row in range(start, end):
+        path = state.results[row]
         marker = "❯ " if row == state.selected else "  "
         text = marker + row_text(state, path, width - len(marker))
         lines.append(f"\x1b[7m{text}\x1b[0m" if row == state.selected else text)
+    hidden = len(state.results) - (end - start)
+    if hidden:
+        lines.append(f"\x1b[2m{f'  … {hidden} more (↑↓ or type to filter)'[:width]}\x1b[0m")
     if not state.results:
         lines.append("  (no matching folders; Enter uses what you typed)" if state.query
                      else "  (looking for folders…)" if not state.index.done else "  (no folders)")

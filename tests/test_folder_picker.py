@@ -173,3 +173,35 @@ def test_digits_out_of_range_show_nothing_and_come_back_as_typed(home):
     plain = PickerState(_index(home))
     plain.type("9")
     assert plain.numbers() is None
+
+
+
+def test_many_suggestions_are_drawn_in_a_window_that_follows_the_highlight(home, monkeypatch):
+    import io
+    import os
+    from openswap.folder_picker import Suggestion
+
+    assert folder_picker.visible_window(5, -1, 8) == (0, 5)
+    assert folder_picker.visible_window(20, -1, 8) == (0, 8)
+    assert folder_picker.visible_window(20, 0, 8) == (0, 8)
+    assert folder_picker.visible_window(20, 10, 8) == (6, 14)
+    assert folder_picker.visible_window(20, 19, 8) == (12, 20)
+    pinned = [Suggestion(home / f"repo{n:02}") for n in range(20)]
+    state = PickerState(_index(home), pinned=pinned, highlight=0)
+    state.move(15)
+    out = io.StringIO()
+    out.fileno = lambda: 1
+    monkeypatch.setattr(os, "get_terminal_size", lambda _fd=None: os.terminal_size((100, 12)))
+    folder_picker._render(out, "Folders: ", state)
+    text = out.getvalue()
+    drawn = [line for line in text.split("\n") if "~/repo" in line]
+    assert len(drawn) == 8  # min(8, 12 - 3)... capped by _VISIBLE
+    assert "16  ~/repo15" in text  # the highlighted one keeps its own number
+    assert "… 12 more" in text
+    # The cursor goes back up exactly as many lines as were drawn below the prompt.
+    assert text.endswith(f"\x1b[{text.count(chr(10))}A\r\x1b[{len('Folders: ')}C")
+    monkeypatch.setattr(os, "get_terminal_size", lambda _fd=None: os.terminal_size((100, 6)))
+    out = io.StringIO()
+    out.fileno = lambda: 1
+    folder_picker._render(out, "Folders: ", state)
+    assert len([line for line in out.getvalue().split("\n") if "~/repo" in line]) == 3  # 6 - 3
