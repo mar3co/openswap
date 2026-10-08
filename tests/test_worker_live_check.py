@@ -345,6 +345,22 @@ def test_main_does_nothing_without_consent(tmp_path, capsys, monkeypatch):
     assert not live.evidence_dir(root).exists()
 
 
+class ShortLivedEscapeMac(SimulatedMac):
+    """launchctl submit succeeds, but its job is gone before the label check."""
+
+    def _simulate(self, command, cwd):
+        if "launchctl submit" in command:
+            return "", 0
+        return super()._simulate(command, cwd)
+
+
+def test_a_successful_launchd_submit_fails_even_if_its_job_is_gone(tmp_path):
+    root = setup_root(tmp_path)
+    evidence = make_check(root, ShortLivedEscapeMac()).run()
+    gate = evidence["gates"]["sandbox_exec"]
+    assert gate["launchd_submit_contained"] is False and gate["passed"] is False
+
+
 class SkippingMac(SimulatedMac):
     """A model that skips some probe commands."""
 

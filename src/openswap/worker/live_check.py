@@ -606,6 +606,7 @@ class LiveCheck:
         seen = {name: bool(observed(key)) for name, _, key, _ in steps}
         required_seen = all(seen[name] for name, _, _, required in steps if required)
         network = observed("example.com")
+        submits = observed(escape_label)
         auth = observed("auth.json")
         detail = {
             "all_required_steps_ran": required_seen,
@@ -623,7 +624,10 @@ class LiveCheck:
             "api_keys_absent": "OPENAI_API_KEY" not in everything and "CODEX_API_KEY" not in everything,
             "shell_network_denied": bool(network) and all(type(i["exit_code"]) is int and i["exit_code"] != 0
                                                           for i in network),
-            "launchd_submit_contained": seen["launchd_submit"] and not loaded,
+            # The submit itself must fail: a short-lived job it started could
+            # be gone by the time the label is checked.
+            "launchd_submit_contained": bool(submits) and not loaded and all(
+                type(i["exit_code"]) is int and i["exit_code"] != 0 for i in submits),
             "execution_stopped": outcome.stopped,
         }
         try:
