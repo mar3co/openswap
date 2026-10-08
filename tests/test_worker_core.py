@@ -606,6 +606,33 @@ def test_readonly_root_may_be_readable_but_not_writable_by_others(tmp_path, mode
             runtime._resolve_workspace("research", "a" * 32)
 
 
+def test_launch_resolves_the_folder_under_the_lifecycle_lock(tmp_path, monkeypatch):
+    """A folder change holds the same lock, so it either sees the STARTING job
+    as in use or finishes first and this job resolves the new folder."""
+    from openswap.locking import FileLock
+
+    update_worker_settings(tmp_path, enabled=True)
+    identity = stable_account_identity("codex", "lifecycle-lock-test")
+    runtime = WorkerRuntime(tmp_path, adapter=_FakeAdapter(), account_identity=identity)
+    original = runtime._resolve_workspace
+    held = []
+
+    def probe(workspace_id, job_id):
+        other = FileLock(tmp_path / "worker" / "lifecycle.lock")
+        acquired = other.acquire(timeout=0)
+        if acquired:
+            other.release()
+        held.append(not acquired)
+        original(workspace_id, job_id)
+        raise ValueError("stop before launch")  # keep the test from running the job
+
+    monkeypatch.setattr(runtime, "_resolve_workspace", probe)
+    runtime.submit(_submission())
+    result = runtime.reconcile_once()
+    assert held == [True]
+    assert result.state == JobState.FAILED and result.diagnostic_code == "provider_unavailable"
+
+
 def test_ipc_startup_failure_clears_the_worker_health_record(tmp_path, monkeypatch):
     from openswap.worker import ipc
 

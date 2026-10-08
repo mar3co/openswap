@@ -264,3 +264,51 @@ def advertised_accounts(value: object) -> tuple[AdvertisedAccount, ...]:
     if len({entry.account_ref for entry in entries}) != len(entries) or sum(e.default for e in entries) > 1:
         raise ProtocolError("invalid_request")
     return tuple(entries)
+
+
+# Optional readiness report extension: approved folders and execution mode.
+MAX_REPORTED_FOLDERS = 20
+MAX_FOLDER_LABEL = 100
+EXECUTION_MODES = frozenset({"disabled", "live"})
+_FOLDER_ID = re.compile(r"[A-Za-z0-9_.-]{1,200}")
+
+
+@dataclass(frozen=True)
+class ReportedFolder:
+    """One entry of the optional ``readiness`` operation: the workspace ID a
+    submission names and an owner-chosen label. Never a path."""
+    id: str
+    label: str
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "label": self.label}
+
+
+def owner_label(value: object, limit: int) -> str:
+    """1..limit characters with no Unicode control character (C0, DEL or C1)."""
+    label = text(value, limit)
+    if any(unicodedata.category(c) == "Cc" for c in label):
+        raise ProtocolError("invalid_request")
+    return label
+
+
+def reported_folders(value: object) -> tuple[ReportedFolder, ...]:
+    """Validate a ``readiness`` folder array: 0-20 closed entries with unique IDs."""
+    if not isinstance(value, list) or len(value) > MAX_REPORTED_FOLDERS:
+        raise ProtocolError("invalid_request")
+    entries = []
+    for item in value:
+        data = fields(item, {"id", "label"})
+        if not isinstance(data["id"], str) or not _FOLDER_ID.fullmatch(data["id"]):
+            raise ProtocolError("invalid_request")
+        entries.append(ReportedFolder(data["id"], owner_label(data["label"], MAX_FOLDER_LABEL)))
+    if len({entry.id for entry in entries}) != len(entries):
+        raise ProtocolError("invalid_request")
+    return tuple(entries)
+
+
+def execution_mode(value: object) -> str:
+    """The reported execution mode: exactly ``"disabled"`` or ``"live"``."""
+    if not isinstance(value, str) or value not in EXECUTION_MODES:
+        raise ProtocolError("invalid_request")
+    return value
