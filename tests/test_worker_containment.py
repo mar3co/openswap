@@ -431,3 +431,80 @@ def test_no_bootout_without_a_boot_session_match(tmp_path):
     proof = containment.stop(handle)
     assert proof.stopped is False
     assert not any(call[0] == "bootout" for call in launchd.calls)
+
+
+class FakeLibproc:
+    """proc_listallpids that fills the buffer the first ``full`` times."""
+
+    def __init__(self, full):
+        self.full = full
+
+    def proc_listallpids(self, buf, size):
+        if buf is None:
+            return 10
+        capacity = size // 4
+        if self.full:
+            self.full -= 1
+            count = capacity
+        else:
+            count = 12
+        for i in range(count):
+            buf[i] = i + 2
+        return count
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="libproc")
+def test_a_listing_that_fills_its_buffer_is_retried_then_refused():
+    table = object.__new__(c.DarwinProcessTable)
+    table._libproc = FakeLibproc(full=2)
+    assert table.pids() == list(range(2, 14))
+    table._libproc = FakeLibproc(full=99)
+    with pytest.raises(ContainmentError):
+        table.pids()
+
+
+def test_concurrent_launches_of_one_label_cannot_both_proceed(tmp_path):
+    from openswap.locking import FileLock
+
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    holder = FileLock(root / f".{c.job_label('a' * 32)}.lock", timeout=0)
+    assert holder.acquire(timeout=0)
+    try:
+        with pytest.raises(ContainmentError) as error:
+            launch(containment, root)
+    finally:
+        holder.release()
+    assert error.value.code == "job_label_in_use" and error.value.launched is False
+    assert launchd.calls == []
+
+
+def test_pre_bootstrap_write_failures_are_unlaunched(tmp_path, monkeypatch):
+    containment, procs, launchd = make(tmp_path)
+
+    def full_disk(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(c, "write_private", full_disk)
+    with pytest.raises(ContainmentError) as error:
+        launch(containment, private_dir(tmp_path))
+    assert error.value.code == "run_dir_unwritable" and error.value.launched is False
+    assert not any(call[0] == "bootstrap" for call in launchd.calls)
+
+
+def test_a_handle_write_failure_after_bootstrap_is_unlaunched_and_unloaded(tmp_path, monkeypatch):
+    containment, procs, launchd = make(tmp_path)
+    original = c._save_handle
+    calls = []
+
+    def failing_after_first(handle):
+        calls.append(handle)
+        if len(calls) > 1:
+            raise OSError(28, "No space left on device")
+        original(handle)
+
+    monkeypatch.setattr(c, "_save_handle", failing_after_first)
+    with pytest.raises(ContainmentError) as error:
+        launch(containment, private_dir(tmp_path))
+    assert error.value.launched is False
+    assert launchd.loaded == {}
