@@ -80,6 +80,9 @@ WRAPPER_SCRIPT = (
     'echo "$rc" > "$d/exit.tmp" && mv "$d/exit.tmp" "$d/exit"\n'
 )
 
+# Files only a launch creates; any of them means the directory is not fresh.
+_WRAPPER_STATE = (GO_FILE, LEADER_PID_FILE, EXIT_FILE, HANDLE_FILE, STDOUT_FILE, "job.plist")
+
 _SZOMB = 5
 _SSTOP = 4
 
@@ -361,17 +364,31 @@ class LaunchdContainment:
         run_dir = Path(run_dir)
         label = job_label(job_id)
         ensure_private_dir(run_dir)
+        if any(os.path.lexists(run_dir / name) for name in _WRAPPER_STATE):
+            # A stale ``go`` would let the new wrapper start the provider
+            # before its coalition is recorded: only a fresh directory runs.
+            raise ContainmentError("run_dir_not_fresh")
         procs = self.procs
+        boot = procs.boot_session()
+        if boot is None:
+            # Without the boot session a saved coalition ID could later name
+            # another boot's coalition, so nothing could ever be swept safely.
+            raise ContainmentError("boot_session_unavailable")
+        loaded = self.label_loaded(JobHandle(label, self.domain, run_dir, boot))
+        if loaded is not False:
+            # In use, or launchd could not say: never bootstrap over (or later
+            # boot out) a service this launch did not create.
+            raise ContainmentError("job_label_in_use" if loaded else "launchd_unavailable")
         write_private(run_dir / STDIN_FILE, stdin_text.encode("utf-8"))
         plist_path = run_dir / "job.plist"
         write_private(plist_path, self.build_plist(label, run_dir, argv, env, cwd))
-        handle = JobHandle(label, self.domain, run_dir, procs.boot_session())
+        handle = JobHandle(label, self.domain, run_dir, boot)
         _save_handle(handle)
-        if self._launchctl(["print", f"{self.domain}/{label}"]).returncode == 0:
-            raise ContainmentError("job_label_in_use")
         booted = self._launchctl(["bootstrap", self.domain, str(plist_path)])
         if booted.returncode != 0:
-            self._abort_unreleased(handle)
+            # The label was confirmed absent above, so a loaded one now is ours.
+            if self.label_loaded(handle):
+                self._abort_unreleased(handle)
             raise ContainmentError("launchd_bootstrap_failed")
         try:
             pid = self._wait_for_leader(run_dir, ready_timeout)
@@ -451,9 +468,11 @@ class LaunchdContainment:
         if handle.boot_session is not None and current_boot is not None and current_boot != handle.boot_session:
             # Every process of an earlier boot is gone, its label with it.
             return StopProof(True, False, 0, rebooted=True)
+        # A saved coalition ID is meaningful only in the boot that recorded it.
+        same_boot = handle.boot_session is not None and current_boot == handle.boot_session
         deadline = self._monotonic() + timeout
         killed = 0
-        if handle.coalition_id is not None:
+        if handle.coalition_id is not None and same_boot:
             killed += self._sweep(handle.coalition_id, deadline=deadline)
         self._launchctl(["bootout", f"{handle.domain}/{handle.label}"])
         loaded = self.label_loaded(handle)
@@ -462,6 +481,8 @@ class LaunchdContainment:
             loaded = self.label_loaded(handle)
         survivors = 0
         if handle.coalition_id is not None:
+            if not same_boot:
+                return StopProof(False, loaded, 0, killed)
             killed += self._sweep(handle.coalition_id, deadline=deadline)
             survivors = len(self._live_members(handle.coalition_id))
             stopped = survivors == 0 and loaded is False

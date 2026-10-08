@@ -183,7 +183,7 @@ def test_wrapper_runs_the_provider_only_after_go(tmp_path):
     assert (run_dir / "exit").read_text().strip() == "0"
 
 
-@pytest.mark.parametrize("problem", ["same_coalition", "bootstrap", "pid_mismatch", "no_pid"])
+@pytest.mark.parametrize("problem", ["same_coalition", "bootstrap", "pid_mismatch", "no_pid", "no_boot"])
 def test_unprovable_launch_is_refused_and_never_released(tmp_path, problem):
     kwargs = {"coalition": WORKER_COALITION} if problem == "same_coalition" else {}
     containment, procs, launchd = make(tmp_path, **kwargs)
@@ -193,6 +193,8 @@ def test_unprovable_launch_is_refused_and_never_released(tmp_path, problem):
         launchd.print_pid_override = 99999
     elif problem == "no_pid":
         launchd.write_pid = False
+    elif problem == "no_boot":
+        procs.boot = None
     root = private_dir(tmp_path)
     with pytest.raises(ContainmentError) as error:
         launch(containment, root)
@@ -335,3 +337,53 @@ def test_real_launchd_contains_a_setsid_daemon(tmp_path):
         assert containment.members(handle) == []
     finally:
         containment.stop(handle)
+
+
+@pytest.mark.parametrize("stale", ["go", "leader.pid", "exit", "handle.json", "stdout.jsonl", "job.plist"])
+def test_a_run_directory_with_wrapper_state_is_refused(tmp_path, stale):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    run_dir = root / ("a" * 32)
+    run_dir.mkdir(mode=0o700)
+    (run_dir / stale).write_text("")
+    with pytest.raises(ContainmentError) as error:
+        launch(containment, root)
+    assert error.value.code == "run_dir_not_fresh" and error.value.launched is False
+    assert not any(call[0] == "bootstrap" for call in launchd.calls)
+
+
+def test_inconclusive_label_check_is_refused_without_touching_launchd(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    original = launchd.__call__
+
+    def flaky(args):
+        if args[0] == "print":
+            launchd.calls.append(list(args))
+            return subprocess.CompletedProcess(args, 124, "", "timeout")
+        return original(args)
+
+    containment._launchctl = flaky
+    with pytest.raises(ContainmentError) as error:
+        launch(containment, private_dir(tmp_path))
+    assert error.value.code == "launchd_unavailable"
+    assert [call[0] for call in launchd.calls] == ["print"]
+
+
+def test_failed_bootstrap_never_boots_out_a_label_it_did_not_load(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    launchd.bootstrap_rc = 5
+    with pytest.raises(ContainmentError):
+        launch(containment, private_dir(tmp_path))
+    assert not any(call[0] == "bootout" for call in launchd.calls)
+
+
+@pytest.mark.parametrize("saved, current", [(None, "boot-a"), ("boot-a", None)])
+def test_a_saved_coalition_is_never_swept_without_a_boot_session_match(tmp_path, saved, current):
+    containment, procs, launchd = make(tmp_path)
+    run_dir = private_dir(tmp_path) / ("c" * 32)
+    run_dir.mkdir(mode=0o700)
+    bystander = procs.new(JOB_COALITION)  # whatever holds that ID now
+    procs.boot = current
+    proof = containment.stop(JobHandle(c.job_label("c" * 32), "gui/501", run_dir, saved, 77, JOB_COALITION, True))
+    assert proof.stopped is False
+    assert bystander in procs.table and procs.signals == []
