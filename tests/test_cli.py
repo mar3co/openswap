@@ -652,7 +652,7 @@ class TestCLI:
         with pytest.raises(SystemExit) as exc:
             cli.main()
         assert exc.value.code == 0
-        assert "Commands:" in capsys.readouterr().out
+        assert "Remote tasks" in capsys.readouterr().out
         assert called.get("ran") is not True
 
     def _service_harness(self, monkeypatch, argv):
@@ -1003,7 +1003,7 @@ class TestSubcommandAliases:
         )
         assert result.returncode == 0
         _assert_advertised_help(result.stdout)
-        assert "Commands:" in result.stdout
+        assert "Remote tasks" in result.stdout and "worker setup" in result.stdout
         assert "keep working" in result.stdout
 
 

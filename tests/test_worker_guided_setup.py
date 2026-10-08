@@ -42,9 +42,11 @@ from tests.test_worker_remote import FakeAdapter, StoreTransport
 
 URL = "http://127.0.0.1:8765"
 OFFER = "Start the Remote tasks worker now so this Mac can accept approved tasks? [Y/n] "
-KEEP = "Keep this account? [Y/n] "
-ACCOUNT = "Account (slot, email or alias; Enter to skip): "
+# The fixture roster has six eligible accounts: Codex 1, 2, 5, 6 and Claude 1, 4.
+ACCOUNT = "Account number (1-6; Enter to skip): "
+KEEP = "Account number (1-6; Enter keeps the current one) [1]: "
 ANOTHER = "Another folder to approve (path; Enter to finish): "
+SUMMARY = "Step 4 of 4 · Summary"
 
 
 @pytest.fixture(autouse=True)
@@ -104,12 +106,16 @@ def test_pair_walks_worker_account_then_folder_then_summary(root, keychain, monk
     assert enable_calls == [root]
     assert guided_setup.WORKER_ONLINE in out
     # Worker first, then the account, then the folder, then the summary.
-    assert (out.index(OFFER) < out.index("Choose the account remote jobs run on") < out.index("Create and approve")
-            < out.index("Remote tasks setup:"))
-    # Codex and Claude accounts are both offered; the API-key Codex slot is not.
-    assert "  1 · alice@example.com (work)  (Codex)" in out and "  3 · " not in out
-    assert "  claude:4 · carol@example.com (claudey)  (Claude)" in out
-    assert "aren't supported" not in out
+    assert (out.index("Step 1 of 4 · Worker") < out.index(OFFER) < out.index("Step 2 of 4 · Account")
+            < out.index("Choose the account remote jobs run on") < out.index("Step 3 of 4 · Research folder")
+            < out.index("Create and approve") < out.index(SUMMARY))
+    # Codex and Claude accounts are both offered, numbered by menu position with
+    # the slot beside them; the API-key Codex slot is not.
+    assert "  • 1  Codex   alice@example.com   (work)     slot 1" in out
+    assert "  • 2  Codex   bob@example.com                slot 2  out of rotation" in out
+    assert "  • 6  Claude  carol@example.com   (claudey)  slot 4" in out
+    assert "slot 3" not in out and "aren't supported" not in out
+    assert ACCOUNT in out
     assert "Pinned Codex account 2 · bob@example.com" in out
     policy = load_worker_settings(root)
     assert policy.pinned_account_ref == BOB
@@ -119,8 +125,8 @@ def test_pair_walks_worker_account_then_folder_then_summary(root, keychain, monk
     if os.name == "posix":
         assert stat.S_IMODE(research_home.stat().st_mode) == 0o700
     assert '(the portal shows "OpenSwap Research")' in out
-    assert "  Research folders: research (OpenSwap Research)" in out
-    assert "  Execution: disabled" in out and guided_setup.EXECUTION_OFF_NOTE in out
+    assert "  ✓ Folders    research (OpenSwap Research)" in out
+    assert "  • Execution  disabled" in out and guided_setup.EXECUTION_OFF_NOTE in out
     assert SECRET not in out
 
 
@@ -135,8 +141,8 @@ def test_pair_on_a_tty_can_skip_every_step(root, keychain, monkeypatch, capsys, 
     assert policy.pinned_account_ref is None and policy.enabled is False
     assert policy.control_service_url == "http://localhost"
     assert _builtin(root)
-    assert "Before Slack can start tasks on this Mac: start the worker" in out
-    assert "pin an account" in out
+    assert "Before Slack can start tasks on this Mac:\n  1. start the worker (`openswap worker enable`)" in out
+    assert "  2. pin an account" in out
 
 
 @pytest.mark.parametrize("answers", [["n"], ["no"], ["later"], []], ids=["n", "no", "other", "eof"])
@@ -148,25 +154,45 @@ def test_pair_offer_no_or_eof_leaves_the_worker_off(root, keychain, monkeypatch,
     assert enable_calls == [] and load_worker_settings(root).enabled is False
 
 
-def test_pair_with_a_pin_asks_to_keep_it(root, keychain, monkeypatch, capsys, enable_calls):
+def test_pair_with_a_pin_keeps_it_on_enter(root, keychain, monkeypatch, capsys, enable_calls):
     cli.set_worker_account(root, "1")
     assert _pair(root, monkeypatch, interactive=True, answers=["n", ""]) == 0
     out = capsys.readouterr().out
-    assert "Remote tasks uses Codex account 1 · alice@example.com (work)." in out
+    # The current pin is marked in the menu and is the prompt's default.
+    assert "  ✓ 1  Codex   alice@example.com   (work)     slot 1  current" in out
     assert KEEP in out and ACCOUNT not in out
+    assert "Kept Codex account 1 · alice@example.com (work)." in out
     assert load_worker_settings(root).pinned_account_ref == ALICE
 
 
-def test_pair_with_a_pin_can_switch_account(root, keychain, monkeypatch, capsys, enable_calls):
+def test_pair_with_a_pin_can_switch_account_by_number(root, keychain, monkeypatch, capsys, enable_calls):
     cli.set_worker_account(root, "1")
-    assert _pair(root, monkeypatch, interactive=True, answers=["n", "n", "2"]) == 0
+    assert _pair(root, monkeypatch, interactive=True, answers=["n", "2"]) == 0
     assert "Pinned Codex account 2 · bob@example.com" in capsys.readouterr().out
     assert load_worker_settings(root).pinned_account_ref == BOB
 
 
-def test_declining_the_pin_then_skipping_keeps_it_and_says_so(root, keychain, monkeypatch, capsys, enable_calls):
+def test_menu_numbers_are_positions_not_slots(root, keychain, monkeypatch, capsys, enable_calls):
+    # Menu 6 is Claude slot 4 (carol); menu 3 is Codex slot 5. Neither equals its slot.
+    assert _pair(root, monkeypatch, interactive=True, answers=["n", "6"]) == 0
+    assert "Pinned Claude account 4 · carol@example.com (claudey)" in capsys.readouterr().out
+    assert load_worker_settings(root).pinned_account_ref.startswith("claude:")
+    assert _setup(root, monkeypatch, ["n", "3", ""]) == 0
+    assert "Pinned Codex account 5 · shared@example.com" in capsys.readouterr().out
+
+
+def test_a_number_outside_the_menu_is_asked_again(root, keychain, monkeypatch, capsys, enable_calls):
+    assert _pair(root, monkeypatch, interactive=True, answers=["n", "0", "7", "work"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("Type a number from 1 to 6.") == 2
+    # Email, alias and claude:<slot> still work beside the number.
+    assert "Pinned Codex account 1 · alice@example.com (work)" in out
+    assert load_worker_settings(root).pinned_account_ref == ALICE
+
+
+def test_eof_at_the_menu_keeps_the_pin_and_says_so(root, keychain, monkeypatch, capsys, enable_calls):
     cli.set_worker_account(root, "1")
-    assert _pair(root, monkeypatch, interactive=True, answers=["n", "n", ""]) == 0
+    assert _pair(root, monkeypatch, interactive=True, answers=["n"]) == 0
     out = capsys.readouterr().out
     assert ("Skipped. 1 · alice@example.com (work) stays selected. Change it later with "
             "`openswap worker account <slot|email|alias>`.") in out
@@ -200,7 +226,7 @@ def test_pair_when_already_enabled_toggles_nothing(root, keychain, monkeypatch, 
     out = capsys.readouterr().out
     assert OFFER not in out and expected in out
     assert enable_calls == [] and load_worker_settings(root).enabled is True
-    assert f"  Worker: {'running' if process == 'running' else 'enabled but not running'}" in out
+    assert ("  ✓ Worker     running" if process == "running" else "  ✗ Worker     enabled but not running") in out
 
 
 @pytest.mark.parametrize("error, expected", [
@@ -234,7 +260,7 @@ def test_a_failing_step_prints_its_command_and_the_rest_still_run(root, keychain
     monkeypatch.setattr(guided_setup, step, lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("x")))
     assert _pair(root, monkeypatch, interactive=False) == 0
     out = capsys.readouterr().out
-    assert fallback in out and "Remote tasks setup:" in out
+    assert fallback in out and SUMMARY in out
     assert load_worker_settings(root).control_service_url == "http://localhost"
 
 
@@ -252,13 +278,13 @@ def test_summary_is_ready_only_when_admission_is_open(root, monkeypatch, capsys,
     monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": "running", "remote_connectivity": "online"})
     assert _setup(root, monkeypatch, ["", "y", ""]) == 0
     out = capsys.readouterr().out
-    assert "  Worker: running (admission paused)" in out
-    assert "Before Slack can start tasks on this Mac: reopen admission (`openswap worker pause --off`)." in out
+    assert "  ✗ Worker     running (admission paused)" in out
+    assert "Before Slack can start tasks on this Mac:\n  1. reopen admission (`openswap worker pause --off`)" in out
     assert "Ready for Slack" not in out
     update_worker_settings(root, paused=False)
     assert _setup(root, monkeypatch, ["", ""]) == 0
     out = capsys.readouterr().out
-    assert "  Worker: running\n" in out and "Ready for Slack" in out
+    assert "  ✓ Worker     running\n" in out and "Ready for Slack" in out
 
 
 @pytest.mark.parametrize(("process", "loaded", "worker"), [
@@ -297,7 +323,7 @@ def test_summary_waits_briefly_for_a_starting_worker(root, monkeypatch, capsys, 
     monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: None)
     guided_setup.summary(root, _Say())
     out = capsys.readouterr().out
-    assert "  Worker: running\n" in out and "wait for the worker" not in out
+    assert "  ✓ Worker     running\n" in out and "wait for the worker" not in out
 
 
 def test_summary_never_calls_a_stuck_starting_worker_ready(root, monkeypatch, capsys, research_home):
@@ -308,7 +334,7 @@ def test_summary_never_calls_a_stuck_starting_worker_ready(root, monkeypatch, ca
     guided_setup.summary(root, _Say(),
                          start_wait_s=0)
     out = capsys.readouterr().out
-    assert "  Worker: starting" in out and "Ready for Slack" not in out
+    assert "  • Worker     starting" in out and "Ready for Slack" not in out
     assert "wait for the worker to finish starting" in out
 
 
@@ -345,7 +371,7 @@ def test_summary_waits_briefly_for_the_service_connection(root, monkeypatch, cap
     monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: None)
     guided_setup.summary(root, _Say())
     out = capsys.readouterr().out
-    assert f"  Service: {URL} (online)" in out and "Ready for Slack" in out
+    assert f"  ✓ Service    {URL} (online)" in out and "Ready for Slack" in out
 
 
 def test_allowed_accounts_without_a_pinned_default_are_not_ready(root, monkeypatch):
@@ -393,7 +419,8 @@ def test_setup_reruns_the_steps_on_a_paired_mac(root, monkeypatch, capsys, enabl
     assert _setup(root, monkeypatch, ["n", "", ""]) == 0
     out = capsys.readouterr().out
     assert "Create and approve" not in out
-    assert "Approved research folders: research (OpenSwap Research)." in out and ANOTHER in out
+    assert "Approved research folders (the control service sees only the ID and label):" in out
+    assert '  ✓ 1  research  "OpenSwap Research"  ' in out and ANOTHER in out
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits only")
@@ -412,7 +439,7 @@ def test_folder_step_adds_other_folders_with_a_suggested_id(root, monkeypatch, c
     assert _setup(root, monkeypatch, ["n", "", "y", str(docs), "", str(tmp_path / "bad"), "Bad ID",
                                       ""]) == 0
     out = capsys.readouterr().out
-    assert "Folder ID [team-docs] " in out
+    assert "Folder ID [team-docs]: " in out
     assert cli._WORKSPACE_MESSAGES["workspace_id_invalid"] in out
     ids = [(w.workspace_id, w.display_label) for w in load_worker_settings(root).workspaces]
     assert ids == [("research", "OpenSwap Research"), ("team-docs", "Team Docs!")]
@@ -459,7 +486,7 @@ def test_workspace_labels_add_rename_reset_and_list(root, tmp_path, capsys):
     assert "label" not in json.loads(settings_path(root).read_text())["worker"]["workspaces"]["docs"]
     assert _run(root, "workspace", "list") == 0
     out = capsys.readouterr().out
-    assert 'docs "docs":' in out and 'research "research":' in out
+    assert '  ✓ docs      "docs"      ' in out and '  ✓ research  "research"  ' in out
 
 
 @pytest.mark.parametrize("argv, code", [
@@ -848,7 +875,10 @@ def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root,
     messages = [kwargs["message"] for _kind, kwargs in dialogs.shown]
     assert "That is not a pairing command" in messages[1]
     assert "Paired worker worker." in messages[2] and "Start the Remote tasks worker now" in messages[2]
-    assert dialogs.shown[-1][1]["ok"] == "Done" and "Remote tasks setup:" in messages[-1]
+    assert dialogs.shown[-1][1]["ok"] == "Done" and SUMMARY in messages[-1]
+    # The dialogs carry the same step headers and plain menu rows: no ANSI codes.
+    assert "Step 1 of 4 · Worker" in messages[2] and "Step 2 of 4 · Account" in messages[3]
+    assert "  • 1  Codex   alice@example.com" in messages[3] and "\x1b[" not in "".join(messages)
     assert app.refreshed == 1
 
 
@@ -934,7 +964,7 @@ def test_setup_pins_a_claude_account_and_points_at_the_claude_live_check(root, k
     out = capsys.readouterr().out
     assert "Pinned Claude account 4 · carol@example.com (claudey)" in out
     assert load_worker_settings(root).pinned_account_ref.startswith("claude:")
-    assert "  Account: Claude 4 · carol@example.com (claudey)" in out
+    assert "  ✓ Account    Claude 4 · carol@example.com (claudey)" in out
     assert guided_setup.CLAUDE_EXECUTION_OFF_NOTE in out and guided_setup.EXECUTION_OFF_NOTE not in out
     for command in ("openswap worker claude pin", "openswap worker claude prepare",
                     "openswap worker live-check --provider claude"):
