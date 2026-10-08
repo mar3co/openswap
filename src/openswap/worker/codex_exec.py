@@ -115,6 +115,17 @@ Rules:
 Task:
 """
 
+WORK_PREAMBLE = """You are working on a task for the owner of this Mac, started remotely through OpenSwap Remote tasks.
+
+Rules:
+- Your current working directory is {where}. Work only there.
+- {commit}
+- Do not install software system-wide, change settings, or start background services.
+- End with a short Markdown summary of what you did{branch_note}.
+
+Task:
+"""
+
 
 def homes_root(backup_root: Path) -> Path:
     return Path(backup_root) / "worker" / "codex-homes"
@@ -137,7 +148,8 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def codex_config(readonly_sources: tuple[Path, ...] = ()) -> str:
+def codex_config(readonly_sources: tuple[Path, ...] = (), write_paths: tuple[Path, ...] = (),
+                 read_paths: tuple[Path, ...] = ()) -> str:
     """The isolated home's whole ``config.toml``; nothing else is configured."""
     lines = [
         "# Managed by OpenSwap Remote tasks and rewritten before every run. Do not edit.",
@@ -176,8 +188,11 @@ def codex_config(readonly_sources: tuple[Path, ...] = ()) -> str:
         '":tmpdir" = "deny"',
         '":slash_tmp" = "deny"',
     ]
-    for source in readonly_sources:
+    for source in (*readonly_sources, *read_paths):
         lines.append(f'{_toml_string(str(Path(source)))} = "read"')
+    # A work folder task also writes what git needs beside its worktree.
+    for path in write_paths:
+        lines.append(f'{_toml_string(str(Path(path)))} = "write"')
     lines += [
         "",
         f'[permissions.{PROFILE_NAME}.filesystem.":workspace_roots"]',
@@ -190,7 +205,8 @@ def codex_config(readonly_sources: tuple[Path, ...] = ()) -> str:
     return "\n".join(lines)
 
 
-def prepare_home(backup_root: Path, identity: str, readonly_sources: tuple[Path, ...] = ()) -> Path:
+def prepare_home(backup_root: Path, identity: str, readonly_sources: tuple[Path, ...] = (),
+                 write_paths: tuple[Path, ...] = (), read_paths: tuple[Path, ...] = ()) -> Path:
     """Create the isolated home (0700) and write its managed config."""
     root = Path(backup_root)
     ensure_private_dir(root / "worker")
@@ -198,7 +214,7 @@ def prepare_home(backup_root: Path, identity: str, readonly_sources: tuple[Path,
     home = isolated_home(root, identity)
     ensure_private_dir(home)
     ensure_private_dir(home / "home")
-    write_private(home / "config.toml", codex_config(readonly_sources).encode("utf-8"))
+    write_private(home / "config.toml", codex_config(readonly_sources, write_paths, read_paths).encode("utf-8"))
     return home
 
 
@@ -353,6 +369,17 @@ def publish_result(run_dir: Path, output_root: Path) -> bool:
 
 
 def build_prompt(task: str, workspace: ResolvedWorkspace) -> str:
+    if workspace.work_dir is not None:
+        if workspace.branch is not None:
+            where = f"a git worktree made for this task, on branch {workspace.branch}"
+            commit = ("Commit your changes on the current branch when you are done; do not switch "
+                      "branches, push, or rewrite other branches.")
+            note = ", and the branch name"
+        else:
+            where = "the owner's folder itself"
+            commit = "Change only what the task needs; do not push or rewrite git history."
+            note = ""
+        return WORK_PREAMBLE.format(where=where, commit=commit, branch_note=note) + task + "\n"
     sources = ", ".join(str(path) for path in workspace.readonly_sources) or "none"
     return PROMPT_PREAMBLE.format(sources=sources) + task + "\n"
 
@@ -531,7 +558,8 @@ class CodexExecAdapter:
     def _prepare_account(self, identity: str, workspace: ResolvedWorkspace) -> Path:
         """The account's isolated home, signed in to exactly ``identity``; refuses otherwise."""
         try:
-            home = prepare_home(self.backup_root, identity, tuple(workspace.readonly_sources))
+            home = prepare_home(self.backup_root, identity, tuple(workspace.readonly_sources),
+                                tuple(workspace.write_paths), tuple(workspace.read_paths))
         except (OSError, ValueError, ContainmentError):
             raise ProviderLaunchRefused("provider_unavailable") from None
         if home_identity(home) != identity:
@@ -545,7 +573,7 @@ class CodexExecAdapter:
 
     def _command(self, pinned, home: Path, output_root: Path, run_dir: Path,
                  workspace: ResolvedWorkspace) -> tuple[list[str], dict[str, str]]:
-        return codex_argv(pinned.binary, output_root, run_dir), codex_env(home, run_dir)
+        return codex_argv(pinned.binary, output_root, run_dir), {**codex_env(home, run_dir), **dict(workspace.env)}
 
     def start(self, job: JobRecord, workspace: ResolvedWorkspace, *, worker_epoch: int) -> ProviderRun:
         # The opt-in check and the provider's release are one step under the
@@ -573,10 +601,15 @@ class CodexExecAdapter:
             raise ProviderLaunchRefused("provider_unavailable") from None
         home = self._prepare_account(identity, workspace)
         output_root = Path(workspace.output_root)
+        # Where the session is launched: the task's worktree (or the folder
+        # itself in direct mode) for a work folder, else its results folder.
+        cwd = Path(workspace.cwd)
         try:
-            granted = [output_root.resolve(strict=True),
-                       *(Path(p).resolve(strict=True) for p in workspace.readonly_sources)]
-            exists_codex_layer = os.path.lexists(output_root / ".codex")
+            granted = [output_root.resolve(strict=True), cwd.resolve(strict=True),
+                       *(Path(p).resolve(strict=True) for p in workspace.readonly_sources),
+                       *(Path(p).resolve(strict=True) for p in workspace.write_paths),
+                       *(Path(p).resolve(strict=True) for p in workspace.read_paths)]
+            exists_codex_layer = os.path.lexists(cwd / ".codex")
             grants_ok = all(self._grant_allowed(path) for path in granted)
         except (OSError, RuntimeError):
             # Replaced, inaccessible or looping since it was validated: nothing
@@ -604,9 +637,9 @@ class CodexExecAdapter:
         except (OSError, ContainmentError):
             raise ProviderLaunchRefused("provider_unavailable") from None
         try:
-            argv, env = self._command(pinned, home, output_root, run_dir, workspace)
+            argv, env = self._command(pinned, home, cwd, run_dir, workspace)
             handle = self.containment.launch(
-                job_id=job.job_id, run_dir=run_dir, argv=argv, env=env, cwd=output_root,
+                job_id=job.job_id, run_dir=run_dir, argv=argv, env=env, cwd=cwd,
                 stdin_text=build_prompt(job.task, workspace),
             )
         except ContainmentError as error:

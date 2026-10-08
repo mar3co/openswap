@@ -259,8 +259,25 @@ class ResolvedWorkspace:
     """Local-only path resolved from a registered opaque workspace ID."""
 
     workspace_id: str
-    output_root: Path
+    output_root: Path  # this task's results folder (artifacts are uploaded from here)
     readonly_sources: tuple[Path, ...] = ()
+    # A work folder task: the session's working directory (the task's git
+    # worktree, or the folder itself in direct mode). None: a research task,
+    # which works in ``output_root``.
+    work_dir: Path | None = None
+    # What the sandbox may write beside the working directory (git's object
+    # store, this worktree's admin folder, the openswap/ branch namespace) and
+    # read (the repo's shared .git).
+    write_paths: tuple[Path, ...] = ()
+    read_paths: tuple[Path, ...] = ()
+    # Extra environment for the task's own git (identity, no auto-gc).
+    env: tuple[tuple[str, str], ...] = ()
+    branch: str | None = None  # the task's own branch, for a worktree
+
+    @property
+    def cwd(self) -> Path:
+        """Where the session is launched."""
+        return self.work_dir if self.work_dir is not None else self.output_root
 
 
 @dataclass(frozen=True)

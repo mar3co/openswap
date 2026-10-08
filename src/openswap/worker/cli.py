@@ -617,6 +617,11 @@ def workspace_refusal(backup_root: Path, workspace, workspaces) -> str | None:
         problem = readable_folder_problem(root, source)
         if problem is not None:
             return _source_problem_code(problem)
+    work = getattr(workspace, "work_root", None)
+    if work is not None:
+        problem = work_folder_problem(root, work, workspace.mode, workspace.repos)
+        if problem is not None:
+            return _work_problem_code(problem)
     for other in workspaces:
         if other.workspace_id == workspace.workspace_id:
             continue
@@ -624,13 +629,75 @@ def workspace_refusal(backup_root: Path, workspace, workspaces) -> str | None:
             return "readonly_source_overlaps_results"
         if any(pathid.overlap(workspace.output_root, source) for source in other.readonly_roots):
             return "folder_overlaps_readable"
+        if work is not None and pathid.overlap(work, other.output_root):
+            return "work_overlaps_results"
+        other_work = getattr(other, "work_root", None)
+        if other_work is not None and pathid.overlap(workspace.output_root, other_work):
+            return "folder_overlaps_work"
     return None
+
+
+def work_folder_problem(backup_root: Path, folder: Path, mode: str = "worktree", repos: bool = False) -> str | None:
+    """Why a remote session may not work in ``folder``, or ``None``.
+
+    The folder policy of ``readable_folder_problem`` (never the home folder,
+    a system or private folder, a credential home or the results folder;
+    owned by the owner and not writable by others), and in worktree mode a
+    git repo (``not_a_repo``), or for a folder of repos at least one repo in
+    it (``no_repos``).
+    """
+    from openswap.worker import worktrees
+
+    problem = readable_folder_problem(Path(backup_root), folder)
+    if problem is not None:
+        return problem
+    if mode == "worktree":
+        if repos:
+            return None if worktrees.child_repos(folder) else "no_repos"
+        if not worktrees.is_repo(folder):
+            return "not_a_repo"
+    return None
+
+
+def _work_problem_code(problem: str) -> str:
+    return f"work_{problem}" if problem in {"not_a_repo", "no_repos"} else f"readable_{problem}"
+
+
+def launchable_workspaces(backup_root: Path, workspaces) -> tuple:
+    """The workspaces a task may name: each approved one, with a folder of repos
+    replaced by one work folder per git repo directly inside it.
+
+    Scanned again on every call (each launch and readiness report), so a new
+    repo appears without changing settings. A repo that is already a work
+    folder of its own is not listed twice. IDs come from the repo's name and
+    never collide: approved IDs first, then repos in name order.
+    """
+    from dataclasses import replace
+
+    from openswap.worker import worktrees
+
+    static = [w for w in workspaces if not getattr(w, "repos", False)]
+    taken = {w.workspace_id for w in workspaces}
+    out = list(static)
+    results = default_research_folder()
+    for parent in workspaces:
+        if not getattr(parent, "repos", False) or parent.work_root is None:
+            continue
+        for repo in worktrees.child_repos(parent.work_root):
+            if any(w.work_root is not None and pathid.same(w.work_root, repo) for w in out):
+                continue
+            workspace_id = suggested_folder_id(repo, taken)
+            taken.add(workspace_id)
+            label = repo.name if valid_account_label(repo.name) else None
+            out.append(replace(parent, workspace_id=workspace_id, output_root=results / workspace_id,
+                               readonly_roots=(), label=label, work_root=repo, repos=False))
+    return tuple(out)
 
 
 def refused_workspaces(backup_root: Path, workspaces=None) -> list[tuple[str, str]]:
     """``(workspace ID, code)`` for each approved workspace whose jobs are refused at launch."""
     if workspaces is None:
-        workspaces = load_worker_settings(Path(backup_root)).workspaces
+        workspaces = launchable_workspaces(backup_root, load_worker_settings(Path(backup_root)).workspaces)
     out = []
     for workspace in workspaces:
         try:
@@ -754,8 +821,20 @@ def add_worker_workspace(
         return _approve_locked(root, kept, workspace_id, output, sources, label)
 
 
-def _approve_locked(root: Path, kept, workspace_id: str, output: Path, sources, label) -> WorkerWorkspace:
-    """Check and save one more workspace after ``kept``; call under the lifecycle lock."""
+def _approve_locked(root: Path, kept, workspace_id: str, output: Path, sources, label, *,
+                    work_root: Path | None = None, mode: str = "worktree", repos: bool = False,
+                    replacing: str | None = None) -> WorkerWorkspace:
+    """Check and save one more workspace after ``kept``; call under the lifecycle lock.
+
+    ``replacing`` names a workspace in ``kept`` this one takes the place of
+    (same ID, same position), as when a read-only folder becomes a work folder.
+    """
+    if replacing is not None:
+        position = next(i for i, item in enumerate(kept) if item.workspace_id == replacing)
+        before, after = kept[:position], kept[position + 1:]
+        kept = (*before, *after)
+    else:
+        before, after = kept, ()
     if any(item.workspace_id == workspace_id for item in kept):
         raise WorkspaceError("workspace_exists")
     if len(kept) >= 16:
@@ -780,15 +859,27 @@ def _approve_locked(root: Path, kept, workspace_id: str, output: Path, sources, 
             raise WorkspaceError(_source_problem_code(problem))
         if pathid.overlap(source, output):
             raise WorkspaceError("readonly_source_overlaps_folder")
-    # Across workspaces too: no job may write where another one only reads.
+    if work_root is not None:
+        work_root = pathid.canonical(work_root)
+        problem = work_folder_problem(root, work_root, mode, repos)
+        if problem is not None:
+            raise WorkspaceError(_work_problem_code(problem))
+        if pathid.overlap(work_root, output):
+            raise WorkspaceError("work_overlaps_results")
+    # Across workspaces too: no job may write where another one only reads,
+    # and no task's results land inside a folder where sessions work.
     for other in kept:
         if any(pathid.overlap(source, other.output_root) for source in sources):
             raise WorkspaceError("readonly_source_overlaps_results")
         if any(pathid.overlap(output, source) for source in other.readonly_roots):
             raise WorkspaceError("folder_overlaps_readable")
-    workspace = WorkerWorkspace(workspace_id, output, sources, label)
+        if work_root is not None and pathid.overlap(work_root, other.output_root):
+            raise WorkspaceError("work_overlaps_results")
+        if other.work_root is not None and pathid.overlap(output, other.work_root):
+            raise WorkspaceError("folder_overlaps_work")
+    workspace = WorkerWorkspace(workspace_id, output, sources, label, work_root, mode, repos)
     try:
-        set_worker_workspaces(root, (*kept, workspace))
+        set_worker_workspaces(root, (*before, workspace, *after) if replacing is not None else (*kept, workspace))
     except ValueError as exc:
         if "disjoint" in str(exc):
             raise WorkspaceError("readonly_source_overlaps_folder") from None
@@ -857,6 +948,141 @@ def add_readable_folder(backup_root: Path, folder: str | Path, *, label: str | N
             raise WorkspaceError("folder_unavailable") from None
         workspace = _approve_locked(root, kept, workspace_id, results / workspace_id, (source,), label)
         return ReadableFolder(workspace, added=True, kept_builtin=kept_builtin)
+
+
+@dataclass(frozen=True)
+class WorkFolder:
+    """What ``add_work_folder`` did."""
+
+    workspace: WorkerWorkspace
+    added: bool  # False: sessions could already work there under this ID
+    kept_builtin: bool = False
+    repos: tuple[str, ...] = ()  # for a folder of repos: the IDs its repos are offered under
+
+
+def work_workspace(workspaces, folder: Path) -> WorkerWorkspace | None:
+    """The workspace whose sessions work in ``folder`` (by identity), if any."""
+    return next((w for w in workspaces if w.work_root is not None and pathid.same(w.work_root, folder)), None)
+
+
+def _expand_folder(path: str | Path) -> Path:
+    text = str(path)
+    if text == "~" or text.startswith("~/"):
+        return home_folder() / text[2:].lstrip("/")
+    return Path(path)
+
+
+def add_work_folder(backup_root: Path, folder: str | Path, *, mode: str = "worktree",
+                    label: str | None = None) -> WorkFolder:
+    """Let remote sessions work in ``folder``, as the guided setup does.
+
+    A git repo becomes one work folder (ID from its name). A folder that is
+    not a repo but holds repos (``~/GitHub``) offers each repo directly
+    inside it as a work folder of its own (see ``launchable_workspaces``).
+    In the default worktree mode a folder with neither is refused: there is
+    nothing to make a task's own copy of. ``mode="direct"`` (CLI only) lets
+    sessions work in the folder itself.
+
+    Results still go to ``~/OpenSwap Research/<id>``. A folder that was
+    added before as a read-only folder keeps its ID and becomes a work
+    folder. The built-in ``research`` folder is replaced as by
+    ``add_readable_folder``.
+    """
+    from openswap.settings import WORK_MODES
+    from openswap.worker import worktrees
+
+    if mode not in WORK_MODES:
+        raise WorkspaceError("mode_invalid")
+    root = Path(backup_root)
+    try:
+        work = pathid.canonical(_absolute_folder(_expand_folder(folder)).resolve(strict=True))
+    except (OSError, RuntimeError):
+        raise WorkspaceError("readable_unavailable") from None
+    repos = mode == "worktree" and not worktrees.is_repo(work) and bool(worktrees.child_repos(work))
+    problem = work_folder_problem(root, work, mode, repos)
+    if problem is not None:
+        raise WorkspaceError(_work_problem_code(problem))
+    if label is None and valid_account_label(work.name):
+        label = work.name
+    label = _valid_workspace_label(label)
+    _migrate_legacy_before_worker_state_change(root)
+    with lifecycle_lock(root):
+        current = load_worker_settings(root)
+        existing = work_workspace(launchable_workspaces(root, current.workspaces), work)
+        if existing is not None:
+            return WorkFolder(existing, added=False, repos=_repo_ids(root, current.workspaces, existing))
+        kept, kept_builtin = current.workspaces, False
+        if is_builtin_default_registry(root, kept):
+            if _workspace_in_use(root, kept[0].workspace_id):
+                kept_builtin = True
+            else:
+                kept = ()
+        results = default_research_folder()
+        try:
+            results.mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            raise WorkspaceError("folder_unavailable") from None
+        legacy = readable_workspace(kept, work)
+        if legacy is not None:
+            # A folder added as read-only before: same ID, now a work folder.
+            workspace = _approve_locked(root, kept, legacy.workspace_id, legacy.output_root, (), label,
+                                        work_root=work, mode=mode, repos=repos, replacing=legacy.workspace_id)
+        else:
+            workspace_id = suggested_folder_id(work, {w.workspace_id for w in kept})
+            workspace = _approve_locked(root, kept, workspace_id, results / workspace_id, (), label,
+                                        work_root=work, mode=mode, repos=repos)
+        saved = load_worker_settings(root).workspaces
+        return WorkFolder(workspace, added=True, kept_builtin=kept_builtin,
+                          repos=_repo_ids(root, saved, workspace))
+
+
+def _repo_ids(root: Path, workspaces, parent) -> tuple[str, ...]:
+    if not parent.repos:
+        return ()
+    static = {w.workspace_id for w in workspaces}
+    return tuple(w.workspace_id for w in launchable_workspaces(root, workspaces)
+                 if w.workspace_id not in static and w.work_root is not None
+                 and pathid.inside(w.work_root, parent.work_root))
+
+
+def set_workspace_mode(backup_root: Path, workspace_id: str, mode: str) -> WorkerWorkspace:
+    """Set where a work folder's sessions run: ``worktree`` (a copy per task) or ``direct``.
+
+    Only on this Mac: the control service can never set it. A repo found in
+    a folder of repos takes its mode from that folder.
+    """
+    from dataclasses import replace
+
+    from openswap.settings import WORK_MODES
+
+    if mode not in WORK_MODES:
+        raise WorkspaceError("mode_invalid")
+    root = Path(backup_root)
+    _migrate_legacy_before_worker_state_change(root)
+    with lifecycle_lock(root):
+        current = load_worker_settings(root)
+        target = next((w for w in current.workspaces if w.workspace_id == workspace_id), None)
+        if target is None:
+            launchable = launchable_workspaces(root, current.workspaces)
+            if any(w.workspace_id == workspace_id for w in launchable):
+                raise WorkspaceError("mode_on_parent")
+            raise WorkspaceError("workspace_not_found")
+        if target.work_root is None:
+            raise WorkspaceError("mode_not_work")
+        if target.mode == mode:
+            return target
+        if _workspace_in_use(root, workspace_id):
+            raise WorkspaceError("workspace_in_use")
+        problem = work_folder_problem(root, target.work_root, mode, target.repos)
+        if problem is not None:
+            raise WorkspaceError(_work_problem_code(problem))
+        updated = replace(target, mode=mode)
+        try:
+            set_worker_workspaces(root, tuple(updated if w.workspace_id == workspace_id else w
+                                              for w in current.workspaces))
+        except (OSError, RuntimeError, ValueError):
+            raise WorkspaceError("settings_unavailable") from None
+        return updated
 
 
 def _unsynced_remote_work(root: Path) -> tuple[tuple[str, ...], frozenset[str]]:
@@ -942,7 +1168,9 @@ def label_worker_workspace(backup_root: Path, workspace_id: str, label: str | No
         target = next((item for item in current.workspaces if item.workspace_id == workspace_id), None)
         if target is None:
             raise WorkspaceError("workspace_not_found")
-        updated = WorkerWorkspace(target.workspace_id, target.output_root, target.readonly_roots, label)
+        from dataclasses import replace
+
+        updated = replace(target, label=label)
         try:
             set_worker_workspaces(root, tuple(
                 updated if item.workspace_id == workspace_id else item for item in current.workspaces
@@ -1278,7 +1506,7 @@ def _run(backup_root: Path, *, managed: bool = False) -> int:
 
 _WORKER_COMMANDS = (
     "setup", "pair", "unpair", "status", "enable", "disable", "pause", "stop", "account", "workspace",
-    "codex", "claude", "live", "live-check", "lease", "run", "submit-test", "refserver",
+    "worktrees", "codex", "claude", "live", "live-check", "lease", "run", "submit-test", "refserver",
 )
 
 
@@ -1396,18 +1624,31 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     workspace_list = workspace_commands.add_parser("list", help="list approved research folders")
     workspace_list.add_argument("--json", action="store_true")
     workspace_add = workspace_commands.add_parser(
-        "add", help="let tasks read a folder (--read DIR), or approve a results folder under an ID",
-        usage="%(prog)s ID FOLDER [--readonly-source DIR] [--label TEXT] [--json]\n"
-              "       %(prog)s --read DIR [--label TEXT] [--json]",
-        description="`add ID FOLDER` approves FOLDER as the folder tasks write their results in. "
-                    "`add --read DIR` lets tasks read DIR but never change it, as `openswap worker setup` "
-                    "does: the ID comes from the folder's name and results go to ~/OpenSwap Research/<ID>.",
+        "add", help="add a folder where sessions work (--work DIR), or a research folder",
+        usage="%(prog)s --work DIR [--direct] [--label TEXT] [--json]\n"
+              "       %(prog)s --read DIR [--label TEXT] [--json]\n"
+              "       %(prog)s ID FOLDER [--readonly-source DIR] [--label TEXT] [--json]",
+        description="`add --work DIR` lets remote sessions work in DIR, as `openswap worker setup` does: "
+                    "a git repo becomes one folder (ID from its name), and a folder of repos offers each "
+                    "repo in it. Each task works in its own git worktree, on a branch openswap/<task>, so "
+                    "your copy is never touched; `--direct` (this Mac only) works in DIR itself. "
+                    "`add --read DIR` lets research tasks read DIR. `add ID FOLDER` approves FOLDER as "
+                    "the folder research tasks write their results in. Results go to "
+                    "~/OpenSwap Research/<ID>.",
     )
     workspace_add.add_argument("workspace_id", metavar="ID", nargs="?")
     workspace_add.add_argument("folder", metavar="FOLDER", nargs="?")
     workspace_add.add_argument(
+        "--work", metavar="DIR", default=None,
+        help="a git repo (or a folder of repos) where remote sessions work, each task in its own worktree",
+    )
+    workspace_add.add_argument(
+        "--direct", action="store_true",
+        help="with --work: sessions work in DIR itself, not a per-task worktree (any folder)",
+    )
+    workspace_add.add_argument(
         "--read", metavar="DIR", default=None,
-        help="a folder tasks may read but never change; ID and results folder are chosen for you",
+        help="a folder research tasks may read but never change; ID and results folder are chosen for you",
     )
     workspace_add.add_argument(
         "--readonly-source", action="append", metavar="DIR",
@@ -1428,6 +1669,26 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     workspace_remove = workspace_commands.add_parser("remove", help="withdraw approval for a workspace ID")
     workspace_remove.add_argument("workspace_id", metavar="ID")
     workspace_remove.add_argument("--json", action="store_true")
+    workspace_mode = workspace_commands.add_parser(
+        "mode", help="set where a folder's sessions work: worktree (a copy per task) or direct",
+        description="Only on this Mac; the control service can never set it. `worktree` (the default) "
+                    "gives each task its own git worktree; `direct` runs the session in the folder "
+                    "itself, like running `claude` or `codex` there.",
+    )
+    workspace_mode.add_argument("workspace_id", metavar="ID")
+    workspace_mode.add_argument("mode", choices=("worktree", "direct"))
+    workspace_mode.add_argument("--json", action="store_true")
+    worktrees_parser = commands.add_parser(
+        "worktrees", help="list the tasks' git worktrees, or prune finished ones",
+        description="Each task in a work folder runs in its own git worktree under "
+                    "~/OpenSwap Research/.worktrees. A finished task's branch is always kept; its "
+                    "worktree is removed when clean and kept when it holds uncommitted work. "
+                    "`prune` removes finished tasks' clean worktrees (with --force, every finished one).",
+    )
+    worktrees_parser.add_argument("action", nargs="?", choices=("list", "prune"), default="list")
+    worktrees_parser.add_argument("--force", action="store_true",
+                                  help="with prune: also remove dirty or locked worktrees of finished tasks")
+    worktrees_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(arguments)
     root = Path(backup_root) if backup_root is not None else get_backup_root()
 
@@ -1532,6 +1793,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         return _account_command(root, args)
     if args.command == "workspace":
         return _workspace_command(root, args)
+    if args.command == "worktrees":
+        return _worktrees_command(root, args)
     if args.command == "status":
         try:
             snapshot = read_status(root)
@@ -1719,6 +1982,17 @@ _WORKSPACE_MESSAGES = {
     "readonly_source_overlaps_results": "That folder holds another folder's task results. Pick another.",
     "folder_overlaps_readable": "That results folder is inside a folder tasks use. Pick another place.",
     "readable_permissions": "Other users can change that folder. Run `chmod go-w` on it, then try again.",
+    "work_not_a_repo": (
+        "That folder isn't a git repo and holds none. Pick a repo, or a folder of repos "
+        "(`--direct` works in a folder as it is)."
+    ),
+    "work_no_repos": "That folder holds no git repos anymore. Pick a repo instead.",
+    "work_overlaps_results": "That folder overlaps where task results are saved. Pick another.",
+    "folder_overlaps_work": "That results folder is inside a folder where sessions work. Pick another place.",
+    "mode_invalid": "The mode is `worktree` or `direct`.",
+    "mode_not_work": "Only folders where sessions work have a mode (add one with `--work`).",
+    "mode_on_parent": "That repo comes from a folder of repos: set the mode on that folder's ID.",
+    "worktree_failed": "Could not make the task's copy of the repo (git worktree).",
     "label_invalid": "Labels are 1-100 characters with no control characters.",
     "worker_lifecycle_busy": "Worker settings are being changed; try again shortly.",
     "settings_unavailable": "Could not save the worker settings.",
@@ -1882,12 +2156,62 @@ def _format_workspaces(workspaces) -> str:
 
 
 def _workspace_payload(workspace) -> dict:
-    return {
+    payload = {
         "workspace_id": workspace.workspace_id,
         "label": workspace.display_label,
         "output_root": str(workspace.output_root),
         "readonly_roots": [str(root) for root in workspace.readonly_roots],
     }
+    if workspace.work_root is not None:
+        payload.update(work_root=str(workspace.work_root), mode=workspace.mode, repos=workspace.repos)
+    return payload
+
+
+def _worktrees_command(root: Path, args) -> int:
+    from openswap.worker import worktrees
+
+    results = default_research_folder()
+    store = LocalJobStore(root)
+
+    def finished(job_id: str) -> bool:
+        try:
+            return store.get(job_id).state.value in {"succeeded", "failed", "cancelled", "interrupted", "expired"}
+        except Exception:
+            return True
+
+    removed = []
+    if args.action == "prune":
+        try:
+            removed = worktrees.sweep(results, finished, force=args.force)
+        except Exception:
+            print("Could not prune the worktrees.", file=sys.stderr)
+            return 1
+    items = worktrees.list_all(results)
+    payload = {
+        "worktrees": [{
+            "workspace_id": item.workspace_id, "job_id": item.job_id, "path": str(item.path),
+            "branch": item.branch, "dirty": item.dirty, "locked": item.locked,
+            "repo_present": item.repo is not None and item.repo.exists(), "finished": finished(item.job_id),
+        } for item in items],
+        "removed": [str(item.path) for item in removed],
+    }
+    rows = []
+    for item in items:
+        state = ("repo moved or deleted" if item.repo is None or not item.repo.exists()
+                 else "uncommitted work" if item.dirty else "clean" if item.dirty is False else "unknown")
+        if item.locked:
+            state += ", locked"
+        rows.append((f"{printer.mark(None if finished(item.job_id) else True)} {item.workspace_id}",
+                     item.branch or "-", state, str(item.path)))
+    lines = [printer.heading("Task worktrees")]
+    if args.action == "prune":
+        lines.append(f"Removed {len(removed)} finished task worktree{'s' if len(removed) != 1 else ''}; "
+                     "branches are kept.")
+    lines.extend(printer.columns(rows) or ["  none"])
+    if items and args.action == "list":
+        lines.append(printer.next_step("`openswap worker worktrees prune` removes finished tasks' clean worktrees."))
+    _write(payload, as_json=args.json, human="\n".join(lines))
+    return 0
 
 
 def _choice_payload(choice) -> dict | None:
@@ -1981,6 +2305,36 @@ def _workspace_command(root: Path, args) -> int:
                 {"workspaces": [_workspace_payload(item) for item in workspaces]},
                 as_json=args.json, human=_format_workspaces(workspaces),
             )
+            return 0
+        if args.workspace_command == "add" and args.work is not None:
+            if args.workspace_id is not None or args.folder is not None or args.readonly_source or args.read:
+                print("Pass `--work DIR` on its own.", file=sys.stderr)
+                return 2
+            result = add_work_folder(root, args.work, mode="direct" if args.direct else "worktree",
+                                     label=args.label)
+            workspace = result.workspace
+            where = workspace.work_root
+            if not result.added:
+                human = f"{where} is already a folder where sessions work ('{workspace.workspace_id}')."
+            elif result.repos or workspace.repos:
+                human = (f"{printer.MARK_OK} Sessions can work in the repos in {where}: "
+                         f"{', '.join(result.repos) or 'none yet'}. Each task gets its own worktree.")
+            else:
+                how = "in the folder itself" if workspace.mode == "direct" else "in its own worktree"
+                human = (f"{printer.MARK_OK} Sessions can work in {where} as '{workspace.workspace_id}', "
+                         f"each task {how}; results go to {workspace.output_root}.")
+            _write({"accepted": True, "added": result.added, "workspace": _workspace_payload(workspace),
+                    "repos": list(result.repos)}, as_json=args.json, human=human)
+            return 0
+        if args.workspace_command == "add" and args.direct:
+            print("`--direct` goes with `--work DIR`.", file=sys.stderr)
+            return 2
+        if args.workspace_command == "mode":
+            workspace = set_workspace_mode(root, args.workspace_id, args.mode)
+            how = ("in the folder itself" if workspace.mode == "direct"
+                   else "each task in its own worktree")
+            _write({"accepted": True, "workspace": _workspace_payload(workspace)}, as_json=args.json,
+                   human=f"{printer.MARK_OK} '{workspace.workspace_id}': sessions work {how}.")
             return 0
         if args.workspace_command == "add" and args.read is not None:
             if args.workspace_id is not None or args.folder is not None or args.readonly_source:

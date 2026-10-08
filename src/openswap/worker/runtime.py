@@ -1547,17 +1547,20 @@ class WorkerRuntime:
         self._launch_committed = None
 
     def _resolve_workspace(self, workspace_id: str, job_id: str) -> ResolvedWorkspace:
+        # A folder of repos offers each repo as a folder of its own, scanned
+        # again for every launch.
+        from openswap.worker.cli import default_research_folder, launchable_workspaces, workspace_refusal
+
         settings = load_worker_settings(self.backup_root)
-        workspace = next((item for item in settings.workspaces if item.workspace_id == workspace_id), None)
+        launchable = launchable_workspaces(self.backup_root, settings.workspaces)
+        workspace = next((item for item in launchable if item.workspace_id == workspace_id), None)
         if workspace is None:
             raise ValueError("workspace is not registered")
         # The folder rules `workspace add` applies, checked again before any
         # folder is created: a source saved before them (or edited into
         # settings, or a case variant on a case-insensitive volume) never
         # reaches the sandbox, and no job writes where another only reads.
-        from openswap.worker.cli import workspace_refusal
-
-        code = workspace_refusal(self.backup_root, workspace, settings.workspaces)
+        code = workspace_refusal(self.backup_root, workspace, launchable)
         if code is not None:
             raise WorkspaceRefused(_REFUSED_TEXT.get(code, "approved read-only source is not allowed"), code)
         base_root = workspace.output_root
@@ -1566,10 +1569,45 @@ class WorkerRuntime:
         output_root = base_root / job_id
         output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         _raise_for_output_problem(output_dir_problem(output_root))
+        if workspace.work_root is None:
+            return ResolvedWorkspace(
+                workspace_id=workspace_id, output_root=output_root,
+                readonly_sources=workspace.readonly_roots,
+            )
+        if workspace.mode == "direct":
+            # The owner opted in on this Mac: the session works in the folder itself.
+            return ResolvedWorkspace(
+                workspace_id=workspace_id, output_root=output_root,
+                work_dir=workspace.work_root, write_paths=(workspace.work_root,),
+            )
+        from openswap.worker import worktrees
+
+        results_root = default_research_folder()
+        # Finished tasks' clean worktrees go first; dirty ones stay for inspection.
+        try:
+            worktrees.sweep(results_root, self._job_finished)
+        except Exception:
+            pass
+        try:
+            tree = worktrees.create(workspace.work_root, results_root, workspace_id, job_id)
+        except worktrees.WorktreeError as error:
+            code = "work_not_a_repo" if error.code in {"not_a_repo", "no_commits"} else "worktree_failed"
+            raise WorkspaceRefused(f"worktree unavailable: {error.code}", code) from None
         return ResolvedWorkspace(
-            workspace_id=workspace_id, output_root=output_root,
-            readonly_sources=workspace.readonly_roots,
+            workspace_id=workspace_id, output_root=output_root, work_dir=tree.path,
+            write_paths=tree.write_paths, read_paths=tree.read_paths,
+            env=tuple(sorted(worktrees.task_env(workspace.work_root).items())), branch=tree.branch,
         )
+
+    def _job_finished(self, job_id: str) -> bool:
+        """Whether a task has ended (an unknown one counts as ended: nothing will use it)."""
+        try:
+            return self.store.get(job_id).state.value in _FINISHED_STATES
+        except Exception:
+            return True
+
+
+_FINISHED_STATES = frozenset({"succeeded", "failed", "cancelled", "interrupted", "expired"})
 
 
 class WorkspaceRefused(ValueError):

@@ -21,7 +21,8 @@ from openswap.settings import load_worker_settings
 from openswap.worker.journal import AdmissionError, JournalError
 from openswap.worker.models import JobState, RemoteAuthorization, SafeEventKind
 from openswap.worker.protocol import (
-    AdvertisedAccount, Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, ProtocolError,
+    AdvertisedAccount, Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, MAX_REPORTED_FOLDERS,
+    ProtocolError,
     ReportedFolder, TERMINAL, fields, integer, timestamp, validate_url,
 )
 
@@ -450,8 +451,13 @@ class RemoteClient:
         """The readiness report: approved folder IDs with their labels, and the execution mode."""
         from openswap.worker.adapter import execution_mode
 
+        from openswap.worker.cli import launchable_workspaces
+
+        # A folder of repos is reported as its repos, scanned again for each
+        # report; at most the protocol's 20 folders.
+        launchable = launchable_workspaces(self.runtime.backup_root, policy.workspaces)
         folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict()
-                   for w in policy.workspaces if offerable(self.runtime.backup_root, w, policy.workspaces)]
+                   for w in launchable if offerable(self.runtime.backup_root, w, launchable)][:MAX_REPORTED_FOLDERS]
         # The pinned account's provider decides (a Claude pin reports Claude's opt-in).
         mode_of = getattr(self.runtime, "execution_mode", None)
         if callable(mode_of):
@@ -910,8 +916,11 @@ class RemoteClient:
             cursor = page.next_cursor
 
     def _upload_artifact(self, claim, local, name):
+        from openswap.worker.cli import launchable_workspaces
+
         policy = load_worker_settings(self.runtime.backup_root)
-        workspace = next((w for w in policy.workspaces if w.workspace_id == local.workspace_id), None)
+        launchable = launchable_workspaces(self.runtime.backup_root, policy.workspaces)
+        workspace = next((w for w in launchable if w.workspace_id == local.workspace_id), None)
         if workspace is None:
             raise ProtocolError("invalid_request")
         directory = workspace.output_root / local.job_id

@@ -85,13 +85,25 @@ class WorkerWorkspace:
     # Owner-chosen display name reported to the control service with the ID
     # (readiness extension); None reports the folder's own name.
     label: str | None = None
+    # A work folder: where the Claude or Codex session is launched and works.
+    # None is a research workspace (the session works in its results folder
+    # and may read ``readonly_roots``).
+    work_root: Path | None = None
+    # "worktree" (default): each task works in its own git worktree of the
+    # repo; "direct": the session works in ``work_root`` itself. Set on this
+    # Mac only, never by the control service.
+    mode: str = "worktree"
+    # ``work_root`` is a folder of git repos: each repo directly inside it is
+    # offered as a work folder of its own (see ``cli.launchable_workspaces``).
+    repos: bool = False
 
     @property
     def display_label(self) -> str:
         """The label the control service sees: the owner's, else the folder name, else the ID."""
         if self.label is not None:
             return self.label
-        name = "".join(c for c in Path(self.output_root).name if unicodedata.category(c) != "Cc")
+        named = self.work_root if self.work_root is not None else self.output_root
+        name = "".join(c for c in Path(named).name if unicodedata.category(c) != "Cc")
         return name[:MAX_ACCOUNT_LABEL] or self.workspace_id
 
 
@@ -340,6 +352,7 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
 
 
 _WORKSPACE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+WORK_MODES = ("worktree", "direct")
 _PINNED_ACCOUNT_RE = re.compile(r"^(?:codex|claude):[0-9a-f]{64}$")
 _ALLOWLIST_REF_RE = re.compile(r"^[0-9a-f]{32}$")
 MAX_ACCOUNT_ALLOWLIST = 20
@@ -483,6 +496,14 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
                 label = config.get("label")
                 if label is not None and not valid_account_label(label):
                     raise ValueError
+                work_text = config.get("workRoot")
+                mode = config.get("mode", "worktree")
+                repos = config.get("repos", False)
+                if (mode not in WORK_MODES or not isinstance(repos, bool)
+                        or (work_text is not None and (not isinstance(work_text, str) or len(work_text) > 2048
+                                                       or not Path(work_text).is_absolute()))
+                        or (work_text is None and (repos or "mode" in config))):
+                    raise ValueError
                 if (not isinstance(root_text, str) or len(root_text) > 2048
                         or not Path(root_text).is_absolute()
                         or not isinstance(readonly_text, list) or len(readonly_text) > 16
@@ -495,7 +516,10 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
                 readonly = tuple(pathid.canonical(item) for item in readonly_text)
                 if any(pathid.overlap(output, root) for root in readonly):
                     raise ValueError
-                workspaces.append(WorkerWorkspace(workspace_id, output, readonly, label))
+                work = pathid.canonical(work_text) if work_text is not None else None
+                if work is not None and pathid.overlap(output, work):
+                    raise ValueError
+                workspaces.append(WorkerWorkspace(workspace_id, output, readonly, label, work, mode, repos))
         except (TypeError, ValueError, OSError):
             _logger.warning("settings.json worker workspace registry is invalid; disabling the worker")
             return WorkerSettings(workspaces=(_default_worker_workspace(backup_root),))
@@ -683,13 +707,26 @@ def _encode_worker_workspaces(workspaces: tuple[WorkerWorkspace, ...]) -> dict[s
             raise ValueError("writable output and read-only roots must be disjoint")
         if workspace.label is not None and not valid_account_label(workspace.label):
             raise ValueError("workspace labels are 1-100 characters with no control characters")
+        work = None
+        if workspace.work_root is not None:
+            work = Path(workspace.work_root)
+            if not work.is_absolute() or len(str(work)) > 2048:
+                raise ValueError("a work folder must be an absolute local path")
+            work = pathid.canonical(work)
+            if pathid.overlap(resolved_output, work):
+                raise ValueError("the results folder and the work folder must be disjoint")
+        if workspace.mode not in WORK_MODES or not isinstance(workspace.repos, bool):
+            raise ValueError("a work folder's mode is worktree or direct")
+        if work is None and (workspace.repos or workspace.mode != "worktree"):
+            raise ValueError("only a work folder has a mode")
         encoded[workspace.workspace_id] = _encode_workspace_config(
-            resolved_output, resolved_readonly, workspace.label,
+            resolved_output, resolved_readonly, workspace.label, work, workspace.mode, workspace.repos,
         )
     return encoded
 
 
-def _encode_workspace_config(output_root, readonly_roots, label: str | None) -> dict[str, object]:
+def _encode_workspace_config(output_root, readonly_roots, label: str | None, work_root=None,
+                             mode: str = "worktree", repos: bool = False) -> dict[str, object]:
     config: dict[str, object] = {
         "outputRoot": str(output_root),
         "readonlyRoots": [str(path) for path in readonly_roots],
@@ -697,6 +734,13 @@ def _encode_workspace_config(output_root, readonly_roots, label: str | None) -> 
     if label is not None:
         # Older releases ignore the key, so a downgrade keeps the folder.
         config["label"] = label
+    if work_root is not None:
+        # Older releases ignore these too: they run such a task in its
+        # results folder with nothing to read, which fails safe.
+        config["workRoot"] = str(work_root)
+        config["mode"] = mode
+        if repos:
+            config["repos"] = True
     return config
 
 
@@ -711,7 +755,9 @@ def _validate_pinned_account_ref(pinned_account_ref: str | None) -> None:
 def _decoded_workspaces(encoded: dict[str, dict[str, object]]) -> tuple[WorkerWorkspace, ...]:
     return tuple(
         WorkerWorkspace(workspace_id, Path(config["outputRoot"]),
-                        tuple(Path(item) for item in config["readonlyRoots"]), config.get("label"))
+                        tuple(Path(item) for item in config["readonlyRoots"]), config.get("label"),
+                        Path(config["workRoot"]) if "workRoot" in config else None,
+                        config.get("mode", "worktree"), config.get("repos", False))
         for workspace_id, config in encoded.items()
     )
 
