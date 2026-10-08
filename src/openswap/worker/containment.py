@@ -650,6 +650,11 @@ class LaunchdContainment:
             # opened by the wrapper's redirections: only an empty directory
             # (apart from a private ``tmp``) runs.
             raise ContainmentError("run_dir_not_fresh")
+        if self._load_mirror(run_dir) is not None:
+            # A recovery record survives only until its job is proven
+            # stopped: an emptied directory may still belong to a running
+            # job, whose only handle this launch would overwrite.
+            raise ContainmentError("run_dir_has_unrecovered_job")
         procs = self.procs
         boot = procs.boot_session()
         if boot is None:
@@ -996,6 +1001,7 @@ class LaunchdContainment:
         procs = self.procs
         kinds: dict[int, str] = {}
         listed_at = self._wall()
+        mono_at = self._monotonic()
         for pid in procs.pids():
             if pid == self._self_pid or pid <= 1:
                 continue
@@ -1024,6 +1030,11 @@ class LaunchdContainment:
                     kinds[pid] = f"zombie@{zombie}" if zombie is not None else "gone"
                 else:
                     kinds[pid] = "stopped" if status == _SSTOP else "running"
+        # Start times are wall-clock: if the clock was stepped during the scan
+        # (wall and monotonic time disagree), the reuse test above proves
+        # nothing, so the scan counts as incomplete.
+        if abs((self._wall() - listed_at) - (self._monotonic() - mono_at)) > 0.05:
+            kinds[0] = "gone"
         return kinds
 
     @staticmethod
