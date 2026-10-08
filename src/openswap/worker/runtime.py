@@ -1159,7 +1159,11 @@ class WorkerRuntime:
             )
         self._active_lease = token
         try:
-            workspace = self._resolve_workspace(starting.workspace_id, starting.job_id)
+            # Resolve under the lifecycle lock that workspace changes hold, so
+            # a folder change either sees this STARTING job and refuses, or
+            # completes first and this job resolves the new folder.
+            with FileLock(self.backup_root / "worker" / "lifecycle.lock", timeout=5):
+                workspace = self._resolve_workspace(starting.workspace_id, starting.job_id)
         except Exception:
             self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
             self._clear_active()

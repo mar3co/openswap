@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
@@ -279,7 +280,9 @@ class Readiness:
         out = []
         if self.paired_url is None:
             out.append("pair this Mac (`openswap worker pair <url> <code>`)")
-        if self.worker not in {"running", "starting"}:
+        if self.worker == "starting":
+            out.append("wait for the worker to finish starting (`openswap worker status`)")
+        elif self.worker != "running":
             out.append("start the worker (`openswap worker enable`)")
         if self.paused:
             out.append("reopen admission (`openswap worker pause --off`)")
@@ -301,12 +304,16 @@ def readiness(root: Path) -> Readiness:
             process = cli.read_status(root).get("process_state")
         except Exception:
             process = None
-        if process in _RUNNING_STATES:
+        if process == "running":
             worker = "running"
-        else:
+        elif process == "starting" or (process in {"stopped", None} and cli._managed_worker_loaded()):
             # Just after `enable` the LaunchAgent is loaded but the process may
-            # not have written its first status yet.
-            worker = "starting" if cli._managed_worker_loaded() else "stopped"
+            # not have written its first status yet. Starting is never ready:
+            # a crashed worker can stay loaded, so only `running` counts.
+            worker = "starting"
+        else:
+            # Stale, stopping or unreadable health is reported as not running.
+            worker = "stopped"
     account = None
     try:
         choices = cli.worker_account_choices(root)
@@ -326,8 +333,13 @@ def readiness(root: Path) -> Readiness:
     )
 
 
-def summary(root: Path, ui: Prompts) -> None:
+def summary(root: Path, ui: Prompts, *, start_wait_s: float = 5.0) -> None:
     state = readiness(root)
+    # Give a worker that `enable` just started a moment to report running.
+    deadline = time.monotonic() + start_wait_s
+    while state.worker == "starting" and time.monotonic() < deadline:
+        time.sleep(0.25)
+        state = readiness(root)
     worker = {"running": "running", "starting": "starting", "stopped": "enabled but not running",
               "off": "off"}[state.worker]
     ui.say("Remote tasks setup:")

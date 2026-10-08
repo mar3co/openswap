@@ -248,6 +248,62 @@ def test_summary_is_ready_only_when_admission_is_open(root, monkeypatch, capsys,
     assert "  Worker: running\n" in out and "Ready for Slack" in out
 
 
+@pytest.mark.parametrize(("process", "loaded", "worker"), [
+    ("running", False, "running"),
+    ("starting", False, "starting"),
+    (None, True, "starting"),  # just enabled: no status written yet
+    ("stopped", True, "starting"),
+    ("stale", True, "stopped"),  # a crashed worker can stay loaded
+    ("unavailable", True, "stopped"),
+    ("stopping", True, "stopped"),
+    ("stopped", False, "stopped"),
+])
+def test_only_a_running_worker_counts_as_ready(root, monkeypatch, process, loaded, worker):
+    cli.set_worker_account(root, "1")
+    update_worker_settings(root, enabled=True)
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": process})
+    monkeypatch.setattr(cli, "_managed_worker_loaded", lambda: loaded)
+    state = guided_setup.readiness(root)
+    assert state.worker == worker
+    expected = {
+        "running": None,
+        "starting": "wait for the worker to finish starting (`openswap worker status`)",
+        "stopped": "start the worker (`openswap worker enable`)",
+    }[worker]
+    worker_steps = {"wait for the worker to finish starting (`openswap worker status`)",
+                    "start the worker (`openswap worker enable`)"}
+    assert worker_steps & set(state.missing) == ({expected} if expected else set())
+
+
+def test_summary_waits_briefly_for_a_starting_worker(root, monkeypatch, capsys, research_home):
+    cli.set_worker_account(root, "1")
+    cli.add_worker_workspace(root, "research", research_home, replace_builtin_default=True)
+    update_worker_settings(root, enabled=True)
+    states = iter(["starting", "starting", "running"])
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": next(states, "running")})
+    monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: None)
+    guided_setup.summary(root, _Say())
+    out = capsys.readouterr().out
+    assert "  Worker: running\n" in out and "wait for the worker" not in out
+
+
+def test_summary_never_calls_a_stuck_starting_worker_ready(root, monkeypatch, capsys, research_home):
+    cli.set_worker_account(root, "1")
+    cli.add_worker_workspace(root, "research", research_home, replace_builtin_default=True)
+    update_worker_settings(root, enabled=True)
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"enabled": True, "process_state": "starting"})
+    guided_setup.summary(root, _Say(),
+                         start_wait_s=0)
+    out = capsys.readouterr().out
+    assert "  Worker: starting" in out and "Ready for Slack" not in out
+    assert "wait for the worker to finish starting" in out
+
+
+class _Say:
+    def say(self, text):
+        print(text)
+
+
 def test_a_failing_pin_keeps_the_setup_going(root, keychain, monkeypatch, capsys, enable_calls):
     monkeypatch.setattr(cli, "set_worker_account", lambda *_: (_ for _ in ()).throw(OSError("disk")))
     assert _pair(root, monkeypatch, interactive=True, answers=["n", "1", "y"]) == 0

@@ -606,9 +606,10 @@ def _workspace_in_use(root: Path, workspace_id: str) -> bool:
     """Whether a job using ``workspace_id`` may still run or upload its results.
 
     Artifact upload re-reads the registry for the job's folder, so a mapping
-    stays while any job using it may still run or upload. (A job that resolves
-    the folder in the moment before a change still runs there; its upload then
-    needs the ID added back to the same folder.) Call under the lifecycle lock.
+    stays while any job using it may still run or upload. The runtime resolves
+    a job's folder under the same lifecycle lock while the job is STARTING, so
+    a job either counts as in use here or resolves the changed registry. Call
+    under the lifecycle lock.
     """
     try:
         unsynced, unadmitted = _unsynced_remote_work(root)
