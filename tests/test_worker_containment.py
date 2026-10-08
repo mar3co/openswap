@@ -1,0 +1,335 @@
+"""Per-job launchd containment: fake launchd/process table, plus an opt-in real run."""
+
+from __future__ import annotations
+
+import os
+import plistlib
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+
+from openswap.worker import containment as c
+from openswap.worker.containment import (
+    ContainmentError,
+    LaunchdContainment,
+    JobHandle,
+    load_handle,
+)
+
+WORKER_PID = 4242
+WORKER_COALITION = 7
+JOB_COALITION = 900
+
+
+class FakeProcs:
+    """A tiny process table: pid -> [coalition, status]."""
+
+    def __init__(self, boot="boot-a"):
+        self.table = {WORKER_PID: [WORKER_COALITION, 2]}
+        self.boot = boot
+        self.signals: list[tuple[int, int]] = []
+        self.unkillable: set[int] = set()
+        self.spawn_on_scan = 0  # running members fork this many times while racing
+        self._next = 5000
+
+    def new(self, coalition, status=2):
+        self._next += 1
+        self.table[self._next] = [coalition, status]
+        return self._next
+
+    def pids(self):
+        if self.spawn_on_scan:
+            racers = [pid for pid, (cid, st) in self.table.items() if cid == JOB_COALITION and st != 4]
+            if racers:
+                self.spawn_on_scan -= 1
+                self.new(JOB_COALITION)
+        return list(self.table)
+
+    def coalition_of(self, pid):
+        entry = self.table.get(pid)
+        return entry[0] if entry else None
+
+    def status_of(self, pid):
+        entry = self.table.get(pid)
+        return entry[1] if entry else None
+
+    def signal(self, pid, signum):
+        self.signals.append((pid, signum))
+        if pid not in self.table:
+            raise ProcessLookupError(pid)
+        if signum == signal.SIGSTOP:
+            self.table[pid][1] = 4
+        elif signum in (signal.SIGKILL, signal.SIGTERM) and pid not in self.unkillable:
+            del self.table[pid]
+
+    def boot_session(self):
+        return self.boot
+
+
+class FakeLaunchd:
+    def __init__(self, procs: FakeProcs, *, coalition=JOB_COALITION):
+        self.procs = procs
+        self.coalition = coalition
+        self.loaded: dict[str, int] = {}
+        self.calls: list[list[str]] = []
+        self.bootstrap_rc = 0
+        self.print_pid_override = None
+        self.write_pid = True
+        self.keep_loaded = False
+        self.escaped: list[int] = []
+
+    def __call__(self, args):
+        self.calls.append(list(args))
+        verb = args[0]
+        if verb == "print":
+            label = args[1].split("/", 2)[2]
+            if label in self.loaded:
+                pid = self.print_pid_override or self.loaded[label]
+                return subprocess.CompletedProcess(args, 0, f"{label} = {{\n\tstate = running\n\tpid = {pid}\n}}\n", "")
+            return subprocess.CompletedProcess(args, 113, "", "Could not find service")
+        if verb == "bootstrap":
+            if self.bootstrap_rc:
+                return subprocess.CompletedProcess(args, self.bootstrap_rc, "", "error")
+            plist = plistlib.loads(Path(args[2]).read_bytes())
+            run_dir = Path(plist["ProgramArguments"][4])
+            leader = self.procs.new(self.coalition)
+            self.loaded[plist["Label"]] = leader
+            if self.write_pid:
+                (run_dir / "leader.pid").write_text(f"{leader}\n")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "bootout":
+            label = args[1].split("/", 2)[2]
+            leader = self.loaded.get(label)
+            if leader is not None and not self.keep_loaded:
+                self.procs.table.pop(leader, None)  # launchd kills the leader's group only
+                del self.loaded[label]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        raise AssertionError(args)
+
+
+def make(tmp_path, **kwargs):
+    procs = FakeProcs()
+    launchd = FakeLaunchd(procs, **kwargs)
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    containment = LaunchdContainment(
+        uid=501, procs=procs, launchctl=launchd, sleep=sleep,
+        monotonic=lambda: clock[0], self_pid=WORKER_PID,
+    )
+    return containment, procs, launchd
+
+
+def private_dir(tmp_path, name="runs"):
+    root = tmp_path / name
+    root.mkdir(mode=0o700)
+    return root
+
+
+def launch(containment, root, job_id="a" * 32, **kwargs):
+    return containment.launch(
+        job_id=job_id, run_dir=root / job_id, argv=["/bin/echo", "hi"],
+        env={"PATH": "/usr/bin:/bin"}, cwd=root, stdin_text="task", **kwargs,
+    )
+
+
+def test_launch_records_coalition_before_releasing_the_provider(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    handle = launch(containment, root)
+    assert handle.coalition_id == JOB_COALITION
+    assert handle.released is True
+    assert handle.label == "com.opensoft.openswap.worker.job." + "a" * 32
+    assert handle.domain == "gui/501"
+    assert (root / ("a" * 32) / "go").exists()
+    assert load_handle(root / ("a" * 32)) == handle
+    plist = plistlib.loads((root / ("a" * 32) / "job.plist").read_bytes())
+    assert plist["ProgramArguments"][:2] == ["/bin/sh", "-c"]
+    assert plist["ProgramArguments"][5:] == ["/bin/echo", "hi"]
+    assert plist["KeepAlive"] is False and plist["AbandonProcessGroup"] is False
+    assert plist["EnvironmentVariables"] == {"PATH": "/usr/bin:/bin"}
+    assert plist["Umask"] == 0o077
+    assert (root / ("a" * 32) / "stdin.txt").read_text() == "task"
+    assert oct((root / ("a" * 32) / "stdin.txt").stat().st_mode & 0o777) == "0o600"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell wrapper")
+def test_wrapper_runs_the_provider_only_after_go(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "stdin.txt").write_text("")
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", c.WRAPPER_SCRIPT, "openswap-job", str(run_dir), "/bin/echo", "ran"],
+    )
+    for _ in range(200):
+        if (run_dir / "leader.pid").exists():
+            break
+        time.sleep(0.01)
+    assert int((run_dir / "leader.pid").read_text()) == proc.pid
+    time.sleep(0.2)
+    assert not (run_dir / "stdout.jsonl").exists()
+    (run_dir / "go").write_text("")
+    assert proc.wait(timeout=10) == 0
+    assert (run_dir / "stdout.jsonl").read_text() == "ran\n"
+    assert (run_dir / "exit").read_text().strip() == "0"
+
+
+@pytest.mark.parametrize("problem", ["same_coalition", "bootstrap", "pid_mismatch", "no_pid"])
+def test_unprovable_launch_is_refused_and_never_released(tmp_path, problem):
+    kwargs = {"coalition": WORKER_COALITION} if problem == "same_coalition" else {}
+    containment, procs, launchd = make(tmp_path, **kwargs)
+    if problem == "bootstrap":
+        launchd.bootstrap_rc = 5
+    elif problem == "pid_mismatch":
+        launchd.print_pid_override = 99999
+    elif problem == "no_pid":
+        launchd.write_pid = False
+    root = private_dir(tmp_path)
+    with pytest.raises(ContainmentError) as error:
+        launch(containment, root)
+    assert error.value.launched is False
+    assert not (root / ("a" * 32) / "go").exists()
+    assert launchd.loaded == {}
+    assert WORKER_PID in procs.table  # never signalled the worker's coalition
+    assert all(pid != WORKER_PID for pid, _ in procs.signals)
+
+
+def test_label_already_loaded_is_refused(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    launchd.loaded[c.job_label("a" * 32)] = procs.new(JOB_COALITION)
+    with pytest.raises(ContainmentError) as error:
+        launch(containment, private_dir(tmp_path))
+    assert error.value.code == "job_label_in_use"
+    assert error.value.launched is False
+
+
+def test_stop_kills_escaped_setsid_members_that_bootout_misses(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    escaped = [procs.new(JOB_COALITION) for _ in range(3)]
+    unrelated = procs.new(55)
+    proof = containment.stop(handle)
+    assert proof.stopped is True and proof.survivors == 0 and proof.label_loaded is False
+    assert not any(pid in procs.table for pid in escaped)
+    assert unrelated in procs.table and WORKER_PID in procs.table
+    # Every member is frozen before any is killed.
+    kinds = [sig for _, sig in procs.signals]
+    assert kinds.index(signal.SIGKILL) > max(i for i, s in enumerate(kinds) if s == signal.SIGSTOP)
+
+
+def test_sweep_wins_a_fork_race(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    procs.new(JOB_COALITION)
+    procs.spawn_on_scan = 25
+    proof = containment.stop(handle)
+    assert proof.stopped is True
+    assert not [p for p, (cid, _) in procs.table.items() if cid == JOB_COALITION]
+
+
+def test_unkillable_member_or_loaded_label_is_not_proof(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    stuck = procs.new(JOB_COALITION)
+    procs.unkillable.add(stuck)
+    proof = containment.stop(handle, timeout=1.0)
+    assert proof.stopped is False and proof.survivors == 1
+
+    containment, procs, launchd = make(tmp_path / "second")
+    (tmp_path / "second").mkdir()
+    handle = launch(containment, private_dir(tmp_path / "second"))
+    launchd.keep_loaded = True
+    proof = containment.stop(handle, timeout=1.0)
+    assert proof.stopped is False and proof.label_loaded is True
+
+
+def test_zombies_are_not_survivors(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    procs.new(JOB_COALITION, status=5)
+    assert containment.stop(handle).stopped is True
+
+
+def test_recover_after_reboot_is_proof_without_signals(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    handle = launch(containment, root)
+    procs.boot = "boot-b"
+    procs.signals.clear()
+    proof = containment.recover(handle.run_dir)
+    assert proof.stopped is True and proof.rebooted is True
+    assert procs.signals == []
+
+
+def test_recover_without_handle_is_none_and_unreleased_handle_proves_by_unload(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    assert containment.recover(root / "missing") is None
+    run_dir = root / ("b" * 32)
+    run_dir.mkdir(mode=0o700)
+    c._save_handle(JobHandle(c.job_label("b" * 32), "gui/501", run_dir, "boot-a"))
+    proof = containment.recover(run_dir)
+    assert proof.stopped is True and proof.never_released is True
+    # Released but with no coalition recorded cannot be proven.
+    c._save_handle(JobHandle(c.job_label("b" * 32), "gui/501", run_dir, "boot-a", released=True))
+    assert containment.recover(run_dir).stopped is False
+
+
+@pytest.mark.parametrize("payload", [
+    "not json", '{"label": "x", "domain": "gui/501"}',
+    '{"label": "com.opensoft.openswap.worker.job.aa", "domain": "system"}',
+    '{"label": "com.opensoft.openswap.worker.job.aa", "domain": "gui/501", "coalition_id": "1"}',
+    '{"label": "com.opensoft.openswap.worker.job.aa", "domain": "gui/501", "released": 1}',
+])
+def test_malformed_handles_are_ignored(tmp_path, payload):
+    (tmp_path / "handle.json").write_text(payload)
+    assert load_handle(tmp_path) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks")
+def test_symlinked_handle_is_ignored(tmp_path):
+    real = tmp_path / "real.json"
+    real.write_text('{"label": "com.opensoft.openswap.worker.job.aa", "domain": "gui/501"}')
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "handle.json").symlink_to(real)
+    assert load_handle(run) is None
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or os.environ.get("OPENSWAP_LAUNCHD_TESTS") != "1",
+    reason="real launchd containment; set OPENSWAP_LAUNCHD_TESTS=1 on a Mac",
+)
+def test_real_launchd_contains_a_setsid_daemon(tmp_path):
+    root = tmp_path / "runs"
+    root.mkdir(mode=0o700)
+    started = tmp_path / "started"
+    script = (
+        "use POSIX;"
+        "if (fork()==0) { setsid(); if (fork()==0) { close STDIN; close STDOUT; close STDERR;"
+        " exec '/bin/sleep','297'; } exit 0; }"
+        f"open(my $f, '>', '{started}'); close $f; sleep 300;"
+    )
+    containment = LaunchdContainment()
+    handle = containment.launch(
+        job_id=uuid.uuid4().hex, run_dir=root / "job", argv=["/usr/bin/perl", "-e", script],
+        env={"PATH": "/usr/bin:/bin"}, cwd=tmp_path, stdin_text="",
+    )
+    try:
+        for _ in range(200):
+            if started.exists():
+                break
+            time.sleep(0.05)
+        assert len(containment.members(handle)) >= 3
+        proof = containment.stop(handle)
+        assert proof.stopped is True
+        assert containment.members(handle) == []
+    finally:
+        containment.stop(handle)
