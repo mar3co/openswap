@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -423,32 +424,70 @@ def test_a_changed_pin_applies_to_the_next_job_without_a_restart(root):
     assert adapter.leased == [ALICE, BOB]
 
 
-def test_a_pin_change_just_before_the_launch_takes_the_guard_is_honoured(root, monkeypatch):
-    """The pin is read under the Codex mutation guard: a change that completes
-    right before the launch takes the guard is the account the job uses."""
-    from contextlib import contextmanager
-
+def test_a_pin_change_just_before_the_launch_takes_its_locks_is_honoured(root, monkeypatch):
+    """The pin is read under the lifecycle lock and the Codex mutation guard:
+    a change that completes right before the launch takes them is the account
+    the job uses (one that arrives later waits for the lease to be taken)."""
     update_worker_settings(root, enabled=True)
     cli.set_worker_account(root, "1")
     adapter = _FinishingAdapter(root)
     runtime = WorkerRuntime(root, adapter=adapter)
-    real_guard = runtime.leases.mutation_guard
+    real_probe = adapter.probe
     raced = []
 
-    @contextmanager
-    def racing_guard(*args, **kwargs):
+    def racing_probe(*args, **kwargs):
         if not raced:
             raced.append(True)
             cli.set_worker_account(root, "2")  # the owner's change lands first
-        with real_guard(*args, **kwargs) as guard:
-            yield guard
+        return real_probe(*args, **kwargs)
 
-    monkeypatch.setattr(runtime.leases, "mutation_guard", racing_guard)
+    monkeypatch.setattr(adapter, "probe", racing_probe)
     job = runtime.submit(_submission())
     assert runtime.reconcile_once().state == JobState.SUCCEEDED
     assert raced == [True]
     assert runtime.get(job.job_id).pinned_account_ref == BOB
     assert adapter.leased == [BOB]
+
+
+def test_an_owner_command_holding_the_lifecycle_lock_waits_out_the_launch(root, monkeypatch):
+    """Lock order: the launch takes the lifecycle lock before _launch_lock, so
+    a stop arriving over IPC while an owner command holds the lifecycle lock
+    still gets _launch_lock, and the launch waits instead of deadlocking."""
+    import threading as _threading
+
+    update_worker_settings(root, enabled=True)
+    cli.set_worker_account(root, "1")
+    adapter = _FinishingAdapter(root)
+    runtime = WorkerRuntime(root, adapter=adapter)
+    holding, release = _threading.Event(), _threading.Event()
+    got_launch_lock = []
+
+    def owner_command():
+        with cli.lifecycle_lock(root):
+            holding.set()
+            release.wait(5)
+            time.sleep(0.3)  # the launch is now waiting for the lifecycle lock
+            # What a disable's IPC stop handler does in the worker process.
+            acquired = runtime._launch_lock.acquire(timeout=2)
+            got_launch_lock.append(acquired)
+            if acquired:
+                runtime._launch_lock.release()
+
+    real_probe = adapter.probe
+
+    def probe_then_let_owner_in(*args, **kwargs):
+        result = real_probe(*args, **kwargs)
+        command.start()
+        holding.wait(5)
+        release.set()
+        return result
+
+    command = _threading.Thread(target=owner_command)
+    monkeypatch.setattr(adapter, "probe", probe_then_let_owner_in)
+    runtime.submit(_submission())
+    assert runtime.reconcile_once().state == JobState.SUCCEEDED
+    command.join(5)
+    assert got_launch_lock == [True]
 
 
 def test_clearing_the_pin_fails_the_next_job_as_before(root):

@@ -834,8 +834,23 @@ class WorkerRuntime:
             availability = self.adapter.probe()
         except Exception:
             availability = ProviderAvailability(False, "provider_unavailable", None)
-        with self._launch_lock:
-            prepared = self._prepare_launch(claimed, availability, shutdown_event)
+        # The lease and the job's folder are settled under the lifecycle lock
+        # that owner commands hold (workspace changes, account pins, enable,
+        # pause, disable). It is taken before _launch_lock, the same order as
+        # those commands, whose stop/pause requests reach this process over IPC
+        # and need _launch_lock: a folder change then either sees this job as
+        # in use or completes first and the job resolves the new folder.
+        lifecycle = FileLock(self.backup_root / "worker" / "lifecycle.lock", timeout=5)
+        locked = lifecycle.acquire()
+        try:
+            with self._launch_lock:
+                if locked:
+                    prepared = self._prepare_launch(claimed, availability, shutdown_event)
+                else:
+                    prepared = self._fail_claimed(claimed, "provider_unavailable")
+        finally:
+            if locked:
+                lifecycle.release()
         if isinstance(prepared, JobRecord):
             return prepared
         starting, token, workspace = prepared
@@ -1078,6 +1093,17 @@ class WorkerRuntime:
                 return None, None, outcome["skipped"]
             return outcome.get("run"), None, None
 
+    def _fail_claimed(self, claimed: JobRecord, diagnostic: str) -> JobRecord:
+        """Fail a claimed job before any lease or launch (a stop wins)."""
+        current = self.store.get(claimed.job_id)
+        if current.state == JobState.CANCEL_REQUESTED:
+            return self._cancel_before_launch(current)
+        return self.store.transition(
+            current.job_id, expected_states=(JobState.CLAIMED,),
+            new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
+            expected_generation=current.generation, diagnostic_code=diagnostic,
+        )
+
     def _prepare_launch(
         self, claimed: JobRecord, availability: ProviderAvailability,
         shutdown_event: threading.Event | None = None,
@@ -1159,11 +1185,7 @@ class WorkerRuntime:
             )
         self._active_lease = token
         try:
-            # Resolve under the lifecycle lock that workspace changes hold, so
-            # a folder change either sees this STARTING job and refuses, or
-            # completes first and this job resolves the new folder.
-            with FileLock(self.backup_root / "worker" / "lifecycle.lock", timeout=5):
-                workspace = self._resolve_workspace(starting.workspace_id, starting.job_id)
+            workspace = self._resolve_workspace(starting.workspace_id, starting.job_id)
         except Exception:
             self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
             self._clear_active()
