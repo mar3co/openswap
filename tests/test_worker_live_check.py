@@ -30,6 +30,12 @@ FIXTURES = Path(__file__).parent / "fixtures"
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="the live check is macOS-only")
 
 
+@pytest.fixture(autouse=True)
+def this_mac(monkeypatch):
+    # The evidence binding to this Mac (hardware UUID + install), fixed in tests.
+    monkeypatch.setattr(live, "host_binding", lambda root, **kw: "4e" * 32)
+
+
 def auth_json(account_id=ACCOUNT_ID):
     import base64
 
@@ -1093,3 +1099,10 @@ def test_helper_cleanup_never_kills_a_recycled_pid(tmp_path, monkeypatch):
     monkeypatch.setattr(live_check.os, "kill", lambda pid, sig: sent.append((pid, sig)))
     check._kill_markers("openswap-live-check-x-child")
     assert sent == [(4242, signal.SIGSTOP), (4242, signal.SIGCONT)]  # resumed, not killed
+
+
+
+def test_evidence_records_the_binding_to_this_mac(tmp_path):
+    root = setup_root(tmp_path)
+    evidence = make_check(root, SimulatedMac()).run()
+    assert evidence["host_binding"] == "4e" * 32
