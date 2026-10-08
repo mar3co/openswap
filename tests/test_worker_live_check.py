@@ -336,12 +336,14 @@ def test_preflight_refusals(tmp_path, problem, code):
     assert error.value.code == code
 
 
-def test_preflight_refuses_while_the_worker_runs_unpaused(tmp_path, monkeypatch):
+@pytest.mark.parametrize("state", ["RUNNING", "STALE", "UNAVAILABLE"])
+def test_preflight_refuses_while_the_worker_runs_unpaused(tmp_path, monkeypatch, state):
     from openswap.worker import runtime
     from openswap.worker.models import ProviderAvailability, RemoteConnectivity, WorkerProcessState, WorkerSnapshot
 
     root = setup_root(tmp_path)
-    snapshot = WorkerSnapshot(True, False, WorkerProcessState.RUNNING, RemoteConnectivity.DISABLED,
+    # A stale or unreadable worker may still be running and admit a job mid-check.
+    snapshot = WorkerSnapshot(True, False, getattr(WorkerProcessState, state), RemoteConnectivity.DISABLED,
                               ProviderAvailability(False, "live_adapter_disabled"), None, 0)
     monkeypatch.setattr(runtime, "read_worker_snapshot", lambda root: snapshot)
     mac = SimulatedMac()
@@ -762,3 +764,21 @@ def test_a_submitted_probe_job_is_unloaded_even_if_the_check_is_interrupted(tmp_
     with pytest.raises(KeyboardInterrupt):
         check.run()
     assert "print" in calls and "bootout" in calls
+
+
+
+def test_a_denied_environment_probe_proves_no_absence(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    original = mac._simulate
+
+    def env_denied(command, cwd):
+        if command == "/usr/bin/env":
+            return "env: Operation not permitted", 126
+        return original(command, cwd)
+
+    mac._simulate = env_denied
+    gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
+    assert gate["environment_printed"] is False
+    assert gate["worker_environment_absent"] is False and gate["api_keys_absent"] is False
+    assert gate["passed"] is False

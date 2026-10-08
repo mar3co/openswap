@@ -480,9 +480,13 @@ class LiveCheck:
         snapshot = read_worker_snapshot(self.root)
         if snapshot.active_job is not None:
             raise CheckRefused("job_active", "A worker job is active. Wait for it or stop it first.")
-        if snapshot.process_state.value == "running" and not snapshot.paused:
-            raise CheckRefused("worker_running", "The worker is running. Pause it first: "
-                                                 "`openswap worker pause` (reopen with `--off`).")
+        if not snapshot.paused and snapshot.process_state.value != "stopped":
+            # Running, or stale/unavailable (it may still be running and could
+            # admit a job mid-check): only a paused or confirmed-stopped worker
+            # cannot race the check for the account.
+            raise CheckRefused("worker_running", "The worker is running (or its state cannot be read). "
+                                                 "Pause it first: `openswap worker pause` "
+                                                 "(reopen with `--off`).")
         lease = self.leases.read_current()
         if lease is not None and lease.state != "released":
             raise CheckRefused("lease_held", "A Codex account lease is held. Resolve it first "
@@ -702,6 +706,11 @@ class LiveCheck:
                                env=codex_env(home, self.check_root), capture_output=True, text=True,
                                check=False, timeout=30).returncode == 0
         required_seen = all(seen[name] for name, _, _, required in steps if required)
+        # The absence checks below mean something only if the job's
+        # environment was actually printed: a denied or failed env proves nothing.
+        environment_seen = any(
+            type(i["exit_code"]) is int and i["exit_code"] == 0 and "PATH=" in i["output"]
+            for i in observed("/usr/bin/env"))
         network = observed("example.com")
         submits = observed(escape_label)
         auth = observed("auth.json")
@@ -726,8 +735,11 @@ class LiveCheck:
             "codex_home_read_denied": tokens["home"] not in everything,
             "auth_read_denied": bool(auth) and all(type(i["exit_code"]) is int and i["exit_code"] != 0
                                                    for i in auth),
-            "worker_environment_absent": tokens["env"] not in everything and ENV_SENTINEL not in everything,
-            "api_keys_absent": "OPENAI_API_KEY" not in everything and "CODEX_API_KEY" not in everything,
+            "environment_printed": environment_seen,
+            "worker_environment_absent": environment_seen and tokens["env"] not in everything
+            and ENV_SENTINEL not in everything,
+            "api_keys_absent": environment_seen and "OPENAI_API_KEY" not in everything
+            and "CODEX_API_KEY" not in everything,
             "shell_network_denied": outside_ok and bool(network) and all(
                 type(i["exit_code"]) is int and i["exit_code"] != 0 for i in network),
             # The submit itself must fail: a short-lived job it started could
