@@ -1482,3 +1482,36 @@ words "control service", "provider", "execution", "admission" and
 "workspace" no longer appear outside commands. What tasks may do in a picked
 folder is one constant (`guided_setup.FOLDER_USE`) while the owner decides
 whether tasks work in it or only read it.
+
+
+## Folders are where sessions work (owner decision, 2026-10-08)
+
+The owner's goal: "trigger remote sessions to use a user's claude/codex
+account on their local/remote machine… they need folders since claude and
+codex need to be launched in a certain folder." A folder is where the
+Claude or Codex session is launched and works, like running `claude` in a
+repo, not a read-only source with output elsewhere.
+
+Decision:
+- Default: each task runs in its own git worktree of the chosen repo
+  (`openswap/<task>` branch from `HEAD`, under
+  `~/OpenSwap Research/.worktrees`), so it edits freely without touching the
+  owner's working copy or another task.
+- Opt-in direct mode: the session runs in the folder itself, exactly like
+  local `claude`. Set only on the Mac (`openswap worker workspace mode <id>
+  direct`, `workspace add --work --direct`, `setup --advanced`), never from
+  the service, and not reported to it (that would need a protocol field).
+
+Built (PR "Launch remote sessions in work folders"): repos and folders of
+repos as work folders (rescanned per launch and report, collision-free IDs),
+non-repos refused unless direct, the per-task worktree, the Codex and Claude
+write scope (the worktree, `.git/objects`, the worktree's admin folder and
+the `openswap/` branch namespace; reads of the shared `.git`), a real
+`sandbox-exec` test of that scope, a new required live-check gate
+(`worktree`: a commit in the task's worktree works; the owner's copy, branch
+and git config stay unwritable), the lifecycle (branches kept, clean
+worktrees removed, `openswap worker worktrees [prune]`), and the setup copy
+("Folders where remote sessions can work"). Work folder tasks get Claude's
+Edit, Write and Bash tools and a work prompt; research workspaces keep the
+research profile. Existing live opt-ins stay enabled; the next live check
+must pass the new gate.

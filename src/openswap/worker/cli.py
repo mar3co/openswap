@@ -1556,13 +1556,19 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     pair_parser = commands.add_parser("pair", help="approve enrollment locally and store its device key in login Keychain")
     pair_parser.add_argument("url")
     pair_parser.add_argument("code")
-    commands.add_parser(
-        "setup", help="walk through starting the worker, the account and the folders tasks use",
+    setup_parser = commands.add_parser(
+        "setup", help="walk through starting the worker, the account and the folders sessions work in",
         description="The guided steps `pair` runs after pairing: start the worker, pick the Codex "
-                    "or Claude account, pick the folders tasks use (~/GitHub is suggested when it "
-                    "exists; on a terminal, type to search, or numbers like 1 3), then a checklist "
-                    "with one next step. Results are saved under ~/OpenSwap Research. Only each "
-                    "folder's ID and name reach the control service; paths never leave this Mac.",
+                    "or Claude account, pick the folders where remote sessions work (git repos, or a "
+                    "folder of repos such as ~/GitHub; on a terminal, type to search, or numbers like "
+                    "1 3), then a checklist with one next step. Each task works in its own git worktree "
+                    "on an openswap/ branch, so your copy is never touched. Results are saved under "
+                    "~/OpenSwap Research. Only each folder's ID and name reach the control service; "
+                    "paths never leave this Mac.",
+    )
+    setup_parser.add_argument(
+        "--advanced", action="store_true",
+        help="also offer to run sessions in a folder itself (direct mode) instead of a worktree",
     )
     unpair_parser = commands.add_parser(
         "unpair", help="remove the device key and configured service URL; pass a URL to remove an enrollment "
@@ -1785,7 +1791,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             print("This Mac is not paired yet. Copy the pairing command from the control service "
                   "(OpenTag: Workers page) and run it: `openswap worker pair <url> <code>`.", file=sys.stderr)
             return 1
-        _guided_setup(root)
+        _guided_setup(root, advanced=args.advanced)
         return 0
     if args.command == "run":
         return _run(root, managed=args.managed)
@@ -2231,17 +2237,19 @@ def _interactive_terminal() -> bool:
         return False
 
 
-def _guided_setup(root: Path, *, interactive: bool | None = None, read_line=None) -> None:
+def _guided_setup(root: Path, *, interactive: bool | None = None, read_line=None, advanced: bool = False) -> None:
     """The guided steps after pairing (and `openswap worker setup`), on this terminal.
 
-    Start the worker, confirm the account, choose the folders tasks may read, then a
+    Start the worker, confirm the account, pick the folders where sessions work, then a
     summary. Without a terminal it prints each step's command instead.
     """
     from openswap.worker import guided_setup
 
     if interactive is None:
         interactive = _interactive_terminal()
-    guided_setup.run(root, guided_setup.TerminalPrompts(interactive=interactive, read_line=read_line))
+    ui = guided_setup.TerminalPrompts(interactive=interactive, read_line=read_line)
+    ui.advanced = advanced
+    guided_setup.run(root, ui)
 
 
 def _account_command(root: Path, args) -> int:

@@ -324,7 +324,7 @@ folder: 1–200 characters, ASCII letters, digits, `_`, `.` and `-` only (the
 reference client's IDs are narrower: 1–64 lowercase letters, digits, `_` and
 `-`). IDs are unique within the request. The reference client leaves out a
 workspace whose jobs it would refuse at launch (`workspace_refused`, see
-[Choosing the folders tasks read](#choosing-the-folders-tasks-read)), and one
+[Choosing the folders sessions work in](#choosing-the-folders-sessions-work-in)), and one
 it cannot check; the report changes, and is sent again, once that is fixed.
 `label` is 1–100 characters with no
 Unicode control characters (U+0000–U+001F or U+007F–U+009F); the owner chooses
@@ -464,12 +464,15 @@ and ends with at most one `Next:` command.
    [N]" with the pin as the default, or "Account (1-N, Enter skips)". A number
    picks by menu position (the two providers may share slot numbers); an
    email, alias or `claude:<slot>` still works.
-3. **Pick the folders.** One line ("Tasks can open the folders you pick.
-   Results go to ~/OpenSwap Research.") and the folder search; see
-   [Choosing the folders tasks read](#choosing-the-folders-tasks-read).
+3. **Pick the folders.** One line ("Folders where remote sessions can work.
+   Each task gets its own copy (a git worktree), so your files aren't
+   touched.") and the folder search; see
+   [Choosing the folders sessions work in](#choosing-the-folders-sessions-work-in).
+   `openswap worker setup --advanced` also offers, after each repo, to run
+   its sessions in the folder itself (direct mode).
 4. **Summary.** A checklist (`✓`/`✗`/`•`, each with its words): Paired (the
    service URL and its link state), Worker, Account, Folders (ID and label)
-   and Live tasks (on or off), then one line: "Next:" with the first thing
+   (", direct" after a folder in direct mode) and Live tasks (on or off), then one line: "Next:" with the first thing
    still missing, else the live-check command for the pinned account's
    provider while live tasks are off (`openswap worker live-check`; for a
    Claude account `openswap worker claude pin`, `openswap worker claude
@@ -487,17 +490,90 @@ disabled or not running, human `worker status` adds "Next: paired with
 unchanged), and the menu bar's Remote tasks section shows "Paired, worker
 off" under **Enable local worker**.
 
-### Choosing the folders tasks read
+### Choosing the folders sessions work in
 
-Most owners keep their code in one folder, so the setup step starts there. It
-looks for likely code folders in the home folder: `~/GitHub`,
-`~/Documents/GitHub`, `~/Developer`, `~/Code`, `~/Projects`, `~/src`,
-`~/repos` and `~/dev`. It keeps only existing folders that pass the read-only
+A folder is where a remote Claude or Codex session is launched and works,
+like running `claude` or `codex` in a repo (owner decision, 2026-10-08). It
+is not a read-only source with output elsewhere.
+
+**What can be chosen.** A git repo becomes one folder; its ID comes from its
+name. A folder that is not a repo but holds repos (`~/GitHub`) is saved once
+and offers each git repo directly inside it as a folder of its own (e.g.
+`opentag`, `openswap`). It is scanned again for every launch and readiness
+report, so a new repo appears without changing settings. Repo IDs never
+collide: approved IDs first, then repos in name order, each made unique with
+`-2`, `-3`, …; a repo already added on its own is not listed twice; the
+folder of repos itself is never a place a task can name. A folder that is
+neither a repo nor holds one is refused in the default mode ("That folder
+isn't a git repo and holds none."): falling back to a read-only launch would
+silently give one folder a different capability, so the one way to work in a
+plain folder is the explicit direct mode. A folder added as read-only by an
+earlier release keeps its ID and becomes a work folder when it is picked
+again.
+
+**Each task gets its own worktree** (the default). Before launch the worker
+runs `git worktree add -b openswap/<first 8 of the task id> <path> HEAD`
+with the repo's hooks disabled, so making the copy never runs code from the
+repo outside the sandbox. `HEAD` is the commit the owner has checked out,
+the same one local `claude` sees; it works with no remote and no
+`origin/HEAD`. The owner's uncommitted changes are not carried over and
+never touched. The worktree is
+`~/OpenSwap Research/.worktrees/<folder id>/<task id>`, owner-only (0700).
+Claude or Codex runs with it as the working directory, and is asked to commit
+on its branch and not to push or switch branches. The task's git gets
+`gc.auto=0` and `maintenance.auto=false`, and the repo's `user.name` and
+`user.email` (read by the worker; the sandbox may not read `~/.gitconfig`).
+Submodules are not checked out in the task's copy.
+
+**Direct mode** (advanced, this Mac only): the session works in the folder
+itself, exactly like local `claude`. Set it with `openswap worker workspace
+mode <id> direct` (or `worktree` to go back), `openswap worker workspace add
+--work <folder> --direct`, or `openswap worker setup --advanced`. The control
+service can never set it, and the readiness report does not carry it (that
+would need a protocol field). A repo found in a folder of repos takes the
+folder's mode.
+
+Either way, the task's results (`result.md`) still go to its own results
+folder, `~/OpenSwap Research/<id>/<task id>`, and artifacts are uploaded from
+there.
+
+**Sandbox.** For both Codex (its permission profile) and Claude (the Seatbelt
+profile) a worktree task may write only:
+
+- the worktree;
+- `<repo>/.git/objects`;
+- this worktree's admin folder `<repo>/.git/worktrees/<name>` (its HEAD,
+  index and logs);
+- the `openswap/` branch namespace, `<repo>/.git/refs/heads/openswap/` and
+  `<repo>/.git/logs/refs/heads/openswap/` (git updates a ref by writing a
+  sibling `.lock` file and renaming it, so the grant is the namespace folder,
+  never the owner's own branches).
+
+It may also read `<repo>/.git`, never the owner's working copy. A direct-mode
+task may write the folder. The owner's working copy, `.git/config`, hooks,
+other refs and `packed-refs` stay unwritable. The protections below
+(credential homes, `~/Library`, the home folder, path identity) apply to
+every work folder and every grant.
+
+**When a task ends** its branch is always kept. Its worktree is removed when
+it is clean, and kept for inspection when it holds uncommitted work or is
+locked; finished tasks are swept before each new worktree launch. `openswap
+worker worktrees` lists them (folder, branch, state, path); `openswap worker
+worktrees prune` removes finished tasks' clean worktrees (`--force`: every
+finished one), then runs `git worktree prune`. A repo moved or deleted
+between tasks refuses the next launch (`workspace_refused`) and its orphaned
+worktrees are removed; a repo without commits is refused. Two tasks in one
+repo get two worktrees and two branches.
+
+**The setup step.** Most owners keep their code in one folder, so the step
+starts there. It looks for likely code folders in the home folder:
+`~/GitHub`, `~/Documents/GitHub`, `~/Developer`, `~/Code`, `~/Projects`,
+`~/src`, `~/repos` and `~/dev`, keeping only existing folders that pass the
 checks below, once each (a symlink to a listed folder is not listed twice).
-A folder that holds three git repos or fewer is followed by those repos, so
-the owner can offer just one. A GitHub folder (any found folder named
-GitHub) is listed first and marked "recommended"; folders already readable
-are marked `✓`.
+Repos and folders of repos are listed first. A folder that holds three git
+repos or fewer is followed by those repos, so the owner can pick just one. A
+GitHub folder (any found folder named GitHub) is listed first and marked
+"recommended"; folders already added are marked `✓`.
 
 On a terminal the step is a type-to-search picker. The detected folders are
 its numbered suggestions, with the recommended one highlighted so Enter
@@ -505,82 +581,70 @@ picks it:
 
 ```text
 Step 3 of 4 · Folders
-Tasks can open the folders you pick. Results go to ~/OpenSwap Research.
+Folders where remote sessions can work. Each task gets its own copy (a git worktree), so your files aren't touched.
 Folders:
 ❯ • 1  ~/GitHub           (recommended)
   • 2  ~/GitHub/openswap  (git repo)
   • 3  ~/GitHub/opentag   (git repo)
-  • 4  ~/Projects
 type or 1 3 · ↑↓ move · Tab complete · Enter pick · Esc skip
 ```
 
-Typing filters the suggestions first, then the folders of the home folder
-(the same index as #88's picker); text that looks like a path (`~/…`, `/…`,
-or anything with `/`) completes inside that folder; digits with spaces or
-commas (`1 3`, `1,3`) pick suggestions by number. After a pick ("✓ ~/GitHub
-(github)") the same picker opens again as "Add another (Enter to finish)",
-nothing highlighted and the picks ticked `✓`; Enter on nothing (or Esc)
-finishes. When folders are already set up, nothing is highlighted and Enter
-on nothing keeps them. With nothing detected the picker is the plain #88
-folder search. A refused folder prints one line (what is wrong, what to do)
-and the same picker opens again.
+Typing filters the suggestions first, then the folders of the home folder;
+text that looks like a path (`~/…`, `/…`, or anything with `/`) completes
+inside that folder; digits with spaces or commas (`1 3`, `1,3`) pick
+suggestions by number. After a pick ("✓ ~/GitHub: openswap, opentag" for a
+folder of repos, "✓ ~/Code/site (site)" for a repo) the same picker opens
+again as "Add another (Enter to finish)", nothing highlighted and the picks
+ticked `✓`; Enter on nothing (or Esc) finishes. When folders are already set
+up, nothing is highlighted and Enter on nothing keeps them. A refused folder
+prints one line (what is wrong, what to do) and the same picker opens again.
 
-The menu bar, and a terminal run that is piped, scripted or on Windows,
-keep the numbered list and one question instead, "Folders (numbers or a
-path) [1]" (or "Folders (Enter keeps current)"); with nothing detected they
-ask "Type the path to your code folder, for example ~/GitHub" through #88's
-native folder chooser (menu bar) or a typed line. The answer is one or more
-numbers (`1 3` or `1,3`), or one folder path (a path dragged into Terminal may
-be shell-escaped). Choosing adds folders; it never removes one (`openswap
-worker workspace remove <id>` does). A typed path that exists is used exactly
-as typed (apostrophes included); otherwise a path that starts with a quote or
-holds a backslash is read as one shell word, as Terminal writes a dragged-in
-path. Only each folder's ID and name reach the control service; paths never
-leave this Mac.
+The menu bar, and a terminal run that is piped, scripted or on Windows, keep
+the numbered list and one question instead, "Folders (numbers or a path)
+[1]" (or "Folders (Enter keeps current)"); with nothing detected they ask
+"Type the path to your code folder, for example ~/GitHub" through the native
+folder chooser (menu bar) or a typed line. The answer is one or more numbers
+(`1 3` or `1,3`), or one folder path (a path dragged into Terminal may be
+shell-escaped). Choosing adds folders; it never removes one (`openswap
+worker workspace remove <id>` does). Only each folder's ID and name reach
+the control service; paths never leave this Mac. `openswap worker workspace
+add --work <folder> [--direct] [--label TEXT]` does the same from the command
+line.
 
-Each chosen folder becomes a workspace of its own:
+Each chosen folder becomes a workspace:
 
-- **ID:** the folder's name, lowercased, with anything other than letters,
-  digits, `-` and `_` turned into `-` (`site.io` → `site-io`), made unique
-  with `-2`, `-3`, …. It is one of the service's `[A-Za-z0-9_.-]` folder IDs.
-  The label the service shows is the folder's own name.
-- **Read-only source:** the folder itself, read by the Codex or Claude
-  sandbox and never written.
+- **ID and label:** the folder's name, lowercased, with anything other than
+  letters, digits, `-` and `_` turned into `-` (`site.io` → `site-io`), made
+  unique with `-2`, `-3`, …. It is one of the service's `[A-Za-z0-9_.-]`
+  folder IDs. The label the service shows is the folder's own name.
 - **Results:** `~/OpenSwap Research/<id>`, created owner-only (0700) without
-  asking, as is `~/OpenSwap Research`. The worker writes each job into its own
-  `<id>/<job_id>` folder there. An existing results folder that others can
-  access is refused, never re-permissioned.
+  asking, as is `~/OpenSwap Research`. An existing results folder that
+  others can access is refused, never re-permissioned.
 - **The built-in folder:** the first chosen folder replaces the built-in
   `research` workspace in the OpenSwap backup root, unless a job may still run
   or upload its results in it; then `research` stays beside the new one until
   `openswap worker workspace remove research`. Without a chosen folder,
-  `research` stays as a results-only workspace.
+  `research` stays as a results-only research workspace.
 
-A folder may not be read if it is, or contains, the home folder; is a system
-folder (`/System`, `/Library`, `/usr`, `/etc`, `/Applications`, …) or contains
-one; is `~/Library` or a hidden folder in the home folder (or inside one),
-except a synced cloud drive there: a provider's folder in
-`~/Library/CloudStorage` (Dropbox, Google Drive, OneDrive, …) or iCloud Drive
-(`~/Library/Mobile Documents/com~apple~CloudDocs`), and the folders inside
-them, but never `CloudStorage` or `Mobile Documents` themselves, and never
-when one of those bases is a symlink (the folder's own resolved path must
-run through the real `CloudStorage` or `Mobile Documents/com~apple~CloudDocs`);
-is, contains or sits inside the OpenSwap backup root, Codex home or Claude
-config home; or overlaps `~/OpenSwap Research`. Like every read-only source it
-must be a real directory owned by the owner and not writable by group or
-others. A folder tasks read may not overlap any workspace's results folder,
-and a results folder may not overlap any folder tasks read, so no job ever
-writes where another only reads. The same policy applies to every
-`--readonly-source` of `workspace add <id> <folder>`. The worker checks both
-rules again for every job before it creates the job's folder, so settings
-saved earlier (or edited by hand) that break them still load and can be
-listed and fixed, but a job in such a workspace fails as `workspace_refused`
-and never reaches the sandbox. `openswap worker status` (and `--json`, as
-`refused_workspaces`) and the setup summary name each refused workspace ID
-and the reason. `openswap worker workspace add --read <folder>
-[--label TEXT]` makes the same workspace from the command line and prints
-(or, with `--json`, returns) it; a folder that a workspace already reads is
-left as it is.
+**Folder checks.** A work folder (and a research workspace's read-only
+source) may not be, or contain, the home folder; be a system folder
+(`/System`, `/Library`, `/usr`, `/etc`, `/Applications`, …) or contain one;
+be `~/Library` or a hidden folder in the home folder (or inside one), except
+a synced cloud drive there: a provider's folder in `~/Library/CloudStorage`
+(Dropbox, Google Drive, OneDrive, …) or iCloud Drive (`~/Library/Mobile
+Documents/com~apple~CloudDocs`), and the folders inside them, but never
+`CloudStorage` or `Mobile Documents` themselves, and never when one of those
+bases is a symlink; be, contain or sit inside the OpenSwap backup root, Codex
+home or Claude config home; or overlap `~/OpenSwap Research`. It must be a
+real directory owned by the owner and not writable by group or others. No
+work folder or read-only source may overlap any workspace's results folder,
+and no results folder may sit inside one. The worker checks these rules
+again for every job before it creates any folder, so settings saved earlier
+(or edited by hand) that break them still load and can be listed and fixed,
+but a job in such a workspace fails as `workspace_refused` and never reaches
+the sandbox. `openswap worker status` (and `--json`, as
+`refused_workspaces`) and the setup summary name each refused workspace and
+the reason.
 
 Paths are compared by their on-disk spelling and by filesystem identity
 (device and inode along the ancestors), never by the typed string: on a
@@ -589,6 +653,11 @@ firmlink or other alias is the folder it names. Settings store the on-disk
 spelling. The same comparison guards what the Codex and Claude sandboxes may
 be granted at launch (the private worker directory, the default Claude and
 Codex homes and the backup root).
+
+Research workspaces from earlier releases keep working: `openswap worker
+workspace add --read <folder>` lets research tasks read a folder, and
+`workspace add <id> <folder>` approves a results folder; their tasks work in
+the results folder as before.
 
 ### Choosing the account and research folders
 
@@ -607,7 +676,9 @@ openswap worker account allow 3 [--label "Team research"]   # allow for a per-jo
 openswap worker account label 3 "Team research"             # rename (slot, email, alias or ref)
 openswap worker account disallow 3 [--clear-default]        # withdraw (slot, email, alias or ref)
 openswap worker workspace list             # approved research folders
-openswap worker workspace add --read ~/GitHub  # tasks read ~/GitHub; results in ~/OpenSwap Research/github
+openswap worker workspace add --work ~/GitHub  # sessions work in each repo in ~/GitHub, a worktree per task
+openswap worker workspace mode openswap direct  # advanced: work in the folder itself (this Mac only)
+openswap worker worktrees [prune]          # task worktrees; prune removes finished clean ones
 openswap worker workspace add tag-research ~/Research/opentag \
   [--readonly-source ~/src/project] [--label "Tag research"]   # label default: the folder's name
 openswap worker workspace label tag-research "Tag research"   # or --reset to the folder's name

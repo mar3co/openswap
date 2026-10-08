@@ -349,3 +349,35 @@ def test_under_seatbelt_a_commit_works_and_writes_outside_are_denied(root, home,
     assert sandboxed("git update-ref refs/heads/main HEAD") != 0  # the owner's branches
     assert sandboxed(f"echo x > '{repo}/.git/config'") != 0
     assert _git(repo, "rev-parse", "main") != _git(repo, "rev-parse", resolved.branch)
+
+
+# --- setup ------------------------------------------------------------------------------------
+
+
+def test_the_summary_names_the_mode_only_when_direct(root, home):
+    from openswap.worker import guided_setup
+
+    cli.add_work_folder(root, _repo(home / "GitHub" / "a"))
+    cli.add_work_folder(root, _repo(home / "GitHub" / "b"), mode="direct")
+    assert guided_setup.readiness(root).readable == ("a (a)", "b (b, direct)")
+
+
+def test_setup_advanced_offers_the_direct_mode(root, home, monkeypatch, capsys):
+    from openswap.worker import guided_setup
+
+    monkeypatch.setattr(cli, "_managed_worker_loaded", lambda: False)
+    configure_worker_service(root, "http://127.0.0.1:8765", "worker-1")
+    _repo(home / "GitHub")
+    answers = iter(["n", "", "1", "y"])
+
+    def read(prompt):
+        print(prompt)
+        return next(answers)
+
+    cli._guided_setup(root, interactive=True, read_line=read, advanced=True)
+    out = capsys.readouterr().out
+    assert f"{guided_setup.FOLDER_USE}. {guided_setup.FOLDER_COPY}" in out
+    assert "Work in ~/GitHub itself, without a copy? [y/N]" in out
+    assert "✓ github works in the folder itself." in out
+    assert load_worker_settings(root).workspaces[0].mode == "direct"
+    assert "  ✓ Folders     github (GitHub, direct)" in out

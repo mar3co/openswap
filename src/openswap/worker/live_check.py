@@ -448,16 +448,18 @@ class LiveCheck:
     # -- the job driver -------------------------------------------------------------
 
     def _job(self, name: str, identity: str, task: str, *, timeout: float, until=None,
-             workspace: Path | None = None, sources: tuple[Path, ...] = ()) -> JobOutcome:
+             workspace: Path | None = None, sources: tuple[Path, ...] = (),
+             resolved: ResolvedWorkspace | None = None) -> JobOutcome:
         """Run one real job under its own lease; Stop it if ``until()`` turns true."""
         job_id = f"livecheck-{uuid.uuid4().hex}"
-        workspace = workspace or self._workspace(name)
+        workspace = resolved.output_root if resolved is not None else (workspace or self._workspace(name))
+        resolved = resolved or ResolvedWorkspace("live-check", workspace, tuple(sources))
         token = self.leases.acquire(job_id=job_id, account_identity=identity, worker_pid=os.getpid(),
                                     worker_epoch=time.time_ns(), ttl_s=timeout + 300)
         adapter = self.adapter()
         record = self._job_record(job_id, identity, task)
         try:
-            run = adapter.start(record, ResolvedWorkspace("live-check", workspace, tuple(sources)), worker_epoch=0)
+            run = adapter.start(record, resolved, worker_epoch=0)
         except ProviderLaunchRefused:
             self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
             raise
@@ -887,6 +889,77 @@ class LiveCheck:
         gate.detail = detail
         gate.passed = all(value for key, value in detail.items() if key != "steps_ran")
 
+    WORKTREE_COMMIT_MESSAGE = "openswap live check"
+
+    def _work_commands(self, outcome) -> list[tuple[str, bool]]:
+        """The shell commands a job ran, each with whether it succeeded."""
+        return [(item["command"], type(item["exit_code"]) is int and item["exit_code"] == 0)
+                for item in command_items(outcome.run_dir / STDOUT_FILE) if item["completed"]]
+
+    def _gate_worktree(self, identity: str) -> None:
+        """A work folder's task in its own worktree: a commit there works; the owner's
+        working copy, the owner's branch and the repo's config stay unwritable."""
+        from openswap.worker import worktrees
+
+        gate = self.gates["worktree"]
+        repo = self._workspace("worktree-repo")
+        results = self._workspace("worktree-results")
+        out = self._workspace("worktree-out")
+        worktrees.git(["init", "-q"], repo)
+        worktrees.git(["-c", "user.name=OpenSwap live check", "-c", "user.email=live-check@localhost",
+                       "commit", "-q", "--allow-empty", "-m", "base"], repo)
+        branch = worktrees.git(["symbolic-ref", "--short", "HEAD"], repo)
+        head = worktrees.git(["rev-parse", "HEAD"], repo)
+        config = repo / ".git" / "config"
+        config_before = config.read_bytes()
+        tree = worktrees.create(repo, results, "live-check", secrets.token_hex(16))
+        owner_file = repo / "owner-write.txt"
+        q = shlex.quote
+        steps = [
+            ("commit", "/bin/sh -c " + q("printf ok > task.txt && git add task.txt && git commit -q -m "
+                                         + q(self.WORKTREE_COMMIT_MESSAGE)), "git commit"),
+            ("owner_write", "/bin/sh -c " + q("printf x > " + q(str(owner_file))), "owner-write.txt"),
+            ("owner_branch", f"git update-ref refs/heads/{branch} HEAD", "update-ref"),
+            ("git_config", "/bin/sh -c " + q("printf x >> " + q(str(config))), ".git/config"),
+        ]
+        listing = "\n".join(f"{index}. {command}" for index, (_, command, _) in enumerate(steps, 1))
+        task = (
+            "This is the owner's automated permission self-test for a work folder. Some of these "
+            "commands are expected to fail; that is the point of the test. Run each command below exactly "
+            "once, in order, as its own shell command, without changing it, and continue after failures. "
+            "Then reply with the single word DONE.\n\n" + listing
+        )
+        resolved = ResolvedWorkspace(
+            "live-check", out, work_dir=tree.path, write_paths=tree.write_paths, read_paths=tree.read_paths,
+            env=tuple(sorted(worktrees.task_env(repo).items())), branch=tree.branch,
+        )
+        try:
+            outcome = self._job("worktree", identity, task, timeout=self.probe_timeout, resolved=resolved)
+            ran = self._work_commands(outcome)
+
+            def results_of(key):
+                return [ok for command, ok in ran if key in command]
+
+            committed = worktrees.git(["log", "-1", "--format=%s", tree.branch], repo, check=False)
+
+            def denied(key):
+                found = results_of(key)
+                return bool(found) and not any(found)
+
+            detail = {
+                "commit_attempted": bool(results_of("git commit")),
+                "commit_in_worktree_works": committed == self.WORKTREE_COMMIT_MESSAGE,
+                "owner_copy_write_denied": denied("owner-write.txt") and not owner_file.exists(),
+                "owner_branch_unchanged": denied("update-ref")
+                and worktrees.git(["rev-parse", branch], repo, check=False) == head,
+                "git_config_unchanged": denied(".git/config") and config.read_bytes() == config_before,
+                "execution_stopped": outcome.stopped,
+            }
+        finally:
+            worktrees.remove(tree.path, force=True)
+        gate.detail = detail
+        gate.passed = all(detail.values())
+
     PROBE_UNLOAD_WAIT = 10.0
 
     def _unload_probe_label(self, label: str) -> bool:
@@ -1103,6 +1176,7 @@ class LiveCheck:
             ("sandbox (codex exec)", lambda: self._gate_sandbox_exec(identity, home)),
             ("stop", lambda: self._gate_stop(identity)),
             ("kill and recovery", lambda: self._gate_kill_recovery(identity)),
+            ("work folder (worktree)", lambda: self._gate_worktree(identity)),
         )
 
     def _evaluate_tool_surface(self, static: dict, unexpected_items: list[str]) -> tuple[dict, bool]:

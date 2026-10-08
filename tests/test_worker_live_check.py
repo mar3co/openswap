@@ -94,6 +94,19 @@ def test_parse_features_and_command_items(tmp_path):
 # -- a simulated Mac: sandboxed or leaky -------------------------------------------------
 
 
+_GIT_ID = {"GIT_AUTHOR_NAME": "Task", "GIT_AUTHOR_EMAIL": "task@localhost",
+           "GIT_COMMITTER_NAME": "Task", "GIT_COMMITTER_EMAIL": "task@localhost"}
+
+
+def run_for_real(command, cwd):
+    """Run a work-folder self-test command for real (git in a temp repo)."""
+    import os as _os
+
+    result = subprocess.run(command, shell=True, cwd=cwd, env={**_os.environ, **_GIT_ID},
+                            capture_output=True, text=True)
+    return result.stdout + result.stderr, result.returncode
+
+
 class SimulatedMac:
     """Containment, process list and command runner for a simulated Codex.
 
@@ -168,6 +181,12 @@ class SimulatedMac:
             (cwd / "link.txt").symlink_to(target)  # writing the link inside the folder works
             if not self.sandboxed:
                 return Path(target).read_text(), 0
+        # A work folder's self-test: the commit in the task's worktree works;
+        # writes to the owner's copy, branch or git config are denied (or, on
+        # a leaky Mac, really happen).
+        if "git commit" in command or (not self.sandboxed and any(
+                key in command for key in ("owner-write.txt", "update-ref", ".git/config"))):
+            return run_for_real(command, cwd)
         if "launchctl submit" in command:
             if not self.sandboxed:
                 self.submitted_labels.add(command.split()[3])
@@ -1137,3 +1156,20 @@ def test_the_killed_worker_leaves_its_own_lease_and_recovery_releases_it_on_proo
     gate = evidence["gates"]["kill_recovery"]
     assert gate["lease_left_by_worker"] is True and gate["lease_released_on_proof"] is True
     assert AccountLeaseStore(root, "codex").read_current().state == "released"
+
+
+def test_the_worktree_gate_commits_in_the_task_copy_and_nothing_else(tmp_path):
+    root = setup_root(tmp_path)
+    gate = make_check(root, SimulatedMac()).run()["gates"]["worktree"]
+    assert gate["passed"] is True
+    assert gate["commit_in_worktree_works"] and gate["owner_copy_write_denied"]
+    assert gate["owner_branch_unchanged"] and gate["git_config_unchanged"]
+    # The task's worktree is removed after the check.
+    assert not any((root / "live-check").glob("*/worktree-results/.worktrees/live-check/*"))
+
+
+def test_a_writable_owner_copy_fails_the_worktree_gate(tmp_path):
+    root = setup_root(tmp_path)
+    gate = make_check(root, SimulatedMac(sandboxed=False)).run()["gates"]["worktree"]
+    assert gate["passed"] is False
+    assert gate["owner_copy_write_denied"] is False and gate["git_config_unchanged"] is False

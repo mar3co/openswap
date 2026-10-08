@@ -43,6 +43,9 @@ REQUIRED_GATES = (
     "sandbox_exec",
     "stop",
     "kill_recovery",
+    # A work folder's task: a commit in its worktree works; the owner's copy,
+    # branches and git config stay out of reach.
+    "worktree",
 )
 
 

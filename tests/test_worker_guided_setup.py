@@ -113,10 +113,22 @@ def _code(home, *names, mode=0o755):
     return made[0]
 
 
+def _repo(*folders):
+    """Make each folder a real git repo with one commit; returns the first."""
+    import subprocess
+
+    env = {**os.environ, "GIT_AUTHOR_NAME": "Owner", "GIT_AUTHOR_EMAIL": "owner@example.com",
+           "GIT_COMMITTER_NAME": "Owner", "GIT_COMMITTER_EMAIL": "owner@example.com"}
+    for folder in folders:
+        for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "first"]):
+            subprocess.run(["git", *args], cwd=folder, env=env, check=True, capture_output=True)
+    return folders[0]
+
+
 @pytest.fixture
 def github(research_home):
-    """``~/GitHub`` in the fake home, as most owners have it."""
-    return _code(research_home.parent, "GitHub")
+    """``~/GitHub`` in the fake home, a git repo of its own."""
+    return _repo(_code(research_home.parent, "GitHub"))
 
 
 # --- pair: the guided steps, in order -------------------------------------------------------
@@ -142,13 +154,14 @@ def test_pair_walks_worker_account_then_folder_then_summary(root, keychain, monk
     assert "✓ Codex 2 · bob@example.com" in out
     policy = load_worker_settings(root)
     assert policy.pinned_account_ref == BOB
-    # The built-in `research` folder is replaced: tasks read ~/GitHub and never
-    # change it; results go to ~/OpenSwap Research/github, created owner-only.
-    assert f"{guided_setup.FOLDER_USE}. Results go to ~/OpenSwap Research." in out
+    # The built-in `research` folder is replaced: sessions work in ~/GitHub, each
+    # task in its own worktree; results go to ~/OpenSwap Research/github.
+    assert f"{guided_setup.FOLDER_USE}. {guided_setup.FOLDER_COPY}" in out
     assert "  • 1  ~/GitHub  (recommended)" in out
     (workspace,) = policy.workspaces
     assert workspace.workspace_id == "github" and workspace.display_label == "GitHub"
-    assert workspace.readonly_roots == (github.resolve(),)
+    assert workspace.work_root == github.resolve() and workspace.mode == "worktree"
+    assert workspace.readonly_roots == ()
     assert workspace.output_root == (research_home / "github").resolve()
     if os.name == "posix":
         assert stat.S_IMODE(research_home.stat().st_mode) == 0o700
@@ -246,7 +259,7 @@ def test_pair_without_a_tty_prints_each_next_step(root, keychain, monkeypatch, c
         assert line in out
     # The summary ends with one Next: the first gap (the worker), not the live check.
     assert out.rstrip().endswith("Next: `openswap worker enable` to start the worker.")
-    assert "openswap worker workspace add --read <folder>" in out
+    assert "openswap worker workspace add --work <folder>" in out
     assert "  • Folders     none" in out
     assert enable_calls == [] and _builtin(root)
     assert load_worker_settings(root).pinned_account_ref is None
@@ -469,7 +482,7 @@ def test_setup_reruns_the_steps_on_a_paired_mac(root, monkeypatch, capsys, enabl
 
 
 def test_setup_without_a_tty_lists_the_readable_folders(root, monkeypatch, capsys, enable_calls, github):
-    cli.add_readable_folder(root, github)
+    cli.add_work_folder(root, github)
     configure_worker_service(root, URL, "worker-1")
     _answers(monkeypatch, [], interactive=False)
     assert _run(root, "setup") == 0
@@ -530,7 +543,7 @@ def test_a_folder_named_github_anywhere_is_recommended(root, research_home):
 
 def test_without_a_github_folder_the_first_other_one_is_the_default(root, monkeypatch, capsys, enable_calls,
                                                                      research_home):
-    _code(research_home.parent, "Projects", "src")
+    _repo(*[_code(research_home.parent, name) for name in ("Projects", "src")])
     assert _setup(root, monkeypatch, ["n", "", ""]) == 0
     out = capsys.readouterr().out
     assert "  • 1  ~/Projects\n  • 2  ~/src\n" in out and "recommended" not in out
@@ -540,27 +553,28 @@ def test_without_a_github_folder_the_first_other_one_is_the_default(root, monkey
 
 
 def test_with_nothing_found_the_step_asks_for_a_path(root, monkeypatch, capsys, enable_calls, tmp_path):
-    work = _code(tmp_path, "My Code.v2")
+    work = _repo(_code(tmp_path, "My Code.v2"))
     assert _setup(root, monkeypatch, ["n", "", "1", str(work)]) == 0
     out = capsys.readouterr().out
     assert TYPE_PATH in out and "Type a folder path." in out
     (workspace,) = load_worker_settings(root).workspaces
     assert workspace.workspace_id == "my-code-v2" and workspace.display_label == "My Code.v2"
-    assert workspace.readonly_roots == (work.resolve(),)
+    assert workspace.work_root == work.resolve()
 
 
 def test_enter_with_nothing_found_keeps_the_builtin_results_folder(root, monkeypatch, capsys, enable_calls):
     assert _setup(root, monkeypatch, ["n", "", ""]) == 0
     out = capsys.readouterr().out
     assert TYPE_PATH in out and "No folder added." in out
-    assert "`openswap worker workspace add --read <folder>`" in out
+    assert "`openswap worker workspace add --work <folder>`" in out
     assert _builtin(root)
     assert "  • Folders     none" in out
 
 
 def test_several_numbers_make_one_workspace_each(root, monkeypatch, capsys, enable_calls, research_home):
     home = research_home.parent
-    _code(home, "GitHub/site.io/.git", "GitHub/api/.git", "Projects")
+    _repo(_code(home, "GitHub/site.io"), _code(home, "GitHub/api"))
+    _code(home, "Projects")
     assert _setup(root, monkeypatch, ["n", "", "9", "3, 2 3"]) == 0
     out = capsys.readouterr().out
     assert "Type numbers from 1 to 4, or a folder path." in out
@@ -690,7 +704,7 @@ def test_apostrophes_in_an_existing_path_are_never_shell_syntax(root, monkeypatc
                                                                  research_home, tmp_path):
     home = research_home.parent
     oneil = _code(tmp_path, "O'Neil's")
-    moms = _code(home, "Kid's Stuff/Mom's")
+    moms = _repo(_code(home, "Kid's Stuff/Mom's"))
     assert guided_setup.parse_folder_choice(str(oneil), 0) == str(oneil)
     assert guided_setup.parse_folder_choice("~/Kid's Stuff/Mom's", 0) == "~/Kid's Stuff/Mom's"
     # Not there as typed: an apostrophe that does not start the text is still literal.
@@ -700,7 +714,7 @@ def test_apostrophes_in_an_existing_path_are_never_shell_syntax(root, monkeypatc
     assert guided_setup.parse_folder_choice(f'"{oneil}"', 0) == str(oneil)
     assert _setup(root, monkeypatch, ["n", "", "~/Kid's Stuff/Mom's"]) == 0
     (workspace,) = load_worker_settings(root).workspaces
-    assert workspace.readonly_roots == (moms.resolve(),) and workspace.display_label == "Mom's"
+    assert workspace.work_root == moms.resolve() and workspace.display_label == "Mom's"
     assert workspace.workspace_id == "mom-s"
 
 
@@ -1452,13 +1466,13 @@ def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root,
     policy = load_worker_settings(root)
     assert policy.control_service_url == "http://localhost" and policy.pinned_account_ref == ALICE
     (workspace,) = policy.workspaces
-    assert workspace.workspace_id == "github" and workspace.readonly_roots == (github.resolve(),)
+    assert workspace.workspace_id == "github" and workspace.work_root == github.resolve()
     assert workspace.output_root == (research_home / "github").resolve()
     messages = [kwargs["message"] for _kind, kwargs in dialogs.shown]
     # The numbered list and the question share one dialog; Enter's default is prefilled.
     folders = dialogs.shown[4][1]
     assert "Step 3 of 4 · Folders" in folders["message"]
-    assert f"{guided_setup.FOLDER_USE}. Results go to ~/OpenSwap Research." in folders["message"]
+    assert f"{guided_setup.FOLDER_USE}. {guided_setup.FOLDER_COPY}" in folders["message"]
     assert "  • 1  ~/GitHub  (recommended)" in folders["message"]
     assert folders["message"].endswith("Folders (numbers or a path)")
     assert folders["default_text"] == "1" and folders["ok"] == "Continue"
@@ -1493,7 +1507,7 @@ def test_menu_setup_on_a_paired_mac_skips_pairing(root, enable_calls):
 
 def test_menu_setup_reads_several_folders_by_number(root, enable_calls, research_home):
     configure_worker_service(root, URL, "worker-1")
-    _code(research_home.parent, "GitHub", "Projects")
+    _repo(*[_code(research_home.parent, name) for name in ("GitHub", "Projects")])
     dialogs = _Dialogs([0, (0, ""), (1, "1, 2"), 1])
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
@@ -1600,7 +1614,7 @@ def test_a_claude_pin_with_a_passing_claude_check_reports_live(root, monkeypatch
 def test_menu_setup_approves_a_folder_from_the_native_chooser(root, enable_calls, tmp_path):
     """With no code folder found, the native chooser picks the folder tasks may read."""
     configure_worker_service(root, URL, "worker-1")
-    notes = _code(tmp_path, "Notes")
+    notes = _repo(_code(tmp_path, "Notes"))
     dialogs = _Dialogs([0, (0, ""), (1, str(notes)), 1])
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
@@ -1611,12 +1625,12 @@ def test_menu_setup_approves_a_folder_from_the_native_chooser(root, enable_calls
     assert chooser["title"] == "Set up Remote tasks"
     assert "Type the path to your code folder, for example ~/GitHub" in chooser["message"]
     (workspace,) = load_worker_settings(root).workspaces
-    assert workspace.workspace_id == "notes" and workspace.readonly_roots == (notes.resolve(),)
+    assert workspace.workspace_id == "notes" and workspace.work_root == notes.resolve()
 
 
 def test_with_folders_found_the_menu_bar_asks_for_numbers_not_the_chooser(root, enable_calls, research_home):
     configure_worker_service(root, URL, "worker-1")
-    _code(research_home.parent, "GitHub")
+    _repo(_code(research_home.parent, "GitHub"))
     dialogs = _Dialogs([0, (0, ""), (1, "1"), 1])
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
@@ -1652,7 +1666,7 @@ class _Searching(guided_setup.TerminalPrompts):
 
 def test_the_terminal_folder_step_searches_then_offers_another(root, research_home, capsys):
     home = research_home.parent
-    github = _code(home, "GitHub/openswap/.git", "GitHub/opentag/.git").parents[1]
+    github = _repo(_code(home, "GitHub/openswap"), _code(home, "GitHub/opentag")).parent
     ui = _Searching([str(github), "9", "2 3", ""])
     guided_setup.choose_folders(root, ui)
     out = capsys.readouterr().out
@@ -1666,14 +1680,18 @@ def test_the_terminal_folder_step_searches_then_offers_another(root, research_ho
     # After a pick the same search opens again, nothing highlighted, the pick ticked.
     assert all(call[0] == "Add another (Enter to finish)" and call[2] is None for call in later)
     assert [s.checked for s in later[0][1]] == [True, False, False]
-    assert "✓ ~/GitHub (github)" in out and "Type numbers from 1 to 3, or a folder path." in out
-    assert "✓ ~/GitHub/openswap (openswap)" in out and "✓ ~/GitHub/opentag (opentag)" in out
-    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github", "openswap", "opentag"]
+    # A folder of repos: tasks name each repo in it; picking a repo again changes nothing.
+    assert "✓ ~/GitHub: openswap, opentag" in out and "Type numbers from 1 to 3, or a folder path." in out
+    assert "✓ ~/GitHub/openswap (openswap, already added)" in out
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github"]
+    assert [w.workspace_id for w in cli.launchable_workspaces(root, load_worker_settings(root).workspaces)] == [
+        "openswap", "opentag"]
+    assert "  ✓ 2  ~/GitHub/openswap" not in out
 
 
 def test_the_terminal_folder_search_refuses_like_any_answer(root, research_home, capsys):
     home = research_home.parent
-    _code(home, "GitHub")
+    _repo(_code(home, "GitHub"))
     ui = _Searching([str(home), "~/GitHub", ""])
     guided_setup.choose_folders(root, ui)
     out = capsys.readouterr().out
@@ -1691,7 +1709,7 @@ def test_escape_at_the_first_search_adds_nothing(root, research_home, capsys):
 
 
 def test_with_folders_already_added_nothing_is_highlighted(root, research_home, capsys, github):
-    cli.add_readable_folder(root, github)
+    cli.add_work_folder(root, github)
     ui = _Searching([""])
     guided_setup.choose_folders(root, ui)
     assert ui.calls[0][2] is None and ui.calls[0][1][0].checked

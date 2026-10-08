@@ -470,6 +470,19 @@ def test_claude_evidence_enables_only_claude_and_only_for_its_binary(tmp_path):
 # -- the Claude live check, simulated -------------------------------------------------------------
 
 
+_GIT_ID = {"GIT_AUTHOR_NAME": "Task", "GIT_AUTHOR_EMAIL": "task@localhost",
+           "GIT_COMMITTER_NAME": "Task", "GIT_COMMITTER_EMAIL": "task@localhost"}
+
+
+def run_for_real(command, cwd):
+    """Run a work-folder self-test command for real (git in a temp repo)."""
+    import os as _os
+
+    result = subprocess.run(command, shell=True, cwd=cwd, env={**_os.environ, **_GIT_ID},
+                            capture_output=True, text=True)
+    return result.stdout + result.stderr, result.returncode
+
+
 class SimulatedClaudeMac(FakeLaunch):
     """Claude Code as the live check drives it, with a sandbox that holds."""
 
@@ -482,7 +495,17 @@ class SimulatedClaudeMac(FakeLaunch):
         reads = re.findall(r"^\d+\. (/.+)$", stdin_text, flags=re.M)
         lines = [INIT]
         running = "thoroughly" in stdin_text
-        if reads:
+        if "work folder" in stdin_text:
+            for index, command in enumerate(re.findall(r"^\d+\. (.+)$", stdin_text, flags=re.M)):
+                output, code = run_for_real(command, cwd) if "git commit" in command else ("denied", 1)
+                lines.append({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": f"b{index}", "name": "Bash", "input": {"command": command}}]}})
+                lines.append({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": f"b{index}", "is_error": code != 0,
+                     "content": output}]}})
+            lines.append({"type": "result", "subtype": "success", "is_error": False, "result": "DONE",
+                          "usage": {"output_tokens": 3}})
+        elif reads:
             for index, path in enumerate(reads):
                 allowed = path.startswith(str(cwd) + "/")
                 lines.append({"type": "assistant", "message": {"content": [
