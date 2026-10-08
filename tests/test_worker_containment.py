@@ -801,3 +801,21 @@ def test_a_stale_stop_keeps_a_replacement_launchs_mirror(tmp_path):
                              cwd=root, stdin_text="")
     containment.stop(old)
     assert containment._load_mirror(new.run_dir) is not None
+
+
+
+def test_a_pid_seen_alive_before_and_gone_now_is_not_harmless(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    assert containment._complete({5: "gone"}, {5: "gone"}) is True
+    assert containment._complete({5: "gone"}, {5: "other"}) is False
+    assert containment._complete({5: "gone"}, {}) is False
+
+
+def test_exit_status_belongs_to_its_own_launch(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    old = launch(containment, root)
+    (old.run_dir / "exit").write_text("0\n")
+    assert containment.exit_status(old) == 0
+    c._save_handle(replace(old, launch_id="f" * 16))  # the directory now belongs to another launch
+    assert containment.exit_status(old) is None
