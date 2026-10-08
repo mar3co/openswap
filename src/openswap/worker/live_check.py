@@ -841,14 +841,31 @@ class LiveCheck:
         gate.detail = detail
         gate.passed = all(value for key, value in detail.items() if key != "steps_ran")
 
+    PROBE_UNLOAD_WAIT = 10.0
+
     def _unload_probe_label(self, label: str) -> bool:
-        """Whether the probe's launchd submission loaded a job (which is then unloaded)."""
+        """Whether the probe's launchd submission loaded a job; if so it is booted
+        out and polled until gone (the owner is told if it would not go)."""
+        target = f"gui/{os.getuid()}/{label}"
+
+        def present() -> bool:
+            return self._run(["/bin/launchctl", "print", target], capture_output=True, text=True,
+                             check=False, timeout=20).returncode == 0
+
         try:
-            loaded = self._run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
-                               capture_output=True, text=True, check=False, timeout=20).returncode == 0
+            loaded = present()
             if loaded:
-                self._run(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
-                          capture_output=True, text=True, check=False, timeout=20)
+                deadline = self._monotonic() + self.PROBE_UNLOAD_WAIT
+                while True:
+                    self._run(["/bin/launchctl", "bootout", target], capture_output=True, text=True,
+                              check=False, timeout=20)
+                    if not present():
+                        break
+                    if self._monotonic() >= deadline:
+                        self.out(f"  warning: the escaped probe job {label} is still loaded; "
+                                 f"remove it with `launchctl bootout {target}`")
+                        break
+                    self._sleep(0.5)
         except (OSError, subprocess.SubprocessError):
             return True  # unknown: treat as an escape
         return loaded
