@@ -452,36 +452,54 @@ PAIRING_QUESTION = (
 )
 
 
+def ask_pairing_command(ui: Prompts) -> tuple[str, str] | None:
+    """Ask for the pasted pairing command until it parses; ``None`` when skipped."""
+    for _attempt in range(_MAX_ATTEMPTS):
+        text = ui.ask(PAIRING_QUESTION)
+        if not text:
+            return None
+        parsed = parse_pairing_command(text)
+        if parsed is not None:
+            return parsed
+        ui.say("That is not a pairing command. Copy the whole command from the Workers page.")
+    return None
+
+
+def pair_once(root: Path, url: str, code: str) -> tuple[str, str]:
+    """Pair with a parsed command; no prompts, so it can run off a UI thread.
+
+    Returns ``(outcome, message)``: ``"paired"``, ``"retry"`` (the service
+    refused the code; ask for a new one) or ``"failed"`` (stop).
+    """
+    from openswap.worker.pairing import pair
+    from openswap.worker.protocol import ProtocolError
+
+    try:
+        _cli()._migrate_legacy_before_worker_state_change(root)
+        worker_id = pair(root, url, code)
+    except ProtocolError as exc:
+        return "retry", (f"Could not pair: {exc.code}. Pairing codes are single-use and expire after "
+                         "10 minutes; create a new one if needed.")
+    except (ClaudeSwitchError, OSError, RuntimeError, ValueError):
+        return "failed", "Could not pair: local settings unavailable."
+    return "paired", f"Paired worker {worker_id}."
+
+
 def pair_interactively(root: Path, ui: Prompts) -> bool:
     """Ask for the pairing command and pair, for front ends without a command line.
 
     The owner pasting the code here is the local approval, exactly like
     running ``openswap worker pair``. Returns whether this Mac is now paired.
+    The menu bar instead runs ``pair_once`` on a worker thread.
     """
-    from openswap.worker.pairing import pair
-    from openswap.worker.protocol import ProtocolError
-
-    cli = _cli()
     for _attempt in range(_MAX_ATTEMPTS):
-        text = ui.ask(PAIRING_QUESTION)
-        if not text:
-            return False
-        parsed = parse_pairing_command(text)
+        parsed = ask_pairing_command(ui)
         if parsed is None:
-            ui.say("That is not a pairing command. Copy the whole command from the Workers page.")
-            continue
-        try:
-            cli._migrate_legacy_before_worker_state_change(root)
-            worker_id = pair(root, *parsed)
-        except ProtocolError as exc:
-            ui.say(f"Could not pair: {exc.code}. Pairing codes are single-use and expire after "
-                   "10 minutes; create a new one if needed.")
-            continue
-        except (ClaudeSwitchError, OSError, RuntimeError, ValueError):
-            ui.say("Could not pair: local settings unavailable.")
             return False
-        ui.say(f"Paired worker {worker_id}.")
-        return True
+        outcome, message = pair_once(root, *parsed)
+        ui.say(message)
+        if outcome != "retry":
+            return outcome == "paired"
     return False
 
 

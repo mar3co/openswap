@@ -790,7 +790,9 @@ class _Dialogs:
 def _menu(root, dialogs):
     from tests.menubar_harness import extract_class
 
-    app_type = extract_class(menubar.__file__, "MenuBarApp", {"_run_guided_setup", "_on_setting"},
+    app_type = extract_class(menubar.__file__, "MenuBarApp",
+                             {"_run_guided_setup", "_on_setting", "_ask_guided_pairing", "_drain_guided_pairing",
+                              "_finish_guided_setup", "_end_guided_setup"},
                              {"threading": threading})
     app = app_type()
     app.switcher = SimpleNamespace(backup_dir=root)
@@ -800,6 +802,13 @@ def _menu(root, dialogs):
     app.refreshed = 0
     app._worker_view_active = lambda: setattr(app, "refreshed", app.refreshed + 1)
     return app
+
+
+def _settle(app):
+    """What on_sync_tick does: wait for each pairing request, then resume on this thread."""
+    while getattr(app, "_guided_pairing", None) is not None:
+        app._guided_pairing["thread"].join(10)
+        app._drain_guided_pairing()
 
 
 def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root, keychain, monkeypatch,
@@ -816,6 +825,7 @@ def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root,
     ])
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
+    _settle(app)
     assert enable_calls == [root]
     policy = load_worker_settings(root)
     assert policy.control_service_url == "http://localhost" and policy.pinned_account_ref == ALICE
@@ -831,6 +841,7 @@ def test_menu_setup_cancelled_at_pairing_does_nothing(root, keychain):
     dialogs = _Dialogs([(0, "")])
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
+    _settle(app)
     assert len(dialogs.shown) == 1 and load_worker_settings(root).control_service_url is None
 
 
@@ -839,6 +850,7 @@ def test_menu_setup_on_a_paired_mac_skips_pairing(root, enable_calls):
     dialogs = _Dialogs([0, (0, ""), 0, (0, ""), 1])
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
+    _settle(app)
     assert "Start the Remote tasks worker now" in dialogs.shown[0][1]["message"]
     assert enable_calls == [] and _builtin(root)
 
@@ -852,8 +864,27 @@ def test_menu_setup_reports_a_refused_code(root, keychain, monkeypatch):
     dialogs = _Dialogs([(1, "http://localhost used"), (0, ""), 1])
     app = _menu(root, dialogs)
     app._on_setting("remote_tasks_setup", None)
+    _settle(app)
     assert "Could not pair: invalid_code." in dialogs.shown[1][1]["message"]
     assert load_worker_settings(root).control_service_url is None
+
+
+def test_menu_setup_pairs_off_the_ui_thread(root, keychain, monkeypatch, enable_calls):
+    threads = []
+
+    class Recording(PairTransport):
+        def request(self, *args, **kwargs):
+            threads.append(threading.current_thread())
+            return super().request(*args, **kwargs)
+
+    monkeypatch.setattr(pairing, "Transport", lambda *_: Recording())
+    dialogs = _Dialogs([(1, "openswap worker pair http://localhost one-use"), 0, (0, ""), 0, (0, ""), 1])
+    app = _menu(root, dialogs)
+    app._on_setting("remote_tasks_setup", None)
+    assert app._guided_pairing is not None and app.refreshed == 0  # the UI thread returned at once
+    _settle(app)
+    assert threads and all(thread is not threading.current_thread() for thread in threads)
+    assert load_worker_settings(root).control_service_url == "http://localhost" and app.refreshed == 1
 
 
 @pytest.mark.parametrize("text, expected", [
