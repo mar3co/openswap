@@ -1217,7 +1217,7 @@ def test_kill_phase_drops_a_freeze_when_a_member_runs_again(tmp_path):
     containment, procs, launchd = make(tmp_path)
     member = procs.new(JOB_COALITION, status=2)
     assert containment._kill_frozen(JOB_COALITION, deadline=1e9, known=set(), killed=set(),
-                                    frozen=True) is None
+                                    frozen=True, previous={}) is None
     assert (member, signal.SIGSTOP) in procs.signals and (member, signal.SIGKILL) not in procs.signals
 
 
@@ -1258,3 +1258,21 @@ def test_real_launchd_contains_a_sighup_ignoring_child_of_an_orphaned_group(tmp_
     finally:
         containment.stop(handle)
         subprocess.run(["/usr/bin/pkill", "-f", "sleep 293"], capture_output=True)
+
+
+
+def test_the_first_scan_after_a_freeze_must_be_complete(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    # The freeze's last scan saw no member; the next one lists a pid gone by
+    # its query (it may have forked first): an empty but incomplete scan.
+    scans = iter([{5001: "gone"}, {}])
+    containment._scan = lambda coalition_id: next(scans)
+    containment._sleep = lambda s: None
+    proven, killed = containment._kill_frozen(JOB_COALITION, deadline=1e9, known=set(), killed=set(),
+                                              frozen=True, previous={})
+    assert proven is True  # only on the second scan, complete against the first
+    containment._scan = lambda coalition_id: {5001: "gone"}
+    clock = iter([0.0, 10.0])
+    containment._monotonic = lambda: next(clock, 10.0)
+    assert containment._kill_frozen(JOB_COALITION, deadline=5.0, known=set(), killed=set(),
+                                    frozen=True, previous={}) == (False, 0)

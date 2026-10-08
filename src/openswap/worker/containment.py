@@ -1132,20 +1132,24 @@ class LaunchdContainment:
         killed: set[int] = set()
         while True:
             try:
-                frozen = self._freeze(coalition_id, deadline=deadline, known=known)
+                frozen, last = self._freeze(coalition_id, deadline=deadline, known=known)
             except ContainmentError:
                 # No trustworthy listing: kill what is known, prove nothing.
                 return False, len(killed) + self._kill_known(coalition_id, known - killed)
             outcome = self._kill_frozen(coalition_id, deadline=deadline, known=known, killed=killed,
-                                        frozen=frozen)
+                                        frozen=frozen, previous=last)
             if outcome is not None:
                 return outcome[0], len(killed) + outcome[1]
             # A member ran again: re-establish the freeze (if time remains).
             if self._monotonic() >= deadline:
                 return False, len(killed)
 
-    def _freeze(self, coalition_id: int, *, deadline: float, known: set[int]) -> bool:
-        """Stop members until two consecutive complete scans agree; False at the deadline."""
+    def _freeze(self, coalition_id: int, *, deadline: float,
+                known: set[int]) -> tuple[bool, dict[int, str] | None]:
+        """Stop members until two consecutive complete scans agree.
+
+        Returns ``(frozen, last scan)``; ``frozen`` is False at the deadline.
+        """
         previous: dict[int, str] | None = None
         previous_complete = False  # whether ``previous`` was itself a complete scan
         while True:
@@ -1162,24 +1166,25 @@ class LaunchdContainment:
             ):
                 # Both scans complete on their own: an incomplete first scan
                 # (a pid gone by its query may have forked) cannot anchor it.
-                return True
+                return True, scan
             for pid in running:
                 self._stop_member(coalition_id, pid)
             previous, previous_complete = scan, complete
             if self._monotonic() >= deadline:
-                return False
+                return False, scan
             self._sleep(0.002)
 
     def _kill_frozen(self, coalition_id: int, *, deadline: float, known: set[int], killed: set[int],
-                     frozen: bool) -> tuple[bool, int] | None:
+                     frozen: bool, previous: dict[int, str] | None = None) -> tuple[bool, int] | None:
         """Kill stopped members until the coalition is empty.
 
         Returns ``(proven, 0)`` when it is empty (``proven`` only if the
         freeze held throughout), ``(False, extra)`` on an unreadable table or
         at the deadline, and None when a frozen sweep sees a member running
-        again (the caller re-freezes).
+        again (the caller re-freezes). ``previous`` is the freeze's last scan:
+        even the first scan here must be complete against it, so an empty
+        scan holding a pid gone (or a new zombie) since then is never proof.
         """
-        previous: dict[int, str] | None = None
         while True:
             try:
                 scan = self._scan(coalition_id)
@@ -1187,8 +1192,7 @@ class LaunchdContainment:
                 return False, self._kill_known(coalition_id, known - killed)
             known |= {pid for pid, kind in scan.items() if kind in {"running", "stopped"}}
             members = [pid for pid, kind in scan.items() if kind in {"running", "stopped"}]
-            if not members and "unknown" not in scan.values() and (
-                    previous is None or self._complete(scan, previous)):
+            if not members and "unknown" not in scan.values() and self._complete(scan, previous):
                 return frozen, 0
             if frozen and any(kind in {"running", "unknown"} for kind in scan.values()):
                 # The freeze no longer holds (an orphaned group got SIGCONT,
