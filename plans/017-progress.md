@@ -1243,6 +1243,46 @@ not exercised); a default login held in the Keychain rather than
 launchd-mediated escape when the model does not run that step. Phase 4's
 exit still needs the staging Slack run after this.
 
+### Review hardening (2026-10-08)
+
+Codex review rounds 13 to 21 on #81 to #84 tightened the live path further.
+None of this changes the owner steps.
+
+- **Stop proof.** Pids are bound to a stable identity:
+  - A harmless zombie is identified by its start time from `kern.proc.pid`.
+  - A freeze needs two consecutive complete scans.
+  - A `SIGSTOP` that may have hit a recycled pid is undone, and `SIGKILL`
+    only reaches members already observed stopped.
+  - The leader pid is re-verified with launchd after the coalition lookup.
+  - Ownership of a loaded label comes only from exactly one parsed plist
+    path; anything else is unknown, and stop then proves nothing.
+  - Run directories are keyed by their on-disk spelling (`F_GETPATH`), and
+    paths with control characters are refused.
+  - Recovery reads handles only after an in-progress launch releases them.
+  - Locks and recovery mirrors moved from `~/Library/Caches` to
+    `~/Library/Application Support/com.opensoft.openswap/`.
+- **Codex adapter.**
+  - `--ignore-rules` is passed.
+  - A launch is refused while the job folder holds a `.codex` layer.
+  - `codex login` and `logout` are refused under a managed Codex layer.
+  - A failed login counts as failed even with the account's old credentials
+    still in the home.
+  - Login and logout resolve the slot and take the lease under one guard.
+- **Live check.**
+  - It holds the worker lifecycle lock throughout, and refuses a stale,
+    unreadable or running worker.
+  - The default login is fingerprinted by metadata only and is never
+    opened. The baseline is taken before any sign-in prompt.
+  - Denials count only from completed commands, and each has a positive
+    control: an exit-0 `env`, a created symlink, writable `/tmp` and
+    `$TMPDIR` outside the sandbox, and a curl that runs inside it.
+  - The exec probe also covers an approved read-only source and the job's
+    own `$TMPDIR`.
+  - Leftovers from earlier checks, mirror-only ones included, must be proven
+    stopped.
+  - Helpers and the escaped probe job are always cleaned up, and sentinel
+    files get fresh, exclusive names.
+
 ## Claude accounts (2026-10-08)
 
 **Owner decision (2026-10-07).** Remote tasks may run on the owner's Claude
