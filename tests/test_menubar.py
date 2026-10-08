@@ -550,6 +550,14 @@ def test_chatgpt_capability_freshness_and_activation_helpers():
     assert menubar.desktop_capability_status_copy(incompatible) == (
         "This ChatGPT build isn’t compatible with switching."
     )
+    legacy = DesktopCapability(state="invalid", reason="legacy_chat_app")
+    assert menubar.desktop_capability_status_copy(legacy) == (
+        "This is the older ChatGPT app. Update ChatGPT to switch accounts."
+    )
+    no_cli = DesktopCapability(state="invalid", reason="helper_missing")
+    assert menubar.desktop_capability_status_copy(no_cli) == (
+        "This ChatGPT build is missing its Codex tools."
+    )
     retryable = DesktopCapability(state="invalid", reason="probe_failed", observed_at=now)
     assert menubar.desktop_capability_status_copy(retryable) == (
         "ChatGPT compatibility couldn’t be checked."

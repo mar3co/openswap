@@ -126,6 +126,10 @@ def desktop_capability_status_copy(capability: DesktopCapability) -> str:
         return "ChatGPT switching isn’t available on this Mac."
     if capability.state == "missing":
         return "ChatGPT isn’t installed."
+    if capability.reason == "legacy_chat_app":
+        return "This is the older ChatGPT app. Update ChatGPT to switch accounts."
+    if capability.reason in ("helper_missing", "helper_not_executable"):
+        return "This ChatGPT build is missing its Codex tools."
     if capability.reason in ("known_incompatible_build", "incompatible_backend"):
         return "This ChatGPT build isn’t compatible with switching."
     if capability.reason == "probe_failed":
