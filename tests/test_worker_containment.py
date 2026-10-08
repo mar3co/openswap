@@ -100,7 +100,8 @@ class FakeProcs:
         return pid not in self.table or pid in self.zombies or pid in self.dead_unreadable
 
     def zombie_identity(self, pid):
-        return f"100.{pid:06d}" if pid in self.zombies else None
+        entry = self.table.get(pid)
+        return f"100.{pid:06d}" if pid in self.zombies or (entry and entry[1] == 5) else None
 
 
 
@@ -999,3 +1000,38 @@ def test_locks_and_mirrors_live_outside_the_cache_folder():
     lock_dir = c.default_lock_dir()
     assert "Caches" not in lock_dir.parts and lock_dir.parts[-3:] == (
         "Application Support", "com.opensoft.openswap", "job-locks")
+
+
+
+def test_a_member_turning_zombie_mid_scan_makes_the_scan_incomplete(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    zombie = procs.new(JOB_COALITION, status=5)
+    first = containment._scan(JOB_COALITION)
+    assert first[zombie].startswith("zombie@")
+    assert containment._complete(first, {}) is False  # newly seen: it may have forked
+    assert containment._complete(containment._scan(JOB_COALITION), first) is True  # the same zombie again
+
+
+def test_a_failed_bootstrap_never_boots_out_someone_elses_service(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    root = private_dir(tmp_path)
+    label = c.job_label("a" * 32)
+    calls = []
+    real = containment._launchctl
+
+    def launchctl(args):
+        calls.append(list(args))
+        if args[0] == "bootstrap":
+            # A competing process loaded the label from its own plist first.
+            launchd.loaded[label] = 4242
+            return subprocess.CompletedProcess(args, 5, "", "")
+        if args[0] == "print" and label in launchd.loaded:
+            return subprocess.CompletedProcess(args, 0, "\tpath = /elsewhere/other.plist\n\tpid = 4242\n", "")
+        return real(args)
+
+    containment._launchctl = launchctl
+    with pytest.raises(ContainmentError) as error:
+        containment.launch(job_id="a" * 32, run_dir=root / ("a" * 32), argv=["/bin/echo"], env={}, cwd=root,
+                           stdin_text="")
+    assert error.value.code == "launchd_bootstrap_failed"
+    assert not any(call[0] == "bootout" for call in calls)
