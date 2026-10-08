@@ -746,8 +746,8 @@ class CodexExecAdapter:
 
         Only a directory with a summary recording a proven stop is ever
         removed (an unproven one keeps its handle for recovery), and never one
-        of a run this adapter is still tracking. The newest ``RUNS_KEPT`` stay;
-        beyond them, those older than ``RUN_RETENTION_SECONDS`` go.
+        of a run this adapter is still tracking. Only the newest ``RUNS_KEPT``
+        stay, and none older than ``RUN_RETENTION_SECONDS``.
         """
         import shutil
 
@@ -771,8 +771,10 @@ class CodexExecAdapter:
                 finished.append((mtime, entry))
         finished.sort(reverse=True)
         cutoff = time.time() - RUN_RETENTION_SECONDS
-        for mtime, entry in finished[RUNS_KEPT:]:
-            if mtime < cutoff:
+        for index, (mtime, entry) in enumerate(finished):
+            # Beyond the newest RUNS_KEPT, or older than the retention period:
+            # either alone is enough, so heavy use cannot outgrow the cap.
+            if index >= RUNS_KEPT or mtime < cutoff:
                 shutil.rmtree(entry, ignore_errors=True)
 
     def _forget(self, process_id: int, stopped: bool) -> None:

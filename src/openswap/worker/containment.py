@@ -92,6 +92,7 @@ WRAPPER_SCRIPT = (
     'rc=$?\n'
     'echo "$rc" > "$d/exit.tmp" && /bin/mv "$d/exit.tmp" "$d/exit"\n'
 )
+WRAPPER_PREFIX = ("/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/bin/sh", "-c", WRAPPER_SCRIPT, "openswap-job")
 
 def _fresh(run_dir: Path) -> bool:
     """An empty run directory, apart from a private real ``tmp`` directory."""
@@ -470,7 +471,10 @@ class LaunchdContainment:
         provider = ["/usr/bin/env", "-i", *(f"{key}={value}" for key, value in env.items()), *argv]
         return plistlib.dumps({
             "Label": label,
-            "ProgramArguments": ["/bin/sh", "-c", WRAPPER_SCRIPT, "openswap-job", str(run_dir), *provider],
+            # launchd adds its own domain environment (``launchctl setenv``
+            # included), so the shell itself starts from ``env -i``: nothing
+            # inherited can run before the coalition is recorded.
+            "ProgramArguments": [*WRAPPER_PREFIX, str(run_dir), *provider],
             "WorkingDirectory": str(cwd),
             "EnvironmentVariables": dict(WRAPPER_ENV),
             "RunAtLoad": True,
@@ -730,10 +734,20 @@ class LaunchdContainment:
         finally:
             lock.release()
         if proof.stopped:
-            mirror = self._load_mirror(handle.run_dir)
-            # Only this launch's mirror: a later launch may have reused the path.
-            if mirror is not None and mirror.launch_id == handle.launch_id and mirror.label == handle.label:
-                self._forget_mirror(handle.run_dir)
+            # Check and delete under the run directory's lock, which every
+            # launch into it holds, so a replacement's mirror is never removed.
+            try:
+                dir_lock = FileLock(self._lock_dir / f"rundir-{_run_dir_key(handle.run_dir)}.lock", timeout=5)
+                held = dir_lock.acquire()
+            except OSError:
+                held = False
+            if held:
+                try:
+                    mirror = self._load_mirror(handle.run_dir)
+                    if mirror is not None and mirror.launch_id == handle.launch_id and mirror.label == handle.label:
+                        self._forget_mirror(handle.run_dir)
+                finally:
+                    dir_lock.release()
         return proof
 
     def _stop_locked(self, handle: JobHandle, *, timeout: float) -> StopProof:
