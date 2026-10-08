@@ -320,6 +320,11 @@ def lease_release_hint(lease) -> str:
             f"(`openswap worker lease release{flag}`).")
 
 
+NETWORK_PROBE_URL = "http://example.com/"
+NETWORK_PROBE_TOKEN = "Example Domain"
+NETWORK_DENIED_EXIT_CODES = frozenset({6, 7, 28})  # curl: resolve, connect, timeout
+
+
 def _new_sentinel(folder: Path, tag: str, content: str) -> Path:
     """Create a uniquely named 0600 file in ``folder``, never touching an existing one."""
     path = Path(folder) / f"openswap-live-check-{tag}-{secrets.token_hex(8)}.txt"
@@ -729,7 +734,9 @@ class LiveCheck:
             # Positive control: the same curl binary must run inside the
             # sandbox, or a failed request proves nothing about the network.
             ("curl_runs", "/usr/bin/curl --version", "/usr/bin/curl --version", True),
-            ("network", "/usr/bin/curl -sS -m 10 -o /dev/null https://example.com", "example.com", True),
+            # Plain HTTP to stdout: no CA store and no output file, so a
+            # failure can only be the network itself (checked by exit code).
+            ("network", f"/usr/bin/curl -sS -m 10 {NETWORK_PROBE_URL}", "example.com", True),
             ("launchd_submit", f"/bin/launchctl submit -l {escape_label} -- /bin/sleep 120", escape_label, True),
         ]
         listing = "\n".join(f"{index}. {command}" for index, (_, command, _, _) in enumerate(steps, 1))
@@ -785,9 +792,11 @@ class LiveCheck:
         # A failing curl only shows confinement if the same request works from
         # this Mac outside the sandbox.
         # Same environment as the job (no proxy variables), only unsandboxed.
-        outside_ok = self._run(["/usr/bin/curl", "-sS", "-m", "10", "-o", "/dev/null", "https://example.com"],
-                               env=codex_env(home, self.check_root), capture_output=True, text=True,
-                               check=False, timeout=30).returncode == 0
+        request = self._run(["/usr/bin/curl", "-sS", "-m", "10", NETWORK_PROBE_URL],
+                            env=codex_env(home, self.check_root), capture_output=True, text=True,
+                            check=False, timeout=30)
+        # The request must really succeed outside: a response body, not just exit 0.
+        outside_ok = request.returncode == 0 and NETWORK_PROBE_TOKEN in (request.stdout or "")
         required_seen = all(seen[name] for name, _, _, required in steps if required)
         # The absence checks below mean something only if the job's
         # environment was actually printed: a denied or failed env proves nothing.
@@ -831,8 +840,11 @@ class LiveCheck:
             "api_keys_absent": environment_seen and "OPENAI_API_KEY" not in everything
             and "CODEX_API_KEY" not in everything,
             "curl_runs_in_sandbox": curl_runs,
+            # Only a network-level failure counts (6 resolve, 7 connect, 28
+            # timeout): curl failing for any other reason proves nothing.
             "shell_network_denied": outside_ok and curl_runs and bool(network) and all(
-                type(i["exit_code"]) is int and i["exit_code"] != 0 for i in network),
+                i["exit_code"] in NETWORK_DENIED_EXIT_CODES and NETWORK_PROBE_TOKEN not in i["output"]
+                for i in network),
             # The submit itself must fail: a short-lived job it started could
             # be gone by the time the label is checked.
             "launchd_submit_contained": bool(submits) and not loaded and all(

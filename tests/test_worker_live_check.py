@@ -97,6 +97,7 @@ class SimulatedMac:
     def __init__(self, *, sandboxed=True, contain=True, links=True, curl_blocked=False):
         self.links = links
         self.curl_blocked = curl_blocked
+        self.curl_request_code = 7
         self.booted_out = set()
         self.tmpdir_writes = 0
         self.sandboxed = sandboxed
@@ -152,6 +153,8 @@ class SimulatedMac:
             return "", 0
         if command == "/usr/bin/env":
             return "PATH=/usr/bin:/bin\nHOME=/x\n", 0
+        if command.startswith("/usr/bin/curl -sS") and self.sandboxed:
+            return "curl: (7) Failed to connect to example.com port 80", self.curl_request_code
         if command == "/usr/bin/curl --version":
             return ("", 126) if self.curl_blocked else ("curl 8.7.1 (x86_64-apple-darwin25.0)\n", 0)
         if "ln -s" in command and self.links:
@@ -208,7 +211,9 @@ class SimulatedMac:
         if argv[0] == "/usr/bin/curl":
             env = kwargs.get("env") or {}
             self.curl_envs.append(env)
-            return subprocess.CompletedProcess(argv, 0 if self.network_outside else 6, "", "")
+            if self.network_outside:
+                return subprocess.CompletedProcess(argv, 0, "<title>Example Domain</title>", "")
+            return subprocess.CompletedProcess(argv, 6, "", "curl: (6) Could not resolve host")
         if argv[0] == "/usr/bin/defaults":
             return subprocess.CompletedProcess(argv, 0 if self.managed_key else 1, "", "")
         if argv[0] == "/bin/launchctl":
@@ -1039,3 +1044,13 @@ def test_a_curl_that_cannot_run_in_the_sandbox_proves_no_network_denial(tmp_path
     gate = make_check(root, SimulatedMac(curl_blocked=True)).run()["gates"]["sandbox_exec"]
     assert gate["curl_runs_in_sandbox"] is False and gate["shell_network_denied"] is False
     assert gate["passed"] is False
+
+
+
+@pytest.mark.parametrize("code", [60, 77, 23, 1])
+def test_a_curl_failure_that_is_not_the_network_proves_nothing(tmp_path, code):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    mac.curl_request_code = code  # TLS, CA store, write error, other
+    gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
+    assert gate["shell_network_denied"] is False and gate["passed"] is False
