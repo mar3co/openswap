@@ -53,6 +53,7 @@ from openswap.worker.containment import (
     ContainmentError,
     JobHandle,
     LaunchdContainment,
+    StopProof,
     ensure_private_dir,
     write_private,
 )
@@ -423,6 +424,9 @@ class _Run:
     unparsed_lines: int = 0
 
 
+_NO_PROOF = StopProof(False, None, 0)
+
+
 class CodexExecAdapter:
     """Production adapter; runs nothing unless live mode is on (see :mod:`live`)."""
 
@@ -572,7 +576,8 @@ class CodexExecAdapter:
                 events = self._read_new(state)
                 if self._streams_too_large(state):
                     finished = self._finish(state, failure="provider_unavailable")
-                    self._forget(run.process_id, finished.execution_stopped)
+                    if finished.execution_stopped:
+                        self._forget(run.process_id, True)
                     return (*events, finished)
                 if events:
                     return tuple(events)
@@ -583,7 +588,8 @@ class CodexExecAdapter:
                     events = self._read_new(state, drain=True)
                     finished = self._finish(state)
                     events.append(finished)
-                    self._forget(run.process_id, finished.execution_stopped)
+                    if finished.execution_stopped:
+                        self._forget(run.process_id, True)
                     return tuple(events)
             if self._monotonic() >= deadline:
                 return ()
@@ -693,7 +699,7 @@ class CodexExecAdapter:
     def _finish(self, state: _Run, *, failure: str | None = None) -> SafeEvent:
         """Sweep the job, then report its outcome with the sweep's proof."""
         exit_status = self.containment.exit_status(state.handle)
-        proof = self.containment.stop(state.handle)
+        proof = self._stop_with_retries(state)
         state.finished = True
         if failure is not None:
             state.failure = failure
@@ -708,6 +714,23 @@ class CodexExecAdapter:
             state, SafeEventKind.PROVIDER_FINISHED, state=outcome, diagnostic_code=diagnostic,
             execution_stopped=proof.stopped is True,
         )
+
+    STOP_ATTEMPTS = 3
+
+    def _stop_with_retries(self, state: _Run):
+        """A transient process-table or launchctl failure should not quarantine
+        the account: retry the sweep a few times before reporting no proof."""
+        proof = None
+        for attempt in range(self.STOP_ATTEMPTS):
+            try:
+                proof = self.containment.stop(state.handle)
+            except ContainmentError:
+                proof = None
+            if proof is not None and proof.stopped is True:
+                return proof
+            if attempt + 1 < self.STOP_ATTEMPTS:
+                self._sleep(0.5)
+        return proof if proof is not None else _NO_PROOF
 
     def _stderr_failure(self, state: _Run) -> str:
         try:
@@ -789,16 +812,17 @@ class CodexExecAdapter:
                                        diagnostic_code=None if stopped else "execution_uncertain")
             return InterruptResult(requested=False, execution_stopped=False, diagnostic_code="execution_uncertain")
         with state.lock:
-            if state.finished:
-                summary = self._read_summary(state)
-                stopped = isinstance(summary, dict) and summary.get("stop_proof", {}).get("stopped") is True
-            else:
-                proof = self.containment.stop(state.handle)
+            summary = self._read_summary(state) if state.finished else None
+            stopped = isinstance(summary, dict) and summary.get("stop_proof", {}).get("stopped") is True
+            if not stopped:
+                # Not finished, or finished without proof: (re)try the sweep.
+                proof = self._stop_with_retries(state)
                 state.finished = True
                 stopped = proof.stopped is True
                 self._write_summary(state, self.containment.exit_status(state.handle), proof.to_dict(),
                                     "interrupted", None)
-        self._forget(run.process_id, stopped)
+        if stopped:
+            self._forget(run.process_id, True)
         return InterruptResult(
             requested=True, execution_stopped=stopped,
             diagnostic_code=None if stopped else "execution_uncertain",

@@ -1135,3 +1135,23 @@ def test_recent_proven_runs_beyond_the_count_cap_are_pruned(tmp_path, monkeypatc
     make_adapter(tmp_path, FakeContainment(SUCCESS_SCRIPT)).start(job_record(), workspace(tmp_path), worker_epoch=1)
     left = {entry.name for entry in runs.iterdir()}
     assert {"recent-0", "recent-1"} <= left and not {"recent-2", "recent-3"} & left
+
+
+
+def test_an_unproven_finish_is_retried_and_stays_recoverable(tmp_path):
+    sign_in(tmp_path)
+    containment = FakeContainment(SUCCESS_SCRIPT)
+    proofs = iter([StopProof(False, False, 1)] * 3 + [StopProof(True, False, 0)])
+
+    def flaky_stop(handle, timeout=15.0):
+        containment.stops += 1
+        return next(proofs)
+
+    containment.stop = flaky_stop
+    adapter = make_adapter(tmp_path, containment)
+    run = adapter.start(job_record(), workspace(tmp_path), worker_epoch=1)
+    finished = drain(adapter, run)[-1]
+    assert finished.execution_stopped is False and containment.stops == 3
+    # Still registered: a later interrupt retries the sweep and can prove it.
+    assert adapter.interrupt(run) == InterruptResult(True, True, None)
+    assert containment.stops == 4 and adapter._runs == {}
