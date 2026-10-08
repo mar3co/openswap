@@ -108,6 +108,10 @@ def _fresh(run_dir: Path) -> bool:
     return True
 
 
+def _run_dir_key(run_dir: Path) -> str:
+    return hashlib.sha256(str(Path(run_dir)).encode()).hexdigest()[:32]
+
+
 def default_lock_dir() -> Path:
     """Per-user directory for label locks, shared by every run root of this user.
 
@@ -481,7 +485,19 @@ class LaunchdContainment:
         if not acquired:
             raise ContainmentError("job_label_in_use")
         try:
-            return self._launch_locked(label, run_dir, argv, env, cwd, stdin_text, ready_timeout)
+            # The run directory is claimed too, whatever the label: two
+            # launches into one directory would share its wrapper files.
+            try:
+                dir_lock = FileLock(self._lock_dir / f"rundir-{_run_dir_key(run_dir)}.lock", timeout=0)
+                dir_acquired = dir_lock.acquire(timeout=0)
+            except OSError:
+                raise ContainmentError("label_lock_unavailable") from None
+            if not dir_acquired:
+                raise ContainmentError("run_dir_in_use")
+            try:
+                return self._launch_locked(label, run_dir, argv, env, cwd, stdin_text, ready_timeout)
+            finally:
+                dir_lock.release()
         finally:
             lock.release()
 
@@ -555,7 +571,9 @@ class LaunchdContainment:
         # without the acknowledgement and the provider never ran.
         deadline = self._monotonic() + RELEASE_ACK_SECONDS
         while not os.path.lexists(run_dir / STARTED_FILE):
-            if not self.leader_alive(handle):
+            # Only a confirmed exit (not an unreadable process) means the
+            # wrapper gave up before it could start the provider.
+            if handle.leader_pid is not None and self.procs.is_dead(handle.leader_pid):
                 if os.path.lexists(run_dir / STARTED_FILE):
                     break
                 self._stop_locked(handle, timeout=15.0)
@@ -613,7 +631,7 @@ class LaunchdContainment:
     # -- stop -----------------------------------------------------------------
 
     def _mirror_path(self, run_dir: Path) -> Path:
-        digest = hashlib.sha256(str(Path(run_dir)).encode()).hexdigest()[:32]
+        digest = _run_dir_key(run_dir)
         return self._lock_dir.parent / "job-handles" / f"{digest}.json"
 
     def _persist(self, handle: JobHandle) -> None:
