@@ -335,6 +335,13 @@ def test_summary_waits_briefly_for_the_service_connection(root, monkeypatch, cap
     assert f"  Service: {URL} (online)" in out and "Ready for Slack" in out
 
 
+def test_allowed_accounts_without_a_pinned_default_are_not_ready(root, monkeypatch):
+    cli.allow_worker_account(root, "1")
+    cli.set_worker_account(root, None)
+    assert guided_setup.readiness(root).account is None
+    assert "pin a Codex account (`openswap worker account <slot>`)" in guided_setup.readiness(root).missing
+
+
 class _Say:
     def say(self, text):
         print(text)

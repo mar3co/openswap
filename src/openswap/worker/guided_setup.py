@@ -329,10 +329,11 @@ def readiness(root: Path) -> Readiness:
     account = None
     try:
         choices = cli.worker_account_choices(root)
+        # Only a pinned default counts: a task without a per-task choice
+        # needs it, and the allowed accounts reach the service only once it
+        # acknowledges them, which the local settings cannot show.
         if choices.pinned is not None and not choices.pinned_missing:
             account = choices.pinned.label()
-        elif choices.allowlist and any(choices.slot_for(e.identity) for e in choices.allowlist):
-            account = "chosen per task from the allowed accounts"
     except Exception:
         pass
     return Readiness(
