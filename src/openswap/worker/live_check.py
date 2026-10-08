@@ -38,6 +38,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import secrets
 import shlex
 import signal
@@ -213,6 +214,38 @@ def _texts(*paths: Path, limit: int = 8 * 1024 * 1024) -> str:
     return "\n".join(out)
 
 
+_SHELL_WRAPPER = re.compile(
+    r"^(?:/usr/bin/env\s+)?(?:/bin/|/usr/bin/|/usr/local/bin/|/opt/homebrew/bin/)?(?:ba|z|da)?sh\s+-l?c\s+(.+)$",
+    re.S,
+)
+
+
+def command_tokens(command: str) -> list[str] | None:
+    """A probe command's tokens with any ``sh``/``bash``/``zsh -c`` wrappers removed.
+
+    Codex runs a model's command through the user's shell (``bash -lc '…'``
+    and the like), and several probes are themselves ``/bin/sh -c '…'``;
+    unwrapping both sides lets the exact requested command be compared
+    regardless of quoting. ``None`` when the text cannot be tokenized.
+    """
+    text = command.strip()
+    for _ in range(5):
+        match = _SHELL_WRAPPER.match(text)
+        if not match:
+            break
+        try:
+            inner = shlex.split(match.group(1))
+        except ValueError:
+            return None
+        if len(inner) != 1:
+            break
+        text = inner[0].strip()
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return None
+
+
 def parse_features(text: str) -> dict[str, bool]:
     states = {}
     for line in text.splitlines():
@@ -328,7 +361,9 @@ class LiveCheck:
         except ProviderLaunchRefused:
             self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
             raise
-        except Exception:
+        except BaseException:
+            # Ctrl-C included: the launch may have released a launchd job,
+            # so sweep it and settle the lease on proof before leaving.
             self._settle_uncertain(token, job_id)
             raise
         events, finished, reason = [], None, "timeout"
@@ -597,13 +632,21 @@ class LiveCheck:
         everything = _texts(outcome.run_dir / STDOUT_FILE, outcome.run_dir / STDERR_FILE, ws)
 
         keys = [key for _, _, key, _ in steps]
+        expected = {key: command_tokens(command) for _, command, key, _ in steps}
         # Each probe must run as its own command: an item that matches several
         # probes (the model chained them) proves none of them, since its exit
         # code and output belong to the whole chain.
         combined = [item for item in items if sum(key in item["command"] for key in keys) > 1]
 
         def observed(key):
-            return [item for item in items if key in item["command"] and item not in combined]
+            # Only the exact requested command counts (apart from the shell
+            # wrapper Codex adds): a modified one, say with its output sent to
+            # /dev/null or its failure faked, proves nothing about the probe.
+            return [
+                item for item in items
+                if item not in combined and expected[key] is not None
+                and command_tokens(item["command"]) == expected[key]
+            ]
 
         loaded = self._run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{escape_label}"],
                            capture_output=True, text=True, check=False, timeout=20).returncode == 0
@@ -854,8 +897,11 @@ def child_main(raw: str) -> None:
 
 
 def _ask(question: str) -> bool:
+    # Prompts go to stderr, so stdout stays the evidence object under --json.
+    sys.stderr.write(f"{question} [y/N] ")
+    sys.stderr.flush()
     try:
-        return input(f"{question} [y/N] ").strip().lower() in {"y", "yes"}
+        return input().strip().lower() in {"y", "yes"}
     except EOFError:
         return False
 

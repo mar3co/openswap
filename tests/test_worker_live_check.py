@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -398,6 +399,74 @@ def test_chained_probes_prove_nothing(tmp_path):
     assert gate["each_probe_its_own_command"] is False
     assert gate["auth_read_denied"] is False and gate["shell_network_denied"] is False
     assert gate["passed"] is False
+
+
+def test_command_tokens_unwrap_shells_and_compare_exactly():
+    probe = "/bin/sh -c 'printf x > /tmp/a b.txt'"
+    assert live_check.command_tokens(probe) == ["printf", "x", ">", "/tmp/a", "b.txt"]
+    assert live_check.command_tokens(f"bash -lc {shlex.quote(probe)}") == live_check.command_tokens(probe)
+    assert live_check.command_tokens("/bin/zsh -lc 'cat /x/read-me.txt'") == ["cat", "/x/read-me.txt"]
+    assert live_check.command_tokens("cat /x/read-me.txt >/dev/null") != ["cat", "/x/read-me.txt"]
+
+
+class RewritingMac(SimulatedMac):
+    """The model quietly rewrites the probes so they 'fail' without trying."""
+
+    def launch(self, *, job_id, run_dir, argv, env, cwd, stdin_text, ready_timeout=15.0):
+        def rewrite(match):
+            command = match.group(2)
+            if "read-me.txt" in command:
+                command += " >/dev/null"
+            elif "auth.json" in command or "example.com" in command:
+                command = f"false # {command}"
+            return f"{match.group(1)}{command}"
+
+        stdin_text = re.sub(r"^(\d+\. )(.+)$", rewrite, stdin_text, flags=re.M)
+        return super().launch(job_id=job_id, run_dir=run_dir, argv=argv, env=env, cwd=cwd,
+                              stdin_text=stdin_text, ready_timeout=ready_timeout)
+
+    def _simulate(self, command, cwd):
+        if command.startswith("false #"):
+            return "", 1
+        return super()._simulate(command, cwd)
+
+
+def test_rewritten_probes_prove_nothing(tmp_path):
+    root = setup_root(tmp_path)
+    evidence = make_check(root, RewritingMac(sandboxed=False)).run()
+    gate = evidence["gates"]["sandbox_exec"]
+    assert gate["steps_ran"]["outside_read"] is False
+    assert gate["steps_ran"]["auth_read"] is False and gate["steps_ran"]["network"] is False
+    assert gate["passed"] is False
+
+
+def test_ctrl_c_during_launch_settles_the_lease(tmp_path):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    check = make_check(root, mac)
+    check.check_root = root / "live-check" / "t"
+    cont.ensure_private_dir(check.check_root.parent)
+    cont.ensure_private_dir(check.check_root)
+    original = mac.launch
+
+    def launch_then_interrupt(**kwargs):
+        original(**kwargs)
+        raise KeyboardInterrupt
+
+    mac.launch = launch_then_interrupt
+    ws = check._workspace("stop")
+    check._helper_script(ws)
+    with pytest.raises(KeyboardInterrupt):
+        check._job("stop", IDENTITY, LiveCheck.HELPER_TASK, timeout=60, workspace=ws)
+    assert all(not job["running"] for job in mac.jobs.values())
+    assert AccountLeaseStore(root, "codex").read_current().state == "released"
+
+
+def test_prompts_go_to_stderr(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", io.StringIO("y\n"))
+    assert live_check._ask("Run it now?") is True
+    out, err = capsys.readouterr()
+    assert out == "" and "Run it now? [y/N]" in err
 
 
 class ShortLivedEscapeMac(SimulatedMac):
