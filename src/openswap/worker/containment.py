@@ -646,8 +646,9 @@ class LaunchdContainment:
                 raise ContainmentError("job_leader_unverified")
             coalition = procs.coalition_of(pid)
             own = procs.coalition_of(self._self_pid)
-            if coalition is None or coalition == own:
-                # Without a coalition of its own the job cannot be swept.
+            if coalition is None or own is None or coalition == own:
+                # Without a coalition provably distinct from the worker's, the
+                # job cannot be swept (a sweep would hit the worker's own).
                 raise ContainmentError("job_coalition_unavailable")
             # The pid could have been recycled between the print and the
             # lookup: launchd must still report it as this service's process
