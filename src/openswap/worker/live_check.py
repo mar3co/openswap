@@ -321,6 +321,7 @@ def lease_release_hint(lease) -> str:
             f"(`openswap worker lease release{flag}`).")
 
 
+WC_CONTROL_BYTES = 37  # size of the wc positive-control file
 NETWORK_PROBE_URL = "http://example.com/"
 NETWORK_PROBE_TOKEN = "Example Domain"
 # A timeout (28) is not denial: `-m` bounds the whole transfer, so a request
@@ -703,6 +704,11 @@ class LiveCheck:
         tokens = {name: secrets.token_hex(16)
                   for name in ("inside", "outside", "link", "home", "env", "source", "source_link")}
         (ws / "inside.txt").write_text(tokens["inside"] + "\n")
+        # Positive control for the auth probe: the same wc binary must run
+        # inside the sandbox on a readable file, or a failed `wc auth.json`
+        # (wc itself blocked, say) proves nothing about the credential.
+        wc_control = ws / "wc-control.txt"
+        wc_control.write_text("x" * WC_CONTROL_BYTES)
         (outside / "read-me.txt").write_text(tokens["outside"] + "\n")
         (outside / "link-target.txt").write_text(tokens["link"] + "\n")
         # An approved read-only source, as `workspace add --readonly-source`
@@ -728,6 +734,7 @@ class LiveCheck:
             # wc prints only a byte count, so no redirect is needed (a denied
             # /dev/null would fail a redirected read for the wrong reason) and
             # the credential never reaches the event stream.
+            ("wc_runs", f"/usr/bin/wc -c {q(str(wc_control))}", "wc-control.txt", True),
             ("auth_read", f"/usr/bin/wc -c {q(str(home / 'auth.json'))}",
              "auth.json", True),
             ("symlink_read", f"/bin/sh -c {q('ln -s ' + q(str(outside / 'link-target.txt')) + ' link.txt; cat link.txt')}",
@@ -825,6 +832,8 @@ class LiveCheck:
                         for i in observed("/usr/bin/curl --version"))
         submits = observed(escape_label)
         auth = observed("auth.json")
+        wc_runs = any(i["exit_code"] == 0 and str(WC_CONTROL_BYTES) in i["output"].split()
+                      for i in observed("wc-control.txt"))
         detail = {
             "all_required_steps_ran": required_seen,
             "no_unexpected_commands": not unexpected,
@@ -849,8 +858,9 @@ class LiveCheck:
             "tmp_write_denied": _all_failed(observed(tmp_marker.name)) and not tmp_marker.exists()
             and _writable_outside(tmp_marker.parent),
             "codex_home_read_denied": _all_failed(observed(sentinel.name)) and tokens["home"] not in everything,
-            "auth_read_denied": bool(auth) and all(type(i["exit_code"]) is int and i["exit_code"] != 0
-                                                   for i in auth),
+            "wc_runs_in_sandbox": wc_runs,
+            "auth_read_denied": wc_runs and bool(auth) and all(
+                type(i["exit_code"]) is int and i["exit_code"] != 0 for i in auth),
             "environment_printed": environment_seen,
             "worker_environment_absent": environment_seen and tokens["env"] not in everything
             and ENV_SENTINEL not in everything,
