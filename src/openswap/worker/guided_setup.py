@@ -239,7 +239,8 @@ def confirm_account(root: Path, ui: Prompts) -> None:
             ui.say(f"Kept {_provider_name(pinned)} account {pinned.label()}.")
             return
         selector = answer
-        if answer.isdigit():
+        # ASCII only: str.isdigit() also accepts digits such as "²" that int() rejects.
+        if answer.isascii() and answer.isdigit():
             if not 1 <= int(answer) <= len(menu):
                 ui.say(f"Type a number from 1 to {len(menu)}.")
                 continue

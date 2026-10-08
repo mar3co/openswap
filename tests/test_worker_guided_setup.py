@@ -181,6 +181,14 @@ def test_menu_numbers_are_positions_not_slots(root, keychain, monkeypatch, capsy
     assert "Pinned Codex account 5 · shared@example.com" in capsys.readouterr().out
 
 
+def test_a_non_ascii_digit_is_asked_again_not_a_crash(root, keychain, monkeypatch, capsys, enable_calls):
+    # "²".isdigit() is True but int("²") raises; it must not end the account step.
+    assert _pair(root, monkeypatch, interactive=True, answers=["n", "²", "6"]) == 0
+    out = capsys.readouterr().out
+    assert "Pinned Claude account 4 · carol@example.com (claudey)" in out
+    assert load_worker_settings(root).pinned_account_ref.startswith("claude:")
+
+
 def test_a_number_outside_the_menu_is_asked_again(root, keychain, monkeypatch, capsys, enable_calls):
     assert _pair(root, monkeypatch, interactive=True, answers=["n", "0", "7", "work"]) == 0
     out = capsys.readouterr().out
