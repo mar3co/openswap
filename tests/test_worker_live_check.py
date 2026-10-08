@@ -97,6 +97,8 @@ class SimulatedMac:
         self.jobs: dict[str, dict] = {}
         self.processes: list[tuple[int, str]] = []
         self.submitted_labels: set[str] = set()
+        self.managed_key = False
+        self.features_text = None
 
     # containment
     def launch(self, *, job_id, run_dir, argv, env, cwd, stdin_text, ready_timeout=15.0):
@@ -183,6 +185,8 @@ class SimulatedMac:
         while "--disable" in args:
             i = args.index("--disable")
             del args[i:i + 2]
+        if argv[0] == "/usr/bin/defaults":
+            return subprocess.CompletedProcess(argv, 0 if self.managed_key else 1, "", "")
         if argv[0] == "/bin/launchctl":
             label = argv[2].rsplit("/", 1)[-1]
             return subprocess.CompletedProcess(argv, 0 if label in self.submitted_labels else 113, "", "")
@@ -190,6 +194,8 @@ class SimulatedMac:
             return subprocess.CompletedProcess(argv, 0, "No MCP servers configured yet.\n", "")
         if args[:2] == ["features", "list"]:
             text = "shell_tool stable true\n" + "".join(f"{n} stable false\n" for n in codex_exec.DISABLED_FEATURES)
+            if self.features_text is not None:
+                text = self.features_text
             return subprocess.CompletedProcess(argv, 0, text, "")
         if args[:1] == ["sandbox"]:
             script = args[-1]
@@ -343,6 +349,25 @@ def test_main_does_nothing_without_consent(tmp_path, capsys, monkeypatch):
     assert live_check.main(["live-check"], root) == 1
     assert "Not run" in capsys.readouterr().out
     assert not live.evidence_dir(root).exists()
+
+
+@pytest.mark.parametrize("problem", ["missing_feature", "feature_on", "managed_key", "managed_file"])
+def test_tool_surface_needs_every_feature_off_and_no_managed_layer(tmp_path, problem):
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    names = list(codex_exec.DISABLED_FEATURES)
+    if problem == "missing_feature":
+        mac.features_text = "shell_tool stable true\n" + "".join(f"{n} stable false\n" for n in names[1:])
+    elif problem == "feature_on":
+        mac.features_text = "shell_tool stable true\n" + "".join(
+            f"{n} stable {'true' if n == 'apps' else 'false'}\n" for n in names)
+    elif problem == "managed_key":
+        mac.managed_key = True
+    else:
+        (codex_exec.isolated_home(root, IDENTITY) / "managed_config.toml").write_text("")
+    evidence = make_check(root, mac).run()
+    assert evidence["gates"]["tool_surface"]["passed"] is False
+    assert evidence["passed"] is False
 
 
 class ShortLivedEscapeMac(SimulatedMac):

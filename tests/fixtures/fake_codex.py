@@ -13,7 +13,12 @@ import re
 import subprocess
 import sys
 
-DISABLED = ("apps", "hooks", "plugins", "multi_agent", "browser_use", "computer_use", "code_mode")
+DISABLED = (
+    "apps", "hooks", "plugins", "multi_agent", "browser_use", "browser_use_external",
+    "browser_use_full_cdp_access", "computer_use", "code_mode_host", "code_mode",
+    "unified_exec", "unified_exec_tty", "skill_search", "skill_mcp_dependency_install",
+    "remote_plugin", "workspace_dependencies",
+)
 
 
 def emit(record):

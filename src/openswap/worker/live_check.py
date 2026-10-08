@@ -63,6 +63,7 @@ from openswap.worker.codex_exec import (
     codex_env,
     global_args,
     home_identity,
+    managed_codex_config,
     isolated_home,
     prepare_home,
     runs_root,
@@ -92,10 +93,6 @@ PROBE_TIMEOUT_SECONDS = 10 * 60
 HELPER_WAIT_SECONDS = 5 * 60
 # Item types that would mean a tool surface the research profile disables was used.
 FORBIDDEN_ITEM_MARKERS = ("mcp", "plugin", "connector", "browser", "computer", "app_", "collab", "spawn")
-SYSTEM_CONFIG_PATHS = (
-    "/etc/codex/config.toml", "/etc/codex/requirements.toml", "/etc/codex/managed_config.toml",
-    "/etc/codex/hooks.json", "/Library/Managed Preferences/com.openai.codex.plist",
-)
 RESEARCH_TASK = (
     "Using web search, find the version number of the most recent stable Python 3 release listed on "
     "python.org, and the date it was released. Answer in two sentences and cite the python.org page "
@@ -267,6 +264,7 @@ class LiveCheck:
         return CodexExecAdapter(
             self.root, containment=self.containment, verify=self._verify,
             mode=lambda: "live", bind_to_opt_in=False, monotonic=self._monotonic, sleep=self._sleep,
+            managed=lambda home: managed_codex_config(home, run=self._run),
         )
 
     def _default_list_processes(self) -> list[tuple[int, str]]:
@@ -457,16 +455,19 @@ class LiveCheck:
     def _gate_tool_surface_static(self, pinned, home: Path) -> dict:
         cwd = self._workspace("static")
         mcp = self._codex(pinned, home, "mcp", "list", cwd=cwd)
-        features = parse_features(self._codex(pinned, home, "features", "list", cwd=cwd).stdout or "")
-        listed = [name for name in DISABLED_FEATURES if name in features]
-        still_on = [name for name in listed if features[name]]
-        present = [path for path in SYSTEM_CONFIG_PATHS if os.path.lexists(path)]
+        listing = self._codex(pinned, home, "features", "list", cwd=cwd)
+        features = parse_features(listing.stdout or "")
         return {
             "mcp_servers_none": mcp.returncode == 0 and "no mcp servers" in (mcp.stdout or "").lower(),
-            "disabled_features_listed": len(listed),
-            "disabled_features_still_on": still_on,
-            "features_parsed": len(listed) >= 3 and features.get("shell_tool") is True,
-            "system_config_present": [Path(path).name for path in present],
+            "features_listed": listing.returncode == 0,
+            # Every disabled feature must be listed, and listed off.
+            "disabled_features_missing": [name for name in DISABLED_FEATURES if name not in features],
+            "disabled_features_still_on": [name for name in DISABLED_FEATURES if features.get(name)],
+            "shell_tool_on": features.get("shell_tool") is True,
+            "managed_config_present": [
+                entry if entry.startswith("defaults:") else Path(entry).name
+                for entry in managed_codex_config(home, run=self._run)
+            ],
         }
 
     def _gate_sandbox_wrapper(self, pinned, home: Path) -> None:
@@ -783,8 +784,9 @@ class LiveCheck:
         tool = self.gates["tool_surface"]
         tool.detail = {**static, "unexpected_item_types": unexpected_items}
         tool.passed = bool(static) and (
-            static.get("mcp_servers_none") is True and static.get("features_parsed") is True
-            and not static.get("disabled_features_still_on") and not static.get("system_config_present")
+            static.get("mcp_servers_none") is True and static.get("features_listed") is True
+            and static.get("disabled_features_missing") == [] and static.get("disabled_features_still_on") == []
+            and static.get("shell_tool_on") is True and static.get("managed_config_present") == []
             and not unexpected_items
         )
         default_after = _sha256_file(default_auth)

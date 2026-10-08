@@ -525,7 +525,10 @@ folder, denies `$TMPDIR` and `/tmp`, and has no shell network; no `--sandbox`
 flag is ever passed (that would make Codex ignore the profile). Research uses
 Codex's live web search. Apps, hooks, plugins, multi-agent, browser and
 computer use, code mode, unified exec and skill search are disabled; project
-config discovery and `AGENTS.md` are off. The job's argv is fixed:
+config discovery and `AGENTS.md` are off. A job refuses to launch while any
+managed or system Codex layer that could override this exists (requirement or
+managed files in the isolated home, `/etc/codex`, the machine or per-user
+managed preferences, or their payload keys). The job's argv is fixed:
 `codex --strict-config --disable … exec --json --ephemeral
 --skip-git-repo-check --cd <output> --output-last-message <output>/result.md -`,
 with the task on stdin.

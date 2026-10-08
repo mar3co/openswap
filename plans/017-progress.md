@@ -1171,7 +1171,8 @@ live check measures a `launchctl submit` attempt from inside the sandbox.
   flag, because the permissions doc says it makes Codex ignore the profile.
   Live web search on; apps, hooks, plugins, multi-agent, browser/computer use,
   code mode, unified exec and skill search disabled; `project_root_markers =
-  []`, `project_doc_max_bytes = 0`. The job's environment is a fixed
+  []`, `project_doc_max_bytes = 0`. A launch refuses while any managed or system
+  Codex layer exists that could override the profile. The job's environment is a fixed
   allowlist supplied by launchd.
 - Events: `thread.started` becomes `provider_started`; the end of the run
   becomes one `provider_finished` (`succeeded` only for exit 0, a
@@ -1195,7 +1196,8 @@ live check measures a `launchctl submit` attempt from inside the sandbox.
 **Evidence harness.** `openswap worker live-check` refuses while the worker is
 running unpaused, a job is active or a lease is held, then records, for the
 pinned (or `--account`) account: `pinned_cli`, `account_identity`,
-`default_login_unchanged`, `tool_surface`, `sandbox_wrapper`,
+`default_login_unchanged`, `tool_surface` (every disabled feature listed
+and off, no MCP servers, no managed layer), `sandbox_wrapper`,
 `research_run`, `sandbox_exec`, `stop` and `kill_recovery`. The adversarial
 `codex exec` job is asked to read and write outside its folder, read a
 sentinel in `CODEX_HOME`, read `auth.json` into `/dev/null`, follow a symlink
