@@ -1106,9 +1106,11 @@ class WorkerRuntime:
                     late = outcome.get("abandoned", False)
                 if late and isinstance(run, ProviderRun):
                     try:
-                        self.adapter.interrupt(run)
+                        late_stop = self.adapter.interrupt(run)
                     except BaseException:
-                        pass
+                        late_stop = None
+                    with outcome_lock:
+                        outcome["late_stop"] = late_stop
             except BaseException as error:
                 with outcome_lock:
                     outcome["error"] = error
@@ -1116,10 +1118,15 @@ class WorkerRuntime:
             finally:
                 if late:
                     refused = isinstance(outcome.get("error"), ProviderLaunchRefused)
+                    late_stop = outcome.get("late_stop")
+                    stopped = isinstance(late_stop, InterruptResult) and late_stop.execution_stopped is True
                     try:
                         if refused:
                             # The adapter proved nothing launched: no quarantine.
                             self.leases.release(token, ReleaseEvidence.UNLAUNCHED)
+                        elif stopped:
+                            # The late run was interrupted with proof that it stopped.
+                            self.leases.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
                         else:
                             # The abandoned call has now returned: the lease stays
                             # uncertain, but it may be released on confirmation.

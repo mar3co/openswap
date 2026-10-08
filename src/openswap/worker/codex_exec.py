@@ -824,6 +824,12 @@ class CodexExecAdapter:
             return InterruptResult(requested=True, execution_stopped=False, diagnostic_code="execution_uncertain")
         if proof is None:
             return None
+        # Record the outcome like any finished run, so retention applies.
+        summary = {"job_id": job_id, "outcome": "recovered", "stop_proof": proof.to_dict()}
+        try:
+            write_private(run_dir / SUMMARY_FILE, json.dumps(summary).encode())
+        except OSError:
+            pass
         return InterruptResult(
             requested=True, execution_stopped=proof.stopped is True,
             diagnostic_code=None if proof.stopped else "execution_uncertain",
