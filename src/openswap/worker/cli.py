@@ -895,6 +895,10 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     if arguments and arguments[0] == "refserver":
         from openswap.worker.refserver.cli import main as refserver_main
         return refserver_main(arguments[1:])
+    if arguments[:1] == ["live-check"]:
+        from openswap.worker.live_check import main as live_check_main
+        root = Path(backup_root) if backup_root is not None else get_backup_root()
+        return live_check_main(arguments, root, migrate=_migrate_legacy_before_worker_state_change)
     if arguments[:1] in (["codex"], ["live"]):
         from openswap.worker.live_cli import main as live_main
         root = Path(backup_root) if backup_root is not None else get_backup_root()
@@ -910,6 +914,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     commands.add_parser("refserver", help="serve the reference protocol or manage pairing/revocation")
     commands.add_parser("codex", help="install, verify and sign in the pinned Codex CLI that remote jobs run")
     commands.add_parser("live", help="show or change the explicit live-execution opt-in")
+    commands.add_parser("live-check", help="run real Codex jobs on this Mac and record phase-1 live evidence")
     run = commands.add_parser("run", help="run the background worker process")
     # Passed only by the LaunchAgent: a manual run refuses while it is loaded.
     run.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)
@@ -1548,8 +1553,8 @@ _START_WORKER_NEXT = (
     "`openswap worker enable`."
 )
 _EXECUTION_OFF_NOTE = (
-    "Task execution itself stays off until the production adapter is enabled "
-    "(provider: live_adapter_disabled), so jobs are refused for now."
+    "Task execution itself stays off (provider: live_adapter_disabled) until you run "
+    "`openswap worker live-check` on this Mac and enable live execution, so jobs are refused for now."
 )
 _RUNNING_STATES = frozenset({"starting", "running"})
 
@@ -1600,7 +1605,10 @@ def _post_pair_worker_offer(root: Path, *, interactive: bool, read_line=None) ->
                 print("Could not enable worker. Start it later with `openswap worker enable`.")
             else:
                 print("Remote tasks worker enabled. The portal shows this Mac online within about 15 seconds.")
-    print(_EXECUTION_OFF_NOTE)
+    from openswap.worker.live import LIVE, execution_mode
+
+    if execution_mode(root) != LIVE:
+        print(_EXECUTION_OFF_NOTE)
 
 
 def _worker_off_hint(root: Path, snapshot: dict) -> str | None:

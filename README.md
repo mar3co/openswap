@@ -75,13 +75,17 @@ The command-line executable is `openswap`.
 | `openswap worker account [slot]` | List or pin the Codex account remote jobs run on (Claude not supported yet) |
 | `openswap worker account allow <slot>` | Allow a Codex account for a per-job choice by the control service (`disallow`, `label`) |
 | `openswap worker workspace add <id> <folder>` | Approve a research folder under the portal's workspace ID (`list`, `remove`) |
+| `openswap worker codex install` | Install the pinned official Codex CLI 0.157.1 for Remote tasks (SHA-256 verified) |
+| `openswap worker codex login [slot]` | Sign an account in to its own isolated Codex home (your default login is untouched) |
+| `openswap worker live-check` | Run short real jobs on this Mac, record phase-1 evidence, then offer to enable live execution |
+| `openswap worker live status` | Show whether remote jobs really run (`enable --evidence FILE`, `disable`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |
 | `openswap upgrade` | Pull the checkout and reinstall |
 | `openswap statusline --install` | Opt-in: wrap Claude Code status line |
 | `openswap statusline --codex` | Paint the live Codex account label (no config.toml wrap) |
 
-Remote tasks are off by default and do not execute provider jobs yet; the pairing, account and folder setup is described in [the worker protocol doc](docs/worker-protocol.md#choosing-the-account-and-research-folders).
+Remote tasks are off by default, and jobs do not run until you pass the live check and enable live execution on this Mac; the pairing, account and folder setup is described in [the worker protocol doc](docs/worker-protocol.md#choosing-the-account-and-research-folders) and the live steps in [Running jobs live](docs/worker-protocol.md#running-jobs-live-codex).
 Pairing does not start the worker: the portal shows the Mac Offline until you run `openswap worker enable` (or turn on Settings → General → **Enable local worker**). On a terminal, `pair` asks whether to start it now; `openswap worker status` says so while the Mac is paired but the worker is off.
 
 `openswap help` lists the main commands. Full list: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).

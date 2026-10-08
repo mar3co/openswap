@@ -84,3 +84,14 @@ The installed `0.158.0-alpha.2.1` prerelease and public stable `0.157.1` CLI hel
 - [Codex skills](https://learn.chatgpt.com/docs/build-skills)
 - [Codex permission profiles and limits](https://learn.chatgpt.com/docs/permissions)
 - [Codex authentication](https://learn.chatgpt.com/docs/auth)
+
+## Implementation status (2026-10-07)
+
+`src/openswap/worker/codex_exec.py` implements this contract for the pinned
+stable 0.157.1 CLI, and `src/openswap/worker/containment.py` implements
+`interrupt` as a per-job launchd job plus a resource-coalition sweep that
+covers detached descendants. Both run only after the owner enables live
+execution from passing `openswap worker live-check` evidence, which measures
+the acceptance items above on the owner's Mac. Until that run the items above
+remain unmeasured with a real provider; see the [progress log](../../017-progress.md#live-path-prepared-2026-10-07).
+

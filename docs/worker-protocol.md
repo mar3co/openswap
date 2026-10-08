@@ -372,8 +372,9 @@ registration (worker epoch) is replaced only when the enrollment changes or is
 gone/expired locally; a locked Keychain, a transport fault or a failed status
 write reports `offline` and keeps it, since re-registering interrupts the
 service-side jobs of the registration it replaces. With no configured URL it
-performs no network or Keychain access. The production adapter still refuses
-jobs in this phase.
+performs no network or Keychain access. The production adapter refuses jobs
+(`live_adapter_disabled`) until the owner enables live execution; see
+[Running jobs live](#running-jobs-live-codex).
 
 Pairing does not start the worker, so a freshly paired Mac stays offline in the
 service until the worker runs. After the account and folder steps, `pair` on an
@@ -387,7 +388,8 @@ No, any other answer, or EOF leaves the worker off and prints
 asks nothing. An already enabled worker is never toggled: `pair` says it is
 running, or that it is enabled but not running (for example its LaunchAgent was
 unloaded) and points at `worker enable` and `worker status`. A final line notes
-that execution stays off (`live_adapter_disabled`) for now. Nothing in this
+that execution stays off (`live_adapter_disabled`) until live execution is
+enabled. Nothing in this
 step can fail pairing. While a URL is configured and the worker is disabled or
 not running, human `worker status` adds "Paired with <origin> but the worker is
 off; run `openswap worker enable`" (`--json` is unchanged), and the menu bar's
@@ -470,8 +472,92 @@ launch-time checks up front: a real directory owned by you with no group or
 other access, and read-only sources owned by you and not writable by others.
 It refuses a folder that is, or contains, your home folder, the OpenSwap
 backup root, Codex home or the Claude config folder. At least one workspace
-must stay approved. Execution remains disabled: the production Codex adapter
-refuses every job until the Phase 1 live-evidence gates clear.
+must stay approved. Jobs still fail `live_adapter_disabled` until the owner
+runs the live check and enables live execution (next section).
+
+### Running jobs live (Codex)
+
+Live execution is off by default, and nothing turns it on except the owner's
+explicit opt-in after a passing live check on this Mac. The steps, on an Apple
+silicon Mac:
+
+```sh
+openswap worker pause                 # if the worker is running; reopen later with --off
+openswap worker codex install         # official Codex CLI 0.157.1, SHA-256 verified
+openswap worker account 2             # pin the account remote jobs run on, if not yet
+openswap worker codex login           # sign that account in to its own isolated Codex home
+openswap worker live-check            # 4 short real jobs, evidence file, then offers to enable
+openswap worker pause --off           # reopen admission
+```
+
+`openswap worker live status` shows the mode, `openswap worker live disable`
+turns it off again, and `openswap worker live enable --evidence FILE` enables
+it from a passing evidence file without re-running the check.
+`openswap worker codex status` re-verifies the binary and lists which accounts
+have an isolated sign-in.
+
+**Pinned CLI.** `codex install` downloads the `codex-aarch64-apple-darwin.tar.gz`
+asset of the official `rust-v0.157.1` release (or reads `--archive PATH`) and
+refuses it unless its SHA-256 is the published
+`3c45b162b7a76f51325015b1d0a8112c73219b7a9b59cd5762c37c9ba55894fa`. Its single
+binary goes into the private worker directory with a manifest of its own
+SHA-256; before every job the worker re-hashes it and checks that
+`--version` prints `codex-cli 0.157.1`. A Codex on `PATH` or inside
+ChatGPT.app is never used, and live execution stays bound to the binary the
+check measured.
+
+**Account isolation.** Every eligible account has its own `CODEX_HOME` under
+the private worker directory. `codex login [SLOT|EMAIL|ALIAS]` runs the pinned
+CLI's own `login` (browser, or `--device-auth`) with that home and file-backed
+credentials, while holding the Codex account lease. The default `~/.codex`
+login and the roster's saved copies are never read, copied or written by a
+job; only the Codex process running in that home refreshes its tokens. A
+sign-in to a different account than the one selected is signed straight back
+out. Before each launch the home's signed-in account must be the job's leased
+account, or the job fails `provider_auth_unavailable` without launching
+(`unlaunched=true`). A per-job account choice needs that account signed in the
+same way.
+
+**Sandbox.** The worker rewrites the home's `config.toml` before every run. It
+selects a named permission profile that denies `:root`, reads `:minimal` plus
+the workspace's approved read-only sources, writes only the job's output
+folder, denies `$TMPDIR` and `/tmp`, and has no shell network; no `--sandbox`
+flag is ever passed (that would make Codex ignore the profile). Research uses
+Codex's live web search. Apps, hooks, plugins, multi-agent, browser and
+computer use, code mode, unified exec and skill search are disabled; project
+config discovery and `AGENTS.md` are off. The job's argv is fixed:
+`codex --strict-config --disable … exec --json --ephemeral
+--skip-git-repo-check --cd <output> --output-last-message <output>/result.md -`,
+with the task on stdin.
+
+**Containment and Stop.** Each job runs as its own launchd job
+(`com.opensoft.openswap.worker.job.<id>`) with an allowlisted environment, so
+the worker's own environment never reaches it. Stop, completion and recovery
+all end the same way: every process in the job's resource coalition is
+frozen, then killed, and the label is unloaded. `execution_stopped` is
+reported only when no member is left and the label is gone; otherwise the job
+is `interrupted` and the account lease stays quarantined until
+`openswap worker lease release`. A worker that crashes leaves the job
+running under launchd; the next worker start stops it and frees the lease
+only on that proof. Events reduce to `provider_started` and one
+`provider_finished`; model text, commands and URLs stay in the job's private
+run directory and in `result.md`.
+
+**The live check** runs, against the pinned account and with the live adapter
+exactly as jobs use it: the static tool-surface checks, a `codex sandbox`
+probe, one web-research job, one adversarial `codex exec` job that is asked to
+read and write outside its folder, read `CODEX_HOME`, print its environment,
+use the network and submit a launchd job (each outcome checked on disk and in
+the event stream, with positive controls so a refusal cannot pass), one job
+stopped while a `setsid()` helper runs, and one job whose launching worker
+process is killed and then recovered. It refuses while the worker is running
+unpaused, a job is active or a lease is held. The evidence file (mode 0600,
+under the worker directory's `live-evidence/`) holds pass/fail booleans and
+counts only, never model output or secrets; each job's folder (with its
+`result.md`) stays under the backup root's `live-check/<UTC time>/` for
+inspection. Only when every gate passes does
+it offer to enable live execution (`--enable` does so without asking,
+`--no-enable` never). It uses some of the account's quota.
 
 `worker status --json` includes `remote_connectivity` and
 `remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.

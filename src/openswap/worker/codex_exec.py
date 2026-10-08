@@ -343,8 +343,13 @@ class CodexExecAdapter:
         mode=None,
         monotonic=time.monotonic,
         sleep=time.sleep,
+        bind_to_opt_in: bool = True,
     ):
         self.backup_root = Path(backup_root)
+        # The live check runs before (or to renew) the opt-in, so it checks
+        # the binary it verified itself rather than the one an older opt-in
+        # recorded.
+        self._bind_to_opt_in = bind_to_opt_in
         self._containment = containment
         self._verify = verify or (lambda **kw: codex_cli.verify(self.backup_root, **kw))
         self._mode = mode or (lambda: execution_mode(self.backup_root))
@@ -371,6 +376,8 @@ class CodexExecAdapter:
 
     def _pinned(self, *, check_version: bool):
         pinned = self._verify(check_version=check_version)
+        if not self._bind_to_opt_in:
+            return pinned
         expected = load_live_execution(self.backup_root).codex_sha256
         if expected is not None and pinned.binary_sha256 != expected:
             raise codex_cli.CodexCliError("binary_not_the_checked_one")
