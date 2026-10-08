@@ -1156,3 +1156,17 @@ def test_an_unproven_finish_is_retried_and_stays_recoverable(tmp_path):
     # Still registered: a later interrupt retries the sweep and can prove it.
     assert adapter.interrupt(run) == InterruptResult(True, True, None)
     assert containment.stops == 4 and adapter._runs == {}
+
+
+
+def test_a_failed_login_is_a_failure_even_with_this_accounts_old_credentials(tmp_path):
+    _roster(tmp_path, {"1": ACCOUNT_ID})
+    home = codex_exec.prepare_home(tmp_path, IDENTITY)
+    (home / "auth.json").write_text(auth_json(ACCOUNT_ID))  # stale credentials of this account
+
+    def failing(argv, env, check=False, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    with pytest.raises(live_cli.AccountPinError) as error:
+        live_cli.login(tmp_path, "1", run=failing, verify=pinned)
+    assert error.value.code == "login_failed"

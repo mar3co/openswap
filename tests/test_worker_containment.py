@@ -863,3 +863,17 @@ def test_a_real_zombie_has_a_stable_identity_and_an_exited_pid_none():
     finally:
         child.wait()
     assert procs.zombie_identity(pid) is None
+
+
+
+def test_polling_exit_status_recreates_the_lock_directory_privately(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    (handle.run_dir / "exit").write_text("0\n")
+    for lock in containment._lock_dir.iterdir():
+        lock.unlink()
+    containment._lock_dir.rmdir()  # e.g. the cache folder was cleared
+    assert containment.exit_status(handle) == 0
+    if os.name == "posix":
+        assert (containment._lock_dir.stat().st_mode & 0o777) == 0o700
+    assert containment.stop(handle).stopped is True  # later operations still work

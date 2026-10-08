@@ -115,8 +115,12 @@ def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
                 # The other account's credentials are still there: say so.
                 raise AccountPinError("login_account_mismatch_still_signed_in")
             raise AccountPinError("login_account_mismatch")
+    if result.returncode != 0:
+        # Even with this account's (possibly stale) credentials still in the
+        # home: a login that failed proves nothing about them.
+        raise AccountPinError("login_failed")
     if signed_in != identity:
-        raise AccountPinError("login_not_completed" if result.returncode == 0 else "login_failed")
+        raise AccountPinError("login_not_completed")
     return {"slot": choice.number, "account_ref": identity, "signed_in": True}
 
 

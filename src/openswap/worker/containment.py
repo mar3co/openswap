@@ -542,9 +542,9 @@ class LaunchdContainment:
             # The run directory is claimed too, whatever the label: two
             # launches into one directory would share its wrapper files.
             try:
-                dir_lock = FileLock(self._lock_dir / f"rundir-{_run_dir_key(run_dir)}.lock", timeout=0)
+                dir_lock = self._run_dir_lock(run_dir, 0)
                 dir_acquired = dir_lock.acquire(timeout=0)
-            except OSError:
+            except (OSError, ContainmentError):
                 raise ContainmentError("label_lock_unavailable") from None
             if not dir_acquired:
                 raise ContainmentError("run_dir_in_use")
@@ -664,9 +664,9 @@ class LaunchdContainment:
         a replacement launch can never slip its own ``exit`` in between.
         """
         try:
-            dir_lock = FileLock(self._lock_dir / f"rundir-{_run_dir_key(handle.run_dir)}.lock", timeout=0)
+            dir_lock = self._run_dir_lock(handle.run_dir, 0)
             held = dir_lock.acquire(timeout=0)
-        except OSError:
+        except (OSError, ContainmentError):
             return None
         if not held:
             return None  # a launch into this directory is in progress: not ours
@@ -737,10 +737,18 @@ class LaunchdContainment:
         except OSError:
             pass
 
-    def _label_lock(self, label: str) -> FileLock:
+    def _private_lock(self, name: str, timeout: float) -> FileLock:
+        """A lock in the private lock directory, created (0700) and checked first,
+        so no caller can leave it behind with the lock library's default mode."""
         self._lock_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         ensure_private_dir(self._lock_dir)
-        return FileLock(self._lock_dir / f"{label}.lock", timeout=0)
+        return FileLock(self._lock_dir / name, timeout=timeout)
+
+    def _label_lock(self, label: str) -> FileLock:
+        return self._private_lock(f"{label}.lock", 0)
+
+    def _run_dir_lock(self, run_dir: Path, timeout: float) -> FileLock:
+        return self._private_lock(f"rundir-{_run_dir_key(run_dir)}.lock", timeout)
 
     def _owns_label(self, handle: JobHandle) -> bool | None:
         """Whether the loaded label is this handle's job: ``None`` when nothing is loaded.
@@ -779,9 +787,9 @@ class LaunchdContainment:
             # Check and delete under the run directory's lock, which every
             # launch into it holds, so a replacement's mirror is never removed.
             try:
-                dir_lock = FileLock(self._lock_dir / f"rundir-{_run_dir_key(handle.run_dir)}.lock", timeout=5)
+                dir_lock = self._run_dir_lock(handle.run_dir, 5)
                 held = dir_lock.acquire()
-            except OSError:
+            except (OSError, ContainmentError):
                 held = False
             if held:
                 try:
