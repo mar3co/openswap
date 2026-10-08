@@ -1269,11 +1269,14 @@ Stacked on the live-check PR:
   trust-on-first-use; jobs run with the auto-updater off, and an update needs a
   re-pin and a new live check (the opt-in is bound to the binary).
 - **Profile.** The account's OpenSwap-managed session profile (plan 003,
-  `CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`), prepared once by the
-  owner with `openswap worker claude prepare` under the Claude lease. A launch
-  refuses unlaunched (`provider_auth_unavailable`) unless the profile is
-  signed in as the leased identity, and (`provider_unavailable`) while an
-  interactive live session uses that profile. The worker never reads, uploads,
+  `CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`), signed in once by the
+  owner with `openswap worker claude prepare`, which runs the pinned Claude
+  Code's own `claude auth login` into that profile under the Claude lease
+  (OpenSwap seeds no credential). A launch refuses unlaunched
+  (`provider_auth_unavailable`) unless the profile is signed in as the leased
+  identity, and (`provider_unavailable`) while an interactive live session
+  uses that profile or while it mirrors the default profile's customizations
+  (scheduled kickoff's sharing). The worker never reads, uploads,
   proxies or logs a credential, and never changes the default login; the CLI
   owns refresh.
 - **Adapter (`worker/claude_exec.py`).** `claude -p --output-format
@@ -1309,7 +1312,7 @@ denied; job folder and profile allowed); full suite green.
 openswap worker pause
 openswap worker account claude:<slot>    # pin the Claude account
 openswap worker claude pin               # pin the installed claude binary
-openswap worker claude prepare           # set up that account's profile (no default-login change)
+openswap worker claude prepare           # Claude's own sign-in into that account's profile (browser)
 openswap worker live-check --provider claude   # answer y to enable if all gates pass
 openswap worker pause --off
 ```

@@ -469,8 +469,9 @@ and an absent field with no pin fails it `provider_unavailable`, in both cases
 before any lease, reconciled `failed` with `unlaunched=true`; another account
 is never substituted. With no pin, the remote client still claims work while
 the backend acknowledged a non-empty set and an allowed account is in the
-roster. With a pin, it claims work only while the pinned account's
-provider can run, since a claim without `account_ref` runs on the pin. The reference service implements `accounts`, accepts `account_ref`
+roster. The worker polls only while every provider a claim could
+need (the pin's and each allowed account's) can run, since the service may
+hand out a claim for any of them. The reference service implements `accounts`, accepts `account_ref`
 only when the worker currently advertises it, and `submit-test` takes
 `--account-ref`.
 
@@ -585,7 +586,7 @@ Live execution for Claude is a separate opt-in from Codex's, off by default.
 openswap worker pause                          # if the worker is running
 openswap worker account claude:4               # pin the Claude account (or allow it for a per-job choice)
 openswap worker claude pin                     # record the installed claude binary's version and SHA-256
-openswap worker claude prepare                 # set up that account's OpenSwap profile
+openswap worker claude prepare                 # sign that account in to its OpenSwap profile (Claude's own login)
 openswap worker live-check --provider claude   # short real jobs, evidence file, then offers to enable
 openswap worker pause --off
 ```
@@ -604,12 +605,17 @@ A `claude` installed inside `~/.claude` (the old npm-local layout) is refused,
 because jobs cannot read that folder.
 
 **Account.** Each Claude account runs from its OpenSwap session profile
-(`CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`, the same profiles live
-Claude sessions use), which `claude prepare` sets up under the Claude account
-lease. Your default Claude login (`~/.claude`, `~/.claude.json` and its
-Keychain item) is never changed; after preparation only Claude Code signs in,
-stores and refreshes tokens in that profile, and the worker never reads,
-uploads, proxies or logs a credential. A launch refuses without starting
+(`CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`, the same folders live
+Claude sessions use). If that profile is not signed in as the account,
+`claude prepare` runs the pinned Claude Code's own `claude auth login
+--claudeai --email <account>` with `CLAUDE_CONFIG_DIR` set to it, while holding
+the Claude account lease; Claude Code then keeps the sign-in in the profile's
+own Keychain item. OpenSwap never reads, copies or seeds a credential for
+this, and your default Claude login (`~/.claude`, `~/.claude.json` and its
+Keychain item) is never changed. A sign-in to a different account is signed
+straight back out. A profile already signed in is left as it is. Only Claude
+Code refreshes tokens, and the worker never reads, uploads, proxies or logs a
+credential. A launch refuses without starting
 anything (`provider_auth_unavailable`, `unlaunched=true`) unless the profile
 is signed in as the job's account, and (`provider_unavailable`) while an
 interactive session is using that profile or while the profile mirrors

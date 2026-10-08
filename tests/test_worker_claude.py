@@ -443,32 +443,6 @@ def test_claude_evidence_enables_only_claude_and_only_for_its_binary(tmp_path):
 # -- profile preparation ----------------------------------------------------------------------
 
 
-def test_prepare_uses_the_session_profile_mechanism_without_a_conflicting_lease(tmp_path):
-    root = setup_root(tmp_path, prepared=False)
-    seen = []
-
-    def prepare(number):
-        # setup_session asserts that no Claude lease is active: prepare must not hold one.
-        with AccountLeaseStore(root, "claude").mutation_guard() as guard:
-            guard.assert_available()
-        seen.append((number, AccountLeaseStore(root, "claude").read_current()))
-        profile = claude_exec.profile_for(root, IDENTITY)
-        profile.mkdir(parents=True, mode=0o700)
-        (profile / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": EMAIL,
-                                                                           "organizationUuid": ORG}}))
-
-    result = live_cli.claude_prepare(root, "claude:4", prepare=prepare)
-    assert result == {"slot": "4", "account_ref": IDENTITY, "profile_ready": True}
-    assert seen == [("4", None)]
-
-
-def test_prepare_refuses_a_profile_logged_in_elsewhere(tmp_path):
-    root = setup_root(tmp_path, prepared=True, profile_email="other@example.com")
-    with pytest.raises(live_cli.AccountPinError) as error:
-        live_cli.claude_prepare(root, "4", prepare=lambda number: None)
-    assert error.value.code == "claude_profile_not_ready"
-
-
 # -- the Claude live check, simulated -------------------------------------------------------------
 
 
@@ -622,32 +596,6 @@ def test_enabling_from_a_claude_check_names_claude_in_the_opt_out(tmp_path, monk
 
 
 
-def test_prepare_refuses_while_a_claude_job_holds_the_lease(tmp_path):
-    root = setup_root(tmp_path, prepared=False)
-    AccountLeaseStore(root, "claude").acquire(job_id="b" * 32, account_identity=IDENTITY, worker_pid=os.getpid(),
-                                              worker_epoch=1, ttl_s=60)
-
-    def prepare(number):  # what SessionManager.setup_session does first
-        with AccountLeaseStore(root, "claude").mutation_guard() as guard:
-            guard.assert_available()
-
-    with pytest.raises(LeaseConflictError):
-        live_cli.claude_prepare(root, "claude:4", prepare=prepare)
-
-
-
-def test_prepare_leaves_a_ready_profile_alone_and_refuses_during_a_job(tmp_path):
-    root = setup_root(tmp_path, prepared=True)
-    calls = []
-    result = live_cli.claude_prepare(root, "claude:4", prepare=lambda number: calls.append(number))
-    assert result["profile_ready"] is True and calls == []  # nothing rewritten
-    AccountLeaseStore(root, "claude").acquire(job_id="b" * 32, account_identity=IDENTITY, worker_pid=os.getpid(),
-                                              worker_epoch=1, ttl_s=60)
-    with pytest.raises(LeaseConflictError):
-        live_cli.claude_prepare(root, "claude:4", prepare=lambda number: calls.append(number))
-    assert calls == []
-
-
 def test_a_replaced_pin_between_probe_and_start_is_an_unlaunched_refusal(tmp_path):
     root = setup_root(tmp_path)
     write_live_execution(root, LiveExecutionSettings(True, "ab" * 32, "00" * 32, "now"), "claude")
@@ -675,12 +623,15 @@ def test_a_profile_sharing_the_default_customizations_is_refused_and_prepare_cle
 
     calls = []
 
-    def unshare(number):  # what setup_session(share=False) does on reuse
-        calls.append(number)
-        (profile / SHARE_MANIFEST).unlink()
+    def unshare(path):  # removes the mirrored links and the manifest
+        calls.append(path)
+        (path / SHARE_MANIFEST).unlink()
 
-    assert live_cli.claude_prepare(root, "claude:4", prepare=unshare)["profile_ready"] is True
-    assert calls == ["4"]
+    def no_login(argv, **kwargs):
+        raise AssertionError("already signed in: no login")
+
+    result = live_cli.claude_prepare(root, "claude:4", run=no_login, verify=lambda: pinned(), unshare=unshare)
+    assert result["profile_ready"] is True and calls == [profile]
 
 
 def test_a_link_into_the_default_profile_counts_as_shared(tmp_path):
@@ -693,15 +644,27 @@ def test_a_link_into_the_default_profile_counts_as_shared(tmp_path):
     assert claude_exec.profile_shared(profile, home) is True
 
 
-def test_polling_follows_the_pinned_provider_only(tmp_path):
-    root = setup_root(tmp_path)
-    runtime, codex, claude = _runtime(root, CODEX_IDENTITY)
+def test_polling_needs_every_provider_a_claim_could_select(tmp_path):
     from openswap.worker.models import ProviderAvailability
 
-    codex.probe = lambda: ProviderAvailability(False, "live_adapter_disabled", None)
-    claude.probe = lambda: ProviderAvailability(True, None, "2.1.285 (Claude Code)")
+    root = setup_root(tmp_path)
+    runtime, codex, claude = _runtime(root, CODEX_IDENTITY)
+    on = lambda: ProviderAvailability(True, None, "v")  # noqa: E731
+    off = lambda: ProviderAvailability(False, "live_adapter_disabled", None)  # noqa: E731
+    codex.probe, claude.probe = off, on
     assert runtime._candidate_providers() == ["codex"]
-    assert runtime.provider_availability().available is False
+    assert runtime.provider_availability().available is False  # the pin's provider is off
+    codex.probe = on
+    assert runtime.provider_availability().available is True
+    # An allowlisted Claude account the service may choose: its provider must be on too.
+    from openswap.worker.cli import allow_worker_account
+
+    allow_worker_account(root, "claude:4")
+    assert runtime._candidate_providers() == ["codex", "claude"]
+    claude.probe = off
+    assert runtime.provider_availability().diagnostic_code == "live_adapter_disabled"
+    claude.probe = on
+    assert runtime.provider_availability().available is True
 
 
 
@@ -776,3 +739,69 @@ def test_a_held_claude_lease_points_at_the_claude_store(tmp_path):
         check.run()
     assert error.value.code == "lease_held"
     assert "`openswap worker lease release --provider claude`" in str(error.value)
+
+
+def _native_login(root, email=EMAIL, code=0):
+    """A stand-in for `claude auth login`: signs the profile in CLAUDE_CONFIG_DIR in."""
+    calls = []
+
+    def run(argv, env, check=False, **kwargs):
+        calls.append((list(argv), dict(env), AccountLeaseStore(root, "claude").read_current()))
+        profile = Path(env["CLAUDE_CONFIG_DIR"])
+        if argv[1:3] == ["auth", "login"] and email is not None:
+            (profile / ".claude.json").write_text(json.dumps(
+                {"oauthAccount": {"emailAddress": email, "organizationUuid": ORG}}))
+        elif argv[1:3] == ["auth", "logout"]:
+            (profile / ".claude.json").unlink(missing_ok=True)
+        return subprocess.CompletedProcess(argv, code, "", "")
+
+    run.calls = calls
+    return run
+
+
+def test_prepare_signs_in_with_claudes_own_login_under_the_claude_lease(tmp_path, monkeypatch):
+    from openswap.session import SessionManager
+
+    monkeypatch.setattr(SessionManager, "setup_session",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no credential seeding")))
+    root = setup_root(tmp_path, prepared=False)
+    run = _native_login(root)
+    result = live_cli.claude_prepare(root, "claude:4", run=run, verify=lambda: pinned())
+    assert result == {"slot": "4", "account_ref": IDENTITY, "profile_ready": True, "signed_in_now": True}
+    argv, env, lease = run.calls[0]
+    profile = claude_exec.profile_for(root, IDENTITY)
+    assert argv == ["/fake/claude", "auth", "login", "--claudeai", "--email", EMAIL]
+    assert env["CLAUDE_CONFIG_DIR"] == str(profile) and "ANTHROPIC_API_KEY" not in env
+    assert lease is not None and lease.state == "active" and lease.account_identity == IDENTITY
+    assert AccountLeaseStore(root, "claude").read_current().state == "released"
+    assert not (profile / ".credentials.json").exists()  # nothing seeded by OpenSwap
+
+
+def test_prepare_signs_a_different_account_back_out(tmp_path):
+    root = setup_root(tmp_path, prepared=False)
+    run = _native_login(root, email="someone@example.com")
+    with pytest.raises(live_cli.AccountPinError) as error:
+        live_cli.claude_prepare(root, "claude:4", run=run, verify=lambda: pinned())
+    assert error.value.code == "login_account_mismatch"
+    assert [call[0][1:3] for call in run.calls] == [["auth", "login"], ["auth", "logout"]]
+    assert AccountLeaseStore(root, "claude").read_current().state == "released"
+
+
+def test_prepare_reports_a_failed_login(tmp_path):
+    root = setup_root(tmp_path, prepared=False)
+    with pytest.raises(live_cli.AccountPinError) as error:
+        live_cli.claude_prepare(root, "claude:4", run=_native_login(root, email=None, code=1), verify=lambda: pinned())
+    assert error.value.code == "login_failed"
+
+
+def test_prepare_leaves_a_ready_profile_alone_and_refuses_during_a_job(tmp_path):
+    root = setup_root(tmp_path, prepared=True)
+    run = _native_login(root)
+    result = live_cli.claude_prepare(root, "claude:4", run=run, verify=lambda: pinned())
+    assert result["profile_ready"] is True and result["signed_in_now"] is False and run.calls == []
+    AccountLeaseStore(root, "claude").acquire(job_id="b" * 32, account_identity=IDENTITY, worker_pid=os.getpid(),
+                                              worker_epoch=1, ttl_s=60)
+    with pytest.raises(LeaseConflictError):
+        live_cli.claude_prepare(root, "claude:4", run=run, verify=lambda: pinned())
+    assert run.calls == []
+

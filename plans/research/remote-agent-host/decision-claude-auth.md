@@ -21,12 +21,13 @@ What the implementation does under this decision (plan 017, phase 1):
   update the owner re-pins and re-runs the live check.
 - Selects the account through its OpenSwap-managed Claude profile (plan 003
   session profiles: `CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`),
-  prepared by the owner with `openswap worker claude prepare`. The owner's
-  default Claude login (`~/.claude`, `~/.claude.json` and its Keychain item)
+  signed in by the owner with `openswap worker claude prepare`, which runs
+  the binary's own `claude auth login` into that profile (OpenSwap seeds no
+  credential; Claude Code keeps the sign-in in the profile's own Keychain
+  item). The owner's default Claude login (`~/.claude`, `~/.claude.json` and its Keychain item)
   is never changed; the live check records its metadata before and after
   and fails if it moved.
-- After preparation, the CLI alone signs in, stores and refreshes tokens in
-  that profile. The worker never reads, uploads, proxies or logs a
+- The CLI alone signs in, stores and refreshes tokens in that profile. The worker never reads, uploads, proxies or logs a
   credential, and the job environment is an allowlist without API keys.
 - Restricts each job to research tools (`Read`, `Grep`, `Glob`, `WebSearch`,
   `WebFetch`; `--restricted`, `dontAsk`, no MCP, no slash commands, no

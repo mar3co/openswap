@@ -205,17 +205,43 @@ _MUTATING = {("codex", "install"), ("codex", "login"), ("codex", "logout"), ("li
              ("live", "disable"), ("claude", "pin"), ("claude", "prepare")}
 
 
-def claude_prepare(backup_root: Path, selector: str | None, *, prepare=None) -> dict:
-    """Prepare (or refresh) a Claude account's OpenSwap session profile for remote jobs.
+def _unshare_profile(profile: Path) -> None:
+    """Remove what scheduled kickoff mirrored from ``~/.claude`` (links and MCP mirror only)."""
+    from openswap.session import SessionManager
+    from openswap.switcher import ClaudeAccountSwitcher
 
-    Uses the same session-profile mechanism scheduled kickoff uses, with
-    nothing shared from ``~/.claude`` (``share=False``). No lease is taken
-    here: ``setup_session`` itself holds the Claude mutation guard and refuses
-    while any Claude lease is active, which is also what serializes it with a
-    worker launch (whose lease acquisition takes the same guard). Remote jobs
-    then run with ``CLAUDE_CONFIG_DIR`` pointing at it; the owner's default
-    login is untouched.
+    SessionManager(ClaudeAccountSwitcher())._sync_sharing(profile, share=False, share_history=False)
+
+
+def _claude_login_env(profile: Path) -> dict[str, str]:
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": str(Path.home()),
+        # The exact string jobs export: Claude Code derives the profile's own
+        # Keychain item from it, so the default login's item is never used.
+        "CLAUDE_CONFIG_DIR": str(profile),
+        "DISABLE_AUTOUPDATER": "1",
+    }
+    for name in ("TERM", "USER", "LOGNAME", "LANG"):
+        if os.environ.get(name):
+            env[name] = os.environ[name]
+    return env
+
+
+def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.run, verify=None,
+                   unshare=None) -> dict:
+    """Get a Claude account's OpenSwap profile ready for remote jobs, with Claude's own login.
+
+    The profile is the account's OpenSwap session folder (plan 003). If it is
+    not signed in as this account, the pinned Claude Code signs in there itself
+    (`claude auth login`, with ``CLAUDE_CONFIG_DIR`` set to the profile), so
+    OpenSwap never reads, copies or seeds a credential, and the default login
+    (``~/.claude`` and its Keychain item) is never touched. Customizations a
+    scheduled kickoff mirrored into it are removed. A profile already signed
+    in and unshared is left exactly as it is. The Claude lease is held during
+    the login, so no job launches on the profile meanwhile.
     """
+    from openswap.worker import claude_cli
     from openswap.worker.accounts import resolve_account_selector, resolve_claude_selector
     from openswap.worker.claude_exec import profile_for, profile_identity, profile_shared
 
@@ -229,35 +255,54 @@ def claude_prepare(backup_root: Path, selector: str | None, *, prepare=None) -> 
         choice = resolve_account_selector(root, selector)
     except AccountPinError:
         choice = None
-    if choice is None or choice.provider != "claude":
+    if choice is None or choice.provider != "claude" or not getattr(choice, "email", None):
         # A bare slot means a Codex slot first; here only Claude makes sense.
-        choice = resolve_claude_selector(root, selector)
+        choice = resolve_claude_selector(root, selector if choice is None or choice.provider != "claude"
+                                         else choice.account_ref)
     identity = choice.account_ref
+    profile = profile_for(root, identity)
+    if profile is None:
+        raise AccountPinError("account_not_found")
 
-    def default_prepare(number: str) -> None:
-        from openswap.session import SessionManager
-        from openswap.switcher import ClaudeAccountSwitcher
-
-        SessionManager(ClaudeAccountSwitcher()).setup_session(number, share=False)
+    def ready() -> bool:
+        return profile.is_dir() and profile_identity(profile) == identity and not profile_shared(profile)
 
     store = AccountLeaseStore(root, "claude")
     with store.mutation_guard() as guard:
-        # Under the guard every Claude lease change takes: refuse while a job
-        # (or anything else) holds a Claude lease, and leave a profile that is
-        # already signed in as this account exactly as it is.
+        # Refuse while a job (or anything else) holds a Claude lease.
         guard.assert_available()
-        existing = profile_for(root, identity)
-        if existing is not None and profile_identity(existing) == identity and not profile_shared(existing):
-            return {"slot": choice.number, "account_ref": identity, "profile_ready": True}
-    # Not ready, or sharing the default profile's customizations: setup_session
-    # (share=False) takes the same guard itself on a fresh setup, and on reuse
-    # removes the mirrored items; a job launch refuses a shared profile meanwhile.
-    (prepare or default_prepare)(choice.number)
-    profile = profile_for(root, identity)
-    ready = profile is not None and profile_identity(profile) == identity and not profile_shared(profile)
-    if not ready:
+        if ready():
+            return {"slot": choice.number, "account_ref": identity, "profile_ready": True, "signed_in_now": False}
+    pinned = (verify or (lambda: claude_cli.verify(root)))()
+    if profile.is_dir() and profile_shared(profile):
+        (unshare or _unshare_profile)(profile)
+    signed_in_now = False
+    if not (profile.is_dir() and profile_identity(profile) == identity):
+        profile.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        profile.mkdir(mode=0o700, exist_ok=True)
+        env = _claude_login_env(profile)
+        with store.mutation_guard() as guard:
+            guard.assert_available()
+            token = guard.acquire(job_id=f"prepare-{uuid.uuid4().hex}", account_identity=identity,
+                                  worker_pid=os.getpid(), worker_epoch=time.time_ns(), ttl_s=LOGIN_LEASE_SECONDS)
+        try:
+            result = run([str(pinned.binary), "auth", "login", "--claudeai", "--email", choice.email],
+                         env=env, check=False)
+            signed = profile_identity(profile)
+            if signed is not None and signed != identity:
+                # Signed in as someone else: sign that account back out of the profile.
+                cleanup = run([str(pinned.binary), "auth", "logout"], env=env, check=False, capture_output=True)
+                if cleanup.returncode != 0 or profile_identity(profile) is not None:
+                    raise AccountPinError("login_account_mismatch_still_signed_in")
+                raise AccountPinError("login_account_mismatch")
+        finally:
+            store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+        if result.returncode != 0:
+            raise AccountPinError("login_failed")
+        signed_in_now = True
+    if not ready():
         raise AccountPinError("claude_profile_not_ready")
-    return {"slot": choice.number, "account_ref": identity, "profile_ready": True}
+    return {"slot": choice.number, "account_ref": identity, "profile_ready": True, "signed_in_now": signed_in_now}
 
 
 def claude_status(backup_root: Path) -> dict:
@@ -419,6 +464,9 @@ def _claude_command(root: Path, args) -> int:
             lines.append(f"  claude:{name}: {ready}" + (f" [{', '.join(marks)}]" if marks else ""))
         _emit(status, args.json, "\n".join(lines))
         return 0 if cli["pinned"] else 1
+    if not args.json:
+        print("If that account is not signed in to its OpenSwap profile yet, Claude Code opens its own "
+              "sign-in in your browser.")
     result = claude_prepare(root, args.selector)
     _emit(result, args.json, f"Claude account {result['slot']}'s OpenSwap profile is ready for remote jobs. "
                              "Your default Claude login was not changed.")

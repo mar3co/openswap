@@ -419,32 +419,33 @@ class WorkerRuntime:
         return self.adapters.get(provider_of(identity) or "codex", self.adapter)
 
     def _candidate_providers(self) -> list[str]:
-        pinned = provider_of(self.account_identity)
-        if pinned is not None:
-            # A claim without an account_ref runs on the pin, and polling
-            # cannot ask for scoped claims only: poll only while the pin's
-            # provider can run, or such a claim would be taken just to fail.
-            return [pinned]
+        """Every provider the next claim could run on: the pin's and each allowlisted account's."""
         policy = load_worker_settings(self.backup_root)
         providers = []
-        for identity in (entry.identity for entry in policy.account_allowlist):
+        for identity in (self.account_identity, *(entry.identity for entry in policy.account_allowlist)):
             provider = provider_of(identity)
             if provider is not None and provider not in providers:
                 providers.append(provider)
         return providers or ["codex"]
 
     def provider_availability(self) -> ProviderAvailability:
-        """Whether a job could launch now: the pinned account's provider (with no pin, an allowlisted one's)."""
-        first = None
+        """Whether any claim could launch now: every provider it might need is available.
+
+        Polling cannot ask for claims on one provider only: the service may
+        hand out a claim for the pin (no ``account_ref``) or for any advertised
+        account. So the worker polls only while all of those providers can
+        run, or such a claim would be taken just to fail.
+        """
+        found = None
         for provider in self._candidate_providers():
             try:
                 availability = self.adapters[provider].probe()
             except Exception:
                 availability = ProviderAvailability(False, "provider_unavailable", None)
-            if availability.available:
+            if not availability.available:
                 return availability
-            first = first or availability
-        return first or ProviderAvailability(False, "provider_unavailable", None)
+            found = found or availability
+        return found or ProviderAvailability(False, "provider_unavailable", None)
 
     def _resolve_launch_account(self, job: JobRecord) -> tuple[str | None, str | None]:
         """``(identity, None)`` for this launch, or ``(None, diagnostic)``; under the launch lock.
