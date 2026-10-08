@@ -65,21 +65,22 @@ def _emit(payload: dict, as_json: bool, human: str) -> None:
 
 
 @contextmanager
-def account_session_lease(backup_root: Path, identity: str, purpose: str):
-    """Hold the Codex lease for a short owner action on one account.
+def selected_account_lease(backup_root: Path, selector: str | None, purpose: str):
+    """Resolve ``selector`` and take that account's Codex lease atomically.
 
-    A login or logout rewrites the isolated home's ``auth.json``; holding the
-    one-per-host lease meanwhile keeps the worker from launching on it (and
-    keeps switch/move/remove off that account). Released as stopped once the
-    child process has exited.
+    Both happen under one hold of the Codex mutation guard, which `codex
+    move`, switch and remove also take, so the slot cannot change between
+    resolving it and leasing the account it named. Yields the choice.
     """
-    store = AccountLeaseStore(Path(backup_root), identity.split(":", 1)[0])
-    token = store.acquire(
-        job_id=f"{purpose}-{uuid.uuid4().hex}", account_identity=identity,
-        worker_pid=os.getpid(), worker_epoch=time.time_ns(), ttl_s=LOGIN_LEASE_SECONDS,
-    )
+    store = AccountLeaseStore(Path(backup_root), "codex")
+    with store.mutation_guard() as guard:
+        choice = _resolve(Path(backup_root), selector)
+        token = guard.acquire(
+            job_id=f"{purpose}-{uuid.uuid4().hex}", account_identity=choice.account_ref,
+            worker_pid=os.getpid(), worker_epoch=time.time_ns(), ttl_s=LOGIN_LEASE_SECONDS,
+        )
     try:
-        yield
+        yield choice
     finally:
         store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
 
@@ -112,12 +113,11 @@ def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
           run=subprocess.run, verify=None, managed=None) -> dict:
     """Sign one roster account in to its isolated home with Codex's own login."""
     root = Path(backup_root)
-    choice = _resolve(root, selector)
-    identity = choice.account_ref
     pinned = (verify or (lambda: codex_cli.verify(root)))()
     argv = [str(pinned.binary), "login"] + (["--device-auth"] if device_auth else [])
-    with account_session_lease(root, identity, "login"):
+    with selected_account_lease(root, selector, "login") as choice:
         # Under the lease: a job running on this account owns its home's config.
+        identity = choice.account_ref
         home = prepare_home(root, identity)
         _refuse_managed(home, managed)
         env = _login_env(home)
@@ -140,12 +140,11 @@ def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
 
 def logout(backup_root: Path, selector: str | None, *, run=subprocess.run, verify=None, managed=None) -> dict:
     root = Path(backup_root)
-    choice = _resolve(root, selector)
-    identity = choice.account_ref
-    home = isolated_home(root, identity)
     pinned = (verify or (lambda: codex_cli.verify(root)))()
-    with account_session_lease(root, identity, "logout"):
+    with selected_account_lease(root, selector, "logout") as choice:
         # Under the lease, so a login in progress finishes (or fails) first.
+        identity = choice.account_ref
+        home = isolated_home(root, identity)
         _refuse_managed(home, managed)
         if not os.path.lexists(home / "auth.json"):
             return {"slot": choice.number, "account_ref": identity, "signed_in": False}
