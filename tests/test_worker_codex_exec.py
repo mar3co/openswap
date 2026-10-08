@@ -1415,3 +1415,31 @@ def test_a_copied_opt_in_never_lends_its_accounts_to_a_new_check(tmp_path, monke
     second = tmp_path / "second.json"
     second.write_text(json.dumps(passing_evidence(account={"identity": other, "slot": "2"})))
     assert live.enable_live(tmp_path, second, pinned()).accounts == (IDENTITY, other)
+
+
+
+def _codex_status(**overrides):
+    other = stable_account_identity("codex", "acct-other")
+    status = {"cli": {"installed": True, "version": "codex-cli 0.157.1"}, "execution_mode": "disabled",
+              "checked_accounts": [],
+              "accounts": [{"slot": "1", "alias": None, "account_ref": IDENTITY, "pinned": True, "allowed": True,
+                            "isolated_sign_in": True},
+                           {"slot": "2", "alias": None, "account_ref": other, "pinned": False, "allowed": True,
+                            "isolated_sign_in": False}]}
+    status.update(overrides)
+    return status, other
+
+
+def test_codex_status_picks_pin_and_login_before_the_live_check():
+    status, other = _codex_status()
+    status["accounts"][0]["pinned"] = False
+    assert "openswap worker account <slot>" in live_cli._codex_next_step(status)  # no live-check without a pin
+    status, other = _codex_status()
+    assert "openswap worker codex login 2" in live_cli._codex_next_step(status)
+    status["accounts"][1]["isolated_sign_in"] = True
+    assert live_cli._codex_next_step(status).endswith("`openswap worker live-check`.")
+    status["execution_mode"] = "live"
+    status["checked_accounts"] = [IDENTITY]
+    assert "--account 2" in live_cli._codex_next_step(status)  # not "nothing remains"
+    status["checked_accounts"] = [IDENTITY, other]
+    assert live_cli._codex_next_step(status).startswith("nothing")

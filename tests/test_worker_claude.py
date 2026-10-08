@@ -987,3 +987,42 @@ def test_the_readiness_report_follows_the_pinned_provider(tmp_path):
     codex.execution_mode = "live"
     assert RemoteClient._readiness(SimpleNamespace(runtime=runtime), load_worker_settings(root))["execution"] == \
         "disabled"
+
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks")
+def test_status_never_calls_a_profile_under_a_symlinked_ancestor_ready(tmp_path):
+    root = setup_root(tmp_path)
+    claude_cli.pin(root, binary=fake_claude(tmp_path))
+    sessions = root / "sessions"
+    moved = tmp_path / "moved-sessions"
+    sessions.rename(moved)
+    sessions.symlink_to(moved)
+    ready = {a["slot"]: a["profile_ready"] for a in live_cli.claude_status(root)["accounts"]}
+    assert ready == {"4": False}
+
+
+def _claude_status(**overrides):
+    status = {"cli": {"pinned": True, "version": "2.1.285 (Claude Code)"}, "execution_mode": "disabled",
+              "checked_accounts": [],
+              "accounts": [{"slot": "4", "alias": None, "account_ref": IDENTITY, "pinned": True, "allowed": True,
+                            "profile_ready": True},
+                           {"slot": "5", "alias": None, "account_ref": "claude:" + "5" * 64, "pinned": False,
+                            "allowed": True, "profile_ready": False}]}
+    status.update(overrides)
+    return status
+
+
+def test_claude_status_picks_pin_and_prepare_before_the_live_check():
+    status = _claude_status()
+    status["accounts"][0]["pinned"] = False
+    assert "openswap worker account claude:<slot>" in live_cli._claude_next_step(status)
+    status = _claude_status()
+    assert "openswap worker claude prepare claude:5" in live_cli._claude_next_step(status)
+    status["accounts"][1]["profile_ready"] = True
+    assert "live-check --provider claude`" in live_cli._claude_next_step(status)
+    status["execution_mode"] = "live"
+    status["checked_accounts"] = [IDENTITY]
+    assert "--account claude:5" in live_cli._claude_next_step(status)
+    status["checked_accounts"] = [IDENTITY, "claude:" + "5" * 64]
+    assert live_cli._claude_next_step(status).startswith("nothing")

@@ -207,16 +207,60 @@ def _format_codex_status(status: dict) -> str:
         lines.append("  No eligible Codex accounts in the roster. Add one with `openswap codex add`.")
     lines.extend(printer.columns(_account_status_rows(status["accounts"], "isolated_sign_in",
                                                       "signed in", "not signed in")))
-    if not cli["installed"]:
-        lines.append(printer.next_step("install the pinned CLI: `openswap worker codex install`."))
-    elif any(a["pinned"] and not a["isolated_sign_in"] for a in status["accounts"]):
-        lines.append(printer.next_step("sign the default account in: `openswap worker codex login`."))
-    elif not live:
-        lines.append(printer.next_step("run the live check and enable live execution: "
-                                       "`openswap worker live-check`."))
-    else:
-        lines.append(printer.next_step("nothing: live execution is on. `openswap worker live disable` turns it off."))
+    lines.append(printer.next_step(_codex_next_step(status)))
     return "\n".join(lines)
+
+
+def _unchecked(status: dict, account: dict) -> bool:
+    """Whether a live check is still missing for this account (only known when the status says)."""
+    checked = status.get("checked_accounts")
+    return checked is not None and account.get("account_ref") not in checked
+
+
+def _codex_next_step(status: dict) -> str:
+    accounts = status["accounts"]
+    pinned = next((a for a in accounts if a["pinned"]), None)
+    allowed = [a for a in accounts if a["allowed"] and not a["pinned"]]
+    if not status["cli"]["installed"]:
+        return "install the pinned CLI: `openswap worker codex install`."
+    if pinned is None:
+        # The live check runs on the pinned account: pin one first.
+        return "pin the Codex account remote jobs run on: `openswap worker account <slot>`."
+    if not pinned["isolated_sign_in"]:
+        return "sign the default account in: `openswap worker codex login`."
+    unsigned = next((a for a in allowed if not a["isolated_sign_in"]), None)
+    if unsigned is not None:
+        return f"sign allowed account {unsigned['slot']} in: `openswap worker codex login {unsigned['slot']}`."
+    if status["execution_mode"] != "live":
+        return "run the live check and enable live execution: `openswap worker live-check`."
+    unchecked = next((a for a in [pinned, *allowed] if _unchecked(status, a)), None)
+    if unchecked is not None:
+        return (f"run the live check on account {unchecked['slot']} too: "
+                f"`openswap worker live-check --account {unchecked['slot']}`.")
+    return "nothing: live execution is on. `openswap worker live disable` turns it off."
+
+
+def _claude_next_step(status: dict) -> str:
+    accounts = status["accounts"]
+    pinned = next((a for a in accounts if a["pinned"]), None)
+    allowed = [a for a in accounts if a["allowed"] and not a["pinned"]]
+    if not status["cli"]["pinned"]:
+        return "pin the installed Claude Code: `openswap worker claude pin`."
+    if pinned is None:
+        return "pin the Claude account remote jobs run on: `openswap worker account claude:<slot>`."
+    if not pinned["profile_ready"]:
+        return "prepare the default account's profile: `openswap worker claude prepare`."
+    unready = next((a for a in allowed if not a["profile_ready"]), None)
+    if unready is not None:
+        return (f"prepare allowed account {unready['slot']}'s profile: "
+                f"`openswap worker claude prepare claude:{unready['slot']}`.")
+    if status["execution_mode"] != "live":
+        return "run the live check and enable live execution: `openswap worker live-check --provider claude`."
+    unchecked = next((a for a in [pinned, *allowed] if _unchecked(status, a)), None)
+    if unchecked is not None:
+        return (f"run the live check on account {unchecked['slot']} too: "
+                f"`openswap worker live-check --provider claude --account claude:{unchecked['slot']}`.")
+    return "nothing: live execution is on. `openswap worker live disable --provider claude` turns it off."
 
 
 _MUTATING = {("codex", "install"), ("codex", "login"), ("codex", "logout"), ("live", "enable"),
@@ -262,7 +306,7 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
     from openswap.worker import claude_cli
     from openswap.worker.accounts import resolve_account_selector, resolve_claude_selector
     from openswap.worker.claude_exec import (
-        managed_claude_config, profile_for, profile_identity, profile_shared,
+        managed_claude_config, profile_for, profile_identity, profile_shared, profile_symlinked,
     )
 
     root = Path(backup_root)
@@ -284,8 +328,7 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
     if profile is None:
         raise AccountPinError("account_not_found")
 
-    if profile.is_symlink() or any(parent.is_symlink() for parent in profile.parents
-                                   if parent.is_relative_to(root)):
+    if profile_symlinked(root, profile):
         # Jobs refuse a symlinked profile; never prepare (or log in to) one.
         raise AccountPinError("claude_profile_unsafe")
 
@@ -334,7 +377,9 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
 def claude_status(backup_root: Path) -> dict:
     from openswap.worker import claude_cli
     from openswap.worker.accounts import claude_accounts
-    from openswap.worker.claude_exec import managed_claude_config, profile_for, profile_identity, profile_shared
+    from openswap.worker.claude_exec import (
+        managed_claude_config, profile_for, profile_identity, profile_shared, profile_symlinked,
+    )
 
     root = Path(backup_root)
     try:
@@ -355,7 +400,8 @@ def claude_status(backup_root: Path) -> dict:
             "allowed": choice.account_ref in allowed,
             # Exactly what a launch requires: signed in as the account and
             # not mirroring the default profile's customizations.
-            "profile_ready": profile is not None and profile_identity(profile) == choice.account_ref
+            "profile_ready": profile is not None and not profile_symlinked(root, profile)
+            and profile_identity(profile) == choice.account_ref
             and not profile_shared(profile) and not managed_claude_config(profile),
         })
     return {"cli": cli, "accounts": accounts, **live_status(root, "claude")}
@@ -508,16 +554,7 @@ def _format_claude_status(status: dict) -> str:
         lines.append("  No eligible Claude accounts in the roster. Add one with `openswap add`.")
     lines.extend(printer.columns(_account_status_rows(status["accounts"], "profile_ready",
                                                       "profile ready", "profile not prepared")))
-    if not cli["pinned"]:
-        lines.append(printer.next_step("pin the installed Claude Code: `openswap worker claude pin`."))
-    elif any(a["pinned"] and not a["profile_ready"] for a in status["accounts"]):
-        lines.append(printer.next_step("prepare the default account's profile: `openswap worker claude prepare`."))
-    elif not live:
-        lines.append(printer.next_step("run the live check and enable live execution: "
-                                       "`openswap worker live-check --provider claude`."))
-    else:
-        lines.append(printer.next_step("nothing: live execution is on. "
-                                       "`openswap worker live disable --provider claude` turns it off."))
+    lines.append(printer.next_step(_claude_next_step(status)))
     return "\n".join(lines)
 
 
