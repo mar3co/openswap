@@ -39,6 +39,9 @@ class FakeProcs:
         self.spawn_on_scan = 0  # running members fork this many times while racing
         self.vanishing = 0  # this many scans list one pid that is gone by its query
         self.zombies: list[int] = []  # listed every scan, never queryable
+        self.dead_unreadable: set[int] = set()
+        self.live_unreadable: set[int] = set()  # listed, alive, coalition unreadable
+        self.table_fails = 0  # pids() raises this many more times
         self._next = 5000
 
     def new(self, coalition, status=2):
@@ -47,6 +50,11 @@ class FakeProcs:
         return self._next
 
     def pids(self):
+        if self.table_fails:
+            self.table_fails -= 1
+            raise ContainmentError("process_table_unavailable")
+        if self.live_unreadable:
+            return [*self.table, *self.live_unreadable]
         if self.vanishing:
             # Listed, then gone before it can be queried (or a zombie).
             self._next += 1
@@ -62,6 +70,8 @@ class FakeProcs:
         return list(self.table)
 
     def coalition_of(self, pid):
+        if pid in self.live_unreadable:
+            return None
         entry = self.table.get(pid)
         return entry[0] if entry else None
 
@@ -81,6 +91,12 @@ class FakeProcs:
     def boot_session(self):
         return self.boot
 
+    def is_dead(self, pid):
+        if pid in self.live_unreadable:
+            return False
+        return pid not in self.table or pid in self.zombies or pid in self.dead_unreadable
+
+
 
 class FakeLaunchd:
     def __init__(self, procs: FakeProcs, *, coalition=JOB_COALITION):
@@ -94,6 +110,7 @@ class FakeLaunchd:
         self.keep_loaded = False
         self.escaped: list[int] = []
         self.run_dirs: dict[str, str] = {}
+        self.plists: dict[str, str] = {}
         self.bootstraps = 0
 
     def __call__(self, args):
@@ -103,9 +120,9 @@ class FakeLaunchd:
             label = args[1].split("/", 2)[2]
             if label in self.loaded:
                 pid = self.print_pid_override or self.loaded[label]
-                owner = self.run_dirs.get(label, "")
+                plist_path = self.plists.get(label, "")
                 return subprocess.CompletedProcess(
-                    args, 0, f"{label} = {{\n\tpath = {owner}/job.plist\n\tstate = running\n\tpid = {pid}\n}}\n", "")
+                    args, 0, f"{label} = {{\n\tpath = {plist_path}\n\tstate = running\n\tpid = {pid}\n}}\n", "")
             return subprocess.CompletedProcess(args, 113, "", "Could not find service")
         if verb == "bootstrap":
             if self.bootstrap_rc:
@@ -117,6 +134,7 @@ class FakeLaunchd:
             self.bootstraps += 1
             self.loaded[plist["Label"]] = leader
             self.run_dirs[plist["Label"]] = str(run_dir)
+            self.plists[plist["Label"]] = args[2]
             if self.write_pid:
                 (run_dir / "leader.pid").write_text(f"{leader}\n")
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -169,7 +187,7 @@ def test_launch_records_coalition_before_releasing_the_provider(tmp_path):
     assert handle.domain == "gui/501"
     assert (root / ("a" * 32) / "go").exists()
     assert load_handle(root / ("a" * 32)) == handle
-    plist = plistlib.loads((root / ("a" * 32) / "job.plist").read_bytes())
+    plist = plistlib.loads(handle.plist_path.read_bytes())
     assert plist["ProgramArguments"][:2] == ["/bin/sh", "-c"]
     assert plist["ProgramArguments"][5:] == ["/bin/echo", "hi"]
     assert plist["KeepAlive"] is False and plist["AbandonProcessGroup"] is False
@@ -587,5 +605,37 @@ def test_ownership_needs_the_exact_plist_path(tmp_path):
     handle = launch(containment, root)
     assert containment._owns_label(handle) is True
     # A service whose plist lives under a path that merely starts with this one.
-    launchd.run_dirs[handle.label] = str(nested / "retry")
+    launchd.plists[handle.label] = str(nested / "retry" / handle.plist_path.name)
     assert containment._owns_label(handle) is False
+    # The same run directory relaunched: a different launch, a different plist.
+    launchd.plists[handle.label] = str(nested / "job-0123456789abcdef.plist")
+    assert containment._owns_label(handle) is False
+
+
+def test_a_live_process_with_an_unreadable_coalition_blocks_the_proof(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    procs.live_unreadable = {77777}
+    proof = containment.stop(handle, timeout=1.0)
+    assert proof.stopped is False
+    assert (77777, signal.SIGKILL) not in procs.signals and (77777, signal.SIGSTOP) not in procs.signals
+
+
+def test_a_failing_process_table_still_cleans_up_and_proves_nothing(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    handle = launch(containment, private_dir(tmp_path))
+    escaped = procs.new(JOB_COALITION)
+    original = procs.pids
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 2:  # after one good scan that saw the members
+            raise ContainmentError("process_table_unavailable")
+        return original()
+
+    procs.pids = flaky
+    proof = containment.stop(handle, timeout=1.0)
+    assert proof.stopped is False
+    assert escaped not in procs.table  # killed from the last good scan
+    assert launchd.loaded == {}  # the label was still booted out
