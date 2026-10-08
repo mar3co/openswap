@@ -955,16 +955,19 @@ class LaunchdContainment:
         """``SIGSTOP`` a pid just seen in the coalition, then make sure it was ours.
 
         The member may exit between the check and the signal and its pid be
-        reused by an unrelated process. If, after the signal, that pid is in
-        another coalition, it is resumed: the stop was not meant for it.
+        reused by an unrelated process. Unless, after the signal, that pid is
+        still provably in the coalition, it is resumed.
         """
         procs = self.procs
         try:
             if procs.coalition_of(pid) != coalition_id:
                 return
             procs.signal(pid, signal.SIGSTOP)
-            now = procs.coalition_of(pid)
-            if now is not None and now != coalition_id:
+            if procs.coalition_of(pid) != coalition_id:
+                # Not provably ours any more (another coalition, or unreadable):
+                # resume it. If it was our member after all, the sweep sees it
+                # running again and stops it on the next pass; a freeze is
+                # only ever proven from members observed stopped.
                 procs.signal(pid, signal.SIGCONT)
         except (ProcessLookupError, PermissionError, ContainmentError):
             pass
