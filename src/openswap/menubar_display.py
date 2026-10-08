@@ -242,6 +242,9 @@ CODEX_RELOGIN_CARD_NOTE = (
     "Action required · OAuth expired. Sign in again with Codex."
 )
 RESTORE_CARD_NOTE = "Click to restore the saved Claude login."
+REMOTE_TASKS_PAIRED_OFF_NOTE = (
+    "Paired, worker off · Turn on Enable local worker so this Mac can accept approved tasks."
+)
 MISSING_LOGIN_CARD_NOTE = "Action required · Sign in with Claude Code."
 RECONCILE_CARD_NOTE = "Action required · Login mismatch. Click for details."
 _CLAUDE_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
@@ -382,6 +385,7 @@ def settings_page_rows(
     worker_enabled: bool = False,
     worker_paused: bool = False,
     worker_status: dict | None = None,
+    worker_paired: bool = False,
     section: str | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
@@ -509,6 +513,18 @@ def settings_page_rows(
             "value": settings.refresh_interval,
         },
     ]
+    if worker_paired and not worker_enabled and (
+        (worker_status or {}).get("operation") != "worker_enable_or_disable"
+    ):
+        # Pairing never starts the worker; say so right under its switch.
+        hint_at = next(i for i, row in enumerate(general) if row["id"] == "remote_tasks_enabled") + 1
+        general.insert(hint_at, {
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_paired_off",
+            "label": REMOTE_TASKS_PAIRED_OFF_NOTE,
+        })
     title_controls = {"show_account_name", "title_pct_5h", "title_pct_7d", "title_scoped"}
     if settings.menu_bar_provider == "logo":
         general = [row for row in general if row["id"] not in title_controls]

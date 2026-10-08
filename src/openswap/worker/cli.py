@@ -1033,11 +1033,17 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             if args.command == "pair":
                 worker_id = pair(root, args.url, args.code)
                 print(f"Paired worker {worker_id}. Local execution policy is still controlled on this Mac.")
+                interactive = _interactive_terminal()
                 try:
-                    _post_pair_setup(root, interactive=_interactive_terminal())
+                    _post_pair_setup(root, interactive=interactive)
                 except Exception:
                     # Pairing already succeeded; the follow-up is optional.
                     print("Next: `openswap worker account` and `openswap worker workspace add <id> <folder>`.")
+                try:
+                    _post_pair_worker_offer(root, interactive=interactive)
+                except Exception:
+                    # Same rule: the offer can never fail pairing.
+                    print(_START_WORKER_NEXT)
             else:
                 if unpair(root, args.url):
                     print("Worker unpaired; remote access disabled.")
@@ -1074,7 +1080,13 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         except Exception:
             print("Worker status unavailable.", file=sys.stderr)
             return 1
-        _write(snapshot, as_json=args.json, human=_format_status(snapshot))
+        human = None
+        if not args.json:
+            human = _format_status(snapshot)
+            hint = _worker_off_hint(root, snapshot)
+            if hint is not None:
+                human = f"{human}\n{hint}"
+        _write(snapshot, as_json=args.json, human=human)
         return 0
     if args.command == "stop":
         try:
@@ -1111,14 +1123,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         try:
             payload = enable_worker(root)
         except ClaudeSwitchError as exc:
-            message = (
-                "Worker configuration is invalid; fix local worker settings before enabling."
-                if str(exc) == "worker_configuration_invalid"
-                else "Worker is still stopping; wait for it to exit before enabling."
-                if str(exc) == "worker_stop_unconfirmed"
-                else "Could not enable worker."
-            )
-            print(message, file=sys.stderr)
+            print(_enable_failure_message(exc), file=sys.stderr)
             return 1
         _write(payload, as_json=args.json, human="Remote tasks worker enabled.")
         return 0
@@ -1513,6 +1518,96 @@ def _workspace_command(root: Path, args) -> int:
     else:
         print(_WORKSPACE_MESSAGES.get(code, f"Workspace change refused ({code})."), file=sys.stderr)
     return 1
+
+
+def _enable_failure_message(exc: ClaudeSwitchError) -> str:
+    """What `openswap worker enable` prints when enable_worker refuses."""
+    code = str(exc)
+    if code == "worker_configuration_invalid":
+        return "Worker configuration is invalid; fix local worker settings before enabling."
+    if code == "worker_stop_unconfirmed":
+        return "Worker is still stopping; wait for it to exit before enabling."
+    return "Could not enable worker."
+
+
+# enable_worker's own refusal codes. Anything else (for example launchctl or
+# file-system detail from installing the LaunchAgent) is not echoed.
+_ENABLE_DIAGNOSTICS = frozenset({
+    "worker_configuration_invalid", "worker_stop_unconfirmed", "worker_running_unmanaged",
+    "kickoff_in_progress", "worker_lifecycle_busy", "worker_state_unavailable",
+})
+
+_START_WORKER_NEXT = (
+    "Next: start the Remote tasks worker so this Mac can accept approved tasks: "
+    "`openswap worker enable`."
+)
+_EXECUTION_OFF_NOTE = (
+    "Task execution itself stays off until the production adapter is enabled "
+    "(provider: live_adapter_disabled), so jobs are refused for now."
+)
+_RUNNING_STATES = frozenset({"starting", "running"})
+
+
+def _post_pair_worker_offer(root: Path, *, interactive: bool, read_line=None) -> None:
+    """After pairing: offer to start the worker, through `worker enable`'s own path.
+
+    Enrollment never enables local execution by itself: the worker starts only
+    when the owner answers yes on a terminal. Pairing has already succeeded;
+    nothing here can undo or fail it.
+    """
+    read_line = read_line or input
+    enabled = load_worker_settings(root).enabled is True
+    if enabled:
+        try:
+            process = read_status(root).get("process_state")
+        except Exception:
+            process = None
+        if process in _RUNNING_STATES:
+            print("The Remote tasks worker is already running on this Mac.")
+        else:
+            # Enabled but not running (for example its LaunchAgent was
+            # unloaded). Report it; never toggle anything from here.
+            print("The Remote tasks worker is enabled but not running. Run `openswap worker enable` "
+                  "to start it again, or `openswap worker status` to check.")
+    elif not interactive:
+        print(_START_WORKER_NEXT)
+    else:
+        try:
+            answer = read_line(
+                "Start the Remote tasks worker now so this Mac can accept approved tasks? [Y/n] "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            answer = None
+        if answer not in {"", "y", "yes"}:
+            print("Not started. Start it later with `openswap worker enable`.")
+        else:
+            try:
+                enable_worker(root)
+            except ClaudeSwitchError as exc:
+                code = str(exc)
+                message = _enable_failure_message(exc)
+                if code in _ENABLE_DIAGNOSTICS:
+                    message = f"{message.rstrip('.')} ({code})."
+                print(f"{message} Start it later with `openswap worker enable`.")
+            except Exception:
+                print("Could not enable worker. Start it later with `openswap worker enable`.")
+            else:
+                print("Remote tasks worker enabled. The portal shows this Mac online within about 15 seconds.")
+    print(_EXECUTION_OFF_NOTE)
+
+
+def _worker_off_hint(root: Path, snapshot: dict) -> str | None:
+    """One line for `worker status` when paired but the worker is not running."""
+    try:
+        url = load_worker_settings(root).control_service_url
+    except Exception:
+        return None
+    if url is None:
+        return None
+    if snapshot.get("enabled") is True and snapshot.get("process_state") in _RUNNING_STATES:
+        return None
+    return f"Paired with {url} but the worker is off; run `openswap worker enable`."
 
 
 def _format_status(snapshot: dict) -> str:

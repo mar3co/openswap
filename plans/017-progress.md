@@ -1078,6 +1078,20 @@ Execution is still disabled: the production adapter remains
 `UnavailableCodexAdapter` until Phase 1's live-evidence gates clear, so this
 step lets the owner finish setup but does not run any provider job.
 
+## Post-pair worker offer (2026-10-07)
+
+An owner paired a Mac and the portal kept it Offline ("No heartbeat yet"):
+pairing never starts the worker and nothing said `openswap worker enable` was
+the next step. Enrollment still does not enable execution on its own. After the
+account and folder steps, `worker pair` on a terminal now asks to start the
+worker and, on yes, calls `enable_worker` (the function behind `worker enable`
+and the menu toggle); no, EOF and non-terminal runs print the command; an
+enabled worker is reported, never toggled, and pairing cannot fail here.
+Human `worker status` adds a one-line "Paired with <origin> but the worker is
+off" hint, and the menu bar shows "Paired, worker off" under **Enable local
+worker**. A conftest guard keeps pairing tests non-interactive so `pytest -s`
+on a terminal cannot reach the real launchctl.
+
 ## Optional per-job account choice, OpenSwap side (2026-10-07)
 
 The "Optional per-job account choice (v1 extension)" section of
@@ -1093,7 +1107,8 @@ progress.
   `--clear-default` to withdraw the default), the list view and a menu bar
   **Web choice** popup manage it under the same locks as the pin.
 - The remote client sends `accounts` after each registration and on a local
-  fingerprint change; a 404 `unsupported_version` disables it until the next
+  fingerprint change; a 404 (`unsupported_version`, or `not_found` from older
+  reference servers) disables it until the next
   registration. A claim's `account_ref` is accepted only once the enrollment
   advertised accounts, and the runtime resolves it against the current
   allowlist under the launch lock. A reference no longer allowed fails
