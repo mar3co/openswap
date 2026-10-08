@@ -82,8 +82,23 @@ WRAPPER_SCRIPT = (
     'echo "$rc" > "$d/exit.tmp" && mv "$d/exit.tmp" "$d/exit"\n'
 )
 
-# Files only a launch creates; any of them means the directory is not fresh.
-_WRAPPER_STATE = (GO_FILE, LEADER_PID_FILE, EXIT_FILE, HANDLE_FILE, STDOUT_FILE, "job.plist")
+def _fresh(run_dir: Path) -> bool:
+    """An empty run directory, apart from a private real ``tmp`` directory."""
+    try:
+        names = os.listdir(run_dir)
+    except OSError:
+        return False
+    for name in names:
+        if name != "tmp":
+            return False
+        info = (run_dir / name).lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return False
+    return True
+
+
+def _label_lock(run_dir: Path, label: str) -> FileLock:
+    return FileLock(Path(run_dir).parent / f".{label}.lock", timeout=0)
 
 _SZOMB = 5
 _SSTOP = 4
@@ -379,10 +394,10 @@ class LaunchdContainment:
             ensure_private_dir(run_dir)
         except OSError:
             raise ContainmentError("run_dir_unavailable") from None
-        # One launch per label at a time: the label check, bootstrap and any
-        # cleanup below run under this lock, so a label loaded after a failed
+        # One launch or stop per label at a time: the label check, bootstrap
+        # and any cleanup run under this lock, so a label loaded after a failed
         # bootstrap can only be this launch's own.
-        lock = FileLock(run_dir.parent / f".{label}.lock", timeout=0)
+        lock = _label_lock(run_dir, label)
         try:
             acquired = lock.acquire(timeout=0)
         except OSError:
@@ -395,9 +410,11 @@ class LaunchdContainment:
             lock.release()
 
     def _launch_locked(self, label, run_dir, argv, env, cwd, stdin_text, ready_timeout) -> JobHandle:
-        if any(os.path.lexists(run_dir / name) for name in _WRAPPER_STATE):
-            # A stale ``go`` would let the new wrapper start the provider
-            # before its coalition is recorded: only a fresh directory runs.
+        if not _fresh(run_dir):
+            # A stale ``go`` would start the provider before its coalition is
+            # recorded, and any pre-existing name (a symlink, say) would be
+            # opened by the wrapper's redirections: only an empty directory
+            # (apart from a private ``tmp``) runs.
             raise ContainmentError("run_dir_not_fresh")
         procs = self.procs
         boot = procs.boot_session()
@@ -455,7 +472,7 @@ class LaunchdContainment:
             write_private(run_dir / GO_FILE, b"")
         except BaseException:
             # The handle already says released, so recovery sweeps it either way.
-            self.stop(handle)
+            self._stop_locked(handle, timeout=15.0)
             raise ContainmentError("job_release_failed", launched=True) from None
         return handle
 
@@ -505,8 +522,36 @@ class LaunchdContainment:
 
     # -- stop -----------------------------------------------------------------
 
+    def _owns_label(self, handle: JobHandle) -> bool | None:
+        """Whether the loaded label is this handle's job: ``None`` when nothing is loaded.
+
+        A launched job's arguments name its own run directory, so a service
+        another launch loaded under the same label is never mistaken for it.
+        """
+        printed = self._launchctl(["print", f"{handle.domain}/{handle.label}"])
+        if printed.returncode != 0:
+            return None
+        return str(handle.run_dir) in (printed.stdout or "")
+
     def stop(self, handle: JobHandle, *, timeout: float = 15.0) -> StopProof:
-        """Stop every member of the job and report proof, never a guess."""
+        """Stop every member of the job and report proof, never a guess.
+
+        Takes the label's lock (shared with :meth:`launch`) so it can never
+        interleave with a launch of the same label.
+        """
+        lock = _label_lock(handle.run_dir, handle.label)
+        try:
+            acquired = lock.acquire(timeout=timeout)
+        except OSError:
+            acquired = False
+        if not acquired:
+            return StopProof(False, None, 0)
+        try:
+            return self._stop_locked(handle, timeout=timeout)
+        finally:
+            lock.release()
+
+    def _stop_locked(self, handle: JobHandle, *, timeout: float) -> StopProof:
         procs = self.procs
         current_boot = procs.boot_session()
         if handle.boot_session is not None and current_boot is not None and current_boot != handle.boot_session:
@@ -520,11 +565,17 @@ class LaunchdContainment:
         frozen, killed = True, 0
         if handle.coalition_id is not None:
             frozen, killed = self._sweep(handle.coalition_id, deadline=deadline)
-        self._launchctl(["bootout", f"{handle.domain}/{handle.label}"])
-        loaded = self.label_loaded(handle)
-        while loaded and self._monotonic() < deadline:
-            self._sleep(0.1)
+        owned = self._owns_label(handle)
+        if owned:
+            self._launchctl(["bootout", f"{handle.domain}/{handle.label}"])
             loaded = self.label_loaded(handle)
+            while loaded and self._monotonic() < deadline:
+                self._sleep(0.1)
+                loaded = self.label_loaded(handle)
+        else:
+            # Not loaded, or loaded by another launch: this job's service is
+            # gone either way, and someone else's is never booted out.
+            loaded = False if owned is False or self.label_loaded(handle) is False else None
         if handle.coalition_id is not None:
             # Sweep again: anything the bootout left behind is still a member.
             again_frozen, again_killed = self._sweep(handle.coalition_id, deadline=deadline)
