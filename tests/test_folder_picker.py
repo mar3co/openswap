@@ -61,8 +61,7 @@ def test_empty_query_lists_the_top_of_home_first(home):
     assert _shown(index, index.search(""))[:3] == ["~/Documents", "~/GitHub", "~/Projects"]
 
 
-def test_typed_paths_complete_inside_the_parent(home, monkeypatch):
-    monkeypatch.setenv("HOME", str(home))
+def test_typed_paths_complete_inside_the_parent(home):
     index = _index(home)
     assert _shown(index, index.search("~/GitHub/opensoft/opent")) == ["~/GitHub/opensoft/opentag"]
     assert _shown(index, index.search(str(home / "GitHub") + "/")) == [
@@ -72,8 +71,7 @@ def test_typed_paths_complete_inside_the_parent(home, monkeypatch):
     assert index.search("/no/such/place/") == []
 
 
-def test_keys_move_complete_and_pick(home, monkeypatch):
-    monkeypatch.setenv("HOME", str(home))
+def test_keys_move_complete_and_pick(home):
     state = PickerState(_index(home))
     assert state.selected == -1 and state.choice() == ""  # empty Enter finishes
     for char in "opens":
@@ -93,6 +91,20 @@ def test_keys_move_complete_and_pick(home, monkeypatch):
     assert state.results == [] and state.choice() == "~/brand-new"
     state.backspace()
     assert state.query == "~/brand-ne"
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "openpty"), reason="needs a pseudo-terminal")
+def test_escape_sequences_are_drained_not_typed():
+    import os
+
+    reader, writer = os.openpty()
+    try:
+        os.write(writer, b"\x1b[1;5Ax\x1b[Bq\x1b")
+        keys = [folder_picker._read_key(reader) for _ in range(5)]
+    finally:
+        os.close(reader)
+        os.close(writer)
+    assert keys == ["up", "x", "down", "q", "esc"]
 
 
 def test_without_a_terminal_it_reads_a_typed_line(monkeypatch):

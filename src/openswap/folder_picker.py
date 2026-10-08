@@ -139,7 +139,8 @@ def _subfolders(parent: Path, *, hidden: bool = False) -> list[Path]:
 
 def _complete_path(query: str, home: Path, limit: int) -> list[Path]:
     """Folders inside the typed parent whose name matches the last segment."""
-    expanded = os.path.expanduser(query)
+    # "~" is the index's home, not $HOME/%USERPROFILE%, so both agree.
+    expanded = str(home) + query[1:] if query == "~" or query.startswith("~/") else query
     if expanded.endswith("/"):
         parent, prefix = Path(expanded), ""
     else:
@@ -232,7 +233,11 @@ _HINT = "type to search · ↑↓ choose · Tab complete · Enter pick · Esc or
 
 
 def _render(out, question: str, state: PickerState) -> None:
-    width = max(20, os.get_terminal_size(out.fileno()).columns - 1)
+    try:
+        columns = os.get_terminal_size(out.fileno()).columns
+    except (OSError, ValueError):
+        columns = 80
+    width = max(20, columns - 1)
     home = state.index.home
     lines = []
     for row, path in enumerate(state.results):
@@ -254,10 +259,17 @@ def _read_key(fd: int) -> str:
 
     first = os.read(fd, 1)
     if first == b"\x1b":
-        if select.select([fd], [], [], 0.03)[0]:
-            rest = os.read(fd, 2)
-            return {b"[A": "up", b"[B": "down", b"OA": "up", b"OB": "down"}.get(rest, "")
-        return "esc"
+        # Drain the whole sequence (e.g. Ctrl+Up is ESC [1;5A) so none of it is typed.
+        rest = b""
+        while len(rest) < 16 and select.select([fd], [], [], 0.03)[0]:
+            rest += os.read(fd, 1)
+            if rest[:1] in (b"[", b"O") and len(rest) > 1 and 0x40 <= rest[-1] <= 0x7E:
+                break
+        if not rest:
+            return "esc"
+        if rest[:1] in (b"[", b"O"):
+            return {b"A": "up", b"B": "down"}.get(rest[-1:], "")
+        return ""
     if first and first[0] >= 0xC0:
         extra = 3 if first[0] >= 0xF0 else 2 if first[0] >= 0xE0 else 1
         first += os.read(fd, extra)
