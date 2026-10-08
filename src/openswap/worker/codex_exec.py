@@ -533,6 +533,11 @@ class CodexExecAdapter:
             # The model would reach CODEX_HOME, run directories, leases or the
             # journal through this root.
             raise ProviderLaunchRefused("provider_unavailable")
+        if os.path.lexists(output_root / ".codex"):
+            # A project-local Codex layer in the job's working directory could
+            # add MCP servers or override the research profile, and the live
+            # check never measured it: refuse rather than load it.
+            raise ProviderLaunchRefused("provider_unavailable")
         try:
             ensure_private_dir(runs_root(self.backup_root))
             self._prune_runs()

@@ -974,3 +974,28 @@ def test_recover_waits_for_an_in_progress_launch_before_reading_its_handle(tmp_p
     finally:
         held.release()
     assert containment.recover(handle.run_dir).stopped is True
+
+
+
+def test_an_incomplete_scan_cannot_anchor_a_freeze(tmp_path):
+    containment, procs, launchd = make(tmp_path)
+    scans = iter([{5001: "gone"}, {}, {}])
+    containment._scan = lambda coalition_id: next(scans, {})
+    seen = []
+    original = containment._complete
+
+    def complete(scan, previous):
+        seen.append((dict(scan), None if previous is None else dict(previous)))
+        return original(scan, previous)
+
+    containment._complete = complete
+    frozen, _ = containment._sweep(JOB_COALITION, deadline=1e9)
+    assert frozen is True
+    # The freeze was proven only after two complete scans, not on {} after {gone}.
+    assert len(seen) >= 3
+
+
+def test_locks_and_mirrors_live_outside_the_cache_folder():
+    lock_dir = c.default_lock_dir()
+    assert "Caches" not in lock_dir.parts and lock_dir.parts[-3:] == (
+        "Application Support", "com.opensoft.openswap", "job-locks")

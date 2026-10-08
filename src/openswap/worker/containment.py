@@ -127,7 +127,10 @@ def default_lock_dir() -> Path:
         home = Path.home()
     # From the account database, not $HOME or $TMPDIR, so every process of
     # this user agrees whatever its environment.
-    return home / "Library" / "Caches" / "com.opensoft.openswap" / "job-locks"
+    # Application Support, not Caches: a cleared cache would unlink a held
+    # lock's inode (letting another process lock a new file) and drop the
+    # recovery mirrors next to it.
+    return home / "Library" / "Application Support" / "com.opensoft.openswap" / "job-locks"
 
 _SZOMB = 5
 _SSTOP = 4
@@ -1024,6 +1027,7 @@ class LaunchdContainment:
         procs = self.procs
         frozen = False
         previous: dict[int, str] | None = None
+        previous_complete = False  # whether ``previous`` was itself a complete scan
         known: set[int] = set()
         while True:
             try:
@@ -1034,17 +1038,20 @@ class LaunchdContainment:
             known |= {pid for pid, kind in scan.items() if kind in {"running", "stopped"}}
             running = [pid for pid, kind in scan.items() if kind == "running"]
             stopped = {pid for pid, kind in scan.items() if kind == "stopped"}
+            complete = self._complete(scan, previous)
             if (
                 not running and "unknown" not in scan.values()
-                and previous is not None and self._complete(scan, previous)
+                and previous is not None and complete and previous_complete
                 and "running" not in previous.values() and "unknown" not in previous.values()
                 and stopped == {pid for pid, kind in previous.items() if kind == "stopped"}
             ):
+                # Both scans complete on their own: an incomplete first scan
+                # (a pid gone by its query may have forked) cannot anchor it.
                 frozen = True
                 break
             for pid in running:
                 self._stop_member(coalition_id, pid)
-            previous = scan
+            previous, previous_complete = scan, complete
             if self._monotonic() >= deadline:
                 break
             self._sleep(0.002)
