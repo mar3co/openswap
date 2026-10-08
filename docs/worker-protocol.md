@@ -560,7 +560,9 @@ use the network and submit a launchd job (each outcome checked on disk and in
 the event stream, with positive controls so a refusal cannot pass), one job
 stopped while a `setsid()` helper runs, and one job whose launching worker
 process is killed and then recovered. It refuses while the worker is running
-unpaused, a job is active or a lease is held. The evidence file (mode 0600,
+unpaused (or its state cannot be read), a job is active or a lease is held, and
+holds the worker lifecycle lock until it finishes, so `pause --off`, `enable`,
+a worker start or a pin change waits instead of reopening admission mid-check. The evidence file (mode 0600,
 under the worker directory's `live-evidence/`) holds pass/fail booleans and
 counts only, never model output or secrets; each job's folder (with its
 `result.md`) stays under the backup root's `live-check/<UTC time>/` for

@@ -670,6 +670,12 @@ def _roster(tmp_path, accounts):
     }))
 
 
+@pytest.fixture(autouse=True)
+def no_managed_codex_layer(monkeypatch):
+    # Login/logout check this Mac's managed Codex layers; tests opt in to one.
+    monkeypatch.setattr(live_cli, "managed_codex_config", lambda home, **kw: [])
+
+
 def _login_run(account_id):
     calls = []
 
@@ -1170,3 +1176,18 @@ def test_a_failed_login_is_a_failure_even_with_this_accounts_old_credentials(tmp
     with pytest.raises(live_cli.AccountPinError) as error:
         live_cli.login(tmp_path, "1", run=failing, verify=pinned)
     assert error.value.code == "login_failed"
+
+
+
+@pytest.mark.parametrize("action", ["login", "logout"])
+def test_login_and_logout_refuse_while_a_managed_layer_exists(tmp_path, action):
+    _roster(tmp_path, {"1": ACCOUNT_ID})
+    home = codex_exec.prepare_home(tmp_path, IDENTITY)
+    (home / "auth.json").write_text(auth_json(ACCOUNT_ID))
+    run = _login_run(ACCOUNT_ID)
+    with pytest.raises(live_cli.AccountPinError) as error:
+        getattr(live_cli, action)(tmp_path, "1", run=run, verify=pinned, managed=lambda h: ["/etc/codex"])
+    assert error.value.code == "managed_codex_config"
+    assert run.calls == []  # Codex never ran
+    assert (home / "auth.json").exists()
+    assert AccountLeaseStore(tmp_path, "codex").read_current().state == "released"

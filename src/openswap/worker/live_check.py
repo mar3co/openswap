@@ -935,7 +935,35 @@ class LiveCheck:
 
     # -- the whole check -------------------------------------------------------------
 
+    LIFECYCLE_WAIT = 5.0  # seconds to wait for a concurrent lifecycle change
+
     def run(self, *, install=None, login=None) -> dict:
+        """Run every gate while holding the worker lifecycle lock.
+
+        `worker pause --off`, `enable`, a worker start and pin changes all take
+        that lock, so the paused or stopped state the preflight sees cannot
+        change while evidence is collected (the static probes run outside an
+        account lease).
+        """
+        from openswap.exceptions import ClaudeSwitchError
+        from openswap.locking import FileLock
+        from openswap.worker.journal import JournalError, LocalJobStore
+
+        try:
+            LocalJobStore(self.root)._ensure_private_dir()
+            barrier = FileLock(self.root / "worker" / "lifecycle.lock", timeout=self.LIFECYCLE_WAIT)
+            held = barrier.acquire(timeout=self.LIFECYCLE_WAIT)
+        except (OSError, JournalError, ClaudeSwitchError):
+            held = False
+        if not held:
+            raise CheckRefused("worker_busy", "Another worker command is changing the worker right now. "
+                                              "Try again in a moment.")
+        try:
+            return self._run_gates(install=install, login=login)
+        finally:
+            barrier.release()
+
+    def _run_gates(self, *, install=None, login=None) -> dict:
         pinned, choice, identity, home = self._preflight(install=install, login=login)
         default_before = self._default_login_snapshot()
         # Outside the private worker directory: the adapter refuses any job

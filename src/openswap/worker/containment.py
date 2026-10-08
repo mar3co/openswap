@@ -318,6 +318,10 @@ def job_label(job_id: str) -> str:
     return label
 
 
+def _printable_path(path: Path) -> bool:
+    return not any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in str(path))
+
+
 def ensure_private_dir(path: Path) -> None:
     """Create ``path`` (0700) or verify an existing one is a private real dir."""
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -528,6 +532,11 @@ class LaunchdContainment:
             raise ContainmentError("run_dir_unavailable") from None
         # One spelling per physical directory, for its locks, handle and mirror.
         run_dir = Path(os.path.realpath(run_dir))
+        if not _printable_path(run_dir):
+            # Ownership is proven by matching the plist path that
+            # `launchctl print` shows on one line; a path with a line break or
+            # other control character cannot be matched, so it never launches.
+            raise ContainmentError("run_dir_unsafe")
         # One launch or stop per label at a time: the label check, bootstrap
         # and any cleanup run under this lock, so a label loaded after a failed
         # bootstrap can only be this launch's own.
@@ -912,16 +921,45 @@ class LaunchdContainment:
         """Members, plus live processes whose coalition cannot be read (they may be members)."""
         return [pid for pid, kind in self._scan(coalition_id).items() if kind in {"running", "stopped", "unknown"}]
 
+    def _stop_member(self, coalition_id: int, pid: int) -> None:
+        """``SIGSTOP`` a pid just seen in the coalition, then make sure it was ours.
+
+        The member may exit between the check and the signal and its pid be
+        reused by an unrelated process. If, after the signal, that pid is in
+        another coalition, it is resumed: the stop was not meant for it.
+        """
+        procs = self.procs
+        try:
+            if procs.coalition_of(pid) != coalition_id:
+                return
+            procs.signal(pid, signal.SIGSTOP)
+            now = procs.coalition_of(pid)
+            if now is not None and now != coalition_id:
+                procs.signal(pid, signal.SIGCONT)
+        except (ProcessLookupError, PermissionError, ContainmentError):
+            pass
+
+    def _kill_stopped_member(self, coalition_id: int, pid: int) -> bool:
+        """``SIGKILL`` a pid only while it is a stopped member of the coalition.
+
+        A stopped process cannot exit on its own, so its pid cannot be
+        recycled between this check and the signal.
+        """
+        procs = self.procs
+        try:
+            if procs.coalition_of(pid) != coalition_id or procs.status_of(pid) != _SSTOP:
+                return False
+            procs.signal(pid, signal.SIGKILL)
+            return True
+        except (ProcessLookupError, PermissionError, ContainmentError):
+            return False
+
     def _kill_known(self, coalition_id: int, pids) -> int:
-        killed = 0
+        pids = list(pids)
         for pid in pids:
-            try:
-                if self.procs.coalition_of(pid) == coalition_id:
-                    self.procs.signal(pid, signal.SIGKILL)
-                    killed += 1
-            except (ProcessLookupError, PermissionError, ContainmentError):
-                pass
-        return killed
+            self._stop_member(coalition_id, pid)
+        self._sleep(0.01)  # SIGSTOP is delivered asynchronously
+        return sum(1 for pid in pids if self._kill_stopped_member(coalition_id, pid))
 
     def _sweep(self, coalition_id: int, *, deadline: float) -> tuple[bool, int]:
         """Freeze every member, then kill them all; returns ``(proven, killed)``.
@@ -957,11 +995,7 @@ class LaunchdContainment:
                 frozen = True
                 break
             for pid in running:
-                if procs.coalition_of(pid) == coalition_id:
-                    try:
-                        procs.signal(pid, signal.SIGSTOP)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                self._stop_member(coalition_id, pid)
             previous = scan
             if self._monotonic() >= deadline:
                 break
@@ -979,12 +1013,12 @@ class LaunchdContainment:
                     previous is None or self._complete(scan, previous)):
                 return frozen, len(killed)
             for pid in members:
-                if procs.coalition_of(pid) == coalition_id:
-                    try:
-                        procs.signal(pid, signal.SIGKILL)
-                        killed.add(pid)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                # A member still running (no proven freeze) is stopped first
+                # and killed on a later pass, once it is seen stopped.
+                if scan[pid] == "running":
+                    self._stop_member(coalition_id, pid)
+                elif self._kill_stopped_member(coalition_id, pid):
+                    killed.add(pid)
             previous = scan
             if self._monotonic() >= deadline:
                 return False, len(killed)

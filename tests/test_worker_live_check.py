@@ -821,3 +821,45 @@ def test_a_probe_that_only_started_proves_no_denial(tmp_path):
     mac.launch = launch
     gate = make_check(root, mac).run()["gates"]["sandbox_exec"]
     assert gate["outside_read_denied"] is False and gate["passed"] is False
+
+
+
+def test_the_check_holds_the_lifecycle_lock_so_admission_cannot_reopen(tmp_path):
+    from openswap.locking import FileLock
+
+    root = setup_root(tmp_path)
+    mac = SimulatedMac()
+    check = make_check(root, mac)
+    seen = []
+    original = check._preflight
+
+    def preflight(**kwargs):
+        other = FileLock(root / "worker" / "lifecycle.lock", timeout=0)
+        seen.append(other.acquire(timeout=0))  # what `worker pause --off` would try
+        if seen[-1]:
+            other.release()
+        return original(**kwargs)
+
+    check._preflight = preflight
+    assert check.run()["passed"] is True
+    assert seen == [False]
+    after = FileLock(root / "worker" / "lifecycle.lock", timeout=0)
+    assert after.acquire(timeout=0)  # released afterwards
+    after.release()
+
+
+def test_the_check_refuses_while_a_lifecycle_change_holds_the_lock(tmp_path):
+    from openswap.locking import FileLock
+
+    root = setup_root(tmp_path)
+    (root / "worker").mkdir(mode=0o700, exist_ok=True)
+    holder = FileLock(root / "worker" / "lifecycle.lock", timeout=0)
+    assert holder.acquire(timeout=0)
+    try:
+        check = make_check(root, SimulatedMac())
+        check.LIFECYCLE_WAIT = 0
+        with pytest.raises(live_check.CheckRefused) as error:
+            check.run()
+        assert error.value.code == "worker_busy"
+    finally:
+        holder.release()
