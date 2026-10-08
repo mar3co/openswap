@@ -634,6 +634,10 @@ class LaunchdContainment:
     # -- observation ----------------------------------------------------------
 
     def exit_status(self, handle: JobHandle) -> int | None:
+        # The directory may since hold another launch: its exit is not ours.
+        current = load_handle(handle.run_dir)
+        if current is not None and current.launch_id != handle.launch_id:
+            return None
         text = read_private_text(handle.run_dir / EXIT_FILE, limit=32)
         if text is None or not text.strip().lstrip("-").isdigit():
             return None
@@ -841,7 +845,9 @@ class LaunchdContainment:
         """
         if previous is None:
             return False
-        return all(pid in previous for pid, kind in scan.items() if kind == "gone")
+        # Only a pid already unqueryable last time (a lingering zombie) is
+        # harmless: a pid seen alive before may have been reused since.
+        return all(previous.get(pid) == "gone" for pid, kind in scan.items() if kind == "gone")
 
     def _live_members(self, coalition_id: int) -> list[int]:
         """Members, plus live processes whose coalition cannot be read (they may be members)."""
