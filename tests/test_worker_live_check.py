@@ -94,8 +94,9 @@ class SimulatedMac:
     ``sandboxed`` decides what the simulated research sandbox allows.
     """
 
-    def __init__(self, *, sandboxed=True, contain=True, links=True):
+    def __init__(self, *, sandboxed=True, contain=True, links=True, curl_blocked=False):
         self.links = links
+        self.curl_blocked = curl_blocked
         self.booted_out = set()
         self.tmpdir_writes = 0
         self.sandboxed = sandboxed
@@ -151,6 +152,8 @@ class SimulatedMac:
             return "", 0
         if command == "/usr/bin/env":
             return "PATH=/usr/bin:/bin\nHOME=/x\n", 0
+        if command == "/usr/bin/curl --version":
+            return ("", 126) if self.curl_blocked else ("curl 8.7.1 (x86_64-apple-darwin25.0)\n", 0)
         if "ln -s" in command and self.links:
             target = re.search(r"ln -s '?(/[^ ']+link-target\.txt)", command).group(1)
             (cwd / "link.txt").symlink_to(target)  # writing the link inside the folder works
@@ -1028,3 +1031,11 @@ def test_the_default_login_baseline_is_taken_before_any_sign_in(tmp_path, monkey
     check._preflight = preflight
     check.run()
     assert order[:2] == ["snapshot", "preflight"]
+
+
+
+def test_a_curl_that_cannot_run_in_the_sandbox_proves_no_network_denial(tmp_path):
+    root = setup_root(tmp_path)
+    gate = make_check(root, SimulatedMac(curl_blocked=True)).run()["gates"]["sandbox_exec"]
+    assert gate["curl_runs_in_sandbox"] is False and gate["shell_network_denied"] is False
+    assert gate["passed"] is False
