@@ -452,8 +452,9 @@ runs.
    its LaunchAgent was unloaded) and points at `worker enable` and
    `worker status`.
 2. **Confirm the account.** With an account pinned it shows it and asks "Keep
-   this account? [Y/n]"; otherwise (or on No) it lists the eligible Codex
-   accounts and asks for one (Enter skips).
+   this account? [Y/n]"; otherwise (or on No) it lists the eligible Codex and
+   Claude accounts (Claude ones as `claude:<slot>`) and asks for one (Enter
+   skips).
 3. **Approve a research folder.** While the registry is still only the
    built-in `research` folder inside the OpenSwap backup root, it offers to
    create `~/OpenSwap Research` (owner-only, 0700) and approve it as `research`
@@ -464,8 +465,12 @@ runs.
 4. **Summary.** The service, worker state, account, approved folders (ID and
    label) and the execution mode, then either "Ready for Slack" or the list of
    what is still missing, and a note that execution stays off
-   (`live_adapter_disabled`) while the execution mode is `disabled`, pointing
-   at `openswap worker live-check` (see [Running jobs live](#running-jobs-live-codex)).
+   (`live_adapter_disabled`) while the execution mode is `disabled`, with the
+   live-check steps for the pinned account's provider (`openswap worker
+   live-check`; for a Claude account `openswap worker claude pin`, `openswap
+   worker claude prepare`, `openswap worker live-check --provider claude`; see
+   [Running jobs live](#running-jobs-live-codex)). The execution mode, here and
+   in the readiness report, is that of the pinned account's provider.
 
 Without a terminal, `pair` asks nothing and prints each step's command. While
 a URL is configured and the worker is disabled or not running, human
