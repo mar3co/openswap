@@ -607,12 +607,23 @@ def test_verify_without_install(tmp_path):
 # -- live opt-in -----------------------------------------------------------------------
 
 
+HOST = "4e" * 32
+REAL_HOST_BINDING = live.host_binding
+
+
+@pytest.fixture(autouse=True)
+def this_mac(monkeypatch):
+    # The evidence binding to this Mac (hardware UUID + install), fixed in tests.
+    monkeypatch.setattr(live, "host_binding", lambda root, **kw: HOST)
+
+
 def passing_evidence(binary_sha=BINARY_SHA, **overrides):
     data = {
         "kind": live.EVIDENCE_KIND, "schema": live.EVIDENCE_SCHEMA, "passed": True,
         "codex": {"version": codex_cli.CODEX_VERSION_OUTPUT, "binary_sha256": binary_sha},
         "gates": {name: {"passed": True} for name in live.REQUIRED_GATES},
         "account": {"identity": IDENTITY, "slot": "1"},
+        "host_binding": HOST,
     }
     data.update(overrides)
     return data
@@ -1319,3 +1330,27 @@ def test_a_proven_recovery_whose_summary_cannot_be_written_is_removed(tmp_path, 
     monkeypatch.setattr(codex_exec, "write_private", lambda path, data: (_ for _ in ()).throw(OSError(28, "full")))
     assert adapter.recover("b" * 32).execution_stopped is True
     assert not run_dir.exists()
+
+
+
+def test_evidence_from_another_mac_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "platform_supported", lambda: True)
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text(json.dumps(passing_evidence(host_binding="00" * 32)))
+    with pytest.raises(live.LiveModeError) as error:
+        live.enable_live(tmp_path, evidence, pinned())
+    assert "evidence_from_another_mac" in error.value.problems
+    monkeypatch.setattr(live, "host_binding", lambda root, **kw: None)
+    with pytest.raises(live.LiveModeError) as error:
+        live.enable_live(tmp_path, evidence, pinned())
+    assert error.value.code == "host_unverifiable"
+
+
+def test_host_binding_hashes_the_hardware_uuid_and_install(tmp_path):
+    out = '  "IOPlatformUUID" = "12345678-ABCD-1234-ABCD-1234567890AB"\n'
+    run = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, out, "")  # noqa: E731
+    real = REAL_HOST_BINDING
+    first = real(tmp_path / "a", run=run)
+    assert first is not None and len(first) == 64 and "12345678" not in first
+    assert real(tmp_path / "b", run=run) != first  # another install
+    assert real(tmp_path / "a", run=lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "")) is None
