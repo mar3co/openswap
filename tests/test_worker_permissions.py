@@ -209,6 +209,15 @@ def test_the_limit_defaults_to_follow_and_an_unreadable_one_is_read_only(tmp_pat
     assert load_permission_override(tmp_path) == "read-only"
     with pytest.raises(ValueError):
         write_permission_override(tmp_path, "everything")
+    # A settings file that cannot be read or parsed is not "no limit".
+    for text in ("{not json", "[]", json.dumps({"worker": "x"})):
+        (tmp_path / "settings.json").write_text(text)
+        assert load_permission_override(tmp_path) == "read-only"
+    (tmp_path / "settings.json").write_text(json.dumps({"ui": {}}))
+    assert load_permission_override(tmp_path) == "follow"
+    (tmp_path / "settings.json").unlink()
+    (tmp_path / "settings.json").mkdir()  # unreadable as a file
+    assert load_permission_override(tmp_path) == "read-only"
 
 
 def test_the_permissions_command_shows_and_sets_the_limit(tmp_path, capsys):

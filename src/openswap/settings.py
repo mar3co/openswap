@@ -658,8 +658,11 @@ _OVERRIDE_KEY = "permissionOverride"
 
 
 def _override_from_raw(raw: dict) -> str:
-    section = raw.get("worker")
-    value = section.get(_OVERRIDE_KEY, "follow") if isinstance(section, dict) else "follow"
+    section = raw.get("worker", {})
+    if not isinstance(section, dict):
+        _logger.warning("settings.json worker section is invalid; remote sessions run read-only")
+        return "read-only"
+    value = section.get(_OVERRIDE_KEY, "follow")
     if value not in PERMISSION_OVERRIDES:
         # Fail closed: an unreadable limit is the strictest one, never none.
         _logger.warning("settings.json worker permission limit is invalid; remote sessions run read-only")
@@ -671,9 +674,22 @@ def load_permission_override(backup_root: Path) -> str:
     """The per-Mac limit on remote sessions: ``follow`` (the default), ``no-shell`` or ``read-only``.
 
     Set only on this Mac (``openswap worker permissions``); the control
-    service has no way to change it.
+    service has no way to change it. Fails closed: only an absent settings
+    file means the default; one that cannot be read or parsed reads as
+    ``read-only`` (``_read_raw`` would turn it into defaults).
     """
-    return _override_from_raw(_read_raw(settings_path(Path(backup_root))))
+    path = settings_path(Path(backup_root))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "follow"
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        _logger.warning("Could not read %s (%s); remote sessions run read-only", path, error)
+        return "read-only"
+    if not isinstance(raw, dict):
+        _logger.warning("%s is not a JSON object; remote sessions run read-only", path)
+        return "read-only"
+    return _override_from_raw(raw)
 
 
 def write_permission_override(backup_root: Path, value: str) -> str:
