@@ -518,8 +518,12 @@ again.
 **Each task gets its own worktree** (the default). Before launch the worker
 runs `git worktree add -b openswap/<first 8 of the task id> <path> HEAD`.
 Every git command the worker runs (outside the sandbox) runs nothing from
-the repo: hooks, checkout and clean filters (every configured driver is
-emptied), `core.fsmonitor`, commit signing and submodule recursion are off,
+the repo: hooks, checkout and clean filters (every driver any config file
+or include could define is emptied, an `includeIf` included whatever its
+condition, so a filter that only an `onbranch:openswap/**` or `gitdir:`
+include turns on never runs either; the task's copy is checked out as a
+command of its own, never by `worktree add`'s child git), `core.fsmonitor`,
+commit signing and submodule recursion are off,
 and on a task's worktree git is pointed at it from the worker's own record
 (`GIT_DIR`/`GIT_WORK_TREE`), never through the task-writable `.git` file,
 and only after checking the task did not repoint its admin folder or switch
