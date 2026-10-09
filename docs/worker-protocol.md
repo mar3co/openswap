@@ -544,10 +544,11 @@ its shell commands through the profile's `shell_environment_policy`. A task
 never writes a ref, not even its own branch: it edits with whatever tools the
 account's own permission settings allow (see [Permissions](#permissions-the-accounts-own-settings)),
 and when it ends, by finishing, Stop, a
-timeout or a worker restart, the worker imports its objects (loose ones each
-verified against their name in bounded steps, packs through `git
-index-pack`; nothing existing overwritten), commits what it left to the
-task's branch and keeps the branch. A worktree whose work could not be
+timeout or a worker restart, the worker commits what it left for the
+task's branch, imports only the objects that commit needs from the task's
+object folder (packed by `git pack-objects` and checked by `git index-pack
+--strict`, as a fetched pack would be; nothing else the task left there ever
+reaches the repo's store), and only then moves the branch, which it keeps. A worktree whose work could not be
 committed is kept, and so is one where the task left files the repo ignores
 (build output, `.env` files): those are never committed, so the worktree
 stays until `openswap worker worktrees prune --force`. The task's copy is a
