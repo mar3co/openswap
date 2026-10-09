@@ -199,12 +199,13 @@ class ClaudeLiveCheck(LiveCheck):
 
     def _probe_options(self) -> dict:
         """The Read probes: every read allowed by Claude Code, so only the Seatbelt profile can refuse."""
-        return {"override": "follow",
+        # The profile's own settings are left out: its deny rules must not decide a boundary probe.
+        return {"override": "follow", "profile_settings": False,
                 "settings": {"permissions": {"defaultMode": "bypassPermissions", "allow": ["Read"]}}}
 
     def _widest_options(self) -> dict:
         """The widest an account can allow: ``bypassPermissions`` with the shell and every write."""
-        return {"override": "follow", "settings": {"permissions": {
+        return {"override": "follow", "profile_settings": False, "settings": {"permissions": {
             "defaultMode": "bypassPermissions", "allow": ["Read", "Write", "Edit", "Bash"]}}}
 
     # -- preflight and evidence hooks ---------------------------------------------

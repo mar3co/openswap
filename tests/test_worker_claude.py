@@ -773,6 +773,8 @@ class SimulatedClaudeMac(FakeLaunch):
         inside = target.startswith(str(cwd) + "/") or (tool == "Bash" and str(cwd) in target)
         if tool not in tools:
             return False, f"No such tool: {tool}"
+        if tool in getattr(self, "_deny", []):
+            return False, f"Permission to use {tool} has been denied."  # a bare deny rule, in any mode
         if tool == "Read":
             # A Mac volume is case-insensitive; Claude Code (2.1.7+) checks deny rules on the
             # path as given and on where a symlink leads.
@@ -924,7 +926,9 @@ def _simulated_check(tmp_path, mac_class=None):
 def test_the_claude_permission_gates_record_what_they_measured(tmp_path):
     root, mac, check = _simulated_check(tmp_path)
     profile = claude_exec.profile_for(root, IDENTITY)
-    (profile / "settings.json").write_text(json.dumps({"permissions": {"defaultMode": "dontAsk"}}))
+    # A restrictive account: its own deny rules must not decide the boundary probes.
+    (profile / "settings.json").write_text(json.dumps({"permissions": {"defaultMode": "dontAsk",
+                                                                       "deny": ["Read", "Write", "Bash"]}}))
     evidence = check.run()
     permissions = evidence["gates"]["permissions"]
     assert permissions["passed"] is True and permissions["account_mode"] == "dontAsk"
