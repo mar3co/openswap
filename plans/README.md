@@ -30,7 +30,7 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 015  | Desktop recovery and quiet completion feedback | P1 | M | — | DONE; profile detection still blocked |
 | 016  | App-aware ChatGPT switching | P1 | M | 014, 015, PR #49 | DONE |
 
-Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED
+Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED. Feature proposals use PROPOSED until accepted; 017 is accepted and tracked in its progress log.
 
 010's implementation and review fixes merged in PR #36 on 2026-09-17 UTC;
 the deferred manual UI verification keeps its overall status IN PROGRESS.
@@ -57,6 +57,49 @@ ChatGPT desktop app was excluded from that plan, not proven impossible. Plan
 validation gate. Plan 009 is independent of 007/008
 but touches `menubar.py`, so do not run it concurrently with 008's
 install/upgrade rewiring. Three phases with a green-suite gate between them.
+
+## Feature proposals
+
+| Plan | Proposal | Status |
+|------|----------|--------|
+| [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag or a self-hosted server | ACCEPTED; Phase 1 signoff (#59) and the local-only Phase 2 worker (#60) are merged; Phase 1 live-evidence gates remain blocked; Phase 3 credential-free scaffolding reviewed and fixed in two rounds on 2026-09-30, merge of #63–#67 pending; owner HTTPS/network pilot, server retention/audit trail still open ([progress](017-progress.md)) |
+
+017 recommends an optional OpenSwap worker process, with OpenTag as its first
+client, a pluggable control service (OpenTag-hosted, self-hosted MIT reference
+server, or any server implementing the published protocol), and defers a
+standalone OpenServer product. It includes provider research,
+architecture, staged delivery and acceptance criteria. This is a design proposal;
+merging it does not implement or enable remote execution. Its research snapshots
+are dated 2026-09-27 and must be revalidated during the feasibility spike. The
+OpenTag connector side is tracked in mar3co/opentag#135 (private repository).
+Phase 1 remains blocked pending supported-version authenticated execution,
+restriction, cancellation/recovery and account-ownership evidence. The owner
+authorized Phase 2 local-only infrastructure to proceed in parallel; remote
+access stays off and the production Codex adapter remains disabled. The Claude
+auth decision is a separate gate before any Claude adapter. PR
+[#59](https://github.com/mar3co/openswap/pull/59) merged on 2026-09-30 as
+Phase 1 signoff and PR [#60](https://github.com/mar3co/openswap/pull/60)
+merged the local-only Phase 2 worker the same day; neither merge replaces the
+remaining technical Phase 1 gates, which need an owner-authorized account
+context and an authenticated `codex exec` run. Phase 3 credential-free
+scaffolding is delivered as stacked PRs #63–#67
+under explicit owner authorization to overlap the open gates; the stack was
+fully reviewed and fixed on 2026-09-30 in two rounds (three HIGH bugs and the
+re-review findings closed on the branches) and its merge is pending. Its exit remains open pending owner-run
+HTTPS deployment, submission from another network, backend switching by URL,
+and server retention/purge with an audit trail.
+The local worker defaults off; the UI exposes its
+opt-in/status/stop/pause controls, and the CLI provides `openswap worker
+enable|status|stop|pause|disable`. `settings.json` stores the local enabled and
+paused policy, approved opaque workspace mappings, and optional pinned
+account reference. The Phase 3 test-only `worker submit-test` command requires
+local pairing and
+`--i-understand-this-is-a-test-tool`; the reference service and
+[protocol](../docs/worker-protocol.md) provide the credential-free round trip.
+Pair/unpair use login Keychain on macOS; service connectivity and remote last
+seen are independent of local process/provider status. The
+production Codex adapter reports unavailable; only synthetic fake-adapter
+tests exercise job execution and lifecycle. See [017 progress](017-progress.md).
 
 ## Dependency notes
 

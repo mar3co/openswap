@@ -13,12 +13,14 @@ import json
 import os
 import plistlib
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from openswap import menubar
+from openswap import menubar_display
 from openswap.autoswitch import (
     AllExhaustedEvent,
     ConfigWarningEvent,
@@ -29,6 +31,7 @@ from openswap.autoswitch import (
     SwitchEvent,
 )
 from openswap.exceptions import ClaudeSwitchError
+from openswap.settings import WorkerSettings, update_worker_settings
 from openswap.switcher import (
     USAGE_API_KEY,
     USAGE_FOREIGN_CREDENTIAL,
@@ -301,6 +304,121 @@ def test_settings_page_sections_separate_display_from_provider_automation():
     )
 
 
+def test_remote_tasks_settings_are_opt_in_redacted_and_stop_targets_job_id():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(),
+        strategy="best",
+        threshold=90,
+        worker_enabled=True,
+        worker_paused=True,
+        worker_status={
+            "process_state": "running",
+            "provider": {"available": False, "diagnostic_code": "live_adapter_disabled"},
+            "active_job": {
+                "job_id": "job-local-7",
+                "state": "cancel_requested",
+                "task": "sensitive task text",
+            },
+            "queue_depth": 1,
+        },
+        section=menubar.SETTINGS_SECTION_GENERAL,
+    )
+    by_id = {row["id"]: row for row in rows}
+
+    assert by_id["remote_tasks_enabled"]["value"] is True
+    assert by_id["remote_tasks_paused"]["value"] is True
+    assert by_id["remote_tasks_stop"]["value"] == "job-local-7"
+    assert by_id["remote_tasks_stop"]["disabled"] is False
+    status = by_id["remote_tasks_status"]["value"]
+    assert "provider live_adapter_disabled" in status
+    assert "cancel_requested" in status
+    assert "sensitive task text" not in status
+
+    off_rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(),
+        strategy="best",
+        threshold=90,
+        section=menubar.SETTINGS_SECTION_GENERAL,
+    )
+    off = {row["id"]: row for row in off_rows}
+    assert off["remote_tasks_enabled"]["value"] is False
+    assert off["remote_tasks_paused"]["disabled"] is True
+    assert off["remote_tasks_stop"]["disabled"] is True
+
+    available_rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(),
+        strategy="best",
+        threshold=90,
+        worker_enabled=True,
+        worker_status={
+            "process_state": "running",
+            "provider": {"available": True, "diagnostic_code": None},
+            "active_job": {"job_id": "job-local-8", "state": "succeeded"},
+        },
+        section=menubar.SETTINGS_SECTION_GENERAL,
+    )
+    available = {row["id"]: row for row in available_rows}
+    assert "provider available" in available["remote_tasks_status"]["value"]
+    assert "job succeeded" in available["remote_tasks_status"]["value"]
+
+
+def test_worker_status_poll_refreshes_policy_and_discards_stale_policy(
+    tmp_path: Path, monkeypatch
+):
+    from tests.menubar_harness import extract_class
+
+    update_worker_settings(tmp_path, enabled=True, paused=True)
+    monkeypatch.setattr(
+        "openswap.worker.cli.read_status",
+        lambda _root: {
+            "process_state": "running",
+            "enabled": True,
+            "paused": True,
+            "active_job": None,
+            "queue_depth": 0,
+        },
+    )
+    app_type = extract_class(
+        menubar.__file__,
+        "MenuBarApp",
+        {"_worker_status_worker", "_with_account_picker", "_drain_worker_result"},
+        {},
+    )
+    app = app_type()
+    app.switcher = SimpleNamespace(backup_dir=tmp_path)
+    app._worker_generation = 4
+    app._worker_result_lock = threading.Lock()
+    app._worker_status_inflight = True
+    app._worker_operation = None
+    app._worker_policy = WorkerSettings()
+    app._worker_status_cache = {"process_state": "unavailable"}
+    app._worker_result = None
+    app._panel = None
+
+    # The status read observes policy changed by a separate CLI process and
+    # applies snapshot and policy together when the UI drains that generation.
+    app._worker_status_worker(4)
+    app._drain_worker_result()
+    assert app._worker_policy.enabled is True
+    assert app._worker_policy.paused is True
+    assert app._worker_status_cache["process_state"] == "running"
+
+    # A result from an older status generation cannot overwrite a newer policy.
+    latest_policy = WorkerSettings(enabled=False, paused=False)
+    app._worker_policy = latest_policy
+    app._worker_generation = 5
+    app._worker_status_inflight = True
+    app._worker_result = (
+        4,
+        {"process_state": "stale"},
+        WorkerSettings(enabled=True, paused=True),
+        None,
+    )
+    app._drain_worker_result()
+    assert app._worker_policy is latest_policy
+    assert app._worker_status_cache["process_state"] == "running"
+
+
 def test_settings_page_rows_include_required_ids_and_values():
     from openswap.kickoff import kickoff_time_options, kickoff_time_value
 
@@ -431,6 +549,14 @@ def test_chatgpt_capability_freshness_and_activation_helpers():
     incompatible = DesktopCapability(state="invalid", reason="incompatible_backend")
     assert menubar.desktop_capability_status_copy(incompatible) == (
         "This ChatGPT build isn’t compatible with switching."
+    )
+    legacy = DesktopCapability(state="invalid", reason="legacy_chat_app")
+    assert menubar.desktop_capability_status_copy(legacy) == (
+        "This is the older ChatGPT app. Update ChatGPT to switch accounts."
+    )
+    no_cli = DesktopCapability(state="invalid", reason="helper_missing")
+    assert menubar.desktop_capability_status_copy(no_cli) == (
+        "This ChatGPT build is missing its Codex tools."
     )
     retryable = DesktopCapability(state="invalid", reason="probe_failed", observed_at=now)
     assert menubar.desktop_capability_status_copy(retryable) == (
@@ -1426,7 +1552,7 @@ def test_apply_hold_line_reloads_open_main_panel_only_when_copy_changes():
         "self._reload_main_panel_if_shown()"
     )
     reload_fn = text[
-        text.index("def _reload_main_panel_if_shown") : text.index("def _stop_engine")
+        text.index("def _reload_main_panel_if_shown") : text.index("def _worker_view_active")
     ]
     assert "== MAIN_PAGE" in reload_fn
     assert "SETTINGS_PAGE" not in reload_fn
@@ -2292,12 +2418,46 @@ def test_plan_relogin_click_captures_only_on_email_and_org_match():
     assert wrong_org.kind == "confirm_open_login"
     assert wrong_org.kind != "capture"
     title = menubar.relogin_wrong_account_title(wrong_org)
-    assert title == "Sign in as personal?"
+    assert title == "personal needs a new sign-in"
     msg = menubar.relogin_wrong_account_message(wrong_org)
     assert msg == (
-        "Claude Code is using adsonline right now. "
-        "Your saved adsonline account is not removed. "
-        "Continue to sign in as personal?"
+        "personal's saved login has expired, so OpenSwap can't switch to it. "
+        "Sign in as personal in the login window that opens.\n\n"
+        "Claude Code is on adsonline right now and will sign out of it. "
+        "adsonline stays saved in OpenSwap, so you can switch back later."
+    )
+
+    assert wrong_org.reason == "expired"
+
+    no_saved_login = menubar.plan_relogin_click(
+        live=("a@x.com", "org-ads"),
+        slot=slot,
+        slot_name="personal",
+        live_name="adsonline",
+        reason="missing",
+    )
+    assert no_saved_login is not None
+    assert no_saved_login.kind == "confirm_open_login"
+    assert (
+        menubar.relogin_wrong_account_title(no_saved_login)
+        == "personal needs a sign-in"
+    )
+    assert menubar.relogin_wrong_account_message(no_saved_login).startswith(
+        "OpenSwap has no saved login for personal, so it can't switch to it. "
+        "Sign in as personal in the login window that opens."
+    )
+
+    unverified = menubar.plan_relogin_click(
+        live=("a@x.com", "org-ads"),
+        slot=slot,
+        slot_name="personal",
+        live_name="adsonline",
+        reason="unverified",
+    )
+    assert unverified is not None
+    assert menubar.relogin_wrong_account_message(unverified).startswith(
+        "OpenSwap couldn't confirm personal's saved login, so it can't "
+        "switch to it."
     )
 
     signed_out = menubar.plan_relogin_click(
@@ -2428,13 +2588,44 @@ def test_launch_claude_login_opens_command_file(tmp_path):
     assert calls[0][1] == str(dest)
 
 
-def test_launch_claude_login_missing_claude():
+def test_launch_claude_login_missing_claude(monkeypatch):
+    # `launch_claude_login` falls back to common install directories after
+    # PATH lookup. Simulate the resolver's final missing result so this test
+    # stays deterministic on machines with Claude installed in one of them.
+    seen = {}
+
+    def fake_resolve(**kwargs):
+        seen.update(kwargs)
+        return None
+
+    monkeypatch.setattr(menubar_display, "resolve_claude_bin", fake_resolve)
+    which = lambda _name: None  # noqa: E731
     with pytest.raises(ClaudeSwitchError, match="claude"):
         menubar.launch_claude_login(
             "a@x.com",
-            which=lambda _name: None,
+            which=which,
             run=lambda *_a, **_k: SimpleNamespace(returncode=0),
         )
+    # The caller's `which` must reach the resolver rather than be ignored.
+    assert seen.get("which") is which
+
+
+def test_resolve_claude_bin_returns_none_when_path_and_extra_dirs_miss(tmp_path):
+    assert (
+        menubar_display.resolve_claude_bin(
+            which=lambda _name: None, extra_dirs=(str(tmp_path),)
+        )
+        is None
+    )
+
+
+def test_resolve_claude_bin_falls_back_to_extra_dirs(tmp_path):
+    candidate = tmp_path / "claude"
+    candidate.write_text("#!/bin/sh\n")
+    resolved = menubar_display.resolve_claude_bin(
+        which=lambda _name: None, extra_dirs=(str(tmp_path),)
+    )
+    assert resolved == str(candidate)
 
 
 def test_display_helpers_import_without_rumps():
@@ -2836,6 +3027,64 @@ def test_account_click_confirms_before_switching_for_both_providers():
     assert claude_branch.index("_repair_relogin(") < claude_branch.index("_confirm_switch(")
 
 
+def test_account_click_routes_login_mismatch_to_explained_repair():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    click = text[text.index("def _on_account_click") : text.index("def _repair_relogin")]
+    claude_branch = click[click.index("_slot_needs_relogin") :]
+    # A mismatch on the active card must not fall into the silent self-switch.
+    assert claude_branch.index("_repair_reconcile(") < claude_branch.index("_confirm_switch(")
+    repair = text[text.index("def _repair_reconcile") : text.index("def _capture_relogin")]
+    # Look up whose login is live and explain it before touching anything.
+    # The engine decides ownership (uuid-first), never display names.
+    assert "live_credential_owner(num)" in repair
+    # Roster/config errors surface as an alert, like a failed switch.
+    assert "self.switcher.live_credential_owner(num)" in repair
+    assert repair.index("_run_switch(") < repair.index("live_credential_owner(num)")
+    assert "except OSError" in repair
+    assert "_name_for_identity" not in repair
+    # Already fixed since the card was drawn: refresh, don't prompt.
+    assert repair.index('"matches"') < repair.index("self._alert(")
+    # Every restore goes through the dialog; no unconfirmed switch path.
+    assert '!= "own"' not in repair
+    assert repair.index("self._alert(") < repair.index("switch_to(")
+    assert "reconcile_dialog_copy(" in repair
+    assert repair.index("self._alert(") < repair.index("switch_to(")
+    # Unverifiable owner: offer a fresh sign-in instead of a blind restore.
+    assert repair.index("force_login=True") < repair.index("switch_to(")
+    assert '"repaired"' in repair and "refresh_async()" in repair
+
+
+def test_reconcile_dialog_names_the_real_owner_and_both_choices():
+    title, body, ok = menubar.reconcile_dialog_copy(
+        "adsonline", "gomryo@gmail.com",
+        owner_email="yohan@virtualshield.com", owner_name="virtualshield",
+    )
+    assert ok == "Restore adsonline"
+    assert "adsonline (gomryo@gmail.com)" in body
+    assert "belongs to yohan@virtualshield.com" in body
+    assert "click virtualshield's card" in body
+    # Switching uses the saved login, which may need a fresh sign-in.
+    assert "sign in again" in body
+    assert "Claude app" in body
+
+
+def test_reconcile_dialog_for_unsaved_owner_says_to_add_it():
+    _t, body, _ok = menubar.reconcile_dialog_copy(
+        "adsonline", "gomryo@gmail.com",
+        owner_email="someone@example.com", owner_name=None,
+    )
+    assert "add it as an account" in body
+
+
+def test_reconcile_dialog_when_owner_unknown_changes_nothing():
+    title, body, ok = menubar.reconcile_dialog_copy(
+        "adsonline", "gomryo@gmail.com", owner_email=None, owner_name=None,
+    )
+    assert title == "Couldn't check Claude Code's login"
+    assert "Nothing has been changed" in body
+    assert ok == "Sign in as adsonline"
+
+
 def test_account_click_restores_saved_live_login_before_normal_confirmation():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     click = text[text.index("def _on_account_click") : text.index("def _repair_relogin")]
@@ -2960,7 +3209,7 @@ def test_every_settings_row_is_dispatched():
         threshold=90,
     )
     for row in rows:
-        if row["kind"] == "group":
+        if row["kind"] in {"group", "status"}:
             continue
         assert f'"{row["id"]}"' in body, row["id"]
 

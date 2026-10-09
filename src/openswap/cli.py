@@ -113,6 +113,36 @@ _SUBCOMMAND_FLAGS = {
 }
 
 
+# Every verb the pre-dispatch and the parser accept, for the "did you mean"
+# on a mistype (`openswap acount`) or a worker verb typed without `worker`
+# (`openswap account`, `openswap pair`).
+_KNOWN_VERBS = frozenset({
+    *_SUBCOMMAND_FLAGS, "switch", "auto", "codex", "widget", "statusline", "setup", "config",
+    "unclaimed", "alias", "swap", "move", "worker", "tui", "watch", "run", "map", "unmap",
+})
+# The worker verbs an owner is likely to type at the top level.
+_WORKER_VERBS = ("setup", "pair", "unpair", "status", "enable", "disable", "pause", "stop", "account",
+                 "workspace", "codex", "claude", "live", "live-check")
+
+
+def unknown_command_message(word: str) -> str:
+    """One line for an unknown first word: the closest commands, else the help hint."""
+    import difflib
+
+    prog = _prog_name()
+    close = []
+    if word in _WORKER_VERBS:
+        close.append(f"worker {word}")
+    close.extend(difflib.get_close_matches(word, sorted(_KNOWN_VERBS - {"tui", "watch", "run", "map", "unmap"}),
+                                           n=2, cutoff=0.6))
+    close.extend(name for name in difflib.get_close_matches(
+        word, [f"worker {verb}" for verb in _WORKER_VERBS], n=2, cutoff=0.6) if name not in close)
+    if close:
+        suggestion = " or ".join(f"`{prog} {name}`" for name in close[:3])
+        return f"{prog}: unknown command '{word}'. Did you mean {suggestion}?"
+    return f"{prog}: unknown command '{word}'. Run `{prog} help` to list the commands."
+
+
 def _translate_subcommand(argv: list[str]) -> list[str]:
     """Rewrite a leading memorable subcommand into the equivalent flag argv.
 
@@ -1399,10 +1429,20 @@ def _menubar_service(args) -> int:
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
-    _migrate_legacy_cswap_state()
+    # Checked before worker dispatch so a stale `cswap` launcher cannot reach
+    # the worker CLI (or anything else) under the removed command name.
     if _invoked_as_removed_cswap_command():
+        _migrate_legacy_cswap_state()
         error("The 'cswap' command has been removed. Use 'openswap' instead.")
         sys.exit(2)
+    # The worker is a separate local process. Dispatch before legacy migration,
+    # theme/TLS setup, or any account engine construction so its startup cannot
+    # touch provider state or import the menu-bar UI.
+    if len(sys.argv) > 1 and sys.argv[1] == "worker":
+        from openswap.worker.cli import main as worker_main
+
+        sys.exit(worker_main(sys.argv[2:]))
+    _migrate_legacy_cswap_state()
     _use_native_tls()
     argv = sys.argv[1:]
     try:
@@ -1443,6 +1483,10 @@ def main() -> None:
         _move_command(argv[1:])
         return
 
+    if argv and not argv[0].startswith("-") and argv[0] not in _KNOWN_VERBS:
+        error(unknown_command_message(argv[0]))
+        sys.exit(2)
+
     if argv and argv[0] in ("tui", "watch"):
         error(
             "The terminal dashboard is gone. Use the macOS extra "
@@ -1474,36 +1518,44 @@ def main() -> None:
         usage="%(prog)s <command> [args] [options]",
         description="""OpenSwap: OpenSoft macOS CLI for rotating Claude Code accounts
 
-Commands:
-  %(prog)s help                       show this help
-  %(prog)s setup                      save the current login and start the menu bar extra
-  %(prog)s list                       list managed accounts
-  %(prog)s status                     show current account
+Claude accounts:
+  %(prog)s list                       list managed accounts (alias: ls)
+  %(prog)s status                     show the current account
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
-  %(prog)s add                        add the current account
+  %(prog)s add                        save the current login as an account
   %(prog)s add-token [TOKEN|-]        register an API key or setup-token
-  %(prog)s remove <num|email>         remove an account
+  %(prog)s remove <num|email>         remove an account (alias: rm)
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
-  %(prog)s alias <num|email> <name>   set a short alias for an account
-  %(prog)s alias <num|email> --unset  remove an account's alias
-  %(prog)s alias                      list all aliases
+  %(prog)s alias <num|email> <name>   set a short alias (--unset removes it; bare lists them)
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
-  %(prog)s codex add|list|switch|remove|disable|enable|alias|export|import|swap|move|desktop  Codex CLI / ChatGPT desktop
-  %(prog)s config [set KEY VALUE]     show or change shared policy (settings.json)
-  %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
-  %(prog)s menubar                    macOS menu bar extra
-  %(prog)s menubar --install-service  keep the extra running via launchd
-  %(prog)s widget --install           macOS Desktop / Notification Center widget
-  %(prog)s statusline --install       opt-in: wrap Claude Code status line
-  %(prog)s purge                      remove all openswap data
 
-Aliases: ls=list  rm=remove""",
+Codex accounts:
+  %(prog)s codex add|list|switch|remove|disable|enable|alias|export|import|swap|move|desktop
+
+Remote tasks (tasks from Slack on this Mac):
+  %(prog)s worker setup               guided setup: worker, account, readable folders
+  %(prog)s worker status              worker, service and job state
+  %(prog)s worker account [slot]      list or pin the account remote jobs use
+  %(prog)s worker enable|disable      start or stop the local worker
+  %(prog)s worker --help              every worker command (pair, workspace, live-check, ...)
+
+Menu bar and widgets:
+  %(prog)s setup                      save the current login and start the menu bar extra
+  %(prog)s menubar                    macOS menu bar extra (--install-service keeps it up)
+  %(prog)s widget --install           macOS Desktop / Notification Center widget
+  %(prog)s statusline --install       opt-in: wrap the Claude Code status line
+
+Other:
+  %(prog)s config [set KEY VALUE]     show or change shared policy (settings.json)
+  %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
+  %(prog)s purge                      remove all openswap data
+  %(prog)s help                       show this help""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Flags combine with subcommands:
   %(prog)s switch --strategy best           # pick the account with most quota left

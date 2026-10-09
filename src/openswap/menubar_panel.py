@@ -177,6 +177,8 @@ SETTINGS_BTN_GAP_X = 6.0
 SETTINGS_BTN_GAP_Y = 4.0
 SETTINGS_ROW_GAP = 6.0
 SETTINGS_POPUP_H = 24.0
+# Room left for a short label ("Account") beside a full-width popup.
+SETTINGS_WIDE_POPUP_LABEL_W = 72.0
 SETTINGS_BACK_W = 64.0
 SETTINGS_BACK_H = 22.0
 SETTINGS_TABS_H = 40.0
@@ -851,6 +853,11 @@ class MenuBarPanel:
         on_empty_action=None,
         login_state=None,
         on_login_action=None,
+        worker_enabled=None,
+        worker_paused=None,
+        worker_status=None,
+        on_worker_view_active=None,
+        worker_paired=None,
     ):
         self._on_switch = on_switch
         self._on_rotate = on_rotate
@@ -875,6 +882,11 @@ class MenuBarPanel:
         self._on_empty_action = on_empty_action
         self._login_state = login_state or (lambda: {"stage": "idle"})
         self._on_login_action = on_login_action
+        self._worker_enabled = worker_enabled or (lambda: False)
+        self._worker_paused = worker_paused or (lambda: False)
+        self._worker_status = worker_status or (lambda: {})
+        self._worker_paired = worker_paired or (lambda: False)
+        self._on_worker_view_active = on_worker_view_active
         self._login_alias = ""
         self._login_alias_field = None
         self._login_brand_started_at = None
@@ -1185,6 +1197,11 @@ class MenuBarPanel:
             else SETTINGS_SECTION_GENERAL
         )
         self._page = SETTINGS_PAGE
+        if (
+            self._settings_section == SETTINGS_SECTION_GENERAL
+            and self._on_worker_view_active is not None
+        ):
+            self._on_worker_view_active()
         self.reload()
 
     def _show_main(self, _sender=None):
@@ -1211,11 +1228,17 @@ class MenuBarPanel:
         btn.setFont_(font)
         btn.removeAllItems()
         selected = 0
-        for i, (value, lab) in enumerate(options or []):
+        # Options are (value, label) or (value, label, {"disabled": True}).
+        if any(len(option) > 2 for option in options or []):
+            btn.setAutoenablesItems_(False)
+        for i, option in enumerate(options or []):
+            value, lab = option[0], option[1]
             btn.addItemWithTitle_(lab)
             item = btn.lastItem()
             if item is not None:
                 item.setRepresentedObject_(value)
+                if len(option) > 2 and (option[2] or {}).get("disabled"):
+                    item.setEnabled_(False)
             if value == current:
                 selected = i
         if btn.numberOfItems() > 0:
@@ -1757,12 +1780,28 @@ class MenuBarPanel:
             )
         except Exception:
             codex_enabled = True
+        try:
+            worker_enabled = bool(self._worker_enabled())
+            worker_paused = bool(self._worker_paused())
+            worker_status = self._worker_status()
+            if not isinstance(worker_status, dict):
+                worker_status = {}
+        except Exception:
+            worker_enabled, worker_paused, worker_status = False, False, {}
+        try:
+            worker_paired = bool(self._worker_paired())
+        except Exception:
+            worker_paired = False
         rows = settings_page_rows(
             settings,
             strategy=strategy,
             threshold=threshold,
             has_codex=has_codex,
             codex_enabled=codex_enabled,
+            worker_enabled=worker_enabled,
+            worker_paused=worker_paused,
+            worker_status=worker_status,
+            worker_paired=worker_paired,
             section=self._settings_section,
         )
 
@@ -1788,6 +1827,8 @@ class MenuBarPanel:
             kind = row.get("kind")
             if kind == "group":
                 return 34.0 if row.get("style") == "hint" else SETTINGS_GROUP_H
+            if kind == "status":
+                return 44.0
             if kind == "toggle":
                 return SETTINGS_TOGGLE_H
             if kind == "popup":
@@ -1878,27 +1919,66 @@ class MenuBarPanel:
                 )
                 root.addSubview_(sw)
             elif kind == "popup":
+                popup_w = (
+                    max(SETTINGS_POPUP_W, inner_w - SETTINGS_WIDE_POPUP_LABEL_W)
+                    if row.get("wide") else SETTINGS_POPUP_W
+                )
                 root.addSubview_(
                     _label(
                         row.get("label") or "",
                         font_body,
                         pal["fg"],
-                        NSMakeRect(PAD, y + 5, inner_w - SETTINGS_POPUP_W - 8, 20),
+                        NSMakeRect(PAD, y + 5, inner_w - popup_w - 8, 20),
                     )
                 )
-                self._add_popup(
+                popup = self._add_popup(
                     root,
                     row.get("options") or [],
                     row.get("value"),
                     NSMakeRect(
-                        PANEL_WIDTH - PAD - SETTINGS_POPUP_W,
+                        PANEL_WIDTH - PAD - popup_w,
                         y + (h - SETTINGS_POPUP_H) / 2,
-                        SETTINGS_POPUP_W,
+                        popup_w,
                         SETTINGS_POPUP_H,
                     ),
                     row["id"],
                     font_small,
                 )
+                popup.setEnabled_(not bool(row.get("disabled")))
+            elif kind == "status":
+                root.addSubview_(
+                    _label(
+                        row.get("label") or "",
+                        font_small,
+                        pal["muted"],
+                        NSMakeRect(PAD, y, inner_w, 14),
+                    )
+                )
+                value_label = _label(
+                    row.get("value") or "Worker status unavailable",
+                    font_small,
+                    pal["muted"],
+                    NSMakeRect(PAD, y + 14, inner_w, h - 14),
+                )
+                _wrap(value_label)
+                root.addSubview_(value_label)
+            elif kind == "button":
+                root.addSubview_(
+                    _label(
+                        row.get("label") or "",
+                        font_body,
+                        pal["fg"],
+                        NSMakeRect(PAD, y + 5, inner_w - 78, 20),
+                    )
+                )
+                button = self._add_button(
+                    root,
+                    row.get("title") or "Action",
+                    NSMakeRect(PANEL_WIDTH - PAD - 70, y + 2, 70, 26),
+                    lambda _s, rid=row["id"], v=row.get("value"): self._emit_setting(rid, v),
+                    font_small,
+                )
+                button.setEnabled_(not bool(row.get("disabled")))
             elif kind == "choice":
                 root.addSubview_(
                     _label(

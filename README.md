@@ -70,11 +70,25 @@ The command-line executable is `openswap`.
 | `openswap codex move` | Assign a Codex account to a slot |
 | `openswap codex desktop` | Experimental ChatGPT preflight, switch, and recovery (`switch` and `recover` need `--confirm-restart --confirm-idle`) |
 | `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
+| `openswap worker pair <url> <code>` | Remote tasks (opt-in): pair with a control service, then the guided setup: start the worker, pick an account, choose the folders tasks may read (`~/GitHub` is suggested) |
+| `openswap worker setup` | Rerun the guided setup on a paired Mac (also Settings → General → **Set up Remote tasks…**) |
+| `openswap worker enable` | Start the Remote tasks worker (LaunchAgent) so a paired Mac heartbeats and shows online |
+| `openswap worker account [slot]` | List or pin the Codex or Claude account remote jobs run on (`claude:4`, `codex:2`) |
+| `openswap worker account allow <slot>` | Allow an account for a per-job choice by the control service (`disallow`, `label`) |
+| `openswap worker workspace add --read <folder>` | Let remote tasks read a folder but never change it; results go to `~/OpenSwap Research/<id>` (`add <id> <folder>` approves a results folder; `list`, `label`, `remove`). The control service sees only IDs and labels |
+| `openswap worker codex install` | Install the pinned official Codex CLI 0.157.1 for Remote tasks (SHA-256 verified) |
+| `openswap worker codex login [slot]` | Sign an account in to its own isolated Codex home (your default login is untouched) |
+| `openswap worker claude pin` / `prepare` | Pin the installed Claude Code binary and prepare an account's OpenSwap profile (your default login is untouched) |
+| `openswap worker live-check` | Run short real jobs on this Mac, record phase-1 evidence, then offer to enable live execution (`--provider claude`) |
+| `openswap worker live status` | Show whether remote jobs really run (`enable --evidence FILE`, `disable`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |
 | `openswap upgrade` | Pull the checkout and reinstall |
 | `openswap statusline --install` | Opt-in: wrap Claude Code status line |
 | `openswap statusline --codex` | Paint the live Codex account label (no config.toml wrap) |
+
+Remote tasks are off by default, and jobs do not run until you pass the live check and enable live execution on this Mac; the pairing, account and folder setup is described in [the worker protocol doc](docs/worker-protocol.md#choosing-the-account-and-research-folders) and the live steps in [Running jobs live](docs/worker-protocol.md#running-jobs-live-codex).
+Pairing does not start the worker: the portal shows the Mac Offline until you run `openswap worker enable` (or turn on Settings → General → **Enable local worker**). On a terminal, `pair` asks whether to start it now; `openswap worker status` says so while the Mac is paired but the worker is off.
 
 `openswap help` lists the main commands. Full list: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
 

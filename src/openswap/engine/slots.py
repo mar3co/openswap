@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from openswap.engine.notes import *  # noqa: F403
+from openswap.worker.leases import AccountLeaseStore
 
 class SlotsMixin:
     """Roster (sequence.json), backup Keychain, aliases, disabled flags, slot numbers."""
@@ -320,7 +321,8 @@ class SlotsMixin:
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
         self._refuse_session_shell()
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             return self._swap_accounts_locked(first, second)
 
     def _read_backup_or_abort(self, account_num: str, email: str) -> str:
@@ -726,7 +728,8 @@ class SlotsMixin:
         # the mutation (via the *_locked helpers — FileLock is non-reentrant):
         # a slot number resolved outside the lock could be renumbered by a
         # concurrent swap/move and end up moving the wrong account.
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             self._get_sequence_data_migrated()
 
             num_src = self._resolve_account_identifier(account)
@@ -1021,10 +1024,12 @@ class SlotsMixin:
         """Persist rotated credentials to a slot's backup store, under the lock.
 
         For inactive accounts only — never routes to the active store. Mirrors
-        the persist callback ``_fetch_account_usage`` uses. The caller must NOT
-        hold ``self.lock_file`` (FileLock is non-reentrant).
+        the persist callback ``_fetch_account_usage`` uses. The provider
+        mutation guard atomically checks the worker lease and holds the same
+        provider lock through the write.
         """
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as guard:
+            guard.assert_available()
             self._write_account_credentials(account_num, email, credentials)
 
     def account_identity(self, account_num: str) -> dict:
@@ -1253,8 +1258,13 @@ class SlotsMixin:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
-        # Ensure org fields are migrated before resolving accounts
-        self._get_sequence_data_migrated()
+        # Ensure org fields are migrated before resolving accounts. The
+        # migration rewrites sequence.json, so it runs under the lease guard
+        # (as move does); the prompts below stay outside it and the removal
+        # re-checks under the guard.
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
+            self._get_sequence_data_migrated()
 
         # Resolve identifier
         if not identifier.isdigit():
@@ -1318,7 +1328,8 @@ class SlotsMixin:
                 print(dimmed("Cancelled"))
                 return
 
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             data = self._get_sequence_data()
             account_info = (data or {}).get("accounts", {}).get(account_num)
             if not account_info:

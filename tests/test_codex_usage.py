@@ -80,10 +80,31 @@ def test_read_rate_limits_handshake_then_request(tmp_path: Path):
 
 def test_read_rate_limits_error_reply_raises(tmp_path: Path):
     proc = FakeProc([json.dumps({"id": 1, "result": {}}), json.dumps({"id": 2, "error": {"message": "unauthorized"}})])
-    with pytest.raises(CodexUsageError, match="unauthorized"):
+    with pytest.raises(CodexUsageError, match="unauthorized") as caught:
         read_rate_limits(tmp_path, codex_bin="/opt/codex", popen=lambda *a, **k: proc)
+    assert caught.value._openswap_process_stopped is True
+
+
+def test_read_rate_limits_launch_error_proves_unlaunched(tmp_path: Path):
+    with pytest.raises(FileNotFoundError) as caught:
+        read_rate_limits(
+            tmp_path,
+            codex_bin="/missing/codex",
+            popen=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("missing")),
+        )
+    assert caught.value._openswap_unlaunched is True
 
 def test_read_rate_limits_eof_raises(tmp_path: Path):
     proc = FakeProc([])
     with pytest.raises(CodexUsageError):
         read_rate_limits(tmp_path, codex_bin="/opt/codex", popen=lambda *a, **k: proc)
+
+
+def test_missing_rate_limits_reply_reports_confirmed_stop(tmp_path: Path):
+    proc = FakeProc([
+        json.dumps({"id": 1, "result": {}}),
+        json.dumps({"id": 2, "result": {"rateLimits": None}}),
+    ])
+    with pytest.raises(CodexUsageError, match="no rateLimits") as caught:
+        read_rate_limits(tmp_path, codex_bin="/opt/codex", popen=lambda *a, **k: proc)
+    assert caught.value._openswap_process_stopped is True

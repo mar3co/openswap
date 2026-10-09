@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from openswap.engine.notes import *  # noqa: F403
+from openswap.worker.leases import AccountLeaseStore
 
 class SwitchMixin:
     """Capture, activate, classify outgoing live bytes, shared MCP merge."""
@@ -399,7 +400,8 @@ class SwitchMixin:
             # on a race.
             self._reject_identity_drift_since_verify(identity)
 
-            with FileLock(self.lock_file):
+            with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+                lease_guard.assert_available()
                 seq = self._get_sequence_data() or {}
                 account_num = self._find_account_slot(
                     seq, current_email, current_org_uuid
@@ -532,7 +534,8 @@ class SwitchMixin:
         self._reject_identity_drift_since_verify(identity)
 
         prune_identity = None
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             data = self._get_sequence_data() or {
                 "activeAccountNumber": None,
                 "lastUpdated": "",
@@ -746,7 +749,8 @@ class SwitchMixin:
 
         # If the account already exists (same email, personal), refresh in place.
         if slot is None and self._account_exists(email, ""):
-            with FileLock(self.lock_file):
+            with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+                lease_guard.assert_available()
                 seq = self._get_sequence_data() or {}
                 account_num = self._find_account_slot(seq, email, "")
                 if account_num is None:
@@ -819,7 +823,8 @@ class SwitchMixin:
             account_num = str(self._get_next_account_number())
 
         prune_identity = None
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_available()
             data = self._get_sequence_data() or {
                 "activeAccountNumber": None,
                 "lastUpdated": "",
@@ -1607,6 +1612,21 @@ class SwitchMixin:
             result["message"] = (
                 f"Activated Account-{to['number']} ({to['email']}) from stored backup"
             )
+        # Likewise a reconciled self-switch rewrote a diverged live login;
+        # the menu bar needs to tell that apart from a true no-op. Only when
+        # the under-lock classifier verified ownership: "unresolved" (the
+        # live bytes moved after the pre-lock lookup) proves nothing.
+        elif (
+            result is not None
+            and provenance is not None
+            and not result["switched"]
+            and op.get("outgoing") not in (None, "unresolved")
+        ):
+            to = result["to"]
+            result["reason"] = "repaired"
+            result["message"] = (
+                f"Repaired Account-{to['number']} ({to['email']}) live login"
+            )
         return result
 
     def _self_switch_action(self, slot: str, email: str) -> tuple[str, dict | None]:
@@ -2000,7 +2020,12 @@ class SwitchMixin:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with (
+            AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard,
+            claude_credentials_lock(),
+            claude_config_lock(),
+        ):
+            lease_guard.assert_unleased()
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
@@ -2502,7 +2527,10 @@ class SwitchMixin:
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        return {
+            "from": from_ref, "to": to_ref, "warnings": warnings_out,
+            "outgoing": kind,
+        }
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active

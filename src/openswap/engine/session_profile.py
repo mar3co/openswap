@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from openswap.engine.notes import *  # noqa: F403
+from openswap.worker.leases import AccountLeaseStore
 
 class SessionProfileMixin:
     """Isolated CLAUDE_CONFIG_DIR profile for idle-slot kickoff; adopt rotated creds back."""
@@ -186,7 +187,8 @@ class SessionProfileMixin:
         from openswap.session import profile_is_quiescent
 
         session_dir = self._session_dir(account_num, email)
-        with FileLock(self.lock_file):
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
+            lease_guard.assert_unleased()
             if not profile_is_quiescent(session_dir):
                 return False
             profile = self._session_profile_ahead(account_num, email, org_uuid)

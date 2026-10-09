@@ -1388,10 +1388,18 @@ class TestGuards:
         block_real_keychain.set_password(service, account, "creds")
 
         monkeypatch.setattr("builtins.input", lambda *a: "y")
+        monkeypatch.setattr(
+            "openswap.worker.launch_agent.status",
+            lambda: {"loaded": False, "installed": False},
+        )
         seeded_switcher.purge()
 
         assert block_real_keychain.get_password(service, account) is None
-        assert not seeded_switcher.backup_dir.exists()
+        assert seeded_switcher.backup_dir.exists()
+        assert not (seeded_switcher.backup_dir / "sessions").exists()
+        assert (seeded_switcher.backup_dir / ".lock").is_file()
+        assert (seeded_switcher.backup_dir / "codex" / ".lock").is_file()
+        assert (seeded_switcher.backup_dir / "worker" / "lifecycle.lock").is_file()
 
     def test_switch_warns_on_live_target_but_completes(
         self, seeded_switcher, monkeypatch, capsys

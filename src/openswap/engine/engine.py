@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+
 from openswap.engine.notes import *  # noqa: F403
 from openswap.engine.consume import ConsumeMixin
 from openswap.engine.freshen import FreshenMixin
@@ -11,6 +13,7 @@ from openswap.engine.session_profile import SessionProfileMixin
 from openswap.engine.slots import SlotsMixin
 from openswap.engine.snapshot import SnapshotMixin
 from openswap.engine.switch import SwitchMixin
+from openswap.worker.leases import AccountLeaseStore
 
 
 class Engine(
@@ -291,13 +294,25 @@ class Engine(
           macOS both the Keychain items via ``security`` and any fallback ``.enc``
           files), plus a best-effort sweep of any pre-migration keyring / Windows
           Credential Manager entries left behind
-        - The active backup directory (XDG path on Linux/WSL, ~/.claude-swap-backup elsewhere)
+        - All managed data under the active backup directory; Claude and
+          Codex provider locks, the worker lifecycle lock and the unleased
+          kickoff locks remain as empty concurrency anchors
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
         """
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
-        legacy_distinct = legacy != self.backup_dir
+        provider_lock_paths = (
+            self.backup_dir / ".lock",
+            self.backup_dir / "codex" / ".lock",
+            self.backup_dir / ".settings.lock",
+            self.backup_dir / "worker" / "lifecycle.lock",
+            self.backup_dir / "worker" / "leases" / "claude.unleased.lock",
+            self.backup_dir / "worker" / "leases" / "codex.unleased.lock",
+        )
+        legacy_distinct = legacy != self.backup_dir and not any(
+            _path_is_within(lock_path, legacy) for lock_path in provider_lock_paths
+        )
 
         # Refuse while any session-mode claude is running: purging would pull
         # its profile (and keychain entry) out from under a live process.
@@ -356,6 +371,165 @@ class Engine(
             print(dimmed("Cancelled"))
             return
 
+        # Confirmation stays outside the locks. Hold the lifecycle lock across
+        # status checks and deletion so a concurrent enable/run cannot start a
+        # worker while the journal is removed. Purge never unloads a managed
+        # worker automatically; an installed service must be explicitly
+        # disabled before retrying.
+        stores = [
+            AccountLeaseStore(self.backup_dir, provider)
+            for provider in ("claude", "codex")
+        ]
+        codex_dir = self.backup_dir / "codex"
+        worker_dir = self.backup_dir / "worker"
+        settings_lock_path = self.backup_dir / ".settings.lock"
+        lifecycle_path = worker_dir / "lifecycle.lock"
+        if (
+            self.backup_dir.is_symlink()
+            or codex_dir.is_symlink()
+            or worker_dir.is_symlink()
+            or (self.backup_dir / ".lock").is_symlink()
+            or (codex_dir / ".lock").is_symlink()
+            or settings_lock_path.is_symlink()
+            or (settings_lock_path.exists() and not settings_lock_path.is_file())
+            or lifecycle_path.is_symlink()
+        ):
+            raise SessionError(
+                "A worker, provider, or settings lock path is unsafe; refusing "
+                "to purge account and lease state."
+            )
+        from openswap.worker.cli import lifecycle_lock
+        from openswap.settings import _settings_write_lock
+
+        with lifecycle_lock(self.backup_dir):
+            # Use the canonical settings lock after the lifecycle lock and
+            # before provider locks. This serializes purge with every settings
+            # writer and keeps the lock inode stable while settings.json is
+            # removed, so a waiting writer cannot proceed through an unlinked
+            # lock and race a replacement lock.
+            with _settings_write_lock(self.backup_dir):
+                # The global provider-lock order (Codex, then Claude) that
+                # the worker and the account commands also use; sorting by
+                # lock path put Claude's <backup>/.lock first and could
+                # deadlock against them.
+                from openswap.worker.leases import provider_lock_rank
+
+                stores.sort(key=provider_lock_rank)
+                # Refuse active/uncertain leases before worker checks; release
+                # provider locks before status IPC, then recheck before delete.
+                with ExitStack() as stack:
+                    for store in stores:
+                        guard = stack.enter_context(store.mutation_guard())
+                        guard.assert_available()
+                self._refuse_worker_restart_locked()
+                with ExitStack() as stack:
+                    for store in stores:
+                        guard = stack.enter_context(store.mutation_guard())
+                        guard.assert_available()
+                    # A kickoff with Remote tasks off holds only its unleased-run
+                    # lock: refuse while one runs, and hold both so none starts.
+                    for store in stores:
+                        if not stack.enter_context(store.unleased_run(timeout=0)):
+                            raise SessionError(
+                                "A scheduled kickoff is running; retry purge when it finishes."
+                            )
+                    self._purge_confirmed(legacy, legacy_distinct, session_dirs)
+
+    def _refuse_worker_restart_locked(self) -> None:
+        """Require an explicitly disabled and stopped worker before purge."""
+        import json
+
+        from openswap.settings import settings_path
+        from openswap.worker.cli import _snapshot
+
+        try:
+            snapshot = _snapshot(self.backup_dir)
+            policy_path = settings_path(self.backup_dir)
+            raw_settings = (
+                json.loads(policy_path.read_text(encoding="utf-8"))
+                if policy_path.exists()
+                else {}
+            )
+        except Exception:
+            raise SessionError(
+                "Worker status is unavailable. Run `openswap worker disable`, "
+                "stop any manual worker, and retry purge."
+            ) from None
+        if not isinstance(raw_settings, dict):
+            raise SessionError(
+                "Worker policy is unresolved. Run `openswap worker disable` "
+                "and retry purge."
+            )
+        raw_worker = raw_settings.get("worker", {})
+        if not isinstance(raw_worker, dict):
+            raise SessionError(
+                "Worker policy is unresolved. Run `openswap worker disable` "
+                "and retry purge."
+            )
+        enabled = raw_worker.get("enabled", False)
+        if type(enabled) is not bool:
+            raise SessionError(
+                "Worker policy is unresolved. Run `openswap worker disable` "
+                "and retry purge."
+            )
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("process_state") != "stopped"
+            or snapshot.get("active_job") is not None
+            or snapshot.get("lease_quarantined") is not False
+        ):
+            raise SessionError(
+                "Worker is running or its state is unresolved. Run `openswap "
+                "worker disable`, stop any manual worker, and retry purge."
+            )
+        if enabled:
+            raise SessionError(
+                "Remote tasks worker is enabled. Run `openswap worker disable` "
+                "and retry purge."
+            )
+        if self.platform == Platform.MACOS:
+            from openswap.worker.launch_agent import status as worker_service_status
+
+            try:
+                service = worker_service_status()
+            except Exception:
+                raise SessionError(
+                    "Worker service status is unavailable. Run `openswap "
+                    "worker disable` and retry purge."
+                ) from None
+            if (
+                not isinstance(service, dict)
+                or type(service.get("loaded")) is not bool
+                or type(service.get("installed")) is not bool
+            ):
+                raise SessionError(
+                    "Worker service status is unresolved. Run `openswap "
+                    "worker disable` and retry purge."
+                )
+            if service["loaded"] or service["installed"]:
+                raise SessionError(
+                    "Remote tasks worker is installed or loaded. Run "
+                    "`openswap worker disable` and retry purge."
+                )
+
+        # A stopped snapshot alone is not proof that a manually started worker
+        # released its singleton lock. The lifecycle lock excludes new starts.
+        instance_path = self.backup_dir / "worker" / "instance.lock"
+        if instance_path.is_symlink():
+            raise SessionError("Worker process lock is unsafe; refusing to purge.")
+        try:
+            with FileLock(instance_path, timeout=0):
+                pass
+        except Exception:
+            raise SessionError(
+                "Worker process may still be running. Run `openswap worker "
+                "disable`, stop any manual worker, and retry purge."
+            ) from None
+
+    def _purge_confirmed(
+        self, legacy: Path, legacy_distinct: bool, session_dirs: list[Path]
+    ) -> None:
+        """Delete purge targets while settings and provider locks are held."""
         removed_items = []
 
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
@@ -416,15 +590,21 @@ class Engine(
                 f"Session profiles: {', '.join(d.name for d in session_dirs)}"
             )
 
-        # Remove backup directory
+        # Remove managed data, but preserve settings, provider and lifecycle
+        # lock files and their parent directories. Unlinking a held lock inode
+        # would let another process create a new lock at the same path and
+        # bypass it.
         if self.backup_dir.exists():
             # Close log handlers before deleting (required on Windows)
             for handler in self._logger.handlers[:]:
                 handler.close()
                 self._logger.removeHandler(handler)
 
-            shutil.rmtree(self.backup_dir)
-            removed_items.append(f"Directory: {self.backup_dir}")
+            self._remove_backup_data_preserving_locks()
+            removed_items.append(
+                f"Backup data: {self.backup_dir} "
+                "(settings, provider and lifecycle lock files retained)"
+            )
 
         # Also clean a stale legacy directory if it somehow still exists
         # (e.g. a partial pre-migration state, or files re-created after init).
@@ -444,3 +624,70 @@ class Engine(
 
         print(f"\n{accent('Purge complete.')}")
 
+    def _remove_backup_data_preserving_locks(self) -> None:
+        """Remove backup data without unlinking held settings/provider locks."""
+        root = self.backup_dir
+        for child in list(root.iterdir()):
+            if child.name == ".settings.lock":
+                if child.is_symlink() or not child.is_file():
+                    raise SessionError("Settings lock path is unsafe; refusing purge.")
+                continue
+            if child.name == ".lock":
+                if child.is_symlink() or not child.is_file():
+                    raise SessionError("Claude provider lock path is unsafe; refusing purge.")
+                continue
+            if child.name == "codex" and not child.is_symlink() and child.is_dir():
+                for codex_child in list(child.iterdir()):
+                    if codex_child.name == ".lock":
+                        if codex_child.is_symlink() or not codex_child.is_file():
+                            raise SessionError("Codex provider lock path is unsafe; refusing purge.")
+                        continue
+                    self._remove_purge_entry(codex_child)
+                continue
+            if child.name == "worker" and not child.is_symlink() and child.is_dir():
+                for worker_child in list(child.iterdir()):
+                    if worker_child.name == "lifecycle.lock":
+                        if worker_child.is_symlink() or not worker_child.is_file():
+                            raise SessionError(
+                                "Worker lifecycle lock path is unsafe; refusing purge."
+                            )
+                        continue
+                    if (
+                        worker_child.name == "leases"
+                        and not worker_child.is_symlink()
+                        and worker_child.is_dir()
+                    ):
+                        # Keep the held unleased-run lock inodes (and their
+                        # directory); remove every lease document.
+                        for lease_child in list(worker_child.iterdir()):
+                            if lease_child.name in _UNLEASED_LOCK_NAMES:
+                                if lease_child.is_symlink() or not lease_child.is_file():
+                                    raise SessionError(
+                                        "Unleased-run lock path is unsafe; refusing purge."
+                                    )
+                                continue
+                            self._remove_purge_entry(lease_child)
+                        continue
+                    self._remove_purge_entry(worker_child)
+                continue
+            self._remove_purge_entry(child)
+
+    @staticmethod
+    def _remove_purge_entry(path: Path) -> None:
+        """Remove one entry without following a symlink to an external tree."""
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+
+
+_UNLEASED_LOCK_NAMES = frozenset({"claude.unleased.lock", "codex.unleased.lock"})
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    """Return whether ``path`` is ``root`` or one of its descendants."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True

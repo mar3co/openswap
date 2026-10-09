@@ -85,9 +85,7 @@ class TestMoveAccount:
             def __exit__(self, *exc):
                 return False
 
-        from tests.conftest import patch_engine_filelock
-
-        patch_engine_filelock(monkeypatch, SpyLock)
+        monkeypatch.setattr("openswap.worker.leases.FileLock", SpyLock)
         switcher.move_account("2", "5")
 
         assert entered == [switcher.lock_file]
@@ -123,9 +121,7 @@ class TestMoveAccount:
             def __exit__(self, *exc):
                 return False
 
-        from tests.conftest import patch_engine_filelock
-
-        patch_engine_filelock(monkeypatch, SpyLock)
+        monkeypatch.setattr("openswap.worker.leases.FileLock", SpyLock)
         num_src, num_target, swapped = switcher.move_account("1", "2")
 
         assert (num_src, num_target, swapped) == ("1", "2", True)

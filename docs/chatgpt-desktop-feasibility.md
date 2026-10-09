@@ -142,7 +142,7 @@ still not prove that Chat, Work, and Codex all adopted the same session.
 Run the committed probe without touching a real login:
 
 ```sh
-python3 tools/probe_codex_auth_reload.py --codex /Applications/ChatGPT.app/Contents/Resources/codex
+python3 tools/probe_codex_auth_reload.py --codex /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex
 ```
 
 The probe uses disposable home/config directories, explicitly selects file

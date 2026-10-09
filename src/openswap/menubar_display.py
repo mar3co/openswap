@@ -126,6 +126,10 @@ def desktop_capability_status_copy(capability: DesktopCapability) -> str:
         return "ChatGPT switching isn’t available on this Mac."
     if capability.state == "missing":
         return "ChatGPT isn’t installed."
+    if capability.reason == "legacy_chat_app":
+        return "This is the older ChatGPT app. Update ChatGPT to switch accounts."
+    if capability.reason in ("helper_missing", "helper_not_executable"):
+        return "This ChatGPT build is missing its Codex tools."
     if capability.reason in ("known_incompatible_build", "incompatible_backend"):
         return "This ChatGPT build isn’t compatible with switching."
     if capability.reason == "probe_failed":
@@ -168,6 +172,63 @@ def combine_title_pct(show_5h: bool, show_7d: bool) -> str:
         return "7d"
     return "off"
 REFRESH_LABELS: dict[int, str] = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
+
+
+def _remote_tasks_status_copy(
+    snapshot: dict, *, enabled: bool, paused: bool,
+) -> str:
+    """Render only bounded status fields; never expose job/provider payloads."""
+    process = snapshot.get("process_state")
+    if process not in {"stopped", "starting", "running", "stopping", "stale", "unavailable"}:
+        process = "unavailable"
+    provider = snapshot.get("provider")
+    provider_available = isinstance(provider, dict) and provider.get("available") is True
+    diagnostic = provider.get("diagnostic_code") if isinstance(provider, dict) else None
+    if not isinstance(diagnostic, str) or not diagnostic.isascii() or len(diagnostic) > 64:
+        diagnostic = "unavailable"
+    diagnostic = "".join(c for c in diagnostic if c.isalnum() or c in "_-") or "unavailable"
+    active = snapshot.get("active_job")
+    active_state = active.get("state") if isinstance(active, dict) else None
+    if not isinstance(active_state, str) or active_state not in {
+        "queued", "claimed", "starting", "running", "waiting_for_approval",
+        "cancel_requested", "succeeded", "failed", "cancelled", "interrupted",
+        "expired",
+    }:
+        active_state = "idle" if active is None else "unknown"
+    queue = snapshot.get("queue_depth")
+    if type(queue) is not int or queue < 0:
+        queue = 0
+    provider_label = "available" if provider_available else diagnostic
+    operation = snapshot.get("operation")
+    if not isinstance(operation, str) or operation not in {
+        "worker_enable_or_disable", "worker_admission_update", "worker_stop_requested",
+        "worker_account_update", "worker_control_busy", "worker_status_checking",
+    }:
+        operation = None
+    notice = snapshot.get("diagnostic_notice")
+    if not isinstance(notice, str) or not notice.isascii() or len(notice) > 64:
+        notice = None
+    if notice is not None:
+        notice = "".join(c for c in notice if c.isalnum() or c in "_-") or None
+    remote = snapshot.get("remote_connectivity")
+    service = ""
+    if remote in {"online", "offline", "revoked", "expired"}:
+        service = f" · service {remote}"
+        seen = snapshot.get("remote_last_seen_at")
+        if isinstance(seen, str) and len(seen) <= 40:
+            try:
+                from datetime import datetime
+                parsed = datetime.fromisoformat(seen.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    service += f" · last seen {parsed.isoformat()}"
+            except ValueError:
+                pass
+    tail = f" · {operation}" if operation else (f" · {notice}" if notice else "")
+    return (
+        f"{'enabled' if enabled else 'disabled'} · {process} · "
+        f"admission {'paused' if paused else 'open'} · provider {provider_label} · "
+        f"job {active_state} · queue {min(queue, 999)}{service}{tail}"
+    )
 SETTINGS_PAGE = "settings"
 MAIN_PAGE = "main"
 SETTINGS_SECTION_GENERAL = "general"
@@ -185,8 +246,11 @@ CODEX_RELOGIN_CARD_NOTE = (
     "Action required · OAuth expired. Sign in again with Codex."
 )
 RESTORE_CARD_NOTE = "Click to restore the saved Claude login."
+REMOTE_TASKS_PAIRED_OFF_NOTE = (
+    "Paired, worker off · Turn on Enable local worker so this Mac can accept approved tasks."
+)
 MISSING_LOGIN_CARD_NOTE = "Action required · Sign in with Claude Code."
-RECONCILE_CARD_NOTE = "Action required · Login mismatch. Click to repair."
+RECONCILE_CARD_NOTE = "Action required · Login mismatch. Click for details."
 _CLAUDE_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 
 
@@ -322,6 +386,10 @@ def settings_page_rows(
     threshold: float,
     has_codex: bool = False,
     codex_enabled: bool = True,
+    worker_enabled: bool = False,
+    worker_paused: bool = False,
+    worker_status: dict | None = None,
+    worker_paired: bool = False,
     section: str | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
@@ -388,6 +456,58 @@ def settings_page_rows(
             "kind": "group",
             "style": "section",
             "section": SETTINGS_SECTION_GENERAL,
+            "id": "group_remote_tasks",
+            "label": "Remote tasks",
+        },
+        {
+            # The guided steps of `openswap worker pair`/`setup`, in dialogs.
+            "kind": "button",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_setup",
+            "label": "Set up Remote tasks…",
+            "title": "Set Up",
+            "value": None,
+            "disabled": (worker_status or {}).get("operation") is not None,
+        },
+        {
+            "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_enabled",
+            "label": "Enable local worker",
+            "value": bool(worker_enabled),
+        },
+        _remote_tasks_account_row((worker_status or {}).get("account_picker")),
+        _remote_tasks_web_choice_row((worker_status or {}).get("account_picker")),
+        {
+            "kind": "status",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_status",
+            "label": "Status",
+            "value": _remote_tasks_status_copy(
+                worker_status or {}, enabled=worker_enabled, paused=worker_paused,
+            ),
+        },
+        {
+            "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_paused",
+            "label": "Pause admission",
+            "value": bool(worker_paused),
+            "disabled": not worker_enabled,
+        },
+        {
+            "kind": "button",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_stop",
+            "label": "Active job",
+            "title": "Stop",
+            "value": _worker_active_job_id(worker_status or {}),
+            "disabled": _worker_active_job_id(worker_status or {}) is None,
+        },
+        {
+            "kind": "group",
+            "style": "section",
+            "section": SETTINGS_SECTION_GENERAL,
             "id": "group_behavior",
             "label": "Behavior",
         },
@@ -407,6 +527,18 @@ def settings_page_rows(
             "value": settings.refresh_interval,
         },
     ]
+    if worker_paired and not worker_enabled and (
+        (worker_status or {}).get("operation") != "worker_enable_or_disable"
+    ):
+        # Pairing never starts the worker; say so right under its switch.
+        hint_at = next(i for i, row in enumerate(general) if row["id"] == "remote_tasks_enabled") + 1
+        general.insert(hint_at, {
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "remote_tasks_paired_off",
+            "label": REMOTE_TASKS_PAIRED_OFF_NOTE,
+        })
     title_controls = {"show_account_name", "title_pct_5h", "title_pct_7d", "title_scoped"}
     if settings.menu_bar_provider == "logo":
         general = [row for row in general if row["id"] not in title_controls]
@@ -591,6 +723,138 @@ def settings_page_rows(
             section = SETTINGS_SECTION_GENERAL
         rows = [row for row in rows if row["section"] == section]
     return rows
+
+
+def _bounded_text(value, limit: int = 120) -> str:
+    if not isinstance(value, str):
+        return ""
+    return "".join(c for c in value if c.isprintable())[:limit]
+
+
+def _remote_tasks_account_row(picker) -> dict:
+    """Popup row for the Remote tasks account pin; no AppKit.
+
+    Options are ``(value, label)`` or ``(value, label, {"disabled": True})``.
+    Eligible Codex roster slots carry their opaque ``codex:`` reference (the
+    pinned one is the selected, checkmarked item), ``""`` is "None", and
+    Claude accounts are listed disabled: they wait on a separate Claude
+    authentication gate. Built from roster metadata the controller read off
+    the UI thread; until it arrives the row is a disabled placeholder.
+    """
+    row = {
+        "kind": "popup",
+        "section": SETTINGS_SECTION_GENERAL,
+        "id": "remote_tasks_account",
+        "label": "Account",
+        "wide": True,
+    }
+    if not isinstance(picker, dict):
+        return {**row, "options": [("", "Loading accounts…")], "value": "", "disabled": True}
+    pinned = picker.get("pinned_account_ref")
+    pinned = pinned if isinstance(pinned, str) and pinned.startswith(("codex:", "claude:")) else None
+    options: list[tuple] = [("", "None")]
+    listed = set()
+    for entry in picker.get("codex") or []:
+        if not isinstance(entry, dict):
+            continue
+        number = _bounded_text(entry.get("number"), 8)
+        name = _bounded_text(entry.get("email")) or "(no email)"
+        alias = _bounded_text(entry.get("alias"), 40)
+        label = f"Codex {number} · {name}" + (f" ({alias})" if alias else "")
+        ref = entry.get("account_ref")
+        if entry.get("eligible") is True and isinstance(ref, str) and ref.startswith("codex:"):
+            options.append((ref, label))
+            listed.add(ref)
+        else:
+            options.append((f"ineligible:{number}", f"{label} — API key, not eligible", {"disabled": True}))
+    for entry in picker.get("claude") or []:
+        if not isinstance(entry, dict):
+            continue
+        number = _bounded_text(entry.get("number"), 8)
+        name = _bounded_text(entry.get("email")) or "(no email)"
+        alias = _bounded_text(entry.get("alias"), 40)
+        label = f"Claude {number} · {name}" + (f" ({alias})" if alias else "")
+        ref = entry.get("account_ref")
+        if entry.get("eligible") is True and isinstance(ref, str) and ref.startswith("claude:"):
+            options.append((ref, label))
+            listed.add(ref)
+        else:
+            options.append((f"ineligible-claude:{number}", f"{label} — not eligible", {"disabled": True}))
+    if pinned is not None and pinned not in listed:
+        options.append((pinned, "Pinned account was removed", {"disabled": True}))
+    return {**row, "options": options, "value": pinned or ""}
+
+
+def _remote_tasks_web_choice_row(picker) -> dict:
+    """Popup of allow/disallow toggles for the accounts a control service may
+    choose per job; no AppKit.
+
+    The selected item is a summary (``""``, a no-op); every other item names
+    its action, ``allow:<codex ref>`` or ``disallow:<codex ref>``, so a stale
+    menu can never flip an account the wrong way. Allowed accounts carry a
+    check mark; the pinned default is shown checked but disabled (pin another
+    account, or use ``openswap worker account disallow --clear-default``).
+    Claude and API-key slots are not offered.
+    """
+    row = {
+        "kind": "popup",
+        "section": SETTINGS_SECTION_GENERAL,
+        "id": "remote_tasks_web_choice",
+        "label": "Web choice",
+        "wide": True,
+    }
+    if not isinstance(picker, dict):
+        return {**row, "options": [("", "Loading accounts…")], "value": "", "disabled": True}
+    pinned = picker.get("pinned_account_ref")
+    allowlist = [entry for entry in picker.get("allowlist") or [] if isinstance(entry, dict)]
+    allowed = {
+        entry.get("identity") for entry in allowlist
+        if isinstance(entry.get("identity"), str) and entry["identity"].startswith(("codex:", "claude:"))
+    }
+    count = len(allowed)
+    summary = (
+        "No accounts allowed for web choice" if count == 0
+        else f"{count} account{'s' if count != 1 else ''} allowed for web choice"
+    )
+    options: list[tuple] = [("", summary)]
+    listed = set()
+    entries = [("Codex", "codex:", e) for e in picker.get("codex") or []] + [
+        ("Claude", "claude:", e) for e in picker.get("claude") or []]
+    for provider_name, prefix, entry in entries:
+        if not isinstance(entry, dict) or entry.get("eligible") is not True:
+            continue
+        ref = entry.get("account_ref")
+        if not isinstance(ref, str) or not ref.startswith(prefix):
+            continue
+        number = _bounded_text(entry.get("number"), 8)
+        name = _bounded_text(entry.get("email")) or "(no email)"
+        alias = _bounded_text(entry.get("alias"), 40)
+        label = f"{provider_name} {number} · {name}" + (f" ({alias})" if alias else "")
+        listed.add(ref)
+        if ref == pinned:
+            options.append((f"default:{ref}", f"✓ {label} — default", {"disabled": True}))
+        elif ref in allowed:
+            options.append((f"disallow:{ref}", f"✓ {label}"))
+        else:
+            options.append((f"allow:{ref}", f"   {label}"))
+    for entry in allowlist:
+        identity = entry.get("identity")
+        if identity in listed or not isinstance(identity, str) or not identity.startswith(("codex:", "claude:")):
+            continue
+        name = _bounded_text(entry.get("label"), 60) or "account"
+        if identity == pinned:
+            options.append((f"default:{identity}", f"✓ {name} — removed, default", {"disabled": True}))
+        else:
+            options.append((f"disallow:{identity}", f"✓ {name} — removed from roster"))
+    return {**row, "options": options, "value": ""}
+
+
+def _worker_active_job_id(snapshot: dict) -> str | None:
+    active = snapshot.get("active_job")
+    job_id = active.get("job_id") if isinstance(active, dict) else None
+    if isinstance(job_id, str) and job_id and len(job_id) <= 128 and job_id.isascii():
+        return job_id
+    return None
 
 
 # After the pointer leaves the popover (not on open). Click-outside still
@@ -1184,6 +1448,9 @@ class ReloginClickPlan:
     slot_name: str
     login_email: str
     live_name: str | None = None
+    # Why a click can't just switch: expired (saved login is dead), missing
+    # (no saved login at all), unverified (saved login couldn't be checked).
+    reason: str = "expired"
 
 
 def display_needs_relogin(display) -> bool:
@@ -1275,37 +1542,115 @@ def plan_relogin_click(
     slot: tuple[str, str] | None,
     slot_name: str,
     live_name: str | None,
+    reason: str = "expired",
 ) -> ReloginClickPlan | None:
     """Decide capture vs open-login. Capture only when email and org both match."""
     if slot is None:
         return None
     email = slot[0]
     if live is not None and live == slot:
-        return ReloginClickPlan("capture", slot_name, email, live_name)
+        return ReloginClickPlan("capture", slot_name, email, live_name, reason)
     if live is None:
-        return ReloginClickPlan("open_login", slot_name, email, None)
-    return ReloginClickPlan("confirm_open_login", slot_name, email, live_name)
+        return ReloginClickPlan("open_login", slot_name, email, None, reason)
+    return ReloginClickPlan(
+        "confirm_open_login", slot_name, email, live_name, reason
+    )
 
 
 def relogin_wrong_account_title(plan: ReloginClickPlan) -> str:
-    """Alert title: name the slot they clicked, not the live login."""
-    return f"Sign in as {plan.slot_name}?"
+    """Alert title: say why a click can't just switch."""
+    if plan.reason == "expired":
+        return f"{plan.slot_name} needs a new sign-in"
+    return f"{plan.slot_name} needs a sign-in"
+
+
+def _relogin_reason_sentence(plan: ReloginClickPlan) -> str:
+    name = plan.slot_name
+    if plan.reason == "missing":
+        return f"OpenSwap has no saved login for {name}, so it can't switch to it."
+    if plan.reason == "unverified":
+        return (
+            f"OpenSwap couldn't confirm {name}'s saved login, so it can't "
+            "switch to it."
+        )
+    return f"{name}'s saved login has expired, so OpenSwap can't switch to it."
 
 
 def relogin_wrong_account_message(plan: ReloginClickPlan) -> str:
-    """Alert body: Claude Code's current login changes; the saved slot stays."""
+    """Alert body: the problem, the fix, and what happens to the live login.
+
+    Lead with the reason a click can't just switch (``plan.reason``), then
+    the fix, then what happens to the account Claude Code is on now.
+    """
     live_name = plan.live_name or "another account"
     return (
-        f"Claude Code is using {live_name} right now. "
-        f"Your saved {live_name} account is not removed. "
-        f"Continue to sign in as {plan.slot_name}?"
+        f"{_relogin_reason_sentence(plan)} "
+        f"Sign in as {plan.slot_name} in the login window that opens.\n\n"
+        f"Claude Code is on {live_name} right now and will sign out of it. "
+        f"{live_name} stays saved in OpenSwap, so you can switch back later."
+    )
+
+
+def reconcile_dialog_copy(
+    slot_name: str,
+    slot_email: str,
+    *,
+    owner_email: str | None,
+    owner_name: str | None,
+) -> tuple[str, str, str]:
+    """(title, body, ok button) for a login-mismatch card click.
+
+    ``owner_email`` is who the live token really belongs to (None when it
+    could not be checked); ``owner_name`` is set only when that account is
+    saved in OpenSwap. The body says what each choice does before anything
+    is touched, so the user can fix the source of the mismatch first.
+    """
+    expected = f"{slot_name} ({slot_email})" if slot_email else slot_name
+    if owner_email is None:
+        return (
+            "Couldn't check Claude Code's login",
+            (
+                f"OpenSwap expects {expected}, but Claude Code's current login "
+                f"doesn't match {slot_name}'s saved login, and OpenSwap couldn't "
+                "confirm whose it is. Nothing has been changed.\n\n"
+                "Check your connection and try again, or sign in again as "
+                f"{slot_name}."
+            ),
+            f"Sign in as {slot_name}",
+        )
+    if owner_name:
+        other = (
+            f"To use {owner_name} instead: click Cancel, then click "
+            f"{owner_name}'s card. That switches to {owner_name}'s saved "
+            "login; if it's out of date, you'll need to sign in again."
+        )
+    else:
+        other = (
+            f"To keep using {owner_email}: click Cancel and add it as an "
+            "account first."
+        )
+    owner = owner_name or owner_email
+    return (
+        "Claude Code is on a different account",
+        (
+            f"OpenSwap expects {expected}, but Claude Code's current login "
+            f"belongs to {owner_email}.\n\n"
+            f"To use {slot_name}: click Restore. OpenSwap puts {slot_name}'s "
+            f"saved login back and keeps {owner}'s login.\n\n"
+            f"{other}\n\n"
+            f"If you signed in as {owner} in the Claude app or another Claude "
+            f"Code window, sign in there as {slot_name} too, or it will switch "
+            "back."
+        ),
+        f"Restore {slot_name}",
     )
 
 
 def relogin_login_opened_message(slot_name: str) -> str:
     return (
-        f"Sign in as {slot_name} in the Terminal window. After that, click this "
-        "card again, or wait and the extra will capture it."
+        f"Sign in as {slot_name} in the Terminal window that opened. "
+        f"OpenSwap saves the new login on its own; click {slot_name} again "
+        "if it doesn't show up."
     )
 
 

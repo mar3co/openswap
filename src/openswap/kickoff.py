@@ -11,9 +11,11 @@ credential copy cannot rotate its refresh token.
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,6 +24,11 @@ from pathlib import Path
 from openswap.codex.auth import CODEX_HOME_ENV
 from openswap.exceptions import SessionError
 from openswap.session import AUTH_OVERRIDE_ENV_VARS
+from openswap import paths
+from openswap.settings import load_worker_settings
+from openswap.worker.leases import (
+    AccountLeaseStore, LeaseConflictError, ReleaseEvidence, stable_account_identity,
+)
 
 KICKOFF_PROMPT = "ok"
 KICKOFF_TIMEOUT_S = 90.0
@@ -183,6 +190,238 @@ def _five_hour_resets_at_ts(usage: dict | str | None) -> float | None:
     return dt.timestamp()
 
 
+def _is_codex_slot_home(selected_home: Path | str | None, backup_root: Path) -> bool:
+    if selected_home is None:
+        return False
+    try:
+        slots_dir = (backup_root / "codex" / "slots").resolve()
+        return Path(selected_home).resolve().parent == slots_dir
+    except OSError:
+        return False
+
+
+def _kickoff_account_identity(provider: str, selected_home: Path | str | None) -> str:
+    """Resolve a kickoff's stable identity from the local OpenSwap roster.
+
+    Slot paths are used only to locate a roster row; the lease identity is
+    derived from provider account metadata, never the mutable slot number.
+    """
+    backup_root = paths.get_backup_root()
+    state_file = backup_root / ("codex/sequence.json" if provider == "codex" else "sequence.json")
+    try:
+        roster = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise SessionError("Cannot verify the account for scheduled kickoff.") from None
+    if not isinstance(roster, dict):
+        raise SessionError("Cannot verify the account for scheduled kickoff.")
+    accounts = roster.get("accounts")
+    if not isinstance(accounts, dict):
+        raise SessionError("Cannot verify the account for scheduled kickoff.")
+
+    if provider == "claude" and selected_home is None:
+        # The no-override kickoff runs against Claude's default profile, whose
+        # identity can change outside OpenSwap without updating activeAccountNumber.
+        # Read only the public account metadata from the default global config;
+        # never inspect credential contents to choose a lease identity.
+        try:
+            default_config = json.loads(
+                paths.get_default_global_config_path().read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            raise SessionError("Cannot verify the account for scheduled kickoff.") from None
+        oauth_account = (
+            default_config.get("oauthAccount")
+            if isinstance(default_config, dict)
+            else None
+        )
+        if not isinstance(oauth_account, dict):
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+        email = oauth_account.get("emailAddress")
+        organization = oauth_account.get("organizationUuid", "")
+        if organization is None:
+            organization = ""
+        if (
+            not isinstance(email, str)
+            or not email
+            or not isinstance(organization, str)
+        ):
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+
+        # Use the engine's canonical (email, organizationUuid) slot semantics,
+        # but reject duplicates instead of choosing the first matching row.
+        matching_slots = [
+            number
+            for number, record in accounts.items()
+            if isinstance(record, dict)
+            and record.get("email") == email
+            and (record.get("organizationUuid") or "") == organization
+        ]
+        if len(matching_slots) != 1:
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+        return stable_account_identity(provider, email, organization)
+
+    if provider == "codex" and not _is_codex_slot_home(selected_home, backup_root):
+        # Same reasoning as the Claude branch above, for the live Codex login
+        # (``None``, or the engine's own home as the menu bar passes it):
+        # resolve identity the way the engine does (CodexEngine
+        # current_account_number / _live_slot, via the auth.json the child
+        # will use), never the roster's possibly-stale activeAccountNumber.
+        from openswap.codex.auth import auth_path, codex_home, parse_auth
+
+        live_home = codex_home() if selected_home is None else Path(selected_home)
+        try:
+            live_text = auth_path(live_home).read_text(encoding="utf-8")
+        except OSError:
+            raise SessionError("Cannot verify the account for scheduled kickoff.") from None
+        identity = parse_auth(live_text)
+        if identity is None or not (identity.email or identity.account_id):
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+        matching_slots = [
+            number
+            for number, record in accounts.items()
+            if isinstance(record, dict)
+            and record.get("email") == identity.email
+            and record.get("accountId") == identity.account_id
+        ]
+        if len(matching_slots) != 1 or not identity.account_id:
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+        return stable_account_identity(provider, identity.account_id)
+
+    selected_num = str(roster.get("activeAccountNumber") or "")
+    if selected_home is not None:
+        home = Path(selected_home)
+        if provider == "codex":
+            selected_num = home.name
+        else:
+            from openswap.session import slugify_email
+
+            for number, record in accounts.items():
+                if not isinstance(record, dict):
+                    continue
+                email = str(record.get("email") or "")
+                if email and home.name == f"{number}-{slugify_email(email)}":
+                    selected_num = str(number)
+                    break
+
+    record = accounts.get(selected_num)
+    if not isinstance(record, dict):
+        raise SessionError("Cannot verify the account for scheduled kickoff.")
+    if provider == "codex":
+        account_id = record.get("accountId")
+        if not isinstance(account_id, str) or not account_id:
+            raise SessionError("Cannot verify the account for scheduled kickoff.")
+        return stable_account_identity(provider, account_id)
+    email = record.get("email")
+    organization = record.get("organizationUuid") or ""
+    if not isinstance(email, str) or not email:
+        raise SessionError("Cannot verify the account for scheduled kickoff.")
+    return stable_account_identity(provider, email, str(organization))
+
+
+def _launch_tracked_run(launch: dict):
+    """``subprocess.run`` (``check=False``) that records when the child exists.
+
+    Only an ``OSError`` raised before ``Popen`` returns proves the kickoff
+    never launched; one raised later (pipe communication or cleanup) may
+    leave a detached helper running.
+    """
+
+    def run(argv, *, timeout=None, capture_output=False, check=False, **popen_kwargs):
+        if check:
+            raise ValueError("kickoff runs never use check=True")
+        if capture_output:
+            popen_kwargs["stdout"] = subprocess.PIPE
+            popen_kwargs["stderr"] = subprocess.PIPE
+        process = subprocess.Popen(argv, **popen_kwargs)
+        launch["started"] = True
+        with process:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise
+            except BaseException:
+                process.kill()
+                raise
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+    return run
+
+
+# How long a kickoff waits for an in-progress worker enable to finish.
+_UNLEASED_RUN_WAIT_S = 5.0
+
+
+def _run_kickoff_with_lease(provider: str, selected_home, run_fn, argv, **kwargs):
+    # With the default runner a launch failure is provable; an injected runner
+    # cannot say whether it launched, so its OSError stays uncertain.
+    launch: dict | None = None
+    if run_fn is None:
+        launch = {}
+        run_fn = _launch_tracked_run(launch)
+    backup_root = paths.get_backup_root()
+    store = AccountLeaseStore(backup_root, provider)
+    if not load_worker_settings(backup_root).enabled:
+        # With Remote tasks off no lease is taken, so a bare kickoff timeout
+        # cannot quarantine an account for a feature nobody turned on (matching
+        # pre-worker behaviour). The unleased-run lock keeps Remote tasks from
+        # being enabled (and a worker leasing this account) while it runs; the
+        # policy is re-read once it is held, since enabling may have won it.
+        with store.unleased_run(timeout=_UNLEASED_RUN_WAIT_S) as held:
+            if not held:
+                raise LeaseConflictError(
+                    f"Cannot run a {provider} kickoff while Remote tasks is changing."
+                )
+            if not load_worker_settings(backup_root).enabled:
+                # An unresolved lease left from when it was on still refuses
+                # the ping. The read takes no lock (lease documents are
+                # replaced atomically), so this adds no contention with
+                # switching.
+                leftover = store.read_current()
+                if leftover is not None and leftover.state != "released":
+                    raise LeaseConflictError(
+                        f"Cannot run a {provider} kickoff while an account lease is unresolved."
+                    )
+                return run_fn(argv, **kwargs)
+    # Identity is resolved only while holding the same provider lock used for
+    # lease acquisition and account mutations, closing the snapshot/acquire race.
+    with store.mutation_guard() as guard:
+        guard.assert_available()
+        account_identity = _kickoff_account_identity(provider, selected_home)
+        token = guard.acquire(
+            job_id=f"kickoff-{uuid.uuid4().hex}",
+            account_identity=account_identity,
+            worker_pid=os.getpid(),
+            worker_epoch=time.time_ns(),
+            ttl_s=float(kwargs["timeout"]) + 30.0,
+        )
+    try:
+        result = run_fn(argv, **kwargs)
+    except subprocess.TimeoutExpired:
+        # subprocess.run() kills and reaps only the direct child; a helper it
+        # spawned may still be using the profile, so stopping is not proven.
+        # The owner can clear this with `openswap worker lease release`.
+        store.mark_uncertain(token, "kickoff_timeout")
+        raise
+    except OSError:
+        if launch is not None and not launch.get("started"):
+            store.release(token, ReleaseEvidence.UNLAUNCHED)
+        else:
+            store.mark_uncertain(token, "kickoff_outcome_unknown")
+        raise
+    except BaseException:
+        store.mark_uncertain(token, "kickoff_outcome_unknown")
+        raise
+    # Owner decision (plan 017): for a scheduled kickoff ping, the direct
+    # child's normal exit is the stop evidence. A helper it detached could
+    # outlive it; that is the same best-effort process-tree limit recorded in
+    # the phase-one cancellation-boundary research, accepted here so a routine
+    # ping does not leave the account quarantined.
+    store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
+    return result
+
+
 def kickoff_account_eligible(
     *,
     is_api_key: bool,
@@ -312,11 +551,11 @@ def invoke_kickoff(
     pings the live default login (no ``CLAUDE_CONFIG_DIR``) so the backup
     refresh token is not spent a second time.
 
-    Uses a returning ``subprocess.run`` (or the injected ``run``). Never calls
+    Uses a returning ``subprocess.run`` equivalent (or the injected ``run``). Never calls
     ``os.execvpe`` / ``os.execvp`` — the menu-bar process must keep running.
     """
     which_fn = shutil.which if which is None else which
-    run_fn = subprocess.run if run is None else run
+    run_fn = run
     claude_bin = which_fn("claude")
     if not claude_bin:
         raise SessionError(
@@ -325,8 +564,8 @@ def invoke_kickoff(
     argv = build_kickoff_argv(claude_bin)
     env = build_kickoff_env(session_dir, environ)
     cwd = str(session_dir) if session_dir is not None else None
-    return run_fn(
-        argv,
+    return _run_kickoff_with_lease(
+        "claude", session_dir, run_fn, argv,
         env=env,
         cwd=cwd,
         stdin=subprocess.DEVNULL,
@@ -369,7 +608,7 @@ def invoke_codex_kickoff(
     live login (no ``CODEX_HOME``). Uses a returning ``subprocess.run``.
     """
     which_fn = shutil.which if which is None else which
-    run_fn = subprocess.run if run is None else run
+    run_fn = run
     codex_bin = which_fn("codex")
     if not codex_bin:
         raise SessionError(
@@ -378,8 +617,8 @@ def invoke_codex_kickoff(
     argv = build_codex_kickoff_argv(codex_bin)
     env = build_codex_kickoff_env(home, environ)
     cwd = str(home) if home is not None else None
-    return run_fn(
-        argv,
+    return _run_kickoff_with_lease(
+        "codex", home, run_fn, argv,
         env=env,
         cwd=cwd,
         # A GUI app can inherit a pipe on stdin. Close it so Codex does not

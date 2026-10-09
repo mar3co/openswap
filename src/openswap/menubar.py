@@ -180,6 +180,22 @@ def run(switcher, codex=None) -> int:
             self._desktop_switching = False
             self._desktop_result = None
             self._desktop_status = "Experimental · Switching reopens ChatGPT"
+            from openswap.settings import load_worker_settings
+            self._worker_policy = load_worker_settings(switcher.backup_dir)
+            self._worker_status_cache = {
+                "process_state": "unavailable",
+                "provider": {"available": False, "diagnostic_code": "status_checking"},
+                "active_job": None,
+                "queue_depth": 0,
+                "lease_quarantined": True,
+                "operation": "worker_status_checking",
+            }
+            self._worker_status_inflight = False
+            self._worker_last_refresh_at = 0.0
+            self._worker_operation = None
+            self._worker_result = None
+            self._worker_generation = 0
+            self._worker_result_lock = threading.Lock()
             self._desktop_app = DesktopApp()
             self._desktop_app_lock = threading.Lock()
             self._chatgpt_capability = DesktopCapability("checking", "checking")
@@ -423,6 +439,17 @@ def run(switcher, codex=None) -> int:
         def on_sync_tick(self, _timer):
             self._poll_login()
             self._drain_desktop_result()
+            self._drain_worker_result()
+            self._drain_guided_setup()
+            panel = self._panel
+            if (
+                panel is not None
+                and panel.is_shown()
+                and getattr(panel, "_page", None) == SETTINGS_PAGE
+                and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_GENERAL
+                and time.monotonic() - self._worker_last_refresh_at >= 4.0
+            ):
+                self._worker_view_active()
             if self._desktop_switching:
                 return
             self._consume_widget_command()
@@ -588,6 +615,271 @@ def run(switcher, codex=None) -> int:
             ):
                 if getattr(panel, "_selected_provider", None) == "chatgpt":
                     self._on_chatgpt_view_active()
+                panel.reload()
+
+        def _worker_view_active(self):
+            """Refresh only the local, redacted worker snapshot off the UI thread."""
+            if self._worker_status_inflight or self._worker_operation is not None:
+                return
+            self._worker_status_inflight = True
+            self._worker_last_refresh_at = time.monotonic()
+            self._worker_generation += 1
+            generation = self._worker_generation
+            threading.Thread(
+                target=self._worker_status_worker,
+                args=(generation,),
+                daemon=True,
+            ).start()
+
+        def _worker_status_worker(self, generation):
+            policy = None
+            try:
+                from openswap.settings import load_worker_settings
+                from openswap.worker.cli import read_status
+
+                root = self.switcher.backup_dir
+                snapshot = read_status(root)
+                policy = load_worker_settings(root)
+            except Exception:
+                snapshot = {
+                    "process_state": "unavailable",
+                    "provider": {"available": False, "diagnostic_code": "status_unavailable"},
+                    "active_job": None,
+                    "queue_depth": 0,
+                    "lease_quarantined": True,
+                }
+                try:
+                    from openswap.settings import load_worker_settings
+
+                    policy = load_worker_settings(self.switcher.backup_dir)
+                except Exception:
+                    pass
+            snapshot = self._with_account_picker(snapshot)
+            with self._worker_result_lock:
+                if generation == self._worker_generation:
+                    self._worker_result = (generation, snapshot, policy, None)
+
+        def _with_account_picker(self, snapshot):
+            """Attach roster metadata for the Remote tasks account popup.
+
+            Runs on the worker thread: slot numbers, emails, aliases and the
+            opaque account references only, never credentials.
+            """
+            snapshot = dict(snapshot)
+            try:
+                from openswap.worker.cli import worker_account_choices
+
+                snapshot["account_picker"] = worker_account_choices(
+                    self.switcher.backup_dir
+                ).to_dict()
+            except Exception:
+                snapshot.pop("account_picker", None)
+            return snapshot
+
+        def _run_guided_setup(self):
+            """Set up Remote tasks…: the steps of `openswap worker pair`, in dialogs.
+
+            Pair from the pasted pairing command when this Mac is not paired,
+            then start the worker, confirm the account, approve a research
+            folder and show the summary, through the same functions as the
+            CLI. The steps run on a worker thread (pairing, launchctl, locks);
+            ``on_sync_tick`` shows each dialog on the UI thread as it is asked.
+            """
+            if self._worker_operation is not None or getattr(self, "_guided_setup", None) is not None:
+                return
+            from openswap.worker import guided_setup
+
+            root = self.switcher.backup_dir
+            ui = guided_setup.ThreadedPrompts(guided_setup.DialogPrompts(
+                self._alert, self._prompt, choose_folder=self._choose_folder,
+            ))
+            self._guided_setup = ui
+
+            def steps():
+                from openswap.settings import load_worker_settings
+
+                try:
+                    paired = load_worker_settings(root).control_service_url is not None
+                    if paired or guided_setup.pair_interactively(root, ui):
+                        guided_setup.run(root, ui)
+                except Exception:
+                    ui.say("Setup stopped unexpectedly. Run `openswap worker setup` in Terminal to finish.")
+                finally:
+                    try:
+                        ui.flush()
+                    finally:
+                        ui.finished = True
+
+            threading.Thread(target=steps, name="openswap-guided-setup", daemon=True).start()
+
+        def _drain_guided_setup(self):
+            """On the UI thread: show the setup's pending dialog; refresh when it ends."""
+            ui = getattr(self, "_guided_setup", None)
+            if ui is None:
+                return
+            ui.serve()
+            if ui.finished:
+                self._guided_setup = None
+                self._worker_view_active()
+
+        def _worker_action(self, row_id, value):
+            if self._worker_operation is not None:
+                return
+            self._worker_operation = {
+                "remote_tasks_enabled": "worker_enable_or_disable",
+                "remote_tasks_paused": "worker_admission_update",
+                "remote_tasks_stop": "worker_stop_requested",
+                "remote_tasks_account": "worker_account_update",
+                "remote_tasks_web_choice": "worker_account_update",
+            }.get(row_id)
+            if self._worker_operation is None:
+                return
+            self._worker_status_cache = dict(self._worker_status_cache)
+            self._worker_status_cache["operation"] = self._worker_operation
+            self._worker_generation += 1
+            generation = self._worker_generation
+            threading.Thread(
+                target=self._worker_action_worker,
+                args=(generation, row_id, value),
+                daemon=True,
+            ).start()
+
+        def _worker_action_worker(self, generation, row_id, value):
+            diagnostic = None
+            policy = None
+            try:
+                from openswap.settings import load_worker_settings
+                from openswap.worker.cli import (
+                    disable_worker,
+                    enable_worker,
+                    request_pause,
+                    request_stop,
+                    read_status,
+                )
+
+                root = self.switcher.backup_dir
+                if row_id == "remote_tasks_enabled":
+                    if self._worker_policy.enabled:
+                        ok, _result, diagnostic = disable_worker(root)
+                        if not ok:
+                            diagnostic = diagnostic or "worker_disable_blocked"
+                    else:
+                        enable_worker(root)
+                elif row_id == "remote_tasks_paused":
+                    result = request_pause(root, not self._worker_policy.paused)
+                    if result.get("accepted") is not True:
+                        diagnostic = result.get("diagnostic_code") or "pause_refused"
+                elif row_id == "remote_tasks_stop":
+                    if not isinstance(value, str) or not value:
+                        diagnostic = "job_identity_unknown"
+                    else:
+                        result = request_stop(root, value)
+                        if result.get("accepted") is not True:
+                            diagnostic = result.get("diagnostic_code") or "stop_refused"
+                elif row_id == "remote_tasks_account":
+                    diagnostic = self._pin_worker_account(root, value)
+                elif row_id == "remote_tasks_web_choice":
+                    diagnostic = self._toggle_web_choice(root, value)
+                policy = load_worker_settings(root)
+                snapshot = read_status(root)
+            except Exception:
+                snapshot = {
+                    "process_state": "unavailable",
+                    "provider": {"available": False, "diagnostic_code": "status_unavailable"},
+                    "active_job": None,
+                    "queue_depth": 0,
+                    "lease_quarantined": True,
+                }
+                diagnostic = diagnostic or "worker_control_failed"
+                try:
+                    from openswap.settings import load_worker_settings
+
+                    policy = load_worker_settings(self.switcher.backup_dir)
+                except Exception:
+                    pass
+            snapshot = self._with_account_picker(snapshot)
+            with self._worker_result_lock:
+                if generation == self._worker_generation:
+                    self._worker_result = (generation, snapshot, policy, diagnostic)
+
+        def _pin_worker_account(self, root, value):
+            """Pin (or clear) through the CLI's own function; returns a diagnostic.
+
+            Only ``""`` (None) and an opaque ``codex:`` reference are accepted:
+            the popup's Claude and ineligible entries are disabled, and a
+            stray value is refused rather than guessed at.
+            """
+            from openswap.exceptions import ClaudeSwitchError
+            from openswap.worker.accounts import AccountPinError
+            from openswap.worker.cli import set_worker_account
+
+            from openswap.worker.accounts import provider_of
+
+            if value == "":
+                selector = None
+            elif provider_of(value) is not None:
+                selector = str(value)
+            else:
+                return "account_not_eligible"
+            try:
+                set_worker_account(root, selector)
+            except AccountPinError as exc:
+                return exc.code
+            except ClaudeSwitchError as exc:
+                return "worker_lifecycle_busy" if str(exc) == "worker_lifecycle_busy" else "settings_unavailable"
+            return None
+
+        def _toggle_web_choice(self, root, value):
+            """Allow or disallow one account for a per-job choice; returns a diagnostic.
+
+            Only ``allow:codex:…`` and ``disallow:codex:…`` act, through the
+            CLI's own functions; the pinned default is never disallowed here.
+            """
+            from openswap.exceptions import ClaudeSwitchError
+            from openswap.worker.accounts import AccountPinError
+            from openswap.worker.cli import allow_worker_account, disallow_worker_account
+
+            from openswap.worker.accounts import provider_of
+
+            action, _, ref = value.partition(":") if isinstance(value, str) else ("", "", "")
+            if action not in {"allow", "disallow"} or provider_of(ref) is None:
+                return "account_not_eligible"
+            try:
+                if action == "allow":
+                    allow_worker_account(root, ref)
+                else:
+                    disallow_worker_account(root, ref)
+            except AccountPinError as exc:
+                return exc.code
+            except ClaudeSwitchError as exc:
+                return "worker_lifecycle_busy" if str(exc) == "worker_lifecycle_busy" else "settings_unavailable"
+            return None
+
+        def _drain_worker_result(self):
+            with self._worker_result_lock:
+                result = self._worker_result
+                if result is None:
+                    return
+                generation, snapshot, policy, diagnostic = result
+                self._worker_result = None
+            if generation != self._worker_generation:
+                if self._worker_operation is None:
+                    self._worker_status_inflight = False
+                return
+            self._worker_status_inflight = False
+            self._worker_operation = None
+            self._worker_status_cache = dict(snapshot)
+            if policy is not None:
+                self._worker_policy = policy
+            self._worker_status_cache.pop("operation", None)
+            self._worker_status_cache["diagnostic_notice"] = diagnostic
+            panel = self._panel
+            if (
+                panel is not None
+                and panel.is_shown()
+                and getattr(panel, "_page", None) == SETTINGS_PAGE
+                and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_GENERAL
+            ):
                 panel.reload()
 
         def _stop_codex_engine(self):
@@ -1094,6 +1386,11 @@ def run(switcher, codex=None) -> int:
                 on_empty_action=self._on_empty_action,
                 login_state=lambda: dict(self._login_ui_state),
                 on_login_action=self._on_login_action,
+                worker_enabled=lambda: self._worker_policy.enabled,
+                worker_paused=lambda: self._worker_policy.paused,
+                worker_status=lambda: self._worker_status_cache,
+                on_worker_view_active=self._worker_view_active,
+                worker_paired=lambda: self._worker_policy.control_service_url is not None,
             )
             self._panel.attach(nsitem)
 
@@ -1240,7 +1537,16 @@ def run(switcher, codex=None) -> int:
             return self._guard(lambda: self.codex.set_account_disabled(number, False))
 
         def _on_setting(self, row_id, value):
-            if row_id == "menu_bar_provider":
+            if row_id == "remote_tasks_web_choice" and not value:
+                return  # the summary item: nothing to toggle
+            if row_id == "remote_tasks_setup":
+                self._run_guided_setup()
+            elif row_id in {
+                "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_stop",
+                "remote_tasks_account", "remote_tasks_web_choice",
+            }:
+                self._worker_action(row_id, value)
+            elif row_id == "menu_bar_provider":
                 if value not in MENU_BAR_PROVIDER_CHOICES:
                     return
                 self.settings.menu_bar_provider = value
@@ -1678,6 +1984,24 @@ def run(switcher, codex=None) -> int:
             prompt = make_dialog_prompt(**kwargs)
             return self._dialog(prompt.run)
 
+        def _choose_folder(self, *, title: str, message: str) -> str | None:
+            """The native folder chooser (Finder-style browse and search); None on Cancel."""
+            import AppKit
+
+            panel = AppKit.NSOpenPanel.openPanel()
+            panel.setTitle_(title)
+            panel.setMessage_(message)
+            panel.setPrompt_("Approve")
+            panel.setCanChooseDirectories_(True)
+            panel.setCanChooseFiles_(False)
+            panel.setCanCreateDirectories_(True)
+            panel.setAllowsMultipleSelection_(False)
+            panel.setDirectoryURL_(AppKit.NSURL.fileURLWithPath_(AppKit.NSHomeDirectory()))
+            if self._dialog(panel.runModal) != AppKit.NSModalResponseOK:
+                return None
+            urls = panel.URLs()
+            return str(urls[0].path()) if urls and len(urls) else None
+
         def _show_error(self, message: str):
             self._alert(title="openswap", message=message)
 
@@ -1818,6 +2142,12 @@ def run(switcher, codex=None) -> int:
                     )
             return False
 
+        def _slot_needs_reconcile(self, num) -> bool:
+            for row in self.snapshot.get("accounts") or []:
+                if str(row[0]) == str(num):
+                    return display_needs_reconcile(row[3])
+            return False
+
         def _slot_missing_login(self, num) -> bool:
             for row in self.snapshot.get("accounts") or []:
                 if str(row[0]) == str(num):
@@ -1858,8 +2188,12 @@ def run(switcher, codex=None) -> int:
                 return
             if self._slot_missing_login(num):
                 self._repair_relogin(
-                    num, close_panel=close_panel, force_login=True
+                    num, close_panel=close_panel, force_login=True,
+                    reason="missing",
                 )
+                return
+            if self._slot_needs_reconcile(num):
+                self._repair_reconcile(num, close_panel=close_panel)
                 return
             if self._slot_needs_restore(num):
                 try:
@@ -1943,20 +2277,24 @@ def run(switcher, codex=None) -> int:
             )
             return self._alert(title=title, message=message, ok="Switch", cancel="Cancel") == 1
 
-        def _repair_relogin(self, num, *, close_panel, force_login=False):
+        def _repair_relogin(
+            self, num, *, close_panel, force_login=False, reason="expired"
+        ):
             slot = self._slot_identity(num)
             slot_name = self._name_for_num(num)
             live = self.switcher.live_identity()
             live_name = self._name_for_identity(live)
             plan = plan_relogin_click(
-                live=live, slot=slot, slot_name=slot_name, live_name=live_name
+                live=live, slot=slot, slot_name=slot_name, live_name=live_name,
+                reason=reason,
             )
             if plan is None:
                 self._show_error(f"Couldn't find {slot_name} in the account list.")
                 return
             if force_login and plan.kind == "capture":
                 plan = ReloginClickPlan(
-                    "open_login", plan.slot_name, plan.login_email, plan.live_name
+                    "open_login", plan.slot_name, plan.login_email,
+                    plan.live_name, plan.reason,
                 )
             if plan.kind == "capture":
                 self._capture_relogin(num, close_panel=close_panel)
@@ -1964,11 +2302,79 @@ def run(switcher, codex=None) -> int:
             if plan.kind == "confirm_open_login" and self._alert(
                 title=relogin_wrong_account_title(plan),
                 message=relogin_wrong_account_message(plan),
-                ok="Open login",
+                ok=f"Sign in as {plan.slot_name}",
                 cancel="Cancel",
             ) != 1:
                 return
             self._open_claude_login(plan)
+
+        def _repair_reconcile(self, num, *, close_panel):
+            name = self._name_for_num(num)
+            try:
+                owner = self._run_switch(
+                    lambda: self.switcher.live_credential_owner(num)
+                )
+            except OSError as e:
+                # The lookup can record a verified uuid in the roster.
+                self._show_error(f"Couldn't update OpenSwap's account list: {e}")
+                return
+            if owner is None:
+                return
+            if owner["state"] in ("matches", "own"):
+                # Already this account's login (fixed since the card was
+                # drawn, or just a token refresh): nothing to repair, and no
+                # restore may run without the confirmation below.
+                self._notify(
+                    NotificationCopy(
+                        title=f"{name}'s login is already fixed",
+                        body="Claude Code is using the right account.",
+                    )
+                )
+                self.refresh_async()
+                return
+            slot = self._slot_identity(num)
+            owner_email = owner.get("email")
+            if owner["state"] == "other" and not owner_email:
+                owner_email = "an unknown account"
+            title, message, ok = reconcile_dialog_copy(
+                name, slot[0] if slot else "",
+                owner_email=owner_email,
+                owner_name=(
+                    self._name_for_num(owner["slot"])
+                    if owner.get("slot") else None
+                ),
+            )
+            if self._alert(
+                title=title, message=message, ok=ok, cancel="Cancel"
+            ) != 1:
+                return
+            if owner["state"] == "unknown":
+                self._repair_relogin(
+                    num, close_panel=close_panel, force_login=True,
+                    reason="unverified",
+                )
+                return
+            result = self._run_switch(
+                lambda: self.switcher.switch_to(str(num), json_output=True)
+            )
+            if result is None:
+                return
+            if result.get("reason") == "repaired":
+                self._notify(
+                    NotificationCopy(
+                        title=f"{name}'s login restored",
+                        body="Claude Code is using the right account again.",
+                    )
+                )
+                self.refresh_async()
+            elif not result.get("switched"):
+                # The login changed again between the check and the repair.
+                self._show_error(
+                    f"Claude Code's login changed while checking. Click {name} "
+                    "again to see what it's using now."
+                )
+                return
+            self._finish_manual_switch(result, name, close_panel=close_panel)
 
         def _capture_relogin(self, num, *, close_panel):
             slot = self._slot_identity(num)
