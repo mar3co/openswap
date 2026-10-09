@@ -490,6 +490,40 @@ def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_
     assert codes["state"] == "0" and codes["own_sign_in"] == "0"
 
 
+@pytest.mark.skipif(sys.platform != "darwin" or not os.path.exists("/usr/bin/sandbox-exec"), reason="Seatbelt")
+def test_nothing_the_session_starts_can_leave_the_sandbox_for_real(tmp_path):
+    import socket
+    import tempfile
+
+    sb, _profile, _home = _job_profile(tmp_path)
+    # A local daemon's socket (Docker's, say) would act outside the sandbox.
+    short = Path(tempfile.mkdtemp(prefix="os-", dir="/tmp"))
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(short / "s"))
+        server.listen(4)
+        connect = f"/usr/bin/nc -U -w 1 {short / 's'} </dev/null >/dev/null 2>&1"
+        outside = subprocess.run(["/bin/sh", "-c", connect], timeout=30).returncode
+        codes = _sandboxed(sb, "; ".join([
+            f"{connect}; echo unix_socket $?",
+            f"/bin/launchctl print gui/{os.getuid()} >/dev/null 2>&1; echo launchctl $?",
+            "/usr/bin/curl -sS -m 10 -o /dev/null https://example.com 2>/dev/null; echo dns_and_tls $?",
+        ]))
+    finally:
+        server.close()
+        import shutil
+
+        shutil.rmtree(short, ignore_errors=True)
+    assert outside == 0 and codes["unix_socket"] != "0"
+    assert codes["launchctl"] == "126"
+    # Name resolution (mDNSResponder's socket) and TLS still work, when this Mac is online at all.
+    online = subprocess.run(["/usr/bin/curl", "-sS", "-m", "10", "-o", "/dev/null", "https://example.com"],
+                            capture_output=True, timeout=30).returncode == 0
+    assert codes["dns_and_tls"] == "0" or not online
+    sb_text = sb.read_text()
+    assert "(deny lsopen)" in sb_text and "(deny appleevent-send)" in sb_text and "(deny job-creation)" in sb_text
+
+
 @pytest.mark.skipif(sys.platform != "darwin" or not (os.environ.get("OPENSWAP_KEYCHAIN_SANDBOX_TESTS") == "1"
                                                      or os.environ.get("GITHUB_ACTIONS") == "true"),
                     reason="creates a throwaway keychain file; set OPENSWAP_KEYCHAIN_SANDBOX_TESTS=1 on a Mac")
@@ -760,6 +794,12 @@ class SimulatedClaudeMac(FakeLaunch):
             return subprocess.CompletedProcess(argv, 0, '"mdat"<timedate>=0x1 "20261001"\n', "")
         if argv[0] == "/bin/ps":
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "/bin/launchctl":
+            # Nothing a sandboxed probe submitted is loaded.
+            return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+        if argv[0] == "/usr/bin/pkill":
+            self.__dict__.setdefault("killed", []).append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "", "")
         raise AssertionError(argv)
 
 
@@ -844,6 +884,10 @@ class LeakyKeychainMac(SimulatedClaudeMac):
     ALLOWED_PROBES = SimulatedClaudeMac.ALLOWED_PROBES | {"security_tool", "keychain_services", "settings_write"}
 
 
+class AppsEscapeMac(SimulatedClaudeMac):
+    ALLOWED_PROBES = SimulatedClaudeMac.ALLOWED_PROBES | {"open_app"}
+
+
 class IgnoresTheModeMac(SimulatedClaudeMac):
     def _attempt(self, tool, target, cwd, mode, tools, allow):
         return super()._attempt(tool, target, cwd, "bypassPermissions", tools, allow)
@@ -857,6 +901,7 @@ class IgnoresDenyRulesMac(SimulatedClaudeMac):
 
 @pytest.mark.parametrize("mac_class, gate, key", [
     (IgnoresDenyRulesMac, "permissions", "credential_rule_holds"),
+    (AppsEscapeMac, "sandbox_wrapper", "app_launch_denied"),
     (LeakyKeychainMac, "sign_in_isolation", "keychain_services_denied"),
     (LeakyKeychainMac, "sign_in_isolation", "profile_settings_write_denied"),
     (IgnoresTheModeMac, "permissions", "headless_shell_denied"),

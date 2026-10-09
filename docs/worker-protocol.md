@@ -986,14 +986,20 @@ backup root (other accounts, worker state) unreadable and unwritable, and
 takes the Keychain away: `/usr/bin/security` cannot start, the Keychain's
 services cannot be looked up and `~/Library/Keychains` cannot be read, so no
 command the session runs can reach another account's sign-in, the default
-login or the worker's device key. Containment, Stop, recovery, `result.md`
+login or the worker's device key. Nothing it starts can leave the sandbox or
+the job's coalition either: LaunchServices (`open`; an app it opens runs
+unsandboxed), Apple Events, launchd job creation (and `launchctl`) and local
+Unix sockets other than name resolution's are denied. Containment, Stop, recovery, `result.md`
 and failure codes are the same as for Codex. A job also refuses while any
 managed Claude Code policy applies (the system `managed-settings.json` or
 `managed-settings.d/`, managed preferences, or server-managed policy cached
 in the profile as a non-empty `remote-settings.json`): it could add hooks,
 permission rules or an API key helper the owner did not choose.
 
-**The Claude live check** records the same gates as the Codex one. The Read
+**The Claude live check** records the same gates as the Codex one. Its
+`sandbox-exec` probe also tries to bootstrap a launchd agent and to open an
+app through LaunchServices from inside the job's profile; both must fail and
+nothing may be left loaded or running. The Read
 probes run in `bypassPermissions` with every read allowed, so only the
 Seatbelt profile can refuse (a read in the job folder must work; reads
 outside it, of a sentinel in the profile and of `~/.claude.json` must fail).

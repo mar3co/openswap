@@ -1602,7 +1602,13 @@ Built (PR #93, stacked on #90):
   `prepare` signs it in again. The profile's configuration files (settings,
   memory and rules, agents and their memory, commands, skills, hooks, output
   styles, plugins, and each project's auto-memory, with auto-memory off) are
-  unwritable from a job, so one task cannot widen the next.
+  unwritable from a job, so one task cannot widen the next. And nothing a
+  shell starts can leave the sandbox or the coalition: measured on this Mac,
+  `open -g -j -a Calculator` from an `(allow default)` profile starts an
+  unsandboxed app, so the profile now denies `lsopen`, `appleevent-send`,
+  `job-creation` (and `launchctl`), and local Unix sockets other than
+  mDNSResponder's (a daemon such as Docker's would act for the task). The
+  live check's sandbox probe tries a launchd agent and an app launch.
 - **Item 5, what works.** Claude Code's bash sandbox nested in OpenSwap's: no;
   real `sandbox-exec` inside `sandbox-exec` fails `sandbox_apply: Operation
   not permitted` (macOS 27.0.1). Passing the token at launch: the CLI accepts

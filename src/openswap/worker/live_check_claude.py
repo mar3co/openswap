@@ -14,7 +14,8 @@ with the live Claude adapter exactly as remote jobs use it:
   API key in use, and the CLI reported the permission mode it runs in.
 - ``sandbox_wrapper``: the Seatbelt profile the job runs under allows the job
   folder and denies writes outside it, ``/tmp`` and reads of OpenSwap's
-  backup root, tested with ``sandbox-exec`` directly.
+  backup root, and that a launchd agent or an app opened through
+  LaunchServices cannot start from it, tested with ``sandbox-exec`` directly.
 - ``research_run``: a real web-research job succeeds with structured events,
   web search and a cited URL, and stops with proof.
 - ``sandbox_exec``: a real job in ``bypassPermissions`` (so only the Seatbelt
@@ -354,12 +355,23 @@ class ClaudeLiveCheck(LiveCheck):
             output_root=ws.resolve(), profile=profile.resolve(), run_tmp=(self.check_root / "tmp").resolve(),
             home=self._home.resolve(), backup_root=self.root.resolve(),
         ).encode())
+        # Escapes a shell command could try (the account's settings may allow
+        # one): a launchd job and an app started through LaunchServices both
+        # run outside this sandbox and the job's coalition.
+        label = f"com.opensoft.openswap.livecheck.escape.{secrets.token_hex(6)}"
+        agent = ws / "escape.plist"
+        agent.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
+            f"<key>Label</key><string>{label}</string><key>ProgramArguments</key>"
+            "<array><string>/bin/sleep</string><string>120</string></array></dict></plist>\n")
         steps = {
             "inside_read": f"cat '{ws / 'inside.txt'}' >/dev/null 2>&1",
             "inside_write": f"printf ok > '{ws / 'inside-write.txt'}' 2>/dev/null",
             "outside_read": f"cat '{outside / 'secret.txt'}' >/dev/null 2>&1",
             "outside_write": f"printf x > '{outside / 'write.txt'}' 2>/dev/null",
             "tmp_write": f"printf x > '{tmp_marker}' 2>/dev/null",
+            "launch_agent": f"/bin/launchctl bootstrap gui/{os.getuid()} '{agent}' >/dev/null 2>&1",
+            "open_app": "/usr/bin/open -g -j -a Calculator >/dev/null 2>&1",
         }
         script = "\n".join(f'{command}; echo "R {name} $?"' for name, command in steps.items())
         try:
@@ -377,12 +389,19 @@ class ClaudeLiveCheck(LiveCheck):
                 "outside_read_denied": codes.get("outside_read", 0) != 0,
                 "outside_write_denied": codes.get("outside_write", 0) != 0 and not (outside / "write.txt").exists(),
                 "tmp_write_denied": codes.get("tmp_write", 0) != 0 and not tmp_marker.exists(),
+                # The submission itself must fail and nothing may be loaded.
+                "launchd_job_denied": codes.get("launch_agent", 0) != 0
+                and self._unload_probe_label(label) is False,
+                "app_launch_denied": codes.get("open_app", 0) != 0,
             }
         finally:
             try:
                 tmp_marker.unlink()
             except OSError:
                 pass
+        if not detail["app_launch_denied"]:
+            # It escaped: do not leave the app running.
+            self._run(["/usr/bin/pkill", "-x", "Calculator"], capture_output=True, check=False, timeout=20)
         gate.detail = detail
         gate.passed = all(detail.values())
 

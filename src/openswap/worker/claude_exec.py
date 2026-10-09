@@ -85,6 +85,7 @@ KEYCHAIN_SERVICES = (
     "com.apple.security.keychain-circle", "com.apple.securityd.systemkeychain",
 )
 SECURITY_TOOL = "/usr/bin/security"
+LAUNCHCTL = "/bin/launchctl"
 MANAGED_CLAUDE_PATHS = (
     "/Library/Application Support/ClaudeCode/managed-settings.json",
     "/Library/Application Support/ClaudeCode/managed-mcp.json",
@@ -256,6 +257,9 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
       it runs can read any Keychain item (other accounts' sign-ins, the
       default login, the worker's device key). Claude Code falls back to the
       profile's own credentials file.
+    - No way out: LaunchServices, Apple Events, launchd job creation and
+      local Unix sockets (other than name resolution's) are denied, so
+      nothing the session starts runs outside this sandbox or the coalition.
     """
     # ``output_root`` is the session's working directory; ``write_paths`` add
     # what git needs for a work folder's worktree.
@@ -285,6 +289,18 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
         f"(deny process-exec (literal {_sb_string(SECURITY_TOOL)}))",
         f"(deny mach-lookup {services})",
         f"(deny file-read* file-write* (subpath {_sb_string(home / 'Library' / 'Keychains')}))",
+        # Nothing the session starts may leave this sandbox or the job's
+        # coalition: no app or document opened through LaunchServices (an
+        # opened app runs unsandboxed), no Apple Events to other apps, no
+        # launchd job, and no local Unix socket (a daemon such as Docker's
+        # would act outside the sandbox on the task's behalf).
+        "(deny lsopen)",
+        "(deny appleevent-send)",
+        "(deny job-creation)",
+        f"(deny process-exec (literal {_sb_string(LAUNCHCTL)}))",
+        "(deny network-outbound (remote unix-socket))",
+        # Name resolution goes through mDNSResponder's socket.
+        '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))',
         "",
     ]
     return "\n".join(lines)
