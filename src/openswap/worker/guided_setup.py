@@ -65,6 +65,9 @@ class TerminalPrompts:
     _index: object = field(default=None, repr=False)
 
     def say(self, text: str) -> None:
+        # The one `Next:` line is bold on a colour terminal, like every other command's.
+        if text.startswith("Next: "):
+            text = printer.next_step(text.removeprefix("Next: "))
         self.write(text)
 
     def section(self, title: str) -> None:
@@ -190,7 +193,7 @@ def offer_worker(root: Path, ui: Prompts) -> None:
             message = f"{message.rstrip('.')} ({code})."
         ui.say(f"{message} {START_WORKER_NEXT}")
     except Exception:
-        ui.say(f"Could not enable worker. {START_WORKER_NEXT}")
+        ui.say(f"Could not start the worker. {START_WORKER_NEXT}")
     else:
         ui.say(WORKER_ONLINE)
 
@@ -277,24 +280,7 @@ def confirm_account(root: Path, ui: Prompts) -> None:
 
 
 def _display_path(path: Path) -> str:
-    path = Path(path)
-    home = _cli().home_folder()
-    for base in (home, _resolved(home)):
-        if base is None:
-            continue
-        try:
-            relative = path.relative_to(base)
-        except ValueError:
-            continue
-        return "~/" + relative.as_posix() if relative.parts else "~"
-    return str(path)
-
-
-def _resolved(path: Path) -> Path | None:
-    try:
-        return Path(path).resolve()
-    except (OSError, RuntimeError):
-        return None
+    return _cli().display_path(path)
 
 
 def _describe(workspace) -> str:
@@ -629,7 +615,7 @@ class Readiness:
         if self.account is None:
             out.append("`openswap worker account <slot>` to pick an account")
         if not self.folders:
-            out.append("`openswap worker workspace add --read <folder>` to add a folder")
+            out.append("`openswap worker workspace add --work <folder>` to add a folder")
         if self.refused:
             names = ", ".join(f'"{workspace_id}"' for workspace_id, _code in self.refused)
             out.append(f"`openswap worker workspace list` to fix {names}")

@@ -192,7 +192,7 @@ def test_allow_label_and_list(root, capsys):
     assert _run(root, "account", "allow", "bob@example.com") == 0
     assert _entry(root, BOB) == bob
     assert _run(root, "account", "label", bob.account_ref, "Second") == 0
-    assert "as \"Second\"" in capsys.readouterr().out
+    assert '✓ Renamed: "Second" (Codex 2).' in capsys.readouterr().out
     assert _entry(root, BOB).account_ref == bob.account_ref and _entry(root, BOB).label == "Second"
     assert _run(root, "account", "label", "work", "Main") == 0  # a roster selector works too
 
@@ -200,9 +200,10 @@ def test_allow_label_and_list(root, capsys):
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
     alice = _entry(root, ALICE)
-    assert f"  ✓ {alice.account_ref}  \"Main\"    Codex slot 1  default" in out
-    assert f"  • {bob.account_ref}  \"Second\"  Codex slot 2" in out
-    assert SECRET not in out
+    # The slot, not the reference: the reference is for the service, the slot is what `disallow` takes.
+    assert '  ✓ Codex 1  "Main"    pinned' in out
+    assert '  • Codex 2  "Second"' in out
+    assert alice.account_ref not in out and bob.account_ref not in out and SECRET not in out
 
     assert _run(root, "account", "--json") == 0
     listed = json.loads(capsys.readouterr().out)
@@ -265,7 +266,8 @@ def test_an_account_gone_from_the_roster_can_be_disallowed_by_reference(root, ca
     bob = _entry(root, BOB)
     _write_codex_roster(root, {"1": {"email": "alice@example.com", "accountId": "acct-alice", "alias": "work"}})
     assert _run(root, "account") == 0
-    assert f"  ✗ {bob.account_ref}  \"Codex account 2\"  no longer in the Codex roster" in capsys.readouterr().out
+    # A gone account shows the reference, the only name `disallow` can still reach it by.
+    assert f'  ✗ Codex (removed)  "Codex account 2"  gone: disallow {bob.account_ref}' in capsys.readouterr().out
     assert _run(root, "account", "disallow", "2", "--json") == 1  # the slot is gone
     assert json.loads(capsys.readouterr().out)["diagnostic_code"] == "account_not_found"
     assert _run(root, "account", "disallow", bob.account_ref) == 0

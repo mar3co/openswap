@@ -158,33 +158,32 @@ class ClaudeLiveCheck(LiveCheck):
             raise CheckRefused("unsupported_platform", "The live check needs an Apple silicon Mac.")
         snapshot = read_worker_snapshot(self.root)
         if snapshot.active_job is not None:
-            raise CheckRefused("job_active", "A worker job is active. Wait for it or stop it first.")
+            raise CheckRefused("job_active", "A task is running. Wait for it, or `openswap worker stop` ends it.")
         if not snapshot.paused and snapshot.process_state.value != "stopped":
             # Running, stale or unreadable: it could admit a job mid-check.
-            raise CheckRefused("worker_running", "The worker is running (or its state cannot be read). "
-                                                 "Pause it first: `openswap worker pause` "
-                                                 "(reopen with `--off`).")
+            raise CheckRefused("worker_running", "The worker is taking tasks. Next: `openswap worker pause` "
+                                                 "(`--off` resumes afterwards).")
         lease = self.leases.read_current()
         if lease is not None and lease.state != "released":
             raise CheckRefused("lease_held", lease_release_hint(lease))
         try:
             pinned = self._verify(check_version=True)
         except claude_cli.ClaudeCliError as error:
-            raise CheckRefused("cli_" + error.code, "The pinned Claude Code CLI is not ready "
-                               f"({error.code}). Run `openswap worker claude pin`.") from None
+            raise CheckRefused("cli_" + error.code, f"Claude Code is not ready ({error.code}). "
+                               "Next: `openswap worker claude pin`.") from None
         selector = self.selector or load_worker_settings(self.root).pinned_account_ref or ""
         try:
             choice = resolve_account_selector(self.root, selector)
         except AccountPinError:
             choice = None
         if choice is None or choice.provider != "claude":
-            raise CheckRefused("account_not_claude", "Choose a Claude account: `openswap worker account "
-                               "claude:<slot>` or pass --account claude:<slot>.")
+            raise CheckRefused("account_not_claude", "No Claude account to check. Next: `openswap worker "
+                               "account claude:<slot>`, or pass --account claude:<slot>.")
         identity = choice.account_ref
         profile = profile_for(self.root, identity)
         if profile is None or profile_identity(profile) != identity:
-            raise CheckRefused("profile_not_ready", f"Claude account {choice.number}'s OpenSwap profile is not "
-                               f"ready. Run `openswap worker claude prepare claude:{choice.number}`.")
+            raise CheckRefused("profile_not_ready", f"Claude account {choice.number} is not signed in for "
+                               f"tasks. Next: `openswap worker claude prepare claude:{choice.number}`.")
         gate = self.gates["pinned_cli"]
         gate.passed = True
         gate.detail = {"version": pinned.version, "binary_sha256": pinned.binary_sha256}

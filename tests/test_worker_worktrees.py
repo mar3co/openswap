@@ -303,7 +303,7 @@ def test_worktrees_command_lists_and_prunes(root, home, capsys):
     (item,) = json.loads(capsys.readouterr().out)["worktrees"]
     assert item["branch"] == "openswap/aaaaaaaa" and item["dirty"] is False and item["finished"] is True
     assert cli.main(["worktrees", "prune"], backup_root=root) == 0
-    assert "Removed 1 finished task worktree; branches are kept." in capsys.readouterr().out
+    assert "✓ Removed 1 (branches are kept)." in capsys.readouterr().out
     assert not resolved.work_dir.exists()
 
 

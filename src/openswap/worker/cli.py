@@ -484,6 +484,21 @@ def home_folder() -> Path:
     return Path.home()
 
 
+def display_path(path: str | Path) -> str:
+    """A path for the terminal: ``~`` for the home folder (as given, or resolved)."""
+    path = Path(path)
+    home = home_folder()
+    for base in (home, _resolved(home)):
+        if base is None:
+            continue
+        try:
+            relative = path.relative_to(base)
+        except ValueError:
+            continue
+        return "~/" + relative.as_posix() if relative.parts else "~"
+    return str(path)
+
+
 def default_research_folder() -> Path:
     """Where task results are saved: ``~/OpenSwap Research``, one folder per workspace ID."""
     return home_folder() / DEFAULT_RESEARCH_FOLDER_NAME
@@ -816,7 +831,7 @@ def refused_workspaces(backup_root: Path, workspaces=None) -> list[tuple[str, st
 
 
 def refusal_line(workspace_id: str, code: str) -> str:
-    """One path-free line saying which workspace is refused at launch and why."""
+    """One path-free line saying which folder is refused at launch and why."""
     reason = _WORKSPACE_MESSAGES.get(code, "It breaks the folder rules.")
     return f'{printer.MARK_BAD} "{workspace_id}" is blocked ({code}). {reason}'
 
@@ -1625,10 +1640,10 @@ def _run(backup_root: Path, *, managed: bool = False) -> int:
     try:
         with lifecycle_lock(backup_root):
             if not load_worker_settings(backup_root).enabled:
-                print("Worker is disabled. Enable Remote tasks before starting it.")
+                print(f"Remote tasks are off. {_ENABLE_NEXT}")
                 return 0
     except ClaudeSwitchError:
-        print("Worker lifecycle is busy; try again shortly.", file=sys.stderr)
+        print(BUSY_MESSAGE, file=sys.stderr)
         return 1
     # Imported only in the dedicated worker command, after the default-off
     # policy check. The runtime owns its own SQLite journal and local socket.
@@ -1636,13 +1651,50 @@ def _run(backup_root: Path, *, managed: bool = False) -> int:
 
     result = int(run_worker(backup_root, managed=managed, service_loaded=_managed_worker_loaded))
     if result == WORKER_REFUSED_MANAGED:
-        print(
-            "The Remote tasks LaunchAgent is running the worker; "
-            "disable it before running the worker manually.",
-            file=sys.stderr,
-        )
+        print("The worker is already running in the background; `openswap worker disable` stops it first.",
+              file=sys.stderr)
         return 1
     return result
+
+
+# One line each; the same wording wherever the situation comes up.
+BUSY_MESSAGE = "Another worker change is in progress; try again in a moment."
+SETTINGS_MESSAGE = "Could not save the worker settings."
+# Plain text (not ``printer.next_step``): module constants must not latch the colour detection.
+_ENABLE_NEXT = "Next: `openswap worker enable` to start the worker."
+
+
+_STOP_MESSAGES = {
+    "job_not_found": "no task has that ID",
+    "active_job_mismatch": "a different task is running (omit the ID to stop it)",
+    "stale_job_state": "the task changed state just now; try again",
+}
+# Why `disable` stopped short: (what is wrong, the command that clears it or None).
+_DISABLE_BLOCKED = {
+    "job_still_active": ("a task is still running", "`openswap worker stop` to end it."),
+    "job_stop_not_confirmed": ("the running task has not stopped yet", "wait, then `openswap worker disable` again."),
+    "lease_state_unknown": ("an account may still be in use", "`openswap worker lease release` to free it."),
+    "worker_state_unknown": ("the worker's state could not be read", None),
+    "worker_status_unavailable": ("the worker's state could not be read", None),
+    "worker_unload_failed": ("the background service could not be unloaded", None),
+    "settings_unavailable": ("the worker settings could not be saved", None),
+    "job_identity_unknown": ("the running task could not be identified", None),
+}
+_LEASE_MESSAGES = {
+    "lease_not_found": "no account is held.",
+    "lease_state_unknown": "the account's state could not be read.",
+    "worker_owner_may_be_alive": "the worker holding it may still be running.",
+    "lease_not_expired": "it is still within its time; wait for it to expire.",
+    "job_not_terminal": "its task has not ended.",
+    "provider_start_pending": "its task is still starting; wait for the worker to record it.",
+    "stop_unproven_confirm_required": ("it cannot prove the task stopped. Once nothing runs on the account, "
+                                       "pass --confirm-stopped."),
+}
+
+
+def _migration_message(exc: ClaudeSwitchError) -> str:
+    """One line when the legacy backup folder could not be moved first."""
+    return f"Could not move the old OpenSwap data folder: {exc}"
 
 
 _WORKER_COMMANDS = (
@@ -1683,39 +1735,36 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         return 2
     parser = argparse.ArgumentParser(
         prog="openswap worker",
-        description="Control the opt-in Remote Agent Host worker.",
+        description="Remote tasks on this Mac: the worker, the account, the folders and the live check.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("refserver", help="serve the reference protocol or manage pairing/revocation")
-    commands.add_parser("codex", help="install, verify and sign in the pinned Codex CLI that remote jobs run")
-    commands.add_parser("live", help="show or change the explicit live-execution opt-in")
-    commands.add_parser("claude", help="pin the Claude Code CLI and prepare account profiles for Remote tasks")
-    commands.add_parser("live-check", help="run real Codex or Claude jobs on this Mac and record phase-1 live evidence")
+    commands.add_parser("codex", help="install and sign in the Codex CLI tasks run with")
+    commands.add_parser("live", help="show, turn on or turn off live tasks")
+    commands.add_parser("claude", help="pin Claude Code and sign the account in for tasks")
+    commands.add_parser("live-check", help="run a few short real tasks here and record the evidence")
     run = commands.add_parser("run", help="run the background worker process")
     # Passed only by the LaunchAgent: a manual run refuses while it is loaded.
     run.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)
-    pair_parser = commands.add_parser("pair", help="approve enrollment locally and store its device key in login Keychain")
+    pair_parser = commands.add_parser("pair", help="pair this Mac with the pairing command from OpenTag")
     pair_parser.add_argument("url")
     pair_parser.add_argument("code")
     setup_parser = commands.add_parser(
-        "setup", help="walk through starting the worker, the account and the folders sessions work in",
-        description="The guided steps `pair` runs after pairing: start the worker, pick the Codex "
-                    "or Claude account, pick the folders where remote sessions work (git repos, or a "
-                    "folder of repos such as ~/GitHub; on a terminal, type to search, or numbers like "
-                    "1 3), then a checklist with one next step. Each task works in its own git worktree "
-                    "on an openswap/ branch, so your copy is never touched. Results are saved under "
-                    "~/OpenSwap Research. Only each folder's ID and name reach the control service; "
-                    "paths never leave this Mac.",
+        "setup", help="guided setup: the worker, the account and the folders tasks work in",
+        description="The steps `pair` runs after pairing: start the worker, pick the account, pick the "
+                    "folders tasks work in (a git repo, or a folder of repos such as ~/GitHub), then a "
+                    "checklist with one next step. Each task works in its own git worktree, so your copy "
+                    "is never touched; results go to ~/OpenSwap Research. Only each folder's ID and name "
+                    "leave this Mac, never its path.",
     )
     setup_parser.add_argument(
         "--advanced", action="store_true",
-        help="also offer to run sessions in a folder itself (direct mode) instead of a worktree",
+        help="also offer to run tasks in a folder itself instead of a worktree",
     )
     unpair_parser = commands.add_parser(
-        "unpair", help="remove the device key and configured service URL; pass a URL to remove an enrollment "
-                       "that settings no longer reference",
+        "unpair", help="unpair this Mac (pass a URL to forget an old pairing instead)",
     )
-    unpair_parser.add_argument("url", nargs="?", default=None, help="service URL to unpair (default: the configured one)")
+    unpair_parser.add_argument("url", nargs="?", default=None, help="the service to forget (default: the paired one)")
     submit_parser = commands.add_parser("submit-test", help="TEST ONLY: submit a bounded research job to a paired service")
     submit_parser.add_argument("--url", required=True)
     submit_parser.add_argument("--task", required=True)
@@ -1729,112 +1778,108 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     submit_parser.add_argument("--account-ref", default=None,
                                help="optional: an account reference the worker advertised (account choice extension)")
     submit_parser.add_argument("--i-understand-this-is-a-test-tool", action="store_true")
-    status_parser = commands.add_parser("status", help="show local worker status")
+    status_parser = commands.add_parser("status", help="the worker, the service link and the running task")
     status_parser.add_argument("--json", action="store_true")
-    stop_parser = commands.add_parser("stop", help="request interruption of the active job")
-    stop_parser.add_argument("job_id", nargs="?", help="omit to target the active job")
+    stop_parser = commands.add_parser("stop", help="stop the running task")
+    stop_parser.add_argument("job_id", nargs="?", help="omit to target the running task")
     stop_parser.add_argument("--json", action="store_true")
-    pause_parser = commands.add_parser("pause", help="pause or reopen job admission")
-    pause_parser.add_argument("--off", action="store_true", help="reopen admission")
+    pause_parser = commands.add_parser("pause", help="stop taking new tasks (--off takes them again)")
+    pause_parser.add_argument("--off", action="store_true", help="take new tasks again")
     pause_parser.add_argument("--json", action="store_true")
-    enable_parser = commands.add_parser("enable", help="opt in and install the worker LaunchAgent")
+    enable_parser = commands.add_parser("enable", help="start the worker (it stays on after a restart)")
     enable_parser.add_argument("--json", action="store_true")
-    disable_parser = commands.add_parser("disable", help="safely stop and disable the worker")
+    disable_parser = commands.add_parser("disable", help="stop the worker and turn Remote tasks off")
     disable_parser.add_argument("--json", action="store_true")
-    lease_parser = commands.add_parser("lease", help="manage the local worker's account lease")
+    lease_parser = commands.add_parser("lease", help="free an account a crashed task still holds")
     lease_commands = lease_parser.add_subparsers(dest="lease_command", required=True)
     lease_release_parser = lease_commands.add_parser(
-        "release", help="release a stuck lease once its worker is proven gone"
+        "release", help="free the account once its task is proven gone"
     )
     lease_release_parser.add_argument("--provider", choices=("codex", "claude"), default="codex")
     lease_release_parser.add_argument(
         "--confirm-stopped", action="store_true",
-        help="attest that no process using the account is still running, when that cannot be proven",
+        help="confirm that nothing is still running on the account, when that cannot be proven",
     )
     lease_release_parser.add_argument("--json", action="store_true")
     account_parser = commands.add_parser(
         "account",
-        help="list or pin the Codex or Claude account remote jobs run on",
-        description="With no argument, list Codex and Claude roster slots, the accounts allowed for a "
-                    "per-job choice, and mark the pinned default. Pass a slot, email or alias to "
-                    "pin that account for the next job (`claude:4` or `codex:2` names the provider; "
-                    "a bare slot means Codex first). `account allow|disallow|label` manage "
-                    "the accounts a control service may choose per job (see `account allow --help`).",
+        help="list the accounts, or pin the one tasks run on",
+        description="With no argument, list the Codex and Claude accounts and the pinned one. Pass a "
+                    "slot, email or alias to pin that account (`claude:4` or `codex:2` names the kind; a "
+                    "bare slot is Codex first). `allow`, `disallow` and `label` manage the accounts a "
+                    "task may pick instead (see `account allow --help`).",
     )
     account_parser.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
     account_parser.add_argument("--clear", action="store_true", help="remove the pin")
     account_parser.add_argument("--json", action="store_true")
     workspace_parser = commands.add_parser(
-        "workspace", help="manage the approved research folders and their opaque IDs",
+        "workspace", help="the folders tasks work in or read",
     )
     workspace_commands = workspace_parser.add_subparsers(dest="workspace_command", required=True)
-    workspace_list = workspace_commands.add_parser("list", help="list approved research folders")
+    workspace_list = workspace_commands.add_parser("list", help="list the folders")
     workspace_list.add_argument("--json", action="store_true")
     workspace_add = workspace_commands.add_parser(
-        "add", help="add a folder where sessions work (--work DIR), or a research folder",
+        "add", help="add a folder tasks work in (--work DIR) or read (--read DIR)",
         usage="%(prog)s --work DIR [--direct] [--label TEXT] [--json]\n"
               "       %(prog)s --read DIR [--label TEXT] [--json]\n"
               "       %(prog)s ID FOLDER [--readonly-source DIR] [--label TEXT] [--json]",
-        description="`add --work DIR` lets remote sessions work in DIR, as `openswap worker setup` does: "
-                    "a git repo becomes one folder (ID from its name), and a folder of repos offers each "
-                    "repo in it. Each task works in its own git worktree, on a branch openswap/<task>, so "
-                    "your copy is never touched; `--direct` (this Mac only) works in DIR itself. "
-                    "`add --read DIR` lets research tasks read DIR. `add ID FOLDER` approves FOLDER as "
-                    "the folder research tasks write their results in. Results go to "
-                    "~/OpenSwap Research/<ID>.",
+        description="`--work DIR` lets tasks work in DIR: a git repo becomes one folder (ID from its "
+                    "name); a folder of repos offers each repo in it. Each task works in its own git "
+                    "worktree on a branch openswap/<task>, so your copy is never touched; `--direct` "
+                    "works in DIR itself. `--read DIR` lets tasks read DIR but never change it. "
+                    "`ID FOLDER` makes FOLDER a results folder. Results go to ~/OpenSwap Research/<ID>.",
     )
     workspace_add.add_argument("workspace_id", metavar="ID", nargs="?")
     workspace_add.add_argument("folder", metavar="FOLDER", nargs="?")
     workspace_add.add_argument(
         "--work", metavar="DIR", default=None,
-        help="a git repo (or a folder of repos) where remote sessions work, each task in its own worktree",
+        help="a git repo (or a folder of repos) tasks work in, each in its own worktree",
     )
     workspace_add.add_argument(
         "--direct", action="store_true",
-        help="with --work: sessions work in DIR itself, not a per-task worktree (any folder)",
+        help="with --work: tasks work in DIR itself, not in a worktree (any folder)",
     )
     workspace_add.add_argument(
         "--read", metavar="DIR", default=None,
-        help="a folder research tasks may read but never change; ID and results folder are chosen for you",
+        help="a folder tasks may read but never change",
     )
     workspace_add.add_argument(
         "--readonly-source", action="append", metavar="DIR",
-        help="a source checkout the job may read but never write (repeatable)",
+        help="with ID FOLDER: a folder the task may read but never write (repeatable)",
     )
     workspace_add.add_argument(
         "--label", default=None,
-        help="name the control service shows for this folder (1-100 characters; default: the folder's name)",
+        help="the name shown for this folder (1-100 characters; default: the folder's name)",
     )
     workspace_add.add_argument("--json", action="store_true")
     workspace_label = workspace_commands.add_parser(
-        "label", help="rename the label the control service shows for a workspace ID",
+        "label", help="rename the name shown for a folder",
     )
     workspace_label.add_argument("workspace_id", metavar="ID")
     workspace_label.add_argument("label", metavar="TEXT", nargs="?", default=None)
     workspace_label.add_argument("--reset", action="store_true", help="show the folder's own name again")
     workspace_label.add_argument("--json", action="store_true")
-    workspace_remove = workspace_commands.add_parser("remove", help="withdraw approval for a workspace ID")
+    workspace_remove = workspace_commands.add_parser("remove", help="remove a folder (its files are kept)")
     workspace_remove.add_argument("workspace_id", metavar="ID")
     workspace_remove.add_argument("--json", action="store_true")
     workspace_mode = workspace_commands.add_parser(
-        "mode", help="set where a folder's sessions work: worktree (a copy per task) or direct",
-        description="Only on this Mac; the control service can never set it. `worktree` (the default) "
-                    "gives each task its own git worktree; `direct` runs the session in the folder "
-                    "itself, like running `claude` or `codex` there.",
+        "mode", help="where a folder's tasks work: worktree (a copy per task) or direct",
+        description="`worktree` (the default) gives each task its own git worktree; `direct` runs the "
+                    "task in the folder itself, like running `claude` or `codex` there. Set only here, "
+                    "never remotely.",
     )
     workspace_mode.add_argument("workspace_id", metavar="ID")
     workspace_mode.add_argument("mode", choices=("worktree", "direct"))
     workspace_mode.add_argument("--json", action="store_true")
     worktrees_parser = commands.add_parser(
-        "worktrees", help="list the tasks' git worktrees, or prune finished ones",
-        description="Each task in a work folder runs in its own git worktree under "
-                    "~/OpenSwap Research/.worktrees. A finished task's branch is always kept; its "
-                    "worktree is removed when clean and kept when it holds uncommitted work. "
-                    "`prune` removes finished tasks' clean worktrees (with --force, every finished one).",
+        "worktrees", help="list the tasks' worktrees, or prune finished ones",
+        description="Each task works in its own git worktree under ~/OpenSwap Research/.worktrees. "
+                    "A finished task's branch is always kept; `prune` removes its worktree when clean "
+                    "(with --force, even with uncommitted work).",
     )
     worktrees_parser.add_argument("action", nargs="?", choices=("list", "prune"), default="list")
     worktrees_parser.add_argument("--force", action="store_true",
-                                  help="with prune: also remove dirty or locked worktrees of finished tasks")
+                                  help="with prune: also remove worktrees with uncommitted work or a lock")
     worktrees_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(arguments)
     root = Path(backup_root) if backup_root is not None else get_backup_root()
@@ -1882,7 +1927,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             # data must move first or a later enable finds both roots populated.
             _migrate_legacy_before_worker_state_change(root)
         except ClaudeSwitchError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+            print(_migration_message(exc), file=sys.stderr)
             return 1
         try:
             if args.command == "pair":
@@ -1896,26 +1941,26 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                     print("Next: `openswap worker setup` to finish setting up.")
             else:
                 if unpair(root, args.url):
-                    print("Worker unpaired; remote access disabled.")
+                    print(f"{printer.MARK_OK} Unpaired. Remote tasks are off; remote access disabled.")
                 elif load_worker_settings(root).control_service_url is not None:
                     # Only an orphan was removed: the configured enrollment is still live.
-                    print("Removed the saved enrollment for that service. Remote access to the "
-                          "configured service is unchanged; run `unpair` without a URL to disable it.")
+                    print(f"{printer.MARK_OK} Forgot that old pairing. The current pairing is unchanged; "
+                          "`openswap worker unpair` without a URL ends it.")
                 else:
-                    print("Removed any saved enrollment for that service; no control service is configured.")
+                    print(f"{printer.MARK_OK} Forgot that pairing. This Mac is not paired.")
             return 0
         except ProtocolError as exc:
-            print(f"Could not {args.command}: {exc.code}.", file=sys.stderr)
+            print(f"Could not {args.command} ({exc.code}).", file=sys.stderr)
             return 1
         except (OSError, RuntimeError, ValueError):
-            print(f"Could not {args.command}: local settings unavailable.", file=sys.stderr)
+            print(f"Could not {args.command}: the worker settings are unavailable.", file=sys.stderr)
             return 1
 
     if args.command in {"run", "enable", "disable", "pause"}:
         try:
             _migrate_legacy_before_worker_state_change(root)
         except ClaudeSwitchError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+            print(_migration_message(exc), file=sys.stderr)
             return 1
 
     if args.command == "setup":
@@ -1923,14 +1968,15 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             _migrate_legacy_before_worker_state_change(root)
             paired = load_worker_settings(root).control_service_url is not None
         except ClaudeSwitchError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+            print(_migration_message(exc), file=sys.stderr)
             return 1
         except (OSError, RuntimeError, ValueError):
-            print("Worker settings unavailable.", file=sys.stderr)
+            print("Could not read the worker settings.", file=sys.stderr)
             return 1
         if not paired:
-            print("This Mac is not paired yet. Copy the pairing command from the control service "
-                  "(OpenTag: Workers page) and run it: `openswap worker pair <url> <code>`.", file=sys.stderr)
+            print("Not paired yet. " + printer.next_step(
+                "run the pairing command from OpenTag's Workers page: `openswap worker pair <url> <code>`."),
+                file=sys.stderr)
             return 1
         _guided_setup(root, advanced=args.advanced)
         return 0
@@ -1946,7 +1992,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         try:
             snapshot = read_status(root)
         except Exception:
-            print("Worker status unavailable.", file=sys.stderr)
+            print("Could not read the worker status.", file=sys.stderr)
             return 1
         try:
             refused = refused_workspaces(root)
@@ -1962,8 +2008,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                 human = f"{human}\n{refusal_line(workspace_id, code)}"
             if refused:
                 human = f"{human}\n" + printer.next_step(
-                    "fix or remove those workspaces: `openswap worker workspace list`, "
-                    "`openswap worker workspace remove <id>`.")
+                    "`openswap worker workspace remove <id>` to drop a blocked folder "
+                    "(`openswap worker workspace list` shows them).")
             hint = _worker_off_hint(root, snapshot)
             if hint is not None:
                 human = f"{human}\n{hint}"
@@ -1973,31 +2019,32 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         try:
             result = request_stop(root, args.job_id)
         except IpcError as exc:
-            print(f"Could not request worker stop: {exc}", file=sys.stderr)
+            print(f"Could not reach the worker ({exc}).", file=sys.stderr)
             return 1
+        code = result.get("diagnostic_code")
         if result.get("accepted") is not True:
-            _write(result, as_json=args.json, human="Worker refused the stop request.")
+            _write(result, as_json=args.json,
+                   human=f"{printer.MARK_BAD} Not stopped: {_STOP_MESSAGES.get(code, 'the worker refused')} ({code}).")
             return 1
-        _write(
-            result,
-            as_json=args.json,
-            human="Stop requested; execution status will update when confirmed.",
-        )
+        human = (f"{printer.MARK_DOT} No task is running." if code in {"no_active_job", "job_not_active"}
+                 else f"{printer.MARK_OK} Stopping the task. `openswap worker status` shows when it has ended.")
+        _write(result, as_json=args.json, human=human)
         return 0
     if args.command == "pause":
         paused = not args.off
         try:
             payload = request_pause(root, paused)
         except (IpcError, ClaudeSwitchError):
-            print("Could not update worker admission.", file=sys.stderr)
+            print("Could not change whether the worker takes tasks.", file=sys.stderr)
             return 1
         except (OSError, RuntimeError, ValueError):
-            print("Could not update worker admission settings.", file=sys.stderr)
+            print(SETTINGS_MESSAGE, file=sys.stderr)
             return 1
         _write(
             payload,
             as_json=args.json,
-            human="Worker admission paused." if paused else "Worker admission reopened.",
+            human=(f"{printer.MARK_OK} Paused: no new task starts. `openswap worker pause --off` resumes."
+                   if paused else f"{printer.MARK_OK} Taking tasks again."),
         )
         return 0 if payload["accepted"] else 1
     if args.command == "enable":
@@ -2006,36 +2053,34 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         except ClaudeSwitchError as exc:
             print(_enable_failure_message(exc), file=sys.stderr)
             return 1
-        _write(payload, as_json=args.json, human="Remote tasks worker enabled.")
+        from openswap.worker.guided_setup import WORKER_ONLINE
+
+        _write(payload, as_json=args.json, human=WORKER_ONLINE)
         return 0
     if args.command == "disable":
         try:
             ok, result, diagnostic = disable_worker(root)
         except ClaudeSwitchError:
-            print("Worker lifecycle is busy; try again shortly.", file=sys.stderr)
+            print(BUSY_MESSAGE, file=sys.stderr)
             return 1
         if not ok:
             if diagnostic == "worker_stop_unconfirmed":
-                print(
-                    "Worker stop is not confirmed; it remains disabled and "
-                    "admission-paused. Wait for it to exit before enabling.",
-                    file=sys.stderr,
-                )
+                print("The worker is still stopping; wait a moment before `openswap worker enable`.",
+                      file=sys.stderr)
             else:
                 # A blocked disable restores the prior opt-in, so report the
                 # persisted policy rather than assuming it is still enabled.
                 try:
-                    state = "enabled" if load_worker_settings(root).enabled else "disabled"
+                    state = "on" if load_worker_settings(root).enabled else "off"
                 except Exception:
                     state = None
-                if state is None:
-                    message = f"Worker disable was blocked ({diagnostic}); admission stays paused."
-                else:
-                    message = f"Worker remains {state} and admission-paused ({diagnostic})."
-                print(message, file=sys.stderr)
+                reason, step = _DISABLE_BLOCKED.get(diagnostic, ("the worker could not be proven idle", None))
+                where = "no new task starts" if state is None else f"Remote tasks stay {state}, paused"
+                line = f"Not stopped: {reason} ({diagnostic}). {where}."
+                print(line if step is None else f"{line} {printer.next_step(step)}", file=sys.stderr)
             return 1
         payload = {"enabled": False, **result}
-        _write(payload, as_json=args.json, human="Remote tasks worker disabled.")
+        _write(payload, as_json=args.json, human=f"{printer.MARK_OK} Worker stopped. Remote tasks are off.")
         return 0
     if args.command == "lease" and args.lease_command == "release":
         try:
@@ -2043,81 +2088,56 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                 root, args.provider, confirm_stopped=args.confirm_stopped
             )
         except ClaudeSwitchError:
-            print("Worker lifecycle is busy; try again shortly.", file=sys.stderr)
+            print(BUSY_MESSAGE, file=sys.stderr)
             return 1
         if not ok:
-            print(f"Lease was not released ({diagnostic}).", file=sys.stderr)
-            if diagnostic == "stop_unproven_confirm_required":
-                print(
-                    "Stopping cannot be proven. Once no kickoff or provider process "
-                    "is running for this account, rerun with --confirm-stopped.",
-                    file=sys.stderr,
-                )
+            print(f"Not released ({diagnostic}): {_LEASE_MESSAGES.get(diagnostic, 'the account may still be in use.')}",
+                  file=sys.stderr)
             return 1
         payload = {"released": True, **result}
-        human = (
-            "Account lease was already released." if diagnostic == "already_released"
-            else "Account lease released."
-        )
+        human = (f"{printer.MARK_DOT} The account was already free." if diagnostic == "already_released"
+                 else f"{printer.MARK_OK} Account freed.")
         _write(payload, as_json=args.json, human=human)
         return 0
     parser.error("unsupported worker command")
     return 2
 
 
+# Errors are one line: what is wrong, then what to do.
 _ACCOUNT_MESSAGES = {
-    "claude_not_supported": (
-        "That names a Claude account. Use `claude:<slot>` to pick a Claude account explicitly."
-    ),
-    "account_not_found": "No account matches that. Run `openswap worker account` to list them.",
-    "account_ambiguous": "That matches several accounts; use the slot number (claude:<slot> for Claude).",
-    "account_not_eligible": (
-        "That slot can't be pinned: a Codex API-key login has no ChatGPT account ID, "
-        "and a Claude slot needs an email."
-    ),
-    "roster_unavailable": "The account roster could not be read.",
-    "account_roster_busy": "Accounts are being changed; try again shortly.",
-    "worker_lifecycle_busy": "Worker settings are being changed; try again shortly.",
-    "settings_unavailable": "Could not save the worker settings.",
+    "claude_not_supported": "That is a Claude account: name it `claude:<slot>`.",
+    "account_not_found": "No account matches that. `openswap worker account` lists them.",
+    "account_ambiguous": "That matches several accounts; use the slot number (`claude:<slot>` for Claude).",
+    "account_not_eligible": "That account can't be pinned: a Codex API-key login, or a Claude slot without an email.",
+    "roster_unavailable": "Could not read the accounts.",
+    "account_roster_busy": "The accounts are being changed; try again in a moment.",
+    "worker_lifecycle_busy": BUSY_MESSAGE,
+    "settings_unavailable": SETTINGS_MESSAGE,
     "too_many_accounts": "At most 20 accounts can be allowed; disallow one first.",
-    "account_not_allowlisted": (
-        "That account is not allowed for a per-job choice. Run `openswap worker account` to list them."
-    ),
-    "account_is_default": (
-        "That account is the pinned default. Pin another first, or pass --clear-default "
-        "to disallow it and leave no default."
-    ),
-    "label_invalid": "Labels are 1-100 characters with no control characters.",
+    "account_not_allowlisted": "Tasks can't pick that account yet. `openswap worker account` lists the allowed ones.",
+    "account_is_default": "That is the pinned account. Pin another first, or pass --clear-default.",
+    "label_invalid": "A label is 1-100 characters with no control characters.",
 }
 
 _WORKSPACE_MESSAGES = {
-    "workspace_id_invalid": (
-        "Workspace IDs are 1-64 characters: lowercase letters, digits, '-' and '_', "
-        "starting with a letter or digit."
-    ),
-    "workspace_exists": "That workspace ID is already approved; remove it first to change its folder.",
-    "workspace_not_found": "No approved workspace has that ID.",
-    "last_workspace": "At least one research folder must stay approved; add another before removing this one.",
-    "workspace_in_use": "A job using this research folder is still running or uploading its results; try again once it has finished.",
-    "too_many_workspaces": "At most 16 research folders can be approved.",
-    "too_many_readonly_sources": "At most 16 read-only sources can be approved per workspace.",
-    "folder_invalid": "That folder path is not valid.",
-    "folder_unavailable": "The folder could not be created or read.",
-    "folder_unsafe": "The folder must be a real directory, not a symlink or a file.",
-    "folder_permissions": "Only you may open a results folder. Run `chmod 700` on it, then try again.",
-    "folder_exposes_credentials": (
-        "That folder is, or contains, your home folder or an OpenSwap, Codex or Claude "
-        "credential folder. Choose a dedicated research folder."
-    ),
-    "readonly_source_exposes_credentials": (
-        "That read-only source overlaps your home folder or an OpenSwap, Codex or Claude "
-        "credential folder."
-    ),
-    "readonly_source_unavailable": "A read-only source does not exist or cannot be read.",
-    "readonly_source_unsafe": "A read-only source must be a real directory, not a symlink or a file.",
-    "readonly_source_not_owned": "A read-only source must be owned by you.",
-    "readonly_source_permissions": "A read-only source must not be writable by group or others.",
-    "readonly_source_overlaps_folder": "The research folder and its read-only sources must not overlap.",
+    "workspace_id_invalid": "An ID is 1-64 characters: lowercase letters, digits, '-' and '_', starting with a letter or digit.",
+    "workspace_exists": "That ID is taken. Remove it first to change its folder.",
+    "workspace_not_found": "No folder has that ID. `openswap worker workspace list` shows them.",
+    "last_workspace": "The last folder can't be removed; add another first.",
+    "workspace_in_use": "A task is still running or uploading in that folder; try again when it has ended.",
+    "too_many_workspaces": "At most 16 folders can be added.",
+    "too_many_readonly_sources": "At most 16 read-only folders per results folder.",
+    "folder_invalid": "That is not a valid path.",
+    "folder_unavailable": "That folder could not be created or read.",
+    "folder_unsafe": "That is not a real folder (a symlink or a file).",
+    "folder_permissions": "Only you may open a results folder: run `chmod 700` on it, then try again.",
+    "folder_exposes_credentials": "That folder is, or holds, your home folder or a sign-in folder. Pick a dedicated one.",
+    "readonly_source_exposes_credentials": "That folder overlaps your home folder or a sign-in folder.",
+    "readonly_source_unavailable": "That read-only folder doesn't exist or can't be opened.",
+    "readonly_source_unsafe": "That read-only folder is not a real folder (a symlink or a file).",
+    "readonly_source_not_owned": "That read-only folder isn't yours. Pick one you own.",
+    "readonly_source_permissions": "Other users can change that read-only folder: run `chmod go-w` on it.",
+    "readonly_source_overlaps_folder": "A results folder and its read-only folders must not overlap.",
     "readable_system": "That's a system folder. Pick one with your own files, like ~/GitHub.",
     "readable_home": "That's your whole home folder. Pick a folder inside it, like ~/GitHub.",
     "readable_private": "That's app data or a hidden folder. Pick one with your own files.",
@@ -2128,25 +2148,19 @@ _WORKSPACE_MESSAGES = {
     "readable_not_owned": "That folder isn't yours. Pick one you own.",
     "readonly_source_overlaps_results": "That folder holds another folder's task results. Pick another.",
     "folder_overlaps_readable": "That results folder is inside a folder tasks use. Pick another place.",
-    "readable_permissions": "Other users can change that folder. Run `chmod go-w` on it, then try again.",
-    "work_not_a_repo": (
-        "That folder isn't a git repo and holds none. Pick a repo, or a folder of repos "
-        "(`--direct` works in a folder as it is)."
-    ),
+    "readable_permissions": "Other users can change that folder: run `chmod go-w` on it, then try again.",
+    "work_not_a_repo": "That's not a git repo and holds none. Pick a repo or a folder of repos (`--direct` takes any folder).",
     "work_no_repos": "That folder holds no git repos anymore. Pick a repo instead.",
     "work_overlaps_results": "That folder overlaps where task results are saved. Pick another.",
-    "folder_overlaps_work": "That results folder is inside a folder where sessions work. Pick another place.",
-    "work_overlaps_readable": (
-        "That folder overlaps one that research tasks only read. Remove that one first "
-        "(`openswap worker workspace remove <id>`)."
-    ),
+    "folder_overlaps_work": "That results folder is inside a folder tasks work in. Pick another place.",
+    "work_overlaps_readable": "That folder overlaps one tasks only read. Remove that one first (`openswap worker workspace remove <id>`).",
     "mode_invalid": "The mode is `worktree` or `direct`.",
-    "mode_not_work": "Only folders where sessions work have a mode (add one with `--work`).",
+    "mode_not_work": "Only a folder tasks work in has a mode (add one with `--work`).",
     "mode_on_parent": "That repo comes from a folder of repos: set the mode on that folder's ID.",
-    "worktree_failed": "Could not make the task's copy of the repo (git worktree).",
-    "label_invalid": "Labels are 1-100 characters with no control characters.",
-    "worker_lifecycle_busy": "Worker settings are being changed; try again shortly.",
-    "settings_unavailable": "Could not save the worker settings.",
+    "worktree_failed": "Could not make the task's worktree of the repo.",
+    "label_invalid": "A label is 1-100 characters with no control characters.",
+    "worker_lifecycle_busy": BUSY_MESSAGE,
+    "settings_unavailable": SETTINGS_MESSAGE,
 }
 
 
@@ -2158,47 +2172,42 @@ def _account_rows(choices: AccountChoices, accounts) -> list[tuple[str, ...]]:
         if pinned:
             notes.append("pinned")
         if not choice.eligible:
-            notes.append("not eligible: no ChatGPT account ID (API key)" if choice.provider == "codex"
-                         else "not eligible: no email")
+            notes.append("API key: can't be pinned" if choice.provider == "codex" else "no email: can't be pinned")
         if choice.disabled:
             notes.append("out of rotation")
         rows.append((f"{printer.mark(True if pinned else False if not choice.eligible else None)} "
                      f"{choice.number}", choice.email or "(no email)",
-                     f"({choice.alias})" if choice.alias else "", "; ".join(notes)))
+                     f"({choice.alias})" if choice.alias else "", ", ".join(notes)))
     return rows
 
 
-def _format_accounts(choices: AccountChoices) -> str:
-    """The human ``openswap worker account`` listing: roster, allowed accounts, one next step."""
+def _format_accounts(choices: AccountChoices, next_step: str | None = None) -> str:
+    """The human ``openswap worker account`` listing: both kinds, the allowed ones, one next step.
+
+    ``next_step`` is what follows once an account is pinned (the pinned
+    kind's live-check path); ``None`` when nothing is left to do.
+    """
     lines = [printer.heading("Remote tasks account"),
-             "Remote jobs run on the pinned account unless the control service picks an allowed one.",
-             "", printer.heading("Codex accounts (pin with the slot number, email or alias)")]
+             printer.heading("Codex (pin by slot, email or alias)")]
     if not choices.codex:
-        lines.append("  No Codex accounts saved. Add one with `openswap codex add`.")
+        lines.append("  none (`openswap codex add` saves one)")
     lines.extend(printer.columns(_account_rows(choices, choices.codex)))
-    lines.append(printer.heading("Claude accounts (pin with `claude:<slot>`)"))
+    lines.append(printer.heading("Claude (pin with claude:<slot>)"))
     if not choices.claude:
-        lines.append("  No Claude accounts saved. Add one with `openswap add`.")
+        lines.append("  none (`openswap add` saves one)")
     lines.extend(printer.columns(_account_rows(choices, choices.claude)))
-    lines.append("")
-    lines.append(printer.heading("Allowed for a per-job choice by the control service"))
-    lines.append("The service sees only the reference and the label; the pinned account is its default.")
-    if not choices.allowlist:
-        lines.append("  None. Allow one with `openswap worker account allow <slot|email|alias>`.")
-    lines.extend(printer.columns([_allowlist_row(entry, choices) for entry in choices.allowlist]))
-    lines.append("")
+    if choices.allowlist:
+        # Shown to the service by label only; a task may pick one instead of the pin.
+        lines.append(printer.heading("Also allowed for tasks to pick"))
+        lines.extend(printer.columns([_allowlist_row(entry, choices) for entry in choices.allowlist]))
     if choices.pinned_missing:
-        lines.append("The pinned account is no longer in its roster; jobs fail "
-                     "(provider_auth_unavailable) until you pin another.")
-        lines.append(printer.next_step("pin another account: `openswap worker account <slot|email|alias>`"))
+        lines.append(f"{printer.MARK_BAD} The pinned account is gone; tasks fail until you pin another.")
+        lines.append(printer.next_step(f"`openswap worker account {_example(choices)}` to pin an account."))
     elif choices.pinned_ref is None:
-        lines.append("No account pinned: remote jobs that do not pick an allowed account fail until you pin one.")
-        lines.append(printer.next_step(f"pin an account, for example `openswap worker account {_example(choices)}`"))
-    else:
-        pinned = choices.pinned
-        lines.append(f"Pinned: {'Claude' if pinned.provider == 'claude' else 'Codex'} {pinned.label()}. "
-                     "Change it with `openswap worker account <slot|email|alias>`; `--clear` removes the pin.")
-    lines.append(printer.dimmed("Manage the per-job choices with `openswap worker account allow|disallow|label`."))
+        lines.append(printer.next_step(f"`openswap worker account {_example(choices)}` to pin the account "
+                                       "tasks run on."))
+    elif next_step is not None:
+        lines.append(printer.next_step(next_step))
     return "\n".join(lines)
 
 
@@ -2214,12 +2223,14 @@ def _example(choices: AccountChoices) -> str:
 
 
 def _allowlist_row(entry: AllowlistedAccount, choices: AccountChoices) -> tuple[str, ...]:
+    """``mark  Kind slot  "label"  note``; a gone account shows the reference ``disallow`` takes."""
     default = entry.identity == choices.pinned_ref
     slot = choices.slot_for(entry.identity)
     provider = "Claude" if entry.identity.startswith("claude:") else "Codex"
-    where = f"{provider} slot {slot.number}" if slot is not None else f"no longer in the {provider} roster"
-    return (f"{printer.mark(True if default else None if slot is not None else False)} {entry.account_ref}",
-            json.dumps(entry.label, ensure_ascii=False), where, "default" if default else "")
+    where = f"{provider} {slot.number}" if slot is not None else f"{provider} (removed)"
+    note = "pinned" if default else "" if slot is not None else f"gone: disallow {entry.account_ref}"
+    return (f"{printer.mark(True if default else None if slot is not None else False)} {where}",
+            json.dumps(entry.label, ensure_ascii=False), note)
 
 
 def _allowlist_payload(entry: AllowlistedAccount, pinned_ref: str | None) -> dict:
@@ -2236,22 +2247,21 @@ def _allowlist_command(root: Path, arguments: list[str]) -> int:
     """``openswap worker account allow|disallow|label``: the per-job choice allowlist."""
     parser = argparse.ArgumentParser(
         prog="openswap worker account",
-        description="Manage the Codex and Claude accounts a control service may choose per job. Each "
-                    "allowed account is advertised only as a random reference and a label you "
-                    "choose (by default the slot alias or 'Codex account N' / 'Claude account N', "
-                    "never the email).",
+        description="The accounts a task may pick instead of the pinned one. Each is shown to the "
+                    "service only by a label you choose (by default the alias, or 'Codex account N' / "
+                    "'Claude account N'), never the email.",
     )
     commands = parser.add_subparsers(dest="allowlist_command", required=True)
-    allow = commands.add_parser("allow", help="allow a Codex or Claude account for a per-job choice")
+    allow = commands.add_parser("allow", help="let tasks pick this account")
     allow.add_argument("selector", metavar="SLOT|EMAIL|ALIAS")
-    allow.add_argument("--label", default=None, help="label the control service shows (1-100 characters)")
+    allow.add_argument("--label", default=None, help="the name shown for it (1-100 characters)")
     allow.add_argument("--json", action="store_true")
-    disallow = commands.add_parser("disallow", help="withdraw an allowed account")
+    disallow = commands.add_parser("disallow", help="stop tasks picking this account")
     disallow.add_argument("target", metavar="SLOT|EMAIL|ALIAS|REF")
     disallow.add_argument("--clear-default", action="store_true",
-                          help="also clear the pin when the account is the pinned default")
+                          help="also remove the pin when it is the pinned account")
     disallow.add_argument("--json", action="store_true")
-    label = commands.add_parser("label", help="rename an allowed account's label")
+    label = commands.add_parser("label", help="rename the name shown for an allowed account")
     label.add_argument("target", metavar="SLOT|EMAIL|ALIAS|REF")
     label.add_argument("label", metavar="TEXT")
     label.add_argument("--json", action="store_true")
@@ -2259,14 +2269,13 @@ def _allowlist_command(root: Path, arguments: list[str]) -> int:
     try:
         if args.allowlist_command == "allow":
             entry = allow_worker_account(root, args.selector, args.label)
-            human = (f"{printer.MARK_OK} Allowed {json.dumps(entry.label, ensure_ascii=False)} "
-                     f"({entry.account_ref}) for a per-job choice.")
+            human = f"{printer.MARK_OK} Tasks may pick {_allowed_name(root, entry)}."
         elif args.allowlist_command == "disallow":
             entry = disallow_worker_account(root, args.target, clear_default=args.clear_default)
-            human = f"Disallowed {json.dumps(entry.label, ensure_ascii=False)} ({entry.account_ref})."
+            human = f"{printer.MARK_OK} Tasks can no longer pick {_allowed_name(root, entry)}."
         else:
             entry = label_worker_account(root, args.target, args.label)
-            human = f"Relabelled {entry.account_ref} as {json.dumps(entry.label, ensure_ascii=False)}."
+            human = f"{printer.MARK_OK} Renamed: {_allowed_name(root, entry)}."
         pinned = load_worker_settings(root).pinned_account_ref
     except AccountPinError as exc:
         code = exc.code
@@ -2274,7 +2283,7 @@ def _allowlist_command(root: Path, arguments: list[str]) -> int:
         code = str(exc) if str(exc) == "worker_lifecycle_busy" else "settings_unavailable"
     else:
         if args.allowlist_command == "disallow" and args.clear_default and pinned is None:
-            human += " No default account is pinned now."
+            human += " " + printer.next_step("`openswap worker account <slot>` to pin an account.")
         payload = {"accepted": True, "account": _allowlist_payload(entry, pinned),
                    "pinned_account_ref": pinned}
         if args.allowlist_command == "disallow":
@@ -2290,20 +2299,44 @@ def _allowlist_command(root: Path, arguments: list[str]) -> int:
 
 
 def _format_workspaces(workspaces) -> str:
-    lines = [printer.heading("Approved research folders"),
-             "The control service sees only the ID and the label; paths never leave this Mac. "
-             "Tasks read the folders under \"reads\" but never change them."]
+    """``mark  ID  "label"  what tasks do there``; the ID is what every other command takes."""
+    lines = [printer.heading("Folders")]
     rows = []
     for workspace in workspaces:
+        work = getattr(workspace, "work_root", None)
+        if work is not None:
+            how = "works in the folder itself" if workspace.mode == "direct" else "own worktree per task"
+            where = f"works in each repo in {display_path(work)}" if workspace.repos else f"works in {display_path(work)}"
+            use = f"{where} ({how})"
+        elif workspace.readonly_roots:
+            use = "reads " + ", ".join(display_path(source) for source in workspace.readonly_roots)
+        else:
+            use = f"writes results in {display_path(workspace.output_root)}"
         rows.append((f"{printer.MARK_OK} {workspace.workspace_id}",
-                     json.dumps(workspace.display_label, ensure_ascii=False), "results:", str(workspace.output_root)))
-        for source in workspace.readonly_roots:
-            rows.append(("", "", "reads:", str(source)))
+                     json.dumps(workspace.display_label, ensure_ascii=False), use))
     lines.extend(printer.columns(rows))
-    lines.append(printer.next_step(
-        "let tasks read a folder with `openswap worker workspace add --read <folder>`; "
-        "`openswap worker workspace remove <id>` withdraws one."))
+    lines.append(printer.next_step("`openswap worker workspace add --work <folder>` adds one; "
+                                   "`openswap worker workspace remove <id>` drops one."))
     return "\n".join(lines)
+
+
+def _named(workspace) -> str:
+    """``"id"``, plus the label when the owner chose one."""
+    name = f'"{workspace.workspace_id}"'
+    if getattr(workspace, "label", None) is not None:
+        name += f" (shown as {json.dumps(workspace.display_label, ensure_ascii=False)})"
+    return name
+
+
+def _allowed_name(root: Path, entry: AllowlistedAccount) -> str:
+    """``"label" (Codex 1)`` for an allowed account; the reference when its slot is gone."""
+    try:
+        slot = worker_account_choices(root).slot_for(entry.identity)
+    except Exception:
+        slot = None
+    provider = "Claude" if entry.identity.startswith("claude:") else "Codex"
+    where = f"{provider} {slot.number}" if slot is not None else entry.account_ref
+    return f"{json.dumps(entry.label, ensure_ascii=False)} ({where})"
 
 
 def _workspace_payload(workspace) -> dict:
@@ -2348,19 +2381,19 @@ def _worktrees_command(root: Path, args) -> int:
     }
     rows = []
     for item in items:
+        done = finished(item.job_id)
         state = ("repo moved or deleted" if not item.available
                  else "uncommitted work" if item.dirty else "clean" if item.dirty is False else "unknown")
         if item.locked:
             state += ", locked"
-        rows.append((f"{printer.mark(None if finished(item.job_id) else True)} {item.workspace_id}",
-                     item.branch or "-", state, str(item.path)))
+        rows.append((f"{printer.mark(None if done else True)} {item.workspace_id}",
+                     "finished" if done else "running", item.branch or "-", state, display_path(item.path)))
     lines = [printer.heading("Task worktrees")]
     if args.action == "prune":
-        lines.append(f"Removed {len(removed)} finished task worktree{'s' if len(removed) != 1 else ''}; "
-                     "branches are kept.")
+        lines.append(f"{printer.MARK_OK} Removed {len(removed)} (branches are kept).")
     lines.extend(printer.columns(rows) or ["  none"])
-    if items and args.action == "list":
-        lines.append(printer.next_step("`openswap worker worktrees prune` removes finished tasks' clean worktrees."))
+    if args.action == "list" and any(finished(item.job_id) for item in items):
+        lines.append(printer.next_step("`openswap worker worktrees prune` to remove the finished ones."))
     _write(payload, as_json=args.json, human="\n".join(lines))
     return 0
 
@@ -2405,9 +2438,13 @@ def _account_command(root: Path, args) -> int:
         try:
             choices = worker_account_choices(root)
         except Exception:
-            print("Worker account settings unavailable.", file=sys.stderr)
+            print("Could not read the accounts.", file=sys.stderr)
             return 1
-        _write(choices.to_dict(), as_json=args.json, human=_format_accounts(choices))
+        human = None
+        if not args.json:
+            pinned = choices.pinned if choices.pinned_ref is not None and not choices.pinned_missing else None
+            human = _format_accounts(choices, None if pinned is None else _after_pin(root, _kind(pinned)))
+        _write(choices.to_dict(), as_json=args.json, human=human)
         return 0
     try:
         choice = set_worker_account(root, None if args.clear else args.selector)
@@ -2418,13 +2455,13 @@ def _account_command(root: Path, args) -> int:
     else:
         payload = {"accepted": True, "pinned": _choice_payload(choice)}
         if choice is None:
-            human = ("Cleared the Remote tasks account; remote jobs that do not pick an allowed account "
-                     "fail until you pin one.\n" + printer.next_step(
-                         "pin one again with `openswap worker account <slot|email|alias>`."))
+            human = (f"{printer.MARK_OK} Pin removed; tasks fail until you pin an account.\n"
+                     + printer.next_step("`openswap worker account <slot>` to pin one."))
         else:
-            provider = "Claude" if choice.provider == "claude" else "Codex"
-            human = (f"{printer.MARK_OK} Remote tasks will use {provider} account {choice.label()} "
-                     f"from the next job.\n" + printer.next_step(_after_pin(root, provider)))
+            human = f"{printer.MARK_OK} Pinned {_kind(choice)} {choice.label()}."
+            after = _after_pin(root, _kind(choice))
+            if after is not None:
+                human += "\n" + printer.next_step(after)
         _write(payload, as_json=args.json, human=human)
         return 0
     if args.json:
@@ -2434,8 +2471,12 @@ def _account_command(root: Path, args) -> int:
     return 1
 
 
-def _after_pin(root: Path, provider: str) -> str:
-    """What comes after pinning: the provider's live-check path while its live execution is off."""
+def _kind(choice) -> str:
+    return "Claude" if getattr(choice, "provider", "codex") == "claude" else "Codex"
+
+
+def _after_pin(root: Path, provider: str) -> str | None:
+    """The step after pinning: the kind's live-check path while its live tasks are off, else nothing."""
     try:
         from openswap.worker.live import execution_mode
 
@@ -2443,11 +2484,11 @@ def _after_pin(root: Path, provider: str) -> str:
     except Exception:
         live = False
     if live:
-        return f"nothing more: live execution for {provider} is on. `openswap worker status` shows the worker."
+        return None
     if provider == "Claude":
         return ("`openswap worker claude pin`, `openswap worker claude prepare`, then "
-                "`openswap worker live-check --provider claude` before jobs run.")
-    return "`openswap worker codex install` and `openswap worker live-check` before jobs run."
+                "`openswap worker live-check --provider claude` to turn on live tasks.")
+    return "`openswap worker codex install`, then `openswap worker live-check` to turn on live tasks."
 
 
 def _workspace_command(root: Path, args) -> int:
@@ -2466,18 +2507,15 @@ def _workspace_command(root: Path, args) -> int:
             result = add_work_folder(root, args.work, mode="direct" if args.direct else "worktree",
                                      label=args.label)
             workspace = result.workspace
-            where = workspace.work_root
+            where = display_path(workspace.work_root)
+            how = "works in the folder itself" if workspace.mode == "direct" else "own worktree per task"
             if not result.added:
-                human = f"{where} is already a folder where sessions work ('{workspace.workspace_id}')."
+                human = f"{printer.MARK_DOT} {where} is already added as \"{workspace.workspace_id}\"."
             elif result.repos or workspace.repos:
-                human = (f"{printer.MARK_OK} Sessions can work in the repos in {where}: "
-                         f"{', '.join(result.repos) or 'none yet'}. "
-                         + ("Each task works in its repo itself." if workspace.mode == "direct"
-                            else "Each task gets its own worktree."))
+                human = (f"{printer.MARK_OK} Added {where}: tasks can work in "
+                         f"{', '.join(result.repos) or 'its repos (none yet)'} ({how}).")
             else:
-                how = "in the folder itself" if workspace.mode == "direct" else "in its own worktree"
-                human = (f"{printer.MARK_OK} Sessions can work in {where} as '{workspace.workspace_id}', "
-                         f"each task {how}; results go to {workspace.output_root}.")
+                human = f"{printer.MARK_OK} Added {where} as {_named(workspace)} ({how})."
             _write({"accepted": True, "added": result.added, "workspace": _workspace_payload(workspace),
                     "repos": list(result.repos)}, as_json=args.json, human=human)
             return 0
@@ -2486,10 +2524,9 @@ def _workspace_command(root: Path, args) -> int:
             return 2
         if args.workspace_command == "mode":
             workspace = set_workspace_mode(root, args.workspace_id, args.mode)
-            how = ("in the folder itself" if workspace.mode == "direct"
-                   else "each task in its own worktree")
+            how = "in the folder itself" if workspace.mode == "direct" else "in a worktree of their own"
             _write({"accepted": True, "workspace": _workspace_payload(workspace)}, as_json=args.json,
-                   human=f"{printer.MARK_OK} '{workspace.workspace_id}': sessions work {how}.")
+                   human=f"{printer.MARK_OK} Tasks in \"{workspace.workspace_id}\" now work {how}.")
             return 0
         if args.workspace_command == "add" and args.read is not None:
             if args.workspace_id is not None or args.folder is not None or args.readonly_source:
@@ -2499,18 +2536,16 @@ def _workspace_command(root: Path, args) -> int:
             workspace = result.workspace
             (source,) = workspace.readonly_roots
             if result.added:
-                human = (f"{printer.MARK_OK} Remote tasks can read {source} as workspace "
-                         f"'{workspace.workspace_id}' (the control service shows "
-                         f"{json.dumps(workspace.display_label, ensure_ascii=False)}). They never change it; "
-                         f"results are saved in {workspace.output_root}.")
+                human = (f"{printer.MARK_OK} Added {display_path(source)} as {_named(workspace)} "
+                         "(tasks read it, never change it).")
             else:
-                human = f"{source} is already readable as workspace '{workspace.workspace_id}'."
+                human = f"{printer.MARK_DOT} {display_path(source)} is already added as \"{workspace.workspace_id}\"."
             _write({"accepted": True, "added": result.added, "workspace": _workspace_payload(workspace)},
                    as_json=args.json, human=human)
             return 0
         if args.workspace_command == "add":
             if args.workspace_id is None or args.folder is None:
-                print("Pass `ID FOLDER`, or `--read DIR` for a folder tasks may read.", file=sys.stderr)
+                print("Pass `--work DIR`, `--read DIR`, or `ID FOLDER`.", file=sys.stderr)
                 return 2
             workspace = add_worker_workspace(
                 root, args.workspace_id, args.folder, tuple(args.readonly_source or ()), label=args.label,
@@ -2518,9 +2553,8 @@ def _workspace_command(root: Path, args) -> int:
             _write(
                 {"accepted": True, "workspace": _workspace_payload(workspace)},
                 as_json=args.json,
-                human=f"Approved research folder {workspace.output_root} as workspace "
-                      f"'{workspace.workspace_id}' (the control service shows "
-                      f"{json.dumps(workspace.display_label, ensure_ascii=False)}).",
+                human=f"{printer.MARK_OK} Added {display_path(workspace.output_root)} as "
+                      f"{_named(workspace)} (tasks write their results there).",
             )
             return 0
         if args.workspace_command == "label":
@@ -2531,14 +2565,14 @@ def _workspace_command(root: Path, args) -> int:
             _write(
                 {"accepted": True, "workspace": _workspace_payload(workspace)},
                 as_json=args.json,
-                human=f"Workspace '{workspace.workspace_id}' is shown as "
+                human=f"{printer.MARK_OK} \"{workspace.workspace_id}\" is shown as "
                       f"{json.dumps(workspace.display_label, ensure_ascii=False)}.",
             )
             return 0
         remove_worker_workspace(root, args.workspace_id)
         _write(
             {"accepted": True, "removed": args.workspace_id}, as_json=args.json,
-            human=f"Removed workspace '{args.workspace_id}'; its folder and files are unchanged.",
+            human=f"{printer.MARK_OK} Removed \"{args.workspace_id}\" (its files are kept).",
         )
         return 0
     except WorkspaceError as exc:
@@ -2558,10 +2592,16 @@ def _enable_failure_message(exc: ClaudeSwitchError) -> str:
     """What `openswap worker enable` prints when enable_worker refuses."""
     code = str(exc)
     if code == "worker_configuration_invalid":
-        return "Worker configuration is invalid; fix local worker settings before enabling."
+        return "Could not start the worker: its settings are invalid (the pinned account or a folder)."
     if code == "worker_stop_unconfirmed":
-        return "Worker is still stopping; wait for it to exit before enabling."
-    return "Could not enable worker."
+        return "Could not start the worker: it is still stopping; try again in a moment."
+    if code == "worker_running_unmanaged":
+        return "Could not start the worker: `openswap worker run` is already running it."
+    if code == "kickoff_in_progress":
+        return "Could not start the worker: a scheduled kickoff is running; try again in a moment."
+    if code == "worker_lifecycle_busy":
+        return BUSY_MESSAGE
+    return "Could not start the worker."
 
 
 # enable_worker's own refusal codes. Anything else (for example launchctl or
@@ -2575,16 +2615,26 @@ _RUNNING_STATES = frozenset({"starting", "running"})
 
 
 def _worker_off_hint(root: Path, snapshot: dict) -> str | None:
-    """One line for `worker status` when paired but the worker is not running."""
+    """The one `Next:` line for `worker status`: start the worker, resume, or turn on live tasks."""
     try:
-        url = load_worker_settings(root).control_service_url
+        settings = load_worker_settings(root)
     except Exception:
         return None
-    if url is None:
+    if settings.control_service_url is None:
         return None
-    if snapshot.get("enabled") is True and snapshot.get("process_state") in _RUNNING_STATES:
-        return None
-    return printer.next_step(f"paired with {url} but the worker is off; run `openswap worker enable`.")
+    if not (snapshot.get("enabled") is True and snapshot.get("process_state") in _RUNNING_STATES):
+        return printer.next_step(f"`openswap worker enable` to start the worker (paired with "
+                                 f"{settings.control_service_url}).")
+    if snapshot.get("paused") is True:
+        return printer.next_step("`openswap worker pause --off` to take tasks again.")
+    provider = snapshot.get("provider") or {}
+    if provider.get("available") is not True and provider.get("diagnostic_code") == "live_adapter_disabled":
+        from openswap.worker.accounts import provider_of
+        from openswap.worker.guided_setup import execution_off_note
+
+        note = execution_off_note(provider_of(settings.pinned_account_ref))
+        return printer.next_step(note.removeprefix("Next: "))
+    return None
 
 
 def _format_status(snapshot: dict) -> str:
@@ -2594,19 +2644,22 @@ def _format_status(snapshot: dict) -> str:
     paused = snapshot.get("paused") is True
     provider = snapshot.get("provider") or {}
     available = provider.get("available") is True
-    provider_state = "available" if available else provider.get("diagnostic_code") or "unavailable"
+    code = provider.get("diagnostic_code")
+    live = "on" if available else "off" if code in {None, "live_adapter_disabled"} else f"off ({code})"
     remote = snapshot.get("remote_connectivity", "disabled")
-    seen = snapshot.get("remote_last_seen_at") or "never"
+    seen = snapshot.get("remote_last_seen_at")
     active = snapshot.get("active_job")
     job = f"{active.get('job_id')} ({active.get('state')})" if active else "none"
-    worker_ok = True if process == "running" else None if process in {"starting", "stopped"} else False
+    # One row for the worker: off (not enabled), else the process state.
+    worker = process if enabled else "off"
+    worker_ok = (False if not enabled else True if process == "running"
+                 else None if process in {"starting", "stopped"} else False)
     service_ok = True if remote == "online" else None if remote in {"disabled", "offline"} else False
     rows = [
-        (f"{printer.mark(enabled)} Remote tasks", "enabled" if enabled else "disabled"),
-        (f"{printer.mark(worker_ok)} Worker", process),
-        (f"{printer.mark(not paused)} Admission", "paused" if paused else "open"),
-        (f"{printer.mark(available)} Provider", provider_state),
-        (f"{printer.mark(service_ok)} Service", f"{remote} (last seen {seen})"),
-        (f"{printer.mark(None)} Job", job),
+        (f"{printer.mark(worker_ok)} Worker", worker),
+        (f"{printer.mark(not paused)} Taking tasks", "paused" if paused else "yes"),
+        (f"{printer.mark(True if available else None)} Live tasks", live),
+        (f"{printer.mark(service_ok)} Service", f"{remote} (seen {seen})" if seen else remote),
+        (f"{printer.mark(None)} Task", job),
     ]
-    return "\n".join([printer.heading("Remote tasks worker"), *printer.columns(rows)])
+    return "\n".join([printer.heading("Remote tasks"), *printer.columns(rows)])

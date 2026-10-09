@@ -1437,9 +1437,9 @@ def test_codex_status_picks_pin_and_login_before_the_live_check():
     status, other = _codex_status()
     assert "openswap worker codex login 2" in live_cli._codex_next_step(status)
     status["accounts"][1]["isolated_sign_in"] = True
-    assert live_cli._codex_next_step(status).endswith("`openswap worker live-check`.")
+    assert live_cli._codex_next_step(status).endswith("`openswap worker live-check` to turn on live tasks.")
     status["execution_mode"] = "live"
     status["checked_accounts"] = [IDENTITY]
     assert "--account 2" in live_cli._codex_next_step(status)  # not "nothing remains"
     status["checked_accounts"] = [IDENTITY, other]
-    assert live_cli._codex_next_step(status).startswith("nothing")
+    assert live_cli._codex_next_step(status) is None  # live tasks run on every account: no next step

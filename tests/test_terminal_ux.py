@@ -72,7 +72,7 @@ def test_account_listing_styles_headings_on_a_colour_terminal_but_not_json(root,
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
     assert out.startswith(f"{BOLD}Remote tasks account\x1b[0m\n")
-    assert f"{BOLD}Codex accounts (pin with the slot number, email or alias)\x1b[0m" in out
+    assert f"{BOLD}Codex (pin by slot, email or alias)\x1b[0m" in out
     assert "  • 1  alice@example.com   (work)" in out  # rows stay plain: marks and words carry the meaning
     assert _run(root, "account", "--json") == 0
     raw = capsys.readouterr().out
@@ -88,7 +88,7 @@ def test_no_color_disables_styling_even_on_a_colour_terminal(root, capsys, monke
     printer._colors_enabled = None
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
-    assert "\x1b[" not in out and "Next: pin an account" in out
+    assert "\x1b[" not in out and "Next: `openswap worker account 1` to pin" in out
 
 
 def test_step_headers_are_bold_on_a_colour_terminal_only(monkeypatch):
@@ -153,6 +153,9 @@ def test_account_menu_numbers_both_providers_in_order(root):
 
 
 def test_status_rows_are_marked_and_worded(root, monkeypatch, capsys):
+    from openswap.settings import configure_worker_service
+
+    configure_worker_service(root, "https://opentag.me", "worker-1")
     snapshot = {"enabled": True, "paused": True, "process_state": "running",
                 "provider": {"available": True}, "remote_connectivity": "online",
                 "remote_last_seen_at": "2026-10-08T09:00:00Z", "active_job": {"job_id": "abc", "state": "running"}}
@@ -160,14 +163,30 @@ def test_status_rows_are_marked_and_worded(root, monkeypatch, capsys):
     assert _run(root, "status") == 0
     out = capsys.readouterr().out
     assert out == (
-        "Remote tasks worker\n"
-        "  ✓ Remote tasks  enabled\n"
+        "Remote tasks\n"
         "  ✓ Worker        running\n"
-        "  ✗ Admission     paused\n"
-        "  ✓ Provider      available\n"
-        "  ✓ Service       online (last seen 2026-10-08T09:00:00Z)\n"
-        "  • Job           abc (running)\n"
+        "  ✗ Taking tasks  paused\n"
+        "  ✓ Live tasks    on\n"
+        "  ✓ Service       online (seen 2026-10-08T09:00:00Z)\n"
+        "  • Task          abc (running)\n"
+        "Next: `openswap worker pause --off` to take tasks again.\n"
     )
+    # Not paused, live tasks off: the one next step is the pinned kind's live check.
+    snapshot.update(paused=False, provider={"available": False, "diagnostic_code": "live_adapter_disabled"},
+                    active_job=None)
+    cli.set_worker_account(root, "claude:4")
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert "  • Live tasks    off\n" in out and "  • Task          none\n" in out
+    assert out.endswith("Next: `openswap worker claude pin`, `openswap worker claude prepare`, then "
+                        "`openswap worker live-check --provider claude` to turn on live tasks.\n")
+    # Any other reason live tasks are off is shown with the row, not restated.
+    snapshot["provider"] = {"available": False, "diagnostic_code": "provider_auth_unavailable"}
+    monkeypatch.setattr(cli, "read_status", lambda _root: {**snapshot, "enabled": False, "process_state": "stopped"})
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert "  ✗ Worker        off\n" in out and "  • Live tasks    off (provider_auth_unavailable)\n" in out
+    assert out.count("Next:") == 1 and "`openswap worker enable`" in out
 
 
 def test_codex_and_claude_status_point_at_the_next_step():
@@ -175,37 +194,54 @@ def test_codex_and_claude_status_point_at_the_next_step():
              "accounts": [{"slot": "1", "alias": "work", "pinned": True, "allowed": True, "isolated_sign_in": False},
                           {"slot": "2", "alias": None, "pinned": False, "allowed": False, "isolated_sign_in": True}]}
     out = live_cli._format_codex_status(codex)
-    assert "  ✓ Pinned CLI      codex-cli 0.157.1 (verified)" in out
-    assert "  • Live execution  disabled" in out
-    assert "  ✗ 1  (work)  not signed in  default, allowed" in out
-    assert "  ✓ 2          signed in" in out
-    assert out.endswith("Next: sign the default account in: `openswap worker codex login`.")
+    assert out == (
+        "Codex for Remote tasks\n"
+        "  ✓ Codex CLI   codex-cli 0.157.1 (verified)\n"
+        "  • Live tasks  off\n"
+        "Accounts\n"
+        "  ✗ 1  (work)  not signed in  pinned, allowed\n"
+        "  ✓ 2          signed in\n"
+        "Next: `openswap worker codex login` to sign the pinned account in."
+    )
     codex["accounts"][0]["isolated_sign_in"] = True
-    assert live_cli._format_codex_status(codex).endswith("`openswap worker live-check`.")
+    assert live_cli._format_codex_status(codex).endswith("Next: `openswap worker live-check` to turn on live tasks.")
     codex["cli"] = {"installed": False, "problem": "not_installed"}
-    assert live_cli._format_codex_status(codex).endswith("`openswap worker codex install`.")
+    assert live_cli._format_codex_status(codex).endswith("`openswap worker codex install` to install the Codex CLI.")
 
     claude = {"cli": {"pinned": False, "problem": "not_pinned"}, "execution_mode": "disabled",
               "accounts": [{"slot": "4", "alias": "claudey", "pinned": True, "allowed": False, "profile_ready": False}]}
     out = live_cli._format_claude_status(claude)
-    assert "  ✗ Pinned binary   not ready (not_pinned)" in out
-    assert "  ✗ 4  (claudey)  profile not prepared  default" in out
-    assert out.endswith("Next: pin the installed Claude Code: `openswap worker claude pin`.")
+    assert "  ✗ Claude Code  not ready (not_pinned)" in out
+    assert "  ✗ 4  (claudey)  not signed in  pinned" in out
+    assert out.endswith("Next: `openswap worker claude pin` to pin the installed Claude Code.")
     claude["cli"] = {"pinned": True, "version": "2.1.285 (Claude Code)"}
-    assert live_cli._format_claude_status(claude).endswith("`openswap worker claude prepare`.")
+    assert live_cli._format_claude_status(claude).endswith("`openswap worker claude prepare` to sign the pinned account in.")
     claude["accounts"][0]["profile_ready"] = True
     claude["execution_mode"] = "live"
-    assert "live execution is on" in live_cli._format_claude_status(claude)
+    out = live_cli._format_claude_status(claude)
+    # Live tasks on for every account: nothing to do, so no `Next:` at all.
+    assert "  ✓ Live tasks   on" in out and "Next:" not in out
 
 
-def test_live_check_gates_are_marked_pass_or_fail():
-    gates = {name: {"passed": True} for name in live_check.REQUIRED_GATES}
-    first = live_check.REQUIRED_GATES[0]
-    gates[first] = {"passed": False, "reason": "sandbox leaked"}
+def test_live_check_gates_fold_to_one_line_unless_failed_or_verbose():
+    gates = {name: {"passed": True, "steps_ran": 3} for name in live_check.REQUIRED_GATES}
+    assert live_check._format({"gates": gates}) == (
+        "  ✓ passed: the pinned CLI, the account, your own login untouched, tools, sandbox, a research task, "
+        "sandbox (a task), stop, kill recovery, worktree"
+    )
+    gates["sandbox_wrapper"] = {"passed": False, "reason": "sandbox leaked", "write_outside": "/tmp/x",
+                                "network_denied": True, "steps_ran": 2}
     out = live_check._format({"gates": gates})
-    lines = out.splitlines()
-    assert lines[0] == f"  ✗ FAIL  {first}" and lines[1] == "            reason: sandbox leaked"
-    assert lines[2].startswith("  ✓ PASS  ")
+    assert out.splitlines() == [
+        "  ✓ passed: the pinned CLI, the account, your own login untouched, tools, a research task, "
+        "sandbox (a task), stop, kill recovery, worktree",
+        "  ✗ failed: sandbox (reason: sandbox leaked; write_outside: /tmp/x)",
+    ]
+    verbose = live_check._format({"gates": gates}, verbose=True).splitlines()
+    assert len(verbose) == len(live_check.REQUIRED_GATES)
+    assert verbose[0] == "  ✓ passed  the pinned CLI"
+    assert verbose[4] == "  ✗ failed  sandbox                   reason: sandbox leaked; write_outside: /tmp/x"
+    assert all(("passed" in line or "failed" in line) and line[2] in "✓✗" for line in verbose)
 
 
 # --- discoverability -----------------------------------------------------------------------------

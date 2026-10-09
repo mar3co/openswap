@@ -282,13 +282,14 @@ def test_pair_when_already_enabled_toggles_nothing(root, keychain, monkeypatch, 
 
 
 @pytest.mark.parametrize("error, expected", [
-    (cli.ClaudeSwitchError("kickoff_in_progress"), "Could not enable worker (kickoff_in_progress)."),
+    (cli.ClaudeSwitchError("kickoff_in_progress"),
+     "Could not start the worker: a scheduled kickoff is running; try again in a moment (kickoff_in_progress)."),
     (cli.ClaudeSwitchError("worker_stop_unconfirmed"),
-     "Worker is still stopping; wait for it to exit before enabling (worker_stop_unconfirmed)."),
+     "Could not start the worker: it is still stopping; try again in a moment (worker_stop_unconfirmed)."),
     # Detail that is not one of enable_worker's codes (paths, launchctl text) is not echoed.
     (cli.ClaudeSwitchError("Could not write the worker LaunchAgent: /Users/someone/secret"),
-     "Could not enable worker."),
-    (OSError("disk"), "Could not enable worker."),
+     "Could not start the worker."),
+    (OSError("disk"), "Could not start the worker."),
 ])
 def test_pair_reports_a_refused_enable_and_the_manual_command(root, keychain, monkeypatch, capsys, error, expected):
     def refuse(_root):
@@ -897,7 +898,7 @@ def test_status_and_summary_name_the_refused_workspaces(root, research_home, mon
     assert ('✗ "a" is blocked (folder_overlaps_readable). '
             + cli._WORKSPACE_MESSAGES["folder_overlaps_readable"]) in out
     assert '"b" is blocked (readonly_source_overlaps_results)' in out
-    assert "Next: fix or remove those workspaces" in out
+    assert "Next: `openswap worker workspace remove <id>` to drop a blocked folder" in out
     assert _run(root, "status", "--json") == 0
     assert json.loads(capsys.readouterr().out)["refused_workspaces"] == [
         {"workspace_id": "a", "diagnostic_code": "folder_overlaps_readable"},
@@ -966,7 +967,7 @@ def test_workspace_add_read_makes_the_same_workspace_as_the_setup(root, capsys, 
         "readonly_roots": [str(github.resolve())],
     }
     assert _run(root, "workspace", "add", "--read", str(github)) == 0
-    assert "is already readable as workspace 'github'." in capsys.readouterr().out
+    assert '• ~/GitHub is already added as "github".' in capsys.readouterr().out
     assert len(load_worker_settings(root).workspaces) == 1
     assert _run(root, "workspace", "add", "--read", str(research_home.parent), "--json") == 1
     assert json.loads(capsys.readouterr().out) == {"accepted": False, "diagnostic_code": "readable_home"}
@@ -980,7 +981,7 @@ def test_workspace_add_read_and_the_positional_form_are_exclusive(root, capsys, 
     assert _builtin(root)
     # The positional form is unchanged: the folder is where results are written.
     assert _run(root, "workspace", "add", "docs", str(tmp_path / "docs")) == 0
-    assert "Approved research folder" in capsys.readouterr().out
+    assert '✓ Added ' in capsys.readouterr().out
 
 
 def test_the_default_replaces_only_the_builtin_folder_and_not_while_in_use(root, monkeypatch, research_home):
