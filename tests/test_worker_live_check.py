@@ -139,6 +139,10 @@ class SimulatedMac:
         job = {"running": False, "exit": 0, "helpers": []}
         lines = [{"type": "thread.started"}]
         cwd = Path(cwd)
+        # Without its shell tool, Codex runs no command at all.
+        shell = not any(a == "--disable" and b == "shell_tool" for a, b in zip(argv, argv[1:]))
+        if not shell:
+            stdin_text = re.sub(r"^\d+\. .+$", "", stdin_text, flags=re.M).replace("sh ./helper.sh", "")
         if "sh ./helper.sh" in stdin_text:
             script = (cwd / "helper.sh").read_text()
             markers = re.findall(r'"(openswap-live-check-[0-9a-f]+-(?:child|detached))", "(\d+)"', script)
@@ -296,9 +300,15 @@ class FakeChild:
     def __init__(self, check: LiveCheck, payload: dict):
         from openswap.worker.models import ResolvedWorkspace
 
+        from openswap.worker.permissions import CodexPermissions
+
         live_check.child_acquire_lease(check.root, payload)  # as the real child does
         record = check._job_record(payload["job_id"], payload["identity"], payload["task"])
-        check.adapter().start(record, ResolvedWorkspace("live-check", Path(payload["workspace"]), ()),
+        # The settings the real child takes from its payload.
+        adapter = check.adapter(override=payload.get("override"),
+                                permissions=CodexPermissions(approval=payload["approval"])
+                                if payload.get("approval") else None)
+        adapter.start(record, ResolvedWorkspace("live-check", Path(payload["workspace"]), ()),
                               worker_epoch=0)
         self.stdout = io.StringIO("STARTED\n")
         self.killed = False
@@ -350,6 +360,24 @@ def test_a_sandboxed_contained_mac_passes_every_gate_and_can_be_enabled(tmp_path
     assert "Operation not permitted" not in text and "python.org" not in text  # no model output
     settings = live.enable_live(root, path, pinned())
     assert settings.enabled and live.execution_mode(root) == "live"
+
+
+@pytest.mark.parametrize("restriction", ["no-shell", "untrusted"])
+def test_a_restrictive_mac_or_account_can_still_pass_every_gate(tmp_path, restriction):
+    # The probes that need a shell (sandbox, stop, kill and recovery, work folder)
+    # run with their own settings; the account's or the Mac's limit cannot fail them.
+    from openswap.settings import write_permission_override
+    from openswap.worker.permissions import CodexPermissions, write_codex_permissions
+
+    root = setup_root(tmp_path)
+    if restriction == "no-shell":
+        write_permission_override(root, "no-shell")
+    else:
+        write_codex_permissions(codex_exec.isolated_home(root, IDENTITY), CodexPermissions("untrusted"))
+    mac = SimulatedMac()
+    evidence = make_check(root, mac).run()
+    failed = {name: gate for name, gate in evidence["gates"].items() if not gate["passed"]}
+    assert failed == {} and evidence["passed"] is True
 
 
 def test_a_leaky_sandbox_fails_the_sandbox_gates(tmp_path):

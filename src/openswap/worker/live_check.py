@@ -1253,8 +1253,9 @@ class LiveCheck:
         def helper_running(job_id):
             return bool(self._marker_pids(detached))
 
+        # A shell, whatever this account or Mac allows: the probe needs it.
         outcome = self._job("stop", identity, self.HELPER_TASK, timeout=self.helper_wait, until=helper_running,
-                            workspace=ws)
+                            workspace=ws, adapter_options=self._probe_options())
         left = self._marker_pids(child, detached)
         handle = load_handle(outcome.run_dir)
         detail = {
@@ -1298,7 +1299,9 @@ class LiveCheck:
         # does, so its death leaves the same abandoned lease behind.
         process = self._spawn_child({"root": str(self.root), "job_id": job_id, "identity": identity,
                                      "provider": self.provider, "workspace": str(ws), "task": self.HELPER_TASK,
-                                     "lease_ttl": self.helper_wait + 300})
+                                     "lease_ttl": self.helper_wait + 300,
+                                     # A shell, whatever this account or Mac allows: the probe needs it.
+                                     "override": "follow", "approval": "on-request"})
         detail = {"worker_started_job": False, "detached_helper_observed": False, "job_outlived_worker": False,
                   "lease_left_by_worker": False, "recovery_stopped": False, "helpers_left": None,
                   "lease_released_on_proof": False}
@@ -1512,7 +1515,15 @@ def child_main(raw: str) -> None:
         adapter = ClaudeCodeAdapter(root, mode=lambda: "live", bind_to_opt_in=False,
                                     settings_for_check=payload.get("settings"))
     else:
-        adapter = CodexExecAdapter(root, mode=lambda: "live", bind_to_opt_in=False)
+        from openswap.worker.permissions import CodexPermissions
+
+        approval = payload.get("approval")
+        override = payload.get("override")
+        adapter = CodexExecAdapter(
+            root, mode=lambda: "live", bind_to_opt_in=False,
+            override=(lambda: override) if override in ("follow", "no-shell", "read-only") else None,
+            permissions_for_check=CodexPermissions(approval=approval) if approval in ("never", "on-request") else None,
+        )
     child_acquire_lease(root, payload)
     now = datetime.now(timezone.utc)
     record = JobRecord(
