@@ -160,6 +160,14 @@ def test_the_owners_codex_config_and_its_selected_profile_are_copied(tmp_path):
     assert default_codex_permissions(tmp_path) == CodexPermissions("untrusted", "read-only", "user", True)
     (tmp_path / "config.toml").write_text('approval_policy = { granular = { sandbox_approval = true } }\n')
     assert default_codex_permissions(tmp_path).approval == "on-request"
+    # A granular false is a rejection: an automatic reviewer must not get to approve it.
+    (tmp_path / "config.toml").write_text('approvals_reviewer = "auto_review"\n'
+                                          'approval_policy = { granular = { sandbox_approval = false } }\n')
+    assert default_codex_permissions(tmp_path) == CodexPermissions("on-request", "workspace-write", "user", True)
+    for bad in ('approval_policy = { granular = { sandbox_approval = "maybe" } }\n',
+                'approval_policy = { granular = {} }\n', 'approval_policy = { other = true }\n'):
+        (tmp_path / "config.toml").write_text(bad)
+        assert default_codex_permissions(tmp_path) is None
     (tmp_path / "config.toml").write_text('model = "o3"\n')
     assert default_codex_permissions(tmp_path) is None
     assert default_codex_permissions(tmp_path / "missing") is None
@@ -392,6 +400,35 @@ def test_codex_settings_copy_and_set_under_the_accounts_lease(tmp_path):
     with pytest.raises(live_cli.AccountPinError) as error:
         live_cli.codex_settings(root, "1", copy_settings=True, codex_home=tmp_path / "missing")
     assert error.value.code == "codex_default_settings_missing"
+
+
+def test_codex_login_records_settings_under_the_same_lease(tmp_path, monkeypatch):
+    from openswap.worker.leases import AccountLeaseStore
+    from tests.test_worker_codex_exec import ACCOUNT_ID, IDENTITY, _login_run, _roster, pinned
+
+    _roster(tmp_path, {"1": ACCOUNT_ID})
+    seen = []
+    original = permissions.write_codex_permissions
+
+    def spy(home, value):
+        seen.append(AccountLeaseStore(tmp_path, "codex").read_current().state)
+        return original(home, value)
+
+    monkeypatch.setattr(permissions, "write_codex_permissions", spy)
+    result = live_cli.login(tmp_path, "1", run=_login_run(ACCOUNT_ID), verify=pinned,
+                            settings=CodexPermissions("never", "read-only", recorded=True))
+    assert seen == ["active"]  # written while the sign-in's lease is still held
+    assert result["permissions"]["sandbox_mode"] == "read-only"
+    assert read_codex_permissions(codex_exec.isolated_home(tmp_path, IDENTITY)) == CodexPermissions(
+        "never", "read-only", "user", True)
+    # A failed sign-in records nothing.
+    other = tmp_path / "other"
+    other.mkdir()
+    _roster(other, {"1": ACCOUNT_ID})
+    with pytest.raises(live_cli.AccountPinError):
+        live_cli.login(other, "1", run=_login_run("acct-someone-else"), verify=pinned,
+                       settings=CodexPermissions("never", recorded=True))
+    assert not (codex_exec.isolated_home(other, IDENTITY) / "permissions.json").exists()
 
 
 def test_a_codex_job_runs_with_its_accounts_settings_and_the_limit(tmp_path, monkeypatch):

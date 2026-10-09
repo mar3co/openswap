@@ -121,8 +121,13 @@ def _refuse_managed(home: Path, managed) -> None:
 
 
 def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
-          run=subprocess.run, verify=None, managed=None) -> dict:
-    """Sign one roster account in to its isolated home with Codex's own login."""
+          run=subprocess.run, verify=None, managed=None, settings=None) -> dict:
+    """Sign one roster account in to its isolated home with Codex's own login.
+
+    ``settings`` (a :class:`~openswap.worker.permissions.CodexPermissions`) is
+    recorded for the account's remote tasks after a successful sign-in, under
+    the same account lease, so no job can start in between on the old ones.
+    """
     root = Path(backup_root)
     pinned = (verify or (lambda: codex_cli.verify(root)))()
     argv = [str(pinned.binary), "login"] + (["--device-auth"] if device_auth else [])
@@ -143,13 +148,20 @@ def login(backup_root: Path, selector: str | None, *, device_auth: bool = False,
                 # The other account's credentials are still there: say so.
                 raise AccountPinError("login_account_mismatch_still_signed_in")
             raise AccountPinError("login_account_mismatch")
+        if settings is not None and result.returncode == 0 and signed_in == identity:
+            from openswap.worker.permissions import write_codex_permissions
+
+            write_codex_permissions(home, settings)
     if result.returncode != 0:
         # Even with this account's (possibly stale) credentials still in the
         # home: a login that failed proves nothing about them.
         raise AccountPinError("login_failed")
     if signed_in != identity:
         raise AccountPinError("login_not_completed")
-    return {"slot": choice.number, "account_ref": identity, "signed_in": True}
+    out = {"slot": choice.number, "account_ref": identity, "signed_in": True}
+    if settings is not None:
+        out["permissions"] = settings.to_dict() | {"recorded": True}
+    return out
 
 
 def logout(backup_root: Path, selector: str | None, *, run=subprocess.run, verify=None, managed=None) -> dict:
@@ -690,14 +702,22 @@ def _codex_command(root: Path, args) -> int:
         _emit(status, args.json, _format_codex_status(status))
         return 0 if status["cli"]["installed"] else 1
     if args.codex_command == "login":
-        result = login(root, args.selector, device_auth=args.device_auth)
+        from openswap.worker.permissions import default_codex_permissions
+
+        # Decided before the sign-in, and recorded with it under one account
+        # lease, so no job can start on the account in between.
+        settings = None
+        if args.copy_settings:
+            settings = default_codex_permissions()
+            if settings is None:
+                raise AccountPinError("codex_default_settings_missing")
+        elif not args.json and _interactive():
+            settings = _offer_codex_copy(root, args.selector)
+        result = login(root, args.selector, device_auth=args.device_auth, settings=settings)
         lines = [f"{printer.MARK_OK} Codex account {result['slot']} is signed in to its isolated home. "
                  "Your default Codex login was not changed."]
-        copy = args.copy_settings or (not args.json and _interactive() and _offer_codex_copy(root, result))
-        if copy:
-            settings = codex_settings(root, str(result["slot"]), copy_settings=True)
-            result["permissions"] = settings["permissions"]
-            lines.append(f"{printer.MARK_OK} Remote tasks on it follow {_codex_describe(settings['permissions'])}.")
+        if settings is not None:
+            lines.append(f"{printer.MARK_OK} Remote tasks on it follow {_codex_describe(result['permissions'])}.")
         _emit(result, args.json, "\n".join(lines) + "\n"
               + printer.next_step("run the live check: `openswap worker live-check`."))
         return 0
@@ -809,20 +829,26 @@ def _ask_claude_settings(current, default) -> tuple[bool, str | None]:
     return copy, mode
 
 
-def _offer_codex_copy(root: Path, result: dict) -> bool:
-    """After a sign-in: offer the owner's own Codex approval and sandbox settings, once."""
+def _offer_codex_copy(root: Path, selector: str | None):
+    """Before a sign-in: offer the owner's own Codex approval and sandbox settings, once.
+
+    The settings to record with the sign-in, or None.
+    """
     from openswap.worker.permissions import PermissionSettingsError, default_codex_permissions, read_codex_permissions
 
     try:
-        if read_codex_permissions(isolated_home(root, result["account_ref"])).recorded:
-            return False
-    except PermissionSettingsError:
-        return False
+        choice = _resolve(root, selector)
+        if read_codex_permissions(isolated_home(root, choice.account_ref)).recorded:
+            return None
+    except (AccountPinError, PermissionSettingsError):
+        return None
     default = default_codex_permissions()
     if default is None:
-        return False
-    return _yes(f"Remote tasks follow this account's Codex approval and sandbox settings. Use yours from "
-                f"~/.codex/config.toml ({default.describe()})?")
+        return None
+    if not _yes(f"Remote tasks follow this account's Codex approval and sandbox settings. Use yours from "
+                f"~/.codex/config.toml ({default.describe()})?"):
+        return None
+    return default
 
 
 def _format_claude_status(status: dict) -> str:

@@ -336,12 +336,18 @@ class CodexPermissions:
 
 def _codex_from(raw: dict, *, recorded: bool) -> CodexPermissions:
     approval = raw.get("approval_policy", "on-request")
-    if isinstance(approval, dict):
-        # A granular policy: some prompts asked, some refused; headless, every
-        # ask is refused, which is ``on-request``.
-        approval = "on-request"
     sandbox = raw.get("sandbox_mode", "workspace-write")
     reviewer = raw.get("approvals_reviewer", "user")
+    if isinstance(approval, dict):
+        # A granular policy: some prompts asked (refused headless), some
+        # refused outright. Kept as ``on-request`` with the owner as the
+        # reviewer, so every ask is refused: an automatic reviewer could
+        # approve what a granular ``false`` would have rejected.
+        granular = approval.get("granular")
+        if (set(approval) != {"granular"} or not isinstance(granular, dict) or not granular
+                or not all(isinstance(key, str) and type(value) is bool for key, value in granular.items())):
+            raise PermissionSettingsError("settings_invalid")
+        approval, reviewer = "on-request", "user"
     if approval not in CODEX_APPROVALS or sandbox not in CODEX_SANDBOXES or reviewer not in CODEX_REVIEWERS:
         raise PermissionSettingsError("settings_invalid")
     return CodexPermissions(approval, sandbox, reviewer, recorded)
