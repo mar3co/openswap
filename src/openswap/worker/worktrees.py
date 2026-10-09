@@ -399,14 +399,19 @@ def _free_branch(repo: Path, job_id: str) -> str:
 
     A branch ``openswap`` (or ``openswap/<short id>/…``) would block the
     usual name as a file/folder clash in ``refs/heads``, so the fallbacks are
-    the full ID, then the flat ``openswap-<id>`` forms.
+    the full ID, then the flat ``openswap-<id>`` forms. Names are compared
+    ignoring case: on a case-insensitive volume (the macOS default) a loose
+    ``OpenSwap`` branch blocks ``openswap/<id>`` just the same, and a name
+    that differs only in case would be the same file. Treating them as taken
+    on a case-sensitive volume only costs a fallback name.
     """
     # Full names: a short name turns into `heads/<name>` when a tag shares it.
-    existing = {line[len("refs/heads/"):] for line in git(
+    existing = {line[len("refs/heads/"):].casefold() for line in git(
         ["for-each-ref", "--format=%(refname)", "refs/heads/"], repo, timeout=30).splitlines()
         if line.startswith("refs/heads/")}
 
     def free(name: str) -> bool:
+        name = name.casefold()
         parts = name.split("/")
         prefixes = {"/".join(parts[:i]) for i in range(1, len(parts))}
         return name not in existing and not (prefixes & existing) and not any(
