@@ -456,7 +456,26 @@ def test_a_tampered_worktree_is_never_finished_or_run_by_the_worker(root, home):
     assert worktrees.sweep(home / "OpenSwap Research", lambda _job: True) == []  # kept for inspection
 
 
-def test_import_never_takes_a_bad_or_existing_object(root, home):
+def _plant(tree, data: bytes, name: str | None = None) -> str:
+    """A loose object file in the task's own object folder, named ``name`` or by its content's SHA-1."""
+    import hashlib
+    import zlib
+
+    name = name or hashlib.sha1(data).hexdigest()
+    folder = tree.objects / name[:2]
+    folder.mkdir(exist_ok=True)
+    (folder / name[2:]).write_bytes(zlib.compress(data))
+    return name
+
+
+def _in_store(repo, name: str) -> bool:
+    return subprocess.run(["git", "cat-file", "-e", name], cwd=repo, capture_output=True,
+                          env={**os.environ, "GIT_DIR": str(repo / ".git")}).returncode == 0
+
+
+def test_nothing_the_branch_does_not_need_is_ever_imported(root, home):
+    """Bad, malformed, foreign or huge loose objects the task left in its folder
+    never reach the repo's store: only what the branch needs is imported."""
     import zlib
 
     repo = _repo(home / "GitHub" / "openswap")
@@ -464,15 +483,41 @@ def test_import_never_takes_a_bad_or_existing_object(root, home):
     resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
     tree = resolved.worktree
     head_blob = _git(repo, "rev-parse", "HEAD:README.md")
-    planted = tree.objects / head_blob[:2]
-    planted.mkdir()
-    (planted / head_blob[2:]).write_bytes(zlib.compress(b"blob 4\0evil"))  # an existing name, wrong content
-    bad = "ab" * 20
-    (tree.objects / bad[:2]).mkdir(exist_ok=True)
-    (tree.objects / bad[:2] / bad[2:]).write_bytes(zlib.compress(b"blob 3\0bad"))
-    assert worktrees.import_objects(tree) == 0
+    _plant(tree, b"blob 4\0evil", head_blob)  # an existing name, wrong content
+    wrong = _plant(tree, b"blob 3\0bad", "ab" * 20)  # content that does not hash to its name
+    headerless = _plant(tree, b"no git header here")  # hashes to its name, but is no git object
+    well_formed = _plant(tree, b"blob 6\0spare!")  # a valid object nothing refers to
+    (tree.objects / "cd").mkdir()
+    (tree.objects / "cd" / ("e" * 38)).write_bytes(zlib.compress(b"blob 99999999\0" + b"\0" * (8 << 20), 9))
+    (resolved.work_dir / "work.txt").write_text("task work")
+    assert worktrees.finish(tree, "left over") is True
+    assert _git(repo, "show", f"{resolved.branch}:work.txt") == "task work"
     assert _git(repo, "cat-file", "-p", head_blob) == "hello"
-    assert not (repo / ".git" / "objects" / bad[:2] / bad[2:]).exists()
+    for name in (wrong, headerless, well_formed, "cd" + "e" * 38):
+        assert not _in_store(repo, name)
+    subprocess.run(["git", "fsck", "--no-dangling"], cwd=repo, check=True, capture_output=True)
+
+
+def test_a_malformed_object_the_work_needs_keeps_the_branch_where_it_was(root, home):
+    """A task can name a malformed object after a file it leaves in the checkout,
+    so the commit would need it: git's own checks refuse it, and the branch
+    stays put with the worktree kept."""
+    import hashlib
+
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    content = b"task work\n"
+    name = hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest()
+    _plant(tree, b"blob 3\0bad", name)  # the file's blob name, other bytes
+    (resolved.work_dir / "work.txt").write_bytes(content)
+    tip = _git(repo, "rev-parse", resolved.branch)
+    assert worktrees.finish(tree, "left over") is False
+    assert _git(repo, "rev-parse", resolved.branch) == tip
+    assert not _in_store(repo, name)
+    subprocess.run(["git", "fsck", "--no-dangling"], cwd=repo, check=True, capture_output=True)
+    assert worktrees.remove(resolved.work_dir) is False
 
 
 def test_repo_ids_stay_with_their_repo(root, home):
@@ -566,38 +611,6 @@ def test_filter_driver_names_with_dots_are_disabled_too(root, home, tmp_path):
     _git(repo, "-c", "filter.late.smudge=cat", "commit", "-q", "-am", "late")
     _runtime(root)._resolve_workspace("openswap", "b" * 32)
     assert not marker.exists()
-
-
-def test_a_huge_expanding_object_is_never_inflated(root, home, monkeypatch):
-    import zlib
-
-    monkeypatch.setattr(worktrees, "_MAX_OBJECT_BYTES", 1 << 20)
-    repo = _repo(home / "GitHub" / "openswap")
-    cli.add_work_folder(root, repo)
-    tree = _runtime(root)._resolve_workspace("openswap", "a" * 32).worktree
-    bomb = zlib.compress(b"blob 99999999\0" + b"\0" * (8 << 20), 9)  # 8 MB from a few KB
-    assert len(bomb) < (1 << 20)
-    seen = []
-    real = zlib.decompressobj
-
-    class Recording:
-        def __init__(self):
-            self.inner = real()
-
-        def __getattr__(self, name):
-            return getattr(self.inner, name)
-
-        def decompress(self, data, max_length=0):
-            out = self.inner.decompress(data, max_length)
-            seen.append(len(out))
-            return out
-
-    monkeypatch.setattr(worktrees.zlib, "decompressobj", Recording)
-    (tree.objects / "aa").mkdir()
-    (tree.objects / "aa" / ("b" * 38)).write_bytes(bomb)
-    assert worktrees.import_objects(tree) == 0
-    # Decompressed in bounded steps, and given up past the limit.
-    assert seen and max(seen) <= 1 << 20 and sum(seen) <= (1 << 20) + (1 << 20)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="the worker runs on macOS; repack with alternates differs on Windows")
@@ -992,7 +1005,7 @@ def test_a_tag_named_like_the_branch_never_vouches_for_its_objects(root, home):
     subprocess.run(["git", "add", "work.txt"], cwd=resolved.work_dir, check=True, capture_output=True,
                    env={**os.environ, **worktrees.task_env(repo, tree)})
     real_import = worktrees.import_objects
-    worktrees.import_objects = lambda tree: None  # and it never reaches the repo's store
+    worktrees.import_objects = lambda tree, commit=None: True  # and it never reaches the repo's store
     try:
         assert worktrees.finish(tree, "left over") is False
     finally:

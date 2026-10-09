@@ -10,9 +10,10 @@ touching the owner's working copy or another task. The worktree lives under
 The task writes new git objects to its own object folder
 (``<task id>.objects``, with the repo's object store as a read-only
 alternate), so it can never delete or rewrite the objects the owner's
-checkout and other tasks use. When the task ends the worker imports its
-objects (each one verified against its name), commits anything left
-uncommitted to the task's branch, and keeps the branch. A clean worktree is
+checkout and other tasks use. When the task ends the worker commits
+anything left uncommitted for the task's branch, imports only the objects
+that commit needs (through ``git pack-objects`` and ``git index-pack
+--strict``), then moves the branch and keeps it. A clean worktree is
 then removed; one the worker could not finish is kept for inspection.
 ``openswap worker worktrees`` lists them and ``prune`` removes them.
 
@@ -27,13 +28,11 @@ admin folder.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import stat
 import subprocess
 import tempfile
-import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,7 +43,6 @@ BRANCH_PREFIX = "openswap"
 _GIT_TIMEOUT_S = 300
 _MAX_CHILD_REPOS = 64
 _MAX_SCANNED_CHILDREN = 5000
-_MAX_OBJECT_BYTES = 512 * 1024 * 1024
 _MAX_PACK_BYTES = 2 * 1024 * 1024 * 1024
 # The task's own git must never start background maintenance that rewrites
 # packs or refs outside the paths it may write.
@@ -492,106 +490,58 @@ def intact(tree: Worktree) -> bool:
             and head == f"ref: refs/heads/{tree.branch}")
 
 
-def _object_format(tree: Worktree) -> str:
+def import_objects(tree: Worktree, commit: str | None = None) -> bool:
+    """Copy into the repo's store the objects ``commit`` (default: the branch) needs and lacks.
+
+    Only those objects, never anything else the task left in its object
+    folder, and only through git's own checks: ``rev-list`` names what is
+    missing (stopping at every other ref and the owner's ``HEAD``),
+    ``pack-objects`` packs it from the repo's store plus the task's folder,
+    and ``index-pack --strict`` checks every object (its header, its hash
+    and, as ``fsck`` would, its content) as it would a fetched pack before
+    anything lands. Returns whether all of it is now in the repo's store.
+    """
+    commit = commit or f"refs/heads/{tree.branch}"
+    read_env = _read_env(tree)
     try:
-        return git(["rev-parse", "--show-object-format"], tree.common_dir, timeout=30, check=False,
-                   env=tree.repo_env()) or "sha1"
+        names = git(["rev-list", "--objects", "--no-object-names", "--single-worktree", commit, "--not",
+                     f"--exclude=refs/heads/{tree.branch}", "--all"], tree.common_dir, timeout=_GIT_TIMEOUT_S,
+                    env=read_env)
     except WorktreeError:
-        return "sha1"
-
-
-def _verified(data: bytes, name: str, algorithm: str) -> bool:
-    """Whether a loose object's compressed ``data`` hashes to ``name``, decompressing
-    in bounded steps (a tiny file may expand to gigabytes)."""
-    digest = hashlib.new(algorithm)
-    stream = zlib.decompressobj()
-    total = 0
-    chunk = stream.decompress(data, 1 << 20)
-    while True:
-        total += len(chunk)
-        if total > _MAX_OBJECT_BYTES:
-            return False
-        digest.update(chunk)
-        if not stream.unconsumed_tail:
-            break
-        chunk = stream.decompress(stream.unconsumed_tail, 1 << 20)
-    tail = stream.flush()
-    if total + len(tail) > _MAX_OBJECT_BYTES or not stream.eof:
         return False
-    digest.update(tail)
-    return digest.hexdigest() == name
-
-
-def _import_packs(tree: Worktree) -> bool:
-    """Index each pack the task made (a ``git repack`` or ``gc``) into the repo's store.
-
-    ``git index-pack`` checks every object as it would a fetched pack.
-    Returns whether every pack was imported.
-    """
-    ok = True
+    if not names:
+        return True
+    safe = [arg for item in _SAFE_CONFIG for arg in ("-c", item)]
     try:
-        packs = sorted(p for p in (Path(tree.objects) / "pack").glob("*.pack") if p.is_file() and not p.is_symlink())
-    except OSError:
-        return False
-    for pack in packs:
-        try:
-            if pack.stat().st_size > _MAX_PACK_BYTES:
-                ok = False  # never fed to git; the worktree is kept for the owner
-                continue
-            command = ["git", *(arg for item in _SAFE_CONFIG for arg in ("-c", item)),
-                       "index-pack", "--stdin", "--fix-thin", f"--max-input-size={_MAX_PACK_BYTES}"]
-            # Streamed from the file: never read into the worker's memory.
-            with open(pack, "rb") as stream:
-                result = subprocess.run(command, cwd=str(tree.common_dir), stdin=stream, capture_output=True,
-                                        timeout=_GIT_TIMEOUT_S, check=False,
-                                        env=_git_env({"GIT_DIR": str(tree.common_dir)}))
-            ok = ok and result.returncode == 0
-        except (OSError, subprocess.SubprocessError):
-            ok = False
-    return ok
-
-
-def import_objects(tree: Worktree) -> int:
-    """Copy the task's new loose objects into the repo's store; each verified against its name.
-
-    A file whose content does not hash to its name is skipped, and nothing
-    already in the store is overwritten, so a task can never plant a bad
-    copy of an object the owner will need. Packs go through ``git
-    index-pack``. Returns how many loose objects were imported.
-    """
-    algorithm = "sha256" if _object_format(tree) == "sha256" else "sha1"
-    target_root = Path(tree.common_dir) / "objects"
-    _import_packs(tree)
-    imported = 0
-    try:
-        folders = [p for p in Path(tree.objects).iterdir() if len(p.name) == 2 and p.is_dir() and not p.is_symlink()]
-    except OSError:
-        return 0
-    for folder in folders:
-        try:
-            files = [p for p in folder.iterdir() if p.is_file() and not p.is_symlink()]
-        except OSError:
-            continue
-        for path in files:
-            name = folder.name + path.name
-            target = target_root / folder.name / path.name
-            if os.path.lexists(target):
-                continue
+        with tempfile.TemporaryFile() as listing:
+            listing.write(names.encode() + b"\n")
+            listing.seek(0)
+            packer = subprocess.Popen(["git", *safe, "pack-objects", "--stdout", "-q"], cwd=str(tree.common_dir),
+                                      stdin=listing, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                      env=_git_env(read_env))
             try:
-                if path.stat().st_size > _MAX_OBJECT_BYTES:
-                    continue
-                data = path.read_bytes()
-                if not _verified(data, name, algorithm):
-                    continue
-                target.parent.mkdir(exist_ok=True)
-                temporary = target.parent / f".openswap-import-{path.name}"
-                temporary.write_bytes(data)
-                os.chmod(temporary, 0o444)
-                os.replace(temporary, target)
-                imported += 1
-            except (OSError, zlib.error, ValueError):
-                continue
-    return imported
+                # Streamed from git to git: never held in the worker's memory.
+                indexed = subprocess.run(
+                    ["git", *safe, "index-pack", "--stdin", "--strict", f"--max-input-size={_MAX_PACK_BYTES}"],
+                    cwd=str(tree.common_dir), stdin=packer.stdout, capture_output=True, timeout=_GIT_TIMEOUT_S,
+                    check=False, env=_git_env({"GIT_DIR": str(tree.common_dir)}))
+            finally:
+                packer.stdout.close()
+                try:
+                    packer.wait(timeout=_GIT_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    packer.kill()
+                    packer.wait()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if packer.returncode != 0 or indexed.returncode != 0:
+        return False
+    try:
+        git(["rev-list", "--objects", "--quiet", commit], tree.common_dir, timeout=_GIT_TIMEOUT_S,
+            env=tree.repo_env())
+    except WorktreeError:
+        return False
+    return True
 
 
 def _private_env(tree: Worktree, index: Path) -> dict[str, str]:
@@ -602,13 +552,17 @@ def _private_env(tree: Worktree, index: Path) -> dict[str, str]:
     worker uses the repo's shared ``.git`` (which the task cannot write), the
     checkout as the work tree, and an index of its own.
     """
-    return {"GIT_DIR": str(tree.common_dir), "GIT_WORK_TREE": str(tree.path), "GIT_INDEX_FILE": str(index),
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternate_path(tree.objects)}
+    return {**_read_env(tree), "GIT_WORK_TREE": str(tree.path), "GIT_INDEX_FILE": str(index)}
+
+
+def _read_env(tree: Worktree) -> dict[str, str]:
+    """Reading (never writing) the repo's store plus the task's own objects."""
+    return {"GIT_DIR": str(tree.common_dir), "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternate_path(tree.objects)}
 
 
 def _tip(tree: Worktree) -> str:
     return git(["rev-parse", "--verify", "--quiet", f"refs/heads/{tree.branch}^{{commit}}"], tree.common_dir,
-               timeout=30, env=tree.repo_env())
+               timeout=30, env=_read_env(tree))
 
 
 def _pending(tree: Worktree, scratch: Path) -> tuple[str, str, str]:
@@ -618,7 +572,7 @@ def _pending(tree: Worktree, scratch: Path) -> tuple[str, str, str]:
     git(["read-tree", tip], tree.common_dir, timeout=120, env=env)
     git(["add", "-A", "--", "."], tree.path, timeout=_GIT_TIMEOUT_S, env=env)
     current = git(["write-tree"], tree.common_dir, timeout=120, env=env)
-    return tip, git(["rev-parse", f"{tip}^{{tree}}"], tree.common_dir, timeout=30, env=tree.repo_env()), current
+    return tip, git(["rev-parse", f"{tip}^{{tree}}"], tree.common_dir, timeout=30, env=_read_env(tree)), current
 
 
 def _ignored(tree: Worktree, env: dict[str, str]) -> bool:
@@ -633,7 +587,7 @@ def _ignored(tree: Worktree, env: dict[str, str]) -> bool:
 
 
 def finish(tree: Worktree, message: str) -> bool:
-    """After the task: import its objects, commit what it left on its branch, keep the branch.
+    """After the task: commit what it left on its branch, import what that needs, keep the branch.
 
     Returns whether the branch now holds everything in the checkout (so the
     worktree may be removed): not when the task left ignored files, which are
@@ -645,15 +599,19 @@ def finish(tree: Worktree, message: str) -> bool:
     """
     if not intact(tree) or _made_sparse(tree):
         return False
-    import_objects(tree)
     try:
         with tempfile.TemporaryDirectory(prefix="openswap-finish-") as scratch:
             tip, tip_tree, current = _pending(tree, Path(scratch))
+            commit = tip
             if current != tip_tree:
                 identity_env = {k: v for k, v in task_env(tree.common_dir, git_env=tree.repo_env()).items()
                                 if k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}
                 commit = git(["commit-tree", current, "-p", tip, "-m", message], tree.common_dir, timeout=60,
-                             env={**tree.repo_env(), **identity_env})
+                             env={**_private_env(tree, Path(scratch) / "index"), **identity_env})
+            # The branch moves only once everything it will need is in the repo's store.
+            if not import_objects(tree, commit):
+                return False
+            if commit != tip:
                 git(["update-ref", "-m", message, f"refs/heads/{tree.branch}", commit, tip], tree.common_dir,
                     timeout=60, env=tree.repo_env())
             leftover = _ignored(tree, _private_env(tree, Path(scratch) / "index"))
