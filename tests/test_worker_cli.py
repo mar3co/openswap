@@ -290,7 +290,8 @@ def test_blocked_disable_reports_the_persisted_opt_in(
     state = "on" if enabled else "off"
     assert capsys.readouterr().err == (
         f"Not stopped: an account may still be in use (lease_state_unknown). Remote tasks stay {state}, "
-        "paused. Next: `openswap worker lease release` to free it.\n"
+        "paused. Next: `openswap worker lease release` or `openswap worker lease release --provider claude` "
+        "to free it.\n"
     )
 
 

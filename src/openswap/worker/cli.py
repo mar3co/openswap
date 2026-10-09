@@ -1673,7 +1673,7 @@ _STOP_MESSAGES = {
 _DISABLE_BLOCKED = {
     "job_still_active": ("a task is still running", "`openswap worker stop` to end it."),
     "job_stop_not_confirmed": ("the running task has not stopped yet", "wait, then `openswap worker disable` again."),
-    "lease_state_unknown": ("an account may still be in use", "`openswap worker lease release` to free it."),
+    "lease_state_unknown": ("an account may still be in use", None),  # step: _lease_release_step
     "worker_state_unknown": ("the worker's state could not be read", None),
     "worker_status_unavailable": ("the worker's state could not be read", None),
     "worker_unload_failed": ("the background service could not be unloaded", None),
@@ -1690,6 +1690,27 @@ _LEASE_MESSAGES = {
     "stop_unproven_confirm_required": ("it cannot prove the task stopped. Once nothing runs on the account, "
                                        "pass --confirm-stopped."),
 }
+
+
+def _lease_release_step(root: Path) -> str:
+    """The `lease release` command for each account store still held (Claude needs `--provider claude`).
+
+    Read-only: the same snapshot the status reads. When neither store can be
+    read, both commands are named rather than guessing the Codex default.
+    """
+    held = []
+    for provider in ("codex", "claude"):
+        try:
+            lease = AccountLeaseStore(root, provider).read_current()
+        except Exception:
+            held = []
+            break
+        if lease is not None and lease.state in {"active", "uncertain"}:
+            held.append(provider)
+    if not held:
+        held = ["codex", "claude"]
+    commands = [f"`openswap worker lease release{' --provider claude' if p == 'claude' else ''}`" for p in held]
+    return f"{' or '.join(commands)} to free it."
 
 
 def _migration_message(exc: ClaudeSwitchError) -> str:
@@ -2075,6 +2096,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                 except Exception:
                     state = None
                 reason, step = _DISABLE_BLOCKED.get(diagnostic, ("the worker could not be proven idle", None))
+                if diagnostic == "lease_state_unknown":
+                    step = _lease_release_step(root)
                 where = "no new task starts" if state is None else f"Remote tasks stay {state}, paused"
                 line = f"Not stopped: {reason} ({diagnostic}). {where}."
                 print(line if step is None else f"{line} {printer.next_step(step)}", file=sys.stderr)

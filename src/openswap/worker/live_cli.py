@@ -63,7 +63,9 @@ _PIN_MESSAGES = {
                                                "Run `openswap worker codex logout` for this slot, then try again."),
     "logout_failed": "The sign-out did not complete; the account may still be signed in. Try again.",
     "claude_profile_unsafe": "That account's folder is a symlink; tasks refuse it. Remove the link, then try again.",
-    "claude_profile_not_ready": "The account is still not ready after signing in. Try again.",
+    "claude_profile_not_ready": ("The account is signed in, but a managed Claude Code policy on this Mac "
+                                 "(managed-settings.json, a managed preference or a cached remote policy) "
+                                 "would apply to tasks. Remove it, then try again."),
 }
 
 
@@ -268,12 +270,14 @@ def _claude_next_step(status: dict) -> str | None:
         return "`openswap worker claude pin` to pin the installed Claude Code."
     if pinned is None:
         return "`openswap worker account claude:<slot>` to pin the account tasks run on."
+    # Not ready: not signed in, or a managed Claude Code policy applies. `prepare` signs in
+    # when needed and otherwise names the policy, so it is the next step either way.
     if not pinned["profile_ready"]:
-        return "`openswap worker claude prepare` to sign the pinned account in."
+        return "`openswap worker claude prepare` to get the pinned account ready."
     unready = next((a for a in allowed if not a["profile_ready"]), None)
     if unready is not None:
-        return (f"`openswap worker claude prepare claude:{unready['slot']}` to sign account "
-                f"{unready['slot']} in.")
+        return (f"`openswap worker claude prepare claude:{unready['slot']}` to get account "
+                f"{unready['slot']} ready.")
     if status["execution_mode"] != "live":
         return "`openswap worker live-check --provider claude` to turn on live tasks."
     unchecked = next((a for a in [pinned, *allowed] if _unchecked(status, a)), None)
@@ -454,7 +458,7 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     claude_status_parser = claude_commands.add_parser("status", help="Claude Code, live tasks and each account's sign-in")
     claude_status_parser.add_argument("--json", action="store_true")
     prepare = claude_commands.add_parser(
-        "prepare", help="sign an account in for tasks (default: the pinned one); your own login is untouched",
+        "prepare", help="get an account ready for tasks (default: the pinned one); your own login is untouched",
     )
     prepare.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
     prepare.add_argument("--json", action="store_true")
@@ -602,7 +606,7 @@ def _format_claude_status(status: dict) -> str:
     if not status["accounts"]:
         lines.append("  none (`openswap add` saves one)")
     lines.extend(printer.columns(_account_status_rows(status["accounts"], "profile_ready",
-                                                      "signed in", "not signed in")))
+                                                      "ready", "not ready")))
     step = _claude_next_step(status)
     if step is not None:
         lines.append(printer.next_step(step))

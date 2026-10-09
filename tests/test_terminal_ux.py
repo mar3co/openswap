@@ -191,6 +191,21 @@ def test_status_rows_are_marked_and_worded(root, monkeypatch, capsys):
     assert out.count("Next:") == 1 and "`openswap worker enable`" in out
 
 
+def test_blocked_disable_names_the_lease_store_that_is_held(root, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    held = {"claude"}
+    monkeypatch.setattr(cli.AccountLeaseStore, "read_current",
+                        lambda self: SimpleNamespace(state="active") if self.provider in held else None)
+    monkeypatch.setattr(cli, "disable_worker", lambda _root: (False, {}, "lease_state_unknown"))
+    assert _run(root, "disable") == 1
+    assert capsys.readouterr().err.endswith("Next: `openswap worker lease release --provider claude` to free it.\n")
+    held.add("codex")
+    assert _run(root, "disable") == 1
+    assert capsys.readouterr().err.endswith(
+        "Next: `openswap worker lease release` or `openswap worker lease release --provider claude` to free it.\n")
+
+
 def test_live_mode_refusals_point_at_a_retry_or_a_new_live_check():
     from openswap.worker.live import LiveModeError
 
@@ -257,10 +272,11 @@ def test_codex_and_claude_status_point_at_the_next_step():
               "accounts": [{"slot": "4", "alias": "claudey", "pinned": True, "allowed": False, "profile_ready": False}]}
     out = live_cli._format_claude_status(claude)
     assert "  ✗ Claude Code  not ready (not_pinned)" in out
-    assert "  ✗ 4  (claudey)  not signed in  pinned" in out
+    assert "  ✗ 4  (claudey)  not ready  pinned" in out
     assert out.endswith("Next: `openswap worker claude pin` to pin the installed Claude Code.")
     claude["cli"] = {"pinned": True, "version": "2.1.285 (Claude Code)"}
-    assert live_cli._format_claude_status(claude).endswith("`openswap worker claude prepare` to sign the pinned account in.")
+    # "ready" covers both a missing sign-in and a managed policy: `prepare` signs in or names the policy.
+    assert live_cli._format_claude_status(claude).endswith("`openswap worker claude prepare` to get the pinned account ready.")
     claude["accounts"][0]["profile_ready"] = True
     claude["execution_mode"] = "live"
     out = live_cli._format_claude_status(claude)
