@@ -475,6 +475,8 @@ def _job_profile(tmp_path, *, exec_deny=True):
     (profile / "CLAUDE.md").write_text("\n")
     (profile / ".credentials.json").write_text("placeholder\n")
     (home / "Library" / "Keychains" / "login.keychain-db").write_text("k")
+    (home / ".ssh").mkdir(exist_ok=True)
+    (home / ".ssh" / "id_test").write_text("key")
     text = claude_exec.seatbelt_profile(output_root=out.resolve(), profile=profile.resolve(),
                                         run_tmp=(tmp_path / "t").resolve(), home=home.resolve(),
                                         backup_root=root.resolve(), user_dirs=[])
@@ -504,6 +506,9 @@ def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_
         f"printf x >> {profile}/CLAUDE.md 2>/dev/null; echo memory $?",
         f"printf {{}} > {profile}/remote-settings.json 2>/dev/null; echo remote_policy $?",
         f"printf {{}} > {profile}/.claude.json 2>/dev/null; echo account_state $?",
+        f"mkdir -p {home}/.ssh 2>/dev/null; cat {home}/.ssh/id_test >/dev/null 2>&1; echo ssh_key $?",
+        f"mkdir -p {tmp_path / 't'} && ln {profile}/settings.json {tmp_path / 't' / 'alias'} 2>/dev/null; "
+        f"echo hard_link $?",
         f"printf x > {profile}/skills/s.md 2>/dev/null; echo skill $?",
         f"printf x > {profile}/rules/r.md 2>/dev/null; echo rule $?",
         f"printf x > {profile}/projects/-repo/memory/MEMORY.md 2>/dev/null; echo auto_memory $?",
@@ -536,6 +541,9 @@ def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_
     assert codes["skill"] != "0" and codes["remote_policy"] != "0"
     # Per-project approvals and the account the identity check reads.
     assert codes["account_state"] != "0"
+    # No ssh key (it would reach this Mac's sshd on any address), no hard-link alias of a protected file.
+    assert codes["ssh_key"] != "0" and codes["hard_link"] != "0"
+    assert not os.path.lexists(tmp_path / "t" / "alias")
     assert (profile / "settings.json").read_text() == "{}\n" and (profile / "CLAUDE.md").read_text() == "\n"
     # Claude Code's own state, and (honestly) the account's own sign-in, stay reachable.
     assert codes["state"] == "0" and codes["own_sign_in"] == "0"

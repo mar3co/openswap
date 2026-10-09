@@ -260,7 +260,8 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
     # what git needs for a work folder's worktree.
     own = [output_root, *write_paths, profile, run_tmp]
     support = [home / "Library" / "Caches", *(darwin_user_dirs() if user_dirs is None else user_dirs)]
-    hidden = [home / ".claude", home / ".codex", backup_root]
+    # ~/.ssh too: its keys would let a shell reach this Mac's sshd on any address and port.
+    hidden = [home / ".claude", home / ".codex", home / ".ssh", backup_root]
     readable = [profile, output_root, *readonly_sources, *write_paths, *read_paths]
     configuration = [f"(literal {_sb_string(profile / name)})" for name in CLAUDE_PROFILE_CONFIG]
     # A subpath also covers the entry itself, so nothing can be renamed or
@@ -295,6 +296,7 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
         "(deny lsopen)",
         "(deny appleevent-send)",
         "(deny job-creation)",
+        "(deny file-link)",
         f"(deny process-exec (literal {_sb_string(LAUNCHCTL)}))",
         "(deny network-outbound (remote unix-socket))",
         # Name resolution goes through mDNSResponder's socket.
@@ -435,7 +437,7 @@ class ClaudeCodeAdapter(CodexExecAdapter):
         for own in (backup / "worker" / "research", backup / "live-check"):
             if pathid.inside(path, own):
                 return True
-        for hidden in (home / ".claude", home / ".codex", backup):
+        for hidden in (home / ".claude", home / ".codex", home / ".ssh", backup):
             if pathid.overlap(path, hidden):
                 return False
         return not pathid.inside(home / ".claude.json", path)

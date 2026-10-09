@@ -996,7 +996,11 @@ unsandboxed), Apple Events, launchd job creation (and `launchctl`), local
 Unix sockets other than name resolution's, connections to this Mac
 (`localhost`; `sshd` would run a command outside the sandbox) and ssh to any
 address (port 22) are denied. So a task cannot reach a server on this Mac,
-not even one it started, or use ssh (git over HTTPS still works).
+not even one it started, or use ssh (git over HTTPS still works). `~/.ssh` is
+unreadable too, so its keys cannot reach `sshd` on this Mac by another address or
+port, and hard links are denied, so no protected file gets a writable alias.
+Other services the owner exposes on the network stay reachable as from any
+machine on it.
 Containment, Stop, recovery, `result.md`
 and failure codes are the same as for Codex. A job also refuses while any
 managed Claude Code policy applies (the system `managed-settings.json` or
