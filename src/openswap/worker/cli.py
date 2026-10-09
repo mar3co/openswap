@@ -765,7 +765,8 @@ def launchable_workspaces(backup_root: Path, workspaces) -> tuple:
     for parent in workspaces:
         if not getattr(parent, "repos", False) or parent.work_root is None:
             continue
-        repos = [repo for repo in worktrees.child_repos(parent.work_root)
+        known = set(repo_ids(Path(backup_root)))
+        repos = [repo for repo in worktrees.child_repos(parent.work_root, keep=known)
                  if not any(w.work_root is not None and pathid.same(w.work_root, repo) for w in out)]
         assigned = _assign_repo_ids(Path(backup_root), repos, static_ids)
         for repo in repos:

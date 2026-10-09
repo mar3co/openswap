@@ -689,3 +689,26 @@ def test_a_task_survives_its_linked_working_copy_being_removed(root, home):
     removed = worktrees.sweep(home / "OpenSwap Research", lambda _job: True)
     assert [item.job_id for item in removed] == ["a" * 32]
     assert _git(main, "show", f"{resolved.branch}:edit.txt") == "keep me"
+
+
+
+def test_a_branch_named_openswap_never_blocks_a_launch(root, home):
+    repo = _repo(home / "GitHub" / "openswap")
+    _git(repo, "branch", "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    assert resolved.branch == "openswap-aaaaaaaa"
+    _git(repo, "branch", "openswap-bbbbbbbb")
+    assert _runtime(root)._resolve_workspace("openswap", "b" * 32).branch == "openswap-" + "b" * 32
+
+
+def test_repos_added_later_never_push_an_offered_one_out(root, home, monkeypatch):
+    monkeypatch.setattr(worktrees, "_MAX_CHILD_REPOS", 2)
+    github = home / "GitHub"
+    _repo(github / "zz-first")
+    cli.add_work_folder(root, github)
+    assert _ids(root) == ["zz-first"]
+    for name in ("aa", "bb", "cc"):
+        _repo(github / name)
+    ids = _ids(root)
+    assert "zz-first" in ids and len(ids) == 3  # the two new ones the cap allows, and the kept one

@@ -41,6 +41,7 @@ WORKTREES_DIR = ".worktrees"
 BRANCH_PREFIX = "openswap"
 _GIT_TIMEOUT_S = 300
 _MAX_CHILD_REPOS = 64
+_MAX_SCANNED_CHILDREN = 5000
 _MAX_OBJECT_BYTES = 512 * 1024 * 1024
 _MAX_PACK_BYTES = 2 * 1024 * 1024 * 1024
 # The task's own git must never start background maintenance that rewrites
@@ -153,23 +154,32 @@ def is_repo(folder: Path) -> bool:
     return bool(top) and pathid.same(top, folder)
 
 
-def child_repos(parent: Path) -> list[Path]:
-    """The git repos directly inside ``parent`` (not hidden, not symlinks), by name."""
+def child_repos(parent: Path, keep: set[str] | frozenset[str] = frozenset()) -> list[Path]:
+    """The git repos directly inside ``parent`` (not hidden, not symlinks), by name.
+
+    At most ``_MAX_CHILD_REPOS`` new ones; a repo whose path is in ``keep``
+    (already offered under an ID) is listed whatever the cap, so repos added
+    later can never push it out.
+    """
     out = []
+    new = 0
     try:
         children = sorted(Path(parent).iterdir(), key=lambda p: (p.name.lower(), p.name))
     except OSError:
         return []
-    for child in children:
+    for child in children[:_MAX_SCANNED_CHILDREN]:
         try:
             if child.name.startswith(".") or child.is_symlink() or not child.is_dir():
                 continue
         except OSError:
             continue
         if os.path.lexists(child / ".git"):
-            out.append(pathid.canonical(child))
-            if len(out) >= _MAX_CHILD_REPOS:
-                break
+            repo = pathid.canonical(child)
+            if str(repo) in keep:
+                out.append(repo)
+            elif new < _MAX_CHILD_REPOS:
+                out.append(repo)
+                new += 1
     return out
 
 
@@ -316,9 +326,7 @@ def create(repo: Path, results_root: Path, workspace_id: str, job_id: str) -> Wo
         (objects / "pack").mkdir(mode=0o700)
     except OSError:
         raise WorktreeError("worktree_unavailable") from None
-    branch = f"{BRANCH_PREFIX}/{job_id[:8]}"
-    if git(["branch", "--list", branch], repo, timeout=30):
-        branch = f"{BRANCH_PREFIX}/{job_id}"
+    branch = _free_branch(repo, job_id)
     try:
         git(["worktree", "add", "--quiet", "-b", branch, str(dest), "HEAD"], repo)
     except WorktreeError:
@@ -356,6 +364,28 @@ def _undo_create(repo: Path, dest: Path, objects: Path, branch: str) -> None:
         _record_path(dest).unlink()
     except OSError:
         pass
+
+
+def _free_branch(repo: Path, job_id: str) -> str:
+    """``openswap/<short id>``, or a name no existing branch blocks.
+
+    A branch ``openswap`` (or ``openswap/<short id>/…``) would block the
+    usual name as a file/folder clash in ``refs/heads``, so the fallbacks are
+    the full ID, then the flat ``openswap-<id>`` forms.
+    """
+    existing = set(git(["for-each-ref", "--format=%(refname:short)", "refs/heads/"], repo, timeout=30).splitlines())
+
+    def free(name: str) -> bool:
+        parts = name.split("/")
+        prefixes = {"/".join(parts[:i]) for i in range(1, len(parts))}
+        return name not in existing and not (prefixes & existing) and not any(
+            other.startswith(name + "/") for other in existing)
+
+    for name in (f"{BRANCH_PREFIX}/{job_id[:8]}", f"{BRANCH_PREFIX}/{job_id}",
+                 f"{BRANCH_PREFIX}-{job_id[:8]}", f"{BRANCH_PREFIX}-{job_id}"):
+        if free(name):
+            return name
+    raise WorktreeError("branch_unavailable")
 
 
 def identity(repo: Path, env: dict[str, str] | None = None) -> dict[str, str]:
