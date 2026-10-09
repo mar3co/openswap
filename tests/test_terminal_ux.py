@@ -178,8 +178,16 @@ def test_status_rows_are_marked_and_worded(root, monkeypatch, capsys):
     assert _run(root, "status") == 0
     out = capsys.readouterr().out
     assert "  • Live tasks    off\n" in out and "  • Task          none\n" in out
-    assert out.endswith("Next: `openswap worker claude pin`, `openswap worker claude prepare`, then "
+    # The live check refuses while the worker takes tasks: pause comes first.
+    assert out.endswith("Next: `openswap worker pause`, then `openswap worker claude pin`, "
+                        "`openswap worker claude prepare`, then "
                         "`openswap worker live-check --provider claude` to turn on live tasks.\n")
+    snapshot["paused"] = True
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert "  ✗ Taking tasks  paused\n" in out and "`openswap worker pause`," not in out
+    assert out.endswith("`openswap worker live-check --provider claude` to turn on live tasks.\n")
+    snapshot["paused"] = False
     # Any other reason live tasks are off is shown with the row, not restated.
     snapshot["provider"] = {"available": False, "diagnostic_code": "provider_auth_unavailable"}
     monkeypatch.setattr(cli, "read_status", lambda _root: {**snapshot, "enabled": False, "process_state": "stopped"})

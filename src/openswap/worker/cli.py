@@ -2650,15 +2650,17 @@ def _worker_off_hint(root: Path, snapshot: dict) -> str | None:
     if not (snapshot.get("enabled") is True and snapshot.get("process_state") in _RUNNING_STATES):
         return printer.next_step(f"`openswap worker enable` to start the worker (paired with "
                                  f"{settings.control_service_url}).")
-    if snapshot.get("paused") is True:
-        return printer.next_step("`openswap worker pause --off` to take tasks again.")
+    paused = snapshot.get("paused") is True
     provider = snapshot.get("provider") or {}
     if provider.get("available") is not True and provider.get("diagnostic_code") == "live_adapter_disabled":
         from openswap.worker.accounts import provider_of
         from openswap.worker.guided_setup import execution_off_note
 
-        note = execution_off_note(provider_of(settings.pinned_account_ref))
+        # The live check refuses while the worker takes tasks: pause first unless already paused.
+        note = execution_off_note(provider_of(settings.pinned_account_ref), pause_first=not paused)
         return printer.next_step(note.removeprefix("Next: "))
+    if paused:
+        return printer.next_step("`openswap worker pause --off` to take tasks again.")
     return None
 
 

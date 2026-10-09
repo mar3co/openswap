@@ -139,9 +139,20 @@ CLAUDE_EXECUTION_OFF_NOTE = (
 READY_NOTE = f"{printer.MARK_OK} Ready: Slack can send tasks to this Mac."
 
 
-def execution_off_note(provider: str | None) -> str:
-    """The one `Next:` line for turning on live tasks with the pinned account's provider."""
-    return CLAUDE_EXECUTION_OFF_NOTE if provider == "claude" else EXECUTION_OFF_NOTE
+# The live check refuses while the worker takes tasks: a running, unpaused worker pauses first.
+PAUSE_FIRST = "`openswap worker pause`, then "
+
+
+def execution_off_note(provider: str | None, *, pause_first: bool = False) -> str:
+    """The one `Next:` line for turning on live tasks with the pinned account's provider.
+
+    ``pause_first`` when the worker is running and taking tasks: the live
+    check refuses until it is paused (``worker pause --off`` resumes after).
+    """
+    note = CLAUDE_EXECUTION_OFF_NOTE if provider == "claude" else EXECUTION_OFF_NOTE
+    if pause_first:
+        note = "Next: " + PAUSE_FIRST + note.removeprefix("Next: ")
+    return note
 
 
 def _provider_name(choice) -> str:
@@ -707,7 +718,8 @@ def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> No
     if state.missing:
         ui.say(f"Next: {state.missing[0]}.")
     elif state.execution != "live":
-        ui.say(execution_off_note(state.provider))
+        # Nothing missing means the worker runs and takes tasks: the check needs it paused.
+        ui.say(execution_off_note(state.provider, pause_first=state.worker == "running" and not state.paused))
     else:
         ui.say(READY_NOTE)
 

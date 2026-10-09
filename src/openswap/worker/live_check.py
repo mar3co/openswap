@@ -1511,9 +1511,26 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
             enable_live(root, path, claude_cli.verify(root), "claude")
         else:
             enable_live(root, path, codex_cli.verify(root))
-    except (LiveModeError, codex_cli.CodexCliError, claude_cli.ClaudeCliError) as error:
-        code = getattr(error, "code", None) or str(error)
-        print(f"Could not turn live tasks on ({code}). Next: `openswap worker live enable{flag}`.", file=sys.stderr)
+    except LiveModeError as error:
+        from openswap.worker.live_cli import _live_mode_message
+
+        # A lock held by another command: `live enable` retries with this evidence. Anything
+        # else (the evidence, this Mac) is explained by the shared message, which names the fix.
+        if error.code in {"live_lock_busy", "live_lock_unavailable"}:
+            print(f"Could not turn live tasks on ({error.code}). Next: `openswap worker live enable{flag}`.",
+                  file=sys.stderr)
+        else:
+            print(f"Could not turn live tasks on ({error.code}). {_live_mode_message(error, evidence.get('provider'))}",
+                  file=sys.stderr)
+        return 1
+    except (codex_cli.CodexCliError, claude_cli.ClaudeCliError) as error:
+        from openswap.worker.live_cli import _CLAUDE_MESSAGES, _message
+
+        # The CLI changed between the check and now (an update): its own message names the
+        # re-pin or reinstall; the check must then run again on the new binary.
+        text = _CLAUDE_MESSAGES.get(error.code, f"Refused ({error.code}).") if isinstance(
+            error, claude_cli.ClaudeCliError) else _message(error.code)
+        print(f"Could not turn live tasks on ({error.code}): {text} Then run the live check again.", file=sys.stderr)
         return 1
     say(f"{printer.MARK_OK} Live tasks are on for {name}. `openswap worker live disable{flag}` turns them off.")
     return 0

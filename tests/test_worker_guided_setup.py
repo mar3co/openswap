@@ -337,7 +337,9 @@ def test_summary_is_ready_only_when_admission_is_open(root, monkeypatch, capsys,
     update_worker_settings(root, paused=False)
     assert _setup(root, monkeypatch, ["", ""]) == 0
     out = capsys.readouterr().out
-    assert "  ✓ Worker      running\n" in out and guided_setup.EXECUTION_OFF_NOTE in out
+    # Taking tasks: the live check refuses until the worker is paused, so that comes first.
+    assert "  ✓ Worker      running\n" in out
+    assert "Next: `openswap worker pause`, then `openswap worker live-check` to turn on live tasks." in out
 
 
 @pytest.mark.parametrize(("process", "loaded", "worker"), [
@@ -410,7 +412,7 @@ def test_a_paired_worker_is_ready_only_while_online(root, monkeypatch, capsys, r
     assert guided_setup.readiness(root).missing == ((step,) if step else ())
     guided_setup.summary(root, _Say(), start_wait_s=0)
     out = capsys.readouterr().out
-    assert (guided_setup.EXECUTION_OFF_NOTE in out) is (step is None)
+    assert (guided_setup.PAUSE_FIRST + guided_setup.EXECUTION_OFF_NOTE.removeprefix("Next: ") in out) is (step is None)
 
 
 def test_summary_waits_briefly_for_the_service_connection(root, monkeypatch, capsys, research_home):
@@ -424,7 +426,8 @@ def test_summary_waits_briefly_for_the_service_connection(root, monkeypatch, cap
     monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: None)
     guided_setup.summary(root, _Say())
     out = capsys.readouterr().out
-    assert f"  ✓ Paired      {URL} (online)" in out and guided_setup.EXECUTION_OFF_NOTE in out
+    assert f"  ✓ Paired      {URL} (online)" in out
+    assert out.rstrip().endswith(guided_setup.execution_off_note("codex", pause_first=True))
 
 
 def test_allowed_accounts_without_a_pinned_default_are_not_ready(root, monkeypatch):
@@ -1588,7 +1591,7 @@ def test_setup_pins_a_claude_account_and_points_at_the_claude_live_check(root, k
         "enabled": True, "process_state": "running", "remote_connectivity": "online"})
     guided_setup.summary(root, _Say(), start_wait_s=0)
     out = capsys.readouterr().out
-    assert out.rstrip().endswith(guided_setup.CLAUDE_EXECUTION_OFF_NOTE)
+    assert out.rstrip().endswith(guided_setup.execution_off_note("claude", pause_first=True))
     assert guided_setup.EXECUTION_OFF_NOTE not in out
     for command in ("openswap worker claude pin", "openswap worker claude prepare",
                     "openswap worker live-check --provider claude"):
