@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import tomllib
 from dataclasses import dataclass
@@ -90,6 +91,10 @@ CLAUDE_MODES = ("default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPerm
 # What `claude prepare` copies from ~/.claude/settings.json: the mode and the rules.
 COPIED_CLAUDE_KEYS = ("defaultMode", "allow", "deny", "ask", "disableBypassPermissionsMode")
 _RULE_KEYS = ("allow", "deny", "ask")
+# A permission rule: a tool name (``Bash``, ``mcp__server__tool``), optionally
+# with one parenthesized specifier that does not itself end the rule early
+# (``Bash(git status:*)``, ``Read(//abs/**)``, ``WebFetch(domain:x.com)``).
+_RULE_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*(?:\((?:[^()\n]|\([^()\n]*\))*\))?")
 # The built-in tools that run commands. Unknown names are ignored by Claude
 # Code, so the list may name tools a given version does not have.
 CLAUDE_SHELL_TOOLS = ("Bash", "PowerShell", "Monitor", "REPL", "BashOutput", "KillShell")
@@ -136,6 +141,14 @@ class ClaudePermissions:
         return {"mode": self.mode, "allow_rules": self.allow, "deny_rules": self.deny, "ask_rules": self.ask}
 
 
+def _rule_ok(rule: str) -> bool:
+    if not _RULE_SHAPE.fullmatch(rule):
+        return False
+    if rule.startswith("Bash(") and ":*" in rule[5:-1].removesuffix(":*"):
+        return False  # the prefix wildcard ``:*`` is only valid at the end
+    return True
+
+
 def _claude_permissions_block(settings: dict) -> dict:
     block = settings.get("permissions", {})
     if not isinstance(block, dict):
@@ -147,6 +160,10 @@ def _claude_permissions_block(settings: dict) -> dict:
         rules = block.get(key, [])
         if (not isinstance(rules, list) or len(rules) > 4096
                 or not all(isinstance(rule, str) and 0 < len(rule) <= 4096 for rule in rules)):
+            raise PermissionSettingsError("settings_invalid")
+        if key in _RULE_KEYS and not all(_rule_ok(rule) for rule in rules):
+            # Not `Tool` or `Tool(specifier)`: a Claude Code version that
+            # rejects the file over it would drop every deny rule with it.
             raise PermissionSettingsError("settings_invalid")
     # The only value Claude Code accepts; anything else would make it drop the file.
     if block.get("disableBypassPermissionsMode", "disable") != "disable":

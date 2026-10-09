@@ -1044,7 +1044,8 @@ instead of a tool list OpenSwap picks
   extra directories) from `~/.claude/settings.json`, `--mode MODE` sets the
   mode, and run in a terminal on a profile with none it asks. A settings file
   Claude Code would silently ignore (not JSON, a symlink, an unknown mode,
-  rules that are not strings) refuses the launch instead of dropping your
+  rules that are not `Tool` or `Tool(specifier)`, a Bash `:*` not at the end)
+  refuses the launch instead of dropping your
   deny rules. `openswap worker claude status` shows each account's mode and
   rule counts.
 - **Codex.** Each account keeps `approval_policy`, `approvals_reviewer` and
