@@ -303,7 +303,7 @@ def test_worktrees_command_lists_and_prunes(root, home, capsys):
     (item,) = json.loads(capsys.readouterr().out)["worktrees"]
     assert item["branch"] == "openswap/aaaaaaaa" and item["dirty"] is False and item["finished"] is True
     assert cli.main(["worktrees", "prune"], backup_root=root) == 0
-    assert "Removed 1 finished task worktree; branches are kept." in capsys.readouterr().out
+    assert "✓ Removed 1 (branches are kept)." in capsys.readouterr().out
     assert not resolved.work_dir.exists()
 
 
@@ -409,7 +409,7 @@ def test_setup_advanced_offers_a_per_mac_permission_limit(root, home, monkeypatc
     cli._guided_setup(root, interactive=True, read_line=read, advanced=True)
     out = capsys.readouterr().out
     assert cli.permission_override(root) == "no-shell"
-    assert "✓ This Mac limits every remote task: no shell commands" in out
+    assert "✓ This Mac limits every task: no shell commands" in out
     # The summary shows the limit because it is not the default.
     assert "Permissions" in out.split(guided_setup.PERMISSIONS_OFFER)[1] and "no-shell (this Mac)" in out
     # Without --advanced nothing is asked, and the default is not shown.

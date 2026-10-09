@@ -65,6 +65,9 @@ class TerminalPrompts:
     _index: object = field(default=None, repr=False)
 
     def say(self, text: str) -> None:
+        # The one `Next:` line is bold on a colour terminal, like every other command's.
+        if text.startswith("Next: "):
+            text = printer.next_step(text.removeprefix("Next: "))
         self.write(text)
 
     def section(self, title: str) -> None:
@@ -136,9 +139,20 @@ CLAUDE_EXECUTION_OFF_NOTE = (
 READY_NOTE = f"{printer.MARK_OK} Ready: Slack can send tasks to this Mac."
 
 
-def execution_off_note(provider: str | None) -> str:
-    """The one `Next:` line for turning on live tasks with the pinned account's provider."""
-    return CLAUDE_EXECUTION_OFF_NOTE if provider == "claude" else EXECUTION_OFF_NOTE
+# The live check refuses while the worker takes tasks: a running, unpaused worker pauses first.
+PAUSE_FIRST = "`openswap worker pause`, then "
+
+
+def execution_off_note(provider: str | None, *, pause_first: bool = False) -> str:
+    """The one `Next:` line for turning on live tasks with the pinned account's provider.
+
+    ``pause_first`` when the worker is running and taking tasks: the live
+    check refuses until it is paused (``worker pause --off`` resumes after).
+    """
+    note = CLAUDE_EXECUTION_OFF_NOTE if provider == "claude" else EXECUTION_OFF_NOTE
+    if pause_first:
+        note = "Next: " + PAUSE_FIRST + note.removeprefix("Next: ")
+    return note
 
 
 def _provider_name(choice) -> str:
@@ -190,7 +204,7 @@ def offer_worker(root: Path, ui: Prompts) -> None:
             message = f"{message.rstrip('.')} ({code})."
         ui.say(f"{message} {START_WORKER_NEXT}")
     except Exception:
-        ui.say(f"Could not enable worker. {START_WORKER_NEXT}")
+        ui.say(f"Could not start the worker. {START_WORKER_NEXT}")
     else:
         ui.say(WORKER_ONLINE)
 
@@ -277,24 +291,7 @@ def confirm_account(root: Path, ui: Prompts) -> None:
 
 
 def _display_path(path: Path) -> str:
-    path = Path(path)
-    home = _cli().home_folder()
-    for base in (home, _resolved(home)):
-        if base is None:
-            continue
-        try:
-            relative = path.relative_to(base)
-        except ValueError:
-            continue
-        return "~/" + relative.as_posix() if relative.parts else "~"
-    return str(path)
-
-
-def _resolved(path: Path) -> Path | None:
-    try:
-        return Path(path).resolve()
-    except (OSError, RuntimeError):
-        return None
+    return _cli().display_path(path)
 
 
 def _describe(workspace) -> str:
@@ -627,12 +624,14 @@ class Readiness:
                 "revoked": "`openswap worker pair <url> <code>` to pair again (this Mac was removed)",
                 "expired": "`openswap worker pair <url> <code>` to pair again (the pairing expired)",
             }.get(self.connection, "wait a moment, then `openswap worker status`"))
-        if self.paused:
+        # A paused worker is what the live check needs: resuming is a step only once live
+        # tasks are on (until then the summary names the check, without a pause first).
+        if self.paused and self.execution == "live":
             out.append("`openswap worker pause --off` to resume")
         if self.account is None:
             out.append("`openswap worker account <slot>` to pick an account")
         if not self.folders:
-            out.append("`openswap worker workspace add --read <folder>` to add a folder")
+            out.append("`openswap worker workspace add --work <folder>` to add a folder")
         if self.refused:
             names = ", ".join(f'"{workspace_id}"' for workspace_id, _code in self.refused)
             out.append(f"`openswap worker workspace list` to fix {names}")
@@ -707,11 +706,11 @@ def _settling(state: Readiness) -> bool:
     )
 
 
-SIGN_IN_NOTE = ("Note: shell commands in remote Claude tasks can read or replace that account's own sign-in (macOS "
-                "cannot run Claude Code's own sandbox inside OpenSwap's). `openswap worker permissions "
-                "no-shell` prevents it.")
-PERMISSIONS_OFFER = ("Remote sessions follow each account's own Claude or Codex permission settings. "
-                     "Limit every remote task on this Mac? (follow, no-shell, read-only)")
+SIGN_IN_NOTE = ("Note: a shell command in a Claude task can read or replace that account's own sign-in (macOS "
+                "can't run Claude Code's sandbox inside OpenSwap's). `openswap worker permissions no-shell` "
+                "prevents it.")
+PERMISSIONS_OFFER = ("Tasks follow each account's own Claude or Codex permission settings. "
+                     "Limit every task on this Mac? (follow, no-shell, read-only)")
 
 
 def offer_permissions(root: Path, ui: Prompts) -> None:
@@ -758,7 +757,8 @@ def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> No
     if state.missing:
         ui.say(f"Next: {state.missing[0]}.")
     elif state.execution != "live":
-        ui.say(execution_off_note(state.provider))
+        # Nothing missing means the worker runs and takes tasks: the check needs it paused.
+        ui.say(execution_off_note(state.provider, pause_first=state.worker == "running" and not state.paused))
     else:
         ui.say(READY_NOTE)
 

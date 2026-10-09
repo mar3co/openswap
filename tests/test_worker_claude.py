@@ -1490,7 +1490,7 @@ def test_claude_status_picks_pin_and_prepare_before_the_live_check():
     status["checked_accounts"] = [IDENTITY]
     assert "--account claude:5" in live_cli._claude_next_step(status)
     status["checked_accounts"] = [IDENTITY, "claude:" + "5" * 64]
-    assert live_cli._claude_next_step(status).startswith("nothing")
+    assert live_cli._claude_next_step(status) is None  # live tasks run on every account: no next step
 
 
 

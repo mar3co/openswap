@@ -44,31 +44,49 @@ LOGIN_LEASE_SECONDS = 15 * 60
 
 _CLI_MESSAGES = {
     "unsupported_platform": "Remote tasks run Codex only on Apple silicon Macs.",
-    "not_installed": "The pinned Codex CLI is not installed. Run `openswap worker codex install`.",
-    "archive_hash_mismatch": "The downloaded archive does not match the published SHA-256; nothing was installed.",
-    "download_failed": "Could not download the Codex release asset.",
-    "binary_hash_mismatch": "The installed Codex binary changed since it was verified. Reinstall it.",
-    "version_mismatch": "The installed binary does not report codex-cli 0.157.1. Reinstall it.",
+    "not_installed": "The Codex CLI is not installed. Next: `openswap worker codex install`.",
+    "archive_hash_mismatch": "The download did not match the published SHA-256; nothing was installed.",
+    "download_failed": "Could not download the Codex CLI. Check the connection, then try again.",
+    "binary_hash_mismatch": "The Codex CLI changed since it was verified. Next: `openswap worker codex install`.",
+    "version_mismatch": "The installed Codex CLI is not 0.157.1. Next: `openswap worker codex install`.",
 }
 
+# Errors are one line: what is wrong, then what to do.
 _PIN_MESSAGES = {
-    "managed_codex_config": ("A managed or system Codex configuration on this Mac could override where Codex "
-                             "stores sign-ins, so OpenSwap won't sign accounts in or out (remote jobs refuse too)."),
-    "claude_settings_invalid": ("That account's profile has a settings.json Claude Code would ignore (not valid "
-                                "JSON, a symlink, or permission keys it does not accept). Remote tasks refuse to "
-                                "run until it is fixed or removed."),
-    "claude_sign_in_not_in_profile": ("Claude Code signed in, but did not keep the sign-in in the profile's "
-                                      "credentials file, which is the only place remote tasks can use it."),
+    "managed_codex_config": "A managed Codex configuration on this Mac could move sign-ins; remove it first.",
+    "no_pinned_account": "No account is pinned. Next: `openswap worker account <slot>`.",
+    "no_pinned_claude_account": "No Claude account is pinned. Next: `openswap worker account claude:<slot>`.",
+    "login_failed": "The sign-in did not complete. Try again.",
+    "login_not_completed": "The sign-in did not complete. Try again.",
+    "login_account_mismatch": "That was a different account; it was signed out again. Sign in as the one named.",
+    "login_account_mismatch_still_signed_in": ("That was a different account and it could not be signed out. "
+                                               "Run `openswap worker codex logout` for this slot, then try again."),
+    "logout_failed": "The sign-out did not complete; the account may still be signed in. Try again.",
+    "claude_profile_unsafe": "That account's folder is a symlink; tasks refuse it. Remove the link, then try again.",
+    "claude_profile_not_ready": ("The account is signed in, but a managed Claude Code policy on this Mac "
+                                 "(managed-settings.json, a managed preference or a cached remote policy) "
+                                 "would apply to tasks. Remove it, then try again."),
+    "claude_settings_invalid": ("That account's settings.json is one Claude Code would ignore (not valid JSON, "
+                                "a symlink, or permission keys it rejects); tasks refuse it. Fix or remove it, "
+                                "then try again."),
+    "claude_sign_in_not_in_profile": ("Claude Code signed in, but not into the account's own credentials file, "
+                                      "the only place tasks can use it. Try again."),
     "claude_default_settings_missing": "~/.claude/settings.json has no permission settings to copy.",
-    "codex_settings_invalid": ("That account's remote-task settings (permissions.json in its isolated Codex "
-                               "home) are not valid. Set them again with `openswap worker codex settings`."),
+    "codex_settings_invalid": ("That account's task settings are not valid. Next: `openswap worker codex "
+                               "settings <slot>` to set them again."),
     "codex_default_settings_missing": ("~/.codex/config.toml sets no approval_policy, approvals_reviewer or "
                                        "sandbox_mode to copy."),
 }
 
 
 def _message(code: str) -> str:
-    return _CLI_MESSAGES.get(code, f"Refused: {code}.")
+    return _CLI_MESSAGES.get(code, f"Refused ({code}).")
+
+
+def _pin_message(code: str) -> str:
+    from openswap.worker.cli import _ACCOUNT_MESSAGES
+
+    return _PIN_MESSAGES.get(code) or _ACCOUNT_MESSAGES.get(code) or f"Refused ({code})."
 
 
 def _emit(payload: dict, as_json: bool, human: str) -> None:
@@ -278,13 +296,13 @@ def _account_status_rows(accounts, ready_key: str, ready: str, not_ready: str,
                          describe=None) -> list[tuple[str, ...]]:
     rows = []
     for account in accounts:
-        roles = [m for m, on in (("default", account["pinned"]), ("allowed", account["allowed"])) if on]
+        roles = [m for m, on in (("pinned", account["pinned"]), ("allowed", account["allowed"])) if on]
         row = (f"{printer.mark(account[ready_key])} {account['slot']}",
                f"({account['alias']})" if account["alias"] else "",
                ready if account[ready_key] else not_ready, ", ".join(roles))
-        if describe is not None:
-            # What its remote tasks may do (the account's own settings).
-            permissions = account.get("permissions")
+        if describe is not None and "permissions" in account:
+            # What its tasks may do (the account's own settings); None: they could not be read.
+            permissions = account["permissions"]
             row += (describe(permissions) if permissions is not None else "settings unreadable",)
         rows.append(row)
     return rows
@@ -297,26 +315,28 @@ def _override_line(status: dict) -> str | None:
     override = status.get("permission_override", FOLLOW)
     if override == FOLLOW:
         return None
-    return f"  {printer.mark(None)} This Mac limits every remote task: {OVERRIDE_DESCRIPTIONS[override]}."
+    return f"  {printer.mark(None)} This Mac limits every task: {OVERRIDE_DESCRIPTIONS[override]}."
 
 
 def _format_codex_status(status: dict) -> str:
-    """``codex status``: the pinned CLI, the opt-in, one row per account, then the next step."""
+    """``codex status``: the CLI, live tasks, one row per account, then the next step."""
     cli = status["cli"]
     live = status["execution_mode"] == "live"
     lines = [printer.heading("Codex for Remote tasks"), *printer.columns([
-        (f"{printer.mark(cli['installed'])} Pinned CLI",
+        (f"{printer.mark(cli['installed'])} Codex CLI",
          f"{cli['version']} (verified)" if cli["installed"] else f"not ready ({cli['problem']})"),
-        (f"{printer.mark(True if live else None)} Live execution", status["execution_mode"]),
-    ]), printer.heading("Accounts (isolated sign-in; slot and alias)")]
+        (f"{printer.mark(True if live else None)} Live tasks", "on" if live else "off"),
+    ]), printer.heading("Accounts")]
     if not status["accounts"]:
-        lines.append("  No eligible Codex accounts in the roster. Add one with `openswap codex add`.")
+        lines.append("  none (`openswap codex add` saves one)")
     lines.extend(printer.columns(_account_status_rows(status["accounts"], "isolated_sign_in",
                                                       "signed in", "not signed in", _codex_describe)))
     override = _override_line(status)
     if override is not None:
         lines.append(override)
-    lines.append(printer.next_step(_codex_next_step(status)))
+    step = _codex_next_step(status)
+    if step is not None:
+        lines.append(printer.next_step(step))
     return "\n".join(lines)
 
 
@@ -326,61 +346,64 @@ def _unchecked(status: dict, account: dict) -> bool:
     return checked is not None and account.get("account_ref") not in checked
 
 
-def _codex_next_step(status: dict) -> str:
+def _codex_next_step(status: dict) -> str | None:
+    """The one command that moves Codex forward, or ``None`` when live tasks run on every account."""
     accounts = status["accounts"]
     pinned = next((a for a in accounts if a["pinned"]), None)
     allowed = [a for a in accounts if a["allowed"] and not a["pinned"]]
     if not status["cli"]["installed"]:
-        return "install the pinned CLI: `openswap worker codex install`."
+        return "`openswap worker codex install` to install the Codex CLI."
     if pinned is None:
         # The live check runs on the pinned account: pin one first.
-        return "pin the Codex account remote jobs run on: `openswap worker account <slot>`."
+        return "`openswap worker account <slot>` to pin the account tasks run on."
     if not pinned["isolated_sign_in"]:
-        return "sign the default account in: `openswap worker codex login`."
+        return "`openswap worker codex login` to sign the pinned account in."
     unsigned = next((a for a in allowed if not a["isolated_sign_in"]), None)
     if unsigned is not None:
-        return f"sign allowed account {unsigned['slot']} in: `openswap worker codex login {unsigned['slot']}`."
+        return f"`openswap worker codex login {unsigned['slot']}` to sign account {unsigned['slot']} in."
     unreadable = next((a for a in [pinned, *allowed] if "permissions" in a and a["permissions"] is None), None)
     if unreadable is not None:
         # Every launch on it refuses until its settings are valid again.
-        return (f"set account {unreadable['slot']}'s remote-task settings again (they cannot be read): "
-                f"`openswap worker codex settings {unreadable['slot']} --copy-settings`.")
+        return (f"`openswap worker codex settings {unreadable['slot']} --copy-settings` to set account "
+                f"{unreadable['slot']}'s task settings again (they can't be read).")
     if status.get("recheck_needed"):
-        return ("run the live check again (remote tasks now follow each account's own settings): "
-                "`openswap worker live-check`.")
+        return "`openswap worker live-check` to check again (tasks now follow each account's own settings)."
     if status["execution_mode"] != "live":
-        return "run the live check and enable live execution: `openswap worker live-check`."
+        return "`openswap worker live-check` to turn on live tasks."
     unchecked = next((a for a in [pinned, *allowed] if _unchecked(status, a)), None)
     if unchecked is not None:
-        return (f"run the live check on account {unchecked['slot']} too: "
-                f"`openswap worker live-check --account {unchecked['slot']}`.")
-    return "nothing: live execution is on. `openswap worker live disable` turns it off."
+        return (f"`openswap worker live-check --account {unchecked['slot']}` to check account "
+                f"{unchecked['slot']} too.")
+    return None
 
 
-def _claude_next_step(status: dict) -> str:
+def _claude_next_step(status: dict) -> str | None:
+    """The one command that moves Claude forward, or ``None`` when live tasks run on every account."""
     accounts = status["accounts"]
     pinned = next((a for a in accounts if a["pinned"]), None)
     allowed = [a for a in accounts if a["allowed"] and not a["pinned"]]
     if not status["cli"]["pinned"]:
-        return "pin the installed Claude Code: `openswap worker claude pin`."
+        return "`openswap worker claude pin` to pin the installed Claude Code."
     if pinned is None:
-        return "pin the Claude account remote jobs run on: `openswap worker account claude:<slot>`."
+        return "`openswap worker account claude:<slot>` to pin the account tasks run on."
+    # Not ready: not signed in, or a managed Claude Code policy applies. `prepare` signs in
+    # when needed and otherwise names the policy, so it is the next step either way.
     if not pinned["profile_ready"]:
-        return "prepare the default account's profile: `openswap worker claude prepare`."
+        return "`openswap worker claude prepare` to get the pinned account ready."
     unready = next((a for a in allowed if not a["profile_ready"]), None)
     if unready is not None:
-        return (f"prepare allowed account {unready['slot']}'s profile: "
-                f"`openswap worker claude prepare claude:{unready['slot']}`.")
+        return (f"`openswap worker claude prepare claude:{unready['slot']}` to get account "
+                f"{unready['slot']} ready.")
     if status.get("recheck_needed"):
-        return ("run the live check again (remote tasks now follow each account's own settings): "
-                "`openswap worker live-check --provider claude`.")
+        return ("`openswap worker live-check --provider claude` to check again (tasks now follow each "
+                "account's own settings).")
     if status["execution_mode"] != "live":
-        return "run the live check and enable live execution: `openswap worker live-check --provider claude`."
+        return "`openswap worker live-check --provider claude` to turn on live tasks."
     unchecked = next((a for a in [pinned, *allowed] if _unchecked(status, a)), None)
     if unchecked is not None:
-        return (f"run the live check on account {unchecked['slot']} too: "
-                f"`openswap worker live-check --provider claude --account claude:{unchecked['slot']}`.")
-    return "nothing: live execution is on. `openswap worker live disable --provider claude` turns it off."
+        return (f"`openswap worker live-check --provider claude --account claude:{unchecked['slot']}` "
+                f"to check account {unchecked['slot']} too.")
+    return None
 
 
 _MUTATING = {("codex", "install"), ("codex", "login"), ("codex", "logout"), ("codex", "settings"),
@@ -598,29 +621,29 @@ def claude_status(backup_root: Path) -> dict:
 
 
 def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
-    parser = argparse.ArgumentParser(prog="openswap worker", description="Live Codex and Claude setup for Remote tasks.")
+    parser = argparse.ArgumentParser(prog="openswap worker", description="Codex, Claude Code and live tasks on this Mac.")
     commands = parser.add_subparsers(dest="command", required=True)
-    codex = commands.add_parser("codex", help="install and sign in the pinned Codex CLI for Remote tasks")
+    codex = commands.add_parser("codex", help="install and sign in the Codex CLI tasks run with")
     codex_commands = codex.add_subparsers(dest="codex_command", required=True)
-    install = codex_commands.add_parser("install", help="download and verify the official Codex CLI 0.157.1")
+    install = codex_commands.add_parser("install", help="download and verify Codex CLI 0.157.1")
     install.add_argument("--archive", type=Path, help="use an already downloaded release archive")
     install.add_argument("--json", action="store_true")
-    status = codex_commands.add_parser("status", help="re-verify the pinned CLI and list isolated sign-ins")
+    status = codex_commands.add_parser("status", help="the Codex CLI, live tasks and each account's sign-in")
     status.add_argument("--json", action="store_true")
     login_parser = codex_commands.add_parser(
-        "login", help="sign an account in to its own isolated Codex home (default: the pinned account)",
+        "login", help="sign an account in for tasks (default: the pinned one); your own login is untouched",
     )
     login_parser.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
     login_parser.add_argument("--device-auth", action="store_true", help="use Codex's device-code sign-in")
     login_parser.add_argument("--copy-settings", action="store_true",
                               help="also use your ~/.codex/config.toml approval and sandbox settings for this "
-                                   "account's remote tasks")
+                                   "account's tasks")
     login_parser.add_argument("--json", action="store_true")
     settings_parser = codex_commands.add_parser(
-        "settings", help="show or set the approval and sandbox settings an account's remote tasks follow",
-        description="Remote tasks on a Codex account follow its own approval policy, reviewer and sandbox "
-                    "mode, like `codex` run there. Nobody is at the Mac to approve, so whatever would ask is "
-                    "denied (unless the reviewer is auto_review). OpenSwap's folder rules hold in every mode.",
+        "settings", help="show or set the approval and sandbox settings an account's tasks follow",
+        description="Tasks on a Codex account follow its own approval policy, reviewer and sandbox mode, like "
+                    "`codex` run there. Nobody is at the Mac to approve, so anything that would ask is denied "
+                    "(unless the reviewer is auto_review). The folder rules hold in every mode.",
     )
     settings_parser.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
     settings_parser.add_argument("--copy-settings", action="store_true",
@@ -630,40 +653,40 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     settings_parser.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"))
     settings_parser.add_argument("--reviewer", choices=("user", "auto_review", "guardian_subagent"))
     settings_parser.add_argument("--json", action="store_true")
-    logout_parser = codex_commands.add_parser("logout", help="sign an account out of its isolated Codex home")
+    logout_parser = codex_commands.add_parser("logout", help="sign an account out of tasks")
     logout_parser.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
     logout_parser.add_argument("--json", action="store_true")
-    claude = commands.add_parser("claude", help="pin the Claude Code CLI and prepare account profiles for Remote tasks")
+    claude = commands.add_parser("claude", help="pin Claude Code and sign the account in for tasks")
     claude_commands = claude.add_subparsers(dest="claude_command", required=True)
-    claude_pin = claude_commands.add_parser("pin", help="record the installed Claude Code binary's version and SHA-256")
+    claude_pin = claude_commands.add_parser("pin", help="pin the installed Claude Code (its version and SHA-256)")
     claude_pin.add_argument("--binary", type=Path, help="pin this binary instead of the installed `claude`")
     claude_pin.add_argument("--json", action="store_true")
-    claude_status_parser = claude_commands.add_parser("status", help="re-verify the pinned binary and list profiles")
+    claude_status_parser = claude_commands.add_parser("status", help="Claude Code, live tasks and each account's sign-in")
     claude_status_parser.add_argument("--json", action="store_true")
     prepare = claude_commands.add_parser(
-        "prepare", help="prepare an account's OpenSwap session profile (default: the pinned Claude account)",
+        "prepare", help="get an account ready for tasks (default: the pinned one); your own login is untouched",
     )
     prepare.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
     prepare.add_argument("--copy-settings", action="store_true",
                          help="copy the permission mode and allow/deny/ask rules from ~/.claude/settings.json "
-                              "into the profile (remote tasks follow the profile's settings)")
+                              "for this account's tasks")
     prepare.add_argument("--mode", choices=("default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"),
-                         help="set the permission mode remote tasks on this account use")
+                         help="the permission mode tasks on this account use")
     prepare.add_argument("--json", action="store_true")
-    live = commands.add_parser("live", help="show or change the live-execution opt-in")
+    live = commands.add_parser("live", help="show, turn on or turn off live tasks")
     live_commands = live.add_subparsers(dest="live_command", required=True)
-    live_status_parser = live_commands.add_parser("status", help="show whether real jobs run")
+    live_status_parser = live_commands.add_parser("status", help="whether live tasks are on")
     live_status_parser.add_argument("--json", action="store_true")
-    enable = live_commands.add_parser("enable", help="run real jobs (needs passing live-check evidence)")
-    enable.add_argument("--evidence", type=Path, help="evidence file (default: the latest live-check)")
+    enable = live_commands.add_parser("enable", help="turn live tasks on (needs a passed live check)")
+    enable.add_argument("--evidence", type=Path, help="the live check's evidence file (default: the latest)")
     enable.add_argument("--json", action="store_true")
     disable = live_commands.add_parser(
-        "disable", help="stop launching real jobs (a running job continues; `openswap worker stop` ends it)",
+        "disable", help="turn live tasks off (a running task continues; `openswap worker stop` ends it)",
     )
     disable.add_argument("--json", action="store_true")
     for sub in (live_status_parser, enable, disable):
         sub.add_argument("--provider", choices=("codex", "claude"), default="codex",
-                         help="which provider's opt-in (default: codex)")
+                         help="Codex or Claude (default: codex)")
     args = parser.parse_args(arguments)
     root = Path(backup_root)
     try:
@@ -681,26 +704,57 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         print(_message(error.code), file=sys.stderr)
         return 1
     except ClaudeCliError as error:
-        print(_CLAUDE_MESSAGES.get(error.code, f"Refused: {error.code}."), file=sys.stderr)
+        print(_CLAUDE_MESSAGES.get(error.code, f"Refused ({error.code})."), file=sys.stderr)
         return 1
     except AccountPinError as error:
-        print(_PIN_MESSAGES.get(error.code, f"Refused: {error.code}."), file=sys.stderr)
+        print(_pin_message(error.code), file=sys.stderr)
         return 1
     except LiveModeError as error:
-        detail = f" ({', '.join(error.problems)})" if error.problems else ""
-        print(f"Refused: {error.code}{detail}.", file=sys.stderr)
+        print(_live_mode_message(error, getattr(args, "provider", "codex")), file=sys.stderr)
         return 1
-    except (AccountLeaseError, ClaudeSwitchError) as error:
-        print(f"Refused: {error}", file=sys.stderr)
+    except AccountLeaseError as error:
+        print(f"That account is in use ({error}); try again when its task has ended.", file=sys.stderr)
         return 1
+    except ClaudeSwitchError as error:
+        from openswap.worker.cli import BUSY_MESSAGE
+
+        print(BUSY_MESSAGE if str(error) == "worker_lifecycle_busy" else f"Refused ({error}).", file=sys.stderr)
+        return 1
+
+
+# Refusals with no live check to run next: the lock codes (from `live enable` or `live disable`;
+# the owner retries the same command) and an unsupported Mac, where a live check refuses too.
+_LIVE_FINAL_MESSAGES = {
+    "live_lock_unavailable": "Could not take the live-tasks lock; try again in a moment.",
+    "live_lock_busy": "Live tasks are being changed; try again in a moment.",
+    "unsupported_platform": "Live tasks run only on Apple silicon Macs.",
+}
+# The evidence and host codes come only from enabling: a new live check is the fix.
+_LIVE_EVIDENCE_MESSAGES = {
+    "evidence_unreadable": "The live check's evidence file can't be read.",
+    "evidence_invalid": "The live check's evidence file is not valid.",
+    "host_unverifiable": "This Mac could not be identified, so the evidence can't be matched to it.",
+    "evidence_not_passing": "The live check did not pass, or no longer matches this Mac.",
+}
+
+
+def _live_mode_message(error: LiveModeError, provider: str) -> str:
+    """One line: what refused the change, then the step that clears it (retry, or a new live check)."""
+    if error.code in _LIVE_FINAL_MESSAGES:
+        return _LIVE_FINAL_MESSAGES[error.code]
+    flag = " --provider claude" if provider == "claude" else ""
+    text = _LIVE_EVIDENCE_MESSAGES.get(error.code, f"Refused ({error.code}).")
+    if error.problems:
+        text = f"{text.rstrip('.')} ({', '.join(error.problems)})."
+    return f"{text} Next: `openswap worker live-check{flag}`."
 
 
 def _codex_command(root: Path, args) -> int:
     if args.codex_command == "install":
         pinned = codex_cli.install(root, archive_path=args.archive)
         _emit(pinned.to_dict(), args.json,
-              f"{printer.MARK_OK} Installed {pinned.version}; archive SHA-256 matches the published digest.\n"
-              + printer.next_step("sign the pinned account in: `openswap worker codex login`."))
+              f"{printer.MARK_OK} Installed {pinned.version} (verified).\n"
+              + printer.next_step("`openswap worker codex login` to sign the pinned account in."))
         return 0
     if args.codex_command == "status":
         status = codex_status(root)
@@ -719,22 +773,22 @@ def _codex_command(root: Path, args) -> int:
         elif not args.json and _interactive():
             settings = _offer_codex_copy(root, args.selector)
         result = login(root, args.selector, device_auth=args.device_auth, settings=settings)
-        lines = [f"{printer.MARK_OK} Codex account {result['slot']} is signed in to its isolated home. "
-                 "Your default Codex login was not changed."]
+        lines = [f"{printer.MARK_OK} Signed in Codex account {result['slot']} for tasks "
+                 "(your own Codex login is untouched)."]
         if settings is not None:
-            lines.append(f"{printer.MARK_OK} Remote tasks on it follow {_codex_describe(result['permissions'])}.")
+            lines.append(f"{printer.MARK_OK} Its tasks follow {_codex_describe(result['permissions'])}.")
         _emit(result, args.json, "\n".join(lines) + "\n"
-              + printer.next_step("run the live check: `openswap worker live-check`."))
+              + printer.next_step("`openswap worker live-check` to turn on live tasks."))
         return 0
     if args.codex_command == "settings":
         result = codex_settings(root, args.selector, copy_settings=args.copy_settings, approval=args.approval,
                                 sandbox=args.sandbox, reviewer=args.reviewer)
         verb = "now follow" if result["changed"] else "follow"
-        _emit(result, args.json, f"{printer.MARK_OK} Remote tasks on Codex account {result['slot']} {verb} "
+        _emit(result, args.json, f"{printer.MARK_OK} Tasks on Codex account {result['slot']} {verb} "
                                  f"{_codex_describe(result['permissions'])}.\n" + _HEADLESS_NOTE)
         return 0
     result = logout(root, args.selector)
-    _emit(result, args.json, f"{printer.MARK_OK} Codex account {result['slot']} is signed out of its isolated home.")
+    _emit(result, args.json, f"{printer.MARK_OK} Signed out Codex account {result['slot']}.")
     return 0
 
 
@@ -743,12 +797,13 @@ _CLAUDE_MESSAGES = {
                             "deny rules. Update it, then run `openswap worker claude pin` again."),
     "unsupported_platform": "Remote tasks run Claude Code only on Apple silicon Macs.",
     "not_installed": "Claude Code is not installed. Install it, then run `openswap worker claude pin`.",
-    "not_pinned": "No Claude Code binary is pinned. Run `openswap worker claude pin`.",
-    "binary_changed": ("Claude Code changed since it was pinned (an update). Run `openswap worker claude pin` "
-                       "and `openswap worker live-check --provider claude` again."),
-    "binary_permissions": "The Claude Code binary is writable by others; it can't be pinned.",
-    "binary_in_claude_config": ("That Claude Code is installed inside ~/.claude, which remote jobs can't read. "
-                                "Install it with Homebrew or the native installer, then pin again."),
+    "not_pinned": "Claude Code is not pinned. Next: `openswap worker claude pin`.",
+    "binary_changed": ("Claude Code was updated since it was pinned. Next: `openswap worker claude pin`, then "
+                       "`openswap worker live-check --provider claude`."),
+    "binary_permissions": "That Claude Code is writable by other users, so it can't be pinned.",
+    "binary_in_claude_config": ("That Claude Code is inside ~/.claude, which tasks can't read. Install it with "
+                                "Homebrew or the native installer, then pin again."),
+    "version_unrecognized": "That Claude Code did not report a version. Reinstall it, then pin again.",
 }
 
 
@@ -758,30 +813,27 @@ def _claude_command(root: Path, args) -> int:
     if args.claude_command == "pin":
         pinned = claude_cli.pin(root, binary=args.binary)
         _emit(pinned.to_dict(), args.json,
-              f"{printer.MARK_OK} Pinned Claude Code {pinned.version} ({pinned.binary_sha256[:12]}…).\n"
-              + printer.next_step("prepare the account's profile: `openswap worker claude prepare`, then "
-                                  "`openswap worker live-check --provider claude`."))
+              f"{printer.MARK_OK} Pinned Claude Code {pinned.version}.\n"
+              + printer.next_step("`openswap worker claude prepare` to sign the pinned account in."))
         return 0
     if args.claude_command == "status":
         status = claude_status(root)
         _emit(status, args.json, _format_claude_status(status))
         return 0 if status["cli"]["pinned"] else 1
     if not args.json:
-        print("If that account is not signed in to its OpenSwap profile yet, Claude Code opens its own "
-              "sign-in in your browser.")
+        print("Claude Code may open its sign-in in your browser; your own Claude login is untouched.")
     decide = _ask_claude_settings if not args.json and _interactive() else None
     result = claude_prepare(root, args.selector, copy_settings=args.copy_settings, mode=args.mode, decide=decide)
     permissions = result.get("permissions") or {}
-    _emit(result, args.json, f"{printer.MARK_OK} Claude account {result['slot']}'s OpenSwap profile is ready "
-                             "for remote jobs. Your default Claude login was not changed.\n"
-                             f"{printer.MARK_OK} Remote tasks on it follow its own settings: "
-                             f"{_claude_describe(permissions)}.\n" + _HEADLESS_NOTE + "\n"
-                             + printer.next_step("run the live check: `openswap worker live-check --provider claude`."))
+    _emit(result, args.json, f"{printer.MARK_OK} Claude account {result['slot']} is signed in for tasks.\n"
+                             f"{printer.MARK_OK} Its tasks follow its own settings: {_claude_describe(permissions)}.\n"
+                             + _HEADLESS_NOTE + "\n"
+                             + printer.next_step("`openswap worker live-check --provider claude` to turn on live tasks."))
     return 0
 
 
 _HEADLESS_NOTE = ("Nobody is at this Mac to approve, so anything that would ask is denied. "
-                  "`openswap worker permissions` can limit every remote task on this Mac.")
+                  "`openswap worker permissions` can limit every task on this Mac.")
 
 
 def _interactive() -> bool:
@@ -821,18 +873,18 @@ def _ask_claude_settings(current, default) -> tuple[bool, str | None]:
     if default is not None:
         summary = ClaudePermissions(default.get("defaultMode"), len(default.get("allow", [])),
                                     len(default.get("deny", [])), len(default.get("ask", []))).describe()
-        copy = _yes(f"Remote tasks follow this account's own Claude Code permission settings. Copy yours "
+        copy = _yes(f"Tasks follow this account's own Claude Code permission settings. Copy yours "
                     f"from ~/.claude/settings.json ({summary})?")
     mode_now = ((default or {}).get("defaultMode") if copy else None) or "Claude Code's default"
     try:
-        answer = input(f"Permission mode for remote tasks on this account ({', '.join(CLAUDE_MODES)}; "
+        answer = input(f"Permission mode for tasks on this account ({', '.join(CLAUDE_MODES)}; "
                        f"Enter keeps {mode_now}): ").strip()
     except EOFError:
         answer = ""
     mode = answer if answer in CLAUDE_MODES else None
     if answer and mode is None:
-        print(f"Not a mode; keeping {mode_now}. Change it later with "
-              "`openswap worker claude prepare --mode <mode>`.")
+        print(f"Not a mode; keeping {mode_now}. Next: `openswap worker claude prepare --mode <mode>` "
+              "to change it later.")
     return copy, mode
 
 
@@ -852,55 +904,55 @@ def _offer_codex_copy(root: Path, selector: str | None):
     default = default_codex_permissions()
     if default is None:
         return None
-    if not _yes(f"Remote tasks follow this account's Codex approval and sandbox settings. Use yours from "
+    if not _yes(f"Tasks follow this account's Codex approval and sandbox settings. Use yours from "
                 f"~/.codex/config.toml ({default.describe()})?"):
         return None
     return default
 
 
 def _format_claude_status(status: dict) -> str:
-    """``claude status``: the pinned binary, the opt-in, one row per account, then the next step."""
+    """``claude status``: Claude Code, live tasks, one row per account, then the next step."""
     cli = status["cli"]
     live = status["execution_mode"] == "live"
     lines = [printer.heading("Claude Code for Remote tasks"), *printer.columns([
-        (f"{printer.mark(cli['pinned'])} Pinned binary",
+        (f"{printer.mark(cli['pinned'])} Claude Code",
          f"{cli['version']} (verified)" if cli["pinned"] else f"not ready ({cli['problem']})"),
-        (f"{printer.mark(True if live else None)} Live execution", status["execution_mode"]),
-    ]), printer.heading("Accounts (OpenSwap profile; pin with `claude:<slot>`)")]
+        (f"{printer.mark(True if live else None)} Live tasks", "on" if live else "off"),
+    ]), printer.heading("Accounts (pin with claude:<slot>)")]
     if not status["accounts"]:
-        lines.append("  No eligible Claude accounts in the roster. Add one with `openswap add`.")
+        lines.append("  none (`openswap add` saves one)")
     lines.extend(printer.columns(_account_status_rows(status["accounts"], "profile_ready",
-                                                      "profile ready", "profile not prepared", _claude_describe)))
+                                                      "ready", "not ready", _claude_describe)))
     override = _override_line(status)
     if override is not None:
         lines.append(override)
-    lines.append(printer.next_step(_claude_next_step(status)))
+    step = _claude_next_step(status)
+    if step is not None:
+        lines.append(printer.next_step(step))
     return "\n".join(lines)
 
 
 def _live_command(root: Path, args) -> int:
     provider = args.provider
+    name = "Claude" if provider == "claude" else "Codex"
     flag = " --provider claude" if provider == "claude" else ""
     if args.live_command == "status":
         status = live_status(root, provider)
         live = status["execution_mode"] == "live"
-        human = f"{printer.mark(True if live else None)} Live execution ({provider}): {status['execution_mode']}"
+        human = f"{printer.mark(True if live else None)} Live tasks ({name}): {'on' if live else 'off'}"
         if not live:
-            human += "\n" + printer.next_step(f"run the live check and enable live execution: "
-                                               f"`openswap worker live-check{flag}`.")
+            human += "\n" + printer.next_step(f"`openswap worker live-check{flag}` to turn them on.")
         _emit(status, args.json, human)
         return 0
     if args.live_command == "disable":
         disable_live(root, provider)
         status = live_status(root, provider)
-        _emit(status, args.json, f"{printer.MARK_OK} Live execution is off: no new job will launch (they fail with "
-                                 "live_adapter_disabled). A job already running continues; "
+        _emit(status, args.json, f"{printer.MARK_OK} Live tasks are off for {name}. A running task continues; "
                                  "`openswap worker stop` ends it.")
         return 0
     evidence = args.evidence or latest_evidence(root, provider)
     if evidence is None:
-        print(f"No {provider} live-check evidence found. Run `openswap worker live-check --provider {provider}` first.",
-              file=sys.stderr)
+        print(f"No live check has run for {name} yet. Next: `openswap worker live-check{flag}`.", file=sys.stderr)
         return 1
     if provider == "claude":
         from openswap.worker import claude_cli
@@ -910,9 +962,6 @@ def _live_command(root: Path, args) -> int:
         pinned = codex_cli.verify(root)
     enable_live(root, evidence, pinned, provider)
     status = live_status(root, provider)
-    text = ("Live execution is on for Claude: remote jobs on Claude accounts run the pinned Claude Code on "
-            "their OpenSwap profile." if provider == "claude" else
-            "Live execution is on: remote jobs run with the pinned Codex CLI on the isolated sign-in of their account.")
-    _emit(status, args.json, f"{printer.MARK_OK} {text} `openswap worker live disable --provider {provider}` "
-                             "turns it off.")
+    _emit(status, args.json, f"{printer.MARK_OK} Live tasks are on for {name}. "
+                             f"`openswap worker live disable{flag}` turns them off.")
     return 0

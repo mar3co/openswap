@@ -2518,7 +2518,7 @@ class SwitchMixin:
                 self.list_accounts()
             except Exception as e:
                 self._logger.warning(f"Post-switch usage display failed: {e!r}")
-                print(dimmed("  (usage display unavailable — run `openswap --list` to retry)"))
+                print(dimmed("  (usage display unavailable — run `openswap list` to retry)"))
             print()
             self._print_switch_followup()
             print()

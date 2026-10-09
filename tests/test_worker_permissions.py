@@ -275,7 +275,7 @@ def test_the_permissions_command_shows_and_sets_the_limit(tmp_path, capsys):
     assert "follow each account's own Claude or Codex permission settings (the default)" in capsys.readouterr().out
     assert cli.main(["permissions", "no-shell"], backup_root=tmp_path) == 0
     out = capsys.readouterr().out
-    assert "This Mac limits every remote task: no shell commands" in out and "next task" in out
+    assert "This Mac limits every task: no shell commands" in out and "next task" in out
     assert cli.main(["permissions", "--json"], backup_root=tmp_path) == 0
     assert json.loads(capsys.readouterr().out) == {"permission_override": "no-shell"}
     with pytest.raises(SystemExit):
@@ -352,14 +352,14 @@ def test_an_opt_in_from_before_this_change_no_longer_runs_jobs(tmp_path, monkeyp
     assert status["recheck_needed"] is True and status["execution_mode"] == "disabled"
     text = live_cli._codex_next_step({**status, "cli": {"installed": True}, "accounts": [
         {"pinned": True, "allowed": True, "isolated_sign_in": True, "slot": "1", "account_ref": "x"}]})
-    assert "run the live check again" in text
+    assert "`openswap worker live-check` to check again" in text
     monkeypatch.setattr(live, "_HOST_CACHE", {})
 
 
 def test_codex_status_sends_the_owner_to_repair_unreadable_settings():
     account = {"pinned": True, "allowed": True, "isolated_sign_in": True, "slot": "1", "account_ref": "x"}
     live_ok = {"cli": {"installed": True}, "execution_mode": "live", "checked_accounts": ["x"]}
-    assert live_cli._codex_next_step({**live_ok, "accounts": [{**account, "permissions": {}}]}).startswith("nothing")
+    assert live_cli._codex_next_step({**live_ok, "accounts": [{**account, "permissions": {}}]}) is None
     text = live_cli._codex_next_step({**live_ok, "accounts": [{**account, "permissions": None}]})
     assert "openswap worker codex settings 1 --copy-settings" in text
 

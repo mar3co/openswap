@@ -82,23 +82,23 @@ def _run(root: Path, *argv: str) -> int:
 def test_account_list_marks_the_pin_and_lists_claude_accounts(root, capsys):
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
-    assert "Codex accounts (pin with the slot number, email or alias)" in out
+    assert "Codex (pin by slot, email or alias)" in out
     assert "  • 1  alice@example.com   (work)" in out
-    assert "  ✗ 3  (no email)                  not eligible: no ChatGPT account ID (API key)" in out
-    assert "Claude accounts (pin with `claude:<slot>`)" in out
+    assert "  ✗ 3  (no email)                  API key: can't be pinned" in out
+    assert "Claude (pin with claude:<slot>)" in out
     assert "  • 4  carol@example.com  (claudey)" in out
-    assert "No account pinned" in out
-    assert "Next: pin an account, for example `openswap worker account 1`" in out
-    assert SECRET not in out
+    assert "Next: `openswap worker account 1` to pin the account tasks run on." in out
+    assert "Also allowed" not in out and SECRET not in out
 
     assert _run(root, "account", "2") == 0
     out = capsys.readouterr().out
-    assert "✓ Remote tasks will use Codex account 2 · bob@example.com from the next job." in out
-    assert "Next: `openswap worker codex install` and `openswap worker live-check` before jobs run." in out
+    assert "✓ Pinned Codex 2 · bob@example.com." in out
+    assert "Next: `openswap worker codex install`, then `openswap worker live-check` to turn on live tasks." in out
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
-    assert "  ✓ 2  bob@example.com             pinned; out of rotation" in out
-    assert "Pinned: Codex 2 · bob@example.com. Change it with" in out and "Next:" not in out
+    assert "  ✓ 2  bob@example.com             pinned, out of rotation" in out
+    # Pinned: the one next step is the Codex live-check path, nothing else restated.
+    assert out.count("Next:") == 1 and out.endswith("to turn on live tasks.\n")
 
 
 def test_account_list_json_is_metadata_only(root, capsys):
@@ -121,7 +121,7 @@ def test_account_list_json_is_metadata_only(root, capsys):
 @pytest.mark.parametrize("selector", ["1", "alice@example.com", "work", ALICE])
 def test_account_pins_a_codex_slot_by_number_email_alias_or_reference(root, capsys, selector):
     assert _run(root, "account", selector) == 0
-    assert "Remote tasks will use Codex account 1 · alice@example.com (work)" in capsys.readouterr().out
+    assert "✓ Pinned Codex 1 · alice@example.com (work)." in capsys.readouterr().out
     assert load_worker_settings(root).pinned_account_ref == ALICE
 
 
@@ -148,7 +148,8 @@ def test_account_clear_and_json_pin(root, capsys):
         "provider": "codex", "number": "2", "email": "bob@example.com", "alias": None, "account_ref": BOB,
     }}
     assert _run(root, "account", "--clear") == 0
-    assert "Cleared" in capsys.readouterr().out
+    # A task that picks an allowed account still runs without a pin; only the others wait.
+    assert "✓ Pin removed; tasks that don't pick an allowed account fail until you pin an account." in capsys.readouterr().out
     assert load_worker_settings(root).pinned_account_ref is None
 
 
@@ -190,7 +191,7 @@ def test_a_claude_account_pins_as_a_typed_claude_reference(root, capsys, selecto
     """Owner decision 2026-10-07: Claude accounts are eligible. A bare selector is
     a Codex slot first, so slot 1 needs ``claude:1``; the pin is ``claude:``-typed."""
     assert _run(root, "account", selector) == 0
-    assert "Remote tasks will use Claude account" in capsys.readouterr().out
+    assert "✓ Pinned Claude " in capsys.readouterr().out
     assert load_worker_settings(root).pinned_account_ref == expected
 
 
@@ -246,7 +247,9 @@ def test_a_removed_pinned_account_is_reported(root, capsys):
     del roster["accounts"]["1"]
     (root / "codex" / "sequence.json").write_text(json.dumps(roster))
     assert _run(root, "account") == 0
-    assert "no longer in the Codex roster" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "✗ The pinned account is gone; tasks that don't pick an allowed account fail until you pin another." in out
+    assert "Next: `openswap worker account 2` to pin an account." in out
     assert _run(root, "account", "--json") == 0
     assert json.loads(capsys.readouterr().out)["pinned_missing"] is True
 
@@ -257,7 +260,7 @@ def test_a_removed_pinned_account_is_reported(root, capsys):
 def test_workspace_add_list_remove(root, tmp_path, capsys):
     folder = tmp_path / "research-a"
     assert _run(root, "workspace", "add", "tag-research", str(folder)) == 0
-    assert "as workspace 'tag-research'" in capsys.readouterr().out
+    assert 'as "tag-research" (tasks write their results there).' in capsys.readouterr().out
     assert folder.is_dir()
     if os.name == "posix":
         assert folder.stat().st_mode & 0o777 == 0o700
@@ -268,7 +271,7 @@ def test_workspace_add_list_remove(root, tmp_path, capsys):
     assert listed[1]["output_root"] == str(folder.resolve())
 
     assert _run(root, "workspace", "remove", "research") == 0
-    assert "folder and files are unchanged" in capsys.readouterr().out
+    assert '✓ Removed "research" (its files are kept).' in capsys.readouterr().out
     assert _run(root, "workspace", "remove", "tag-research", "--json") == 1
     assert json.loads(capsys.readouterr().out)["diagnostic_code"] == "last_workspace"
     assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["tag-research"]
@@ -577,7 +580,7 @@ def test_status_hints_at_enable_when_paired_but_off(root, monkeypatch, capsys, s
     configure_worker_service(root, "https://tag.example.com", "worker-1")
     out = _status(root, monkeypatch, capsys, snapshot)
     assert out.splitlines()[-1] == (
-        "Next: paired with https://tag.example.com but the worker is off; run `openswap worker enable`."
+        "Next: `openswap worker enable` to start the worker (paired with https://tag.example.com)."
     )
 
 
@@ -589,8 +592,8 @@ def test_status_has_no_hint_when_unpaired_or_running(root, monkeypatch, capsys, 
     if paired:
         configure_worker_service(root, "https://tag.example.com", "worker-1")
     out = _status(root, monkeypatch, capsys, snapshot)
-    assert "paired with" not in out and len(out.splitlines()) == 7
-    assert out.splitlines()[0] == "Remote tasks worker"
+    assert "paired with" not in out and len(out.splitlines()) == 6
+    assert out.splitlines()[0] == "Remote tasks"
 
 
 def test_status_json_is_unchanged_when_paired_but_off(root, monkeypatch, capsys):

@@ -282,13 +282,14 @@ def test_pair_when_already_enabled_toggles_nothing(root, keychain, monkeypatch, 
 
 
 @pytest.mark.parametrize("error, expected", [
-    (cli.ClaudeSwitchError("kickoff_in_progress"), "Could not enable worker (kickoff_in_progress)."),
+    (cli.ClaudeSwitchError("kickoff_in_progress"),
+     "Could not start the worker: a scheduled kickoff is running; try again in a moment (kickoff_in_progress)."),
     (cli.ClaudeSwitchError("worker_stop_unconfirmed"),
-     "Worker is still stopping; wait for it to exit before enabling (worker_stop_unconfirmed)."),
+     "Could not start the worker: it is still stopping; try again in a moment (worker_stop_unconfirmed)."),
     # Detail that is not one of enable_worker's codes (paths, launchctl text) is not echoed.
     (cli.ClaudeSwitchError("Could not write the worker LaunchAgent: /Users/someone/secret"),
-     "Could not enable worker."),
-    (OSError("disk"), "Could not enable worker."),
+     "Could not start the worker."),
+    (OSError("disk"), "Could not start the worker."),
 ])
 def test_pair_reports_a_refused_enable_and_the_manual_command(root, keychain, monkeypatch, capsys, error, expected):
     def refuse(_root):
@@ -331,12 +332,15 @@ def test_summary_is_ready_only_when_admission_is_open(root, monkeypatch, capsys,
     assert _setup(root, monkeypatch, ["", "y", ""]) == 0
     out = capsys.readouterr().out
     assert "  ✗ Worker      running (paused)" in out
-    assert "Next: `openswap worker pause --off` to resume." in out
-    assert guided_setup.EXECUTION_OFF_NOTE not in out
+    # Paused is what the live check needs: it is named directly, with no resume first.
+    assert "pause --off" not in out and guided_setup.EXECUTION_OFF_NOTE in out
+    assert "`openswap worker pause`," not in out
     update_worker_settings(root, paused=False)
     assert _setup(root, monkeypatch, ["", ""]) == 0
     out = capsys.readouterr().out
-    assert "  ✓ Worker      running\n" in out and guided_setup.EXECUTION_OFF_NOTE in out
+    # Taking tasks: the live check refuses until the worker is paused, so that comes first.
+    assert "  ✓ Worker      running\n" in out
+    assert "Next: `openswap worker pause`, then `openswap worker live-check` to turn on live tasks." in out
 
 
 @pytest.mark.parametrize(("process", "loaded", "worker"), [
@@ -409,7 +413,7 @@ def test_a_paired_worker_is_ready_only_while_online(root, monkeypatch, capsys, r
     assert guided_setup.readiness(root).missing == ((step,) if step else ())
     guided_setup.summary(root, _Say(), start_wait_s=0)
     out = capsys.readouterr().out
-    assert (guided_setup.EXECUTION_OFF_NOTE in out) is (step is None)
+    assert (guided_setup.PAUSE_FIRST + guided_setup.EXECUTION_OFF_NOTE.removeprefix("Next: ") in out) is (step is None)
 
 
 def test_summary_waits_briefly_for_the_service_connection(root, monkeypatch, capsys, research_home):
@@ -423,7 +427,8 @@ def test_summary_waits_briefly_for_the_service_connection(root, monkeypatch, cap
     monkeypatch.setattr(guided_setup.time, "sleep", lambda _s: None)
     guided_setup.summary(root, _Say())
     out = capsys.readouterr().out
-    assert f"  ✓ Paired      {URL} (online)" in out and guided_setup.EXECUTION_OFF_NOTE in out
+    assert f"  ✓ Paired      {URL} (online)" in out
+    assert out.rstrip().endswith(guided_setup.execution_off_note("codex", pause_first=True))
 
 
 def test_allowed_accounts_without_a_pinned_default_are_not_ready(root, monkeypatch):
@@ -897,7 +902,7 @@ def test_status_and_summary_name_the_refused_workspaces(root, research_home, mon
     assert ('✗ "a" is blocked (folder_overlaps_readable). '
             + cli._WORKSPACE_MESSAGES["folder_overlaps_readable"]) in out
     assert '"b" is blocked (readonly_source_overlaps_results)' in out
-    assert "Next: fix or remove those workspaces" in out
+    assert "Next: `openswap worker workspace remove <id>` to drop a blocked folder" in out
     assert _run(root, "status", "--json") == 0
     assert json.loads(capsys.readouterr().out)["refused_workspaces"] == [
         {"workspace_id": "a", "diagnostic_code": "folder_overlaps_readable"},
@@ -966,7 +971,7 @@ def test_workspace_add_read_makes_the_same_workspace_as_the_setup(root, capsys, 
         "readonly_roots": [str(github.resolve())],
     }
     assert _run(root, "workspace", "add", "--read", str(github)) == 0
-    assert "is already readable as workspace 'github'." in capsys.readouterr().out
+    assert '• ~/GitHub is already added as "github".' in capsys.readouterr().out
     assert len(load_worker_settings(root).workspaces) == 1
     assert _run(root, "workspace", "add", "--read", str(research_home.parent), "--json") == 1
     assert json.loads(capsys.readouterr().out) == {"accepted": False, "diagnostic_code": "readable_home"}
@@ -980,7 +985,7 @@ def test_workspace_add_read_and_the_positional_form_are_exclusive(root, capsys, 
     assert _builtin(root)
     # The positional form is unchanged: the folder is where results are written.
     assert _run(root, "workspace", "add", "docs", str(tmp_path / "docs")) == 0
-    assert "Approved research folder" in capsys.readouterr().out
+    assert '✓ Added ' in capsys.readouterr().out
 
 
 def test_the_default_replaces_only_the_builtin_folder_and_not_while_in_use(root, monkeypatch, research_home):
@@ -1587,7 +1592,7 @@ def test_setup_pins_a_claude_account_and_points_at_the_claude_live_check(root, k
         "enabled": True, "process_state": "running", "remote_connectivity": "online"})
     guided_setup.summary(root, _Say(), start_wait_s=0)
     out = capsys.readouterr().out
-    assert out.rstrip().endswith(guided_setup.CLAUDE_EXECUTION_OFF_NOTE)
+    assert out.rstrip().endswith(guided_setup.execution_off_note("claude", pause_first=True))
     assert guided_setup.EXECUTION_OFF_NOTE not in out
     for command in ("openswap worker claude pin", "openswap worker claude prepare",
                     "openswap worker live-check --provider claude"):

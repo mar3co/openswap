@@ -206,8 +206,7 @@ def test_disable_waits_for_manual_worker_and_enable_refuses_held_instance_lock(
 
         assert exit_code == 1
         assert capsys.readouterr().err == (
-            "Worker stop is not confirmed; it remains disabled and "
-            "admission-paused. Wait for it to exit before enabling.\n"
+            "The worker is still stopping; wait a moment before `openswap worker enable`.\n"
         )
         policy = load_worker_settings(tmp_path)
         assert policy.enabled is False
@@ -288,9 +287,11 @@ def test_blocked_disable_reports_the_persisted_opt_in(
 
     assert cli.main(["disable"], backup_root=tmp_path) == 1
 
-    state = "enabled" if enabled else "disabled"
+    state = "on" if enabled else "off"
     assert capsys.readouterr().err == (
-        f"Worker remains {state} and admission-paused (lease_state_unknown).\n"
+        f"Not stopped: an account may still be in use (lease_state_unknown). Remote tasks stay {state}, "
+        "paused. Next: `openswap worker lease release` or `openswap worker lease release --provider claude` "
+        "(whichever is held) to free it.\n"
     )
 
 
@@ -349,7 +350,7 @@ def test_manual_run_refuses_while_the_launch_agent_is_loaded(tmp_path: Path, mon
         lambda root, **kwargs: real_run_worker(root, runtime_factory=factory, **kwargs),
     )
     assert cli.main(["run"], backup_root=tmp_path) == 1
-    assert "LaunchAgent is running the worker" in capsys.readouterr().err
+    assert "already running in the background" in capsys.readouterr().err
     assert started == []
 
     # The LaunchAgent's own start passes --managed and is not refused.
@@ -373,7 +374,7 @@ def test_enable_refuses_invalid_pinned_account_without_installing(
 
     assert exit_code == 1
     assert capsys.readouterr().err == (
-        "Worker configuration is invalid; fix local worker settings before enabling.\n"
+        "Could not start the worker: its settings are invalid (the pinned account or a folder).\n"
     )
     assert installs == []
     assert load_worker_settings(tmp_path).enabled is False

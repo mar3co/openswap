@@ -333,8 +333,7 @@ def lease_release_hint(lease) -> str:
     provider = str(getattr(lease, "account_identity", "") or "").split(":", 1)[0]
     flag = " --provider claude" if provider == "claude" else ""
     name = "A Claude" if provider == "claude" else "A Codex"
-    return (f"{name} account lease is held. Resolve it first "
-            f"(`openswap worker lease release{flag}`).")
+    return f"{name} account is still held by an earlier task. Next: `openswap worker lease release{flag}`."
 
 
 WC_CONTROL_BYTES = 37  # size of the wc positive-control file
@@ -599,14 +598,13 @@ class LiveCheck:
             raise CheckRefused("unsupported_platform", "The live check needs an Apple silicon Mac.")
         snapshot = read_worker_snapshot(self.root)
         if snapshot.active_job is not None:
-            raise CheckRefused("job_active", "A worker job is active. Wait for it or stop it first.")
+            raise CheckRefused("job_active", "A task is running. Wait for it, or `openswap worker stop` ends it.")
         if not snapshot.paused and snapshot.process_state.value != "stopped":
             # Running, or stale/unavailable (it may still be running and could
             # admit a job mid-check): only a paused or confirmed-stopped worker
             # cannot race the check for the account.
-            raise CheckRefused("worker_running", "The worker is running (or its state cannot be read). "
-                                                 "Pause it first: `openswap worker pause` "
-                                                 "(reopen with `--off`).")
+            raise CheckRefused("worker_running", "The worker is taking tasks. Next: `openswap worker pause` "
+                                                 "(`--off` resumes afterwards).")
         lease = self.leases.read_current()
         if lease is not None and lease.state != "released":
             raise CheckRefused("lease_held", lease_release_hint(lease))
@@ -614,24 +612,23 @@ class LiveCheck:
             pinned = self._verify(check_version=True)
         except codex_cli.CodexCliError as error:
             if error.code != "not_installed" or install is None or not install():
-                raise CheckRefused("cli_" + error.code, "The pinned Codex CLI is not ready "
-                                   f"({error.code}). Run `openswap worker codex install`.") from None
+                raise CheckRefused("cli_" + error.code, f"The Codex CLI is not ready ({error.code}). "
+                                   "Next: `openswap worker codex install`.") from None
             pinned = self._verify(check_version=True)
         try:
             choice = resolve_codex_selector(
                 self.root, self.selector or load_worker_settings(self.root).pinned_account_ref or "")
         except AccountPinError as error:
-            raise CheckRefused("account_" + error.code, "Choose the account first: "
-                               "`openswap worker account <slot>` or pass --account.") from None
+            raise CheckRefused("account_" + error.code, "No account to check. Next: "
+                               "`openswap worker account <slot>`, or pass --account.") from None
         identity = choice.account_ref
         home = isolated_home(self.root, identity)
         if home_identity(home) != identity:
             if login is None or not login(choice):
                 raise CheckRefused("account_not_signed_in", f"Codex account {choice.number} is not signed in "
-                                   "to its isolated home. Run `openswap worker codex login "
-                                   f"{choice.number}`.")
+                                   f"for tasks. Next: `openswap worker codex login {choice.number}`.")
             if home_identity(home) != identity:
-                raise CheckRefused("account_not_signed_in", "The isolated sign-in did not complete.")
+                raise CheckRefused("account_not_signed_in", "The sign-in did not complete. Try again.")
         gate = self.gates["pinned_cli"]
         gate.passed = pinned.version == codex_cli.CODEX_VERSION_OUTPUT
         gate.detail = {"version": pinned.version, "archive_sha256": pinned.archive_sha256,
@@ -654,8 +651,8 @@ class LiveCheck:
                     # evidence gathered next to it would prove nothing.
                     raise CheckRefused(
                         "leftover_not_stopped",
-                        "A job from an earlier live check could not be proven stopped. Restart this Mac "
-                        "(a reboot is proof), then run the check again.")
+                        "A task from an earlier live check may still be running. Restart this Mac, "
+                        "then run the check again.")
 
     def _gate_tool_surface_static(self, pinned, home: Path) -> dict:
         cwd = self._workspace("static")
@@ -1418,8 +1415,7 @@ class LiveCheck:
         except (OSError, JournalError, ClaudeSwitchError):
             held = False
         if not held:
-            raise CheckRefused("worker_busy", "Another worker command is changing the worker right now. "
-                                              "Try again in a moment.")
+            raise CheckRefused("worker_busy", "Another worker change is in progress; try again in a moment.")
         try:
             return self._run_gates(install=install, login=login)
         finally:
@@ -1561,34 +1557,69 @@ def _ask(question: str) -> bool:
         return False
 
 
-def _format(evidence: dict) -> str:
+# What each gate proves, in the owner's words (the evidence file keeps the gate names).
+GATE_NAMES = {
+    "pinned_cli": "the pinned CLI",
+    "account_identity": "the account",
+    "default_login_unchanged": "your own login untouched",
+    "tool_surface": "tools",
+    "sandbox_wrapper": "sandbox",
+    "research_run": "a research task",
+    "sandbox_exec": "sandbox (a task)",
+    "stop": "stop",
+    "kill_recovery": "kill recovery",
+    "worktree": "worktree",
+    "permissions": "permissions",
+    "sign_in_isolation": "sign-in isolation",
+}
+
+
+def _gate_detail(gate: dict) -> str:
+    """The gate's findings on one line, ``key: value`` pairs; empty when it only passed."""
+    items = [(key, value) for key, value in gate.items()
+             if key not in {"passed", "steps_ran"} and value not in (True, None)]
+    return "; ".join(f"{key}: {value}" for key, value in items)
+
+
+def _format(evidence: dict, *, verbose: bool = False) -> str:
+    """The gates: one line of the passed ones, one line per failed gate with its findings.
+
+    With ``verbose``, one line per gate, each with its findings.
+    """
     from openswap import printer
 
+    gates = evidence["gates"]
+    results = [(name, gates[name].get("passed") is True) for name in REQUIRED_GATES]
+    if verbose:
+        rows = [(f"{printer.mark(passed)} {'passed' if passed else 'failed'}", GATE_NAMES.get(name, name),
+                 _gate_detail(gates[name])) for name, passed in results]
+        return "\n".join(printer.columns(rows))
     lines = []
-    for name in REQUIRED_GATES:
-        gate = evidence["gates"][name]
-        passed = gate.get("passed") is True
-        lines.append(f"  {printer.mark(passed)} {'PASS' if passed else 'FAIL'}  {name}")
-        if not passed:
-            for key, value in gate.items():
-                if key != "passed" and value not in (True, None) and key != "steps_ran":
-                    lines.append(f"            {key}: {value}")
+    passed = [GATE_NAMES.get(name, name) for name, ok in results if ok]
+    if passed:
+        lines.append(f"  {printer.MARK_OK} passed: {', '.join(passed)}")
+    for name, ok in results:
+        if not ok:
+            detail = _gate_detail(gates[name])
+            lines.append(f"  {printer.MARK_BAD} failed: {GATE_NAMES.get(name, name)}" + (f" ({detail})" if detail else ""))
     return "\n".join(lines)
 
 
 def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     parser = argparse.ArgumentParser(
         prog="openswap worker live-check",
-        description="Run short real Codex or Claude jobs on the pinned account and record phase-1 live evidence.",
+        description="Run a few short real tasks on the pinned account here and record the evidence that "
+                    "turns live tasks on.",
     )
-    parser.add_argument("--account", metavar="SLOT|EMAIL|ALIAS", help="check this account (default: the pin)")
+    parser.add_argument("--account", metavar="SLOT|EMAIL|ALIAS", help="check this account (default: the pinned one)")
     parser.add_argument("--provider", choices=("codex", "claude"),
-                        help="which provider to check (default: the account's)")
+                        help="Codex or Claude (default: the account's kind)")
     parser.add_argument("--output", type=Path, help="also copy the evidence file here")
-    parser.add_argument("--yes", action="store_true", help="do not ask before running the real jobs")
+    parser.add_argument("--yes", action="store_true", help="do not ask before running the real tasks")
     choice = parser.add_mutually_exclusive_group()
-    choice.add_argument("--enable", action="store_true", help="enable live execution if every gate passes")
-    choice.add_argument("--no-enable", action="store_true", help="never offer to enable live execution")
+    choice.add_argument("--enable", action="store_true", help="turn live tasks on if every gate passes")
+    choice.add_argument("--no-enable", action="store_true", help="never offer to turn live tasks on")
+    parser.add_argument("--verbose", action="store_true", help="show every gate with its findings")
     parser.add_argument("--json", action="store_true", help="print the evidence as JSON")
     parser.add_argument("--child", help=argparse.SUPPRESS)
     args = parser.parse_args(arguments[1:] if arguments[:1] == ["live-check"] else arguments)
@@ -1602,20 +1633,19 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     # With --json, stdout carries only the evidence object; everything else is stderr.
     say = (lambda message: print(message, file=sys.stderr)) if args.json else print
     if not args.yes:
-        say("The live check runs short, real Codex or Claude jobs on the selected account (they use some of its "
-            "quota), checks the sandbox and Stop, and writes an evidence file. It takes about 5 to 15 minutes.")
+        say("The live check runs a few short real tasks on the account (some quota; about 5 to 15 minutes).")
         if not interactive or not _ask("Run it now?"):
             say("Not run. Pass --yes to run without asking.")
             return 1
 
     def install():
-        if not interactive or not _ask("The pinned Codex CLI 0.157.1 is not installed. Download and verify it now?"):
+        if not interactive or not _ask("Codex CLI 0.157.1 is not installed. Download and verify it now?"):
             return False
         codex_cli.install(root)
         return True
 
     def login(account):
-        if not interactive or not _ask(f"Sign Codex account {account.number} in to its isolated home now?"):
+        if not interactive or not _ask(f"Sign Codex account {account.number} in for tasks now?"):
             return False
         from openswap.worker.live_cli import login as do_login
         do_login(root, account.number)
@@ -1628,6 +1658,8 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         check = ClaudeLiveCheck(root, selector=args.account, out=say)
     else:
         check = LiveCheck(root, selector=args.account, out=say)
+    from openswap import printer
+
     try:
         evidence = check.run(install=install, login=login)
     except CheckRefused as error:
@@ -1636,26 +1668,31 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     except (codex_cli.CodexCliError, AccountPinError, AccountLeaseError) as error:
         # A prerequisite the owner accepted (install, sign-in) failed.
         code = getattr(error, "code", None) or str(error)
-        print(f"Live check not run: {code}.", file=sys.stderr)
+        print(f"Live check not run ({code}).", file=sys.stderr)
         return 1
     path = write_evidence(root, evidence, args.output)
+    name = "Claude" if evidence.get("provider") == "claude" else "Codex"
+    flag = " --provider claude" if evidence.get("provider") == "claude" else ""
+    failed = sum(1 for gate in REQUIRED_GATES if evidence["gates"][gate].get("passed") is not True)
     if args.json:
         print(json.dumps(evidence, sort_keys=True))
     else:
-        print(("All phase-1 live gates passed." if evidence["passed"] else "Some gates failed.") + "\n"
-              + _format(evidence))
-    say(f"Evidence: {path}")
+        verdict = (f"{printer.MARK_OK} Live check passed ({len(REQUIRED_GATES)} gates)." if evidence["passed"]
+                   else f"{printer.MARK_BAD} Live check failed ({failed} of {len(REQUIRED_GATES)} gates).")
+        print(verdict + "\n" + _format(evidence, verbose=args.verbose))
+    from openswap.worker.cli import display_path
+
+    say(f"Evidence: {display_path(path)}")
     if evidence.get("gates", {}).get("sign_in_isolation", {}).get("own_sign_in_readable_by_shell") is True:
-        say("Note: shell commands in remote tasks on this account can read or replace its own sign-in (macOS "
-            "cannot run Claude Code's own sandbox inside OpenSwap's). `openswap worker permissions no-shell` "
-            "prevents it.")
+        say("Note: a shell command in a task on this account can read or replace its own sign-in (macOS can't "
+            "run Claude Code's sandbox inside OpenSwap's). `openswap worker permissions no-shell` prevents it.")
     if not evidence["passed"]:
-        say("Live execution stays off.")
+        say(f"Live tasks stay off for {name}.")
         return 1
-    if args.no_enable or not (args.enable or (interactive and not args.json and _ask("Enable live execution now?"))):
-        flag = " --provider claude" if evidence.get("provider") == "claude" else ""
-        say(f"Live execution stays off. Enable it later with "
-            f"`openswap worker live enable{flag} --evidence {path}`.")
+    if args.no_enable or not (args.enable or (interactive and not args.json and _ask("Turn live tasks on now?"))):
+        # Named evidence: a later check (another account, a failure) must not stand in for this one.
+        say(f"Live tasks stay off for {name}. " + printer.next_step(
+            f"`openswap worker live enable{flag} --evidence {shlex.quote(str(path))}` to turn them on."))
         return 0
     from openswap.worker import claude_cli
 
@@ -1664,11 +1701,26 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
             enable_live(root, path, claude_cli.verify(root), "claude")
         else:
             enable_live(root, path, codex_cli.verify(root))
-    except (LiveModeError, codex_cli.CodexCliError, claude_cli.ClaudeCliError) as error:
-        print(f"Could not enable live execution: {error}", file=sys.stderr)
+    except LiveModeError as error:
+        from openswap.worker.live_cli import _live_mode_message
+
+        # A lock held by another command: `live enable` retries with this evidence. Anything
+        # else (the evidence, this Mac) is explained by the shared message, which names the fix.
+        if error.code in {"live_lock_busy", "live_lock_unavailable"}:
+            print(f"Could not turn live tasks on ({error.code}). Next: `openswap worker live enable{flag} "
+                  f"--evidence {shlex.quote(str(path))}`.", file=sys.stderr)
+        else:
+            print(f"Could not turn live tasks on ({error.code}). {_live_mode_message(error, evidence.get('provider'))}",
+                  file=sys.stderr)
         return 1
-    if evidence.get("provider") == "claude":
-        say("Live execution is on for Claude. `openswap worker live disable --provider claude` turns it off.")
-    else:
-        say("Live execution is on. `openswap worker live disable` turns it off.")
+    except (codex_cli.CodexCliError, claude_cli.ClaudeCliError) as error:
+        from openswap.worker.live_cli import _CLAUDE_MESSAGES, _message
+
+        # The CLI changed between the check and now (an update): its own message names the
+        # re-pin or reinstall; the check must then run again on the new binary.
+        text = _CLAUDE_MESSAGES.get(error.code, f"Refused ({error.code}).") if isinstance(
+            error, claude_cli.ClaudeCliError) else _message(error.code)
+        print(f"Could not turn live tasks on ({error.code}): {text} Then run the live check again.", file=sys.stderr)
+        return 1
+    say(f"{printer.MARK_OK} Live tasks are on for {name}. `openswap worker live disable{flag}` turns them off.")
     return 0

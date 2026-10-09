@@ -72,7 +72,7 @@ def test_account_listing_styles_headings_on_a_colour_terminal_but_not_json(root,
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
     assert out.startswith(f"{BOLD}Remote tasks account\x1b[0m\n")
-    assert f"{BOLD}Codex accounts (pin with the slot number, email or alias)\x1b[0m" in out
+    assert f"{BOLD}Codex (pin by slot, email or alias)\x1b[0m" in out
     assert "  • 1  alice@example.com   (work)" in out  # rows stay plain: marks and words carry the meaning
     assert _run(root, "account", "--json") == 0
     raw = capsys.readouterr().out
@@ -88,7 +88,7 @@ def test_no_color_disables_styling_even_on_a_colour_terminal(root, capsys, monke
     printer._colors_enabled = None
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
-    assert "\x1b[" not in out and "Next: pin an account" in out
+    assert "\x1b[" not in out and "Next: `openswap worker account 1` to pin" in out
 
 
 def test_step_headers_are_bold_on_a_colour_terminal_only(monkeypatch):
@@ -153,6 +153,9 @@ def test_account_menu_numbers_both_providers_in_order(root):
 
 
 def test_status_rows_are_marked_and_worded(root, monkeypatch, capsys):
+    from openswap.settings import configure_worker_service
+
+    configure_worker_service(root, "https://opentag.me", "worker-1")
     snapshot = {"enabled": True, "paused": True, "process_state": "running",
                 "provider": {"available": True}, "remote_connectivity": "online",
                 "remote_last_seen_at": "2026-10-08T09:00:00Z", "active_job": {"job_id": "abc", "state": "running"}}
@@ -160,14 +163,188 @@ def test_status_rows_are_marked_and_worded(root, monkeypatch, capsys):
     assert _run(root, "status") == 0
     out = capsys.readouterr().out
     assert out == (
-        "Remote tasks worker\n"
-        "  ✓ Remote tasks  enabled\n"
+        "Remote tasks\n"
         "  ✓ Worker        running\n"
-        "  ✗ Admission     paused\n"
-        "  ✓ Provider      available\n"
-        "  ✓ Service       online (last seen 2026-10-08T09:00:00Z)\n"
-        "  • Job           abc (running)\n"
+        "  ✗ Taking tasks  paused\n"
+        "  ✓ Live tasks    on\n"
+        "  ✓ Service       online (seen 2026-10-08T09:00:00Z)\n"
+        "  • Task          abc (running)\n"
+        "Next: `openswap worker pause --off` to take tasks again.\n"
     )
+    # Not paused, live tasks off: the one next step is the pinned kind's live check.
+    snapshot.update(paused=False, provider={"available": False, "diagnostic_code": "live_adapter_disabled"},
+                    active_job=None)
+    cli.set_worker_account(root, "claude:4")
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert "  • Live tasks    off\n" in out and "  • Task          none\n" in out
+    # The live check refuses while the worker takes tasks: pause comes first.
+    assert out.endswith("Next: `openswap worker pause`, then `openswap worker claude pin`, "
+                        "`openswap worker claude prepare`, then "
+                        "`openswap worker live-check --provider claude` to turn on live tasks.\n")
+    snapshot["paused"] = True
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert "  ✗ Taking tasks  paused\n" in out and "`openswap worker pause`," not in out
+    assert out.endswith("`openswap worker live-check --provider claude` to turn on live tasks.\n")
+    snapshot["paused"] = False
+    # Any other reason live tasks are off is shown with the row, not restated.
+    snapshot["provider"] = {"available": False, "diagnostic_code": "provider_auth_unavailable"}
+    monkeypatch.setattr(cli, "read_status", lambda _root: {**snapshot, "enabled": False, "process_state": "stopped"})
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert "  ✗ Worker        off\n" in out and "  • Live tasks    off (provider_auth_unavailable)\n" in out
+    # A worker that is not running admits nothing, whatever the pause flag says.
+    assert "  • Taking tasks  no (worker not running)\n" in out
+    assert out.count("Next:") == 1 and "`openswap worker enable`" in out
+
+
+def test_status_points_the_live_check_at_an_unchecked_allowed_account(root, monkeypatch, capsys):
+    from openswap.settings import configure_worker_service
+    from openswap.worker import live
+    from tests.test_worker_accounts import ALICE
+
+    configure_worker_service(root, "https://opentag.me", "worker-1")
+    cli.set_worker_account(root, "1")
+    cli.allow_worker_account(root, "claude:4")
+    snapshot = {"enabled": True, "paused": True, "process_state": "running",
+                "provider": {"available": False, "diagnostic_code": "live_adapter_disabled"},
+                "remote_connectivity": "online", "active_job": None}
+    monkeypatch.setattr(cli, "read_status", lambda _root: snapshot)
+    modes = {"codex": {"execution_mode": "live", "checked_accounts": [ALICE]},
+             "claude": {"execution_mode": "live", "checked_accounts": []}}
+    monkeypatch.setattr(live, "live_status", lambda _root, provider="codex": modes[provider])
+    # Codex is live and the pin was checked; the allowed Claude account was not: check it.
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert out.endswith("Next: `openswap worker live-check --provider claude --account claude:4` "
+                        "to check account 4 too.\n")
+    # Taking tasks: the pause still comes first.
+    snapshot["paused"] = False
+    assert _run(root, "status") == 0
+    assert capsys.readouterr().out.endswith("Next: `openswap worker pause`, then `openswap worker live-check "
+                                            "--provider claude --account claude:4` to check account 4 too.\n")
+    # The allowed account's kind has live tasks off altogether: its own path comes first.
+    modes["claude"] = {"execution_mode": "disabled", "checked_accounts": []}
+    assert _run(root, "status") == 0
+    assert capsys.readouterr().out.endswith("`openswap worker claude pin`, `openswap worker claude prepare`, then "
+                                            "`openswap worker live-check --provider claude` to turn on live tasks.\n")
+    # Codex itself off: the pinned path, whatever the allowed accounts.
+    modes["codex"] = {"execution_mode": "disabled", "checked_accounts": []}
+    assert _run(root, "status") == 0
+    assert capsys.readouterr().out.endswith("Next: `openswap worker pause`, then `openswap worker live-check` "
+                                            "to turn on live tasks.\n")
+    # The allowed account left its roster: no check can cover it, so drop it by reference,
+    # even while its kind's live tasks are off.
+    modes["codex"] = {"execution_mode": "live", "checked_accounts": [ALICE]}
+    modes["claude"] = {"execution_mode": "disabled", "checked_accounts": []}
+    (reference,) = [entry.account_ref for entry in cli.worker_account_choices(root).allowlist
+                    if entry.identity.startswith("claude:")]
+    roster = json.loads((root / "sequence.json").read_text(encoding="utf-8"))
+    del roster["accounts"]["4"]
+    (root / "sequence.json").write_text(json.dumps(roster), encoding="utf-8")
+    snapshot["paused"] = True
+    assert _run(root, "status") == 0
+    assert capsys.readouterr().out.endswith(f"Next: `openswap worker account disallow {reference}` to drop an "
+                                            "allowed account that left its roster.\n")
+
+
+def test_status_gives_one_next_step_even_with_a_blocked_folder(root, monkeypatch, capsys):
+    from openswap.settings import configure_worker_service
+
+    snapshot = {"enabled": True, "paused": False, "process_state": "running",
+                "provider": {"available": False, "diagnostic_code": "live_adapter_disabled"},
+                "remote_connectivity": "online", "active_job": None}
+    monkeypatch.setattr(cli, "read_status", lambda _root: snapshot)
+    monkeypatch.setattr(cli, "refused_workspaces", lambda _root: [("a", "folder_overlaps_readable")])
+    # Unpaired: the blocked folder is the one step.
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert '✗ "a" is blocked (folder_overlaps_readable).' in out and out.count("Next:") == 1
+    assert out.endswith("Next: `openswap worker workspace remove <id>` to drop a blocked folder "
+                        "(`openswap worker workspace list` shows them).\n")
+    # Paired and running with live tasks off: the folder still comes before the live check.
+    configure_worker_service(root, "https://opentag.me", "worker-1")
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert out.count("Next:") == 1 and "workspace remove" in out and "live-check" not in out
+    # The worker being off outranks it.
+    monkeypatch.setattr(cli, "read_status", lambda _root: {**snapshot, "enabled": False, "process_state": "stopped"})
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert out.count("Next:") == 1 and out.endswith(
+        "Next: `openswap worker enable` to start the worker (paired with https://opentag.me).\n")
+
+
+def test_a_refused_pause_says_what_still_holds(root, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "request_pause", lambda _root, paused: {
+        "accepted": False, "paused": not paused, "diagnostic_code": "settings_unavailable"})
+    assert _run(root, "pause") == 1
+    out, err = capsys.readouterr()
+    assert out == "" and err == "✗ Not changed (settings_unavailable); the worker is still taking tasks.\n"
+    assert _run(root, "pause", "--off") == 1
+    assert capsys.readouterr().err.endswith("the worker is still paused.\n")
+    assert _run(root, "pause", "--json") == 1
+    assert json.loads(capsys.readouterr().out)["accepted"] is False
+
+
+def test_blocked_disable_names_the_lease_store_that_is_held(root, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    held = {"claude"}
+    monkeypatch.setattr(cli.AccountLeaseStore, "read_current",
+                        lambda self: SimpleNamespace(state="active") if self.provider in held else None)
+    monkeypatch.setattr(cli, "disable_worker", lambda _root: (False, {}, "lease_state_unknown"))
+    assert _run(root, "disable") == 1
+    assert capsys.readouterr().err.endswith("Next: `openswap worker lease release --provider claude` to free it.\n")
+    # Both held: `disable` stays blocked until both are freed, so "and", not "or".
+    held.add("codex")
+    assert _run(root, "disable") == 1
+    assert capsys.readouterr().err.endswith(
+        "Next: `openswap worker lease release` and `openswap worker lease release --provider claude` to free them.\n")
+
+
+def test_live_mode_refusals_point_at_a_retry_or_a_new_live_check():
+    from openswap.worker.live import LiveModeError
+
+    # A lock failure can come from `live disable` too: never send the owner to a quota-using check.
+    assert live_cli._live_mode_message(LiveModeError("live_lock_busy"), "codex") == (
+        "Live tasks are being changed; try again in a moment.")
+    assert "live-check" not in live_cli._live_mode_message(LiveModeError("live_lock_unavailable"), "claude")
+    # Evidence problems only come from enabling: a new live check is the fix.
+    assert live_cli._live_mode_message(LiveModeError("evidence_not_passing", ("stop",)), "claude") == (
+        "The live check did not pass, or no longer matches this Mac (stop). "
+        "Next: `openswap worker live-check --provider claude`.")
+    assert live_cli._live_mode_message(LiveModeError("evidence_invalid"), "codex").endswith(
+        "Next: `openswap worker live-check`.")
+    # An Intel Mac: a live check would refuse too, so no next step is offered.
+    assert live_cli._live_mode_message(LiveModeError("unsupported_platform"), "codex") == (
+        "Live tasks run only on Apple silicon Macs.")
+
+
+def test_workspace_list_says_what_tasks_do_in_each_folder(root, tmp_path, monkeypatch):
+    from openswap.settings import WorkerWorkspace
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(cli, "home_folder", lambda: home)
+    results = home / "OpenSwap Research"
+    out = cli._format_workspaces((
+        WorkerWorkspace("research", results / "research", ()),
+        WorkerWorkspace("docs", results / "docs", (home / "Docs",)),
+        WorkerWorkspace("mixed", tmp_path / "out", (home / "src", home / "notes"), "Mixed"),
+        WorkerWorkspace("github", results / "github", (), None, home / "GitHub", "worktree", True),
+        WorkerWorkspace("app", results / "app", (), None, home / "GitHub" / "app", "direct", False),
+    ))
+    assert out.splitlines() == [
+        "Folders",
+        '  ✓ research  "research"  writes results in ~/OpenSwap Research/research',
+        '  ✓ docs      "docs"      reads ~/Docs; writes results in ~/OpenSwap Research/docs',
+        f'  ✓ mixed     "Mixed"     reads ~/src, ~/notes; writes results in {tmp_path / "out"}',
+        '  ✓ github    "GitHub"    works in each repo in ~/GitHub (own worktree per task)',
+        '  ✓ app       "app"       works in ~/GitHub/app (works in the folder itself)',
+        "Next: `openswap worker workspace add --work <folder>` adds one; "
+        "`openswap worker workspace remove <id>` drops one.",
+    ]
 
 
 def test_codex_and_claude_status_point_at_the_next_step():
@@ -175,37 +352,55 @@ def test_codex_and_claude_status_point_at_the_next_step():
              "accounts": [{"slot": "1", "alias": "work", "pinned": True, "allowed": True, "isolated_sign_in": False},
                           {"slot": "2", "alias": None, "pinned": False, "allowed": False, "isolated_sign_in": True}]}
     out = live_cli._format_codex_status(codex)
-    assert "  ✓ Pinned CLI      codex-cli 0.157.1 (verified)" in out
-    assert "  • Live execution  disabled" in out
-    assert "  ✗ 1  (work)  not signed in  default, allowed" in out
-    assert "  ✓ 2          signed in" in out
-    assert out.endswith("Next: sign the default account in: `openswap worker codex login`.")
+    assert out == (
+        "Codex for Remote tasks\n"
+        "  ✓ Codex CLI   codex-cli 0.157.1 (verified)\n"
+        "  • Live tasks  off\n"
+        "Accounts\n"
+        "  ✗ 1  (work)  not signed in  pinned, allowed\n"
+        "  ✓ 2          signed in\n"
+        "Next: `openswap worker codex login` to sign the pinned account in."
+    )
     codex["accounts"][0]["isolated_sign_in"] = True
-    assert live_cli._format_codex_status(codex).endswith("`openswap worker live-check`.")
+    assert live_cli._format_codex_status(codex).endswith("Next: `openswap worker live-check` to turn on live tasks.")
     codex["cli"] = {"installed": False, "problem": "not_installed"}
-    assert live_cli._format_codex_status(codex).endswith("`openswap worker codex install`.")
+    assert live_cli._format_codex_status(codex).endswith("`openswap worker codex install` to install the Codex CLI.")
 
     claude = {"cli": {"pinned": False, "problem": "not_pinned"}, "execution_mode": "disabled",
               "accounts": [{"slot": "4", "alias": "claudey", "pinned": True, "allowed": False, "profile_ready": False}]}
     out = live_cli._format_claude_status(claude)
-    assert "  ✗ Pinned binary   not ready (not_pinned)" in out
-    assert "  ✗ 4  (claudey)  profile not prepared  default" in out
-    assert out.endswith("Next: pin the installed Claude Code: `openswap worker claude pin`.")
+    assert "  ✗ Claude Code  not ready (not_pinned)" in out
+    assert "  ✗ 4  (claudey)  not ready  pinned" in out
+    assert out.endswith("Next: `openswap worker claude pin` to pin the installed Claude Code.")
     claude["cli"] = {"pinned": True, "version": "2.1.285 (Claude Code)"}
-    assert live_cli._format_claude_status(claude).endswith("`openswap worker claude prepare`.")
+    # "ready" covers both a missing sign-in and a managed policy: `prepare` signs in or names the policy.
+    assert live_cli._format_claude_status(claude).endswith("`openswap worker claude prepare` to get the pinned account ready.")
     claude["accounts"][0]["profile_ready"] = True
     claude["execution_mode"] = "live"
-    assert "live execution is on" in live_cli._format_claude_status(claude)
+    out = live_cli._format_claude_status(claude)
+    # Live tasks on for every account: nothing to do, so no `Next:` at all.
+    assert "  ✓ Live tasks   on" in out and "Next:" not in out
 
 
-def test_live_check_gates_are_marked_pass_or_fail():
-    gates = {name: {"passed": True} for name in live_check.REQUIRED_GATES}
-    first = live_check.REQUIRED_GATES[0]
-    gates[first] = {"passed": False, "reason": "sandbox leaked"}
+def test_live_check_gates_fold_to_one_line_unless_failed_or_verbose():
+    gates = {name: {"passed": True, "steps_ran": 3} for name in live_check.REQUIRED_GATES}
+    assert live_check._format({"gates": gates}) == (
+        "  ✓ passed: the pinned CLI, the account, your own login untouched, tools, sandbox, a research task, "
+        "sandbox (a task), stop, kill recovery, worktree, permissions, sign-in isolation"
+    )
+    gates["sandbox_wrapper"] = {"passed": False, "reason": "sandbox leaked", "write_outside": "/tmp/x",
+                                "network_denied": True, "steps_ran": 2}
     out = live_check._format({"gates": gates})
-    lines = out.splitlines()
-    assert lines[0] == f"  ✗ FAIL  {first}" and lines[1] == "            reason: sandbox leaked"
-    assert lines[2].startswith("  ✓ PASS  ")
+    assert out.splitlines() == [
+        "  ✓ passed: the pinned CLI, the account, your own login untouched, tools, a research task, "
+        "sandbox (a task), stop, kill recovery, worktree, permissions, sign-in isolation",
+        "  ✗ failed: sandbox (reason: sandbox leaked; write_outside: /tmp/x)",
+    ]
+    verbose = live_check._format({"gates": gates}, verbose=True).splitlines()
+    assert len(verbose) == len(live_check.REQUIRED_GATES)
+    assert verbose[0] == "  ✓ passed  the pinned CLI"
+    assert verbose[4] == "  ✗ failed  sandbox                   reason: sandbox leaked; write_outside: /tmp/x"
+    assert all(("passed" in line or "failed" in line) and line[2] in "✓✗" for line in verbose)
 
 
 # --- discoverability -----------------------------------------------------------------------------
