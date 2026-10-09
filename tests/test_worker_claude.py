@@ -342,6 +342,11 @@ def test_the_profiles_permission_settings_are_validated_before_launch(tmp_path):
     assert summary["permission_mode"] == "bypassPermissions"
     assert summary["permissions"] == {"mode": "bypassPermissions", "allow_rules": 0, "deny_rules": 1, "ask_rules": 0,
                                       "override": "follow", "for_check": False, "profile_settings": True}
+    # The validated permission keys go on the command line too: a schema problem elsewhere in
+    # the file (Claude Code would then skip the file) cannot drop the mode or the deny rules.
+    argv = launcher.launches[0]["argv"]
+    assert json.loads(argv[argv.index("--settings") + 1]) == {"permissions": {
+        "defaultMode": "bypassPermissions", "deny": ["Bash(rm:*)", *_credential_rules(root)]}}
 
 
 def test_a_sign_in_kept_only_in_the_keychain_is_refused_unlaunched(tmp_path):

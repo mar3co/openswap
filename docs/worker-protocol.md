@@ -1046,7 +1046,9 @@ instead of a tool list OpenSwap picks
   Claude Code would silently ignore (not JSON, a symlink, an unknown mode,
   rules that are not `Tool` or `Tool(specifier)`, a Bash `:*` not at the end)
   refuses the launch instead of dropping your
-  deny rules. `openswap worker claude status` shows each account's mode and
+  deny rules, and the validated permission keys are passed again on the
+  command line (`--settings`), so a schema problem elsewhere in the file, which
+  makes Claude Code skip the file, cannot drop them. `openswap worker claude status` shows each account's mode and
   rule counts.
 - **Codex.** Each account keeps `approval_policy`, `approvals_reviewer` and
   `sandbox_mode` in its isolated home (`permissions.json`), set with

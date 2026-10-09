@@ -187,6 +187,40 @@ def read_claude_permissions(profile: Path) -> ClaudePermissions:
     return _summary(_claude_permissions_block(settings or {}))
 
 
+# The permission keys a launch also passes at flag level (``--settings``).
+FLAG_PERMISSION_KEYS = (*COPIED_CLAUDE_KEYS, "additionalDirectories")
+
+
+def profile_permission_flags(profile: Path) -> dict:
+    """The profile's validated permission keys, to pass again as flag-level settings.
+
+    Claude Code skips a whole settings file that fails its schema anywhere
+    (a malformed hook, an unknown key), and with it the mode and every deny
+    rule. Passing the validated permission keys on the command line as well
+    keeps them in force even then; they are the same values, so nothing else
+    changes. Raises like :func:`read_claude_permissions`.
+    """
+    settings = _read_json_object(Path(profile) / CLAUDE_SETTINGS_FILE) or {}
+    block = _claude_permissions_block(settings)
+    return {key: block[key] for key in FLAG_PERMISSION_KEYS if key in block}
+
+
+def merge_flag_settings(base: dict, overlay: dict | None) -> dict:
+    """``overlay`` over ``base`` (flag-level settings): rule lists add up, other keys replace."""
+    merged = json.loads(json.dumps(base))
+    for key, value in (overlay or {}).items():
+        if key == "permissions" and isinstance(value, dict):
+            block = merged.setdefault("permissions", {})
+            for name, item in value.items():
+                if name in _RULE_KEYS and isinstance(item, list):
+                    block[name] = [*block.get(name, []), *item]
+                else:
+                    block[name] = item
+        else:
+            merged[key] = value
+    return merged
+
+
 def default_claude_permissions(home: Path | None = None) -> dict | None:
     """The permission keys of the owner's ``~/.claude/settings.json`` (None when it sets none)."""
     path = (Path(home) if home is not None else Path.home()) / ".claude" / CLAUDE_SETTINGS_FILE

@@ -100,6 +100,23 @@ def test_settings_claude_code_would_ignore_are_refused(tmp_path, text):
         write_claude_permissions(tmp_path, mode="default")
 
 
+def test_the_profiles_permission_keys_are_repeated_at_flag_level(tmp_path):
+    (tmp_path / "settings.json").write_text(json.dumps({
+        "hooks": {"Stop": []}, "model": "opus",
+        "permissions": {"defaultMode": "dontAsk", "allow": ["Read"], "deny": ["Bash(rm:*)"],
+                        "additionalDirectories": ["/x"], "disableBypassPermissionsMode": "disable"}}))
+    own = permissions.profile_permission_flags(tmp_path)
+    assert own == {"defaultMode": "dontAsk", "allow": ["Read"], "deny": ["Bash(rm:*)"],
+                   "additionalDirectories": ["/x"], "disableBypassPermissionsMode": "disable"}
+    merged = permissions.merge_flag_settings({"permissions": own},
+                                             {"permissions": {"defaultMode": "plan", "deny": ["Write"]},
+                                              "disableAllHooks": True})
+    # The live check's own values win; rule lists add up.
+    assert merged["permissions"]["defaultMode"] == "plan"
+    assert merged["permissions"]["deny"] == ["Bash(rm:*)", "Write"] and merged["disableAllHooks"] is True
+    assert own["deny"] == ["Bash(rm:*)"]  # the base is not changed
+
+
 def test_ordinary_rules_are_accepted(tmp_path):
     rules = ["Bash", "Bash(npm run test:*)", "Bash(git status)", "Read(//Users/me/**)", "Edit(src/**)",
              "WebFetch(domain:example.com)", "mcp__github__get_issue", "Read(./a (copy)/b)", "WebSearch"]

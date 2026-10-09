@@ -69,6 +69,8 @@ from openswap.worker.permissions import (
     CLAUDE_READ_ONLY_TOOLS,
     PermissionSettingsError,
     claude_permission_args,
+    merge_flag_settings,
+    profile_permission_flags,
     read_claude_permissions,
 )
 
@@ -458,6 +460,9 @@ class ClaudeCodeAdapter(CodexExecAdapter):
             # Claude Code would silently ignore a settings file it cannot
             # validate, dropping the owner's deny rules: refuse instead.
             permissions = read_claude_permissions(profile)
+            # And pass the validated permission keys at flag level too, so a
+            # schema problem elsewhere in the file cannot drop them.
+            own = profile_permission_flags(profile) if self._profile_settings else {}
         except PermissionSettingsError:
             raise ProviderLaunchRefused("provider_unavailable") from None
         override = self.override()
@@ -465,9 +470,9 @@ class ClaudeCodeAdapter(CodexExecAdapter):
         # Seatbelt profile cannot tell it from its tools): deny rules keep the
         # file tools off it, as spelled and as resolved.
         credentials = {str(profile / CREDENTIALS_FILE), str(profile.resolve() / CREDENTIALS_FILE)}
+        overlay = merge_flag_settings({"permissions": own} if own else {}, self._settings_for_check)
         try:
-            self._permission_args = claude_permission_args(override, self._settings_for_check,
-                                                           tuple(sorted(credentials)))
+            self._permission_args = claude_permission_args(override, overlay, tuple(sorted(credentials)))
         except ValueError:
             raise ProviderLaunchRefused("provider_unavailable") from None
         self._launch_summary = {"permissions": {**permissions.to_dict(), "override": override,
