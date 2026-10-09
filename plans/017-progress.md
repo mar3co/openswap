@@ -1524,3 +1524,131 @@ its own folder (the shared store is a read-only alternate) and the worker
 imports them verified; Claude work tasks get no Bash (it would share the
 sandbox that reads the account's credentials), so the worker commits what a
 task leaves; and results upload still works after a repo is removed.
+
+## Sessions follow the account's own permission settings (owner decision, 2026-10-08)
+
+The owner asked, about the fixed research tool list and the "no Bash for
+Claude" rule: "Shouldnt shell commands be optional for the user to decide?
+or stick with claude mode? like if claude is in auto … why are we deciding
+that thats a system level setting no?" They then approved this design:
+
+1. **Tools follow the account's own settings.** A remote session uses the
+   permission mode and allow/deny rules from that account's Claude Code
+   settings (its OpenSwap profile), exactly as running `claude` there would,
+   covering shell, edits and web. Nobody is at the Mac, so anything that
+   would ask is denied, unless the mode is `auto`, where Claude's own auto
+   mode decides. The fixed `--restricted --tools` list is no longer the
+   default.
+2. **Codex gets the same treatment:** the account's approval policy and
+   sandbox mode instead of a mode OpenSwap forces; approval prompts resolve to
+   deny unless the policy never asks.
+3. **Optional per-Mac limit, set only on the Mac, never from the web**
+   (`openswap worker permissions follow|no-shell|read-only`, and an advanced
+   setup choice). Default: follow the account's settings. Status and the setup
+   summary show it only when it is not the default.
+4. **OpenSwap keeps only system-level boundaries**, enforced by Seatbelt in
+   every mode including `bypassPermissions`: the folder or per-task worktree
+   write scope; no access to other accounts' credentials, the backup root,
+   the journal or the owner's working copy; the identity and
+   case-insensitive path protections.
+5. **Keep the account's own sign-in away from shell commands where
+   possible**, as protection rather than a restriction; the live check says
+   honestly whether it held.
+
+Built (PR #93, stacked on #90):
+
+- **Claude.** `claude -p --setting-sources user --permission-prompts none`
+  (flags checked in `claude --help`, Claude Code 2.1.286): the mode and rules
+  come from the profile's `settings.json`; a repo's settings never apply
+  (`-p` skips the trust dialog). Measured on the installed CLI with a
+  signed-out profile: `init` reports the profile's `defaultMode`, project
+  settings are ignored, and an invalid settings file is silently dropped, so
+  a launch now refuses one (`provider_unavailable`) rather than lose the
+  owner's deny rules. `openswap worker claude prepare --copy-settings
+  --mode <mode>` copies the mode and the allow/deny/ask rules (never hooks,
+  model or extra directories) from `~/.claude/settings.json`; interactively it
+  asks for a profile with none. Managed or enterprise policy still refuses a
+  launch.
+- **Codex.** `permissions.json` in each isolated home (approval policy,
+  reviewer, sandbox mode), set with `openswap worker codex settings
+  [--copy-settings]` or offered after `codex login`; the managed
+  `config.toml` carries it. `codex exec` refuses every approval request, so
+  asking policies run as `on-request`; `auto_review` decides by itself;
+  `untrusted` runs with no shell tool; `read-only` makes the folder
+  read-only. Codex's own sandbox is the only boundary its shell has (it cannot
+  be wrapped: no nested sandboxes), so the folder rules and the shell's lack of
+  network stay, `danger-full-access` included. Checked with the Codex 0.160.0
+  bundled in ChatGPT.app (`codex sandbox`, no sign-in): the read-only config
+  denies a write, `--disable shell_tool` turns the shell off, `auto_review`
+  parses.
+- **Per-Mac limit.** `worker.permissionOverride` in settings.json (absent:
+  `follow`; unreadable: `read-only`). `no-shell`: Claude gets
+  `--disallowedTools Bash,PowerShell,Monitor,REPL,BashOutput,KillShell` and no
+  hooks, Codex no shell tool; `read-only`: Claude's read and web tools only,
+  Codex a read-only sandbox. No protocol, IPC or remote path names it.
+- **Boundaries, new because a shell is now possible.** The Claude Seatbelt
+  profile takes the Keychain away (`/usr/bin/security` cannot start, the
+  Keychain's mach services cannot be looked up, `~/Library/Keychains` is
+  unreadable). Without that, any shell command could read every
+  `security`-created item without a prompt: other accounts' sign-ins, the
+  default login and the worker's device key. Claude Code reads its own sign-in
+  through `security` child processes, indistinguishable from a task's, so it
+  now keeps it in the profile's `.credentials.json` (its own plaintext
+  fallback; measured: a denied `security` exec fails fast and is not a
+  "transient" Keychain error, so the fallback write happens). `claude prepare`
+  runs Claude Code's own `auth login` with only the Keychain taken away, so the
+  sign-in lands there; OpenSwap still never touches a credential. A profile
+  signed in only in the Keychain refuses (`provider_auth_unavailable`) until
+  `prepare` signs it in again. The profile's configuration files (settings,
+  memory and rules, agents and their memory, commands, skills, hooks, output
+  styles, plugins, and `projects/` where each project's auto-memory lives, with auto-memory off) are
+  unwritable from a job, so one task cannot widen the next. And nothing a
+  shell starts can leave the sandbox or the coalition: measured on this Mac,
+  `open -g -j -a Calculator` from an `(allow default)` profile starts an
+  unsandboxed app, so the profile now denies `lsopen`, `appleevent-send`,
+  `job-creation` (and `launchctl`), local Unix sockets other than
+  mDNSResponder's (a daemon such as Docker's would act for the task),
+  loopback connections and port 22 to any address (`ssh localhost` would run
+  a command through `sshd`). Cost: a Claude task cannot reach a server on
+  this Mac, even one it started, or use ssh, as Codex shells (no network)
+  cannot either. The live check's sandbox probe tries a launchd agent, an
+  app launch and a loopback connection.
+- **Item 5, what works.** Claude Code's bash sandbox nested in OpenSwap's: no;
+  real `sandbox-exec` inside `sandbox-exec` fails `sandbox_apply: Operation
+  not permitted` (macOS 27.0.1). Passing the token at launch: the CLI accepts
+  `CLAUDE_CODE_OAUTH_TOKEN` / `_FILE_DESCRIPTOR`, but never refreshes or
+  persists such a token, so OpenSwap would have to read the credential and own
+  its rotation, which the decision memo rules out; not adopted. Every job
+  gets flag-level deny rules (`Read(//…/.credentials.json)`, `Edit(…)`) that
+  keep Claude's file tools off the credentials file in every mode (the live
+  check measures one in `bypassPermissions` on a stand-in file). Result: under
+  `follow`, a Claude task's shell can read that account's own sign-in, or
+  replace it with another sign-in later tasks on the account would use (the
+  launch's identity check reads `.claude.json`, now unwritable from a job, but
+  cannot tell whose token the credentials file holds, and Claude Code must write that file; `claude auth status` only reports
+  them), and nothing else of the kind; `no-shell` prevents it. Also tried:
+  SBPL `(with no-sandbox)` does let a Mach-O leave the outer profile for a
+  stricter one, but it does not apply to a script, and OpenSwap ships no
+  binary of its own to use as a fixed shell wrapper, while allowing it for
+  `/usr/bin/sandbox-exec` would let any process in the job escape. The setup summary says so
+  in one line for a Claude account with the shell allowed. Codex's shell
+  cannot read its `auth.json` or the Keychain (measured with `codex sandbox`).
+- **Live check.** New required gates `permissions` and `sign_in_isolation`
+  (see the module docstrings and [worker-protocol](../docs/worker-protocol.md#permissions-the-accounts-own-settings)).
+  The Claude Read probes and both providers' worktree jobs run with the
+  widest settings, so only OpenSwap's boundary can refuse. Opt-ins now record
+  `policyVersion` 2; one recorded before (a fixed tool list, no shell) stays
+  off and status says to run the check again.
+
+Validation: full suite green; real Seatbelt tests of the new rules on this Mac
+(`security` exits 126, profile settings and memory unwritable, state and the
+credentials file reachable); an opt-in real test that a throwaway keychain
+file's item is unreachable through the service rule alone
+(`OPENSWAP_KEYCHAIN_SANDBOX_TESTS=1`, also on in GitHub Actions); simulated
+live checks for both providers, including Macs that fail the new gates.
+
+**Still unproven until the owner's live check:** a real sign-in and its
+refresh into `.credentials.json` with the Keychain unreachable; that the
+pinned Codex 0.157.1 accepts `approvals_reviewer` (only written when an
+account uses `auto_review` or `guardian_subagent`) and the read-only
+filesystem entries; the model performing the new permission probes.

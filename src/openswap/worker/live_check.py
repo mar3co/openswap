@@ -25,6 +25,18 @@ pass/fail evidence for every phase-1 live gate to a private JSON file:
 - ``kill_recovery``: a separate worker process that launched a job is
   ``SIGKILL``ed; the job is shown to outlive it, then recovery stops it with
   proof, as a restarted worker does.
+- ``worktree``: a work folder's task, under the widest settings an account can
+  have, commits in its own worktree while the owner's copy, branch and git
+  config stay unwritable.
+- ``permissions`` (owner decision 2026-10-08: jobs follow the account's own
+  approval policy and sandbox mode): the config a launch writes carries the
+  account's policy, a read-only sandbox denies a write in the folder,
+  ``no-shell`` turns the shell tool off, and the probe job (policy
+  ``on-request``, so any escalation it asks for is refused headless) could
+  not write outside its folder.
+- ``sign_in_isolation``: a shell command in Codex's sandbox reaches neither a
+  throwaway Keychain item (found outside the sandbox) nor the isolated
+  home's ``auth.json``.
 
 It changes nothing about live mode unless every gate passes and the owner then
 says yes (or passed ``--enable``). Model text, commands and secrets are never
@@ -106,6 +118,10 @@ RESIDUAL_NOTES = (
     "sandbox_exec measures a launchctl submit attempt when the model runs it.",
     "Evidence covers this Mac, this binary and the checked account; other accounts need their own "
     "`openswap worker codex login`.",
+    "Jobs follow each account's own permission settings; the permissions gate measures the mechanism "
+    "(a given mode is honoured, a prompt is refused headless, the per-Mac limit holds), not which mode "
+    "the owner picks.",
+    "The Keychain probes add one throwaway login-Keychain item (random, not a secret) and remove it.",
 )
 
 
@@ -392,12 +408,46 @@ class LiveCheck:
 
     # -- plumbing -----------------------------------------------------------------
 
-    def adapter(self) -> CodexExecAdapter:
+    def adapter(self, *, override: str | None = None, permissions=None) -> CodexExecAdapter:
+        """The live adapter as jobs use it; ``override``/``permissions`` measure a given setting."""
         return CodexExecAdapter(
             self.root, containment=self.containment, verify=self._verify,
             mode=lambda: "live", bind_to_opt_in=False, monotonic=self._monotonic, sleep=self._sleep,
             managed=lambda home: managed_codex_config(home, run=self._run),
+            override=(lambda: override) if override is not None else None, permissions_for_check=permissions,
         )
+
+    # -- Keychain probes (sign_in_isolation) -------------------------------------------
+
+    def _keychain_item(self) -> str | None:
+        """A throwaway login-Keychain item (random, not a secret) for the Keychain probes; None if it
+        could not be added. Removed by :meth:`_drop_keychain_item`."""
+        service = f"openswap-live-check-{secrets.token_hex(8)}"
+        try:
+            result = self._run(["/usr/bin/security", "add-generic-password", "-a", "openswap-live-check",
+                                "-s", service, "-w", secrets.token_hex(16)],
+                               capture_output=True, text=True, check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return service if result.returncode == 0 else None
+
+    def _keychain_found(self, service: str) -> bool:
+        """Positive control: the item is found outside any sandbox (attributes only)."""
+        try:
+            result = self._run(["/usr/bin/security", "find-generic-password", "-s", service],
+                               capture_output=True, text=True, check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    def _drop_keychain_item(self, service: str | None) -> None:
+        if service is None:
+            return
+        try:
+            self._run(["/usr/bin/security", "delete-generic-password", "-s", service],
+                      capture_output=True, text=True, check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def _default_list_processes(self) -> list[tuple[int, str]]:
         result = self._run(["/bin/ps", "-axo", "pid=,command="], capture_output=True, text=True,
@@ -423,10 +473,11 @@ class LiveCheck:
         return [pid for pid, command in self._list_processes()
                 if command.split(None, 1)[:1] and command.split(None, 1)[0] in wanted]
 
-    def _codex(self, pinned, home: Path, *args: str, cwd: Path, timeout: float = 60) -> subprocess.CompletedProcess:
+    def _codex(self, pinned, home: Path, *args: str, cwd: Path, timeout: float = 60,
+               shell: bool = True) -> subprocess.CompletedProcess:
         env = codex_env(home, self.check_root)
         try:
-            return self._run([str(pinned.binary), *global_args(), *args], env=env, cwd=str(cwd),
+            return self._run([str(pinned.binary), *global_args(shell=shell), *args], env=env, cwd=str(cwd),
                              capture_output=True, text=True, check=False, timeout=timeout)
         except (OSError, subprocess.SubprocessError):
             return subprocess.CompletedProcess(args, 127, "", "")
@@ -450,14 +501,18 @@ class LiveCheck:
 
     def _job(self, name: str, identity: str, task: str, *, timeout: float, until=None,
              workspace: Path | None = None, sources: tuple[Path, ...] = (),
-             resolved: ResolvedWorkspace | None = None) -> JobOutcome:
-        """Run one real job under its own lease; Stop it if ``until()`` turns true."""
+             resolved: ResolvedWorkspace | None = None, adapter_options: dict | None = None) -> JobOutcome:
+        """Run one real job under its own lease; Stop it if ``until()`` turns true.
+
+        ``adapter_options`` (``adapter()`` keywords) run it with given
+        permission settings instead of the account's own.
+        """
         job_id = f"livecheck-{uuid.uuid4().hex}"
         workspace = resolved.output_root if resolved is not None else (workspace or self._workspace(name))
         resolved = resolved or ResolvedWorkspace("live-check", workspace, tuple(sources))
         token = self.leases.acquire(job_id=job_id, account_identity=identity, worker_pid=os.getpid(),
                                     worker_epoch=time.time_ns(), ttl_s=timeout + 300)
-        adapter = self.adapter()
+        adapter = self.adapter(**(adapter_options or {}))
         record = self._job_record(job_id, identity, task)
         try:
             run = adapter.start(record, resolved, worker_epoch=0)
@@ -674,7 +729,8 @@ class LiveCheck:
 
     def _gate_research(self, identity: str) -> None:
         gate = self.gates["research_run"]
-        outcome = self._job("research", identity, RESEARCH_TASK, timeout=self.research_timeout)
+        outcome = self._job("research", identity, RESEARCH_TASK, timeout=self.research_timeout,
+                            adapter_options=self._research_options())
         summary = outcome.summary
         result_text, _ = _texts(outcome.workspace / RESULT_FILE)
         kinds = [event.kind.value for event in outcome.events]
@@ -769,8 +825,11 @@ class LiveCheck:
         )
         loaded = False
         try:
+            # Under a policy that may ask (on-request), with the shell on:
+            # every escalation the model requests is refused (nobody is at the
+            # Mac), so a write outside still fails (the `permissions` gate).
             outcome = self._job("sandbox", identity, task, timeout=self.probe_timeout, workspace=ws,
-                                sources=(source,))
+                                sources=(source,), adapter_options=self._probe_options())
         finally:
             os.environ.pop(ENV_SENTINEL, None)
             try:
@@ -949,8 +1008,10 @@ class LiveCheck:
             env=tuple(sorted(worktrees.task_env(repo, tree).items())), branch=tree.branch, worktree=tree,
         )
         try:
+            # The most the account's settings could allow, so only OpenSwap's
+            # write scope can deny the writes outside the worktree.
             outcome = self._job("worktree", identity, self._worktree_task(steps), timeout=self.probe_timeout,
-                                resolved=resolved)
+                                resolved=resolved, adapter_options=self._widest_options())
             attempts = self._work_attempts(outcome)
 
             def results_of(key):
@@ -980,6 +1041,114 @@ class LiveCheck:
 
     # Codex runs shell commands; a Claude work task has file tools only.
     _shell_steps = True
+
+    # -- permissions (owner decision 2026-10-08) -------------------------------------------
+
+    def _research_options(self) -> dict:
+        """Research jobs run with the account's own settings."""
+        return {}
+
+    def _probe_options(self) -> dict:
+        """The sandbox probe job: shell on, and a policy that may ask (``on-request``)."""
+        from openswap.worker.permissions import CodexPermissions
+
+        return {"override": "follow", "permissions": CodexPermissions(approval="on-request")}
+
+    def _widest_options(self) -> dict:
+        """The widest settings an account can have: only OpenSwap's own boundary is left."""
+        from openswap.worker.permissions import CodexPermissions
+
+        return {"override": "follow", "permissions": CodexPermissions(approval="never", sandbox="danger-full-access")}
+
+    def _gate_permissions(self, pinned, home: Path, identity: str) -> None:
+        """Codex follows the account's approval policy and sandbox mode, and the per-Mac limit.
+
+        Static (no extra model turn): the config a launch writes carries the
+        account's policy; a read-only sandbox denies a write in the folder;
+        ``no-shell`` turns the shell tool off. The sandbox probe job ran under
+        ``on-request`` (asks refused headless) and its outside write failed.
+        """
+        from openswap.worker.permissions import (
+            NO_SHELL, CodexPermissions, PermissionSettingsError, read_codex_permissions,
+        )
+
+        gate = self.gates["permissions"]
+        detail: dict = {}
+        try:
+            account = read_codex_permissions(home)
+            detail["account_settings"] = account.to_dict()
+            detail["account_settings_readable"] = True
+        except PermissionSettingsError:
+            account = None
+            detail["account_settings_readable"] = False
+        try:
+            if account is not None:
+                launch = account.launch(self._owner_override())
+                prepare_home(self.root, identity, launch=launch)
+                text = (home / "config.toml").read_text(encoding="utf-8")
+                detail["config_follows_account"] = f'approval_policy = "{launch.approval_policy}"' in text
+            ws = self._workspace("permissions-read-only")
+            (ws / "inside.txt").write_text("inside\n")
+            prepare_home(self.root, identity, launch=CodexPermissions(sandbox="read-only").launch("follow"))
+            script = (f"cat {shlex.quote(str(ws / 'inside.txt'))} >/dev/null 2>&1; echo \"R read $?\"; "
+                      f"printf x > {shlex.quote(str(ws / 'write.txt'))} 2>/dev/null; echo \"R write $?\"")
+            result = self._codex(pinned, home, "sandbox", "--permission-profile", PROFILE_NAME, "--cd", str(ws),
+                                 "/bin/sh", "-c", script, cwd=ws)
+            codes = dict(line.split()[1:] for line in (result.stdout or "").splitlines()
+                         if len(line.split()) == 3 and line.startswith("R "))
+            detail["read_only_sandbox_reads"] = codes.get("read") == "0"
+            detail["read_only_sandbox_denies_writes"] = (codes.get("write", "0") != "0"
+                                                         and not (ws / "write.txt").exists())
+            listing = self._codex(pinned, home, "features", "list", cwd=ws,
+                                  shell=CodexPermissions().launch(NO_SHELL).shell)
+            features = parse_features(listing.stdout or "")
+            detail["no_shell_removes_shell_tool"] = listing.returncode == 0 and features.get("shell_tool") is False
+        finally:
+            prepare_home(self.root, identity)
+        probe = self.gates["sandbox_exec"].detail
+        detail["asks_denied_headless"] = (probe.get("all_required_steps_ran") is True
+                                          and probe.get("outside_write_denied") is True)
+        detail["override_on_this_mac"] = self._owner_override()
+        gate.detail = detail
+        gate.passed = all(value is True for key, value in detail.items()
+                          if key not in ("account_settings", "override_on_this_mac"))
+
+    def _owner_override(self) -> str:
+        from openswap.settings import load_permission_override
+
+        try:
+            return load_permission_override(self.root)
+        except Exception:
+            return "read-only"
+
+    def _gate_sign_in_isolation(self, pinned, home: Path, identity: str) -> None:
+        """A shell command in a Codex task reaches neither the Keychain nor the account's sign-in."""
+        gate = self.gates["sign_in_isolation"]
+        ws = self._workspace("sign-in")
+        service = self._keychain_item()
+        try:
+            q = shlex.quote
+            steps = {
+                "keychain": f"/usr/bin/security find-generic-password -s {q(service or 'missing')} >/dev/null 2>&1",
+                "own_sign_in": f"/bin/dd if={q(str(home / 'auth.json'))} of=/dev/null count=0 2>/dev/null",
+            }
+            script = "\n".join(f'{command}; echo "R {name} $?"' for name, command in steps.items())
+            prepare_home(self.root, identity)
+            result = self._codex(pinned, home, "sandbox", "--permission-profile", PROFILE_NAME, "--cd", str(ws),
+                                 "/bin/sh", "-c", script, cwd=ws)
+            codes = dict(line.split()[1:] for line in (result.stdout or "").splitlines()
+                         if len(line.split()) == 3 and line.startswith("R "))
+            found = service is not None and self._keychain_found(service)
+        finally:
+            self._drop_keychain_item(service)
+        detail = {
+            "ran": set(codes) == set(steps),
+            "keychain_control_found": found,
+            "keychain_denied": found and codes.get("keychain", "0") != "0",
+            "own_sign_in_readable_by_shell": codes.get("own_sign_in") == "0",
+        }
+        gate.detail = detail
+        gate.passed = detail["ran"] and detail["keychain_denied"] and not detail["own_sign_in_readable_by_shell"]
 
     PROBE_UNLOAD_WAIT = 10.0
 
@@ -1084,8 +1253,9 @@ class LiveCheck:
         def helper_running(job_id):
             return bool(self._marker_pids(detached))
 
+        # A shell, whatever this account or Mac allows: the probe needs it.
         outcome = self._job("stop", identity, self.HELPER_TASK, timeout=self.helper_wait, until=helper_running,
-                            workspace=ws)
+                            workspace=ws, adapter_options=self._probe_options())
         left = self._marker_pids(child, detached)
         handle = load_handle(outcome.run_dir)
         detail = {
@@ -1129,7 +1299,9 @@ class LiveCheck:
         # does, so its death leaves the same abandoned lease behind.
         process = self._spawn_child({"root": str(self.root), "job_id": job_id, "identity": identity,
                                      "provider": self.provider, "workspace": str(ws), "task": self.HELPER_TASK,
-                                     "lease_ttl": self.helper_wait + 300})
+                                     "lease_ttl": self.helper_wait + 300,
+                                     # A shell, whatever this account or Mac allows: the probe needs it.
+                                     "override": "follow", "approval": "on-request"})
         detail = {"worker_started_job": False, "detached_helper_observed": False, "job_outlived_worker": False,
                   "lease_left_by_worker": False, "recovery_stopped": False, "helpers_left": None,
                   "lease_released_on_proof": False}
@@ -1195,6 +1367,8 @@ class LiveCheck:
             ("sandbox (codex sandbox)", lambda: self._gate_sandbox_wrapper(pinned, home)),
             ("research job", lambda: self._gate_research(identity)),
             ("sandbox (codex exec)", lambda: self._gate_sandbox_exec(identity, home)),
+            ("permissions", lambda: self._gate_permissions(pinned, home, identity)),
+            ("sign-in isolation", lambda: self._gate_sign_in_isolation(pinned, home, identity)),
             ("stop", lambda: self._gate_stop(identity)),
             ("kill and recovery", lambda: self._gate_kill_recovery(identity)),
             ("work folder (worktree)", lambda: self._gate_worktree(identity)),
@@ -1338,9 +1512,18 @@ def child_main(raw: str) -> None:
     if payload.get("provider") == "claude":
         from openswap.worker.claude_exec import ClaudeCodeAdapter
 
-        adapter = ClaudeCodeAdapter(root, mode=lambda: "live", bind_to_opt_in=False)
+        adapter = ClaudeCodeAdapter(root, mode=lambda: "live", bind_to_opt_in=False,
+                                    settings_for_check=payload.get("settings"))
     else:
-        adapter = CodexExecAdapter(root, mode=lambda: "live", bind_to_opt_in=False)
+        from openswap.worker.permissions import CodexPermissions
+
+        approval = payload.get("approval")
+        override = payload.get("override")
+        adapter = CodexExecAdapter(
+            root, mode=lambda: "live", bind_to_opt_in=False,
+            override=(lambda: override) if override in ("follow", "no-shell", "read-only") else None,
+            permissions_for_check=CodexPermissions(approval=approval) if approval in ("never", "on-request") else None,
+        )
     child_acquire_lease(root, payload)
     now = datetime.now(timezone.utc)
     record = JobRecord(
@@ -1462,6 +1645,10 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         print(("All phase-1 live gates passed." if evidence["passed"] else "Some gates failed.") + "\n"
               + _format(evidence))
     say(f"Evidence: {path}")
+    if evidence.get("gates", {}).get("sign_in_isolation", {}).get("own_sign_in_readable_by_shell") is True:
+        say("Note: shell commands in remote tasks on this account can read or replace its own sign-in (macOS "
+            "cannot run Claude Code's own sandbox inside OpenSwap's). `openswap worker permissions no-shell` "
+            "prevents it.")
     if not evidence["passed"]:
         say("Live execution stays off.")
         return 1

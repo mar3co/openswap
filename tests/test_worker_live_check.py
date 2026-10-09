@@ -139,6 +139,10 @@ class SimulatedMac:
         job = {"running": False, "exit": 0, "helpers": []}
         lines = [{"type": "thread.started"}]
         cwd = Path(cwd)
+        # Without its shell tool, Codex runs no command at all.
+        shell = not any(a == "--disable" and b == "shell_tool" for a, b in zip(argv, argv[1:]))
+        if not shell:
+            stdin_text = re.sub(r"^\d+\. .+$", "", stdin_text, flags=re.M).replace("sh ./helper.sh", "")
         if "sh ./helper.sh" in stdin_text:
             script = (cwd / "helper.sh").read_text()
             markers = re.findall(r'"(openswap-live-check-[0-9a-f]+-(?:child|detached))", "(\d+)"', script)
@@ -236,9 +240,23 @@ class SimulatedMac:
 
     def run(self, argv, **kwargs):
         args = [a for a in argv[1:] if a != "--strict-config"]
+        disabled = set()
         while "--disable" in args:
             i = args.index("--disable")
+            disabled.add(args[i + 1])
             del args[i:i + 2]
+        if argv[0] == "/usr/bin/security":
+            # The login Keychain, outside any sandbox (the check's throwaway item).
+            items = self.__dict__.setdefault("keychain", set())
+            service = argv[argv.index("-s") + 1]
+            if argv[1] == "add-generic-password":
+                items.add(service)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[1] == "delete-generic-password":
+                found = service in items
+                items.discard(service)
+                return subprocess.CompletedProcess(argv, 0 if found else 44, "", "")
+            return subprocess.CompletedProcess(argv, 0 if service in items else 44, "", "")
         if argv[0] == "/usr/bin/curl":
             env = kwargs.get("env") or {}
             self.curl_envs.append(env)
@@ -257,7 +275,9 @@ class SimulatedMac:
         if args[:2] == ["mcp", "list"]:
             return subprocess.CompletedProcess(argv, 0, "No MCP servers configured yet.\n", "")
         if args[:2] == ["features", "list"]:
-            text = "shell_tool stable true\n" + "".join(f"{n} stable false\n" for n in codex_exec.DISABLED_FEATURES)
+            shell = "false" if "shell_tool" in disabled else "true"
+            text = f"shell_tool stable {shell}\n" + "".join(f"{n} stable false\n"
+                                                          for n in codex_exec.DISABLED_FEATURES)
             if self.features_text is not None:
                 text = self.features_text
             return subprocess.CompletedProcess(argv, 0, text, "")
@@ -265,7 +285,7 @@ class SimulatedMac:
             script = args[-1]
             out = []
             for name in re.findall(r'echo "R (\w+) \$\?"', script):
-                allowed = name in {"inside_read", "inside_write"} or not self.sandboxed
+                allowed = name in {"inside_read", "inside_write", "read"} or not self.sandboxed
                 if name == "inside_write" or (not self.sandboxed and name == "outside_write"):
                     target = re.search(r"printf \w+ > (\S+) 2>/dev/null; echo \"R " + name, script)
                     Path(target.group(1).strip("'")).write_text("x")
@@ -280,9 +300,15 @@ class FakeChild:
     def __init__(self, check: LiveCheck, payload: dict):
         from openswap.worker.models import ResolvedWorkspace
 
+        from openswap.worker.permissions import CodexPermissions
+
         live_check.child_acquire_lease(check.root, payload)  # as the real child does
         record = check._job_record(payload["job_id"], payload["identity"], payload["task"])
-        check.adapter().start(record, ResolvedWorkspace("live-check", Path(payload["workspace"]), ()),
+        # The settings the real child takes from its payload.
+        adapter = check.adapter(override=payload.get("override"),
+                                permissions=CodexPermissions(approval=payload["approval"])
+                                if payload.get("approval") else None)
+        adapter.start(record, ResolvedWorkspace("live-check", Path(payload["workspace"]), ()),
                               worker_epoch=0)
         self.stdout = io.StringIO("STARTED\n")
         self.killed = False
@@ -317,6 +343,14 @@ def test_a_sandboxed_contained_mac_passes_every_gate_and_can_be_enabled(tmp_path
     assert evidence["passed"] is True
     assert set(evidence["gates"]) == set(live.REQUIRED_GATES)
     assert evidence["account"] == {"identity": IDENTITY, "slot": "1"}
+    permissions = evidence["gates"]["permissions"]
+    assert permissions["config_follows_account"] and permissions["no_shell_removes_shell_tool"]
+    assert permissions["asks_denied_headless"] and permissions["account_settings"]["approval_policy"] == "on-request"
+    assert evidence["gates"]["sign_in_isolation"]["keychain_control_found"] is True
+    assert mac.__dict__.get("keychain") == set()  # the throwaway Keychain item is gone
+    # The probe jobs ran with a policy that may ask; the account's own config is restored after.
+    config = (codex_exec.isolated_home(root, IDENTITY) / "config.toml").read_text()
+    assert 'approval_policy = "never"' in config and '"." = "write"' in config
     lease = AccountLeaseStore(root, "codex").read_current()
     assert lease.state == "released"
     path = live_check.write_evidence(root, evidence)
@@ -328,6 +362,24 @@ def test_a_sandboxed_contained_mac_passes_every_gate_and_can_be_enabled(tmp_path
     assert settings.enabled and live.execution_mode(root) == "live"
 
 
+@pytest.mark.parametrize("restriction", ["no-shell", "untrusted"])
+def test_a_restrictive_mac_or_account_can_still_pass_every_gate(tmp_path, restriction):
+    # The probes that need a shell (sandbox, stop, kill and recovery, work folder)
+    # run with their own settings; the account's or the Mac's limit cannot fail them.
+    from openswap.settings import write_permission_override
+    from openswap.worker.permissions import CodexPermissions, write_codex_permissions
+
+    root = setup_root(tmp_path)
+    if restriction == "no-shell":
+        write_permission_override(root, "no-shell")
+    else:
+        write_codex_permissions(codex_exec.isolated_home(root, IDENTITY), CodexPermissions("untrusted"))
+    mac = SimulatedMac()
+    evidence = make_check(root, mac).run()
+    failed = {name: gate for name, gate in evidence["gates"].items() if not gate["passed"]}
+    assert failed == {} and evidence["passed"] is True
+
+
 def test_a_leaky_sandbox_fails_the_sandbox_gates(tmp_path):
     root = setup_root(tmp_path)
     evidence = make_check(root, SimulatedMac(sandboxed=False)).run()
@@ -337,6 +389,11 @@ def test_a_leaky_sandbox_fails_the_sandbox_gates(tmp_path):
     assert gates["sandbox_exec"]["passed"] is False
     assert gates["sandbox_exec"]["outside_read_denied"] is False
     assert gates["sandbox_exec"]["launchd_submit_contained"] is False
+    # A shell that reaches the Keychain and the isolated sign-in.
+    assert gates["sign_in_isolation"]["passed"] is False
+    assert gates["sign_in_isolation"]["keychain_denied"] is False
+    assert gates["sign_in_isolation"]["own_sign_in_readable_by_shell"] is True
+    assert gates["permissions"]["read_only_sandbox_denies_writes"] is False
     assert evidence["passed"] is False
     path = live_check.write_evidence(root, evidence)
     with pytest.raises(live.LiveModeError):
