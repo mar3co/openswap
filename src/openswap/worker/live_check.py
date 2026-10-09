@@ -1502,7 +1502,9 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         say(f"Live tasks stay off for {name}.")
         return 1
     if args.no_enable or not (args.enable or (interactive and not args.json and _ask("Turn live tasks on now?"))):
-        say(f"Live tasks stay off for {name}. " + printer.next_step(f"`openswap worker live enable{flag}` to turn them on."))
+        # Named evidence: a later check (another account, a failure) must not stand in for this one.
+        say(f"Live tasks stay off for {name}. " + printer.next_step(
+            f"`openswap worker live enable{flag} --evidence {shlex.quote(str(path))}` to turn them on."))
         return 0
     from openswap.worker import claude_cli
 

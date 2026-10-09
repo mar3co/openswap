@@ -199,6 +199,45 @@ def test_status_rows_are_marked_and_worded(root, monkeypatch, capsys):
     assert out.count("Next:") == 1 and "`openswap worker enable`" in out
 
 
+def test_status_gives_one_next_step_even_with_a_blocked_folder(root, monkeypatch, capsys):
+    from openswap.settings import configure_worker_service
+
+    snapshot = {"enabled": True, "paused": False, "process_state": "running",
+                "provider": {"available": False, "diagnostic_code": "live_adapter_disabled"},
+                "remote_connectivity": "online", "active_job": None}
+    monkeypatch.setattr(cli, "read_status", lambda _root: snapshot)
+    monkeypatch.setattr(cli, "refused_workspaces", lambda _root: [("a", "folder_overlaps_readable")])
+    # Unpaired: the blocked folder is the one step.
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert '✗ "a" is blocked (folder_overlaps_readable).' in out and out.count("Next:") == 1
+    assert out.endswith("Next: `openswap worker workspace remove <id>` to drop a blocked folder "
+                        "(`openswap worker workspace list` shows them).\n")
+    # Paired and running with live tasks off: the folder still comes before the live check.
+    configure_worker_service(root, "https://opentag.me", "worker-1")
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert out.count("Next:") == 1 and "workspace remove" in out and "live-check" not in out
+    # The worker being off outranks it.
+    monkeypatch.setattr(cli, "read_status", lambda _root: {**snapshot, "enabled": False, "process_state": "stopped"})
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert out.count("Next:") == 1 and out.endswith(
+        "Next: `openswap worker enable` to start the worker (paired with https://opentag.me).\n")
+
+
+def test_a_refused_pause_says_what_still_holds(root, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "request_pause", lambda _root, paused: {
+        "accepted": False, "paused": not paused, "diagnostic_code": "settings_unavailable"})
+    assert _run(root, "pause") == 1
+    out, err = capsys.readouterr()
+    assert out == "" and err == "✗ Not changed (settings_unavailable); the worker is still taking tasks.\n"
+    assert _run(root, "pause", "--off") == 1
+    assert capsys.readouterr().err.endswith("the worker is still paused.\n")
+    assert _run(root, "pause", "--json") == 1
+    assert json.loads(capsys.readouterr().out)["accepted"] is False
+
+
 def test_blocked_disable_names_the_lease_store_that_is_held(root, monkeypatch, capsys):
     from types import SimpleNamespace
 

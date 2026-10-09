@@ -2027,11 +2027,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             human = _format_status(snapshot)
             for workspace_id, code in refused:
                 human = f"{human}\n{refusal_line(workspace_id, code)}"
-            if refused:
-                human = f"{human}\n" + printer.next_step(
-                    "`openswap worker workspace remove <id>` to drop a blocked folder "
-                    "(`openswap worker workspace list` shows them).")
-            hint = _worker_off_hint(root, snapshot)
+            hint = _worker_off_hint(root, snapshot, refused=bool(refused))
             if hint is not None:
                 human = f"{human}\n{hint}"
         _write(snapshot, as_json=args.json, human=human)
@@ -2061,13 +2057,22 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         except (OSError, RuntimeError, ValueError):
             print(SETTINGS_MESSAGE, file=sys.stderr)
             return 1
+        if payload["accepted"] is not True:
+            # The worker refused and the previous setting was restored: say what still holds.
+            if args.json:
+                _write(payload, as_json=True)
+            else:
+                still = "paused" if payload.get("paused") else "taking tasks"
+                print(f"{printer.MARK_BAD} Not changed ({payload.get('diagnostic_code')}); the worker is still "
+                      f"{still}.", file=sys.stderr)
+            return 1
         _write(
             payload,
             as_json=args.json,
             human=(f"{printer.MARK_OK} Paused: no new task starts. `openswap worker pause --off` resumes."
                    if paused else f"{printer.MARK_OK} Taking tasks again."),
         )
-        return 0 if payload["accepted"] else 1
+        return 0
     if args.command == "enable":
         try:
             payload = enable_worker(root)
@@ -2643,17 +2648,29 @@ _ENABLE_DIAGNOSTICS = frozenset({
 _RUNNING_STATES = frozenset({"starting", "running"})
 
 
-def _worker_off_hint(root: Path, snapshot: dict) -> str | None:
-    """The one `Next:` line for `worker status`: start the worker, resume, or turn on live tasks."""
+_REFUSED_FOLDERS_STEP = ("`openswap worker workspace remove <id>` to drop a blocked folder "
+                         "(`openswap worker workspace list` shows them).")
+
+
+def _worker_off_hint(root: Path, snapshot: dict, *, refused: bool = False) -> str | None:
+    """The one `Next:` line for `worker status`, in priority order.
+
+    Start the worker (when paired but off), fix a blocked folder, pause and
+    run the live check (or the check alone once paused), resume. Never more
+    than one, so two situations never give competing instructions.
+    """
     try:
         settings = load_worker_settings(root)
     except Exception:
-        return None
-    if settings.control_service_url is None:
-        return None
-    if not (snapshot.get("enabled") is True and snapshot.get("process_state") in _RUNNING_STATES):
+        settings = None
+    paired = settings is not None and settings.control_service_url is not None
+    if paired and not (snapshot.get("enabled") is True and snapshot.get("process_state") in _RUNNING_STATES):
         return printer.next_step(f"`openswap worker enable` to start the worker (paired with "
                                  f"{settings.control_service_url}).")
+    if refused:
+        return printer.next_step(_REFUSED_FOLDERS_STEP)
+    if not paired:
+        return None
     paused = snapshot.get("paused") is True
     provider = snapshot.get("provider") or {}
     if provider.get("available") is not True and provider.get("diagnostic_code") == "live_adapter_disabled":
