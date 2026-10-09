@@ -13,19 +13,32 @@ recovery and retention this class reuses:
   session profile (``<backup>/sessions/<slot>-<email>``), the profile scheduled
   kickoff already uses, prepared once with ``openswap worker claude prepare``.
   The job runs only when the profile's recorded login is exactly the leased
-  account and no interactive Claude session is using it. The owner's default
-  ``~/.claude`` login is never used or changed; the CLI owns its refresh, and
-  OpenSwap never reads, copies, logs or uploads the credentials.
-- **Tools.** ``--restricted`` with only Read, Grep, Glob, WebSearch and WebFetch:
-  no shell, no code execution, no write or edit tool, no MCP
-  (``--strict-mcp-config``), no skills, no session persistence; anything that
-  would prompt is denied. Approved read-only sources are added with
-  ``--add-dir``.
+  account, its sign-in is in the profile's own credentials file (Claude
+  Code's file store: jobs cannot reach the Keychain, below) and no
+  interactive Claude session is using it. The owner's default ``~/.claude``
+  login is never used or changed; the CLI owns its refresh, and OpenSwap never
+  reads, copies, logs or uploads the credentials.
+- **Tools.** The account's own permission settings (owner decision
+  2026-10-08, :mod:`openswap.worker.permissions`): Claude Code reads the mode
+  and the allow, deny and ask rules from the profile's ``settings.json``
+  (``--setting-sources user``; a repo's own settings never apply), and
+  ``--permission-prompts none`` denies whatever would ask, since nobody is at
+  the Mac (``auto`` mode decides by itself, as it does locally). The per-Mac
+  limit (``openswap worker permissions``) can take the shell away
+  (``no-shell``) or leave only read and web tools (``read-only``). No MCP
+  (``--strict-mcp-config``), no skills, no session persistence. Approved
+  read-only sources are added with ``--add-dir``.
 - **Sandbox.** The CLI runs under ``sandbox-exec`` with a Seatbelt profile that
-  allows writes only to the job folder, its own profile, its temporary
-  directory and caches, and denies reads of the default Claude and Codex
-  logins and of OpenSwap's backup root other than this profile and the job
-  folder.
+  holds whatever the mode, ``bypassPermissions`` included: writes only to the
+  job folder (or the task's worktree), its own profile (never the files there
+  that configure later sessions), its temporary directory and caches; no
+  reads of the default Claude and Codex logins or of OpenSwap's backup root
+  other than this profile and the job folder; and no Keychain at all (no
+  ``security`` command, no Keychain service), so a shell command cannot read
+  another account's sign-in, the default login or the worker's own keys. Claude
+  Code then keeps this account's sign-in in the profile's credentials file,
+  which a shell command in the task can read (macOS refuses to start Claude
+  Code's own bash sandbox inside this one); ``no-shell`` prevents that.
 - **Result.** The ``result`` message's text becomes ``result.md``, published
   only after the stop is proven, like Codex's final message.
 """
@@ -34,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 
 from openswap.worker import claude_cli
@@ -48,14 +62,28 @@ from openswap.worker.containment import write_private
 from openswap.worker.leases import LeaseStateError, stable_account_identity
 from openswap.worker.live import execution_mode
 from openswap.worker.models import ResolvedWorkspace, SafeEventKind
+from openswap.worker.permissions import (
+    CLAUDE_PROFILE_CONFIG,
+    CLAUDE_PROFILE_CONFIG_DIRS,
+    CLAUDE_READ_ONLY_TOOLS,
+    PermissionSettingsError,
+    claude_permission_args,
+    read_claude_permissions,
+)
 
-RESEARCH_TOOLS = ("Read", "Grep", "Glob", "WebSearch", "WebFetch")
-# A work folder task edits files in its worktree (or, in direct mode, the
-# folder). No Bash: a shell would run with the Claude process's own sandbox,
-# which must read and write the account's profile (its credentials). What it
-# leaves is committed to its branch by the worker when it finishes.
-WORK_TOOLS = (*RESEARCH_TOOLS, "Edit", "Write")
+# The tools the ``read-only`` limit leaves (reading and web research).
+RESEARCH_TOOLS = CLAUDE_READ_ONLY_TOOLS
 SANDBOX_PROFILE_FILE = "claude.sb"
+# Claude Code's file store for the sign-in (used when the Keychain is unreachable).
+CREDENTIALS_FILE = ".credentials.json"
+# The Keychain's services: a job reaches none of them. ``trustd`` (certificate
+# trust) is not among them, so TLS still works.
+KEYCHAIN_SERVICES = (
+    "com.apple.SecurityServer", "com.apple.securityd", "com.apple.securityd.xpc", "com.apple.secd",
+    "com.apple.security.agent", "com.apple.security.agent.login", "com.apple.security.authhost",
+    "com.apple.security.keychain-circle", "com.apple.securityd.systemkeychain",
+)
+SECURITY_TOOL = "/usr/bin/security"
 MANAGED_CLAUDE_PATHS = (
     "/Library/Application Support/ClaudeCode/managed-settings.json",
     "/Library/Application Support/ClaudeCode/managed-mcp.json",
@@ -71,9 +99,11 @@ REMOTE_SETTINGS_FILE = "remote-settings.json"  # server-managed policy, cached i
 def managed_claude_config(profile: Path, *, run=None, user: str | None = None) -> list[str]:
     """Managed Claude Code policy that would apply to a job (empty when none).
 
-    ``--restricted`` still loads managed settings, which can add hooks,
-    environment values or permissions the live check never measured. So any
-    source refuses a launch: the system files, any fragment in
+    Managed settings apply over everything a job passes and the account's
+    own settings: they can add hooks, environment values, permission rules or
+    an API key helper the owner did not choose for the account and the live
+    check never measured. So any source refuses a launch: the system files,
+    any fragment in
     ``managed-settings.d``, the machine or per-user managed preferences, and
     the server-managed policy Claude Code caches in the profile
     (``remote-settings.json``) unless that cache is an empty object.
@@ -201,12 +231,22 @@ def darwin_user_dirs() -> list[Path]:
 def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: Path, backup_root: Path,
                      readonly_sources: tuple[Path, ...] = (), user_dirs: list[Path] | None = None,
                      write_paths: tuple[Path, ...] = (), read_paths: tuple[Path, ...] = ()) -> str:
-    """The Seatbelt profile ``claude`` runs under (later rules win in SBPL).
+    """The Seatbelt profile ``claude`` and everything it starts run under (later rules win in SBPL).
 
-    Writes: only the output folder, this account's profile, the run's own
-    temporary folder, and this user's cache/temporary folders (system
-    frameworks need them). The other accounts, OpenSwap's own state and the
-    owner's default Claude/Codex logins are neither readable nor writable.
+    It holds whatever Claude Code's own permission mode allows:
+
+    - Writes: only the output folder, this account's profile, the run's own
+      temporary folder, and this user's cache/temporary folders (system
+      frameworks need them). Never the profile files that configure later
+      sessions (settings, memory, agents, commands, skills, hooks, plugins),
+      so one task cannot widen the next.
+    - The other accounts, OpenSwap's own state and the owner's default
+      Claude/Codex logins are neither readable nor writable.
+    - No Keychain: the ``security`` tool cannot start and the Keychain's
+      services cannot be reached, so neither Claude Code nor a shell command
+      it runs can read any Keychain item (other accounts' sign-ins, the
+      default login, the worker's device key). Claude Code falls back to the
+      profile's own credentials file.
     """
     # ``output_root`` is the session's working directory; ``write_paths`` add
     # what git needs for a work folder's worktree.
@@ -214,6 +254,9 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
     support = [home / "Library" / "Caches", *(darwin_user_dirs() if user_dirs is None else user_dirs)]
     hidden = [home / ".claude", home / ".codex", backup_root]
     readable = [profile, output_root, *readonly_sources, *write_paths, *read_paths]
+    configuration = [f"(literal {_sb_string(profile / name)})" for name in CLAUDE_PROFILE_CONFIG]
+    configuration += [f"(subpath {_sb_string(profile / name)})" for name in CLAUDE_PROFILE_CONFIG_DIRS]
+    services = " ".join(f"(global-name {_sb_string(name)})" for name in KEYCHAIN_SERVICES)
 
     def subpaths(paths):
         return " ".join(f"(subpath {_sb_string(p)})" for p in paths)
@@ -225,11 +268,32 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
         f'(allow file-write* {subpaths(support)} (subpath "/dev") (literal "/dev/null"))',
         f"(deny file-write* {subpaths(hidden)} (literal {_sb_string(home / '.claude.json')}))",
         f"(allow file-write* {subpaths(own)})",
+        f"(deny file-write* {' '.join(configuration)})",
         f"(deny file-read* {subpaths(hidden)} (literal {_sb_string(home / '.claude.json')}))",
         f"(allow file-read* {subpaths(readable)})",
+        f"(deny process-exec (literal {_sb_string(SECURITY_TOOL)}))",
+        f"(deny mach-lookup {services})",
+        f"(deny file-read* file-write* (subpath {_sb_string(home / 'Library' / 'Keychains')}))",
         "",
     ]
     return "\n".join(lines)
+
+
+def keychain_free_profile() -> str:
+    """A Seatbelt profile that only takes the Keychain away (``openswap worker claude prepare``).
+
+    Claude Code's own sign-in then stores the account's credentials in the
+    profile's credentials file, where jobs (which cannot reach the Keychain)
+    find them. OpenSwap itself never touches them.
+    """
+    services = " ".join(f"(global-name {_sb_string(name)})" for name in KEYCHAIN_SERVICES)
+    return "\n".join([
+        "(version 1)",
+        "(allow default)",
+        f"(deny process-exec (literal {_sb_string(SECURITY_TOOL)}))",
+        f"(deny mach-lookup {services})",
+        "",
+    ])
 
 
 def claude_env(home: Path, profile: Path, run_dir: Path) -> dict[str, str]:
@@ -256,19 +320,44 @@ def claude_env(home: Path, profile: Path, run_dir: Path) -> dict[str, str]:
 
 
 def claude_argv(binary: Path, sandbox_profile: Path, readonly_sources: tuple[Path, ...] = (),
-                tools: tuple[str, ...] = RESEARCH_TOOLS) -> list[str]:
-    """Fixed launcher arguments; the task arrives on stdin. Nothing comes from the caller."""
-    tools = ",".join(tools)
+                permission_args: tuple[str, ...] | list[str] = (), setting_sources: str = "user",
+                ) -> list[str]:
+    """Launcher arguments; the task arrives on stdin. Nothing comes from the remote caller.
+
+    No permission mode or tool list is passed: Claude Code takes them from the
+    profile's ``settings.json`` (``--setting-sources user``), exactly as
+    ``claude`` run there would. ``--permission-prompts none`` turns every
+    prompt into a denial. ``permission_args`` is the per-Mac limit
+    (:func:`openswap.worker.permissions.claude_permission_args`). Only the
+    live check passes ``setting_sources=""`` (its own settings alone); a
+    repo's project or local settings never apply.
+    """
+    if setting_sources not in ("user", ""):
+        raise ValueError("only the account's own settings may apply")
     argv = [
         "/usr/bin/sandbox-exec", "-f", str(sandbox_profile), str(binary),
         "-p", "--output-format", "stream-json", "--verbose",
-        "--restricted", "--tools", tools, "--allowedTools", tools,
-        "--permission-mode", "dontAsk", "--permission-prompts", "none",
+        "--setting-sources", setting_sources, "--permission-prompts", "none",
         "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence",
+        *permission_args,
     ]
     for source in readonly_sources:
         argv += ["--add-dir", str(source)]
     return argv
+
+
+def credentials_in_file(profile: Path) -> bool:
+    """Whether the profile's sign-in is in Claude Code's credentials file (existence only, never read).
+
+    Jobs cannot reach the Keychain, so Claude Code reads the sign-in from
+    there; `openswap worker claude prepare` puts it there with Claude Code's
+    own login.
+    """
+    try:
+        info = (Path(profile) / CREDENTIALS_FILE).lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size > 0
 
 
 class ClaudeCodeAdapter(CodexExecAdapter):
@@ -277,7 +366,8 @@ class ClaudeCodeAdapter(CodexExecAdapter):
     provider = "claude"
     _cli_errors = (claude_cli.ClaudeCliError,)
 
-    def __init__(self, backup_root: Path, *, home: Path | None = None, live_sessions=None, **kwargs):
+    def __init__(self, backup_root: Path, *, home: Path | None = None, live_sessions=None,
+                 settings_for_check: dict | None = None, profile_settings: bool = True, **kwargs):
         root = Path(backup_root)
         kwargs.setdefault("verify", lambda **kw: claude_cli.verify(root, **kw))
         kwargs.setdefault("mode", lambda: execution_mode(root, "claude"))
@@ -285,6 +375,12 @@ class ClaudeCodeAdapter(CodexExecAdapter):
         super().__init__(root, **kwargs)
         self._home = Path(home) if home is not None else Path.home()
         self._live_sessions = live_sessions or _live_sessions
+        # The live check runs some jobs with given settings (flag-level, over
+        # the profile's) to measure a specific mode; jobs never do.
+        self._settings_for_check = dict(settings_for_check) if settings_for_check else None
+        # The live check's mode probes leave the profile's own settings out
+        # (``--setting-sources ""``), so the owner's rules cannot decide them.
+        self._profile_settings = profile_settings or self._settings_for_check is None
 
     def _grant_allowed(self, path: Path) -> bool:
         """Also never grant a path overlapping the folders the Seatbelt profile hides.
@@ -318,8 +414,9 @@ class ClaudeCodeAdapter(CodexExecAdapter):
             # A symlinked profile (or ancestor) would turn the Seatbelt
             # allowance for it into one for wherever the link points.
             raise ProviderLaunchRefused("provider_auth_unavailable")
-        if profile_identity(profile) != identity:
-            # Not prepared, or logged in as another account: never run on it.
+        if profile_identity(profile) != identity or not credentials_in_file(profile):
+            # Not prepared, logged in as another account, or signed in only in
+            # the Keychain, which jobs cannot reach: never run on it.
             raise ProviderLaunchRefused("provider_auth_unavailable")
         if self._live_sessions(profile):
             # An interactive Claude session owns this profile's refresh now.
@@ -330,6 +427,17 @@ class ClaudeCodeAdapter(CodexExecAdapter):
             raise ProviderLaunchRefused("provider_unavailable")
         if self._managed(profile):
             raise ProviderLaunchRefused("provider_unavailable")
+        try:
+            # Claude Code would silently ignore a settings file it cannot
+            # validate, dropping the owner's deny rules: refuse instead.
+            permissions = read_claude_permissions(profile)
+        except PermissionSettingsError:
+            raise ProviderLaunchRefused("provider_unavailable") from None
+        override = self.override()
+        self._permission_args = claude_permission_args(override, self._settings_for_check)
+        self._launch_summary = {"permissions": {**permissions.to_dict(), "override": override,
+                                                "for_check": self._settings_for_check is not None,
+                                                "profile_settings": self._profile_settings}}
         return profile
 
     def _command(self, pinned, profile: Path, output_root: Path, run_dir: Path,
@@ -346,9 +454,9 @@ class ClaudeCodeAdapter(CodexExecAdapter):
             write_private(sb, text.encode("utf-8"))
         except (OSError, ValueError):
             raise ProviderLaunchRefused("provider_unavailable") from None
-        tools = WORK_TOOLS if workspace.work_dir is not None else RESEARCH_TOOLS
         env = {**claude_env(self._home, profile, run_dir), **dict(workspace.env)}
-        return claude_argv(pinned.binary, sb, sources, tools), env
+        return claude_argv(pinned.binary, sb, sources, self._permission_args,
+                           "user" if self._profile_settings else ""), env
 
     def _line(self, state, line: bytes):
         if not line.strip():
@@ -369,6 +477,8 @@ class ClaudeCodeAdapter(CodexExecAdapter):
             state.extra["mcp_servers"] = len(servers) if isinstance(servers, list) else None
             source = record.get("apiKeySource")
             state.extra["api_key_source"] = source if isinstance(source, str) and len(source) <= 40 else None
+            mode = record.get("permissionMode")
+            state.extra["permission_mode"] = mode if isinstance(mode, str) and len(mode) <= 40 else None
             if not state.started:
                 state.started = True
                 return [self._event(state, SafeEventKind.PROVIDER_STARTED)]

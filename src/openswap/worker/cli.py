@@ -1620,8 +1620,39 @@ def _run(backup_root: Path, *, managed: bool = False) -> int:
 
 _WORKER_COMMANDS = (
     "setup", "pair", "unpair", "status", "enable", "disable", "pause", "stop", "account", "workspace",
-    "worktrees", "codex", "claude", "live", "live-check", "lease", "run", "submit-test", "refserver",
+    "worktrees", "permissions", "codex", "claude", "live", "live-check", "lease", "run", "submit-test",
+    "refserver",
 )
+
+
+def permission_override(backup_root: Path) -> str:
+    """The per-Mac limit on remote sessions (unreadable reads as the strictest)."""
+    from openswap.settings import load_permission_override
+
+    try:
+        return load_permission_override(backup_root)
+    except Exception:
+        return "read-only"
+
+
+def set_permission_override(backup_root: Path, value: str) -> str:
+    """Set the per-Mac limit. Only this Mac's owner can: no protocol message reaches it.
+
+    It applies from the next launch; a task already running keeps what it started with.
+    """
+    from openswap.settings import write_permission_override
+
+    return write_permission_override(backup_root, value)
+
+
+def permissions_text(value: str) -> str:
+    """One line for the per-Mac limit, as `permissions`, `status` and the setup summary say it."""
+    from openswap.worker.permissions import FOLLOW, OVERRIDE_DESCRIPTIONS
+
+    if value == FOLLOW:
+        return ("Remote tasks on this Mac follow each account's own Claude or Codex permission settings "
+                "(the default).")
+    return f"This Mac limits every remote task: {OVERRIDE_DESCRIPTIONS[value]}."
 
 
 def unknown_command_message(prog: str, word: str, commands) -> str:
@@ -1805,6 +1836,18 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                     "worktree is removed when clean and kept when it holds uncommitted work. "
                     "`prune` removes finished tasks' clean worktrees (with --force, every finished one).",
     )
+    permissions_parser = commands.add_parser(
+        "permissions", help="show or set this Mac's limit on what remote sessions may do",
+        description="Remote Claude and Codex sessions follow each account's own permission settings "
+                    "(`claude prepare --copy-settings/--mode`, `codex settings`), like running claude or "
+                    "codex there; nobody is at the Mac to approve, so anything that would ask is denied. "
+                    "This optional limit applies to every remote task on this Mac and can only be set here, "
+                    "never from the control service: `follow` (the default), `no-shell` (no shell commands "
+                    "or hooks) or `read-only` (Claude: read and web tools only; Codex: a read-only sandbox). "
+                    "The folder or worktree write scope and the hidden sign-ins hold in every mode.",
+    )
+    permissions_parser.add_argument("limit", nargs="?", choices=("follow", "no-shell", "read-only"))
+    permissions_parser.add_argument("--json", action="store_true")
     worktrees_parser.add_argument("action", nargs="?", choices=("list", "prune"), default="list")
     worktrees_parser.add_argument("--force", action="store_true",
                                   help="with prune: also remove dirty or locked worktrees of finished tasks")
@@ -1915,6 +1958,22 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         return _workspace_command(root, args)
     if args.command == "worktrees":
         return _worktrees_command(root, args)
+    if args.command == "permissions":
+        if args.limit is None:
+            value = permission_override(root)
+            _write({"permission_override": value}, as_json=args.json, human=permissions_text(value) + "\n"
+                   + printer.next_step("change it with `openswap worker permissions follow|no-shell|read-only`."))
+            return 0
+        try:
+            _migrate_legacy_before_worker_state_change(root)
+            value = set_permission_override(root, args.limit)
+        except (ClaudeSwitchError, OSError, RuntimeError, ValueError):
+            print("Could not save the worker settings.", file=sys.stderr)
+            return 1
+        _write({"permission_override": value}, as_json=args.json,
+               human=f"{printer.MARK_OK} {permissions_text(value)} It applies from the next task; one "
+                     "already running keeps what it started with.")
+        return 0
     if args.command == "status":
         try:
             snapshot = read_status(root)
@@ -1928,6 +1987,10 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         if refused:
             snapshot = {**snapshot, "refused_workspaces": [
                 {"workspace_id": workspace_id, "diagnostic_code": code} for workspace_id, code in refused]}
+        override = permission_override(root)
+        if override != "follow":
+            # Only a limit beyond the accounts' own settings is reported.
+            snapshot = {**snapshot, "permission_override": override}
         human = None
         if not args.json:
             human = _format_status(snapshot)
@@ -2580,4 +2643,9 @@ def _format_status(snapshot: dict) -> str:
         (f"{printer.mark(service_ok)} Service", f"{remote} (last seen {seen})"),
         (f"{printer.mark(None)} Job", job),
     ]
+    override = snapshot.get("permission_override", "follow")
+    if override != "follow":
+        # Only a non-default limit is worth a row: by default sessions follow
+        # each account's own settings.
+        rows.append((f"{printer.mark(None)} Permissions", f"{override} (set on this Mac)"))
     return "\n".join([printer.heading("Remote tasks worker"), *printer.columns(rows)])

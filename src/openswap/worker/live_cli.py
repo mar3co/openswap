@@ -54,6 +54,16 @@ _CLI_MESSAGES = {
 _PIN_MESSAGES = {
     "managed_codex_config": ("A managed or system Codex configuration on this Mac could override where Codex "
                              "stores sign-ins, so OpenSwap won't sign accounts in or out (remote jobs refuse too)."),
+    "claude_settings_invalid": ("That account's profile has a settings.json Claude Code would ignore (not valid "
+                                "JSON, a symlink, or permission keys it does not accept). Remote tasks refuse to "
+                                "run until it is fixed or removed."),
+    "claude_sign_in_not_in_profile": ("Claude Code signed in, but did not keep the sign-in in the profile's "
+                                      "credentials file, which is the only place remote tasks can use it."),
+    "claude_default_settings_missing": "~/.claude/settings.json has no permission settings to copy.",
+    "codex_settings_invalid": ("That account's remote-task settings (permissions.json in its isolated Codex "
+                               "home) are not valid. Set them again with `openswap worker codex settings`."),
+    "codex_default_settings_missing": ("~/.codex/config.toml sets no approval_policy, approvals_reviewer or "
+                                       "sandbox_mode to copy."),
 }
 
 
@@ -161,7 +171,69 @@ def logout(backup_root: Path, selector: str | None, *, run=subprocess.run, verif
     return {"slot": choice.number, "account_ref": identity, "signed_in": False}
 
 
+def codex_settings(backup_root: Path, selector: str | None, *, copy_settings: bool = False,
+                   approval: str | None = None, sandbox: str | None = None, reviewer: str | None = None,
+                   codex_home: Path | None = None) -> dict:
+    """Show or set an account's Codex approval and sandbox settings for remote tasks.
+
+    ``copy_settings`` takes ``approval_policy``, ``approvals_reviewer`` and
+    ``sandbox_mode`` from the owner's ``~/.codex/config.toml`` (and its
+    selected profile); the explicit values then override them. Written under
+    the account's Codex lease, so no job of it is running meanwhile.
+    """
+    from dataclasses import replace
+
+    from openswap.worker.permissions import (
+        CODEX_APPROVALS, CODEX_REVIEWERS, CODEX_SANDBOXES, CodexPermissions, PermissionSettingsError,
+        default_codex_permissions, read_codex_permissions, write_codex_permissions,
+    )
+
+    root = Path(backup_root)
+    if ((approval is not None and approval not in CODEX_APPROVALS)
+            or (sandbox is not None and sandbox not in CODEX_SANDBOXES)
+            or (reviewer is not None and reviewer not in CODEX_REVIEWERS)):
+        raise AccountPinError("codex_settings_value_invalid")
+    changing = copy_settings or approval is not None or sandbox is not None or reviewer is not None
+    if not changing:
+        # Showing needs no lease (a running job keeps it).
+        choice = _resolve(root, selector)
+        try:
+            current = read_codex_permissions(isolated_home(root, choice.account_ref))
+        except PermissionSettingsError:
+            raise AccountPinError("codex_settings_invalid") from None
+        return {"slot": choice.number, "account_ref": choice.account_ref, "permissions": current.to_dict(),
+                "changed": False}
+    with selected_account_lease(root, selector, "settings") as choice:
+        home = isolated_home(root, choice.account_ref)
+        try:
+            base = read_codex_permissions(home)
+        except PermissionSettingsError:
+            base = CodexPermissions()  # being replaced
+        if copy_settings:
+            copied = default_codex_permissions(codex_home)
+            if copied is None:
+                raise AccountPinError("codex_default_settings_missing")
+            base = copied
+        base = replace(base, **{key: value for key, value in (("approval", approval), ("sandbox", sandbox),
+                                                               ("reviewer", reviewer)) if value is not None})
+        prepare_home(root, choice.account_ref)  # the isolated home, 0700, if it is not there yet
+        current = write_codex_permissions(home, base)
+    return {"slot": choice.number, "account_ref": choice.account_ref, "permissions": current.to_dict(),
+            "changed": True}
+
+
+def _override(root: Path) -> str:
+    from openswap.settings import load_permission_override
+
+    try:
+        return load_permission_override(root)
+    except Exception:
+        return "read-only"
+
+
 def codex_status(backup_root: Path) -> dict:
+    from openswap.worker.permissions import PermissionSettingsError, read_codex_permissions
+
     root = Path(backup_root)
     try:
         pinned = codex_cli.verify(root)
@@ -175,23 +247,45 @@ def codex_status(backup_root: Path) -> dict:
         if choice.account_ref is None:
             continue
         home = isolated_home(root, choice.account_ref)
+        try:
+            permissions = read_codex_permissions(home).to_dict()
+        except PermissionSettingsError:
+            permissions = None
         accounts.append({
             "slot": choice.number, "alias": choice.alias, "account_ref": choice.account_ref,
             "pinned": choice.account_ref == policy.pinned_account_ref,
             "allowed": choice.account_ref in allowed,
             "isolated_sign_in": home_identity(home) == choice.account_ref,
+            # The approval and sandbox settings remote tasks follow (None: unreadable).
+            "permissions": permissions,
         })
-    return {"cli": cli, "accounts": accounts, **live_status(root)}
+    return {"cli": cli, "accounts": accounts, **live_status(root), "permission_override": _override(root)}
 
 
-def _account_status_rows(accounts, ready_key: str, ready: str, not_ready: str) -> list[tuple[str, ...]]:
+def _account_status_rows(accounts, ready_key: str, ready: str, not_ready: str,
+                         describe=None) -> list[tuple[str, ...]]:
     rows = []
     for account in accounts:
         roles = [m for m, on in (("default", account["pinned"]), ("allowed", account["allowed"])) if on]
-        rows.append((f"{printer.mark(account[ready_key])} {account['slot']}",
-                     f"({account['alias']})" if account["alias"] else "",
-                     ready if account[ready_key] else not_ready, ", ".join(roles)))
+        row = (f"{printer.mark(account[ready_key])} {account['slot']}",
+               f"({account['alias']})" if account["alias"] else "",
+               ready if account[ready_key] else not_ready, ", ".join(roles))
+        if describe is not None:
+            # What its remote tasks may do (the account's own settings).
+            permissions = account.get("permissions")
+            row += (describe(permissions) if permissions is not None else "settings unreadable",)
+        rows.append(row)
     return rows
+
+
+def _override_line(status: dict) -> str | None:
+    """The per-Mac limit, shown only when it is not the default."""
+    from openswap.worker.permissions import FOLLOW, OVERRIDE_DESCRIPTIONS
+
+    override = status.get("permission_override", FOLLOW)
+    if override == FOLLOW:
+        return None
+    return f"  {printer.mark(None)} This Mac limits every remote task: {OVERRIDE_DESCRIPTIONS[override]}."
 
 
 def _format_codex_status(status: dict) -> str:
@@ -206,7 +300,10 @@ def _format_codex_status(status: dict) -> str:
     if not status["accounts"]:
         lines.append("  No eligible Codex accounts in the roster. Add one with `openswap codex add`.")
     lines.extend(printer.columns(_account_status_rows(status["accounts"], "isolated_sign_in",
-                                                      "signed in", "not signed in")))
+                                                      "signed in", "not signed in", _codex_describe)))
+    override = _override_line(status)
+    if override is not None:
+        lines.append(override)
     lines.append(printer.next_step(_codex_next_step(status)))
     return "\n".join(lines)
 
@@ -231,6 +328,9 @@ def _codex_next_step(status: dict) -> str:
     unsigned = next((a for a in allowed if not a["isolated_sign_in"]), None)
     if unsigned is not None:
         return f"sign allowed account {unsigned['slot']} in: `openswap worker codex login {unsigned['slot']}`."
+    if status.get("recheck_needed"):
+        return ("run the live check again (remote tasks now follow each account's own settings): "
+                "`openswap worker live-check`.")
     if status["execution_mode"] != "live":
         return "run the live check and enable live execution: `openswap worker live-check`."
     unchecked = next((a for a in [pinned, *allowed] if _unchecked(status, a)), None)
@@ -254,6 +354,9 @@ def _claude_next_step(status: dict) -> str:
     if unready is not None:
         return (f"prepare allowed account {unready['slot']}'s profile: "
                 f"`openswap worker claude prepare claude:{unready['slot']}`.")
+    if status.get("recheck_needed"):
+        return ("run the live check again (remote tasks now follow each account's own settings): "
+                "`openswap worker live-check --provider claude`.")
     if status["execution_mode"] != "live":
         return "run the live check and enable live execution: `openswap worker live-check --provider claude`."
     unchecked = next((a for a in [pinned, *allowed] if _unchecked(status, a)), None)
@@ -263,8 +366,8 @@ def _claude_next_step(status: dict) -> str:
     return "nothing: live execution is on. `openswap worker live disable --provider claude` turns it off."
 
 
-_MUTATING = {("codex", "install"), ("codex", "login"), ("codex", "logout"), ("live", "enable"),
-             ("live", "disable"), ("claude", "pin"), ("claude", "prepare")}
+_MUTATING = {("codex", "install"), ("codex", "login"), ("codex", "logout"), ("codex", "settings"),
+             ("live", "enable"), ("live", "disable"), ("claude", "pin"), ("claude", "prepare")}
 
 
 def _unshare_profile(profile: Path) -> None:
@@ -290,23 +393,49 @@ def _claude_login_env(profile: Path) -> dict[str, str]:
     return env
 
 
+def _keychain_free_run(root: Path, run, argv: list[str], **kwargs):
+    """Run ``argv`` under a Seatbelt profile with no Keychain (see ``keychain_free_profile``)."""
+    from openswap.worker.claude_exec import keychain_free_profile
+    from openswap.worker.containment import ensure_private_dir, write_private
+
+    worker = root / "worker"
+    ensure_private_dir(worker)
+    profile = worker / "claude-sign-in.sb"
+    write_private(profile, keychain_free_profile().encode("utf-8"))
+    return run(["/usr/bin/sandbox-exec", "-f", str(profile), *argv], **kwargs)
+
+
 def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.run, verify=None,
-                   unshare=None) -> dict:
+                   unshare=None, copy_settings: bool = False, mode: str | None = None, decide=None,
+                   home: Path | None = None) -> dict:
     """Get a Claude account's OpenSwap profile ready for remote jobs, with Claude's own login.
 
     The profile is the account's OpenSwap session folder (plan 003). If it is
-    not signed in as this account, the pinned Claude Code signs in there itself
-    (`claude auth login`, with ``CLAUDE_CONFIG_DIR`` set to the profile), so
-    OpenSwap never reads, copies or seeds a credential, and the default login
-    (``~/.claude`` and its Keychain item) is never touched. Customizations a
-    scheduled kickoff mirrored into it are removed. A profile already signed
-    in and unshared is left exactly as it is. The Claude lease is held during
-    the login, so no job launches on the profile meanwhile.
+    not signed in as this account, or its sign-in is only in the Keychain
+    (which jobs cannot reach), the pinned Claude Code signs in there itself
+    (`claude auth login`, with ``CLAUDE_CONFIG_DIR`` set to the profile) with
+    the Keychain out of reach, so Claude Code keeps the sign-in in the
+    profile's credentials file. OpenSwap never reads, copies or seeds a
+    credential, and the default login (``~/.claude`` and its Keychain item) is
+    never touched. Customizations a scheduled kickoff mirrored into it are
+    removed. The Claude lease is held throughout, so no job launches on the
+    profile meanwhile.
+
+    Permission settings (owner decision 2026-10-08): ``copy_settings`` copies
+    the mode and the allow, deny and ask rules from ``~/.claude/settings.json``
+    into the profile's ``settings.json``; ``mode`` then sets the mode. With
+    neither, ``decide(current, default)`` (interactive setup) may return
+    ``(copy, mode)`` for a profile that has no permission settings yet.
     """
     from openswap.worker import claude_cli
     from openswap.worker.accounts import resolve_account_selector, resolve_claude_selector
     from openswap.worker.claude_exec import (
-        managed_claude_config, profile_for, profile_identity, profile_shared, profile_symlinked,
+        credentials_in_file, managed_claude_config, profile_for, profile_identity, profile_shared,
+        profile_symlinked,
+    )
+    from openswap.worker.permissions import (
+        CLAUDE_MODES, PermissionSettingsError, default_claude_permissions, read_claude_permissions,
+        write_claude_permissions,
     )
 
     root = Path(backup_root)
@@ -332,18 +461,34 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
         # Jobs refuse a symlinked profile; never prepare (or log in to) one.
         raise AccountPinError("claude_profile_unsafe")
 
-    def ready() -> bool:
-        return (profile.is_dir() and profile_identity(profile) == identity and not profile_shared(profile)
-                and not managed_claude_config(profile))
+    def signed_in() -> bool:
+        return profile.is_dir() and profile_identity(profile) == identity and credentials_in_file(profile)
 
+    def ready() -> bool:
+        return signed_in() and not profile_shared(profile) and not managed_claude_config(profile)
+
+    def current_permissions():
+        try:
+            return read_claude_permissions(profile) if profile.is_dir() else None
+        except PermissionSettingsError:
+            # Launches refuse it too; only the owner can say what they meant.
+            raise AccountPinError("claude_settings_invalid") from None
+
+    if mode is not None and mode not in CLAUDE_MODES:
+        raise AccountPinError("mode_invalid")
     store = AccountLeaseStore(root, "claude")
     with store.mutation_guard() as guard:
         # Refuse while a job (or anything else) holds a Claude lease; if the
         # profile needs any change, take the lease before letting go of the
-        # guard, so no launch can interleave with the cleanup or the login.
+        # guard, so no launch can interleave with the cleanup, the login or a
+        # settings change.
         guard.assert_available()
-        if ready():
-            return {"slot": choice.number, "account_ref": identity, "profile_ready": True, "signed_in_now": False}
+        current = current_permissions()
+        asking = decide is not None and not copy_settings and mode is None and (
+            current is None or not current.configured)
+        if ready() and not (copy_settings or mode is not None or asking):
+            return {"slot": choice.number, "account_ref": identity, "profile_ready": True, "signed_in_now": False,
+                    "permissions": current.to_dict() if current is not None else None}
         token = guard.acquire(job_id=f"prepare-{uuid.uuid4().hex}", account_identity=identity,
                               worker_pid=os.getpid(), worker_epoch=time.time_ns(), ttl_s=LOGIN_LEASE_SECONDS)
     signed_in_now = False
@@ -351,35 +496,54 @@ def claude_prepare(backup_root: Path, selector: str | None, *, run=subprocess.ru
         pinned = (verify or (lambda: claude_cli.verify(root)))()
         if profile.is_dir() and profile_shared(profile):
             (unshare or _unshare_profile)(profile)
-        if not (profile.is_dir() and profile_identity(profile) == identity):
+        if not signed_in():
             profile.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             profile.mkdir(mode=0o700, exist_ok=True)
             env = _claude_login_env(profile)
-            result = run([str(pinned.binary), "auth", "login", "--claudeai", "--email", choice.email],
-                         env=env, check=False)
+            # Without the Keychain, so the sign-in lands in the profile's file.
+            result = _keychain_free_run(root, run, [str(pinned.binary), "auth", "login", "--claudeai", "--email",
+                                                    choice.email], env=env, check=False)
             signed = profile_identity(profile)
             if signed is not None and signed != identity:
                 # Signed in as someone else: sign that account back out of the profile.
-                cleanup = run([str(pinned.binary), "auth", "logout"], env=env, check=False, capture_output=True)
+                cleanup = _keychain_free_run(root, run, [str(pinned.binary), "auth", "logout"], env=env,
+                                             check=False, capture_output=True)
                 if cleanup.returncode != 0 or profile_identity(profile) is not None:
                     raise AccountPinError("login_account_mismatch_still_signed_in")
                 raise AccountPinError("login_account_mismatch")
             if result.returncode != 0:
                 raise AccountPinError("login_failed")
+            if not credentials_in_file(profile):
+                # Claude Code kept the sign-in somewhere jobs cannot reach.
+                raise AccountPinError("claude_sign_in_not_in_profile")
             signed_in_now = True
+        current = current_permissions()
+        if asking:
+            copy_settings, mode = decide(current, default_claude_permissions(home))
+        if copy_settings or mode is not None:
+            copied = default_claude_permissions(home) if copy_settings else None
+            if copy_settings and copied is None:
+                raise AccountPinError("claude_default_settings_missing")
+            try:
+                current = write_claude_permissions(profile, copied=copied, mode=mode)
+            except (OSError, PermissionSettingsError):
+                raise AccountPinError("claude_settings_invalid") from None
     finally:
         store.release(token, ReleaseEvidence.CONFIRMED_STOPPED)
     if not ready():
         raise AccountPinError("claude_profile_not_ready")
-    return {"slot": choice.number, "account_ref": identity, "profile_ready": True, "signed_in_now": signed_in_now}
+    return {"slot": choice.number, "account_ref": identity, "profile_ready": True, "signed_in_now": signed_in_now,
+            "permissions": current.to_dict() if current is not None else None}
 
 
 def claude_status(backup_root: Path) -> dict:
     from openswap.worker import claude_cli
     from openswap.worker.accounts import claude_accounts
     from openswap.worker.claude_exec import (
-        managed_claude_config, profile_for, profile_identity, profile_shared, profile_symlinked,
+        credentials_in_file, managed_claude_config, profile_for, profile_identity, profile_shared,
+        profile_symlinked,
     )
+    from openswap.worker.permissions import PermissionSettingsError, read_claude_permissions
 
     root = Path(backup_root)
     try:
@@ -394,17 +558,26 @@ def claude_status(backup_root: Path) -> dict:
         if choice.account_ref is None:
             continue
         profile = profile_for(root, choice.account_ref)
+        try:
+            permissions = read_claude_permissions(profile).to_dict() if profile is not None else None
+        except PermissionSettingsError:
+            permissions = None
         accounts.append({
             "slot": choice.number, "alias": choice.alias, "account_ref": choice.account_ref,
             "pinned": choice.account_ref == policy.pinned_account_ref,
             "allowed": choice.account_ref in allowed,
-            # Exactly what a launch requires: signed in as the account and
-            # not mirroring the default profile's customizations.
+            # Exactly what a launch requires: signed in as the account, in
+            # the profile's credentials file, with settings a launch can
+            # trust, and not mirroring the default profile's customizations.
             "profile_ready": profile is not None and not profile_symlinked(root, profile)
-            and profile_identity(profile) == choice.account_ref
+            and profile_identity(profile) == choice.account_ref and credentials_in_file(profile)
+            and permissions is not None
             and not profile_shared(profile) and not managed_claude_config(profile),
+            # The mode and rule counts remote tasks follow (None: unreadable settings).
+            "permissions": permissions,
         })
-    return {"cli": cli, "accounts": accounts, **live_status(root, "claude")}
+    return {"cli": cli, "accounts": accounts, **live_status(root, "claude"),
+            "permission_override": _override(root)}
 
 
 def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
@@ -422,7 +595,24 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
     )
     login_parser.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
     login_parser.add_argument("--device-auth", action="store_true", help="use Codex's device-code sign-in")
+    login_parser.add_argument("--copy-settings", action="store_true",
+                              help="also use your ~/.codex/config.toml approval and sandbox settings for this "
+                                   "account's remote tasks")
     login_parser.add_argument("--json", action="store_true")
+    settings_parser = codex_commands.add_parser(
+        "settings", help="show or set the approval and sandbox settings an account's remote tasks follow",
+        description="Remote tasks on a Codex account follow its own approval policy, reviewer and sandbox "
+                    "mode, like `codex` run there. Nobody is at the Mac to approve, so whatever would ask is "
+                    "denied (unless the reviewer is auto_review). OpenSwap's folder rules hold in every mode.",
+    )
+    settings_parser.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
+    settings_parser.add_argument("--copy-settings", action="store_true",
+                                 help="copy approval_policy, approvals_reviewer and sandbox_mode from "
+                                      "~/.codex/config.toml")
+    settings_parser.add_argument("--approval", choices=("never", "on-request", "on-failure", "untrusted"))
+    settings_parser.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"))
+    settings_parser.add_argument("--reviewer", choices=("user", "auto_review", "guardian_subagent"))
+    settings_parser.add_argument("--json", action="store_true")
     logout_parser = codex_commands.add_parser("logout", help="sign an account out of its isolated Codex home")
     logout_parser.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
     logout_parser.add_argument("--json", action="store_true")
@@ -437,6 +627,11 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         "prepare", help="prepare an account's OpenSwap session profile (default: the pinned Claude account)",
     )
     prepare.add_argument("selector", nargs="?", metavar="SLOT|EMAIL|ALIAS")
+    prepare.add_argument("--copy-settings", action="store_true",
+                         help="copy the permission mode and allow/deny/ask rules from ~/.claude/settings.json "
+                              "into the profile (remote tasks follow the profile's settings)")
+    prepare.add_argument("--mode", choices=("default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"),
+                         help="set the permission mode remote tasks on this account use")
     prepare.add_argument("--json", action="store_true")
     live = commands.add_parser("live", help="show or change the live-execution opt-in")
     live_commands = live.add_subparsers(dest="live_command", required=True)
@@ -496,9 +691,22 @@ def _codex_command(root: Path, args) -> int:
         return 0 if status["cli"]["installed"] else 1
     if args.codex_command == "login":
         result = login(root, args.selector, device_auth=args.device_auth)
-        _emit(result, args.json, f"{printer.MARK_OK} Codex account {result['slot']} is signed in to its "
-                                 "isolated home. Your default Codex login was not changed.\n"
-                                 + printer.next_step("run the live check: `openswap worker live-check`."))
+        lines = [f"{printer.MARK_OK} Codex account {result['slot']} is signed in to its isolated home. "
+                 "Your default Codex login was not changed."]
+        copy = args.copy_settings or (not args.json and _interactive() and _offer_codex_copy(root, result))
+        if copy:
+            settings = codex_settings(root, str(result["slot"]), copy_settings=True)
+            result["permissions"] = settings["permissions"]
+            lines.append(f"{printer.MARK_OK} Remote tasks on it follow {_codex_describe(settings['permissions'])}.")
+        _emit(result, args.json, "\n".join(lines) + "\n"
+              + printer.next_step("run the live check: `openswap worker live-check`."))
+        return 0
+    if args.codex_command == "settings":
+        result = codex_settings(root, args.selector, copy_settings=args.copy_settings, approval=args.approval,
+                                sandbox=args.sandbox, reviewer=args.reviewer)
+        verb = "now follow" if result["changed"] else "follow"
+        _emit(result, args.json, f"{printer.MARK_OK} Remote tasks on Codex account {result['slot']} {verb} "
+                                 f"{_codex_describe(result['permissions'])}.\n" + _HEADLESS_NOTE)
         return 0
     result = logout(root, args.selector)
     _emit(result, args.json, f"{printer.MARK_OK} Codex account {result['slot']} is signed out of its isolated home.")
@@ -534,11 +742,87 @@ def _claude_command(root: Path, args) -> int:
     if not args.json:
         print("If that account is not signed in to its OpenSwap profile yet, Claude Code opens its own "
               "sign-in in your browser.")
-    result = claude_prepare(root, args.selector)
+    decide = _ask_claude_settings if not args.json and _interactive() else None
+    result = claude_prepare(root, args.selector, copy_settings=args.copy_settings, mode=args.mode, decide=decide)
+    permissions = result.get("permissions") or {}
     _emit(result, args.json, f"{printer.MARK_OK} Claude account {result['slot']}'s OpenSwap profile is ready "
                              "for remote jobs. Your default Claude login was not changed.\n"
+                             f"{printer.MARK_OK} Remote tasks on it follow its own settings: "
+                             f"{_claude_describe(permissions)}.\n" + _HEADLESS_NOTE + "\n"
                              + printer.next_step("run the live check: `openswap worker live-check --provider claude`."))
     return 0
+
+
+_HEADLESS_NOTE = ("Nobody is at this Mac to approve, so anything that would ask is denied. "
+                  "`openswap worker permissions` can limit every remote task on this Mac.")
+
+
+def _interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _yes(question: str, default: bool = True) -> bool:
+    hint = "[Y/n]" if default else "[y/N]"
+    try:
+        answer = input(f"{question} {hint} ").strip().lower()
+    except EOFError:
+        return False
+    return default if not answer else answer in {"y", "yes"}
+
+
+def _claude_describe(permissions: dict) -> str:
+    from openswap.worker.permissions import ClaudePermissions
+
+    if not permissions:
+        return "Claude Code's defaults"
+    return ClaudePermissions(permissions.get("mode"), permissions.get("allow_rules", 0),
+                             permissions.get("deny_rules", 0), permissions.get("ask_rules", 0)).describe()
+
+
+def _codex_describe(permissions: dict) -> str:
+    from openswap.worker.permissions import CodexPermissions
+
+    return CodexPermissions(permissions["approval_policy"], permissions["sandbox_mode"],
+                            permissions["approvals_reviewer"], permissions["recorded"]).describe()
+
+
+def _ask_claude_settings(current, default) -> tuple[bool, str | None]:
+    """Interactive `claude prepare`, for a profile with no permission settings yet."""
+    from openswap.worker.permissions import CLAUDE_MODES, ClaudePermissions
+
+    copy = False
+    if default is not None:
+        summary = ClaudePermissions(default.get("defaultMode"), len(default.get("allow", [])),
+                                    len(default.get("deny", [])), len(default.get("ask", []))).describe()
+        copy = _yes(f"Remote tasks follow this account's own Claude Code permission settings. Copy yours "
+                    f"from ~/.claude/settings.json ({summary})?")
+    mode_now = ((default or {}).get("defaultMode") if copy else None) or "Claude Code's default"
+    try:
+        answer = input(f"Permission mode for remote tasks on this account ({', '.join(CLAUDE_MODES)}; "
+                       f"Enter keeps {mode_now}): ").strip()
+    except EOFError:
+        answer = ""
+    mode = answer if answer in CLAUDE_MODES else None
+    if answer and mode is None:
+        print(f"Not a mode; keeping {mode_now}. Change it later with "
+              "`openswap worker claude prepare --mode <mode>`.")
+    return copy, mode
+
+
+def _offer_codex_copy(root: Path, result: dict) -> bool:
+    """After a sign-in: offer the owner's own Codex approval and sandbox settings, once."""
+    from openswap.worker.permissions import PermissionSettingsError, default_codex_permissions, read_codex_permissions
+
+    try:
+        if read_codex_permissions(isolated_home(root, result["account_ref"])).recorded:
+            return False
+    except PermissionSettingsError:
+        return False
+    default = default_codex_permissions()
+    if default is None:
+        return False
+    return _yes(f"Remote tasks follow this account's Codex approval and sandbox settings. Use yours from "
+                f"~/.codex/config.toml ({default.describe()})?")
 
 
 def _format_claude_status(status: dict) -> str:
@@ -553,7 +837,10 @@ def _format_claude_status(status: dict) -> str:
     if not status["accounts"]:
         lines.append("  No eligible Claude accounts in the roster. Add one with `openswap add`.")
     lines.extend(printer.columns(_account_status_rows(status["accounts"], "profile_ready",
-                                                      "profile ready", "profile not prepared")))
+                                                      "profile ready", "profile not prepared", _claude_describe)))
+    override = _override_line(status)
+    if override is not None:
+        lines.append(override)
     lines.append(printer.next_step(_claude_next_step(status)))
     return "\n".join(lines)
 

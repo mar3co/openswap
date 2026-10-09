@@ -568,6 +568,11 @@ class LiveExecutionSettings:
     # The Mac and install the passing check ran on (see live.host_binding):
     # a restored or copied opt-in never applies anywhere else.
     host_binding: str | None = None
+    # Which job permission behaviour the check measured (LIVE_POLICY_VERSION).
+    # An opt-in stored before the key existed reads as 1 (OpenSwap's fixed
+    # tool list): it no longer applies once jobs follow the account's own
+    # permission settings.
+    policy_version: int = 2
 
     @property
     def binary_sha256(self) -> str | None:
@@ -575,6 +580,8 @@ class LiveExecutionSettings:
 
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+# What job permission behaviour a live check measures (see openswap.worker.live).
+LIVE_POLICY_VERSION = LiveExecutionSettings.policy_version
 # One opt-in per provider; Codex keeps the original key.
 _LIVE_KEYS = {"codex": "liveExecution", "claude": "liveExecutionClaude"}
 _LIVE_ACCOUNT_RE = re.compile(r"^(?:codex|claude):[0-9a-f]{64}$")
@@ -596,7 +603,9 @@ def _live_from_raw(raw: dict, provider: str = "codex") -> LiveExecutionSettings:
     enabled_at = live.get("enabledAt")
     accounts = live.get("accounts", [])
     host = live.get("hostBinding")
+    policy = live.get("policyVersion", 1)
     if (not isinstance(host, str) or not _HEX64_RE.fullmatch(host)
+            or type(policy) is not int or not 1 <= policy <= 1000
             or not isinstance(evidence, str) or not _HEX64_RE.fullmatch(evidence)
             or not isinstance(codex, str) or not _HEX64_RE.fullmatch(codex)
             or not isinstance(enabled_at, str) or len(enabled_at) > 64
@@ -604,7 +613,7 @@ def _live_from_raw(raw: dict, provider: str = "codex") -> LiveExecutionSettings:
             or not all(isinstance(a, str) and _LIVE_ACCOUNT_RE.fullmatch(a) for a in accounts)):
         _logger.warning("settings.json live execution opt-in is invalid; live execution stays off")
         return LiveExecutionSettings()
-    return LiveExecutionSettings(True, evidence, codex, enabled_at, tuple(dict.fromkeys(accounts)), host)
+    return LiveExecutionSettings(True, evidence, codex, enabled_at, tuple(dict.fromkeys(accounts)), host, policy)
 
 
 def load_live_execution(backup_root: Path, provider: str = "codex") -> LiveExecutionSettings:
@@ -631,6 +640,7 @@ def write_live_execution(
                 "enabled": True, "evidenceSha256": value.evidence_sha256,
                 "codexSha256": value.codex_sha256, "enabledAt": value.enabled_at,
                 "accounts": list(value.accounts), "hostBinding": value.host_binding,
+                "policyVersion": value.policy_version,
             }
         else:
             section.pop(key, None)
@@ -640,6 +650,49 @@ def write_live_execution(
             raise ValueError("live execution settings failed validation")
         atomic_write_json(path, raw)
         return parsed
+
+
+# The per-Mac limit on what remote sessions may do (openswap.worker.permissions).
+PERMISSION_OVERRIDES = ("follow", "no-shell", "read-only")
+_OVERRIDE_KEY = "permissionOverride"
+
+
+def _override_from_raw(raw: dict) -> str:
+    section = raw.get("worker")
+    value = section.get(_OVERRIDE_KEY, "follow") if isinstance(section, dict) else "follow"
+    if value not in PERMISSION_OVERRIDES:
+        # Fail closed: an unreadable limit is the strictest one, never none.
+        _logger.warning("settings.json worker permission limit is invalid; remote sessions run read-only")
+        return "read-only"
+    return value
+
+
+def load_permission_override(backup_root: Path) -> str:
+    """The per-Mac limit on remote sessions: ``follow`` (the default), ``no-shell`` or ``read-only``.
+
+    Set only on this Mac (``openswap worker permissions``); the control
+    service has no way to change it.
+    """
+    return _override_from_raw(_read_raw(settings_path(Path(backup_root))))
+
+
+def write_permission_override(backup_root: Path, value: str) -> str:
+    if value not in PERMISSION_OVERRIDES:
+        raise ValueError("unknown permission limit")
+    path = settings_path(Path(backup_root))
+    with _settings_write_lock(Path(backup_root)):
+        raw = _read_raw_for_write(path)
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        section = raw.get("worker")
+        if not isinstance(section, dict):
+            section = {}
+        if value == "follow":
+            section.pop(_OVERRIDE_KEY, None)
+        else:
+            section[_OVERRIDE_KEY] = value
+        raw["worker"] = section
+        atomic_write_json(path, raw)
+        return _override_from_raw(raw)
 
 
 def load_worker_settings(backup_root: Path) -> WorkerSettings:

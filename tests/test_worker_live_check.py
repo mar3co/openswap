@@ -236,9 +236,23 @@ class SimulatedMac:
 
     def run(self, argv, **kwargs):
         args = [a for a in argv[1:] if a != "--strict-config"]
+        disabled = set()
         while "--disable" in args:
             i = args.index("--disable")
+            disabled.add(args[i + 1])
             del args[i:i + 2]
+        if argv[0] == "/usr/bin/security":
+            # The login Keychain, outside any sandbox (the check's throwaway item).
+            items = self.__dict__.setdefault("keychain", set())
+            service = argv[argv.index("-s") + 1]
+            if argv[1] == "add-generic-password":
+                items.add(service)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[1] == "delete-generic-password":
+                found = service in items
+                items.discard(service)
+                return subprocess.CompletedProcess(argv, 0 if found else 44, "", "")
+            return subprocess.CompletedProcess(argv, 0 if service in items else 44, "", "")
         if argv[0] == "/usr/bin/curl":
             env = kwargs.get("env") or {}
             self.curl_envs.append(env)
@@ -257,7 +271,9 @@ class SimulatedMac:
         if args[:2] == ["mcp", "list"]:
             return subprocess.CompletedProcess(argv, 0, "No MCP servers configured yet.\n", "")
         if args[:2] == ["features", "list"]:
-            text = "shell_tool stable true\n" + "".join(f"{n} stable false\n" for n in codex_exec.DISABLED_FEATURES)
+            shell = "false" if "shell_tool" in disabled else "true"
+            text = f"shell_tool stable {shell}\n" + "".join(f"{n} stable false\n"
+                                                          for n in codex_exec.DISABLED_FEATURES)
             if self.features_text is not None:
                 text = self.features_text
             return subprocess.CompletedProcess(argv, 0, text, "")
@@ -265,7 +281,7 @@ class SimulatedMac:
             script = args[-1]
             out = []
             for name in re.findall(r'echo "R (\w+) \$\?"', script):
-                allowed = name in {"inside_read", "inside_write"} or not self.sandboxed
+                allowed = name in {"inside_read", "inside_write", "read"} or not self.sandboxed
                 if name == "inside_write" or (not self.sandboxed and name == "outside_write"):
                     target = re.search(r"printf \w+ > (\S+) 2>/dev/null; echo \"R " + name, script)
                     Path(target.group(1).strip("'")).write_text("x")
@@ -317,6 +333,14 @@ def test_a_sandboxed_contained_mac_passes_every_gate_and_can_be_enabled(tmp_path
     assert evidence["passed"] is True
     assert set(evidence["gates"]) == set(live.REQUIRED_GATES)
     assert evidence["account"] == {"identity": IDENTITY, "slot": "1"}
+    permissions = evidence["gates"]["permissions"]
+    assert permissions["config_follows_account"] and permissions["no_shell_removes_shell_tool"]
+    assert permissions["asks_denied_headless"] and permissions["account_settings"]["approval_policy"] == "on-request"
+    assert evidence["gates"]["sign_in_isolation"]["keychain_control_found"] is True
+    assert mac.__dict__.get("keychain") == set()  # the throwaway Keychain item is gone
+    # The probe jobs ran with a policy that may ask; the account's own config is restored after.
+    config = (codex_exec.isolated_home(root, IDENTITY) / "config.toml").read_text()
+    assert 'approval_policy = "never"' in config and '"." = "write"' in config
     lease = AccountLeaseStore(root, "codex").read_current()
     assert lease.state == "released"
     path = live_check.write_evidence(root, evidence)
@@ -337,6 +361,11 @@ def test_a_leaky_sandbox_fails_the_sandbox_gates(tmp_path):
     assert gates["sandbox_exec"]["passed"] is False
     assert gates["sandbox_exec"]["outside_read_denied"] is False
     assert gates["sandbox_exec"]["launchd_submit_contained"] is False
+    # A shell that reaches the Keychain and the isolated sign-in.
+    assert gates["sign_in_isolation"]["passed"] is False
+    assert gates["sign_in_isolation"]["keychain_denied"] is False
+    assert gates["sign_in_isolation"]["own_sign_in_readable_by_shell"] is True
+    assert gates["permissions"]["read_only_sandbox_denies_writes"] is False
     assert evidence["passed"] is False
     path = live_check.write_evidence(root, evidence)
     with pytest.raises(live.LiveModeError):

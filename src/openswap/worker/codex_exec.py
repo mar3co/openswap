@@ -58,7 +58,15 @@ from openswap.worker.containment import (
     write_private,
 )
 from openswap.worker.leases import LeaseStateError, stable_account_identity
-from openswap.worker.live import LIVE, LiveModeError, current_host_binding, execution_mode, live_lock
+from openswap.worker.live import (
+    LIVE,
+    LIVE_POLICY_VERSION,
+    LiveModeError,
+    current_host_binding,
+    execution_mode,
+    live_lock,
+)
+from openswap.worker.permissions import OVERRIDES, READ_ONLY, CodexLaunch, read_codex_permissions
 from openswap.worker.models import (
     InterruptResult,
     JobRecord,
@@ -69,7 +77,7 @@ from openswap.worker.models import (
     SafeEvent,
     SafeEventKind,
 )
-from openswap.settings import load_live_execution
+from openswap.settings import load_live_execution, load_permission_override
 
 PROFILE_NAME = "openswap-research"
 RESULT_FILE = "result.md"
@@ -149,13 +157,26 @@ def _toml_string(value: str) -> str:
 
 
 def codex_config(readonly_sources: tuple[Path, ...] = (), write_paths: tuple[Path, ...] = (),
-                 read_paths: tuple[Path, ...] = (), env: dict[str, str] | None = None) -> str:
-    """The isolated home's whole ``config.toml``; nothing else is configured."""
+                 read_paths: tuple[Path, ...] = (), env: dict[str, str] | None = None,
+                 launch: CodexLaunch | None = None) -> str:
+    """The isolated home's whole ``config.toml``; nothing else is configured.
+
+    ``launch`` carries the account's approval policy and reviewer and whether
+    the folder is writable (:mod:`openswap.worker.permissions`); without it
+    (a sign-in, which runs no task) nothing may ask and nothing changes.
+    """
+    approval = launch.approval_policy if launch is not None else "never"
+    if approval not in ("never", "on-request"):
+        raise ValueError("unsupported approval policy")
+    reviewer = launch.reviewer if launch is not None else None
+    writable = launch.writable if launch is not None else True
     lines = [
         "# Managed by OpenSwap Remote tasks and rewritten before every run. Do not edit.",
+        "# The approval policy is this account's (openswap worker codex settings).",
         'cli_auth_credentials_store = "file"',
         'forced_login_method = "chatgpt"',
-        'approval_policy = "never"',
+        f'approval_policy = "{approval}"',
+        *([f"approvals_reviewer = {_toml_string(reviewer)}"] if reviewer is not None else []),
         f'default_permissions = "{PROFILE_NAME}"',
         "project_root_markers = []",
         "project_doc_max_bytes = 0",
@@ -192,13 +213,14 @@ def codex_config(readonly_sources: tuple[Path, ...] = (), write_paths: tuple[Pat
     ]
     for source in (*readonly_sources, *read_paths):
         lines.append(f'{_toml_string(str(Path(source)))} = "read"')
-    # A work folder task also writes what git needs beside its worktree.
+    # A work folder task also writes what git needs beside its worktree
+    # (read only under a read-only sandbox).
     for path in write_paths:
-        lines.append(f'{_toml_string(str(Path(path)))} = "write"')
+        lines.append(f'{_toml_string(str(Path(path)))} = "{"write" if writable else "read"}"')
     lines += [
         "",
         f'[permissions.{PROFILE_NAME}.filesystem.":workspace_roots"]',
-        '"." = "write"',
+        f'"." = "{"write" if writable else "read"}"',
         "",
         f"[permissions.{PROFILE_NAME}.network]",
         "enabled = false",
@@ -209,7 +231,7 @@ def codex_config(readonly_sources: tuple[Path, ...] = (), write_paths: tuple[Pat
 
 def prepare_home(backup_root: Path, identity: str, readonly_sources: tuple[Path, ...] = (),
                  write_paths: tuple[Path, ...] = (), read_paths: tuple[Path, ...] = (),
-                 env: dict[str, str] | None = None) -> Path:
+                 env: dict[str, str] | None = None, launch: CodexLaunch | None = None) -> Path:
     """Create the isolated home (0700) and write its managed config."""
     root = Path(backup_root)
     ensure_private_dir(root / "worker")
@@ -218,7 +240,7 @@ def prepare_home(backup_root: Path, identity: str, readonly_sources: tuple[Path,
     ensure_private_dir(home)
     ensure_private_dir(home / "home")
     write_private(home / "config.toml",
-                  codex_config(readonly_sources, write_paths, read_paths, env).encode("utf-8"))
+                  codex_config(readonly_sources, write_paths, read_paths, env, launch).encode("utf-8"))
     return home
 
 
@@ -278,22 +300,24 @@ def codex_env(home: Path, run_dir: Path) -> dict[str, str]:
     }
 
 
-def global_args() -> list[str]:
+def global_args(*, shell: bool = True) -> list[str]:
     args = ["--strict-config"]
-    for feature in DISABLED_FEATURES:
+    for feature in (*DISABLED_FEATURES, *(() if shell else ("shell_tool",))):
         args += ["--disable", feature]
     return args
 
 
-def codex_argv(binary: Path, output_root: Path, run_dir: Path) -> list[str]:
+def codex_argv(binary: Path, output_root: Path, run_dir: Path, *, shell: bool = True) -> list[str]:
     """Fixed launcher arguments; nothing comes from the remote caller.
 
     ``--ignore-rules`` keeps exec-policy ``.rules`` files (in the isolated
     home or the job folder) from changing what the research policy allows.
+    ``shell=False`` (the per-Mac ``no-shell`` limit, or an account whose
+    approval policy is ``untrusted``) removes Codex's shell tool.
     """
     return [
-        str(binary), *global_args(), "exec", "--json", "--ephemeral", "--skip-git-repo-check", "--ignore-rules",
-        "--cd", str(output_root), "--output-last-message", str(run_dir / LAST_MESSAGE_FILE), "-",
+        str(binary), *global_args(shell=shell), "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+        "--ignore-rules", "--cd", str(output_root), "--output-last-message", str(run_dir / LAST_MESSAGE_FILE), "-",
     ]
 
 
@@ -491,8 +515,16 @@ class CodexExecAdapter:
         monotonic=time.monotonic,
         sleep=time.sleep,
         bind_to_opt_in: bool = True,
+        override=None,
+        permissions_for_check=None,
     ):
         self.backup_root = Path(backup_root)
+        # The per-Mac limit, read at every launch (``openswap worker permissions``).
+        self._override = override or (lambda: load_permission_override(self.backup_root))
+        # The live check measures given settings instead of the account's own.
+        self._permissions_for_check = permissions_for_check
+        # What the launch being prepared runs with, counted into its summary.
+        self._launch_summary: dict = {}
         # The live check runs before (or to renew) the opt-in, so it checks
         # the binary it verified itself rather than the one an older opt-in
         # recorded.
@@ -534,7 +566,8 @@ class CodexExecAdapter:
         # reads as disabled, with no binding).
         binding = load_live_execution(self.backup_root, self.provider)
         if (not binding.enabled or binding.codex_sha256 is None or pinned.binary_sha256 != binding.codex_sha256
-                or binding.host_binding != current_host_binding(self.backup_root)):
+                or binding.host_binding != current_host_binding(self.backup_root)
+                or binding.policy_version != LIVE_POLICY_VERSION):
             # The active adapter's own error type, so its start/probe turn it
             # into an unlaunched refusal.
             raise self._cli_errors[0]("binary_not_the_checked_one")
@@ -561,15 +594,33 @@ class CodexExecAdapter:
 
     _cli_errors = (codex_cli.CodexCliError,)
 
+    def override(self) -> str:
+        """The per-Mac limit; unreadable reads as the strictest one."""
+        try:
+            value = self._override()
+        except Exception:
+            return READ_ONLY
+        return value if value in OVERRIDES else READ_ONLY
+
     def _prepare_account(self, identity: str, workspace: ResolvedWorkspace) -> Path:
         """The account's isolated home, signed in to exactly ``identity``; refuses otherwise."""
+        override = self.override()
         try:
+            permissions = self._permissions_for_check or read_codex_permissions(isolated_home(self.backup_root,
+                                                                                              identity))
+            launch = permissions.launch(override)
             # The task's git settings reach its shell commands too (Codex
             # passes only a core environment to them otherwise).
             home = prepare_home(self.backup_root, identity, tuple(workspace.readonly_sources),
-                                tuple(workspace.write_paths), tuple(workspace.read_paths), dict(workspace.env))
+                                tuple(workspace.write_paths), tuple(workspace.read_paths), dict(workspace.env),
+                                launch)
         except (OSError, ValueError, ContainmentError):
+            # Includes settings that cannot be trusted (PermissionSettingsError):
+            # never guess what the owner allowed.
             raise ProviderLaunchRefused("provider_unavailable") from None
+        self._launch = launch
+        self._launch_summary = {"permissions": {**permissions.to_dict(), "override": override,
+                                                "shell": launch.shell, "writable": launch.writable}}
         if home_identity(home) != identity:
             # Not signed in, or signed in to a different account than the
             # leased one: never run on whatever is there.
@@ -581,7 +632,8 @@ class CodexExecAdapter:
 
     def _command(self, pinned, home: Path, output_root: Path, run_dir: Path,
                  workspace: ResolvedWorkspace) -> tuple[list[str], dict[str, str]]:
-        return codex_argv(pinned.binary, output_root, run_dir), {**codex_env(home, run_dir), **dict(workspace.env)}
+        return (codex_argv(pinned.binary, output_root, run_dir, shell=self._launch.shell),
+                {**codex_env(home, run_dir), **dict(workspace.env)})
 
     def start(self, job: JobRecord, workspace: ResolvedWorkspace, *, worker_epoch: int) -> ProviderRun:
         # The opt-in check and the provider's release are one step under the
@@ -660,6 +712,7 @@ class CodexExecAdapter:
                 raise ProviderLaunchRefused("provider_unavailable") from None
             raise RuntimeError("execution_uncertain") from None
         run = _Run(job.job_id, handle, run_dir, output_root, worktree=workspace.worktree)
+        run.extra.update(self._launch_summary)
         with self._runs_lock:
             self._runs[handle.leader_pid] = run
             self._finished.pop(handle.leader_pid, None)

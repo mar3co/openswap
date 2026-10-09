@@ -23,7 +23,17 @@ from pathlib import Path
 
 from openswap.locking import FileLock
 
-from openswap.settings import LiveExecutionSettings, load_live_execution, write_live_execution
+# LIVE_POLICY_VERSION: what job permissions the live check measures. 2: jobs
+# follow the account's own Claude or Codex permission settings (owner decision
+# 2026-10-08), under the per-Mac limit. An opt-in recorded from an older check
+# stays off until a new check passes, since that check measured a fixed tool
+# list and no shell.
+from openswap.settings import (
+    LIVE_POLICY_VERSION,
+    LiveExecutionSettings,
+    load_live_execution,
+    write_live_execution,
+)
 from openswap.worker.codex_cli import CODEX_VERSION_OUTPUT, PinnedCodex, platform_supported
 
 DISABLED = "disabled"
@@ -46,6 +56,12 @@ REQUIRED_GATES = (
     # A work folder's task: a commit in its worktree works; the owner's copy,
     # branches and git config stay out of reach.
     "worktree",
+    # The account's permission mode is honoured, an action that would ask is
+    # denied (nobody is at the Mac), and the per-Mac limit is honoured.
+    "permissions",
+    # Shell commands cannot reach the Keychain (other accounts' sign-ins, the
+    # default login); records whether they can read the account's own sign-in.
+    "sign_in_isolation",
 )
 
 
@@ -115,7 +131,7 @@ def execution_mode(backup_root: Path, provider: str = "codex") -> str:
         live = load_live_execution(Path(backup_root), provider)
     except Exception:
         return DISABLED
-    if not live.enabled or not platform_supported():
+    if not live.enabled or not platform_supported() or live.policy_version != LIVE_POLICY_VERSION:
         return DISABLED
     # An opt-in restored or copied from another Mac or install never applies.
     return LIVE if live.host_binding == current_host_binding(backup_root) else DISABLED
@@ -261,12 +277,13 @@ def enable_live(backup_root: Path, evidence_path: Path, pinned, provider: str = 
         # Keep earlier accounts only from an opt-in made on this Mac and install
         # with this binary; a restored or copied one starts over.
         keep = (current.enabled and current.codex_sha256 == pinned.binary_sha256
-                and current.host_binding == host)
+                and current.host_binding == host and current.policy_version == LIVE_POLICY_VERSION)
         accounts = current.accounts if keep else ()
         return write_live_execution(Path(backup_root), LiveExecutionSettings(
             enabled=True, evidence_sha256=digest, codex_sha256=pinned.binary_sha256,
             enabled_at=datetime.now(timezone.utc).isoformat(),
             accounts=tuple(dict.fromkeys((*accounts, account))), host_binding=host,
+            policy_version=LIVE_POLICY_VERSION,
         ), provider)
 
 
@@ -290,4 +307,7 @@ def live_status(backup_root: Path, provider: str = "codex") -> dict:
         "codex_sha256": live.codex_sha256,
         "enabled_at": live.enabled_at,
         "checked_accounts": list(live.accounts),
+        # Opted in from a check that measured older job permissions: off
+        # until a new check passes.
+        "recheck_needed": live.enabled and live.policy_version != LIVE_POLICY_VERSION,
     }
