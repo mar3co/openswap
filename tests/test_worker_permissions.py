@@ -150,14 +150,23 @@ def test_the_per_mac_limit_maps_to_claude_arguments():
 
 def test_the_credentials_file_gets_deny_rules_for_the_file_tools_in_every_mode():
     rules = permissions.credential_rules(["/b/sessions/4-a_b.com/.credentials.json"])
+    anywhere = "//**/.[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS].[jJ][sS][oO][nN]"
+    # The path as given, and the name anywhere in any case (the firmlink
+    # /System/Volumes/Data/… and case variants are other spellings of the file).
     assert rules == ["Read(//b/sessions/4-a_b.com/.credentials.json)",
-                     "Edit(//b/sessions/4-a_b.com/.credentials.json)"]
+                     "Edit(//b/sessions/4-a_b.com/.credentials.json)", f"Read({anywhere})", f"Edit({anywhere})"]
+    import fnmatch
+
+    pattern = anywhere[1:].replace("**", "*")
+    for spelling in ("/System/Volumes/Data/Users/u/p/.credentials.json", "/Users/u/p/.CREDENTIALS.JSON",
+                     "/Users/u/x/../p/.Credentials.json"):
+        assert fnmatch.fnmatchcase(spelling, pattern)
     args = claude_permission_args("read-only", {"permissions": {"deny": ["Bash(rm:*)"], "defaultMode": "plan"}},
                                   ["/b/c.json"])
     settings = json.loads(args[args.index("--settings") + 1])
     # Added to the live check's own rules, never replacing them.
-    assert settings["permissions"] == {"defaultMode": "plan",
-                                       "deny": ["Bash(rm:*)", "Read(//b/c.json)", "Edit(//b/c.json)"]}
+    assert settings["permissions"]["defaultMode"] == "plan"
+    assert settings["permissions"]["deny"][:3] == ["Bash(rm:*)", "Read(//b/c.json)", "Edit(//b/c.json)"]
     for bad in ("relative/.credentials.json", "/a\nb"):
         with pytest.raises(ValueError):
             permissions.credential_rules([bad])

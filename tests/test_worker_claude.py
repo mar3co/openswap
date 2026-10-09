@@ -6,6 +6,7 @@ fake scripts, launches are simulated, and profiles hold public metadata only.
 
 from __future__ import annotations
 
+import fnmatch
 import io
 import json
 import os
@@ -282,7 +283,9 @@ def test_argv_follows_the_profiles_own_settings_and_denies_every_prompt(tmp_path
 def _credential_rules(root):
     profile = claude_exec.profile_for(root, IDENTITY)
     paths = sorted({str(profile / ".credentials.json"), str(profile.resolve() / ".credentials.json")})
-    return [rule for path in paths for rule in (f"Read(/{path})", f"Edit(/{path})")]
+    rules = [rule for path in paths for rule in (f"Read(/{path})", f"Edit(/{path})")]
+    anywhere = "//**/.[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS].[jJ][sS][oO][nN]"
+    return rules + [f"Read({anywhere})", f"Edit({anywhere})"]
 
 
 @pytest.mark.parametrize("override, expected", [
@@ -745,7 +748,8 @@ class SimulatedClaudeMac(FakeLaunch):
         inside = target.startswith(str(cwd) + "/") or (tool == "Bash" and str(cwd) in target)
         if tool not in tools:
             return False, f"No such tool: {tool}"
-        if tool == "Read" and f"Read(/{target})" in getattr(self, "_deny", []):
+        if tool == "Read" and any(rule.startswith("Read(/") and fnmatch.fnmatchcase(target, rule[6:-1].replace("**", "*"))
+                                  for rule in getattr(self, "_deny", [])):
             return False, "Permission to read this file has been denied."  # a deny rule, in any mode
         if tool == "Read":
             return (True, Path(target).read_text()) if inside else (False, "Permission denied")

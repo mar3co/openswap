@@ -1085,7 +1085,9 @@ instead of a tool list OpenSwap picks
 - **The account's own sign-in.** Claude Code reads it from the profile's
   credentials file, so the Seatbelt profile cannot hide that file from the
   session. Claude's file tools are kept off it by deny rules OpenSwap adds to
-  every job (deny rules hold in every mode; the live check measures one in
+  every job, for its path and for its name in any folder and any letter case
+  (so `/System/Volumes/Data/Users/…` or a case variant is covered too; deny
+  rules hold in every mode, and the live check measures them in
   `bypassPermissions`). A shell command in a Claude task is not bound by
   them and can read it, or replace it with another sign-in that later tasks
   on this account would then use (the launch checks the account the profile

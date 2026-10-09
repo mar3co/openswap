@@ -278,10 +278,28 @@ def credential_rules(paths) -> list[str]:
     the sign-in.
     """
     rules = []
+    names = []
     for path in paths:
         literal = _gitignore_literal(str(path))
         rules += [f"Read(/{literal})", f"Edit(/{literal})"]
+        name = Path(str(path)).name
+        if name not in names:
+            names.append(name)
+    for name in names:
+        # The same file has other spellings (``/System/Volumes/Data/Users/…``,
+        # a case variant on a case-insensitive volume, ``..`` segments): match
+        # its name anywhere, in any case, as well.
+        anywhere = f"//**/{_case_insensitive_glob(name)}"
+        rules += [f"Read({anywhere})", f"Edit({anywhere})"]
     return rules
+
+
+def _case_insensitive_glob(name: str) -> str:
+    """A file name as a gitignore pattern matching it in any letter case."""
+    out = []
+    for ch in _gitignore_literal("/" + name)[1:]:
+        out.append(f"[{ch.lower()}{ch.upper()}]" if ch.isascii() and ch.isalpha() else ch)
+    return "".join(out)
 
 
 def _gitignore_literal(path: str) -> str:
