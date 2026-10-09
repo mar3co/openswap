@@ -514,6 +514,10 @@ def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_
         f"mv {out}/staged {profile}/projects/-next 2>/dev/null; echo renamed_in $?",
         f"ln -s {out}/staged {profile}/projects/-linked 2>/dev/null; echo linked_in $?",
         f"mv {profile}/projects {profile}/old-projects 2>/dev/null; echo projects_moved $?",
+        # The whole profile moved aside (to the run's writable temporary folder) and replaced.
+        f"mkdir -p {tmp_path / 't'} && mv {profile} {tmp_path / 't' / 'old-profile'} 2>/dev/null; "
+        f"echo profile_moved $?",
+        f"mkdir -p {out}/fake-profile && rmdir {profile} 2>/dev/null; echo profile_removed $?",
         f"printf x > {profile}/state.json; echo state $?",
         f"cat {profile}/.credentials.json >/dev/null; echo own_sign_in $?",
     ]))
@@ -521,6 +525,7 @@ def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_
     # The whole projects/ folder (auto-memory lives there), its entries included.
     assert codes["project_state"] != "0" and codes["renamed_in"] != "0" and codes["linked_in"] != "0"
     assert codes["projects_moved"] != "0"
+    assert codes["profile_moved"] != "0" and codes["profile_removed"] != "0" and profile.is_dir()
     assert not (profile / "projects" / "-next").exists() and not os.path.lexists(profile / "projects" / "-linked")
     # The `security` tool cannot start at all (126), so Claude Code's Keychain
     # write fails fast and it keeps the sign-in in its credentials file.

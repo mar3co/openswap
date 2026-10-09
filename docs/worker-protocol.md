@@ -982,7 +982,8 @@ that configure or instruct later sessions (`settings.json`,
 `settings.local.json`, `CLAUDE.md`, the cached server policy (`remote-settings.json`,
 `policy-limits.json`), `scheduled_tasks.json`, `rules/`, `agents/`, `agent-memory/`,
 `commands/`, `skills/`, `hooks/`, `output-styles/`, `plugins/`, and `projects/`,
-where each project's auto-memory lives, entries included; jobs also run with
+where each project's auto-memory lives, entries included; nor may the profile
+folder itself be moved aside or replaced by a prepared copy; jobs also run with
 auto-memory off). It makes the default login, `~/.codex` and the rest of the
 backup root (other accounts, worker state) unreadable and unwritable, and
 takes the Keychain away: `/usr/bin/security` cannot start, the Keychain's

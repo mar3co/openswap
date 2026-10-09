@@ -266,6 +266,9 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
     # A subpath also covers the entry itself, so nothing can be renamed or
     # linked into place (``projects/`` holds each project's auto-memory).
     configuration += [f"(subpath {_sb_string(profile / name)})" for name in CLAUDE_PROFILE_CONFIG_DIRS]
+    # The profile's own entry: it can be neither moved aside nor replaced by a
+    # prepared copy (writes inside it are separate paths and stay allowed).
+    configuration.append(f"(literal {_sb_string(profile)})")
     services = " ".join(f"(global-name {_sb_string(name)})" for name in KEYCHAIN_SERVICES)
 
     def subpaths(paths):
