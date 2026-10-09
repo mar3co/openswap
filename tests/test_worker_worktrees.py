@@ -829,3 +829,207 @@ def test_a_failed_checkout_removes_the_branch_it_made(root, home, monkeypatch):
     folder = home / "OpenSwap Research" / ".worktrees" / "openswap"
     assert not (folder / ("a" * 32)).exists() and not (folder / f"{'a' * 32}.objects").exists()
     assert _runtime(root)._resolve_workspace("openswap", "a" * 32).branch == "openswap/aaaaaaaa"
+
+
+
+def test_direct_mode_on_a_folder_of_repos_applies_to_each_repo(root, home):
+    github = home / "GitHub"
+    _repo(github / "openswap")
+    _repo(github / "opentag")
+    parent = cli.add_work_folder(root, github, mode="direct").workspace
+    assert parent.repos is True and parent.mode == "direct"  # still a folder of repos
+    launchable = cli.launchable_workspaces(root, load_worker_settings(root).workspaces)
+    assert [(w.workspace_id, w.mode, w.work_root.name) for w in launchable] == [
+        ("openswap", "direct", "openswap"), ("opentag", "direct", "opentag")]
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    assert resolved.work_dir == (github / "openswap").resolve()  # the repo, never the parent
+    assert resolved.write_paths == ((github / "openswap").resolve(),)
+    # And back: the same parent, each repo in its own worktree again.
+    assert cli.set_workspace_mode(root, "github", "worktree").repos is True
+    assert _runtime(root)._resolve_workspace("opentag", "b" * 32).branch == "openswap/bbbbbbbb"
+
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_links_planted_in_the_admin_folder_are_never_written_through(root, home, tmp_path):
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    victims = {}
+    for name in ("COMMIT_EDITMSG", "ORIG_HEAD", "index.lock", "logs/HEAD", "FETCH_HEAD"):
+        victim = tmp_path / f"victim-{name.replace('/', '-')}"
+        victim.write_text("owner's file")
+        target = tree.git_dir / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        target.symlink_to(victim)
+        victims[name] = victim
+    (resolved.work_dir / "work.txt").write_text("task work")
+    assert worktrees.is_dirty(tree) is True
+    assert worktrees.finish(tree, "left over") is True
+    assert _git(repo, "show", f"{resolved.branch}:work.txt") == "task work"
+    for victim in victims.values():
+        assert victim.read_text() == "owner's file"
+    assert worktrees.remove(resolved.work_dir) is True
+    for victim in victims.values():
+        assert victim.read_text() == "owner's file"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_a_linked_admin_head_is_not_intact(root, home, tmp_path):
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    tree = _runtime(root)._resolve_workspace("openswap", "a" * 32).worktree
+    real = tmp_path / "HEAD"
+    real.write_text((tree.git_dir / "HEAD").read_text())
+    (tree.git_dir / "HEAD").unlink()
+    (tree.git_dir / "HEAD").symlink_to(real)
+    assert worktrees.intact(tree) is False
+
+
+
+def test_ignored_files_the_task_left_keep_the_worktree(root, home):
+    repo = _repo(home / "GitHub" / "openswap")
+    (repo / ".gitignore").write_text("build/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "ignore build")
+    cli.add_work_folder(root, repo)
+    runtime = _runtime(root)
+    resolved = runtime._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    assert worktrees.is_dirty(tree) is False
+    (resolved.work_dir / "notes.txt").write_text("tracked work")
+    (resolved.work_dir / "build").mkdir()
+    (resolved.work_dir / "build" / "out.bin").write_text("ignored output")
+    # The rest is committed; the ignored output is not, so the worktree stays.
+    assert worktrees.finish(tree, "left over") is False
+    assert _git(repo, "show", f"{resolved.branch}:notes.txt") == "tracked work"
+    assert worktrees.is_dirty(tree) is True
+    assert worktrees.remove(resolved.work_dir) is False
+    results = home / "OpenSwap Research"
+    assert worktrees.sweep(results, _finish(runtime, "a" * 32)) == []
+    assert (resolved.work_dir / "build" / "out.bin").read_text() == "ignored output"
+    # Once the owner has looked (or with --force), it goes.
+    (resolved.work_dir / "build" / "out.bin").unlink()
+    (resolved.work_dir / "build").rmdir()
+    assert worktrees.finish(tree, "left over") is True
+    assert worktrees.remove(resolved.work_dir) is True
+
+
+
+def test_adding_a_folder_of_repos_again_keeps_the_one_saved(root, home):
+    github = home / "GitHub"
+    _repo(github / "openswap")
+    _repo(github / "opentag")
+    first = cli.add_work_folder(root, github)
+    again = cli.add_work_folder(root, github)
+    assert first.added is True and again.added is False
+    assert again.workspace.workspace_id == first.workspace.workspace_id
+    assert again.repos == first.repos == ("openswap", "opentag")
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == [first.workspace.workspace_id]
+    # A repo inside it is found too, as the repo's own folder.
+    child = cli.add_work_folder(root, github / "openswap")
+    assert child.added is False and child.workspace.workspace_id == "openswap"
+    assert len(load_worker_settings(root).workspaces) == 1
+
+
+
+def test_a_queued_repo_task_holds_its_folder_of_repos(root, home):
+    """A task sent to a repo in a folder of repos uses the repo's ID, never the
+    parent's: the parent's mode and approval stay while it may still run."""
+    from openswap.worker.models import JobState
+    from openswap.worker.journal import LocalJobStore
+
+    github = home / "GitHub"
+    _repo(github / "openswap")
+    _repo(github / "opentag")
+    parent = cli.add_work_folder(root, github).workspace
+    other = _repo(home / "elsewhere" / "tool")
+    cli.add_work_folder(root, other)
+    runtime = _runtime(root)
+    store = LocalJobStore(root)
+    epoch = store.current_epoch()
+    job = store.create(_submission(workspace_id="opentag"), owner_ref="local-user", worker_epoch=epoch)
+    with pytest.raises(cli.WorkspaceError) as refused:
+        cli.set_workspace_mode(root, parent.workspace_id, "direct")
+    assert refused.value.code == "workspace_in_use"
+    with pytest.raises(cli.WorkspaceError) as refused:
+        cli.remove_worker_workspace(root, parent.workspace_id)
+    assert refused.value.code == "workspace_in_use"
+    assert runtime._resolve_workspace("opentag", job.job_id).branch is not None  # still a worktree
+    store.transition(job.job_id, expected_states=(JobState.QUEUED,), new_state=JobState.CANCELLED,
+                     worker_epoch=epoch, expected_generation=job.generation)
+    assert cli.set_workspace_mode(root, parent.workspace_id, "direct").mode == "direct"
+    cli.remove_worker_workspace(root, parent.workspace_id)
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["tool"]
+
+
+
+def _sparse_repo(path: Path) -> Path:
+    repo = _repo(path)
+    for name in ("a", "b"):
+        (repo / name).mkdir()
+        (repo / name / name).write_text(name)
+    _git(repo, "add", "a", "b")
+    _git(repo, "commit", "-q", "-m", "two folders")
+    _git(repo, "sparse-checkout", "set", "a")
+    assert not (repo / "b").exists()
+    return repo
+
+
+def test_a_sparse_owner_checkout_gives_the_task_a_full_copy(root, home):
+    repo = _sparse_repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    assert (resolved.work_dir / "a" / "a").exists() and (resolved.work_dir / "b" / "b").exists()
+    assert not (tree.git_dir / "config.worktree").exists()
+    assert not (tree.git_dir / "info" / "sparse-checkout").exists()
+    assert worktrees.is_dirty(tree) is False
+    (resolved.work_dir / "b" / "b").write_text("task work")
+    # The owner's rules (cone "a") never hide the task's change or delete "b".
+    assert worktrees.finish(tree, "left over") is True
+    assert _git(repo, "show", f"{resolved.branch}:b/b") == "task work"
+    assert _git(repo, "show", f"{resolved.branch}:a/a") == "a"
+    assert not (repo / "b").exists()  # the owner's checkout stays sparse
+
+
+def test_a_task_that_makes_its_copy_sparse_keeps_its_worktree(root, home):
+    repo = _sparse_repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    (resolved.work_dir / "b" / "b").write_text("task work")
+    _git(resolved.work_dir, "sparse-checkout", "set", "b")
+    assert not (resolved.work_dir / "a").exists()
+    tip = _git(repo, "rev-parse", resolved.branch)
+    assert worktrees.finish(tree, "left over") is False
+    assert _git(repo, "rev-parse", resolved.branch) == tip  # nothing committed, "a" never deleted
+    assert worktrees.is_dirty(tree) is None
+    assert worktrees.remove(resolved.work_dir) is False
+    assert (resolved.work_dir / "b" / "b").read_text() == "task work"
+
+
+
+def test_a_tag_named_like_the_branch_never_vouches_for_its_objects(root, home):
+    """The final check walks ``refs/heads/<branch>``: a tag of the same name
+    (pointing at objects the repo has) must not pass for a branch whose
+    commit still needs the task's own object folder."""
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    _git(repo, "tag", resolved.branch, "HEAD")
+    (resolved.work_dir / "work.txt").write_text("task work")
+    # The task's own git stores the blob in its object folder only.
+    subprocess.run(["git", "add", "work.txt"], cwd=resolved.work_dir, check=True, capture_output=True,
+                   env={**os.environ, **worktrees.task_env(repo, tree)})
+    real_import = worktrees.import_objects
+    worktrees.import_objects = lambda tree: None  # and it never reaches the repo's store
+    try:
+        assert worktrees.finish(tree, "left over") is False
+    finally:
+        worktrees.import_objects = real_import
+    assert not (tree.path.parent / f"{tree.path.name}.finished").exists()

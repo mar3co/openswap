@@ -1111,7 +1111,10 @@ def add_work_folder(backup_root: Path, folder: str | Path, *, mode: str = "workt
         work = pathid.canonical(_absolute_folder(_expand_folder(folder)).resolve(strict=True))
     except (OSError, RuntimeError):
         raise WorkspaceError("readable_unavailable") from None
-    repos = mode == "worktree" and not worktrees.is_repo(work) and bool(worktrees.child_repos(work))
+    # A folder that holds repos is a folder of repos in either mode: direct
+    # mode then applies to each repo in it (a session works in that repo
+    # itself), never to the folder as a whole.
+    repos = not worktrees.is_repo(work) and bool(worktrees.child_repos(work))
     problem = work_folder_problem(root, work, mode, repos)
     if problem is not None:
         raise WorkspaceError(_work_problem_code(problem))
@@ -1121,7 +1124,10 @@ def add_work_folder(backup_root: Path, folder: str | Path, *, mode: str = "workt
     _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
         current = load_worker_settings(root)
-        existing = work_workspace(launchable_workspaces(root, current.workspaces), work)
+        # The saved folders first: a folder of repos is expanded into its
+        # repos for launching, so only the saved list still holds the parent.
+        existing = work_workspace(current.workspaces, work) or work_workspace(
+            launchable_workspaces(root, current.workspaces), work)
         if existing is not None:
             return WorkFolder(existing, added=False, repos=_repo_ids(root, current.workspaces, existing))
         kept, kept_builtin = current.workspaces, False
@@ -1185,7 +1191,7 @@ def set_workspace_mode(backup_root: Path, workspace_id: str, mode: str) -> Worke
             raise WorkspaceError("mode_not_work")
         if target.mode == mode:
             return target
-        if _workspace_in_use(root, workspace_id):
+        if _folder_in_use(root, current.workspaces, target):
             raise WorkspaceError("workspace_in_use")
         problem = work_folder_problem(root, target.work_root, mode, target.repos)
         if problem is not None:
@@ -1243,17 +1249,38 @@ def remove_worker_workspace(backup_root: Path, workspace_id: str) -> None:
     _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
         current = load_worker_settings(root)
+        target = next((item for item in current.workspaces if item.workspace_id == workspace_id), None)
         remaining = tuple(item for item in current.workspaces if item.workspace_id != workspace_id)
-        if len(remaining) == len(current.workspaces):
+        if target is None:
             raise WorkspaceError("workspace_not_found")
         if not remaining:
             raise WorkspaceError("last_workspace")
-        if _workspace_in_use(root, workspace_id):
+        if _folder_in_use(root, current.workspaces, target):
             raise WorkspaceError("workspace_in_use")
         try:
             set_worker_workspaces(root, remaining)
         except (OSError, RuntimeError, ValueError):
             raise WorkspaceError("settings_unavailable") from None
+
+
+def _folder_ids(root: Path, workspaces, workspace) -> tuple[str, ...]:
+    """Every ID a job may use for a saved folder: its own and, for a folder of repos, each repo's.
+
+    A repo's ID is the one it was ever given (``repo_ids``), whether or not
+    the repo is still offered, plus any offered now.
+    """
+    ids = [workspace.workspace_id]
+    if getattr(workspace, "repos", False) and workspace.work_root is not None:
+        for path, repo_id in repo_ids(root).items():
+            if repo_id not in ids and pathid.inside(Path(path), workspace.work_root):
+                ids.append(repo_id)
+        ids += [repo_id for repo_id in _repo_ids(root, workspaces, workspace) if repo_id not in ids]
+    return tuple(ids)
+
+
+def _folder_in_use(root: Path, workspaces, workspace) -> bool:
+    """Whether a job using a saved folder, or any repo in a folder of repos, may still run or upload."""
+    return any(_workspace_in_use(root, workspace_id) for workspace_id in _folder_ids(root, workspaces, workspace))
 
 
 def _workspace_in_use(root: Path, workspace_id: str) -> bool:
@@ -2507,7 +2534,9 @@ def _workspace_command(root: Path, args) -> int:
                 human = f"{where} is already a folder where sessions work ('{workspace.workspace_id}')."
             elif result.repos or workspace.repos:
                 human = (f"{printer.MARK_OK} Sessions can work in the repos in {where}: "
-                         f"{', '.join(result.repos) or 'none yet'}. Each task gets its own worktree.")
+                         f"{', '.join(result.repos) or 'none yet'}. "
+                         + ("Each task works in its repo itself." if workspace.mode == "direct"
+                            else "Each task gets its own worktree."))
             else:
                 how = "in the folder itself" if workspace.mode == "direct" else "in its own worktree"
                 human = (f"{printer.MARK_OK} Sessions can work in {where} as '{workspace.workspace_id}', "

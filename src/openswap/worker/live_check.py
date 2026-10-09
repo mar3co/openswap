@@ -1022,7 +1022,7 @@ class LiveCheck:
                 return bool(found) and not any(found)
 
             # In the repo's own store (no alternates): the worker imported and committed it.
-            committed = bool(worktrees.git(["rev-parse", "--verify", "--quiet", f"{tree.branch}:task.txt"],
+            committed = bool(worktrees.git(["rev-parse", "--verify", "--quiet", f"refs/heads/{tree.branch}:task.txt"],
                                            repo, check=False, env={"GIT_DIR": str(tree.common_dir)}))
             detail = {
                 "task_file_written": any(results_of("task.txt")),
@@ -1031,7 +1031,7 @@ class LiveCheck:
                 "git_config_unchanged": denied(".git/config") and config.read_bytes() == config_before,
                 "shared_objects_write_denied": denied("openswap-planted") and not planted.exists(),
                 "owner_branch_unchanged": (denied("update-ref") if self._shell_steps else True)
-                and worktrees.git(["rev-parse", branch], repo, check=False) == head,
+                and worktrees.git(["rev-parse", f"refs/heads/{branch}"], repo, check=False) == head,
                 "execution_stopped": outcome.stopped,
             }
         finally:

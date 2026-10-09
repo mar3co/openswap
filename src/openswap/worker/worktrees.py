@@ -30,7 +30,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
+import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +53,9 @@ GIT_TASK_CONFIG = (("gc.auto", "0"), ("maintenance.auto", "false"))
 _SAFE_CONFIG = (
     f"core.hooksPath={os.devnull}", "core.fsmonitor=false", "submodule.recurse=false",
     "commit.gpgSign=false", "tag.gpgSign=false", "core.sshCommand=false", "protocol.allow=never",
+    # Never the owner's (or a task's) sparse-checkout rules: a task's copy is a
+    # full checkout, and the worker's private index sees every path.
+    "core.sparseCheckout=false", "index.sparse=false",
 )
 
 
@@ -357,6 +362,11 @@ def create(repo: Path, results_root: Path, workspace_id: str, job_id: str) -> Wo
         git_dir_text = git(["rev-parse", "--git-dir"], dest, timeout=30)
         git_dir = Path(git_dir_text)
         git_dir = pathid.canonical(git_dir if git_dir.is_absolute() else dest / git_dir)
+        # `worktree add` copies the owner's per-worktree config and sparse
+        # rules; the task's copy is full and has neither.
+        for copied in (git_dir / "config.worktree", git_dir / "info" / "sparse-checkout"):
+            if os.path.lexists(copied):
+                os.unlink(copied)
         os.chmod(dest, 0o700)
         tree = Worktree(pathid.canonical(dest), repo, common, git_dir, branch, pathid.canonical(objects))
         record = _record_path(dest)
@@ -447,6 +457,17 @@ def task_env(repo: Path, tree: Worktree | None = None, *, git_env: dict[str, str
     return env
 
 
+def _made_sparse(tree: Worktree) -> bool:
+    """Whether the task gave its checkout sparse rules or config of its own.
+
+    A sparse checkout leaves paths out of the folder that are still on the
+    branch, which the worker's private index would read as deletions. Such a
+    worktree is never committed or removed by the worker.
+    """
+    admin = Path(tree.git_dir)
+    return any(os.path.lexists(admin / name) for name in ("config.worktree", "info/sparse-checkout"))
+
+
 def intact(tree: Worktree) -> bool:
     """Whether the task left its admin folder pointing at its own repo and branch.
 
@@ -456,10 +477,15 @@ def intact(tree: Worktree) -> bool:
     """
     admin = Path(tree.git_dir)
     try:
-        common_text = (admin / "commondir").read_text(encoding="utf-8").strip()
-        gitdir_text = (admin / "gitdir").read_text(encoding="utf-8").strip()
-        head = (admin / "HEAD").read_text(encoding="utf-8").strip()
-    except OSError:
+        texts = []
+        for name in ("commondir", "gitdir", "HEAD"):
+            path = admin / name
+            # Regular files only: never follow a link (or block on a FIFO) the task planted.
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                return False
+            texts.append(path.read_text(encoding="utf-8").strip())
+        common_text, gitdir_text, head = texts
+    except (OSError, UnicodeDecodeError):
         return False
     common = Path(common_text) if Path(common_text).is_absolute() else admin / common_text
     return (pathid.same(common, tree.common_dir) and pathid.same(Path(gitdir_text).parent, tree.path)
@@ -568,30 +594,77 @@ def import_objects(tree: Worktree) -> int:
     return imported
 
 
-def finish(tree: Worktree, message: str) -> bool:
-    """After the task: import its objects, commit what it left uncommitted, keep the branch.
+def _private_env(tree: Worktree, index: Path) -> dict[str, str]:
+    """The worker's git on a task's checkout without its admin folder.
 
-    Returns whether the worktree is now clean (so it may be removed). Does
-    nothing when the task repointed its admin folder or switched branches.
+    The admin folder (HEAD, index, logs, COMMIT_EDITMSG) is task-writable, so
+    a link planted there could make an unsandboxed git write anywhere. The
+    worker uses the repo's shared ``.git`` (which the task cannot write), the
+    checkout as the work tree, and an index of its own.
     """
-    if not intact(tree):
+    return {"GIT_DIR": str(tree.common_dir), "GIT_WORK_TREE": str(tree.path), "GIT_INDEX_FILE": str(index),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternate_path(tree.objects)}
+
+
+def _tip(tree: Worktree) -> str:
+    return git(["rev-parse", "--verify", "--quiet", f"refs/heads/{tree.branch}^{{commit}}"], tree.common_dir,
+               timeout=30, env=tree.repo_env())
+
+
+def _pending(tree: Worktree, scratch: Path) -> tuple[str, str, str]:
+    """``(tip, tip tree, checkout tree)``: the branch tip and the tree the checkout holds now."""
+    env = _private_env(tree, scratch / "index")
+    tip = _tip(tree)
+    git(["read-tree", tip], tree.common_dir, timeout=120, env=env)
+    git(["add", "-A", "--", "."], tree.path, timeout=_GIT_TIMEOUT_S, env=env)
+    current = git(["write-tree"], tree.common_dir, timeout=120, env=env)
+    return tip, git(["rev-parse", f"{tip}^{{tree}}"], tree.common_dir, timeout=30, env=tree.repo_env()), current
+
+
+def _ignored(tree: Worktree, env: dict[str, str]) -> bool:
+    """Whether the checkout holds files the repo's ignore rules leave out of a commit.
+
+    A fresh checkout has none, so any there are the task's (build output,
+    ``.env`` files, logs). They are never committed, but they keep the
+    worktree for the owner to look at.
+    """
+    return bool(git(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory"], tree.path,
+                    timeout=_GIT_TIMEOUT_S, env=env))
+
+
+def finish(tree: Worktree, message: str) -> bool:
+    """After the task: import its objects, commit what it left on its branch, keep the branch.
+
+    Returns whether the branch now holds everything in the checkout (so the
+    worktree may be removed): not when the task left ignored files, which are
+    never committed. Does nothing when the task repointed its admin
+    folder or switched branches. Never reads or writes the task-writable
+    admin folder beyond the checks in ``intact``: the commit is built in a
+    private index and the branch moved with ``update-ref`` in the shared
+    ``.git``.
+    """
+    if not intact(tree) or _made_sparse(tree):
         return False
     import_objects(tree)
-    env = {**tree.worker_env(), **task_env(tree.common_dir, git_env=tree.repo_env())}
-    # The worker's own commit goes straight to the repo's store.
-    env.pop("GIT_OBJECT_DIRECTORY", None)
-    env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = alternate_path(tree.objects)
     try:
-        if git(["status", "--porcelain", "--ignore-submodules=all"], tree.path, env=env, timeout=120):
-            git(["add", "-A"], tree.path, env=env)
-            git(["commit", "-q", "--no-verify", "-m", message], tree.path, env=env)
-        # Everything the branch needs must now be in the repo's own store.
-        git(["rev-list", "--objects", "--quiet", tree.branch], tree.common_dir, timeout=120,
+        with tempfile.TemporaryDirectory(prefix="openswap-finish-") as scratch:
+            tip, tip_tree, current = _pending(tree, Path(scratch))
+            if current != tip_tree:
+                identity_env = {k: v for k, v in task_env(tree.common_dir, git_env=tree.repo_env()).items()
+                                if k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}
+                commit = git(["commit-tree", current, "-p", tip, "-m", message], tree.common_dir, timeout=60,
+                             env={**tree.repo_env(), **identity_env})
+                git(["update-ref", "-m", message, f"refs/heads/{tree.branch}", commit, tip], tree.common_dir,
+                    timeout=60, env=tree.repo_env())
+            leftover = _ignored(tree, _private_env(tree, Path(scratch) / "index"))
+        # Everything the branch needs must now be in the repo's own store
+        # (by its full name: a tag of the same name never stands in for it).
+        git(["rev-list", "--objects", "--quiet", f"refs/heads/{tree.branch}"], tree.common_dir, timeout=120,
             env=tree.repo_env())
-        if git(["status", "--porcelain", "--ignore-submodules=all"], tree.path, env=env, timeout=120):
-            return False
-    except WorktreeError:
+    except (WorktreeError, OSError):
         return False
+    if leftover:
+        return False  # the branch has the rest; the worktree stays for the ignored files
     # Finished: a later sweep may remove it.
     try:
         (Path(tree.path).parent / f"{Path(tree.path).name}.finished").touch()
@@ -600,12 +673,14 @@ def finish(tree: Worktree, message: str) -> bool:
     return True
 
 
-
 def remove(path: Path, *, force: bool = False) -> bool:
     """Remove a worktree directory, its admin entry and its object folder; its branch is kept.
 
-    Uses the worker's record, never the task-writable ``.git`` file. Without
-    ``force`` a worktree that is not intact or not clean is kept.
+    Uses the worker's record, never the task-writable ``.git`` file, and runs
+    no git inside the checkout: the folders are deleted (links are removed,
+    never followed) and ``git worktree prune`` drops the registration.
+    Without ``force`` a worktree that is not intact or holds work not on its
+    branch is kept.
     """
     path = Path(path)
     tree = load_record(path)
@@ -613,19 +688,15 @@ def remove(path: Path, *, force: bool = False) -> bool:
     if not force:
         if tree is None or not repo_ok or not intact(tree) or is_dirty(tree) is not False:
             return False
-    if repo_ok and intact(tree):
-        # Twice --force also removes a locked worktree.
-        args = ["worktree", "remove", *(["--force", "--force"] if force else []), str(path)]
-        try:
-            git(args, tree.common_dir, env=tree.repo_env())
-        except WorktreeError:
-            if not force:
-                return False
-    if path.exists():
+    if path.exists() or path.is_symlink():
         remove_tree(path)
     if tree is not None:
         if Path(tree.objects).exists():
             remove_tree(tree.objects)
+        admin = Path(tree.git_dir)
+        if repo_ok and pathid.inside(admin, Path(tree.common_dir) / "worktrees") and not admin.is_symlink() \
+                and admin.is_dir():
+            remove_tree(admin)
         if repo_ok:
             try:
                 git(["worktree", "prune"], tree.common_dir, timeout=60, check=False, env=tree.repo_env())
@@ -640,15 +711,24 @@ def remove(path: Path, *, force: bool = False) -> bool:
 
 
 def is_dirty(tree: Worktree | Path) -> bool | None:
-    """Whether a worktree holds uncommitted or untracked work (None when git cannot tell)."""
+    """Whether a checkout holds work not on its branch, ignored files included (None when git cannot tell).
+
+    Read through a private index (see ``_private_env``), never the
+    task-writable admin folder.
+    """
     if not isinstance(tree, Worktree):
         tree = load_record(tree)
-    if tree is None or not tree.available or not intact(tree):
+    if tree is None or not tree.available or not intact(tree) or _made_sparse(tree):
         return None
     try:
-        return bool(git(["status", "--porcelain", "--ignore-submodules=all"], tree.path,
-                        env=tree.worker_env(), timeout=60))
-    except WorktreeError:
+        with tempfile.TemporaryDirectory(prefix="openswap-status-") as scratch:
+            env = _private_env(tree, Path(scratch) / "index")
+            git(["read-tree", _tip(tree)], tree.common_dir, timeout=120, env=env)
+            git(["update-index", "-q", "--refresh"], tree.path, timeout=120, env=env, check=False)
+            changed = git(["diff-files", "--name-only"], tree.path, timeout=120, env=env)
+            untracked = git(["ls-files", "--others", "--exclude-standard"], tree.path, timeout=120, env=env)
+            return bool(changed or untracked) or _ignored(tree, env)
+    except (WorktreeError, OSError):
         return None
 
 

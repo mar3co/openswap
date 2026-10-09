@@ -543,7 +543,12 @@ timeout or a worker restart, the worker imports its objects (loose ones each
 verified against their name in bounded steps, packs through `git
 index-pack`; nothing existing overwritten), commits what it left to the
 task's branch and keeps the branch. A worktree whose work could not be
-committed is kept. Submodules are not checked out in the
+committed is kept, and so is one where the task left files the repo ignores
+(build output, `.env` files): those are never committed, so the worktree
+stays until `openswap worker worktrees prune --force`. The task's copy is a
+full checkout even when the owner's is sparse (sparse rules are not carried
+over); a task that makes its copy sparse keeps the worktree uncommitted,
+since paths it left out would read as deleted. Submodules are not checked out in the
 task's copy.
 
 **Direct mode** (advanced, this Mac only): the session works in the folder
@@ -551,7 +556,7 @@ itself, exactly like local `claude`. Set it with `openswap worker workspace
 mode <id> direct` (or `worktree` to go back), `openswap worker workspace add
 --work <folder> --direct`, or `openswap worker setup --advanced`. The control
 service can never set it, and the readiness report does not carry it (that
-would need a protocol field). A repo found in a folder of repos takes the
+would need a protocol field). A folder of repos stays one in direct mode: each repo in it is still a folder of its own, whose sessions then work in that repo itself (never in the parent folder as a whole); a repo found in it takes the
 folder's mode.
 
 Either way, the task's results (`result.md`) still go to its own results
