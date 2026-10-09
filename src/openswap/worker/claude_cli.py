@@ -38,6 +38,13 @@ def version_tuple(version: str) -> tuple[int, int, int]:
     """``(major, minor, patch)`` of a ``claude --version`` line."""
     major, minor, patch = re.match(r"^(\d+)\.(\d+)\.(\d+)", version).groups()
     return int(major), int(minor), int(patch)
+
+
+def version_supported(version: str) -> bool:
+    """At or after the stable :data:`MIN_VERSION` release (a prerelease of it comes before it)."""
+    numbers = version_tuple(version)
+    prerelease = re.match(r"^\d+\.\d+\.\d+-", version) is not None
+    return numbers > MIN_VERSION or (numbers == MIN_VERSION and not prerelease)
 # ``~/.claude/local`` (the old npm-local install) is deliberately absent: jobs
 # run with ``~/.claude`` hidden by Seatbelt, so a binary there could not start.
 CANDIDATES = ("~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude")
@@ -120,7 +127,7 @@ def _version(binary: Path, run) -> str:
     version = (result.stdout or "").strip()
     if result.returncode != 0 or not _VERSION_RE.fullmatch(version):
         raise ClaudeCliError("version_unrecognized")
-    if version_tuple(version) < MIN_VERSION:
+    if not version_supported(version):
         # Older versions let a symlink get around deny rules (GHSA-4q92-rfm6-2cqx),
         # and jobs rely on deny rules to keep the file tools off the sign-in.
         raise ClaudeCliError("version_unsupported")
@@ -237,7 +244,7 @@ def verify(backup_root: Path, *, run=subprocess.run, supported: bool | None = No
         raise ClaudeCliError("pin_invalid")
     if not _VERSION_RE.fullmatch(raw["version"]):
         raise ClaudeCliError("pin_invalid")
-    if version_tuple(raw["version"]) < MIN_VERSION:
+    if not version_supported(raw["version"]):
         # Pinned before this minimum existed: never run, even without a version probe.
         raise ClaudeCliError("version_unsupported")
     binary = Path(raw["binary"])

@@ -109,6 +109,12 @@ def test_a_claude_code_that_lets_symlinks_past_deny_rules_is_never_pinned_or_run
         claude_cli.pin(root, binary=fake_claude(tmp_path, "2.1.6 (Claude Code)"))
     assert error.value.code == "version_unsupported"
     assert claude_cli.version_tuple("2.1.7 (Claude Code)") == claude_cli.MIN_VERSION
+    # A prerelease of the floor predates the fix; a build tag (+) does not change the release.
+    assert not claude_cli.version_supported("2.1.7-beta.1 (Claude Code)")
+    assert claude_cli.version_supported("2.1.7+build.5 (Claude Code)")
+    assert claude_cli.version_supported("2.1.8-beta (Claude Code)") and claude_cli.version_supported("3.0.0 (Claude Code)")
+    with pytest.raises(claude_cli.ClaudeCliError):
+        claude_cli.pin(root, binary=fake_claude(tmp_path, "2.1.7-rc.2 (Claude Code)"))
     pin = claude_cli.pin(root, binary=fake_claude(tmp_path, "2.1.7 (Claude Code)"))
     assert claude_cli.verify(root, check_version=False) == pin
     # A pin recorded before the minimum existed is refused even without a version probe.
