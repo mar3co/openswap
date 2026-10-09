@@ -764,3 +764,33 @@ def test_a_blocked_branch_name_leaves_nothing_behind(root, home, monkeypatch):
     assert not (folder / f"{'a' * 32}.objects").exists()
     monkeypatch.setattr(worktrees, "_free_branch", real_free_branch)
     assert _runtime(root)._resolve_workspace("openswap", "a" * 32).work_dir.exists()  # a retry works
+
+
+
+def test_a_tag_sharing_a_branch_name_never_hides_the_branch(root, home):
+    repo = _repo(home / "GitHub" / "openswap")
+    _git(repo, "branch", "openswap")
+    _git(repo, "tag", "openswap")
+    cli.add_work_folder(root, repo)
+    assert _runtime(root)._resolve_workspace("openswap", "a" * 32).branch == "openswap-aaaaaaaa"
+
+
+def test_a_failed_checkout_removes_the_branch_it_made(root, home, monkeypatch):
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    real_git = worktrees.git
+
+    def failing_checkout(args, cwd, **kwargs):
+        result = real_git(args, cwd, **kwargs)
+        if args[:2] == ["worktree", "add"]:
+            raise worktrees.WorktreeError("git_failed")  # the branch exists, the checkout "failed"
+        return result
+
+    monkeypatch.setattr(worktrees, "git", failing_checkout)
+    with pytest.raises(WorkspaceRefused):
+        _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    monkeypatch.setattr(worktrees, "git", real_git)
+    assert "openswap/aaaaaaaa" not in _git(repo, "branch", "--list")
+    folder = home / "OpenSwap Research" / ".worktrees" / "openswap"
+    assert not (folder / ("a" * 32)).exists() and not (folder / f"{'a' * 32}.objects").exists()
+    assert _runtime(root)._resolve_workspace("openswap", "a" * 32).branch == "openswap/aaaaaaaa"

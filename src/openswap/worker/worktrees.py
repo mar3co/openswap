@@ -339,12 +339,18 @@ def create(repo: Path, results_root: Path, workspace_id: str, job_id: str) -> Wo
         if os.path.lexists(objects):
             remove_tree(objects)
         raise WorktreeError("worktree_unavailable") from None
+    # Nothing of this task may stay behind, or a retry finds `worktree_exists`.
     try:
         branch = _free_branch(repo, job_id)
+    except WorktreeError:
+        remove_tree(objects)
+        raise
+    try:
         git(["worktree", "add", "--quiet", "-b", branch, str(dest), "HEAD"], repo)
     except WorktreeError:
-        # Nothing of this task may stay behind, or a retry finds `worktree_exists`.
-        remove_tree(objects)
+        # `-b` may have made the branch before the checkout failed: it was
+        # free a moment ago, so it is this task's to delete.
+        _undo_create(repo, dest, objects, branch)
         raise
     try:
         common = common_dir(repo)
@@ -387,7 +393,10 @@ def _free_branch(repo: Path, job_id: str) -> str:
     usual name as a file/folder clash in ``refs/heads``, so the fallbacks are
     the full ID, then the flat ``openswap-<id>`` forms.
     """
-    existing = set(git(["for-each-ref", "--format=%(refname:short)", "refs/heads/"], repo, timeout=30).splitlines())
+    # Full names: a short name turns into `heads/<name>` when a tag shares it.
+    existing = {line[len("refs/heads/"):] for line in git(
+        ["for-each-ref", "--format=%(refname)", "refs/heads/"], repo, timeout=30).splitlines()
+        if line.startswith("refs/heads/")}
 
     def free(name: str) -> bool:
         parts = name.split("/")
