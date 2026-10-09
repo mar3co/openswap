@@ -41,7 +41,7 @@ What the implementation does under this decision (plan 017, phase 1):
   Still no MCP, no slash commands, no session persistence, and managed
   policy still refuses a launch. The Seatbelt profile holds in every mode:
   writes only to the approved folder or the task's worktree, the profile
-  (never its settings, memory, skills, hooks or plugins), the run's temporary
+  (never its settings, memory, rules, auto-memory, skills, hooks or plugins), the run's temporary
   folder and this user's cache folders; the owner's default login, the other
   accounts and OpenSwap's own state hidden; and no Keychain (`security`
   cannot start, the Keychain's services cannot be looked up), so a shell

@@ -1600,7 +1600,8 @@ Built (PR #93, stacked on #90):
   sign-in lands there; OpenSwap still never touches a credential. A profile
   signed in only in the Keychain refuses (`provider_auth_unavailable`) until
   `prepare` signs it in again. The profile's configuration files (settings,
-  memory, agents, commands, skills, hooks, output styles, plugins) are
+  memory and rules, agents and their memory, commands, skills, hooks, output
+  styles, plugins, and each project's auto-memory, with auto-memory off) are
   unwritable from a job, so one task cannot widen the next.
 - **Item 5, what works.** Claude Code's bash sandbox nested in OpenSwap's: no;
   real `sandbox-exec` inside `sandbox-exec` fails `sandbox_apply: Operation

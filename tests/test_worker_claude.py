@@ -263,6 +263,7 @@ def test_argv_follows_the_profiles_own_settings_and_denies_every_prompt(tmp_path
     env = launch["env"]
     assert env["CLAUDE_CONFIG_DIR"] == str(claude_exec.profile_for(root, IDENTITY))
     assert "ANTHROPIC_API_KEY" not in env and env["DISABLE_AUTOUPDATER"] == "1"
+    assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"  # no notes for a later task to load
     sb = (Path(launch["run_dir"]) / "claude.sb").read_text()
     assert "(deny file-write*)" in sb and "(allow default)" in sb
     assert str(workspace(root).output_root.resolve()) in sb
@@ -423,8 +424,10 @@ def test_seatbelt_profile_enforces_the_boundary_for_real(tmp_path):
 
 def _job_profile(tmp_path, *, exec_deny=True):
     root = tmp_path / "backup"
-    out, profile, home = tmp_path / "out", root / "sessions" / "p", tmp_path / "home"
-    for path in (out, profile, home / "Library" / "Keychains", profile / "skills"):
+    # A dot in the profile's name, as in an email slug: the auto-memory rule is a regular expression.
+    out, profile, home = tmp_path / "out", root / "sessions" / "4-a_b.com", tmp_path / "home"
+    for path in (out, profile, home / "Library" / "Keychains", profile / "skills", profile / "rules",
+                 profile / "projects" / "-repo" / "memory", profile / "projects" / "-repo" / "todo"):
         path.mkdir(parents=True, exist_ok=True)
     (profile / "settings.json").write_text("{}\n")
     (profile / "CLAUDE.md").write_text("\n")
@@ -457,9 +460,16 @@ def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_
         f"2>/dev/null; echo settings_replaced $?",
         f"printf x >> {profile}/CLAUDE.md 2>/dev/null; echo memory $?",
         f"printf x > {profile}/skills/s.md 2>/dev/null; echo skill $?",
+        f"printf x > {profile}/rules/r.md 2>/dev/null; echo rule $?",
+        f"printf x > {profile}/projects/-repo/memory/MEMORY.md 2>/dev/null; echo auto_memory $?",
+        f"mkdir {profile}/projects/-other 2>/dev/null; mkdir {profile}/projects/-other/memory 2>/dev/null; "
+        f"echo new_auto_memory $?",
+        f"printf x > {profile}/projects/-repo/todo/t.json; echo project_state $?",
         f"printf x > {profile}/state.json; echo state $?",
         f"cat {profile}/.credentials.json >/dev/null; echo own_sign_in $?",
     ]))
+    assert codes["rule"] != "0" and codes["auto_memory"] != "0" and codes["new_auto_memory"] != "0"
+    assert codes["project_state"] == "0"
     # The `security` tool cannot start at all (126), so Claude Code's Keychain
     # write fails fast and it keeps the sign-in in its credentials file.
     assert codes["security"] == "126"

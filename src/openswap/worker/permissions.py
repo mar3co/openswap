@@ -95,10 +95,14 @@ _RULE_KEYS = ("allow", "deny", "ask")
 CLAUDE_SHELL_TOOLS = ("Bash", "PowerShell", "Monitor", "REPL", "BashOutput", "KillShell")
 # ``read-only``: reading and web research only.
 CLAUDE_READ_ONLY_TOOLS = ("Read", "Grep", "Glob", "WebSearch", "WebFetch")
-# Files in the profile that change what a later session may do. Jobs may not
-# write them (Seatbelt), so a task can never widen the next one.
+# Files in the profile that change what a later session may do or is told.
+# Jobs may not write them (Seatbelt), so a task can never widen or instruct
+# the next one: settings, user memory and rules, agents and their memory,
+# commands, skills, hooks, output styles, plugins, and each project's
+# auto-memory (``projects/<project>/memory``, see claude_exec).
 CLAUDE_PROFILE_CONFIG = ("settings.json", "settings.local.json", "CLAUDE.md")
-CLAUDE_PROFILE_CONFIG_DIRS = ("agents", "commands", "skills", "hooks", "output-styles", "plugins")
+CLAUDE_PROFILE_CONFIG_DIRS = ("agents", "agent-memory", "commands", "rules", "skills", "hooks", "output-styles",
+                              "plugins")
 
 
 @dataclass(frozen=True)

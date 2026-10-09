@@ -971,9 +971,11 @@ The Seatbelt profile holds whatever the mode, `bypassPermissions` included.
 It allows writes only to the job's output folder (or the task's worktree and
 what git needs beside it), the account's profile, the run's temporary folder
 and this user's cache and temporary folders, and never to the profile files
-that configure later sessions (`settings.json`, `settings.local.json`,
-`CLAUDE.md`, `agents/`, `commands/`, `skills/`, `hooks/`, `output-styles/`,
-`plugins/`). It makes the default login, `~/.codex` and the rest of the
+that configure or instruct later sessions (`settings.json`,
+`settings.local.json`, `CLAUDE.md`, `rules/`, `agents/`, `agent-memory/`,
+`commands/`, `skills/`, `hooks/`, `output-styles/`, `plugins/`, and each
+project's auto-memory `projects/<project>/memory/`; jobs also run with
+auto-memory off). It makes the default login, `~/.codex` and the rest of the
 backup root (other accounts, worker state) unreadable and unwritable, and
 takes the Keychain away: `/usr/bin/security` cannot start, the Keychain's
 services cannot be looked up and `~/Library/Keychains` cannot be read, so no
