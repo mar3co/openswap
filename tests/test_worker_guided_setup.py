@@ -332,8 +332,9 @@ def test_summary_is_ready_only_when_admission_is_open(root, monkeypatch, capsys,
     assert _setup(root, monkeypatch, ["", "y", ""]) == 0
     out = capsys.readouterr().out
     assert "  ✗ Worker      running (paused)" in out
-    assert "Next: `openswap worker pause --off` to resume." in out
-    assert guided_setup.EXECUTION_OFF_NOTE not in out
+    # Paused is what the live check needs: it is named directly, with no resume first.
+    assert "pause --off" not in out and guided_setup.EXECUTION_OFF_NOTE in out
+    assert "`openswap worker pause`," not in out
     update_worker_settings(root, paused=False)
     assert _setup(root, monkeypatch, ["", ""]) == 0
     out = capsys.readouterr().out

@@ -621,7 +621,9 @@ class Readiness:
                 "revoked": "`openswap worker pair <url> <code>` to pair again (this Mac was removed)",
                 "expired": "`openswap worker pair <url> <code>` to pair again (the pairing expired)",
             }.get(self.connection, "wait a moment, then `openswap worker status`"))
-        if self.paused:
+        # A paused worker is what the live check needs: resuming is a step only once live
+        # tasks are on (until then the summary names the check, without a pause first).
+        if self.paused and self.execution == "live":
             out.append("`openswap worker pause --off` to resume")
         if self.account is None:
             out.append("`openswap worker account <slot>` to pick an account")

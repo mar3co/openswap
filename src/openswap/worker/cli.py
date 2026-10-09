@@ -2708,6 +2708,13 @@ def _live_off_step(root: Path, settings) -> str:
             if not isinstance(identity, str):
                 continue
             provider = provider_of(identity) or "codex"
+            # An account that left its roster first: no live check of its kind can cover it.
+            slot = choices.slot_for(identity)
+            if slot is None:
+                if reference is None:
+                    return "`openswap worker account <slot>` to pin an account; the pinned one is gone."
+                return (f"`openswap worker account disallow {reference}` to drop an allowed account that "
+                        "left its roster.")
             if provider not in statuses:
                 statuses[provider] = live_status(root, provider)
             status = statuses[provider]
@@ -2715,12 +2722,6 @@ def _live_off_step(root: Path, settings) -> str:
                 return execution_off_note(provider).removeprefix("Next: ")
             if identity in (status.get("checked_accounts") or ()):
                 continue
-            slot = choices.slot_for(identity)
-            if slot is None:
-                if reference is None:
-                    return "`openswap worker account <slot>` to pin an account; the pinned one is gone."
-                return (f"`openswap worker account disallow {reference}` to drop an allowed account that "
-                        "left its roster.")
             selector = f"claude:{slot.number}" if provider == "claude" else slot.number
             flag = " --provider claude" if provider == "claude" else ""
             return f"`openswap worker live-check{flag} --account {selector}` to check account {slot.number} too."

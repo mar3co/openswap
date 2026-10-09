@@ -234,9 +234,10 @@ def test_status_points_the_live_check_at_an_unchecked_allowed_account(root, monk
     assert _run(root, "status") == 0
     assert capsys.readouterr().out.endswith("Next: `openswap worker pause`, then `openswap worker live-check` "
                                             "to turn on live tasks.\n")
-    # The allowed account left its roster: no check can cover it, so drop it by reference.
+    # The allowed account left its roster: no check can cover it, so drop it by reference,
+    # even while its kind's live tasks are off.
     modes["codex"] = {"execution_mode": "live", "checked_accounts": [ALICE]}
-    modes["claude"] = {"execution_mode": "live", "checked_accounts": []}
+    modes["claude"] = {"execution_mode": "disabled", "checked_accounts": []}
     (reference,) = [entry.account_ref for entry in cli.worker_account_choices(root).allowlist
                     if entry.identity.startswith("claude:")]
     roster = json.loads((root / "sequence.json").read_text(encoding="utf-8"))
