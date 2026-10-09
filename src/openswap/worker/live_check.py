@@ -1519,8 +1519,8 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         # A lock held by another command: `live enable` retries with this evidence. Anything
         # else (the evidence, this Mac) is explained by the shared message, which names the fix.
         if error.code in {"live_lock_busy", "live_lock_unavailable"}:
-            print(f"Could not turn live tasks on ({error.code}). Next: `openswap worker live enable{flag}`.",
-                  file=sys.stderr)
+            print(f"Could not turn live tasks on ({error.code}). Next: `openswap worker live enable{flag} "
+                  f"--evidence {shlex.quote(str(path))}`.", file=sys.stderr)
         else:
             print(f"Could not turn live tasks on ({error.code}). {_live_mode_message(error, evidence.get('provider'))}",
                   file=sys.stderr)

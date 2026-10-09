@@ -2690,7 +2690,9 @@ def _live_off_step(root: Path, settings) -> str:
     `live_adapter_disabled` means the pinned kind's live tasks are off, or
     an account a task may pick (the pin or an allowed one) was never
     checked. The first such account, in the worker's own order, decides:
-    its kind's live-check path, or `--account <slot>` for that account.
+    its kind's live-check path, `--account <slot>` for that account, or,
+    for an account that left its roster (no check can cover it), the
+    `account` command that drops it.
     """
     from openswap.worker.accounts import provider_of
     from openswap.worker.guided_setup import execution_off_note
@@ -2700,7 +2702,9 @@ def _live_off_step(root: Path, settings) -> str:
     try:
         choices = worker_account_choices(root)
         statuses: dict[str, dict] = {}
-        for identity in (settings.pinned_account_ref, *(entry.identity for entry in settings.account_allowlist)):
+        candidates = [(settings.pinned_account_ref, None),
+                      *((entry.identity, entry.account_ref) for entry in settings.account_allowlist)]
+        for identity, reference in candidates:
             if not isinstance(identity, str):
                 continue
             provider = provider_of(identity) or "codex"
@@ -2713,7 +2717,10 @@ def _live_off_step(root: Path, settings) -> str:
                 continue
             slot = choices.slot_for(identity)
             if slot is None:
-                continue
+                if reference is None:
+                    return "`openswap worker account <slot>` to pin an account; the pinned one is gone."
+                return (f"`openswap worker account disallow {reference}` to drop an allowed account that "
+                        "left its roster.")
             selector = f"claude:{slot.number}" if provider == "claude" else slot.number
             flag = " --provider claude" if provider == "claude" else ""
             return f"`openswap worker live-check{flag} --account {selector}` to check account {slot.number} too."
