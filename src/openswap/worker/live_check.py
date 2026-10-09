@@ -1130,7 +1130,7 @@ class LiveCheck:
             q = shlex.quote
             steps = {
                 "keychain": f"/usr/bin/security find-generic-password -s {q(service or 'missing')} >/dev/null 2>&1",
-                "own_sign_in": f"cat {q(str(home / 'auth.json'))} >/dev/null 2>&1",
+                "own_sign_in": f"/bin/dd if={q(str(home / 'auth.json'))} of=/dev/null count=0 2>/dev/null",
             }
             script = "\n".join(f'{command}; echo "R {name} $?"' for name, command in steps.items())
             prepare_home(self.root, identity)

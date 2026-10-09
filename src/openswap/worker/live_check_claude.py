@@ -537,8 +537,8 @@ class ClaudeLiveCheck(LiveCheck):
         try:
             job = run(profile_file("sign-in.sb", profile), {
                 "security_tool": query,
-                # Into /dev/null: the sign-in never reaches this process or the evidence.
-                "own_sign_in": f"cat {q(str(profile / CREDENTIALS_FILE))} >/dev/null 2>&1",
+                # Opened, never read (count=0): the sign-in never reaches any process or the evidence.
+                "own_sign_in": f"/bin/dd if={q(str(profile / CREDENTIALS_FILE))} of=/dev/null count=0 2>/dev/null",
             }, profile)
             services = run(profile_file("sign-in-services.sb", profile, security_exec_denied=False),
                            {"keychain_services": query}, profile)

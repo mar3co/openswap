@@ -79,7 +79,9 @@ The command-line executable is `openswap`.
 | `openswap worker workspace add --read <folder>` | Let remote tasks read a folder but never change it; results go to `~/OpenSwap Research/<id>` (`add <id> <folder>` approves a results folder; `list`, `label`, `remove`). The control service sees only IDs and labels |
 | `openswap worker codex install` | Install the pinned official Codex CLI 0.157.1 for Remote tasks (SHA-256 verified) |
 | `openswap worker codex login [slot]` | Sign an account in to its own isolated Codex home (your default login is untouched) |
-| `openswap worker claude pin` / `prepare` | Pin the installed Claude Code binary and prepare an account's OpenSwap profile (your default login is untouched) |
+| `openswap worker codex settings [slot]` | Show or set the approval policy and sandbox mode that account's remote tasks follow (`--copy-settings` takes yours from `~/.codex/config.toml`) |
+| `openswap worker claude pin` / `prepare` | Pin the installed Claude Code binary and prepare an account's OpenSwap profile (your default login is untouched); `prepare --copy-settings --mode <mode>` sets the permission settings its remote tasks follow |
+| `openswap worker permissions [follow\|no-shell\|read-only]` | Remote sessions follow each account's own Claude or Codex permission settings; anything that would ask is denied. Optionally limit every remote task on this Mac (set only here, never from the service) |
 | `openswap worker live-check` | Run short real jobs on this Mac, record phase-1 evidence, then offer to enable live execution (`--provider claude`) |
 | `openswap worker live status` | Show whether remote jobs really run (`enable --evidence FILE`, `disable`) |
 | `openswap menubar` | macOS extra |

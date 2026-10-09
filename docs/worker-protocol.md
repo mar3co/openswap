@@ -479,7 +479,13 @@ and ends with at most one `Next:` command.
    prepare`, then `openswap worker live-check --provider claude`; see
    [Running jobs live](#running-jobs-live-codex)), else "✓ Ready: Slack can
    send tasks to this Mac." Live tasks, here and in the readiness report,
-   follow the pinned account's provider.
+   follow the pinned account's provider. With `--advanced` the step first
+   asks for the per-Mac permission limit ("Limit every remote task on this
+   Mac? (follow, no-shell, read-only)", Enter keeps it); the checklist shows
+   a Permissions row only when the limit is not the default, and for a
+   Claude account whose shell is not limited one line says that shell
+   commands can read that account's own sign-in (see
+   [Permissions](#permissions-the-accounts-own-settings)).
 
 Each step is headed `Step N of 4 · <name>`; on a terminal the headers are
 bold unless `NO_COLOR` is set or stdout is not a terminal, and the menu bar
@@ -535,10 +541,9 @@ objects the owner's checkout and other tasks use; it also gets `gc.auto=0`,
 `maintenance.auto=false` and the repo's `user.name` and `user.email` (read by
 the worker; the sandbox may not read `~/.gitconfig`). Codex passes these to
 its shell commands through the profile's `shell_environment_policy`. A task
-never writes a ref, not even its own branch: it edits (Codex with its shell,
-Claude with file tools only: Read, Grep, Glob, Edit, Write and web tools, no
-Bash, since a shell would share the Claude process's sandbox, which must read
-the account's credential profile), and when it ends, by finishing, Stop, a
+never writes a ref, not even its own branch: it edits with whatever tools the
+account's own permission settings allow (see [Permissions](#permissions-the-accounts-own-settings)),
+and when it ends, by finishing, Stop, a
 timeout or a worker restart, the worker imports its objects (loose ones each
 verified against their name in bounded steps, packs through `git
 index-pack`; nothing existing overwritten), commits what it left to the
@@ -826,10 +831,13 @@ account, or the job fails `provider_auth_unavailable` without launching
 same way.
 
 **Sandbox.** The worker rewrites the home's `config.toml` before every run. It
-selects a named permission profile that denies `:root`, reads `:minimal` plus
-the workspace's approved read-only sources, writes only the job's output
-folder, denies `$TMPDIR` and `/tmp`, and has no shell network; no `--sandbox`
-flag is ever passed (that would make Codex ignore the profile). Research uses
+carries the account's own approval policy and reviewer (see
+[Permissions](#permissions-the-accounts-own-settings)) and selects a named
+permission profile that denies `:root`, reads `:minimal` plus the
+workspace's approved read-only sources, writes only the job's output folder
+(nothing at all under a read-only sandbox), denies `$TMPDIR` and `/tmp`, and
+has no shell network; no `--sandbox` flag is ever passed (that would make
+Codex ignore the profile). Research uses
 Codex's live web search. Apps, hooks, plugins, multi-agent, browser and
 computer use, code mode, unified exec and skill search are disabled; project
 config discovery and `AGENTS.md` are off. A job whose folder contains a `.codex` entry (a
@@ -839,7 +847,7 @@ managed files in the isolated home, `/etc/codex`, the machine or per-user
 managed preferences, or their payload keys). The job's argv is fixed:
 `codex --strict-config --disable … exec --json --ephemeral
 --skip-git-repo-check --ignore-rules --cd <output> --output-last-message <output>/result.md -`,
-with the task on stdin.
+with the task on stdin (`--disable shell_tool` too when the shell is off).
 
 **Containment and Stop.** Each job runs as its own launchd job
 (`com.opensoft.openswap.worker.job.<id>`) with an allowlisted environment, so
@@ -860,9 +868,19 @@ probe, one web-research job, one adversarial `codex exec` job that is asked to
 read and write outside its folder, read `CODEX_HOME`, print its environment,
 read an approved read-only source (and try to write it and follow a link out
 of it), write its own `$TMPDIR`, use the network and submit a launchd job (each outcome checked on disk and in
-the event stream, with positive controls so a refusal cannot pass), one job
-stopped while a `setsid()` helper runs, and one job whose launching worker
-process is killed and then recovered. It refuses while the worker is running
+the event stream, with positive controls so a refusal cannot pass; it runs
+under the `on-request` policy, so any escalation the model asks for is
+refused headless), one job stopped while a `setsid()` helper runs, one job
+whose launching worker process is killed and then recovered, and one work
+folder job under the widest settings an account can have
+(`danger-full-access`, `never`), so only OpenSwap's write scope keeps the
+owner's copy, branch and git config unchanged. The `permissions` gate checks,
+without another model turn, that the config a launch writes carries the
+account's approval policy, that a read-only sandbox denies a write in the
+folder and that `no-shell` turns the shell tool off; the `sign_in_isolation`
+gate runs, through `codex sandbox`, a `security` lookup of a throwaway login
+Keychain item (added for the check, found outside the sandbox, removed after)
+and a read of the isolated home's `auth.json`: both must fail. It refuses while the worker is running
 unpaused (or its state cannot be read), a job is active or a lease is held, and
 holds the worker lifecycle lock until it finishes, so `pause --off`, `enable`,
 a worker start or a pin change waits instead of reopening admission mid-check. The evidence file (mode 0600,
@@ -879,7 +897,10 @@ the account the check ran on: jobs on any other account (another pin, or an
 allowed account a per-job choice selects) are refused `live_adapter_disabled`
 until a check passes on that account too (`live-check --account <slot>`), and
 the worker does not claim work while any selectable account is unchecked. A
-new binary starts the list over.
+new binary starts the list over. An opt-in also records which job permission
+behaviour its check measured (`policyVersion`); one recorded before jobs
+followed the account's own settings stays off (status says to run the check
+again) until a new check passes.
 
 ### Running jobs live (Claude)
 
@@ -893,7 +914,8 @@ Live execution for Claude is a separate opt-in from Codex's, off by default.
 openswap worker pause                          # if the worker is running
 openswap worker account claude:4               # pin the Claude account (or allow it for a per-job choice)
 openswap worker claude pin                     # record the installed claude binary's version and SHA-256
-openswap worker claude prepare                 # sign that account in to its OpenSwap profile (Claude's own login)
+openswap worker claude prepare                 # sign that account in to its OpenSwap profile (Claude's own login),
+                                               # and offer to copy your permission settings into it
 openswap worker live-check --provider claude   # short real jobs, evidence file, then offers to enable
 openswap worker pause --off
 ```
@@ -916,44 +938,133 @@ because jobs cannot read that folder.
 
 **Account.** Each Claude account runs from its OpenSwap session profile
 (`CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`, the same folders live
-Claude sessions use). If that profile is not signed in as the account,
+Claude sessions use). If that profile is not signed in as the account, or
+its sign-in is only in the Keychain (which jobs cannot reach, below),
 `claude prepare` runs the pinned Claude Code's own `claude auth login
 --claudeai --email <account>` with `CLAUDE_CONFIG_DIR` set to it, while holding
-the Claude account lease; Claude Code then keeps the sign-in in the profile's
-own Keychain item. OpenSwap never reads, copies or seeds a credential for
+the Claude account lease, under a Seatbelt profile that only takes the
+Keychain away; Claude Code then keeps the sign-in in the profile's own
+credentials file (`.credentials.json`, its plaintext store when the Keychain
+is unreachable). OpenSwap never reads, copies or seeds a credential for
 this, and your default Claude login (`~/.claude`, `~/.claude.json` and its
 Keychain item) is never changed. A sign-in to a different account is signed
-straight back out. A profile already signed in is left as it is. Only Claude
-Code refreshes tokens, and the worker never reads, uploads, proxies or logs a
-credential. A launch refuses without starting
+straight back out. A profile already signed in there is left as it is. Only
+Claude Code refreshes tokens, and the worker never reads, uploads, proxies or
+logs a credential. A launch refuses without starting
 anything (`provider_auth_unavailable`, `unlaunched=true`) unless the profile
-is signed in as the job's account, and (`provider_unavailable`) while an
-interactive session is using that profile or while the profile mirrors
-customizations from your default profile (scheduled kickoff's sharing);
-`claude prepare` removes those mirrored items.
+is signed in as the job's account with its sign-in in that file, and
+(`provider_unavailable`) while an interactive session is using that profile,
+while the profile mirrors customizations from your default profile (scheduled
+kickoff's sharing; `claude prepare` removes those mirrored items), or while
+its `settings.json` is one Claude Code would ignore (see
+[Permissions](#permissions-the-accounts-own-settings)).
 
-**Tools and sandbox.** The argv is fixed: `sandbox-exec -f <profile.sb> claude
--p --output-format stream-json --verbose --restricted --tools
-Read,Grep,Glob,WebSearch,WebFetch --allowedTools (same) --permission-mode
-dontAsk --permission-prompts none --strict-mcp-config --disable-slash-commands
---no-session-persistence`, plus `--add-dir` for each approved read-only
-source, with the task on stdin and an allowlisted environment (no API keys).
-The Seatbelt profile allows writes only to the job's output folder, the
-account's profile, the run's temporary folder and this user's cache and
-temporary folders, and makes the default login, `~/.codex` and the rest of
-the backup root (other accounts, worker state) unreadable and unwritable.
-Containment, Stop, recovery, `result.md` and failure codes are the same as for
-Codex. A job also refuses while any managed Claude Code policy applies (the
-system `managed-settings.json` or `managed-settings.d/`, managed preferences,
-or server-managed policy cached in the profile as a non-empty
-`remote-settings.json`).
+**Tools and sandbox.** The argv: `sandbox-exec -f <profile.sb> claude -p
+--output-format stream-json --verbose --setting-sources user
+--permission-prompts none --strict-mcp-config --disable-slash-commands
+--no-session-persistence`, plus the per-Mac limit's arguments (none by
+default) and `--add-dir` for each approved read-only source, with the task on
+stdin and an allowlisted environment (no API keys). No tool list or mode is
+OpenSwap's: Claude Code takes them from the profile's `settings.json`.
+The Seatbelt profile holds whatever the mode, `bypassPermissions` included.
+It allows writes only to the job's output folder (or the task's worktree and
+what git needs beside it), the account's profile, the run's temporary folder
+and this user's cache and temporary folders, and never to the profile files
+that configure later sessions (`settings.json`, `settings.local.json`,
+`CLAUDE.md`, `agents/`, `commands/`, `skills/`, `hooks/`, `output-styles/`,
+`plugins/`). It makes the default login, `~/.codex` and the rest of the
+backup root (other accounts, worker state) unreadable and unwritable, and
+takes the Keychain away: `/usr/bin/security` cannot start, the Keychain's
+services cannot be looked up and `~/Library/Keychains` cannot be read, so no
+command the session runs can reach another account's sign-in, the default
+login or the worker's device key. Containment, Stop, recovery, `result.md`
+and failure codes are the same as for Codex. A job also refuses while any
+managed Claude Code policy applies (the system `managed-settings.json` or
+`managed-settings.d/`, managed preferences, or server-managed policy cached
+in the profile as a non-empty `remote-settings.json`): it could add hooks,
+permission rules or an API key helper the owner did not choose.
 
-**The Claude live check** records the same gates as the Codex one, with Read
-probes instead of shell commands (a read in the job folder must work; reads
-outside it, of a sentinel in the profile and of `~/.claude.json` must fail),
-the tool list from Claude Code's `init` event (only the five research tools,
-no MCP server, no API key), and the same stop and kill-recovery jobs. Its
-evidence file is `live-check-claude-<UTC>.json`.
+**The Claude live check** records the same gates as the Codex one. The Read
+probes run in `bypassPermissions` with every read allowed, so only the
+Seatbelt profile can refuse (a read in the job folder must work; reads
+outside it, of a sentinel in the profile and of `~/.claude.json` must fail).
+The tool surface gate reads Claude Code's `init` event (no MCP server, no API
+key, a reported permission mode). The `permissions` gate runs four short
+jobs with the profile's own settings left out (`--setting-sources ""`) so the
+owner's rules cannot decide them: in `default` mode a shell command and a
+write, which would ask, must both be refused; in `acceptEdits` the write must
+work; under `no-shell` no shell tool may be listed and under `read-only` only
+the read and web tools; and the research job's mode must be the profile's.
+The `sign_in_isolation` gate runs a shell directly under the job's Seatbelt
+profile and environment: `security` must not start, a throwaway login
+Keychain item (found outside, removed after) must stay unreachable through
+the Keychain's services alone, and the profile's settings and memory must be
+unwritable while its state stays writable; whether the shell can read the
+account's own credentials file is recorded as it is (it can). The work folder
+job runs in `bypassPermissions` with the shell. Its evidence file is
+`live-check-claude-<UTC>.json`.
+
+### Permissions: the account's own settings
+
+The owner decided on 2026-10-08 that remote sessions follow the permission
+settings of the account they run on, like running `claude` or `codex` there,
+instead of a tool list OpenSwap picks
+([plan](../plans/017-progress.md#sessions-follow-the-accounts-own-permission-settings-owner-decision-2026-10-08)).
+
+- **Claude.** The mode (`default`, `acceptEdits`, `plan`, `auto`, `dontAsk`,
+  `bypassPermissions`) and the allow, deny and ask rules come from the
+  profile's own `settings.json` (user settings; a repo's
+  `.claude/settings.json` never applies, since `claude -p` skips the trust
+  dialog that would approve it). `openswap worker claude prepare
+  --copy-settings` copies the mode and those rules (never hooks, the model or
+  extra directories) from `~/.claude/settings.json`, `--mode MODE` sets the
+  mode, and run in a terminal on a profile with none it asks. A settings file
+  Claude Code would silently ignore (not JSON, a symlink, an unknown mode,
+  rules that are not strings) refuses the launch instead of dropping your
+  deny rules. `openswap worker claude status` shows each account's mode and
+  rule counts.
+- **Codex.** Each account keeps `approval_policy`, `approvals_reviewer` and
+  `sandbox_mode` in its isolated home (`permissions.json`), set with
+  `openswap worker codex settings [SLOT] [--copy-settings] [--approval P]
+  [--sandbox M] [--reviewer R]` (`--copy-settings` reads `~/.codex/config.toml`
+  and its selected profile; `codex login` offers it after a sign-in). Without
+  any, Codex's defaults apply (`on-request`, `workspace-write`). Codex's own
+  sandbox is the only boundary its shell commands have (it cannot be wrapped
+  in another: macOS refuses nested sandboxes), so OpenSwap keeps its folder
+  rules and the shell's lack of network whatever the sandbox mode says;
+  `read-only` makes the folder read-only too. `untrusted`, which asks before
+  every command not known to be safe, runs with no shell tool.
+- **Nobody can approve.** Anything that would ask is denied: Claude runs with
+  `--permission-prompts none`, and `codex exec` refuses every approval
+  request. An account's own automatic mode still decides: Claude's `auto`,
+  Codex's `auto_review` reviewer.
+- **Per-Mac limit, set only on the Mac.** `openswap worker permissions
+  follow|no-shell|read-only` (also `openswap worker setup --advanced`). The
+  default, `follow`, adds nothing. `no-shell`: Claude gets no shell tool
+  (`--disallowedTools Bash,PowerShell,Monitor,REPL,BashOutput,KillShell`) and
+  no hooks; Codex no shell tool. `read-only`: Claude keeps only Read, Grep,
+  Glob, WebSearch and WebFetch (and no hooks); Codex a read-only sandbox. It
+  applies from the next task. No wire operation, IPC request or remote
+  message can set it, and the readiness report does not carry it. `worker
+  status` (human and `--json`) and the setup summary show it only when it is
+  not `follow`; an unreadable value reads as `read-only`.
+- **What OpenSwap keeps.** The folder or per-task worktree write scope; no
+  access to other accounts' sign-ins, the backup root or the journal, and no
+  writes to the owner's working copy; the identity checks and
+  case-insensitive path checks. These hold in every mode, including
+  `bypassPermissions` and `danger-full-access`. Outside them a session can do
+  what `claude` or `codex` could do there, for example read files in your
+  home folder that its mode allows.
+- **The account's own sign-in.** A shell command in a Claude task can read
+  that account's own sign-in: Claude Code reads it from the profile's
+  credentials file, and everything it starts runs in the same sandbox.
+  Claude Code's own bash sandbox, which could hide it, cannot start inside
+  OpenSwap's (macOS refuses a nested `sandbox-exec`: `sandbox_apply:
+  Operation not permitted`), and handing the CLI its token at launch
+  (`CLAUDE_CODE_OAUTH_TOKEN`) would mean OpenSwap reads the credential and
+  takes over its refresh, which the decision memo rules out. `no-shell` (or
+  `read-only`) prevents it; the setup summary and the live check say so. A
+  Codex shell command cannot read its account's `auth.json`.
 
 **Readiness report.** After each registration, and whenever an approved
 folder, its label or the execution mode changes (by local fingerprint, like
