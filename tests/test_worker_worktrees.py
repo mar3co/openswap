@@ -736,3 +736,31 @@ def test_a_folder_of_repos_that_lost_its_repos_is_reported_refused(root, home):
     assert cli.refused_workspaces(root) == [("github", "work_no_repos")]  # ...and it says why
     worktrees.remove_tree(github)
     assert cli.refused_workspaces(root) == [("github", "readable_unavailable")]
+
+
+
+def test_a_direct_folder_of_repos_that_lost_its_repos_is_reported_refused(root, home):
+    github = home / "GitHub"
+    repo = _repo(github / "openswap")
+    cli.add_work_folder(root, github)
+    cli.set_workspace_mode(root, "github", "direct")
+    assert cli.refused_workspaces(root) == []
+    worktrees.remove_tree(repo)
+    assert cli.refused_workspaces(root) == [("github", "work_no_repos")]
+
+
+def test_a_blocked_branch_name_leaves_nothing_behind(root, home, monkeypatch):
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+
+    def blocked(_repo, _job_id):
+        raise worktrees.WorktreeError("branch_unavailable")
+
+    real_free_branch = worktrees._free_branch
+    monkeypatch.setattr(worktrees, "_free_branch", blocked)
+    with pytest.raises(WorkspaceRefused):
+        _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    folder = home / "OpenSwap Research" / ".worktrees" / "openswap"
+    assert not (folder / f"{'a' * 32}.objects").exists()
+    monkeypatch.setattr(worktrees, "_free_branch", real_free_branch)
+    assert _runtime(root)._resolve_workspace("openswap", "a" * 32).work_dir.exists()  # a retry works

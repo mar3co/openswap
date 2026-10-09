@@ -679,11 +679,11 @@ def work_folder_problem(backup_root: Path, folder: Path, mode: str = "worktree",
     problem = readable_folder_problem(Path(backup_root), folder)
     if problem is not None:
         return problem
-    if mode == "worktree":
-        if repos:
-            return None if worktrees.child_repos(folder) else "no_repos"
-        if not worktrees.is_repo(folder):
-            return "not_a_repo"
+    # A folder of repos needs a repo in it whatever its repos' mode.
+    if repos:
+        return None if worktrees.child_repos(folder) else "no_repos"
+    if mode == "worktree" and not worktrees.is_repo(folder):
+        return "not_a_repo"
     return None
 
 

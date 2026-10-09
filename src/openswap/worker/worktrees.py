@@ -336,11 +336,14 @@ def create(repo: Path, results_root: Path, workspace_id: str, job_id: str) -> Wo
         (objects / "info").mkdir(mode=0o700)
         (objects / "pack").mkdir(mode=0o700)
     except OSError:
+        if os.path.lexists(objects):
+            remove_tree(objects)
         raise WorktreeError("worktree_unavailable") from None
-    branch = _free_branch(repo, job_id)
     try:
+        branch = _free_branch(repo, job_id)
         git(["worktree", "add", "--quiet", "-b", branch, str(dest), "HEAD"], repo)
     except WorktreeError:
+        # Nothing of this task may stay behind, or a retry finds `worktree_exists`.
         remove_tree(objects)
         raise
     try:
