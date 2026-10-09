@@ -49,6 +49,7 @@ import os
 import secrets
 import shlex
 import signal
+import socket
 import subprocess
 import time
 import uuid
@@ -373,6 +374,18 @@ class ClaudeLiveCheck(LiveCheck):
             "launch_agent": f"/bin/launchctl bootstrap gui/{os.getuid()} '{agent}' >/dev/null 2>&1",
             "open_app": "/usr/bin/open -g -j -a Calculator >/dev/null 2>&1",
         }
+        # A service on this Mac (sshd, say) would run commands outside the
+        # sandbox: a listener this check holds must be unreachable from it.
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        port = listener.getsockname()[1]
+        steps["loopback"] = f"/usr/bin/nc -z -w 3 127.0.0.1 {port} >/dev/null 2>&1"
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=5):
+                loopback_control = True  # reachable outside the sandbox
+        except OSError:
+            loopback_control = False
         script = "\n".join(f'{command}; echo "R {name} $?"' for name, command in steps.items())
         try:
             result = self._run(["/usr/bin/sandbox-exec", "-f", str(sb), "/bin/sh", "-c", script],
@@ -393,8 +406,10 @@ class ClaudeLiveCheck(LiveCheck):
                 "launchd_job_denied": codes.get("launch_agent", 0) != 0
                 and self._unload_probe_label(label) is False,
                 "app_launch_denied": codes.get("open_app", 0) != 0,
+                "loopback_denied": loopback_control and codes.get("loopback", 0) != 0,
             }
         finally:
+            listener.close()
             try:
                 tmp_marker.unlink()
             except OSError:

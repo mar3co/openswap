@@ -257,9 +257,10 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
       it runs can read any Keychain item (other accounts' sign-ins, the
       default login, the worker's device key). Claude Code falls back to the
       profile's own credentials file.
-    - No way out: LaunchServices, Apple Events, launchd job creation and
-      local Unix sockets (other than name resolution's) are denied, so
-      nothing the session starts runs outside this sandbox or the coalition.
+    - No way out: LaunchServices, Apple Events, launchd job creation, local
+      Unix sockets (other than name resolution's), loopback connections and
+      ssh (port 22, to any address) are denied, so nothing the session starts
+      runs outside this sandbox or the coalition.
     """
     # ``output_root`` is the session's working directory; ``write_paths`` add
     # what git needs for a work folder's worktree.
@@ -301,6 +302,10 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
         "(deny network-outbound (remote unix-socket))",
         # Name resolution goes through mDNSResponder's socket.
         '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))',
+        # No service on this Mac (sshd would run a command outside the
+        # sandbox and the coalition), nor ssh to this Mac by another address.
+        '(deny network-outbound (remote ip "localhost:*"))',
+        '(deny network-outbound (remote tcp "*:22"))',
         "",
     ]
     return "\n".join(lines)

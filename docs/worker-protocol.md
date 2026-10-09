@@ -988,8 +988,12 @@ services cannot be looked up and `~/Library/Keychains` cannot be read, so no
 command the session runs can reach another account's sign-in, the default
 login or the worker's device key. Nothing it starts can leave the sandbox or
 the job's coalition either: LaunchServices (`open`; an app it opens runs
-unsandboxed), Apple Events, launchd job creation (and `launchctl`) and local
-Unix sockets other than name resolution's are denied. Containment, Stop, recovery, `result.md`
+unsandboxed), Apple Events, launchd job creation (and `launchctl`), local
+Unix sockets other than name resolution's, connections to this Mac
+(`localhost`; `sshd` would run a command outside the sandbox) and ssh to any
+address (port 22) are denied. So a task cannot reach a server on this Mac,
+not even one it started, or use ssh (git over HTTPS still works).
+Containment, Stop, recovery, `result.md`
 and failure codes are the same as for Codex. A job also refuses while any
 managed Claude Code policy applies (the system `managed-settings.json` or
 `managed-settings.d/`, managed preferences, or server-managed policy cached
@@ -997,8 +1001,9 @@ in the profile as a non-empty `remote-settings.json`): it could add hooks,
 permission rules or an API key helper the owner did not choose.
 
 **The Claude live check** records the same gates as the Codex one. Its
-`sandbox-exec` probe also tries to bootstrap a launchd agent and to open an
-app through LaunchServices from inside the job's profile; both must fail and
+`sandbox-exec` probe also tries to bootstrap a launchd agent, to open an
+app through LaunchServices and to connect to a loopback listener the check
+holds (reachable outside) from inside the job's profile; all must fail and
 nothing may be left loaded or running. The Read
 probes run in `bypassPermissions` with every read allowed, so only the
 Seatbelt profile can refuse (a read in the job folder must work; reads

@@ -499,22 +499,32 @@ def test_nothing_the_session_starts_can_leave_the_sandbox_for_real(tmp_path):
     # A local daemon's socket (Docker's, say) would act outside the sandbox.
     short = Path(tempfile.mkdtemp(prefix="os-", dir="/tmp"))
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         server.bind(str(short / "s"))
         server.listen(4)
+        tcp.bind(("127.0.0.1", 0))
+        tcp.listen(4)
         connect = f"/usr/bin/nc -U -w 1 {short / 's'} </dev/null >/dev/null 2>&1"
+        loopback = f"/usr/bin/nc -z -w 2 127.0.0.1 {tcp.getsockname()[1]} >/dev/null 2>&1"
         outside = subprocess.run(["/bin/sh", "-c", connect], timeout=30).returncode
+        loopback_outside = subprocess.run(["/bin/sh", "-c", loopback], timeout=30).returncode
         codes = _sandboxed(sb, "; ".join([
+            f"{loopback}; echo loopback $?",
             f"{connect}; echo unix_socket $?",
             f"/bin/launchctl print gui/{os.getuid()} >/dev/null 2>&1; echo launchctl $?",
             "/usr/bin/curl -sS -m 10 -o /dev/null https://example.com 2>/dev/null; echo dns_and_tls $?",
         ]))
     finally:
         server.close()
+        tcp.close()
         import shutil
 
         shutil.rmtree(short, ignore_errors=True)
     assert outside == 0 and codes["unix_socket"] != "0"
+    # sshd (or any service) on this Mac would run commands outside the sandbox.
+    assert loopback_outside == 0 and codes["loopback"] != "0"
+    assert '(deny network-outbound (remote tcp "*:22"))' in sb.read_text()
     assert codes["launchctl"] == "126"
     # Name resolution (mDNSResponder's socket) and TLS still work, when this Mac is online at all.
     online = subprocess.run(["/usr/bin/curl", "-sS", "-m", "10", "-o", "/dev/null", "https://example.com"],

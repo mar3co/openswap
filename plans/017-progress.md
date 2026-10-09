@@ -1606,9 +1606,13 @@ Built (PR #93, stacked on #90):
   shell starts can leave the sandbox or the coalition: measured on this Mac,
   `open -g -j -a Calculator` from an `(allow default)` profile starts an
   unsandboxed app, so the profile now denies `lsopen`, `appleevent-send`,
-  `job-creation` (and `launchctl`), and local Unix sockets other than
-  mDNSResponder's (a daemon such as Docker's would act for the task). The
-  live check's sandbox probe tries a launchd agent and an app launch.
+  `job-creation` (and `launchctl`), local Unix sockets other than
+  mDNSResponder's (a daemon such as Docker's would act for the task),
+  loopback connections and port 22 to any address (`ssh localhost` would run
+  a command through `sshd`). Cost: a Claude task cannot reach a server on
+  this Mac, even one it started, or use ssh, as Codex shells (no network)
+  cannot either. The live check's sandbox probe tries a launchd agent, an
+  app launch and a loopback connection.
 - **Item 5, what works.** Claude Code's bash sandbox nested in OpenSwap's: no;
   real `sandbox-exec` inside `sandbox-exec` fails `sandbox_apply: Operation
   not permitted` (macOS 27.0.1). Passing the token at launch: the CLI accepts
