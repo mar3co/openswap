@@ -53,6 +53,9 @@ GIT_TASK_CONFIG = (("gc.auto", "0"), ("maintenance.auto", "false"))
 _SAFE_CONFIG = (
     f"core.hooksPath={os.devnull}", "core.fsmonitor=false", "submodule.recurse=false",
     "commit.gpgSign=false", "tag.gpgSign=false", "core.sshCommand=false", "protocol.allow=never",
+    # Never the owner's (or a task's) sparse-checkout rules: a task's copy is a
+    # full checkout, and the worker's private index sees every path.
+    "core.sparseCheckout=false", "index.sparse=false",
 )
 
 
@@ -359,6 +362,11 @@ def create(repo: Path, results_root: Path, workspace_id: str, job_id: str) -> Wo
         git_dir_text = git(["rev-parse", "--git-dir"], dest, timeout=30)
         git_dir = Path(git_dir_text)
         git_dir = pathid.canonical(git_dir if git_dir.is_absolute() else dest / git_dir)
+        # `worktree add` copies the owner's per-worktree config and sparse
+        # rules; the task's copy is full and has neither.
+        for copied in (git_dir / "config.worktree", git_dir / "info" / "sparse-checkout"):
+            if os.path.lexists(copied):
+                os.unlink(copied)
         os.chmod(dest, 0o700)
         tree = Worktree(pathid.canonical(dest), repo, common, git_dir, branch, pathid.canonical(objects))
         record = _record_path(dest)
@@ -447,6 +455,17 @@ def task_env(repo: Path, tree: Worktree | None = None, *, git_env: dict[str, str
     if tree is not None:
         env.update(tree.env())
     return env
+
+
+def _made_sparse(tree: Worktree) -> bool:
+    """Whether the task gave its checkout sparse rules or config of its own.
+
+    A sparse checkout leaves paths out of the folder that are still on the
+    branch, which the worker's private index would read as deletions. Such a
+    worktree is never committed or removed by the worker.
+    """
+    admin = Path(tree.git_dir)
+    return any(os.path.lexists(admin / name) for name in ("config.worktree", "info/sparse-checkout"))
 
 
 def intact(tree: Worktree) -> bool:
@@ -624,7 +643,7 @@ def finish(tree: Worktree, message: str) -> bool:
     private index and the branch moved with ``update-ref`` in the shared
     ``.git``.
     """
-    if not intact(tree):
+    if not intact(tree) or _made_sparse(tree):
         return False
     import_objects(tree)
     try:
@@ -698,7 +717,7 @@ def is_dirty(tree: Worktree | Path) -> bool | None:
     """
     if not isinstance(tree, Worktree):
         tree = load_record(tree)
-    if tree is None or not tree.available or not intact(tree):
+    if tree is None or not tree.available or not intact(tree) or _made_sparse(tree):
         return None
     try:
         with tempfile.TemporaryDirectory(prefix="openswap-status-") as scratch:

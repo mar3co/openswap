@@ -545,7 +545,10 @@ index-pack`; nothing existing overwritten), commits what it left to the
 task's branch and keeps the branch. A worktree whose work could not be
 committed is kept, and so is one where the task left files the repo ignores
 (build output, `.env` files): those are never committed, so the worktree
-stays until `openswap worker worktrees prune --force`. Submodules are not checked out in the
+stays until `openswap worker worktrees prune --force`. The task's copy is a
+full checkout even when the owner's is sparse (sparse rules are not carried
+over); a task that makes its copy sparse keeps the worktree uncommitted,
+since paths it left out would read as deleted. Submodules are not checked out in the
 task's copy.
 
 **Direct mode** (advanced, this Mac only): the session works in the folder

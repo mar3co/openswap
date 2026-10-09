@@ -929,3 +929,49 @@ def test_a_queued_repo_task_holds_its_folder_of_repos(root, home):
     assert cli.set_workspace_mode(root, parent.workspace_id, "direct").mode == "direct"
     cli.remove_worker_workspace(root, parent.workspace_id)
     assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["tool"]
+
+
+
+def _sparse_repo(path: Path) -> Path:
+    repo = _repo(path)
+    for name in ("a", "b"):
+        (repo / name).mkdir()
+        (repo / name / name).write_text(name)
+    _git(repo, "add", "a", "b")
+    _git(repo, "commit", "-q", "-m", "two folders")
+    _git(repo, "sparse-checkout", "set", "a")
+    assert not (repo / "b").exists()
+    return repo
+
+
+def test_a_sparse_owner_checkout_gives_the_task_a_full_copy(root, home):
+    repo = _sparse_repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    assert (resolved.work_dir / "a" / "a").exists() and (resolved.work_dir / "b" / "b").exists()
+    assert not (tree.git_dir / "config.worktree").exists()
+    assert not (tree.git_dir / "info" / "sparse-checkout").exists()
+    assert worktrees.is_dirty(tree) is False
+    (resolved.work_dir / "b" / "b").write_text("task work")
+    # The owner's rules (cone "a") never hide the task's change or delete "b".
+    assert worktrees.finish(tree, "left over") is True
+    assert _git(repo, "show", f"{resolved.branch}:b/b") == "task work"
+    assert _git(repo, "show", f"{resolved.branch}:a/a") == "a"
+    assert not (repo / "b").exists()  # the owner's checkout stays sparse
+
+
+def test_a_task_that_makes_its_copy_sparse_keeps_its_worktree(root, home):
+    repo = _sparse_repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    (resolved.work_dir / "b" / "b").write_text("task work")
+    _git(resolved.work_dir, "sparse-checkout", "set", "b")
+    assert not (resolved.work_dir / "a").exists()
+    tip = _git(repo, "rev-parse", resolved.branch)
+    assert worktrees.finish(tree, "left over") is False
+    assert _git(repo, "rev-parse", resolved.branch) == tip  # nothing committed, "a" never deleted
+    assert worktrees.is_dirty(tree) is None
+    assert worktrees.remove(resolved.work_dir) is False
+    assert (resolved.work_dir / "b" / "b").read_text() == "task work"
