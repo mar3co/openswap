@@ -658,3 +658,34 @@ def test_a_failed_setup_leaves_nothing_behind(root, home, monkeypatch):
     assert _git(repo, "worktree", "list").count("\n") == 0
     # The same task can be set up again.
     assert _runtime(root)._resolve_workspace("openswap", "a" * 32).work_dir.exists()
+
+
+
+@pytest.mark.skipif(os.name == "nt", reason="':' is not allowed in Windows names")
+def test_a_repo_path_with_a_colon_still_works(root, home):
+    repo = _repo(home / "GitHub" / "a:b")
+    cli.add_work_folder(root, repo)
+    workspace_id = _ids(root)[0]
+    resolved = _runtime(root)._resolve_workspace(workspace_id, "a" * 32)
+    env = {**os.environ, **dict(resolved.env)}
+    assert dict(resolved.env)["GIT_ALTERNATE_OBJECT_DIRECTORIES"].startswith('"')
+    assert subprocess.run(["git", "rev-parse", "HEAD"], cwd=resolved.work_dir, env=env).returncode == 0
+    (resolved.work_dir / "x.txt").write_text("x")
+    assert worktrees.finish(resolved.worktree, "left over") is True
+    assert _git(repo, "show", f"{resolved.branch}:x.txt") == "x"
+
+
+def test_a_task_survives_its_linked_working_copy_being_removed(root, home):
+    main = _repo(home / "Code" / "main")
+    linked = home / "GitHub" / "linked"
+    linked.parent.mkdir(parents=True, exist_ok=True)
+    _git(main, "worktree", "add", "-q", "-b", "linked", str(linked))
+    os.chmod(linked, 0o755)
+    cli.add_work_folder(root, linked)
+    runtime = _runtime(root)
+    resolved = runtime._resolve_workspace("linked", "a" * 32)
+    (resolved.work_dir / "edit.txt").write_text("keep me")
+    worktrees.remove_tree(linked)  # the approved copy is gone, the shared repo is not
+    removed = worktrees.sweep(home / "OpenSwap Research", lambda _job: True)
+    assert [item.job_id for item in removed] == ["a" * 32]
+    assert _git(main, "show", f"{resolved.branch}:edit.txt") == "keep me"

@@ -2305,13 +2305,13 @@ def _worktrees_command(root: Path, args) -> int:
         "worktrees": [{
             "workspace_id": item.workspace_id, "job_id": item.job_id, "path": str(item.path),
             "branch": item.branch, "dirty": item.dirty, "locked": item.locked,
-            "repo_present": item.repo is not None and item.repo.exists(), "finished": finished(item.job_id),
+            "repo_present": item.available, "finished": finished(item.job_id),
         } for item in items],
         "removed": [str(item.path) for item in removed],
     }
     rows = []
     for item in items:
-        state = ("repo moved or deleted" if item.repo is None or not item.repo.exists()
+        state = ("repo moved or deleted" if not item.available
                  else "uncommitted work" if item.dirty else "clean" if item.dirty is False else "unknown")
         if item.locked:
             state += ", locked"

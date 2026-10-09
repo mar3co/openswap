@@ -180,6 +180,15 @@ def common_dir(repo: Path) -> Path:
     return pathid.canonical(path if path.is_absolute() else Path(repo) / path)
 
 
+def alternate_path(path: Path) -> str:
+    """One entry for ``GIT_ALTERNATE_OBJECT_DIRECTORIES``, a colon-separated list:
+    C-quoted when the path holds a ``:`` or a quote (both legal in macOS names)."""
+    text = str(path)
+    if os.name != "nt" and (any(char in text for char in ':"\\') or text.startswith('"')):
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return text
+
+
 def worktrees_root(results_root: Path) -> Path:
     return Path(results_root) / WORKTREES_DIR
 
@@ -215,7 +224,16 @@ class Worktree:
     def env(self) -> dict[str, str]:
         """The task's git: new objects to its own folder, the repo's as alternates."""
         return {"GIT_OBJECT_DIRECTORY": str(self.objects),
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.common_dir / "objects")}
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternate_path(self.common_dir / "objects")}
+
+    @property
+    def available(self) -> bool:
+        """Whether the repo's shared ``.git`` is still there (the approved working copy
+        may be gone, as when it was itself a linked worktree, while the repo is not)."""
+        return Path(self.common_dir).is_dir()
+
+    def repo_env(self) -> dict[str, str]:
+        return {"GIT_DIR": str(self.common_dir)}
 
     def worker_env(self) -> dict[str, str]:
         """The worker's git on this worktree: from the record, never the task-writable ``.git`` file."""
@@ -340,7 +358,7 @@ def _undo_create(repo: Path, dest: Path, objects: Path, branch: str) -> None:
         pass
 
 
-def identity(repo: Path) -> dict[str, str]:
+def identity(repo: Path, env: dict[str, str] | None = None) -> dict[str, str]:
     """The repo's commit identity as git environment variables (empty when unset).
 
     The task's sandbox may not read ``~/.gitconfig``, so the worker reads it
@@ -350,7 +368,7 @@ def identity(repo: Path) -> dict[str, str]:
     for key, variables in (("user.name", ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME")),
                            ("user.email", ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"))):
         try:
-            value = git(["config", "--get", key], repo, timeout=30, check=False)
+            value = git(["config", "--get", key], repo, timeout=30, check=False, env=env)
         except WorktreeError:
             value = ""
         if value and "\n" not in value and len(value) <= 200:
@@ -359,14 +377,14 @@ def identity(repo: Path) -> dict[str, str]:
     return out
 
 
-def task_env(repo: Path, tree: Worktree | None = None) -> dict[str, str]:
+def task_env(repo: Path, tree: Worktree | None = None, *, git_env: dict[str, str] | None = None) -> dict[str, str]:
     """Environment for the task's own git: no background maintenance, the repo's
     identity, and (for a worktree) its own object folder."""
     env = {"GIT_CONFIG_COUNT": str(len(GIT_TASK_CONFIG))}
     for index, (key, value) in enumerate(GIT_TASK_CONFIG):
         env[f"GIT_CONFIG_KEY_{index}"] = key
         env[f"GIT_CONFIG_VALUE_{index}"] = value
-    env.update(identity(repo))
+    env.update(identity(repo, git_env))
     env.setdefault("GIT_AUTHOR_NAME", "OpenSwap task")
     env.setdefault("GIT_COMMITTER_NAME", "OpenSwap task")
     env.setdefault("GIT_AUTHOR_EMAIL", "openswap-task@localhost")
@@ -397,7 +415,8 @@ def intact(tree: Worktree) -> bool:
 
 def _object_format(tree: Worktree) -> str:
     try:
-        return git(["rev-parse", "--show-object-format"], tree.repo, timeout=30, check=False) or "sha1"
+        return git(["rev-parse", "--show-object-format"], tree.common_dir, timeout=30, check=False,
+                   env=tree.repo_env()) or "sha1"
     except WorktreeError:
         return "sha1"
 
@@ -505,17 +524,17 @@ def finish(tree: Worktree, message: str) -> bool:
     if not intact(tree):
         return False
     import_objects(tree)
-    env = {**tree.worker_env(), **task_env(tree.repo)}
+    env = {**tree.worker_env(), **task_env(tree.common_dir, git_env=tree.repo_env())}
     # The worker's own commit goes straight to the repo's store.
     env.pop("GIT_OBJECT_DIRECTORY", None)
-    env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(tree.objects)
+    env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = alternate_path(tree.objects)
     try:
         if git(["status", "--porcelain", "--ignore-submodules=all"], tree.path, env=env, timeout=120):
             git(["add", "-A"], tree.path, env=env)
             git(["commit", "-q", "--no-verify", "-m", message], tree.path, env=env)
         # Everything the branch needs must now be in the repo's own store.
-        git(["rev-list", "--objects", "--quiet", tree.branch], tree.repo, timeout=120,
-            env={"GIT_DIR": str(tree.common_dir)})
+        git(["rev-list", "--objects", "--quiet", tree.branch], tree.common_dir, timeout=120,
+            env=tree.repo_env())
         if git(["status", "--porcelain", "--ignore-submodules=all"], tree.path, env=env, timeout=120):
             return False
     except WorktreeError:
@@ -537,7 +556,7 @@ def remove(path: Path, *, force: bool = False) -> bool:
     """
     path = Path(path)
     tree = load_record(path)
-    repo_ok = tree is not None and tree.repo.exists()
+    repo_ok = tree is not None and tree.available
     if not force:
         if tree is None or not repo_ok or not intact(tree) or is_dirty(tree) is not False:
             return False
@@ -545,7 +564,7 @@ def remove(path: Path, *, force: bool = False) -> bool:
         # Twice --force also removes a locked worktree.
         args = ["worktree", "remove", *(["--force", "--force"] if force else []), str(path)]
         try:
-            git(args, tree.repo)
+            git(args, tree.common_dir, env=tree.repo_env())
         except WorktreeError:
             if not force:
                 return False
@@ -556,7 +575,7 @@ def remove(path: Path, *, force: bool = False) -> bool:
             remove_tree(tree.objects)
         if repo_ok:
             try:
-                git(["worktree", "prune"], tree.repo, timeout=60, check=False)
+                git(["worktree", "prune"], tree.common_dir, timeout=60, check=False, env=tree.repo_env())
             except WorktreeError:
                 pass
     for leftover in (_record_path(path), path.parent / f"{path.name}.finished"):
@@ -571,7 +590,7 @@ def is_dirty(tree: Worktree | Path) -> bool | None:
     """Whether a worktree holds uncommitted or untracked work (None when git cannot tell)."""
     if not isinstance(tree, Worktree):
         tree = load_record(tree)
-    if tree is None or not tree.repo.exists() or not intact(tree):
+    if tree is None or not tree.available or not intact(tree):
         return None
     try:
         return bool(git(["status", "--porcelain", "--ignore-submodules=all"], tree.path,
@@ -592,6 +611,7 @@ class TaskWorktree:
     dirty: bool | None
     locked: bool
     intact: bool = True
+    available: bool = True  # the repo's shared .git is still there
 
 
 def _locked(tree: Worktree | None) -> bool:
@@ -613,7 +633,7 @@ def list_all(results_root: Path) -> list[TaskWorktree]:
             continue
         for task in tasks:
             tree = load_record(task)
-            present = tree is not None and tree.repo.exists()
+            present = tree is not None and tree.available
             whole = present and intact(tree)
             out.append(TaskWorktree(
                 folder.name, task.name, task, tree.repo if tree is not None else None,
@@ -621,6 +641,7 @@ def list_all(results_root: Path) -> list[TaskWorktree]:
                 is_dirty(tree) if whole else None,
                 _locked(tree),
                 whole or not present,
+                present,
             ))
     return out
 
@@ -637,7 +658,7 @@ def sweep(results_root: Path, finished, *, force: bool = False) -> list[TaskWork
     for item in list_all(results_root):
         if not finished(item.job_id):
             continue
-        repo_gone = item.repo is None or not item.repo.exists()
+        repo_gone = not item.available
         tree = load_record(item.path)
         if not repo_gone and tree is not None:
             # A task stopped by Stop, a timeout or a restart never reached the
