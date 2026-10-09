@@ -1046,3 +1046,19 @@ def test_a_tag_named_like_the_branch_never_vouches_for_its_objects(root, home):
     finally:
         worktrees.import_objects = real_import
     assert not (tree.path.parent / f"{tree.path.name}.finished").exists()
+
+
+
+@pytest.mark.parametrize("blocking", ["OpenSwap", "OPENSWAP/aaaaaaaa", "OpenSwap/AAAAAAAA/x"])
+def test_a_branch_differing_only_in_case_never_blocks_a_task(root, home, blocking):
+    """On a case-insensitive volume a loose ``OpenSwap`` branch is the same file
+    as ``openswap``: the task takes a name no branch blocks in any case."""
+    repo = _repo(home / "GitHub" / "openswap")
+    _git(repo, "branch", blocking)
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    taken = blocking.casefold()
+    assert resolved.branch.casefold() != taken
+    assert not resolved.branch.casefold().startswith(taken + "/")
+    assert not taken.startswith(resolved.branch.casefold() + "/")
+    assert _git(repo, "rev-parse", f"refs/heads/{blocking}") == _git(repo, "rev-parse", "HEAD")
