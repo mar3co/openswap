@@ -85,6 +85,8 @@ def test_a_dotfiles_link_for_the_default_settings_is_read(tmp_path):
 @pytest.mark.parametrize("text", [
     "not json", "[]", json.dumps({"permissions": []}), json.dumps({"permissions": {"defaultMode": "yolo"}}),
     json.dumps({"permissions": {"allow": "Bash"}}), json.dumps({"permissions": {"deny": [1]}}),
+    json.dumps({"permissions": {"disableBypassPermissionsMode": True}}),
+    json.dumps({"permissions": {"additionalDirectories": "/tmp"}}),
 ])
 def test_settings_claude_code_would_ignore_are_refused(tmp_path, text):
     (tmp_path / "settings.json").write_text(text)

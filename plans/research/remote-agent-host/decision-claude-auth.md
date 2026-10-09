@@ -47,7 +47,9 @@ What the implementation does under this decision (plan 017, phase 1):
   cannot start, the Keychain's services cannot be looked up), so a shell
   command cannot read another account's sign-in or the worker's keys.
   Recorded risk: with the shell allowed, a command in the task can read this
-  account's own credentials file, because Claude Code must read it and macOS
+  account's own credentials file, or replace it (so later tasks on the
+  account would run as whatever sign-in it put there), because Claude Code
+  must read and write it and macOS
   will not nest Claude Code's own bash sandbox inside OpenSwap's; handing the
   CLI its token at launch would require OpenSwap to read the credential,
   which this decision rules out. `no-shell` prevents it, and the live check

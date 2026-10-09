@@ -135,11 +135,14 @@ def _claude_permissions_block(settings: dict) -> dict:
     mode = block.get("defaultMode")
     if mode is not None and mode not in CLAUDE_MODES:
         raise PermissionSettingsError("settings_invalid")
-    for key in _RULE_KEYS:
+    for key in (*_RULE_KEYS, "additionalDirectories"):
         rules = block.get(key, [])
         if (not isinstance(rules, list) or len(rules) > 4096
                 or not all(isinstance(rule, str) and 0 < len(rule) <= 4096 for rule in rules)):
             raise PermissionSettingsError("settings_invalid")
+    # The only value Claude Code accepts; anything else would make it drop the file.
+    if block.get("disableBypassPermissionsMode", "disable") != "disable":
+        raise PermissionSettingsError("settings_invalid")
     return block
 
 

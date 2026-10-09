@@ -484,7 +484,7 @@ and ends with at most one `Next:` command.
    Mac? (follow, no-shell, read-only)", Enter keeps it); the checklist shows
    a Permissions row only when the limit is not the default, and for a
    Claude account whose shell is not limited one line says that shell
-   commands can read that account's own sign-in (see
+   commands can read or replace that account's own sign-in (see
    [Permissions](#permissions-the-accounts-own-settings)).
 
 Each step is headed `Step N of 4 · <name>`; on a terminal the headers are
@@ -1072,8 +1072,13 @@ instead of a tool list OpenSwap picks
   session. Claude's file tools are kept off it by deny rules OpenSwap adds to
   every job (deny rules hold in every mode; the live check measures one in
   `bypassPermissions`). A shell command in a Claude task is not bound by
-  them and can read it, because everything Claude Code starts runs in the
-  same sandbox: Claude Code's own bash sandbox, which could hide it, cannot
+  them and can read it, or replace it with another sign-in that later tasks
+  on this account would then use (the launch checks the account the profile
+  records, which a shell can rewrite too), because everything Claude Code
+  starts runs in the same sandbox and Claude Code must be able to write the
+  file to refresh its token. This is what a shell command run by local
+  `claude` can do to its Keychain item as well. Claude Code's own bash
+  sandbox, which could hide it, cannot
   start inside OpenSwap's (macOS refuses a nested `sandbox-exec`:
   `sandbox_apply: Operation not permitted`), and handing the CLI its token
   at launch (`CLAUDE_CODE_OAUTH_TOKEN`) would mean OpenSwap reads the

@@ -707,7 +707,7 @@ def _settling(state: Readiness) -> bool:
     )
 
 
-SIGN_IN_NOTE = ("Note: shell commands in remote Claude tasks can read that account's own sign-in (macOS "
+SIGN_IN_NOTE = ("Note: shell commands in remote Claude tasks can read or replace that account's own sign-in (macOS "
                 "cannot run Claude Code's own sandbox inside OpenSwap's). `openswap worker permissions "
                 "no-shell` prevents it.")
 PERMISSIONS_OFFER = ("Remote sessions follow each account's own Claude or Codex permission settings. "

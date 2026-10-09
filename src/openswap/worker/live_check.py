@@ -1635,8 +1635,9 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
               + _format(evidence))
     say(f"Evidence: {path}")
     if evidence.get("gates", {}).get("sign_in_isolation", {}).get("own_sign_in_readable_by_shell") is True:
-        say("Note: shell commands in remote tasks on this account can read its own sign-in (macOS cannot run "
-            "Claude Code's own sandbox inside OpenSwap's). `openswap worker permissions no-shell` prevents it.")
+        say("Note: shell commands in remote tasks on this account can read or replace its own sign-in (macOS "
+            "cannot run Claude Code's own sandbox inside OpenSwap's). `openswap worker permissions no-shell` "
+            "prevents it.")
     if not evidence["passed"]:
         say("Live execution stays off.")
         return 1
