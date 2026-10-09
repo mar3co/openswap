@@ -657,8 +657,9 @@ def finish(tree: Worktree, message: str) -> bool:
                 git(["update-ref", "-m", message, f"refs/heads/{tree.branch}", commit, tip], tree.common_dir,
                     timeout=60, env=tree.repo_env())
             leftover = _ignored(tree, _private_env(tree, Path(scratch) / "index"))
-        # Everything the branch needs must now be in the repo's own store.
-        git(["rev-list", "--objects", "--quiet", tree.branch], tree.common_dir, timeout=120,
+        # Everything the branch needs must now be in the repo's own store
+        # (by its full name: a tag of the same name never stands in for it).
+        git(["rev-list", "--objects", "--quiet", f"refs/heads/{tree.branch}"], tree.common_dir, timeout=120,
             env=tree.repo_env())
     except (WorktreeError, OSError):
         return False

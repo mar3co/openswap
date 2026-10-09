@@ -975,3 +975,26 @@ def test_a_task_that_makes_its_copy_sparse_keeps_its_worktree(root, home):
     assert worktrees.is_dirty(tree) is None
     assert worktrees.remove(resolved.work_dir) is False
     assert (resolved.work_dir / "b" / "b").read_text() == "task work"
+
+
+
+def test_a_tag_named_like_the_branch_never_vouches_for_its_objects(root, home):
+    """The final check walks ``refs/heads/<branch>``: a tag of the same name
+    (pointing at objects the repo has) must not pass for a branch whose
+    commit still needs the task's own object folder."""
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    _git(repo, "tag", resolved.branch, "HEAD")
+    (resolved.work_dir / "work.txt").write_text("task work")
+    # The task's own git stores the blob in its object folder only.
+    subprocess.run(["git", "add", "work.txt"], cwd=resolved.work_dir, check=True, capture_output=True,
+                   env={**os.environ, **worktrees.task_env(repo, tree)})
+    real_import = worktrees.import_objects
+    worktrees.import_objects = lambda tree: None  # and it never reaches the repo's store
+    try:
+        assert worktrees.finish(tree, "left over") is False
+    finally:
+        worktrees.import_objects = real_import
+    assert not (tree.path.parent / f"{tree.path.name}.finished").exists()
