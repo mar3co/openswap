@@ -130,9 +130,14 @@ def test_the_credentials_file_gets_deny_rules_for_the_file_tools_in_every_mode()
     # Added to the live check's own rules, never replacing them.
     assert settings["permissions"] == {"defaultMode": "plan",
                                        "deny": ["Bash(rm:*)", "Read(//b/c.json)", "Edit(//b/c.json)"]}
-    for bad in ("relative/.credentials.json", "/a(b)/c", "/a\nb"):
+    for bad in ("relative/.credentials.json", "/a\nb"):
         with pytest.raises(ValueError):
             permissions.credential_rules([bad])
+    # Legal folder names that are gitignore syntax match only themselves.
+    assert permissions.credential_rules(["/Users/[ops]/a*b?/c\\d (x)/.credentials.json"])[0] == (
+        "Read(//Users/\\[ops\\]/a\\*b\\?/c\\\\d (x)/.credentials.json)")
+    assert permissions.credential_rules(["/Users/x /f"])[0] == "Read(//Users/x /f)"
+    assert permissions.credential_rules(["/a/b "])[0] == "Read(//a/b\\ )"
 
 
 # -- Codex: the isolated home's permissions.json ------------------------------------------

@@ -220,11 +220,24 @@ def credential_rules(paths) -> list[str]:
     """
     rules = []
     for path in paths:
-        text = str(path)
-        if not text.startswith("/") or any(ch in text for ch in "()\n"):
-            raise ValueError("unsupported path for a permission rule")
-        rules += [f"Read(/{text})", f"Edit(/{text})"]
+        literal = _gitignore_literal(str(path))
+        rules += [f"Read(/{literal})", f"Edit(/{literal})"]
     return rules
+
+
+def _gitignore_literal(path: str) -> str:
+    """An absolute path as a gitignore pattern matching exactly that path.
+
+    Read and Edit rules use gitignore syntax, so ``*``, ``?``, ``[``, ``]``
+    and ``\\`` in a folder name (legal on macOS) are escaped; a trailing
+    space would be dropped, so it is escaped too. Parentheses need no escape.
+    """
+    if not path.startswith("/") or any(ord(ch) < 0x20 for ch in path):
+        raise ValueError("unsupported path for a permission rule")
+    text = "".join("\\" + ch if ch in "\\*?[]" else ch for ch in path)
+    if text.endswith(" "):
+        text = text[:-1] + "\\ "
+    return text
 
 
 def claude_permission_args(override: str, overlay: dict | None = None, protected=()) -> list[str]:
