@@ -340,6 +340,11 @@ def _codex_next_step(status: dict) -> str:
     unsigned = next((a for a in allowed if not a["isolated_sign_in"]), None)
     if unsigned is not None:
         return f"sign allowed account {unsigned['slot']} in: `openswap worker codex login {unsigned['slot']}`."
+    unreadable = next((a for a in [pinned, *allowed] if "permissions" in a and a["permissions"] is None), None)
+    if unreadable is not None:
+        # Every launch on it refuses until its settings are valid again.
+        return (f"set account {unreadable['slot']}'s remote-task settings again (they cannot be read): "
+                f"`openswap worker codex settings {unreadable['slot']} --copy-settings`.")
     if status.get("recheck_needed"):
         return ("run the live check again (remote tasks now follow each account's own settings): "
                 "`openswap worker live-check`.")

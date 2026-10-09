@@ -356,6 +356,14 @@ def test_an_opt_in_from_before_this_change_no_longer_runs_jobs(tmp_path, monkeyp
     monkeypatch.setattr(live, "_HOST_CACHE", {})
 
 
+def test_codex_status_sends_the_owner_to_repair_unreadable_settings():
+    account = {"pinned": True, "allowed": True, "isolated_sign_in": True, "slot": "1", "account_ref": "x"}
+    live_ok = {"cli": {"installed": True}, "execution_mode": "live", "checked_accounts": ["x"]}
+    assert live_cli._codex_next_step({**live_ok, "accounts": [{**account, "permissions": {}}]}).startswith("nothing")
+    text = live_cli._codex_next_step({**live_ok, "accounts": [{**account, "permissions": None}]})
+    assert "openswap worker codex settings 1 --copy-settings" in text
+
+
 def test_the_new_gates_are_required_to_enable():
     assert {"permissions", "sign_in_isolation"} <= set(live.REQUIRED_GATES)
 
