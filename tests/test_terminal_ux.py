@@ -297,10 +297,11 @@ def test_blocked_disable_names_the_lease_store_that_is_held(root, monkeypatch, c
     monkeypatch.setattr(cli, "disable_worker", lambda _root: (False, {}, "lease_state_unknown"))
     assert _run(root, "disable") == 1
     assert capsys.readouterr().err.endswith("Next: `openswap worker lease release --provider claude` to free it.\n")
+    # Both held: `disable` stays blocked until both are freed, so "and", not "or".
     held.add("codex")
     assert _run(root, "disable") == 1
     assert capsys.readouterr().err.endswith(
-        "Next: `openswap worker lease release` or `openswap worker lease release --provider claude` to free it.\n")
+        "Next: `openswap worker lease release` and `openswap worker lease release --provider claude` to free them.\n")
 
 
 def test_live_mode_refusals_point_at_a_retry_or_a_new_live_check():

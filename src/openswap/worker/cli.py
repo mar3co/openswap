@@ -1695,22 +1695,26 @@ _LEASE_MESSAGES = {
 def _lease_release_step(root: Path) -> str:
     """The `lease release` command for each account store still held (Claude needs `--provider claude`).
 
-    Read-only: the same snapshot the status reads. When neither store can be
-    read, both commands are named rather than guessing the Codex default.
+    Read-only: the same snapshot the status reads. Every held store must be
+    freed before `disable` goes through, so two are joined with "and"; when
+    neither store can be read, both commands are offered as alternatives
+    rather than guessing the Codex default.
     """
-    held = []
+    held, known = [], True
     for provider in ("codex", "claude"):
         try:
             lease = AccountLeaseStore(root, provider).read_current()
         except Exception:
-            held = []
+            held, known = [], False
             break
         if lease is not None and lease.state in {"active", "uncertain"}:
             held.append(provider)
     if not held:
-        held = ["codex", "claude"]
+        held, known = ["codex", "claude"], False
     commands = [f"`openswap worker lease release{' --provider claude' if p == 'claude' else ''}`" for p in held]
-    return f"{' or '.join(commands)} to free it."
+    if known:
+        return f"{' and '.join(commands)} to free {'them' if len(commands) > 1 else 'it'}."
+    return f"{' or '.join(commands)} (whichever is held) to free it."
 
 
 def _migration_message(exc: ClaudeSwitchError) -> str:
