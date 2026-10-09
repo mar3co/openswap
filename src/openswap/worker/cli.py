@@ -1111,7 +1111,10 @@ def add_work_folder(backup_root: Path, folder: str | Path, *, mode: str = "workt
         work = pathid.canonical(_absolute_folder(_expand_folder(folder)).resolve(strict=True))
     except (OSError, RuntimeError):
         raise WorkspaceError("readable_unavailable") from None
-    repos = mode == "worktree" and not worktrees.is_repo(work) and bool(worktrees.child_repos(work))
+    # A folder that holds repos is a folder of repos in either mode: direct
+    # mode then applies to each repo in it (a session works in that repo
+    # itself), never to the folder as a whole.
+    repos = not worktrees.is_repo(work) and bool(worktrees.child_repos(work))
     problem = work_folder_problem(root, work, mode, repos)
     if problem is not None:
         raise WorkspaceError(_work_problem_code(problem))
@@ -2444,7 +2447,9 @@ def _workspace_command(root: Path, args) -> int:
                 human = f"{where} is already a folder where sessions work ('{workspace.workspace_id}')."
             elif result.repos or workspace.repos:
                 human = (f"{printer.MARK_OK} Sessions can work in the repos in {where}: "
-                         f"{', '.join(result.repos) or 'none yet'}. Each task gets its own worktree.")
+                         f"{', '.join(result.repos) or 'none yet'}. "
+                         + ("Each task works in its repo itself." if workspace.mode == "direct"
+                            else "Each task gets its own worktree."))
             else:
                 how = "in the folder itself" if workspace.mode == "direct" else "in its own worktree"
                 human = (f"{printer.MARK_OK} Sessions can work in {where} as '{workspace.workspace_id}', "

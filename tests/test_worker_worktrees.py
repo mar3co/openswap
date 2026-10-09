@@ -794,3 +794,21 @@ def test_a_failed_checkout_removes_the_branch_it_made(root, home, monkeypatch):
     folder = home / "OpenSwap Research" / ".worktrees" / "openswap"
     assert not (folder / ("a" * 32)).exists() and not (folder / f"{'a' * 32}.objects").exists()
     assert _runtime(root)._resolve_workspace("openswap", "a" * 32).branch == "openswap/aaaaaaaa"
+
+
+
+def test_direct_mode_on_a_folder_of_repos_applies_to_each_repo(root, home):
+    github = home / "GitHub"
+    _repo(github / "openswap")
+    _repo(github / "opentag")
+    parent = cli.add_work_folder(root, github, mode="direct").workspace
+    assert parent.repos is True and parent.mode == "direct"  # still a folder of repos
+    launchable = cli.launchable_workspaces(root, load_worker_settings(root).workspaces)
+    assert [(w.workspace_id, w.mode, w.work_root.name) for w in launchable] == [
+        ("openswap", "direct", "openswap"), ("opentag", "direct", "opentag")]
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    assert resolved.work_dir == (github / "openswap").resolve()  # the repo, never the parent
+    assert resolved.write_paths == ((github / "openswap").resolve(),)
+    # And back: the same parent, each repo in its own worktree again.
+    assert cli.set_workspace_mode(root, "github", "worktree").repos is True
+    assert _runtime(root)._resolve_workspace("opentag", "b" * 32).branch == "openswap/bbbbbbbb"

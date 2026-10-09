@@ -551,7 +551,7 @@ itself, exactly like local `claude`. Set it with `openswap worker workspace
 mode <id> direct` (or `worktree` to go back), `openswap worker workspace add
 --work <folder> --direct`, or `openswap worker setup --advanced`. The control
 service can never set it, and the readiness report does not carry it (that
-would need a protocol field). A repo found in a folder of repos takes the
+would need a protocol field). A folder of repos stays one in direct mode: each repo in it is still a folder of its own, whose sessions then work in that repo itself (never in the parent folder as a whole); a repo found in it takes the
 folder's mode.
 
 Either way, the task's results (`result.md`) still go to its own results
