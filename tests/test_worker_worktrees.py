@@ -852,3 +852,32 @@ def test_a_linked_admin_head_is_not_intact(root, home, tmp_path):
     (tree.git_dir / "HEAD").unlink()
     (tree.git_dir / "HEAD").symlink_to(real)
     assert worktrees.intact(tree) is False
+
+
+
+def test_ignored_files_the_task_left_keep_the_worktree(root, home):
+    repo = _repo(home / "GitHub" / "openswap")
+    (repo / ".gitignore").write_text("build/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "ignore build")
+    cli.add_work_folder(root, repo)
+    runtime = _runtime(root)
+    resolved = runtime._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    assert worktrees.is_dirty(tree) is False
+    (resolved.work_dir / "notes.txt").write_text("tracked work")
+    (resolved.work_dir / "build").mkdir()
+    (resolved.work_dir / "build" / "out.bin").write_text("ignored output")
+    # The rest is committed; the ignored output is not, so the worktree stays.
+    assert worktrees.finish(tree, "left over") is False
+    assert _git(repo, "show", f"{resolved.branch}:notes.txt") == "tracked work"
+    assert worktrees.is_dirty(tree) is True
+    assert worktrees.remove(resolved.work_dir) is False
+    results = home / "OpenSwap Research"
+    assert worktrees.sweep(results, _finish(runtime, "a" * 32)) == []
+    assert (resolved.work_dir / "build" / "out.bin").read_text() == "ignored output"
+    # Once the owner has looked (or with --force), it goes.
+    (resolved.work_dir / "build" / "out.bin").unlink()
+    (resolved.work_dir / "build").rmdir()
+    assert worktrees.finish(tree, "left over") is True
+    assert worktrees.remove(resolved.work_dir) is True

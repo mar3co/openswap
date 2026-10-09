@@ -602,11 +602,23 @@ def _pending(tree: Worktree, scratch: Path) -> tuple[str, str, str]:
     return tip, git(["rev-parse", f"{tip}^{{tree}}"], tree.common_dir, timeout=30, env=tree.repo_env()), current
 
 
+def _ignored(tree: Worktree, env: dict[str, str]) -> bool:
+    """Whether the checkout holds files the repo's ignore rules leave out of a commit.
+
+    A fresh checkout has none, so any there are the task's (build output,
+    ``.env`` files, logs). They are never committed, but they keep the
+    worktree for the owner to look at.
+    """
+    return bool(git(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory"], tree.path,
+                    timeout=_GIT_TIMEOUT_S, env=env))
+
+
 def finish(tree: Worktree, message: str) -> bool:
     """After the task: import its objects, commit what it left on its branch, keep the branch.
 
     Returns whether the branch now holds everything in the checkout (so the
-    worktree may be removed). Does nothing when the task repointed its admin
+    worktree may be removed): not when the task left ignored files, which are
+    never committed. Does nothing when the task repointed its admin
     folder or switched branches. Never reads or writes the task-writable
     admin folder beyond the checks in ``intact``: the commit is built in a
     private index and the branch moved with ``update-ref`` in the shared
@@ -625,11 +637,14 @@ def finish(tree: Worktree, message: str) -> bool:
                              env={**tree.repo_env(), **identity_env})
                 git(["update-ref", "-m", message, f"refs/heads/{tree.branch}", commit, tip], tree.common_dir,
                     timeout=60, env=tree.repo_env())
+            leftover = _ignored(tree, _private_env(tree, Path(scratch) / "index"))
         # Everything the branch needs must now be in the repo's own store.
         git(["rev-list", "--objects", "--quiet", tree.branch], tree.common_dir, timeout=120,
             env=tree.repo_env())
     except (WorktreeError, OSError):
         return False
+    if leftover:
+        return False  # the branch has the rest; the worktree stays for the ignored files
     # Finished: a later sweep may remove it.
     try:
         (Path(tree.path).parent / f"{Path(tree.path).name}.finished").touch()
@@ -676,7 +691,7 @@ def remove(path: Path, *, force: bool = False) -> bool:
 
 
 def is_dirty(tree: Worktree | Path) -> bool | None:
-    """Whether a checkout holds work not on its branch (None when git cannot tell).
+    """Whether a checkout holds work not on its branch, ignored files included (None when git cannot tell).
 
     Read through a private index (see ``_private_env``), never the
     task-writable admin folder.
@@ -692,7 +707,7 @@ def is_dirty(tree: Worktree | Path) -> bool | None:
             git(["update-index", "-q", "--refresh"], tree.path, timeout=120, env=env, check=False)
             changed = git(["diff-files", "--name-only"], tree.path, timeout=120, env=env)
             untracked = git(["ls-files", "--others", "--exclude-standard"], tree.path, timeout=120, env=env)
-            return bool(changed or untracked)
+            return bool(changed or untracked) or _ignored(tree, env)
     except (WorktreeError, OSError):
         return None
 

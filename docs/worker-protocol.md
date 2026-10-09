@@ -543,7 +543,9 @@ timeout or a worker restart, the worker imports its objects (loose ones each
 verified against their name in bounded steps, packs through `git
 index-pack`; nothing existing overwritten), commits what it left to the
 task's branch and keeps the branch. A worktree whose work could not be
-committed is kept. Submodules are not checked out in the
+committed is kept, and so is one where the task left files the repo ignores
+(build output, `.env` files): those are never committed, so the worktree
+stays until `openswap worker worktrees prune --force`. Submodules are not checked out in the
 task's copy.
 
 **Direct mode** (advanced, this Mac only): the session works in the folder
