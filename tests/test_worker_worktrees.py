@@ -712,3 +712,27 @@ def test_repos_added_later_never_push_an_offered_one_out(root, home, monkeypatch
         _repo(github / name)
     ids = _ids(root)
     assert "zz-first" in ids and len(ids) == 3  # the two new ones the cap allows, and the kept one
+
+
+
+def test_an_offered_repo_past_the_scan_limit_is_still_listed(root, home, monkeypatch):
+    github = home / "GitHub"
+    _repo(github / "zz-last")
+    cli.add_work_folder(root, github)
+    assert _ids(root) == ["zz-last"]
+    monkeypatch.setattr(worktrees, "_MAX_SCANNED_CHILDREN", 2)
+    for name in ("aa", "bb", "cc"):
+        (github / name).mkdir()  # plain folders sorting first fill the scan limit
+    assert "zz-last" in _ids(root)
+
+
+def test_a_folder_of_repos_that_lost_its_repos_is_reported_refused(root, home):
+    github = home / "GitHub"
+    repo = _repo(github / "openswap")
+    cli.add_work_folder(root, github)
+    assert cli.refused_workspaces(root) == []
+    worktrees.remove_tree(repo)
+    assert _ids(root) == []  # nothing left to offer...
+    assert cli.refused_workspaces(root) == [("github", "work_no_repos")]  # ...and it says why
+    worktrees.remove_tree(github)
+    assert cli.refused_workspaces(root) == [("github", "readable_unavailable")]

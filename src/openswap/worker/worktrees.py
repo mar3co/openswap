@@ -167,20 +167,31 @@ def child_repos(parent: Path, keep: set[str] | frozenset[str] = frozenset()) -> 
         children = sorted(Path(parent).iterdir(), key=lambda p: (p.name.lower(), p.name))
     except OSError:
         return []
-    for child in children[:_MAX_SCANNED_CHILDREN]:
+    def usable(child: Path) -> bool:
         try:
-            if child.name.startswith(".") or child.is_symlink() or not child.is_dir():
-                continue
+            return (not child.name.startswith(".") and not child.is_symlink() and child.is_dir()
+                    and os.path.lexists(child / ".git"))
         except OSError:
+            return False
+
+    for child in children[:_MAX_SCANNED_CHILDREN]:
+        if not usable(child):
             continue
-        if os.path.lexists(child / ".git"):
-            repo = pathid.canonical(child)
-            if str(repo) in keep:
-                out.append(repo)
-            elif new < _MAX_CHILD_REPOS:
-                out.append(repo)
-                new += 1
-    return out
+        repo = pathid.canonical(child)
+        if str(repo) in keep:
+            out.append(repo)
+        elif new < _MAX_CHILD_REPOS:
+            out.append(repo)
+            new += 1
+    # Repos already offered are checked by path, apart from the scan limits,
+    # so neither cap can drop one a queued task may still name.
+    parent_path = pathid.canonical(parent)
+    for text in keep:
+        repo = Path(text)
+        if repo in out or not pathid.same(repo.parent, parent_path) or not usable(repo):
+            continue
+        out.append(pathid.canonical(repo))
+    return sorted(out, key=lambda p: (p.name.lower(), p.name))
 
 
 def common_dir(repo: Path) -> Path:

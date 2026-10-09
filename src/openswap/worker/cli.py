@@ -792,11 +792,20 @@ def results_folder(backup_root: Path, workspace_id: str, workspaces) -> Path | N
 
 
 def refused_workspaces(backup_root: Path, workspaces=None) -> list[tuple[str, str]]:
-    """``(workspace ID, code)`` for each approved workspace whose jobs are refused at launch."""
+    """``(workspace ID, code)`` for each approved workspace whose jobs are refused at launch.
+
+    Without ``workspaces`` it checks what settings hold: every launchable
+    workspace, and every saved folder of repos too. Such a folder is never
+    itself launchable, so one that became unavailable or lost all its repos
+    would otherwise vanish from the report with nothing said.
+    """
+    checked = workspaces
     if workspaces is None:
-        workspaces = launchable_workspaces(backup_root, load_worker_settings(Path(backup_root)).workspaces)
+        saved = load_worker_settings(Path(backup_root)).workspaces
+        workspaces = launchable_workspaces(backup_root, saved)
+        checked = (*workspaces, *(w for w in saved if w.repos))
     out = []
-    for workspace in workspaces:
+    for workspace in checked:
         try:
             code = workspace_refusal(backup_root, workspace, workspaces)
         except Exception:
