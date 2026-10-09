@@ -50,6 +50,11 @@ from openswap.worker.live import execution_mode
 from openswap.worker.models import ResolvedWorkspace, SafeEventKind
 
 RESEARCH_TOOLS = ("Read", "Grep", "Glob", "WebSearch", "WebFetch")
+# A work folder task edits files in its worktree (or, in direct mode, the
+# folder). No Bash: a shell would run with the Claude process's own sandbox,
+# which must read and write the account's profile (its credentials). What it
+# leaves is committed to its branch by the worker when it finishes.
+WORK_TOOLS = (*RESEARCH_TOOLS, "Edit", "Write")
 SANDBOX_PROFILE_FILE = "claude.sb"
 MANAGED_CLAUDE_PATHS = (
     "/Library/Application Support/ClaudeCode/managed-settings.json",
@@ -194,7 +199,8 @@ def darwin_user_dirs() -> list[Path]:
 
 
 def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: Path, backup_root: Path,
-                     readonly_sources: tuple[Path, ...] = (), user_dirs: list[Path] | None = None) -> str:
+                     readonly_sources: tuple[Path, ...] = (), user_dirs: list[Path] | None = None,
+                     write_paths: tuple[Path, ...] = (), read_paths: tuple[Path, ...] = ()) -> str:
     """The Seatbelt profile ``claude`` runs under (later rules win in SBPL).
 
     Writes: only the output folder, this account's profile, the run's own
@@ -202,10 +208,12 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
     frameworks need them). The other accounts, OpenSwap's own state and the
     owner's default Claude/Codex logins are neither readable nor writable.
     """
-    own = [output_root, profile, run_tmp]
+    # ``output_root`` is the session's working directory; ``write_paths`` add
+    # what git needs for a work folder's worktree.
+    own = [output_root, *write_paths, profile, run_tmp]
     support = [home / "Library" / "Caches", *(darwin_user_dirs() if user_dirs is None else user_dirs)]
     hidden = [home / ".claude", home / ".codex", backup_root]
-    readable = [profile, output_root, *readonly_sources]
+    readable = [profile, output_root, *readonly_sources, *write_paths, *read_paths]
 
     def subpaths(paths):
         return " ".join(f"(subpath {_sb_string(p)})" for p in paths)
@@ -247,9 +255,10 @@ def claude_env(home: Path, profile: Path, run_dir: Path) -> dict[str, str]:
     }
 
 
-def claude_argv(binary: Path, sandbox_profile: Path, readonly_sources: tuple[Path, ...] = ()) -> list[str]:
+def claude_argv(binary: Path, sandbox_profile: Path, readonly_sources: tuple[Path, ...] = (),
+                tools: tuple[str, ...] = RESEARCH_TOOLS) -> list[str]:
     """Fixed launcher arguments; the task arrives on stdin. Nothing comes from the caller."""
-    tools = ",".join(RESEARCH_TOOLS)
+    tools = ",".join(tools)
     argv = [
         "/usr/bin/sandbox-exec", "-f", str(sandbox_profile), str(binary),
         "-p", "--output-format", "stream-json", "--verbose",
@@ -330,12 +339,16 @@ class ClaudeCodeAdapter(CodexExecAdapter):
             text = seatbelt_profile(
                 output_root=output_root.resolve(), profile=profile.resolve(), run_tmp=(run_dir / "tmp").resolve(),
                 home=self._home.resolve(), backup_root=self.backup_root.resolve(), readonly_sources=sources,
+                write_paths=tuple(Path(p).resolve() for p in workspace.write_paths),
+                read_paths=tuple(Path(p).resolve() for p in workspace.read_paths),
             )
             sb = run_dir / SANDBOX_PROFILE_FILE
             write_private(sb, text.encode("utf-8"))
         except (OSError, ValueError):
             raise ProviderLaunchRefused("provider_unavailable") from None
-        return claude_argv(pinned.binary, sb, sources), claude_env(self._home, profile, run_dir)
+        tools = WORK_TOOLS if workspace.work_dir is not None else RESEARCH_TOOLS
+        env = {**claude_env(self._home, profile, run_dir), **dict(workspace.env)}
+        return claude_argv(pinned.binary, sb, sources, tools), env
 
     def _line(self, state, line: bytes):
         if not line.strip():

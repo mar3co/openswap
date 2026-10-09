@@ -1,7 +1,7 @@
 """The guided Remote tasks setup shared by ``openswap worker pair`` and the menu bar.
 
 After pairing, the owner is walked through the same steps everywhere: start the
-worker, confirm the Codex or Claude account, choose the folders tasks may read, then a
+worker, confirm the Codex or Claude account, pick the folders where sessions work, then a
 summary of what is still missing before Slack can start tasks on this Mac. Each step
 uses the same functions as the matching ``openswap worker`` command; the
 front end only supplies prompts (``Prompts``). Pairing has already succeeded
@@ -123,11 +123,11 @@ class TerminalPrompts:
 # short line of context and ends with at most one `Next:` command.
 START_WORKER_NEXT = "Next: `openswap worker enable` to start the worker."
 ACCOUNT_NEXT = "Next: `openswap worker account <slot>` to pick an account."
-FOLDER_NEXT = "Next: `openswap worker workspace add --read <folder>` to add a folder."
-# What tasks may do in the folders the owner picks, in one place: today a
-# picked folder is a read-only source, and the owner may later decide tasks
-# work in it instead.
-FOLDER_USE = "Tasks can open the folders you pick"
+FOLDER_NEXT = "Next: `openswap worker workspace add --work <folder>` to add a folder."
+# What the folders the owner picks are for, in one place: where remote
+# Claude or Codex sessions are launched and work (owner decision 2026-10-08).
+FOLDER_USE = "Folders where remote sessions can work"
+FOLDER_COPY = "Each task gets its own copy (a git worktree), so your files aren't touched."
 EXECUTION_OFF_NOTE = "Next: `openswap worker live-check` to turn on live tasks."
 CLAUDE_EXECUTION_OFF_NOTE = (
     "Next: `openswap worker claude pin`, `openswap worker claude prepare`, then "
@@ -298,20 +298,37 @@ def _resolved(path: Path) -> Path | None:
 
 
 def _describe(workspace) -> str:
-    return f"{workspace.workspace_id} ({workspace.display_label})"
+    """``id (label)``; the mode only when it is the advanced direct one."""
+    direct = getattr(workspace, "work_root", None) is not None and workspace.mode == "direct"
+    return f"{workspace.workspace_id} ({workspace.display_label}{', direct' if direct else ''})"
+
+
+def _folder_of(workspace) -> list[Path]:
+    work = getattr(workspace, "work_root", None)
+    return [work] if work is not None else list(workspace.readonly_roots)
 
 
 def folder_lines(workspaces) -> list[str]:
-    """One numbered, aligned line per readable folder: ID, label, then the path (local only)."""
+    """One numbered, aligned line per folder: ID, label, then the path (local only)."""
     return printer.columns([
         (f"{printer.MARK_OK} {number}", workspace.workspace_id, f'"{workspace.display_label}"',
-         ", ".join(_display_path(source) for source in workspace.readonly_roots))
+         ", ".join(_display_path(source) for source in _folder_of(workspace)),
+         "direct" if getattr(workspace, "work_root", None) is not None and workspace.mode == "direct" else "")
         for number, workspace in enumerate(workspaces, start=1)
     ])
 
 
 def _readable(workspaces) -> list:
-    return [w for w in workspaces if w.readonly_roots]
+    """The folders the owner picked: work folders (and read-only folders from before)."""
+    return [w for w in workspaces if w.readonly_roots or getattr(w, "work_root", None) is not None]
+
+
+def _picked(root: Path, workspaces) -> list:
+    """The picked folders as tasks see them: a folder of repos as its repos."""
+    try:
+        return _readable(_cli().launchable_workspaces(root, workspaces))
+    except Exception:
+        return _readable(workspaces)
 
 
 def _say_folders(ui, workspaces) -> None:
@@ -348,9 +365,12 @@ def folder_menu(root: Path, workspaces) -> FolderMenu:
         detected = cli.detect_code_folders(root)
     except Exception:
         detected = []
+    # Repos and folders of repos first: a session needs one to work in.
+    detected = [folder for folder in detected if _has_repos(folder)] + \
+        [folder for folder in detected if not _has_repos(folder)]
     reads = {}
     for workspace in _readable(workspaces):
-        for source in workspace.readonly_roots:
+        for source in _folder_of(workspace):
             reads.setdefault(Path(source), workspace.workspace_id)
     folders = list(detected) + [source for source in reads if source not in detected]
     recommended = 0 if detected and cli.is_github_folder(detected[0]) else None
@@ -369,6 +389,17 @@ def folder_menu(root: Path, workspaces) -> FolderMenu:
         rows.append((f"{printer.mark(True if folder in reads else None)} {index + 1}", _display_path(folder), note))
     return FolderMenu(tuple(folders), tuple(printer.columns(rows)), recommended, frozenset(reads),
                       tuple(all_notes))
+
+
+def _has_repos(folder: Path) -> bool:
+    """Whether ``folder`` is a git repo or holds one directly (a cheap check: no git run)."""
+    if os.path.lexists(Path(folder) / ".git"):
+        return True
+    try:
+        return any(os.path.lexists(child / ".git") for child in Path(folder).iterdir()
+                   if not child.name.startswith("."))
+    except OSError:
+        return False
 
 
 def _names_a_path(text: str) -> bool:
@@ -435,11 +466,11 @@ def choose_folders(root: Path, ui: Prompts) -> None:
     current = _readable(policy.workspaces)
     if not ui.interactive:
         if current:
-            _say_folders(ui, current)
+            _say_folders(ui, _picked(root, policy.workspaces))
         else:
             ui.say(FOLDER_NEXT)
         return
-    ui.say(f"{FOLDER_USE}. Results go to {_display_path(cli.default_research_folder())}.")
+    ui.say(f"{FOLDER_USE}. {FOLDER_COPY}")
     if getattr(ui, "can_search_folders", lambda: False)():
         _search_folders(root, ui, bool(current))
         return
@@ -516,13 +547,13 @@ def _search_folders(root: Path, ui, has_current: bool) -> None:
 
 
 def _add_folders(root: Path, ui, folders) -> bool:
-    """Make each folder readable and say what happened; whether any is readable now."""
+    """Add each folder as one where sessions work and say what happened; whether any was."""
     cli = _cli()
     any_ok = False
     for folder in folders:
         shown = _display_path(Path(folder)) if os.path.isabs(str(folder)) else str(folder)
         try:
-            result = cli.add_readable_folder(root, folder)
+            result = cli.add_work_folder(root, folder)
         except cli.WorkspaceError as exc:
             ui.say(f"{shown}: {_workspace_message(exc.code)}")
             continue
@@ -531,14 +562,31 @@ def _add_folders(root: Path, ui, folders) -> bool:
             continue
         any_ok = True
         workspace = result.workspace
-        (source,) = workspace.readonly_roots
-        if not result.added:
-            ui.say(f"{printer.MARK_OK} {_display_path(source)} ({workspace.workspace_id}, already added)")
-            continue
-        ui.say(f"{printer.MARK_OK} {_display_path(source)} ({workspace.workspace_id})")
+        where = _display_path(workspace.work_root)
+        if workspace.repos:
+            # A folder of repos: tasks name each repo in it.
+            ui.say(f"{printer.MARK_OK} {where}: {', '.join(result.repos) or 'no repos yet'}")
+        elif not result.added:
+            ui.say(f"{printer.MARK_OK} {where} ({workspace.workspace_id}, already added)")
+        else:
+            ui.say(f"{printer.MARK_OK} {where} ({workspace.workspace_id})")
+            _offer_direct(root, ui, workspace)
         if result.kept_builtin:
             ui.say(f"\"{cli.DEFAULT_RESEARCH_ID}\" stays until its running task ends.")
     return any_ok
+
+
+def _offer_direct(root: Path, ui, workspace) -> None:
+    """The advanced choice (``openswap worker setup --advanced`` only): work in the folder itself."""
+    if not getattr(ui, "advanced", False) or workspace.mode == "direct":
+        return
+    if ui.confirm(f"Work in {_display_path(workspace.work_root)} itself, without a copy?", default=False):
+        try:
+            _cli().set_workspace_mode(root, workspace.workspace_id, "direct")
+        except Exception:
+            ui.say(f"Could not change it. Next: `openswap worker workspace mode {workspace.workspace_id} direct`.")
+            return
+        ui.say(f"{printer.MARK_OK} {workspace.workspace_id} works in the folder itself.")
 
 
 @dataclass(frozen=True)
@@ -636,8 +684,8 @@ def readiness(root: Path) -> Readiness:
         worker=worker,
         account=account,
         folders=tuple(_describe(w) for w in policy.workspaces),
-        readable=tuple(_describe(w) for w in _readable(policy.workspaces)),
-        refused=_refused(root, policy.workspaces),
+        readable=tuple(_describe(w) for w in _picked(root, policy.workspaces)),
+        refused=_refused(root, None),
         # The live mode of the pinned account's provider: a Claude pin with a
         # passing Claude live check is live, whatever the Codex opt-in says.
         execution=execution_mode(pinned_adapter(root)),

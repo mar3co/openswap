@@ -21,7 +21,8 @@ from openswap.settings import load_worker_settings
 from openswap.worker.journal import AdmissionError, JournalError
 from openswap.worker.models import JobState, RemoteAuthorization, SafeEventKind
 from openswap.worker.protocol import (
-    AdvertisedAccount, Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, ProtocolError,
+    AdvertisedAccount, Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, MAX_REPORTED_FOLDERS,
+    ProtocolError,
     ReportedFolder, TERMINAL, fields, integer, timestamp, validate_url,
 )
 
@@ -34,6 +35,8 @@ APPROVAL = "waiting_for_approval"
 # sent as: the service's diagnostic list is closed. `worker status` and the
 # local journal keep the specific code.
 WIRE_DIAGNOSTICS = {"workspace_refused": "provider_unavailable"}
+# How often the readiness report rescans folders of repos when nothing changed.
+FOLDER_RESCAN_SECONDS = 30.0
 # Validation failures the service (or the local export check) reports for one
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
@@ -450,8 +453,22 @@ class RemoteClient:
         """The readiness report: approved folder IDs with their labels, and the execution mode."""
         from openswap.worker.adapter import execution_mode
 
-        folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict()
-                   for w in policy.workspaces if offerable(self.runtime.backup_root, w, policy.workspaces)]
+        from openswap.worker.cli import launchable_workspaces
+
+        # A folder of repos is reported as its repos, scanned again when the
+        # settings change and at least every FOLDER_RESCAN_SECONDS (the scan
+        # runs git for each repo, so not on every tick); at most the
+        # protocol's 20 folders.
+        cached = getattr(self, "_folders_cache", None)
+        now = time.monotonic()
+        if cached is not None and cached[0] == policy.workspaces and now - cached[1] < FOLDER_RESCAN_SECONDS:
+            folders = cached[2]
+        else:
+            launchable = launchable_workspaces(self.runtime.backup_root, policy.workspaces)
+            folders = [ReportedFolder(w.workspace_id, w.display_label).to_dict()
+                       for w in launchable
+                       if offerable(self.runtime.backup_root, w, launchable)][:MAX_REPORTED_FOLDERS]
+            self._folders_cache = (policy.workspaces, now, folders)
         # The pinned account's provider decides (a Claude pin reports Claude's opt-in).
         mode_of = getattr(self.runtime, "execution_mode", None)
         if callable(mode_of):
@@ -910,11 +927,15 @@ class RemoteClient:
             cursor = page.next_cursor
 
     def _upload_artifact(self, claim, local, name):
+        from openswap.worker.cli import results_folder
+
+        # The results folder, even if the task's repo is gone since it ran:
+        # a repo from a folder of repos keeps its ID for good.
         policy = load_worker_settings(self.runtime.backup_root)
-        workspace = next((w for w in policy.workspaces if w.workspace_id == local.workspace_id), None)
-        if workspace is None:
+        folder = results_folder(self.runtime.backup_root, local.workspace_id, policy.workspaces)
+        if folder is None:
             raise ProtocolError("invalid_request")
-        directory = workspace.output_root / local.job_id
+        directory = folder / local.job_id
         if directory.is_symlink() or directory.resolve() != directory:
             raise ProtocolError("invalid_request")
         opened = _open_artifact(directory, name)

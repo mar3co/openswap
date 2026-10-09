@@ -70,11 +70,12 @@ The command-line executable is `openswap`.
 | `openswap codex move` | Assign a Codex account to a slot |
 | `openswap codex desktop` | Experimental ChatGPT preflight, switch, and recovery (`switch` and `recover` need `--confirm-restart --confirm-idle`) |
 | `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
-| `openswap worker pair <url> <code>` | Remote tasks (opt-in): pair with a control service, then the guided setup: start the worker, pick an account, choose the folders tasks may read (`~/GitHub` is suggested) |
+| `openswap worker pair <url> <code>` | Remote tasks (opt-in): pair with a control service, then the guided setup: start the worker, pick an account, pick the folders where remote sessions work (`~/GitHub` is suggested) |
 | `openswap worker setup` | Rerun the guided setup on a paired Mac (also Settings → General → **Set up Remote tasks…**) |
 | `openswap worker enable` | Start the Remote tasks worker (LaunchAgent) so a paired Mac heartbeats and shows online |
 | `openswap worker account [slot]` | List or pin the Codex or Claude account remote jobs run on (`claude:4`, `codex:2`) |
 | `openswap worker account allow <slot>` | Allow an account for a per-job choice by the control service (`disallow`, `label`) |
+| `openswap worker workspace add --work <folder>` | Let remote sessions work in a git repo (or each repo in a folder of repos), each task in its own worktree on an `openswap/` branch (`mode <id> direct` works in the folder itself; `openswap worker worktrees` lists and prunes) |
 | `openswap worker workspace add --read <folder>` | Let remote tasks read a folder but never change it; results go to `~/OpenSwap Research/<id>` (`add <id> <folder>` approves a results folder; `list`, `label`, `remove`). The control service sees only IDs and labels |
 | `openswap worker codex install` | Install the pinned official Codex CLI 0.157.1 for Remote tasks (SHA-256 verified) |
 | `openswap worker codex login [slot]` | Sign an account in to its own isolated Codex home (your default login is untouched) |

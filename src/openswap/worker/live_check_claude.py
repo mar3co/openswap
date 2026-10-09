@@ -90,6 +90,7 @@ def claude_tool_items(stdout_path: Path) -> list[dict]:
                 tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
                 calls[key] = {"tool": block.get("name") if isinstance(block.get("name"), str) else "",
                               "path": tool_input.get("file_path") if isinstance(tool_input.get("file_path"), str) else "",
+                              "command": tool_input.get("command") if isinstance(tool_input.get("command"), str) else "",
                               "is_error": None, "output": ""}
             elif record.get("type") == "user" and block.get("type") == "tool_result":
                 call = calls.get(str(block.get("tool_use_id")))
@@ -117,9 +118,29 @@ class ClaudeLiveCheck(LiveCheck):
     def _job(self, *args, **kwargs):
         outcome = super()._job(*args, **kwargs)
         # Claude reports tool calls, not Codex items: record the tools it used.
-        self.item_types_seen |= {item["tool"] for item in claude_tool_items(outcome.run_dir / STDOUT_FILE)
-                                 if item["tool"]}
+        # A work folder's job has its own tools (Edit, Write, Bash); the tool
+        # surface gate is about research jobs only.
+        if kwargs.get("resolved") is None:
+            self.item_types_seen |= {item["tool"] for item in claude_tool_items(outcome.run_dir / STDOUT_FILE)
+                                     if item["tool"]}
         return outcome
+
+    # A Claude work task has file tools only (no shell: see claude_exec.WORK_TOOLS).
+    _shell_steps = False
+
+    def _work_attempts(self, outcome) -> list[tuple[str, bool]]:
+        return [(item["path"], item["is_error"] is False)
+                for item in claude_tool_items(outcome.run_dir / STDOUT_FILE)
+                if item["tool"] in {"Write", "Edit"} and item["is_error"] is not None]
+
+    def _worktree_task(self, steps) -> str:
+        listing = "\n".join(f"{index}. {path}" for index, (_, _, path) in enumerate(steps, 1))
+        return (
+            "This is the owner's automated permission self-test for a work folder. Some of these writes "
+            "are expected to fail; that is the point of the test. Use the Write tool once on each of these "
+            "files, in order, writing the text ok, and continue after failures. Do not use any other tool. "
+            "Then reply with the single word DONE.\n\n" + listing
+        )
 
     def adapter(self) -> ClaudeCodeAdapter:
         extra = {"live_sessions": self._live_sessions} if self._live_sessions is not None else {}
@@ -210,6 +231,7 @@ class ClaudeLiveCheck(LiveCheck):
             ("sandbox (claude -p)", lambda: self._gate_sandbox_exec(identity, profile)),
             ("stop", lambda: self._gate_stop(identity)),
             ("kill and recovery", lambda: self._gate_kill_recovery(identity)),
+            ("work folder (worktree)", lambda: self._gate_worktree(identity)),
         )
 
     def _evaluate_tool_surface(self, static: dict, unexpected_items: list[str]) -> tuple[dict, bool]:
