@@ -507,24 +507,30 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         return 1
 
 
-_LIVE_MODE_MESSAGES = {
-    "live_lock_unavailable": "Could not take the live-tasks lock.",
+# The lock codes can come from `live enable` or `live disable`: the owner retries the same
+# command. The evidence and host codes come only from enabling: a new live check is the fix.
+_LIVE_LOCK_MESSAGES = {
+    "live_lock_unavailable": "Could not take the live-tasks lock; try again in a moment.",
     "live_lock_busy": "Live tasks are being changed; try again in a moment.",
+}
+_LIVE_EVIDENCE_MESSAGES = {
     "evidence_unreadable": "The live check's evidence file can't be read.",
     "evidence_invalid": "The live check's evidence file is not valid.",
     "unsupported_platform": "Live tasks run only on Apple silicon Macs.",
     "host_unverifiable": "This Mac could not be identified, so the evidence can't be matched to it.",
-    "evidence_not_passing": "The live check did not pass, or no longer matches this Mac",
+    "evidence_not_passing": "The live check did not pass, or no longer matches this Mac.",
 }
 
 
 def _live_mode_message(error: LiveModeError, provider: str) -> str:
-    """One line: why live tasks stay off, then the live check to run again."""
+    """One line: what refused the change, then the step that clears it (retry, or a new live check)."""
+    if error.code in _LIVE_LOCK_MESSAGES:
+        return _LIVE_LOCK_MESSAGES[error.code]
     flag = " --provider claude" if provider == "claude" else ""
-    text = _LIVE_MODE_MESSAGES.get(error.code, f"Refused ({error.code})")
+    text = _LIVE_EVIDENCE_MESSAGES.get(error.code, f"Refused ({error.code}).")
     if error.problems:
-        text += f" ({', '.join(error.problems)})"
-    return f"{text.rstrip('.')}. Next: `openswap worker live-check{flag}`."
+        text = f"{text.rstrip('.')} ({', '.join(error.problems)})."
+    return f"{text} Next: `openswap worker live-check{flag}`."
 
 
 def _codex_command(root: Path, args) -> int:

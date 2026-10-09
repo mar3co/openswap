@@ -2654,10 +2654,13 @@ def _format_status(snapshot: dict) -> str:
     worker = process if enabled else "off"
     worker_ok = (False if not enabled else True if process == "running"
                  else None if process in {"starting", "stopped"} else False)
+    # Only a running worker admits tasks: off, stopped or stale, it takes none whatever the pause flag.
+    running = enabled and process in _RUNNING_STATES
+    taking = ("paused" if paused else "yes") if running else "no (worker not running)"
     service_ok = True if remote == "online" else None if remote in {"disabled", "offline"} else False
     rows = [
         (f"{printer.mark(worker_ok)} Worker", worker),
-        (f"{printer.mark(not paused)} Taking tasks", "paused" if paused else "yes"),
+        (f"{printer.mark(None if not running else not paused)} Taking tasks", taking),
         (f"{printer.mark(True if available else None)} Live tasks", live),
         (f"{printer.mark(service_ok)} Service", f"{remote} (seen {seen})" if seen else remote),
         (f"{printer.mark(None)} Task", job),

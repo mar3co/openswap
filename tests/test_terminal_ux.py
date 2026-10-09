@@ -186,7 +186,24 @@ def test_status_rows_are_marked_and_worded(root, monkeypatch, capsys):
     assert _run(root, "status") == 0
     out = capsys.readouterr().out
     assert "  ✗ Worker        off\n" in out and "  • Live tasks    off (provider_auth_unavailable)\n" in out
+    # A worker that is not running admits nothing, whatever the pause flag says.
+    assert "  • Taking tasks  no (worker not running)\n" in out
     assert out.count("Next:") == 1 and "`openswap worker enable`" in out
+
+
+def test_live_mode_refusals_point_at_a_retry_or_a_new_live_check():
+    from openswap.worker.live import LiveModeError
+
+    # A lock failure can come from `live disable` too: never send the owner to a quota-using check.
+    assert live_cli._live_mode_message(LiveModeError("live_lock_busy"), "codex") == (
+        "Live tasks are being changed; try again in a moment.")
+    assert "live-check" not in live_cli._live_mode_message(LiveModeError("live_lock_unavailable"), "claude")
+    # Evidence problems only come from enabling: a new live check is the fix.
+    assert live_cli._live_mode_message(LiveModeError("evidence_not_passing", ("stop",)), "claude") == (
+        "The live check did not pass, or no longer matches this Mac (stop). "
+        "Next: `openswap worker live-check --provider claude`.")
+    assert live_cli._live_mode_message(LiveModeError("evidence_invalid"), "codex").endswith(
+        "Next: `openswap worker live-check`.")
 
 
 def test_codex_and_claude_status_point_at_the_next_step():
