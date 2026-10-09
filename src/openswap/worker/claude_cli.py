@@ -29,6 +29,15 @@ from openswap.worker.codex_cli import CodexCliError, platform_supported, sha256_
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)? \(Claude Code\)$")
+# The oldest Claude Code jobs run: earlier ones let a symlink bypass deny
+# rules (GHSA-4q92-rfm6-2cqx), which keep the file tools off the sign-in.
+MIN_VERSION = (2, 1, 7)
+
+
+def version_tuple(version: str) -> tuple[int, int, int]:
+    """``(major, minor, patch)`` of a ``claude --version`` line."""
+    major, minor, patch = re.match(r"^(\d+)\.(\d+)\.(\d+)", version).groups()
+    return int(major), int(minor), int(patch)
 # ``~/.claude/local`` (the old npm-local install) is deliberately absent: jobs
 # run with ``~/.claude`` hidden by Seatbelt, so a binary there could not start.
 CANDIDATES = ("~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude")
@@ -111,6 +120,10 @@ def _version(binary: Path, run) -> str:
     version = (result.stdout or "").strip()
     if result.returncode != 0 or not _VERSION_RE.fullmatch(version):
         raise ClaudeCliError("version_unrecognized")
+    if version_tuple(version) < MIN_VERSION:
+        # Older versions let a symlink get around deny rules (GHSA-4q92-rfm6-2cqx),
+        # and jobs rely on deny rules to keep the file tools off the sign-in.
+        raise ClaudeCliError("version_unsupported")
     return version
 
 
@@ -222,6 +235,11 @@ def verify(backup_root: Path, *, run=subprocess.run, supported: bool | None = No
             or not isinstance(raw.get("version"), str)
             or not isinstance(raw.get("binary_sha256"), str) or not _HEX64.fullmatch(raw["binary_sha256"])):
         raise ClaudeCliError("pin_invalid")
+    if not _VERSION_RE.fullmatch(raw["version"]):
+        raise ClaudeCliError("pin_invalid")
+    if version_tuple(raw["version"]) < MIN_VERSION:
+        # Pinned before this minimum existed: never run, even without a version probe.
+        raise ClaudeCliError("version_unsupported")
     binary = Path(raw["binary"])
     _check_binary(binary, backup_root)
     try:

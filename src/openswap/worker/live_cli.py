@@ -734,6 +734,8 @@ def _codex_command(root: Path, args) -> int:
 
 
 _CLAUDE_MESSAGES = {
+    "version_unsupported": ("That Claude Code is older than 2.1.7, which lets a symlink get around permission "
+                            "deny rules. Update it, then run `openswap worker claude pin` again."),
     "unsupported_platform": "Remote tasks run Claude Code only on Apple silicon Macs.",
     "not_installed": "Claude Code is not installed. Install it, then run `openswap worker claude pin`.",
     "not_pinned": "No Claude Code binary is pinned. Run `openswap worker claude pin`.",

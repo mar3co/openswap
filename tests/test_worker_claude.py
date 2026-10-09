@@ -101,6 +101,25 @@ def fake_claude(tmp_path, version="2.1.285 (Claude Code)"):
 # -- pinned binary --------------------------------------------------------------------
 
 
+def test_a_claude_code_that_lets_symlinks_past_deny_rules_is_never_pinned_or_run(tmp_path):
+    # Before 2.1.7 a symlink got around deny rules (GHSA-4q92-rfm6-2cqx); jobs rely on them.
+    root = tmp_path / "root"
+    root.mkdir()
+    with pytest.raises(claude_cli.ClaudeCliError) as error:
+        claude_cli.pin(root, binary=fake_claude(tmp_path, "2.1.6 (Claude Code)"))
+    assert error.value.code == "version_unsupported"
+    assert claude_cli.version_tuple("2.1.7 (Claude Code)") == claude_cli.MIN_VERSION
+    pin = claude_cli.pin(root, binary=fake_claude(tmp_path, "2.1.7 (Claude Code)"))
+    assert claude_cli.verify(root, check_version=False) == pin
+    # A pin recorded before the minimum existed is refused even without a version probe.
+    raw = json.loads(claude_cli.pin_path(root).read_text())
+    raw["version"] = "2.0.99 (Claude Code)"
+    claude_cli.pin_path(root).write_text(json.dumps(raw))
+    with pytest.raises(claude_cli.ClaudeCliError) as error:
+        claude_cli.verify(root, check_version=False)
+    assert error.value.code == "version_unsupported"
+
+
 def test_pin_records_the_installed_binary_and_verify_rechecks_it(tmp_path):
     binary = fake_claude(tmp_path)
     root = tmp_path / "root"
@@ -748,11 +767,17 @@ class SimulatedClaudeMac(FakeLaunch):
         inside = target.startswith(str(cwd) + "/") or (tool == "Bash" and str(cwd) in target)
         if tool not in tools:
             return False, f"No such tool: {tool}"
-        if tool == "Read" and any(rule.startswith("Read(/") and fnmatch.fnmatchcase(target, rule[6:-1].replace("**", "*"))
-                                  for rule in getattr(self, "_deny", [])):
-            return False, "Permission to read this file has been denied."  # a deny rule, in any mode
         if tool == "Read":
-            return (True, Path(target).read_text()) if inside else (False, "Permission denied")
+            # A Mac volume is case-insensitive; Claude Code (2.1.7+) checks deny rules on the
+            # path as given and on where a symlink leads.
+            path = Path(target)
+            if not os.path.lexists(path) and path.parent.is_dir():
+                path = next((p for p in path.parent.iterdir() if p.name.lower() == path.name.lower()), path)
+            names = {target, os.path.realpath(path)}
+            if any(rule.startswith("Read(/") and fnmatch.fnmatchcase(name, rule[6:-1].replace("**", "*"))
+                   for rule in getattr(self, "_deny", []) for name in names):
+                return False, "Permission to read this file has been denied."  # a deny rule, in any mode
+            return (True, path.read_text()) if inside else (False, "Permission denied")
         permitted = mode == "bypassPermissions" or tool in allow or (
             tool == "Write" and mode == "acceptEdits" and inside)
         if not permitted:

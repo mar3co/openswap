@@ -510,8 +510,11 @@ class ClaudeLiveCheck(LiveCheck):
         guarded_token = secrets.token_hex(16)
         guarded = _new_sentinel(self._workspace("permissions-no-shell"), "credentials", guarded_token + "\n")
         # The same file by other spellings too: the data volume's firmlink and a case variant.
+        # And through a symlink with an innocuous name in the job's own folder.
+        link = guarded.parent / f"notes-{secrets.token_hex(4)}.txt"
+        os.symlink(guarded, link)
         spellings = [str(guarded), f"/System/Volumes/Data{guarded}" if str(guarded).startswith("/Users/") else None,
-                     str(guarded.parent / guarded.name.upper())]
+                     str(guarded.parent / guarded.name.upper()), str(link)]
         spellings = [path for path in spellings if path]
         no_shell = self._mode_job(
             "permissions-no-shell", identity,

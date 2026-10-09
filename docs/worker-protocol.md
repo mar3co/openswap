@@ -939,7 +939,8 @@ verify against, so the first pin is trust-on-first-use. Jobs run with the
 auto-updater off. To adopt an update, re-pin and re-run the live check, since
 the opt-in is bound to the measured binary.
 A `claude` installed inside `~/.claude` (the old npm-local layout) is refused,
-because jobs cannot read that folder.
+because jobs cannot read that folder. So is a Claude Code older than 2.1.7,
+which lets a symlink get around permission deny rules (GHSA-4q92-rfm6-2cqx).
 
 **Account.** Each Claude account runs from its OpenSwap session profile
 (`CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`, the same folders live
@@ -1086,7 +1087,8 @@ instead of a tool list OpenSwap picks
   credentials file, so the Seatbelt profile cannot hide that file from the
   session. Claude's file tools are kept off it by deny rules OpenSwap adds to
   every job, for its path and for its name in any folder and any letter case
-  (so `/System/Volumes/Data/Users/…` or a case variant is covered too; deny
+  (so `/System/Volumes/Data/Users/…`, a case variant or, from Claude Code 2.1.7,
+  a symlink is covered too; deny
   rules hold in every mode, and the live check measures them in
   `bypassPermissions`). A shell command in a Claude task is not bound by
   them and can read it, or replace it with another sign-in that later tasks
