@@ -507,16 +507,17 @@ def main(arguments: list[str], backup_root: Path, *, migrate=None) -> int:
         return 1
 
 
-# The lock codes can come from `live enable` or `live disable`: the owner retries the same
-# command. The evidence and host codes come only from enabling: a new live check is the fix.
-_LIVE_LOCK_MESSAGES = {
+# Refusals with no live check to run next: the lock codes (from `live enable` or `live disable`;
+# the owner retries the same command) and an unsupported Mac, where a live check refuses too.
+_LIVE_FINAL_MESSAGES = {
     "live_lock_unavailable": "Could not take the live-tasks lock; try again in a moment.",
     "live_lock_busy": "Live tasks are being changed; try again in a moment.",
+    "unsupported_platform": "Live tasks run only on Apple silicon Macs.",
 }
+# The evidence and host codes come only from enabling: a new live check is the fix.
 _LIVE_EVIDENCE_MESSAGES = {
     "evidence_unreadable": "The live check's evidence file can't be read.",
     "evidence_invalid": "The live check's evidence file is not valid.",
-    "unsupported_platform": "Live tasks run only on Apple silicon Macs.",
     "host_unverifiable": "This Mac could not be identified, so the evidence can't be matched to it.",
     "evidence_not_passing": "The live check did not pass, or no longer matches this Mac.",
 }
@@ -524,8 +525,8 @@ _LIVE_EVIDENCE_MESSAGES = {
 
 def _live_mode_message(error: LiveModeError, provider: str) -> str:
     """One line: what refused the change, then the step that clears it (retry, or a new live check)."""
-    if error.code in _LIVE_LOCK_MESSAGES:
-        return _LIVE_LOCK_MESSAGES[error.code]
+    if error.code in _LIVE_FINAL_MESSAGES:
+        return _LIVE_FINAL_MESSAGES[error.code]
     flag = " --provider claude" if provider == "claude" else ""
     text = _LIVE_EVIDENCE_MESSAGES.get(error.code, f"Refused ({error.code}).")
     if error.problems:

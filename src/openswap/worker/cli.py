@@ -2308,10 +2308,12 @@ def _format_workspaces(workspaces) -> str:
             how = "works in the folder itself" if workspace.mode == "direct" else "own worktree per task"
             where = f"works in each repo in {display_path(work)}" if workspace.repos else f"works in {display_path(work)}"
             use = f"{where} ({how})"
-        elif workspace.readonly_roots:
-            use = "reads " + ", ".join(display_path(source) for source in workspace.readonly_roots)
         else:
+            # A results folder, with the folders its tasks may read first (a `--read` folder,
+            # or `ID FOLDER --readonly-source DIR`): both places are the owner's to find.
             use = f"writes results in {display_path(workspace.output_root)}"
+            if workspace.readonly_roots:
+                use = "reads " + ", ".join(display_path(source) for source in workspace.readonly_roots) + f"; {use}"
         rows.append((f"{printer.MARK_OK} {workspace.workspace_id}",
                      json.dumps(workspace.display_label, ensure_ascii=False), use))
     lines.extend(printer.columns(rows))

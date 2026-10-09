@@ -204,6 +204,34 @@ def test_live_mode_refusals_point_at_a_retry_or_a_new_live_check():
         "Next: `openswap worker live-check --provider claude`.")
     assert live_cli._live_mode_message(LiveModeError("evidence_invalid"), "codex").endswith(
         "Next: `openswap worker live-check`.")
+    # An Intel Mac: a live check would refuse too, so no next step is offered.
+    assert live_cli._live_mode_message(LiveModeError("unsupported_platform"), "codex") == (
+        "Live tasks run only on Apple silicon Macs.")
+
+
+def test_workspace_list_says_what_tasks_do_in_each_folder(root, tmp_path, monkeypatch):
+    from openswap.settings import WorkerWorkspace
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(cli, "home_folder", lambda: home)
+    results = home / "OpenSwap Research"
+    out = cli._format_workspaces((
+        WorkerWorkspace("research", results / "research", ()),
+        WorkerWorkspace("docs", results / "docs", (home / "Docs",)),
+        WorkerWorkspace("mixed", tmp_path / "out", (home / "src", home / "notes"), "Mixed"),
+        WorkerWorkspace("github", results / "github", (), None, home / "GitHub", "worktree", True),
+        WorkerWorkspace("app", results / "app", (), None, home / "GitHub" / "app", "direct", False),
+    ))
+    assert out.splitlines() == [
+        "Folders",
+        '  ✓ research  "research"  writes results in ~/OpenSwap Research/research',
+        '  ✓ docs      "docs"      reads ~/Docs; writes results in ~/OpenSwap Research/docs',
+        f'  ✓ mixed     "Mixed"     reads ~/src, ~/notes; writes results in {tmp_path / "out"}',
+        '  ✓ github    "GitHub"    works in each repo in ~/GitHub (own worktree per task)',
+        '  ✓ app       "app"       works in ~/GitHub/app (works in the folder itself)',
+        "Next: `openswap worker workspace add --work <folder>` adds one; "
+        "`openswap worker workspace remove <id>` drops one.",
+    ]
 
 
 def test_codex_and_claude_status_point_at_the_next_step():
