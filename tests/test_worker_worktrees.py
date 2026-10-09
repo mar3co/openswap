@@ -812,3 +812,43 @@ def test_direct_mode_on_a_folder_of_repos_applies_to_each_repo(root, home):
     # And back: the same parent, each repo in its own worktree again.
     assert cli.set_workspace_mode(root, "github", "worktree").repos is True
     assert _runtime(root)._resolve_workspace("opentag", "b" * 32).branch == "openswap/bbbbbbbb"
+
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_links_planted_in_the_admin_folder_are_never_written_through(root, home, tmp_path):
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    victims = {}
+    for name in ("COMMIT_EDITMSG", "ORIG_HEAD", "index.lock", "logs/HEAD", "FETCH_HEAD"):
+        victim = tmp_path / f"victim-{name.replace('/', '-')}"
+        victim.write_text("owner's file")
+        target = tree.git_dir / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        target.symlink_to(victim)
+        victims[name] = victim
+    (resolved.work_dir / "work.txt").write_text("task work")
+    assert worktrees.is_dirty(tree) is True
+    assert worktrees.finish(tree, "left over") is True
+    assert _git(repo, "show", f"{resolved.branch}:work.txt") == "task work"
+    for victim in victims.values():
+        assert victim.read_text() == "owner's file"
+    assert worktrees.remove(resolved.work_dir) is True
+    for victim in victims.values():
+        assert victim.read_text() == "owner's file"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_a_linked_admin_head_is_not_intact(root, home, tmp_path):
+    repo = _repo(home / "GitHub" / "openswap")
+    cli.add_work_folder(root, repo)
+    tree = _runtime(root)._resolve_workspace("openswap", "a" * 32).worktree
+    real = tmp_path / "HEAD"
+    real.write_text((tree.git_dir / "HEAD").read_text())
+    (tree.git_dir / "HEAD").unlink()
+    (tree.git_dir / "HEAD").symlink_to(real)
+    assert worktrees.intact(tree) is False
