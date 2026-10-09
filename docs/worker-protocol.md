@@ -978,7 +978,8 @@ It allows writes only to the job's output folder (or the task's worktree and
 what git needs beside it), the account's profile, the run's temporary folder
 and this user's cache and temporary folders, and never to the profile files
 that configure or instruct later sessions (`settings.json`,
-`settings.local.json`, `CLAUDE.md`, `rules/`, `agents/`, `agent-memory/`,
+`settings.local.json`, `CLAUDE.md`, the cached server policy (`remote-settings.json`,
+`policy-limits.json`), `scheduled_tasks.json`, `rules/`, `agents/`, `agent-memory/`,
 `commands/`, `skills/`, `hooks/`, `output-styles/`, `plugins/`, and `projects/`,
 where each project's auto-memory lives, entries included; jobs also run with
 auto-memory off). It makes the default login, `~/.codex` and the rest of the

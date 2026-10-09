@@ -102,7 +102,13 @@ CLAUDE_READ_ONLY_TOOLS = ("Read", "Grep", "Glob", "WebSearch", "WebFetch")
 # project's auto-memory lives there; protecting the whole folder also stops a
 # task from renaming a prepared folder into place). Jobs keep no session
 # history (``--no-session-persistence``), so they need nothing there.
-CLAUDE_PROFILE_CONFIG = ("settings.json", "settings.local.json", "CLAUDE.md")
+# Also the cached server policy and its limits, which an ordinary (kickoff or
+# interactive) session on this profile would load as managed policy, and the
+# files that schedule or start work later.
+CLAUDE_PROFILE_CONFIG = ("settings.json", "settings.local.json", "CLAUDE.md", "CLAUDE.local.md",
+                         "remote-settings.json", "remote-settings-consent.json", "policy-limits.json",
+                         "scheduled_tasks.json", "monitors.json", "daemon.json", "cowork_settings.json",
+                         "keybindings.json")
 CLAUDE_PROFILE_CONFIG_DIRS = ("agents", "agent-memory", "commands", "rules", "skills", "hooks", "output-styles",
                               "plugins", "projects")
 

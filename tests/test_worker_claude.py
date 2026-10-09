@@ -469,6 +469,7 @@ def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_
         f"printf x > {profile}/new.json 2>/dev/null && mv {profile}/new.json {profile}/settings.json "
         f"2>/dev/null; echo settings_replaced $?",
         f"printf x >> {profile}/CLAUDE.md 2>/dev/null; echo memory $?",
+        f"printf {{}} > {profile}/remote-settings.json 2>/dev/null; echo remote_policy $?",
         f"printf x > {profile}/skills/s.md 2>/dev/null; echo skill $?",
         f"printf x > {profile}/rules/r.md 2>/dev/null; echo rule $?",
         f"printf x > {profile}/projects/-repo/memory/MEMORY.md 2>/dev/null; echo auto_memory $?",
@@ -493,7 +494,7 @@ def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_
     assert codes["security"] == "126"
     assert codes["keychain_file"] == "1"
     assert codes["settings"] != "0" and codes["settings_replaced"] != "0" and codes["memory"] != "0"
-    assert codes["skill"] != "0"
+    assert codes["skill"] != "0" and codes["remote_policy"] != "0"
     assert (profile / "settings.json").read_text() == "{}\n" and (profile / "CLAUDE.md").read_text() == "\n"
     # Claude Code's own state, and (honestly) the account's own sign-in, stay reachable.
     assert codes["state"] == "0" and codes["own_sign_in"] == "0"
