@@ -1062,3 +1062,68 @@ def test_a_branch_differing_only_in_case_never_blocks_a_task(root, home, blockin
     assert not resolved.branch.casefold().startswith(taken + "/")
     assert not taken.startswith(resolved.branch.casefold() + "/")
     assert _git(repo, "rev-parse", f"refs/heads/{blocking}") == _git(repo, "rev-parse", "HEAD")
+
+
+
+def _hostile_includes(repo: Path, tmp_path: Path) -> list[Path]:
+    """Filters defined only behind conditions that are false while the owner's
+    branch is checked out, and one more behind an include inside them."""
+    import shlex
+
+    markers = [tmp_path / name for name in ("SMUDGED", "CLEANED", "PROCESSED", "NESTED", "GITDIR")]
+    script = tmp_path / "filter.sh"
+    script.write_text('#!/bin/sh\ntouch "$1"\ncat\n')
+    script.chmod(0o755)
+
+    def command(marker):
+        return f"{shlex.quote(str(script))} {shlex.quote(str(marker))}"
+
+    def write(file, *pairs):
+        for key, value in pairs:
+            _git(tmp_path, "config", "--file", str(file), key, value)
+
+    nested, branch, gitdir = tmp_path / "nested.inc", tmp_path / "branch.inc", tmp_path / "gitdir.inc"
+    write(nested, ("filter.deep.er.smudge", command(markers[3])))
+    write(branch, ("filter.evil.smudge", command(markers[0])), ("filter.evil.clean", command(markers[1])),
+          ("filter.proc.process", command(markers[2])), ("include.path", str(nested)))
+    write(gitdir, ("filter.wt.smudge", command(markers[4])))
+    _git(repo, "config", "includeIf.onbranch:openswap/**.path", str(branch))
+    _git(repo, "config", "includeIf.gitdir:**/worktrees/**.path", str(gitdir))
+    (repo / ".gitattributes").write_text("a.txt filter=evil\nb.txt filter=proc\nc.txt filter=deep.er\n"
+                                         "d.txt filter=wt\n")
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt"):
+        (repo / name).write_text(name)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "attributes")
+    assert not any(marker.exists() for marker in markers)  # inactive on the owner's branch
+    return markers
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the filter script is a shell script")
+def test_filters_behind_conditional_includes_never_run(root, home, tmp_path):
+    """A filter behind ``includeIf "onbranch:openswap/**"`` (or ``gitdir:``) is
+    not defined while the owner's branch is checked out, but would be in the
+    task's worktree: the worker never runs it, on create, status, finish or
+    removal."""
+    repo = _repo(home / "GitHub" / "openswap")
+    markers = _hostile_includes(repo, tmp_path)
+    cli.add_work_folder(root, repo)
+    resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
+    tree = resolved.worktree
+    assert (resolved.work_dir / "a.txt").read_text() == "a.txt"  # checked out, unfiltered
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt"):
+        (resolved.work_dir / name).write_text(f"task {name}")
+    assert worktrees.is_dirty(tree) is True
+    assert worktrees.finish(tree, "left over") is True
+    assert _git(repo, "show", f"{resolved.branch}:a.txt") == "task a.txt"
+    assert worktrees.remove(resolved.work_dir) is True
+    assert [marker.name for marker in markers if marker.exists()] == []
+
+
+def test_every_driver_behind_any_include_is_emptied(home, tmp_path):
+    repo = _repo(home / "GitHub" / "openswap")
+    _hostile_includes(repo, tmp_path)
+    overrides = dict(worktrees._filter_overrides(repo, worktrees._git_env()))
+    for driver in ("evil", "proc", "deep.er", "wt"):
+        assert overrides[f"filter.{driver}.smudge"] == overrides[f"filter.{driver}.process"] == ""
+        assert overrides[f"filter.{driver}.required"] == "false"

@@ -19,7 +19,9 @@ then removed; one the worker could not finish is kept for inspection.
 
 Every git command here runs as the worker, outside the task's sandbox. So
 none may run code from the repo or from anything the task could write:
-hooks are disabled (``core.hooksPath``), as are checkout and clean filters,
+hooks are disabled (``core.hooksPath``), as are checkout and clean filters
+(every driver any config file or include could define, whatever the
+include's condition),
 ``core.fsmonitor``, commit signing and submodule recursion; and git is
 pointed at the worktree with explicit ``GIT_DIR``/``GIT_WORK_TREE`` from a
 record the task cannot write, after checking the task did not repoint its
@@ -87,24 +89,83 @@ def _run(command: list[str], cwd: Path, env: dict[str, str], timeout: float) -> 
         raise WorktreeError("git_unavailable") from None
 
 
-def _filter_overrides(cwd: Path, env: dict[str, str]) -> list[tuple[str, str]]:
-    """Settings that turn every configured filter driver into a no-op.
+_MAX_CONFIG_FILES = 64
 
-    Reading configuration runs nothing, so the driver names are read first
-    (again for every command: the owner may add one at any time) and each
-    driver's ``smudge``, ``clean`` and ``process`` are emptied. A driver name
-    may contain dots or ``=``: it is everything between ``filter.`` and the
-    last dot, and the settings travel as ``GIT_CONFIG_KEY_n``/``VALUE_n``
-    pairs, never as ``-c name=value`` (which splits at the first ``=``).
+
+def _is_include(key: str) -> bool:
+    return key == "include.path" or (key.startswith("includeif.") and key.endswith(".path"))
+
+
+def _driver(key: str) -> str | None:
+    """``name`` for a ``filter.<name>.<setting>`` key (a name may hold dots or ``=``)."""
+    if not key.startswith("filter."):
+        return None
+    return key[len("filter."):].rpartition(".")[0] or None
+
+
+def _include_target(value: str, including: Path, env: dict[str, str]) -> Path:
+    if value == "~" or value.startswith("~/"):
+        return Path(env.get("HOME") or Path.home()) / value[2:]
+    target = Path(value)
+    return target if target.is_absolute() else including.parent / target
+
+
+def _configured_drivers(cwd: Path, env: dict[str, str], base: list[str]) -> set[str]:
+    """Every filter driver any config git may read here could define, whatever its conditions.
+
+    Conditional includes (``includeIf "onbranch:…"``, ``"gitdir:…"``,
+    ``"hasconfig:…"``) are judged per command: one inactive now may be
+    active for the next (``worktree add -b openswap/…`` switches branch
+    under a child git). So every config file git reads is listed, and each
+    include in it is followed regardless of its condition, as raw files
+    (``--no-includes``). Reading configuration runs nothing.
+    """
+    listing = _run([*base, "config", "--list", "--show-origin", "--name-only", "--null"], cwd, env, 30)
+    fields = listing.stdout.split("\0")
+    drivers, pending, seen = set(), [], set()
+    for origin, key in zip(fields[0::2], fields[1::2]):
+        name = _driver(key)
+        if name:
+            drivers.add(name)
+        if origin.startswith("file:"):
+            path = Path(origin[len("file:"):])
+            pending.append(path if path.is_absolute() else Path(cwd) / path)
+    while pending and len(seen) < _MAX_CONFIG_FILES:
+        path = pending.pop()
+        try:
+            key_path = os.path.normcase(os.path.abspath(path))
+        except (OSError, ValueError):
+            continue
+        if key_path in seen or not os.path.isfile(path):
+            continue
+        seen.add(key_path)
+        raw = _run([*base, "config", "--file", str(path), "--no-includes", "--null", "--list"], cwd, env, 30)
+        for entry in raw.stdout.split("\0"):
+            key, _, value = entry.partition("\n")
+            name = _driver(key)
+            if name:
+                drivers.add(name)
+            elif _is_include(key) and value:
+                pending.append(_include_target(value, path, env))
+    return drivers
+
+
+def _filter_overrides(cwd: Path, env: dict[str, str]) -> list[tuple[str, str]]:
+    """Settings that turn every filter driver git could find here into a no-op.
+
+    The driver names are read first (again for every command: the owner may
+    add one at any time), from every config file and every include,
+    conditional or not (see ``_configured_drivers``), and each driver's
+    ``smudge``, ``clean`` and ``process`` are emptied. These settings come
+    from the environment, which git ranks above every config file and every
+    include. A driver name may contain dots or ``=``: it is everything
+    between ``filter.`` and the last dot, and the settings travel as
+    ``GIT_CONFIG_KEY_n``/``VALUE_n`` pairs, never as ``-c name=value`` (which
+    splits at the first ``=``).
     """
     base = ["git", *(arg for item in _SAFE_CONFIG for arg in ("-c", item))]
-    result = _run([*base, "config", "--null", "--name-only", "--get-regexp", r"^filter\."], cwd, env, 30)
-    drivers = sorted({name[len("filter."):].rpartition(".")[0] for name in result.stdout.split("\0")
-                      if name.startswith("filter.") and "." in name[len("filter."):]})
     out = []
-    for driver in drivers:
-        if not driver:
-            continue
+    for driver in sorted(_configured_drivers(Path(cwd), env, base)):
         for part in ("smudge", "clean", "process"):
             out.append((f"filter.{driver}.{part}", ""))
         out.append((f"filter.{driver}.required", "false"))
@@ -349,7 +410,10 @@ def create(repo: Path, results_root: Path, workspace_id: str, job_id: str) -> Wo
         remove_tree(objects)
         raise
     try:
-        git(["worktree", "add", "--quiet", "-b", branch, str(dest), "HEAD"], repo)
+        # No checkout here: `worktree add` checks out in a child git whose
+        # config is read on the new branch, after the filter scan above ran
+        # on the owner's. The checkout runs below as a command of its own.
+        git(["worktree", "add", "--quiet", "--no-checkout", "-b", branch, str(dest), "HEAD"], repo)
     except WorktreeError:
         # `-b` may have made the branch before the checkout failed: it was
         # free a moment ago, so it is this task's to delete.
@@ -365,6 +429,9 @@ def create(repo: Path, results_root: Path, workspace_id: str, job_id: str) -> Wo
         for copied in (git_dir / "config.worktree", git_dir / "info" / "sparse-checkout"):
             if os.path.lexists(copied):
                 os.unlink(copied)
+        # Now in the new worktree, on the task's branch: config (and any
+        # include that branch turns on) is read again for this command.
+        git(["reset", "--hard", "--quiet"], dest, env={"GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(dest)})
         os.chmod(dest, 0o700)
         tree = Worktree(pathid.canonical(dest), repo, common, git_dir, branch, pathid.canonical(objects))
         record = _record_path(dest)
@@ -518,18 +585,24 @@ def import_objects(tree: Worktree, commit: str | None = None) -> bool:
         return True
     safe = [arg for item in _SAFE_CONFIG for arg in ("-c", item)]
     try:
+        read_full = _with_config(_git_env(read_env), _filter_overrides(Path(tree.common_dir), _git_env(read_env)))
+        store_env = _git_env({"GIT_DIR": str(tree.common_dir)})
+        store_full = _with_config(store_env, _filter_overrides(Path(tree.common_dir), store_env))
+    except WorktreeError:
+        return False
+    try:
         with tempfile.TemporaryFile() as listing:
             listing.write(names.encode() + b"\n")
             listing.seek(0)
             packer = subprocess.Popen(["git", *safe, "pack-objects", "--stdout", "-q"], cwd=str(tree.common_dir),
                                       stdin=listing, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                      env=_git_env(read_env))
+                                      env=read_full)
             try:
                 # Streamed from git to git: never held in the worker's memory.
                 indexed = subprocess.run(
                     ["git", *safe, "index-pack", "--stdin", "--strict", f"--max-input-size={_MAX_PACK_BYTES}"],
                     cwd=str(tree.common_dir), stdin=packer.stdout, capture_output=True, timeout=_GIT_TIMEOUT_S,
-                    check=False, env=_git_env({"GIT_DIR": str(tree.common_dir)}))
+                    check=False, env=store_full)
             finally:
                 packer.stdout.close()
                 try:
