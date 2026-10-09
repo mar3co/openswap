@@ -2674,15 +2674,52 @@ def _worker_off_hint(root: Path, snapshot: dict, *, refused: bool = False) -> st
     paused = snapshot.get("paused") is True
     provider = snapshot.get("provider") or {}
     if provider.get("available") is not True and provider.get("diagnostic_code") == "live_adapter_disabled":
-        from openswap.worker.accounts import provider_of
-        from openswap.worker.guided_setup import execution_off_note
+        from openswap.worker.guided_setup import PAUSE_FIRST
 
         # The live check refuses while the worker takes tasks: pause first unless already paused.
-        note = execution_off_note(provider_of(settings.pinned_account_ref), pause_first=not paused)
-        return printer.next_step(note.removeprefix("Next: "))
+        step = _live_off_step(root, settings)
+        return printer.next_step(step if paused else PAUSE_FIRST + step)
     if paused:
         return printer.next_step("`openswap worker pause --off` to take tasks again.")
     return None
+
+
+def _live_off_step(root: Path, settings) -> str:
+    """Why the worker reports live tasks off, as the live check that fixes it (without `Next: `).
+
+    `live_adapter_disabled` means the pinned kind's live tasks are off, or
+    an account a task may pick (the pin or an allowed one) was never
+    checked. The first such account, in the worker's own order, decides:
+    its kind's live-check path, or `--account <slot>` for that account.
+    """
+    from openswap.worker.accounts import provider_of
+    from openswap.worker.guided_setup import execution_off_note
+    from openswap.worker.live import live_status
+
+    pinned_note = execution_off_note(provider_of(settings.pinned_account_ref)).removeprefix("Next: ")
+    try:
+        choices = worker_account_choices(root)
+        statuses: dict[str, dict] = {}
+        for identity in (settings.pinned_account_ref, *(entry.identity for entry in settings.account_allowlist)):
+            if not isinstance(identity, str):
+                continue
+            provider = provider_of(identity) or "codex"
+            if provider not in statuses:
+                statuses[provider] = live_status(root, provider)
+            status = statuses[provider]
+            if status.get("execution_mode") != "live":
+                return execution_off_note(provider).removeprefix("Next: ")
+            if identity in (status.get("checked_accounts") or ()):
+                continue
+            slot = choices.slot_for(identity)
+            if slot is None:
+                continue
+            selector = f"claude:{slot.number}" if provider == "claude" else slot.number
+            flag = " --provider claude" if provider == "claude" else ""
+            return f"`openswap worker live-check{flag} --account {selector}` to check account {slot.number} too."
+    except Exception:
+        pass
+    return pinned_note
 
 
 def _format_status(snapshot: dict) -> str:

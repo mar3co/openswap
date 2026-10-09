@@ -199,6 +199,43 @@ def test_status_rows_are_marked_and_worded(root, monkeypatch, capsys):
     assert out.count("Next:") == 1 and "`openswap worker enable`" in out
 
 
+def test_status_points_the_live_check_at_an_unchecked_allowed_account(root, monkeypatch, capsys):
+    from openswap.settings import configure_worker_service
+    from openswap.worker import live
+    from tests.test_worker_accounts import ALICE
+
+    configure_worker_service(root, "https://opentag.me", "worker-1")
+    cli.set_worker_account(root, "1")
+    cli.allow_worker_account(root, "claude:4")
+    snapshot = {"enabled": True, "paused": True, "process_state": "running",
+                "provider": {"available": False, "diagnostic_code": "live_adapter_disabled"},
+                "remote_connectivity": "online", "active_job": None}
+    monkeypatch.setattr(cli, "read_status", lambda _root: snapshot)
+    modes = {"codex": {"execution_mode": "live", "checked_accounts": [ALICE]},
+             "claude": {"execution_mode": "live", "checked_accounts": []}}
+    monkeypatch.setattr(live, "live_status", lambda _root, provider="codex": modes[provider])
+    # Codex is live and the pin was checked; the allowed Claude account was not: check it.
+    assert _run(root, "status") == 0
+    out = capsys.readouterr().out
+    assert out.endswith("Next: `openswap worker live-check --provider claude --account claude:4` "
+                        "to check account 4 too.\n")
+    # Taking tasks: the pause still comes first.
+    snapshot["paused"] = False
+    assert _run(root, "status") == 0
+    assert capsys.readouterr().out.endswith("Next: `openswap worker pause`, then `openswap worker live-check "
+                                            "--provider claude --account claude:4` to check account 4 too.\n")
+    # The allowed account's kind has live tasks off altogether: its own path comes first.
+    modes["claude"] = {"execution_mode": "disabled", "checked_accounts": []}
+    assert _run(root, "status") == 0
+    assert capsys.readouterr().out.endswith("`openswap worker claude pin`, `openswap worker claude prepare`, then "
+                                            "`openswap worker live-check --provider claude` to turn on live tasks.\n")
+    # Codex itself off: the pinned path, whatever the allowed accounts.
+    modes["codex"] = {"execution_mode": "disabled", "checked_accounts": []}
+    assert _run(root, "status") == 0
+    assert capsys.readouterr().out.endswith("Next: `openswap worker pause`, then `openswap worker live-check` "
+                                            "to turn on live tasks.\n")
+
+
 def test_status_gives_one_next_step_even_with_a_blocked_folder(root, monkeypatch, capsys):
     from openswap.settings import configure_worker_service
 
