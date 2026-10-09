@@ -148,7 +148,8 @@ def test_account_clear_and_json_pin(root, capsys):
         "provider": "codex", "number": "2", "email": "bob@example.com", "alias": None, "account_ref": BOB,
     }}
     assert _run(root, "account", "--clear") == 0
-    assert "✓ Pin removed; tasks fail until you pin an account." in capsys.readouterr().out
+    # A task that picks an allowed account still runs without a pin; only the others wait.
+    assert "✓ Pin removed; tasks that don't pick an allowed account fail until you pin an account." in capsys.readouterr().out
     assert load_worker_settings(root).pinned_account_ref is None
 
 
@@ -247,7 +248,7 @@ def test_a_removed_pinned_account_is_reported(root, capsys):
     (root / "codex" / "sequence.json").write_text(json.dumps(roster))
     assert _run(root, "account") == 0
     out = capsys.readouterr().out
-    assert "✗ The pinned account is gone; tasks fail until you pin another." in out
+    assert "✗ The pinned account is gone; tasks that don't pick an allowed account fail until you pin another." in out
     assert "Next: `openswap worker account 2` to pin an account." in out
     assert _run(root, "account", "--json") == 0
     assert json.loads(capsys.readouterr().out)["pinned_missing"] is True

@@ -2224,7 +2224,7 @@ def _format_accounts(choices: AccountChoices, next_step: str | None = None) -> s
         lines.append(printer.heading("Also allowed for tasks to pick"))
         lines.extend(printer.columns([_allowlist_row(entry, choices) for entry in choices.allowlist]))
     if choices.pinned_missing:
-        lines.append(f"{printer.MARK_BAD} The pinned account is gone; tasks fail until you pin another.")
+        lines.append(f"{printer.MARK_BAD} The pinned account is gone; {_NO_PIN} until you pin another.")
         lines.append(printer.next_step(f"`openswap worker account {_example(choices)}` to pin an account."))
     elif choices.pinned_ref is None:
         lines.append(printer.next_step(f"`openswap worker account {_example(choices)}` to pin the account "
@@ -2480,7 +2480,7 @@ def _account_command(root: Path, args) -> int:
     else:
         payload = {"accepted": True, "pinned": _choice_payload(choice)}
         if choice is None:
-            human = (f"{printer.MARK_OK} Pin removed; tasks fail until you pin an account.\n"
+            human = (f"{printer.MARK_OK} Pin removed; {_NO_PIN} until you pin an account.\n"
                      + printer.next_step("`openswap worker account <slot>` to pin one."))
         else:
             human = f"{printer.MARK_OK} Pinned {_kind(choice)} {choice.label()}."
@@ -2494,6 +2494,10 @@ def _account_command(root: Path, args) -> int:
     else:
         print(_ACCOUNT_MESSAGES.get(code, f"Could not pin that account ({code})."), file=sys.stderr)
     return 1
+
+
+# Without a pin, a task that picks an allowed account still runs; every other task fails.
+_NO_PIN = "tasks that don't pick an allowed account fail"
 
 
 def _kind(choice) -> str:
