@@ -1608,7 +1608,10 @@ Built (PR #93, stacked on #90):
   not permitted` (macOS 27.0.1). Passing the token at launch: the CLI accepts
   `CLAUDE_CODE_OAUTH_TOKEN` / `_FILE_DESCRIPTOR`, but never refreshes or
   persists such a token, so OpenSwap would have to read the credential and own
-  its rotation, which the decision memo rules out; not adopted. Result: under
+  its rotation, which the decision memo rules out; not adopted. Every job
+  gets flag-level deny rules (`Read(//…/.credentials.json)`, `Edit(…)`) that
+  keep Claude's file tools off the credentials file in every mode (the live
+  check measures one in `bypassPermissions` on a stand-in file). Result: under
   `follow`, a Claude task's shell can read that account's own sign-in (and
   nothing else of the kind); `no-shell` prevents it. The setup summary says so
   in one line for a Claude account with the shell allowed. Codex's shell

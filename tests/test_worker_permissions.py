@@ -118,6 +118,21 @@ def test_the_per_mac_limit_maps_to_claude_arguments():
         claude_permission_args("everything")
 
 
+def test_the_credentials_file_gets_deny_rules_for_the_file_tools_in_every_mode():
+    rules = permissions.credential_rules(["/b/sessions/4-a_b.com/.credentials.json"])
+    assert rules == ["Read(//b/sessions/4-a_b.com/.credentials.json)",
+                     "Edit(//b/sessions/4-a_b.com/.credentials.json)"]
+    args = claude_permission_args("read-only", {"permissions": {"deny": ["Bash(rm:*)"], "defaultMode": "plan"}},
+                                  ["/b/c.json"])
+    settings = json.loads(args[args.index("--settings") + 1])
+    # Added to the live check's own rules, never replacing them.
+    assert settings["permissions"] == {"defaultMode": "plan",
+                                       "deny": ["Bash(rm:*)", "Read(//b/c.json)", "Edit(//b/c.json)"]}
+    for bad in ("relative/.credentials.json", "/a(b)/c", "/a\nb"):
+        with pytest.raises(ValueError):
+            permissions.credential_rules([bad])
+
+
 # -- Codex: the isolated home's permissions.json ------------------------------------------
 
 
@@ -204,6 +219,33 @@ def test_the_permissions_command_shows_and_sets_the_limit(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out) == {"permission_override": "no-shell"}
     with pytest.raises(SystemExit):
         cli.main(["permissions", "everything"], backup_root=tmp_path)
+
+
+def test_the_limit_is_written_under_the_live_lock(tmp_path, monkeypatch):
+    # Every launch holds the live lock from reading the limit until its job is
+    # released, so a limit that was set can no longer be overtaken by one.
+    from contextlib import contextmanager
+
+    from openswap.worker import live as live_module
+
+    held = []
+
+    @contextmanager
+    def lock(root, **kwargs):
+        held.append(True)
+        try:
+            yield
+        finally:
+            held.append(False)
+
+    def write(root, value):
+        assert held == [True]
+        return value
+
+    monkeypatch.setattr(live_module, "live_lock", lock)
+    monkeypatch.setattr(settings_module, "write_permission_override", write)
+    assert cli.set_permission_override(tmp_path, "read-only") == "read-only"
+    assert held == [True, False]
 
 
 def test_status_shows_the_limit_only_when_it_is_not_the_default(tmp_path, monkeypatch, capsys):

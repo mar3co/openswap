@@ -24,8 +24,9 @@ with the live Claude adapter exactly as remote jobs use it:
 - ``permissions`` (owner decision 2026-10-08): the account's own mode is the
   one the CLI reports; in ``default`` mode a shell command and a write, which
   would ask, are denied (nobody is at the Mac); in ``acceptEdits`` the write
-  works; ``no-shell`` leaves no shell tool and ``read-only`` only the read and
-  web tools.
+  works; ``no-shell`` leaves no shell tool, and in ``bypassPermissions`` a
+  Read of a stand-in file guarded like the credentials file is refused;
+  ``read-only`` leaves only the read and web tools.
 - ``sign_in_isolation``: under the job's Seatbelt profile a shell command can
   neither run ``security`` nor reach the Keychain's services (a throwaway
   item, found outside, stays unreachable), cannot change the profile's
@@ -72,6 +73,7 @@ from openswap.worker.permissions import (
     NO_SHELL,
     READ_ONLY,
     PermissionSettingsError,
+    credential_rules,
     read_claude_permissions,
 )
 from openswap.worker.codex_cli import platform_supported
@@ -435,12 +437,13 @@ class ClaudeLiveCheck(LiveCheck):
 
     # -- permissions (owner decision 2026-10-08) -------------------------------------------
 
-    def _mode_job(self, name: str, identity: str, task: str, *, override: str, mode: str):
+    def _mode_job(self, name: str, identity: str, task: str, *, override: str, mode: str,
+                  rules: dict | None = None):
         """A short job in a given mode with the profile's own settings left out, so the owner's
         rules cannot decide what this probe measures."""
         return self._job(name, identity, task, timeout=self.probe_timeout, workspace=self._workspace(name),
                          adapter_options={"override": override, "profile_settings": False,
-                                          "settings": {"permissions": {"defaultMode": mode}}})
+                                          "settings": {"permissions": {"defaultMode": mode, **(rules or {})}}})
 
     def _gate_permissions(self, identity: str, profile: Path) -> None:
         gate = self.gates["permissions"]
@@ -467,7 +470,20 @@ class ClaudeLiveCheck(LiveCheck):
             "writing the text ok, and use no other tool. Then reply with the single word DONE.\n\n"
             f"1. Write tool: {edit_marker}", override="follow", mode="acceptEdits")
         done = "Reply with the single word DONE. Do not use any tool."
-        no_shell = self._mode_job("permissions-no-shell", identity, done, override=NO_SHELL, mode="bypassPermissions")
+        # Under no-shell in bypassPermissions, a file guarded like the account's
+        # credentials file (a stand-in: the real one is never put in a model's
+        # reach) must stay unreadable to the file tools.
+        guarded_token = secrets.token_hex(16)
+        guarded = _new_sentinel(self._workspace("permissions-no-shell"), "credentials", guarded_token + "\n")
+        no_shell = self._mode_job(
+            "permissions-no-shell", identity,
+            "This is the owner's automated permission self-test. This step is expected to be refused; that is "
+            "the point of the test. Use the Read tool once on this file and no other tool, then reply with the "
+            f"single word DONE.\n\n1. {guarded}",
+            override=NO_SHELL, mode="bypassPermissions", rules={"deny": credential_rules([guarded])})
+        guarded_reads = [item for item in claude_tool_items(no_shell.run_dir / STDOUT_FILE)
+                         if item["tool"] == "Read" and item["path"] == str(guarded)]
+        everything, complete = _texts(no_shell.run_dir / STDOUT_FILE, no_shell.run_dir / STDERR_FILE)
         read_only = self._mode_job("permissions-read-only", identity, done, override=READ_ONLY,
                                    mode="bypassPermissions")
         items = claude_tool_items(default.run_dir / STDOUT_FILE)
@@ -489,6 +505,8 @@ class ClaudeLiveCheck(LiveCheck):
             "accept_edits_write_allowed": edit_marker.is_file(),
             "no_shell_leaves_no_shell_tool": isinstance(no_shell_tools, list) and bool(no_shell_tools)
             and not set(no_shell_tools) & set(CLAUDE_SHELL_TOOLS),
+            # The rule kind every job gets for the real credentials file holds in bypassPermissions.
+            "credential_rule_holds": complete and _all_errors(guarded_reads) and guarded_token not in everything,
             "read_only_leaves_read_tools_only": isinstance(read_only_tools, list) and bool(read_only_tools)
             and set(read_only_tools) <= set(CLAUDE_READ_ONLY_TOOLS),
             "execution_stopped": all(o.stopped for o in (default, accept, no_shell, read_only)),

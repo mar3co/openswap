@@ -255,11 +255,13 @@ def test_argv_follows_the_profiles_own_settings_and_denies_every_prompt(tmp_path
     assert argv[argv.index("--output-format") + 1] == "stream-json"
     assert "--strict-mcp-config" in argv and "--no-session-persistence" in argv and "--disable-slash-commands" in argv
     assert argv[argv.index("--add-dir") + 1] == str(source.resolve())
-    # No tool list or mode of OpenSwap's own (the default per-Mac limit is "follow").
+    # No tool list or mode of OpenSwap's own (the default per-Mac limit is "follow")...
     for forbidden in ("--restricted", "--tools", "--allowedTools", "--disallowedTools", "--permission-mode",
-                      "--settings", "--model", "--dangerously-skip-permissions",
-                      "--allow-dangerously-skip-permissions", "--mcp-config"):
+                      "--model", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+                      "--mcp-config"):
         assert forbidden not in argv
+    # ...only deny rules keeping the file tools off the credentials file, in every mode.
+    assert json.loads(argv[argv.index("--settings") + 1]) == {"permissions": {"deny": _credential_rules(root)}}
     env = launch["env"]
     assert env["CLAUDE_CONFIG_DIR"] == str(claude_exec.profile_for(root, IDENTITY))
     assert "ANTHROPIC_API_KEY" not in env and env["DISABLE_AUTOUPDATER"] == "1"
@@ -277,12 +279,18 @@ def test_argv_follows_the_profiles_own_settings_and_denies_every_prompt(tmp_path
     assert "Find it" in launch["stdin"]
 
 
+def _credential_rules(root):
+    profile = claude_exec.profile_for(root, IDENTITY)
+    paths = sorted({str(profile / ".credentials.json"), str(profile.resolve() / ".credentials.json")})
+    return [rule for path in paths for rule in (f"Read(/{path})", f"Edit(/{path})")]
+
+
 @pytest.mark.parametrize("override, expected", [
     ("no-shell", ["--disallowedTools", "Bash,PowerShell,Monitor,REPL,BashOutput,KillShell",
-                  "--settings", '{"disableAllHooks":true}']),
-    ("read-only", ["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--settings", '{"disableAllHooks":true}']),
-    ("follow", []),
-    ("unreadable", ["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--settings", '{"disableAllHooks":true}']),
+                  "--settings", {"disableAllHooks": True}]),
+    ("read-only", ["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--settings", {"disableAllHooks": True}]),
+    ("follow", ["--settings", {}]),
+    ("unreadable", ["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--settings", {"disableAllHooks": True}]),
 ])
 def test_the_per_mac_limit_narrows_the_tools(tmp_path, override, expected):
     from openswap.settings import write_permission_override
@@ -300,7 +308,8 @@ def test_the_per_mac_limit_narrows_the_tools(tmp_path, override, expected):
     run = adapter.start(job_record(), workspace(root), worker_epoch=1)
     argv = launcher.launches[0]["argv"]
     tail = argv[argv.index("--no-session-persistence") + 1:]
-    assert tail == expected
+    settings = {**expected[-1], "permissions": {"deny": _credential_rules(root)}}
+    assert tail[:-1] == expected[:-1] and json.loads(tail[-1]) == settings
     drain(adapter, run)
     summary = json.loads((Path(root) / "worker" / "runs" / ("a" * 32) / "summary.json").read_text())
     assert summary["permissions"]["override"] == ("read-only" if override == "unreadable" else override)
@@ -663,6 +672,7 @@ class SimulatedClaudeMac(FakeLaunch):
         mode = (overlay.get("permissions", {}).get("defaultMode")
                 or profile.get("permissions", {}).get("defaultMode") or "auto")
         allow = overlay.get("permissions", {}).get("allow", []) + profile.get("permissions", {}).get("allow", [])
+        self._deny = overlay.get("permissions", {}).get("deny", []) + profile.get("permissions", {}).get("deny", [])
         tools = list(self.TOOLS)
         if "--tools" in argv:
             tools = argv[argv.index("--tools") + 1].split(",")
@@ -676,6 +686,8 @@ class SimulatedClaudeMac(FakeLaunch):
         inside = target.startswith(str(cwd) + "/") or (tool == "Bash" and str(cwd) in target)
         if tool not in tools:
             return False, f"No such tool: {tool}"
+        if tool == "Read" and f"Read(/{target})" in getattr(self, "_deny", []):
+            return False, "Permission to read this file has been denied."  # a deny rule, in any mode
         if tool == "Read":
             return (True, Path(target).read_text()) if inside else (False, "Permission denied")
         permitted = mode == "bypassPermissions" or tool in allow or (
@@ -837,7 +849,14 @@ class IgnoresTheModeMac(SimulatedClaudeMac):
         return super()._attempt(tool, target, cwd, "bypassPermissions", tools, allow)
 
 
+class IgnoresDenyRulesMac(SimulatedClaudeMac):
+    def _attempt(self, tool, target, cwd, mode, tools, allow):
+        self._deny = []
+        return super()._attempt(tool, target, cwd, mode, tools, allow)
+
+
 @pytest.mark.parametrize("mac_class, gate, key", [
+    (IgnoresDenyRulesMac, "permissions", "credential_rule_holds"),
     (LeakyKeychainMac, "sign_in_isolation", "keychain_services_denied"),
     (LeakyKeychainMac, "sign_in_isolation", "profile_settings_write_denied"),
     (IgnoresTheModeMac, "permissions", "headless_shell_denied"),

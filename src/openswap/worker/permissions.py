@@ -206,14 +206,36 @@ def write_claude_permissions(profile: Path, *, copied: dict | None = None, mode:
     return _summary(block)
 
 
-def claude_permission_args(override: str, overlay: dict | None = None) -> list[str]:
-    """Extra ``claude`` arguments for the per-Mac limit (none for ``follow``).
+def credential_rules(paths) -> list[str]:
+    """Deny rules keeping Claude Code's file tools off ``paths`` (absolute, ``//`` form).
+
+    Claude Code must read its own credentials file, so the Seatbelt profile
+    cannot hide it; these rules keep the Read, Edit and search tools off it in
+    every mode (deny rules win over allow rules and the mode). A shell command
+    is not bound by them, which is why ``no-shell`` is the limit that protects
+    the sign-in.
+    """
+    rules = []
+    for path in paths:
+        text = str(path)
+        if not text.startswith("/") or any(ch in text for ch in "()\n"):
+            raise ValueError("unsupported path for a permission rule")
+        rules += [f"Read(/{text})", f"Edit(/{text})"]
+    return rules
+
+
+def claude_permission_args(override: str, overlay: dict | None = None, protected=()) -> list[str]:
+    """Extra ``claude`` arguments: the per-Mac limit and the ``protected`` files' deny rules.
 
     ``overlay`` is flag-level settings (higher precedence than the profile's),
-    used only by the live check to measure specific modes.
+    used only by the live check to measure specific modes. Flag-level deny
+    rules add to the profile's own.
     """
-    settings = dict(overlay or {})
+    settings = json.loads(json.dumps(overlay or {}))  # a deep copy
     args: list[str] = []
+    if protected:
+        block = settings.setdefault("permissions", {})
+        block["deny"] = [*block.get("deny", []), *credential_rules(protected)]
     if override == NO_SHELL:
         args += ["--disallowedTools", ",".join(CLAUDE_SHELL_TOOLS)]
         settings["disableAllHooks"] = True

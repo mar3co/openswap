@@ -964,7 +964,9 @@ its `settings.json` is one Claude Code would ignore (see
 --output-format stream-json --verbose --setting-sources user
 --permission-prompts none --strict-mcp-config --disable-slash-commands
 --no-session-persistence`, plus the per-Mac limit's arguments (none by
-default) and `--add-dir` for each approved read-only source, with the task on
+default), `--settings` with deny rules that keep the file tools (`Read`,
+`Edit` and the search tools) off the profile's credentials file in every
+mode, and `--add-dir` for each approved read-only source, with the task on
 stdin and an allowlisted environment (no API keys). No tool list or mode is
 OpenSwap's: Claude Code takes them from the profile's `settings.json`.
 The Seatbelt profile holds whatever the mode, `bypassPermissions` included.
@@ -996,8 +998,11 @@ key, a reported permission mode). The `permissions` gate runs four short
 jobs with the profile's own settings left out (`--setting-sources ""`) so the
 owner's rules cannot decide them: in `default` mode a shell command and a
 write, which would ask, must both be refused; in `acceptEdits` the write must
-work; under `no-shell` no shell tool may be listed and under `read-only` only
-the read and web tools; and the research job's mode must be the profile's.
+work; under `no-shell` (in `bypassPermissions`) no shell tool may be listed
+and a Read of a stand-in file guarded by the same kind of deny rule as the
+credentials file must be refused without its content appearing anywhere;
+under `read-only` only the read and web tools may be listed; and the research
+job's mode must be the profile's.
 The `sign_in_isolation` gate runs a shell directly under the job's Seatbelt
 profile and environment: `security` must not start, a throwaway login
 Keychain item (found outside, removed after) must stay unreachable through
@@ -1058,16 +1063,19 @@ instead of a tool list OpenSwap picks
   `bypassPermissions` and `danger-full-access`. Outside them a session can do
   what `claude` or `codex` could do there, for example read files in your
   home folder that its mode allows.
-- **The account's own sign-in.** A shell command in a Claude task can read
-  that account's own sign-in: Claude Code reads it from the profile's
-  credentials file, and everything it starts runs in the same sandbox.
-  Claude Code's own bash sandbox, which could hide it, cannot start inside
-  OpenSwap's (macOS refuses a nested `sandbox-exec`: `sandbox_apply:
-  Operation not permitted`), and handing the CLI its token at launch
-  (`CLAUDE_CODE_OAUTH_TOKEN`) would mean OpenSwap reads the credential and
-  takes over its refresh, which the decision memo rules out. `no-shell` (or
-  `read-only`) prevents it; the setup summary and the live check say so. A
-  Codex shell command cannot read its account's `auth.json`.
+- **The account's own sign-in.** Claude Code reads it from the profile's
+  credentials file, so the Seatbelt profile cannot hide that file from the
+  session. Claude's file tools are kept off it by deny rules OpenSwap adds to
+  every job (deny rules hold in every mode; the live check measures one in
+  `bypassPermissions`). A shell command in a Claude task is not bound by
+  them and can read it, because everything Claude Code starts runs in the
+  same sandbox: Claude Code's own bash sandbox, which could hide it, cannot
+  start inside OpenSwap's (macOS refuses a nested `sandbox-exec`:
+  `sandbox_apply: Operation not permitted`), and handing the CLI its token
+  at launch (`CLAUDE_CODE_OAUTH_TOKEN`) would mean OpenSwap reads the
+  credential and takes over its refresh, which the decision memo rules out.
+  `no-shell` (or `read-only`) prevents it; the setup summary and the live
+  check say so. A Codex shell command cannot read its account's `auth.json`.
 
 **Readiness report.** After each registration, and whenever an approved
 folder, its label or the execution mode changes (by local fingerprint, like

@@ -36,9 +36,10 @@ recovery and retention this class reuses:
   other than this profile and the job folder; and no Keychain at all (no
   ``security`` command, no Keychain service), so a shell command cannot read
   another account's sign-in, the default login or the worker's own keys. Claude
-  Code then keeps this account's sign-in in the profile's credentials file,
-  which a shell command in the task can read (macOS refuses to start Claude
-  Code's own bash sandbox inside this one); ``no-shell`` prevents that.
+  Code then keeps this account's sign-in in the profile's credentials file.
+  Deny rules keep Claude's file tools off that file in every mode, but a
+  shell command in the task can read it (macOS refuses to start Claude Code's
+  own bash sandbox inside this one); ``no-shell`` prevents that.
 - **Result.** The ``result`` message's text becomes ``result.md``, published
   only after the stop is proven, like Codex's final message.
 """
@@ -447,7 +448,15 @@ class ClaudeCodeAdapter(CodexExecAdapter):
         except PermissionSettingsError:
             raise ProviderLaunchRefused("provider_unavailable") from None
         override = self.override()
-        self._permission_args = claude_permission_args(override, self._settings_for_check)
+        # The credentials file stays readable to Claude Code itself (the
+        # Seatbelt profile cannot tell it from its tools): deny rules keep the
+        # file tools off it, as spelled and as resolved.
+        credentials = {str(profile / CREDENTIALS_FILE), str(profile.resolve() / CREDENTIALS_FILE)}
+        try:
+            self._permission_args = claude_permission_args(override, self._settings_for_check,
+                                                           tuple(sorted(credentials)))
+        except ValueError:
+            raise ProviderLaunchRefused("provider_unavailable") from None
         self._launch_summary = {"permissions": {**permissions.to_dict(), "override": override,
                                                 "for_check": self._settings_for_check is not None,
                                                 "profile_settings": self._profile_settings}}

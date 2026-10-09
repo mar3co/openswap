@@ -1666,10 +1666,15 @@ def set_permission_override(backup_root: Path, value: str) -> str:
     """Set the per-Mac limit. Only this Mac's owner can: no protocol message reaches it.
 
     It applies from the next launch; a task already running keeps what it started with.
+    Written under the live lock, which every launch holds from reading the
+    limit until its job is released, so once this returns no launch that read
+    the old limit can still start (the same order as ``live enable``/``disable``).
     """
     from openswap.settings import write_permission_override
+    from openswap.worker.live import live_lock
 
-    return write_permission_override(backup_root, value)
+    with live_lock(backup_root):
+        return write_permission_override(backup_root, value)
 
 
 def permissions_text(value: str) -> str:
