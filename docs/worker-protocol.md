@@ -979,7 +979,8 @@ It allows writes only to the job's output folder (or the task's worktree and
 what git needs beside it), the account's profile, the run's temporary folder
 and this user's cache and temporary folders, and never to the profile files
 that configure or instruct later sessions (`settings.json`,
-`settings.local.json`, `CLAUDE.md`, the cached server policy (`remote-settings.json`,
+`settings.local.json`, `CLAUDE.md`, `.claude.json` (per-project approvals, and the
+account the launch checks), the cached server policy (`remote-settings.json`,
 `policy-limits.json`), `scheduled_tasks.json`, `rules/`, `agents/`, `agent-memory/`,
 `commands/`, `skills/`, `hooks/`, `output-styles/`, `plugins/`, and `projects/`,
 where each project's auto-memory lives, entries included; nor may the profile
@@ -1093,8 +1094,8 @@ instead of a tool list OpenSwap picks
   rules hold in every mode, and the live check measures them in
   `bypassPermissions`). A shell command in a Claude task is not bound by
   them and can read it, or replace it with another sign-in that later tasks
-  on this account would then use (the launch checks the account the profile
-  records, which a shell can rewrite too), because everything Claude Code
+  on this account would then use (the launch checks the account recorded in
+  `.claude.json`, which the shell cannot change, but not whose token the file holds), because everything Claude Code
   starts runs in the same sandbox and Claude Code must be able to write the
   file to refresh its token. This is what a shell command run by local
   `claude` can do to its Keychain item as well. Claude Code's own bash

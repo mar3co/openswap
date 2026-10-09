@@ -1624,8 +1624,8 @@ Built (PR #93, stacked on #90):
   check measures one in `bypassPermissions` on a stand-in file). Result: under
   `follow`, a Claude task's shell can read that account's own sign-in, or
   replace it with another sign-in later tasks on the account would use (the
-  launch's identity check reads `.claude.json`, which the shell can rewrite
-  too; Claude Code must write both, and `claude auth status` only reports
+  launch's identity check reads `.claude.json`, now unwritable from a job, but
+  cannot tell whose token the credentials file holds, and Claude Code must write that file; `claude auth status` only reports
   them), and nothing else of the kind; `no-shell` prevents it. Also tried:
   SBPL `(with no-sandbox)` does let a Mach-O leave the outer profile for a
   stricter one, but it does not apply to a script, and OpenSwap ships no

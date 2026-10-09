@@ -110,7 +110,9 @@ CLAUDE_READ_ONLY_TOOLS = ("Read", "Grep", "Glob", "WebSearch", "WebFetch")
 # Also the cached server policy and its limits, which an ordinary (kickoff or
 # interactive) session on this profile would load as managed policy, and the
 # files that schedule or start work later.
-CLAUDE_PROFILE_CONFIG = ("settings.json", "settings.local.json", "CLAUDE.md", "CLAUDE.local.md",
+# ``.claude.json`` too: it keeps per-project approvals (``projects[…].allowedTools``)
+# and the account the launch's identity check reads.
+CLAUDE_PROFILE_CONFIG = (".claude.json", "settings.json", "settings.local.json", "CLAUDE.md", "CLAUDE.local.md",
                          "remote-settings.json", "remote-settings-consent.json", "policy-limits.json",
                          "scheduled_tasks.json", "monitors.json", "daemon.json", "cowork_settings.json",
                          "keybindings.json")
