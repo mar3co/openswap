@@ -898,3 +898,34 @@ def test_adding_a_folder_of_repos_again_keeps_the_one_saved(root, home):
     child = cli.add_work_folder(root, github / "openswap")
     assert child.added is False and child.workspace.workspace_id == "openswap"
     assert len(load_worker_settings(root).workspaces) == 1
+
+
+
+def test_a_queued_repo_task_holds_its_folder_of_repos(root, home):
+    """A task sent to a repo in a folder of repos uses the repo's ID, never the
+    parent's: the parent's mode and approval stay while it may still run."""
+    from openswap.worker.models import JobState
+    from openswap.worker.journal import LocalJobStore
+
+    github = home / "GitHub"
+    _repo(github / "openswap")
+    _repo(github / "opentag")
+    parent = cli.add_work_folder(root, github).workspace
+    other = _repo(home / "elsewhere" / "tool")
+    cli.add_work_folder(root, other)
+    runtime = _runtime(root)
+    store = LocalJobStore(root)
+    epoch = store.current_epoch()
+    job = store.create(_submission(workspace_id="opentag"), owner_ref="local-user", worker_epoch=epoch)
+    with pytest.raises(cli.WorkspaceError) as refused:
+        cli.set_workspace_mode(root, parent.workspace_id, "direct")
+    assert refused.value.code == "workspace_in_use"
+    with pytest.raises(cli.WorkspaceError) as refused:
+        cli.remove_worker_workspace(root, parent.workspace_id)
+    assert refused.value.code == "workspace_in_use"
+    assert runtime._resolve_workspace("opentag", job.job_id).branch is not None  # still a worktree
+    store.transition(job.job_id, expected_states=(JobState.QUEUED,), new_state=JobState.CANCELLED,
+                     worker_epoch=epoch, expected_generation=job.generation)
+    assert cli.set_workspace_mode(root, parent.workspace_id, "direct").mode == "direct"
+    cli.remove_worker_workspace(root, parent.workspace_id)
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["tool"]
