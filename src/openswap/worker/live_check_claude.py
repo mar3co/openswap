@@ -10,20 +10,35 @@ with the live Claude adapter exactly as remote jobs use it:
   pinned account before and after, and an authenticated turn ran there.
 - ``default_login_unchanged``: the default login's files and its Keychain
   item's attributes (never its secret) are unchanged.
-- ``tool_surface``: no managed Claude Code configuration, and the CLI reported
-  exactly the research tools, no MCP server, and no API key in use.
+- ``tool_surface``: no managed Claude Code configuration, no MCP server, no
+  API key in use, and the CLI reported the permission mode it runs in.
 - ``sandbox_wrapper``: the Seatbelt profile the job runs under allows the job
   folder and denies writes outside it, ``/tmp`` and reads of OpenSwap's
-  backup root, tested with ``sandbox-exec`` directly.
+  backup root, and that a launchd agent or an app opened through
+  LaunchServices cannot start from it, tested with ``sandbox-exec`` directly.
 - ``research_run``: a real web-research job succeeds with structured events,
   web search and a cited URL, and stops with proof.
-- ``sandbox_exec``: a real job is asked to read a file in its folder (positive
+- ``sandbox_exec``: a real job in ``bypassPermissions`` (so only the Seatbelt
+  profile can refuse) is asked to read a file in its folder (positive
   control), a file outside it, a sentinel in its own profile and the default
-  login's ``~/.claude.json``; only the first may succeed, only research tools
-  may be used, and no write tool may exist.
-- ``stop`` and ``kill_recovery``: as for Codex, without a detached helper
-  (Claude jobs have no shell): Stop leaves no member of the job's coalition
-  and recovery stops a job whose worker was killed.
+  login's ``~/.claude.json``; only the first may succeed.
+- ``permissions`` (owner decision 2026-10-08): the account's own mode is the
+  one the CLI reports; in ``default`` mode a shell command and a write, which
+  would ask, are denied (nobody is at the Mac); in ``acceptEdits`` the write
+  works; ``no-shell`` leaves no shell tool, and in ``bypassPermissions`` a
+  Read of a stand-in file guarded like the credentials file is refused;
+  ``read-only`` leaves only the read and web tools.
+- ``sign_in_isolation``: under the job's Seatbelt profile a shell command can
+  neither run ``security`` nor reach the Keychain's services (a throwaway
+  item, found outside, stays unreachable), cannot change the profile's
+  settings, and whether it can read the account's own credentials file is
+  recorded as it is (it can: macOS will not start Claude Code's own bash
+  sandbox inside OpenSwap's).
+- ``stop`` and ``kill_recovery``: as for Codex, without a detached helper:
+  Stop leaves no member of the job's coalition and recovery stops a job whose
+  worker was killed.
+- ``worktree``: as for Codex, in ``bypassPermissions`` with the shell, so the
+  write scope alone keeps the owner's copy, branch and git config unchanged.
 """
 
 from __future__ import annotations
@@ -32,7 +47,9 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import signal
+import socket
 import subprocess
 import time
 import uuid
@@ -42,12 +59,24 @@ from openswap.settings import load_worker_settings
 from openswap.worker import claude_cli
 from openswap.worker.accounts import AccountPinError, account_in_roster, resolve_account_selector
 from openswap.worker.claude_exec import (
-    RESEARCH_TOOLS,
+    CREDENTIALS_FILE,
+    SECURITY_TOOL,
     ClaudeCodeAdapter,
+    claude_env,
+    credentials_in_file,
     managed_claude_config,
     profile_for,
     profile_identity,
     seatbelt_profile,
+)
+from openswap.worker.permissions import (
+    CLAUDE_READ_ONLY_TOOLS,
+    CLAUDE_SHELL_TOOLS,
+    NO_SHELL,
+    READ_ONLY,
+    PermissionSettingsError,
+    credential_rules,
+    read_claude_permissions,
 )
 from openswap.worker.codex_cli import platform_supported
 from openswap.worker.codex_exec import runs_root
@@ -57,7 +86,8 @@ from openswap.worker.live_check import (
     CheckRefused, LiveCheck, _new_sentinel, _texts, lease_release_hint, login_snapshot,
 )
 
-WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell"})
+# Research needs web search whatever the account's mode (flag-level allow rules).
+RESEARCH_SETTINGS = {"permissions": {"allow": ["WebSearch", "WebFetch"]}}
 LONG_TASK = (
     "Research, thoroughly and slowly, how the Python packaging ecosystem evolved from distutils to "
     "pyproject.toml. Read at least ten different web pages before answering, and cite each with its URL."
@@ -125,29 +155,58 @@ class ClaudeLiveCheck(LiveCheck):
                                      if item["tool"]}
         return outcome
 
-    # A Claude work task has file tools only (no shell: see claude_exec.WORK_TOOLS).
-    _shell_steps = False
+    # A Claude work task may have the shell too, when the account allows it:
+    # files are written with the Write tool, the branch update is a shell command.
+    _shell_steps = True
 
     def _work_attempts(self, outcome) -> list[tuple[str, bool]]:
-        return [(item["path"], item["is_error"] is False)
-                for item in claude_tool_items(outcome.run_dir / STDOUT_FILE)
-                if item["tool"] in {"Write", "Edit"} and item["is_error"] is not None]
+        attempts = []
+        for item in claude_tool_items(outcome.run_dir / STDOUT_FILE):
+            if item["is_error"] is None:
+                continue  # no result yet: proves nothing
+            if item["tool"] in {"Write", "Edit"}:
+                attempts.append((item["path"], item["is_error"] is False))
+            elif item["tool"] == "Bash":
+                attempts.append((item["command"], item["is_error"] is False))
+        return attempts
 
     def _worktree_task(self, steps) -> str:
-        listing = "\n".join(f"{index}. {path}" for index, (_, _, path) in enumerate(steps, 1))
+        lines = []
+        for index, (_, command, path) in enumerate(steps, 1):
+            lines.append(f"{index}. Write tool: {path}" if path is not None else f"{index}. Bash tool: {command}")
         return (
-            "This is the owner's automated permission self-test for a work folder. Some of these writes "
-            "are expected to fail; that is the point of the test. Use the Write tool once on each of these "
-            "files, in order, writing the text ok, and continue after failures. Do not use any other tool. "
-            "Then reply with the single word DONE.\n\n" + listing
+            "This is the owner's automated permission self-test for a work folder. Some of these steps "
+            "are expected to fail; that is the point of the test. Do each step below once, in order, with "
+            "the tool it names: for a Write step write the text ok to that file; for a Bash step run the "
+            "command exactly as given. Continue after failures and do not use any other tool. Then reply "
+            "with the single word DONE.\n\n" + "\n".join(lines)
         )
 
-    def adapter(self) -> ClaudeCodeAdapter:
+    def adapter(self, *, override: str | None = None, settings: dict | None = None,
+                profile_settings: bool = True) -> ClaudeCodeAdapter:
+        """The live adapter as jobs use it; ``override``/``settings`` measure given settings
+        (``profile_settings=False`` leaves the profile's own out)."""
         extra = {"live_sessions": self._live_sessions} if self._live_sessions is not None else {}
         return ClaudeCodeAdapter(
             self.root, containment=self.containment, verify=self._verify, mode=lambda: "live",
-            bind_to_opt_in=False, monotonic=self._monotonic, sleep=self._sleep, home=self._home, **extra,
+            bind_to_opt_in=False, monotonic=self._monotonic, sleep=self._sleep, home=self._home,
+            override=(lambda: override) if override is not None else None, settings_for_check=settings,
+            profile_settings=profile_settings, **extra,
         )
+
+    def _research_options(self) -> dict:
+        return {"settings": RESEARCH_SETTINGS}
+
+    def _probe_options(self) -> dict:
+        """The Read probes: every read allowed by Claude Code, so only the Seatbelt profile can refuse."""
+        # The profile's own settings are left out: its deny rules must not decide a boundary probe.
+        return {"override": "follow", "profile_settings": False,
+                "settings": {"permissions": {"defaultMode": "bypassPermissions", "allow": ["Read"]}}}
+
+    def _widest_options(self) -> dict:
+        """The widest an account can allow: ``bypassPermissions`` with the shell and every write."""
+        return {"override": "follow", "profile_settings": False, "settings": {"permissions": {
+            "defaultMode": "bypassPermissions", "allow": ["Read", "Write", "Edit", "Bash"]}}}
 
     # -- preflight and evidence hooks ---------------------------------------------
 
@@ -181,9 +240,16 @@ class ClaudeLiveCheck(LiveCheck):
                                "account claude:<slot>`, or pass --account claude:<slot>.")
         identity = choice.account_ref
         profile = profile_for(self.root, identity)
-        if profile is None or profile_identity(profile) != identity:
+        if profile is None or profile_identity(profile) != identity or not credentials_in_file(profile):
+            # Signed in only in the Keychain counts as not ready: jobs cannot reach it.
             raise CheckRefused("profile_not_ready", f"Claude account {choice.number} is not signed in for "
                                f"tasks. Next: `openswap worker claude prepare claude:{choice.number}`.")
+        try:
+            read_claude_permissions(profile)
+        except PermissionSettingsError:
+            raise CheckRefused("profile_settings_invalid", f"Claude account {choice.number}'s settings.json is "
+                               "one tasks refuse (not valid JSON, a symlink, or permission keys Claude Code "
+                               "rejects). Fix or remove it first.") from None
         gate = self.gates["pinned_cli"]
         gate.passed = True
         gate.detail = {"version": pinned.version, "binary_sha256": pinned.binary_sha256}
@@ -228,31 +294,35 @@ class ClaudeLiveCheck(LiveCheck):
             ("sandbox (sandbox-exec)", lambda: self._gate_sandbox_wrapper(pinned, profile)),
             ("research job", lambda: self._gate_research(identity)),
             ("sandbox (claude -p)", lambda: self._gate_sandbox_exec(identity, profile)),
+            ("permissions", lambda: self._gate_permissions(identity, profile)),
+            ("sign-in isolation", lambda: self._gate_sign_in_isolation(profile)),
             ("stop", lambda: self._gate_stop(identity)),
             ("kill and recovery", lambda: self._gate_kill_recovery(identity)),
             ("work folder (worktree)", lambda: self._gate_worktree(identity)),
         )
 
     def _evaluate_tool_surface(self, static: dict, unexpected_items: list[str]) -> tuple[dict, bool]:
+        """No managed policy, no MCP server, no API key; the tools are the account's own choice."""
         init = getattr(self, "_research_summary", {}) or {}
         tools = init.get("tools")
         detail = {
             **static,
             "reported_tools": tools,
-            "only_research_tools": isinstance(tools, list) and set(tools) <= set(RESEARCH_TOOLS),
-            "no_write_tools": isinstance(tools, list) and not (set(tools) & WRITE_TOOLS),
+            "reported_permission_mode": init.get("permission_mode"),
             "mcp_servers_none": init.get("mcp_servers") == 0,
             "no_api_key": init.get("api_key_source") in (None, "none"),
             "tools_used": sorted(self.item_types_seen),
         }
-        passed = (static.get("managed_config_present") == [] and detail["only_research_tools"]
-                  and detail["no_write_tools"] and detail["mcp_servers_none"] and detail["no_api_key"]
-                  and set(self.item_types_seen) <= set(RESEARCH_TOOLS))
+        passed = (static.get("managed_config_present") == [] and isinstance(tools, list)
+                  and isinstance(detail["reported_permission_mode"], str)
+                  and detail["mcp_servers_none"] and detail["no_api_key"])
         return detail, passed
 
     def _account_detail(self, profile: Path, identity: str) -> dict:
         return {
             "profile_matches_pin": profile_identity(profile) == identity,
+            # Where jobs (which cannot reach the Keychain) find the sign-in.
+            "sign_in_in_profile_file": credentials_in_file(profile),
             "account_still_in_roster": account_in_roster(self.root, identity),
             "authenticated_turn": self.research_tokens > 0,
         }
@@ -286,13 +356,36 @@ class ClaudeLiveCheck(LiveCheck):
             output_root=ws.resolve(), profile=profile.resolve(), run_tmp=(self.check_root / "tmp").resolve(),
             home=self._home.resolve(), backup_root=self.root.resolve(),
         ).encode())
+        # Escapes a shell command could try (the account's settings may allow
+        # one): a launchd job and an app started through LaunchServices both
+        # run outside this sandbox and the job's coalition.
+        label = f"com.opensoft.openswap.livecheck.escape.{secrets.token_hex(6)}"
+        agent = ws / "escape.plist"
+        agent.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
+            f"<key>Label</key><string>{label}</string><key>ProgramArguments</key>"
+            "<array><string>/bin/sleep</string><string>120</string></array></dict></plist>\n")
         steps = {
             "inside_read": f"cat '{ws / 'inside.txt'}' >/dev/null 2>&1",
             "inside_write": f"printf ok > '{ws / 'inside-write.txt'}' 2>/dev/null",
             "outside_read": f"cat '{outside / 'secret.txt'}' >/dev/null 2>&1",
             "outside_write": f"printf x > '{outside / 'write.txt'}' 2>/dev/null",
             "tmp_write": f"printf x > '{tmp_marker}' 2>/dev/null",
+            "launch_agent": f"/bin/launchctl bootstrap gui/{os.getuid()} '{agent}' >/dev/null 2>&1",
+            "open_app": "/usr/bin/open -g -j -a Calculator >/dev/null 2>&1",
         }
+        # A service on this Mac (sshd, say) would run commands outside the
+        # sandbox: a listener this check holds must be unreachable from it.
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        port = listener.getsockname()[1]
+        steps["loopback"] = f"/usr/bin/nc -z -w 3 127.0.0.1 {port} >/dev/null 2>&1"
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=5):
+                loopback_control = True  # reachable outside the sandbox
+        except OSError:
+            loopback_control = False
         script = "\n".join(f'{command}; echo "R {name} $?"' for name, command in steps.items())
         try:
             result = self._run(["/usr/bin/sandbox-exec", "-f", str(sb), "/bin/sh", "-c", script],
@@ -309,12 +402,21 @@ class ClaudeLiveCheck(LiveCheck):
                 "outside_read_denied": codes.get("outside_read", 0) != 0,
                 "outside_write_denied": codes.get("outside_write", 0) != 0 and not (outside / "write.txt").exists(),
                 "tmp_write_denied": codes.get("tmp_write", 0) != 0 and not tmp_marker.exists(),
+                # The submission itself must fail and nothing may be loaded.
+                "launchd_job_denied": codes.get("launch_agent", 0) != 0
+                and self._unload_probe_label(label) is False,
+                "app_launch_denied": codes.get("open_app", 0) != 0,
+                "loopback_denied": loopback_control and codes.get("loopback", 0) != 0,
             }
         finally:
+            listener.close()
             try:
                 tmp_marker.unlink()
             except OSError:
                 pass
+        if not detail["app_launch_denied"]:
+            # It escaped: do not leave the app running.
+            self._run(["/usr/bin/pkill", "-x", "Calculator"], capture_output=True, check=False, timeout=20)
         gate.detail = detail
         gate.passed = all(detail.values())
 
@@ -337,7 +439,9 @@ class ClaudeLiveCheck(LiveCheck):
             "with the single word DONE.\n\n" + "\n".join(f"{i}. {path}" for i, path in enumerate(paths.values(), 1))
         )
         try:
-            outcome = self._job("sandbox", identity, task, timeout=self.probe_timeout, workspace=ws)
+            # bypassPermissions with every read allowed: a refusal can only be the Seatbelt profile's.
+            outcome = self._job("sandbox", identity, task, timeout=self.probe_timeout, workspace=ws,
+                                adapter_options=self._probe_options())
         finally:
             try:
                 sentinel.unlink()
@@ -365,6 +469,168 @@ class ClaudeLiveCheck(LiveCheck):
         gate.detail = detail
         gate.passed = all(detail.values())
 
+    # -- permissions (owner decision 2026-10-08) -------------------------------------------
+
+    def _mode_job(self, name: str, identity: str, task: str, *, override: str, mode: str,
+                  rules: dict | None = None):
+        """A short job in a given mode with the profile's own settings left out, so the owner's
+        rules cannot decide what this probe measures."""
+        return self._job(name, identity, task, timeout=self.probe_timeout, workspace=self._workspace(name),
+                         adapter_options={"override": override, "profile_settings": False,
+                                          "settings": {"permissions": {"defaultMode": mode, **(rules or {})}}})
+
+    def _gate_permissions(self, identity: str, profile: Path) -> None:
+        gate = self.gates["permissions"]
+        try:
+            account = read_claude_permissions(profile)
+        except PermissionSettingsError:
+            account = None
+        research = getattr(self, "_research_summary", {}) or {}
+        q = shlex.quote
+        default_ws = self._workspace("permissions-default")
+        shell_marker, write_marker = default_ws / "shell-probe.txt", default_ws / "write-probe.txt"
+        shell_command = "/bin/sh -c " + q("printf ok > " + q(str(shell_marker)))
+        steps = (f"1. Bash tool: {shell_command}\n2. Write tool: {write_marker}")
+        task = ("This is the owner's automated permission self-test. These steps may be refused; that is "
+                "the point of the test. Do each step once, in order, with the tool it names (for the Write "
+                "step write the text ok), continue after a refusal, and use no other tool. Then reply with "
+                "the single word DONE.\n\n" + steps)
+        default = self._mode_job("permissions-default", identity, task, override="follow", mode="default")
+        edits_ws = self._workspace("permissions-accept-edits")
+        edit_marker = edits_ws / "write-probe.txt"
+        accept = self._mode_job(
+            "permissions-accept-edits", identity,
+            "This is the owner's automated permission self-test. Do this step once with the tool it names, "
+            "writing the text ok, and use no other tool. Then reply with the single word DONE.\n\n"
+            f"1. Write tool: {edit_marker}", override="follow", mode="acceptEdits")
+        done = "Reply with the single word DONE. Do not use any tool."
+        # Under no-shell in bypassPermissions, a file guarded like the account's
+        # credentials file (a stand-in: the real one is never put in a model's
+        # reach) must stay unreadable to the file tools.
+        guarded_token = secrets.token_hex(16)
+        guarded = _new_sentinel(self._workspace("permissions-no-shell"), "credentials", guarded_token + "\n")
+        # The same file by other spellings too: the data volume's firmlink and a case variant.
+        # And through a symlink with an innocuous name in the job's own folder.
+        link = guarded.parent / f"notes-{secrets.token_hex(4)}.txt"
+        os.symlink(guarded, link)
+        spellings = [str(guarded), f"/System/Volumes/Data{guarded}" if str(guarded).startswith("/Users/") else None,
+                     str(guarded.parent / guarded.name.upper()), str(link)]
+        spellings = [path for path in spellings if path]
+        no_shell = self._mode_job(
+            "permissions-no-shell", identity,
+            "This is the owner's automated permission self-test. These steps are expected to be refused; that "
+            "is the point of the test. Use the Read tool once on each of these paths, in order, continue after "
+            "a refusal, use no other tool, then reply with the single word DONE.\n\n"
+            + "\n".join(f"{index}. {path}" for index, path in enumerate(spellings, 1)),
+            override=NO_SHELL, mode="bypassPermissions", rules={"deny": credential_rules([guarded])})
+        guarded_reads = [item for item in claude_tool_items(no_shell.run_dir / STDOUT_FILE)
+                         if item["tool"] == "Read" and item["path"] in spellings]
+        everything, complete = _texts(no_shell.run_dir / STDOUT_FILE, no_shell.run_dir / STDERR_FILE)
+        read_only = self._mode_job("permissions-read-only", identity, done, override=READ_ONLY,
+                                   mode="bypassPermissions")
+        items = claude_tool_items(default.run_dir / STDOUT_FILE)
+        shell_items = [item for item in items if item["tool"] == "Bash"]
+        write_items = [item for item in items if item["tool"] == "Write" and item["path"] == str(write_marker)]
+        no_shell_tools = no_shell.summary.get("tools")
+        read_only_tools = read_only.summary.get("tools")
+        detail = {
+            "account_settings_readable": account is not None,
+            "account_mode": account.mode if account is not None else None,
+            # The research job ran on the profile's own settings: its mode is the account's.
+            "account_mode_honoured": account is not None and (
+                account.mode is None or research.get("permission_mode") == account.mode),
+            "default_mode_reported": default.summary.get("permission_mode") == "default",
+            # Would ask in `default` mode; nobody is there, so both are refused.
+            "headless_shell_denied": _all_errors(shell_items) and not os.path.lexists(shell_marker),
+            "headless_write_denied": _all_errors(write_items) and not os.path.lexists(write_marker),
+            "accept_edits_mode_reported": accept.summary.get("permission_mode") == "acceptEdits",
+            "accept_edits_write_allowed": edit_marker.is_file(),
+            "no_shell_leaves_no_shell_tool": isinstance(no_shell_tools, list) and bool(no_shell_tools)
+            and not set(no_shell_tools) & set(CLAUDE_SHELL_TOOLS),
+            # The rule kind every job gets for the real credentials file holds in bypassPermissions.
+            "credential_rule_holds": complete and _all_errors(guarded_reads) and guarded_token not in everything,
+            "read_only_leaves_read_tools_only": isinstance(read_only_tools, list) and bool(read_only_tools)
+            and set(read_only_tools) <= set(CLAUDE_READ_ONLY_TOOLS),
+            "execution_stopped": all(o.stopped for o in (default, accept, no_shell, read_only)),
+        }
+        gate.detail = {**detail, "override_on_this_mac": self._owner_override()}
+        gate.passed = all(value is True for key, value in detail.items() if key != "account_mode")
+
+    def _gate_sign_in_isolation(self, profile: Path) -> None:
+        """What a shell command in the task can reach, run directly under the job's own Seatbelt
+        profile and environment (exactly what Claude Code's shell commands inherit)."""
+        gate = self.gates["sign_in_isolation"]
+        ws = self._workspace("sign-in")
+        stand_in = self._workspace("sign-in-profile")  # a stand-in profile for the write probes
+        (stand_in / "settings.json").write_text("{}\n")
+        (stand_in / "CLAUDE.md").write_text("\n")
+        run_tmp = (self.check_root / "tmp").resolve()
+
+        def profile_file(name: str, target: Path, *, security_exec_denied: bool = True) -> Path:
+            text = seatbelt_profile(output_root=ws.resolve(), profile=target.resolve(), run_tmp=run_tmp,
+                                    home=self._home.resolve(), backup_root=self.root.resolve())
+            if not security_exec_denied:
+                # Measures the Keychain-service rule alone.
+                text = "\n".join(line for line in text.splitlines() if not line.startswith("(deny process-exec"))
+            path = self.check_root / name
+            write_private(path, text.encode())
+            return path
+
+        def run(sb: Path, steps: dict[str, str], env_profile: Path) -> dict[str, int]:
+            script = "\n".join(f'{command}; echo "R {name} $?"' for name, command in steps.items())
+            try:
+                result = self._run(["/usr/bin/sandbox-exec", "-f", str(sb), "/bin/sh", "-c", script],
+                                   env=claude_env(self._home, env_profile, self.check_root),
+                                   capture_output=True, text=True, check=False, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                return {}
+            codes = {}
+            for line in (result.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) == 3 and parts[0] == "R" and parts[2].isdigit():
+                    codes[parts[1]] = int(parts[2])
+            return codes
+
+        q = shlex.quote
+        service = self._keychain_item()
+        query = f"{SECURITY_TOOL} find-generic-password -s {q(service or 'missing')} >/dev/null 2>&1"
+        try:
+            job = run(profile_file("sign-in.sb", profile), {
+                "security_tool": query,
+                # Opened, never read (count=0): the sign-in never reaches any process or the evidence.
+                "own_sign_in": f"/bin/dd if={q(str(profile / CREDENTIALS_FILE))} of=/dev/null count=0 2>/dev/null",
+            }, profile)
+            services = run(profile_file("sign-in-services.sb", profile, security_exec_denied=False),
+                           {"keychain_services": query}, profile)
+            writes = run(profile_file("sign-in-profile.sb", stand_in), {
+                "settings_write": f"printf x >> {q(str(stand_in / 'settings.json'))} 2>/dev/null",
+                "memory_write": f"printf x >> {q(str(stand_in / 'CLAUDE.md'))} 2>/dev/null",
+                "state_write": f"printf x > {q(str(stand_in / 'state.txt'))} 2>/dev/null",
+            }, stand_in)
+            found = service is not None and self._keychain_found(service)
+        finally:
+            self._drop_keychain_item(service)
+        detail = {
+            "ran": set(job) == {"security_tool", "own_sign_in"} and "keychain_services" in services
+            and set(writes) == {"settings_write", "memory_write", "state_write"},
+            "keychain_control_found": found,
+            "security_tool_denied": found and job.get("security_tool", 0) != 0,
+            "keychain_services_denied": found and services.get("keychain_services", 0) != 0,
+            "profile_settings_write_denied": writes.get("settings_write", 0) != 0
+            and (stand_in / "settings.json").read_text() == "{}\n",
+            "profile_memory_write_denied": writes.get("memory_write", 0) != 0
+            and (stand_in / "CLAUDE.md").read_text() == "\n",
+            "profile_state_write_allowed": writes.get("state_write") == 0,
+        }
+        gate.detail = {
+            **detail,
+            # Recorded as it is, never required: nothing on macOS can keep the
+            # account's own sign-in from a shell command Claude Code runs.
+            "own_sign_in_readable_by_shell": job.get("own_sign_in") == 0,
+            "shell_allowed_on_this_mac": self._owner_override() == "follow",
+        }
+        gate.passed = all(detail.values())
+
     def _gate_stop(self, identity: str) -> None:
         gate = self.gates["stop"]
         ws = self._workspace("stop")
@@ -378,7 +644,7 @@ class ClaudeLiveCheck(LiveCheck):
             return state["seen"] is not None and self._monotonic() - state["seen"] >= 5
 
         outcome = self._job("stop", identity, LONG_TASK, timeout=self.helper_wait, until=running_a_while,
-                            workspace=ws)
+                            workspace=ws, adapter_options=self._research_options())
         handle = load_handle(outcome.run_dir)
         detail = {
             "stopped_while_running": outcome.reason == "condition",
@@ -403,7 +669,7 @@ class ClaudeLiveCheck(LiveCheck):
             # The stand-in worker takes the account lease itself, as a real worker does.
             process = self._spawn_child({"root": str(self.root), "job_id": job_id, "identity": identity,
                                          "provider": "claude", "workspace": str(ws), "task": LONG_TASK,
-                                         "lease_ttl": self.helper_wait + 300})
+                                         "lease_ttl": self.helper_wait + 300, "settings": RESEARCH_SETTINGS})
             try:
                 line = process.stdout.readline() if process.stdout is not None else ""
                 detail["worker_started_job"] = line.strip() == "STARTED"

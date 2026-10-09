@@ -378,7 +378,8 @@ def test_setup_advanced_offers_the_direct_mode(root, home, monkeypatch, capsys):
     monkeypatch.setattr(cli, "_managed_worker_loaded", lambda: False)
     configure_worker_service(root, "http://127.0.0.1:8765", "worker-1")
     _repo(home / "GitHub")
-    answers = iter(["n", "", "1", "y"])
+    # The last answer keeps the default per-Mac permission limit (Enter).
+    answers = iter(["n", "", "1", "y", ""])
 
     def read(prompt):
         print(prompt)
@@ -391,6 +392,32 @@ def test_setup_advanced_offers_the_direct_mode(root, home, monkeypatch, capsys):
     assert "✓ github works in the folder itself." in out
     assert load_worker_settings(root).workspaces[0].mode == "direct"
     assert "  ✓ Folders     github (GitHub, direct)" in out
+    assert guided_setup.PERMISSIONS_OFFER in out and "Permissions" not in out.split(guided_setup.PERMISSIONS_OFFER)[1]
+
+
+def test_setup_advanced_offers_a_per_mac_permission_limit(root, home, monkeypatch, capsys):
+    from openswap.worker import guided_setup
+
+    monkeypatch.setattr(cli, "_managed_worker_loaded", lambda: False)
+    configure_worker_service(root, "http://127.0.0.1:8765", "worker-1")
+    answers = iter(["n", "", "", "no-shell"])
+
+    def read(prompt):
+        print(prompt)
+        return next(answers, "")
+
+    cli._guided_setup(root, interactive=True, read_line=read, advanced=True)
+    out = capsys.readouterr().out
+    assert cli.permission_override(root) == "no-shell"
+    assert "✓ This Mac limits every task: no shell commands" in out
+    # The summary shows the limit because it is not the default.
+    assert "Permissions" in out.split(guided_setup.PERMISSIONS_OFFER)[1] and "no-shell (this Mac)" in out
+    # Without --advanced nothing is asked, and the default is not shown.
+    cli.set_permission_override(root, "follow")
+    answers = iter(["n", "", ""])
+    cli._guided_setup(root, interactive=True, read_line=read, advanced=False)
+    out = capsys.readouterr().out
+    assert guided_setup.PERMISSIONS_OFFER not in out and "Permissions" not in out
 
 
 # --- review fixes: nothing of the repo runs as the worker; stable IDs; own objects ---------------
@@ -554,16 +581,24 @@ def test_results_are_found_after_the_repo_is_gone(root, home):
     assert cli.results_folder(root, "../x", workspaces) is None
 
 
-def test_claude_work_tasks_get_no_shell_and_codex_shells_get_the_git_settings(root, home):
-    from openswap.worker.claude_exec import WORK_TOOLS
+def test_codex_shells_get_the_git_settings_and_a_read_only_sandbox_writes_nothing(root, home):
     from openswap.worker.codex_exec import _toml_string, codex_config
+    from openswap.worker.permissions import CodexPermissions
 
-    assert "Bash" not in WORK_TOOLS and {"Edit", "Write"} <= set(WORK_TOOLS)
     cli.add_work_folder(root, _repo(home / "GitHub" / "openswap"))
     resolved = _runtime(root)._resolve_workspace("openswap", "a" * 32)
     text = codex_config((), resolved.write_paths, resolved.read_paths, dict(resolved.env))
     assert f"GIT_OBJECT_DIRECTORY = {_toml_string(str(resolved.worktree.objects))}" in text
     assert "gc.auto" in text
+    for path in resolved.write_paths:
+        assert f'{_toml_string(str(path))} = "write"' in text
+    # The account's read-only sandbox (or the per-Mac read-only limit): the
+    # worktree and what git needs beside it become read-only too.
+    read_only = codex_config((), resolved.write_paths, resolved.read_paths, dict(resolved.env),
+                             CodexPermissions(sandbox="read-only").launch("follow"))
+    assert '"write"' not in read_only
+    for path in resolved.write_paths:
+        assert f'{_toml_string(str(path))} = "read"' in read_only
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits only")

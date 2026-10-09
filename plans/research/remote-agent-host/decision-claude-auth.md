@@ -23,18 +23,37 @@ What the implementation does under this decision (plan 017, phase 1):
   session profiles: `CLAUDE_CONFIG_DIR=<backup>/sessions/<n>-<slug>`),
   signed in by the owner with `openswap worker claude prepare`, which runs
   the binary's own `claude auth login` into that profile (OpenSwap seeds no
-  credential; Claude Code keeps the sign-in in the profile's own Keychain
-  item). The owner's default Claude login (`~/.claude`, `~/.claude.json` and its Keychain item)
+  credential). Since 2026-10-08 that login runs with the Keychain out of
+  reach, so Claude Code keeps the sign-in in the profile's own credentials
+  file (its plaintext store) instead of a Keychain item: jobs cannot reach
+  the Keychain at all (below). The owner's default Claude login (`~/.claude`, `~/.claude.json` and its Keychain item)
   is never changed; the live check records its metadata before and after
   and fails if it moved.
 - The CLI alone signs in, stores and refreshes tokens in that profile. The worker never reads, uploads, proxies or logs a
   credential, and the job environment is an allowlist without API keys.
-- Restricts each job to research tools (`Read`, `Grep`, `Glob`, `WebSearch`,
-  `WebFetch`; `--restricted`, `dontAsk`, no MCP, no slash commands, no
-  session persistence) inside a Seatbelt profile that only allows writes to
-  the approved folder, the profile, the run's temporary folder and this
-  user's cache folders, and hides the owner's default login, the other
-  accounts and OpenSwap's own state.
+- ~~Restricts each job to research tools (`--restricted`, `dontAsk`)~~.
+  Owner decision 2026-10-08 ([plan 017](../../017-progress.md#sessions-follow-the-accounts-own-permission-settings-owner-decision-2026-10-08)):
+  each job follows the account's own permission settings (the mode and
+  allow/deny/ask rules in its profile's `settings.json`, which `claude
+  prepare --copy-settings` can copy from `~/.claude/settings.json`), with
+  every prompt denied because nobody is at the Mac, under an optional
+  per-Mac limit (`openswap worker permissions follow|no-shell|read-only`).
+  Still no MCP, no slash commands, no session persistence, and managed
+  policy still refuses a launch. The Seatbelt profile holds in every mode:
+  writes only to the approved folder or the task's worktree, the profile
+  (never its settings, memory, rules, auto-memory, skills, hooks or plugins), the run's temporary
+  folder and this user's cache folders; the owner's default login, the other
+  accounts and OpenSwap's own state hidden; and no Keychain (`security`
+  cannot start, the Keychain's services cannot be looked up), so a shell
+  command cannot read another account's sign-in or the worker's keys.
+  Recorded risk: with the shell allowed, a command in the task can read this
+  account's own credentials file, or replace it (so later tasks on the
+  account would run as whatever sign-in it put there), because Claude Code
+  must read and write it and macOS
+  will not nest Claude Code's own bash sandbox inside OpenSwap's; handing the
+  CLI its token at launch would require OpenSwap to read the credential,
+  which this decision rules out. `no-shell` prevents it, and the live check
+  records it.
 - Runs live only after `openswap worker live-check --provider claude` passes
   on that Mac and the owner opts in; the opt-in is separate from Codex's and
   bound to the pinned binary.

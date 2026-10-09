@@ -605,6 +605,9 @@ class Readiness:
     # The running worker's link to the control service: "online", "offline",
     # "revoked", "expired" or "disabled"; None when unknown.
     connection: str | None = None
+    # The per-Mac limit on remote sessions ("follow", the default: each
+    # account's own Claude or Codex settings; "no-shell"; "read-only").
+    permission_override: str = "follow"
 
     @property
     def missing(self) -> tuple[str, ...]:
@@ -691,6 +694,7 @@ def readiness(root: Path) -> Readiness:
         provider=provider,
         paused=policy.paused is True,
         connection=connection if isinstance(connection, str) else None,
+        permission_override=cli.permission_override(root),
     )
 
 
@@ -702,7 +706,36 @@ def _settling(state: Readiness) -> bool:
     )
 
 
+SIGN_IN_NOTE = ("Note: a shell command in a Claude task can read or replace that account's own sign-in (macOS "
+                "can't run Claude Code's sandbox inside OpenSwap's). `openswap worker permissions no-shell` "
+                "prevents it.")
+PERMISSIONS_OFFER = ("Tasks follow each account's own Claude or Codex permission settings. "
+                     "Limit every task on this Mac? (follow, no-shell, read-only)")
+
+
+def offer_permissions(root: Path, ui: Prompts) -> None:
+    """The advanced choice (``openswap worker setup --advanced`` only): a per-Mac limit."""
+    if not getattr(ui, "advanced", False) or not ui.interactive:
+        return
+    cli = _cli()
+    current = cli.permission_override(root)
+    answer = ui.ask(PERMISSIONS_OFFER, default=current)
+    if answer is None or answer.strip() in ("", current):
+        return
+    value = answer.strip().lower()
+    if value not in ("follow", "no-shell", "read-only"):
+        ui.say(f"Kept {current}. Next: `openswap worker permissions follow|no-shell|read-only`.")
+        return
+    try:
+        cli.set_permission_override(root, value)
+    except Exception:
+        ui.say(f"Could not change it. Next: `openswap worker permissions {value}`.")
+        return
+    ui.say(f"{printer.MARK_OK} {cli.permissions_text(value)}")
+
+
 def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> None:
+    offer_permissions(root, ui)
     state = readiness(root)
     # Give a worker that `enable` just started a moment to report running and
     # reach the service. A front end may set ``settle_wait_s`` to change it.
@@ -716,6 +749,10 @@ def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> No
         ui.say(line)
     for workspace_id, code in state.refused:
         ui.say(_cli().refusal_line(workspace_id, code))
+    if state.provider == "claude" and state.permission_override == "follow":
+        # Shell is the account's to allow, and nothing can keep its own
+        # sign-in from a shell command (see the live check's sign_in_isolation).
+        ui.say(SIGN_IN_NOTE)
     # The checklist shows every gap; one `Next:` names the first to close.
     if state.missing:
         ui.say(f"Next: {state.missing[0]}.")
@@ -751,6 +788,9 @@ def checklist(state: Readiness) -> list[str]:
         (f"{printer.mark(True if state.execution == 'live' else None)} Live tasks",
          "on" if state.execution == "live" else "off"),
     ]
+    if state.permission_override != "follow":
+        # Shown only when this Mac limits sessions beyond the accounts' own settings.
+        rows.append((f"{printer.mark(None)} Permissions", f"{state.permission_override} (this Mac)"))
     return printer.columns(rows)
 
 

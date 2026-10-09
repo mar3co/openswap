@@ -386,14 +386,14 @@ def test_live_check_gates_fold_to_one_line_unless_failed_or_verbose():
     gates = {name: {"passed": True, "steps_ran": 3} for name in live_check.REQUIRED_GATES}
     assert live_check._format({"gates": gates}) == (
         "  ✓ passed: the pinned CLI, the account, your own login untouched, tools, sandbox, a research task, "
-        "sandbox (a task), stop, kill recovery, worktree"
+        "sandbox (a task), stop, kill recovery, worktree, permissions, sign-in isolation"
     )
     gates["sandbox_wrapper"] = {"passed": False, "reason": "sandbox leaked", "write_outside": "/tmp/x",
                                 "network_denied": True, "steps_ran": 2}
     out = live_check._format({"gates": gates})
     assert out.splitlines() == [
         "  ✓ passed: the pinned CLI, the account, your own login untouched, tools, a research task, "
-        "sandbox (a task), stop, kill recovery, worktree",
+        "sandbox (a task), stop, kill recovery, worktree, permissions, sign-in isolation",
         "  ✗ failed: sandbox (reason: sandbox leaked; write_outside: /tmp/x)",
     ]
     verbose = live_check._format({"gates": gates}, verbose=True).splitlines()

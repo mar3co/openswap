@@ -1724,8 +1724,43 @@ def _migration_message(exc: ClaudeSwitchError) -> str:
 
 _WORKER_COMMANDS = (
     "setup", "pair", "unpair", "status", "enable", "disable", "pause", "stop", "account", "workspace",
-    "worktrees", "codex", "claude", "live", "live-check", "lease", "run", "submit-test", "refserver",
+    "worktrees", "permissions", "codex", "claude", "live", "live-check", "lease", "run", "submit-test",
+    "refserver",
 )
+
+
+def permission_override(backup_root: Path) -> str:
+    """The per-Mac limit on remote sessions (unreadable reads as the strictest)."""
+    from openswap.settings import load_permission_override
+
+    try:
+        return load_permission_override(backup_root)
+    except Exception:
+        return "read-only"
+
+
+def set_permission_override(backup_root: Path, value: str) -> str:
+    """Set the per-Mac limit. Only this Mac's owner can: no protocol message reaches it.
+
+    It applies from the next launch; a task already running keeps what it started with.
+    Written under the live lock, which every launch holds from reading the
+    limit until its job is released, so once this returns no launch that read
+    the old limit can still start (the same order as ``live enable``/``disable``).
+    """
+    from openswap.settings import write_permission_override
+    from openswap.worker.live import live_lock
+
+    with live_lock(backup_root):
+        return write_permission_override(backup_root, value)
+
+
+def permissions_text(value: str) -> str:
+    """One line for the per-Mac limit, as `permissions`, `status` and the setup summary say it."""
+    from openswap.worker.permissions import FOLLOW, OVERRIDE_DESCRIPTIONS
+
+    if value == FOLLOW:
+        return "Tasks on this Mac follow each account's own Claude or Codex permission settings (the default)."
+    return f"This Mac limits every task: {OVERRIDE_DESCRIPTIONS[value]}."
 
 
 def unknown_command_message(prog: str, word: str, commands) -> str:
@@ -1902,6 +1937,17 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                     "A finished task's branch is always kept; `prune` removes its worktree when clean "
                     "(with --force, even with uncommitted work).",
     )
+    permissions_parser = commands.add_parser(
+        "permissions", help="show or set this Mac's limit on what tasks may do",
+        description="Tasks follow each account's own permission settings (`claude prepare "
+                    "--copy-settings/--mode`, `codex settings`), like running claude or codex there; nobody "
+                    "is at the Mac to approve, so anything that would ask is denied. This limit applies to "
+                    "every task on this Mac and is set only here, never remotely: `follow` (the default), "
+                    "`no-shell` (no shell commands or hooks) or `read-only` (Claude: read and web tools only; "
+                    "Codex: a read-only sandbox). The folder rules and the hidden sign-ins hold in every mode.",
+    )
+    permissions_parser.add_argument("limit", nargs="?", choices=("follow", "no-shell", "read-only"))
+    permissions_parser.add_argument("--json", action="store_true")
     worktrees_parser.add_argument("action", nargs="?", choices=("list", "prune"), default="list")
     worktrees_parser.add_argument("--force", action="store_true",
                                   help="with prune: also remove worktrees with uncommitted work or a lock")
@@ -2013,6 +2059,21 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         return _workspace_command(root, args)
     if args.command == "worktrees":
         return _worktrees_command(root, args)
+    if args.command == "permissions":
+        if args.limit is None:
+            value = permission_override(root)
+            _write({"permission_override": value}, as_json=args.json, human=permissions_text(value) + "\n"
+                   + printer.next_step("`openswap worker permissions follow|no-shell|read-only` to change it."))
+            return 0
+        try:
+            _migrate_legacy_before_worker_state_change(root)
+            value = set_permission_override(root, args.limit)
+        except (ClaudeSwitchError, OSError, RuntimeError, ValueError):
+            print(SETTINGS_MESSAGE, file=sys.stderr)
+            return 1
+        _write({"permission_override": value}, as_json=args.json,
+               human=f"{printer.MARK_OK} {permissions_text(value)} Applies from the next task.")
+        return 0
     if args.command == "status":
         try:
             snapshot = read_status(root)
@@ -2026,6 +2087,10 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         if refused:
             snapshot = {**snapshot, "refused_workspaces": [
                 {"workspace_id": workspace_id, "diagnostic_code": code} for workspace_id, code in refused]}
+        override = permission_override(root)
+        if override != "follow":
+            # Only a limit beyond the accounts' own settings is reported.
+            snapshot = {**snapshot, "permission_override": override}
         human = None
         if not args.json:
             human = _format_status(snapshot)
@@ -2762,4 +2827,9 @@ def _format_status(snapshot: dict) -> str:
         (f"{printer.mark(service_ok)} Service", f"{remote} (seen {seen})" if seen else remote),
         (f"{printer.mark(None)} Task", job),
     ]
+    override = snapshot.get("permission_override", "follow")
+    if override != "follow":
+        # Only a non-default limit is worth a row: by default tasks follow
+        # each account's own settings.
+        rows.append((f"{printer.mark(None)} Permissions", f"{override} (this Mac)"))
     return "\n".join([printer.heading("Remote tasks"), *printer.columns(rows)])

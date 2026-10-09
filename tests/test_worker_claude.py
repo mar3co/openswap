@@ -6,6 +6,7 @@ fake scripts, launches are simulated, and profiles hold public metadata only.
 
 from __future__ import annotations
 
+import fnmatch
 import io
 import json
 import os
@@ -81,6 +82,8 @@ def setup_root(tmp_path, *, prepared=True, profile_email=EMAIL):
         profile.mkdir(parents=True, mode=0o700)
         (profile / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": profile_email, "organizationUuid": ORG}}))
+        # Claude Code's file store for the sign-in (a placeholder: jobs reach no Keychain).
+        (profile / ".credentials.json").write_text("{}")
     return root
 
 
@@ -96,6 +99,31 @@ def fake_claude(tmp_path, version="2.1.285 (Claude Code)"):
 
 
 # -- pinned binary --------------------------------------------------------------------
+
+
+def test_a_claude_code_that_lets_symlinks_past_deny_rules_is_never_pinned_or_run(tmp_path):
+    # Before 2.1.7 a symlink got around deny rules (GHSA-4q92-rfm6-2cqx); jobs rely on them.
+    root = tmp_path / "root"
+    root.mkdir()
+    with pytest.raises(claude_cli.ClaudeCliError) as error:
+        claude_cli.pin(root, binary=fake_claude(tmp_path, "2.1.6 (Claude Code)"))
+    assert error.value.code == "version_unsupported"
+    assert claude_cli.version_tuple("2.1.7 (Claude Code)") == claude_cli.MIN_VERSION
+    # A prerelease of the floor predates the fix; a build tag (+) does not change the release.
+    assert not claude_cli.version_supported("2.1.7-beta.1 (Claude Code)")
+    assert claude_cli.version_supported("2.1.7+build.5 (Claude Code)")
+    assert claude_cli.version_supported("2.1.8-beta (Claude Code)") and claude_cli.version_supported("3.0.0 (Claude Code)")
+    with pytest.raises(claude_cli.ClaudeCliError):
+        claude_cli.pin(root, binary=fake_claude(tmp_path, "2.1.7-rc.2 (Claude Code)"))
+    pin = claude_cli.pin(root, binary=fake_claude(tmp_path, "2.1.7 (Claude Code)"))
+    assert claude_cli.verify(root, check_version=False) == pin
+    # A pin recorded before the minimum existed is refused even without a version probe.
+    raw = json.loads(claude_cli.pin_path(root).read_text())
+    raw["version"] = "2.0.99 (Claude Code)"
+    claude_cli.pin_path(root).write_text(json.dumps(raw))
+    with pytest.raises(claude_cli.ClaudeCliError) as error:
+        claude_cli.verify(root, check_version=False)
+    assert error.value.code == "version_unsupported"
 
 
 def test_pin_records_the_installed_binary_and_verify_rechecks_it(tmp_path):
@@ -232,7 +260,7 @@ def drain(adapter, run):
     return events
 
 
-def test_argv_env_and_seatbelt_are_fixed_research_only(tmp_path):
+def test_argv_follows_the_profiles_own_settings_and_denies_every_prompt(tmp_path):
     root = setup_root(tmp_path)
     launcher = FakeLaunch(SUCCESS)
     source = tmp_path / "src"
@@ -245,23 +273,117 @@ def test_argv_env_and_seatbelt_are_fixed_research_only(tmp_path):
     launch = launcher.launches[0]
     argv = launch["argv"]
     assert argv[:3] == ["/usr/bin/sandbox-exec", "-f", str(Path(launch["run_dir"]) / "claude.sb")]
-    assert argv[3] == "/fake/claude" and "-p" in argv and "--restricted" in argv
-    assert argv[argv.index("--tools") + 1] == "Read,Grep,Glob,WebSearch,WebFetch"
+    assert argv[3] == "/fake/claude" and "-p" in argv
+    # The mode and the rules come from the profile's settings.json alone (no repo settings)...
+    assert argv[argv.index("--setting-sources") + 1] == "user"
+    # ...and nobody is at the Mac: anything that would ask is denied.
+    assert argv[argv.index("--permission-prompts") + 1] == "none"
     assert argv[argv.index("--output-format") + 1] == "stream-json"
-    assert "--strict-mcp-config" in argv and "--no-session-persistence" in argv
+    assert "--strict-mcp-config" in argv and "--no-session-persistence" in argv and "--disable-slash-commands" in argv
     assert argv[argv.index("--add-dir") + 1] == str(source.resolve())
-    for forbidden in ("--model", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
-                      "--mcp-config", "--settings", "Bash", "Write", "Edit"):
-        assert forbidden not in argv and not any(forbidden in arg.split(",") for arg in argv)
+    # No tool list or mode of OpenSwap's own (the default per-Mac limit is "follow")...
+    for forbidden in ("--restricted", "--tools", "--allowedTools", "--disallowedTools", "--permission-mode",
+                      "--model", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+                      "--mcp-config"):
+        assert forbidden not in argv
+    # ...only deny rules keeping the file tools off the credentials file, in every mode.
+    assert json.loads(argv[argv.index("--settings") + 1]) == {"permissions": {"deny": _credential_rules(root)}}
     env = launch["env"]
     assert env["CLAUDE_CONFIG_DIR"] == str(claude_exec.profile_for(root, IDENTITY))
     assert "ANTHROPIC_API_KEY" not in env and env["DISABLE_AUTOUPDATER"] == "1"
+    assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"  # no notes for a later task to load
     sb = (Path(launch["run_dir"]) / "claude.sb").read_text()
     assert "(deny file-write*)" in sb and "(allow default)" in sb
     assert str(workspace(root).output_root.resolve()) in sb
     assert f'(subpath "{root.resolve()}")' in sb  # the backup root is hidden...
-    assert str(claude_exec.profile_for(root, IDENTITY).resolve()) in sb  # ...except this profile
+    profile = claude_exec.profile_for(root, IDENTITY).resolve()
+    assert str(profile) in sb  # ...except this profile
+    # Whatever the mode: no Keychain, and no write to what configures the next session.
+    assert '(deny process-exec (literal "/usr/bin/security"))' in sb
+    assert '(global-name "com.apple.SecurityServer")' in sb and '(deny mach-lookup' in sb
+    assert f'(literal "{profile / "settings.json"}")' in sb and f'(subpath "{profile / "skills"}")' in sb
     assert "Find it" in launch["stdin"]
+
+
+def _credential_rules(root):
+    profile = claude_exec.profile_for(root, IDENTITY)
+    paths = sorted({str(profile / ".credentials.json"), str(profile.resolve() / ".credentials.json")})
+    rules = [rule for path in paths for rule in (f"Read(/{path})", f"Edit(/{path})")]
+    anywhere = "//**/.[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS].[jJ][sS][oO][nN]"
+    return rules + [f"Read({anywhere})", f"Edit({anywhere})"]
+
+
+@pytest.mark.parametrize("override, expected", [
+    ("no-shell", ["--disallowedTools", "Bash,PowerShell,Monitor,REPL,BashOutput,KillShell",
+                  "--settings", {"disableAllHooks": True}]),
+    ("read-only", ["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--settings", {"disableAllHooks": True}]),
+    ("follow", ["--settings", {}]),
+    ("unreadable", ["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--settings", {"disableAllHooks": True}]),
+])
+def test_the_per_mac_limit_narrows_the_tools(tmp_path, override, expected):
+    from openswap.settings import write_permission_override
+
+    root = setup_root(tmp_path)
+    if override == "unreadable":
+        # A limit that cannot be read is the strictest one, never none.
+        raw = json.loads((root / "settings.json").read_text()) if (root / "settings.json").exists() else {}
+        raw.setdefault("worker", {})["permissionOverride"] = "everything"
+        (root / "settings.json").write_text(json.dumps(raw))
+    else:
+        write_permission_override(root, override)
+    launcher = FakeLaunch(SUCCESS)
+    adapter = make_adapter(root, launcher)  # reads the limit from settings at launch
+    run = adapter.start(job_record(), workspace(root), worker_epoch=1)
+    argv = launcher.launches[0]["argv"]
+    tail = argv[argv.index("--no-session-persistence") + 1:]
+    settings = {**expected[-1], "permissions": {"deny": _credential_rules(root)}}
+    assert tail[:-1] == expected[:-1] and json.loads(tail[-1]) == settings
+    drain(adapter, run)
+    summary = json.loads((Path(root) / "worker" / "runs" / ("a" * 32) / "summary.json").read_text())
+    assert summary["permissions"]["override"] == ("read-only" if override == "unreadable" else override)
+
+
+def test_the_profiles_permission_settings_are_validated_before_launch(tmp_path):
+    root = setup_root(tmp_path)
+    profile = claude_exec.profile_for(root, IDENTITY)
+    for bad in ("not json", json.dumps({"permissions": {"defaultMode": "yolo"}}),
+                json.dumps({"permissions": {"deny": "Bash"}}), json.dumps([1])):
+        (profile / "settings.json").write_text(bad)
+        launcher = FakeLaunch(SUCCESS)
+        with pytest.raises(ProviderLaunchRefused) as error:
+            make_adapter(root, launcher).start(job_record(), workspace(root), worker_epoch=1)
+        # Claude Code would silently drop such a file (and the owner's deny rules with it).
+        assert error.value.diagnostic_code == "provider_unavailable" and launcher.launches == []
+    (profile / "settings.json").unlink()
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{}")
+    (profile / "settings.json").symlink_to(target)
+    with pytest.raises(ProviderLaunchRefused):
+        make_adapter(root, FakeLaunch(SUCCESS)).start(job_record(), workspace(root), worker_epoch=1)
+    (profile / "settings.json").unlink()
+    (profile / "settings.json").write_text(json.dumps({"permissions": {"defaultMode": "bypassPermissions",
+                                                                       "deny": ["Bash(rm:*)"]}}))
+    launcher = FakeLaunch([{**INIT, "permissionMode": "bypassPermissions"}, *SUCCESS[1:]])
+    adapter = make_adapter(root, launcher)
+    drain(adapter, adapter.start(job_record(), workspace(root), worker_epoch=1))
+    summary = json.loads((Path(root) / "worker" / "runs" / ("a" * 32) / "summary.json").read_text())
+    assert summary["permission_mode"] == "bypassPermissions"
+    assert summary["permissions"] == {"mode": "bypassPermissions", "allow_rules": 0, "deny_rules": 1, "ask_rules": 0,
+                                      "override": "follow", "for_check": False, "profile_settings": True}
+    # The validated permission keys go on the command line too: a schema problem elsewhere in
+    # the file (Claude Code would then skip the file) cannot drop the mode or the deny rules.
+    argv = launcher.launches[0]["argv"]
+    assert json.loads(argv[argv.index("--settings") + 1]) == {"permissions": {
+        "defaultMode": "bypassPermissions", "deny": ["Bash(rm:*)", *_credential_rules(root)]}}
+
+
+def test_a_sign_in_kept_only_in_the_keychain_is_refused_unlaunched(tmp_path):
+    root = setup_root(tmp_path)
+    (claude_exec.profile_for(root, IDENTITY) / ".credentials.json").unlink()
+    launcher = FakeLaunch(SUCCESS)
+    with pytest.raises(ProviderLaunchRefused) as error:
+        make_adapter(root, launcher).start(job_record(), workspace(root), worker_epoch=1)
+    assert error.value.diagnostic_code == "provider_auth_unavailable" and launcher.launches == []
 
 
 def test_a_codex_job_never_runs_on_the_claude_adapter_and_vice_versa(tmp_path):
@@ -340,6 +462,156 @@ def test_seatbelt_profile_enforces_the_boundary_for_real(tmp_path):
                             capture_output=True, text=True)
     codes = dict(line.split() for line in result.stdout.splitlines())
     assert codes == {"R1": "1", "R2": "0", "R3": "0", "R4": "1", "R5": "1", "R6": "0"}
+
+
+def _job_profile(tmp_path, *, exec_deny=True):
+    root = tmp_path / "backup"
+    # A dot in the profile's name, as in an email slug: the auto-memory rule is a regular expression.
+    out, profile, home = tmp_path / "out", root / "sessions" / "4-a_b.com", tmp_path / "home"
+    for path in (out, profile, home / "Library" / "Keychains", profile / "skills", profile / "rules",
+                 profile / "projects" / "-repo" / "memory", profile / "projects" / "-repo" / "todo"):
+        path.mkdir(parents=True, exist_ok=True)
+    (profile / "settings.json").write_text("{}\n")
+    (profile / "CLAUDE.md").write_text("\n")
+    (profile / ".credentials.json").write_text("placeholder\n")
+    (home / "Library" / "Keychains" / "login.keychain-db").write_text("k")
+    (home / ".ssh").mkdir(exist_ok=True)
+    (home / ".ssh" / "id_test").write_text("key")
+    text = claude_exec.seatbelt_profile(output_root=out.resolve(), profile=profile.resolve(),
+                                        run_tmp=(tmp_path / "t").resolve(), home=home.resolve(),
+                                        backup_root=root.resolve(), user_dirs=[])
+    if not exec_deny:
+        text = "\n".join(line for line in text.splitlines() if not line.startswith("(deny process-exec"))
+    sb = tmp_path / ("p.sb" if exec_deny else "services.sb")
+    sb.write_text(text)
+    return sb, profile, home
+
+
+def _sandboxed(sb, script):
+    result = subprocess.run(["/usr/bin/sandbox-exec", "-f", str(sb), "/bin/sh", "-c", script],
+                            capture_output=True, text=True, timeout=60)
+    return dict(line.split() for line in result.stdout.splitlines())
+
+
+@pytest.mark.skipif(sys.platform != "darwin" or not os.path.exists("/usr/bin/sandbox-exec"), reason="Seatbelt")
+def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_away_for_real(tmp_path):
+    out = tmp_path / "out"  # the job folder
+    sb, profile, home = _job_profile(tmp_path)
+    codes = _sandboxed(sb, "; ".join([
+        "/usr/bin/security find-generic-password -s openswap-test-missing >/dev/null 2>&1; echo security $?",
+        f"head -c 1 {home}/Library/Keychains/login.keychain-db >/dev/null 2>&1; echo keychain_file $?",
+        f"printf x >> {profile}/settings.json 2>/dev/null; echo settings $?",
+        f"printf x > {profile}/new.json 2>/dev/null && mv {profile}/new.json {profile}/settings.json "
+        f"2>/dev/null; echo settings_replaced $?",
+        f"printf x >> {profile}/CLAUDE.md 2>/dev/null; echo memory $?",
+        f"printf {{}} > {profile}/remote-settings.json 2>/dev/null; echo remote_policy $?",
+        f"printf {{}} > {profile}/.claude.json 2>/dev/null; echo account_state $?",
+        f"mkdir -p {home}/.ssh 2>/dev/null; cat {home}/.ssh/id_test >/dev/null 2>&1; echo ssh_key $?",
+        f"mkdir -p {tmp_path / 't'} && ln {profile}/settings.json {tmp_path / 't' / 'alias'} 2>/dev/null; "
+        f"echo hard_link $?",
+        f"printf x > {profile}/skills/s.md 2>/dev/null; echo skill $?",
+        f"printf x > {profile}/rules/r.md 2>/dev/null; echo rule $?",
+        f"printf x > {profile}/projects/-repo/memory/MEMORY.md 2>/dev/null; echo auto_memory $?",
+        f"mkdir {profile}/projects/-other 2>/dev/null; mkdir {profile}/projects/-other/memory 2>/dev/null; "
+        f"echo new_auto_memory $?",
+        f"printf x > {profile}/projects/-repo/todo/t.json 2>/dev/null; echo project_state $?",
+        # A folder prepared where the task may write, renamed or linked into place.
+        f"mkdir -p {out}/staged/memory && printf x > {out}/staged/memory/MEMORY.md && "
+        f"mv {out}/staged {profile}/projects/-next 2>/dev/null; echo renamed_in $?",
+        f"ln -s {out}/staged {profile}/projects/-linked 2>/dev/null; echo linked_in $?",
+        f"mv {profile}/projects {profile}/old-projects 2>/dev/null; echo projects_moved $?",
+        # The whole profile moved aside (to the run's writable temporary folder) and replaced.
+        f"mkdir -p {tmp_path / 't'} && mv {profile} {tmp_path / 't' / 'old-profile'} 2>/dev/null; "
+        f"echo profile_moved $?",
+        f"mkdir -p {out}/fake-profile && rmdir {profile} 2>/dev/null; echo profile_removed $?",
+        f"printf x > {profile}/state.json; echo state $?",
+        f"cat {profile}/.credentials.json >/dev/null; echo own_sign_in $?",
+    ]))
+    assert codes["rule"] != "0" and codes["auto_memory"] != "0" and codes["new_auto_memory"] != "0"
+    # The whole projects/ folder (auto-memory lives there), its entries included.
+    assert codes["project_state"] != "0" and codes["renamed_in"] != "0" and codes["linked_in"] != "0"
+    assert codes["projects_moved"] != "0"
+    assert codes["profile_moved"] != "0" and codes["profile_removed"] != "0" and profile.is_dir()
+    assert not (profile / "projects" / "-next").exists() and not os.path.lexists(profile / "projects" / "-linked")
+    # The `security` tool cannot start at all (126), so Claude Code's Keychain
+    # write fails fast and it keeps the sign-in in its credentials file.
+    assert codes["security"] == "126"
+    assert codes["keychain_file"] == "1"
+    assert codes["settings"] != "0" and codes["settings_replaced"] != "0" and codes["memory"] != "0"
+    assert codes["skill"] != "0" and codes["remote_policy"] != "0"
+    # Per-project approvals and the account the identity check reads.
+    assert codes["account_state"] != "0"
+    # No ssh key (it would reach this Mac's sshd on any address), no hard-link alias of a protected file.
+    assert codes["ssh_key"] != "0" and codes["hard_link"] != "0"
+    assert not os.path.lexists(tmp_path / "t" / "alias")
+    assert (profile / "settings.json").read_text() == "{}\n" and (profile / "CLAUDE.md").read_text() == "\n"
+    # Claude Code's own state, and (honestly) the account's own sign-in, stay reachable.
+    assert codes["state"] == "0" and codes["own_sign_in"] == "0"
+
+
+@pytest.mark.skipif(sys.platform != "darwin" or not os.path.exists("/usr/bin/sandbox-exec"), reason="Seatbelt")
+def test_nothing_the_session_starts_can_leave_the_sandbox_for_real(tmp_path):
+    import socket
+    import tempfile
+
+    sb, _profile, _home = _job_profile(tmp_path)
+    # A local daemon's socket (Docker's, say) would act outside the sandbox.
+    short = Path(tempfile.mkdtemp(prefix="os-", dir="/tmp"))
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server.bind(str(short / "s"))
+        server.listen(4)
+        tcp.bind(("127.0.0.1", 0))
+        tcp.listen(4)
+        connect = f"/usr/bin/nc -U -w 1 {short / 's'} </dev/null >/dev/null 2>&1"
+        loopback = f"/usr/bin/nc -z -w 2 127.0.0.1 {tcp.getsockname()[1]} >/dev/null 2>&1"
+        outside = subprocess.run(["/bin/sh", "-c", connect], timeout=30).returncode
+        loopback_outside = subprocess.run(["/bin/sh", "-c", loopback], timeout=30).returncode
+        codes = _sandboxed(sb, "; ".join([
+            f"{loopback}; echo loopback $?",
+            f"{connect}; echo unix_socket $?",
+            f"/bin/launchctl print gui/{os.getuid()} >/dev/null 2>&1; echo launchctl $?",
+            "/usr/bin/curl -sS -m 10 -o /dev/null https://example.com 2>/dev/null; echo dns_and_tls $?",
+        ]))
+    finally:
+        server.close()
+        tcp.close()
+        import shutil
+
+        shutil.rmtree(short, ignore_errors=True)
+    assert outside == 0 and codes["unix_socket"] != "0"
+    # sshd (or any service) on this Mac would run commands outside the sandbox.
+    assert loopback_outside == 0 and codes["loopback"] != "0"
+    assert '(deny network-outbound (remote tcp "*:22"))' in sb.read_text()
+    assert codes["launchctl"] == "126"
+    # Name resolution (mDNSResponder's socket) and TLS still work, when this Mac is online at all.
+    online = subprocess.run(["/usr/bin/curl", "-sS", "-m", "10", "-o", "/dev/null", "https://example.com"],
+                            capture_output=True, timeout=30).returncode == 0
+    assert codes["dns_and_tls"] == "0" or not online
+    sb_text = sb.read_text()
+    assert "(deny lsopen)" in sb_text and "(deny appleevent-send)" in sb_text and "(deny job-creation)" in sb_text
+
+
+@pytest.mark.skipif(sys.platform != "darwin" or not (os.environ.get("OPENSWAP_KEYCHAIN_SANDBOX_TESTS") == "1"
+                                                     or os.environ.get("GITHUB_ACTIONS") == "true"),
+                    reason="creates a throwaway keychain file; set OPENSWAP_KEYCHAIN_SANDBOX_TESTS=1 on a Mac")
+def test_no_keychain_service_is_reachable_from_the_job_for_real(tmp_path):
+    # A throwaway keychain file (never the login keychain, never added as default),
+    # so only the Keychain-service rule can make the lookup fail.
+    keychain = tmp_path / "probe.keychain-db"
+    subprocess.run(["/usr/bin/security", "create-keychain", "-p", "probe", str(keychain)], check=True, timeout=60)
+    try:
+        subprocess.run(["/usr/bin/security", "unlock-keychain", "-p", "probe", str(keychain)], check=True, timeout=60)
+        subprocess.run(["/usr/bin/security", "add-generic-password", "-a", "openswap", "-s", "openswap-probe",
+                        "-w", "not-a-secret", str(keychain)], check=True, timeout=60)
+        query = f"/usr/bin/security find-generic-password -s openswap-probe {keychain} >/dev/null 2>&1"
+        outside = subprocess.run(["/bin/sh", "-c", query], timeout=60).returncode
+        sb, _profile, _home = _job_profile(tmp_path, exec_deny=False)
+        inside = _sandboxed(sb, f"{query}; echo found $?")
+        assert outside == 0 and inside["found"] != "0"
+    finally:
+        subprocess.run(["/usr/bin/security", "delete-keychain", str(keychain)], timeout=60)
 
 
 def test_the_seatbelt_write_set_is_this_users_folders_only(tmp_path):
@@ -491,32 +763,74 @@ class SimulatedClaudeMac(FakeLaunch):
         self.home = home
         self.jobs = {}
 
+    TOOLS = ["Task", "Bash", "Edit", "Read", "Write", "WebFetch", "WebSearch"]
+
+    def _settings(self, argv, env):
+        """The mode, tools and allow rules Claude Code would start with for ``argv``."""
+        overlay = json.loads(argv[argv.index("--settings") + 1]) if "--settings" in argv else {}
+        profile = {}
+        if argv[argv.index("--setting-sources") + 1] == "user":
+            path = Path(env["CLAUDE_CONFIG_DIR"]) / "settings.json"
+            profile = json.loads(path.read_text()) if path.exists() else {}
+        mode = (overlay.get("permissions", {}).get("defaultMode")
+                or profile.get("permissions", {}).get("defaultMode") or "auto")
+        allow = overlay.get("permissions", {}).get("allow", []) + profile.get("permissions", {}).get("allow", [])
+        self._deny = overlay.get("permissions", {}).get("deny", []) + profile.get("permissions", {}).get("deny", [])
+        tools = list(self.TOOLS)
+        if "--tools" in argv:
+            tools = argv[argv.index("--tools") + 1].split(",")
+        if "--disallowedTools" in argv:
+            tools = [t for t in tools if t not in argv[argv.index("--disallowedTools") + 1].split(",")]
+        return mode, tools, allow
+
+    def _attempt(self, tool, target, cwd, mode, tools, allow):
+        """One tool call: Claude Code's permission check, then a Seatbelt that holds (writes and reads
+        only inside the job's folder)."""
+        inside = target.startswith(str(cwd) + "/") or (tool == "Bash" and str(cwd) in target)
+        if tool not in tools:
+            return False, f"No such tool: {tool}"
+        if tool in getattr(self, "_deny", []):
+            return False, f"Permission to use {tool} has been denied."  # a bare deny rule, in any mode
+        if tool == "Read":
+            # A Mac volume is case-insensitive; Claude Code (2.1.7+) checks deny rules on the
+            # path as given and on where a symlink leads.
+            path = Path(target)
+            if not os.path.lexists(path) and path.parent.is_dir():
+                path = next((p for p in path.parent.iterdir() if p.name.lower() == path.name.lower()), path)
+            names = {target, os.path.realpath(path)}
+            if any(rule.startswith("Read(/") and fnmatch.fnmatchcase(name, rule[6:-1].replace("**", "*"))
+                   for rule in getattr(self, "_deny", []) for name in names):
+                return False, "Permission to read this file has been denied."  # a deny rule, in any mode
+            return (True, path.read_text()) if inside else (False, "Permission denied")
+        permitted = mode == "bypassPermissions" or tool in allow or (
+            tool == "Write" and mode == "acceptEdits" and inside)
+        if not permitted:
+            return False, f"Claude requested permissions to use {tool}, but you haven't granted it yet."
+        if tool == "Write":
+            if not inside:
+                return False, "EPERM: operation not permitted"
+            Path(target).write_text("ok")
+            return True, "written"
+        if not inside:
+            return False, "Operation not permitted"  # the sandbox refuses (git update-ref, outside writes)
+        output, code = run_for_real(target, cwd)
+        return code == 0, output
+
     def launch(self, *, job_id, run_dir, argv, env, cwd, stdin_text, ready_timeout=15.0):
-        reads = re.findall(r"^\d+\. (/.+)$", stdin_text, flags=re.M)
-        lines = [INIT]
+        mode, tools, allow = self._settings(argv, env)
+        steps = [(tool or "Read", named or path) for tool, named, path
+                 in re.findall(r"^\d+\. (?:(Bash|Write) tool: (.+)|(/.+))$", stdin_text, flags=re.M)]
+        lines = [{**INIT, "tools": tools, "permissionMode": mode}]
         running = "thoroughly" in stdin_text
-        if "work folder" in stdin_text:
-            # File tools only: a write inside the task's worktree works, any other is refused.
-            for index, path in enumerate(re.findall(r"^\d+\. (/.+)$", stdin_text, flags=re.M)):
-                allowed = path.startswith(str(cwd) + "/")
-                if allowed:
-                    Path(path).write_text("ok")
+        if steps or "DONE" in stdin_text:
+            # The self-tests: each numbered step with the tool it names (a bare path is a Read).
+            for index, (tool, target) in enumerate(steps):
+                ok, content = self._attempt(tool, target, Path(cwd), mode, tools, allow)
+                tool_input = {"command": target} if tool == "Bash" else {"file_path": target}
                 lines.append({"type": "assistant", "message": {"content": [
-                    {"type": "tool_use", "id": f"w{index}", "name": "Write",
-                     "input": {"file_path": path, "content": "ok"}}]}})
+                    {"type": "tool_use", "id": f"t{index}", "name": tool, "input": tool_input}]}})
                 lines.append({"type": "user", "message": {"content": [
-                    {"type": "tool_result", "tool_use_id": f"w{index}", "is_error": not allowed,
-                     "content": "written" if allowed else "Permission denied"}]}})
-            lines.append({"type": "result", "subtype": "success", "is_error": False, "result": "DONE",
-                          "usage": {"output_tokens": 3}})
-        elif reads:
-            for index, path in enumerate(reads):
-                allowed = path.startswith(str(cwd) + "/")
-                lines.append({"type": "assistant", "message": {"content": [
-                    {"type": "tool_use", "id": f"r{index}", "name": "Read", "input": {"file_path": path}}]}})
-                lines.append({"type": "user", "message": {"content": [
-                    {"type": "tool_result", "tool_use_id": f"r{index}", "is_error": not allowed,
-                     "content": Path(path).read_text() if allowed else "Permission denied"}]}})
+                    {"type": "tool_result", "tool_use_id": f"t{index}", "is_error": not ok, "content": content}]}})
             lines.append({"type": "result", "subtype": "success", "is_error": False, "result": "DONE",
                           "usage": {"output_tokens": 3}})
         elif not running:
@@ -527,6 +841,10 @@ class SimulatedClaudeMac(FakeLaunch):
         self.jobs[handle.label] = running
         return handle
 
+    # What a shell command under the job's Seatbelt profile gets (sign_in_isolation and the wrapper):
+    # the folder, the profile's own state and its credentials file; no Keychain, no profile settings.
+    ALLOWED_PROBES = {"inside_read", "inside_write", "own_sign_in", "state_write"}
+
     def run(self, argv, **kwargs):
         if argv[0] == "/usr/bin/sandbox-exec":
             script = argv[-1]
@@ -535,11 +853,30 @@ class SimulatedClaudeMac(FakeLaunch):
                 if name == "inside_write":
                     target = re.search(r"printf ok > '([^']+)'", script).group(1)
                     Path(target).write_text("ok")
-                out.append(f"R {name} {0 if name.startswith('inside') else 1}")
+                if name == "state_write":
+                    target = re.search(r"printf x > (\S+) 2>/dev/null; echo \"R state_write", script).group(1)
+                    Path(target.strip("'")).write_text("x")
+                out.append(f"R {name} {0 if name in self.ALLOWED_PROBES else 126 if name == 'security_tool' else 1}")
             return subprocess.CompletedProcess(argv, 0, "\n".join(out) + "\n", "")
         if argv[0] == "/usr/bin/security":
+            items = self.__dict__.setdefault("keychain", {"Claude Code-credentials"})
+            service = argv[argv.index("-s") + 1]
+            if argv[1] == "add-generic-password":
+                items.add(service)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[1] == "delete-generic-password":
+                items.discard(service)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if service not in items:
+                return subprocess.CompletedProcess(argv, 44, "", "")
             return subprocess.CompletedProcess(argv, 0, '"mdat"<timedate>=0x1 "20261001"\n', "")
         if argv[0] == "/bin/ps":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "/bin/launchctl":
+            # Nothing a sandboxed probe submitted is loaded.
+            return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+        if argv[0] == "/usr/bin/pkill":
+            self.__dict__.setdefault("killed", []).append(argv[-1])
             return subprocess.CompletedProcess(argv, 0, "", "")
         raise AssertionError(argv)
 
@@ -583,6 +920,77 @@ def test_a_simulated_claude_live_check_passes_and_enables_claude_only(tmp_path):
     live.enable_live(root, path, pinned(), "claude")
     assert live.execution_mode(root, "claude") == "live" and live.execution_mode(root, "codex") == "disabled"
 
+
+
+def _simulated_check(tmp_path, mac_class=None):
+    from openswap.worker.live_check_claude import ClaudeLiveCheck
+
+    root = setup_root(tmp_path)
+    configure_worker_local_policy(root, pinned_account_ref=IDENTITY,
+                                  workspaces=(WorkerWorkspace("research", (root / "research").resolve()),))
+    home = tmp_path / "home"
+    home.mkdir()
+    mac = (mac_class or SimulatedClaudeMac)(home)
+    holder = {}
+    check = ClaudeLiveCheck(root, out=lambda *a: None, containment=mac, verify=lambda **kw: pinned(), run=mac.run,
+                            spawn_child=lambda payload: Child(holder["check"], payload), sleep=lambda s: None,
+                            home=home, live_sessions=lambda p: False)
+    holder["check"] = check
+    return root, mac, check
+
+
+def test_the_claude_permission_gates_record_what_they_measured(tmp_path):
+    root, mac, check = _simulated_check(tmp_path)
+    profile = claude_exec.profile_for(root, IDENTITY)
+    # A restrictive account: its own deny rules must not decide the boundary probes.
+    (profile / "settings.json").write_text(json.dumps({"permissions": {"defaultMode": "dontAsk",
+                                                                       "deny": ["Read", "Write", "Bash"]}}))
+    evidence = check.run()
+    permissions = evidence["gates"]["permissions"]
+    assert permissions["passed"] is True and permissions["account_mode"] == "dontAsk"
+    assert permissions["headless_shell_denied"] and permissions["headless_write_denied"]
+    assert permissions["accept_edits_write_allowed"] and permissions["no_shell_leaves_no_shell_tool"]
+    isolation = evidence["gates"]["sign_in_isolation"]
+    assert isolation["passed"] is True and isolation["security_tool_denied"] and isolation["keychain_services_denied"]
+    # Recorded honestly, never required: a shell command can read the account's own sign-in.
+    assert isolation["own_sign_in_readable_by_shell"] is True and isolation["shell_allowed_on_this_mac"] is True
+    assert mac.keychain == {"Claude Code-credentials"}  # the throwaway item is gone
+    # The work folder ran with the shell in bypassPermissions: only the write scope refused.
+    worktree = evidence["gates"]["worktree"]
+    assert worktree["passed"] is True and worktree["owner_branch_unchanged"] is True
+
+
+class LeakyKeychainMac(SimulatedClaudeMac):
+    ALLOWED_PROBES = SimulatedClaudeMac.ALLOWED_PROBES | {"security_tool", "keychain_services", "settings_write"}
+
+
+class AppsEscapeMac(SimulatedClaudeMac):
+    ALLOWED_PROBES = SimulatedClaudeMac.ALLOWED_PROBES | {"open_app"}
+
+
+class IgnoresTheModeMac(SimulatedClaudeMac):
+    def _attempt(self, tool, target, cwd, mode, tools, allow):
+        return super()._attempt(tool, target, cwd, "bypassPermissions", tools, allow)
+
+
+class IgnoresDenyRulesMac(SimulatedClaudeMac):
+    def _attempt(self, tool, target, cwd, mode, tools, allow):
+        self._deny = []
+        return super()._attempt(tool, target, cwd, mode, tools, allow)
+
+
+@pytest.mark.parametrize("mac_class, gate, key", [
+    (IgnoresDenyRulesMac, "permissions", "credential_rule_holds"),
+    (AppsEscapeMac, "sandbox_wrapper", "app_launch_denied"),
+    (LeakyKeychainMac, "sign_in_isolation", "keychain_services_denied"),
+    (LeakyKeychainMac, "sign_in_isolation", "profile_settings_write_denied"),
+    (IgnoresTheModeMac, "permissions", "headless_shell_denied"),
+])
+def test_a_mac_that_does_not_hold_fails_the_new_gates(tmp_path, mac_class, gate, key):
+    _root, _mac, check = _simulated_check(tmp_path, mac_class)
+    evidence = check.run()
+    assert evidence["gates"][gate]["passed"] is False and evidence["gates"][gate][key] is False
+    assert evidence["passed"] is False
 
 
 def test_a_binary_inside_the_hidden_claude_folder_is_never_pinned(tmp_path, monkeypatch):
@@ -812,18 +1220,28 @@ def test_a_held_claude_lease_points_at_the_claude_store(tmp_path):
     assert "`openswap worker lease release --provider claude`" in str(error.value)
 
 
-def _native_login(root, email=EMAIL, code=0):
+def _native_login(root, email=EMAIL, code=0, file_store=True):
     """A stand-in for `claude auth login`: signs the profile in CLAUDE_CONFIG_DIR in."""
     calls = []
 
     def run(argv, env, check=False, **kwargs):
+        # Claude Code runs with the Keychain out of reach (a Seatbelt wrapper),
+        # so it keeps the sign-in in the profile's credentials file.
+        assert argv[:2] == ["/usr/bin/sandbox-exec", "-f"]
+        sandbox = Path(argv[2]).read_text()
+        assert '(deny process-exec (literal "/usr/bin/security"))' in sandbox
+        assert '(global-name "com.apple.SecurityServer")' in sandbox
+        argv = argv[3:]
         calls.append((list(argv), dict(env), AccountLeaseStore(root, "claude").read_current()))
         profile = Path(env["CLAUDE_CONFIG_DIR"])
         if argv[1:3] == ["auth", "login"] and email is not None:
             (profile / ".claude.json").write_text(json.dumps(
                 {"oauthAccount": {"emailAddress": email, "organizationUuid": ORG}}))
+            if file_store:
+                (profile / ".credentials.json").write_text("{}")  # Claude Code's own write (a placeholder)
         elif argv[1:3] == ["auth", "logout"]:
             (profile / ".claude.json").unlink(missing_ok=True)
+            (profile / ".credentials.json").unlink(missing_ok=True)
         return subprocess.CompletedProcess(argv, code, "", "")
 
     run.calls = calls
@@ -838,14 +1256,34 @@ def test_prepare_signs_in_with_claudes_own_login_under_the_claude_lease(tmp_path
     root = setup_root(tmp_path, prepared=False)
     run = _native_login(root)
     result = live_cli.claude_prepare(root, "claude:4", run=run, verify=lambda: pinned())
-    assert result == {"slot": "4", "account_ref": IDENTITY, "profile_ready": True, "signed_in_now": True}
+    assert result == {"slot": "4", "account_ref": IDENTITY, "profile_ready": True, "signed_in_now": True,
+                      "permissions": {"mode": None, "allow_rules": 0, "deny_rules": 0, "ask_rules": 0}}
     argv, env, lease = run.calls[0]
     profile = claude_exec.profile_for(root, IDENTITY)
     assert argv == ["/fake/claude", "auth", "login", "--claudeai", "--email", EMAIL]
     assert env["CLAUDE_CONFIG_DIR"] == str(profile) and "ANTHROPIC_API_KEY" not in env
     assert lease is not None and lease.state == "active" and lease.account_identity == IDENTITY
     assert AccountLeaseStore(root, "claude").read_current().state == "released"
-    assert not (profile / ".credentials.json").exists()  # nothing seeded by OpenSwap
+    assert not (profile / "settings.json").exists()  # no settings unless the owner asks
+
+
+def test_prepare_refuses_a_sign_in_kept_only_in_the_keychain(tmp_path):
+    # Jobs cannot reach the Keychain: a sign-in Claude Code kept there is not usable.
+    root = setup_root(tmp_path, prepared=False)
+    with pytest.raises(live_cli.AccountPinError) as error:
+        live_cli.claude_prepare(root, "claude:4", run=_native_login(root, file_store=False), verify=lambda: pinned())
+    assert error.value.code == "claude_sign_in_not_in_profile"
+    assert AccountLeaseStore(root, "claude").read_current().state == "released"
+
+
+def test_prepare_signs_in_again_when_the_sign_in_is_only_in_the_keychain(tmp_path):
+    root = setup_root(tmp_path, prepared=True)
+    profile = claude_exec.profile_for(root, IDENTITY)
+    (profile / ".credentials.json").unlink()  # an older prepare: the sign-in is in the Keychain
+    run = _native_login(root)
+    result = live_cli.claude_prepare(root, "claude:4", run=run, verify=lambda: pinned())
+    assert result["signed_in_now"] is True and [c[0][1:3] for c in run.calls] == [["auth", "login"]]
+    assert claude_exec.credentials_in_file(profile)
 
 
 def test_prepare_signs_a_different_account_back_out(tmp_path):
