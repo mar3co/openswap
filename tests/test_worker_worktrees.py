@@ -881,3 +881,20 @@ def test_ignored_files_the_task_left_keep_the_worktree(root, home):
     (resolved.work_dir / "build").rmdir()
     assert worktrees.finish(tree, "left over") is True
     assert worktrees.remove(resolved.work_dir) is True
+
+
+
+def test_adding_a_folder_of_repos_again_keeps_the_one_saved(root, home):
+    github = home / "GitHub"
+    _repo(github / "openswap")
+    _repo(github / "opentag")
+    first = cli.add_work_folder(root, github)
+    again = cli.add_work_folder(root, github)
+    assert first.added is True and again.added is False
+    assert again.workspace.workspace_id == first.workspace.workspace_id
+    assert again.repos == first.repos == ("openswap", "opentag")
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == [first.workspace.workspace_id]
+    # A repo inside it is found too, as the repo's own folder.
+    child = cli.add_work_folder(root, github / "openswap")
+    assert child.added is False and child.workspace.workspace_id == "openswap"
+    assert len(load_worker_settings(root).workspaces) == 1

@@ -1124,7 +1124,10 @@ def add_work_folder(backup_root: Path, folder: str | Path, *, mode: str = "workt
     _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
         current = load_worker_settings(root)
-        existing = work_workspace(launchable_workspaces(root, current.workspaces), work)
+        # The saved folders first: a folder of repos is expanded into its
+        # repos for launching, so only the saved list still holds the parent.
+        existing = work_workspace(current.workspaces, work) or work_workspace(
+            launchable_workspaces(root, current.workspaces), work)
         if existing is not None:
             return WorkFolder(existing, added=False, repos=_repo_ids(root, current.workspaces, existing))
         kept, kept_builtin = current.workspaces, False
