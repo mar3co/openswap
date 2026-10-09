@@ -13,6 +13,9 @@ from pathlib import Path
 with open(Path(SPECPATH, "..", "..", "pyproject.toml"), "rb") as f:
     VERSION = tomllib.load(f)["project"]["version"]
 BUILD_NUMBER = os.environ.get("OPENSWAP_BUILD_NUMBER", "1")
+# build.sh sets this to arm64 or x86_64. PyInstaller fails rather than freeze
+# an arch other than the one the release zip is named for; None means native.
+TARGET_ARCH = os.environ.get("OPENSWAP_ARCH") or None
 
 a = Analysis(
     ["entry.py"],
@@ -28,6 +31,7 @@ exe = EXE(
     name="OpenSwap",
     console=False,
     argv_emulation=False,
+    target_arch=TARGET_ARCH,
 )
 coll = COLLECT(exe, a.binaries, a.datas, name="OpenSwap")
 app = BUNDLE(

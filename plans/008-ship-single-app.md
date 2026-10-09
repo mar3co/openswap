@@ -24,11 +24,15 @@
   release plumbing that needs no Apple credentials. `build.sh` reads the
   version from `pyproject.toml`, signs every Mach-O by file type, checks the
   notarization status and prints Apple's log on failure, and always ends with
-  `dist/OpenSwap-<version>.zip` + `.sha256` (ditto, after stapling). The
-  workflow uploads that zip instead of the `.app` folder (upload-artifact
-  drops execute bits and symlinks), checks the tag against the pyproject
-  version, assesses the unpacked zip, lints the cask, and drafts a GitHub
-  release with the zip, checksum, and rendered cask.
+  `dist/OpenSwap-<version>-<arch>.zip` + `.sha256` (ditto, after stapling).
+  The freeze is single-architecture (uv's Python is), so the workflow builds
+  natively on an arm64 and an x86_64 runner, and `build.sh` fails if any
+  Mach-O in the bundle lacks the target arch. Each leg uploads its zip
+  instead of the `.app` folder (upload-artifact drops execute bits and
+  symlinks), checks the tag against the pyproject version, and assesses and
+  runs the unpacked zip; one leg lints the cask. After both pass, a GitHub
+  release is drafted with both zips, their checksums, and a cask whose
+  `on_arm`/`on_intel` blocks carry each zip's URL and sha256.
   `.github/workflows/homebrew-tap.yml` copies the cask into the tap when a
   person publishes the release. Template: `packaging/homebrew/openswap.rb.in`.
 
@@ -196,11 +200,16 @@ pointing at the bundle is left alone.
 ### Step 7: First release (operator runs, executor prepares)
 
 1. Bump `pyproject.toml` version; commit; tag `v<version>`; push the tag.
-2. Workflow `macOS app` builds, notarizes, assesses the unpacked zip, and
-   drafts the release with `OpenSwap-<version>.zip`, `.sha256`, `openswap.rb`.
+2. Workflow `macOS app` builds and notarizes on arm64 and x86_64, assesses
+   each unpacked zip, and drafts the release with
+   `OpenSwap-<version>-arm64.zip`, `OpenSwap-<version>-x86_64.zip`, their
+   `.sha256` files, and `openswap.rb`.
 3. Operator publishes the draft; workflow `Homebrew tap` pushes the cask.
 4. On a clean user account: `brew install --cask mar3co/openswap/openswap`,
    `openswap setup`, open the popover, add the widget, `openswap list`.
+   Do this on an Apple silicon Mac and on an Intel Mac (or confirm with
+   `brew fetch --cask --arch=intel` that the Intel zip downloads and its
+   checksum matches).
 5. On the operator's Mac (uv install present): same, and confirm Step 5's
    migration left one extra running and one widget provider
    (`pluginkit -m -i com.opensoft.openswap.widget.extension` shows one path).

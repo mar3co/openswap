@@ -1,11 +1,12 @@
 name: macOS app
 
-# Freeze OpenSwap.app on a macOS runner. Sign and notarize when repository
-# secrets are present. Pull requests always freeze unsigned (do not expose
-# the production certificate to PR code). Tag builds require the certificate
-# and end in a draft GitHub release carrying the zip, its checksum, and the
-# rendered Homebrew cask. Publishing that draft is a person's call; the
-# homebrew-tap workflow then copies the cask into the tap.
+# Freeze OpenSwap.app on macOS runners, once per CPU architecture. Sign and
+# notarize when repository secrets are present. Pull requests always freeze
+# unsigned (do not expose the production certificate to PR code). Tag builds
+# require the certificate and end in a draft GitHub release carrying both
+# zips, their checksums, and the rendered Homebrew cask. Publishing that draft
+# is a person's call; the homebrew-tap workflow then copies the cask into the
+# tap.
 
 on:
   workflow_dispatch:
@@ -20,7 +21,20 @@ on:
 
 jobs:
   macos-app:
-    runs-on: macos-latest
+    # uv's Python is single-architecture, so the frozen app is too. Build each
+    # arch natively; the cask serves arm64 to Apple silicon and x86_64 to
+    # Intel Macs. Both runners use the same macOS image so the Xcode that
+    # builds the widget matches.
+    name: macos-app (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26
+          - arch: x86_64
+            runner: macos-26-intel
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -28,9 +42,19 @@ jobs:
       # `secrets` is not available in a step-level `if`, only in `env` and
       # `with`. Hoist the presence check here so steps can gate on it.
       HAS_SIGNING_P12: ${{ secrets.SIGNING_APPLICATION_P12_BASE64 != '' }}
+      OPENSWAP_ARCH: ${{ matrix.arch }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Runner is ${{ matrix.arch }}
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          if [ "$(uname -m)" != "$OPENSWAP_ARCH" ]; then
+            echo "runner $RUNNER_LABEL is $(uname -m), expected $OPENSWAP_ARCH" >&2
+            exit 1
+          fi
 
       - name: Tag builds must sign
         if: startsWith(github.ref, 'refs/tags/')
@@ -61,11 +85,14 @@ jobs:
       - name: Install xcodegen
         run: brew install xcodegen
 
-      # Render with a dummy checksum; this checks the template, not a release.
+      # Render with dummy checksums; this checks the template, not a release.
+      # One leg is enough: the template does not depend on the runner.
       - name: Lint Homebrew cask
+        if: matrix.arch == 'arm64'
         run: |
           mkdir -p "$RUNNER_TEMP/Casks"
-          bash packaging/homebrew/render-cask.sh 0.0.0 "$(printf '0%.0s' $(seq 64))" \
+          bash packaging/homebrew/render-cask.sh 0.0.0 \
+            "$(printf 'a%.0s' $(seq 64))" "$(printf 'b%.0s' $(seq 64))" \
             > "$RUNNER_TEMP/Casks/openswap.rb"
           brew style "$RUNNER_TEMP/Casks/openswap.rb"
 
@@ -81,10 +108,26 @@ jobs:
           NOTARY_KEY_BASE64: ${{ secrets.NOTARY_KEY_BASE64 }}
         run: bash packaging/macos/ci-import-signing-keychain.sh
 
+      # build.sh freezes for OPENSWAP_ARCH and fails if any Mach-O in the
+      # bundle does not run on it.
       - name: Freeze (sign and notarize when identity is set)
         env:
           OPENSWAP_BUILD_NUMBER: ${{ github.run_number }}
         run: bash packaging/macos/build.sh
+
+      # Every build, signed or not: the zip that would ship unpacks to an app
+      # whose executable is built for this arch and starts on it.
+      - name: Unpacked zip runs on ${{ matrix.arch }}
+        run: |
+          version="$(awk -F'"' '/^version = /{print $2; exit}' pyproject.toml)"
+          ZIP="packaging/macos/dist/OpenSwap-${version}-${OPENSWAP_ARCH}.zip"
+          CHECK="$RUNNER_TEMP/zip-run"
+          rm -rf "$CHECK" && mkdir -p "$CHECK"
+          ditto -x -k "$ZIP" "$CHECK"
+          EXE="$CHECK/OpenSwap.app/Contents/MacOS/OpenSwap"
+          lipo -archs "$EXE"
+          lipo -archs "$EXE" | grep -qw "$OPENSWAP_ARCH"
+          "$EXE" --version
 
       # build.sh exits 0 when it cannot sign, so a green run is not by itself
       # proof of a shippable app. Assert it on the one path that ships, against
@@ -93,7 +136,7 @@ jobs:
       - name: Tag builds must be signed, notarized, and stapled
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          ZIP="$(ls packaging/macos/dist/OpenSwap-*.zip)"
+          ZIP="packaging/macos/dist/OpenSwap-${GITHUB_REF_NAME#v}-${OPENSWAP_ARCH}.zip"
           CHECK="$RUNNER_TEMP/zip-check"
           rm -rf "$CHECK" && mkdir -p "$CHECK"
           ditto -x -k "$ZIP" "$CHECK"
@@ -108,14 +151,16 @@ jobs:
       - name: Upload OpenSwap zip
         uses: actions/upload-artifact@v4
         with:
-          name: OpenSwap-app
+          name: OpenSwap-app-${{ matrix.arch }}
           path: |
-            packaging/macos/dist/OpenSwap-*.zip
-            packaging/macos/dist/OpenSwap-*.zip.sha256
+            packaging/macos/dist/OpenSwap-*-${{ matrix.arch }}.zip
+            packaging/macos/dist/OpenSwap-*-${{ matrix.arch }}.zip.sha256
           if-no-files-found: error
           retention-days: 14
 
   release:
+    # `needs` waits for every matrix leg, so a release is drafted only when
+    # both architectures built, signed, and passed the assessment above.
     needs: macos-app
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
@@ -126,14 +171,19 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: OpenSwap-app
+          pattern: OpenSwap-app-*
+          merge-multiple: true
           path: dist
 
-      - name: Render cask
+      - name: Verify checksums and render cask
         run: |
           version="${GITHUB_REF_NAME#v}"
-          sha256="$(cut -d' ' -f1 < "dist/OpenSwap-${version}.zip.sha256")"
-          bash packaging/homebrew/render-cask.sh "$version" "$sha256" > dist/openswap.rb
+          for arch in arm64 x86_64; do
+            (cd dist && sha256sum -c "OpenSwap-${version}-${arch}.zip.sha256")
+          done
+          arm64="$(cut -d' ' -f1 < "dist/OpenSwap-${version}-arm64.zip.sha256")"
+          x86_64="$(cut -d' ' -f1 < "dist/OpenSwap-${version}-x86_64.zip.sha256")"
+          bash packaging/homebrew/render-cask.sh "$version" "$arm64" "$x86_64" > dist/openswap.rb
           cat dist/openswap.rb
 
       - name: Create draft release
@@ -143,6 +193,8 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
             --title "OpenSwap ${version}" --generate-notes \
-            "dist/OpenSwap-${version}.zip" \
-            "dist/OpenSwap-${version}.zip.sha256" \
+            "dist/OpenSwap-${version}-arm64.zip" \
+            "dist/OpenSwap-${version}-arm64.zip.sha256" \
+            "dist/OpenSwap-${version}-x86_64.zip" \
+            "dist/OpenSwap-${version}-x86_64.zip.sha256" \
             dist/openswap.rb

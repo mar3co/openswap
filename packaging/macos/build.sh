@@ -6,8 +6,11 @@
 # Notary: OPENSWAP_NOTARY_PROFILE (keychain) or OPENSWAP_NOTARY_KEY_PATH +
 # OPENSWAP_NOTARY_KEY_ID + OPENSWAP_NOTARY_ISSUER.
 # OPENSWAP_BUILD_NUMBER (optional, default 1) becomes CFBundleVersion.
+# OPENSWAP_ARCH (optional, default `uname -m`) is arm64 or x86_64. The freeze
+# is single-architecture because uv's Python is, so a release builds once per
+# arch on a matching runner and the cask picks the zip for the user's CPU.
 #
-# Every run ends with $DIST/OpenSwap-<version>.zip and its .sha256. The zip is
+# Every run ends with $DIST/OpenSwap-<version>-<arch>.zip and its .sha256. The zip is
 # made with ditto after stapling, so it is the file to ship: a plain copy of
 # the .app folder (actions/upload-artifact, cp without -R) drops the execute
 # bits and symlinks and breaks the signature.
@@ -28,7 +31,38 @@ if [[ -z "$VERSION" ]]; then
   echo "could not read version from $ROOT/pyproject.toml" >&2
   exit 1
 fi
-RELEASE_ZIP="$DIST/OpenSwap-$VERSION.zip"
+ARCH="${OPENSWAP_ARCH:-$(uname -m)}"
+case "$ARCH" in
+  arm64 | x86_64) ;;
+  *)
+    echo "OPENSWAP_ARCH must be arm64 or x86_64, not '$ARCH'" >&2
+    exit 1
+    ;;
+esac
+# openswap.spec hands this to PyInstaller as target_arch, which refuses an
+# arch the running Python cannot produce instead of freezing the wrong one.
+export OPENSWAP_ARCH="$ARCH"
+RELEASE_ZIP="$DIST/OpenSwap-$VERSION-$ARCH.zip"
+
+# Every Mach-O in the bundle must run on $ARCH: the cask serves this zip to
+# that CPU only, so one wheel or helper built for the other arch would ship a
+# broken app. The appex and helper may be universal; that is fine.
+check_arch() {
+  local bad=0 f archs
+  while IFS= read -r -d '' f; do
+    file -b "$f" | grep -q '^Mach-O' || continue
+    archs="$(lipo -archs "$f" 2>/dev/null || true)"
+    if ! grep -qw -- "$ARCH" <<<"$archs"; then
+      echo "not $ARCH: ${f#"$APP"/} (${archs:-unknown})" >&2
+      bad=1
+    fi
+  done < <(find "$APP/Contents" -type f -print0)
+  if [[ "$bad" != 0 ]]; then
+    echo "$APP has Mach-O files that do not run on $ARCH" >&2
+    exit 1
+  fi
+  echo "every Mach-O in $APP runs on $ARCH"
+}
 
 # Zip the finished app for shipping. Called on every exit path, so an
 # unsigned PR build uploads the same shape of file a release does.
@@ -101,6 +135,7 @@ fi
   || /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$APP/Contents/Info.plist"
 
 plutil -lint "$APP/Contents/Info.plist"
+check_arch
 
 if [[ -z "$IDENTITY" ]]; then
   echo "OPENSWAP_SIGN_IDENTITY is unset; leaving $APP unsigned." >&2

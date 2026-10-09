@@ -1,8 +1,19 @@
 cask "openswap" do
   version "@VERSION@"
-  sha256 "@SHA256@"
 
-  url "https://github.com/mar3co/openswap/releases/download/v#{version}/OpenSwap-#{version}.zip"
+  # One single-architecture zip per CPU: uv's Python, and so the frozen app,
+  # is built natively on an arm64 and an x86_64 runner.
+  on_arm do
+    sha256 "@SHA256_ARM64@"
+
+    url "https://github.com/mar3co/openswap/releases/download/v#{version}/OpenSwap-#{version}-arm64.zip"
+  end
+  on_intel do
+    sha256 "@SHA256_X86_64@"
+
+    url "https://github.com/mar3co/openswap/releases/download/v#{version}/OpenSwap-#{version}-x86_64.zip"
+  end
+
   name "OpenSwap"
   desc "Menu bar app for rotating Claude Code and Codex CLI accounts"
   homepage "https://github.com/mar3co/openswap"

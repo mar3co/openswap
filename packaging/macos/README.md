@@ -16,15 +16,23 @@ From the repo root:
 ```
 
 Needs Xcode, xcodegen, and uv. Output: `packaging/macos/dist/OpenSwap.app`
-plus `OpenSwap-<version>.zip` and `.sha256` (all gitignored). Bundle size on
-this spike Mac: 26M. The version comes from `pyproject.toml`;
+plus `OpenSwap-<version>-<arch>.zip` and `.sha256` (all gitignored). Bundle
+size on this spike Mac: 26M. The version comes from `pyproject.toml`;
 `OPENSWAP_BUILD_NUMBER` (CI: the run number) sets `CFBundleVersion`.
+
+The app is single-architecture: uv's Python builds are per CPU, so PyInstaller
+freezes for the Mac it runs on. `OPENSWAP_ARCH` (`arm64` or `x86_64`, default
+`uname -m`) names the zip and is passed to PyInstaller as `target_arch`, which
+refuses an arch the running Python cannot produce. Before zipping, `build.sh`
+fails if any Mach-O in the bundle does not include that arch (a universal
+widget appex or reload helper passes).
 
 Ship or copy the zip, not the `.app` folder. It is made with `ditto` after
 stapling; copying the folder by other means (including
 `actions/upload-artifact`) drops execute bits and symlinks and breaks the
-signature. To try a CI build, download the `OpenSwap-app` artifact and unpack
-the zip inside it with `ditto -x -k OpenSwap-*.zip .`.
+signature. To try a CI build, download the `OpenSwap-app-arm64` or
+`OpenSwap-app-x86_64` artifact and unpack the zip inside it with
+`ditto -x -k OpenSwap-*.zip .`.
 
 For an isolated experimental build without replacing the ordinary dist app,
 set absolute `OPENSWAP_DIST_DIR`, `OPENSWAP_BUILD_DIR`, and
@@ -40,8 +48,10 @@ secrets instead.
 ## GitHub Actions
 
 Workflow `macOS app` freezes on `workflow_dispatch`, version tags (`v*`),
-and pull requests that touch packaging or the widget project. Pull requests
-always stay unsigned. Tag builds fail if the certificate secret is missing.
+and pull requests that touch packaging or the widget project. It runs twice,
+natively: `arm64` on `macos-26` and `x86_64` on `macos-26-intel`, and each leg
+unpacks its zip and runs `OpenSwap --version` from it. Pull requests always
+stay unsigned. Tag builds fail if the certificate secret is missing.
 
 Repository secrets (Settings → Secrets and variables → Actions):
 
@@ -65,9 +75,12 @@ the submission before failing, so the reason is in the job log.
 1. Bump `version` in `pyproject.toml`, commit, and push tag `v<version>`.
    The workflow fails if the tag and the pyproject version disagree.
 2. `macOS app` builds, signs, notarizes, unpacks the zip and assesses that
-   copy, then drafts a GitHub release with `OpenSwap-<version>.zip`, its
-   `.sha256`, and `openswap.rb` rendered from
-   `packaging/homebrew/openswap.rb.in`.
+   copy on each architecture. Once both legs pass, it drafts a GitHub release
+   with `OpenSwap-<version>-arm64.zip`, `OpenSwap-<version>-x86_64.zip`,
+   their `.sha256` files, and `openswap.rb` rendered from
+   `packaging/homebrew/openswap.rb.in`. The cask's `on_arm` and `on_intel`
+   blocks carry each zip's URL and checksum, so Homebrew downloads the one
+   built for the user's CPU.
 3. Check the draft and publish it. `Homebrew tap`
    (`.github/workflows/homebrew-tap.yml`) then copies `openswap.rb` into
    `mar3co/homebrew-openswap/Casks/`. It needs repository secret
