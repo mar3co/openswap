@@ -460,6 +460,7 @@ def _sandboxed(sb, script):
 
 @pytest.mark.skipif(sys.platform != "darwin" or not os.path.exists("/usr/bin/sandbox-exec"), reason="Seatbelt")
 def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_away_for_real(tmp_path):
+    out = tmp_path / "out"  # the job folder
     sb, profile, home = _job_profile(tmp_path)
     codes = _sandboxed(sb, "; ".join([
         "/usr/bin/security find-generic-password -s openswap-test-missing >/dev/null 2>&1; echo security $?",
@@ -473,12 +474,20 @@ def test_the_seatbelt_profile_takes_the_keychain_and_the_profiles_configuration_
         f"printf x > {profile}/projects/-repo/memory/MEMORY.md 2>/dev/null; echo auto_memory $?",
         f"mkdir {profile}/projects/-other 2>/dev/null; mkdir {profile}/projects/-other/memory 2>/dev/null; "
         f"echo new_auto_memory $?",
-        f"printf x > {profile}/projects/-repo/todo/t.json; echo project_state $?",
+        f"printf x > {profile}/projects/-repo/todo/t.json 2>/dev/null; echo project_state $?",
+        # A folder prepared where the task may write, renamed or linked into place.
+        f"mkdir -p {out}/staged/memory && printf x > {out}/staged/memory/MEMORY.md && "
+        f"mv {out}/staged {profile}/projects/-next 2>/dev/null; echo renamed_in $?",
+        f"ln -s {out}/staged {profile}/projects/-linked 2>/dev/null; echo linked_in $?",
+        f"mv {profile}/projects {profile}/old-projects 2>/dev/null; echo projects_moved $?",
         f"printf x > {profile}/state.json; echo state $?",
         f"cat {profile}/.credentials.json >/dev/null; echo own_sign_in $?",
     ]))
     assert codes["rule"] != "0" and codes["auto_memory"] != "0" and codes["new_auto_memory"] != "0"
-    assert codes["project_state"] == "0"
+    # The whole projects/ folder (auto-memory lives there), its entries included.
+    assert codes["project_state"] != "0" and codes["renamed_in"] != "0" and codes["linked_in"] != "0"
+    assert codes["projects_moved"] != "0"
+    assert not (profile / "projects" / "-next").exists() and not os.path.lexists(profile / "projects" / "-linked")
     # The `security` tool cannot start at all (126), so Claude Code's Keychain
     # write fails fast and it keeps the sign-in in its credentials file.
     assert codes["security"] == "126"

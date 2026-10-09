@@ -217,14 +217,6 @@ def _sb_string(path: Path | str) -> str:
     return f'"{text}"'
 
 
-def _sb_regex(path: Path | str) -> str:
-    """``path`` as a literal inside an SBPL ``#"..."`` regular expression."""
-    text = str(path)
-    if any(ord(ch) < 0x20 or ch in '"' for ch in text):
-        raise ValueError("unsupported character in a sandbox path")
-    return "".join("\\" + ch if ch in ".^$*+?()[]{}|\\" else ch for ch in text)
-
-
 def darwin_user_dirs() -> list[Path]:
     """This user's own temporary and cache directories (``/var/folders/../T`` and ``../C``)."""
     found = []
@@ -269,9 +261,9 @@ def seatbelt_profile(*, output_root: Path, profile: Path, run_tmp: Path, home: P
     hidden = [home / ".claude", home / ".codex", backup_root]
     readable = [profile, output_root, *readonly_sources, *write_paths, *read_paths]
     configuration = [f"(literal {_sb_string(profile / name)})" for name in CLAUDE_PROFILE_CONFIG]
+    # A subpath also covers the entry itself, so nothing can be renamed or
+    # linked into place (``projects/`` holds each project's auto-memory).
     configuration += [f"(subpath {_sb_string(profile / name)})" for name in CLAUDE_PROFILE_CONFIG_DIRS]
-    # Each project's auto-memory, which later sessions in that folder load.
-    configuration.append(f'(regex #"^{_sb_regex(profile / "projects")}/[^/]+/memory(/|$)")')
     services = " ".join(f"(global-name {_sb_string(name)})" for name in KEYCHAIN_SERVICES)
 
     def subpaths(paths):

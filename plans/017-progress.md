@@ -1601,7 +1601,7 @@ Built (PR #93, stacked on #90):
   signed in only in the Keychain refuses (`provider_auth_unavailable`) until
   `prepare` signs it in again. The profile's configuration files (settings,
   memory and rules, agents and their memory, commands, skills, hooks, output
-  styles, plugins, and each project's auto-memory, with auto-memory off) are
+  styles, plugins, and `projects/` where each project's auto-memory lives, with auto-memory off) are
   unwritable from a job, so one task cannot widen the next. And nothing a
   shell starts can leave the sandbox or the coalition: measured on this Mac,
   `open -g -j -a Calculator` from an `(allow default)` profile starts an

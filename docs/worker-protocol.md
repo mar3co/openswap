@@ -979,8 +979,8 @@ what git needs beside it), the account's profile, the run's temporary folder
 and this user's cache and temporary folders, and never to the profile files
 that configure or instruct later sessions (`settings.json`,
 `settings.local.json`, `CLAUDE.md`, `rules/`, `agents/`, `agent-memory/`,
-`commands/`, `skills/`, `hooks/`, `output-styles/`, `plugins/`, and each
-project's auto-memory `projects/<project>/memory/`; jobs also run with
+`commands/`, `skills/`, `hooks/`, `output-styles/`, `plugins/`, and `projects/`,
+where each project's auto-memory lives, entries included; jobs also run with
 auto-memory off). It makes the default login, `~/.codex` and the rest of the
 backup root (other accounts, worker state) unreadable and unwritable, and
 takes the Keychain away: `/usr/bin/security` cannot start, the Keychain's

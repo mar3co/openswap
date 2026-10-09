@@ -98,11 +98,13 @@ CLAUDE_READ_ONLY_TOOLS = ("Read", "Grep", "Glob", "WebSearch", "WebFetch")
 # Files in the profile that change what a later session may do or is told.
 # Jobs may not write them (Seatbelt), so a task can never widen or instruct
 # the next one: settings, user memory and rules, agents and their memory,
-# commands, skills, hooks, output styles, plugins, and each project's
-# auto-memory (``projects/<project>/memory``, see claude_exec).
+# commands, skills, hooks, output styles, plugins, and ``projects/`` (each
+# project's auto-memory lives there; protecting the whole folder also stops a
+# task from renaming a prepared folder into place). Jobs keep no session
+# history (``--no-session-persistence``), so they need nothing there.
 CLAUDE_PROFILE_CONFIG = ("settings.json", "settings.local.json", "CLAUDE.md")
 CLAUDE_PROFILE_CONFIG_DIRS = ("agents", "agent-memory", "commands", "rules", "skills", "hooks", "output-styles",
-                              "plugins")
+                              "plugins", "projects")
 
 
 @dataclass(frozen=True)
