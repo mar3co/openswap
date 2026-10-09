@@ -61,6 +61,8 @@ class TerminalPrompts:
     interactive: bool
     read_line: Callable[[str], str] | None = None
     write: Callable[[str], None] = field(default=print)
+    # One home-folder scan shared by every folder search in a run.
+    _index: object = field(default=None, repr=False)
 
     def say(self, text: str) -> None:
         self.write(text)
@@ -99,46 +101,55 @@ class TerminalPrompts:
 
         return pick_folder(f"{question}: ")
 
+    def can_search_folders(self) -> bool:
+        """Whether ``search_folders`` runs the live picker (a real terminal, no scripted input)."""
+        if self.read_line is not None:
+            return False
+        from openswap import folder_picker
 
-# Copy shared by the steps and their fallbacks.
-START_WORKER_NEXT = (
-    "Next: start the Remote tasks worker so this Mac can accept approved tasks: "
-    "`openswap worker enable`."
-)
-ACCOUNT_NEXT = (
-    "Next: pin the account remote jobs run on: `openswap worker account <slot|email|alias>` "
-    "(`claude:<slot>` for a Claude account; `openswap worker account` lists them)."
-)
-FOLDER_NEXT = (
-    "Next: choose a folder remote tasks may read, such as ~/GitHub: "
-    "`openswap worker workspace add --read <folder>` (or run `openswap worker setup` again). "
-    "Tasks never change it, and results are saved under ~/OpenSwap Research. Only an ID and "
-    "the folder's name reach the control service; the path never leaves this Mac."
-)
-EXECUTION_OFF_NOTE = (
-    "Task execution itself stays off (provider: live_adapter_disabled) until you run "
-    "`openswap worker live-check` on this Mac and enable live execution, so jobs are refused for now."
-)
+        return folder_picker.available()
+
+    def search_folders(self, question: str, *, pinned=(), highlight: int | None = None) -> str | None:
+        """The type-to-search picker with ``pinned`` numbered suggestions; "" finishes."""
+        from openswap import folder_picker
+
+        if self._index is None:
+            self._index = folder_picker.FolderIndex(_cli().home_folder()).start()
+        return folder_picker.pick_folder(f"{question}: ", pinned=pinned, highlight=highlight,
+                                         index=self._index)
+
+
+# Copy shared by the steps and their fallbacks. Each step says at most one
+# short line of context and ends with at most one `Next:` command.
+START_WORKER_NEXT = "Next: `openswap worker enable` to start the worker."
+ACCOUNT_NEXT = "Next: `openswap worker account <slot>` to pick an account."
+FOLDER_NEXT = "Next: `openswap worker workspace add --read <folder>` to add a folder."
+# What tasks may do in the folders the owner picks, in one place: today a
+# picked folder is a read-only source, and the owner may later decide tasks
+# work in it instead.
+FOLDER_USE = "Tasks can open the folders you pick"
+EXECUTION_OFF_NOTE = "Next: `openswap worker live-check` to turn on live tasks."
 CLAUDE_EXECUTION_OFF_NOTE = (
-    "Task execution itself stays off (provider: live_adapter_disabled) until the Claude live check "
-    "passes on this Mac, so jobs are refused for now. Run `openswap worker claude pin`, then "
-    "`openswap worker claude prepare`, then `openswap worker live-check --provider claude` "
-    "and enable live execution."
+    "Next: `openswap worker claude pin`, `openswap worker claude prepare`, then "
+    "`openswap worker live-check --provider claude` to turn on live tasks."
 )
-EXECUTION_LIVE_NOTE = "Task execution is live: approved tasks run on this Mac with the chosen account."
+READY_NOTE = f"{printer.MARK_OK} Ready: Slack can send tasks to this Mac."
 
 
 def execution_off_note(provider: str | None) -> str:
-    """The off-note with the live-check steps for the pinned account's provider."""
+    """The one `Next:` line for turning on live tasks with the pinned account's provider."""
     return CLAUDE_EXECUTION_OFF_NOTE if provider == "claude" else EXECUTION_OFF_NOTE
 
 
 def _provider_name(choice) -> str:
     return "Claude" if getattr(choice, "provider", "codex") == "claude" else "Codex"
-WORKER_OFFER = "Start the Remote tasks worker now so this Mac can accept approved tasks?"
-WORKER_ONLINE = "Remote tasks worker enabled. The portal shows this Mac online within about 15 seconds."
+
+
+WORKER_OFFER = "Start the worker now?"
+WORKER_ONLINE = f"{printer.MARK_OK} Worker started. This Mac shows online in about 15 seconds."
 _RUNNING_STATES = frozenset({"starting", "running"})
 _MAX_ATTEMPTS = 3
+_MAX_PICKS = 16
 
 
 def _cli():
@@ -160,16 +171,15 @@ def offer_worker(root: Path, ui: Prompts) -> None:
         except Exception:
             process = None
         if process in _RUNNING_STATES:
-            ui.say("The Remote tasks worker is already running on this Mac.")
+            ui.say(f"{printer.MARK_OK} Worker running.")
         else:
-            ui.say("The Remote tasks worker is enabled but not running. Run `openswap worker enable` "
-                   "to start it again, or `openswap worker status` to check.")
+            ui.say("The worker is on but not running. Next: `openswap worker enable`.")
         return
     if not ui.interactive:
         ui.say(START_WORKER_NEXT)
         return
     if ui.confirm(WORKER_OFFER) is not True:
-        ui.say("Not started. Start it later with `openswap worker enable`.")
+        ui.say(f"Not started. {START_WORKER_NEXT}")
         return
     try:
         cli.enable_worker(root)
@@ -178,9 +188,9 @@ def offer_worker(root: Path, ui: Prompts) -> None:
         message = cli._enable_failure_message(exc)
         if code in cli._ENABLE_DIAGNOSTICS:
             message = f"{message.rstrip('.')} ({code})."
-        ui.say(f"{message} Start it later with `openswap worker enable`.")
+        ui.say(f"{message} {START_WORKER_NEXT}")
     except Exception:
-        ui.say("Could not enable worker. Start it later with `openswap worker enable`.")
+        ui.say(f"Could not enable worker. {START_WORKER_NEXT}")
     else:
         ui.say(WORKER_ONLINE)
 
@@ -216,38 +226,35 @@ def confirm_account(root: Path, ui: Prompts) -> None:
         choices = None
     pinned = choices.pinned if choices is not None and not choices.pinned_missing else None
     if pinned is not None and not ui.interactive:
-        ui.say(f"Remote tasks uses {_provider_name(pinned)} account {pinned.label()}.")
+        ui.say(f"{printer.MARK_OK} Account: {_provider_name(pinned)} {pinned.label()}")
         return
     if not ui.interactive or choices is None:
         ui.say(ACCOUNT_NEXT)
         return
     if choices.pinned_missing:
-        ui.say("The pinned account is no longer in the roster; choose another.")
+        ui.say("Your pinned account is gone; pick another.")
     menu, lines = account_menu(choices, pinned)
     if not menu:
-        ui.say("No eligible account is saved. Add one with `openswap codex add` or `openswap add`, then "
-               "`openswap worker account <slot>`.")
+        ui.say("No account to pick. Next: `openswap codex add` or `openswap add`.")
         return
     # Skipping after declining the current pin cancels the change: say the
     # previous account stays selected rather than implying none is pinned.
-    later = (f"{pinned.label()} stays selected. Change it later with "
-             "`openswap worker account <slot|email|alias>`." if pinned is not None
-             else "Pin one later with `openswap worker account <slot|email|alias>`.")
-    ui.say("Choose the account remote jobs run on. Type its number (an email, alias or "
-           "`claude:<slot>` works too).")
+    later = (f"Kept {_provider_name(pinned)} {pinned.label()}." if pinned is not None
+             else f"Skipped. {ACCOUNT_NEXT}")
+    ui.say("Tasks run on the account you pick.")
     for line in lines:
         ui.say(line)
     current = next((str(n) for n, c in enumerate(menu, start=1)
                     if pinned is not None and c.account_ref == pinned.account_ref), "")
-    question = (f"Account number (1-{len(menu)}; Enter keeps the current one)" if current
-                else f"Account number (1-{len(menu)}; Enter to skip)")
+    # A number, an email, an alias or `claude:<slot>` all work.
+    question = "Account" if current else f"Account (1-{len(menu)}, Enter skips)"
     for _attempt in range(_MAX_ATTEMPTS):
         answer = ui.ask(question, default=current)
         if not answer:
-            ui.say(f"Skipped. {later}")
+            ui.say(later)
             return
         if answer == current:
-            ui.say(f"Kept {_provider_name(pinned)} account {pinned.label()}.")
+            ui.say(f"{printer.MARK_OK} Kept {_provider_name(pinned)} {pinned.label()}")
             return
         selector = answer
         # ASCII only: str.isdigit() also accepts digits such as "²" that int() rejects.
@@ -262,9 +269,9 @@ def confirm_account(root: Path, ui: Prompts) -> None:
             ui.say(cli._ACCOUNT_MESSAGES.get(exc.code, f"Could not pin that account ({exc.code})."))
             continue
         except Exception:
-            ui.say(f"Could not pin that account. {later}")
+            ui.say(f"Could not pick that account. {ACCOUNT_NEXT}")
             return
-        ui.say(f"Pinned {_provider_name(chosen)} account {chosen.label()} for Remote tasks.")
+        ui.say(f"{printer.MARK_OK} {_provider_name(chosen)} {chosen.label()}")
         return
     ui.say(later)
 
@@ -308,7 +315,7 @@ def _readable(workspaces) -> list:
 
 
 def _say_folders(ui, workspaces) -> None:
-    ui.say("Folders remote tasks may read, never change (the control service sees only the ID and label):")
+    ui.say("Folders:")
     for line in folder_lines(workspaces):
         ui.say(line)
 
@@ -331,6 +338,7 @@ class FolderMenu:
     lines: tuple[str, ...]
     recommended: int | None  # menu index of the recommended GitHub folder
     readable: frozenset[Path]  # folders a workspace already reads
+    notes: tuple[str, ...] = ()  # per folder: "recommended", "git repo", "added as <id>"
 
 
 def folder_menu(root: Path, workspaces) -> FolderMenu:
@@ -347,7 +355,7 @@ def folder_menu(root: Path, workspaces) -> FolderMenu:
     folders = list(detected) + [source for source in reads if source not in detected]
     recommended = 0 if detected and cli.is_github_folder(detected[0]) else None
     parents = set(detected)
-    rows = []
+    rows, all_notes = [], []
     for index, folder in enumerate(folders):
         notes = []
         if index == recommended:
@@ -355,10 +363,12 @@ def folder_menu(root: Path, workspaces) -> FolderMenu:
         if folder.parent in parents and folder in detected:
             notes.append("git repo")
         if folder in reads:
-            notes.append(f"readable as {reads[folder]}")
-        rows.append((f"{printer.mark(True if folder in reads else None)} {index + 1}", _display_path(folder),
-                     f"({', '.join(notes)})" if notes else ""))
-    return FolderMenu(tuple(folders), tuple(printer.columns(rows)), recommended, frozenset(reads))
+            notes.append(f"added as {reads[folder]}")
+        note = f"({', '.join(notes)})" if notes else ""
+        all_notes.append(note)
+        rows.append((f"{printer.mark(True if folder in reads else None)} {index + 1}", _display_path(folder), note))
+    return FolderMenu(tuple(folders), tuple(printer.columns(rows)), recommended, frozenset(reads),
+                      tuple(all_notes))
 
 
 def _names_a_path(text: str) -> bool:
@@ -429,26 +439,23 @@ def choose_folders(root: Path, ui: Prompts) -> None:
         else:
             ui.say(FOLDER_NEXT)
         return
+    ui.say(f"{FOLDER_USE}. Results go to {_display_path(cli.default_research_folder())}.")
+    if getattr(ui, "can_search_folders", lambda: False)():
+        _search_folders(root, ui, bool(current))
+        return
     menu = folder_menu(root, policy.workspaces)
-    ui.say("Remote tasks can read the folders you choose here, but never change them.")
-    ui.say(f"Results are saved under {_display_path(cli.default_research_folder())}. The control "
-           "service sees only each folder's ID and name, never its path.")
     if menu.folders:
         for line in menu.lines:
             ui.say(line)
         if current:
-            default, enter = "", "Enter keeps the current ones"
+            default, question = "", "Folders (Enter keeps current)"
         else:
-            default = str((menu.recommended or 0) + 1)
-            enter = f"Enter for {default}"
-        question = f"Folders tasks may read (numbers like 1 3, or a path; {enter})"
+            default, question = str((menu.recommended or 0) + 1), "Folders (numbers or a path)"
     else:
         default = ""
         question = ("Type the path to your code folder, for example ~/GitHub "
-                    f"(Enter {'keeps the current ones' if current else 'to skip'})")
-    later = ("Change them later with `openswap worker workspace add --read <folder>`." if current
-             else "Choose one later with `openswap worker workspace add --read <folder>`, or run "
-                  "`openswap worker setup` again.")
+                    f"({'Enter keeps current' if current else 'Enter skips'})")
+    later = "Kept the current folders." if current else f"No folder added. {FOLDER_NEXT}"
     for _attempt in range(_MAX_ATTEMPTS):
         if menu.folders:
             answer = ui.ask(question, default=default)
@@ -457,12 +464,11 @@ def choose_folders(root: Path, ui: Prompts) -> None:
             # bar's native chooser (#88) finds it; both fall back to typing.
             answer = (getattr(ui, "choose_folder", None) or ui.ask)(question)
         if not answer:
-            ui.say(f"Kept the current folders. {later}" if current else f"No folder chosen. {later}")
+            ui.say(later)
             return
         choice = parse_folder_choice(answer, len(menu.folders))
         if choice is None:
-            ui.say(f"Type numbers from 1 to {len(menu.folders)} (like 1 3), or one folder path."
-                   if menu.folders else "Type one folder path.")
+            ui.say(_bad_choice(len(menu.folders)))
             continue
         picked = [menu.folders[index] for index in choice] if isinstance(choice, list) else [choice]
         if _add_folders(root, ui, picked):
@@ -470,12 +476,51 @@ def choose_folders(root: Path, ui: Prompts) -> None:
     ui.say(later)
 
 
+def _bad_choice(count: int) -> str:
+    return f"Type numbers from 1 to {count}, or a folder path." if count else "Type a folder path."
+
+
+def _search_folders(root: Path, ui, has_current: bool) -> None:
+    """The terminal's folder step: the type-to-search picker, again after each pick.
+
+    The detected folders are its numbered suggestions (GitHub first and
+    highlighted, so Enter picks it); typing searches them and the home
+    folder, and digits pick by number. Every pick goes through
+    ``add_readable_folder`` like any other answer. Enter on nothing (or Esc)
+    finishes.
+    """
+    from openswap.folder_picker import Suggestion
+
+    added = False
+    question = "Folders"
+    for _round in range(_MAX_PICKS):
+        menu = folder_menu(root, load_worker_settings(root).workspaces)
+        pinned = [Suggestion(folder, note, folder in menu.readable)
+                  for folder, note in zip(menu.folders, menu.notes)]
+        # The default is highlighted only on the first pick, and only when
+        # nothing is set up yet: then Enter takes it.
+        highlight = None if added or has_current or not menu.folders else (menu.recommended or 0)
+        answer = ui.search_folders(question, pinned=pinned, highlight=highlight)
+        if not answer:
+            if not added:
+                ui.say("Kept the current folders." if has_current else f"No folder added. {FOLDER_NEXT}")
+            return
+        choice = parse_folder_choice(answer, len(menu.folders))
+        if choice is None:
+            ui.say(_bad_choice(len(menu.folders)))
+            continue
+        picked = [menu.folders[index] for index in choice] if isinstance(choice, list) else [choice]
+        if _add_folders(root, ui, picked):
+            added = True
+            question = "Add another (Enter to finish)"
+
+
 def _add_folders(root: Path, ui, folders) -> bool:
     """Make each folder readable and say what happened; whether any is readable now."""
     cli = _cli()
     any_ok = False
     for folder in folders:
-        shown = _display_path(folder) if isinstance(folder, Path) else folder
+        shown = _display_path(Path(folder)) if os.path.isabs(str(folder)) else str(folder)
         try:
             result = cli.add_readable_folder(root, folder)
         except cli.WorkspaceError as exc:
@@ -488,14 +533,11 @@ def _add_folders(root: Path, ui, folders) -> bool:
         workspace = result.workspace
         (source,) = workspace.readonly_roots
         if not result.added:
-            ui.say(f"{printer.MARK_OK} {_display_path(source)} is already readable as \"{workspace.workspace_id}\".")
+            ui.say(f"{printer.MARK_OK} {_display_path(source)} ({workspace.workspace_id}, already added)")
             continue
-        ui.say(f"{printer.MARK_OK} Tasks can read {_display_path(source)} as \"{workspace.workspace_id}\" "
-               f"(the portal shows \"{workspace.display_label}\"); results go to "
-               f"{_display_path(workspace.output_root)}.")
+        ui.say(f"{printer.MARK_OK} {_display_path(source)} ({workspace.workspace_id})")
         if result.kept_builtin:
-            ui.say(f"The built-in \"{cli.DEFAULT_RESEARCH_ID}\" folder stays approved while a task still uses "
-                   f"it; remove it later with `openswap worker workspace remove {cli.DEFAULT_RESEARCH_ID}`.")
+            ui.say(f"\"{cli.DEFAULT_RESEARCH_ID}\" stays until its running task ends.")
     return any_ok
 
 
@@ -523,28 +565,26 @@ class Readiness:
     def missing(self) -> tuple[str, ...]:
         out = []
         if self.paired_url is None:
-            out.append("pair this Mac (`openswap worker pair <url> <code>`)")
+            out.append("`openswap worker pair <url> <code>` to pair this Mac")
         if self.worker == "starting":
-            out.append("wait for the worker to finish starting (`openswap worker status`)")
+            out.append("wait a moment, then `openswap worker status`")
         elif self.worker != "running":
-            out.append("start the worker (`openswap worker enable`)")
+            out.append("`openswap worker enable` to start the worker")
         elif self.paired_url is not None and self.connection != "online":
             # Only an online worker can receive tasks from the service.
             out.append({
-                "revoked": "pair this Mac again: the service revoked it (`openswap worker pair <url> <code>`)",
-                "expired": "pair this Mac again: its pairing expired (`openswap worker pair <url> <code>`)",
-            }.get(self.connection, "wait for the worker to connect to the service (`openswap worker status`)"))
+                "revoked": "`openswap worker pair <url> <code>` to pair again (this Mac was removed)",
+                "expired": "`openswap worker pair <url> <code>` to pair again (the pairing expired)",
+            }.get(self.connection, "wait a moment, then `openswap worker status`"))
         if self.paused:
-            out.append("reopen admission (`openswap worker pause --off`)")
+            out.append("`openswap worker pause --off` to resume")
         if self.account is None:
-            out.append("pin an account (`openswap worker account <slot>`, or `claude:<slot>`)")
+            out.append("`openswap worker account <slot>` to pick an account")
         if not self.folders:
-            out.append("choose a folder tasks may read (`openswap worker workspace add --read <folder>`)")
+            out.append("`openswap worker workspace add --read <folder>` to add a folder")
         if self.refused:
             names = ", ".join(f'"{workspace_id}"' for workspace_id, _code in self.refused)
-            noun = "workspaces" if len(self.refused) > 1 else "workspace"
-            out.append(f"fix or remove {noun} {names}: jobs there are refused "
-                       "(`openswap worker workspace list`, `openswap worker workspace remove <id>`)")
+            out.append(f"`openswap worker workspace list` to fix {names}")
         return tuple(out)
 
 
@@ -629,13 +669,13 @@ def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> No
         ui.say(line)
     for workspace_id, code in state.refused:
         ui.say(_cli().refusal_line(workspace_id, code))
+    # The checklist shows every gap; one `Next:` names the first to close.
     if state.missing:
-        ui.say("Before Slack can start tasks on this Mac:")
-        for number, step in enumerate(state.missing, start=1):
-            ui.say(f"  {number}. {step}")
+        ui.say(f"Next: {state.missing[0]}.")
+    elif state.execution != "live":
+        ui.say(execution_off_note(state.provider))
     else:
-        ui.say("Ready for Slack: approved tasks from your Slack workspace can reach this Mac.")
-    ui.say(EXECUTION_LIVE_NOTE if state.execution == "live" else execution_off_note(state.provider))
+        ui.say(READY_NOTE)
 
 
 def checklist(state: Readiness) -> list[str]:
@@ -643,24 +683,25 @@ def checklist(state: Readiness) -> list[str]:
     worker = {"running": "running", "starting": "starting", "stopped": "enabled but not running",
               "off": "off"}[state.worker]
     if state.paused:
-        worker += " (admission paused)"
+        worker += " (paused)"
     online = state.worker == "running" and state.connection
     service = f"{state.paired_url} ({state.connection})" if state.paired_url and online else (
-        state.paired_url or "not paired")
+        state.paired_url or "no")
     service_ok = None if state.paired_url is None else (
         True if not online or state.connection == "online"
         else False if state.connection in {"revoked", "expired"} else None)
     worker_ok = (True if state.worker == "running" and not state.paused
                  else None if state.worker == "starting" else False)
     rows = [
-        (f"{printer.mark(service_ok)} Service", service),
+        (f"{printer.mark(service_ok)} Paired", service),
         (f"{printer.mark(worker_ok)} Worker", worker),
-        (f"{printer.mark(state.account is not None)} Account", state.account or "none pinned"),
-        # Reading no folder is allowed (tasks still run), so it is neutral, not missing.
-        (f"{printer.mark(False if state.refused else True if state.readable else None)} Readable folders",
-         ", ".join(state.readable) or "none (tasks read no folder on this Mac)"),
-        # Execution stays off until the live check passes; the note below says how.
-        (f"{printer.mark(True if state.execution == 'live' else None)} Execution", state.execution),
+        (f"{printer.mark(state.account is not None)} Account", state.account or "none"),
+        # No folder is allowed (tasks still run), so it is neutral, not missing.
+        (f"{printer.mark(False if state.refused else True if state.readable else None)} Folders",
+         ", ".join(state.readable) or "none"),
+        # Live tasks stay off until the live check passes; the Next line says how.
+        (f"{printer.mark(True if state.execution == 'live' else None)} Live tasks",
+         "on" if state.execution == "live" else "off"),
     ]
     return printer.columns(rows)
 
@@ -736,8 +777,8 @@ class DialogPrompts:
 
 
 PAIRING_QUESTION = (
-    "Paste the pairing command from your control service (in OpenTag: Workers page, "
-    "Pair a Mac). It looks like: openswap worker pair https://opentag.me CODE"
+    "Paste the pairing command from OpenTag (Workers, Pair a Mac). "
+    "It looks like: openswap worker pair https://opentag.me CODE"
 )
 
 
@@ -810,7 +851,7 @@ def ask_pairing_command(ui: Prompts) -> tuple[str, str] | None:
         parsed = parse_pairing_command(text)
         if parsed is not None:
             return parsed
-        ui.say("That is not a pairing command. Copy the whole command from the Workers page.")
+        ui.say("That is not a pairing command. Copy the whole line from the Workers page.")
     return None
 
 
@@ -827,11 +868,10 @@ def pair_once(root: Path, url: str, code: str) -> tuple[str, str]:
         _cli()._migrate_legacy_before_worker_state_change(root)
         worker_id = pair(root, url, code)
     except ProtocolError as exc:
-        return "retry", (f"Could not pair: {exc.code}. Pairing codes are single-use and expire after "
-                         "10 minutes; create a new one if needed.")
+        return "retry", f"Could not pair ({exc.code}). Codes work once for 10 minutes: make a new one."
     except (ClaudeSwitchError, OSError, RuntimeError, ValueError):
-        return "failed", "Could not pair: local settings unavailable."
-    return "paired", f"Paired worker {worker_id}."
+        return "failed", "Could not pair: settings unavailable."
+    return "paired", f"{printer.MARK_OK} Paired this Mac ({worker_id})."
 
 
 def pair_interactively(root: Path, ui: Prompts) -> bool:

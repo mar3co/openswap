@@ -6,6 +6,10 @@ Tab completes it into the query and Enter picks it. ``pick_folder`` falls back
 to plain ``input()`` whenever stdin/stdout is not a terminal or the platform
 has no ``termios`` (Windows), so scripted and piped runs behave as before.
 
+A caller may pin numbered suggestions (the guided setup's detected code
+folders): they are what an empty query shows, typing searches them before the
+home-folder index, and digits (``1 3``, ``1,3``) select them by number.
+
 The ranking and key handling live in ``FolderIndex`` and ``PickerState`` so
 they are testable without a terminal; ``pick_folder`` only draws and reads.
 """
@@ -13,9 +17,11 @@ they are testable without a terminal; ``pick_folder`` only draws and reads.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 # Never descended into: hidden folders, build output, and the home folders
@@ -154,24 +160,87 @@ def _complete_path(query: str, home: Path, limit: int) -> list[Path]:
     return (starts + contains)[:limit]
 
 
-class PickerState:
-    """The query, the highlighted row and what each key does to them."""
+@dataclass(frozen=True)
+class Suggestion:
+    """A pinned, numbered entry: a folder, a note shown after it and whether it is ticked."""
 
-    def __init__(self, index: FolderIndex):
+    path: Path
+    note: str = ""
+    checked: bool = False
+
+
+_NUMBERS = re.compile(r"[0-9]+(?:[\s,]+[0-9]+)*[\s,]*")
+
+
+class PickerState:
+    """The query, the highlighted row and what each key does to them.
+
+    ``pinned`` suggestions are numbered from 1. With an empty query they are
+    the rows (``highlight`` names the one Enter picks); typed text searches
+    them first, then the home-folder index; a query of numbers shows the
+    suggestions it names and Enter returns the numbers as typed.
+    """
+
+    def __init__(self, index: FolderIndex, *, pinned=(), highlight: int | None = None):
         self.index = index
+        self.pinned: tuple[Suggestion, ...] = tuple(pinned)
         self.query = ""
-        self.selected = -1  # nothing highlighted until the owner types or moves
         self.results: list[Path] = []
         self.refresh()
+        # Nothing highlighted until the owner types or moves, unless a pinned
+        # suggestion is the default.
+        self.selected = highlight if highlight is not None and 0 <= highlight < len(self.results) else -1
+
+    def number_of(self, path: Path) -> int | None:
+        """The pinned number shown for ``path`` (1-based), if it is pinned."""
+        for number, suggestion in enumerate(self.pinned, start=1):
+            if suggestion.path == path:
+                return number
+        return None
+
+    def suggestion(self, path: Path) -> Suggestion | None:
+        number = self.number_of(path)
+        return None if number is None else self.pinned[number - 1]
+
+    def numbers(self) -> list[int] | None:
+        """The pinned numbers the query names (1-based, in order, once each), or ``None``."""
+        if not self.pinned or not _NUMBERS.fullmatch(self.query.strip()) or not self.query.strip():
+            return None
+        out = []
+        for token in re.split(r"[\s,]+", self.query.strip()):
+            if token and int(token) not in out:
+                out.append(int(token))
+        return out
+
+    def _search(self) -> list[Path]:
+        if not self.pinned or _looks_like_path(self.query):
+            return self.index.search(self.query)
+        if not self.query:
+            return [suggestion.path for suggestion in self.pinned]
+        numbers = self.numbers()
+        if numbers is not None:
+            return [self.pinned[n - 1].path for n in numbers if 1 <= n <= len(self.pinned)]
+        needle = self.query.lower()
+        ranked = []
+        for order, suggestion in enumerate(self.pinned):
+            shown = display_path(suggestion.path, self.index.home).lower()
+            score = _score(needle, suggestion.path.name.lower(), shown)
+            if score is not None:
+                ranked.append((score, order, suggestion.path))
+        found = [path for *_rank, path in sorted(ranked, key=lambda item: item[:2])]
+        for path in self.index.search(self.query, limit=_VISIBLE):
+            if path not in found:
+                found.append(path)
+        return found[:_VISIBLE]
 
     def refresh(self) -> None:
-        self.results = self.index.search(self.query)
-        if not self.results:
-            self.selected = -1
-        elif self.query and self.selected < 0:
+        self.results = self._search()
+        if not self.results or self.numbers() is not None:
+            self.selected = -1  # numbers are picked as typed, not by the highlight
+        elif self.query and getattr(self, "selected", -1) < 0:
             self.selected = 0
         else:
-            self.selected = min(self.selected, len(self.results) - 1)
+            self.selected = min(getattr(self, "selected", -1), len(self.results) - 1)
 
     def type(self, text: str) -> None:
         self.query += text
@@ -213,15 +282,28 @@ def _tty_available() -> bool:
         return False
 
 
-def pick_folder(question: str, *, home: Path | None = None) -> str | None:
-    """Pick a folder interactively; "" when the owner finishes, ``None`` on Ctrl-C."""
+def available() -> bool:
+    """Whether ``pick_folder`` can run interactively here (a terminal with ``termios``)."""
+    return _tty_available()
+
+
+def pick_folder(question: str, *, home: Path | None = None, pinned=(), highlight: int | None = None,
+                index: FolderIndex | None = None) -> str | None:
+    """Pick a folder interactively; "" when the owner finishes, ``None`` on Ctrl-C.
+
+    ``pinned`` are numbered ``Suggestion`` rows (see ``PickerState``); a query
+    of numbers comes back as typed. ``index`` lets a caller reuse one scan
+    across several picks.
+    """
     if not _tty_available():
         try:
             return input(question).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return None
-    return _run_picker(question, FolderIndex(home or Path.home()).start())
+    if index is None:
+        index = FolderIndex(home or Path.home()).start()
+    return _run_picker(question, index, pinned=pinned, highlight=highlight)
 
 
 def _fit(text: str, width: int) -> str:
@@ -229,25 +311,60 @@ def _fit(text: str, width: int) -> str:
     return text if len(text) <= width else "…" + text[-(width - 1):]
 
 
-_HINT = "type to search · ↑↓ choose · Tab complete · Enter pick · Esc or empty Enter to finish"
+_HINT = "↑↓ move · Tab complete · Enter pick · Esc skip"
+_PINNED_HINT = "type or 1 3 · ↑↓ move · Tab complete · Enter pick · Esc skip"
+
+
+def row_text(state: PickerState, path: Path, width: int) -> str:
+    """One row: a pinned suggestion as ``✓ 1  ~/GitHub  (note)``, any other folder as its path."""
+    home = state.index.home
+    suggestion = state.suggestion(path)
+    if suggestion is None:
+        return _fit(display_path(path, home), width)
+    shown = [display_path(item.path, home) for item in state.pinned]
+    pad = max(len(text) for text in shown)
+    number = state.number_of(path)
+    digits = len(str(len(state.pinned)))
+    text = f"{'✓' if suggestion.checked else '•'} {str(number).rjust(digits)}  "
+    text += display_path(path, home).ljust(pad) + (f"  {suggestion.note}" if suggestion.note else "")
+    return _fit(text.rstrip(), width)
+
+
+def visible_window(count: int, selected: int, rows: int) -> tuple[int, int]:
+    """The ``[start, end)`` slice of ``count`` results to draw in ``rows`` lines, keeping
+    the highlighted one in view (the top of the list when nothing is highlighted)."""
+    rows = max(1, rows)
+    if count <= rows:
+        return 0, count
+    start = 0 if selected < 0 else min(max(0, selected - rows // 2), count - rows)
+    return start, start + rows
 
 
 def _render(out, question: str, state: PickerState) -> None:
     try:
-        columns = os.get_terminal_size(out.fileno()).columns
+        size = os.get_terminal_size(out.fileno())
+        columns, height = size.columns, size.lines
     except (OSError, ValueError):
-        columns = 80
-    width = max(20, columns - 1)
-    home = state.index.home
+        columns, height = 80, 24
+    width = max(20, (columns or 80) - 1)  # a terminal with no size set reports 0
+    # Never taller than the screen (the prompt, the list, one note and the
+    # hint), or the redraw would scroll the prompt away.
+    rows = min(_VISIBLE, max(1, (height or 24) - 3))
+    start, end = visible_window(len(state.results), state.selected, rows)
     lines = []
-    for row, path in enumerate(state.results):
+    for row in range(start, end):
+        path = state.results[row]
         marker = "❯ " if row == state.selected else "  "
-        text = marker + _fit(display_path(path, home), width - len(marker))
+        text = marker + row_text(state, path, width - len(marker))
         lines.append(f"\x1b[7m{text}\x1b[0m" if row == state.selected else text)
+    hidden = len(state.results) - (end - start)
+    if hidden:
+        lines.append(f"\x1b[2m{f'  … {hidden} more (↑↓ or type to filter)'[:width]}\x1b[0m")
     if not state.results:
         lines.append("  (no matching folders; Enter uses what you typed)" if state.query
                      else "  (looking for folders…)" if not state.index.done else "  (no folders)")
-    lines.append(f"\x1b[2m{_HINT[:width]}\x1b[0m")
+    hint = _PINNED_HINT if state.pinned else _HINT
+    lines.append(f"\x1b[2m{hint[:width]}\x1b[0m")
     head = (question + state.query)[-width:]
     out.write("\r\x1b[J" + head + "".join("\n" + line for line in lines))
     out.write(f"\x1b[{len(lines)}A\r\x1b[{len(head)}C" if head else f"\x1b[{len(lines)}A\r")
@@ -276,14 +393,14 @@ def _read_key(fd: int) -> str:
     return first.decode("utf-8", "ignore")
 
 
-def _run_picker(question: str, index: FolderIndex) -> str | None:
+def _run_picker(question: str, index: FolderIndex, *, pinned=(), highlight: int | None = None) -> str | None:
     import select
     import termios
     import tty
 
     fd, out = sys.stdin.fileno(), sys.stdout
     saved = termios.tcgetattr(fd)
-    state = PickerState(index)
+    state = PickerState(index, pinned=pinned, highlight=highlight)
     result: str | None = None
     scanning = True
     try:
@@ -293,8 +410,9 @@ def _run_picker(question: str, index: FolderIndex) -> str | None:
             if not select.select([fd], [], [], 0.15)[0]:
                 if scanning:  # show folders as the scan finds them, then once more at the end
                     scanning = not index.done
-                    state.refresh()
-                    _render(out, question, state)
+                    if state.query or not state.pinned:  # pinned rows do not wait for the scan
+                        state.refresh()
+                        _render(out, question, state)
                 continue
             key = _read_key(fd)
             if key in ("\r", "\n"):
@@ -320,6 +438,8 @@ def _run_picker(question: str, index: FolderIndex) -> str | None:
         result = None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        out.write("\r\x1b[J" + question + (result or "") + "\n")
+        # The transcript keeps the short ~/ form of a picked folder.
+        shown = display_path(Path(result), index.home) if result and os.path.isabs(result) else (result or "")
+        out.write("\r\x1b[J" + question + shown + "\n")
         out.flush()
     return result

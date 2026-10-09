@@ -117,3 +117,91 @@ def test_without_a_terminal_it_reads_a_typed_line(monkeypatch):
 
     monkeypatch.setattr("builtins.input", eof)
     assert folder_picker.pick_folder("Folder? ") is None
+
+
+# --- pinned suggestions (the setup's detected folders) ------------------------------------------
+
+
+def _pinned(home):
+    from openswap.folder_picker import Suggestion
+
+    return [Suggestion(home / "GitHub", "(recommended)"), Suggestion(home / "GitHub/opensoft/openswap", "(git repo)"),
+            Suggestion(home / "Documents", "", checked=True)]
+
+
+def test_an_empty_query_shows_the_suggestions_with_the_default_highlighted(home):
+    state = PickerState(_index(home), pinned=_pinned(home), highlight=0)
+    assert state.results == [home / "GitHub", home / "GitHub/opensoft/openswap", home / "Documents"]
+    assert state.selected == 0 and state.choice() == str(home / "GitHub")  # Enter picks it
+    assert folder_picker.row_text(state, home / "GitHub", 80) == "• 1  ~/GitHub                    (recommended)"
+    assert folder_picker.row_text(state, home / "Documents", 80) == "✓ 3  ~/Documents"
+    # Without a default nothing is highlighted, and Enter on nothing finishes.
+    state = PickerState(_index(home), pinned=_pinned(home))
+    assert state.selected == -1 and state.choice() == ""
+
+
+def test_typing_searches_the_suggestions_first_then_home(home):
+    state = PickerState(_index(home), pinned=_pinned(home), highlight=0)
+    for char in "opens":
+        state.type(char)
+    shown = _shown(state.index, state.results)
+    assert shown[0] == "~/GitHub/opensoft/openswap"  # the pinned match leads
+    assert "~/GitHub/opensoft" in shown and shown.count("~/GitHub/opensoft/openswap") == 1
+    assert state.selected == 0 and state.choice() == str(home / "GitHub/opensoft/openswap")
+    assert folder_picker.row_text(state, home / "GitHub/opensoft", 80) == "~/GitHub/opensoft"
+    state.clear()
+    for char in "~/GitHub/o":
+        state.type(char)
+    assert _shown(state.index, state.results) == ["~/GitHub/opensoft", "~/GitHub/other"]  # paths still complete
+
+
+@pytest.mark.parametrize(("typed", "rows"), [("1 3", [0, 2]), ("1,3", [0, 2]), ("3, 1 3", [2, 0]), ("2", [1])])
+def test_digits_pick_suggestions_by_number(home, typed, rows):
+    pinned = _pinned(home)
+    state = PickerState(_index(home), pinned=pinned, highlight=0)
+    for char in typed:
+        state.type(char)
+    assert state.results == [pinned[row].path for row in rows]
+    assert state.selected == -1 and state.choice() == typed  # the numbers, as typed
+
+
+def test_digits_out_of_range_show_nothing_and_come_back_as_typed(home):
+    state = PickerState(_index(home), pinned=_pinned(home))
+    state.type("9")
+    assert state.results == [] and state.choice() == "9"
+    # Without suggestions digits are an ordinary search.
+    plain = PickerState(_index(home))
+    plain.type("9")
+    assert plain.numbers() is None
+
+
+
+def test_many_suggestions_are_drawn_in_a_window_that_follows_the_highlight(home, monkeypatch):
+    import io
+    import os
+    from openswap.folder_picker import Suggestion
+
+    assert folder_picker.visible_window(5, -1, 8) == (0, 5)
+    assert folder_picker.visible_window(20, -1, 8) == (0, 8)
+    assert folder_picker.visible_window(20, 0, 8) == (0, 8)
+    assert folder_picker.visible_window(20, 10, 8) == (6, 14)
+    assert folder_picker.visible_window(20, 19, 8) == (12, 20)
+    pinned = [Suggestion(home / f"repo{n:02}") for n in range(20)]
+    state = PickerState(_index(home), pinned=pinned, highlight=0)
+    state.move(15)
+    out = io.StringIO()
+    out.fileno = lambda: 1
+    monkeypatch.setattr(os, "get_terminal_size", lambda _fd=None: os.terminal_size((100, 12)))
+    folder_picker._render(out, "Folders: ", state)
+    text = out.getvalue()
+    drawn = [line for line in text.split("\n") if "~/repo" in line]
+    assert len(drawn) == 8  # min(8, 12 - 3)... capped by _VISIBLE
+    assert "16  ~/repo15" in text  # the highlighted one keeps its own number
+    assert "… 12 more" in text
+    # The cursor goes back up exactly as many lines as were drawn below the prompt.
+    assert text.endswith(f"\x1b[{text.count(chr(10))}A\r\x1b[{len('Folders: ')}C")
+    monkeypatch.setattr(os, "get_terminal_size", lambda _fd=None: os.terminal_size((100, 6)))
+    out = io.StringIO()
+    out.fileno = lambda: 1
+    folder_picker._render(out, "Folders: ", state)
+    assert len([line for line in out.getvalue().split("\n") if "~/repo" in line]) == 3  # 6 - 3

@@ -447,38 +447,36 @@ Every step calls the same function as its own command, and nothing in them can
 fail pairing: a step that fails prints its command and the next step still
 runs.
 
-1. **Start the worker.** "Start the Remote tasks worker now so this Mac can
-   accept approved tasks? [Y/n]". Yes (or Enter) runs the same function as
-   `openswap worker enable` and reports its result: on success the service shows
-   the Mac online within about 15 seconds; a refusal prints `enable`'s message,
-   its diagnostic code when it is one of `enable`'s own, and the manual command.
-   No, any other answer, or EOF leaves the worker off and prints
-   `openswap worker enable`. An already enabled worker is never toggled: the
-   step says it is running, or that it is enabled but not running (for example
-   its LaunchAgent was unloaded) and points at `worker enable` and
-   `worker status`.
-2. **Confirm the account.** A numbered menu of the eligible Codex and Claude
-   accounts (menu number, provider, email, alias, slot; the pinned one marked
-   `✓ … current`), then "Account number (1-N; Enter keeps the current one)"
-   with the pin as the default, or "(1-N; Enter to skip)" without one. A
-   number picks by menu position (the two providers may share slot numbers);
-   an email, alias or `claude:<slot>` still works.
-3. **Choose the folders tasks may read.** One question: which folders remote
-   tasks may read. Tasks read them but never change them, and their results
-   are saved under `~/OpenSwap Research`; see
-   [Choosing the folders tasks read](#choosing-the-folders-tasks-read). Enter
-   takes the recommended GitHub folder (or the first folder found), or keeps
-   the current folders when some are readable already.
-4. **Summary.** A checklist (`✓`/`✗`/`•`, each with its words) of the service,
-   worker state, account, readable folders (ID and label) and the execution
-   mode, then either "Ready for Slack" or the numbered list of what is still
-   missing, and a note that execution stays off
-   (`live_adapter_disabled`) while the execution mode is `disabled`, with the
-   live-check steps for the pinned account's provider (`openswap worker
-   live-check`; for a Claude account `openswap worker claude pin`, `openswap
-   worker claude prepare`, `openswap worker live-check --provider claude`; see
-   [Running jobs live](#running-jobs-live-codex)). The execution mode, here and
-   in the readiness report, is that of the pinned account's provider.
+Each step says at most one short line of context, asks one short question
+with its default visible (`[Y/n]`, `[1]`), confirms a choice in one `✓` line
+and ends with at most one `Next:` command.
+
+1. **Start the worker.** "Start the worker now? [Y/n]". Yes (or Enter) runs
+   the same function as `openswap worker enable`: on success "✓ Worker
+   started. This Mac shows online in about 15 seconds."; a refusal prints
+   `enable`'s message, its diagnostic code when it is one of `enable`'s own,
+   and "Next: `openswap worker enable` …". No, any other answer, or EOF leaves
+   the worker off. An already enabled worker is never toggled: the step says
+   "✓ Worker running.", or that it is on but not running.
+2. **Pick the account.** "Tasks run on the account you pick." and a numbered
+   menu of the eligible Codex and Claude accounts (menu number, provider,
+   email, alias, slot; the pinned one marked `✓ … current`), then "Account
+   [N]" with the pin as the default, or "Account (1-N, Enter skips)". A number
+   picks by menu position (the two providers may share slot numbers); an
+   email, alias or `claude:<slot>` still works.
+3. **Pick the folders.** One line ("Tasks can open the folders you pick.
+   Results go to ~/OpenSwap Research.") and the folder search; see
+   [Choosing the folders tasks read](#choosing-the-folders-tasks-read).
+4. **Summary.** A checklist (`✓`/`✗`/`•`, each with its words): Paired (the
+   service URL and its link state), Worker, Account, Folders (ID and label)
+   and Live tasks (on or off), then one line: "Next:" with the first thing
+   still missing, else the live-check command for the pinned account's
+   provider while live tasks are off (`openswap worker live-check`; for a
+   Claude account `openswap worker claude pin`, `openswap worker claude
+   prepare`, then `openswap worker live-check --provider claude`; see
+   [Running jobs live](#running-jobs-live-codex)), else "✓ Ready: Slack can
+   send tasks to this Mac." Live tasks, here and in the readiness report,
+   follow the pinned account's provider.
 
 Each step is headed `Step N of 4 · <name>`; on a terminal the headers are
 bold unless `NO_COLOR` is set or stdout is not a terminal, and the menu bar
@@ -499,29 +497,46 @@ checks below, once each (a symlink to a listed folder is not listed twice).
 A folder that holds three git repos or fewer is followed by those repos, so
 the owner can offer just one. A GitHub folder (any found folder named
 GitHub) is listed first and marked "recommended"; folders already readable
-are marked `✓`:
+are marked `✓`.
+
+On a terminal the step is a type-to-search picker. The detected folders are
+its numbered suggestions, with the recommended one highlighted so Enter
+picks it:
 
 ```text
-Remote tasks can read the folders you choose here, but never change them.
-Results are saved under ~/OpenSwap Research. The control service sees only each folder's ID and name, never its path.
-  • 1  ~/GitHub            (recommended)
-  • 2  ~/GitHub/openswap   (git repo)
-  • 3  ~/GitHub/opentag    (git repo)
+Step 3 of 4 · Folders
+Tasks can open the folders you pick. Results go to ~/OpenSwap Research.
+Folders:
+❯ • 1  ~/GitHub           (recommended)
+  • 2  ~/GitHub/openswap  (git repo)
+  • 3  ~/GitHub/opentag   (git repo)
   • 4  ~/Projects
-Folders tasks may read (numbers like 1 3, or a path; Enter for 1) [1]:
+type or 1 3 · ↑↓ move · Tab complete · Enter pick · Esc skip
 ```
 
-The answer is one or more numbers (`1 3` or `1,3`), or one folder path (a
-path dragged into Terminal may be shell-escaped). Enter takes the default: the
-recommended GitHub folder, else the first folder found, or, when a folder is
-readable already, keeps the current ones. With nothing found it asks "Type
-the path to your code folder, for example ~/GitHub" through the terminal's
-folder search or the menu bar's native folder chooser, and Enter (or Cancel)
-skips. Choosing adds folders; it never removes one (`openswap worker workspace
-remove <id>` does). In the menu bar the list and the question are one dialog.
-A typed path that exists is used exactly as typed (apostrophes included);
-otherwise a path that starts with a quote or holds a backslash is read as one
-shell word, as Terminal writes a dragged-in path.
+Typing filters the suggestions first, then the folders of the home folder
+(the same index as #88's picker); text that looks like a path (`~/…`, `/…`,
+or anything with `/`) completes inside that folder; digits with spaces or
+commas (`1 3`, `1,3`) pick suggestions by number. After a pick ("✓ ~/GitHub
+(github)") the same picker opens again as "Add another (Enter to finish)",
+nothing highlighted and the picks ticked `✓`; Enter on nothing (or Esc)
+finishes. When folders are already set up, nothing is highlighted and Enter
+on nothing keeps them. With nothing detected the picker is the plain #88
+folder search. A refused folder prints one line (what is wrong, what to do)
+and the same picker opens again.
+
+The menu bar, and a terminal run that is piped, scripted or on Windows,
+keep the numbered list and one question instead, "Folders (numbers or a
+path) [1]" (or "Folders (Enter keeps current)"); with nothing detected they
+ask "Type the path to your code folder, for example ~/GitHub" through #88's
+native folder chooser (menu bar) or a typed line. The answer is one or more
+numbers (`1 3` or `1,3`), or one folder path (a path dragged into Terminal may
+be shell-escaped). Choosing adds folders; it never removes one (`openswap
+worker workspace remove <id>` does). A typed path that exists is used exactly
+as typed (apostrophes included); otherwise a path that starts with a quote or
+holds a backslash is read as one shell word, as Terminal writes a dragged-in
+path. Only each folder's ID and name reach the control service; paths never
+leave this Mac.
 
 Each chosen folder becomes a workspace of its own:
 

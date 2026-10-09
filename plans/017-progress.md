@@ -1463,3 +1463,22 @@ Documents/com~apple~CloudDocs` under the canonical `~/Library`, and refuses a
 base that is a symlink, so a base linked to `~/Library` opens nothing. The
 readiness report leaves out workspaces the worker would refuse (or cannot
 check), and reports them again once fixed.
+
+
+## Setup: search the folders, and say less (2026-10-08)
+
+Owner feedback on the merged folder step: ~/GitHub was listed, but typing did
+not search. On a terminal the folder step is now #88's type-to-search picker
+with the detected folders as numbered suggestions (GitHub first and
+highlighted, so Enter picks it); typing searches them, then the home folder;
+digits pick by number; after a pick it opens again as "Add another". Piped,
+scripted and Windows runs and the menu bar keep the numbered question. Every
+pick still goes through `add_readable_folder`.
+
+A wording pass cut the guided setup to a step header, at most one line of
+context, one short question with its default, one-line ✓ confirmations and
+one `Next:` per step; the summary is the checklist plus one `Next:`. The
+words "control service", "provider", "execution", "admission" and
+"workspace" no longer appear outside commands. What tasks may do in a picked
+folder is one constant (`guided_setup.FOLDER_USE`) while the owner decides
+whether tasks work in it or only read it.
