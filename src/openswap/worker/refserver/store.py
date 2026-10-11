@@ -15,9 +15,9 @@ from contextlib import closing
 
 from openswap.worker.models import SafeEventKind
 from openswap.worker.protocol import (
-    Artifact, DEVICE_TTL_SECONDS, HEARTBEAT_SECONDS, LEASE_SECONDS, MAX_ARTIFACTS,
-    MISSED_HEARTBEATS, ProtocolError, Submission, TERMINAL, advertised_accounts, event_from_dict,
-    execution_mode, fields, integer, reported_folders, text, stamp as wire_stamp,
+    Artifact, DEVICE_TTL_SECONDS, FEATURES, HEARTBEAT_SECONDS, LEASE_SECONDS, MAX_ARTIFACTS,
+    MISSED_HEARTBEATS, ProtocolError, Submission, TERMINAL, advertised_accounts, capability_features,
+    event_from_dict, execution_mode, fields, integer, reported_folders, text, stamp as wire_stamp,
 )
 
 # Jobs whose cancel flag a reconnecting worker must still enforce.
@@ -86,6 +86,8 @@ class ControlStore:
                     device TEXT PRIMARY KEY, epoch INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS readiness (
                     device TEXT PRIMARY KEY, folders TEXT NOT NULL, execution TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS capabilities (
+                    device TEXT PRIMARY KEY, epoch INTEGER NOT NULL, features TEXT NOT NULL);
             ''')
             if "confirmed" not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
@@ -132,6 +134,21 @@ class ControlStore:
             row = db.execute("SELECT folders,execution FROM readiness WHERE device=?", (worker_id,)).fetchone()
         return None if row is None else {"folders": json.loads(row[0]), "execution": row[1]}
 
+    def capabilities(self, worker_id: str) -> list[str] | None:
+        """The features the worker's current registration advertised and this service
+        accepted, or None when it has not sent `capabilities` (for the operator and tests)."""
+        with closing(self.connect()) as db:
+            row = db.execute("SELECT c.features FROM capabilities c JOIN devices d ON d.id=c.device "
+                             "WHERE c.device=? AND c.epoch=d.epoch", (worker_id,)).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    @staticmethod
+    def _origin_advertised(db, device) -> bool:
+        """Whether the worker's current registration advertised "origin" (and it was accepted)."""
+        row = db.execute("SELECT features FROM capabilities WHERE device=? AND epoch=?",
+                         (device["id"], device["epoch"])).fetchone()
+        return row is not None and "origin" in json.loads(row[0])
+
     def revoke(self, worker_id: str) -> None:
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
@@ -140,6 +157,7 @@ class ControlStore:
             db.execute("DELETE FROM advertised_accounts WHERE device=?", (worker_id,))
             db.execute("DELETE FROM account_choice_epochs WHERE device=?", (worker_id,))
             db.execute("DELETE FROM readiness WHERE device=?", (worker_id,))
+            db.execute("DELETE FROM capabilities WHERE device=?", (worker_id,))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state NOT IN "
                        "('queued','succeeded','failed','cancelled','interrupted','expired')", (worker_id,))
 
@@ -246,6 +264,8 @@ class ControlStore:
             db.execute("DELETE FROM account_choice_epochs WHERE device=?", (device["id"],))
             # ...and has not reported its folders or execution mode either.
             db.execute("DELETE FROM readiness WHERE device=?", (device["id"],))
+            # ...nor advertised any capability.
+            db.execute("DELETE FROM capabilities WHERE device=?", (device["id"],))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state IN "
                        "('claimed','starting','running','cancel_requested')", (device["id"],))
             return {"worker_id": device["id"], "worker_epoch": epoch,
@@ -272,8 +292,11 @@ class ControlStore:
                 # sent `accounts`, so a worker without the extension never receives it.
                 sent = db.execute("SELECT 1 FROM account_choice_epochs WHERE device=? AND epoch=?",
                                   (device["id"], device["epoch"])).fetchone() is not None
+                # Likewise a job carrying origin, only while this registration advertises it.
+                origin = self._origin_advertised(db, device)
                 job = db.execute("SELECT * FROM jobs WHERE device=? AND state='queued'"
                                  + ("" if sent else " AND json_extract(payload,'$.account_ref') IS NULL")
+                                 + ("" if origin else " AND json_extract(payload,'$.origin') IS NULL")
                                  + " ORDER BY rowid LIMIT 1", (device["id"],)).fetchone()
                 if job is None:
                     return {"claim": None}
@@ -301,11 +324,20 @@ class ControlStore:
             db.execute("INSERT OR REPLACE INTO readiness VALUES (?,?,?)",
                        (device["id"], json.dumps([f.to_dict() for f in folders]), mode))
             return {"folder_count": len(folders)}
+        if op == "capabilities":
+            # Optional capabilities extension: atomically replace the advertised set;
+            # unknown features are ignored, the answer is the subset accepted here.
+            data = fields(value, {"worker_epoch", "features"})
+            self._epoch(data, device)
+            accepted = [feature for feature in capability_features(data["features"]) if feature in FEATURES]
+            db.execute("INSERT OR REPLACE INTO capabilities VALUES (?,?,?)",
+                       (device["id"], device["epoch"], json.dumps(accepted)))
+            return {"features": accepted}
         if op == "submit":
-            submission = Submission.from_dict(value, allow_account_ref=True)
+            submission = Submission.from_dict(value, allow_account_ref=True, allow_origin=True)
             if submission.worker_id != device["id"]:
                 raise ProtocolError("forbidden", 403)
-            # account_ref, when present, is part of the normalized idempotency payload.
+            # account_ref and origin, when present, are part of the normalized idempotency payload.
             payload = json.dumps(submission.to_dict(), sort_keys=True)
             prior = db.execute("SELECT * FROM jobs WHERE device=? AND idem=?",
                                (device["id"], submission.job.idempotency_key)).fetchone()
@@ -317,6 +349,9 @@ class ControlStore:
             if submission.account_ref is not None and db.execute(
                     "SELECT 1 FROM advertised_accounts WHERE device=? AND account_ref=?",
                     (device["id"], submission.account_ref)).fetchone() is None:
+                raise ProtocolError("invalid_request")
+            # ...and carry an origin only for a worker whose current registration advertised it.
+            if submission.origin is not None and not self._origin_advertised(db, device):
                 raise ProtocolError("invalid_request")
             if device["seen"] is None or device["seen"] <= now - HEARTBEAT_SECONDS * MISSED_HEARTBEATS:
                 raise ProtocolError("offline_worker", 409)

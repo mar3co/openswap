@@ -7,7 +7,9 @@ from uuid import uuid4
 from openswap.settings import load_worker_settings
 from openswap.worker.models import JobState, JobSubmission
 from openswap.worker.pairing import load_enrollment
-from openswap.worker.protocol import ProtocolError, Submission, fields, text, timestamp, validate_url
+from openswap.worker.protocol import (
+    ProtocolError, Submission, fields, submission_origin, text, timestamp, validate_url,
+)
 from openswap.worker.remote import Transport
 
 
@@ -45,7 +47,8 @@ def resolve_expiry(*, expires_in: float | None = None, expires_at: datetime | st
 def submit_test(root: Path, *, url: str, task: str, workspace_id: str,
                 runtime_limit: float, acknowledged: bool, expires_in: float | None = None,
                 expires_at: datetime | str | None = None, idempotency_key: str | None = None,
-                account_ref: str | None = None, transport=None) -> dict:
+                account_ref: str | None = None, origin_kind: str | None = None,
+                origin_label: str | None = None, transport=None) -> dict:
     """Submit one canonical test job; a retry with the same key returns the same job.
 
     The key defaults to a fresh random value. Callers that may retry after a
@@ -53,9 +56,16 @@ def submit_test(root: Path, *, url: str, task: str, workspace_id: str,
     service admits a second job (new key) or refuses the changed payload.
     ``account_ref`` (optional account choice extension) names an account the
     worker advertised; it is part of the payload, so a retry repeats it too.
+    ``origin_kind`` and ``origin_label`` (optional submission origin extension,
+    both or neither) are sent as ``origin``; the service accepts it only for a
+    worker that advertised it, and a retry repeats it too.
     """
     if acknowledged is not True:
         raise ProtocolError("test_tool_acknowledgement_required")
+    if (origin_kind is None) != (origin_label is None):
+        raise ProtocolError("invalid_request")  # both or neither
+    origin = (None if origin_kind is None
+              else submission_origin({"kind": origin_kind, "label": origin_label}))
     url = validate_url(url)
     key = uuid4().hex if idempotency_key is None else text(idempotency_key)
     if load_worker_settings(root).control_service_url != url:
@@ -69,8 +79,8 @@ def submit_test(root: Path, *, url: str, task: str, workspace_id: str,
                             allow_past=idempotency_key is not None and expires_at is not None)
     try:
         job = JobSubmission(key, "codex", task, "research", workspace_id, expiry, runtime_limit)
-        request = Submission.from_dict(Submission(enrollment.worker_id, job, account_ref).to_dict(),
-                                       allow_account_ref=True)
+        request = Submission.from_dict(Submission(enrollment.worker_id, job, account_ref, origin).to_dict(),
+                                       allow_account_ref=True, allow_origin=True)
     except (TypeError, ValueError, OverflowError):
         raise ProtocolError("invalid_request") from None
     result = (transport or Transport(url, enrollment.device_key)).request("submit", request.to_dict())
