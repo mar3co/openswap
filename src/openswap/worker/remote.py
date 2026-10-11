@@ -23,7 +23,7 @@ from openswap.worker.models import JobState, RemoteAuthorization, SafeEventKind
 from openswap.worker.protocol import (
     AdvertisedAccount, Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, MAX_REPORTED_FOLDERS,
     ProtocolError,
-    ReportedFolder, TERMINAL, fields, integer, timestamp, validate_url,
+    ReportedFolder, TERMINAL, capability_features, fields, integer, timestamp, validate_url,
 )
 
 STATES = frozenset(state.value for state in JobState)
@@ -34,7 +34,10 @@ APPROVAL = "waiting_for_approval"
 # Local diagnostics the protocol does not list, and the listed code each is
 # sent as: the service's diagnostic list is closed. `worker status` and the
 # local journal keep the specific code.
-WIRE_DIAGNOSTICS = {"workspace_refused": "provider_unavailable"}
+WIRE_DIAGNOSTICS = {"workspace_refused": "provider_unavailable", "origin_refused": "provider_unavailable"}
+# What this worker advertises with `capabilities` after each registration. The
+# set never changes at runtime in this release.
+WORKER_FEATURES = ("origin",)
 # How often the readiness report rescans folders of repos when nothing changed.
 FOLDER_RESCAN_SECONDS = 30.0
 # Validation failures the service (or the local export check) reports for one
@@ -182,6 +185,12 @@ class RemoteJournal:
             # non-empty account set. Claims may carry account_ref only after that.
             db.execute("CREATE TABLE IF NOT EXISTS account_choice (service TEXT PRIMARY KEY, "
                        "advertised INTEGER NOT NULL DEFAULT 0)")
+            # Capabilities extension: the registration (worker epoch) whose
+            # `capabilities` the service last acknowledged, and the features it
+            # accepted. Claims may carry `origin` only while that is the
+            # current registration and "origin" was accepted.
+            db.execute("CREATE TABLE IF NOT EXISTS capabilities (service TEXT PRIMARY KEY, "
+                       "worker_epoch INTEGER NOT NULL, features TEXT NOT NULL)")
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=5)
@@ -197,6 +206,24 @@ class RemoteJournal:
         with closing(self.connect()) as db, db:
             db.execute("INSERT INTO account_choice(service,advertised) VALUES (?,1) "
                        "ON CONFLICT(service) DO UPDATE SET advertised=1", (self.service,))
+
+    def capabilities(self) -> tuple[int, tuple[str, ...]] | None:
+        """``(worker_epoch, accepted features)`` last acknowledged for this enrollment, or None."""
+        with closing(self.connect()) as db:
+            row = db.execute("SELECT worker_epoch,features FROM capabilities WHERE service=?",
+                             (self.service,)).fetchone()
+        if row is None:
+            return None
+        try:
+            return int(row["worker_epoch"]), capability_features(json.loads(row["features"]))
+        except (ValueError, TypeError, ProtocolError):
+            return None
+
+    def record_capabilities(self, worker_epoch: int, features) -> None:
+        with closing(self.connect()) as db, db:
+            db.execute("INSERT INTO capabilities(service,worker_epoch,features) VALUES (?,?,?) "
+                       "ON CONFLICT(service) DO UPDATE SET worker_epoch=excluded.worker_epoch, "
+                       "features=excluded.features", (self.service, worker_epoch, json.dumps(list(features))))
 
     def remember(self, claim):
         with closing(self.connect()) as db, db:
@@ -287,6 +314,14 @@ class RemoteClient:
         # Optional readiness report extension, tracked the same way.
         self._readiness_sent = None
         self._readiness_unsupported_epoch = None
+        # Optional capabilities extension: sent once per registration.
+        # ``_origin_epoch`` is the registration whose "origin" the service
+        # accepted (durable in the remote journal); a claim may carry `origin`
+        # only while it is the current one.
+        self._capabilities_sent = None
+        self._capabilities_unsupported_epoch = None
+        recorded = self.journal.capabilities()
+        self._origin_epoch = recorded[0] if recorded is not None and "origin" in recorded[1] else None
         self.runtime.remote_launch_guard = self.launch_allowed
         self.runtime.remote_account_ref = self.requested_account_ref
 
@@ -382,8 +417,8 @@ class RemoteClient:
 
     @staticmethod
     def _stored_claim(binding):
-        """A claim already validated when it was received (with or without account_ref)."""
-        return Claim.from_dict(json.loads(binding["claim"]), allow_account_ref=True)
+        """A claim already validated when it was received (with or without account_ref or origin)."""
+        return Claim.from_dict(json.loads(binding["claim"]), allow_account_ref=True, allow_origin=True)
 
     def requested_account_ref(self, local_id: str) -> str | None:
         """The ``account_ref`` the claim behind a local job carried, or None when absent.
@@ -396,6 +431,46 @@ class RemoteClient:
         if binding is None:
             raise LookupError("no claim is bound to this job")
         return self._stored_claim(binding).submission.account_ref
+
+    def origin_accepted(self) -> bool:
+        """Whether this registration advertised "origin" and the service accepted it."""
+        epoch = self.worker_epoch
+        return epoch is not None and self._origin_epoch == epoch
+
+    def sync_capabilities(self) -> None:
+        """Send ``capabilities`` once after each new registration.
+
+        Never raises: a failure is retried on the next synchronization pass,
+        and claims and heartbeats go on meanwhile (a claim carrying ``origin``
+        is malformed until the service acknowledges). Only a 404
+        (``unsupported_version``, or ``not_found`` from reference servers that
+        predate the extension) records that the backend has no capabilities
+        support, until the next registration.
+        """
+        try:
+            epoch = self.worker_epoch
+            if epoch is None or epoch in (self._capabilities_sent, self._capabilities_unsupported_epoch):
+                return
+            try:
+                response = self.transport.request(
+                    "capabilities", {"worker_epoch": epoch, "features": list(WORKER_FEATURES)})
+            except ProtocolError as exc:
+                if exc.status == 404 and exc.code in {"unsupported_version", "not_found"}:
+                    self._capabilities_unsupported_epoch = epoch
+                elif exc.code in {"revoked", "unauthorized", "device_expired"}:
+                    self._connectivity(exc)
+                return
+            try:
+                accepted = capability_features(fields(response, {"features"})["features"])
+            except ProtocolError:
+                return  # malformed acknowledgement: resend on the next pass
+            if not set(accepted) <= set(WORKER_FEATURES):
+                return  # a feature this worker never advertised: malformed, resend
+            self.journal.record_capabilities(epoch, accepted)
+            self._origin_epoch = epoch if "origin" in accepted else None
+            self._capabilities_sent = epoch
+        except Exception:
+            return
 
     def _advertisement(self, policy) -> tuple[AdvertisedAccount, ...]:
         """The allowlist as advertised: opaque references, labels and the default flag only."""
@@ -637,6 +712,9 @@ class RemoteClient:
         with self._lock:
             if self.state != "online" or self.worker_epoch is None or policy.control_service_url != self.url:
                 return
+        # Optional capabilities: bounded and never raises. It precedes the
+        # claim because a claim may carry `origin` only once it is accepted.
+        self.sync_capabilities()
         # Optional account choice: bounded and never raises. It precedes the
         # claim because account_ready() gates polling on it.
         self.sync_accounts(policy)
@@ -671,9 +749,11 @@ class RemoteClient:
                 return
             response = self._worker_request("poll")
             if response["claim"] is not None:
-                # account_ref is accepted only once this enrollment advertised accounts;
-                # otherwise it is a malformed claim, as before the extension.
-                claim = Claim.from_dict(response["claim"], allow_account_ref=self._accounts_advertised)
+                # account_ref is accepted only once this enrollment advertised accounts,
+                # and origin only once this registration's "origin" was accepted;
+                # otherwise either is a malformed claim, as before the extensions.
+                claim = Claim.from_dict(response["claim"], allow_account_ref=self._accounts_advertised,
+                                        allow_origin=self.origin_accepted())
                 self.journal.remember(claim)  # persist before local admission
                 pending = self.journal.pending()
                 if pending:  # a re-offered claim that already ended here has nothing to sync
@@ -726,7 +806,7 @@ class RemoteClient:
                 # deadline translated into local time.
                 job = claim.submission.job
                 local = self.runtime.submit(replace(job, idempotency_key=idem, expires_at=job.expires_at - self._skew),
-                                            job_id=local_id, remote=True)
+                                            job_id=local_id, remote=True, origin=claim.submission.origin)
             if local.job_id != local_id:
                 local_id = local.job_id
                 self.journal.update(claim.job_id, local_id=local_id)
