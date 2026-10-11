@@ -49,9 +49,9 @@ The owner can still use the native features alongside it.
    openswap folder: fix the flaky test in tests/test_worker_remote.py." The
    assistant calls `workers_list`, `workspaces_list`, then `jobs_request`. The
    reply says an approval is waiting and gives the private approval link. The
-   owner opens it (or the Slack DM it also sends), checks the full task,
-   picks an account if the Mac offers several, and selects **Approve and
-   start**. The service submits the job. The assistant follows it with
+   owner opens it, checks the full task, and selects **Approve and start**
+   (the Mac uses its default account until the portal's account picker
+   ships). The service submits the job. The assistant follows it with
    `requests_get` / `jobs_get` and reads `result.md` with `artifacts_get`.
 2. **A dot doing ongoing work.** The dot decides a local session is needed and
    calls `jobs_request`. The owner gets the same private approval and the dot
@@ -68,7 +68,7 @@ flowchart LR
   S[OpenTag in Slack] --> F2[OpenTag managed openswap tools]
   F --> Q[Approval requests]
   F2 --> Q
-  O[Owner: private portal page or Slack DM] -->|Approve and start| Q
+  O[Owner: private portal page] -->|Approve and start| Q
   Q -->|submit, origin attached| J[Worker protocol v1 job store]
   W[OpenSwap worker on the Mac] -->|outbound poll, heartbeat, events, artifacts| J
   W --> P[Claude Code or Codex in the chosen folder, worktree per task]
@@ -265,15 +265,20 @@ OpenTag's existing retention.
    claude.ai and Claude Desktop. Also record the owner's reading of the Claude
    decision for assistant-started tasks. Exit: a dated client matrix in this
    plan, and a go/no-go per client.
-1. **Authorization and read tools.** Enable the Supabase OAuth 2.1 server and
-   add the consent page, Protected Resource Metadata, the facade endpoint,
-   token scoping, Connected assistants and the read tools. Exit: ChatGPT and
-   Claude connect and list the owner's Macs and folders. pgTAP proves an MCP
-   token cannot read any other table through the Data API. A revoked grant
-   fails the next call. A non-owner's token sees no Mac.
+1. **Authorization and read tools.** Add OpenTag's own authorization server
+   (metadata, dynamic client registration, the consent page, token and
+   revocation endpoints) issuing opaque tokens stored only as SHA-256 hashes in
+   service-only tables, never Supabase JWTs; then Protected Resource Metadata,
+   the facade endpoint, Connected assistants and the read tools. Exit: ChatGPT
+   and Claude connect and list the owner's Macs and folders. pgTAP proves the
+   token tables are unreachable through the Data API and that an MCP token is
+   not a Supabase JWT. A revoked grant fails the next call. A non-owner's token
+   sees no Mac.
 2. **Requests, approval and results.** Add `jobs_request`, `requests_get`,
    `jobs_cancel` and the artifact tools; the origin label on the approval page;
-   limits; the Slack DM notice; and the result-text setting. Exit: in CI, the
+   limits; and the `results:read` consent checkbox. (A Slack DM notice for
+   assistant requests is a follow-up: the outbox is keyed to a Slack thread.)
+   Exit: in CI, the
    conformance job runs the pinned OpenSwap client with the inert adapter, takes
    an MCP-originated request through approval, submission, claim, reconcile and
    artifact retrieval, and proves that no tool path submits without an
