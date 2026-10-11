@@ -82,6 +82,7 @@ The command-line executable is `openswap`.
 | `openswap worker codex settings [slot]` | Show or set the approval policy and sandbox mode that account's remote tasks follow (`--copy-settings` takes yours from `~/.codex/config.toml`) |
 | `openswap worker claude pin` / `prepare` | Pin the installed Claude Code binary and prepare an account's OpenSwap profile (your default login is untouched); `prepare --copy-settings --mode <mode>` sets the permission settings its remote tasks follow |
 | `openswap worker permissions [follow\|no-shell\|read-only]` | Remote sessions follow each account's own Claude or Codex permission settings; anything that would ask is denied. Optionally limit every remote task on this Mac (set only here, never from the service) |
+| `openswap worker origins [refuse\|allow <kind>]` | List where remote tasks may come from (`slack`, `assistant`, `portal`, `test`, `unspecified`) or refuse one on this Mac, for example `refuse assistant` (set only here, never from the service) |
 | `openswap worker live-check` | Run short real jobs on this Mac, record phase-1 evidence, then offer to enable live execution (`--provider claude`) |
 | `openswap worker live status` | Show whether remote jobs really run (`enable --evidence FILE`, `disable`) |
 | `openswap menubar` | macOS extra |

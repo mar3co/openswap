@@ -281,7 +281,7 @@ OpenTag's existing retention.
    from Claude, approves it privately, and reads the result in the assistant.
 3. **Origin extension in OpenSwap.** Specify it in `docs/worker-protocol.md`.
    Implement it in the reference client and server, the OpenSwap UI and CLI, and
-   `worker.allowedOrigins`. OpenTag sends it. Exit: unit and reference-server
+   `worker.refusedOrigins`. OpenTag sends it. Exit: unit and reference-server
    tests (`uv run pytest`), plus a refused `assistant` job that fails unlaunched
    on a Mac that disallows it.
 4. **Hardening and optional follow-ups.** Add per-grant auto-approve only if
@@ -393,3 +393,22 @@ The stack:
 - [Supabase OAuth 2.1 server](https://supabase.com/docs/guides/auth/oauth-server), [Supabase MCP authentication](https://supabase.com/docs/guides/auth/oauth-server/mcp-authentication)
 - [Sign in with ChatGPT: website](https://developers.openai.com/siwc/website)
 - [Claude Code Remote Control](https://code.claude.com/docs/en/remote-control)
+
+## Progress
+
+- **2026-10-11, phase 3 (OpenSwap side), branch `claude/018-origin-extension`.**
+  `docs/worker-protocol.md` specifies the `capabilities` operation and the
+  optional `origin` submission field ("Optional submission origin (v1
+  extension)"). The reference client sends `capabilities` with `["origin"]`
+  after each registration, records the accepted set in its remote journal,
+  treats an `origin` claim before that as malformed, records the origin on the
+  local job and checks `worker.refusedOrigins` (default empty; kinds plus
+  `unspecified`) under the launch lock before any lease: a refused job fails
+  `origin_refused` locally, `provider_unavailable` at the service,
+  `unlaunched=true`. `openswap worker origins [refuse|allow KIND] [--json]`,
+  `worker status` (`active_job.origin`, `last_job.origin`, `refused_origins`)
+  and the menu bar's Remote tasks status line show it. The reference server
+  implements both and `submit-test` takes `--origin-kind`/`--origin-label`.
+  Covered by `tests/test_worker_origin.py` and the loopback e2e test, including
+  a refused `assistant` job that fails unlaunched. The OpenTag side
+  (`capabilities` and `origin` on its protocol server) is still to do.
