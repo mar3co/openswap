@@ -14,7 +14,7 @@ from openswap.settings import update_worker_settings
 from openswap.worker import cli, pairing
 from openswap.worker import submit_test as submit_test_module
 from openswap.worker.leases import stable_account_identity
-from openswap.worker.models import JobState, JobSubmission
+from openswap.worker.models import JobState, JobSubmission, Origin
 from openswap.worker.pairing import load_enrollment
 from openswap.worker.protocol import Artifact, ProtocolError, Submission, stamp
 from openswap.worker.refserver import ControlStore, make_server
@@ -78,6 +78,19 @@ def test_loopback_pair_cli_submit_fake_run_events_and_artifact(tmp_path, keychai
             with pytest.raises(ProtocolError, match="hash_mismatch"):
                 Artifact.from_dict({**artifact, "content_base64": base64.b64encode(content[:-1] + b"?").decode()})
             assert adapter.starts == 1
+            # The worker advertised `origin` at registration, so a job may say where it came
+            # from; the claim carries it unchanged and the local record keeps it.
+            assert store.capabilities(enrollment.worker_id) == ["origin"]
+            assert cli.main([*arguments, "--origin-kind", "assistant", "--origin-label", "ChatGPT"],
+                            backup_root=root) == 0
+            origin_job = json.loads(capsys.readouterr().out)["job_id"]
+            remote.tick()
+            result = runtime.reconcile_once()
+            assert result.state == JobState.SUCCEEDED
+            assert result.origin == Origin("assistant", "ChatGPT")
+            remote.tick()
+            assert transport.request("job", {"job_id": origin_job})["state"] == "succeeded"
+            assert adapter.starts == 2
             assert cli.main(["unpair"], backup_root=root) == 0
             assert not keychain
         finally:
