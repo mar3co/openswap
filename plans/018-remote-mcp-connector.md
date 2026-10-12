@@ -172,7 +172,10 @@ reserved for in-run approvals.
 - **Grant management.** A **Connected assistants** section on the Your Macs page
   lists each grant: the client name and its CIMD/DCR identity, scopes, created,
   last used. Each grant can be revoked, and revocation ends access to job data
-  at once, as device revocation does. Access tokens last about one hour.
+  at once, as device revocation does. It also stops new work at once: approving
+  or starting one of the grant's open requests rechecks, under a lock shared
+  with the disconnect, that the grant is still live and may still ask, so a
+  revoked assistant's pending request can no longer be approved or started. Access tokens last about one hour.
   Refresh tokens rotate and expire after 30 days of non-use.
 - **Sign in with ChatGPT** is not needed. It could later be a portal sign-in
   method; that is a separate decision.
@@ -191,7 +194,10 @@ reserved for in-run approvals.
   sanitize them.
 - **Limits.** At most five open approval requests per grant and 30 requests per
   grant per day, both owner-adjustable. Requests to an offline Mac are refused
-  (`offline_worker`), as in the protocol.
+  (`offline_worker`), as in the protocol. If the Mac goes offline after the
+  request but before the owner approves, the approval still succeeds; only
+  starting it returns `offline_worker`, the request stays approved, and the
+  approval page offers a retry until the request expires.
 - **Notifications.** The assistant's reply carries the approval link, and the
   request is listed on the Your Macs page. A Slack DM notice for assistant
   requests is a follow-up: the existing outbox is keyed to a Slack thread, so
@@ -239,7 +245,10 @@ additive in the same way as `account_ref` and `readiness`:
 - The Mac shows the origin in `worker status`, the menu bar's Remote tasks
   section and the job journal. A **Mac-only** policy,
   `worker.refusedOrigins` (default: none), lists the kinds this Mac refuses.
-  It may also list `unspecified` for jobs that arrive without an origin. A
+  It may also list `unspecified` for jobs that arrive without an origin, which
+  is the strict setting: the backend's start-up hold is time-bounded (above),
+  so a Mac whose capability report keeps failing for longer gets assistant
+  jobs without an origin, and only `unspecified` refuses those. A
   refused job fails before launch: it is reconciled `failed` with
   `unlaunched=true`, uploaded as `provider_unavailable` with a local
   `origin_refused` diagnostic, exactly like a folder the Mac no longer
