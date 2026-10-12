@@ -103,17 +103,26 @@ private preview step that OpenTag's agent uses.
 | --- | --- | --- | --- |
 | `workers_list` | none | The caller's Macs in the granted workspace: `worker_id`, label, connectivity, last seen, `execution` (`live`/`disabled`/null), `is_default`, `default_workspace_id` | Read-only. No account data |
 | `workspaces_list` | `worker_id` | Reported folder IDs and labels (or owner-typed IDs when the Mac has not reported) | Read-only. Labels are the owner's; paths never leave the Mac |
-| `jobs_request` | `task` (1–32,000 chars), optional `worker_id`, `workspace_id`, `runtime_limit_minutes` (1–240, default 60), `idempotency_key` | `request_id`, `state: awaiting_approval`, `approval_url`, the Mac and folder chosen and why | Write. Never accepts an account, model, provider, path, environment or command. The Mac and folder follow the owner's OpenTag defaults (default Mac, its default folder) unless named |
+| `jobs_request` | `task` (1–32,000 chars), required `idempotency_key` (1–100 of `A–Z a–z 0–9 . _ : -`), optional `worker_id`, `workspace_id`, `runtime_limit_minutes` (1–240, default 60) | `request_id`, `state: awaiting_approval`, `approval_url`, the Mac and folder chosen and why | Write. Never accepts an account, model, provider, path, environment or command. The Mac and folder follow the owner's OpenTag defaults (default Mac, its default folder) unless named |
 | `requests_get` | `request_id` | `state` (`awaiting_approval`, `approved`, `denied`, `expired`, `submitted`), and `job_id` once submitted | Read-only. Lets a client follow a request without the job ID |
+| `jobs_list` | none | This grant's own 20 most recent requests, newest first, each with its request view (`request_id`, state, Mac, folder, `job_id` and job state once submitted); expired open requests are reported as `expired` | Read-only. Never another grant's or the owner's other work |
 | `jobs_get` | `job_id` | Protocol job state, `cancel_requested`, timestamps | Read-only |
 | `jobs_events` | `job_id`, `after_cursor` | Safe event summaries (the protocol's closed kinds and diagnostic codes) | Read-only |
 | `jobs_cancel` | `job_id` | `state` | Write, idempotent. Cancelling never needs approval |
 | `artifacts_list` / `artifacts_get` | `job_id` (and `name`) | Metadata; with `results:read`, UTF-8 content as a bounded excerpt (64 KiB) plus an authenticated portal link | Read-only. The full bytes stay behind the portal link |
 
-Tool annotations: the read tools set `readOnlyHint: true`. `jobs_request` and
-`jobs_cancel` set `readOnlyHint: false`, `destructiveHint: false` and
-`openWorldHint: true`, so clients that ask before write actions (ChatGPT does)
-show their own confirmation. That confirmation is a courtesy and never replaces
+`jobs_request` idempotency is per grant and covers the request itself, before
+any approval: a retry with the same key and the same task, runtime and Mac and
+folder selectors (present or absent) returns the original request; any
+difference is `idempotency_conflict`. The approval then carries one fixed
+submission key, so a lost response never produces two approvals or two jobs.
+
+Tool annotations: the read tools set `readOnlyHint: true`. `jobs_request` sets
+`readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true` (its
+required key makes a same-argument retry return the original request) and
+`openWorldHint: true`; `jobs_cancel` can stop a running session, so it sets
+`destructiveHint: true` and `idempotentHint: true`. Clients that ask before
+write actions (ChatGPT does) show their own confirmation. That confirmation is a courtesy and never replaces
 the owner's private approval.
 
 Tool descriptions say plainly that a request waits for the owner, so a model
@@ -139,7 +148,11 @@ reserved for in-run approvals.
   an authorize endpoint with a consent page behind the portal's existing
   Supabase Auth sign-in, a token endpoint (authorization code with PKCE S256,
   refresh) and RFC 7009 revocation. CIMD is a follow-up; ChatGPT falls back to
-  DCR when CIMD is not advertised, and Claude supports DCR.
+  DCR when CIMD is not advertised, and Claude supports DCR. A DCR client name
+  is self-asserted (RFC 7591 §5), so the consent page says OpenTag cannot
+  verify it and leads with the host it will return to; the approval page and
+  Connected assistants say the name came from the app. Verified identities
+  arrive with CIMD.
 - **Token scoping (required, not optional).** Tokens are random opaque
   secrets that OpenTag stores only as SHA-256 hashes in service-only tables,
   like device keys. They are not Supabase JWTs, so the Data API never accepts
@@ -160,7 +173,13 @@ reserved for in-run approvals.
 - **Grant management.** A **Connected assistants** section on the Your Macs page
   lists each grant: the client name and its CIMD/DCR identity, scopes, created,
   last used. Each grant can be revoked, and revocation ends access to job data
-  at once, as device revocation does. Access tokens last about one hour.
+  at once, as device revocation does. It also stops new work at once: approving
+  or starting one of the grant's open requests rechecks, under a lock shared
+  with the disconnect, that the grant is still live and may still ask, so a
+  revoked assistant's pending request can no longer be approved or started.
+  A job the owner already approved and started is the owner's: disconnecting
+  ends the assistant's access to it but does not cancel it, and the owner can
+  stop it from the portal (or revoke the Mac, which stops new claims). Access tokens last about one hour.
   Refresh tokens rotate and expire after 30 days of non-use.
 - **Sign in with ChatGPT** is not needed. It could later be a portal sign-in
   method; that is a separate decision.
@@ -179,7 +198,10 @@ reserved for in-run approvals.
   sanitize them.
 - **Limits.** At most five open approval requests per grant and 30 requests per
   grant per day, both owner-adjustable. Requests to an offline Mac are refused
-  (`offline_worker`), as in the protocol.
+  (`offline_worker`), as in the protocol. If the Mac goes offline after the
+  request but before the owner approves, the approval still succeeds; only
+  starting it returns `offline_worker`, the request stays approved, and the
+  approval page offers a retry until the request expires.
 - **Notifications.** The assistant's reply carries the approval link, and the
   request is listed on the Your Macs page. A Slack DM notice for assistant
   requests is a follow-up: the existing outbox is keyed to a Slack thread, so
@@ -212,12 +234,37 @@ additive in the same way as `account_ref` and `readiness`:
   display name). It is part of the normalized idempotency payload and appears
   in the claim's `submission` unchanged. A backend accepts or sends `origin`
   only for a worker whose current registration advertised `"origin"`; for any
-  other worker, `submit` with `origin` returns 400 `invalid_request`. A claim
-  carrying `origin` before this enrollment advertised it is malformed.
+  other worker, `submit` with `origin` returns 400 `invalid_request`. As with
+  `account_ref`, an identical replay of an existing submission is resolved
+  before that enrollment check, so a retry after a lost response returns its
+  job even if the Mac has re-registered since. A claim
+  carrying `origin` before this enrollment advertised it is malformed, so a
+  queued origin-bearing job waits, like one carrying `account_ref`, until a
+  registration advertises `"origin"` again. If none does (a downgraded
+  client), it is never offered and ends `expired` at its deadline as any
+  unclaimed job does; the owner sees that and can ask again. A
+  backend must not drop an origin it would otherwise send just because the
+  Mac is mid-registration. A Mac advertises right after it registers, so
+  OpenTag answers an approved submission with retryable
+  `offline_worker` for up to 30 seconds after the Mac registers, while the
+  registration has sent no capabilities report (readiness is reported
+  independently and does not count), if
+  the Mac advertised it on an earlier registration or the approval came from
+  an assistant (a first pairing). Slack approvals to a Mac that has never
+  advertised are not held, so legacy Macs keep starting Slack work at once
+  after a restart; such a job arrives without an origin, which only
+  `unspecified` refuses. The approval stays approved until it
+  expires. A capabilities report without `"origin"` ends the wait at once;
+  after the window a Mac that still has not advertised is treated as not
+  supporting origin (a legacy client) and its jobs go without one, so nothing
+  is stranded.
 - The Mac shows the origin in `worker status`, the menu bar's Remote tasks
   section and the job journal. A **Mac-only** policy,
   `worker.refusedOrigins` (default: none), lists the kinds this Mac refuses.
-  It may also list `unspecified` for jobs that arrive without an origin. A
+  It may also list `unspecified` for jobs that arrive without an origin, which
+  is the strict setting: the backend's start-up hold is time-bounded (above),
+  so a Mac whose capability report keeps failing for longer gets assistant
+  jobs without an origin, and only `unspecified` refuses those. A
   refused job fails before launch: it is reconciled `failed` with
   `unlaunched=true`, uploaded as `provider_unavailable` with a local
   `origin_refused` diagnostic, exactly like a folder the Mac no longer
@@ -238,8 +285,14 @@ additive in the same way as `account_ref` and `readiness`:
   on their own Macs, for tasks they start (decision 2026-10-07). An approved
   request from the owner's own assistant connection counts as a task the owner
   started. The owner should confirm that reading in phase 0.
-- The account is the Mac's pin, or one the owner picks among the advertised
-  accounts **at approval**. Assistants never choose an account, model or
+- The account is the Mac's pin (its default account). In this release
+  every approval, Slack or assistant, uses it: the portal picker for choosing
+  among advertised accounts at approval is a follow-up, outside these phases.
+  The account decides the provider: the wire
+  submission keeps protocol v1's fixed `provider: "codex"` value (as Slack
+  previews do), and the Mac launches Claude Code or Codex according to the
+  account it resolves locally. No provider negotiation is needed for this
+  release. Assistants never choose an account, model or
   provider.
 - The Mac makes only outbound requests and never trusts a backend's claim
   about folders, accounts or modes without checking it locally at launch.
@@ -275,13 +328,14 @@ OpenTag's existing retention.
    not a Supabase JWT. A revoked grant fails the next call. A non-owner's token
    sees no Mac.
 2. **Requests, approval and results.** Add `jobs_request`, `requests_get`,
-   `jobs_cancel` and the artifact tools; the origin label on the approval page;
+   `jobs_list`, `jobs_get`, `jobs_events`, `jobs_cancel` and the artifact tools; the origin label on the approval page;
    limits; and the `results:read` consent checkbox. (A Slack DM notice for
    assistant requests is a follow-up: the outbox is keyed to a Slack thread.)
    Exit: in CI, the
    conformance job runs the pinned OpenSwap client with the inert adapter, takes
-   an MCP-originated request through approval, submission, claim, reconcile and
-   artifact retrieval, and proves that no tool path submits without an
+   an MCP-originated request through approval, submission, claim, following it
+   with `jobs_list`, `jobs_get` and `jobs_events`, reconcile and artifact
+   retrieval, and proves that no tool path submits without an
    approval. Live: the owner starts a real session on their Mac from ChatGPT and
    from Claude, approves it privately, and reads the result in the assistant.
 3. **Origin extension in OpenSwap.** Specify it in `docs/worker-protocol.md`.
