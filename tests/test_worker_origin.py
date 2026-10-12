@@ -745,3 +745,26 @@ def test_loopback_origin_submit_test_and_refusal(tmp_path, keychain, capsys):  #
             server.shutdown()
             serving.join(WAIT)
     assert not serving.is_alive()
+
+
+def test_a_refusal_made_while_the_launch_is_authorized_still_stops_it(origin_setup):
+    remote, runtime, adapter, _, _, _, transport, root = origin_setup
+    _submit(origin_setup, origin=CHATGPT)
+    remote.tick()
+    guard = runtime.remote_launch_guard
+    assert guard is not None
+
+    def refuse_then_authorize(job_id):
+        # The owner refuses assistants after the first check, while the
+        # remote authorization is still in flight.
+        cli.set_origin_refused(root, "assistant", True)
+        return guard(job_id)
+
+    runtime.remote_launch_guard = refuse_then_authorize
+    result = runtime.reconcile_once()
+    assert (result.state, result.diagnostic_code) == (JobState.FAILED, "origin_refused")
+    assert adapter.starts == 0
+    lease = runtime.leases.for_job(result.job_id)
+    assert (lease.state, lease.reason) == ("released", "unlaunched")  # released with proof nothing ran
+    remote.tick()
+    assert _reconciled(transport) == [("failed", False, True)]

@@ -1151,6 +1151,10 @@ class WorkerRuntime:
                      or policy.control_service_worker_id not in {None, authorization.worker_id})
             ):
                 return "unpaired"
+        # Reread here too: `openswap worker origins refuse` may have landed
+        # since _prepare_launch checked it.
+        if self._origin_refused(latest):
+            return "origin_refused"
         return None
 
     def _finish_refused(self, starting: JobRecord, token, diagnostic: str) -> JobRecord:
@@ -1184,6 +1188,7 @@ class WorkerRuntime:
                 return self._cancel_before_launch(latest)
             new_state, diagnostic = (
                 (JobState.EXPIRED, "job_expired") if reason == "job_expired"
+                else (JobState.FAILED, reason) if reason in {"origin_refused", "provider_unavailable"}
                 else (JobState.FAILED, "worker_disabled")
             )
             return self.store.transition(
@@ -1226,21 +1231,32 @@ class WorkerRuntime:
                         authorization = self.remote_launch_guard(starting.job_id)
                     except Exception:
                         authorization = False
-                with self._launch_lock:
-                    skipped = self._launch_fence(starting.job_id, shutdown_event, authorization)
-                    with outcome_lock:
-                        # Decided under the same lock the monitor abandons
-                        # through: a launch given up on while the guard ran
-                        # (stop, deadline or shutdown) never reaches start().
-                        abandoned = outcome.get("abandoned")
-                        if skipped is None and abandoned:
-                            skipped = "job_expired" if abandoned == "runtime_limit_reached" else str(abandoned)
-                        if skipped is None:
-                            # Committed atomically with the fence: any stop from
-                            # here on is reported as after the launch.
-                            self._launch_committed = starting.job_id
-                        else:
-                            outcome["skipped"] = skipped
+                # The final fence rereads the origin veto under the lifecycle
+                # lock `openswap worker origins` holds (taken before
+                # _launch_lock, as everywhere), so a refusal that returned
+                # before the launch commits stops it.
+                lifecycle = FileLock(self.backup_root / "worker" / "lifecycle.lock", timeout=5)
+                locked = lifecycle.acquire()
+                try:
+                    with self._launch_lock:
+                        skipped = (self._launch_fence(starting.job_id, shutdown_event, authorization)
+                                   if locked else "provider_unavailable")
+                        with outcome_lock:
+                            # Decided under the same lock the monitor abandons
+                            # through: a launch given up on while the guard ran
+                            # (stop, deadline or shutdown) never reaches start().
+                            abandoned = outcome.get("abandoned")
+                            if skipped is None and abandoned:
+                                skipped = "job_expired" if abandoned == "runtime_limit_reached" else str(abandoned)
+                            if skipped is None:
+                                # Committed atomically with the fence: any stop from
+                                # here on is reported as after the launch.
+                                self._launch_committed = starting.job_id
+                            else:
+                                outcome["skipped"] = skipped
+                finally:
+                    if locked:
+                        lifecycle.release()
                 if skipped is not None:
                     if abandoned:
                         # The monitor recorded the job interrupted and the lease
