@@ -230,18 +230,22 @@ additive in the same way as `account_ref` and `readiness`:
   display name). It is part of the normalized idempotency payload and appears
   in the claim's `submission` unchanged. A backend accepts or sends `origin`
   only for a worker whose current registration advertised `"origin"`; for any
-  other worker, `submit` with `origin` returns 400 `invalid_request`. A claim
+  other worker, `submit` with `origin` returns 400 `invalid_request`. As with
+  `account_ref`, an identical replay of an existing submission is resolved
+  before that enrollment check, so a retry after a lost response returns its
+  job even if the Mac has re-registered since. A claim
   carrying `origin` before this enrollment advertised it is malformed. A
   backend must not drop an origin it would otherwise send just because the
   Mac is mid-registration. A Mac advertises before its first readiness
   report, so OpenTag answers an approved submission with retryable
   `offline_worker` for up to 30 seconds after the Mac registers, while the
-  registration has neither advertised `"origin"` nor reported readiness, if
+  registration has sent neither a capabilities report nor readiness, if
   the Mac advertised it on an earlier registration or the approval came from
   an assistant (a first pairing). The approval stays approved until it
-  expires. After that window a Mac that still has not advertised is treated
-  as not supporting origin (a legacy client) and its jobs go without one, so
-  nothing is stranded.
+  expires. A capabilities report without `"origin"` ends the wait at once;
+  after the window a Mac that still has not advertised is treated as not
+  supporting origin (a legacy client) and its jobs go without one, so nothing
+  is stranded.
 - The Mac shows the origin in `worker status`, the menu bar's Remote tasks
   section and the job journal. A **Mac-only** policy,
   `worker.refusedOrigins` (default: none), lists the kinds this Mac refuses.
