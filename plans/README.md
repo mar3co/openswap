@@ -63,6 +63,7 @@ install/upgrade rewiring. Three phases with a green-suite gate between them.
 | Plan | Proposal | Status |
 |------|----------|--------|
 | [017](017-remote-agent-host.md) | Remote Agent Host: local research jobs dispatched from OpenTag or a self-hosted server | ACCEPTED; Phase 1 signoff (#59) and the local-only Phase 2 worker (#60) are merged; Phase 1 live-evidence gates remain blocked; Phase 3 credential-free scaffolding reviewed and fixed in two rounds on 2026-09-30, merge of #63–#67 pending; owner HTTPS/network pilot, server retention/audit trail still open ([progress](017-progress.md)) |
+| [018](018-remote-mcp-connector.md) | Remote tasks as an MCP connector: ChatGPT, dots, Claude and other MCP clients request sessions on paired Macs through an OAuth-protected facade on the control service, with private owner approval | ACCEPTED 2026-10-11; implementation in stacked PRs (OpenTag facade, OpenSwap origin extension) |
 
 017 recommends an optional OpenSwap worker process, with OpenTag as its first
 client, a pluggable control service (OpenTag-hosted, self-hosted MIT reference
