@@ -103,17 +103,24 @@ private preview step that OpenTag's agent uses.
 | --- | --- | --- | --- |
 | `workers_list` | none | The caller's Macs in the granted workspace: `worker_id`, label, connectivity, last seen, `execution` (`live`/`disabled`/null), `is_default`, `default_workspace_id` | Read-only. No account data |
 | `workspaces_list` | `worker_id` | Reported folder IDs and labels (or owner-typed IDs when the Mac has not reported) | Read-only. Labels are the owner's; paths never leave the Mac |
-| `jobs_request` | `task` (1–32,000 chars), optional `worker_id`, `workspace_id`, `runtime_limit_minutes` (1–240, default 60), `idempotency_key` | `request_id`, `state: awaiting_approval`, `approval_url`, the Mac and folder chosen and why | Write. Never accepts an account, model, provider, path, environment or command. The Mac and folder follow the owner's OpenTag defaults (default Mac, its default folder) unless named |
+| `jobs_request` | `task` (1–32,000 chars), required `idempotency_key` (1–100 of `A–Z a–z 0–9 . _ : -`), optional `worker_id`, `workspace_id`, `runtime_limit_minutes` (1–240, default 60) | `request_id`, `state: awaiting_approval`, `approval_url`, the Mac and folder chosen and why | Write. Never accepts an account, model, provider, path, environment or command. The Mac and folder follow the owner's OpenTag defaults (default Mac, its default folder) unless named |
 | `requests_get` | `request_id` | `state` (`awaiting_approval`, `approved`, `denied`, `expired`, `submitted`), and `job_id` once submitted | Read-only. Lets a client follow a request without the job ID |
 | `jobs_get` | `job_id` | Protocol job state, `cancel_requested`, timestamps | Read-only |
 | `jobs_events` | `job_id`, `after_cursor` | Safe event summaries (the protocol's closed kinds and diagnostic codes) | Read-only |
 | `jobs_cancel` | `job_id` | `state` | Write, idempotent. Cancelling never needs approval |
 | `artifacts_list` / `artifacts_get` | `job_id` (and `name`) | Metadata; with `results:read`, UTF-8 content as a bounded excerpt (64 KiB) plus an authenticated portal link | Read-only. The full bytes stay behind the portal link |
 
-Tool annotations: the read tools set `readOnlyHint: true`. `jobs_request` and
-`jobs_cancel` set `readOnlyHint: false`, `destructiveHint: false` and
-`openWorldHint: true`, so clients that ask before write actions (ChatGPT does)
-show their own confirmation. That confirmation is a courtesy and never replaces
+`jobs_request` idempotency is per grant and covers the request itself, before
+any approval: a retry with the same key and the same task, runtime and Mac and
+folder selectors (present or absent) returns the original request; any
+difference is `idempotency_conflict`. The approval then carries one fixed
+submission key, so a lost response never produces two approvals or two jobs.
+
+Tool annotations: the read tools set `readOnlyHint: true`. `jobs_request` sets
+`readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: false` and
+`openWorldHint: true`; `jobs_cancel` can stop a running session, so it sets
+`destructiveHint: true` and `idempotentHint: true`. Clients that ask before
+write actions (ChatGPT does) show their own confirmation. That confirmation is a courtesy and never replaces
 the owner's private approval.
 
 Tool descriptions say plainly that a request waits for the owner, so a model
@@ -213,7 +220,12 @@ additive in the same way as `account_ref` and `readiness`:
   in the claim's `submission` unchanged. A backend accepts or sends `origin`
   only for a worker whose current registration advertised `"origin"`; for any
   other worker, `submit` with `origin` returns 400 `invalid_request`. A claim
-  carrying `origin` before this enrollment advertised it is malformed.
+  carrying `origin` before this enrollment advertised it is malformed. A
+  backend must not drop an origin it would otherwise send just because the
+  Mac is mid-registration: OpenTag answers an approved submission for a Mac
+  that advertised `"origin"` before, but not yet on its new registration (it
+  advertises before its first readiness report), with retryable
+  `offline_worker`, and the approval stays approved until it expires.
 - The Mac shows the origin in `worker status`, the menu bar's Remote tasks
   section and the job journal. A **Mac-only** policy,
   `worker.refusedOrigins` (default: none), lists the kinds this Mac refuses.
@@ -239,7 +251,11 @@ additive in the same way as `account_ref` and `readiness`:
   request from the owner's own assistant connection counts as a task the owner
   started. The owner should confirm that reading in phase 0.
 - The account is the Mac's pin, or one the owner picks among the advertised
-  accounts **at approval**. Assistants never choose an account, model or
+  accounts **at approval**. The account decides the provider: the wire
+  submission keeps protocol v1's fixed `provider: "codex"` value (as Slack
+  previews do), and the Mac launches Claude Code or Codex according to the
+  account it resolves locally. No provider negotiation is needed for this
+  release. Assistants never choose an account, model or
   provider.
 - The Mac makes only outbound requests and never trusts a backend's claim
   about folders, accounts or modes without checking it locally at launch.
