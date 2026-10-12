@@ -238,7 +238,11 @@ additive in the same way as `account_ref` and `readiness`:
   `account_ref`, an identical replay of an existing submission is resolved
   before that enrollment check, so a retry after a lost response returns its
   job even if the Mac has re-registered since. A claim
-  carrying `origin` before this enrollment advertised it is malformed. A
+  carrying `origin` before this enrollment advertised it is malformed, so a
+  queued origin-bearing job waits, like one carrying `account_ref`, until a
+  registration advertises `"origin"` again. If none does (a downgraded
+  client), it is never offered and ends `expired` at its deadline as any
+  unclaimed job does; the owner sees that and can ask again. A
   backend must not drop an origin it would otherwise send just because the
   Mac is mid-registration. A Mac advertises right after it registers, so
   OpenTag answers an approved submission with retryable
