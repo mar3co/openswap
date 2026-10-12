@@ -229,12 +229,13 @@ additive in the same way as `account_ref` and `readiness`:
   backend must not drop an origin it would otherwise send just because the
   Mac is mid-registration. A Mac advertises before its first readiness
   report, so OpenTag answers an approved submission with retryable
-  `offline_worker` while the current registration has neither advertised
-  `"origin"` nor reported readiness, if the Mac advertised it on an earlier
-  registration or registered under 30 seconds ago (a first pairing). The
-  approval stays approved until it expires. After that window a Mac that
-  still has not advertised does not support origin, and its jobs go without
-  one.
+  `offline_worker` for up to 30 seconds after the Mac registers, while the
+  registration has neither advertised `"origin"` nor reported readiness, if
+  the Mac advertised it on an earlier registration or the approval came from
+  an assistant (a first pairing). The approval stays approved until it
+  expires. After that window a Mac that still has not advertised is treated
+  as not supporting origin (a legacy client) and its jobs go without one, so
+  nothing is stranded.
 - The Mac shows the origin in `worker status`, the menu bar's Remote tasks
   section and the job journal. A **Mac-only** policy,
   `worker.refusedOrigins` (default: none), lists the kinds this Mac refuses.
