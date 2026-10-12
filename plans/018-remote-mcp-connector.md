@@ -147,7 +147,11 @@ reserved for in-run approvals.
   an authorize endpoint with a consent page behind the portal's existing
   Supabase Auth sign-in, a token endpoint (authorization code with PKCE S256,
   refresh) and RFC 7009 revocation. CIMD is a follow-up; ChatGPT falls back to
-  DCR when CIMD is not advertised, and Claude supports DCR.
+  DCR when CIMD is not advertised, and Claude supports DCR. A DCR client name
+  is self-asserted (RFC 7591 §5), so the consent page says OpenTag cannot
+  verify it and leads with the host it will return to; the approval page and
+  Connected assistants say the name came from the app. Verified identities
+  arrive with CIMD.
 - **Token scoping (required, not optional).** Tokens are random opaque
   secrets that OpenTag stores only as SHA-256 hashes in service-only tables,
   like device keys. They are not Supabase JWTs, so the Data API never accepts
@@ -223,10 +227,14 @@ additive in the same way as `account_ref` and `readiness`:
   other worker, `submit` with `origin` returns 400 `invalid_request`. A claim
   carrying `origin` before this enrollment advertised it is malformed. A
   backend must not drop an origin it would otherwise send just because the
-  Mac is mid-registration: OpenTag answers an approved submission for a Mac
-  that advertised `"origin"` before, but not yet on its new registration (it
-  advertises before its first readiness report), with retryable
-  `offline_worker`, and the approval stays approved until it expires.
+  Mac is mid-registration. A Mac advertises before its first readiness
+  report, so OpenTag answers an approved submission with retryable
+  `offline_worker` while the current registration has neither advertised
+  `"origin"` nor reported readiness, if the Mac advertised it on an earlier
+  registration or registered under 30 seconds ago (a first pairing). The
+  approval stays approved until it expires. After that window a Mac that
+  still has not advertised does not support origin, and its jobs go without
+  one.
 - The Mac shows the origin in `worker status`, the menu bar's Remote tasks
   section and the job journal. A **Mac-only** policy,
   `worker.refusedOrigins` (default: none), lists the kinds this Mac refuses.
