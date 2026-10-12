@@ -280,8 +280,10 @@ additive in the same way as `account_ref` and `readiness`:
   on their own Macs, for tasks they start (decision 2026-10-07). An approved
   request from the owner's own assistant connection counts as a task the owner
   started. The owner should confirm that reading in phase 0.
-- The account is the Mac's pin, or one the owner picks among the advertised
-  accounts **at approval**. The account decides the provider: the wire
+- The account is the Mac's pin (its default account). In this release
+  every approval, Slack or assistant, uses it: the portal picker for choosing
+  among advertised accounts at approval is a follow-up, outside these phases.
+  The account decides the provider: the wire
   submission keeps protocol v1's fixed `provider: "codex"` value (as Slack
   previews do), and the Mac launches Claude Code or Codex according to the
   account it resolves locally. No provider negotiation is needed for this
@@ -321,13 +323,13 @@ OpenTag's existing retention.
    not a Supabase JWT. A revoked grant fails the next call. A non-owner's token
    sees no Mac.
 2. **Requests, approval and results.** Add `jobs_request`, `requests_get`,
-   `jobs_cancel` and the artifact tools; the origin label on the approval page;
+   `jobs_list`, `jobs_get`, `jobs_events`, `jobs_cancel` and the artifact tools; the origin label on the approval page;
    limits; and the `results:read` consent checkbox. (A Slack DM notice for
    assistant requests is a follow-up: the outbox is keyed to a Slack thread.)
    Exit: in CI, the
    conformance job runs the pinned OpenSwap client with the inert adapter, takes
-   an MCP-originated request through approval, submission, claim, reconcile and
-   artifact retrieval, and proves that no tool path submits without an
+   an MCP-originated request through approval, submission, claim, following it
+   with `jobs_get` and `jobs_events`, reconcile and artifact retrieval, and proves that no tool path submits without an
    approval. Live: the owner starts a real session on their Mac from ChatGPT and
    from Claude, approves it privately, and reads the result in the assistant.
 3. **Origin extension in OpenSwap.** Specify it in `docs/worker-protocol.md`.
