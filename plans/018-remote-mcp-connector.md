@@ -105,6 +105,7 @@ private preview step that OpenTag's agent uses.
 | `workspaces_list` | `worker_id` | Reported folder IDs and labels (or owner-typed IDs when the Mac has not reported) | Read-only. Labels are the owner's; paths never leave the Mac |
 | `jobs_request` | `task` (1–32,000 chars), required `idempotency_key` (1–100 of `A–Z a–z 0–9 . _ : -`), optional `worker_id`, `workspace_id`, `runtime_limit_minutes` (1–240, default 60) | `request_id`, `state: awaiting_approval`, `approval_url`, the Mac and folder chosen and why | Write. Never accepts an account, model, provider, path, environment or command. The Mac and folder follow the owner's OpenTag defaults (default Mac, its default folder) unless named |
 | `requests_get` | `request_id` | `state` (`awaiting_approval`, `approved`, `denied`, `expired`, `submitted`), and `job_id` once submitted | Read-only. Lets a client follow a request without the job ID |
+| `jobs_list` | none | This grant's own 20 most recent requests, newest first, each with its request view (`request_id`, state, Mac, folder, `job_id` and job state once submitted); expired open requests are reported as `expired` | Read-only. Never another grant's or the owner's other work |
 | `jobs_get` | `job_id` | Protocol job state, `cancel_requested`, timestamps | Read-only |
 | `jobs_events` | `job_id`, `after_cursor` | Safe event summaries (the protocol's closed kinds and diagnostic codes) | Read-only |
 | `jobs_cancel` | `job_id` | `state` | Write, idempotent. Cancelling never needs approval |
@@ -329,7 +330,8 @@ OpenTag's existing retention.
    Exit: in CI, the
    conformance job runs the pinned OpenSwap client with the inert adapter, takes
    an MCP-originated request through approval, submission, claim, following it
-   with `jobs_get` and `jobs_events`, reconcile and artifact retrieval, and proves that no tool path submits without an
+   with `jobs_list`, `jobs_get` and `jobs_events`, reconcile and artifact
+   retrieval, and proves that no tool path submits without an
    approval. Live: the owner starts a real session on their Mac from ChatGPT and
    from Claude, approves it privately, and reads the result in the assistant.
 3. **Origin extension in OpenSwap.** Specify it in `docs/worker-protocol.md`.
