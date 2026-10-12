@@ -117,7 +117,8 @@ difference is `idempotency_conflict`. The approval then carries one fixed
 submission key, so a lost response never produces two approvals or two jobs.
 
 Tool annotations: the read tools set `readOnlyHint: true`. `jobs_request` sets
-`readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: false` and
+`readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true` (its
+required key makes a same-argument retry return the original request) and
 `openWorldHint: true`; `jobs_cancel` can stop a running session, so it sets
 `destructiveHint: true` and `idempotentHint: true`. Clients that ask before
 write actions (ChatGPT does) show their own confirmation. That confirmation is a courtesy and never replaces
