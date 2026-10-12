@@ -175,7 +175,10 @@ reserved for in-run approvals.
   at once, as device revocation does. It also stops new work at once: approving
   or starting one of the grant's open requests rechecks, under a lock shared
   with the disconnect, that the grant is still live and may still ask, so a
-  revoked assistant's pending request can no longer be approved or started. Access tokens last about one hour.
+  revoked assistant's pending request can no longer be approved or started.
+  A job the owner already approved and started is the owner's: disconnecting
+  ends the assistant's access to it but does not cancel it, and the owner can
+  stop it from the portal (or revoke the Mac, which stops new claims). Access tokens last about one hour.
   Refresh tokens rotate and expire after 30 days of non-use.
 - **Sign in with ChatGPT** is not needed. It could later be a portal sign-in
   method; that is a separate decision.
@@ -242,7 +245,10 @@ additive in the same way as `account_ref` and `readiness`:
   registration has sent no capabilities report (readiness is reported
   independently and does not count), if
   the Mac advertised it on an earlier registration or the approval came from
-  an assistant (a first pairing). The approval stays approved until it
+  an assistant (a first pairing). Slack approvals to a Mac that has never
+  advertised are not held, so legacy Macs keep starting Slack work at once
+  after a restart; such a job arrives without an origin, which only
+  `unspecified` refuses. The approval stays approved until it
   expires. A capabilities report without `"origin"` ends the wait at once;
   after the window a Mac that still has not advertised is treated as not
   supporting origin (a legacy client) and its jobs go without one, so nothing
