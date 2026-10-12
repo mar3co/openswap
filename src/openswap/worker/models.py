@@ -38,6 +38,27 @@ class WorkerProcessState(StrEnum):
 
 MAX_JOB_RUNTIME_SECONDS = 4 * 60 * 60
 
+# Optional submission origin extension: where a job came from. ``unspecified``
+# is not a wire kind; local policy uses it for a remote job without an origin.
+ORIGIN_KINDS = ("slack", "assistant", "portal", "test")
+UNSPECIFIED_ORIGIN = "unspecified"
+REFUSABLE_ORIGINS = (*ORIGIN_KINDS, UNSPECIFIED_ORIGIN)
+
+
+@dataclass(frozen=True)
+class Origin:
+    """Where a remote job came from: a wire kind and the client's display name.
+
+    It describes a job and authorizes nothing; the owner may refuse a kind
+    locally (``worker.refusedOrigins``).
+    """
+
+    kind: str
+    label: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"kind": self.kind, "label": self.label}
+
 
 class RemoteConnectivity(StrEnum):
     """Connectivity to the control service, tracked separately from provider/job/process state."""
@@ -129,6 +150,7 @@ class JobRecord:
     generation: int
     diagnostic_code: str | None
     event_cursor: int
+    origin: Origin | None = None
 
     def snapshot(self) -> JobSnapshot:
         return JobSnapshot(
@@ -140,6 +162,7 @@ class JobRecord:
             event_cursor=self.event_cursor,
             diagnostic_code=self.diagnostic_code,
             output_ref=f"{self.workspace_id}/{self.job_id}",
+            origin=self.origin,
         )
 
 
@@ -155,6 +178,8 @@ class JobSnapshot:
     event_cursor: int
     diagnostic_code: str | None
     output_ref: str
+    # The submission origin (kind and label), never the task text.
+    origin: Origin | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -166,6 +191,7 @@ class JobSnapshot:
             "event_cursor": self.event_cursor,
             "diagnostic_code": self.diagnostic_code,
             "output_ref": self.output_ref,
+            "origin": self.origin.to_dict() if self.origin else None,
         }
 
 
@@ -223,6 +249,8 @@ class WorkerSnapshot:
     worker_pid: int | None = None
     lease_quarantined: bool = True
     remote_last_seen_at: datetime | None = None
+    # The most recently finished job (its origin shows in status when idle).
+    last_job: JobSnapshot | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -237,6 +265,7 @@ class WorkerSnapshot:
             "worker_pid": self.worker_pid,
             "lease_quarantined": self.lease_quarantined,
             "remote_last_seen_at": _iso(self.remote_last_seen_at) if self.remote_last_seen_at else None,
+            "last_job": self.last_job.to_dict() if self.last_job else None,
         }
 
 

@@ -92,7 +92,9 @@ must be in the future and no more than 24 hours away at first admission. A
 submission names **no account, model, path, environment, executable or
 argv**. The Mac resolves the opaque workspace ID and pins the locally approved
 account. A backend implementing the optional account choice extension (below)
-may add an `account_ref` the worker itself advertised; nothing else changes. `worker_id` must be the authenticated key's own worker; any other
+may add an `account_ref` the worker itself advertised, and one implementing the
+optional submission origin extension an `origin` for a worker that advertised
+it; nothing else changes. `worker_id` must be the authenticated key's own worker; any other
 value returns `forbidden`. Reusing an idempotency key with the identical
 normalized payload returns the same job even if the worker later goes
 offline; changing its payload returns `idempotency_conflict`. Normalization
@@ -207,7 +209,9 @@ job outcome stands), `remote_sync_conflict` (local only: the service refused
 this job's event history with `cursor_conflict`, so the worker stopped
 syncing it; see below), `workspace_refused` (local only: the job's workspace
 breaks the folder rules at launch; it is uploaded as `provider_unavailable`,
-because the service's diagnostic list is closed).
+because the service's diagnostic list is closed), `origin_refused` (local
+only, uploaded as `provider_unavailable` likewise: this Mac refuses the job's
+[submission origin](#optional-submission-origin-v1-extension)).
 No free-form provider payloads, local paths or account/session identifiers are
 accepted. Upload with `events`, `worker_epoch`, `epoch` together; read by
 omitting all three. Upload at most 200 events; identical cursor replay is
@@ -357,6 +361,84 @@ reported. It must not treat a report as approval of a job or as proof that a
 folder still exists: a job naming an ID the Mac no longer approves fails before
 launch (`provider_unavailable`, `unlaunched=true`), exactly as without the
 extension.
+
+## Optional submission origin (v1 extension)
+
+Without this extension a worker cannot tell a Slack request from one an
+assistant (ChatGPT, Claude) made through the owner's connector. With it, a
+submission may say where it came from, and the Mac shows that and may refuse
+some kinds locally. The origin is descriptive: it never authorizes anything,
+and the Mac still checks the folder, account and mode of every claim before
+launch.
+
+The extension is additive. A worker that never sends `capabilities` sees no
+change, and a backend that does not implement it rejects the operation like any
+unknown operation (404 `unsupported_version`).
+
+| Operation | Request fields | Success response |
+| --- | --- | --- |
+| `capabilities` | `worker_epoch`, `features` (array below) | `features` (array) |
+
+`features` holds 0–20 unique strings, each 1–64 characters of lowercase ASCII
+letters, digits, `_` and `-`. A backend ignores a feature it does not know;
+v1 defines only `"origin"`. The response's `features` is the subset of the
+request the backend accepts (in v1, `["origin"]` or `[]`). The request
+atomically replaces the worker's whole advertised set. It carries the current
+worker epoch like any other mutation and returns `stale_epoch` from a
+superseded registration. The worker sends it after each new registration, and
+only then: in v1 the set never changes while a registration lasts. A new
+registration and a revocation clear the set on the backend. A worker that
+receives 404 `unsupported_version` (or 404 `not_found`, which reference servers
+predating this extension return for an unknown operation) records that the
+backend has no capabilities support and stops sending it until its next
+registration; other failures are retried on the next pass and never hold back
+heartbeats or claims. A response that is not a closed object with a valid
+`features` array, or that names a feature the worker did not send, is
+malformed and the request is sent again on the next pass.
+
+A backend that implements the extension accepts one more optional submission
+field, `origin`, a closed object with exactly:
+
+- `kind`: one of `slack`, `assistant`, `portal` or `test`;
+- `label`: 1–100 characters with no Unicode control characters (U+0000–U+001F
+  or U+007F–U+009F), the client's display name (for example `ChatGPT`).
+
+```json
+"origin": {"kind": "assistant", "label": "ChatGPT"}
+```
+
+When present, `origin` is part of the normalized idempotency payload (the
+object compares verbatim) and appears in the claim's `submission` exactly as
+submitted. A backend accepts `origin` on a new `submit` only for a worker whose
+current registration advertised `"origin"` and had it accepted; otherwise it
+returns 400 `invalid_request`. An identical replay of an admitted submission
+still returns its job. A backend never puts `origin` in a claim for a worker
+that has not advertised it: `poll` offers a queued job carrying `origin` only
+while the worker's current registration advertises it, so after a new
+registration such a job stays queued until `capabilities` is sent again, and
+later jobs without the field may be claimed first. A claim already granted is
+replayed unchanged.
+
+The worker records durably (in its remote journal, scoped to the enrollment's
+worker ID) the registration whose `capabilities` the backend acknowledged and
+the features it accepted. A claim whose submission carries `origin` before the
+current registration advertised it and had it accepted is a malformed claim,
+handled like one carrying an unadvertised `account_ref`. A well-formed origin
+is recorded on the local job when it is admitted, and shown in `worker status`
+and the menu bar.
+
+**Local refusal (this Mac only).** The setting `worker.refusedOrigins` lists
+the kinds this Mac refuses: any of `slack`, `assistant`, `portal`, `test`, and
+`unspecified` (a remote job without `origin`). The default is empty: nothing is
+refused. It is checked under the launch lock, immediately before launch, with
+the folder and account rechecks. A refused job fails before launch: it never
+starts anything and takes no account lease, the worker reconciles it `failed`
+with `unlaunched=true`, uploads the diagnostic `provider_unavailable` (the
+service's diagnostic list is closed) and records `origin_refused` locally. An
+unreadable or invalid setting refuses every kind. Jobs the Mac starts itself
+(the live check) have no origin and are never refused. No wire operation, IPC
+request or remote message can change the list; see
+[Where tasks come from](#where-tasks-come-from).
 
 ## Errors, persistence, and operating the reference service
 
@@ -1126,6 +1208,37 @@ sent at the end of a synchronization pass, after results are delivered and new
 work is claimed, so a slow `readiness` route never delays either. The reference
 service implements `readiness` and keeps the latest report per worker.
 
+### Where tasks come from
+
+When the control service implements the [submission origin
+extension](#optional-submission-origin-v1-extension), each task may say where
+it came from: `slack`, `assistant` (ChatGPT, Claude or another assistant
+through the owner's connector), `portal` or `test`, with the client's name.
+`openswap worker status` shows it for the running task ("From ChatGPT
+(assistant)"), or for the last finished one when none is running, and the menu
+bar's Remote tasks status line says "job running from ChatGPT (assistant)".
+The task text is never shown. `--json` carries it as `origin` (`kind` and
+`label`, or null) on `active_job` and `last_job`.
+
+```sh
+openswap worker origins                    # each kind, allowed or refused (or --json)
+openswap worker origins refuse assistant   # refuse tasks from assistants on this Mac
+openswap worker origins refuse unspecified # refuse tasks that do not say where they came from
+openswap worker origins allow assistant    # take them again
+```
+
+By default this Mac takes tasks from every origin. A refused origin's tasks
+fail before anything is launched (`origin_refused` here, `provider_unavailable`
+at the service, `unlaunched=true`); the change applies from the next task.
+Changes take the worker lifecycle lock, like folder and account changes, and
+can be made only on this Mac, never from the web. `worker status` (human and
+`--json`, as `refused_origins`) lists the refused origins when there are any.
+
+After each registration the worker sends `capabilities` with `["origin"]`; the
+reference service implements it, keeps the accepted set per registration,
+accepts `origin` only from a worker that advertised it, and `submit-test` takes
+`--origin-kind KIND --origin-label LABEL` (both or neither).
+
 `worker status --json` includes `remote_connectivity` and
 `remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.
 CLI and menu-bar status expose connectivity and service last seen without
@@ -1144,7 +1257,8 @@ openswap worker submit-test --url https://control.example \
 ```
 
 It sends only the canonical submission (plus `account_ref` when
-`--account-ref` names an account the worker advertised) and prints the validated JSON job ID
+`--account-ref` names an account the worker advertised, and `origin` when
+`--origin-kind` and `--origin-label` are both given) and prints the validated JSON job ID
 and state (any other response shape, unknown state or extra field is refused
 as `invalid_response` with exit status 1 and nothing echoed). It never supplies
 an adapter, model, account, path or command. A new submission requires the
@@ -1176,7 +1290,8 @@ Run the credential-free roundtrip and deterministic failure tests with:
 ```sh
 uv run pytest -q -n0 tests/test_worker_protocol.py tests/test_worker_refserver.py \
   tests/test_worker_remote.py tests/test_worker_pairing_status.py \
-  tests/test_worker_launch_abandon.py tests/test_worker_remote_e2e.py
+  tests/test_worker_launch_abandon.py tests/test_worker_remote_e2e.py \
+  tests/test_worker_origin.py
 ```
 
 Tests mock Keychain and use an inert adapter. They prove loopback pairing,

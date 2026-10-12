@@ -195,6 +195,8 @@ def _remote_tasks_status_copy(
         "expired",
     }:
         active_state = "idle" if active is None else "unknown"
+    # Where the running task came from (kind and client name, never its text).
+    origin = _remote_task_origin(active.get("origin")) if isinstance(active, dict) else ""
     queue = snapshot.get("queue_depth")
     if type(queue) is not int or queue < 0:
         queue = 0
@@ -227,8 +229,24 @@ def _remote_tasks_status_copy(
     return (
         f"{'enabled' if enabled else 'disabled'} · {process} · "
         f"admission {'paused' if paused else 'open'} · provider {provider_label} · "
-        f"job {active_state} · queue {min(queue, 999)}{service}{tail}"
+        f"job {active_state}{origin} · queue {min(queue, 999)}{service}{tail}"
     )
+
+
+_ORIGIN_KINDS = frozenset({"slack", "assistant", "portal", "test"})
+
+
+def _remote_task_origin(origin) -> str:
+    """`` from ChatGPT (assistant)`` for a task's submission origin, or ``""``.
+
+    The label is the client's display name: bounded and stripped of anything
+    unprintable before it reaches the menu.
+    """
+    if not isinstance(origin, dict) or origin.get("kind") not in _ORIGIN_KINDS:
+        return ""
+    label = origin.get("label")
+    label = "".join(c for c in label[:100] if c.isprintable()).strip() if isinstance(label, str) else ""
+    return f" from {label} ({origin['kind']})" if label else f" from {origin['kind']}"
 SETTINGS_PAGE = "settings"
 MAIN_PAGE = "main"
 SETTINGS_SECTION_GENERAL = "general"

@@ -11,7 +11,9 @@ import re
 import unicodedata
 from urllib.parse import urlsplit
 
-from openswap.worker.models import MAX_JOB_RUNTIME_SECONDS, JobSubmission, JobState, SafeEvent, SafeEventKind
+from openswap.worker.models import (
+    MAX_JOB_RUNTIME_SECONDS, ORIGIN_KINDS, JobSubmission, JobState, Origin, SafeEvent, SafeEventKind,
+)
 from openswap.worker.journal import validate_event_fields
 
 VERSION = 1
@@ -139,19 +141,24 @@ class Submission:
     # Optional account choice extension: an ``account_ref`` the target worker
     # advertised. Accepted only where the caller says the extension applies.
     account_ref: str | None = None
+    # Optional submission origin extension: where the job came from. Accepted
+    # only where the caller says the worker advertised ``"origin"``.
+    origin: Origin | None = None
 
     @classmethod
-    def from_dict(cls, value: object, *, allow_account_ref: bool = False) -> Submission:
+    def from_dict(cls, value: object, *, allow_account_ref: bool = False,
+                  allow_origin: bool = False) -> Submission:
+        optional = ({"account_ref"} if allow_account_ref else set()) | ({"origin"} if allow_origin else set())
         data = fields(value, {"worker_id", "idempotency_key", "provider", "task", "capability_profile",
-                              "workspace_id", "expires_at", "runtime_limit_s"},
-                      {"account_ref"} if allow_account_ref else frozenset())
+                              "workspace_id", "expires_at", "runtime_limit_s"}, optional)
         try:
             job = JobSubmission(text(data["idempotency_key"]), text(data["provider"]),
                                 text(data["task"], 32_000, allow_multiline=True), text(data["capability_profile"], 80),
                                 text(data["workspace_id"]), timestamp(data["expires_at"]),
                                 runtime_limit(data["runtime_limit_s"]))
             account_ref = text(data["account_ref"]) if "account_ref" in data else None
-            return cls(text(data["worker_id"]), job, account_ref)
+            origin = submission_origin(data["origin"]) if "origin" in data else None
+            return cls(text(data["worker_id"]), job, account_ref, origin)
         except (ValueError, TypeError):
             raise ProtocolError("invalid_request") from None
 
@@ -162,6 +169,8 @@ class Submission:
                  "expires_at": stamp(self.job.expires_at), "runtime_limit_s": runtime_limit(self.job.runtime_limit_s)}
         if self.account_ref is not None:
             value["account_ref"] = self.account_ref
+        if self.origin is not None:
+            value["origin"] = self.origin.to_dict()
         return value
 
 
@@ -173,12 +182,15 @@ class Claim:
     submission: Submission
 
     @classmethod
-    def from_dict(cls, value: object, *, allow_account_ref: bool = False) -> Claim:
-        """``allow_account_ref`` only for a worker that advertised accounts: any other
-        worker treats a submission carrying ``account_ref`` as a malformed claim."""
+    def from_dict(cls, value: object, *, allow_account_ref: bool = False, allow_origin: bool = False) -> Claim:
+        """``allow_account_ref`` only for a worker that advertised accounts, and
+        ``allow_origin`` only for one whose current registration advertised
+        ``"origin"`` (and the service accepted it): any other worker treats a
+        submission carrying either field as a malformed claim."""
         data = fields(value, {"job_id", "epoch", "lease_until", "submission"})
         return cls(text(data["job_id"]), integer(data["epoch"], 1), timestamp(data["lease_until"]),
-                   Submission.from_dict(data["submission"], allow_account_ref=allow_account_ref))
+                   Submission.from_dict(data["submission"], allow_account_ref=allow_account_ref,
+                                        allow_origin=allow_origin))
 
     def to_dict(self) -> dict:
         return {"job_id": self.job_id, "epoch": self.epoch, "lease_until": stamp(self.lease_until),
@@ -312,3 +324,35 @@ def execution_mode(value: object) -> str:
     if not isinstance(value, str) or value not in EXECUTION_MODES:
         raise ProtocolError("invalid_request")
     return value
+
+
+# Optional capabilities and submission origin extension.
+MAX_FEATURES = 20
+_FEATURE = re.compile(r"[a-z0-9_-]{1,64}")
+# The features this release defines. A backend answers with the subset it accepts.
+FEATURES = frozenset({"origin"})
+MAX_ORIGIN_LABEL = 100
+
+
+def capability_features(value: object) -> tuple[str, ...]:
+    """Validate a ``capabilities`` feature array: 0-20 unique strings of 1-64 ``[a-z0-9_-]``.
+
+    Unknown features are valid here; a backend ignores them (it answers with
+    the subset it accepts).
+    """
+    if not isinstance(value, list) or len(value) > MAX_FEATURES:
+        raise ProtocolError("invalid_request")
+    if not all(isinstance(item, str) and _FEATURE.fullmatch(item) for item in value):
+        raise ProtocolError("invalid_request")
+    if len(set(value)) != len(value):
+        raise ProtocolError("invalid_request")
+    return tuple(value)
+
+
+def submission_origin(value: object) -> Origin:
+    """A closed ``origin`` object: exactly ``kind`` (a defined kind) and ``label``
+    (1-100 characters, no Unicode control character)."""
+    data = fields(value, {"kind", "label"})
+    if not isinstance(data["kind"], str) or data["kind"] not in ORIGIN_KINDS:
+        raise ProtocolError("invalid_request")
+    return Origin(data["kind"], owner_label(data["label"], MAX_ORIGIN_LABEL))

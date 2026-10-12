@@ -711,6 +711,76 @@ def write_permission_override(backup_root: Path, value: str) -> str:
         return _override_from_raw(raw)
 
 
+# Submission origins this Mac refuses (openswap.worker.models.REFUSABLE_ORIGINS):
+# the four wire kinds plus "unspecified" for a remote job without an origin.
+_REFUSED_ORIGINS_KEY = "refusedOrigins"
+
+
+def _refusable_origins() -> tuple[str, ...]:
+    from openswap.worker.models import REFUSABLE_ORIGINS
+
+    return REFUSABLE_ORIGINS
+
+
+def _refused_origins_from_raw(raw: dict) -> tuple[str, ...]:
+    kinds = _refusable_origins()
+    section = raw.get("worker", {})
+    if not isinstance(section, dict):
+        _logger.warning("settings.json worker section is invalid; every task origin is refused")
+        return kinds
+    value = section.get(_REFUSED_ORIGINS_KEY, [])
+    if (not isinstance(value, list) or not all(isinstance(item, str) and item in kinds for item in value)
+            or len(set(value)) != len(value)):
+        # Fail closed: an unreadable refusal list refuses every origin, never none.
+        _logger.warning("settings.json worker.refusedOrigins is invalid; every task origin is refused")
+        return kinds
+    return tuple(kind for kind in kinds if kind in value)
+
+
+def load_refused_origins(backup_root: Path) -> tuple[str, ...]:
+    """The submission origins this Mac refuses, in canonical order (default: none).
+
+    Set only on this Mac (``openswap worker origins``); the control service has
+    no way to change it. Fails closed: only an absent settings file means the
+    default; one that cannot be read or parsed refuses every origin.
+    """
+    path = settings_path(Path(backup_root))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ()
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        _logger.warning("Could not read %s (%s); every task origin is refused", path, error)
+        return _refusable_origins()
+    if not isinstance(raw, dict):
+        _logger.warning("%s is not a JSON object; every task origin is refused", path)
+        return _refusable_origins()
+    return _refused_origins_from_raw(raw)
+
+
+def write_refused_origins(backup_root: Path, kinds) -> tuple[str, ...]:
+    """Replace the refused origins; an empty list removes the key (the default)."""
+    allowed = _refusable_origins()
+    kinds = tuple(kinds)
+    if not all(isinstance(kind, str) and kind in allowed for kind in kinds):
+        raise ValueError("unknown task origin")
+    canonical = [kind for kind in allowed if kind in kinds]
+    path = settings_path(Path(backup_root))
+    with _settings_write_lock(Path(backup_root)):
+        raw = _read_raw_for_write(path)
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        section = raw.get("worker")
+        if not isinstance(section, dict):
+            section = {}
+        if canonical:
+            section[_REFUSED_ORIGINS_KEY] = canonical
+        else:
+            section.pop(_REFUSED_ORIGINS_KEY, None)
+        raw["worker"] = section
+        atomic_write_json(path, raw)
+        return _refused_origins_from_raw(raw)
+
+
 def load_worker_settings(backup_root: Path) -> WorkerSettings:
     """Read default-off worker policy without creating directories or files."""
     return _worker_from_raw(_read_raw(settings_path(backup_root)), Path(backup_root))

@@ -43,7 +43,9 @@ from openswap.worker.models import (
     JobRecord,
     JobState,
     JobSubmission,
+    Origin,
     ProviderAvailability,
+    UNSPECIFIED_ORIGIN,
     RemoteAuthorization,
     RemoteConnectivity,
     ResolvedWorkspace,
@@ -114,11 +116,14 @@ def _local_snapshot_from_store(
     worker_pid: int | None = None,
 ) -> WorkerSnapshot:
     active_job = None
+    last_job = None
     queue_depth = 0
     if store is not None:
         try:
             active = store.active()
             active_job = active.snapshot() if active else None
+            finished = store.latest_finished()
+            last_job = finished.snapshot() if finished else None
             queue_depth = len(store.queue())
             pid, seen = store.health()
             worker_pid = worker_pid if worker_pid is not None else pid
@@ -126,6 +131,7 @@ def _local_snapshot_from_store(
         except (OSError, sqlite3.Error, RuntimeError, ValueError):
             process_state = WorkerProcessState.UNAVAILABLE
             active_job = None
+            last_job = None
             queue_depth = 0
             worker_pid = None
             last_seen_at = None
@@ -140,6 +146,7 @@ def _local_snapshot_from_store(
         last_seen_at=last_seen_at,
         worker_pid=worker_pid,
         lease_quarantined=_lease_is_quarantined(backup_root),
+        last_job=last_job,
     )
 
 
@@ -237,6 +244,11 @@ def _read_local_worker_snapshot(backup_root: Path, *, now: datetime | None = Non
         ).fetchone()
         queue_depth = db.execute("SELECT COUNT(*) FROM jobs WHERE state='queued'").fetchone()[0]
         active_job = LocalJobStore._record(row).snapshot() if row else None
+        finished = db.execute(
+            "SELECT * FROM jobs WHERE state IN ('succeeded','failed','cancelled','interrupted','expired') "
+            "ORDER BY updated_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        last_job = LocalJobStore._record(finished).snapshot() if finished else None
         raw_pid = metadata.get("worker_pid")
         pid = int(raw_pid) if raw_pid else None
         seen = datetime.fromisoformat(metadata["last_seen_at"]) if metadata.get("last_seen_at") else None
@@ -261,6 +273,7 @@ def _read_local_worker_snapshot(backup_root: Path, *, now: datetime | None = Non
             last_seen_at=seen,
             worker_pid=pid,
             lease_quarantined=_lease_is_quarantined(backup_root),
+            last_job=last_job,
         )
     except (OSError, sqlite3.Error, ValueError, KeyError):
         return WorkerSnapshot(
@@ -498,6 +511,23 @@ class WorkerRuntime:
             return None, "provider_auth_unavailable"
         return identity, None
 
+    def _origin_refused(self, job: JobRecord) -> bool:
+        """Whether this Mac refuses the remote job's submission origin (``worker.refusedOrigins``).
+
+        A remote job without an origin is ``unspecified``. Local jobs (the live
+        check) have no origin and are never refused here. An unreadable policy
+        refuses every kind (see ``load_refused_origins``).
+        """
+        if not job.idempotency_key.startswith("remote:"):
+            return False
+        from openswap.settings import load_refused_origins
+
+        kind = job.origin.kind if job.origin is not None else UNSPECIFIED_ORIGIN
+        try:
+            return kind in load_refused_origins(self.backup_root)
+        except Exception:
+            return True
+
     def _quarantine_lease_for_recovered_jobs(self) -> None:
         """Stop trusting a still-``active`` lease left by a crashed worker.
 
@@ -586,12 +616,17 @@ class WorkerRuntime:
         adapter = self.adapter_for(self.account_identity)
         return "live" if getattr(adapter, "execution_mode", None) == "live" else "disabled"
 
-    def submit(self, submission: JobSubmission, *, job_id: str | None = None, remote: bool = False) -> JobRecord:
+    def submit(self, submission: JobSubmission, *, job_id: str | None = None, remote: bool = False,
+               origin: Origin | None = None) -> JobRecord:
         """Admit a job; ``job_id`` lets a caller publish the ID before the row exists.
 
         The ``remote:`` idempotency prefix marks a job admitted by the remote client
         (its launch needs remote authorization), so only that client may use it.
+        ``origin`` is the claim's submission origin, recorded on the job (shown in
+        status, checked against the local refusal list before launch).
         """
+        if origin is not None and not remote:
+            raise AdmissionError("only a remote job carries a submission origin")
         if submission.idempotency_key.startswith("remote:") != remote:
             raise AdmissionError("the remote: idempotency prefix is reserved for remote jobs")
         with self._admission_lock:
@@ -604,6 +639,7 @@ class WorkerRuntime:
                 raise AdmissionError("job is expired")
             return self.store.create(
                 submission, owner_ref=self.owner_ref, worker_epoch=self.worker_epoch, job_id=job_id,
+                origin=origin,
             )
 
     def get(self, job_id: str) -> JobRecord:
@@ -1115,6 +1151,10 @@ class WorkerRuntime:
                      or policy.control_service_worker_id not in {None, authorization.worker_id})
             ):
                 return "unpaired"
+        # Reread here too: `openswap worker origins refuse` may have landed
+        # since _prepare_launch checked it.
+        if self._origin_refused(latest):
+            return "origin_refused"
         return None
 
     def _finish_refused(self, starting: JobRecord, token, diagnostic: str) -> JobRecord:
@@ -1148,6 +1188,7 @@ class WorkerRuntime:
                 return self._cancel_before_launch(latest)
             new_state, diagnostic = (
                 (JobState.EXPIRED, "job_expired") if reason == "job_expired"
+                else (JobState.FAILED, reason) if reason in {"origin_refused", "provider_unavailable"}
                 else (JobState.FAILED, "worker_disabled")
             )
             return self.store.transition(
@@ -1190,21 +1231,32 @@ class WorkerRuntime:
                         authorization = self.remote_launch_guard(starting.job_id)
                     except Exception:
                         authorization = False
-                with self._launch_lock:
-                    skipped = self._launch_fence(starting.job_id, shutdown_event, authorization)
-                    with outcome_lock:
-                        # Decided under the same lock the monitor abandons
-                        # through: a launch given up on while the guard ran
-                        # (stop, deadline or shutdown) never reaches start().
-                        abandoned = outcome.get("abandoned")
-                        if skipped is None and abandoned:
-                            skipped = "job_expired" if abandoned == "runtime_limit_reached" else str(abandoned)
-                        if skipped is None:
-                            # Committed atomically with the fence: any stop from
-                            # here on is reported as after the launch.
-                            self._launch_committed = starting.job_id
-                        else:
-                            outcome["skipped"] = skipped
+                # The final fence rereads the origin veto under the lifecycle
+                # lock `openswap worker origins` holds (taken before
+                # _launch_lock, as everywhere), so a refusal that returned
+                # before the launch commits stops it.
+                lifecycle = FileLock(self.backup_root / "worker" / "lifecycle.lock", timeout=5)
+                locked = lifecycle.acquire()
+                try:
+                    with self._launch_lock:
+                        skipped = (self._launch_fence(starting.job_id, shutdown_event, authorization)
+                                   if locked else "provider_unavailable")
+                        with outcome_lock:
+                            # Decided under the same lock the monitor abandons
+                            # through: a launch given up on while the guard ran
+                            # (stop, deadline or shutdown) never reaches start().
+                            abandoned = outcome.get("abandoned")
+                            if skipped is None and abandoned:
+                                skipped = "job_expired" if abandoned == "runtime_limit_reached" else str(abandoned)
+                            if skipped is None:
+                                # Committed atomically with the fence: any stop from
+                                # here on is reported as after the launch.
+                                self._launch_committed = starting.job_id
+                            else:
+                                outcome["skipped"] = skipped
+                finally:
+                    if locked:
+                        lifecycle.release()
                 if skipped is not None:
                     if abandoned:
                         # The monitor recorded the job interrupted and the lease
@@ -1324,6 +1376,15 @@ class WorkerRuntime:
                 current.job_id, expected_states=(JobState.CLAIMED,),
                 new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
                 expected_generation=current.generation, diagnostic_code="worker_disabled",
+            )
+        # The owner's local veto on where remote jobs come from, read now under
+        # the lifecycle lock `openswap worker origins` holds: a refused origin
+        # fails the job before any lease or launch.
+        if self._origin_refused(current):
+            return self.store.transition(
+                current.job_id, expected_states=(JobState.CLAIMED,),
+                new_state=JobState.FAILED, worker_epoch=self.worker_epoch,
+                expected_generation=current.generation, diagnostic_code="origin_refused",
             )
         if not availability.available:
             return self.store.transition(

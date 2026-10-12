@@ -16,10 +16,12 @@ from typing import Iterable
 from uuid import uuid4
 
 from openswap.worker.models import (
+    ORIGIN_KINDS,
     EventPage,
     JobRecord,
     JobState,
     JobSubmission,
+    Origin,
     SafeEvent,
     SafeEventKind,
 )
@@ -52,6 +54,9 @@ _SAFE_DIAGNOSTICS = {
     # Local only: sent to the control service as `provider_unavailable`
     # (remote.WIRE_DIAGNOSTICS), whose diagnostic list is closed.
     "workspace_refused",
+    # Local only, sent as `provider_unavailable`: this Mac refuses the job's
+    # submission origin (`worker.refusedOrigins`).
+    "origin_refused",
 }
 
 
@@ -194,7 +199,9 @@ class LocalJobStore:
                 worker_epoch INTEGER NOT NULL,
                 generation INTEGER NOT NULL,
                 diagnostic_code TEXT,
-                event_cursor INTEGER NOT NULL DEFAULT 0
+                event_cursor INTEGER NOT NULL DEFAULT 0,
+                origin_kind TEXT,
+                origin_label TEXT
             );
             CREATE INDEX IF NOT EXISTS jobs_state_created ON jobs(state, created_at);
             CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active ON jobs((1))
@@ -218,6 +225,12 @@ class LocalJobStore:
         row = db.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
         if row is None or row["value"] != str(SCHEMA_VERSION):
             raise JournalError("local worker journal schema is unsupported")
+        # Additive, nullable columns (submission origin): a journal written by
+        # an earlier release gains them in place; older code ignores them.
+        columns = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
+        for column in ("origin_kind", "origin_label"):
+            if column not in columns:
+                db.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
 
     def start_epoch(self, worker_pid: int) -> tuple[int, tuple[str, ...]]:
         """Fence prior processes and mark uncertain active rows interrupted."""
@@ -328,7 +341,13 @@ class LocalJobStore:
         worker_epoch: int,
         job_id: str | None = None,
         now: datetime | None = None,
+        origin: Origin | None = None,
     ) -> JobRecord:
+        if origin is not None and (
+            not isinstance(origin, Origin) or origin.kind not in ORIGIN_KINDS
+            or not isinstance(origin.label, str) or not 1 <= len(origin.label) <= 100
+        ):
+            raise ValueError("origin must be a defined kind with a bounded label")
         if not owner_ref or len(owner_ref) > 256 or type(worker_epoch) is not int or worker_epoch < 0:
             raise ValueError("local owner and epoch are required")
         job_id = job_id or uuid4().hex
@@ -351,6 +370,7 @@ class LocalJobStore:
                     or prior.workspace_id != submission.workspace_id
                     or prior.expires_at != submission.expires_at
                     or prior.runtime_limit_s != submission.runtime_limit_s
+                    or prior.origin != origin
                 ):
                     raise AdmissionError("idempotency key is already bound to a different request")
                 db.commit()
@@ -360,12 +380,12 @@ class LocalJobStore:
                 raise AdmissionError("local worker queue is full")
             db.execute(
                 "INSERT INTO jobs(job_id,idempotency_key,owner_ref,provider,task,capability_profile,workspace_id,state,"
-                "created_at,updated_at,expires_at,runtime_limit_s,worker_epoch,generation) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                "created_at,updated_at,expires_at,runtime_limit_s,worker_epoch,generation,origin_kind,origin_label) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
                 (job_id, submission.idempotency_key, owner_ref, submission.provider, submission.task,
                  submission.capability_profile, submission.workspace_id, JobState.QUEUED.value,
                  timestamp, timestamp, _stamp(submission.expires_at), submission.runtime_limit_s,
-                 worker_epoch),
+                 worker_epoch, origin.kind if origin else None, origin.label if origin else None),
             )
             self._append_event_tx(db, job_id, SafeEventKind.STATE_CHANGED, JobState.QUEUED, None, timestamp)
             db.commit()
@@ -593,6 +613,19 @@ class LocalJobStore:
         finally:
             db.close()
 
+    def latest_finished(self) -> JobRecord | None:
+        """The most recently updated terminal job, for status (its origin, never its task)."""
+        db = self._connect()
+        try:
+            placeholders = ",".join("?" for _ in _TERMINAL_STATES)
+            row = db.execute(
+                f"SELECT * FROM jobs WHERE state IN ({placeholders}) ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                tuple(state.value for state in _TERMINAL_STATES),
+            ).fetchone()
+            return self._record(row) if row else None
+        finally:
+            db.close()
+
     def active(self) -> JobRecord | None:
         db = self._connect()
         try:
@@ -643,5 +676,17 @@ class LocalJobStore:
             runtime_limit_s=row["runtime_limit_s"], pinned_account_ref=row["pinned_account_ref"],
             provider_session_id=row["provider_session_id"], worker_epoch=row["worker_epoch"],
             generation=row["generation"], diagnostic_code=row["diagnostic_code"],
-            event_cursor=row["event_cursor"],
+            event_cursor=row["event_cursor"], origin=_origin(row),
         )
+
+
+def _origin(row: sqlite3.Row) -> Origin | None:
+    """The job's recorded origin; None without one, or in a journal not yet given the columns
+    (status reads it read-only, before the worker adds them)."""
+    keys = row.keys()
+    if "origin_kind" not in keys or "origin_label" not in keys:
+        return None
+    kind, label = row["origin_kind"], row["origin_label"]
+    if kind not in ORIGIN_KINDS or not isinstance(label, str) or not label:
+        return None
+    return Origin(kind, label)

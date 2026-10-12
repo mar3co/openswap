@@ -1724,8 +1724,8 @@ def _migration_message(exc: ClaudeSwitchError) -> str:
 
 _WORKER_COMMANDS = (
     "setup", "pair", "unpair", "status", "enable", "disable", "pause", "stop", "account", "workspace",
-    "worktrees", "permissions", "codex", "claude", "live", "live-check", "lease", "run", "submit-test",
-    "refserver",
+    "worktrees", "permissions", "origins", "codex", "claude", "live", "live-check", "lease", "run",
+    "submit-test", "refserver",
 )
 
 
@@ -1761,6 +1761,104 @@ def permissions_text(value: str) -> str:
     if value == FOLLOW:
         return "Tasks on this Mac follow each account's own Claude or Codex permission settings (the default)."
     return f"This Mac limits every task: {OVERRIDE_DESCRIPTIONS[value]}."
+
+
+ORIGIN_NAMES = {
+    "slack": "Slack",
+    "assistant": "assistants such as ChatGPT or Claude",
+    "portal": "the web portal",
+    "test": "test submissions",
+    "unspecified": "tasks that do not say where they came from",
+}
+
+
+def refused_origins(backup_root: Path) -> tuple[str, ...]:
+    """The task origins this Mac refuses (``worker.refusedOrigins``); a pure read.
+
+    An unreadable setting refuses every origin (see ``load_refused_origins``).
+    """
+    from openswap.settings import load_refused_origins
+
+    return load_refused_origins(Path(backup_root))
+
+
+def set_origin_refused(backup_root: Path, kind: str, refused: bool) -> tuple[str, ...]:
+    """Refuse or allow one task origin; returns the refused origins.
+
+    Only this Mac's owner can: no wire operation, IPC request or remote message
+    reaches it. It takes the worker lifecycle lock, which every launch holds
+    while it checks the origin, so once this returns no launch that read the
+    old list can still start.
+    """
+    from openswap.settings import load_refused_origins, write_refused_origins
+    from openswap.worker.models import REFUSABLE_ORIGINS
+
+    if kind not in REFUSABLE_ORIGINS:
+        raise ValueError("unknown task origin")
+    root = Path(backup_root)
+    _migrate_legacy_before_worker_state_change(root)
+    with lifecycle_lock(root):
+        current = set(load_refused_origins(root))
+        return write_refused_origins(root, current | {kind} if refused else current - {kind})
+
+
+def _format_origins(refused) -> str:
+    from openswap.worker.models import REFUSABLE_ORIGINS
+
+    rows = [(f"{printer.mark(kind not in refused)} {kind}", "refused" if kind in refused else "allowed",
+             ORIGIN_NAMES[kind]) for kind in REFUSABLE_ORIGINS]
+    return "\n".join([printer.heading("Task origins"), *printer.columns(rows)])
+
+
+def origin_text(origin) -> str:
+    """``ChatGPT (assistant)`` for a status line; ``not given`` without an origin."""
+    if not isinstance(origin, dict):
+        return "not given"
+    kind, label = origin.get("kind"), origin.get("label")
+    if kind not in ORIGIN_NAMES or not isinstance(label, str) or not label:
+        return "not given"
+    clean = "".join(c for c in label[:100] if c.isprintable())
+    return f"{clean} ({kind})" if clean else f"({kind})"
+
+
+def _origins_command(root: Path, args) -> int:
+    from openswap.worker.models import REFUSABLE_ORIGINS
+
+    if args.action in (None, "list"):
+        if args.kind is not None:
+            print("`openswap worker origins` lists them; `refuse KIND` or `allow KIND` changes one.",
+                  file=sys.stderr)
+            return 2
+        refused = refused_origins(root)
+        payload = {"origins": [{"kind": kind, "refused": kind in refused} for kind in REFUSABLE_ORIGINS],
+                   "refused_origins": list(refused)}
+        _write(payload, as_json=args.json, human=_format_origins(refused) + "\n" + printer.next_step(
+            "`openswap worker origins refuse <kind>` to refuse one (`allow <kind>` takes it back)."))
+        return 0
+    if args.kind is None:
+        print(f"Name the origin: `openswap worker origins {args.action} "
+              f"{'|'.join(REFUSABLE_ORIGINS)}`.", file=sys.stderr)
+        return 2
+    try:
+        refused = set_origin_refused(root, args.kind, args.action == "refuse")
+    except ClaudeSwitchError as exc:
+        if str(exc) == "worker_lifecycle_busy":
+            print("The worker is busy changing state; try again in a moment.", file=sys.stderr)
+        else:
+            print(SETTINGS_MESSAGE, file=sys.stderr)
+        return 1
+    except (OSError, RuntimeError, ValueError):
+        print(SETTINGS_MESSAGE, file=sys.stderr)
+        return 1
+    if args.action == "refuse":
+        human = (f"{printer.MARK_OK} This Mac refuses tasks from {ORIGIN_NAMES[args.kind]} ({args.kind}). "
+                 "Applies from the next task.")
+    else:
+        human = (f"{printer.MARK_OK} This Mac takes tasks from {ORIGIN_NAMES[args.kind]} ({args.kind}) again. "
+                 "Applies from the next task.")
+    _write({"origins": [{"kind": kind, "refused": kind in refused} for kind in REFUSABLE_ORIGINS],
+            "refused_origins": list(refused)}, as_json=args.json, human=human)
+    return 0
 
 
 def unknown_command_message(prog: str, word: str, commands) -> str:
@@ -1837,6 +1935,10 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                                help="reuse the key printed by a failed attempt so a retry cannot admit a second job")
     submit_parser.add_argument("--account-ref", default=None,
                                help="optional: an account reference the worker advertised (account choice extension)")
+    submit_parser.add_argument("--origin-kind", default=None, choices=("slack", "assistant", "portal", "test"),
+                               help="optional, with --origin-label: where the job came from (origin extension)")
+    submit_parser.add_argument("--origin-label", default=None,
+                               help="optional, with --origin-kind: the client's display name (1-100 characters)")
     submit_parser.add_argument("--i-understand-this-is-a-test-tool", action="store_true")
     status_parser = commands.add_parser("status", help="the worker, the service link and the running task")
     status_parser.add_argument("--json", action="store_true")
@@ -1948,6 +2050,16 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     )
     permissions_parser.add_argument("limit", nargs="?", choices=("follow", "no-shell", "read-only"))
     permissions_parser.add_argument("--json", action="store_true")
+    origins_parser = commands.add_parser(
+        "origins", help="list the places tasks come from, or refuse or allow one",
+        description="Each task says where it came from: slack, assistant (ChatGPT, Claude and other "
+                    "assistants), portal or test; `unspecified` is a task that does not say. By default this "
+                    "Mac takes all of them. A refused origin's tasks fail before anything is launched. Set "
+                    "only here, never remotely; it applies from the next task.",
+    )
+    origins_parser.add_argument("action", nargs="?", choices=("list", "refuse", "allow"))
+    origins_parser.add_argument("kind", nargs="?", choices=("slack", "assistant", "portal", "test", "unspecified"))
+    origins_parser.add_argument("--json", action="store_true")
     worktrees_parser.add_argument("action", nargs="?", choices=("list", "prune"), default="list")
     worktrees_parser.add_argument("--force", action="store_true",
                                   help="with prune: also remove worktrees with uncommitted work or a lock")
@@ -1955,6 +2067,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     args = parser.parse_args(arguments)
     root = Path(backup_root) if backup_root is not None else get_backup_root()
 
+    if args.command == "submit-test" and (args.origin_kind is None) != (args.origin_label is None):
+        submit_parser.error("--origin-kind and --origin-label go together")
     if args.command == "submit-test":
         import shlex
         from uuid import uuid4
@@ -1970,7 +2084,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             result = submit_test(root, url=args.url, task=args.task, workspace_id=args.workspace_id,
                                  runtime_limit=args.runtime_limit, expires_at=expires_at,
                                  acknowledged=args.i_understand_this_is_a_test_tool, idempotency_key=key,
-                                 account_ref=args.account_ref)
+                                 account_ref=args.account_ref, origin_kind=args.origin_kind,
+                                 origin_label=args.origin_label)
         except ProtocolError as exc:
             print(f"Test submission refused: {exc.code}.", file=sys.stderr)
         except (OSError, RuntimeError, ValueError):
@@ -1987,6 +2102,10 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             retry += f" --expires-at={shlex.quote(stamp(expires_at))}"
         if args.account_ref is not None:
             retry += f" --account-ref={shlex.quote(args.account_ref)}"
+        if args.origin_kind is not None:
+            retry += f" --origin-kind={shlex.quote(args.origin_kind)}"
+        if args.origin_label is not None:
+            retry += f" --origin-label={shlex.quote(args.origin_label)}"
         print(f"Retry with {retry} to reuse the same submission.", file=sys.stderr)
         return 1
 
@@ -2059,6 +2178,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         return _workspace_command(root, args)
     if args.command == "worktrees":
         return _worktrees_command(root, args)
+    if args.command == "origins":
+        return _origins_command(root, args)
     if args.command == "permissions":
         if args.limit is None:
             value = permission_override(root)
@@ -2091,6 +2212,15 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         if override != "follow":
             # Only a limit beyond the accounts' own settings is reported.
             snapshot = {**snapshot, "permission_override": override}
+        try:
+            refused_kinds = refused_origins(root)
+        except Exception:
+            from openswap.worker.models import REFUSABLE_ORIGINS
+
+            refused_kinds = REFUSABLE_ORIGINS
+        if refused_kinds:
+            # Like the limit: reported only when the owner refuses something.
+            snapshot = {**snapshot, "refused_origins": list(refused_kinds)}
         human = None
         if not args.json:
             human = _format_status(snapshot)
@@ -2827,9 +2957,20 @@ def _format_status(snapshot: dict) -> str:
         (f"{printer.mark(service_ok)} Service", f"{remote} (seen {seen})" if seen else remote),
         (f"{printer.mark(None)} Task", job),
     ]
+    # Where the running task came from, else the last finished one (never its text).
+    last = snapshot.get("last_job")
+    if isinstance(active, dict):
+        if isinstance(active.get("origin"), dict):
+            rows.append((f"{printer.mark(None)} From", origin_text(active.get("origin"))))
+    elif isinstance(last, dict) and isinstance(last.get("origin"), dict):
+        rows.append((f"{printer.mark(None)} Last task from",
+                     f"{origin_text(last.get('origin'))}, {last.get('state')}"))
     override = snapshot.get("permission_override", "follow")
     if override != "follow":
         # Only a non-default limit is worth a row: by default tasks follow
         # each account's own settings.
         rows.append((f"{printer.mark(None)} Permissions", f"{override} (this Mac)"))
+    refused = snapshot.get("refused_origins")
+    if isinstance(refused, list) and refused:
+        rows.append((f"{printer.mark(None)} Refused origins", f"{', '.join(map(str, refused))} (this Mac)"))
     return "\n".join([printer.heading("Remote tasks"), *printer.columns(rows)])
