@@ -236,10 +236,11 @@ additive in the same way as `account_ref` and `readiness`:
   job even if the Mac has re-registered since. A claim
   carrying `origin` before this enrollment advertised it is malformed. A
   backend must not drop an origin it would otherwise send just because the
-  Mac is mid-registration. A Mac advertises before its first readiness
-  report, so OpenTag answers an approved submission with retryable
+  Mac is mid-registration. A Mac advertises right after it registers, so
+  OpenTag answers an approved submission with retryable
   `offline_worker` for up to 30 seconds after the Mac registers, while the
-  registration has sent neither a capabilities report nor readiness, if
+  registration has sent no capabilities report (readiness is reported
+  independently and does not count), if
   the Mac advertised it on an earlier registration or the approval came from
   an assistant (a first pairing). The approval stays approved until it
   expires. A capabilities report without `"origin"` ends the wait at once;
