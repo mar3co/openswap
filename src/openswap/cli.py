@@ -791,7 +791,7 @@ Codex rotation runs alongside; its outcome is logged, not returned.
         "--cooldown",
         type=float,
         metavar="SECONDS",
-        help="Minimum time between proactive switches (default 300)",
+        help="Minimum time between proactive, consume-first, and credit-return switches (default 300)",
     )
     parser.add_argument(
         "--model",

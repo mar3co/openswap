@@ -345,7 +345,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "credit-return"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -524,6 +524,7 @@ _parse_reset_ts = poll_policy.parse_reset_ts
 # Strategies that rank by soonest reset of a chosen window (weekly or 5h)
 # rather than most headroom. Event trigger stays "consume-first" for both.
 CONSUME_STRATEGIES = frozenset({"consume-first", "soonest-5h"})
+COOLDOWN_TRIGGERS = ("proactive", "consume-first", "credit-return")
 
 
 def _window_reset_ts(
@@ -884,7 +885,12 @@ class AutoSwitchEngine:
 
         active_headroom = headroom.get(current)
         if self.switcher.account_kind_for(current) == "api_key":
-            if not self._key_eligible(current, settings):
+            if not (
+                self._key_eligible(current, settings)
+                or str(state.get("lastSwitchTo")) == current
+            ):
+                self._unhealthy_ticks = 0
+                self._idle_hold_since = None
                 self._emit(
                     NoSwitchEvent(
                         reason="active-api-key",
@@ -971,7 +977,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first", "credit-return") and self._in_cooldown(state):
+        if trigger in COOLDOWN_TRIGGERS and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1025,7 +1031,9 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
         if not oauth_candidates and not api_key_candidates:
             if trigger == "credit-return":
-                return self._hold_on_credit(settings)
+                return self._hold_on_credit(
+                    "no subscription account in rotation"
+                )
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -1153,17 +1161,21 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if not ordered and api_key_candidates and trigger in ("at-limit", "failover"):
             # Last resort when we must move: metered API-key accounts
-            # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+            # (unmeasurable headroom). Never for a proactive or consume-first
+            # move — those would spend paid credit while quota remains.
             ordered = api_key_candidates
 
         if not ordered and trigger == "credit-return":
-            return self._hold_on_credit(settings)
+            return self._hold_on_credit(
+                f"no subscription account below {pct_label(settings.threshold)}%"
+                if any_known
+                else "no subscription has readable usage"
+            )
 
         if not ordered:
-            if not any_known:
+            if not any_known and oauth_candidates:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
                 self._emit(
@@ -1215,7 +1227,7 @@ class AutoSwitchEngine:
             candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
             truly_exhausted = all(
                 h is not None and h <= 0 for h in candidate_headrooms
-            )
+            ) and not api_key_candidates
             if not truly_exhausted:
                 self._emit(
                     NoSwitchEvent(
@@ -1320,6 +1332,10 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.ERROR
+        if trigger == "credit-return":
+            return self._hold_on_credit(
+                "every subscription target was refused at freshen"
+            )
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
@@ -1791,7 +1807,7 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first", "credit-return"):
+            if trigger in COOLDOWN_TRIGGERS:
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
@@ -2072,7 +2088,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first", "credit-return") and self._in_cooldown(state):
+            if trigger in COOLDOWN_TRIGGERS and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2153,18 +2169,10 @@ class AutoSwitchEngine:
 
         return sorted(keys, key=rank)
 
-    def _hold_on_credit(self, settings: AutoSwitchSettings) -> TickOutcome:
+    def _hold_on_credit(self, detail: str) -> TickOutcome:
         """Staying on paid credit is a correct outcome, not a block: a
         subscription window can roll over on any tick."""
-        self._emit(
-            NoSwitchEvent(
-                reason="on-api-credit",
-                detail=(
-                    "no subscription account below "
-                    f"{pct_label(settings.threshold)}%"
-                ),
-            )
-        )
+        self._emit(NoSwitchEvent(reason="on-api-credit", detail=detail))
         return TickOutcome.NO_ACTION
 
     def _check_model_names(
