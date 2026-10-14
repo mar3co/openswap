@@ -619,9 +619,10 @@ def record_manual_switch(backup_dir: Path, *, now: float | None = None) -> None:
     A hand switch from the extra does not go through
     ``AutoSwitchEngine._perform``, so without this the next tick can undo
     it (especially consume-first).
-    Only ``lastSwitchAt`` is written; ``lastSwitchFrom`` / ``lastSwitchTo``
-    stay as the engine left them so the no-return bar still treats a hand
-    switch as "already undid the move".
+    Only ``lastSwitchAt`` is written and ``creditPlacedOn`` cleared (the user
+    now owns whatever is active); ``lastSwitchFrom`` / ``lastSwitchTo`` stay
+    as the engine left them so the no-return bar still treats a hand switch
+    as "already undid the move".
     """
     path = backup_dir / STATE_FILENAME
     lock = FileLock(path.parent / ".autoswitch_state.lock")
@@ -633,6 +634,7 @@ def record_manual_switch(backup_dir: Path, *, now: float | None = None) -> None:
         state = raw if isinstance(raw, dict) else {}
         state["schemaVersion"] = STATE_SCHEMA_VERSION
         state["lastSwitchAt"] = time.time() if now is None else float(now)
+        state.pop("creditPlacedOn", None)
         atomic_write_json(path, state)
 
 
@@ -887,7 +889,7 @@ class AutoSwitchEngine:
         if self.switcher.account_kind_for(current) == "api_key":
             if not (
                 self._key_eligible(current, settings)
-                or str(state.get("lastSwitchTo")) == current
+                or str(state.get("creditPlacedOn")) == current
             ):
                 self._unhealthy_ticks = 0
                 self._idle_hold_since = None
@@ -2117,6 +2119,13 @@ class AutoSwitchEngine:
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
+            # Ownership of a key landing, distinct from lastSwitchTo: a hand
+            # switch clears it (record_manual_switch) but must leave the
+            # no-return bar's lastSwitchTo/lastSwitchFrom alone.
+            if self.switcher.account_kind_for(number) == "api_key":
+                state["creditPlacedOn"] = number
+            else:
+                state.pop("creditPlacedOn", None)
             # WHERE we came from, so the next tick can refuse to undo this,
             # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
             # cannot fake. See `_left_account_recovered` for why the present

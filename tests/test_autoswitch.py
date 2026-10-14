@@ -1881,6 +1881,29 @@ class TestApiKeyAccounts:
         assert h.tick_with_usage({"1": _usage(10), "2": "api key", "3": _usage(100)}) is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_hand_picked_key_after_engine_left_it_is_not_managed(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        assert h.tick_with_usage({"1": _usage(100), "2": "api key", "3": _usage(100)}) is TickOutcome.SWITCHED
+        assert h.state().get("creditPlacedOn") == "2"
+        h.make_live("c@example.com", 3)
+        record_manual_switch(h.switcher.backup_dir, now=h.clock.now)
+        assert "creditPlacedOn" not in h.state()
+        data = h.switcher._get_sequence_data()
+        del data["accounts"]["2"]["creditFor"]
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        h.make_live("key@token.local", 2)
+        record_manual_switch(h.switcher.backup_dir, now=h.clock.now)
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        h.events.clear()
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key", "3": _usage(10)}) is TickOutcome.NO_ACTION
+        assert self._no_switch_reasons(h) == ["active-api-key"]
+
     def test_credit_return_to_best_healthy_subscription(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
