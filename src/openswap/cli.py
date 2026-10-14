@@ -1440,7 +1440,10 @@ def _stamp_hand_switch(state_dir, payload) -> None:
     try:
         record_manual_switch(state_dir)
     except (LockError, OSError) as e:
-        warning(f"Switched, but could not record it for auto-switch: {e}")
+        print(
+            f"Warning: switched, but could not record it for auto-switch: {e}",
+            file=sys.stderr,
+        )
 
 
 def main() -> None:

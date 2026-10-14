@@ -453,6 +453,22 @@ class TestCLI:
         assert "lastSwitchAt" in state
         assert "creditPlacedOn" not in state
 
+    def test_cli_switch_stamp_failure_keeps_json_stdout_clean(self, temp_home: Path, capsys):
+        from openswap.exceptions import LockError
+        from openswap.switcher import ClaudeAccountSwitcher
+
+        payload = {"schemaVersion": 1, "switched": True}
+        with patch.object(sys, "argv", ["openswap", "--switch-to", "1", "--json"]), \
+             patch.object(ClaudeAccountSwitcher, "switch_to", return_value=payload), \
+             patch("openswap.autoswitch.record_manual_switch", side_effect=LockError("busy")), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("openswap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        captured = capsys.readouterr()
+        assert json.loads(captured.out) == payload
+        assert "Warning: switched, but could not record it for auto-switch" in captured.err
+
     def test_cli_switch_noop_does_not_stamp(self, temp_home: Path):
         from openswap.autoswitch import STATE_FILENAME
         from openswap.switcher import ClaudeAccountSwitcher
