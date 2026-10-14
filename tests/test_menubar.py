@@ -1105,8 +1105,10 @@ def test_token_entry_state_strips_whitespace():
 def test_parent_link_choice_maps_the_popup_item_to_a_link():
     from openswap.menubar_display import STALE_PARENT, parent_link_choice
     identities = {"1": ("a@example.com", "org-a")}
+    standalone_value = menubar.token_entry_state("sk-ant-api03-abc", _TOKEN_ROWS, _TOKEN_KINDS)["choices"][0][0]
+    standalone_item = (standalone_value, *(identities.get(standalone_value) or ("", "")))
     assert parent_link_choice(None, identities) is None
-    assert parent_link_choice(("", "", ""), identities) is None
+    assert parent_link_choice(standalone_item, identities) is None
     assert parent_link_choice(("1", "a@example.com", "org-a"), identities) == (
         "a@example.com", "org-a"
     )
