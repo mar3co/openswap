@@ -46,6 +46,21 @@ def test_codex_cli_switch_stamps_the_engine_state(temp_home, capsys, monkeypatch
     stamp.assert_called_once()
     assert stamp.call_args.args[0].name == "codex"
 
+def test_codex_cli_desktop_switch_stamps_the_engine_state(monkeypatch):
+    from unittest.mock import Mock, patch
+
+    engine = Mock(name="CodexEngine")
+    backend = Mock(name="DesktopSwitcher")
+    monkeypatch.setattr("openswap.codex.engine.CodexEngine", Mock(return_value=engine))
+    monkeypatch.setattr("openswap.codex.desktop.DesktopSwitcher", Mock(return_value=backend))
+    argv = ["codex", "desktop", "switch", "2", "--confirm-restart", "--confirm-idle"]
+    with patch("openswap.autoswitch.record_manual_switch") as stamp:
+        backend.switch.return_value = {"switched": True}
+        assert run_cli(argv) == 0
+        backend.switch.return_value = {"switched": False}
+        assert run_cli(argv) == 0
+    stamp.assert_called_once_with(engine.state_dir)
+
 def _one_codex_account(temp_home, monkeypatch):
     home = temp_home / ".codex"; home.mkdir()
     (home / "auth.json").write_text(_auth(email="c@x.com", account_id="acc-c"))

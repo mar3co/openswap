@@ -703,6 +703,7 @@ def _codex_command(argv: list[str]) -> int:
                 confirm_restart=args.confirm_restart,
                 confirm_idle=args.confirm_idle,
             )
+            _stamp_hand_switch(eng.state_dir, result)
             if args.json:
                 print(json.dumps(result, indent=2))
             else:
