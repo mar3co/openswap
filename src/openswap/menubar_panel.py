@@ -2128,7 +2128,7 @@ class MenuBarPanel:
         popup = _PopupButton.alloc().initWithPanel_frame_(self, NSMakeRect(PAD + 12, y, field_w, 28))
         popup.setControlSize_(NSControlSizeSmall)
         popup.setFont_(font_body)
-        self._fill_parent_popup(popup, state["choices"], rows)
+        self._fill_parent_popup(popup, state["choices"], snap.get("identities") or {})
         root.addSubview_(popup)
         y += 28 + 10
 
@@ -2168,14 +2168,14 @@ class MenuBarPanel:
         return root
 
     @staticmethod
-    def _fill_parent_popup(popup, choices, rows):
-        emails = {str(row[0]): str(row[1]) for row in rows}
+    def _fill_parent_popup(popup, choices, identities):
         popup.removeAllItems()
         for value, caption in choices:
             popup.addItemWithTitle_(caption)
             item = popup.lastItem()
             if item is not None:
-                item.setRepresentedObject_((value, emails.get(value, "")))
+                email, org = identities.get(value) or ("", "")
+                item.setRepresentedObject_((value, str(email), str(org or "")))
 
     def _submit_token(self, token_field, label_field, popup, error_label, add):
         add.setEnabled_(False)
@@ -2188,10 +2188,12 @@ class MenuBarPanel:
         if state["show_parent"]:
             item = popup.selectedItem()
             picked = item.representedObject() if item is not None else None
-            credit_for, picked_email = (str(picked[0]), str(picked[1])) if picked else ("", "")
-            current = {str(row[0]): str(row[1]) for row in rows}
-            if credit_for and current.get(credit_for) != picked_email:
-                self._fill_parent_popup(popup, state["choices"], rows)
+            credit_for = str(picked[0]) if picked else ""
+            picked_identity = (str(picked[1]), str(picked[2])) if picked else ("", "")
+            identities = snap.get("identities") or {}
+            email, org = identities.get(credit_for) or ("", "")
+            if credit_for and (str(email), str(org or "")) != picked_identity:
+                self._fill_parent_popup(popup, state["choices"], identities)
                 self._show_token_error(error_label, add, "The account list changed; pick the account again.")
                 return
         error = self._on_add_token(
