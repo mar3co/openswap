@@ -876,8 +876,9 @@ class TestCLICommands:
 
     def test_for_without_add_token_errors(self, capsys):
         with patch.object(sys, "argv", ["openswap", "list", "--for", "1"]):
-            with pytest.raises(SystemExit):
+            with pytest.raises(SystemExit) as excinfo:
                 cli.main()
+        assert excinfo.value.code == 2
         assert "--for can only be used with 'add-token'" in capsys.readouterr().err
 
     def test_add_token_in_help(self):

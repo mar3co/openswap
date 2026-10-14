@@ -794,7 +794,7 @@ def _deterministic_colour(monkeypatch):
     pinning `False` instead of `None` also leaves every test entering
     unlatched, while having switched from un-latching to PINNING — a
     different, wrong mechanism with the same signature. Both directions are
-    covered: `test_printer.py`'s `TestColourEnvDoesNotLeakIntoTests` dies
+    covered: `test_printer.py`'s `TestColorEnvDoesNotLeakIntoTests` dies
     under either pin, not just under "reset removed".
 
     A number nobody can re-take is not evidence — this fixture's own comments

@@ -13,7 +13,7 @@ from tests.menubar_harness import extract_class
 def _panel():
     methods = {
         "__init__", "_select_provider", "_show_settings", "_show_main",
-        "_select_settings_section", "close",
+        "_select_settings_section", "close", "_release_token_field",
     }
     namespace = {
         "MAIN_PAGE": "main",

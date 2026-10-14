@@ -857,6 +857,15 @@ class _RootView(NSVisualEffectView):
         if cb:
             cb(False)
 
+    def cancelOperation_(self, sender):
+        cb = getattr(self, "_cancel", None)
+        if cb:
+            cb()
+            return
+        nxt = self.nextResponder()
+        if nxt is not None:
+            nxt.tryToPerform_with_("cancelOperation:", sender)
+
 
 class _PanelController(NSViewController):
     pass
@@ -924,6 +933,7 @@ class MenuBarPanel:
         self._on_add_token = on_add_token
         self._token_error = ""
         self._token_watcher = None
+        self._token_field = None
         self._worker_enabled = worker_enabled or (lambda: False)
         self._worker_paused = worker_paused or (lambda: False)
         self._worker_status = worker_status or (lambda: {})
@@ -1014,6 +1024,7 @@ class MenuBarPanel:
 
     def close(self) -> None:
         self._page = MAIN_PAGE
+        self._release_token_field()
         self._clear_dismiss_watchers()
         if self._popover is not None and self._popover.isShown():
             self._popover.performClose_(None)
@@ -1339,10 +1350,20 @@ class MenuBarPanel:
         ctl.setAction_("act:")
         return ctl
 
+    def _release_token_field(self) -> None:
+        field = self._token_field
+        self._token_field = None
+        self._token_watcher = None
+        if field is None:
+            return
+        field.setDelegate_(None)
+        window = field.window()
+        if window is not None:
+            window.makeFirstResponder_(None)
+
     def _build(self):
         self._tramps = []
-        if self._page != TOKEN_PAGE:
-            self._token_watcher = None
+        self._release_token_field()
         if self._page == SETTINGS_PAGE:
             return self._build_settings()
         if self._page == TOKEN_PAGE:
@@ -2073,6 +2094,7 @@ class MenuBarPanel:
         state = token_entry_state("", rows, kinds)
 
         root = _RootView.alloc().initWithHover_(self._on_hover)
+        root._cancel = self._show_main
         root.setMaterial_(NSVisualEffectMaterialMenu)
         root.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
         root.setState_(NSVisualEffectStateActive)
@@ -2140,6 +2162,7 @@ class MenuBarPanel:
             add.setEnabled_(current["can_add"] and self._on_add_token is not None)
 
         self._token_watcher = _TextWatcher.alloc().initWithCallback_(refresh)
+        self._token_field = token_field
         token_field.setDelegate_(self._token_watcher)
         refresh()
         return root

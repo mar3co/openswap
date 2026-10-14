@@ -5,7 +5,7 @@
 - Priority: P2; effort: M; risk: MED; dependencies: none (touches the
   autoswitch ranking, the roster record, the extra's More menu).
 - Planned at: `1a6bfb5`.
-- Status: DONE. Implemented on ym/openswap-api-credit-fallback-300cfc from 1a6bfb5. Implementation plan: plans/019-implementation.md.
+- Status: DONE on branch (pending merge). Implemented on `ym/openswap-api-credit-fallback-300cfc` from `1a6bfb5`. Implementation plan: `plans/019-implementation.md`.
 
 ## Why this matters
 

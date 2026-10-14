@@ -1770,8 +1770,11 @@ class SnapshotMixin:
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
             parent = self._credit_parent_in(seq_data, str(num))
-            if parent is not None:
-                markers += f" {muted(f'(API credit for {self.account_email(parent)})')}"
+            parent_email = (
+                seq_data["accounts"][parent].get("email", "") if parent is not None else ""
+            )
+            if parent_email:
+                markers += f" {muted(f'(API credit for {parent_email})')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")

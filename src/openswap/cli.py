@@ -1524,7 +1524,8 @@ Claude accounts:
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        save the current login as an account
-  %(prog)s add-token [TOKEN|-] [--for ID]  register an API key or setup-token
+  %(prog)s add-token [TOKEN|-] [--for ID]
+                                      register an API key or setup-token
   %(prog)s remove <num|email>         remove an account (alias: rm)
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation

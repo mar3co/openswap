@@ -202,7 +202,7 @@ class TestForceUtf8Output:
         printer.force_utf8_output()  # must not raise
 
 
-class TestColourEnvDoesNotLeakIntoTests:
+class TestColorEnvDoesNotLeakIntoTests:
     """A developer's terminal must not decide whether the suite passes.
 
     See ``_deterministic_colour`` in conftest for the measurement. These

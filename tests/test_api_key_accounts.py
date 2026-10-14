@@ -576,7 +576,6 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
         )
         assert salvage[0].read_text(encoding="utf-8") == torn_bytes
 
-
     def test_config_torn_between_the_switch_start_and_step_4_survives(
         self, temp_home: Path
     ):
@@ -1225,7 +1224,6 @@ class TestCreditLink:
         assert by_num["1"].credit_for == ""
         assert [a.number for a in snap.accounts] == ["1", "3", "2"]
 
-
     def test_re_adding_to_its_own_slot_keeps_the_link(self, temp_home: Path, capsys):
         s = _linux_switcher()
         _seed_oauth(s, 1, "a@example.com")
@@ -1294,17 +1292,18 @@ class TestCreditLink:
 
     def test_list_shows_credit_marker_and_json_field(self, temp_home: Path, capsys):
         s = _linux_switcher()
-        _seed_oauth(s, 1, "a@example.com")
-        s.add_account_from_token(API_KEY, credit_for="1")
+        _seed_oauth(s, 5, "a@example.com")
+        s.add_account_from_token(API_KEY, slot=2, credit_for="5")
         capsys.readouterr()
         s.list_accounts(fetch=set())
         out = capsys.readouterr().out
         assert "(API credit for a@example.com)" in out
         payload = s.list_accounts(json_output=True, fetch=set())
         rows = {row["number"]: row for row in payload["accounts"]}
-        assert rows[2]["creditFor"] == 1
-        assert "creditFor" not in rows[1]
-        assert [row["number"] for row in payload["accounts"]] == [1, 2]
+        assert rows[2]["creditFor"] == 5
+        assert "creditFor" not in rows[5]
+        assert [row["number"] for row in payload["accounts"]] == [5, 2]
+
 
 def test_order_keys_after_parents_keeps_strays():
     from openswap.engine.slots import order_keys_after_parents
