@@ -94,6 +94,20 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
         except ValueError as e:
             raise TransferError(f"invalid alias for {email}: {e}") from e
 
+    link = account.get("creditFor")
+    if link is not None:
+        link_org = link.get("organizationUuid") if isinstance(link, dict) else None
+        if (
+            not isinstance(link, dict)
+            or not isinstance(link.get("email"), str)
+            or not switcher._validate_email(link["email"])
+            or (link_org is not None and not isinstance(link_org, str))
+        ):
+            raise TransferError(
+                f"creditFor for {email} must be an object with a valid email "
+                "and an optional organizationUuid string"
+            )
+
     return email, str(raw_number)
 
 
@@ -172,6 +186,8 @@ def _account_record(entry: dict[str, Any]) -> dict[str, Any]:
         record["kind"] = "api_key"
     if entry.get("alias"):
         record["alias"] = entry["alias"]
+    if entry.get("credit_for"):
+        record["creditFor"] = entry["credit_for"]
     return record
 
 
@@ -303,6 +319,12 @@ def export_accounts(
             entry["kind"] = "api_key"
         if record.get("alias"):
             entry["alias"] = record["alias"]
+        link = record.get("creditFor")
+        if is_api_key and isinstance(link, dict) and isinstance(link.get("email"), str):
+            entry["creditFor"] = {
+                "email": link["email"],
+                "organizationUuid": link.get("organizationUuid") or "",
+            }
         accounts_payload.append(entry)
 
     if not accounts_payload:
@@ -463,6 +485,14 @@ def import_accounts(
                 "added": raw.get("added") or get_timestamp(),
                 "kind": "api_key" if is_api_key else "oauth",
                 "alias": alias,
+                "credit_for": (
+                    {
+                        "email": raw["creditFor"]["email"],
+                        "organizationUuid": raw["creditFor"].get("organizationUuid") or "",
+                    }
+                    if is_api_key and isinstance(raw.get("creditFor"), dict)
+                    else None
+                ),
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
             }

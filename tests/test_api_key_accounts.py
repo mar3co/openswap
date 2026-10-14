@@ -1213,6 +1213,32 @@ class TestCreditLink:
         s.move_account("3", "7")
         assert s.credit_parent_for("7") == "2"
 
+    def test_link_survives_export_and_import(self, tmp_path: Path, capsys):
+        src_home = tmp_path / "src"
+        (src_home / ".claude").mkdir(parents=True)
+        with _patched_home(src_home):
+            src = _linux_switcher()
+            _seed_oauth(src, 1, "a@example.com", org_uuid="org-1")
+            src.add_account_from_token(API_KEY, credit_for="1")
+            out = tmp_path / "b.openswap"
+            export_accounts(src, str(out))
+            payload = json.loads(out.read_text(encoding="utf-8"))
+            by_num = {a["number"]: a for a in payload["accounts"]}
+            assert by_num[2]["creditFor"] == {"email": "a@example.com", "organizationUuid": "org-1"}
+            assert "creditFor" not in by_num[1]
+
+        dst_home = tmp_path / "dst"
+        (dst_home / ".claude").mkdir(parents=True)
+        with _patched_home(dst_home):
+            dst = _linux_switcher()
+            _seed_oauth(dst, 1, "other@example.com")
+            import_accounts(dst, str(out))
+            data = dst._get_sequence_data()
+            key_num = next(n for n, r in data["accounts"].items() if r.get("kind") == "api_key")
+            parent_num = next(n for n, r in data["accounts"].items() if r.get("email") == "a@example.com")
+            assert data["accounts"][key_num]["creditFor"] == {"email": "a@example.com", "organizationUuid": "org-1"}
+            assert dst.credit_parent_for(key_num) == parent_num
+
     def test_snapshot_carries_parent_and_orders_key_after_parent(self, temp_home: Path, capsys):
         s = _linux_switcher()
         _seed_oauth(s, 1, "a@example.com")

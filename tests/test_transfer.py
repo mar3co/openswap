@@ -725,6 +725,20 @@ class TestValidation:
         with pytest.raises(TransferError, match="invalid slot number"):
             import_accounts(s, str(f))
 
+    @pytest.mark.parametrize(
+        "link",
+        ["a@example.com", {"email": "../../evil"}, {"email": "a@example.com", "organizationUuid": 7}],
+    )
+    def test_malformed_credit_link_rejected(self, temp_home: Path, link):
+        s = _linux_switcher(temp_home)
+        env = self._make_envelope()
+        env["accounts"][0]["creditFor"] = link
+        f = temp_home / "link.openswap"
+        f.write_text(json.dumps(env))
+
+        with pytest.raises(TransferError, match="creditFor"):
+            import_accounts(s, str(f))
+
     def test_zero_slot_number_rejected(self, temp_home: Path):
         s = _linux_switcher(temp_home)
         env = self._make_envelope(number=0)
