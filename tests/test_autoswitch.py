@@ -1792,6 +1792,174 @@ class TestApiKeyAccounts:
             "active-api-key"
         ]
 
+    def _link(self, harness, key_num: int, parent_num: int) -> None:
+        data = harness.switcher._get_sequence_data()
+        parent = data["accounts"][str(parent_num)]
+        data["accounts"][str(key_num)]["creditFor"] = {
+            "email": parent["email"],
+            "organizationUuid": parent.get("organizationUuid", "") or "",
+        }
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+
+    def _no_switch_reasons(self, h) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_linked_key_eligible_without_flag(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(100), "2": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_unlinked_key_still_excluded_without_flag(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        assert h.tick_with_usage({"1": _usage(100), "2": "api key"}) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_subscription_with_room_beats_linked_key(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(95), "2": "api key", "3": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_left_accounts_key_wins_then_linked_then_unlinked(self, temp_home):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "loose@token.local")
+        h.seed(3, "b@example.com")
+        h.seed(4, "bkey@token.local")
+        h.seed(5, "akey@token.local")
+        h.make_live("a@example.com", 1)
+        for n in (2, 4, 5):
+            self._mark_api_key(h, n)
+        self._link(h, 4, 3)
+        self._link(h, 5, 1)
+        usage = {"1": _usage(100), "2": "api key", "3": _usage(100), "4": "api key", "5": "api key"}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 5
+        assert h.engine._order_keys(["2", "4", "5"], leaving="1") == ["5", "4", "2"]
+
+    def test_two_keys_same_parent_lower_slot_first(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "k2@token.local")
+        h.seed(3, "k3@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._mark_api_key(h, 3)
+        self._link(h, 2, 1)
+        self._link(h, 3, 1)
+        assert h.tick_with_usage({"1": _usage(100), "2": "api key", "3": "api key"}) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_linked_key_eligible_when_parent_disabled(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("c@example.com", 3)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        h.switcher.set_account_disabled("1", True)
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key", "3": _usage(100)}) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_credit_return_to_best_healthy_subscription(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(50), "2": "api key", "3": _usage(20)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "credit-return"
+
+    def test_credit_return_holds_when_every_subscription_is_at_threshold(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        for _ in range(10):
+            outcome = h.tick_with_usage({"1": _usage(92), "2": "api key", "3": _usage(90)})
+            h.clock.advance(60)
+            assert outcome is TickOutcome.NO_ACTION
+        assert h.switcher.current_account_number() == "2"
+        assert set(self._no_switch_reasons(h)) == {"on-api-credit"}
+        assert h.events[-1].detail == "no subscription account below 90%"
+        assert h.engine._unhealthy_ticks == 0
+
+    def test_credit_return_respects_cooldown(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        record_manual_switch(h.switcher.backup_dir, now=h.clock.now)
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key"}) is TickOutcome.NO_ACTION
+        assert self._no_switch_reasons(h) == ["cooldown"]
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key"}) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_credit_return_skips_quarantined_parent(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        h.engine._quarantine("1", "a@example.com", "invalid_grant")
+        h.events.clear()
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key"}) is TickOutcome.NO_ACTION
+        assert self._no_switch_reasons(h) == ["on-api-credit"]
+        assert h.switcher.current_account_number() == "2"
+
+    def test_credit_return_never_lands_on_another_key(self, temp_home):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "other@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._mark_api_key(h, 3)
+        self._link(h, 2, 1)
+        assert h.tick_with_usage({"1": _usage(95), "2": "api key", "3": "api key"}) is TickOutcome.NO_ACTION
+        assert h.switcher.current_account_number() == "2"
+
+    def test_consume_first_never_targets_linked_key(self, temp_home):
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key"}) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
 
 class TestFreshening:
     def test_near_expiry_target_is_refreshed_and_persisted(self, temp_home):
