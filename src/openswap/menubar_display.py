@@ -44,6 +44,7 @@ from openswap.codex.desktop_app import (
     capability_is_fresh,
 )
 from openswap.autoswitch import record_manual_switch
+from openswap.credentials import looks_like_api_key
 from openswap.paths import get_backup_root
 from openswap.settings import atomic_write_json
 from openswap.engine import (
@@ -248,6 +249,8 @@ def _remote_task_origin(origin) -> str:
     label = "".join(c for c in label[:100] if c.isprintable()).strip() if isinstance(label, str) else ""
     return f" from {label} ({origin['kind']})" if label else f" from {origin['kind']}"
 SETTINGS_PAGE = "settings"
+TOKEN_PAGE = "token"
+SETUP_TOKEN_PREFIX = "sk-ant-oat"
 MAIN_PAGE = "main"
 SETTINGS_SECTION_GENERAL = "general"
 SETTINGS_SECTION_AUTOMATION = "automation"
@@ -2062,8 +2065,9 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                  if str(r[0]) == credit_parent),
                 "",
             )
-            title = "API credit"
-            subtitle = f"for {parent_email}" if parent_email else ""
+            title = alias or "API credit"
+            if parent_email:
+                subtitle = f"for {parent_email}"
         if is_codex:
             title = f"Codex · {title}"
         as_of = now
@@ -2186,6 +2190,51 @@ def provider_shared_copy(provider: str) -> str:
     return ""
 
 
+_SECRET_RE = re.compile(r"https?://\S+|\bsk-ant-[A-Za-z0-9_-]+|\b(?:sk|auth)_[A-Za-z0-9_-]+")
+
+
+def sanitize_token_error(message: str) -> str:
+    """Engine error copy for the token page: no URLs, no token-shaped text, one line."""
+    text = str(message or "").replace("\n", " ")
+    text = _SECRET_RE.sub("", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    if len(text) > 180:
+        text = text[:180] + "…"
+    return text
+
+
+def token_entry_state(text: str, accounts: list, kinds: dict | None = None) -> dict:
+    """Pure model for the Add-from-token page.
+
+    ``accounts`` are the snapshot rows; ``kinds`` the snapshot kinds map. The
+    page is stricter than the engine: only ``sk-ant-api`` and ``sk-ant-oat``
+    prefixes are accepted, so a stray paste cannot be stored as a login.
+    """
+    value = (text or "").strip()
+    if not value:
+        kind, line = None, ""
+    elif looks_like_api_key(value):
+        kind, line = "api_key", "API key"
+    elif value.startswith(SETUP_TOKEN_PREFIX):
+        kind, line = "setup_token", "Setup token"
+    else:
+        kind, line = None, "Not a Claude token"
+    choices: list[tuple[str, str]] = [("", "None (standalone)")]
+    for row in accounts or []:
+        num, email, _active, _display, _last_good, alias, org_name, _disabled, _fetched = row
+        if str(num).startswith("codex:") or (kinds or {}).get(str(num)) == "api_key":
+            continue
+        title, _subtitle = account_card_names(email, alias, org_name)
+        choices.append((str(num), f"{title} · {email}"))
+    return {
+        "kind": kind,
+        "line": line,
+        "show_parent": kind == "api_key",
+        "choices": choices,
+        "can_add": kind is not None,
+    }
+
+
 def login_panel_state(state: dict | None) -> dict:
     """Return safe, concise native-view data for the browser login lifecycle.
 
@@ -2242,13 +2291,13 @@ def login_panel_state(state: dict | None) -> dict:
     elif stage == "error":
         result.update(title="Sign-in didn’t finish", body=message or "Try again.", actions=["retry", "cancel"] + ([] if mode == "device" else ["device"]))
     elif stage == "cancelled":
-        result.update(title="Sign-in cancelled", body="", actions=["start", "dismiss"])
+        result.update(title="Sign-in canceled", body="", actions=["start", "dismiss"])
     elif stage == "saved":
         result.update(title="Account saved", body="Ready to use.", actions=["dismiss"])
     elif stage == "saving":
         result.update(title="Saving account…", body="", actions=[])
     elif stage == "cancelling":
-        result.update(title="Cancelling sign-in…", body="", actions=[])
+        result.update(title="Canceling sign-in…", body="", actions=[])
     return result
 
 
@@ -2754,7 +2803,9 @@ def _adapt_snapshot(snap, codex_snap=None) -> dict:
     "active_email": str | None, "active_num": str | None,
     "active_usage": dict | str | None, "active_last_good": dict | None,
     "active_fetched_at": float | None,
-    "active_alias": str | None, "active_org": str | None}``. The snapshot itself is produced by
+    "active_alias": str | None, "active_org": str | None,
+    "identities": {num: (email, org_uuid)}, "kinds": {num: "oauth" | "api_key"},
+    "credit_for": {num: parent_num | ""}}``. The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time (pace marker, signed-out freeze, widget age).

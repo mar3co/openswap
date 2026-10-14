@@ -43,6 +43,7 @@ from AppKit import (
     NSPopover,
     NSPopoverBehaviorApplicationDefined,
     NSRectEdgeMinY,
+    NSSecureTextField,
     NSTextField,
     NSTrackingArea,
     NSTrackingActiveAlways,
@@ -91,6 +92,7 @@ from openswap.menubar import (
     SETTINGS_SECTION_AUTOMATION,
     SETTINGS_SECTION_GENERAL,
     SETTINGS_SECTIONS,
+    TOKEN_PAGE,
     apply_chatgpt_activation,
     DesktopCapability,
     panel_accounts,
@@ -102,6 +104,7 @@ from openswap.menubar import (
     resolve_popover_theme,
     settings_header_frames,
     settings_page_rows,
+    token_entry_state,
     window_suffix,
     trailing_header_frames,
 )
@@ -506,6 +509,20 @@ class _Trampoline(NSObject):
             cb(sender)
 
 
+class _TextWatcher(NSObject):
+    """NSTextField delegate that forwards edits to a Python callable."""
+
+    def initWithCallback_(self, callback):
+        self = objc.super(_TextWatcher, self).init()
+        if self is None:
+            return None
+        self._callback = callback
+        return self
+
+    def controlTextDidChange_(self, _notification):
+        self._callback()
+
+
 class _AppearanceObserver(NSObject):
     """KVO + distributed-notification shim so the popover tracks Dark Mode."""
 
@@ -853,6 +870,7 @@ class MenuBarPanel:
         on_empty_action=None,
         login_state=None,
         on_login_action=None,
+        on_add_token=None,
         worker_enabled=None,
         worker_paused=None,
         worker_status=None,
@@ -882,6 +900,9 @@ class MenuBarPanel:
         self._on_empty_action = on_empty_action
         self._login_state = login_state or (lambda: {"stage": "idle"})
         self._on_login_action = on_login_action
+        self._on_add_token = on_add_token
+        self._token_error = ""
+        self._token_watcher = None
         self._worker_enabled = worker_enabled or (lambda: False)
         self._worker_paused = worker_paused or (lambda: False)
         self._worker_status = worker_status or (lambda: {})
@@ -1155,6 +1176,13 @@ class MenuBarPanel:
         self._page = MAIN_PAGE
         self.reload()
 
+    def show_token_page(self) -> None:
+        """Open the Add-from-token page in the current popover."""
+        self._selected_provider = "claude"
+        self._token_error = ""
+        self._page = TOKEN_PAGE
+        self.reload()
+
     def _login_action(self, action: str, alias: str | None = None) -> None:
         if self._on_login_action is not None:
             self._on_login_action(action, alias=alias)
@@ -1293,6 +1321,8 @@ class MenuBarPanel:
         self._tramps = []
         if self._page == SETTINGS_PAGE:
             return self._build_settings()
+        if self._page == TOKEN_PAGE:
+            return self._build_token_page()
         snap = self._snapshot()
         all_cards = panel_accounts(snap)
         provider = self._selected_provider
@@ -2005,3 +2035,114 @@ class MenuBarPanel:
             y += h + SETTINGS_ROW_GAP
 
         return root
+
+    def _build_token_page(self):
+        pal = _colors()
+        font_title = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+        font_body = NSFont.systemFontOfSize_weight_(12, NSFontWeightRegular)
+        font_small = NSFont.systemFontOfSize_weight_(11, NSFontWeightRegular)
+        inner_w = PANEL_WIDTH - PAD * 2
+        field_w = inner_w - 24
+        snap = self._snapshot()
+        rows = snap.get("accounts") or []
+        kinds = snap.get("kinds") or {}
+        state = token_entry_state("", rows, kinds)
+
+        root = _RootView.alloc().initWithHover_(self._on_hover)
+        root.setMaterial_(NSVisualEffectMaterialMenu)
+        root.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        root.setState_(NSVisualEffectStateActive)
+
+        title = _label("Add from token", font_title, pal["fg"], NSMakeRect(0, 0, 160, 20))
+        title.sizeToFit()
+        ts = title.frame().size
+        back_f, title_f = settings_header_frames(
+            PAD, (SETTINGS_BACK_W, SETTINGS_BACK_H), (ts.width, ts.height)
+        )
+        self._add_button(root, "Back", NSMakeRect(*back_f), self._show_main, font_small)
+        title.setFrame_(NSMakeRect(*title_f))
+        root.addSubview_(title)
+        hairline = _FillView.alloc().initWithColor_(pal["hairline"])
+        hairline.setFrame_(NSMakeRect(PAD, PAD + HEADER_H - 4, inner_w, 1))
+        root.addSubview_(hairline)
+
+        y = PAD + HEADER_H + 8
+        token_field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(PAD + 12, y, field_w, 28))
+        token_field.setPlaceholderString_("API key (sk-ant-api…) or setup token (sk-ant-oat…)")
+        token_field.setFont_(font_body)
+        root.addSubview_(token_field)
+        y += 28 + 6
+        detect = _label("", font_small, pal["muted"], NSMakeRect(PAD + 12, y, field_w, 18))
+        root.addSubview_(detect)
+        y += 18 + 10
+
+        parent_label = _label("Use as API credit for", font_small, pal["muted"], NSMakeRect(PAD + 12, y, field_w, 18))
+        root.addSubview_(parent_label)
+        y += 18 + 4
+        popup = _PopupButton.alloc().initWithPanel_frame_(self, NSMakeRect(PAD + 12, y, field_w, 28))
+        popup.setControlSize_(NSControlSizeSmall)
+        popup.setFont_(font_body)
+        popup.removeAllItems()
+        for value, caption in state["choices"]:
+            popup.addItemWithTitle_(caption)
+            item = popup.lastItem()
+            if item is not None:
+                item.setRepresentedObject_(value)
+        root.addSubview_(popup)
+        y += 28 + 10
+
+        label_field = NSTextField.alloc().initWithFrame_(NSMakeRect(PAD + 12, y, field_w, 28))
+        label_field.setPlaceholderString_("Email label (optional)")
+        label_field.setFont_(font_body)
+        label_field.cell().setUsesSingleLineMode_(True)
+        root.addSubview_(label_field)
+        y += 28 + 10
+
+        error = _label(self._token_error, font_small, pal["muted"], NSMakeRect(PAD + 12, y, field_w, 30))
+        _wrap(error)
+        root.addSubview_(error)
+        y += 30 + 10
+
+        add = self._add_button(
+            root, "Add", NSMakeRect(PAD + 12, y, field_w, 40),
+            lambda _s: self._submit_token(token_field, label_field, popup, error),
+            font_body,
+        )
+        add.setEnabled_(False)
+        add.setKeyEquivalent_("\r")
+        root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, y + 40 + PAD))
+
+        def refresh():
+            current = token_entry_state(token_field.stringValue(), rows, kinds)
+            detect.setStringValue_(current["line"])
+            parent_label.setHidden_(not current["show_parent"])
+            popup.setHidden_(not current["show_parent"])
+            add.setEnabled_(current["can_add"] and self._on_add_token is not None)
+
+        self._token_watcher = _TextWatcher.alloc().initWithCallback_(refresh)
+        token_field.setDelegate_(self._token_watcher)
+        refresh()
+        return root
+
+    def _submit_token(self, token_field, label_field, popup, error_label):
+        snap = self._snapshot()
+        state = token_entry_state(
+            token_field.stringValue(), snap.get("accounts") or [], snap.get("kinds") or {}
+        )
+        if not state["can_add"] or self._on_add_token is None:
+            return
+        credit_for = ""
+        if state["show_parent"]:
+            item = popup.selectedItem()
+            credit_for = str(item.representedObject() or "") if item is not None else ""
+        error = self._on_add_token(
+            token_field.stringValue().strip(),
+            label_field.stringValue().strip(),
+            credit_for,
+        )
+        if error is not None:
+            self._token_error = error
+            error_label.setStringValue_(error)
+            return
+        self._token_error = ""
+        self._show_main()

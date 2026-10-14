@@ -1386,6 +1386,7 @@ def run(switcher, codex=None) -> int:
                 on_empty_action=self._on_empty_action,
                 login_state=lambda: dict(self._login_ui_state),
                 on_login_action=self._on_login_action,
+                on_add_token=self._add_token,
                 worker_enabled=lambda: self._worker_policy.enabled,
                 worker_paused=lambda: self._worker_policy.paused,
                 worker_status=lambda: self._worker_status_cache,
@@ -2564,6 +2565,15 @@ def run(switcher, codex=None) -> int:
                     self._ensure_codex_engine()
 
         def on_add_token(self, _sender):
+            if self._panel is None:
+                self._add_token_prompts()
+                return
+            self._panel.show_token_page()
+            if not self._panel.is_shown():
+                self._panel.toggle()
+
+        def _add_token_prompts(self):
+            """Fallback when the popover could not attach: the old two prompts."""
             email_resp = self._prompt(
                 title="Add account from token",
                 message="Email label (optional; leave blank to auto-name):",
@@ -2576,6 +2586,7 @@ def run(switcher, codex=None) -> int:
                 title="Add account from token",
                 message="API key (sk-ant-api…) or setup token (sk-ant-oat01-…):",
                 ok="Add", cancel="Cancel",
+                secure=True,
             )
             if token_resp.clicked != 1 or not token_resp.text.strip():
                 return
@@ -2583,6 +2594,18 @@ def run(switcher, codex=None) -> int:
                 token=token_resp.text.strip(), email=email, slot=None,
             )):
                 self.refresh_async()
+
+        def _add_token(self, token, label, credit_for):
+            """Token page submit. Returns sanitized error copy, or None on success."""
+            try:
+                self.switcher.add_account_from_token(
+                    token=token, email=label or None, slot=None,
+                    credit_for=credit_for or None,
+                )
+            except ClaudeSwitchError as e:
+                return sanitize_token_error(str(e)) or "Could not add this token."
+            self.refresh_async()
+            return None
 
         def on_open_log(self, _sender):
             import subprocess
