@@ -657,7 +657,7 @@ class SwitchMixin:
         email: str | None = None,
         slot: int | None = None,
         assume_yes: bool = False,
-        credit_for: str | None = None,
+        credit_for: str | tuple[str, str] | None = None,
     ) -> None:
         """Register a raw OAuth setup-token or managed API key as a new account.
 
@@ -678,8 +678,10 @@ class SwitchMixin:
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the extra, confirm first).
             credit_for: Slot number, email, or alias of the subscription account
-                   this API key is API credit for. Only valid with an
-                   ``sk-ant-api…`` key; a setup token is a login of its own.
+                   this API key is API credit for, or that account's
+                   ``(email, organizationUuid)`` identity, which is checked under
+                   the guard instead of being resolved by slot. Only valid with
+                   an ``sk-ant-api…`` key; a setup token is a login of its own.
         """
         self._refuse_session_shell()
         import getpass
@@ -705,13 +707,16 @@ class SwitchMixin:
                     "A setup token is a login of its own and cannot be API "
                     "credit for another account."
                 )
-            parent_num, parent_email, parent_org = self.resolve_account(credit_for)
-            if self._account_kind(parent_num) == "api_key":
-                raise ValidationError(
-                    f"Account {parent_num} ({parent_email}) is an API key; link "
-                    "to a subscription account instead"
-                )
-            parent = (parent_email, parent_org)
+            if isinstance(credit_for, tuple):
+                parent = credit_for
+            else:
+                parent_num, parent_email, parent_org = self.resolve_account(credit_for)
+                if self._account_kind(parent_num) == "api_key":
+                    raise ValidationError(
+                        f"Account {parent_num} ({parent_email}) is an API key; link "
+                        "to a subscription account instead"
+                    )
+                parent = (parent_email, parent_org)
 
         self._commit_add_account_from_token(
             token, email, slot, assume_yes, is_api_key, parent

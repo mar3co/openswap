@@ -2184,18 +2184,20 @@ class MenuBarPanel:
         state = token_entry_state(token_field.stringValue(), rows, snap.get("kinds") or {})
         if not state["can_add"] or self._on_add_token is None:
             return
-        credit_for = ""
+        credit_for = None
         if state["show_parent"]:
             item = popup.selectedItem()
             picked = item.representedObject() if item is not None else None
-            credit_for = str(picked[0]) if picked else ""
+            picked_num = str(picked[0]) if picked else ""
             picked_identity = (str(picked[1]), str(picked[2])) if picked else ("", "")
             identities = snap.get("identities") or {}
-            email, org = identities.get(credit_for) or ("", "")
-            if credit_for and (str(email), str(org or "")) != picked_identity:
+            email, org = identities.get(picked_num) or ("", "")
+            if picked_num and (str(email), str(org or "")) != picked_identity:
                 self._fill_parent_popup(popup, state["choices"], identities)
                 self._show_token_error(error_label, add, "The account list changed; pick the account again.")
                 return
+            if picked_num:
+                credit_for = picked_identity
         error = self._on_add_token(
             token_field.stringValue().strip(),
             label_field.stringValue().strip(),

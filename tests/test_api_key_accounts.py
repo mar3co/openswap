@@ -1154,6 +1154,26 @@ class TestCreditLink:
         assert s._get_sequence_data()["accounts"]["3"]["creditFor"]["organizationUuid"] == "org-1"
         assert s.credit_parent_for("3") == "2"
 
+    def test_for_by_identity_links_that_account_after_a_swap(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        _seed_oauth(s, 2, "b@example.com", org_uuid="org-1")
+        s.swap_accounts("1", "2")
+        s.add_account_from_token(API_KEY, credit_for=("b@example.com", "org-1"))
+        assert s._get_sequence_data()["accounts"]["3"]["creditFor"] == {
+            "email": "b@example.com", "organizationUuid": "org-1",
+        }
+        assert s.credit_parent_for("3") == "1"
+
+    def test_for_by_absent_identity_adds_nothing(self, temp_home: Path, capsys):
+        from openswap.exceptions import ConfigError
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        before = s._get_sequence_data()["accounts"]
+        with pytest.raises(ConfigError, match="linked account changed"):
+            s.add_account_from_token(API_KEY, credit_for=("gone@example.com", ""))
+        assert s._get_sequence_data()["accounts"] == before
+
     def test_ambiguous_email_is_an_error(self, temp_home: Path):
         from openswap.exceptions import ConfigError
         s = _linux_switcher()

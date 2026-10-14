@@ -2600,7 +2600,7 @@ def run(switcher, codex=None) -> int:
             try:
                 self.switcher.add_account_from_token(
                     token=token, email=label or None, slot=None,
-                    credit_for=credit_for or None,
+                    credit_for=credit_for,
                 )
             except ClaudeSwitchError as e:
                 copy = sanitize_token_error(str(e)) or "Could not add this token."

@@ -1120,22 +1120,25 @@ def test_add_token_returns_none_on_success_and_copy_on_failure():
         add_account_from_token=lambda **kw: calls.append(kw), _logger=logger,
     )
     app.refresh_async = lambda: refreshed.append(True)
-    assert app._add_token("sk-ant-api03-abc", "", "1") is None
-    assert calls == [{"token": "sk-ant-api03-abc", "email": None, "slot": None, "credit_for": "1"}]
+    assert app._add_token("sk-ant-api03-abc", "", ("a@x.com", "org-1")) is None
+    assert calls == [{
+        "token": "sk-ant-api03-abc", "email": None, "slot": None,
+        "credit_for": ("a@x.com", "org-1"),
+    }]
     assert refreshed == [True]
 
     def boom(**kw):
         raise ValidationError("rejected sk-ant-api03-abc for https://x.test")
 
     app.switcher = SimpleNamespace(add_account_from_token=boom, _logger=logger)
-    assert app._add_token("sk-ant-api03-abc", "me", "") == "rejected for"
+    assert app._add_token("sk-ant-api03-abc", "me", None) == "rejected for"
     assert refreshed == [True]
 
     def boom_secret_only(**kw):
         raise ValidationError("sk-ant-api03-abc")
 
     app.switcher = SimpleNamespace(add_account_from_token=boom_secret_only, _logger=logger)
-    assert app._add_token("sk-ant-api03-abc", "", "") == "Could not add this token."
+    assert app._add_token("sk-ant-api03-abc", "", None) == "Could not add this token."
     assert refreshed == [True]
 
 
@@ -1164,7 +1167,7 @@ def test_add_token_reports_disk_errors_and_logs_them():
 
     app.switcher = SimpleNamespace(add_account_from_token=boom, _logger=logger)
     app.refresh_async = lambda: None
-    assert app._add_token("sk-ant-api03-abc", "", "") == (
+    assert app._add_token("sk-ant-api03-abc", "", None) == (
         "Could not save this token (disk or permission error). See openswap.log."
     )
     assert logged == [("error", ("add-from-token failed",), {"exc_info": True})]
@@ -1180,7 +1183,7 @@ def test_add_token_logs_engine_rejection_without_the_token():
 
     app.switcher = SimpleNamespace(add_account_from_token=boom, _logger=logger)
     app.refresh_async = lambda: None
-    assert app._add_token("sk-ant-api03-abc", "", "") == "rejected"
+    assert app._add_token("sk-ant-api03-abc", "", None) == "rejected"
     assert len(logged) == 1 and logged[0][0] == "info"
     assert "sk-ant" not in repr(logged)
 
@@ -1193,7 +1196,7 @@ def test_add_token_succeeds_when_refresh_fails():
         raise RuntimeError("refresh broke")
 
     app.refresh_async = bad_refresh
-    assert app._add_token("sk-ant-api03-abc", "", "") is None
+    assert app._add_token("sk-ant-api03-abc", "", None) is None
     assert [entry[0] for entry in logged] == ["warning"]
 
 
