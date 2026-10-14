@@ -702,8 +702,8 @@ class SwitchMixin:
         if credit_for is not None:
             if not is_api_key:
                 raise ValidationError(
-                    "--for links an API key to an account; a setup token is a "
-                    "login of its own and cannot be API credit"
+                    "A setup token is a login of its own and cannot be API "
+                    "credit for another account."
                 )
             parent_num, parent_email, parent_org = self.resolve_account(credit_for)
             if self._account_kind(parent_num) == "api_key":
@@ -716,6 +716,18 @@ class SwitchMixin:
         self._commit_add_account_from_token(
             token, email, slot, assume_yes, is_api_key, parent
         )
+
+    def _require_credit_parent(
+        self, data: dict, credit_for: tuple[str, str], account_num: str
+    ) -> None:
+        """Re-resolve the link target under the guard; refuse a stale or self target."""
+        parent_num = self._find_account_slot(data, *credit_for)
+        if parent_num == account_num:
+            raise ValidationError("cannot link a key to the account it replaces")
+        if parent_num is None or data["accounts"][parent_num].get("kind") == "api_key":
+            raise ConfigError(
+                "The linked account changed while adding; nothing was added. Retry."
+            )
 
     def _commit_add_account_from_token(
         self,
@@ -777,6 +789,8 @@ class SwitchMixin:
                     raise ConfigError(
                         f"Existing account metadata for {email} is inconsistent"
                     )
+                if credit_for is not None:
+                    self._require_credit_parent(seq, credit_for, account_num)
                 self._write_account_credentials(account_num, email, credentials)
                 self._write_account_config(account_num, email, config)
                 if credit_for is not None:
@@ -884,6 +898,13 @@ class SwitchMixin:
             old_num = self._find_account_slot(data, email, "")
             if old_num and old_num != account_num:
                 migrate_from = old_num
+            if credit_for is not None:
+                self._require_credit_parent(data, credit_for, account_num)
+            prior_num = migrate_from or (None if displace_slot else account_num)
+            prior_link = (
+                data["accounts"].get(prior_num, {}).get("creditFor")
+                if prior_num else None
+            )
 
             if displace_slot:
                 self._ensure_no_live_session(
@@ -931,6 +952,8 @@ class SwitchMixin:
                 record["creditFor"] = {
                     "email": credit_for[0], "organizationUuid": credit_for[1],
                 }
+            elif prior_link is not None:
+                record["creditFor"] = prior_link
             data["accounts"][account_num] = record
             if int(account_num) not in data["sequence"]:
                 data["sequence"].append(int(account_num))

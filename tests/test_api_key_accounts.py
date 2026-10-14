@@ -1195,7 +1195,10 @@ class TestCreditLink:
         capsys.readouterr()
         s.remove_account("1", assume_yes=True)
         out = capsys.readouterr().out
-        assert "Slot 2 (API credit for a@example.com) is now a standalone key." in out
+        assert (
+            "Slot 2 (API credit for a@example.com) is now a standalone key "
+            "until that account is added again." in out
+        )
         assert s.credit_parent_for("2") is None
         # The record keeps the link, so re-adding the parent resolves again.
         _seed_oauth(s, 1, "a@example.com")
@@ -1223,7 +1226,75 @@ class TestCreditLink:
         assert [a.number for a in snap.accounts] == ["1", "3", "2"]
 
 
+    def test_re_adding_to_its_own_slot_keeps_the_link(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        s.add_account_from_token(API_KEY, email="k@example.com", credit_for="1")
+        s.add_account_from_token(API_KEY, email="k@example.com", slot=2, assume_yes=True)
+        assert s.credit_parent_for("2") == "1"
+
+    def test_moving_to_a_new_slot_keeps_the_link(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        s.add_account_from_token(API_KEY, email="k@example.com", credit_for="1")
+        s.add_account_from_token(API_KEY, email="k@example.com", slot=5, assume_yes=True)
+        assert "2" not in s._get_sequence_data()["accounts"]
+        assert s.credit_parent_for("5") == "1"
+
+    def test_refresh_in_place_writes_the_link(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        s.add_account_from_token(API_KEY, email="k@example.com")
+        assert s.credit_parent_for("2") is None
+        s.add_account_from_token(OTHER_KEY, email="k@example.com", credit_for="1")
+        assert s.credit_parent_for("2") == "1"
+
+    def test_cannot_link_to_the_account_it_replaces(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        before = s._get_sequence_data()["accounts"]["1"]
+        with pytest.raises(ValidationError, match="cannot link a key to the account it replaces"):
+            s.add_account_from_token(API_KEY, slot=1, credit_for="1", assume_yes=True)
+        assert s._get_sequence_data()["accounts"]["1"] == before
+        assert s._read_account_credentials("1", "a@example.com") == OAUTH_JSON
+
+    def test_a_key_reusing_the_parent_email_is_not_a_parent(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        s.add_account_from_token(API_KEY, credit_for="1")
+        s.remove_account("1", assume_yes=True)
+        s.add_account_from_token(OTHER_KEY, email="a@example.com")
+        assert s.credit_parent_for("2") is None
+
+    def test_an_oauth_record_with_a_link_reports_none(self, temp_home: Path):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        _seed_oauth(s, 2, "b@example.com")
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["creditFor"] = {"email": "a@example.com", "organizationUuid": ""}
+        s._write_json(s.sequence_file, data)
+        assert s.credit_parent_for("2") is None
+
+    def test_a_self_link_reports_none(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        s.add_account_from_token(API_KEY, email="k@example.com")
+        data = s._get_sequence_data()
+        data["accounts"]["1"]["creditFor"] = {"email": "k@example.com", "organizationUuid": ""}
+        s._write_json(s.sequence_file, data)
+        assert s.credit_parent_for("1") is None
+
+    def test_a_non_string_link_email_reports_none(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        s.add_account_from_token(API_KEY)
+        data = s._get_sequence_data()
+        data["accounts"]["2"] = {"uuid": "", "organizationUuid": ""}
+        data["accounts"]["1"]["creditFor"] = {"email": None, "organizationUuid": ""}
+        s._write_json(s.sequence_file, data)
+        assert s.credit_parent_for("1") is None
+
 def test_order_keys_after_parents_keeps_strays():
     from openswap.engine.slots import order_keys_after_parents
     assert order_keys_after_parents([1, 2, 3, 4], {"1": None, "2": None, "3": "1", "4": "7"}) == [1, 3, 2, 4]
     assert order_keys_after_parents([], {}) == []
+    assert order_keys_after_parents([1, 2], {"1": "2", "2": None}) == [2, 1]
+    assert order_keys_after_parents([1, 2, 3], {"2": "1", "3": "1"}) == [1, 2, 3]

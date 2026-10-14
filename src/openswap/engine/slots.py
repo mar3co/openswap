@@ -1044,11 +1044,19 @@ class SlotsMixin:
         """Slot of the subscription account a key is API credit for, from loaded data."""
         record = data.get("accounts", {}).get(str(account_num), {})
         link = record.get("creditFor")
-        if not isinstance(link, dict):
+        if record.get("kind") != "api_key" or not isinstance(link, dict):
             return None
-        return self._find_account_slot(
-            data, link.get("email", ""), link.get("organizationUuid", "") or ""
+        email = link.get("email")
+        if not isinstance(email, str):
+            return None
+        parent = self._find_account_slot(
+            data, email, link.get("organizationUuid", "") or ""
         )
+        if parent is None or parent == str(account_num):
+            return None
+        if data["accounts"][parent].get("kind") == "api_key":
+            return None
+        return parent
 
     def credit_parent_for(self, account_num: str) -> str | None:
         """Parent slot for a linked API key; ``None`` when unlinked or the parent is gone."""
@@ -1388,6 +1396,10 @@ class SlotsMixin:
                     "it moved or was replaced. Nothing was removed."
                 )
             email = live_email
+            orphans = [
+                n for n in data["accounts"]
+                if self._credit_parent_in(data, n) == account_num
+            ]
             self._delete_account_files(account_num, email)
             del data["accounts"][account_num]
             data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
@@ -1396,17 +1408,10 @@ class SlotsMixin:
             self._logger.info(f"Removed account {account_num}: {email}")
 
         print(f"{accent('Removed')} Account-{account_num} ({email})")
-        for num, record in sorted(
-            (data or {}).get("accounts", {}).items(), key=lambda kv: int(kv[0])
-        ):
-            link = record.get("creditFor")
-            if (
-                isinstance(link, dict)
-                and link.get("email") == email
-                and (link.get("organizationUuid") or "") == confirmed_org
-            ):
-                print(dimmed(
-                    f"  Slot {num} (API credit for {email}) is now a standalone key."
-                ))
+        for num in sorted(orphans, key=int):
+            print(dimmed(
+                f"  Slot {num} (API credit for {email}) is now a standalone key "
+                "until that account is added again."
+            ))
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
