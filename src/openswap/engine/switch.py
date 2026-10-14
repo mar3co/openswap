@@ -610,6 +610,7 @@ class SwitchMixin:
             if displace_slot:
                 d_num, d_email, d_org = displace_slot
                 stale_files.append((d_num, d_email))
+                orphans = self._credit_orphans(data, d_num)
                 if int(d_num) in data["sequence"]:
                     data["sequence"].remove(int(d_num))
                 del data["accounts"][d_num]
@@ -650,6 +651,8 @@ class SwitchMixin:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+        if prune_identity:
+            self._print_credit_orphans(orphans, prune_identity[0])
 
     def add_account_from_token(
         self,
@@ -936,6 +939,7 @@ class SwitchMixin:
                 orphans = [
                     account_num if n == migrate_from else n
                     for n in self._credit_orphans(data, d_num)
+                    if not (n == migrate_from and credit_for is not None)
                 ]
                 if int(d_num) in data["sequence"]:
                     data["sequence"].remove(int(d_num))

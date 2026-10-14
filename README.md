@@ -26,7 +26,7 @@ If Claude Code was logged in, the installer saved that account. Log into another
 ```bash
 openswap add
 openswap add-token sk-ant-api03-...   # API key slot (switch only, no usage bars)
-openswap add-token sk-ant-api03-... --for 1   # API credit for account 1: used when a subscription was measured and none has room (or none is in rotation)
+openswap add-token sk-ant-api03-... --for 1   # API credit for account 1: the last resort when no subscription has room
 openswap list             # 5h / 7d usage for every account
 openswap switch           # rotate
 openswap switch 2         # jump to a slot, email, or alias
@@ -58,7 +58,7 @@ The command-line executable is `openswap`.
 | `openswap list` | Accounts with 5h / 7d usage |
 | `openswap switch` / `openswap switch 2` | Rotate, or jump to a slot |
 | `openswap add` | Save the current OAuth login |
-| `openswap add-token` | Save an API key or setup token; `--for NUM\|EMAIL\|ALIAS` links a key to a subscription account as its API credit, used only when a subscription was measured and none has room (or none is in rotation) |
+| `openswap add-token` | Save an API key or setup token; `--for NUM\|EMAIL\|ALIAS` links a key to a subscription account as its API credit, used only on `at-limit` when no subscription has known room, or on `failover` when a subscription was measured and none has room (or none is in rotation) |
 | `openswap remove` | Remove a stored account |
 | `openswap auto` | Background rotation near rate limits |
 | `openswap codex add` | Save the current Codex CLI login |

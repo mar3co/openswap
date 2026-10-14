@@ -2203,6 +2203,24 @@ def sanitize_token_error(message: str) -> str:
     return text
 
 
+STALE_PARENT = "stale-parent"
+
+
+def parent_link_choice(picked, identities: dict):
+    """Turn the parent popup's represented ``(num, email, org)`` into the link to send.
+
+    ``None`` when no parent is picked, the ``(email, organizationUuid)`` identity
+    when the snapshot row for that slot still matches, else ``STALE_PARENT``.
+    """
+    if not picked:
+        return None
+    identity = (str(picked[1]), str(picked[2]))
+    email, org = identities.get(str(picked[0])) or ("", "")
+    if (str(email), str(org or "")) != identity:
+        return STALE_PARENT
+    return identity
+
+
 def token_entry_state(text: str, accounts: list, kinds: dict | None = None) -> dict:
     """Pure model for the Add-from-token page.
 

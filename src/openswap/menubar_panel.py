@@ -105,6 +105,8 @@ from openswap.menubar import (
     resolve_popover_theme,
     settings_header_frames,
     settings_page_rows,
+    STALE_PARENT,
+    parent_link_choice,
     token_entry_state,
     window_suffix,
     trailing_header_frames,
@@ -2195,17 +2197,14 @@ class MenuBarPanel:
         credit_for = None
         if state["show_parent"]:
             item = popup.selectedItem()
-            picked = item.representedObject() if item is not None else None
-            picked_num = str(picked[0]) if picked else ""
-            picked_identity = (str(picked[1]), str(picked[2])) if picked else ("", "")
             identities = snap.get("identities") or {}
-            email, org = identities.get(picked_num) or ("", "")
-            if picked_num and (str(email), str(org or "")) != picked_identity:
+            credit_for = parent_link_choice(
+                item.representedObject() if item is not None else None, identities
+            )
+            if credit_for is STALE_PARENT:
                 self._fill_parent_popup(popup, state["choices"], identities)
                 self._show_token_error(error_label, add, "The account list changed; pick the account again.")
                 return
-            if picked_num:
-                credit_for = picked_identity
         error = self._on_add_token(
             token_field.stringValue().strip(),
             label_field.stringValue().strip(),

@@ -1102,6 +1102,17 @@ def test_token_entry_state_strips_whitespace():
     assert state["can_add"] is True
 
 
+def test_parent_link_choice_maps_the_popup_item_to_a_link():
+    from openswap.menubar_display import STALE_PARENT, parent_link_choice
+    identities = {"1": ("a@example.com", "org-a")}
+    assert parent_link_choice(None, identities) is None
+    assert parent_link_choice(("1", "a@example.com", "org-a"), identities) == (
+        "a@example.com", "org-a"
+    )
+    assert parent_link_choice(("1", "b@example.com", "org-a"), identities) is STALE_PARENT
+    assert parent_link_choice(("1", "a@example.com", "org-a"), {}) is STALE_PARENT
+
+
 def test_sanitize_token_error_strips_secrets_and_urls():
     assert menubar.sanitize_token_error(
         "Bad key sk-ant-api03-abcDEF_123 see https://x.test/a?b=c"

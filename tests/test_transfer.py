@@ -2261,6 +2261,22 @@ class TestCreditLinkImport:
         assert s.credit_parent_for("2") == "1"
         assert "standalone" not in capsys.readouterr().err
 
+    def test_imported_link_to_another_key_is_not_reported_as_absent(
+        self, temp_home: Path, capsys
+    ):
+        s = self._linked_key(temp_home, capsys)
+        out = temp_home / "key.openswap"
+        export_accounts(s, str(out), account="2")
+        envelope = json.loads(out.read_text())
+        key_email = envelope["accounts"][0]["email"]
+        envelope["accounts"][0]["creditFor"] = {"email": key_email, "organizationUuid": ""}
+        out.write_text(json.dumps(envelope))
+
+        import_accounts(s, str(out), force=True)
+
+        assert s.credit_parent_for("2") is None
+        assert "standalone" not in capsys.readouterr().err
+
     def test_imported_key_without_its_parent_prints_a_notice(
         self, temp_home: Path, capsys
     ):

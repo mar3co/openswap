@@ -629,7 +629,9 @@ def import_accounts(
                 if (
                     record.get("kind") == "api_key"
                     and isinstance(link, dict)
-                    and switcher._credit_parent_in(data, num) is None
+                    and switcher._find_account_slot(
+                        data, link.get("email"), link.get("organizationUuid") or ""
+                    ) is None
                 ):
                     _eprint(
                         f"Slot {num} (API credit for {link.get('email')}) is a "

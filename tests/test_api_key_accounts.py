@@ -1243,6 +1243,42 @@ class TestCreditLink:
         s.add_account_from_token(API_KEY, email="k@example.com", slot=1, assume_yes=True)
         assert "Slot 1 (API credit for a@example.com) is now a standalone key" in capsys.readouterr().out
 
+    def test_a_linked_key_relinked_while_displacing_its_parent_is_not_called_standalone(
+        self, temp_home: Path, capsys
+    ):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        _seed_oauth(s, 2, "b@example.com")
+        s.add_account_from_token(API_KEY, email="k@example.com", credit_for="1")
+        capsys.readouterr()
+        s.add_account_from_token(
+            API_KEY, email="k@example.com", slot=1, assume_yes=True, credit_for="2"
+        )
+        assert "standalone" not in capsys.readouterr().out
+        assert s.credit_parent_for("1") == "2"
+
+    def test_overwriting_a_parent_with_a_login_prints_orphan_notice(
+        self, temp_home: Path, mock_claude_config: Path, capsys
+    ):
+        from unittest.mock import patch
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        s.add_account_from_token(API_KEY, credit_for="1")
+        s._get_claude_config_path().write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "new@example.com", "organizationUuid": ""}}
+        ))
+        capsys.readouterr()
+        with patch.object(s, "_read_capture_credentials", return_value=OAUTH_JSON), \
+             patch("openswap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-new", "email": "new@example.com",
+                                 "organizationUuid": ""}):
+            s.add_account(slot=1, assume_yes=True)
+        assert (
+            "Slot 2 (API credit for a@example.com) is now a standalone key "
+            "until that account is added again." in capsys.readouterr().out
+        )
+        assert s.credit_parent_for("2") is None
+
     def test_link_survives_swap_and_move(self, temp_home: Path, capsys):
         s = _linux_switcher()
         _seed_oauth(s, 1, "a@example.com")
