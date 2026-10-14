@@ -1058,6 +1058,21 @@ class SlotsMixin:
             return None
         return parent
 
+    def _credit_orphans(self, data: dict, parent_num: str) -> list[str]:
+        """Keys whose link resolves to ``parent_num`` in loaded data."""
+        return [
+            n for n in data["accounts"]
+            if self._credit_parent_in(data, n) == parent_num
+        ]
+
+    @staticmethod
+    def _print_credit_orphans(orphans: list[str], parent_email: str) -> None:
+        for num in sorted(orphans, key=int):
+            print(dimmed(
+                f"  Slot {num} (API credit for {parent_email}) is now a standalone key "
+                "until that account is added again."
+            ))
+
     def credit_parent_for(self, account_num: str) -> str | None:
         """Parent slot for a linked API key; ``None`` when unlinked or the parent is gone."""
         data = self._get_sequence_data() or {}
@@ -1396,10 +1411,7 @@ class SlotsMixin:
                     "it moved or was replaced. Nothing was removed."
                 )
             email = live_email
-            orphans = [
-                n for n in data["accounts"]
-                if self._credit_parent_in(data, n) == account_num
-            ]
+            orphans = self._credit_orphans(data, account_num)
             self._delete_account_files(account_num, email)
             del data["accounts"][account_num]
             data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
@@ -1408,10 +1420,6 @@ class SlotsMixin:
             self._logger.info(f"Removed account {account_num}: {email}")
 
         print(f"{accent('Removed')} Account-{account_num} ({email})")
-        for num in sorted(orphans, key=int):
-            print(dimmed(
-                f"  Slot {num} (API credit for {email}) is now a standalone key "
-                "until that account is added again."
-            ))
+        self._print_credit_orphans(orphans, email)
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))

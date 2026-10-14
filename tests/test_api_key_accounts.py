@@ -1223,6 +1223,26 @@ class TestCreditLink:
         _seed_oauth(s, 1, "a@example.com")
         assert s.credit_parent_for("2") == "1"
 
+    def test_displacing_parent_with_a_key_prints_orphan_notice(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        s.add_account_from_token(API_KEY, credit_for="1")
+        capsys.readouterr()
+        s.add_account_from_token(OTHER_KEY, slot=1, assume_yes=True)
+        assert (
+            "Slot 2 (API credit for a@example.com) is now a standalone key "
+            "until that account is added again." in capsys.readouterr().out
+        )
+        assert s.credit_parent_for("2") is None
+
+    def test_a_linked_key_moving_onto_its_parent_reports_its_new_slot(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        s.add_account_from_token(API_KEY, email="k@example.com", credit_for="1")
+        capsys.readouterr()
+        s.add_account_from_token(API_KEY, email="k@example.com", slot=1, assume_yes=True)
+        assert "Slot 1 (API credit for a@example.com) is now a standalone key" in capsys.readouterr().out
+
     def test_link_survives_swap_and_move(self, temp_home: Path, capsys):
         s = _linux_switcher()
         _seed_oauth(s, 1, "a@example.com")

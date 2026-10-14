@@ -866,6 +866,7 @@ class SwitchMixin:
             account_num = str(self._get_next_account_number())
 
         prune_identity = None
+        orphans: list[str] = []
         with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
             lease_guard.assert_available()
             data = self._get_sequence_data() or {
@@ -932,6 +933,10 @@ class SwitchMixin:
             if displace_slot:
                 d_num, d_email, d_org = displace_slot
                 stale_files.append((d_num, d_email))
+                orphans = [
+                    account_num if n == migrate_from else n
+                    for n in self._credit_orphans(data, d_num)
+                ]
                 if int(d_num) in data["sequence"]:
                     data["sequence"].remove(int(d_num))
                 del data["accounts"][d_num]
@@ -980,6 +985,8 @@ class SwitchMixin:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+        if prune_identity:
+            self._print_credit_orphans(orphans, prune_identity[0])
 
     def _select_best_switchable(
         self,
