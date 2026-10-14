@@ -74,6 +74,7 @@ from Foundation import (
     NSUserDefaults,
 )
 
+from openswap.menubar_dialog import forward_edit_shortcut
 from openswap.brand_motion import (
     BRAND_MOTION_DURATION,
     SWAP_MOTION_DURATION,
@@ -509,6 +510,24 @@ class _Trampoline(NSObject):
             cb(sender)
 
 
+class _TokenField(NSTextField):
+    """Text field that takes Cmd+A/C/X/V/Z in the accessory app's popover."""
+
+    def performKeyEquivalent_(self, event):
+        if forward_edit_shortcut(event, self):
+            return True
+        return objc.super(_TokenField, self).performKeyEquivalent_(event)
+
+
+class _SecureTokenField(NSSecureTextField):
+    """Secure variant of ``_TokenField``."""
+
+    def performKeyEquivalent_(self, event):
+        if forward_edit_shortcut(event, self):
+            return True
+        return objc.super(_SecureTokenField, self).performKeyEquivalent_(event)
+
+
 class _TextWatcher(NSObject):
     """NSTextField delegate that forwards edits to a Python callable."""
 
@@ -769,6 +788,8 @@ class _CardView(NSView):
         return None
 
     def mouseUp_(self, event):
+        if event.clickCount() > 1:
+            return
         loc = self.convertPoint_fromView_(event.locationInWindow(), None)
         if not NSPointInRect(loc, self.bounds()):
             return
@@ -976,7 +997,7 @@ class MenuBarPanel:
 
     def _on_system_appearance(self) -> None:
         self._sync_popover_appearance()
-        if self.is_shown():
+        if self.is_shown() and self._page != TOKEN_PAGE:
             self.reload()
 
     def is_shown(self) -> bool:
@@ -1038,7 +1059,7 @@ class MenuBarPanel:
 
     def _reset_close_timer(self) -> None:
         self._cancel_close_timer()
-        if not self.is_shown():
+        if not self.is_shown() or self._page == TOKEN_PAGE:
             return
         if self._close_tramp is None:
             self._close_tramp = _Trampoline.alloc().initWithCallback_(
@@ -1234,6 +1255,7 @@ class MenuBarPanel:
 
     def _show_main(self, _sender=None):
         self._page = MAIN_PAGE
+        self._token_error = ""
         if self._selected_provider == "chatgpt" and self._on_chatgpt_view_active is not None:
             self._on_chatgpt_view_active()
         self.reload()
@@ -1319,6 +1341,8 @@ class MenuBarPanel:
 
     def _build(self):
         self._tramps = []
+        if self._page != TOKEN_PAGE:
+            self._token_watcher = None
         if self._page == SETTINGS_PAGE:
             return self._build_settings()
         if self._page == TOKEN_PAGE:
@@ -2067,7 +2091,7 @@ class MenuBarPanel:
         root.addSubview_(hairline)
 
         y = PAD + HEADER_H + 8
-        token_field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(PAD + 12, y, field_w, 28))
+        token_field = _SecureTokenField.alloc().initWithFrame_(NSMakeRect(PAD + 12, y, field_w, 28))
         token_field.setPlaceholderString_("API key (sk-ant-api…) or setup token (sk-ant-oat…)")
         token_field.setFont_(font_body)
         root.addSubview_(token_field)
@@ -2082,30 +2106,26 @@ class MenuBarPanel:
         popup = _PopupButton.alloc().initWithPanel_frame_(self, NSMakeRect(PAD + 12, y, field_w, 28))
         popup.setControlSize_(NSControlSizeSmall)
         popup.setFont_(font_body)
-        popup.removeAllItems()
-        for value, caption in state["choices"]:
-            popup.addItemWithTitle_(caption)
-            item = popup.lastItem()
-            if item is not None:
-                item.setRepresentedObject_(value)
+        self._fill_parent_popup(popup, state["choices"], rows)
         root.addSubview_(popup)
         y += 28 + 10
 
-        label_field = NSTextField.alloc().initWithFrame_(NSMakeRect(PAD + 12, y, field_w, 28))
+        label_field = _TokenField.alloc().initWithFrame_(NSMakeRect(PAD + 12, y, field_w, 28))
         label_field.setPlaceholderString_("Email label (optional)")
         label_field.setFont_(font_body)
         label_field.cell().setUsesSingleLineMode_(True)
         root.addSubview_(label_field)
         y += 28 + 10
 
-        error = _label(self._token_error, font_small, pal["muted"], NSMakeRect(PAD + 12, y, field_w, 30))
+        error_h = float(int(font_small.boundingRectForFont().size.height + 1)) * 3
+        error = _label(self._token_error, font_small, pal["crit"], NSMakeRect(PAD + 12, y, field_w, error_h))
         _wrap(error)
         root.addSubview_(error)
-        y += 30 + 10
+        y += error_h + 10
 
         add = self._add_button(
             root, "Add", NSMakeRect(PAD + 12, y, field_w, 40),
-            lambda _s: self._submit_token(token_field, label_field, popup, error),
+            lambda _s: self._submit_token(token_field, label_field, popup, error, add),
             font_body,
         )
         add.setEnabled_(False)
@@ -2124,25 +2144,45 @@ class MenuBarPanel:
         refresh()
         return root
 
-    def _submit_token(self, token_field, label_field, popup, error_label):
+    @staticmethod
+    def _fill_parent_popup(popup, choices, rows):
+        emails = {str(row[0]): str(row[1]) for row in rows}
+        popup.removeAllItems()
+        for value, caption in choices:
+            popup.addItemWithTitle_(caption)
+            item = popup.lastItem()
+            if item is not None:
+                item.setRepresentedObject_((value, emails.get(value, "")))
+
+    def _submit_token(self, token_field, label_field, popup, error_label, add):
+        add.setEnabled_(False)
         snap = self._snapshot()
-        state = token_entry_state(
-            token_field.stringValue(), snap.get("accounts") or [], snap.get("kinds") or {}
-        )
+        rows = snap.get("accounts") or []
+        state = token_entry_state(token_field.stringValue(), rows, snap.get("kinds") or {})
         if not state["can_add"] or self._on_add_token is None:
             return
         credit_for = ""
         if state["show_parent"]:
             item = popup.selectedItem()
-            credit_for = str(item.representedObject() or "") if item is not None else ""
+            picked = item.representedObject() if item is not None else None
+            credit_for, picked_email = (str(picked[0]), str(picked[1])) if picked else ("", "")
+            current = {str(row[0]): str(row[1]) for row in rows}
+            if credit_for and current.get(credit_for) != picked_email:
+                self._fill_parent_popup(popup, state["choices"], rows)
+                self._show_token_error(error_label, add, "The account list changed; pick the account again.")
+                return
         error = self._on_add_token(
             token_field.stringValue().strip(),
             label_field.stringValue().strip(),
             credit_for,
         )
         if error is not None:
-            self._token_error = error
-            error_label.setStringValue_(error)
+            self._show_token_error(error_label, add, error)
             return
-        self._token_error = ""
+        token_field.setStringValue_("")
         self._show_main()
+
+    def _show_token_error(self, error_label, add, message):
+        self._token_error = message
+        error_label.setStringValue_(message)
+        add.setEnabled_(True)

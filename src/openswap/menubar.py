@@ -2603,8 +2603,16 @@ def run(switcher, codex=None) -> int:
                     credit_for=credit_for or None,
                 )
             except ClaudeSwitchError as e:
-                return sanitize_token_error(str(e)) or "Could not add this token."
-            self.refresh_async()
+                copy = sanitize_token_error(str(e)) or "Could not add this token."
+                self.switcher._logger.info("add-from-token rejected: %s", copy)
+                return copy
+            except OSError:
+                self.switcher._logger.error("add-from-token failed", exc_info=True)
+                return "Could not save this token (disk or permission error). See openswap.log."
+            try:
+                self.refresh_async()
+            except Exception:
+                self.switcher._logger.warning("refresh after add-from-token failed", exc_info=True)
             return None
 
         def on_open_log(self, _sender):

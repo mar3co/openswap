@@ -1060,10 +1060,6 @@ _TOKEN_ROWS = [
 _TOKEN_KINDS = {"1": "oauth", "2": "oauth", "3": "api_key", "codex:1": "oauth"}
 
 
-def test_token_page_constant():
-    assert menubar.TOKEN_PAGE == "token"
-
-
 def test_token_entry_state_empty():
     state = menubar.token_entry_state("", _TOKEN_ROWS, _TOKEN_KINDS)
     assert state["kind"] is None
@@ -1115,19 +1111,13 @@ def test_sanitize_token_error_strips_secrets_and_urls():
 
 
 def test_add_token_returns_none_on_success_and_copy_on_failure():
-    from tests.menubar_harness import extract_class
     from openswap.exceptions import ValidationError
 
-    scope = {
-        "ClaudeSwitchError": menubar.ClaudeSwitchError,
-        "sanitize_token_error": menubar.sanitize_token_error,
-    }
-    app_type = extract_class(menubar.__file__, "MenuBarApp", {"_add_token"}, scope)
-    app = app_type()
+    app, logger, _logged = _token_app()
     calls = []
     refreshed = []
     app.switcher = SimpleNamespace(
-        add_account_from_token=lambda **kw: calls.append(kw)
+        add_account_from_token=lambda **kw: calls.append(kw), _logger=logger,
     )
     app.refresh_async = lambda: refreshed.append(True)
     assert app._add_token("sk-ant-api03-abc", "", "1") is None
@@ -1137,16 +1127,74 @@ def test_add_token_returns_none_on_success_and_copy_on_failure():
     def boom(**kw):
         raise ValidationError("rejected sk-ant-api03-abc for https://x.test")
 
-    app.switcher = SimpleNamespace(add_account_from_token=boom)
+    app.switcher = SimpleNamespace(add_account_from_token=boom, _logger=logger)
     assert app._add_token("sk-ant-api03-abc", "me", "") == "rejected for"
     assert refreshed == [True]
 
     def boom_secret_only(**kw):
         raise ValidationError("sk-ant-api03-abc")
 
-    app.switcher = SimpleNamespace(add_account_from_token=boom_secret_only)
+    app.switcher = SimpleNamespace(add_account_from_token=boom_secret_only, _logger=logger)
     assert app._add_token("sk-ant-api03-abc", "", "") == "Could not add this token."
     assert refreshed == [True]
+
+
+def _token_app():
+    from tests.menubar_harness import extract_class
+
+    scope = {
+        "ClaudeSwitchError": menubar.ClaudeSwitchError,
+        "sanitize_token_error": menubar.sanitize_token_error,
+    }
+    app = extract_class(menubar.__file__, "MenuBarApp", {"_add_token"}, scope)()
+    logged = []
+    logger = SimpleNamespace(
+        info=lambda *a, **k: logged.append(("info", a, k)),
+        error=lambda *a, **k: logged.append(("error", a, k)),
+        warning=lambda *a, **k: logged.append(("warning", a, k)),
+    )
+    return app, logger, logged
+
+
+def test_add_token_reports_disk_errors_and_logs_them():
+    app, logger, logged = _token_app()
+
+    def boom(**kw):
+        raise PermissionError("denied /Users/me/.claude.json")
+
+    app.switcher = SimpleNamespace(add_account_from_token=boom, _logger=logger)
+    app.refresh_async = lambda: None
+    assert app._add_token("sk-ant-api03-abc", "", "") == (
+        "Could not save this token (disk or permission error). See openswap.log."
+    )
+    assert logged == [("error", ("add-from-token failed",), {"exc_info": True})]
+
+
+def test_add_token_logs_engine_rejection_without_the_token():
+    from openswap.exceptions import ValidationError
+
+    app, logger, logged = _token_app()
+
+    def boom(**kw):
+        raise ValidationError("rejected sk-ant-api03-abc")
+
+    app.switcher = SimpleNamespace(add_account_from_token=boom, _logger=logger)
+    app.refresh_async = lambda: None
+    assert app._add_token("sk-ant-api03-abc", "", "") == "rejected"
+    assert len(logged) == 1 and logged[0][0] == "info"
+    assert "sk-ant" not in repr(logged)
+
+
+def test_add_token_succeeds_when_refresh_fails():
+    app, logger, logged = _token_app()
+    app.switcher = SimpleNamespace(add_account_from_token=lambda **kw: None, _logger=logger)
+
+    def bad_refresh():
+        raise RuntimeError("refresh broke")
+
+    app.refresh_async = bad_refresh
+    assert app._add_token("sk-ant-api03-abc", "", "") is None
+    assert [entry[0] for entry in logged] == ["warning"]
 
 
 def test_adapt_snapshot_carries_credit_for():
