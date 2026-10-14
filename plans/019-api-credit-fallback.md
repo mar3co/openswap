@@ -53,14 +53,28 @@ plain text.
 ## Decisions
 
 1. **Last resort, not same-account first.** A subscription with free quota
-   always beats paid credit. A linked key is used only when no subscription
-   candidate qualifies, exactly where keys sit today.
+   always beats paid credit. A key is chosen only on a must-move trigger
+   (`at-limit`: the active account's binding window is at 100%, or
+   `failover`: its usage has been unreadable for `unhealthy_ticks`), and only
+   when no subscription candidate qualifies. A proactive or consume-first
+   trigger never spends credit; with an eligible key in the roster the engine
+   holds at normal cadence (`no-qualifying-candidate`) instead of entering
+   the all-exhausted sleep, so the at-limit switch is not delayed. (Amended
+   2026-10-14 during implementation: the earlier wording "exactly where keys
+   sit today" let a proactive 90% switch strand up to 10% of prepaid quota on
+   paid credit.)
 2. **Linking is consent.** A key linked to a subscription account is eligible
    without `autoswitch.includeApiKeyAccounts`. That flag keeps governing
    unlinked keys and is otherwise unchanged.
 3. **Return only to a healthy subscription.** While an eligible key is active,
    the engine leaves it only for a subscription below the threshold. It never
-   returns to an account that would re-trigger on the next tick.
+   returns to an account that would re-trigger on the next tick. The engine
+   also leaves a key it put the user on (`lastSwitchTo` in
+   `autoswitch_state.json`) even when the link has since gone, so removing a
+   parent never strands the user on credit; only a key the user chose by hand
+   with no link and no flag is left alone. The hold reason names what was
+   actually seen: no subscription below the threshold, none with readable
+   usage, none in rotation, or every target refused at freshen.
 4. **Link by identity, not slot.** The key record stores the parent's
    `(email, organizationUuid)`, so `swap`, `move`, and re-adding the parent
    keep the link. A link whose parent is gone resolves to nothing and the key
