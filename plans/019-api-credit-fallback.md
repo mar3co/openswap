@@ -69,8 +69,8 @@ plain text.
 3. **Return only to a healthy subscription.** While an eligible key is active,
    the engine leaves it only for a subscription below the threshold. It never
    returns to an account that would re-trigger on the next tick. The engine
-   also leaves a key it put the user on (`lastSwitchTo` in
-   `autoswitch_state.json`) even when the link has since gone, so removing a
+   also leaves a key it put the user on (`creditPlacedOn` in
+   `autoswitch_state.json`, which a hand switch clears) even when the link has since gone, so removing a
    parent never strands the user on credit; only a key the user chose by hand
    with no link and no flag is left alone. The hold reason names what was
    actually seen: no subscription below the threshold, none with readable
