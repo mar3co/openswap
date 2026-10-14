@@ -582,7 +582,16 @@ def import_accounts(
 
                 data.setdefault("accounts", {})
                 data.setdefault("sequence", [])
-                data["accounts"][target_num] = _account_record(entry)
+                record = _account_record(entry)
+                prior = data["accounts"].get(target_num) or {}
+                if (
+                    record.get("kind") == "api_key"
+                    and "creditFor" not in record
+                    and prior.get("kind") == "api_key"
+                    and prior.get("creditFor")
+                ):
+                    record["creditFor"] = prior["creditFor"]
+                data["accounts"][target_num] = record
                 if int(target_num) not in data["sequence"]:
                     data["sequence"].append(int(target_num))
                     data["sequence"].sort()
@@ -613,6 +622,19 @@ def import_accounts(
                 else:
                     _eprint(f"Imported {entry['email']} → slot {target_num}")
                     imported += 1
+
+            for num in sorted(written_slots, key=int):
+                record = data["accounts"][num]
+                link = record.get("creditFor")
+                if (
+                    record.get("kind") == "api_key"
+                    and isinstance(link, dict)
+                    and switcher._credit_parent_in(data, num) is None
+                ):
+                    _eprint(
+                        f"Slot {num} (API credit for {link.get('email')}) is a "
+                        "standalone key until that account is added."
+                    )
 
             if (
                 data.get("activeAccountNumber") in (None, 0)
