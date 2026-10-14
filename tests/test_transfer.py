@@ -2261,7 +2261,7 @@ class TestCreditLinkImport:
         assert s.credit_parent_for("2") == "1"
         assert "standalone" not in capsys.readouterr().err
 
-    def test_imported_link_to_another_key_is_not_reported_as_absent(
+    def test_imported_link_to_itself_is_not_reported_as_absent(
         self, temp_home: Path, capsys
     ):
         s = self._linked_key(temp_home, capsys)

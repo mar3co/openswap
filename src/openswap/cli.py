@@ -1662,8 +1662,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=(
             "With 'add-token': link this API key to a subscription account as "
             "its API credit. Auto-switch uses it at the limit when no subscription "
-            "has known room (on failover only when a subscription was measured), "
-            "and returns to a subscription once one has room."
+            "has known room (on failover only when a subscription was measured or "
+            "none is in rotation), and returns to a subscription once one has room."
         ),
     )
     parser.add_argument(
