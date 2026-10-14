@@ -541,6 +541,13 @@ class _TextWatcher(NSObject):
     def controlTextDidChange_(self, _notification):
         self._callback()
 
+    def control_textView_doCommandBySelector_(self, _control, _text_view, selector):
+        cancel = getattr(self, "_cancel", None)
+        if selector != "cancelOperation:" or cancel is None:
+            return False
+        cancel()
+        return True
+
 
 class _AppearanceObserver(NSObject):
     """KVO + distributed-notification shim so the popover tracks Dark Mode."""
@@ -933,7 +940,7 @@ class MenuBarPanel:
         self._on_add_token = on_add_token
         self._token_error = ""
         self._token_watcher = None
-        self._token_field = None
+        self._token_fields = ()
         self._worker_enabled = worker_enabled or (lambda: False)
         self._worker_paused = worker_paused or (lambda: False)
         self._worker_status = worker_status or (lambda: {})
@@ -1351,13 +1358,12 @@ class MenuBarPanel:
         return ctl
 
     def _release_token_field(self) -> None:
-        field = self._token_field
-        self._token_field = None
+        fields = self._token_fields
+        self._token_fields = ()
         self._token_watcher = None
-        if field is None:
-            return
-        field.setDelegate_(None)
-        window = field.window()
+        for field in fields:
+            field.setDelegate_(None)
+        window = fields[0].window() if fields else None
         if window is not None:
             window.makeFirstResponder_(None)
 
@@ -2162,8 +2168,10 @@ class MenuBarPanel:
             add.setEnabled_(current["can_add"] and self._on_add_token is not None)
 
         self._token_watcher = _TextWatcher.alloc().initWithCallback_(refresh)
-        self._token_field = token_field
-        token_field.setDelegate_(self._token_watcher)
+        self._token_watcher._cancel = self._show_main
+        self._token_fields = (token_field, label_field)
+        for field in self._token_fields:
+            field.setDelegate_(self._token_watcher)
         refresh()
         return root
 
