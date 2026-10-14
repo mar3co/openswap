@@ -2101,6 +2101,7 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
+            lands_on_key = self.switcher.account_kind_for(number) == "api_key"
             if getattr(self.switcher, "provider", None) == "codex":
                 result = self.switcher.switch_to(
                     number, json_output=True, automatic=True
@@ -2122,7 +2123,7 @@ class AutoSwitchEngine:
             # Ownership of a key landing, distinct from lastSwitchTo: a hand
             # switch clears it (record_manual_switch) but must leave the
             # no-return bar's lastSwitchTo/lastSwitchFrom alone.
-            if self.switcher.account_kind_for(number) == "api_key":
+            if lands_on_key:
                 state["creditPlacedOn"] = number
             else:
                 state.pop("creditPlacedOn", None)

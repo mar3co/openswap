@@ -1881,6 +1881,32 @@ class TestApiKeyAccounts:
         assert h.tick_with_usage({"1": _usage(10), "2": "api key", "3": _usage(100)}) is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_switch_state_write_does_not_read_the_roster_after_switching(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        switched = []
+        real_switch, real_kind = h.switcher.switch_to, h.switcher.account_kind_for
+
+        def switch_to(*a, **k):
+            result = real_switch(*a, **k)
+            switched.append(True)
+            return result
+
+        def account_kind_for(n):
+            if switched:
+                raise OSError("roster unreadable")
+            return real_kind(n)
+
+        h.switcher.switch_to = switch_to
+        h.switcher.account_kind_for = account_kind_for
+        assert h.tick_with_usage({"1": _usage(100), "2": "api key"}) is TickOutcome.SWITCHED
+        assert h.state().get("creditPlacedOn") == "2"
+        assert h.state().get("lastSwitchFrom") == 1
+
     def test_hand_picked_key_after_engine_left_it_is_not_managed(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
