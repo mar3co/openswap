@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from openswap.engine.notes import *  # noqa: F403
+from openswap.engine.slots import order_keys_after_parents
 from openswap.worker.leases import (
     AccountLeaseError,
     AccountLeaseStore,
@@ -79,6 +80,7 @@ class SnapshotMixin:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    credit_for=self._credit_parent_in(seq_data, n) or "",
                 )
             )
         return AccountsSnapshot(
@@ -166,7 +168,9 @@ class SnapshotMixin:
         # thread writes it here before the fetch pool starts → no data race).
         self._record_active_verdict(None)
         self._record_active_backup_fallback(False)
-        for num in data.get("sequence", []):
+        sequence = list(data.get("sequence", []))
+        parent_of = {str(n): self._credit_parent_in(data, str(n)) for n in sequence}
+        for num in order_keys_after_parents(sequence, parent_of):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
             org_name = account.get("organizationName", "") or ""

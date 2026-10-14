@@ -5,6 +5,37 @@ from __future__ import annotations
 from openswap.engine.notes import *  # noqa: F403
 from openswap.worker.leases import AccountLeaseStore
 
+
+def order_keys_after_parents(
+    sequence: list[int], parent_of: dict[str, str | None]
+) -> list[int]:
+    """Roster order with each linked key placed directly after its parent.
+
+    A key whose parent is not in ``sequence`` keeps its own position.
+    """
+    children: dict[str, list[int]] = {}
+    present = {str(num) for num in sequence}
+    for num in sequence:
+        parent = parent_of.get(str(num))
+        if parent is not None and parent in present:
+            children.setdefault(parent, []).append(num)
+    placed: set[int] = set()
+    ordered: list[int] = []
+    for num in sequence:
+        if num in placed:
+            continue
+        parent = parent_of.get(str(num))
+        if parent is not None and parent in present:
+            continue
+        ordered.append(num)
+        placed.add(num)
+        for child in children.get(str(num), []):
+            ordered.append(child)
+            placed.add(child)
+    ordered.extend(num for num in sequence if num not in placed)
+    return ordered
+
+
 class SlotsMixin:
     """Roster (sequence.json), backup Keychain, aliases, disabled flags, slot numbers."""
 
@@ -1009,6 +1040,21 @@ class SlotsMixin:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
         return self._account_kind(account_num)
 
+    def _credit_parent_in(self, data: dict, account_num: str) -> str | None:
+        """Slot of the subscription account a key is API credit for, from loaded data."""
+        record = data.get("accounts", {}).get(str(account_num), {})
+        link = record.get("creditFor")
+        if not isinstance(link, dict):
+            return None
+        return self._find_account_slot(
+            data, link.get("email", ""), link.get("organizationUuid", "") or ""
+        )
+
+    def credit_parent_for(self, account_num: str) -> str | None:
+        """Parent slot for a linked API key; ``None`` when unlinked or the parent is gone."""
+        data = self._get_sequence_data() or {}
+        return self._credit_parent_in(data, str(account_num))
+
     def sequence_data(self) -> dict | None:
         """Public roster read of ``sequence.json``. None only when it does not exist."""
         return self._get_sequence_data()
@@ -1350,5 +1396,17 @@ class SlotsMixin:
             self._logger.info(f"Removed account {account_num}: {email}")
 
         print(f"{accent('Removed')} Account-{account_num} ({email})")
+        for num, record in sorted(
+            (data or {}).get("accounts", {}).items(), key=lambda kv: int(kv[0])
+        ):
+            link = record.get("creditFor")
+            if (
+                isinstance(link, dict)
+                and link.get("email") == email
+                and (link.get("organizationUuid") or "") == confirmed_org
+            ):
+                print(dimmed(
+                    f"  Slot {num} (API credit for {email}) is now a standalone key."
+                ))
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))

@@ -1103,3 +1103,127 @@ class TestADeniedKeychainSurvivesAnUnreadableFallbackFile:
         assert ac.keychain_unavailable is True, (
             "the keychain WAS denied; an unreadable fallback cannot clear that"
         )
+
+
+# ---------------------------------------------------------------------------
+# API credit link (plan 019)
+# ---------------------------------------------------------------------------
+
+
+def _seed_oauth(s: ClaudeAccountSwitcher, num: int, email: str, org_uuid: str = "", alias: str = "") -> None:
+    s._write_account_credentials(str(num), email, OAUTH_JSON)
+    s._write_account_config(
+        str(num), email,
+        json.dumps({"oauthAccount": {"emailAddress": email, "accountUuid": f"u{num}",
+                                     "organizationUuid": org_uuid or None}}),
+    )
+    data = s._get_sequence_data()
+    record = {"email": email, "uuid": f"u{num}", "organizationUuid": org_uuid,
+              "organizationName": "", "added": "2024-01-01T00:00:00Z"}
+    if alias:
+        record["alias"] = alias
+    data["accounts"][str(num)] = record
+    if num not in data["sequence"]:
+        data["sequence"].append(num)
+        data["sequence"].sort()
+    s._write_json(s.sequence_file, data)
+
+
+class TestCreditLink:
+    def test_for_by_slot_stores_parent_identity(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        s.add_account_from_token(API_KEY, credit_for="1")
+        record = s._get_sequence_data()["accounts"]["2"]
+        assert record["kind"] == "api_key"
+        assert record["creditFor"] == {"email": "a@example.com", "organizationUuid": ""}
+        assert s.credit_parent_for("2") == "1"
+
+    def test_for_by_email_and_alias(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com", alias="work")
+        s.add_account_from_token(API_KEY, credit_for="a@example.com")
+        s.add_account_from_token(OTHER_KEY, credit_for="work")
+        assert s.credit_parent_for("2") == "1"
+        assert s.credit_parent_for("3") == "1"
+
+    def test_link_matches_on_org_uuid(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        _seed_oauth(s, 2, "a@example.com", org_uuid="org-1")
+        s.add_account_from_token(API_KEY, credit_for="2")
+        assert s._get_sequence_data()["accounts"]["3"]["creditFor"]["organizationUuid"] == "org-1"
+        assert s.credit_parent_for("3") == "2"
+
+    def test_ambiguous_email_is_an_error(self, temp_home: Path):
+        from openswap.exceptions import ConfigError
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        _seed_oauth(s, 2, "a@example.com", org_uuid="org-1")
+        with pytest.raises(ConfigError):
+            s.add_account_from_token(API_KEY, credit_for="a@example.com")
+        assert "3" not in s._get_sequence_data()["accounts"]
+
+    def test_setup_token_cannot_be_linked(self, temp_home: Path):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        with pytest.raises(ValidationError, match="setup token"):
+            s.add_account_from_token("sk-ant-oat01-abc", credit_for="1")
+
+    def test_api_key_cannot_be_a_parent(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        s.add_account_from_token(API_KEY)
+        with pytest.raises(ValidationError, match="API key"):
+            s.add_account_from_token(OTHER_KEY, credit_for="1")
+
+    def test_unknown_parent_is_not_found(self, temp_home: Path):
+        from openswap.exceptions import AccountNotFoundError
+        s = _linux_switcher()
+        with pytest.raises(AccountNotFoundError):
+            s.add_account_from_token(API_KEY, credit_for="9")
+
+    def test_unlinked_key_has_no_parent(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        s.add_account_from_token(API_KEY)
+        assert s.credit_parent_for("1") is None
+        assert s.credit_parent_for("99") is None
+
+    def test_removing_parent_orphans_key_and_prints_notice(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        s.add_account_from_token(API_KEY, credit_for="1")
+        capsys.readouterr()
+        s.remove_account("1", assume_yes=True)
+        out = capsys.readouterr().out
+        assert "Slot 2 (API credit for a@example.com) is now a standalone key." in out
+        assert s.credit_parent_for("2") is None
+        # The record keeps the link, so re-adding the parent resolves again.
+        _seed_oauth(s, 1, "a@example.com")
+        assert s.credit_parent_for("2") == "1"
+
+    def test_link_survives_swap_and_move(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        _seed_oauth(s, 2, "b@example.com")
+        s.add_account_from_token(API_KEY, credit_for="1")
+        s.swap_accounts("1", "2")
+        assert s.credit_parent_for("3") == "2"
+        s.move_account("3", "7")
+        assert s.credit_parent_for("7") == "2"
+
+    def test_snapshot_carries_parent_and_orders_key_after_parent(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        _seed_oauth(s, 2, "b@example.com")
+        s.add_account_from_token(API_KEY, credit_for="1")
+        snap = s.accounts_snapshot(fetch=set())
+        by_num = {a.number: a for a in snap.accounts}
+        assert by_num["3"].credit_for == "1"
+        assert by_num["1"].credit_for == ""
+        assert [a.number for a in snap.accounts] == ["1", "3", "2"]
+
+
+def test_order_keys_after_parents_keeps_strays():
+    from openswap.engine.slots import order_keys_after_parents
+    assert order_keys_after_parents([1, 2, 3, 4], {"1": None, "2": None, "3": "1", "4": "7"}) == [1, 3, 2, 4]
+    assert order_keys_after_parents([], {}) == []

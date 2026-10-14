@@ -657,6 +657,7 @@ class SwitchMixin:
         email: str | None = None,
         slot: int | None = None,
         assume_yes: bool = False,
+        credit_for: str | None = None,
     ) -> None:
         """Register a raw OAuth setup-token or managed API key as a new account.
 
@@ -676,6 +677,9 @@ class SwitchMixin:
             slot:  Slot number to use; auto-assigned when ``None``.
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the extra, confirm first).
+            credit_for: Slot number, email, or alias of the subscription account
+                   this API key is API credit for. Only valid with an
+                   ``sk-ant-api…`` key; a setup token is a login of its own.
         """
         self._refuse_session_shell()
         import getpass
@@ -694,8 +698,23 @@ class SwitchMixin:
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
 
+        parent: tuple[str, str] | None = None
+        if credit_for is not None:
+            if not is_api_key:
+                raise ValidationError(
+                    "--for links an API key to an account; a setup token is a "
+                    "login of its own and cannot be API credit"
+                )
+            parent_num, parent_email, parent_org = self.resolve_account(credit_for)
+            if self._account_kind(parent_num) == "api_key":
+                raise ValidationError(
+                    f"Account {parent_num} ({parent_email}) is an API key; link "
+                    "to a subscription account instead"
+                )
+            parent = (parent_email, parent_org)
+
         self._commit_add_account_from_token(
-            token, email, slot, assume_yes, is_api_key
+            token, email, slot, assume_yes, is_api_key, parent
         )
 
     def _commit_add_account_from_token(
@@ -705,6 +724,7 @@ class SwitchMixin:
         slot: int | None,
         assume_yes: bool,
         is_api_key: bool,
+        credit_for: tuple[str, str] | None = None,
     ) -> None:
         """Prompt if needed, then commit the token account under ``lock_file``."""
         with FileLock(self.lock_file):
@@ -759,6 +779,10 @@ class SwitchMixin:
                     )
                 self._write_account_credentials(account_num, email, credentials)
                 self._write_account_config(account_num, email, config)
+                if credit_for is not None:
+                    seq["accounts"][account_num]["creditFor"] = {
+                        "email": credit_for[0], "organizationUuid": credit_for[1],
+                    }
                 # A refreshed credential invalidates any dead-token quarantine on this
                 # slot (mirrors ``add_account``); otherwise the stale strike row keeps
                 # the account stuck at "re-login needed" and it never fetches the new
@@ -903,6 +927,10 @@ class SwitchMixin:
             }
             if is_api_key:
                 record["kind"] = "api_key"
+            if credit_for is not None:
+                record["creditFor"] = {
+                    "email": credit_for[0], "organizationUuid": credit_for[1],
+                }
             data["accounts"][account_num] = record
             if int(account_num) not in data["sequence"]:
                 data["sequence"].append(int(account_num))

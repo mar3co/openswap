@@ -307,6 +307,9 @@ class CodexEngine:
     def account_kind_for(self, account_num: str) -> str:
         return self._record(self._read_roster(), account_num).get("kind", "") or "oauth"
 
+    def credit_parent_for(self, account_num: str) -> str | None:
+        return None
+
     def read_account_credentials(self, account_num: str, email: str) -> str:
         return self._slot_text(account_num)
 
