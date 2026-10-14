@@ -5,7 +5,7 @@
 - Priority: P2; effort: M; risk: MED; dependencies: none (touches the
   autoswitch ranking, the roster record, the extra's More menu).
 - Planned at: `1a6bfb5`.
-- Status: PROPOSED.
+- Status: PROPOSED. Implementation plan: `plans/019-implementation.md`.
 
 ## Why this matters
 
@@ -139,8 +139,8 @@ unchanged.
 - `openswap list` (`Engine.list_accounts` in `engine/snapshot.py`) shows a
   linked key as "API credit for a@example.com" in the place the sentinel
   note sits today, listed directly after its parent.
-  JSON output (`json_output.py`) gains `"creditFor": <parent slot or null>`
-  on key rows.
+  JSON output (`json_output.py`) gains an additive `"creditFor": <parent
+  slot>` on linked key rows only, like `alias` and `disabled`.
 
 ### 4. Extra: cards and hold line
 
@@ -148,8 +148,9 @@ unchanged.
 - A linked key card is titled "API credit" with subtitle
   "for a@example.com", sorted immediately after its parent card. Unlinked
   keys keep today's card.
-- Settings → Automation copy for the existing include-keys toggle says it
-  applies to keys that are not linked to an account.
+- The `openswap config` help for `autoswitch.includeApiKeyAccounts` says it
+  applies to keys that are not linked to an account (the popover has no
+  toggle for it).
 
 ### 5. Extra: Add from token page
 
@@ -226,7 +227,7 @@ unchanged.
   Code reports that error itself; the engine stays on the key until a
   subscription recovers. Follow-up to file on acceptance of this plan: a
   cheap validity probe through the token-count endpoint, surfaced as a
-  sentinel like `token expired`.
+  sentinel like `token expired` (filed as mar3co/openswap#97).
 - The link cannot be verified against the key's organization.
 - Extra-usage overflow on the same login (Anthropic's `/extra-usage`) is a
   different mechanism and is not addressed here.
