@@ -1690,6 +1690,7 @@ class SnapshotMixin:
             if is_active:
                 active_num = num
             entry = entries[str(num)]
+            parent = self._credit_parent_in(seq_data, str(num))
             # JSON carries the decision-grade value: last-good only while it is
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
@@ -1703,6 +1704,7 @@ class SnapshotMixin:
                     last_good_usage=entry.last_good,
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    credit_for=int(parent) if parent is not None else None,
                 )
             )
         payload = {
@@ -1767,6 +1769,9 @@ class SnapshotMixin:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
+            parent = self._credit_parent_in(seq_data, str(num))
+            if parent is not None:
+                markers += f" {muted(f'(API credit for {self.account_email(parent)})')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")

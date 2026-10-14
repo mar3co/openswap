@@ -817,7 +817,7 @@ class TestCLICommands:
             cli.main()
 
         mock_add.assert_called_once_with(
-            token="sk-ant-oat01-abc", email=None, slot=None
+            token="sk-ant-oat01-abc", email=None, slot=None, credit_for=None
         )
 
     def test_email_without_add_token_errors(self, capsys):
@@ -841,7 +841,7 @@ class TestCLICommands:
             cli.main()
 
         mock_add.assert_called_once_with(
-            token="mytoken", email="u@example.com", slot=None
+            token="mytoken", email="u@example.com", slot=None, credit_for=None
         )
 
     def test_add_token_with_slot(self, temp_home: Path, capsys):
@@ -857,8 +857,28 @@ class TestCLICommands:
             cli.main()
 
         mock_add.assert_called_once_with(
-            token="tok", email="u@example.com", slot=3
+            token="tok", email="u@example.com", slot=3, credit_for=None
         )
+
+    def test_add_token_for_dispatches_credit_for(self, temp_home: Path, capsys):
+        from openswap.switcher import ClaudeAccountSwitcher
+
+        with patch.object(
+            sys, "argv", ["openswap", "add-token", "sk-ant-api03-x", "--for", "work"],
+        ), patch.object(
+            ClaudeAccountSwitcher, "add_account_from_token"
+        ) as mock_add:
+            cli.main()
+
+        mock_add.assert_called_once_with(
+            token="sk-ant-api03-x", email=None, slot=None, credit_for="work"
+        )
+
+    def test_for_without_add_token_errors(self, capsys):
+        with patch.object(sys, "argv", ["openswap", "list", "--for", "1"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        assert "--for can only be used with 'add-token'" in capsys.readouterr().err
 
     def test_add_token_in_help(self):
         """The add-token subcommand and the still-visible --email modifier appear."""

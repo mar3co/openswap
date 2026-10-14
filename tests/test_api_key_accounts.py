@@ -253,7 +253,7 @@ class TestUsageDisplay:
         assert entry.decision_value() == USAGE_API_KEY
 
 
-class TestStrategyBehaviour:
+class TestStrategyBehavior:
     """API-key accounts are never *rate-limited* (next-available can fall back to
     them), but `best` must NOT auto-prefer them — they have no measurable quota and
     jumping to one would silently spend paid per-token credits."""
@@ -989,7 +989,7 @@ class TestTheSalvageKeepsItsPromise:
         will not run at all", which is strictly worse than the bug it fixes.
 
         Asserts the NAME, not that the copy succeeds: `:` is a perfectly good
-        filename character on Linux, so a behavioural test is green here and
+        filename character on Linux, so a behavioral test is green here and
         red only on the platform nobody runs locally. The forbidden set is
         Windows', a superset of POSIX's — a name legal there is legal
         everywhere openswap runs.
@@ -1291,6 +1291,20 @@ class TestCreditLink:
         data["accounts"]["1"]["creditFor"] = {"email": None, "organizationUuid": ""}
         s._write_json(s.sequence_file, data)
         assert s.credit_parent_for("1") is None
+
+    def test_list_shows_credit_marker_and_json_field(self, temp_home: Path, capsys):
+        s = _linux_switcher()
+        _seed_oauth(s, 1, "a@example.com")
+        s.add_account_from_token(API_KEY, credit_for="1")
+        capsys.readouterr()
+        s.list_accounts(fetch=set())
+        out = capsys.readouterr().out
+        assert "(API credit for a@example.com)" in out
+        payload = s.list_accounts(json_output=True, fetch=set())
+        rows = {row["number"]: row for row in payload["accounts"]}
+        assert rows[2]["creditFor"] == 1
+        assert "creditFor" not in rows[1]
+        assert [row["number"] for row in payload["accounts"]] == [1, 2]
 
 def test_order_keys_after_parents_keeps_strays():
     from openswap.engine.slots import order_keys_after_parents

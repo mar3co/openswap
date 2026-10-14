@@ -1524,7 +1524,7 @@ Claude accounts:
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        save the current login as an account
-  %(prog)s add-token [TOKEN|-]        register an API key or setup-token
+  %(prog)s add-token [TOKEN|-] [--for ID]  register an API key or setup-token
   %(prog)s remove <num|email>         remove an account (alias: rm)
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
@@ -1566,6 +1566,7 @@ Other:
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-api03-... --email me@example.com
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
+  %(prog)s add-token sk-ant-api03-... --for 2   # API credit for account 2
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
 
@@ -1630,6 +1631,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "defaults to setup-token-{slot}@token.local (or "
             "api-key-{slot}@token.local for API keys) since these tokens "
             "carry no real email metadata."
+        ),
+    )
+    parser.add_argument(
+        "--for",
+        dest="credit_for",
+        metavar="NUM|EMAIL|ALIAS",
+        help=(
+            "With 'add-token': link this API key to a subscription account as "
+            "its API credit. Auto-switch uses it when every subscription is out "
+            "of quota and returns to a subscription once one has room."
         ),
     )
     parser.add_argument(
@@ -1811,6 +1822,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with 'add-token'")
 
+    if args.credit_for is not None and args.add_token is None:
+        parser.error("--for can only be used with 'add-token'")
+
     if args.account is not None and not args.export:
         parser.error("--account can only be used with 'export'")
 
@@ -1865,6 +1879,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 token=args.add_token,
                 email=args.email,
                 slot=args.slot,
+                credit_for=args.credit_for,
             )
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
