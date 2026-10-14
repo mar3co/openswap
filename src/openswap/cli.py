@@ -1639,8 +1639,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         metavar="NUM|EMAIL|ALIAS",
         help=(
             "With 'add-token': link this API key to a subscription account as "
-            "its API credit. Auto-switch uses it when every subscription is out "
-            "of quota and returns to a subscription once one has room."
+            "its API credit. Auto-switch uses it when no subscription has known "
+            "room and returns to a subscription once one has room."
         ),
     )
     parser.add_argument(

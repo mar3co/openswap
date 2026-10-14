@@ -1161,10 +1161,17 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger in ("at-limit", "failover"):
-            # Last resort when we must move: metered API-key accounts
-            # (unmeasurable headroom). Never for a proactive or consume-first
-            # move — those would spend paid credit while quota remains.
+        if (
+            not ordered
+            and api_key_candidates
+            and (
+                trigger == "at-limit"
+                or (trigger == "failover" and (any_known or not oauth_candidates))
+            )
+        ):
+            # Paid credit is the last resort only when no subscription has
+            # known room: at-limit, or a failover where a subscription was
+            # measured this tick or none is in rotation.
             ordered = api_key_candidates
 
         if not ordered and trigger == "credit-return":

@@ -1977,7 +1977,7 @@ class TestApiKeyAccounts:
         self._mark_api_key(h, 2)
         self._link(h, 2, 1)
         outcome = h.tick_with_usage({"1": _usage(91), "2": "api key"})
-        assert outcome in (TickOutcome.NO_ACTION, TickOutcome.BLOCKED)
+        assert outcome is TickOutcome.BLOCKED
         assert not any(isinstance(e, SwitchEvent) for e in h.events)
         assert self._no_switch_reasons(h) == ["no-qualifying-candidate"]
         assert h.switcher.current_account_number() == "1"
@@ -1993,6 +1993,54 @@ class TestApiKeyAccounts:
         assert h.active_number() == 2
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "at-limit"
+
+    def _fail_over(self, h, usage) -> TickOutcome:
+        outcome = None
+        for _ in range(h.settings.unhealthy_ticks):
+            outcome = h.tick_with_usage(usage)
+            h.clock.advance(60)
+        return outcome
+
+    def test_failover_spends_credit_when_peers_are_measured_and_out(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = self._fail_over(h, {"1": None, "2": "api key", "3": _usage(100)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+
+    def test_failover_holds_when_every_peer_is_unreadable(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = self._fail_over(h, {"1": None, "2": "api key", "3": None})
+        assert outcome is TickOutcome.BLOCKED
+        assert self._no_switch_reasons(h)[-1] == "no-comparison"
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.switcher.current_account_number() == "1"
+
+    def test_failover_spends_credit_with_no_subscription_peer(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = self._fail_over(h, {"1": None, "2": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
 
     def test_proactive_with_exhausted_peers_and_key_skips_long_sleep(self, temp_home):
         h = EngineHarness(temp_home)
