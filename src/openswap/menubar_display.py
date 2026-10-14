@@ -2055,6 +2055,15 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 note = f"Stale · last updated {age} · {note}"
         usage = display if isinstance(display, dict) else last_good
         title, subtitle = account_card_names(email, alias, org_name)
+        credit_parent = str((snapshot.get("credit_for") or {}).get(str(num)) or "")
+        if credit_parent:
+            parent_email = next(
+                (str(r[1]) for r in snapshot.get("accounts") or []
+                 if str(r[0]) == credit_parent),
+                "",
+            )
+            title = "API credit"
+            subtitle = f"for {parent_email}" if parent_email else ""
         if is_codex:
             title = f"Codex · {title}"
         as_of = now
@@ -2083,6 +2092,7 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 "active": bool(is_active),
                 "disabled": bool(disabled),
                 "api_key": is_api_key,
+                "credit_for": credit_parent,
                 "note": note,
                 "needs_relogin": needs_relogin,
                 "needs_restore": needs_restore,
@@ -2367,6 +2377,8 @@ def hold_line_from_event(
         return "Holding: no other accounts to switch to."
     if reason == "no-qualifying-candidate":
         return "Holding: no better account yet."
+    if reason == "on-api-credit":
+        return f"Holding on API credit: {detail}." if detail else "Holding on API credit."
     if reason == "active-api-key":
         return "Holding: API-key accounts have no quota to watch."
     if reason == "active-idle":
@@ -2730,6 +2742,7 @@ EMPTY_SNAPSHOT: dict = {
     "active_org": None,
     "identities": {},
     "kinds": {},
+    "credit_for": {},
     "codex_active_num": None,
 }
 
@@ -2756,6 +2769,7 @@ def _adapt_snapshot(snap, codex_snap=None) -> dict:
     active_org = None
     identities: dict[str, tuple[str, str]] = {}
     kinds: dict[str, str] = {}
+    credit_for: dict[str, str] = {}
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
         org_name = getattr(acc, "org_name", "") or ""
@@ -2769,6 +2783,7 @@ def _adapt_snapshot(snap, codex_snap=None) -> dict:
             acc.email, getattr(acc, "org_uuid", "") or "",
         )
         kinds[str(acc.number)] = getattr(acc, "kind", "oauth")
+        credit_for[str(acc.number)] = getattr(acc, "credit_for", "") or ""
         if acc.is_active:
             active_email, active_usage, active_alias = acc.email, display, acc.alias
             active_org = org_name
@@ -2804,6 +2819,7 @@ def _adapt_snapshot(snap, codex_snap=None) -> dict:
         "active_org": active_org,
         "identities": identities,
         "kinds": kinds,
+        "credit_for": credit_for,
         "codex_active_num": codex_active_num,
     }
 

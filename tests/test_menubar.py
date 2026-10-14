@@ -1004,6 +1004,52 @@ def test_panel_accounts_prefers_alias_and_keeps_note():
     assert cards[2]["subtitle"] == "c@x.com"
 
 
+def test_panel_accounts_titles_linked_key_as_api_credit():
+    snap = {
+        "accounts": [
+            (1, "a@x.com", True, _USAGE, _USAGE, "", "", False, None),
+            (2, "api-key-2@token.local", False, "api key", None, "", "", False, None),
+            (3, "api-key-3@token.local", False, "api key", None, "", "", False, None),
+        ],
+        "kinds": {"1": "oauth", "2": "api_key", "3": "api_key"},
+        "credit_for": {"2": "1"},
+    }
+    cards = menubar.panel_accounts(snap)
+    assert cards[1]["title"] == "API credit"
+    assert cards[1]["subtitle"] == "for a@x.com"
+    assert cards[1]["credit_for"] == "1"
+    assert cards[1]["api_key"] is True
+    assert cards[2]["title"] == "personal"
+    assert cards[2]["subtitle"] == "api-key-3@token.local"
+    assert cards[2]["credit_for"] == ""
+
+
+def test_adapt_snapshot_carries_credit_for():
+    from types import SimpleNamespace
+    from openswap.usage_store import UsageEntry
+
+    def acc(number, email, kind, credit_for=""):
+        return SimpleNamespace(
+            number=number, email=email, is_active=False, usage=UsageEntry(),
+            alias="", org_name="", org_uuid="", disabled=False, kind=kind,
+            credit_for=credit_for,
+        )
+
+    snap = SimpleNamespace(accounts=[acc("1", "a@x.com", "oauth"), acc("2", "k@x", "api_key", "1")])
+    adapted = menubar._adapt_snapshot(snap)
+    assert adapted["credit_for"] == {"1": "", "2": "1"}
+
+
+def test_hold_line_on_api_credit():
+    assert menubar.hold_line_from_event(
+        NoSwitchEvent(reason="on-api-credit", detail="no subscription account below 90%"),
+        active_title="API credit", strategy="best",
+    ) == "Holding on API credit: no subscription account below 90%."
+    assert menubar.hold_line_from_event(
+        NoSwitchEvent(reason="on-api-credit"), active_title="API credit", strategy="best",
+    ) == "Holding on API credit."
+
+
 def test_panel_accounts_uses_last_good_when_display_is_a_sentinel():
     snap = {
         "accounts": [
