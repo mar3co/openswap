@@ -1838,4 +1838,4 @@ class TestSetupCommand:
     def test_ctrl_c_exits_130(self, monkeypatch, capsys):
         self._harness(monkeypatch, ["openswap", "setup"], add_raises=KeyboardInterrupt())
         assert self._run() == 130
-        assert "cancelled" in capsys.readouterr().out.lower()
+        assert "canceled" in capsys.readouterr().out.lower()

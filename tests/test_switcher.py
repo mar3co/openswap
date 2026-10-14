@@ -4618,7 +4618,7 @@ class TestDeadTokenQuarantine:
     ):
         """`models=models` at the record call site, not the default `()`.
 
-        `entries()` honours the configured per-model windows when it bounds
+        `entries()` honors the configured per-model windows when it bounds
         429 trust, so a scoped window that ENDS the trust must be visible
         wherever that trust is computed. Defaulted to `()` the window is
         invisible and the row keeps serving data its own reset already killed.
@@ -5236,7 +5236,7 @@ class TestAddAccountSlot:
         # Slot 3 should still be account A
         data = switcher._get_sequence_data()
         assert data["accounts"]["3"]["email"] == "a@example.com"
-        assert "Cancelled" in capsys.readouterr().out
+        assert "Canceled" in capsys.readouterr().out
 
     def test_slot_occupied_overwrite(self, temp_home, capsys):
         """When slot is occupied and user confirms, should overwrite."""
@@ -5318,7 +5318,7 @@ class TestAddAccountSlot:
         data = switcher._get_sequence_data()
         assert data["accounts"]["1"]["email"] == "a@example.com"
         assert data["accounts"]["3"]["email"] == "b@example.com"
-        assert "Cancelled" in capsys.readouterr().out
+        assert "Canceled" in capsys.readouterr().out
 
     def test_slot_must_be_positive(self, temp_home):
         """Slot number must be >= 1."""
@@ -10481,7 +10481,7 @@ class TestConsumeGate:
         where a stash is being written because storage already misbehaved.
 
         `_write_unclaimed_credential`'s own contract is that a failed stash
-        must be LOUD, because callers treat a successful one as the licence to
+        must be LOUD, because callers treat a successful one as the license to
         overwrite the live store.
         """
         s = self._switcher(sample_sequence_data)
@@ -10772,7 +10772,7 @@ class TestConsumeGate:
         be undone by a background poll. The wiped-keychain case keeps its
         documented remedy (re-add).
 
-        Pinned because it is defined behaviour on a path no test covered
+        Pinned because it is defined behavior on a path no test covered
         before, which is exactly the kind that gets "fixed" back.
         """
         from openswap.session import session_dir_for
@@ -11130,7 +11130,7 @@ class TestConsumeGateLockFailures:
         so activating it puts the user on an expired access token that can
         never refresh, and Claude Code logs the account out. Upstream raised
         LockError here, which aborted the tick — safe by accident. Stashing is
-        the better behaviour; reporting it as success is not.
+        the better behavior; reporting it as success is not.
         """
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
@@ -11231,7 +11231,7 @@ class TestPermanentlyUnreadableStashRow:
         the operator needs never renders; ``_DETERMINISTIC_REFRESH_ERRORS``
         decides whether to spend a guaranteed 401 per pass on a token already
         known to be expired. (The third seam, the tick's own message, has a
-        behavioural test in ``tests/test_autoswitch.py``.)
+        behavioral test in ``tests/test_autoswitch.py``.)
         """
         from openswap.oauth import _DETERMINISTIC_REFRESH_ERRORS
         from openswap.switcher import ERROR_NOTES
@@ -12900,7 +12900,7 @@ class TestStashReaderUnreadableVsAbsent:
     Rows A/B/C mirror the review's measured table exactly. The corrupt-entry
     row is a fourth, distinct state: its bytes are genuinely unrecoverable
     (not merely inaccessible right now), so it must keep its CURRENT
-    behaviour byte-identical before and after the fix.
+    behavior byte-identical before and after the fix.
     """
 
     _OLD = json.dumps({
@@ -13006,7 +13006,7 @@ class TestStashReaderUnreadableVsAbsent:
         sys.platform == "win32" or os.geteuid() == 0,
         reason="needs POSIX permission semantics (non-root)",
     )
-    def test_corrupt_entry_keeps_its_current_behaviour(
+    def test_corrupt_entry_keeps_its_current_behavior(
         self, temp_home: Path, sample_sequence_data: dict,
     ):
         """A CORRUPT (undecodable) stash entry is a different defect from an

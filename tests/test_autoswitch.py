@@ -83,7 +83,7 @@ class EngineHarness:
         self.temp_home = temp_home
         # get_backup_root() (switcher.py) resolves via Path.home() on every
         # platform (both its XDG branch and its legacy
-        # get_legacy_backup_root() fallback honour it, paths.py:101-108) —
+        # get_legacy_backup_root() fallback honor it, paths.py:101-108) —
         # but on LINUX/WSL, $XDG_DATA_HOME takes precedence over Path.home()
         # when set (paths.py:102-106). Patching Path.home() alone is not a
         # superset of patching $XDG_DATA_HOME alone: a developer/CI with
@@ -217,7 +217,7 @@ class TestEngineHarnessIsolation:
     guards against is real off Linux (direct probe: two harnesses on
     distinct subtrees collapsed to one store under the legacy
     ~/.claude-swap-backup path, and h1's seeded account silently became
-    h2's). `Path.home()` is honoured by get_backup_root() on EVERY platform
+    h2's). `Path.home()` is honored by get_backup_root() on EVERY platform
     (both its XDG branch and its `get_legacy_backup_root()` fallback —
     paths.py:101-108), so scoping there instead makes the guard, and this
     test, load-bearing everywhere and lets the skipif be deleted.
@@ -1208,7 +1208,7 @@ class TestAdaptiveScheduler:
     def test_an_expired_trust_does_not_turn_one_block_into_a_request_storm(
         self, temp_home
     ):
-        """Spent trust is not a licence to retry; the server's ask still governs.
+        """Spent trust is not a license to retry; the server's ask still governs.
 
         The sibling tests all assert `waited <= trust_left`, which is the
         direction that produced the defect: they are satisfied by a wait of
@@ -2573,7 +2573,7 @@ class TestLoopObeysThePollPlan:
     row to URGENT_INTERVAL_S so the crossing is caught quickly. The loop used
     to sleep ``interval_seconds`` regardless, so on any machine configured
     slower than the plan (360s here, the default) that plan could not be
-    honoured: measured on the linux box mid-episode, the active row asked to
+    honored: measured on the linux box mid-episode, the active row asked to
     be polled 112s ago while the engine still had minutes of sleep left, and
     the account sat over the threshold until the engine was restarted by hand.
     """
@@ -4666,7 +4666,7 @@ class TestHorizonAxisDoesNotFlap:
         """Every sibling anti-flap gate is scoped to the proactive triggers.
 
         `at-limit` and `failover` skip them by design — there we are escaping a
-        dead account, not optimising a return time. The no-return filter ran in
+        dead account, not optimizing a return time. The no-return filter ran in
         `_tick_inner` BEFORE the trigger is consulted, so it stripped the
         candidate from those escapes too.
 
@@ -5001,7 +5001,7 @@ class TestHorizonAxisDoesNotFlap:
     def test_the_bar_never_applies_to_an_escape(self, harness):
         """`at-limit` and `failover` skip every anti-flap gate by design.
 
-        There we are escaping a dead or unreadable active, not optimising a
+        There we are escaping a dead or unreadable active, not optimizing a
         return time — and the account we left may be the only place to go.
         Measured: dropping the trigger check left the full suite green, so
         nothing pinned it. The at-limit half is defended for the wrong reason
@@ -5072,7 +5072,7 @@ class TestHorizonAxisDoesNotFlap:
         `_perform`'s `number: str` while `lastSwitchFrom` comes from
         `account_ref(number: int | None, ...)`. The `landed=2` / `live=2` row
         is the one a bare `==` fails — `2 != "2"` releases a bar that must
-        hold — so the row asserting the HOLD is what pins the normalisation.
+        hold — so the row asserting the HOLD is what pins the normalization.
 
         ABSENT `lastSwitchTo` KEEPS THE BAR: a record written before the key
         existed cannot prove the engine moved away, and this module treats
@@ -5506,7 +5506,7 @@ class TestHorizonAxisDoesNotFlap:
             outcomes.append(h.tick_with_usage({
                 # unchanged since we left it: same headroom, same reset
                 "1": _usage(96, self._days_out(h, 500)),
-                "2": _usage(active_pct, self._days_out(h, 400)),   # active, burnt down
+                "2": _usage(active_pct, self._days_out(h, 400)),   # active, burned down
             }))
             h.clock.advance(301.0)
 
@@ -6075,7 +6075,7 @@ class TestHorizonAxisDoesNotFlap:
         for _ in range(10):
             outcomes.append(h.tick_with_usage({
                 "1": None,                                    # still unreadable
-                "2": _usage(98, self._days_out(h, 400)),       # active, burnt down
+                "2": _usage(98, self._days_out(h, 400)),       # active, burned down
             }))
             h.clock.advance(301.0)
 
@@ -6201,7 +6201,7 @@ class TestHorizonAxisDoesNotFlap:
         for _ in range(10):
             outcomes.append(h.tick_with_usage({
                 "1": _usage(30, self._days_out(h, 10)),   # READABLE, 70 pts
-                "2": _usage(98, self._days_out(h, 400)),  # active burnt to 2 pts
+                "2": _usage(98, self._days_out(h, 400)),  # active burned to 2 pts
             }))
             h.clock.advance(301.0)
 
@@ -6361,7 +6361,7 @@ class TestHorizonAxisDoesNotFlap:
             DMG-b active reset in the PAST, peer back in ~50min-> SWITCHED
 
         POS/NEG must already pass unfixed -- they pin the guard's intended
-        behaviour (both controls invariant, per the review's damage table).
+        behavior (both controls invariant, per the review's damage table).
         DMG-a/DMG-b fail against 5c69ad2 because `isfinite` reads the
         active's `inf` as "unknown" and holds even though the peer is
         inside the horizon.
@@ -6560,7 +6560,7 @@ class TestHorizonAxisDoesNotFlap:
         for _ in range(3):
             outcomes.append(h.tick_with_usage({
                 "1": _usage(96, self._days_out(h, 500)),   # frozen, 4 pts
-                "2": _usage(98, self._days_out(h, 400)),   # active, burnt to 2 pts
+                "2": _usage(98, self._days_out(h, 400)),   # active, burned to 2 pts
             }))
             h.clock.advance(301.0)
         assert TickOutcome.SWITCHED not in outcomes, (
@@ -6728,7 +6728,7 @@ class TestHorizonAxisDoesNotFlap:
         sort FIRST regardless of headroom. `qualifying or fallback` is the
         only thing preventing that, and nothing tested it — measured,
         replacing it with `qualifying + fallback` left the suite green while
-        flipping this scenario 0/3 -> 3/3 in the fallback's favour.
+        flipping this scenario 0/3 -> 3/3 in the fallback's favor.
 
         Active is spent (3 pts). One peer qualifies outright on headroom; one
         margin-failure peer resets sooner. The qualifier must win.
@@ -6750,7 +6750,7 @@ class TestHorizonAxisDoesNotFlap:
         Every account in the fallback is spent, and below SPENT_HEADROOM_PCT a
         headroom edge is under two poll intervals of work. The only real
         question is which account can work again first, which is the same
-        judgement `_recovery_is_useful` makes one gate earlier.
+        judgment `_recovery_is_useful` makes one gate earlier.
 
         Nothing tested it: swapping to `(0, -h, recovery_ts)` left the suite
         green. Exhaustive sweep over 42336 three-account shapes, 558 change
@@ -6914,7 +6914,7 @@ class TestTheReleasePredicateOneStateShapePerTest:
         h.clock.advance(301.0)
         outcome = h.tick_with_usage({
             "1": _usage(96, self._at(h, 500 * 3600)),   # frozen, 4 pts, below floor
-            # active burnt past the bare-ratio boundary
+            # active burned past the bare-ratio boundary
             "2": _usage(98.2, self._at(h, 400 * 3600)),
         })
         assert outcome is not TickOutcome.SWITCHED, (
@@ -7286,7 +7286,7 @@ class TestFreshenRoutesThroughGate:
         oauth.py splits ``invalid_client`` out from ``invalid_grant`` precisely
         because it says nothing about any slot's refresh token — OUR client
         credential was rejected, which is systemic and deterministic. But
-        _freshen_target maps every unrecognised kind to "transient", and a
+        _freshen_target maps every unrecognized kind to "transient", and a
         transient freshen failure surfaces as "could not freshen any candidate
         (network?)". A client_id rotation or block would then present as
         intermittent network trouble on every machine at once, with nothing
@@ -7315,7 +7315,7 @@ class TestFreshenRoutesThroughGate:
         The row is the sole copy of a generation the slot already consumed, so
         the gate defers on every pass — correctly, since nothing on disk tells
         a keychain locked for a minute from one locked forever. But an
-        unrecognised kind maps to "transient", and the tick then renders
+        unrecognized kind maps to "transient", and the tick then renders
         "could not freshen any candidate (network?)" forever, on a condition
         no network change can affect and only the operator can clear.
         """

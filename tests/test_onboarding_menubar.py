@@ -24,7 +24,7 @@ def app(monkeypatch):
     instance._login_session = None
     instance._login_ui_state = {"stage": "idle"}
     instance._login_save_result = None
-    instance._login_cancelled_session = None
+    instance._login_canceled_session = None
     instance._event_lock = threading.Lock()
     instance._hold_reload_pending = False
     instance._show_login_panel = Mock()
@@ -105,7 +105,7 @@ def test_cancel_cleanup_finishes_before_ui_returns_to_idle(app):
     session = Mock()
     app._login_session = session
     app._on_login_action("cancel")
-    assert app._login_ui_state == {"stage": "cancelling"}
+    assert app._login_ui_state == {"stage": "canceling"}
     app._on_login_action("start")
     app.factory.assert_not_called()
     app._login_cancel_worker(session)
@@ -120,7 +120,7 @@ def test_stale_completion_does_not_replace_new_attempt(app):
     old, current = Mock(), Mock()
     current.state.return_value = {"stage": "waiting"}
     app._login_session = current
-    app._login_cancelled_session = old
+    app._login_canceled_session = old
     app._login_save_result = (old, "2", None)
     app._poll_login()
     assert app._login_session is current
@@ -153,7 +153,7 @@ def test_missing_native_panel_never_starts_invisible_login(app):
     app._show_error.assert_called_once()
 
 
-def test_constructor_error_can_be_cancelled_without_session(app):
+def test_constructor_error_can_be_canceled_without_session(app):
     app.factory.side_effect = RuntimeError("private details")
     app._on_login_action("start")
     assert app._login_ui_state["stage"] == "error"
@@ -162,9 +162,9 @@ def test_constructor_error_can_be_cancelled_without_session(app):
     assert app._login_ui_state == {"stage": "idle"}
 
 
-def test_cancelled_state_can_be_dismissed(app):
+def test_canceled_state_can_be_dismissed(app):
     app._login_session = Mock()
-    app._login_ui_state = {"stage": "cancelled"}
+    app._login_ui_state = {"stage": "canceled"}
     app._on_login_action("dismiss")
     assert app._login_session is None
     assert app._login_ui_state == {"stage": "idle"}

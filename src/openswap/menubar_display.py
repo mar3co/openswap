@@ -2244,7 +2244,7 @@ def login_panel_state(state: dict | None) -> dict:
     """
     raw = state if isinstance(state, dict) else {}
     stage = str(raw.get("stage") or "idle").lower()
-    if stage not in {"idle", "starting", "waiting", "ready", "error", "cancelled", "saving", "cancelling", "saved"}:
+    if stage not in {"idle", "starting", "waiting", "ready", "error", "canceled", "saving", "canceling", "saved"}:
         stage = "error"
     email = str(raw.get("email") or "").strip()
     plan = str(raw.get("plan") or "").strip()
@@ -2290,13 +2290,13 @@ def login_panel_state(state: dict | None) -> dict:
         result.update(title="Save this account?", body="", actions=["save", "cancel"])
     elif stage == "error":
         result.update(title="Sign-in didn’t finish", body=message or "Try again.", actions=["retry", "cancel"] + ([] if mode == "device" else ["device"]))
-    elif stage == "cancelled":
+    elif stage == "canceled":
         result.update(title="Sign-in canceled", body="", actions=["start", "dismiss"])
     elif stage == "saved":
         result.update(title="Account saved", body="Ready to use.", actions=["dismiss"])
     elif stage == "saving":
         result.update(title="Saving account…", body="", actions=[])
-    elif stage == "cancelling":
+    elif stage == "canceling":
         result.update(title="Canceling sign-in…", body="", actions=[])
     return result
 
@@ -2504,7 +2504,7 @@ def format_title(
 def format_menu_bar_title(
     snapshot: dict, settings: MenuBarSettings, now: float | None = None
 ) -> str:
-    """Provider-labelled status text, independent of the popover's selected tab.
+    """Provider-labeled status text, independent of the popover's selected tab.
 
     ChatGPT shares the selected Codex credential, but its desktop session is not
     verified by that file. Name that limitation instead of presenting the CLI's

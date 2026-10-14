@@ -576,7 +576,7 @@ class CodexEngine:
                 f"Account-{num} ({email})? [y/N] "
             )
             if confirm.lower() != "y":
-                print(dimmed("Cancelled"))
+                print(dimmed("Canceled"))
                 return
         with AccountLeaseStore(self.backup_dir, "codex").mutation_guard() as lease_guard:
             lease_guard.assert_unleased()

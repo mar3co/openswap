@@ -229,7 +229,7 @@ def _unclaimed_command(argv: list[str]) -> None:
         error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print(f"\n{dimmed('Operation cancelled')}")
+        print(f"\n{dimmed('Operation canceled')}")
         sys.exit(130)
 
 
@@ -274,7 +274,7 @@ Examples:
         error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print(f"\n{dimmed('Operation cancelled')}")
+        print(f"\n{dimmed('Operation canceled')}")
         sys.exit(130)
 
 
@@ -327,7 +327,7 @@ Examples:
         error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print(f"\n{dimmed('Operation cancelled')}")
+        print(f"\n{dimmed('Operation canceled')}")
         sys.exit(130)
 
 
@@ -402,7 +402,7 @@ Examples:
         error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print(f"\n{dimmed('Operation cancelled')}")
+        print(f"\n{dimmed('Operation canceled')}")
         sys.exit(130)
 
 
@@ -719,7 +719,7 @@ def _codex_command(argv: list[str]) -> int:
         error(f"Error: {e}")
         return 1
     except KeyboardInterrupt:
-        print(f"\n{dimmed('Operation cancelled')}")
+        print(f"\n{dimmed('Operation canceled')}")
         return 130
     return 1
 
@@ -1068,7 +1068,7 @@ Examples:
         sys.exit(1)
     except KeyboardInterrupt:
         print(
-            f"\n{dimmed('Operation cancelled')}",
+            f"\n{dimmed('Operation canceled')}",
             file=sys.stderr if json_mode else sys.stdout,
         )
         sys.exit(130)
@@ -1246,7 +1246,7 @@ def _setup_command(argv: list[str]) -> int:
         error("Retry the extra with: openswap menubar --install-service")
         return 1
     except KeyboardInterrupt:
-        print(f"\n{dimmed('Operation cancelled')}")
+        print(f"\n{dimmed('Operation canceled')}")
         if saved:
             print(dimmed("Your Claude account was saved."))
         elif not_saved is not None:
@@ -1610,7 +1610,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     parser.add_argument(
         "--token-status",
         action="store_true",
-        help="Show source-labelled OAuth token diagnostics (use with 'list')",
+        help="Show source-labeled OAuth token diagnostics (use with 'list')",
     )
     parser.add_argument(
         "--json",
@@ -1876,7 +1876,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         try:
             sys.exit(run_self_upgrade())
         except KeyboardInterrupt:
-            print(f"\n{dimmed('Upgrade cancelled')}")
+            print(f"\n{dimmed('Upgrade canceled')}")
             sys.exit(130)
 
     # Initialize switcher and dispatch under a single error handler so
@@ -1987,7 +1987,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         # Route the cancellation note to stderr in JSON mode so stdout stays
         # parseable (the guarantee covers completion / handled errors, not Ctrl-C).
         print(
-            f"\n{dimmed('Operation cancelled')}",
+            f"\n{dimmed('Operation canceled')}",
             file=sys.stderr if args.json else sys.stdout,
         )
         sys.exit(130)

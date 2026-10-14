@@ -29,7 +29,7 @@ Settings → General → Menu bar → **Show** selects **Claude**, **ChatGPT**, 
 After a successful manual or automatic switch in the extra (including widget
 commands and ChatGPT desktop completion), the menu-bar mark's two halves
 exchange vertical positions, then flip horizontally back into the original
-logo. The sequence takes 1.05 seconds. Account text stays still. Cancelled, failed,
+logo. The sequence takes 1.05 seconds. Account text stays still. Canceled, failed,
 already-active, and dry-run switches do not animate. The animation respects
 macOS Reduce Motion and coalesces switches that finish together.
 

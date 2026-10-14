@@ -102,7 +102,7 @@ def test_codex_remove_cancel_does_not_claim_success(temp_home, capsys, monkeypat
     monkeypatch.setattr("builtins.input", lambda *_a, **_k: "n")
     assert run_cli(["codex", "remove", "1"]) == 0
     out = capsys.readouterr().out
-    assert "Cancelled" in out
+    assert "Canceled" in out
     assert "Removed" not in out
     assert (paths.get_backup_root() / "codex" / "slots" / "1" / "auth.json").exists()
 

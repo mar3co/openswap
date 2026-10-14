@@ -1361,7 +1361,7 @@ class SlotsMixin:
                         print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
                     choice = input("Enter account number to remove: ").strip()
                     if not choice.isdigit() or choice not in matches:
-                        print(dimmed("Cancelled"))
+                        print(dimmed("Canceled"))
                         return
                     identifier = choice
 
@@ -1394,7 +1394,7 @@ class SlotsMixin:
                 f"Account-{account_num} ({email})? [y/N] "
             )
             if confirm.lower() != "y":
-                print(dimmed("Cancelled"))
+                print(dimmed("Canceled"))
                 return
 
         with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:

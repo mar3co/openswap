@@ -1382,7 +1382,7 @@ class AutoSwitchEngine:
         `not recovered` return below fires before the ratio leg is read, and
         `recovered` is False because account 1 was 4 pts at departure too.
         The engine then holds the worse account until the at-limit escape.
-        Both sides are `str`-normalised: `lastSwitchTo` is a `str` from
+        Both sides are `str`-normalized: `lastSwitchTo` is a `str` from
         `_perform` and `lastSwitchFrom` an `int` from `account_ref`. A state
         record written before `lastSwitchTo` existed has no such key and
         cannot prove the engine moved away, so it KEEPS the bar — the same
@@ -1601,7 +1601,7 @@ class AutoSwitchEngine:
         # swept fleets, both directions. `leftTrigger` records the actual
         # trigger so this never has to guess again; a record written before
         # this field existed has no such key, so fall back to the old
-        # two-null inference for it (unchanged behaviour for pre-upgrade
+        # two-null inference for it (unchanged behavior for pre-upgrade
         # state).
         left_trigger = state.get("leftTrigger")
         is_failover_snapshot = (
@@ -1898,7 +1898,7 @@ class AutoSwitchEngine:
                 #
                 # Scoped to the SAME triggers as the gate above: at-limit and
                 # failover skip that gate deliberately, because there we are
-                # escaping a dead account rather than optimising a return time.
+                # escaping a dead account rather than optimizing a return time.
                 # `recovery_ts` in BOTH tiers. Tier 1 hard-coded 0.0 there,
                 # which threw away a fact already in hand: two peers with equal
                 # headroom past the horizon then tied, and the tie fell through

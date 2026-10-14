@@ -205,7 +205,7 @@ def run(switcher, codex=None) -> int:
             self._login_session = None
             self._login_ui_state = {"stage": "idle"}
             self._login_save_result = None
-            self._login_cancelled_session = None
+            self._login_canceled_session = None
             self._kickoff_results = None
             self._kickoff_retry_after: float | None = None
             self._kickoff_notified_failure = None
@@ -1419,7 +1419,7 @@ def run(switcher, codex=None) -> int:
         def _on_login_action(self, action, alias=None):
             if self._desktop_switching:
                 return
-            if self._login_ui_state.get("stage") in ("saving", "cancelling"):
+            if self._login_ui_state.get("stage") in ("saving", "canceling"):
                 return
             session = self._login_session
             if action in ("start", "retry", "device"):
@@ -1428,7 +1428,7 @@ def run(switcher, codex=None) -> int:
                 if self._panel is None:
                     self._show_error("Sign-in needs the account panel. Restart OpenSwap and try again.")
                     return
-                if action == "start" and session is not None and session.state().get("stage") != "cancelled":
+                if action == "start" and session is not None and session.state().get("stage") != "canceled":
                     self._show_login_panel()
                     return
                 from openswap.codex.onboarding import LoginSession
@@ -1451,7 +1451,7 @@ def run(switcher, codex=None) -> int:
                 if session is None:
                     self._login_ui_state = {"stage": "idle"}
                 else:
-                    self._login_ui_state = {"stage": "cancelling"}
+                    self._login_ui_state = {"stage": "canceling"}
                     threading.Thread(target=self._login_cancel_worker, args=(session,), daemon=True).start()
             elif action == "save" and session is not None:
                 if session.state().get("stage") != "ready":
@@ -1460,7 +1460,7 @@ def run(switcher, codex=None) -> int:
                 self._hold_reload_pending = True
                 threading.Thread(target=self._login_save_worker, args=(session, alias), daemon=True).start()
             elif action == "dismiss":
-                if self._login_ui_state.get("stage") in ("saved", "cancelled"):
+                if self._login_ui_state.get("stage") in ("saved", "canceled"):
                     self._login_session = None
                     self._login_ui_state = {"stage": "idle"}
                     self._hold_reload_pending = True
@@ -1486,7 +1486,7 @@ def run(switcher, codex=None) -> int:
         def _login_cancel_worker(self, session):
             session.cancel()
             with self._event_lock:
-                self._login_cancelled_session = session
+                self._login_canceled_session = session
 
         def _login_save_worker(self, session, alias):
             try:
@@ -1501,11 +1501,11 @@ def run(switcher, codex=None) -> int:
 
         def _poll_login(self):
             with self._event_lock:
-                cancelled = self._login_cancelled_session
-                self._login_cancelled_session = None
+                canceled = self._login_canceled_session
+                self._login_canceled_session = None
                 result = self._login_save_result
                 self._login_save_result = None
-            if cancelled is self._login_session and cancelled is not None:
+            if canceled is self._login_session and canceled is not None:
                 self._login_session = None
                 self._login_ui_state = {"stage": "idle"}
                 self._hold_reload_pending = True
@@ -1519,7 +1519,7 @@ def run(switcher, codex=None) -> int:
                     self.refresh_async()
                 self._hold_reload_pending = True
                 return
-            if self._login_session is None or self._login_ui_state.get("stage") in ("saving", "cancelling", "saved"):
+            if self._login_session is None or self._login_ui_state.get("stage") in ("saving", "canceling", "saved"):
                 return
             state = self._login_session.state()
             # Keep save errors visible until the user chooses Retry or Cancel.

@@ -43,7 +43,7 @@ class SwitchMixin:
         ``add_account`` verifies a credential over the network and then reads
         ``.claude.json`` again for the bytes it stores. A ``/login`` landing in
         that window puts one account's identity on another's credential -- the
-        same LABELLED-one/CONTAINS-another shape
+        same LABELED-one/CONTAINS-another shape
         ``_reject_foreign_credential_capture`` exists to close, by a different
         door. BOTH write paths need this: ``slot=None`` on a registered account
         is the branch the menu bar and a bare ``--add-account`` take.
@@ -105,7 +105,7 @@ class SwitchMixin:
         and the slot received a different account's token — an ssh session had
         ``.claude.json`` renamed to the new profile while the live keychain
         item still held the original account's credential. The slot ends up
-        LABELLED one account and CONTAINING another, so every later switch to
+        LABELED one account and CONTAINING another, so every later switch to
         it logs the wrong user in and ``--status`` shows a name that is not
         whose token is stored. Nothing surfaces the disagreement.
 
@@ -481,10 +481,10 @@ class SwitchMixin:
                         try:
                             answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
                         except (EOFError, KeyboardInterrupt):
-                            print(f"\n{dimmed('Cancelled')}")
+                            print(f"\n{dimmed('Canceled')}")
                             return
                         if answer not in ("y", "yes"):
-                            print(dimmed("Cancelled"))
+                            print(dimmed("Canceled"))
                             return
                     displace_slot = (
                         account_num,
@@ -852,10 +852,10 @@ class SwitchMixin:
                         try:
                             answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
                         except (EOFError, KeyboardInterrupt):
-                            print(f"\n{dimmed('Cancelled')}")
+                            print(f"\n{dimmed('Canceled')}")
                             return
                         if answer not in ("y", "yes"):
-                            print(dimmed("Cancelled"))
+                            print(dimmed("Canceled"))
                             return
                     displace_slot = (
                         account_num,
@@ -1017,7 +1017,7 @@ class SwitchMixin:
           its limit (switching would not help) → stay
         - ``(None, "none")`` — no other switchable account exists
 
-        Ties (including current-vs-other) resolve in favour of staying put.
+        Ties (including current-vs-other) resolve in favor of staying put.
         Never raises on network failure.
         """
         data = self._get_sequence_data() or {}
@@ -1073,7 +1073,7 @@ class SwitchMixin:
             f"({current_email}) to managed list? [Y/n] "
         )
         if response.lower() == "n":
-            print(dimmed("Setup cancelled. You can run 'openswap --add-account' later."))
+            print(dimmed("Setup canceled. You can run 'openswap --add-account' later."))
             return
 
         self.add_account()
@@ -1532,7 +1532,7 @@ class SwitchMixin:
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
         ``force_if_live_missing`` narrows that recovery for stale UI actions:
-        the force is cancelled under the credential locks if usable live
+        the force is canceled under the credential locks if usable live
         credentials appeared after the card snapshot was taken.
         """
         if force_if_live_missing and not force:
@@ -1572,7 +1572,7 @@ class SwitchMixin:
                         print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
                     choice = input("Enter account number to switch to: ").strip()
                     if not choice.isdigit() or choice not in matches:
-                        print(dimmed("Cancelled"))
+                        print(dimmed("Canceled"))
                         return None
                     identifier = choice
 
@@ -2248,7 +2248,7 @@ class SwitchMixin:
                     # a working install whose config just tore: measured, both
                     # reach this line with `current_account` set and
                     # `_get_current_account()` None. So keep upstream's
-                    # behaviour and stop it being LOSSY: the bytes survive next
+                    # behavior and stop it being LOSSY: the bytes survive next
                     # to the config, named, and the switch still lands.
                     existing_config = (
                         self._read_json(config_path) if config_path.exists() else None
