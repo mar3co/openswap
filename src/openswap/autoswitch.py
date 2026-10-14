@@ -616,7 +616,7 @@ def _ref(number: str, email: str) -> dict:
 def record_manual_switch(backup_dir: Path, *, now: float | None = None) -> None:
     """Stamp ``lastSwitchAt`` so the engine's cooldown covers a hand switch.
 
-    A hand switch from the extra does not go through
+    A hand switch from the extra or the CLI does not go through
     ``AutoSwitchEngine._perform``, so without this the next tick can undo
     it (especially consume-first).
     Only ``lastSwitchAt`` is written and ``creditPlacedOn`` cleared (the user

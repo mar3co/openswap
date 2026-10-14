@@ -4324,7 +4324,7 @@ class TestSwitchToSelfSlotAndForce:
             for p in patches:
                 p.stop()
 
-        assert result is None
+        assert result["reason"] == "activated" and result["switched"] is False
         assert live["creds"] == self.IMPORTED_1
         assert creds[("1", "test@example.com")] == self.IMPORTED_1
         data = switcher._get_sequence_data()
@@ -9118,9 +9118,10 @@ class TestSwitchRemoveGatesAcceptAlias:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         with patch.object(switcher, "_perform_switch", return_value={
-            "from": None, "to": {"number": 2}, "warnings": [],
+            "from": None, "to": {"number": 2, "email": "dev@example.com"}, "warnings": [],
         }) as perform:
-            switcher.switch_to("dev")
+            result = switcher.switch_to("dev")
+        assert result["switched"] is True and result["to"]["number"] == 2
         perform.assert_called_once_with(
             "2", emit_output=True, force_activate=False, provenance=None,
         )

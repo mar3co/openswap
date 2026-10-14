@@ -435,6 +435,37 @@ class TestCLI:
             "2", json_output=False, force=True
         )
 
+    def test_cli_switch_stamps_the_engine_state(self, temp_home: Path):
+        """A CLI hand switch starts the cooldown and ends the engine's key ownership."""
+        from openswap.autoswitch import STATE_FILENAME
+        from openswap.switcher import ClaudeAccountSwitcher
+
+        state_path = ClaudeAccountSwitcher().backup_dir / STATE_FILENAME
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({"creditPlacedOn": "2"}))
+        with patch.object(sys, "argv", ["openswap", "--switch-to", "1"]), \
+             patch.object(ClaudeAccountSwitcher, "switch_to", return_value={"switched": True}), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("openswap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        state = json.loads(state_path.read_text())
+        assert "lastSwitchAt" in state
+        assert "creditPlacedOn" not in state
+
+    def test_cli_switch_noop_does_not_stamp(self, temp_home: Path):
+        from openswap.autoswitch import STATE_FILENAME
+        from openswap.switcher import ClaudeAccountSwitcher
+
+        state_path = ClaudeAccountSwitcher().backup_dir / STATE_FILENAME
+        with patch.object(sys, "argv", ["openswap", "--switch-to", "1"]), \
+             patch.object(ClaudeAccountSwitcher, "switch_to", return_value={"switched": False}), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("openswap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        assert not state_path.exists()
+
     def test_switch_to_without_force_forwards_false(self):
         """Plain --switch-to forwards force=False."""
         with patch("openswap.cli.ClaudeAccountSwitcher") as switcher_cls, \
@@ -1061,12 +1092,13 @@ class TestJsonOutputCli:
         out = capsys.readouterr().out
         assert json.loads(out) == payload  # exactly one JSON object, no extra text
 
-    def test_switch_json_forwarded_and_serialized(self, capsys):
+    def test_switch_json_forwarded_and_serialized(self, capsys, tmp_path):
         payload = {"schemaVersion": 1, "switched": True}
         with patch("openswap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch.object(sys, "argv", ["openswap", "--switch", "--json"]), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch("openswap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.backup_dir = tmp_path
             switcher_cls.return_value.switch.return_value = payload
             cli.main()
 
@@ -1075,7 +1107,7 @@ class TestJsonOutputCli:
         )
         assert json.loads(capsys.readouterr().out) == payload
 
-    def test_switch_json_carries_model_fields_when_in_effect(self, capsys):
+    def test_switch_json_carries_model_fields_when_in_effect(self, capsys, tmp_path):
         """Additive models/modelSource fields make a model-steered pick
         auditable from scripts too."""
         payload = {"schemaVersion": 1, "switched": True}
@@ -1086,6 +1118,7 @@ class TestJsonOutputCli:
              ]), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch("openswap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.backup_dir = tmp_path
             switcher_cls.return_value.switch.return_value = payload
             cli.main()
 

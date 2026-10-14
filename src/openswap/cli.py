@@ -572,6 +572,7 @@ def _codex_command(argv: list[str]) -> int:
                 result = eng.switch(
                     strategy=args.strategy, json_output=args.json, force=args.force
                 )
+            _stamp_hand_switch(eng.state_dir, result)
             if args.json:
                 print(json.dumps(result, indent=2))
             elif result:
@@ -1426,6 +1427,22 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _stamp_hand_switch(state_dir, payload) -> None:
+    """A CLI switch is a hand switch: start the engine's cooldown and end its
+    ownership of a key landing, exactly as the extra does after a card click.
+    The switch has already happened, so a failed stamp is a warning, not an
+    error."""
+    if not (isinstance(payload, dict) and payload.get("switched")):
+        return
+    from openswap.autoswitch import record_manual_switch
+    from openswap.exceptions import LockError
+
+    try:
+        record_manual_switch(state_dir)
+    except (LockError, OSError) as e:
+        warning(f"Switched, but could not record it for auto-switch: {e}")
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1923,10 +1940,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             if payload is not None and models:
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
+            _stamp_hand_switch(switcher.backup_dir, payload)
         elif args.switch_to:
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )
+            _stamp_hand_switch(switcher.backup_dir, payload)
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:

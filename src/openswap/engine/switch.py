@@ -1225,10 +1225,7 @@ class SwitchMixin:
                     )
                 target = fallback
             op = self._perform_switch(target, emit_output=not json_output)
-            return (
-                self._switch_result_from_op(op, strategy_label, warnings)
-                if json_output else None
-            )
+            return self._switch_result_from_op(op, strategy_label, warnings)
 
         current_email, current_org_uuid = identity
 
@@ -1291,10 +1288,7 @@ class SwitchMixin:
             )
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
-                return (
-                    self._switch_result_from_op(op, strategy_label, warnings)
-                    if json_output else None
-                )
+                return self._switch_result_from_op(op, strategy_label, warnings)
             if note == "current-unavailable":
                 if json_output:
                     return self._switch_noop(
@@ -1511,10 +1505,7 @@ class SwitchMixin:
         op = self._perform_switch(
             next_account, emit_output=not json_output, provenance=provenance
         )
-        return (
-            self._switch_result_from_op(op, strategy_label, warnings)
-            if json_output else None
-        )
+        return self._switch_result_from_op(op, strategy_label, warnings)
 
     def switch_to(
         self,
@@ -1647,7 +1638,7 @@ class SwitchMixin:
                 warnings=op["warnings"],
             )
         else:
-            result = self._switch_result_from_op(op, "direct") if json_output else None
+            result = self._switch_result_from_op(op, "direct")
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
         # A cross-slot force stays "switched": reason reports the outcome, not
