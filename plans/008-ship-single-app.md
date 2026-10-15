@@ -142,7 +142,7 @@ path; unfrozen behaviour unchanged (existing tests still pass).
   with the same keys the CLI prints (`app`, `label`, `plist` may be empty).
   `uninstall_widget()` when frozen: `pluginkit -r` only; never delete the
   bundle. `widget_status()` when frozen: report the appex registration
-  (`pluginkit -m -i com.opensoft.openswap.widget.extension`).
+  (`pluginkit -m -D -v -i com.opensoft.openswap.widget.extension`).
 
 **Verify**: tests in `tests/test_widget_snapshot.py` and
 `tests/test_widget_install.py` with subprocess fakes: frozen reload runs the
@@ -212,7 +212,9 @@ pointing at the bundle is left alone.
    checksum matches).
 5. On the operator's Mac (uv install present): same, and confirm Step 5's
    migration left one extra running and one widget provider
-   (`pluginkit -m -i com.opensoft.openswap.widget.extension` shows one path).
+   (`pluginkit -m -D -v -i com.opensoft.openswap.widget.extension` shows one
+   path; without `-D` pluginkit reports only the last instance of the highest
+   version, so a duplicate would not show).
 6. Bump again, release, `brew upgrade --cask openswap`: the extra restarts on
    the new build (`launchctl print gui/$(id -u)/com.opensoft.openswap.menubar`
    shows a new pid and the bundle path). If it does not, the cask's

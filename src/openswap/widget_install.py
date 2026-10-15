@@ -462,8 +462,12 @@ def uninstall_widget(home: Path | None = None, uid: int | None = None) -> dict:
 
 def _appex_registrations() -> list[str]:
     """One entry per registered copy of the appex: its path when pluginkit
-    prints one, else the line itself."""
-    proc = _pluginkit("-m", "-v", "-i", bundle.APPEX_ID)
+    prints one, else the line itself.
+
+    ``-D`` lists every physical copy; without it pluginkit returns only the
+    last instance of the highest version, which hides a duplicate provider.
+    """
+    proc = _pluginkit("-m", "-D", "-v", "-i", bundle.APPEX_ID)
     if proc.returncode != 0:
         return []
     found: list[str] = []

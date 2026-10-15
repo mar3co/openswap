@@ -211,19 +211,32 @@ def test_frozen_uninstall_only_unregisters_and_keeps_the_bundle(frozen_darwin, t
 
 
 def test_frozen_status_reports_each_registered_copy(frozen_darwin, tmp_path):
-    # pluginkit prints macOS paths; a literal one keeps this true on Windows CI.
-    appex = "/Applications/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex"
+    """-D lists every physical copy; plain -m hides a duplicate provider."""
+    # pluginkit prints macOS paths; literal ones keep this true on Windows CI.
+    cask = "/Applications/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex"
+    old = "/Users/x/Applications/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex"
     frozen_darwin["runs"].pluginkit_out = (
         "+    com.opensoft.openswap.widget.extension(1.0)\tAAAA\t2026-10-01 10:00:00 +0000\t"
-        f"{appex}\n"
+        f"{cask}\n"
+        "     com.opensoft.openswap.widget.extension(1.0)\tBBBB\t2026-09-01 10:00:00 +0000\t"
+        f"{old}\n"
+        "\n"
     )
     state = wi.widget_status(home=tmp_path)
     assert frozen_darwin["runs"].calls == [
-        ["pluginkit", "-m", "-v", "-i", "com.opensoft.openswap.widget.extension"]
+        ["pluginkit", "-m", "-D", "-v", "-i", "com.opensoft.openswap.widget.extension"]
     ]
     assert state["bundled"] is True
     assert state["registered"] is True
-    assert state["registrations"] == [appex]
+    assert state["registrations"] == [cask, old]
+
+
+def test_frozen_status_with_one_copy(frozen_darwin, tmp_path):
+    cask = "/Applications/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex"
+    frozen_darwin["runs"].pluginkit_out = (
+        f"+    com.opensoft.openswap.widget.extension(1.0)\tAAAA\t2026-10-01 10:00:00 +0000\t{cask}\n"
+    )
+    assert wi.widget_status(home=tmp_path)["registrations"] == [cask]
 
 
 def test_frozen_status_with_nothing_registered(frozen_darwin, tmp_path):
