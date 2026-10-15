@@ -48,6 +48,19 @@ echo "curl $*" >> "$STUB_LOG"
 cat "$STUB_DIR/uv-installer.sh"
 '''
 
+BREW_STUB = r'''#!/bin/sh
+echo "brew $*" >> "$STUB_LOG"
+case "$1" in
+  --prefix) echo "$STUB_DIR/brew-prefix" ;;
+  install)
+    [ -n "${FAIL_BREW_INSTALL:-}" ] && exit 1
+    mkdir -p "$STUB_DIR/brew-prefix/bin"
+    printf '#!/bin/sh\necho "brew-openswap $*" >> "$STUB_LOG"\nexit "${FAIL_SETUP:-0}"\n' > "$STUB_DIR/brew-prefix/bin/openswap"
+    chmod +x "$STUB_DIR/brew-prefix/bin/openswap"
+    ;;
+esac
+'''
+
 UV_INSTALLER = r'''#!/bin/sh
 [ -n "${FAIL_UV_INSTALLER:-}" ] && exit 1
 [ -n "${UV_INSTALLER_NOOP:-}" ] && exit 0
@@ -76,6 +89,7 @@ def run_installer(
     clt: bool = True,
     uv: bool = True,
     bin_on_path: bool = True,
+    brew: bool = False,
     env: dict[str, str] | None = None,
     script_text: str | None = None,
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
@@ -99,6 +113,8 @@ def run_installer(
     (stubs / "uv.stub").write_text(UV_STUB)
     if uv:
         _write(stubs / "uv", UV_STUB)
+    if brew:
+        _write(stubs / "brew", BREW_STUB)
 
     path = [str(stubs)]
     if bin_on_path:
@@ -290,3 +306,43 @@ class TestInstallScript:
         assert proc.returncode == 1
         assert "xcode-select --reset" in proc.stderr
         assert "dialog" not in proc.stderr
+
+
+class TestHomebrewPath:
+    """With Homebrew the installer installs the app cask instead of cloning."""
+
+    def test_homebrew_installs_the_cask_and_runs_its_setup(self, tmp_path):
+        proc, calls = run_installer(tmp_path, brew=True)
+        assert proc.returncode == 0, proc.stderr
+        assert "brew install --cask mar3co/openswap/openswap" in calls
+        # The cask's own command, not whatever `openswap` comes first on PATH.
+        assert "brew-openswap setup" in calls
+        assert "openswap setup" not in calls
+        assert not any(c.startswith(("git", "uv", "curl", "xcode-select")) for c in calls)
+        assert "supported" in proc.stdout
+        assert "OPENSWAP_DIR" in proc.stdout
+
+    def test_openswap_dir_keeps_the_checkout_path_for_developers(self, tmp_path):
+        target = _fake_checkout(tmp_path / "mine")
+        proc, calls = run_installer(tmp_path, brew=True, env={"OPENSWAP_DIR": str(target)})
+        assert proc.returncode == 0, proc.stderr
+        assert not any(c.startswith("brew") for c in calls)
+        assert "uv tool install --force --editable .[menubar]" in calls
+        assert "openswap setup" in calls
+
+    def test_failed_cask_install_stops_before_setup(self, tmp_path):
+        proc, calls = run_installer(tmp_path, brew=True, env={"FAIL_BREW_INSTALL": "1"})
+        assert proc.returncode == 1
+        assert "brew install --cask" in proc.stderr
+        assert not any("setup" in c for c in calls)
+        assert not any(c.startswith(("git", "uv")) for c in calls)
+
+    def test_setup_failure_is_the_exit_status(self, tmp_path):
+        proc, calls = run_installer(tmp_path, brew=True, env={"FAIL_SETUP": "3"})
+        assert proc.returncode == 3
+        assert "brew-openswap setup" in calls
+
+    def test_piped_script_installs_the_cask(self, tmp_path):
+        proc, calls = run_installer(tmp_path, brew=True, script_text=SCRIPT.read_text())
+        assert proc.returncode == 0, proc.stderr
+        assert "brew-openswap setup" in calls

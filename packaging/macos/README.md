@@ -1,7 +1,10 @@
 # macOS spike build (plan 007)
 
 One `OpenSwap.app`: PyInstaller-frozen extra + embedded WidgetKit appex +
-in-bundle reload helper. Not a product install path (that is plan 008).
+in-bundle reload helper. Users install it with the Homebrew cask
+(`packaging/homebrew/openswap.rb.in`); the app code that runs it from the
+bundle is described in [widget](../../docs/widget.md#cask-app-bundle) and
+[menu bar](../../docs/menubar.md#process).
 
 Local builds freeze unsigned. Signing and notarization run on GitHub Actions
 (`.github/workflows/macos-app.yml`) once repository secrets are set. Never
@@ -88,9 +91,11 @@ the submission before failing, so the reason is in the job log.
    repo only); without it the job warns and the cask is copied by hand. It
    can be re-run for any tag from the Actions tab.
 
-Users then install with `brew install --cask mar3co/openswap/openswap`. The
-app code still assumes a uv install until plan 008 lands; do not publish a
-release before that.
+Users then install with `brew install --cask mar3co/openswap/openswap` and
+run `openswap setup`, which also moves a Mac off the uv install (see
+[menu bar](../../docs/menubar.md#moving-from-a-source-install)). Before
+publishing, check the draft on a clean account and on a Mac with the uv
+install (plan 008 Step 7).
 
 ## Spike verdict
 

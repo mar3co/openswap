@@ -3,8 +3,8 @@
 Python cannot host WidgetKit. Split:
 
 1. Extra writes `~/Library/Application Support/OpenSwap/widget-snapshot.json` (`widget_snapshot.py`). Payload is `accounts` plus `combined.five_hour` / `combined.seven_day` (remaining slots across healthy accounts; signed-out and disabled omitted). The widget computes the same from `accounts` if `combined` is missing.
-2. Extra posts Darwin notification `com.opensoft.openswap.widget.reload`.
-3. `OpenSwap.app` (LSUIElement) listens and calls `WidgetCenter.shared.reloadAllTimelines()`.
+2. Extra asks for a timeline reload. In the cask's app it runs the bundled `Contents/MacOS/openswap-widget-reload` (no wait), which calls `WidgetCenter.shared.reloadAllTimelines()` for its enclosing app. A source install posts Darwin notification `com.opensoft.openswap.widget.reload` instead.
+3. Source install only: the separately built host `~/Applications/OpenSwap.app` (LSUIElement, `com.opensoft.openswap.widget`) listens and calls `reloadAllTimelines()`.
 4. The appex reads the JSON (sandbox: home-relative read-write exception on `Library/Application Support/OpenSwap/` only + `getpwuid` for the real home; container `NSHomeDirectory()` is wrong).
 5. A tap writes `~/Library/Application Support/OpenSwap/widget-command.json` (`{"op":"switch","num":…}`). The extra consumes it on the 1s sync tick and calls CLI `switch_to` (Claude signed-out repair still applies). Widget taps do not take the ChatGPT popover’s gated desktop-restart path. Combined remaining taps the slot with the most remaining on the primary window. The extra must be running; the widget cannot switch on its own. Disabled cards are not tappable. Sentinel notes render even when last-good bars are present.
 
@@ -12,15 +12,31 @@ The widget is `AppIntentConfiguration` (`OpenSwapWidgetIntent`). Right-click →
 
 Sources: `macos/OpenSwapWidget/`. Install: `openswap widget --install` (`widget_install.py`).
 
-## Build
+## Cask app (bundle)
 
-`xcodebuild` scheme `OpenSwapWidget`, Release, `DEVELOPMENT_TEAM=…`, copy to `~/Applications/OpenSwap.app`, bootstrap LaunchAgent `com.opensoft.openswap.widget`.
+The cask's `OpenSwap.app` (`com.opensoft.openswap`) is one notarized bundle, laid out by `packaging/macos/build.sh`:
+
+- `Contents/MacOS/OpenSwap`: the frozen extra and CLI (Homebrew links it as `openswap`)
+- `Contents/MacOS/openswap-widget-reload`: the reload helper (target `OpenSwapWidgetReload`)
+- `Contents/PlugIns/OpenSwapWidgetExtension.appex`: the widget (`com.opensoft.openswap.widget.extension`)
+
+`openswap.bundle` finds it from the resolved `sys.executable`. In the app nothing is built: `openswap widget --install` runs `pluginkit -a` on the bundled appex, retires an old source-install host (below), and runs the helper once. `--uninstall` is `pluginkit -r` only and never deletes the app (that is `brew uninstall`). `--status` lists each registered copy from `pluginkit -m -v -i com.opensoft.openswap.widget.extension`; more than one means two providers. There is no widget LaunchAgent and nothing to wake.
+
+### Moving from a source install
+
+`openswap setup`, the frozen extra's start-up, and `openswap widget --install` in the app retire the old host when `~/Applications/OpenSwap.app` has bundle id `com.opensoft.openswap.widget`: boot out LaunchAgent `com.opensoft.openswap.widget` and remove its plist, `pluginkit -r` its appex, move the app to the Trash (`NSFileManager trashItemAtURL`, recoverable), then `pluginkit -a` the bundled appex. An app with any other bundle id (the cask's own, installed with `--appdir ~/Applications`) is left alone.
+
+The appex id is unchanged but its parent app's bundle id changes from `com.opensoft.openswap.widget` to `com.opensoft.openswap`, so desktop and Notification Center widgets placed with the old host may go blank and need adding again (plan 007 check 4 records what actually happens).
+
+## Build (source install)
+
+`xcodebuild` scheme `OpenSwapWidget`, Release, `DEVELOPMENT_TEAM=…`, copy to `~/Applications/OpenSwap.app`, bootstrap LaunchAgent `com.opensoft.openswap.widget`. The frozen app never takes this path.
 
 `project_dir()` walks from `widget_install.py` until it finds `macos/OpenSwapWidget/OpenSwapWidget.xcodeproj`. That only works from this git checkout (or if sources are vendored next to the package as `macos_widget`). A PyPI wheel does not include `macos/`.
 
 Regenerate the Xcode project with xcodegen from `macos/OpenSwapWidget/project.yml` if you change that file or add a `.swift` file under `Widget/`. `openswap widget --install` runs `xcodebuild` only.
 
-## Signing
+## Signing (source install)
 
 `detect_development_team()` order:
 

@@ -3,16 +3,19 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/mar3co/openswap/main/install.sh | bash
 #
-# Installs uv if needed (uv brings its own Python), clones this repo to
-# ~/.openswap (or installs from $OPENSWAP_DIR), installs the openswap tool,
-# saves the Claude account you are logged into, and starts the menu bar extra.
-# Safe to re-run: ~/.openswap is pulled instead of cloned.
+# With Homebrew (and no $OPENSWAP_DIR) it installs the OpenSwap app cask, the
+# supported path. Otherwise it installs uv if needed (uv brings its own
+# Python), clones this repo to ~/.openswap (or installs from $OPENSWAP_DIR),
+# and installs the openswap tool. Either way it then saves the Claude account
+# you are logged into and starts the menu bar extra. Safe to re-run:
+# ~/.openswap is pulled instead of cloned.
 #
 # Everything lives in main(), invoked inside a group whose closing brace is
 # the last token, so a download that stops anywhere short of that runs nothing.
 set -euo pipefail
 
 REPO_URL="${OPENSWAP_REPO:-https://github.com/mar3co/openswap.git}"
+CASK="mar3co/openswap/openswap"
 INSTALL_DIR="${OPENSWAP_DIR:-$HOME/.openswap}"
 UV_INSTALLER="https://astral.sh/uv/install.sh"
 
@@ -23,9 +26,29 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 # .git is a file in a worktree, so -e rather than -d.
 is_checkout() { [ -e "$1/.git" ] && [ -f "$1/src/openswap/__init__.py" ]; }
 
+install_cask() {
+  say "Homebrew found: installing the OpenSwap app with brew install --cask $CASK (the supported install)"
+  say "To install from a git checkout instead, set OPENSWAP_DIR"
+  brew install --cask "$CASK" || fail "brew install --cask $CASK failed (see above). Fix that, then run this installer again."
+  # Run the cask's own command: an older uv install's ~/.local/bin/openswap
+  # may come first on PATH, and its setup would not move anything over.
+  local prefix
+  prefix="$(brew --prefix)" || fail "brew --prefix failed (see above)."
+  [ -x "$prefix/bin/openswap" ] || fail "brew reported success but $prefix/bin/openswap is missing."
+  say "Saving your Claude account and starting the menu bar extra"
+  "$prefix/bin/openswap" setup
+}
+
 main() {
   [ "$(uname -s)" = "Darwin" ] || fail "OpenSwap ships for macOS only."
   [ "$(id -u)" != 0 ] || fail "Run this installer as your normal user, not with sudo."
+
+  # Developers set OPENSWAP_DIR to install from a checkout; everyone else with
+  # Homebrew gets the app.
+  if [ -z "${OPENSWAP_DIR:-}" ] && command -v brew >/dev/null 2>&1; then
+    install_cask
+    return
+  fi
 
   # /usr/bin/git is a shim that opens the Command Line Tools dialog when run,
   # so a plain `command -v git` cannot tell whether git is really there.
