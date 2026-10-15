@@ -1,3 +1,4 @@
+import os
 import subprocess
 import threading
 
@@ -10,6 +11,9 @@ from openswap.claude_login import (
     login_outcome,
     remove_legacy_login_command,
 )
+
+
+posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX shell and process groups")
 
 
 def _run(script, *, timeout=5.0):
@@ -46,6 +50,7 @@ def test_remove_legacy_login_command_tolerates_absence(tmp_path):
     remove_legacy_login_command(tmp_path)
 
 
+@posix_only
 def test_run_reports_exit_code_and_ansi_stripped_output_tail():
     _run_obj, results, done = _run(
         "printf 'Opening browser\\n\\033[31mLogin successful\\033[0m\\n'; exit 0"
@@ -58,6 +63,7 @@ def test_run_reports_exit_code_and_ansi_stripped_output_tail():
     assert result.output_tail == "Opening browser\nLogin successful"
 
 
+@posix_only
 def test_tail_strips_osc_hyperlinks_without_eating_the_text_between():
     _run_obj, results, done = _run(
         "printf '\\033]8;;https://x\\033\\\\one\\033]8;;\\033\\\\\\nError: real\\n"
@@ -68,6 +74,7 @@ def test_tail_strips_osc_hyperlinks_without_eating_the_text_between():
     assert result.output_tail == "one\nError: real\ntwo"
 
 
+@posix_only
 def test_run_merges_stderr_and_keeps_only_the_tail():
     _run_obj, results, done = _run(
         "echo noise; echo 'Error: boom' >&2; exit 3"
@@ -78,6 +85,7 @@ def test_run_merges_stderr_and_keeps_only_the_tail():
     assert "Error: boom" in result.output_tail
 
 
+@posix_only
 def test_run_times_out_and_terminates_the_cli():
     _run_obj, results, done = _run("sleep 30", timeout=0.3)
     assert done.wait(5)
@@ -86,6 +94,7 @@ def test_run_times_out_and_terminates_the_cli():
     assert result.returncode is None
 
 
+@posix_only
 def test_cancel_terminates_and_reports_canceled_not_failed():
     run, results, done = _run("sleep 30")
     run.cancel()
