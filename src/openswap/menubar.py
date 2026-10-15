@@ -15,7 +15,13 @@ import threading
 import time
 from datetime import datetime
 
-from openswap.exceptions import ClaudeSwitchError, CredentialReadError
+from openswap.claude_login import (
+    ClaudeLoginRun,
+    login_outcome,
+    new_login_outcome,
+    remove_legacy_login_command,
+)
+from openswap.exceptions import ClaudeSwitchError, CredentialMissingError, CredentialReadError
 from openswap.menubar_display import *  # noqa: F403
 from openswap.codex.desktop_app import DesktopApp, DesktopCapability, capability_is_fresh
 from openswap.menubar_display import (  # noqa: F401  tests poke these
@@ -205,6 +211,10 @@ def run(switcher, codex=None) -> int:
             self._login_session = None
             self._login_ui_state = {"stage": "idle"}
             self._login_save_result = None
+            self._claude_login: ClaudeLoginRun | None = None
+            self._claude_login_num: str | None = None
+            self._claude_login_results: list = []
+            self._refresh_pending = False
             self._login_canceled_session = None
             self._kickoff_results = None
             self._kickoff_retry_after: float | None = None
@@ -231,6 +241,7 @@ def run(switcher, codex=None) -> int:
             self.refresh_async()  # first display fetch
             from openswap.widget_snapshot import wake_widget_host
             wake_widget_host()
+            remove_legacy_login_command()
             if self.settings.auto_switch_enabled:
                 self._start_engine()
             if self.settings.chatgpt_switching_enabled and self.settings.chatgpt_auto_enabled:
@@ -238,9 +249,15 @@ def run(switcher, codex=None) -> int:
 
         # ---- display refresh plumbing ----------------------------------------
         def refresh_async(self, full=False):
-            if self._refreshing or self._desktop_switching:
-                return  # in-flight guard: one worker at a time (SnapshotSource
-                        # pacing state is only touched by this single worker)
+            if self._refreshing:
+                # One worker at a time (SnapshotSource pacing state is only
+                # touched by this single worker). A request made while one is
+                # in flight may describe a store change that worker read past,
+                # so the tick runs it again once the worker lands.
+                self._refresh_pending = True
+                return
+            if self._desktop_switching:
+                return
             self._refreshing = True
             populated = {
                 "chatgpt" if str(row[0]).startswith("codex:") else "claude"
@@ -437,6 +454,9 @@ def run(switcher, codex=None) -> int:
             self.refresh_async()
 
         def on_sync_tick(self, _timer):
+            if self._refresh_pending and not self._refreshing:
+                self._refresh_pending = False
+                self.refresh_async()
             self._poll_login()
             self._drain_desktop_result()
             self._drain_worker_result()
@@ -467,6 +487,7 @@ def run(switcher, codex=None) -> int:
             self._drain_engine_events()
             self._apply_hold_line()
             self._drain_relogin_notifies()
+            self._drain_claude_login_result()
             self._maybe_auto_capture_relogin()
             self._drain_kickoff_results()
             self._maybe_kickoff()
@@ -1366,6 +1387,7 @@ def run(switcher, codex=None) -> int:
                 on_switch=self._on_panel_account_click,
                 on_rotate=lambda *_a: self._switch(None)(None),
                 on_best=lambda *_a: self._switch("best")(None),
+                on_add_claude=lambda: self.on_add_claude_login(None),
                 on_toggle_auto=lambda *_a: self.on_toggle_autoswitch(None),
                 on_toggle_chatgpt_auto=lambda *_a: self.on_toggle_chatgpt_auto(None),
                 on_review_chatgpt_switch=self._review_chatgpt_switch,
@@ -1402,6 +1424,8 @@ def run(switcher, codex=None) -> int:
                 return
             if action == "retry":
                 self.refresh_async()
+            elif action == "start" and provider == "claude":
+                self.on_add_claude_login(None)
             elif action in ("add", "start"):
                 if provider == "chatgpt":
                     self._on_login_action("start")
@@ -1709,6 +1733,7 @@ def run(switcher, codex=None) -> int:
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
+            menu.add(rumps.MenuItem("Sign in with Claude…", callback=self.on_add_claude_login))
             menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
             if self.codex is not None:
                 menu.add(rumps.MenuItem("Sign in with ChatGPT…", callback=lambda _sender: self._on_login_action("start")))
@@ -2307,7 +2332,7 @@ def run(switcher, codex=None) -> int:
                 cancel="Cancel",
             ) != 1:
                 return
-            self._open_claude_login(plan)
+            self._open_claude_login(num, plan)
 
         def _repair_reconcile(self, num, *, close_panel):
             name = self._name_for_num(num)
@@ -2388,13 +2413,8 @@ def run(switcher, codex=None) -> int:
                 return
             try:
                 self.switcher.add_account(slot=None)
-            except CredentialReadError:
-                self._alert(
-                    title="openswap",
-                    message="Couldn't read the active credential. If the menu bar is running "
-                            "as a background/login agent, macOS blocks its Keychain access — "
-                            "quit and relaunch it from a Terminal with: openswap menubar",
-                )
+            except CredentialReadError as e:
+                self._alert_credential_read_error(e)
                 return
             except ClaudeSwitchError as e:
                 self._show_error(str(e))
@@ -2404,19 +2424,188 @@ def run(switcher, codex=None) -> int:
             self.refresh_async()
             if close_panel and self._panel is not None:
                 self._panel.close()
+            return True
 
-        def _open_claude_login(self, plan: ReloginClickPlan):
-            try:
-                launch_claude_login(plan.login_email)
-            except ClaudeSwitchError as e:
-                self._show_error(str(e))
+        def _alert_credential_read_error(self, error):
+            # Almost always a launchd/login-agent Keychain block: the active
+            # credential lives in the macOS Keychain, which a background agent
+            # can't read (the security call times out). Point at the fix.
+            self._alert(
+                title="openswap",
+                message=f"Couldn't read the active credential ({error}). If the menu bar "
+                        "is running as a background/login agent, macOS blocks its Keychain "
+                        "access — quit and relaunch it from a Terminal with: openswap menubar",
+            )
+
+        def _open_claude_login(self, num, plan: ReloginClickPlan):
+            claude_bin = self._claude_bin()
+            if claude_bin is None:
                 return
+            self._start_claude_login(claude_bin, plan.login_email, num=str(num))
             self._notify(
                 NotificationCopy(
                     title=f"Sign in as {plan.slot_name}",
                     body=relogin_login_opened_message(plan.slot_name),
                 )
             )
+
+        def on_add_claude_login(self, _sender):
+            claude_bin = self._claude_bin()
+            if claude_bin is None or not self._keep_outgoing_claude_login():
+                return
+            self._start_claude_login(claude_bin, None, num=None)
+            self._notify(
+                NotificationCopy(
+                    title="Sign in with Claude", body=claude_add_opened_message()
+                )
+            )
+
+        def _keep_outgoing_claude_login(self) -> bool:
+            """Save the live login before the sign-in replaces it; False to stop.
+
+            Claude Code may have rotated its refresh token since the slot's
+            backup was written, and the sign-in overwrites the only current copy.
+            The read is strict: a torn config must not pass for "logged out".
+            """
+            from openswap.worker.leases import AccountLeaseError
+
+            try:
+                live = self.switcher._get_current_identity_triple(strict=True)
+                if live is None:
+                    return True
+                if self.switcher.current_account_number() is None:
+                    message = claude_add_unsaved_live_message(live[0])
+                else:
+                    self.switcher.add_account(slot=None)
+                    return True
+            except CredentialMissingError as e:
+                # Nothing to protect, so this falls to the confirm below.
+                self.switcher._logger.warning("claude add: backup failed: %s", e)
+                message = claude_add_backup_failed_message(str(e))
+            except CredentialReadError as e:
+                self.switcher._logger.warning("claude add: backup failed: %s", e)
+                self._alert_credential_read_error(e)
+                return False
+            except AccountLeaseError as e:
+                # A worker job is using this login; signing in would pull it away.
+                self._show_error(str(e))
+                return False
+            except ClaudeSwitchError as e:
+                self.switcher._logger.warning("claude add: backup failed: %s", e)
+                message = claude_add_backup_failed_message(str(e))
+            return self._alert(
+                title="Sign out of Claude Code's current login?", message=message,
+                ok="Continue", cancel="Cancel",
+            ) == 1
+
+        def _claude_bin(self) -> str | None:
+            claude_bin = resolve_claude_bin()
+            if not claude_bin:
+                self._show_error(
+                    "'claude' was not found. Install Claude Code, then try again."
+                )
+                return None
+            return claude_bin
+
+        def _start_claude_login(self, claude_bin, email, *, num):
+            """Start a browser sign-in; ``num`` None adds whoever signs in."""
+            # A second click restarts the sign-in (the browser tab may be gone).
+            if self._claude_login is not None:
+                self._claude_login.cancel()
+            run = ClaudeLoginRun(
+                claude_bin, email,
+                on_done=lambda result: self._on_claude_login_done(run, result),
+            )
+            with self._event_lock:
+                self._claude_login = run
+                self._claude_login_num = num
+            run.start()
+
+        def _on_claude_login_done(self, run, result):
+            # Worker thread: hand the result to the main-thread tick.
+            with self._event_lock:
+                self._claude_login_results.append((run, result))
+
+        def _drain_claude_login_result(self):
+            with self._event_lock:
+                pending, self._claude_login_results = self._claude_login_results, []
+                # A run canceled by a later click reports too; only the
+                # current run's result counts.
+                results = [r for run, r in pending if run is self._claude_login]
+                if not results:
+                    return
+                result = results[-1]
+                num = self._claude_login_num
+                self._claude_login = None
+                self._claude_login_num = None
+            if num is None:
+                self._finish_claude_add(result)
+                return
+            name = self._name_for_num(num)
+            live = self.switcher.live_identity()
+            outcome = login_outcome(result, live=live, slot=self._slot_identity(num))
+            self.switcher._logger.debug(
+                "claude login for %s: %s (returncode=%s timed_out=%s)\n%s",
+                name, outcome, result.returncode, result.timed_out, result.output_tail,
+            )
+            if outcome == "canceled":
+                return
+            if outcome == "timed_out":
+                self._show_error(claude_login_timed_out_message(name))
+            elif outcome == "failed":
+                self._show_error(claude_login_failed_message(name, result.output_tail))
+            elif outcome == "no_login":
+                self._show_error(claude_login_no_login_message(name))
+            elif outcome == "mismatch":
+                self._show_error(
+                    claude_login_mismatch_message(name, self._name_for_identity(live))
+                )
+            elif self._capture_relogin(num, close_panel=False):
+                # Captured here, not left to the tick: auto-capture may already
+                # have saved this slot's old, dead credential and won't look again.
+                self._auto_captured_nums.add(num)
+
+        def _finish_claude_add(self, result):
+            live = self.switcher.live_identity()
+            outcome = new_login_outcome(result, live=live)
+            self.switcher._logger.debug(
+                "claude login for a new account: %s (returncode=%s timed_out=%s)\n%s",
+                outcome, result.returncode, result.timed_out, result.output_tail,
+            )
+            if outcome == "canceled":
+                return
+            if outcome == "timed_out":
+                self._show_error(claude_add_timed_out_message())
+                return
+            if outcome == "failed":
+                self._show_error(claude_add_failed_message(result.output_tail))
+                return
+            if outcome == "no_login":
+                self._show_error(claude_add_no_login_message())
+                return
+            try:
+                num = self.switcher.current_account_number()
+                self.switcher.add_account(slot=None)
+            except CredentialReadError as e:
+                self.switcher._logger.warning("claude add: capture failed: %s", e)
+                if isinstance(e, CredentialMissingError):
+                    self._show_error(str(e))
+                else:
+                    self._alert_credential_read_error(e)
+                return
+            except ClaudeSwitchError as e:
+                self.switcher._logger.warning("claude add: capture failed: %s", e)
+                self._show_error(str(e))
+                return
+            if num is None:
+                self._notify(notification_copy_for_claude_added(live[0], existed=False))
+            else:
+                # Saved here, not left to the tick: a signed-out slot is now captured.
+                self._auto_captured_nums.add(num)
+                self._notify(
+                    notification_copy_for_claude_added(self._name_for_num(num), existed=True)
+                )
+            self.refresh_async()
 
         def _drain_relogin_notifies(self):
             with self._event_lock:
@@ -2628,16 +2817,8 @@ def run(switcher, codex=None) -> int:
                 return
             try:
                 self.switcher.add_account(slot=None)
-            except CredentialReadError:
-                # Almost always a launchd/login-agent Keychain block: the active
-                # credential lives in the macOS Keychain, which a background agent
-                # can't read (the security call times out). Point at the fix.
-                self._alert(
-                    title="openswap",
-                    message="Couldn't read the active credential. If the menu bar is running "
-                            "as a background/login agent, macOS blocks its Keychain access — "
-                            "quit and relaunch it from a Terminal with: openswap menubar",
-                )
+            except CredentialReadError as e:
+                self._alert_credential_read_error(e)
                 return
             except ClaudeSwitchError as e:
                 self._alert(title="openswap", message=str(e))
@@ -2652,6 +2833,8 @@ def run(switcher, codex=None) -> int:
                 self._status_icon_animator.stop()
             if self._login_session is not None:
                 self._login_session.cancel()
+            if self._claude_login is not None:
+                self._claude_login.cancel()
             self._stop_chatgpt_auto_monitor(clear_pending=True)
             self._stop_engine()
             rumps.quit_application()

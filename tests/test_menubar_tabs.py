@@ -172,10 +172,11 @@ def test_empty_state_gives_provider_specific_add_guidance(provider, name):
         assert state["secondary_action"] == "capture"
         assert state["secondary_button"] == "Save current login"
     else:
-        assert "Sign in" in state["body"]
-        assert state["action"] == "add"
-        assert state["button"] == "Add current login"
-        assert "Does not switch" in state["hint"]
+        assert state["action"] == "start"
+        assert state["button"] == "Sign in with Claude"
+        assert state["secondary_action"] == "add"
+        assert state["secondary_button"] == "Save current login"
+        assert state["hint"] == ""
 
 
 @pytest.mark.parametrize("stage", ["starting", "waiting", "ready", "error", "saving", "canceling", "saved"])

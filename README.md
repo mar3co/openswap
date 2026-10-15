@@ -21,7 +21,7 @@ Already have a checkout? `OPENSWAP_DIR=/path/to/openswap bash install.sh` instal
 
 ## Quick start
 
-If Claude Code was logged in, the installer saved that account. Log into another Claude account, then:
+If Claude Code was logged in, the installer saved that account. To add another, click **Add account** on the extra's Claude page (**Sign in with Claude** when it has no accounts yet) and sign in through your browser (Claude Code ends up on the new account). From a terminal, run `claude auth login` with the other account, then:
 
 ```bash
 openswap add
@@ -44,7 +44,7 @@ openswap setup                        # save the current login, start the extra 
 openswap widget --install             # Desktop / Notification Center (this checkout + Xcode)
 ```
 
-Click the extra for usage bars, then a card to switch. Auto-switch waits five minutes before it can move you again. Popover Settings separates **General** display controls from **Automation** for Claude, ChatGPT, and Codex, with one shared quota policy and an optional kickoff schedule for accounts that report a 5-hour window, and **Remote** for the local worker. Add the widget from Edit Widgets (search **OpenSwap**). The popover header and widget host use the OpenSoft mark. Right-click the widget to choose all accounts, combined remaining, or one account.
+Click the extra for usage bars, then a card to switch. **Add account** on the Claude page (also **More › Add account › Sign in with Claude…**) refreshes the current login's saved copy (or asks first if OpenSwap hasn't saved it), runs the Claude browser sign-in, and saves whoever signs in (a new card, or a refresh of one already saved); Claude Code switches to that account. Auto-switch waits five minutes before it can move you again. Popover Settings separates **General** display controls from **Automation** for Claude, ChatGPT, and Codex, with one shared quota policy and an optional kickoff schedule for accounts that report a 5-hour window, and **Remote** for the local worker. Add the widget from Edit Widgets (search **OpenSwap**). The popover header and widget host use the OpenSoft mark. Right-click the widget to choose all accounts, combined remaining, or one account.
 
 [Menu bar](https://github.com/mar3co/openswap/wiki/Menu-Bar) · [Widget](https://github.com/mar3co/openswap/wiki/Desktop-Widget) · [Kickoff](https://github.com/mar3co/openswap/wiki/Five-Hour-Kickoff)
 

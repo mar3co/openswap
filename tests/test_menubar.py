@@ -21,6 +21,8 @@ import pytest
 
 from openswap import menubar
 from openswap import menubar_display
+from openswap.exceptions import ConfigError
+from openswap.worker.leases import LeaseConflictError
 from openswap.autoswitch import (
     AllExhaustedEvent,
     ConfigWarningEvent,
@@ -2676,7 +2678,7 @@ def test_plan_relogin_click_captures_only_on_email_and_org_match():
     msg = menubar.relogin_wrong_account_message(wrong_org)
     assert msg == (
         "personal's saved login has expired, so OpenSwap can't switch to it. "
-        "Sign in as personal in the login window that opens.\n\n"
+        "Sign in as personal in the browser window that opens.\n\n"
         "Claude Code is on adsonline right now and will sign out of it. "
         "adsonline stays saved in OpenSwap, so you can switch back later."
     )
@@ -2698,7 +2700,7 @@ def test_plan_relogin_click_captures_only_on_email_and_org_match():
     )
     assert menubar.relogin_wrong_account_message(no_saved_login).startswith(
         "OpenSwap has no saved login for personal, so it can't switch to it. "
-        "Sign in as personal in the login window that opens."
+        "Sign in as personal in the browser window that opens."
     )
 
     unverified = menubar.plan_relogin_click(
@@ -2807,61 +2809,30 @@ def test_notification_copy_for_relogin_has_no_cli():
     assert "openswap" not in captured.body.lower()
 
 
-def test_build_login_command_text_quotes_email():
-    text = menubar.build_login_command_text(
-        "/opt/homebrew/bin/claude", "a@x.com"
+def test_claude_login_copy_names_the_browser_and_the_retry():
+    opened = menubar.relogin_login_opened_message("personal")
+    assert "browser" in opened
+    assert "Terminal" not in opened
+    mismatch = menubar.claude_login_mismatch_message("personal", "work")
+    assert "signed in as work, not personal" in mismatch
+    assert "different account" in menubar.claude_login_mismatch_message("personal", None)
+    failed = menubar.claude_login_failed_message(
+        "personal", "Opening browser\nError: network down"
     )
-    assert text.startswith("#!/bin/bash\n")
-    assert "tell application" not in text
-    assert "auth login" in text
-    assert "--claudeai" in text
-    assert "a@x.com" in text
+    assert failed.endswith("Error: network down")
+    assert "could not sign in as personal" in failed
+    assert "\n" not in menubar.claude_login_failed_message("personal", "")
+    assert "personal" in menubar.claude_login_timed_out_message("personal")
+    assert "no account signed in" in menubar.claude_login_no_login_message("personal")
 
 
-def test_launch_claude_login_opens_command_file(tmp_path):
-    calls = []
-    dest = tmp_path / "login.command"
-
-    def run(argv, **_kwargs):
-        calls.append(argv)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    menubar.launch_claude_login(
-        "a@x.com",
-        which=lambda name: "/opt/homebrew/bin/claude" if name == "claude" else None,
-        run=run,
-        command_path=dest,
-    )
-    assert dest.is_file()
-    if sys.platform != "win32":
-        assert dest.stat().st_mode & 0o111
-    body = dest.read_text(encoding="utf-8")
-    assert body.startswith("#!/bin/bash\n")
-    assert "a@x.com" in body
-    assert calls[0][0] == "open"
-    assert calls[0][1] == str(dest)
-
-
-def test_launch_claude_login_missing_claude(monkeypatch):
-    # `launch_claude_login` falls back to common install directories after
-    # PATH lookup. Simulate the resolver's final missing result so this test
-    # stays deterministic on machines with Claude installed in one of them.
-    seen = {}
-
-    def fake_resolve(**kwargs):
-        seen.update(kwargs)
-        return None
-
-    monkeypatch.setattr(menubar_display, "resolve_claude_bin", fake_resolve)
-    which = lambda _name: None  # noqa: E731
-    with pytest.raises(ClaudeSwitchError, match="claude"):
-        menubar.launch_claude_login(
-            "a@x.com",
-            which=which,
-            run=lambda *_a, **_k: SimpleNamespace(returncode=0),
-        )
-    # The caller's `which` must reach the resolver rather than be ignored.
-    assert seen.get("which") is which
+def test_claude_login_result_is_drained_before_auto_capture_and_canceled_on_quit():
+    text = Path(menubar.__file__).read_text()
+    tick = text[text.index("def on_sync_tick") : text.index("def _consume_widget_command")]
+    assert tick.index("_drain_claude_login_result()") < tick.index("_maybe_auto_capture_relogin()")
+    quit_ = text[text.index("def on_quit") : text.index("def on_toggle_name")]
+    assert "_claude_login.cancel()" in quit_
+    assert "launch_claude_login" not in text
 
 
 def test_resolve_claude_bin_returns_none_when_path_and_extra_dirs_miss(tmp_path):
@@ -3574,3 +3545,303 @@ def test_every_dialog_goes_through_the_above_popover_helper():
     assert "rumps.alert(" not in rest
     assert "rumps.Window(" not in rest
     assert "activateIgnoringOtherApps_" not in rest
+
+
+def _claude_login_app():
+    import logging
+    from tests.menubar_harness import extract_class
+
+    app_type = extract_class(
+        menubar.__file__, "MenuBarApp",
+        {
+            "_on_claude_login_done", "_drain_claude_login_result", "_finish_claude_add",
+            "_keep_outgoing_claude_login", "on_add_claude_login", "_on_empty_action",
+        },
+        dict(vars(menubar)),
+    )
+    app = app_type()
+    app._event_lock = threading.Lock()
+    app._claude_login_results = []
+    app._auto_captured_nums = set()
+    app._claude_login = object()
+    app._claude_login_num = "2"
+    app.live = None
+    app._name_for_num = lambda num: {"2": "personal"}[str(num)]
+    app._name_for_identity = lambda ident: "work" if ident == ("w@x.com", "org-w") else None
+    app._slot_identity = lambda num: ("a@x.com", "org-1")
+    app.switcher = SimpleNamespace(
+        live_identity=lambda: app.live, _logger=logging.getLogger("test")
+    )
+    app.errors = []
+    app._show_error = app.errors.append
+    app.captured = []
+    app.capture_ok = True
+
+    def capture(num, close_panel):
+        app.captured.append((num, close_panel))
+        return app.capture_ok
+
+    app._capture_relogin = capture
+    return app
+
+
+def test_claude_login_drain_ignores_a_superseded_run_and_captures_the_current_one():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_login_app()
+    app.live = ("a@x.com", "org-1")
+    app._on_claude_login_done(object(), LoginResult(None, False, True, ""))
+    app._on_claude_login_done(
+        app._claude_login, LoginResult(0, False, False, "Login successful")
+    )
+    app._drain_claude_login_result()
+    assert app.captured == [("2", False)]
+    assert "2" in app._auto_captured_nums
+    assert app._claude_login is None and app._claude_login_num is None
+    assert app.errors == []
+
+
+def test_claude_login_drain_leaves_auto_capture_free_to_retry_a_failed_capture():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_login_app()
+    app.live = ("a@x.com", "org-1")
+    app.capture_ok = False
+    app._on_claude_login_done(app._claude_login, LoginResult(0, False, False, ""))
+    app._drain_claude_login_result()
+    assert app.captured == [("2", False)]
+    assert "2" not in app._auto_captured_nums
+
+
+def test_claude_login_drain_keeps_waiting_when_only_a_superseded_run_reported():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_login_app()
+    current = app._claude_login
+    app._on_claude_login_done(object(), LoginResult(None, False, True, ""))
+    app._drain_claude_login_result()
+    assert app._claude_login is current
+    assert app.captured == [] and app.errors == []
+
+
+def test_claude_login_drain_alerts_on_wrong_account_and_failure_without_capturing():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_login_app()
+    app.live = ("w@x.com", "org-w")
+    app._on_claude_login_done(app._claude_login, LoginResult(0, False, False, ""))
+    app._drain_claude_login_result()
+    assert app.captured == []
+    assert "signed in as work, not personal" in app.errors[-1]
+
+    app._claude_login = object()
+    app._claude_login_num = "2"
+    app.live = ("a@x.com", "org-1")  # the dead token is still the live login
+    app._on_claude_login_done(
+        app._claude_login, LoginResult(1, False, False, "Error: boom")
+    )
+    app._drain_claude_login_result()
+    assert app.captured == []
+    assert app.errors[-1].endswith("Error: boom")
+    assert "2" not in app._auto_captured_nums
+
+
+def test_refresh_requested_while_in_flight_runs_on_the_next_tick():
+    from tests.menubar_harness import extract_class
+
+    app_type = extract_class(
+        menubar.__file__, "MenuBarApp", {"refresh_async"}, dict(vars(menubar))
+    )
+    app = app_type()
+    app._refreshing = True
+    app._desktop_switching = False
+    app._refresh_pending = False
+    app.refresh_async()
+    assert app._refresh_pending is True
+    text = Path(menubar.__file__).read_text()
+    tick = text[text.index("def on_sync_tick") : text.index("def _consume_widget_command")]
+    assert tick.index("_refresh_pending") < tick.index("_poll_login()")
+
+
+def _claude_add_app():
+    add_app = _claude_login_app()
+    add_app._claude_login_num = None
+    add_app.switcher.current_account_number = lambda: (
+        "2" if add_app.live == ("a@x.com", "org-1") else None
+    )
+    add_app.added = []
+    add_app.add_error = None
+
+    def add_account(slot):
+        if add_app.add_error is not None:
+            raise add_app.add_error
+        add_app.added.append(slot)
+
+    add_app.switcher.add_account = add_account
+    add_app.notes = []
+    add_app._notify = add_app.notes.append
+    add_app.refreshes = 0
+
+    def refresh_async():
+        add_app.refreshes += 1
+
+    add_app.refresh_async = refresh_async
+    add_app.alerts = []
+    add_app._alert_credential_read_error = lambda e: add_app.alerts.append(str(e))
+    return add_app
+
+
+def test_claude_add_drain_saves_a_new_account_and_says_who():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_add_app()
+    app.live = ("w@x.com", "org-w")
+    app._on_claude_login_done(app._claude_login, LoginResult(0, False, False, ""))
+    app._drain_claude_login_result()
+    assert app.added == [None]
+    assert app.notes[-1].title == "w@x.com added"
+    assert app.refreshes == 1
+    assert app.captured == [] and app.errors == []
+    assert app._claude_login is None
+
+
+def test_claude_add_drain_says_when_the_account_was_already_added():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_add_app()
+    app.live = ("a@x.com", "org-1")
+    app._on_claude_login_done(app._claude_login, LoginResult(0, False, False, ""))
+    app._drain_claude_login_result()
+    assert app.added == [None]
+    assert app.notes[-1].title == "personal is already added"
+    assert "2" in app._auto_captured_nums
+
+
+@pytest.mark.parametrize(
+    "result, live, expected",
+    [
+        ((None, True, False, ""), ("a@x.com", "org-1"), "not finished in time"),
+        ((1, False, False, "Error: boom"), ("a@x.com", "org-1"), "Error: boom"),
+        ((0, False, False, ""), None, "no account signed in"),
+    ],
+)
+def test_claude_add_drain_alerts_without_saving(result, live, expected):
+    from openswap.claude_login import LoginResult
+
+    app = _claude_add_app()
+    app.live = live
+    app._on_claude_login_done(app._claude_login, LoginResult(*result))
+    app._drain_claude_login_result()
+    assert app.added == [] and app.notes == [] and app.refreshes == 0
+    assert expected in app.errors[-1]
+    assert "Add account" in app.errors[-1]
+
+
+def test_claude_add_drain_is_silent_when_canceled():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_add_app()
+    app._on_claude_login_done(app._claude_login, LoginResult(None, False, True, ""))
+    app._drain_claude_login_result()
+    assert app.added == [] and app.errors == [] and app.notes == []
+
+
+def test_claude_add_drain_surfaces_save_errors():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_add_app()
+    app.live = ("w@x.com", "org-w")
+    app.add_error = menubar.ClaudeSwitchError("disk full")
+    app._on_claude_login_done(app._claude_login, LoginResult(0, False, False, ""))
+    app._drain_claude_login_result()
+    assert app.errors == ["disk full"] and app.notes == [] and app.refreshes == 0
+
+    app._claude_login = object()
+    app.add_error = menubar.CredentialReadError("Failed to read")
+    app._on_claude_login_done(app._claude_login, LoginResult(0, False, False, ""))
+    app._drain_claude_login_result()
+    assert app.alerts == ["Failed to read"] and app.notes == []
+
+    app._claude_login = object()
+    app.add_error = menubar.CredentialMissingError("No credentials found")
+    app._on_claude_login_done(app._claude_login, LoginResult(0, False, False, ""))
+    app._drain_claude_login_result()
+    assert app.errors[-1] == "No credentials found" and app.alerts == ["Failed to read"]
+
+
+@pytest.mark.parametrize(
+    "live, backup_error, confirm, backed_up, started",
+    [
+        (None, None, None, False, True),
+        (("a@x.com", "org-1"), None, None, True, True),
+        (("a@x.com", "org-1"), menubar.ClaudeSwitchError("locked"), 1, False, True),
+        (("a@x.com", "org-1"), menubar.ClaudeSwitchError("locked"), 0, False, False),
+        (("a@x.com", "org-1"), menubar.CredentialReadError("keychain"), None, False, False),
+        (("a@x.com", "org-1"), menubar.CredentialMissingError("No credentials"), 1, False, True),
+        (("a@x.com", "org-1"), LeaseConflictError("worker lease"), None, False, False),
+        (("u@x.com", "org-u"), None, 1, False, True),
+        (("u@x.com", "org-u"), None, 0, False, False),
+        ("torn", None, 1, False, True),
+        ("torn", None, 0, False, False),
+    ],
+)
+def test_claude_add_saves_or_confirms_the_login_it_signs_out(
+    live, backup_error, confirm, backed_up, started
+):
+    app = _claude_add_app()
+    app.live = live
+    app.add_error = backup_error
+
+    def strict_read(*, strict):
+        assert strict
+        if live == "torn":
+            raise ConfigError("could not be parsed")
+        return None if live is None else (*live, "uuid")
+
+    app.switcher._get_current_identity_triple = strict_read
+    app._claude_bin = lambda: "/bin/claude"
+    asked = []
+
+    def alert(**kw):
+        asked.append(kw)
+        return confirm
+
+    app._alert = alert
+    starts = []
+    app._start_claude_login = lambda claude_bin, email, num: starts.append((email, num))
+    app.on_add_claude_login(None)
+    assert bool(asked) == (confirm is not None)
+    if live == "torn":
+        assert "could not be parsed" in asked[0]["message"]
+    elif asked:
+        assert str(backup_error or live[0]) in asked[0]["message"]
+    if isinstance(backup_error, LeaseConflictError):
+        assert app.errors == ["worker lease"]
+    assert app.alerts == (["keychain"] if str(backup_error) == "keychain" else [])
+    assert app.added == ([None] if backed_up else [])
+    assert starts == ([(None, None)] if started else [])
+    assert len(app.notes) == int(started)
+
+
+def test_claude_empty_state_signs_in_and_saves_through_separate_actions():
+    app = _claude_add_app()
+    app._desktop_switching = app._refreshing = False
+    calls = []
+    app.on_add_claude_login = lambda _s: calls.append("sign_in")
+    app.on_add_login = lambda _s: calls.append("save")
+    app._on_empty_action("claude", "start")
+    app._on_empty_action("claude", "add")
+    assert calls == ["sign_in", "save"]
+
+
+def test_claude_add_is_offered_on_the_claude_page_and_in_the_add_menu():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    add_menu = text[text.index("def _add_menu") : text.index("def _rename_menu")]
+    assert add_menu.index('"Sign in with Claude…"') < add_menu.index('"From current login"')
+    assert "on_add_claude=" in text
+    panel = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
+        encoding="utf-8"
+    )
+    footer = panel[panel.index('if provider == "claude" and cards:') :]
+    footer = footer[: footer.index("else:")]
+    assert '"Add account"' in footer and "self._on_add_claude" in footer

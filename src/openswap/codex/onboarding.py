@@ -27,7 +27,7 @@ from openswap.codex.engine import CodexEngine
 
 
 _URL_RE = re.compile(r"https://[^\s<>\"']+")
-_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))")
 _DEVICE_RE = re.compile(
     r"(?:device\s+(?:code|authorization)|enter\s+(?:this|the)\s+(?:one-time\s+)?code)\s*[:：]?\s*"
     r"([A-Z0-9]{4,}(?:-[A-Z0-9]{3,})*)",
