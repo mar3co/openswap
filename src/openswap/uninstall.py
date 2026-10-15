@@ -117,7 +117,12 @@ def remove_integrations(
 
 
 def _ours(plist: Path) -> bool:
-    """Whether this install is the one ``plist`` runs."""
+    """Whether this install is the one ``plist`` runs.
+
+    In the app, only this copy of it (or a program that is gone, which no
+    install can still use): an agent on a uv install, a dev build or another
+    copy of the app that still exists outlives this one.
+    """
     if not bundle.is_frozen():
         return True
     try:
@@ -126,7 +131,7 @@ def _ours(plist: Path) -> bool:
         return True  # unreadable: no other install can claim it either
     if not (isinstance(program, list) and program and isinstance(program[0], str)):
         return True
-    return bundle.is_app_executable(program[0])
+    return _runs_this_app(program[0])
 
 
 def _remove_menubar_agent(home: Path, uid: int | None) -> bool:
@@ -242,11 +247,24 @@ def delete_saved_logins() -> int:
     return deleted
 
 
+def _data_roots() -> list[Path]:
+    """The backup root and, when it is a separate folder, the pre-XDG one:
+    both go in a zap, as in purge."""
+    backup = paths.get_backup_root()
+    legacy = paths.get_legacy_backup_root()
+    if legacy.is_relative_to(backup) or backup.is_relative_to(legacy):
+        return [backup]
+    return [backup, legacy]
+
+
 def _session_profiles() -> list[Path]:
-    sessions = paths.get_backup_root() / "sessions"
-    if not sessions.is_dir():
-        return []
-    return sorted(profile for profile in sessions.iterdir() if profile.is_dir())
+    """Session profiles in every root a zap deletes."""
+    found = []
+    for root in _data_roots():
+        sessions = root / "sessions"
+        if sessions.is_dir():
+            found.extend(sorted(p for p in sessions.iterdir() if p.is_dir()))
+    return found
 
 
 def refuse_live_sessions() -> None:
@@ -282,16 +300,14 @@ def data_paths(home: Path | None = None, *, homebrew_zap: bool = False) -> list[
     only what Homebrew's zap leaves behind."""
     home = home if home is not None else Path.home()
     logs = home / "Library" / "Logs"
-    backup = paths.get_backup_root()
+    backup, *legacy = _data_roots()
     found = [] if homebrew_zap else [
         backup,
         home / "Library" / "Containers" / bundle.APPEX_ID,
         *sorted(logs.glob("com.opensoft.openswap.*.log")),
         *sorted(logs.glob("com.opensoft.openswap.*.err")),
     ]
-    legacy = paths.get_legacy_backup_root()
-    if not (legacy.is_relative_to(backup) or backup.is_relative_to(legacy)):
-        found.append(legacy)
+    found.extend(legacy)
     return [path for path in found if path.exists() or path.is_symlink()]
 
 

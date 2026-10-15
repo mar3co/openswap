@@ -128,15 +128,35 @@ class TestRemoveIntegrations:
         assert len(seen["disable"]) == 1
         assert not any(agents.iterdir())
 
-    def test_app_leaves_a_uv_install_alone(self, mac, frozen_app):
+    def test_app_leaves_a_uv_install_alone(self, mac, frozen_app, tmp_path):
         home, agents, seen, _ = mac
-        _plist(agents / "com.opensoft.openswap.menubar.plist", [UV_SCRIPT, "menubar"])
-        _plist(agents / "com.opensoft.openswap.worker.plist", [UV_SCRIPT, "worker", "run"])
+        uv = tmp_path / "uv-bin" / "openswap"
+        uv.parent.mkdir()
+        uv.write_text("#!/bin/sh\n")
+        _plist(agents / "com.opensoft.openswap.menubar.plist", [str(uv), "menubar"])
+        _plist(agents / "com.opensoft.openswap.worker.plist", [str(uv), "worker", "run"])
         removal = uninstall.remove_integrations(home=home, uid=501)
         assert removal.removed == [] and removal.failed == []
         assert "com.opensoft.openswap.menubar" not in seen["menubar"]
         assert seen["disable"] == []
         assert (agents / "com.opensoft.openswap.menubar.plist").exists()
+
+    def test_app_leaves_another_copy_of_the_app_alone(self, mac, frozen_app, tmp_path):
+        """A dev build or a copy from Downloads outlives the cask's app."""
+        home, agents, _, _ = mac
+        other = tmp_path / "Downloads" / "OpenSwap.app" / "Contents" / "MacOS" / "OpenSwap"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"")
+        _plist(agents / "com.opensoft.openswap.menubar.plist", [str(other)])
+        removal = uninstall.remove_integrations(home=home, uid=501)
+        assert removal.removed == []
+        assert (agents / "com.opensoft.openswap.menubar.plist").exists()
+
+    def test_app_removes_an_agent_whose_program_is_gone(self, mac, frozen_app):
+        home, agents, _, _ = mac
+        _plist(agents / "com.opensoft.openswap.menubar.plist", ["/Applications/Old/OpenSwap.app/Contents/MacOS/OpenSwap"])
+        removal = uninstall.remove_integrations(home=home, uid=501)
+        assert removal.removed == ["menu bar login item"]
 
     def test_uv_install_removes_its_own(self, mac):
         home, agents, _, _ = mac
@@ -237,6 +257,7 @@ class TestZapData:
         (sessions / "stray.json").write_text("{}")
         order = []
         monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: tmp_path / "no-legacy")
         monkeypatch.setattr(
             "openswap.session.delete_macos_keychain_entry", lambda d: order.append(d.name)
         )
@@ -251,7 +272,24 @@ class TestZapData:
         for name in scans:
             (sessions / name).mkdir(parents=True)
         monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path / "OpenSwap")
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: tmp_path / ".claude-swap-backup")
         monkeypatch.setattr("openswap.session.scan_live_sessions", lambda d: scans[d.name])
+
+    def test_profiles_in_the_legacy_folder_are_checked_and_cleared(self, monkeypatch, tmp_path):
+        """A zap deletes ~/.claude-swap-backup too, so its profiles count."""
+        live = type("S", (), {"pid": 9})()
+        self._profiles(monkeypatch, tmp_path, {"1-a": ([], 0), "3-c": ([live], 0)})
+        legacy_profile = tmp_path / ".claude-swap-backup" / "sessions" / "3-c"
+        legacy_profile.mkdir(parents=True)
+        (tmp_path / "OpenSwap" / "sessions" / "3-c").rmdir()
+        with pytest.raises(ClaudeSwitchError, match="3-c"):
+            uninstall.refuse_live_sessions()
+        cleared = []
+        monkeypatch.setattr("openswap.session.profile_is_quiescent", lambda d: True)
+        monkeypatch.setattr("openswap.session.delete_macos_keychain_entry", cleared.append)
+        monkeypatch.setattr(macos_keychain, "delete_all", lambda service: 0)
+        uninstall.delete_saved_logins()
+        assert cleared == [tmp_path / "OpenSwap" / "sessions" / "1-a", legacy_profile]
 
     def test_live_session_refuses_a_zap(self, monkeypatch, tmp_path):
         live = type("S", (), {"pid": 4242})()
