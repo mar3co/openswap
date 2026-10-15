@@ -641,6 +641,34 @@ class TestCLI:
         assert exc.value.code == 0
         assert called.get("ran") is True
 
+    @pytest.mark.parametrize("frozen", [True, False], ids=["app", "uv"])
+    def test_menubar_start_migrates_only_in_the_app(self, monkeypatch, request, frozen):
+        order: list[str] = []
+
+        class _FakeSwitcher:
+            def __init__(self, *a, **k):
+                pass
+            def _is_running_in_container(self):
+                return False
+
+        if frozen:
+            request.getfixturevalue("frozen_app")
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", _FakeSwitcher)
+        monkeypatch.setattr(sys, "argv", ["openswap", "menubar"])
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(
+            "openswap.bundle.migrate_from_uv_install", lambda **k: order.append("migrate") or []
+        )
+        monkeypatch.setattr(
+            "openswap.menubar.run", lambda switcher, codex=None: order.append("run") or 0, raising=False
+        )
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0
+        assert order == (["migrate", "run"] if frozen else ["run"])
+
     def test_menubar_subcommand_dispatches(self, monkeypatch):
         """Bare `openswap menubar` should route exactly like `openswap --menubar`."""
         called = {}
@@ -1825,6 +1853,35 @@ class TestSetupCommand:
         tail = out.strip().splitlines()[-2:]
         assert message in tail[0]
         assert "openswap add" in tail[1]
+
+    def test_setup_runs_the_uv_migration_after_installing_the_extra(self, monkeypatch, capsys):
+        order: list[str] = []
+        seen = self._harness(monkeypatch, ["openswap", "setup"])
+        from openswap import launch_agent
+
+        install = launch_agent.install
+        monkeypatch.setattr(launch_agent, "install", lambda: order.append("install") or install())
+
+        def fake_migrate(home=None, uid=None, notify=None):
+            order.append("migrate")
+            notify("An older uv install is still on PATH: run uv tool uninstall openswap")
+            return []
+
+        monkeypatch.setattr("openswap.bundle.migrate_from_uv_install", fake_migrate)
+        assert self._run() == 0
+        assert order == ["install", "migrate"]
+        assert seen["widget"] == 1
+        out = capsys.readouterr().out
+        assert "run uv tool uninstall openswap" in out
+        assert out.index("Menu bar extra running") < out.index("uv tool uninstall")
+
+    def test_setup_in_the_app_does_not_ask_for_xcode(self, monkeypatch, capsys, frozen_app):
+        self._harness(monkeypatch, ["openswap", "setup"])
+        monkeypatch.setattr("openswap.bundle.migrate_from_uv_install", lambda **k: [])
+        assert self._run() == 0
+        out = capsys.readouterr().out
+        assert "Desktop widget: openswap widget --install" in out
+        assert "Xcode" not in out
 
     def test_extra_that_did_not_come_up_is_not_called_running(self, monkeypatch, capsys):
         self._harness(monkeypatch, ["openswap", "setup"], pid=None)

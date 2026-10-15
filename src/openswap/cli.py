@@ -1222,6 +1222,10 @@ def _setup_command(argv: list[str]) -> int:
     lock timeout, ...) still installs the extra but exits 1, because "log in"
     is the wrong advice for it. A failed capture is reported after the extra
     so its hint is the last thing the user reads.
+
+    In the cask's app it also moves a uv install over
+    (``bundle.migrate_from_uv_install``), after the extra is installed so the
+    login item already points at the app.
     """
     parser = argparse.ArgumentParser(
         prog="openswap setup",
@@ -1231,10 +1235,11 @@ def _setup_command(argv: list[str]) -> int:
         ),
     )
     parser.parse_args(argv)
-    from openswap import launch_agent
+    from openswap import bundle, launch_agent
     from openswap.exceptions import NotLoggedInError
     from openswap.update_check import restart_widget_agent
 
+    migration_notes: list[str] = []
     saved = False
     not_saved: tuple[str, str, int] | None = None  # (reason, hint, exit code)
     try:
@@ -1250,6 +1255,7 @@ def _setup_command(argv: list[str]) -> int:
             # still worth installing; the store problem is the user's fix.
             not_saved = (str(e), "When that is fixed, run: openswap add", 1)
         result = launch_agent.install()
+        bundle.migrate_from_uv_install(notify=migration_notes.append)
         widget_detail = restart_widget_agent()
         pid = _wait_for_pid(launch_agent, result["label"])
     except ClaudeSwitchError as e:
@@ -1275,9 +1281,13 @@ def _setup_command(argv: list[str]) -> int:
     else:
         warning("Menu bar extra was installed but is not running yet.")
     print(dimmed(f"  log: {result['stderr_log']}"))
+    for note in migration_notes:
+        warning(note)
     if widget_detail:
         warning(f"Widget host did not restart: {widget_detail}")
         print(dimmed("Run: openswap widget --install"))
+    elif bundle.is_frozen():
+        print(dimmed("Desktop widget: openswap widget --install"))
     else:
         print(dimmed("Desktop widget (needs Xcode): openswap widget --install"))
     if not_saved is None:
@@ -1985,6 +1995,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
             if args.install_service or args.uninstall_service or args.service_status:
                 sys.exit(_menubar_service(args))
+            # The cask's app moves a uv install over on every start; once
+            # done it is a no-op, and it logs rather than raises.
+            from openswap import bundle
+
+            if bundle.is_frozen():
+                bundle.migrate_from_uv_install()
             # menubar is import-safe without the extra; a missing rumps
             # surfaces from run() as a ClaudeSwitchError with the install hint.
             from openswap.codex.engine import CodexEngine
