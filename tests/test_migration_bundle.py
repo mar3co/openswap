@@ -252,9 +252,10 @@ def test_old_widget_host_is_booted_out_unregistered_and_trashed(mac, monkeypatch
     assert ["bootout", f"gui/{UID}/{wi.LABEL}"] in mac["seen"]["launchctl"]
     assert not host_plist.exists()
     assert mac["seen"]["trash"] == [old]
+    # The bundled appex is registered before the old one goes.
     assert mac["seen"]["pluginkit"] == [
-        ["-r", str(old / "Contents/PlugIns/OpenSwapWidgetExtension.appex")],
         ["-a", str(mac["app"] / "Contents/PlugIns/OpenSwapWidgetExtension.appex")],
+        ["-r", str(old / "Contents/PlugIns/OpenSwapWidgetExtension.appex")],
     ]
 
 

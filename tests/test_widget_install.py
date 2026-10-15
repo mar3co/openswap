@@ -261,3 +261,78 @@ def test_unfrozen_install_still_builds_with_xcode(tmp_path, monkeypatch):
         wi.install_widget(home=tmp_path, derived=tmp_path / "derived", team="ABCDE12345")
     assert calls[0][0] == "/usr/bin/xcodebuild"
     assert not any(c[0] == "pluginkit" for c in calls)
+
+
+def _old_host(home: Path) -> Path:
+    import plistlib
+
+    app = home / "Applications" / "OpenSwap.app"
+    (app / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex").mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleIdentifier": "com.opensoft.openswap.widget"})
+    )
+    return app
+
+
+def _built_host(home: Path) -> Path:
+    appex = (
+        home / "Library" / "Caches" / "openswap-widget" / "Build" / "Products" / "Release"
+        / "OpenSwap.app" / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex"
+    )
+    appex.mkdir(parents=True)
+    return appex
+
+
+def test_frozen_install_registers_before_retiring_the_old_host(frozen_darwin, tmp_path):
+    old = _old_host(tmp_path)
+    wi.install_widget(home=tmp_path)
+    bundled = str(frozen_darwin["app"] / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex")
+    calls = [c for c in frozen_darwin["runs"].calls if c[0] == "pluginkit"]
+    # Registered once, before the old copy is unregistered.
+    assert calls == [
+        ["pluginkit", "-a", bundled],
+        ["pluginkit", "-r", str(old / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex")],
+    ]
+    assert frozen_darwin["trashed"] == [old]
+
+
+def test_a_failed_registration_retires_nothing_so_the_next_run_retries(frozen_darwin, tmp_path):
+    old = _old_host(tmp_path)
+    built = _built_host(tmp_path)
+    frozen_darwin["runs"].pluginkit_rc = 1
+    with pytest.raises(ClaudeSwitchError, match="pluginkit could not register"):
+        wi.retire_legacy_host(home=tmp_path, uid=501)
+    assert frozen_darwin["trashed"] == []
+    assert old.is_dir() and built.is_dir()
+    assert all(c[:2] != ["pluginkit", "-r"] for c in frozen_darwin["runs"].calls)
+
+    frozen_darwin["runs"].pluginkit_rc = 0
+    assert wi.retire_legacy_host(home=tmp_path, uid=501) == old
+    assert frozen_darwin["trashed"] == [old]
+
+
+def test_the_build_product_is_unregistered_and_its_cache_removed(frozen_darwin, tmp_path):
+    built = _built_host(tmp_path)
+    cache = tmp_path / "Library" / "Caches" / "openswap-widget"
+    keep = tmp_path / "Library" / "Caches" / "something-else"
+    keep.mkdir()
+    assert wi.retire_legacy_host(home=tmp_path, uid=501) == cache
+    assert ["pluginkit", "-r", str(built)] in frozen_darwin["runs"].calls
+    assert not cache.exists()
+    assert keep.is_dir()
+    assert frozen_darwin["trashed"] == []
+    # Done: a second run has nothing to retire.
+    before = list(frozen_darwin["runs"].calls)
+    assert wi.retire_legacy_host(home=tmp_path, uid=501) is None
+    assert frozen_darwin["runs"].calls == before
+
+
+def test_old_host_and_build_cache_go_together(frozen_darwin, tmp_path):
+    old = _old_host(tmp_path)
+    built = _built_host(tmp_path)
+    assert wi.retire_legacy_host(home=tmp_path, uid=501) == old
+    calls = [c for c in frozen_darwin["runs"].calls if c[0] == "pluginkit"]
+    assert calls[0][:2] == ["pluginkit", "-a"]
+    assert ["pluginkit", "-r", str(built)] in calls
+    assert frozen_darwin["trashed"] == [old]
+    assert not (tmp_path / "Library" / "Caches" / "openswap-widget").exists()

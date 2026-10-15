@@ -322,26 +322,57 @@ def _move_to_trash(path: Path) -> None:
     raise ClaudeSwitchError(f"Could not move {path} to the Trash: {reason}")
 
 
-def retire_legacy_host(home: Path | None = None, uid: int | None = None) -> Path | None:
+def derived_data_path(home: Path | None = None) -> Path:
+    """xcodebuild's derived data for a source install's widget build."""
+    root = home if home is not None else Path.home()
+    return root / "Library" / "Caches" / "openswap-widget"
+
+
+def retire_legacy_host(
+    home: Path | None = None,
+    uid: int | None = None,
+    *,
+    registered: bool = False,
+) -> Path | None:
     """Replace the uv install's widget host with the appex in this bundle.
 
     Two apps carrying the same appex id give WidgetKit two providers, so the
     old host goes: its LaunchAgent is booted out and its plist removed, its
     appex unregistered, and the app moved to the Trash (recoverable, unlike
-    ``rmtree``). Then the bundled appex is registered. Returns the old app's
-    path, or None when there was nothing to retire.
+    ``rmtree``). The xcodebuild product in the derived-data cache carries the
+    same appex, so it is unregistered too and that cache (ours, and nothing
+    else) is deleted.
+
+    The bundled appex is registered first (unless the caller just did,
+    ``registered``): if that fails nothing is removed, and the next run
+    tries again. Returns the old app's path (the cache's when only that was
+    left), or None when there was nothing to retire.
     """
     _require_macos()
     old = legacy_host(home)
-    if old is None:
+    cache = derived_data_path(home)
+    if old is None and not (cache.exists() or cache.is_symlink()):
         return None
-    uninstall_launch_agent(home=home, uid=uid)
-    _pluginkit("-r", str(old / "Contents" / "PlugIns" / bundle.APPEX_NAME))
-    _move_to_trash(old)
-    appex = bundle.appex()
-    if appex is not None:
+    if not registered:
+        appex = bundle.appex()
+        if appex is None or not appex.is_dir():
+            raise ClaudeSwitchError("The widget extension is missing from this app.")
         _pluginkit_or_raise("register", "-a", str(appex))
-    return old
+    if old is not None:
+        uninstall_launch_agent(home=home, uid=uid)
+        _pluginkit("-r", str(old / "Contents" / "PlugIns" / bundle.APPEX_NAME))
+        _move_to_trash(old)
+    built = cache / "Build" / "Products" / "Release" / f"{HOST_PRODUCT}.app"
+    built_appex = built / "Contents" / "PlugIns" / bundle.APPEX_NAME
+    if built_appex.is_dir():
+        _pluginkit("-r", str(built_appex))
+    try:
+        shutil.rmtree(cache)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise ClaudeSwitchError(f"Could not remove the widget build cache {cache}: {e}") from e
+    return old if old is not None else cache
 
 
 def _install_bundled_widget(home: Path | None = None, uid: int | None = None) -> dict:
@@ -350,7 +381,7 @@ def _install_bundled_widget(home: Path | None = None, uid: int | None = None) ->
     if app is None or appex is None or not appex.is_dir():
         raise ClaudeSwitchError(f"The widget extension is missing from {app}.")
     _pluginkit_or_raise("register", "-a", str(appex))
-    retire_legacy_host(home=home, uid=uid)
+    retire_legacy_host(home=home, uid=uid, registered=True)
     notify_widget_reload()
     return {"app": str(app), "label": "", "plist": ""}
 
@@ -370,7 +401,7 @@ def install_widget(
         return _install_bundled_widget(home=home)
     src = project_dir()
     team = team or detect_development_team()
-    derived = derived or (Path.home() / "Library" / "Caches" / "openswap-widget")
+    derived = derived or derived_data_path()
     log_file = derived / "xcodebuild.log"
     try:
         derived.mkdir(parents=True, exist_ok=True)

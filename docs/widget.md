@@ -20,11 +20,17 @@ The cask's `OpenSwap.app` (`com.opensoft.openswap`) is one notarized bundle, lai
 - `Contents/MacOS/openswap-widget-reload`: the reload helper (target `OpenSwapWidgetReload`)
 - `Contents/PlugIns/OpenSwapWidgetExtension.appex`: the widget (`com.opensoft.openswap.widget.extension`)
 
-`openswap.bundle` finds it from the resolved `sys.executable`. In the app nothing is built: `openswap widget --install` runs `pluginkit -a` on the bundled appex, retires an old source-install host (below), and runs the helper once. `--uninstall` is `pluginkit -r` only and never deletes the app (that is `brew uninstall`). `--status` lists each registered copy from `pluginkit -m -v -i com.opensoft.openswap.widget.extension`; more than one means two providers. There is no widget LaunchAgent and nothing to wake.
+`openswap.bundle` finds it from the resolved `sys.executable`. In the app nothing is built: `openswap widget --install` runs `pluginkit -a` on the bundled appex, retires an old source-install host (below), and runs the helper once. `--uninstall` is `pluginkit -r` only and never deletes the app (that is `brew uninstall`). `--status` lists each registered copy from `pluginkit -m -D -v -i com.opensoft.openswap.widget.extension`; more than one means two providers (without `-D` pluginkit reports only the last instance of the highest version, so a duplicate would not show). There is no widget LaunchAgent and nothing to wake.
 
 ### Moving from a source install
 
-`openswap setup`, the frozen extra's start-up, and `openswap widget --install` in the app retire the old host when `~/Applications/OpenSwap.app` has bundle id `com.opensoft.openswap.widget`: boot out LaunchAgent `com.opensoft.openswap.widget` and remove its plist, `pluginkit -r` its appex, move the app to the Trash (`NSFileManager trashItemAtURL`, recoverable), then `pluginkit -a` the bundled appex. An app with any other bundle id (the cask's own, installed with `--appdir ~/Applications`) is left alone.
+`openswap setup`, the frozen extra's start-up, and `openswap widget --install` in the app retire the old host when `~/Applications/OpenSwap.app` has bundle id `com.opensoft.openswap.widget`, or when the source build's derived data `~/Library/Caches/openswap-widget` is still there (its `Build/Products/Release/OpenSwap.app` carries the same appex id):
+
+1. `pluginkit -a` the bundled appex first. If that fails nothing is removed, so the next run tries again.
+2. Boot out LaunchAgent `com.opensoft.openswap.widget` and remove its plist, `pluginkit -r` the old host's appex, and move the app to the Trash (`NSFileManager trashItemAtURL`, recoverable).
+3. `pluginkit -r` the build product's appex and delete `~/Library/Caches/openswap-widget` (that directory only; it is OpenSwap's own build cache).
+
+An app with any other bundle id (the cask's own, installed with `--appdir ~/Applications`) is left alone.
 
 The appex id is unchanged but its parent app's bundle id changes from `com.opensoft.openswap.widget` to `com.opensoft.openswap`, so desktop and Notification Center widgets placed with the old host may go blank and need adding again (plan 007 check 4 records what actually happens).
 
