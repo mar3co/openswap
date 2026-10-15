@@ -157,13 +157,19 @@ def _repoint_menubar_agent(exe: Path, home: Path, uid: int | None) -> str | None
         program = None
     if isinstance(program, list) and program and program[0] == str(exe):
         return None
-    if os.environ.get("XPC_SERVICE_NAME") == launch_agent.LABEL:
-        # This process is that agent: re-bootstrapping would boot it out
-        # mid-start. The rewritten plist takes effect at the next login.
-        plist.write_bytes(launch_agent.build_plist([str(exe)], home=home))
-        return "menubar plist"
-    launch_agent.install(home=home, uid=uid, program=[str(exe)])
-    return "menubar agent"
+    # Never bootstrap here. `openswap setup` installs the agent before it
+    # migrates, so only a running extra reaches this line: the agent itself
+    # (re-bootstrapping would boot it out mid-start) or one opened from Finder
+    # or a terminal (bootstrapping would start a second extra beside it).
+    # Stop the uv extra unless it is this process, rewrite the plist, and let
+    # launchd start the app at the next login.
+    if os.environ.get("XPC_SERVICE_NAME") != launch_agent.LABEL:
+        for old in launch_agent.LEGACY_LABELS:
+            launch_agent.uninstall(old, home=home, uid=uid)
+        if launch_agent.is_loaded(launch_agent.LABEL, uid):
+            launch_agent._launchctl("bootout", launch_agent.service_target(launch_agent.LABEL, uid))
+    plist.write_bytes(launch_agent.build_plist([str(exe)], home=home))
+    return "menubar plist"
 
 
 def _retire_widget_host(home: Path, uid: int | None) -> str | None:

@@ -92,8 +92,18 @@ def _migrate(mac, notes: list[str] | None = None) -> list[str]:
 
 def test_uv_login_item_is_repointed_at_the_bundle(mac):
     _menubar_plist(mac["home"], UV_SCRIPT)
-    assert _migrate(mac) == ["menubar agent"]
-    assert mac["seen"]["install"] == [[str(mac["exe"])]]
+    assert _migrate(mac) == ["menubar plist"]
+    assert _program(launch_agent.plist_path(home=mac["home"])) == str(mac["exe"])
+
+
+def test_opened_from_finder_stops_the_uv_extra_without_starting_another(mac, monkeypatch):
+    """This process is already the extra; bootstrapping would run a second one."""
+    _menubar_plist(mac["home"], UV_SCRIPT)
+    monkeypatch.setattr(launch_agent, "is_loaded", lambda label=launch_agent.LABEL, uid=None: label == launch_agent.LABEL)
+    assert _migrate(mac) == ["menubar plist"]
+    assert mac["seen"]["install"] == []
+    assert ["bootout", f"gui/{UID}/{launch_agent.LABEL}"] in mac["seen"]["launchctl"]
+    assert not any(call[0] == "bootstrap" for call in mac["seen"]["launchctl"])
     assert _program(launch_agent.plist_path(home=mac["home"])) == str(mac["exe"])
 
 
@@ -126,7 +136,7 @@ def test_unreadable_login_item_is_rewritten(mac):
     plist = launch_agent.plist_path(home=mac["home"])
     plist.parent.mkdir(parents=True)
     plist.write_bytes(b"not a plist")
-    assert _migrate(mac) == ["menubar agent"]
+    assert _migrate(mac) == ["menubar plist"]
     assert _program(plist) == str(mac["exe"])
 
 
@@ -180,7 +190,7 @@ def test_a_trash_failure_is_reported_and_the_rest_still_runs(mac, monkeypatch):
 
     monkeypatch.setattr(wi, "_move_to_trash", refuse)
     notes: list[str] = []
-    assert _migrate(mac, notes) == ["menubar agent"]
+    assert _migrate(mac, notes) == ["menubar plist"]
     assert any("widget host" in n and "Operation not permitted" in n for n in notes)
     assert notes[-1] == bundle.UV_INSTALL_NOTICE
 
@@ -217,7 +227,7 @@ def test_second_run_is_a_no_op(mac):
     _menubar_plist(home, UV_SCRIPT)
     _old_host(home)
     first = _migrate(mac)
-    assert first == ["menubar agent", "widget host"]
+    assert first == ["menubar plist", "widget host"]
     calls = {key: len(value) for key, value in mac["seen"].items()}
 
     assert _migrate(mac) == []
@@ -234,10 +244,10 @@ def test_not_frozen_does_nothing(tmp_path, monkeypatch):
 def test_unexpected_errors_are_logged_not_raised(mac, monkeypatch, caplog):
     _menubar_plist(mac["home"], UV_SCRIPT)
 
-    def boom(**kwargs):
+    def boom(*args, **kwargs):
         raise RuntimeError("launchd went away")
 
-    monkeypatch.setattr(launch_agent, "install", boom)
+    monkeypatch.setattr(launch_agent, "is_loaded", boom)
     with caplog.at_level("WARNING", logger="openswap"):
         assert _migrate(mac) == []
     assert "launchd went away" in caplog.text
