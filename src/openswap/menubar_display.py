@@ -11,9 +11,7 @@ import logging
 import os
 import plistlib
 import re
-import shlex
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -45,7 +43,6 @@ from openswap.codex.desktop_app import (
 )
 from openswap.autoswitch import record_manual_switch
 from openswap.credentials import looks_like_api_key
-from openswap.paths import get_backup_root
 from openswap.settings import atomic_write_json
 from openswap.engine import (
     SENTINEL_NOTES,
@@ -1611,7 +1608,7 @@ def relogin_wrong_account_message(plan: ReloginClickPlan) -> str:
     live_name = plan.live_name or "another account"
     return (
         f"{_relogin_reason_sentence(plan)} "
-        f"Sign in as {plan.slot_name} in the login window that opens.\n\n"
+        f"Sign in as {plan.slot_name} in the browser window that opens.\n\n"
         f"Claude Code is on {live_name} right now and will sign out of it. "
         f"{live_name} stays saved in OpenSwap, so you can switch back later."
     )
@@ -1674,9 +1671,39 @@ def reconcile_dialog_copy(
 
 def relogin_login_opened_message(slot_name: str) -> str:
     return (
-        f"Sign in as {slot_name} in the Terminal window that opened. "
-        f"OpenSwap saves the new login on its own; click {slot_name} again "
-        "if it doesn't show up."
+        f"Sign in as {slot_name} in the browser window that opened. "
+        "OpenSwap saves the new login when you're done."
+    )
+
+
+def claude_login_mismatch_message(slot_name: str, live_name: str | None) -> str:
+    who = live_name or "a different account"
+    return (
+        f"You signed in as {who}, not {slot_name}. {slot_name} is still "
+        f"signed out; click {slot_name} again to retry."
+    )
+
+
+def claude_login_no_login_message(slot_name: str) -> str:
+    return (
+        f"The sign-in finished, but Claude Code has no account signed in. "
+        f"Click {slot_name} again to retry."
+    )
+
+
+def claude_login_failed_message(slot_name: str, output_tail: str) -> str:
+    detail = output_tail.strip().splitlines()[-1] if output_tail.strip() else ""
+    detail = f"\n\n{detail}" if detail else ""
+    return (
+        f"Claude Code could not sign in as {slot_name}. Click {slot_name} "
+        f"again to retry.{detail}"
+    )
+
+
+def claude_login_timed_out_message(slot_name: str) -> str:
+    return (
+        f"The sign-in as {slot_name} was not finished in time. Click "
+        f"{slot_name} again to retry."
     )
 
 
@@ -1693,65 +1720,6 @@ def resolve_claude_bin(
         if candidate.is_file():
             return str(candidate)
     return None
-
-
-LOGIN_COMMAND_NAME = "login.command"
-
-
-def build_login_command_text(claude_bin: str, email: str) -> str:
-    """Shell body for a ``.command`` file that runs ``claude auth login``."""
-    cmd = (
-        f"{shlex.quote(claude_bin)} auth login --claudeai --email {shlex.quote(email)}"
-    )
-    return f"#!/bin/bash\nexec {cmd}\n"
-
-
-def write_login_command(claude_bin: str, email: str, path: Path) -> Path:
-    """Write an executable login ``.command`` at ``path`` and return it."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(build_login_command_text(claude_bin, email), encoding="utf-8")
-    path.chmod(0o700)
-    return path
-
-
-def launch_claude_login(
-    email: str,
-    *,
-    which=None,
-    run=None,
-    command_path: Path | None = None,
-) -> str:
-    """Open Terminal on ``claude auth login --email``. Returns the shell command.
-
-    The extra has no TTY, so the OAuth flow cannot run inside this process.
-    Launch Services opens a ``.command`` file (Terminal's document type) instead
-    of Apple Events, so macOS does not ask to let Python control Terminal.
-    """
-    run_fn = subprocess.run if run is None else run
-    claude_bin = resolve_claude_bin(which=which)
-    if not claude_bin:
-        raise ClaudeSwitchError(
-            "'claude' was not found. Install Claude Code, then try again."
-        )
-    dest = command_path or (get_backup_root() / LOGIN_COMMAND_NAME)
-    write_login_command(claude_bin, email, dest)
-    result = run_fn(
-        ["open", str(dest)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if getattr(result, "returncode", 1) != 0:
-        cmd = (
-            f"{shlex.quote(claude_bin)} auth login --claudeai --email "
-            f"{shlex.quote(email)}"
-        )
-        err = (getattr(result, "stderr", None) or "").strip()
-        extra = f" ({err})" if err else ""
-        raise ClaudeSwitchError(
-            f"Couldn't open Terminal{extra}. Run this yourself: {cmd}"
-        )
-    return f"{claude_bin} auth login --claudeai --email {email}"
 
 
 # ---- pure display helpers (operate on the usage-window dict shape produced by

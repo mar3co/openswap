@@ -2676,7 +2676,7 @@ def test_plan_relogin_click_captures_only_on_email_and_org_match():
     msg = menubar.relogin_wrong_account_message(wrong_org)
     assert msg == (
         "personal's saved login has expired, so OpenSwap can't switch to it. "
-        "Sign in as personal in the login window that opens.\n\n"
+        "Sign in as personal in the browser window that opens.\n\n"
         "Claude Code is on adsonline right now and will sign out of it. "
         "adsonline stays saved in OpenSwap, so you can switch back later."
     )
@@ -2698,7 +2698,7 @@ def test_plan_relogin_click_captures_only_on_email_and_org_match():
     )
     assert menubar.relogin_wrong_account_message(no_saved_login).startswith(
         "OpenSwap has no saved login for personal, so it can't switch to it. "
-        "Sign in as personal in the login window that opens."
+        "Sign in as personal in the browser window that opens."
     )
 
     unverified = menubar.plan_relogin_click(
@@ -2807,61 +2807,30 @@ def test_notification_copy_for_relogin_has_no_cli():
     assert "openswap" not in captured.body.lower()
 
 
-def test_build_login_command_text_quotes_email():
-    text = menubar.build_login_command_text(
-        "/opt/homebrew/bin/claude", "a@x.com"
+def test_claude_login_copy_names_the_browser_and_the_retry():
+    opened = menubar.relogin_login_opened_message("personal")
+    assert "browser" in opened
+    assert "Terminal" not in opened
+    mismatch = menubar.claude_login_mismatch_message("personal", "work")
+    assert "signed in as work, not personal" in mismatch
+    assert "different account" in menubar.claude_login_mismatch_message("personal", None)
+    failed = menubar.claude_login_failed_message(
+        "personal", "Opening browser\nError: network down"
     )
-    assert text.startswith("#!/bin/bash\n")
-    assert "tell application" not in text
-    assert "auth login" in text
-    assert "--claudeai" in text
-    assert "a@x.com" in text
+    assert failed.endswith("Error: network down")
+    assert "could not sign in as personal" in failed
+    assert "\n" not in menubar.claude_login_failed_message("personal", "")
+    assert "personal" in menubar.claude_login_timed_out_message("personal")
+    assert "no account signed in" in menubar.claude_login_no_login_message("personal")
 
 
-def test_launch_claude_login_opens_command_file(tmp_path):
-    calls = []
-    dest = tmp_path / "login.command"
-
-    def run(argv, **_kwargs):
-        calls.append(argv)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    menubar.launch_claude_login(
-        "a@x.com",
-        which=lambda name: "/opt/homebrew/bin/claude" if name == "claude" else None,
-        run=run,
-        command_path=dest,
-    )
-    assert dest.is_file()
-    if sys.platform != "win32":
-        assert dest.stat().st_mode & 0o111
-    body = dest.read_text(encoding="utf-8")
-    assert body.startswith("#!/bin/bash\n")
-    assert "a@x.com" in body
-    assert calls[0][0] == "open"
-    assert calls[0][1] == str(dest)
-
-
-def test_launch_claude_login_missing_claude(monkeypatch):
-    # `launch_claude_login` falls back to common install directories after
-    # PATH lookup. Simulate the resolver's final missing result so this test
-    # stays deterministic on machines with Claude installed in one of them.
-    seen = {}
-
-    def fake_resolve(**kwargs):
-        seen.update(kwargs)
-        return None
-
-    monkeypatch.setattr(menubar_display, "resolve_claude_bin", fake_resolve)
-    which = lambda _name: None  # noqa: E731
-    with pytest.raises(ClaudeSwitchError, match="claude"):
-        menubar.launch_claude_login(
-            "a@x.com",
-            which=which,
-            run=lambda *_a, **_k: SimpleNamespace(returncode=0),
-        )
-    # The caller's `which` must reach the resolver rather than be ignored.
-    assert seen.get("which") is which
+def test_claude_login_result_is_drained_before_auto_capture_and_cancelled_on_quit():
+    text = Path(menubar.__file__).read_text()
+    tick = text[text.index("def on_sync_tick") : text.index("def _consume_widget_command")]
+    assert tick.index("_drain_claude_login_result()") < tick.index("_maybe_auto_capture_relogin()")
+    quit_ = text[text.index("def on_quit") : text.index("def on_toggle_name")]
+    assert "_claude_login.cancel()" in quit_
+    assert "launch_claude_login" not in text
 
 
 def test_resolve_claude_bin_returns_none_when_path_and_extra_dirs_miss(tmp_path):
@@ -3574,3 +3543,115 @@ def test_every_dialog_goes_through_the_above_popover_helper():
     assert "rumps.alert(" not in rest
     assert "rumps.Window(" not in rest
     assert "activateIgnoringOtherApps_" not in rest
+
+
+def _claude_login_app():
+    import logging
+    from tests.menubar_harness import extract_class
+
+    app_type = extract_class(
+        menubar.__file__, "MenuBarApp",
+        {"_on_claude_login_done", "_drain_claude_login_result"}, dict(vars(menubar)),
+    )
+    app = app_type()
+    app._event_lock = threading.Lock()
+    app._claude_login_results = []
+    app._auto_captured_nums = set()
+    app._claude_login = object()
+    app._claude_login_num = "2"
+    app.live = None
+    app._name_for_num = lambda num: {"2": "personal"}[str(num)]
+    app._name_for_identity = lambda ident: "work" if ident == ("w@x.com", "org-w") else None
+    app._slot_identity = lambda num: ("a@x.com", "org-1")
+    app.switcher = SimpleNamespace(
+        live_identity=lambda: app.live, _logger=logging.getLogger("test")
+    )
+    app.errors = []
+    app._show_error = app.errors.append
+    app.captured = []
+    app.capture_ok = True
+
+    def capture(num, close_panel):
+        app.captured.append((num, close_panel))
+        return app.capture_ok
+
+    app._capture_relogin = capture
+    return app
+
+
+def test_claude_login_drain_ignores_a_superseded_run_and_captures_the_current_one():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_login_app()
+    app.live = ("a@x.com", "org-1")
+    app._on_claude_login_done(object(), LoginResult(None, False, True, ""))
+    app._on_claude_login_done(
+        app._claude_login, LoginResult(0, False, False, "Login successful")
+    )
+    app._drain_claude_login_result()
+    assert app.captured == [("2", False)]
+    assert "2" in app._auto_captured_nums
+    assert app._claude_login is None and app._claude_login_num is None
+    assert app.errors == []
+
+
+def test_claude_login_drain_leaves_auto_capture_free_to_retry_a_failed_capture():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_login_app()
+    app.live = ("a@x.com", "org-1")
+    app.capture_ok = False
+    app._on_claude_login_done(app._claude_login, LoginResult(0, False, False, ""))
+    app._drain_claude_login_result()
+    assert app.captured == [("2", False)]
+    assert "2" not in app._auto_captured_nums
+
+
+def test_claude_login_drain_keeps_waiting_when_only_a_superseded_run_reported():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_login_app()
+    current = app._claude_login
+    app._on_claude_login_done(object(), LoginResult(None, False, True, ""))
+    app._drain_claude_login_result()
+    assert app._claude_login is current
+    assert app.captured == [] and app.errors == []
+
+
+def test_claude_login_drain_alerts_on_wrong_account_and_failure_without_capturing():
+    from openswap.claude_login import LoginResult
+
+    app = _claude_login_app()
+    app.live = ("w@x.com", "org-w")
+    app._on_claude_login_done(app._claude_login, LoginResult(0, False, False, ""))
+    app._drain_claude_login_result()
+    assert app.captured == []
+    assert "signed in as work, not personal" in app.errors[-1]
+
+    app._claude_login = object()
+    app._claude_login_num = "2"
+    app.live = ("a@x.com", "org-1")  # the dead token is still the live login
+    app._on_claude_login_done(
+        app._claude_login, LoginResult(1, False, False, "Error: boom")
+    )
+    app._drain_claude_login_result()
+    assert app.captured == []
+    assert app.errors[-1].endswith("Error: boom")
+    assert "2" not in app._auto_captured_nums
+
+
+def test_refresh_requested_while_in_flight_runs_on_the_next_tick():
+    from tests.menubar_harness import extract_class
+
+    app_type = extract_class(
+        menubar.__file__, "MenuBarApp", {"refresh_async"}, dict(vars(menubar))
+    )
+    app = app_type()
+    app._refreshing = True
+    app._desktop_switching = False
+    app._refresh_pending = False
+    app.refresh_async()
+    assert app._refresh_pending is True
+    text = Path(menubar.__file__).read_text()
+    tick = text[text.index("def on_sync_tick") : text.index("def _consume_widget_command")]
+    assert tick.index("_refresh_pending") < tick.index("_poll_login()")
