@@ -14,7 +14,7 @@ LaunchAgent `com.opensoft.openswap.menubar` runs `openswap menubar`. Accessory a
 
 1. A menu bar plist whose `ProgramArguments[0]` is not the bundle executable is rewritten, never re-bootstrapped: only a running extra gets here (`setup` installs the agent first), so starting the agent would run a second one. Opened from Finder or a terminal, it boots out the uv extra first; running as that agent (`XPC_SERVICE_NAME` is the label), it leaves itself alone. The next login starts the app.
 2. The old widget host is retired (see [widget](widget.md#moving-from-a-source-install)).
-3. A `~/.local/bin/openswap` that is not a link to the app is reported: `An older uv install is still on PATH: run uv tool uninstall openswap`. The uv tool and `~/.openswap` are not touched.
+3. An `openswap` that is not a link to the app, in uv's tool bin directory (`UV_TOOL_BIN_DIR`, `XDG_BIN_HOME`, `XDG_DATA_HOME/../bin`, `~/.local/bin`), `UV_INSTALL_DIR`, or anywhere on PATH, is reported once: `An older uv install is still on PATH: run uv tool uninstall openswap`. The uv tool and `~/.openswap` are not touched.
 
 `openswap upgrade` in the app runs nothing: it prints `brew upgrade --cask openswap` (or the release page for a copy Homebrew did not install).
 

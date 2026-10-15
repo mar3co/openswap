@@ -31,6 +31,10 @@ def mac(frozen_app, tmp_path, monkeypatch):
     for module in (bundle, launch_agent, wi):
         monkeypatch.setattr(module.sys, "platform", "darwin")
     monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    # A real uv install on this Mac must not show up as a leftover shim.
+    for name in ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME", "UV_INSTALL_DIR", "XDG_DATA_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
     seen: dict[str, list] = {"install": [], "launchctl": [], "pluginkit": [], "trash": [], "reload": []}
 
@@ -208,6 +212,32 @@ def test_leftover_uv_tool_is_reported_once_and_left_alone(mac):
     assert _migrate(mac, notes) == []
     assert notes == ["An older uv install is still on PATH: run uv tool uninstall openswap"]
     assert shim.exists() and checkout.is_dir()
+
+
+@pytest.mark.parametrize("where", ["XDG_BIN_HOME", "UV_TOOL_BIN_DIR", "UV_INSTALL_DIR", "XDG_DATA_HOME", "PATH"])
+def test_uv_tool_outside_local_bin_is_reported(mac, monkeypatch, where):
+    bin_dir = mac["home"] / "tools" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "openswap").write_text("#!/bin/sh\n")
+    if where == "XDG_DATA_HOME":
+        monkeypatch.setenv(where, str(bin_dir.parent / "share"))
+    elif where == "PATH":
+        monkeypatch.setenv(where, f"/usr/bin:{bin_dir}")
+    else:
+        monkeypatch.setenv(where, str(bin_dir))
+    notes: list[str] = []
+    _migrate(mac, notes)
+    assert notes == ["An older uv install is still on PATH: run uv tool uninstall openswap"]
+
+
+def test_one_notice_for_a_shim_found_twice(mac, monkeypatch):
+    local_bin = mac["home"] / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    (local_bin / "openswap").write_text("#!/bin/sh\n")
+    monkeypatch.setenv("PATH", f"{local_bin}:/usr/bin")
+    notes: list[str] = []
+    _migrate(mac, notes)
+    assert len(notes) == 1
 
 
 def test_a_link_to_the_bundle_is_not_a_uv_install(mac):

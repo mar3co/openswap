@@ -61,6 +61,12 @@ def _app_in(folder: Path, monkeypatch) -> Path:
     return exe
 
 
+@pytest.fixture(autouse=True)
+def _no_brew_binary(tmp_path, monkeypatch):
+    """Keep a real `<prefix>/bin/openswap` on this Mac out of the answer."""
+    monkeypatch.setattr(bundle, "BREW_BINARIES", (tmp_path / "brew" / "bin" / "openswap",))
+
+
 @pytest.mark.parametrize("room", [0, 1], ids=["apple-silicon", "intel"])
 def test_installed_by_homebrew_in_the_appdir_with_a_caskroom(tmp_path, monkeypatch, room):
     caskrooms = (tmp_path / "opt" / "Caskroom" / "openswap", tmp_path / "usr" / "Caskroom" / "openswap")
@@ -76,4 +82,30 @@ def test_installed_by_homebrew_is_false_outside_an_appdir(frozen_app, tmp_path, 
     room = tmp_path / "Caskroom" / "openswap"
     room.mkdir(parents=True)
     monkeypatch.setattr(bundle, "CASKROOMS", (room,))
+    assert bundle.installed_by_homebrew(home=tmp_path) is False
+
+
+def test_installed_by_homebrew_with_a_custom_appdir(tmp_path, monkeypatch):
+    """`brew install --cask --appdir=...` still links `<prefix>/bin/openswap` to the app."""
+    room = tmp_path / "Caskroom" / "openswap"
+    room.mkdir(parents=True)
+    monkeypatch.setattr(bundle, "CASKROOMS", (room,))
+    exe = _app_in(tmp_path / "Custom Apps", monkeypatch)
+    link = tmp_path / "brew" / "bin" / "openswap"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(exe)
+    assert bundle.installed_by_homebrew(home=tmp_path) is True
+
+
+def test_a_brew_link_to_another_app_does_not_count(tmp_path, monkeypatch):
+    room = tmp_path / "Caskroom" / "openswap"
+    room.mkdir(parents=True)
+    monkeypatch.setattr(bundle, "CASKROOMS", (room,))
+    other = tmp_path / "Elsewhere" / "OpenSwap"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"")
+    _app_in(tmp_path / "Custom Apps", monkeypatch)
+    link = tmp_path / "brew" / "bin" / "openswap"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(other)
     assert bundle.installed_by_homebrew(home=tmp_path) is False

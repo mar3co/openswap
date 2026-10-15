@@ -34,12 +34,12 @@ APPEX_ID = "com.opensoft.openswap.widget.extension"
 
 UV_INSTALL_NOTICE = "An older uv install is still on PATH: run uv tool uninstall openswap"
 
-# Homebrew's Caskroom on Apple silicon and on Intel. Checked on disk rather
+# Homebrew's prefix on Apple silicon and on Intel. Checked on disk rather
 # than asking `brew --prefix`, so nothing here shells out.
-CASKROOMS = (
-    Path("/opt/homebrew/Caskroom/openswap"),
-    Path("/usr/local/Caskroom/openswap"),
-)
+BREW_PREFIXES = (Path("/opt/homebrew"), Path("/usr/local"))
+CASKROOMS = tuple(prefix / "Caskroom" / "openswap" for prefix in BREW_PREFIXES)
+# The cask's `binary` stanza links this name in `<prefix>/bin` to the app.
+BREW_BINARIES = tuple(prefix / "bin" / "openswap" for prefix in BREW_PREFIXES)
 
 
 def is_frozen() -> bool:
@@ -96,9 +96,21 @@ def installed_by_homebrew(home: Path | None = None) -> bool:
             resolved.add(appdir.resolve())
         except (OSError, RuntimeError):
             resolved.add(appdir)
-    if app.parent not in resolved:
+    if not any(room.is_dir() for room in CASKROOMS):
         return False
-    return any(room.is_dir() for room in CASKROOMS)
+    if app.parent in resolved:
+        return True
+    # Any other --appdir: the cask's binary symlink still points into this app.
+    return any(_links_to(link, executable()) for link in BREW_BINARIES)
+
+
+def _links_to(link: Path, target: Path | None) -> bool:
+    if target is None:
+        return False
+    try:
+        return link.is_symlink() and link.resolve() == target.resolve()
+    except (OSError, RuntimeError):
+        return False
 
 
 def migrate_from_uv_install(
@@ -178,14 +190,35 @@ def _retire_widget_host(home: Path, uid: int | None) -> str | None:
     return None if widget_install.retire_legacy_host(home=home, uid=uid) is None else "widget host"
 
 
+def _uv_bin_dirs(home: Path) -> list[Path]:
+    """Where a uv install's ``openswap`` shim can be, most specific first.
+
+    uv's tool bin directory (``UV_TOOL_BIN_DIR``, ``XDG_BIN_HOME``,
+    ``XDG_DATA_HOME/../bin``, ``~/.local/bin``), the ``UV_INSTALL_DIR`` the
+    installer honours, then every PATH entry, since a shim anywhere on PATH
+    can shadow the cask's command.
+    """
+    env = os.environ
+    dirs = [Path(env[name]) for name in ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME", "UV_INSTALL_DIR") if env.get(name)]
+    if env.get("XDG_DATA_HOME"):
+        dirs.append(Path(env["XDG_DATA_HOME"]).parent / "bin")
+    dirs.append(home / ".local" / "bin")
+    dirs.extend(Path(entry) for entry in env.get("PATH", "").split(os.pathsep) if entry)
+    return dirs
+
+
 def _report_uv_install(exe: Path, home: Path, say: Callable[[str], object]) -> None:
-    shim = home / ".local" / "bin" / "openswap"
-    if not (shim.exists() or shim.is_symlink()):
+    seen: set[Path] = set()
+    for directory in _uv_bin_dirs(home):
+        shim = directory / "openswap"
+        if shim in seen or not (shim.exists() or shim.is_symlink()):
+            continue
+        seen.add(shim)
+        try:
+            if shim.resolve() == exe.resolve():
+                continue  # linked to this app, like the cask's own symlink
+        except (OSError, RuntimeError):
+            pass
+        say(UV_INSTALL_NOTICE)
         return None
-    try:
-        if shim.resolve() == exe.resolve():
-            return None  # linked to this app, like the cask's own symlink
-    except (OSError, RuntimeError):
-        pass
-    say(UV_INSTALL_NOTICE)
     return None
