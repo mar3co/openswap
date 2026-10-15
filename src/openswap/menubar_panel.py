@@ -90,6 +90,7 @@ from openswap.menubar import (
     SETTINGS_POPUP_W,
     SETTINGS_SECTION_AUTOMATION,
     SETTINGS_SECTION_GENERAL,
+    SETTINGS_SECTION_REMOTE,
     SETTINGS_SECTIONS,
     apply_chatgpt_activation,
     DesktopCapability,
@@ -1197,11 +1198,6 @@ class MenuBarPanel:
             else SETTINGS_SECTION_GENERAL
         )
         self._page = SETTINGS_PAGE
-        if (
-            self._settings_section == SETTINGS_SECTION_GENERAL
-            and self._on_worker_view_active is not None
-        ):
-            self._on_worker_view_active()
         self.reload()
 
     def _show_main(self, _sender=None):
@@ -1214,6 +1210,8 @@ class MenuBarPanel:
         if section not in {value for value, _label in SETTINGS_SECTIONS}:
             return
         self._settings_section = section
+        if section == SETTINGS_SECTION_REMOTE and self._on_worker_view_active is not None:
+            self._on_worker_view_active()
         if self.is_shown():
             self.reload()
 

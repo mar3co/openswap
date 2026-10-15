@@ -1388,20 +1388,20 @@ def test_loopback_pair_setup_and_report(root, keychain, monkeypatch, capsys, res
 # --- menu bar --------------------------------------------------------------------------------------
 
 
-def _general_rows(**kwargs):
+def _remote_rows(**kwargs):
     return menubar.settings_page_rows(
         menubar.MenuBarSettings(), strategy="best", threshold=90,
-        section=menubar.SETTINGS_SECTION_GENERAL, **kwargs,
+        section=menubar.SETTINGS_SECTION_REMOTE, **kwargs,
     )
 
 
 def test_menu_has_a_set_up_button_first_in_remote_tasks():
-    rows = _general_rows()
+    rows = _remote_rows()
     ids = [row["id"] for row in rows]
     assert ids.index("group_remote_tasks") + 1 == ids.index("remote_tasks_setup")
     row = rows[ids.index("remote_tasks_setup")]
     assert row["kind"] == "button" and row["label"] == "Set up Remote tasks…" and row["disabled"] is False
-    busy = {r["id"]: r for r in _general_rows(worker_status={"operation": "worker_account_update"})}
+    busy = {r["id"]: r for r in _remote_rows(worker_status={"operation": "worker_account_update"})}
     assert busy["remote_tasks_setup"]["disabled"] is True
 
 
