@@ -216,11 +216,23 @@ def _remove_widget(home: Path, uid: int | None) -> bool:
 
 def delete_saved_logins() -> int:
     """Delete every Keychain item OpenSwap saved: account backups (also under
-    the pre-rename service) and the worker's pairing. Never Claude Code's own
-    items, which hold the login in use now. Returns how many were deleted."""
+    the pre-rename service), the worker's pairing, and each session profile's
+    current login. Never Claude Code's own items, which hold the login in use
+    now. Returns how many service items were deleted.
+
+    Run before the data folder goes, as ``purge`` does: a session profile's
+    item is named from its directory's path, so once that is deleted the
+    item can no longer be found.
+    """
     from openswap import macos_keychain
     from openswap.credentials import LEGACY_BACKUP_SECURITY_SERVICE, SECURITY_SERVICE
+    from openswap.session import delete_macos_keychain_entry
 
+    sessions = paths.get_backup_root() / "sessions"
+    if sessions.is_dir():
+        for profile in sessions.iterdir():
+            if profile.is_dir():
+                delete_macos_keychain_entry(profile)
     deleted = 0
     for service in (SECURITY_SERVICE, LEGACY_BACKUP_SECURITY_SERVICE):
         try:

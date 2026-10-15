@@ -219,12 +219,30 @@ class TestRemoveIntegrations:
 
 
 class TestZapData:
-    def test_delete_saved_logins_covers_both_services(self, monkeypatch):
+    def test_delete_saved_logins_covers_both_services(self, monkeypatch, tmp_path):
         calls = []
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path / "none")
         monkeypatch.setattr(macos_keychain, "delete_all", lambda service: calls.append(service) or 2)
         assert uninstall.delete_saved_logins() == 4
         assert calls == ["openswap", "claude-swap"]
         assert "Claude Code-credentials" not in calls
+
+    def test_delete_saved_logins_clears_session_profiles_first(self, monkeypatch, tmp_path):
+        """A profile's item is named from its path; zap deletes the path."""
+        backup = tmp_path / "OpenSwap"
+        sessions = backup / "sessions"
+        (sessions / "1-a-example-com").mkdir(parents=True)
+        (sessions / "2-b-example-com").mkdir()
+        (sessions / "stray.json").write_text("{}")
+        order = []
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
+        monkeypatch.setattr(
+            "openswap.session.delete_macos_keychain_entry", lambda d: order.append(d.name)
+        )
+        monkeypatch.setattr(macos_keychain, "delete_all", lambda service: order.append(service) or 0)
+        uninstall.delete_saved_logins()
+        assert sorted(order[:2]) == ["1-a-example-com", "2-b-example-com"]
+        assert order[2:] == ["openswap", "claude-swap"]
 
     def test_data_paths_match_what_exists(self, tmp_path, monkeypatch):
         home = tmp_path / "home"
