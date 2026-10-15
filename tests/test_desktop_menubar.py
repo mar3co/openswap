@@ -374,13 +374,17 @@ def test_real_run_wires_submenu_and_completion_timer(tmp_path, monkeypatch):
     assert not live_app._desktop_switching
 
 
-def test_parent_off_keeps_accounts_and_rejects_every_activation_path(app):
+def test_parent_off_turns_the_tab_into_a_codex_cli_switcher(app):
     app.settings.chatgpt_switching_enabled = False
     app.settings.save(app._test_settings_path)
+    app._on_account_click = Mock()
     app._on_panel_account_click(f"{CODEX_NUM_PREFIX}2")
+    # A row click selects that login for Codex CLI; nothing desktop runs and
+    # nobody is sent to Settings.
+    app._on_account_click.assert_called_once_with(f"{CODEX_NUM_PREFIX}2", close_panel=True)
     app._test_thread.assert_not_called()
-    assert app._alert.call_args.kwargs["ok"] == "Enable in Settings"
-    app._panel._show_settings.assert_called()
+    app._alert.assert_not_called()
+    app._panel._show_settings.assert_not_called()
     app._make_desktop_switch("2", "Work")(None)
     app._test_thread.assert_not_called()
     app.codex.switch_to.assert_not_called()

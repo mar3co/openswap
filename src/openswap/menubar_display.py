@@ -82,6 +82,18 @@ def chatgpt_suggestions_effective(settings: "MenuBarSettings") -> bool:
     )
 
 
+def chatgpt_tab_desktop(settings: "MenuBarSettings | None") -> bool:
+    """Whether the ChatGPT tab is about the desktop app (True) or Codex CLI.
+
+    One stored switch, **Enable ChatGPT switching**, decides the tab's whole
+    identity: off, the tab is titled Codex, a card click selects that login
+    for Codex CLI and the footer toggle is live Codex rotation; on, the tab is
+    titled ChatGPT, a click reopens the ChatGPT app and the toggle is ChatGPT
+    suggestions.
+    """
+    return bool(getattr(settings, "chatgpt_switching_enabled", False))
+
+
 def chatgpt_manual_activation_allowed(
     settings: "MenuBarSettings",
     capability: DesktopCapability,
@@ -249,6 +261,9 @@ SETTINGS_PAGE = "settings"
 TOKEN_PAGE = "token"
 SETUP_TOKEN_PREFIX = "sk-ant-oat"
 MAIN_PAGE = "main"
+CHATGPT_SWITCHING_HINT = (
+    "Off: the Codex tab switches Codex CLI. On: the ChatGPT tab reopens the ChatGPT app."
+)
 SETTINGS_SECTION_GENERAL = "general"
 SETTINGS_SECTION_AUTOMATION = "automation"
 SETTINGS_SECTION_REMOTE = "remote"
@@ -612,6 +627,13 @@ def settings_page_rows(
                     "id": "chatgpt_switching_enabled",
                     "label": "Enable ChatGPT switching",
                     "value": bool(settings.chatgpt_switching_enabled),
+                },
+                {
+                    "kind": "group",
+                    "style": "hint",
+                    "section": SETTINGS_SECTION_AUTOMATION,
+                    "id": "chatgpt_switching_hint",
+                    "label": CHATGPT_SWITCHING_HINT,
                 },
                 {
                     "kind": "toggle",
@@ -2135,16 +2157,20 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 "fetched_at": fetched_at,
                 "windows": windows,
                 "provider": provider,
+                "email": email,
+                "alias": alias or "",
             }
         )
     return cards
 
 
-def provider_cards(cards: list[dict], provider: str) -> list[dict]:
+def provider_cards(cards: list[dict], provider: str, *, desktop: bool = True) -> list[dict]:
     """Filter popover cards by UI provider tab.
 
     The ChatGPT tab intentionally reuses the Codex roster: those credentials
     are shared, while the visible copy makes that relationship explicit.
+    ``desktop`` is `chatgpt_tab_desktop`: only the desktop app refuses API
+    keys, so the Codex-mode tab leaves them switchable.
     """
     if provider not in ("claude", "chatgpt"):
         return []
@@ -2159,17 +2185,24 @@ def provider_cards(cards: list[dict], provider: str) -> list[dict]:
             shown["title"] = str(shown["title"])[len("Codex · ") :]
         shown["provider"] = "chatgpt"
         # Desktop-only restrictions must not change widget/CLI behavior.
-        if shown.get("api_key"):
+        if desktop and shown.get("api_key"):
             shown["disabled"] = True
             shown["note"] = "CLI-only · Switch API-key accounts with Codex CLI."
         result.append(shown)
     return result
 
 
-def provider_tab_title(cards: list[dict], provider: str) -> str:
+def provider_tab_name(provider: str, *, desktop: bool = True) -> str:
+    """Tab / empty-state noun: Claude, ChatGPT, or Codex when the tab is CLI-only."""
+    if provider == "chatgpt":
+        return "ChatGPT" if desktop else "Codex"
+    return "Claude"
+
+
+def provider_tab_title(cards: list[dict], provider: str, *, desktop: bool = True) -> str:
     """Provider tab copy that keeps hidden action-required accounts visible."""
-    name = "ChatGPT" if provider == "chatgpt" else "Claude"
-    shown = provider_cards(cards, provider)
+    name = provider_tab_name(provider, desktop=desktop)
+    shown = provider_cards(cards, provider, desktop=desktop)
     if any(
         card.get("needs_restore") or card.get("needs_reconcile")
         for card in shown
@@ -2180,9 +2213,9 @@ def provider_tab_title(cards: list[dict], provider: str) -> str:
     return name
 
 
-def provider_empty_state(provider: str, state: str = "ready") -> dict:
+def provider_empty_state(provider: str, state: str = "ready", *, desktop: bool = True) -> dict:
     """Actionable empty copy; never mistake a failed read for an empty roster."""
-    name = "ChatGPT" if provider == "chatgpt" else "Claude"
+    name = provider_tab_name(provider, desktop=desktop)
     if state == "loading":
         return {"title": f"Loading {name} accounts…",
                 "body": "Checking your saved logins. This may take a moment.",
@@ -2197,7 +2230,7 @@ def provider_empty_state(provider: str, state: str = "ready") -> dict:
                 "action": None, "button": "", "hint": "Your current login stays unchanged."}
     if provider == "chatgpt":
         return {
-            "title": "Add a ChatGPT account",
+            "title": f"Add a {name} account",
             "body": "Add an account without signing out.",
             "action": "start",
             "button": "Sign in with ChatGPT",
@@ -2216,8 +2249,9 @@ def provider_empty_state(provider: str, state: str = "ready") -> dict:
     }
 
 
-def provider_shared_copy(provider: str) -> str:
-    if provider == "chatgpt":
+def provider_shared_copy(provider: str, *, desktop: bool = True) -> str:
+    """Under-tab line: only the desktop-app tab needs to say its roster is Codex's."""
+    if provider == "chatgpt" and desktop:
         return "Shared with Codex · Codex usage"
     return ""
 
@@ -2743,6 +2777,84 @@ def trailing_header_frames(
     ly = max(pad, mid_y - lh / 2.0)
     cy = max(pad, mid_y - ch / 2.0)
     return (x, ly, lw, lh), (x + lw + gap, cy, cw, ch)
+
+
+def trailing_row_frames(
+    panel_width: float,
+    pad: float,
+    sizes: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+    *,
+    row_y: float,
+    row_h: float,
+    gap: float = HEADER_CONTROL_GAP,
+) -> list[tuple[float, float, float, float]]:
+    """Pack controls against the right edge of a row, in the given order.
+
+    ``sizes`` runs left to right; the last control's trailing edge sits ``pad``
+    from the panel's right edge and every control is vertically centered on
+    the row. Returns ``(x, y, w, h)`` frames in a flipped view, in the same
+    order as ``sizes``. The main-page footer uses this for Auto-switch and
+    Add account so the leading Rotate / Best pair can keep fixed positions.
+    """
+    frames: list[tuple[float, float, float, float]] = []
+    x = panel_width - pad
+    for w, h in reversed(list(sizes)):
+        x -= w
+        frames.append((x, row_y + (row_h - h) / 2.0, w, h))
+        x -= gap
+    frames.reverse()
+    return frames
+
+
+CARD_MENU_RENAME = "rename"
+CARD_MENU_TOGGLE_DISABLED = "toggle_disabled"
+CARD_MENU_REMOVE = "remove"
+
+
+def card_menu_items(card: dict, provider: str, *, desktop: bool = True) -> list[tuple[str, str]]:
+    """``(action, label)`` rows for an account card's ··· menu.
+
+    These are the per-account management actions that used to live under
+    More › Rename / Disable / Remove as submenus listing every account. The
+    disable flag only ever holds a slot out of auto-rotation, so on the
+    desktop-app tab the row says so instead of pretending to pause ChatGPT.
+    """
+    disabled = bool(card.get("disabled"))
+    if provider == "chatgpt" and desktop:
+        toggle = "Back in rotation" if disabled else "Hold out of rotation"
+    else:
+        toggle = "Enable" if disabled else "Disable"
+    return [
+        (CARD_MENU_RENAME, "Rename…"),
+        (CARD_MENU_TOGGLE_DISABLED, toggle),
+        (CARD_MENU_REMOVE, "Remove…"),
+    ]
+
+
+def card_title_suffix(card: dict, provider: str, *, desktop: bool = True) -> str:
+    """Parenthetical after a disabled card's title; empty for an enabled one."""
+    if not card.get("disabled"):
+        return ""
+    if card.get("api_key"):
+        return "CLI only"
+    if provider == "chatgpt" and desktop:
+        return "out of rotation"
+    return "disabled"
+
+
+def card_badge_text(card: dict, provider: str, *, desktop: bool = True) -> str:
+    """Trailing badge on an active or action-required card.
+
+    ``shared`` on the desktop-app tab: the row is selected in the shared
+    credential file, which does not prove the running ChatGPT session uses it.
+    """
+    if card.get("action_required"):
+        if card.get("needs_restore") or card.get("needs_reconcile"):
+            return "repair login"
+        return "sign in needed"
+    if card.get("active"):
+        return "shared" if (provider == "chatgpt" and desktop) else "active"
+    return ""
 
 
 def settings_header_frames(

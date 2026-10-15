@@ -3845,3 +3845,211 @@ def test_claude_add_is_offered_on_the_claude_page_and_in_the_add_menu():
     footer = panel[panel.index('if provider == "claude" and cards:') :]
     footer = footer[: footer.index("else:")]
     assert '"Add account"' in footer and "self._on_add_claude" in footer
+
+
+# -- Popover chrome: header icons, per-card menu, trimmed More ----------------
+
+
+def test_trailing_row_frames_pack_right_to_left_in_order():
+    frames = menubar.trailing_row_frames(
+        390.0, 12.0, [(67.0, 14.0), (26.0, 16.0), (90.0, 22.0)],
+        row_y=100.0, row_h=38.0, gap=8.0,
+    )
+    label, switch, add = frames
+    assert add[0] + add[2] == 378.0  # last control hugs the right pad
+    assert switch[0] + switch[2] + 8.0 == add[0]
+    assert label[0] + label[2] + 8.0 == switch[0]
+    # Each control is centered on the row.
+    assert add[1] == 100.0 + (38.0 - 22.0) / 2.0
+    assert label[1] == 100.0 + (38.0 - 14.0) / 2.0
+    assert menubar.trailing_row_frames(390.0, 12.0, [], row_y=0.0, row_h=38.0) == []
+
+
+def test_card_menu_items_say_what_the_disable_flag_really_does():
+    assert menubar.card_menu_items({"disabled": False}, "claude") == [
+        ("rename", "Rename…"), ("toggle_disabled", "Disable"), ("remove", "Remove…"),
+    ]
+    assert menubar.card_menu_items({"disabled": True}, "claude")[1] == ("toggle_disabled", "Enable")
+    # Desktop-app tab: the flag only holds the slot out of Codex rotation.
+    assert menubar.card_menu_items({"disabled": False}, "chatgpt")[1] == (
+        "toggle_disabled", "Hold out of rotation"
+    )
+    assert menubar.card_menu_items({"disabled": True}, "chatgpt")[1] == (
+        "toggle_disabled", "Back in rotation"
+    )
+    # Codex tab: plain Disable / Enable, like Claude.
+    assert menubar.card_menu_items({"disabled": False}, "chatgpt", desktop=False)[1] == (
+        "toggle_disabled", "Disable"
+    )
+    assert menubar.card_menu_items({"disabled": True}, "chatgpt", desktop=False)[1] == (
+        "toggle_disabled", "Enable"
+    )
+
+
+def test_panel_accounts_carry_email_and_alias_for_the_card_menu():
+    snap = {"accounts": [
+        (2, "a@x.com", True, _USAGE, _USAGE, "work", "Acme", False, _NOW - 5),
+        (3, "b@x.com", False, _USAGE, _USAGE, None, "Acme", False, _NOW - 5),
+    ]}
+    cards = menubar.panel_accounts(snap, now=_NOW)
+    assert (cards[0]["email"], cards[0]["alias"]) == ("a@x.com", "work")
+    assert (cards[1]["email"], cards[1]["alias"]) == ("b@x.com", "")
+
+
+def test_panel_header_holds_settings_and_more_icons_and_footer_holds_autoswitch():
+    text = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
+        encoding="utf-8"
+    )
+    build = text[text.index("    def _build(self):") : text.index("    def _build_settings(self):")]
+    header = build[: build.index("inner_w = PANEL_WIDTH - PAD * 2")]
+    assert '"gearshape"' in header and "self._show_settings" in header
+    assert '"ellipsis.circle"' in header and "self._more" in header
+    assert "trailing_header_frames" in header
+    # The Auto-switch switch is built in the header block but only placed in
+    # the footer row, next to Rotate / Best.
+    assert "root.addSubview_(auto)" not in header
+    footer = build[build.index("# Footer") :]
+    assert "trailing_row_frames" in footer
+    assert "[auto_label, auto] if show_auto" in footer
+    assert '"Settings"' not in footer and '"More"' not in footer
+    icon = text[text.index("def _add_icon_button") : text.index("def _alloc_switch")]
+    assert "imageWithSystemSymbolName_accessibilityDescription_" in icon
+    assert "setBordered_(bordered)" in icon
+
+
+def test_card_menu_button_opens_the_account_menu_instead_of_switching():
+    text = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
+        encoding="utf-8"
+    )
+    hit = text[text.index("    def hitTest_(self, point):") : text.index("    def mouseUp_(self, event):")]
+    assert "menu_button" in hit and "isDescendantOf_" in hit
+    build = text[text.index("    def _build(self):") : text.index("    def _build_settings(self):")]
+    card = build[build.index("for card in cards:") :]
+    assert '"ellipsis"' in card and "card_view.menu_button = menu_btn" in card
+    assert "self._card_menu(c, _s)" in card
+    menu = text[text.index("def _card_menu") : text.index("def _select_provider")]
+    assert "_hold_overflow(True)" in menu and "self._on_card_menu(card, sender)" in menu
+    assert "self.close()" not in menu
+
+
+def test_popup_card_menu_wires_rename_disable_remove_for_that_card():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    assert "on_card_menu=self._popup_card_menu" in text
+    body = text[text.index("def _popup_card_menu") : text.index("def _fit_status_item")]
+    assert "card_menu_items(" in body and "desktop=chatgpt_tab_desktop(self.settings)" in body
+    assert "_make_rename(num" in body and "_make_toggle_disabled(num" in body
+    assert "_make_remove(num)" in body
+    assert "popUpMenuPositioningItem_atLocation_inView_" in body
+    assert "_ns_to_py_and_callback" in body  # same rumps leak guard as rebuild_menu
+
+
+def test_more_menu_is_management_only_once_the_popover_is_attached():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    rebuild = text[text.index("def rebuild_menu") : text.index("def _add_menu")]
+    assert "fallback = self._panel is None" in rebuild
+    # Rotate / Best and the per-account submenus stay only for the no-popover
+    # fallback; next-available, Add, creds, history, refresh, quit remain.
+    gated = rebuild[rebuild.index("self.menu = [") :]
+    for name in ("rotate to next", "switch to best", "_rename_menu(rumps)",
+                 "_disable_menu(rumps)", "_remove_menu(rumps)", "_desktop_menu(rumps)"):
+        assert name in gated
+    always = gated.replace("if fallback else []", "")
+    assert '"Claude: next available"' in always
+    assert gated.count("if fallback else []") == 2
+
+
+# -- Second tab: Codex CLI or the ChatGPT desktop app, by one setting ---------
+
+
+def test_chatgpt_tab_desktop_follows_the_switching_setting():
+    assert menubar.chatgpt_tab_desktop(menubar.MenuBarSettings()) is False
+    assert menubar.chatgpt_tab_desktop(
+        menubar.MenuBarSettings(chatgpt_switching_enabled=True)
+    ) is True
+    assert menubar.chatgpt_tab_desktop(None) is False
+
+
+def test_second_tab_copy_is_codex_when_desktop_switching_is_off():
+    assert menubar.provider_tab_title([], "chatgpt", desktop=False) == "Codex"
+    assert menubar.provider_tab_title([], "chatgpt") == "ChatGPT"
+    assert menubar.provider_tab_title([], "claude", desktop=False) == "Claude"
+    assert menubar.provider_shared_copy("chatgpt", desktop=False) == ""
+    assert menubar.provider_shared_copy("chatgpt") == "Shared with Codex · Codex usage"
+    empty = menubar.provider_empty_state("chatgpt", desktop=False)
+    assert empty["title"] == "Add a Codex account"
+    assert empty["button"] == "Sign in with ChatGPT"
+    assert menubar.provider_empty_state("chatgpt")["title"] == "Add a ChatGPT account"
+    assert menubar.provider_empty_state("chatgpt", "loading", desktop=False)["title"] == (
+        "Loading Codex accounts…"
+    )
+
+
+def test_api_key_rows_stay_switchable_on_the_codex_tab():
+    cards = [{"provider": "codex", "title": "Codex · key", "num": "codex:3", "api_key": True}]
+    desktop = menubar.provider_cards(cards, "chatgpt")[0]
+    assert desktop["disabled"] is True and "CLI-only" in desktop["note"]
+    cli = menubar.provider_cards(cards, "chatgpt", desktop=False)[0]
+    assert "disabled" not in cli and "note" not in cli
+
+
+def test_card_badge_and_suffix_follow_the_tab_mode():
+    active = {"active": True}
+    assert menubar.card_badge_text(active, "claude") == "active"
+    assert menubar.card_badge_text(active, "chatgpt") == "shared"
+    assert menubar.card_badge_text(active, "chatgpt", desktop=False) == "active"
+    assert menubar.card_badge_text({"active": False}, "chatgpt") == ""
+    assert menubar.card_badge_text({"action_required": True, "needs_restore": True}, "claude") == "repair login"
+    assert menubar.card_badge_text({"action_required": True}, "chatgpt") == "sign in needed"
+    disabled = {"disabled": True}
+    assert menubar.card_title_suffix(disabled, "claude") == "disabled"
+    assert menubar.card_title_suffix(disabled, "chatgpt") == "out of rotation"
+    assert menubar.card_title_suffix(disabled, "chatgpt", desktop=False) == "disabled"
+    assert menubar.card_title_suffix({"disabled": True, "api_key": True}, "chatgpt") == "CLI only"
+    assert menubar.card_title_suffix({"disabled": False}, "chatgpt") == ""
+
+
+def test_switching_setting_explains_what_the_second_tab_does():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(), strategy="best", threshold=90.0, has_codex=True,
+    )
+    ids = [row["id"] for row in rows]
+    assert ids.index("chatgpt_switching_enabled") < ids.index("chatgpt_switching_hint") < ids.index("chatgpt_auto_enabled")
+    hint = next(row for row in rows if row["id"] == "chatgpt_switching_hint")
+    assert hint["style"] == "hint"
+    assert hint["label"] == menubar.CHATGPT_SWITCHING_HINT
+    assert "Codex CLI" in hint["label"] and "ChatGPT app" in hint["label"]
+
+
+def test_panel_second_tab_toggle_and_copy_follow_the_mode():
+    text = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
+        encoding="utf-8"
+    )
+    build = text[text.index("    def _build(self):") : text.index("    def _build_settings(self):")]
+    assert "desktop_tab = chatgpt_tab_desktop(settings)" in build
+    for call in (
+        "provider_cards(all_cards, provider, desktop=desktop_tab)",
+        "provider_tab_title(all_cards, tab_provider, desktop=desktop_tab)",
+        "provider_shared_copy(provider, desktop=desktop_tab)",
+        "card_title_suffix(card, provider, desktop=desktop_tab)",
+        "card_badge_text(card, provider, desktop=desktop_tab)",
+    ):
+        assert call in build, call
+    toggle = build[build.index('if provider == "chatgpt" and desktop_tab:') : build.index("auto_label = _label(")]
+    assert '"Suggest switches"' in toggle and "self._on_toggle_chatgpt_auto" in toggle
+    assert "self._codex_enabled()" in toggle and "self._on_toggle_codex_auto" in toggle
+    # The desktop status line only belongs to the desktop-app tab.
+    assert 'if (provider == "chatgpt" and desktop_tab) else ""' in build
+    assert "'paused'" not in build and '"selected"' not in build
+
+
+def test_codex_tab_click_switches_codex_cli_instead_of_asking_to_enable():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    click = text[text.index("def _on_panel_account_click") : text.index("def _slot_needs_relogin")]
+    off = click[click.index("if not self.settings.chatgpt_switching_enabled") : click.index("if self._slot_needs_relogin")]
+    assert "self._on_account_click(num, close_panel=True)" in off
+    assert "_offer_enable_chatgpt_switching" not in click
+    toggle = text[text.index("def _toggle_codex_auto") : text.index("def _popup_overflow")]
+    assert "autoswitch.codexEnabled" in toggle and "_reload_main_panel_if_shown" in toggle
+    assert "on_toggle_codex_auto=lambda *_a: self._toggle_codex_auto()" in text
+    setting = text[text.index("def _on_setting") : text.index("def _toggle_codex_auto")]
+    assert "self._toggle_codex_auto()" in setting
