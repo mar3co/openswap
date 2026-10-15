@@ -2,8 +2,11 @@
 
 The menu bar extra is a Python LaunchAgent; WidgetKit extensions are a
 separate signed Swift .appex and cannot import this package. The extra
-writes a JSON file to a stable path under Application Support and pokes
-the widget host via a distributed notification so timelines reload.
+writes a JSON file to a stable path under Application Support and asks for
+a timeline reload. Inside the cask's ``OpenSwap.app`` the appex is in the
+same bundle, so the bundled ``openswap-widget-reload`` tool reloads it. A uv
+install pokes the separately built widget host with a distributed
+notification instead.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from openswap import bundle
 from openswap.fsutil import replace_with_retry
 from openswap.menubar import panel_accounts
 
@@ -111,7 +115,19 @@ def _unlink_quiet(path: Path) -> None:
 
 
 def widget_app_path(home: Path | None = None) -> Path:
-    """Installed host app the WidgetKit extension is embedded in."""
+    """Installed host app the WidgetKit extension is embedded in.
+
+    The frozen app is its own widget host. Otherwise the widget host that
+    ``openswap widget --install`` builds into ``~/Applications``.
+    """
+    app = bundle.app_path()
+    if app is not None:
+        return app
+    return host_app_path(home)
+
+
+def host_app_path(home: Path | None = None) -> Path:
+    """``~/Applications/OpenSwap.app``: where a uv install puts its widget host."""
     root = home if home is not None else Path.home()
     return root / "Applications" / WIDGET_APP_NAME
 
@@ -274,8 +290,24 @@ def write_widget_snapshot(
 
 
 def notify_widget_reload() -> None:
-    """Ask the widget host to reload timelines. No-op off macOS or on failure."""
+    """Ask the widget host to reload timelines. No-op off macOS or on failure.
+
+    The frozen app runs its bundled reload helper and does not wait for it;
+    otherwise this posts the notification the separate widget host observes.
+    """
     if sys.platform != "darwin":
+        return
+    helper = bundle.reload_helper()
+    if helper is not None and helper.is_file():
+        try:
+            subprocess.Popen(
+                [str(helper)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass
         return
     try:
         from Foundation import NSDistributedNotificationCenter
@@ -288,8 +320,11 @@ def notify_widget_reload() -> None:
 
 
 def wake_widget_host(home: Path | None = None) -> None:
-    """Launch the widget host if it is installed, so it can relay reloads."""
-    if sys.platform != "darwin":
+    """Launch the widget host if it is installed, so it can relay reloads.
+
+    The frozen app has no separate host: its reload helper does the relaying.
+    """
+    if sys.platform != "darwin" or bundle.is_frozen():
         return
     app = widget_app_path(home)
     if not app.is_dir():

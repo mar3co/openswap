@@ -1397,6 +1397,54 @@ class TestAutoCommand:
         assert "present" in out
         assert "99" in out
 
+    def test_widget_uninstall_in_the_app_says_unregistered(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "openswap.widget_install.uninstall_widget",
+            lambda: {"unregistered": True, "removed_app": False},
+        )
+        with patch.object(sys, "argv", ["openswap", "widget", "--uninstall"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 0
+        assert "Widget unregistered" in capsys.readouterr().out
+
+    def test_widget_status_in_the_app_lists_registrations(self, monkeypatch, capsys):
+        appex = "/Applications/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex"
+        monkeypatch.setattr(
+            "openswap.widget_install.widget_status",
+            lambda: {
+                "bundled": True,
+                "app": "/Applications/OpenSwap.app",
+                "registered": True,
+                "registrations": [appex],
+            },
+        )
+        with patch.object(sys, "argv", ["openswap", "widget", "--status"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert f"registered ({appex})" in out
+        assert "host service" not in out
+
+    def test_widget_status_in_the_app_when_unregistered(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "openswap.widget_install.widget_status",
+            lambda: {
+                "bundled": True,
+                "app": "/Applications/OpenSwap.app",
+                "registered": False,
+                "registrations": [],
+            },
+        )
+        with patch.object(sys, "argv", ["openswap", "widget", "--status"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "not registered" in out
+        assert "openswap widget --install" in out
+
     def test_switcher_error_exits_1(self, temp_home, capsys):
         from openswap.exceptions import ConfigError
 

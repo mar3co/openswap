@@ -1,9 +1,17 @@
-"""Build and install the macOS WidgetKit companion app.
+"""Install the macOS WidgetKit widget.
 
-The widget is a signed Swift app + appex. Python cannot host WidgetKit, so
-``openswap widget --install`` xcodebuilds the sources next to this package and
-copies the .app into ``~/Applications``. A LaunchAgent keeps the host alive
-so it can reload timelines when the menu bar extra writes a new snapshot.
+The widget is a signed Swift appex. Python cannot host WidgetKit, so it
+needs an app around it, and there are two:
+
+* The cask's ``OpenSwap.app`` already embeds the appex next to the frozen
+  extra. ``openswap widget --install`` only registers it with ``pluginkit``,
+  retires a widget host left over from a uv install, and reloads timelines
+  through the bundled helper. Nothing is built and the bundle is never
+  deleted.
+* A uv install has no bundle, so ``openswap widget --install`` xcodebuilds the
+  sources next to this package into a separate host app in
+  ``~/Applications``. A LaunchAgent keeps that host alive so it can reload
+  timelines when the menu bar extra writes a new snapshot.
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from openswap import bundle
 from openswap.exceptions import ClaudeSwitchError
 from openswap.launch_agent import (
     _launchctl,
@@ -26,12 +35,19 @@ from openswap.launch_agent import (
     service_target,
     status as launch_status,
 )
-from openswap.widget_snapshot import WIDGET_APP_NAME, widget_app_path
+from openswap.widget_snapshot import (
+    WIDGET_APP_NAME,
+    host_app_path,
+    notify_widget_reload,
+    widget_app_path,
+)
 
 LABEL = "com.opensoft.openswap.widget"
 LEGACY_LABEL = "com.cswap.widget"
 SCHEME = "OpenSwapWidget"
 HOST_PRODUCT = "OpenSwap"
+# The separately built Swift host. The cask's app is `com.opensoft.openswap`.
+HOST_BUNDLE_ID = "com.opensoft.openswap.widget"
 
 
 def _require_macos() -> None:
@@ -247,14 +263,111 @@ def _copy_built_app(derived: Path, dest: Path) -> Path:
     return dest
 
 
+def _pluginkit(*args: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["pluginkit", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as e:  # pragma: no cover - pluginkit is in the base OS
+        raise ClaudeSwitchError("pluginkit not found; is this macOS?") from e
+
+
+def _pluginkit_or_raise(action: str, *args: str) -> None:
+    proc = _pluginkit(*args)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise ClaudeSwitchError(
+            f"pluginkit could not {action} the widget (exit {proc.returncode})"
+            + (f": {detail}" if detail else "")
+        )
+
+
+def _bundle_id(app: Path) -> str | None:
+    try:
+        data = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    value = data.get("CFBundleIdentifier") if isinstance(data, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def legacy_host(home: Path | None = None) -> Path | None:
+    """The Swift widget host a uv install built, when it is still installed.
+
+    Identified by its bundle id, so the cask's own app is never mistaken for
+    it even when the cask was installed into ``~/Applications``.
+    """
+    app = host_app_path(home)
+    if not app.is_dir() or app.resolve() == bundle.app_path():
+        return None
+    return app if _bundle_id(app) == HOST_BUNDLE_ID else None
+
+
+def _move_to_trash(path: Path) -> None:
+    """Move ``path`` to the user's Trash, like Finder; a missing path is fine."""
+    try:
+        from Foundation import NSURL, NSFileManager
+
+        ok, _url, err = NSFileManager.defaultManager().trashItemAtURL_resultingItemURL_error_(
+            NSURL.fileURLWithPath_(str(path)), None, None
+        )
+    except Exception as e:
+        raise ClaudeSwitchError(f"Could not move {path} to the Trash: {e}") from e
+    if ok or not path.exists():
+        return
+    reason = err.localizedDescription() if err is not None else "unknown error"
+    raise ClaudeSwitchError(f"Could not move {path} to the Trash: {reason}")
+
+
+def retire_legacy_host(home: Path | None = None, uid: int | None = None) -> Path | None:
+    """Replace the uv install's widget host with the appex in this bundle.
+
+    Two apps carrying the same appex id give WidgetKit two providers, so the
+    old host goes: its LaunchAgent is booted out and its plist removed, its
+    appex unregistered, and the app moved to the Trash (recoverable, unlike
+    ``rmtree``). Then the bundled appex is registered. Returns the old app's
+    path, or None when there was nothing to retire.
+    """
+    _require_macos()
+    old = legacy_host(home)
+    if old is None:
+        return None
+    uninstall_launch_agent(home=home, uid=uid)
+    _pluginkit("-r", str(old / "Contents" / "PlugIns" / bundle.APPEX_NAME))
+    _move_to_trash(old)
+    appex = bundle.appex()
+    if appex is not None:
+        _pluginkit_or_raise("register", "-a", str(appex))
+    return old
+
+
+def _install_bundled_widget(home: Path | None = None, uid: int | None = None) -> dict:
+    app = bundle.app_path()
+    appex = bundle.appex()
+    if app is None or appex is None or not appex.is_dir():
+        raise ClaudeSwitchError(f"The widget extension is missing from {app}.")
+    _pluginkit_or_raise("register", "-a", str(appex))
+    retire_legacy_host(home=home, uid=uid)
+    notify_widget_reload()
+    return {"app": str(app), "label": "", "plist": ""}
+
+
 def install_widget(
     *,
     home: Path | None = None,
     derived: Path | None = None,
     team: str | None = None,
 ) -> dict:
-    """Build, copy to ~/Applications, load the host LaunchAgent, and open it."""
+    """Build, copy to ~/Applications, load the host LaunchAgent, and open it.
+
+    The frozen app builds nothing: it registers the appex it already carries.
+    """
     _require_macos()
+    if bundle.is_frozen():
+        return _install_bundled_widget(home=home)
     src = project_dir()
     team = team or detect_development_team()
     derived = derived or (Path.home() / "Library" / "Caches" / "openswap-widget")
@@ -317,7 +430,23 @@ def install_widget(
 
 
 def uninstall_widget(home: Path | None = None, uid: int | None = None) -> dict:
+    """Remove the built widget host, or unregister the frozen app's appex.
+
+    The frozen app is the cask's to remove; this never deletes it.
+    """
     _require_macos()
+    if bundle.is_frozen():
+        appex = bundle.appex()
+        if appex is None:
+            raise ClaudeSwitchError("The widget extension is missing from this app.")
+        _pluginkit_or_raise("unregister", "-r", str(appex))
+        return {
+            "app": str(bundle.app_path()),
+            "unregistered": True,
+            "removed_app": False,
+            "removed_plist": False,
+            "was_loaded": False,
+        }
     agent = uninstall_launch_agent(home=home, uid=uid)
     app = widget_app_path(home)
     removed_app = app.exists()
@@ -331,8 +460,32 @@ def uninstall_widget(home: Path | None = None, uid: int | None = None) -> dict:
     return {**agent, "removed_app": removed_app, "app": str(app)}
 
 
+def _appex_registrations() -> list[str]:
+    """One entry per registered copy of the appex: its path when pluginkit
+    prints one, else the line itself."""
+    proc = _pluginkit("-m", "-v", "-i", bundle.APPEX_ID)
+    if proc.returncode != 0:
+        return []
+    found: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        paths = [field.strip() for field in line.split("\t") if field.strip().startswith("/")]
+        found.append(paths[-1] if paths else line.strip())
+    return found
+
+
 def widget_status(home: Path | None = None, uid: int | None = None) -> dict:
     _require_macos()
+    if bundle.is_frozen():
+        registrations = _appex_registrations()
+        return {
+            "bundled": True,
+            "app": str(bundle.app_path()),
+            "app_installed": True,
+            "registered": bool(registrations),
+            "registrations": registrations,
+        }
     app = widget_app_path(home)
     state = launch_status(label=LABEL, uid=uid, home=home)
     state["app"] = str(app)

@@ -128,6 +128,88 @@ def test_notify_and_wake_are_noop_off_darwin(monkeypatch, tmp_path: Path):
     ws.wake_widget_host(tmp_path)  # must not raise
 
 
+class _Spawned:
+    """Records subprocess.Popen calls instead of starting anything."""
+
+    def __init__(self):
+        self.calls: list[tuple[list[str], dict]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((list(argv), kwargs))
+        return object()
+
+
+def test_frozen_reload_runs_the_bundled_helper_without_waiting(frozen_app, monkeypatch):
+    spawned = _Spawned()
+    monkeypatch.setattr(ws.sys, "platform", "darwin")
+    monkeypatch.setattr(ws.subprocess, "Popen", spawned)
+    ws.notify_widget_reload()
+    assert [argv for argv, _ in spawned.calls] == [
+        [str(frozen_app / "Contents" / "MacOS" / "openswap-widget-reload")]
+    ]
+    kwargs = spawned.calls[0][1]
+    assert kwargs["stdout"] is ws.subprocess.DEVNULL
+    assert kwargs["stderr"] is ws.subprocess.DEVNULL
+
+
+def test_frozen_reload_swallows_a_helper_that_cannot_start(frozen_app, monkeypatch):
+    monkeypatch.setattr(ws.sys, "platform", "darwin")
+
+    def _boom(*a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(ws.subprocess, "Popen", _boom)
+    ws.notify_widget_reload()  # display path: must not raise
+
+
+def test_unfrozen_reload_posts_the_notification_not_the_helper(monkeypatch):
+    import sys
+    import types
+
+    posted: list[str] = []
+
+    class _Center:
+        def postNotificationName_object_userInfo_deliverImmediately_(self, name, *rest):
+            posted.append(name)
+
+    foundation = types.ModuleType("Foundation")
+    foundation.NSDistributedNotificationCenter = types.SimpleNamespace(  # type: ignore[attr-defined]
+        defaultCenter=lambda: _Center()
+    )
+    monkeypatch.setitem(sys.modules, "Foundation", foundation)
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(ws.sys, "platform", "darwin")
+    spawned = _Spawned()
+    monkeypatch.setattr(ws.subprocess, "Popen", spawned)
+    ws.notify_widget_reload()
+    assert posted == [ws.RELOAD_NOTIFICATION]
+    assert spawned.calls == []
+
+
+def test_frozen_app_has_no_separate_host_to_wake(frozen_app, tmp_path: Path, monkeypatch):
+    (tmp_path / "Applications" / "OpenSwap.app").mkdir(parents=True)
+    spawned = _Spawned()
+    monkeypatch.setattr(ws.sys, "platform", "darwin")
+    monkeypatch.setattr(ws.subprocess, "Popen", spawned)
+    ws.wake_widget_host(tmp_path)
+    assert spawned.calls == []
+
+
+def test_unfrozen_wake_opens_the_installed_host(tmp_path: Path, monkeypatch):
+    host = tmp_path / "Applications" / "OpenSwap.app"
+    host.mkdir(parents=True)
+    spawned = _Spawned()
+    monkeypatch.setattr(ws.sys, "platform", "darwin")
+    monkeypatch.setattr(ws.subprocess, "Popen", spawned)
+    ws.wake_widget_host(tmp_path)
+    assert [argv for argv, _ in spawned.calls] == [["/usr/bin/open", "-ga", str(host)]]
+
+
+def test_frozen_widget_app_is_the_bundle_itself(frozen_app, tmp_path: Path):
+    assert ws.widget_app_path(tmp_path) == frozen_app
+    assert ws.host_app_path(tmp_path) == tmp_path / "Applications" / "OpenSwap.app"
+
+
 def test_default_command_path_under_application_support(tmp_path: Path):
     assert ws.default_command_path(tmp_path) == (
         tmp_path / "Library" / "Application Support" / "OpenSwap" / "widget-command.json"

@@ -1127,17 +1127,23 @@ The menu bar extra must be running so the widget has live usage numbers.
     group.add_argument(
         "--install",
         action="store_true",
-        help="Build the widget app, copy it to ~/Applications, and start it",
+        help=(
+            "Register the widget in OpenSwap.app (a source install builds it "
+            "into ~/Applications with Xcode first)"
+        ),
     )
     group.add_argument(
         "--uninstall",
         action="store_true",
-        help="Stop the widget host and remove ~/Applications/OpenSwap.app",
+        help=(
+            "Unregister the widget (a source install also stops its host and "
+            "removes ~/Applications/OpenSwap.app)"
+        ),
     )
     group.add_argument(
         "--status",
         action="store_true",
-        help="Report whether the widget app and its LaunchAgent are present",
+        help="Report whether the widget is installed and registered",
     )
     args = parser.parse_args(argv)
     from openswap.widget_install import (
@@ -1160,12 +1166,22 @@ The menu bar extra must be running so the widget has live usage numbers.
             return 0
         if args.uninstall:
             result = uninstall_widget()
-            if result.get("removed_app") or result.get("removed_plist") or result.get("was_loaded"):
+            if result.get("unregistered"):
+                print("Widget unregistered.")
+            elif result.get("removed_app") or result.get("removed_plist") or result.get("was_loaded"):
                 print("Widget removed.")
             else:
                 print("Widget was not installed.")
             return 0
         state = widget_status()
+        if state.get("bundled"):
+            if not state["registered"]:
+                print(f"Widget: not registered ({state['app']})")
+                print(dimmed("Register it with: openswap widget --install"))
+                return 0
+            for where in state["registrations"]:
+                print(f"Widget: registered ({where})")
+            return 0
         app_state = "present" if state["app_installed"] else "missing"
         print(f"Widget app: {app_state} ({state['app']})")
         if not state["installed"] and not state["loaded"]:
