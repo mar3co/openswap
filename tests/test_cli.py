@@ -1442,6 +1442,37 @@ class TestAutoCommand:
         assert "present" in out
         assert "99" in out
 
+    def test_uv_widget_install_beside_the_cask_refuses(self, monkeypatch, capsys, tmp_path):
+        """Building the old host again would give the appex two providers."""
+        room = tmp_path / "Caskroom" / "openswap"
+        room.mkdir(parents=True)
+        monkeypatch.setattr("openswap.bundle.CASKROOMS", (room,))
+        monkeypatch.setattr("openswap.widget_install.sys.platform", "darwin")
+        monkeypatch.setattr(
+            "openswap.widget_install.project_dir", lambda: pytest.fail("must not build")
+        )
+        with patch.object(sys, "argv", ["openswap", "widget", "--install"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 1
+        assert "installed with Homebrew" in capsys.readouterr().err
+
+    def test_uv_install_service_beside_the_cask_refuses(self, monkeypatch, capsys, tmp_path):
+        room = tmp_path / "Caskroom" / "openswap"
+        room.mkdir(parents=True)
+        monkeypatch.setattr("openswap.bundle.CASKROOMS", (room,))
+        monkeypatch.setattr(
+            "openswap.launch_agent.install", lambda *a, **k: pytest.fail("must not install")
+        )
+        from argparse import Namespace
+
+        from openswap.exceptions import ClaudeSwitchError
+
+        with pytest.raises(ClaudeSwitchError, match="installed with Homebrew"):
+            cli._menubar_service(
+                Namespace(install_service=True, uninstall_service=False, service_status=False)
+            )
+
     def test_widget_uninstall_in_the_app_says_unregistered(self, monkeypatch, capsys):
         monkeypatch.setattr(
             "openswap.widget_install.uninstall_widget",
@@ -1876,6 +1907,21 @@ class TestSetupCommand:
         out = capsys.readouterr().out
         assert "run uv tool uninstall openswap" in out
         assert out.index("Menu bar extra running") < out.index("uv tool uninstall")
+
+    def test_uv_setup_beside_the_cask_refuses_before_touching_anything(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        """A uv openswap earlier on PATH would re-pin the login item to uv."""
+        seen = self._harness(monkeypatch, ["openswap", "setup"])
+        room = tmp_path / "homebrew" / "Caskroom" / "openswap"
+        room.mkdir(parents=True)
+        monkeypatch.setattr("openswap.bundle.CASKROOMS", (room,))
+        assert self._run() == 1
+        assert seen == {"add": 0, "install": 0, "widget": 0}
+        err = capsys.readouterr().err
+        assert "installed with Homebrew" in err
+        assert str(tmp_path / "homebrew" / "bin" / "openswap") in err
+        assert "uv tool uninstall openswap" in err
 
     def test_setup_in_the_app_does_not_ask_for_xcode(self, monkeypatch, capsys, frozen_app):
         self._harness(monkeypatch, ["openswap", "setup"])

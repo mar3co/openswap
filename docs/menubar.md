@@ -21,6 +21,8 @@ LaunchAgent `com.opensoft.openswap.menubar` runs `openswap menubar`. Accessory a
 
 `openswap upgrade` in the app runs nothing: it prints `brew upgrade --cask openswap` (or the release page for a copy Homebrew did not install).
 
+The other way round, a uv `openswap` that comes first on PATH would undo the move. When the cask is installed (an `openswap` Caskroom exists under `/opt/homebrew` or `/usr/local`; checked on disk), the uv install's `setup`, `upgrade`, `widget --install`, and `menubar --install-service` refuse (`bundle.refuse_uv_beside_cask`), naming `<prefix>/bin/openswap` and `uv tool uninstall openswap`. Its other commands still work, and a source install on a Mac without the cask is unaffected.
+
 After `rumps` attaches the status item, a short timer steals the click for the popover (`menubar_panel.MenuBarPanel`) and sets autosave name `com.opensoft.openswap.menubar`.
 
 ## Split: pure vs AppKit

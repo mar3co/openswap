@@ -28,7 +28,7 @@ On a Mac with Homebrew the same script installs the cask above. Without it, the 
 
 Already have a checkout? `OPENSWAP_DIR=/path/to/openswap bash install.sh` installs from it (with or without Homebrew).
 
-Moving from the source install to the cask: `openswap setup` from the app points the login item at the app and retires the old widget host. It leaves the uv tool in place and tells you to run `uv tool uninstall openswap`; `~/.openswap` is yours to delete. Widgets placed with the old host may need adding again.
+Moving from the source install to the cask: run `$(brew --prefix)/bin/openswap setup` (the uv `openswap` may come first on PATH; with the cask installed it refuses `setup`, `upgrade`, `widget --install` and `menubar --install-service` and names the cask's command). Setup points the login item, the Remote tasks worker, and the status line at the app and retires the old widget host. It leaves the uv tool in place and tells you to run `uv tool uninstall openswap`; `~/.openswap` is yours to delete. Widgets placed with the old host may need adding again.
 
 ## Quick start
 

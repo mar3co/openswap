@@ -896,6 +896,22 @@ def _deterministic_color(monkeypatch):
     monkeypatch.setenv("TERM", "dumb")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_homebrew_cask(monkeypatch):
+    """A cask installed on the test Mac must not change what the suite sees.
+
+    ``openswap.bundle`` checks ``/opt/homebrew`` and ``/usr/local`` on disk
+    (the cask refuses uv flows when it is installed). Point both at a prefix
+    that never exists; tests that need a cask set their own.
+    """
+    from openswap import bundle
+
+    prefix = Path(tempfile.gettempdir()) / "openswap-tests-no-homebrew"
+    monkeypatch.setattr(bundle, "BREW_PREFIXES", (prefix,))
+    monkeypatch.setattr(bundle, "CASKROOMS", (prefix / "Caskroom" / "openswap",))
+    monkeypatch.setattr(bundle, "BREW_BINARIES", (prefix / "bin" / "openswap",))
+
+
 @pytest.fixture
 def frozen_app(tmp_path: Path, monkeypatch) -> Path:
     """Pretend this process is the frozen ``OpenSwap.app`` (plan 008).

@@ -399,6 +399,7 @@ def install_widget(
     _require_macos()
     if bundle.is_frozen():
         return _install_bundled_widget(home=home)
+    bundle.refuse_uv_beside_cask("build the widget")
     src = project_dir()
     team = team or detect_development_team()
     derived = derived or derived_data_path()

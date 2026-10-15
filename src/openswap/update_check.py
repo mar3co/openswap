@@ -211,6 +211,11 @@ def run_self_upgrade() -> int:
         else:
             print(f"Download the latest OpenSwap from {RELEASES_URL}")
         return 0
+    try:
+        bundle.refuse_uv_beside_cask("upgrade itself")
+    except ClaudeSwitchError as exc:
+        error(str(exc))
+        return 1
 
     root = _checkout_root()
     if root is None:

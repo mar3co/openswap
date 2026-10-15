@@ -200,3 +200,25 @@ class TestFrozenApp:
         monkeypatch.setattr(wi, "install_launch_agent", _refuse)
         detail = restart_widget_agent()
         assert detail is not None and str(host) in detail
+
+
+class TestUvBesideTheCask:
+    def test_uv_upgrade_refuses_without_pulling_or_repinning(self, tmp_path, monkeypatch, capsys):
+        """`_refresh_launch_agents` would point the login item back at uv."""
+        import openswap.update_check as uc
+        from openswap import bundle
+
+        room = tmp_path / "homebrew" / "Caskroom" / "openswap"
+        room.mkdir(parents=True)
+        monkeypatch.setattr(bundle, "CASKROOMS", (room,))
+        monkeypatch.delattr(uc.sys, "frozen", raising=False)
+
+        def _refuse(*a, **k):
+            raise AssertionError(f"refused upgrade still ran: {a}")
+
+        monkeypatch.setattr(uc.subprocess, "run", _refuse)
+        monkeypatch.setattr(uc, "_refresh_launch_agents", _refuse)
+        assert uc.run_self_upgrade() == 1
+        err = capsys.readouterr().err
+        assert "installed with Homebrew" in err
+        assert "uv tool uninstall openswap" in err

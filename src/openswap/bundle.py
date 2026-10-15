@@ -104,6 +104,36 @@ def installed_by_homebrew(home: Path | None = None) -> bool:
     return any(_links_to(link, executable()) for link in BREW_BINARIES)
 
 
+def cask_prefix() -> Path | None:
+    """The Homebrew prefix whose Caskroom holds openswap, if the cask is installed."""
+    for room in CASKROOMS:
+        if room.is_dir():
+            return room.parent.parent
+    return None
+
+
+def refuse_uv_beside_cask(action: str) -> None:
+    """Stop a uv install from undoing the move to the cask's app.
+
+    With the cask installed, a uv ``openswap`` earlier on PATH would re-pin
+    the login item to uv (``setup``, ``upgrade``) or rebuild the old widget
+    host (``widget --install``). Filesystem-only; the app itself, and a
+    source install on a Mac without the cask, are never refused.
+    """
+    if is_frozen():
+        return
+    prefix = cask_prefix()
+    if prefix is None:
+        return
+    from openswap.exceptions import ClaudeSwitchError
+
+    raise ClaudeSwitchError(
+        f"OpenSwap is installed with Homebrew, so this uv install will not {action}. "
+        f"Use {prefix / 'bin' / 'openswap'} (or OpenSwap.app) instead, "
+        "and remove this one with: uv tool uninstall openswap"
+    )
+
+
 def _links_to(link: Path, target: Path | None) -> bool:
     if target is None:
         return False

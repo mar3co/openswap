@@ -1240,6 +1240,12 @@ def _setup_command(argv: list[str]) -> int:
     from openswap.exceptions import NotLoggedInError
     from openswap.update_check import restart_widget_agent
 
+    try:
+        bundle.refuse_uv_beside_cask("set up the menu bar extra")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        return 1
+
     migration_notes: list[str] = []
     saved = False
     not_saved: tuple[str, str, int] | None = None  # (reason, hint, exit code)
@@ -1418,9 +1424,10 @@ def _menubar_service(args) -> int:
     non-returning call — folding the service paths inline would leave the
     reader tracing which branches fall through to launching the app.
     """
-    from openswap import launch_agent
+    from openswap import bundle, launch_agent
 
     if args.install_service:
+        bundle.refuse_uv_beside_cask("install the menu bar service")
         result = launch_agent.install()
         print(f"Menu bar service installed ({result['label']}).")
         print(f"  plist: {result['plist']}")

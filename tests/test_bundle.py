@@ -109,3 +109,46 @@ def test_a_brew_link_to_another_app_does_not_count(tmp_path, monkeypatch):
     link.parent.mkdir(parents=True)
     link.symlink_to(other)
     assert bundle.installed_by_homebrew(home=tmp_path) is False
+
+
+def test_installed_by_homebrew_in_slash_applications(tmp_path, monkeypatch):
+    """The cask's default appdir is /Applications, not only ~/Applications."""
+    room = tmp_path / "Caskroom" / "openswap"
+    room.mkdir(parents=True)
+    monkeypatch.setattr(bundle, "CASKROOMS", (room,))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    # resolve() so the comparison holds on Windows CI too (C:\Applications).
+    monkeypatch.setattr(bundle, "app_path", lambda: Path("/Applications").resolve() / "OpenSwap.app")
+    assert bundle.installed_by_homebrew(home=tmp_path) is True
+    room.rmdir()
+    assert bundle.installed_by_homebrew(home=tmp_path) is False
+
+
+# --- a uv install beside the cask ---------------------------------------------
+
+
+def test_uv_beside_the_cask_is_refused_and_told_where_the_app_is(tmp_path, monkeypatch):
+    from openswap.exceptions import ClaudeSwitchError
+
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    prefix = tmp_path / "homebrew"
+    room = prefix / "Caskroom" / "openswap"
+    monkeypatch.setattr(bundle, "CASKROOMS", (room,))
+    bundle.refuse_uv_beside_cask("set up the menu bar extra")  # no cask: fine
+    assert bundle.cask_prefix() is None
+
+    room.mkdir(parents=True)
+    assert bundle.cask_prefix() == prefix
+    with pytest.raises(ClaudeSwitchError) as exc:
+        bundle.refuse_uv_beside_cask("set up the menu bar extra")
+    message = str(exc.value)
+    assert "installed with Homebrew" in message
+    assert str(prefix / "bin" / "openswap") in message
+    assert "uv tool uninstall openswap" in message
+
+
+def test_the_app_itself_is_never_refused(frozen_app, tmp_path, monkeypatch):
+    room = tmp_path / "Caskroom" / "openswap"
+    room.mkdir(parents=True)
+    monkeypatch.setattr(bundle, "CASKROOMS", (room,))
+    bundle.refuse_uv_beside_cask("set up the menu bar extra")
