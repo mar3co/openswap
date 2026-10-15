@@ -4090,3 +4090,21 @@ def test_codex_tab_click_switches_codex_cli_instead_of_asking_to_enable():
     assert "on_toggle_codex_auto=lambda *_a: self._toggle_codex_auto()" in text
     setting = text[text.index("def _on_setting") : text.index("def _toggle_codex_auto")]
     assert "self._toggle_codex_auto()" in setting
+
+
+def test_card_menu_edits_reload_the_open_popover_once_the_refresh_lands():
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    init = text[text.index("self._hold_reload_pending = False") :][:400]
+    assert "self._reload_after_refresh = False" in init
+    helper = text[text.index("def _refresh_and_reload_cards") : text.index("def on_add_login")]
+    assert "self._reload_after_refresh = True" in helper and "self.refresh_async()" in helper
+    rename = text[text.index("def _make_rename") : text.index("def _make_remove")]
+    assert "self._refresh_and_reload_cards()" in rename and "self.refresh_async()" not in rename
+    toggle = text[text.index("def _make_toggle_disabled") : text.index("def _refresh_and_reload_cards")]
+    assert "self._refresh_and_reload_cards()" in toggle and "self.refresh_async()" not in toggle
+    # The worker turns that request into the deferred main-page reload that
+    # the 1s tick honors (hold_panel_reload_plan), and clears it.
+    worker = text[text.index("def _worker(self, full):") : text.index("def _config_mtime_or_none")]
+    tail = worker[worker.index("finally:") :]
+    assert "or self._reload_after_refresh" in tail
+    assert "self._reload_after_refresh = False" in tail and "self._hold_reload_pending = True" in tail

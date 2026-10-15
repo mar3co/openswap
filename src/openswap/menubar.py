@@ -179,6 +179,10 @@ def run(switcher, codex=None) -> int:
             self._hold_slot = None
             self._tick_slot = None
             self._hold_reload_pending = False
+            # Set by card-menu edits (rename, disable/enable): the next refresh
+            # that lands reloads the open main page even though the slot list
+            # and provider states are unchanged.
+            self._reload_after_refresh = False
             self._event_lock = threading.Lock()
             self._panel = None
             self._status_icon_animator = None
@@ -372,7 +376,9 @@ def run(switcher, codex=None) -> int:
             finally:
                 self._refreshing = False
                 if (previous_states != self._account_states or
-                        previous_slots != tuple(row[0] for row in self.snapshot.get("accounts", []))):
+                        previous_slots != tuple(row[0] for row in self.snapshot.get("accounts", []))
+                        or self._reload_after_refresh):
+                    self._reload_after_refresh = False
                     self._hold_reload_pending = True
 
         def _config_mtime_or_none(self):
@@ -2760,7 +2766,7 @@ def run(switcher, codex=None) -> int:
                 else:
                     ok = self._guard(lambda: engine.unset_alias(n))
                 if ok:
-                    self.refresh_async()
+                    self._refresh_and_reload_cards()
             return cb
 
         def _make_remove(self, num):
@@ -2801,10 +2807,21 @@ def run(switcher, codex=None) -> int:
                         lambda: self.switcher.set_account_disabled(str(num), target)
                     )
                 if ok:
-                    self.refresh_async()
+                    self._refresh_and_reload_cards()
                     if provider == "codex" and not target:
                         self._ensure_codex_engine()
             return cb
+
+        def _refresh_and_reload_cards(self):
+            """Refresh, then rebuild the open main page once the snapshot lands.
+
+            The worker only flags a reload for slot-list or provider-state
+            changes; an alias or disabled flag edited from a card's ··· menu
+            changes neither, yet the card's title, suffix, opacity and
+            clickability all come from it.
+            """
+            self._reload_after_refresh = True
+            self.refresh_async()
 
         def on_add_login(self, _sender):
             if self._guard(self.switcher.add_account):
