@@ -83,7 +83,7 @@ class EngineHarness:
         self.temp_home = temp_home
         # get_backup_root() (switcher.py) resolves via Path.home() on every
         # platform (both its XDG branch and its legacy
-        # get_legacy_backup_root() fallback honour it, paths.py:101-108) —
+        # get_legacy_backup_root() fallback honor it, paths.py:101-108) —
         # but on LINUX/WSL, $XDG_DATA_HOME takes precedence over Path.home()
         # when set (paths.py:102-106). Patching Path.home() alone is not a
         # superset of patching $XDG_DATA_HOME alone: a developer/CI with
@@ -217,7 +217,7 @@ class TestEngineHarnessIsolation:
     guards against is real off Linux (direct probe: two harnesses on
     distinct subtrees collapsed to one store under the legacy
     ~/.claude-swap-backup path, and h1's seeded account silently became
-    h2's). `Path.home()` is honoured by get_backup_root() on EVERY platform
+    h2's). `Path.home()` is honored by get_backup_root() on EVERY platform
     (both its XDG branch and its `get_legacy_backup_root()` fallback —
     paths.py:101-108), so scoping there instead makes the guard, and this
     test, load-bearing everywhere and lets the skipif be deleted.
@@ -1208,7 +1208,7 @@ class TestAdaptiveScheduler:
     def test_an_expired_trust_does_not_turn_one_block_into_a_request_storm(
         self, temp_home
     ):
-        """Spent trust is not a licence to retry; the server's ask still governs.
+        """Spent trust is not a license to retry; the server's ask still governs.
 
         The sibling tests all assert `waited <= trust_left`, which is the
         direction that produced the defect: they are satisfied by a wait of
@@ -1792,6 +1792,389 @@ class TestApiKeyAccounts:
             "active-api-key"
         ]
 
+    def _link(self, harness, key_num: int, parent_num: int) -> None:
+        data = harness.switcher._get_sequence_data()
+        parent = data["accounts"][str(parent_num)]
+        data["accounts"][str(key_num)]["creditFor"] = {
+            "email": parent["email"],
+            "organizationUuid": parent.get("organizationUuid", "") or "",
+        }
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+
+    def _no_switch_reasons(self, h) -> list[str]:
+        return [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+
+    def test_linked_key_eligible_without_flag(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(100), "2": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_unlinked_key_still_excluded_without_flag(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        assert h.tick_with_usage({"1": _usage(100), "2": "api key"}) is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+
+    def test_subscription_with_room_beats_linked_key(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(95), "2": "api key", "3": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_left_accounts_key_wins_then_linked_then_unlinked(self, temp_home):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "loose@token.local")
+        h.seed(3, "b@example.com")
+        h.seed(4, "bkey@token.local")
+        h.seed(5, "akey@token.local")
+        h.make_live("a@example.com", 1)
+        for n in (2, 4, 5):
+            self._mark_api_key(h, n)
+        self._link(h, 4, 3)
+        self._link(h, 5, 1)
+        usage = {"1": _usage(100), "2": "api key", "3": _usage(100), "4": "api key", "5": "api key"}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 5
+        assert h.engine._order_keys(["2", "4", "5"], leaving="1") == ["5", "4", "2"]
+
+    def test_two_keys_same_parent_lower_slot_first(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(9, "k9@token.local")
+        h.seed(10, "k10@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 9)
+        self._mark_api_key(h, 10)
+        self._link(h, 9, 1)
+        self._link(h, 10, 1)
+        assert h.engine._order_keys(["10", "9"], leaving="1") == ["9", "10"]
+        assert h.tick_with_usage({"1": _usage(100), "9": "api key", "10": "api key"}) is TickOutcome.SWITCHED
+        assert h.active_number() == 9
+
+    def test_linked_key_eligible_when_parent_disabled(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("c@example.com", 3)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        h.switcher.set_account_disabled("1", True)
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key", "3": _usage(100)}) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_switch_state_write_does_not_read_the_roster_after_switching(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        switched = []
+        real_switch, real_kind = h.switcher.switch_to, h.switcher.account_kind_for
+
+        def switch_to(*a, **k):
+            result = real_switch(*a, **k)
+            switched.append(True)
+            return result
+
+        def account_kind_for(n):
+            if switched:
+                raise OSError("roster unreadable")
+            return real_kind(n)
+
+        h.switcher.switch_to = switch_to
+        h.switcher.account_kind_for = account_kind_for
+        assert h.tick_with_usage({"1": _usage(100), "2": "api key"}) is TickOutcome.SWITCHED
+        assert h.state().get("creditPlacedOn") == "2"
+        assert h.state().get("lastSwitchFrom") == 1
+
+    def test_hand_picked_key_after_engine_left_it_is_not_managed(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        assert h.tick_with_usage({"1": _usage(100), "2": "api key", "3": _usage(100)}) is TickOutcome.SWITCHED
+        assert h.state().get("creditPlacedOn") == "2"
+        h.make_live("c@example.com", 3)
+        record_manual_switch(h.switcher.backup_dir, now=h.clock.now)
+        assert "creditPlacedOn" not in h.state()
+        data = h.switcher._get_sequence_data()
+        del data["accounts"]["2"]["creditFor"]
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        h.make_live("key@token.local", 2)
+        record_manual_switch(h.switcher.backup_dir, now=h.clock.now)
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        h.events.clear()
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key", "3": _usage(10)}) is TickOutcome.NO_ACTION
+        assert self._no_switch_reasons(h) == ["active-api-key"]
+
+    def test_credit_return_to_best_healthy_subscription(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(50), "2": "api key", "3": _usage(20)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "credit-return"
+
+    def test_credit_return_holds_when_every_subscription_is_at_threshold(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        for _ in range(10):
+            outcome = h.tick_with_usage({"1": _usage(92), "2": "api key", "3": _usage(90)})
+            h.clock.advance(60)
+            assert outcome is TickOutcome.NO_ACTION
+        assert h.switcher.current_account_number() == "2"
+        assert set(self._no_switch_reasons(h)) == {"on-api-credit"}
+        assert h.events[-1].detail == "no subscription account below 90%"
+        assert h.engine._unhealthy_ticks == 0
+
+    def test_credit_return_respects_cooldown(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        record_manual_switch(h.switcher.backup_dir, now=h.clock.now)
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key"}) is TickOutcome.NO_ACTION
+        assert self._no_switch_reasons(h) == ["cooldown"]
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key"}) is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_credit_return_skips_quarantined_parent(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        h.engine._quarantine("1", "a@example.com", "invalid_grant")
+        h.events.clear()
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key"}) is TickOutcome.NO_ACTION
+        assert self._no_switch_reasons(h) == ["on-api-credit"]
+        assert h.events[-1].detail == "no subscription account in rotation"
+        assert h.switcher.current_account_number() == "2"
+
+    def test_credit_return_never_lands_on_another_key(self, temp_home):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "other@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._mark_api_key(h, 3)
+        self._link(h, 2, 1)
+        assert h.tick_with_usage({"1": _usage(95), "2": "api key", "3": "api key"}) is TickOutcome.NO_ACTION
+        assert h.switcher.current_account_number() == "2"
+
+    def test_consume_first_never_targets_linked_key(self, temp_home):
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(10, 10, _R_SOON),
+            "2": "api key",
+            "3": _usage7(10, 10, _R_LATER),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.active_number() == 1
+
+    def test_proactive_never_spends_credit(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(91), "2": "api key"})
+        assert outcome is TickOutcome.BLOCKED
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert self._no_switch_reasons(h) == ["no-qualifying-candidate"]
+        assert h.switcher.current_account_number() == "1"
+
+    def test_at_limit_spends_credit(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        assert h.tick_with_usage({"1": _usage(100), "2": "api key"}) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def _fail_over(self, h, usage) -> TickOutcome:
+        outcome = None
+        for _ in range(h.settings.unhealthy_ticks):
+            outcome = h.tick_with_usage(usage)
+            h.clock.advance(60)
+        return outcome
+
+    def test_failover_spends_credit_when_peers_are_measured_and_out(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = self._fail_over(h, {"1": None, "2": "api key", "3": _usage(100)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+
+    def test_failover_holds_when_every_peer_is_unreadable(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = self._fail_over(h, {"1": None, "2": "api key", "3": None})
+        assert outcome is TickOutcome.BLOCKED
+        assert self._no_switch_reasons(h)[-1] == "no-comparison"
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.switcher.current_account_number() == "1"
+
+    def test_failover_spends_credit_with_no_subscription_peer(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = self._fail_over(h, {"1": None, "2": "api key"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+
+    def test_proactive_with_exhausted_peers_and_key_skips_long_sleep(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(92), "2": "api key", "3": _usage(100)})
+        assert outcome is TickOutcome.BLOCKED
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert self._no_switch_reasons(h) == ["no-qualifying-candidate"]
+        assert h.engine._sleep_until_ts is None
+        assert h.engine._blocked_wait_long is False
+
+    def test_engine_leaves_its_key_after_link_is_gone(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        usage = {"1": _usage(100), "2": "api key", "3": _usage(100)}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.switcher.current_account_number() == "2"
+        data = h.switcher._get_sequence_data()
+        del data["accounts"]["1"]
+        data["sequence"].remove(1)
+        h.switcher._write_json(h.switcher.sequence_file, data)
+        h.events.clear()
+        h.clock.advance(h.settings.cooldown_seconds + 1)
+        assert h.tick_with_usage({"2": "api key", "3": _usage(20)}) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "credit-return"
+
+    def test_credit_hold_names_unreadable_usage(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        assert h.tick_with_usage({"1": "token expired", "2": "api key"}) is TickOutcome.NO_ACTION
+        assert self._no_switch_reasons(h) == ["on-api-credit"]
+        assert h.events[-1].detail == "no subscription has readable usage"
+
+    def test_credit_hold_when_freshen_refuses_every_target(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        with patch.object(h.engine, "_freshen_target", return_value="skip-live-session"):
+            outcome = h.tick_with_usage({"1": _usage(10), "2": "api key"})
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._no_switch_reasons(h) == ["on-api-credit"]
+        assert h.events[-1].detail == "every subscription target was refused at freshen"
+
+    def test_flagged_unlinked_active_key_returns_to_subscription(self, temp_home):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        assert h.tick_with_usage({"1": "api key", "2": _usage(20)}) is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "credit-return"
+
+    def test_flagged_unlinked_active_key_holds_without_unhealthy_counting(self, temp_home):
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        for _ in range(5):
+            assert h.tick_with_usage({"1": "api key", "2": _usage(95)}) is TickOutcome.NO_ACTION
+            h.clock.advance(60)
+        assert set(self._no_switch_reasons(h)) == {"on-api-credit"}
+        assert h.engine._unhealthy_ticks == 0
+        assert h.switcher.current_account_number() == "1"
+
 
 class TestFreshening:
     def test_near_expiry_target_is_refreshed_and_persisted(self, temp_home):
@@ -2190,7 +2573,7 @@ class TestLoopObeysThePollPlan:
     row to URGENT_INTERVAL_S so the crossing is caught quickly. The loop used
     to sleep ``interval_seconds`` regardless, so on any machine configured
     slower than the plan (360s here, the default) that plan could not be
-    honoured: measured on the linux box mid-episode, the active row asked to
+    honored: measured on the linux box mid-episode, the active row asked to
     be polled 112s ago while the engine still had minutes of sleep left, and
     the account sat over the threshold until the engine was restarted by hand.
     """
@@ -4283,7 +4666,7 @@ class TestHorizonAxisDoesNotFlap:
         """Every sibling anti-flap gate is scoped to the proactive triggers.
 
         `at-limit` and `failover` skip them by design — there we are escaping a
-        dead account, not optimising a return time. The no-return filter ran in
+        dead account, not optimizing a return time. The no-return filter ran in
         `_tick_inner` BEFORE the trigger is consulted, so it stripped the
         candidate from those escapes too.
 
@@ -4618,7 +5001,7 @@ class TestHorizonAxisDoesNotFlap:
     def test_the_bar_never_applies_to_an_escape(self, harness):
         """`at-limit` and `failover` skip every anti-flap gate by design.
 
-        There we are escaping a dead or unreadable active, not optimising a
+        There we are escaping a dead or unreadable active, not optimizing a
         return time — and the account we left may be the only place to go.
         Measured: dropping the trigger check left the full suite green, so
         nothing pinned it. The at-limit half is defended for the wrong reason
@@ -4689,7 +5072,7 @@ class TestHorizonAxisDoesNotFlap:
         `_perform`'s `number: str` while `lastSwitchFrom` comes from
         `account_ref(number: int | None, ...)`. The `landed=2` / `live=2` row
         is the one a bare `==` fails — `2 != "2"` releases a bar that must
-        hold — so the row asserting the HOLD is what pins the normalisation.
+        hold — so the row asserting the HOLD is what pins the normalization.
 
         ABSENT `lastSwitchTo` KEEPS THE BAR: a record written before the key
         existed cannot prove the engine moved away, and this module treats
@@ -5123,7 +5506,7 @@ class TestHorizonAxisDoesNotFlap:
             outcomes.append(h.tick_with_usage({
                 # unchanged since we left it: same headroom, same reset
                 "1": _usage(96, self._days_out(h, 500)),
-                "2": _usage(active_pct, self._days_out(h, 400)),   # active, burnt down
+                "2": _usage(active_pct, self._days_out(h, 400)),   # active, burned down
             }))
             h.clock.advance(301.0)
 
@@ -5692,7 +6075,7 @@ class TestHorizonAxisDoesNotFlap:
         for _ in range(10):
             outcomes.append(h.tick_with_usage({
                 "1": None,                                    # still unreadable
-                "2": _usage(98, self._days_out(h, 400)),       # active, burnt down
+                "2": _usage(98, self._days_out(h, 400)),       # active, burned down
             }))
             h.clock.advance(301.0)
 
@@ -5818,7 +6201,7 @@ class TestHorizonAxisDoesNotFlap:
         for _ in range(10):
             outcomes.append(h.tick_with_usage({
                 "1": _usage(30, self._days_out(h, 10)),   # READABLE, 70 pts
-                "2": _usage(98, self._days_out(h, 400)),  # active burnt to 2 pts
+                "2": _usage(98, self._days_out(h, 400)),  # active burned to 2 pts
             }))
             h.clock.advance(301.0)
 
@@ -5978,7 +6361,7 @@ class TestHorizonAxisDoesNotFlap:
             DMG-b active reset in the PAST, peer back in ~50min-> SWITCHED
 
         POS/NEG must already pass unfixed -- they pin the guard's intended
-        behaviour (both controls invariant, per the review's damage table).
+        behavior (both controls invariant, per the review's damage table).
         DMG-a/DMG-b fail against 5c69ad2 because `isfinite` reads the
         active's `inf` as "unknown" and holds even though the peer is
         inside the horizon.
@@ -6177,7 +6560,7 @@ class TestHorizonAxisDoesNotFlap:
         for _ in range(3):
             outcomes.append(h.tick_with_usage({
                 "1": _usage(96, self._days_out(h, 500)),   # frozen, 4 pts
-                "2": _usage(98, self._days_out(h, 400)),   # active, burnt to 2 pts
+                "2": _usage(98, self._days_out(h, 400)),   # active, burned to 2 pts
             }))
             h.clock.advance(301.0)
         assert TickOutcome.SWITCHED not in outcomes, (
@@ -6345,7 +6728,7 @@ class TestHorizonAxisDoesNotFlap:
         sort FIRST regardless of headroom. `qualifying or fallback` is the
         only thing preventing that, and nothing tested it — measured,
         replacing it with `qualifying + fallback` left the suite green while
-        flipping this scenario 0/3 -> 3/3 in the fallback's favour.
+        flipping this scenario 0/3 -> 3/3 in the fallback's favor.
 
         Active is spent (3 pts). One peer qualifies outright on headroom; one
         margin-failure peer resets sooner. The qualifier must win.
@@ -6367,7 +6750,7 @@ class TestHorizonAxisDoesNotFlap:
         Every account in the fallback is spent, and below SPENT_HEADROOM_PCT a
         headroom edge is under two poll intervals of work. The only real
         question is which account can work again first, which is the same
-        judgement `_recovery_is_useful` makes one gate earlier.
+        judgment `_recovery_is_useful` makes one gate earlier.
 
         Nothing tested it: swapping to `(0, -h, recovery_ts)` left the suite
         green. Exhaustive sweep over 42336 three-account shapes, 558 change
@@ -6531,7 +6914,7 @@ class TestTheReleasePredicateOneStateShapePerTest:
         h.clock.advance(301.0)
         outcome = h.tick_with_usage({
             "1": _usage(96, self._at(h, 500 * 3600)),   # frozen, 4 pts, below floor
-            # active burnt past the bare-ratio boundary
+            # active burned past the bare-ratio boundary
             "2": _usage(98.2, self._at(h, 400 * 3600)),
         })
         assert outcome is not TickOutcome.SWITCHED, (
@@ -6903,7 +7286,7 @@ class TestFreshenRoutesThroughGate:
         oauth.py splits ``invalid_client`` out from ``invalid_grant`` precisely
         because it says nothing about any slot's refresh token — OUR client
         credential was rejected, which is systemic and deterministic. But
-        _freshen_target maps every unrecognised kind to "transient", and a
+        _freshen_target maps every unrecognized kind to "transient", and a
         transient freshen failure surfaces as "could not freshen any candidate
         (network?)". A client_id rotation or block would then present as
         intermittent network trouble on every machine at once, with nothing
@@ -6932,7 +7315,7 @@ class TestFreshenRoutesThroughGate:
         The row is the sole copy of a generation the slot already consumed, so
         the gate defers on every pass — correctly, since nothing on disk tells
         a keychain locked for a minute from one locked forever. But an
-        unrecognised kind maps to "transient", and the tick then renders
+        unrecognized kind maps to "transient", and the tick then renders
         "could not freshen any candidate (network?)" forever, on a condition
         no network change can affect and only the operator can clear.
         """

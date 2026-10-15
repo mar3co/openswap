@@ -116,23 +116,32 @@ class _DialogButton(NSButton):
         return self.bounds()
 
 
+def forward_edit_shortcut(event, sender) -> bool:
+    """Send Cmd+A/C/X/V/Z to the first responder; True when it was handled.
+
+    Accessory apps have no Edit menu, so the native field editor (secure
+    fields included) never sees these shortcuts unless they are forwarded.
+    """
+    modifiers = event.modifierFlags()
+    if (modifiers & NSEventModifierFlagCommand
+            and not modifiers & (NSEventModifierFlagControl | NSEventModifierFlagOption)):
+        key = str(event.charactersIgnoringModifiers() or "").lower()
+        action = {
+            "a": "selectAll:", "c": "copy:", "x": "cut:", "v": "paste:",
+            "z": "redo:" if modifiers & NSEventModifierFlagShift else "undo:",
+        }.get(key)
+        if action and NSApplication.sharedApplication().sendAction_to_from_(action, None, sender):
+            return True
+    return False
+
+
 class _DialogPanel(NSPanel):
     def cancelOperation_(self, sender):
         self.dialog.finish(0)
 
     def performKeyEquivalent_(self, event):
-        # Accessory apps have no Edit menu; forward standard shortcuts to the
-        # native field editor, including secure fields, while a prompt is open.
-        modifiers = event.modifierFlags()
-        if (modifiers & NSEventModifierFlagCommand
-                and not modifiers & (NSEventModifierFlagControl | NSEventModifierFlagOption)):
-            key = str(event.charactersIgnoringModifiers() or "").lower()
-            action = {
-                "a": "selectAll:", "c": "copy:", "x": "cut:", "v": "paste:",
-                "z": "redo:" if modifiers & NSEventModifierFlagShift else "undo:",
-            }.get(key)
-            if action and NSApplication.sharedApplication().sendAction_to_from_(action, None, self):
-                return True
+        if forward_edit_shortcut(event, self):
+            return True
         return objc.super(_DialogPanel, self).performKeyEquivalent_(event)
 
     def clicked_(self, sender):

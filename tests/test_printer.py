@@ -8,7 +8,7 @@ from io import StringIO
 import pytest
 
 from openswap import printer
-from tests.conftest import _deterministic_colour
+from tests.conftest import _deterministic_color
 
 
 class TestColorDetection:
@@ -202,10 +202,10 @@ class TestForceUtf8Output:
         printer.force_utf8_output()  # must not raise
 
 
-class TestColourEnvDoesNotLeakIntoTests:
+class TestColorEnvDoesNotLeakIntoTests:
     """A developer's terminal must not decide whether the suite passes.
 
-    See ``_deterministic_colour`` in conftest for the measurement. These
+    See ``_deterministic_color`` in conftest for the measurement. These
     assert on OUTPUT: checking only ``"FORCE_COLOR" not in os.environ``
     passes for free on any box that never exported it, which is most
     boxes and every CI runner.
@@ -219,12 +219,12 @@ class TestColourEnvDoesNotLeakIntoTests:
     remove. A guard is not covered by a test that needs the bug to be
     happening already. (The class below closes that hole directly, via
     ``TestEntryAssertionsCatchAPoisonedGlobal`` in this same file — the same
-    argument applied to ``_deterministic_colour``'s own entry assertions.)
+    argument applied to ``_deterministic_color``'s own entry assertions.)
     """
 
     @pytest.fixture(autouse=True, scope="class")
     def _exported(self):
-        """Export both variables BEFORE ``_deterministic_colour`` runs.
+        """Export both variables BEFORE ``_deterministic_color`` runs.
 
         A test cannot set them in its own body: the fixture has already
         scrubbed by then, so the assignment lands after the thing under test
@@ -283,7 +283,7 @@ class TestColourEnvDoesNotLeakIntoTests:
 
 
 class TestEntryAssertionsCatchAPoisonedGlobal:
-    """The two `assert inherited[...]` lines in `_deterministic_colour`,
+    """The two `assert inherited[...]` lines in `_deterministic_color`,
     mutation-killed directly rather than via test ordering.
 
     Calling the fixture body with a scratch `MonkeyPatch` needs no ordering
@@ -295,11 +295,11 @@ class TestEntryAssertionsCatchAPoisonedGlobal:
     @staticmethod
     def _invoke_guard():
         with pytest.MonkeyPatch.context() as mp:
-            _deterministic_colour.__wrapped__(mp)
+            _deterministic_color.__wrapped__(mp)
 
     def test_kills_colors_enabled_assertion(self, monkeypatch):
         monkeypatch.setattr(printer, "_colors_enabled", True)
-        with pytest.raises(AssertionError, match="latched the colour cache"):
+        with pytest.raises(AssertionError, match="latched the color cache"):
             self._invoke_guard()
 
     def test_kills_theme_assertion(self, monkeypatch):

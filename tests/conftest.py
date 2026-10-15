@@ -769,10 +769,10 @@ def _deterministic_poll_jitter(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _deterministic_colour(monkeypatch):
+def _deterministic_color(monkeypatch):
     """A developer's terminal must not decide whether the suite passes.
 
-    ``printer._detect_color_support`` honours ``FORCE_COLOR``/``NO_COLOR``
+    ``printer._detect_color_support`` honors ``FORCE_COLOR``/``NO_COLOR``
     before it consults ``isatty()`` — correct for the CLI, where those
     variables exist to override detection, and wrong under pytest, where
     stdout is captured and every assertion on plain output then breaks.
@@ -794,7 +794,7 @@ def _deterministic_colour(monkeypatch):
     pinning `False` instead of `None` also leaves every test entering
     unlatched, while having switched from un-latching to PINNING — a
     different, wrong mechanism with the same signature. Both directions are
-    covered: `test_printer.py`'s `TestColourEnvDoesNotLeakIntoTests` dies
+    covered: `test_printer.py`'s `TestColorEnvDoesNotLeakIntoTests` dies
     under either pin, not just under "reset removed".
 
     A number nobody can re-take is not evidence — this fixture's own comments
@@ -806,7 +806,7 @@ def _deterministic_colour(monkeypatch):
     Tests that exercise the detection itself set the variables explicitly,
     which overrides this.
     """
-    # Ordering-PROOF half of the guard. `test_colour_cache_isolation.py`'s
+    # Ordering-PROOF half of the guard. `test_color_cache_isolation.py`'s
     # latch/read pairs read as the guard, but they only fire in one ordering:
     # a run that selects only the reader, or splits the pair across workers,
     # is green over a broken fixture. These assertions run before EVERY
@@ -829,7 +829,7 @@ def _deterministic_colour(monkeypatch):
     # `test_printer.py`.
     inherited = (_printer._colors_enabled, _printer._theme)
     assert inherited[0] is None, (
-        "a previous test latched the colour cache and nothing reset it, or a "
+        "a previous test latched the color cache and nothing reset it, or a "
         "broader-scoped fixture latched it during setup"
     )
     assert inherited[1] == "dark", (

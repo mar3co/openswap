@@ -94,7 +94,7 @@ class LoginSession:
             _config_check(self.engine.home)
             binary = self._resolve_binary()
             if self._cancel.is_set():
-                self._finish_cancelled()
+                self._finish_canceled()
                 return
             temp_home = Path(tempfile.mkdtemp(prefix="openswap-codex-login-"))
             if os.name != "nt":
@@ -102,7 +102,7 @@ class LoginSession:
             with self._lock:
                 self._temp_home = temp_home
             if self._cancel.is_set():
-                self._finish_cancelled()
+                self._finish_canceled()
                 return
             argv = [str(binary), "login", "-c", 'cli_auth_credentials_store="file"']
             if self.mode == "device":
@@ -120,14 +120,14 @@ class LoginSession:
                 kwargs["start_new_session"] = True
             with self._lock:
                 if self._cancel.is_set():
-                    self._finish_cancelled_locked()
+                    self._finish_canceled_locked()
                     return
                 proc = self._popen(argv, **kwargs)
                 self._process = proc
                 self._public = {"stage": "waiting", "has_url": False}
             self._wait(proc)
             if self._cancel.is_set():
-                self._finish_cancelled()
+                self._finish_canceled()
                 return
             if proc.returncode != 0:
                 raise RuntimeError("The Codex sign-in did not complete. Please try again.")
@@ -140,7 +140,7 @@ class LoginSession:
                 ) from exc
             with self._lock:
                 if self._cancel.is_set():
-                    self._finish_cancelled_locked()
+                    self._finish_canceled_locked()
                     return
                 self._auth_text = text
                 self._public = {
@@ -166,7 +166,7 @@ class LoginSession:
                 if dead:
                     self._process = None
                 self._running = False
-                terminal = self._public.get("stage") in {"error", "cancelled"}
+                terminal = self._public.get("stage") in {"error", "canceled"}
             if terminal and dead:
                 self._cleanup()
 
@@ -177,7 +177,7 @@ class LoginSession:
         if proc is not None:
             self._terminate(proc)
         with self._lock:
-            self._finish_cancelled_locked()
+            self._finish_canceled_locked()
             dead = proc is None or proc.poll() is not None
             running = self._running
         if dead and not running:
@@ -360,25 +360,25 @@ class LoginSession:
     def _set_error(self, message: str) -> None:
         with self._lock:
             if self._cancel.is_set():
-                self._finish_cancelled_locked()
+                self._finish_canceled_locked()
             else:
                 self._auth_text = None
                 self._url = None
                 self._public = {"stage": "error", "message": message, "has_url": False}
 
-    def _finish_cancelled(self) -> None:
+    def _finish_canceled(self) -> None:
         with self._lock:
-            self._finish_cancelled_locked()
+            self._finish_canceled_locked()
             proc = self._process
             dead = proc is None or proc.poll() is not None
         if dead:
             self._cleanup()
 
-    def _finish_cancelled_locked(self) -> None:
+    def _finish_canceled_locked(self) -> None:
         if self._public.get("stage") != "saved":
             self._auth_text = None
             self._url = None
-            self._public = {"stage": "cancelled", "has_url": False}
+            self._public = {"stage": "canceled", "has_url": False}
 
     def _cleanup(self) -> None:
         with self._lock:

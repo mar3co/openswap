@@ -14,7 +14,7 @@ across `-n` workers, is green over a broken fixture for a reason that has
 nothing to do with the fixture working.
 
 What actually closes the hole is the post-condition in
-`conftest._deterministic_colour`, which asserts both globals are unlatched on
+`conftest._deterministic_color`, which asserts both globals are unlatched on
 entry to EVERY test — no ordering required, and mutation-killed directly (not
 via ordering) by `TestEntryAssertionsCatchAPoisonedGlobal` in
 `test_printer.py`. These pairs stay as the readable narrative of what the
@@ -32,14 +32,14 @@ import pytest
 from openswap import printer
 
 
-def test_a_test_may_latch_the_colour_cache():
+def test_a_test_may_latch_the_color_cache():
     """Stands in for the ordinary tests that latch it in a real run."""
     printer._colors_enabled = True
     assert printer.colors_enabled() is True
 
 
 def test_the_next_test_is_not_styled_by_it(monkeypatch):
-    """The reset in ``_deterministic_colour`` is what makes this pass.
+    """The reset in ``_deterministic_color`` is what makes this pass.
 
     Without it this test inherits the ``True`` latched above and
     ``accent()`` returns the escape-wrapped string — the exact failure the
@@ -136,7 +136,7 @@ def test_the_suite_does_not_query_the_developers_terminal(monkeypatch):
 
         assert appearance.detect_terminal_background() is None
 
-        # AND the pin must be the value that also keeps COLOUR off, checked
+        # AND the pin must be the value that also keeps COLOR off, checked
         # HERE while stdout is still the pty — outside this block stdout is
         # pytest's capture object, `isatty()` is False, and the check passes
         # for a reason that has nothing to do with TERM.
@@ -149,7 +149,7 @@ def test_the_suite_does_not_query_the_developers_terminal(monkeypatch):
         # exists to suppress. The two modules disagree and only one of them
         # was covered.
         printer._colors_enabled = None
-        colours_on = printer.colors_enabled()
+        colors_on = printer.colors_enabled()
 
         os.set_blocking(master, False)
         try:
@@ -163,16 +163,16 @@ def test_the_suite_does_not_query_the_developers_terminal(monkeypatch):
     assert b"\x1b]11;?" not in emitted, (
         f"the OSC-11 query hit the terminal: {emitted!r}"
     )
-    assert colours_on is False, (
+    assert colors_on is False, (
         f"TERM={os.environ.get('TERM')!r} blocks the OSC-11 query but not "
-        "colour detection; under `-s` the suite styles its own assertions"
+        "color detection; under `-s` the suite styles its own assertions"
     )
 
 
 class TestScopedContextDoesNotLeakTheAutouseScrub:
     """H-1 regression: pytest hands out ONE `MonkeyPatch` per test regardless
     of how many fixtures request it, so `monkeypatch.undo()` in a test body
-    also unwinds `_deterministic_colour`'s scrub -- which is what
+    also unwinds `_deterministic_color`'s scrub -- which is what
     `tests/test_move_accounts.py` and `tests/test_swap_accounts.py` did at 8
     sites before this branch moved them to a scoped `MonkeyPatch.context()`.
 

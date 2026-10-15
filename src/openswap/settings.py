@@ -195,7 +195,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
-            help="Minimum seconds between proactive switches",
+            help="Minimum seconds between proactive, consume-first, and credit-return switches",
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
@@ -212,7 +212,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
-            help="Allow rotating onto managed API-key accounts (bill per token)",
+            help=(
+                "Allow rotating onto API-key accounts that are not linked to a "
+                "subscription account (bill per token); keys added with "
+                "'add-token --for' are always eligible as a last resort"
+            ),
         ),
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
@@ -568,7 +572,7 @@ class LiveExecutionSettings:
     # The Mac and install the passing check ran on (see live.host_binding):
     # a restored or copied opt-in never applies anywhere else.
     host_binding: str | None = None
-    # Which job permission behaviour the check measured (LIVE_POLICY_VERSION).
+    # Which job permission behavior the check measured (LIVE_POLICY_VERSION).
     # An opt-in stored before the key existed reads as 1 (OpenSwap's fixed
     # tool list): it no longer applies once jobs follow the account's own
     # permission settings.
@@ -580,7 +584,7 @@ class LiveExecutionSettings:
 
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
-# What job permission behaviour a live check measures (see openswap.worker.live).
+# What job permission behavior a live check measures (see openswap.worker.live).
 LIVE_POLICY_VERSION = LiveExecutionSettings.policy_version
 # One opt-in per provider; Codex keeps the original key.
 _LIVE_KEYS = {"codex": "liveExecution", "claude": "liveExecutionClaude"}

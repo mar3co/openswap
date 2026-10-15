@@ -725,6 +725,20 @@ class TestValidation:
         with pytest.raises(TransferError, match="invalid slot number"):
             import_accounts(s, str(f))
 
+    @pytest.mark.parametrize(
+        "link",
+        ["a@example.com", {"email": "../../evil"}, {"email": "a@example.com", "organizationUuid": 7}],
+    )
+    def test_malformed_credit_link_rejected(self, temp_home: Path, link):
+        s = _linux_switcher(temp_home)
+        env = self._make_envelope()
+        env["accounts"][0]["creditFor"] = link
+        f = temp_home / "link.openswap"
+        f.write_text(json.dumps(env))
+
+        with pytest.raises(TransferError, match="creditFor"):
+            import_accounts(s, str(f))
+
     def test_zero_slot_number_rejected(self, temp_home: Path):
         s = _linux_switcher(temp_home)
         env = self._make_envelope(number=0)
@@ -2217,3 +2231,65 @@ class TestForceOverwriteNarratesTheStrikeClear:
         assert "same credential generation" in err
         assert "invalid_grant" not in err
         assert "refresh-token generation" not in err
+
+
+class TestCreditLinkImport:
+    API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
+
+    def _linked_key(self, temp_home: Path, capsys) -> ClaudeAccountSwitcher:
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "a@example.com")
+        s.add_account_from_token(self.API_KEY, credit_for="1")
+        capsys.readouterr()
+        return s
+
+    def test_force_import_without_a_link_keeps_the_local_link(
+        self, temp_home: Path, capsys
+    ):
+        s = self._linked_key(temp_home, capsys)
+        out = temp_home / "key.openswap"
+        export_accounts(s, str(out), account="2")
+        envelope = json.loads(out.read_text())
+        del envelope["accounts"][0]["creditFor"]
+        out.write_text(json.dumps(envelope))
+
+        import_accounts(s, str(out), force=True)
+
+        assert s._get_sequence_data()["accounts"]["2"]["creditFor"] == {
+            "email": "a@example.com", "organizationUuid": "",
+        }
+        assert s.credit_parent_for("2") == "1"
+        assert "standalone" not in capsys.readouterr().err
+
+    def test_imported_link_to_itself_is_not_reported_as_absent(
+        self, temp_home: Path, capsys
+    ):
+        s = self._linked_key(temp_home, capsys)
+        out = temp_home / "key.openswap"
+        export_accounts(s, str(out), account="2")
+        envelope = json.loads(out.read_text())
+        key_email = envelope["accounts"][0]["email"]
+        envelope["accounts"][0]["creditFor"] = {"email": key_email, "organizationUuid": ""}
+        out.write_text(json.dumps(envelope))
+
+        import_accounts(s, str(out), force=True)
+
+        assert s.credit_parent_for("2") is None
+        assert "standalone" not in capsys.readouterr().err
+
+    def test_imported_key_without_its_parent_prints_a_notice(
+        self, temp_home: Path, capsys
+    ):
+        s = self._linked_key(temp_home, capsys)
+        out = temp_home / "key.openswap"
+        export_accounts(s, str(out), account="2")
+        s.remove_account("2", assume_yes=True)
+        s.remove_account("1", assume_yes=True)
+        capsys.readouterr()
+
+        import_accounts(s, str(out))
+
+        assert (
+            "Slot 2 (API credit for a@example.com) is a standalone key "
+            "until that account is added." in capsys.readouterr().err
+        )

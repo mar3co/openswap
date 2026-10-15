@@ -205,7 +205,7 @@ def run(switcher, codex=None) -> int:
             self._login_session = None
             self._login_ui_state = {"stage": "idle"}
             self._login_save_result = None
-            self._login_cancelled_session = None
+            self._login_canceled_session = None
             self._kickoff_results = None
             self._kickoff_retry_after: float | None = None
             self._kickoff_notified_failure = None
@@ -1386,6 +1386,7 @@ def run(switcher, codex=None) -> int:
                 on_empty_action=self._on_empty_action,
                 login_state=lambda: dict(self._login_ui_state),
                 on_login_action=self._on_login_action,
+                on_add_token=self._add_token,
                 worker_enabled=lambda: self._worker_policy.enabled,
                 worker_paused=lambda: self._worker_policy.paused,
                 worker_status=lambda: self._worker_status_cache,
@@ -1418,7 +1419,7 @@ def run(switcher, codex=None) -> int:
         def _on_login_action(self, action, alias=None):
             if self._desktop_switching:
                 return
-            if self._login_ui_state.get("stage") in ("saving", "cancelling"):
+            if self._login_ui_state.get("stage") in ("saving", "canceling"):
                 return
             session = self._login_session
             if action in ("start", "retry", "device"):
@@ -1427,7 +1428,7 @@ def run(switcher, codex=None) -> int:
                 if self._panel is None:
                     self._show_error("Sign-in needs the account panel. Restart OpenSwap and try again.")
                     return
-                if action == "start" and session is not None and session.state().get("stage") != "cancelled":
+                if action == "start" and session is not None and session.state().get("stage") != "canceled":
                     self._show_login_panel()
                     return
                 from openswap.codex.onboarding import LoginSession
@@ -1450,7 +1451,7 @@ def run(switcher, codex=None) -> int:
                 if session is None:
                     self._login_ui_state = {"stage": "idle"}
                 else:
-                    self._login_ui_state = {"stage": "cancelling"}
+                    self._login_ui_state = {"stage": "canceling"}
                     threading.Thread(target=self._login_cancel_worker, args=(session,), daemon=True).start()
             elif action == "save" and session is not None:
                 if session.state().get("stage") != "ready":
@@ -1459,7 +1460,7 @@ def run(switcher, codex=None) -> int:
                 self._hold_reload_pending = True
                 threading.Thread(target=self._login_save_worker, args=(session, alias), daemon=True).start()
             elif action == "dismiss":
-                if self._login_ui_state.get("stage") in ("saved", "cancelled"):
+                if self._login_ui_state.get("stage") in ("saved", "canceled"):
                     self._login_session = None
                     self._login_ui_state = {"stage": "idle"}
                     self._hold_reload_pending = True
@@ -1485,7 +1486,7 @@ def run(switcher, codex=None) -> int:
         def _login_cancel_worker(self, session):
             session.cancel()
             with self._event_lock:
-                self._login_cancelled_session = session
+                self._login_canceled_session = session
 
         def _login_save_worker(self, session, alias):
             try:
@@ -1500,11 +1501,11 @@ def run(switcher, codex=None) -> int:
 
         def _poll_login(self):
             with self._event_lock:
-                cancelled = self._login_cancelled_session
-                self._login_cancelled_session = None
+                canceled = self._login_canceled_session
+                self._login_canceled_session = None
                 result = self._login_save_result
                 self._login_save_result = None
-            if cancelled is self._login_session and cancelled is not None:
+            if canceled is self._login_session and canceled is not None:
                 self._login_session = None
                 self._login_ui_state = {"stage": "idle"}
                 self._hold_reload_pending = True
@@ -1518,7 +1519,7 @@ def run(switcher, codex=None) -> int:
                     self.refresh_async()
                 self._hold_reload_pending = True
                 return
-            if self._login_session is None or self._login_ui_state.get("stage") in ("saving", "cancelling", "saved"):
+            if self._login_session is None or self._login_ui_state.get("stage") in ("saving", "canceling", "saved"):
                 return
             state = self._login_session.state()
             # Keep save errors visible until the user chooses Retry or Cancel.
@@ -2564,6 +2565,15 @@ def run(switcher, codex=None) -> int:
                     self._ensure_codex_engine()
 
         def on_add_token(self, _sender):
+            if self._panel is None:
+                self._add_token_prompts()
+                return
+            self._panel.show_token_page()
+            if not self._panel.is_shown():
+                self._panel.toggle()
+
+        def _add_token_prompts(self):
+            """Fallback when the popover could not attach: the old two prompts."""
             email_resp = self._prompt(
                 title="Add account from token",
                 message="Email label (optional; leave blank to auto-name):",
@@ -2576,6 +2586,7 @@ def run(switcher, codex=None) -> int:
                 title="Add account from token",
                 message="API key (sk-ant-api…) or setup token (sk-ant-oat01-…):",
                 ok="Add", cancel="Cancel",
+                secure=True,
             )
             if token_resp.clicked != 1 or not token_resp.text.strip():
                 return
@@ -2583,6 +2594,26 @@ def run(switcher, codex=None) -> int:
                 token=token_resp.text.strip(), email=email, slot=None,
             )):
                 self.refresh_async()
+
+        def _add_token(self, token, label, credit_for):
+            """Token page submit. Returns sanitized error copy, or None on success."""
+            try:
+                self.switcher.add_account_from_token(
+                    token=token, email=label or None, slot=None,
+                    credit_for=credit_for,
+                )
+            except ClaudeSwitchError as e:
+                copy = sanitize_token_error(str(e)) or "Could not add this token."
+                self.switcher._logger.info("add-from-token rejected: %s", copy)
+                return copy
+            except OSError:
+                self.switcher._logger.error("add-from-token failed", exc_info=True)
+                return "Could not save this token (disk or permission error). See openswap.log."
+            try:
+                self.refresh_async()
+            except Exception:
+                self.switcher._logger.warning("refresh after add-from-token failed", exc_info=True)
+            return None
 
         def on_open_log(self, _sender):
             import subprocess

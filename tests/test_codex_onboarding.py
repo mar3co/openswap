@@ -170,7 +170,7 @@ class _HangingProcess:
         return self.returncode
 
 
-def test_cancelled_session_has_no_secret_and_removes_temp_home(tmp_path, monkeypatch):
+def test_canceled_session_has_no_secret_and_removes_temp_home(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
     made = []
 
@@ -178,7 +178,7 @@ def test_cancelled_session_has_no_secret_and_removes_temp_home(tmp_path, monkeyp
         made.append((Path(kwargs["env"]["CODEX_HOME"]), _HangingProcess()))
         return made[-1][1]
 
-    # Avoid signalling the synthetic PID while still exercising ownership and cleanup.
+    # Avoid signaling the synthetic PID while still exercising ownership and cleanup.
     monkeypatch.setattr(LoginSession, "_terminate", lambda _self, proc: setattr(proc, "returncode", -15))
     session = LoginSession(engine, codex_bin=sys.executable, popen=popen, timeout=10)
     thread = threading.Thread(target=session.run)
@@ -190,7 +190,7 @@ def test_cancelled_session_has_no_secret_and_removes_temp_home(tmp_path, monkeyp
     thread.join(timeout=2)
     assert not thread.is_alive()
     assert session.state() == {
-        "stage": "cancelled", "has_url": False, "mode": "browser"
+        "stage": "canceled", "has_url": False, "mode": "browser"
     }
     assert "secret-token" not in repr(session.state())
     assert not made[0][0].exists()

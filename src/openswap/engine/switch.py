@@ -43,7 +43,7 @@ class SwitchMixin:
         ``add_account`` verifies a credential over the network and then reads
         ``.claude.json`` again for the bytes it stores. A ``/login`` landing in
         that window puts one account's identity on another's credential -- the
-        same LABELLED-one/CONTAINS-another shape
+        same LABELED-one/CONTAINS-another shape
         ``_reject_foreign_credential_capture`` exists to close, by a different
         door. BOTH write paths need this: ``slot=None`` on a registered account
         is the branch the menu bar and a bare ``--add-account`` take.
@@ -105,7 +105,7 @@ class SwitchMixin:
         and the slot received a different account's token — an ssh session had
         ``.claude.json`` renamed to the new profile while the live keychain
         item still held the original account's credential. The slot ends up
-        LABELLED one account and CONTAINING another, so every later switch to
+        LABELED one account and CONTAINING another, so every later switch to
         it logs the wrong user in and ``--status`` shows a name that is not
         whose token is stored. Nothing surfaces the disagreement.
 
@@ -481,10 +481,10 @@ class SwitchMixin:
                         try:
                             answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
                         except (EOFError, KeyboardInterrupt):
-                            print(f"\n{dimmed('Cancelled')}")
+                            print(f"\n{dimmed('Canceled')}")
                             return
                         if answer not in ("y", "yes"):
-                            print(dimmed("Cancelled"))
+                            print(dimmed("Canceled"))
                             return
                     displace_slot = (
                         account_num,
@@ -610,6 +610,7 @@ class SwitchMixin:
             if displace_slot:
                 d_num, d_email, d_org = displace_slot
                 stale_files.append((d_num, d_email))
+                orphans = self._credit_orphans(data, d_num)
                 if int(d_num) in data["sequence"]:
                     data["sequence"].remove(int(d_num))
                 del data["accounts"][d_num]
@@ -650,6 +651,8 @@ class SwitchMixin:
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+        if prune_identity:
+            self._print_credit_orphans(orphans, prune_identity[0])
 
     def add_account_from_token(
         self,
@@ -657,6 +660,7 @@ class SwitchMixin:
         email: str | None = None,
         slot: int | None = None,
         assume_yes: bool = False,
+        credit_for: str | tuple[str, str] | None = None,
     ) -> None:
         """Register a raw OAuth setup-token or managed API key as a new account.
 
@@ -676,6 +680,11 @@ class SwitchMixin:
             slot:  Slot number to use; auto-assigned when ``None``.
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the extra, confirm first).
+            credit_for: Slot number, email, or alias of the subscription account
+                   this API key is API credit for, or that account's
+                   ``(email, organizationUuid)`` identity, which is checked under
+                   the guard instead of being resolved by slot. Only valid with
+                   an ``sk-ant-api…`` key; a setup token is a login of its own.
         """
         self._refuse_session_shell()
         import getpass
@@ -694,9 +703,39 @@ class SwitchMixin:
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
 
+        parent: tuple[str, str] | None = None
+        if credit_for is not None:
+            if not is_api_key:
+                raise ValidationError(
+                    "A setup token is a login of its own and cannot be API "
+                    "credit for another account."
+                )
+            if isinstance(credit_for, tuple):
+                parent = credit_for
+            else:
+                parent_num, parent_email, parent_org = self.resolve_account(credit_for)
+                if self._account_kind(parent_num) == "api_key":
+                    raise ValidationError(
+                        f"Account {parent_num} ({parent_email}) is an API key; link "
+                        "to a subscription account instead"
+                    )
+                parent = (parent_email, parent_org)
+
         self._commit_add_account_from_token(
-            token, email, slot, assume_yes, is_api_key
+            token, email, slot, assume_yes, is_api_key, parent
         )
+
+    def _require_credit_parent(
+        self, data: dict, credit_for: tuple[str, str], account_num: str
+    ) -> None:
+        """Re-resolve the link target under the guard; refuse a stale or self target."""
+        parent_num = self._find_account_slot(data, *credit_for)
+        if parent_num == account_num:
+            raise ValidationError("cannot link a key to the account it replaces")
+        if parent_num is None or data["accounts"][parent_num].get("kind") == "api_key":
+            raise ConfigError(
+                "The linked account changed while adding; nothing was added. Retry."
+            )
 
     def _commit_add_account_from_token(
         self,
@@ -705,6 +744,7 @@ class SwitchMixin:
         slot: int | None,
         assume_yes: bool,
         is_api_key: bool,
+        credit_for: tuple[str, str] | None = None,
     ) -> None:
         """Prompt if needed, then commit the token account under ``lock_file``."""
         with FileLock(self.lock_file):
@@ -757,8 +797,14 @@ class SwitchMixin:
                     raise ConfigError(
                         f"Existing account metadata for {email} is inconsistent"
                     )
+                if credit_for is not None:
+                    self._require_credit_parent(seq, credit_for, account_num)
                 self._write_account_credentials(account_num, email, credentials)
                 self._write_account_config(account_num, email, config)
+                if credit_for is not None:
+                    seq["accounts"][account_num]["creditFor"] = {
+                        "email": credit_for[0], "organizationUuid": credit_for[1],
+                    }
                 # A refreshed credential invalidates any dead-token quarantine on this
                 # slot (mirrors ``add_account``); otherwise the stale strike row keeps
                 # the account stuck at "re-login needed" and it never fetches the new
@@ -809,10 +855,10 @@ class SwitchMixin:
                         try:
                             answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
                         except (EOFError, KeyboardInterrupt):
-                            print(f"\n{dimmed('Cancelled')}")
+                            print(f"\n{dimmed('Canceled')}")
                             return
                         if answer not in ("y", "yes"):
-                            print(dimmed("Cancelled"))
+                            print(dimmed("Canceled"))
                             return
                     displace_slot = (
                         account_num,
@@ -823,6 +869,7 @@ class SwitchMixin:
             account_num = str(self._get_next_account_number())
 
         prune_identity = None
+        orphans: list[str] = []
         with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
             lease_guard.assert_available()
             data = self._get_sequence_data() or {
@@ -860,6 +907,13 @@ class SwitchMixin:
             old_num = self._find_account_slot(data, email, "")
             if old_num and old_num != account_num:
                 migrate_from = old_num
+            if credit_for is not None:
+                self._require_credit_parent(data, credit_for, account_num)
+            prior_num = migrate_from or (None if displace_slot else account_num)
+            prior_link = (
+                data["accounts"].get(prior_num, {}).get("creditFor")
+                if prior_num else None
+            )
 
             if displace_slot:
                 self._ensure_no_live_session(
@@ -882,6 +936,11 @@ class SwitchMixin:
             if displace_slot:
                 d_num, d_email, d_org = displace_slot
                 stale_files.append((d_num, d_email))
+                orphans = [
+                    account_num if n == migrate_from else n
+                    for n in self._credit_orphans(data, d_num)
+                    if not (n == migrate_from and credit_for is not None)
+                ]
                 if int(d_num) in data["sequence"]:
                     data["sequence"].remove(int(d_num))
                 del data["accounts"][d_num]
@@ -903,6 +962,12 @@ class SwitchMixin:
             }
             if is_api_key:
                 record["kind"] = "api_key"
+            if credit_for is not None:
+                record["creditFor"] = {
+                    "email": credit_for[0], "organizationUuid": credit_for[1],
+                }
+            elif prior_link is not None:
+                record["creditFor"] = prior_link
             data["accounts"][account_num] = record
             if int(account_num) not in data["sequence"]:
                 data["sequence"].append(int(account_num))
@@ -924,6 +989,8 @@ class SwitchMixin:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+        if prune_identity:
+            self._print_credit_orphans(orphans, prune_identity[0])
 
     def _select_best_switchable(
         self,
@@ -954,7 +1021,7 @@ class SwitchMixin:
           its limit (switching would not help) → stay
         - ``(None, "none")`` — no other switchable account exists
 
-        Ties (including current-vs-other) resolve in favour of staying put.
+        Ties (including current-vs-other) resolve in favor of staying put.
         Never raises on network failure.
         """
         data = self._get_sequence_data() or {}
@@ -1010,7 +1077,7 @@ class SwitchMixin:
             f"({current_email}) to managed list? [Y/n] "
         )
         if response.lower() == "n":
-            print(dimmed("Setup cancelled. You can run 'openswap --add-account' later."))
+            print(dimmed("Setup canceled. You can run 'openswap --add-account' later."))
             return
 
         self.add_account()
@@ -1174,10 +1241,7 @@ class SwitchMixin:
                     )
                 target = fallback
             op = self._perform_switch(target, emit_output=not json_output)
-            return (
-                self._switch_result_from_op(op, strategy_label, warnings)
-                if json_output else None
-            )
+            return self._switch_result_from_op(op, strategy_label, warnings)
 
         current_email, current_org_uuid = identity
 
@@ -1240,10 +1304,7 @@ class SwitchMixin:
             )
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
-                return (
-                    self._switch_result_from_op(op, strategy_label, warnings)
-                    if json_output else None
-                )
+                return self._switch_result_from_op(op, strategy_label, warnings)
             if note == "current-unavailable":
                 if json_output:
                     return self._switch_noop(
@@ -1460,10 +1521,7 @@ class SwitchMixin:
         op = self._perform_switch(
             next_account, emit_output=not json_output, provenance=provenance
         )
-        return (
-            self._switch_result_from_op(op, strategy_label, warnings)
-            if json_output else None
-        )
+        return self._switch_result_from_op(op, strategy_label, warnings)
 
     def switch_to(
         self,
@@ -1478,7 +1536,7 @@ class SwitchMixin:
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
         ``force_if_live_missing`` narrows that recovery for stale UI actions:
-        the force is cancelled under the credential locks if usable live
+        the force is canceled under the credential locks if usable live
         credentials appeared after the card snapshot was taken.
         """
         if force_if_live_missing and not force:
@@ -1518,7 +1576,7 @@ class SwitchMixin:
                         print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
                     choice = input("Enter account number to switch to: ").strip()
                     if not choice.isdigit() or choice not in matches:
-                        print(dimmed("Cancelled"))
+                        print(dimmed("Canceled"))
                         return None
                     identifier = choice
 
@@ -1596,7 +1654,7 @@ class SwitchMixin:
                 warnings=op["warnings"],
             )
         else:
-            result = self._switch_result_from_op(op, "direct") if json_output else None
+            result = self._switch_result_from_op(op, "direct")
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
         # A cross-slot force stays "switched": reason reports the outcome, not
@@ -2194,7 +2252,7 @@ class SwitchMixin:
                     # a working install whose config just tore: measured, both
                     # reach this line with `current_account` set and
                     # `_get_current_account()` None. So keep upstream's
-                    # behaviour and stop it being LOSSY: the bytes survive next
+                    # behavior and stop it being LOSSY: the bytes survive next
                     # to the config, named, and the switch still lands.
                     existing_config = (
                         self._read_json(config_path) if config_path.exists() else None

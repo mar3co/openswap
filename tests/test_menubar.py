@@ -1022,6 +1022,242 @@ def test_panel_accounts_prefers_alias_and_keeps_note():
     assert cards[2]["subtitle"] == "c@x.com"
 
 
+def test_panel_accounts_titles_linked_key_as_api_credit():
+    snap = {
+        "accounts": [
+            (1, "a@x.com", True, _USAGE, _USAGE, "", "", False, None),
+            (2, "api-key-2@token.local", False, "api key", None, "", "", False, None),
+            (3, "api-key-3@token.local", False, "api key", None, "", "", False, None),
+        ],
+        "kinds": {"1": "oauth", "2": "api_key", "3": "api_key"},
+        "credit_for": {"2": "1"},
+    }
+    cards = menubar.panel_accounts(snap)
+    assert cards[1]["title"] == "API credit"
+    assert cards[1]["subtitle"] == "for a@x.com"
+    assert cards[1]["credit_for"] == "1"
+    assert cards[1]["api_key"] is True
+    assert cards[2]["title"] == "personal"
+    assert cards[2]["subtitle"] == "api-key-3@token.local"
+    assert cards[2]["credit_for"] == ""
+
+
+def test_panel_accounts_linked_key_alias_wins_as_title():
+    snap = {
+        "accounts": [
+            (1, "a@x.com", True, _USAGE, _USAGE, "", "", False, None),
+            (2, "api-key-2@token.local", False, "api key", None, "team credit", "", False, None),
+        ],
+        "kinds": {"1": "oauth", "2": "api_key"},
+        "credit_for": {"2": "1"},
+    }
+    cards = menubar.panel_accounts(snap)
+    assert cards[1]["title"] == "team credit"
+    assert cards[1]["subtitle"] == "for a@x.com"
+
+
+def test_panel_accounts_linked_key_without_parent_row_keeps_own_subtitle():
+    snap = {
+        "accounts": [
+            (2, "api-key-2@token.local", False, "api key", None, "", "", False, None),
+        ],
+        "kinds": {"2": "api_key"},
+        "credit_for": {"2": "9"},
+    }
+    cards = menubar.panel_accounts(snap)
+    assert cards[0]["title"] == "API credit"
+    assert cards[0]["subtitle"] == "api-key-2@token.local"
+
+
+_TOKEN_ROWS = [
+    (1, "a@x.com", True, _USAGE, _USAGE, "work", "", False, None),
+    (2, "b@x.com", False, _USAGE, _USAGE, "", "Ads Online", False, None),
+    (3, "api-key-3@token.local", False, "api key", None, "", "", False, None),
+    ("codex:1", "c@x.com", False, _USAGE, _USAGE, "", "", False, None),
+]
+_TOKEN_KINDS = {"1": "oauth", "2": "oauth", "3": "api_key", "codex:1": "oauth"}
+
+
+def test_token_entry_state_empty():
+    state = menubar.token_entry_state("", _TOKEN_ROWS, _TOKEN_KINDS)
+    assert state["kind"] is None
+    assert state["line"] == ""
+    assert state["show_parent"] is False
+    assert state["can_add"] is False
+
+
+def test_token_entry_state_api_key_offers_subscription_parents_only():
+    state = menubar.token_entry_state("sk-ant-api03-abc", _TOKEN_ROWS, _TOKEN_KINDS)
+    assert state["kind"] == "api_key"
+    assert state["line"] == "API key"
+    assert state["show_parent"] is True
+    assert state["can_add"] is True
+    assert state["choices"] == [
+        ("", "None (standalone)"),
+        ("1", "work · a@x.com"),
+        ("2", "Ads Online · b@x.com"),
+    ]
+
+
+def test_token_entry_state_setup_token_hides_parent():
+    state = menubar.token_entry_state("sk-ant-oat01-abc", _TOKEN_ROWS, _TOKEN_KINDS)
+    assert state["kind"] == "setup_token"
+    assert state["line"] == "Setup token"
+    assert state["show_parent"] is False
+    assert state["can_add"] is True
+
+
+def test_token_entry_state_rejects_garbage():
+    state = menubar.token_entry_state("hunter2", _TOKEN_ROWS, _TOKEN_KINDS)
+    assert state["kind"] is None
+    assert state["line"] == "Not a Claude token"
+    assert state["can_add"] is False
+
+
+def test_token_entry_state_strips_whitespace():
+    state = menubar.token_entry_state("  sk-ant-api03-abc\n", _TOKEN_ROWS, _TOKEN_KINDS)
+    assert state["kind"] == "api_key"
+    assert state["can_add"] is True
+
+
+def test_parent_link_choice_maps_the_popup_item_to_a_link():
+    from openswap.menubar_display import STALE_PARENT, parent_link_choice
+    identities = {"1": ("a@example.com", "org-a")}
+    standalone_value = menubar.token_entry_state("sk-ant-api03-abc", _TOKEN_ROWS, _TOKEN_KINDS)["choices"][0][0]
+    standalone_item = (standalone_value, *(identities.get(standalone_value) or ("", "")))
+    assert parent_link_choice(None, identities) is None
+    assert parent_link_choice(standalone_item, identities) is None
+    assert parent_link_choice(("1", "a@example.com", "org-a"), identities) == (
+        "a@example.com", "org-a"
+    )
+    assert parent_link_choice(("1", "b@example.com", "org-a"), identities) is STALE_PARENT
+    assert parent_link_choice(("1", "a@example.com", "org-a"), {}) is STALE_PARENT
+
+
+def test_sanitize_token_error_strips_secrets_and_urls():
+    assert menubar.sanitize_token_error(
+        "Bad key sk-ant-api03-abcDEF_123 see https://x.test/a?b=c"
+    ) == "Bad key see"
+    assert menubar.sanitize_token_error("x" * 300).endswith("…")
+    assert len(menubar.sanitize_token_error("x" * 300)) == 181
+
+
+def test_add_token_returns_none_on_success_and_copy_on_failure():
+    from openswap.exceptions import ValidationError
+
+    app, logger, _logged = _token_app()
+    calls = []
+    refreshed = []
+    app.switcher = SimpleNamespace(
+        add_account_from_token=lambda **kw: calls.append(kw), _logger=logger,
+    )
+    app.refresh_async = lambda: refreshed.append(True)
+    assert app._add_token("sk-ant-api03-abc", "", ("a@x.com", "org-1")) is None
+    assert calls == [{
+        "token": "sk-ant-api03-abc", "email": None, "slot": None,
+        "credit_for": ("a@x.com", "org-1"),
+    }]
+    assert refreshed == [True]
+
+    def boom(**kw):
+        raise ValidationError("rejected sk-ant-api03-abc for https://x.test")
+
+    app.switcher = SimpleNamespace(add_account_from_token=boom, _logger=logger)
+    assert app._add_token("sk-ant-api03-abc", "me", None) == "rejected for"
+    assert refreshed == [True]
+
+    def boom_secret_only(**kw):
+        raise ValidationError("sk-ant-api03-abc")
+
+    app.switcher = SimpleNamespace(add_account_from_token=boom_secret_only, _logger=logger)
+    assert app._add_token("sk-ant-api03-abc", "", None) == "Could not add this token."
+    assert refreshed == [True]
+
+
+def _token_app():
+    from tests.menubar_harness import extract_class
+
+    scope = {
+        "ClaudeSwitchError": menubar.ClaudeSwitchError,
+        "sanitize_token_error": menubar.sanitize_token_error,
+    }
+    app = extract_class(menubar.__file__, "MenuBarApp", {"_add_token"}, scope)()
+    logged = []
+    logger = SimpleNamespace(
+        info=lambda *a, **k: logged.append(("info", a, k)),
+        error=lambda *a, **k: logged.append(("error", a, k)),
+        warning=lambda *a, **k: logged.append(("warning", a, k)),
+    )
+    return app, logger, logged
+
+
+def test_add_token_reports_disk_errors_and_logs_them():
+    app, logger, logged = _token_app()
+
+    def boom(**kw):
+        raise PermissionError("denied /Users/me/.claude.json")
+
+    app.switcher = SimpleNamespace(add_account_from_token=boom, _logger=logger)
+    app.refresh_async = lambda: None
+    assert app._add_token("sk-ant-api03-abc", "", None) == (
+        "Could not save this token (disk or permission error). See openswap.log."
+    )
+    assert logged == [("error", ("add-from-token failed",), {"exc_info": True})]
+
+
+def test_add_token_logs_engine_rejection_without_the_token():
+    from openswap.exceptions import ValidationError
+
+    app, logger, logged = _token_app()
+
+    def boom(**kw):
+        raise ValidationError("rejected sk-ant-api03-abc")
+
+    app.switcher = SimpleNamespace(add_account_from_token=boom, _logger=logger)
+    app.refresh_async = lambda: None
+    assert app._add_token("sk-ant-api03-abc", "", None) == "rejected"
+    assert len(logged) == 1 and logged[0][0] == "info"
+    assert "sk-ant" not in repr(logged)
+
+
+def test_add_token_succeeds_when_refresh_fails():
+    app, logger, logged = _token_app()
+    app.switcher = SimpleNamespace(add_account_from_token=lambda **kw: None, _logger=logger)
+
+    def bad_refresh():
+        raise RuntimeError("refresh broke")
+
+    app.refresh_async = bad_refresh
+    assert app._add_token("sk-ant-api03-abc", "", None) is None
+    assert [entry[0] for entry in logged] == ["warning"]
+
+
+def test_adapt_snapshot_carries_credit_for():
+    from types import SimpleNamespace
+    from openswap.usage_store import UsageEntry
+
+    def acc(number, email, kind, credit_for=""):
+        return SimpleNamespace(
+            number=number, email=email, is_active=False, usage=UsageEntry(),
+            alias="", org_name="", org_uuid="", disabled=False, kind=kind,
+            credit_for=credit_for,
+        )
+
+    snap = SimpleNamespace(accounts=[acc("1", "a@x.com", "oauth"), acc("2", "k@x", "api_key", "1")])
+    adapted = menubar._adapt_snapshot(snap)
+    assert adapted["credit_for"] == {"1": "", "2": "1"}
+
+
+def test_hold_line_on_api_credit():
+    assert menubar.hold_line_from_event(
+        NoSwitchEvent(reason="on-api-credit", detail="no subscription account below 90%"),
+        active_title="API credit", strategy="best",
+    ) == "Holding on API credit: no subscription account below 90%."
+    assert menubar.hold_line_from_event(
+        NoSwitchEvent(reason="on-api-credit"), active_title="API credit", strategy="best",
+    ) == "Holding on API credit."
+
+
 def test_panel_accounts_uses_last_good_when_display_is_a_sentinel():
     snap = {
         "accounts": [

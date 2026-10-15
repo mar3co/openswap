@@ -13,7 +13,7 @@ from tests.menubar_harness import extract_class
 def _panel():
     methods = {
         "__init__", "_select_provider", "_show_settings", "_show_main",
-        "_select_settings_section", "close",
+        "_select_settings_section", "close", "_release_token_field",
     }
     namespace = {
         "MAIN_PAGE": "main",
@@ -178,7 +178,7 @@ def test_empty_state_gives_provider_specific_add_guidance(provider, name):
         assert "Does not switch" in state["hint"]
 
 
-@pytest.mark.parametrize("stage", ["starting", "waiting", "ready", "error", "saving", "cancelling", "saved"])
+@pytest.mark.parametrize("stage", ["starting", "waiting", "ready", "error", "saving", "canceling", "saved"])
 def test_login_panel_state_is_concise_and_safe(stage):
     state = menubar.login_panel_state({
         "stage": stage,
@@ -195,7 +195,7 @@ def test_login_panel_state_is_concise_and_safe(stage):
         assert "cancel" in state["actions"]
         assert "copy_link" in state["actions"]
         assert "device" in state["actions"]
-    if stage in ("saving", "cancelling"):
+    if stage in ("saving", "canceling"):
         assert state["actions"] == []
     if stage == "saved":
         assert state["actions"] == ["dismiss"]

@@ -435,6 +435,53 @@ class TestCLI:
             "2", json_output=False, force=True
         )
 
+    def test_cli_switch_stamps_the_engine_state(self, temp_home: Path):
+        """A CLI hand switch starts the cooldown and ends the engine's key ownership."""
+        from openswap.autoswitch import STATE_FILENAME
+        from openswap.switcher import ClaudeAccountSwitcher
+
+        state_path = ClaudeAccountSwitcher().backup_dir / STATE_FILENAME
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({"creditPlacedOn": "2"}))
+        with patch.object(sys, "argv", ["openswap", "--switch-to", "1"]), \
+             patch.object(ClaudeAccountSwitcher, "switch_to", return_value={"switched": True}), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("openswap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        state = json.loads(state_path.read_text())
+        assert "lastSwitchAt" in state
+        assert "creditPlacedOn" not in state
+
+    def test_cli_switch_stamp_failure_keeps_json_stdout_clean(self, temp_home: Path, capsys):
+        from openswap.exceptions import LockError
+        from openswap.switcher import ClaudeAccountSwitcher
+
+        payload = {"schemaVersion": 1, "switched": True}
+        with patch.object(sys, "argv", ["openswap", "--switch-to", "1", "--json"]), \
+             patch.object(ClaudeAccountSwitcher, "switch_to", return_value=payload), \
+             patch("openswap.autoswitch.record_manual_switch", side_effect=LockError("busy")), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("openswap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        captured = capsys.readouterr()
+        assert json.loads(captured.out) == payload
+        assert "Warning: switched, but could not record it for auto-switch" in captured.err
+
+    def test_cli_switch_noop_does_not_stamp(self, temp_home: Path):
+        from openswap.autoswitch import STATE_FILENAME
+        from openswap.switcher import ClaudeAccountSwitcher
+
+        state_path = ClaudeAccountSwitcher().backup_dir / STATE_FILENAME
+        with patch.object(sys, "argv", ["openswap", "--switch-to", "1"]), \
+             patch.object(ClaudeAccountSwitcher, "switch_to", return_value={"switched": False}), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("openswap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        assert not state_path.exists()
+
     def test_switch_to_without_force_forwards_false(self):
         """Plain --switch-to forwards force=False."""
         with patch("openswap.cli.ClaudeAccountSwitcher") as switcher_cls, \
@@ -817,7 +864,7 @@ class TestCLICommands:
             cli.main()
 
         mock_add.assert_called_once_with(
-            token="sk-ant-oat01-abc", email=None, slot=None
+            token="sk-ant-oat01-abc", email=None, slot=None, credit_for=None
         )
 
     def test_email_without_add_token_errors(self, capsys):
@@ -841,7 +888,7 @@ class TestCLICommands:
             cli.main()
 
         mock_add.assert_called_once_with(
-            token="mytoken", email="u@example.com", slot=None
+            token="mytoken", email="u@example.com", slot=None, credit_for=None
         )
 
     def test_add_token_with_slot(self, temp_home: Path, capsys):
@@ -857,8 +904,29 @@ class TestCLICommands:
             cli.main()
 
         mock_add.assert_called_once_with(
-            token="tok", email="u@example.com", slot=3
+            token="tok", email="u@example.com", slot=3, credit_for=None
         )
+
+    def test_add_token_for_dispatches_credit_for(self, temp_home: Path, capsys):
+        from openswap.switcher import ClaudeAccountSwitcher
+
+        with patch.object(
+            sys, "argv", ["openswap", "add-token", "sk-ant-api03-x", "--for", "work"],
+        ), patch.object(
+            ClaudeAccountSwitcher, "add_account_from_token"
+        ) as mock_add:
+            cli.main()
+
+        mock_add.assert_called_once_with(
+            token="sk-ant-api03-x", email=None, slot=None, credit_for="work"
+        )
+
+    def test_for_without_add_token_errors(self, capsys):
+        with patch.object(sys, "argv", ["openswap", "list", "--for", "1"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--for can only be used with 'add-token'" in capsys.readouterr().err
 
     def test_add_token_in_help(self):
         """The add-token subcommand and the still-visible --email modifier appear."""
@@ -1040,12 +1108,13 @@ class TestJsonOutputCli:
         out = capsys.readouterr().out
         assert json.loads(out) == payload  # exactly one JSON object, no extra text
 
-    def test_switch_json_forwarded_and_serialized(self, capsys):
+    def test_switch_json_forwarded_and_serialized(self, capsys, tmp_path):
         payload = {"schemaVersion": 1, "switched": True}
         with patch("openswap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch.object(sys, "argv", ["openswap", "--switch", "--json"]), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch("openswap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.backup_dir = tmp_path
             switcher_cls.return_value.switch.return_value = payload
             cli.main()
 
@@ -1054,7 +1123,7 @@ class TestJsonOutputCli:
         )
         assert json.loads(capsys.readouterr().out) == payload
 
-    def test_switch_json_carries_model_fields_when_in_effect(self, capsys):
+    def test_switch_json_carries_model_fields_when_in_effect(self, capsys, tmp_path):
         """Additive models/modelSource fields make a model-steered pick
         auditable from scripts too."""
         payload = {"schemaVersion": 1, "switched": True}
@@ -1065,6 +1134,7 @@ class TestJsonOutputCli:
              ]), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch("openswap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.backup_dir = tmp_path
             switcher_cls.return_value.switch.return_value = payload
             cli.main()
 
@@ -1768,4 +1838,4 @@ class TestSetupCommand:
     def test_ctrl_c_exits_130(self, monkeypatch, capsys):
         self._harness(monkeypatch, ["openswap", "setup"], add_raises=KeyboardInterrupt())
         assert self._run() == 130
-        assert "cancelled" in capsys.readouterr().out.lower()
+        assert "canceled" in capsys.readouterr().out.lower()

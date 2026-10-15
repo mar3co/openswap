@@ -140,6 +140,7 @@ class AccountSnapshot:
     usage: UsageEntry
     alias: str = ""
     disabled: bool = False  # held out of auto-rotation (still a valid explicit target)
+    credit_for: str = ""  # parent slot when this API key is a subscription account's credit
     provider: str = "claude"
 
     @property

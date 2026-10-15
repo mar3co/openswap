@@ -29,6 +29,38 @@ def test_codex_add_list_switch_roundtrip(temp_home, capsys, monkeypatch):
     assert "a@x.com" in out and "b@x.com" in out
     assert run_cli(["codex", "switch", "1"]) == 2   # already active
 
+def test_codex_cli_switch_stamps_the_engine_state(temp_home, capsys, monkeypatch):
+    from unittest.mock import patch
+
+    home = temp_home / ".codex"; home.mkdir()
+    (home / "auth.json").write_text(_auth(email="a@x.com", account_id="acc-a"))
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setattr("openswap.codex.engine.read_rate_limits", lambda *a, **k: {"primary": {"usedPercent": 3, "windowDurationMins": 300}})
+    monkeypatch.setattr("shutil.which", lambda name: "/opt/codex" if name == "codex" else None)
+    run_cli(["codex", "add"])
+    (home / "auth.json").write_text(_auth(email="b@x.com", account_id="acc-b"))
+    run_cli(["codex", "add"])
+    with patch("openswap.autoswitch.record_manual_switch") as stamp:
+        assert run_cli(["codex", "switch", "1"]) == 0
+        assert run_cli(["codex", "switch", "1"]) == 2   # already active: no stamp
+    stamp.assert_called_once()
+    assert stamp.call_args.args[0].name == "codex"
+
+def test_codex_cli_desktop_switch_stamps_the_engine_state(monkeypatch):
+    from unittest.mock import Mock, patch
+
+    engine = Mock(name="CodexEngine")
+    backend = Mock(name="DesktopSwitcher")
+    monkeypatch.setattr("openswap.codex.engine.CodexEngine", Mock(return_value=engine))
+    monkeypatch.setattr("openswap.codex.desktop.DesktopSwitcher", Mock(return_value=backend))
+    argv = ["codex", "desktop", "switch", "2", "--confirm-restart", "--confirm-idle"]
+    with patch("openswap.autoswitch.record_manual_switch") as stamp:
+        backend.switch.return_value = {"switched": True}
+        assert run_cli(argv) == 0
+        backend.switch.return_value = {"switched": False}
+        assert run_cli(argv) == 0
+    stamp.assert_called_once_with(engine.state_dir)
+
 def _one_codex_account(temp_home, monkeypatch):
     home = temp_home / ".codex"; home.mkdir()
     (home / "auth.json").write_text(_auth(email="c@x.com", account_id="acc-c"))
@@ -70,7 +102,7 @@ def test_codex_remove_cancel_does_not_claim_success(temp_home, capsys, monkeypat
     monkeypatch.setattr("builtins.input", lambda *_a, **_k: "n")
     assert run_cli(["codex", "remove", "1"]) == 0
     out = capsys.readouterr().out
-    assert "Cancelled" in out
+    assert "Canceled" in out
     assert "Removed" not in out
     assert (paths.get_backup_root() / "codex" / "slots" / "1" / "auth.json").exists()
 

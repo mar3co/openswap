@@ -44,6 +44,7 @@ from openswap.codex.desktop_app import (
     capability_is_fresh,
 )
 from openswap.autoswitch import record_manual_switch
+from openswap.credentials import looks_like_api_key
 from openswap.paths import get_backup_root
 from openswap.settings import atomic_write_json
 from openswap.engine import (
@@ -248,6 +249,8 @@ def _remote_task_origin(origin) -> str:
     label = "".join(c for c in label[:100] if c.isprintable()).strip() if isinstance(label, str) else ""
     return f" from {label} ({origin['kind']})" if label else f" from {origin['kind']}"
 SETTINGS_PAGE = "settings"
+TOKEN_PAGE = "token"
+SETUP_TOKEN_PREFIX = "sk-ant-oat"
 MAIN_PAGE = "main"
 SETTINGS_SECTION_GENERAL = "general"
 SETTINGS_SECTION_AUTOMATION = "automation"
@@ -2060,6 +2063,16 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 note = f"Stale · last updated {age} · {note}"
         usage = display if isinstance(display, dict) else last_good
         title, subtitle = account_card_names(email, alias, org_name)
+        credit_parent = str((snapshot.get("credit_for") or {}).get(str(num)) or "")
+        if credit_parent:
+            parent_email = next(
+                (str(r[1]) for r in snapshot.get("accounts") or []
+                 if str(r[0]) == credit_parent),
+                "",
+            )
+            title = alias or "API credit"
+            if parent_email:
+                subtitle = f"for {parent_email}"
         if is_codex:
             title = f"Codex · {title}"
         as_of = now
@@ -2088,6 +2101,7 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 "active": bool(is_active),
                 "disabled": bool(disabled),
                 "api_key": is_api_key,
+                "credit_for": credit_parent,
                 "note": note,
                 "needs_relogin": needs_relogin,
                 "needs_restore": needs_restore,
@@ -2181,6 +2195,70 @@ def provider_shared_copy(provider: str) -> str:
     return ""
 
 
+_SECRET_RE = re.compile(r"https?://\S+|\bsk-ant-[A-Za-z0-9_-]+|\b(?:sk|auth)_[A-Za-z0-9_-]+")
+
+
+def sanitize_token_error(message: str) -> str:
+    """Engine error copy for the token page: no URLs, no token-shaped text, one line."""
+    text = str(message or "").replace("\n", " ")
+    text = _SECRET_RE.sub("", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    if len(text) > 180:
+        text = text[:180] + "…"
+    return text
+
+
+STALE_PARENT = "stale-parent"
+
+
+def parent_link_choice(picked, identities: dict):
+    """Turn the parent popup's represented ``(num, email, org)`` into the link to send.
+
+    ``None`` when no parent is picked (the standalone item carries an empty slot),
+    the ``(email, organizationUuid)`` identity when the snapshot row for that slot
+    still matches, else ``STALE_PARENT``.
+    """
+    if not picked or not str(picked[0]):
+        return None
+    identity = (str(picked[1]), str(picked[2]))
+    email, org = identities.get(str(picked[0])) or ("", "")
+    if (str(email), str(org or "")) != identity:
+        return STALE_PARENT
+    return identity
+
+
+def token_entry_state(text: str, accounts: list, kinds: dict | None = None) -> dict:
+    """Pure model for the Add-from-token page.
+
+    ``accounts`` are the snapshot rows; ``kinds`` the snapshot kinds map. The
+    page is stricter than the engine: only ``sk-ant-api`` and ``sk-ant-oat``
+    prefixes are accepted, so a stray paste cannot be stored as a login.
+    """
+    value = (text or "").strip()
+    if not value:
+        kind, line = None, ""
+    elif looks_like_api_key(value):
+        kind, line = "api_key", "API key"
+    elif value.startswith(SETUP_TOKEN_PREFIX):
+        kind, line = "setup_token", "Setup token"
+    else:
+        kind, line = None, "Not a Claude token"
+    choices: list[tuple[str, str]] = [("", "None (standalone)")]
+    for row in accounts or []:
+        num, email, _active, _display, _last_good, alias, org_name, _disabled, _fetched = row
+        if str(num).startswith("codex:") or (kinds or {}).get(str(num)) == "api_key":
+            continue
+        title, _subtitle = account_card_names(email, alias, org_name)
+        choices.append((str(num), f"{title} · {email}"))
+    return {
+        "kind": kind,
+        "line": line,
+        "show_parent": kind == "api_key",
+        "choices": choices,
+        "can_add": kind is not None,
+    }
+
+
 def login_panel_state(state: dict | None) -> dict:
     """Return safe, concise native-view data for the browser login lifecycle.
 
@@ -2190,7 +2268,7 @@ def login_panel_state(state: dict | None) -> dict:
     """
     raw = state if isinstance(state, dict) else {}
     stage = str(raw.get("stage") or "idle").lower()
-    if stage not in {"idle", "starting", "waiting", "ready", "error", "cancelled", "saving", "cancelling", "saved"}:
+    if stage not in {"idle", "starting", "waiting", "ready", "error", "canceled", "saving", "canceling", "saved"}:
         stage = "error"
     email = str(raw.get("email") or "").strip()
     plan = str(raw.get("plan") or "").strip()
@@ -2236,14 +2314,14 @@ def login_panel_state(state: dict | None) -> dict:
         result.update(title="Save this account?", body="", actions=["save", "cancel"])
     elif stage == "error":
         result.update(title="Sign-in didn’t finish", body=message or "Try again.", actions=["retry", "cancel"] + ([] if mode == "device" else ["device"]))
-    elif stage == "cancelled":
-        result.update(title="Sign-in cancelled", body="", actions=["start", "dismiss"])
+    elif stage == "canceled":
+        result.update(title="Sign-in canceled", body="", actions=["start", "dismiss"])
     elif stage == "saved":
         result.update(title="Account saved", body="Ready to use.", actions=["dismiss"])
     elif stage == "saving":
         result.update(title="Saving account…", body="", actions=[])
-    elif stage == "cancelling":
-        result.update(title="Cancelling sign-in…", body="", actions=[])
+    elif stage == "canceling":
+        result.update(title="Canceling sign-in…", body="", actions=[])
     return result
 
 
@@ -2372,6 +2450,8 @@ def hold_line_from_event(
         return "Holding: no other accounts to switch to."
     if reason == "no-qualifying-candidate":
         return "Holding: no better account yet."
+    if reason == "on-api-credit":
+        return f"Holding on API credit: {detail}." if detail else "Holding on API credit."
     if reason == "active-api-key":
         return "Holding: API-key accounts have no quota to watch."
     if reason == "active-idle":
@@ -2448,7 +2528,7 @@ def format_title(
 def format_menu_bar_title(
     snapshot: dict, settings: MenuBarSettings, now: float | None = None
 ) -> str:
-    """Provider-labelled status text, independent of the popover's selected tab.
+    """Provider-labeled status text, independent of the popover's selected tab.
 
     ChatGPT shares the selected Codex credential, but its desktop session is not
     verified by that file. Name that limitation instead of presenting the CLI's
@@ -2735,6 +2815,7 @@ EMPTY_SNAPSHOT: dict = {
     "active_org": None,
     "identities": {},
     "kinds": {},
+    "credit_for": {},
     "codex_active_num": None,
 }
 
@@ -2746,7 +2827,9 @@ def _adapt_snapshot(snap, codex_snap=None) -> dict:
     "active_email": str | None, "active_num": str | None,
     "active_usage": dict | str | None, "active_last_good": dict | None,
     "active_fetched_at": float | None,
-    "active_alias": str | None, "active_org": str | None}``. The snapshot itself is produced by
+    "active_alias": str | None, "active_org": str | None,
+    "identities": {num: (email, org_uuid)}, "kinds": {num: "oauth" | "api_key"},
+    "credit_for": {num: parent_num | ""}}``. The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
     fetching, no I/O. Per-account ``fetched_at`` is the underlying
     measurement's fetch time (pace marker, signed-out freeze, widget age).
@@ -2761,6 +2844,7 @@ def _adapt_snapshot(snap, codex_snap=None) -> dict:
     active_org = None
     identities: dict[str, tuple[str, str]] = {}
     kinds: dict[str, str] = {}
+    credit_for: dict[str, str] = {}
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
         org_name = getattr(acc, "org_name", "") or ""
@@ -2774,6 +2858,7 @@ def _adapt_snapshot(snap, codex_snap=None) -> dict:
             acc.email, getattr(acc, "org_uuid", "") or "",
         )
         kinds[str(acc.number)] = getattr(acc, "kind", "oauth")
+        credit_for[str(acc.number)] = getattr(acc, "credit_for", "") or ""
         if acc.is_active:
             active_email, active_usage, active_alias = acc.email, display, acc.alias
             active_org = org_name
@@ -2809,6 +2894,7 @@ def _adapt_snapshot(snap, codex_snap=None) -> dict:
         "active_org": active_org,
         "identities": identities,
         "kinds": kinds,
+        "credit_for": credit_for,
         "codex_active_num": codex_active_num,
     }
 

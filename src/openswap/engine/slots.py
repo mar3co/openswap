@@ -5,6 +5,37 @@ from __future__ import annotations
 from openswap.engine.notes import *  # noqa: F403
 from openswap.worker.leases import AccountLeaseStore
 
+
+def order_keys_after_parents(
+    sequence: list[int], parent_of: dict[str, str | None]
+) -> list[int]:
+    """Roster order with each linked key placed directly after its parent.
+
+    A key whose parent is not in ``sequence`` keeps its own position.
+    """
+    children: dict[str, list[int]] = {}
+    present = {str(num) for num in sequence}
+    for num in sequence:
+        parent = parent_of.get(str(num))
+        if parent is not None and parent in present:
+            children.setdefault(parent, []).append(num)
+    placed: set[int] = set()
+    ordered: list[int] = []
+    for num in sequence:
+        if num in placed:
+            continue
+        parent = parent_of.get(str(num))
+        if parent is not None and parent in present:
+            continue
+        ordered.append(num)
+        placed.add(num)
+        for child in children.get(str(num), []):
+            ordered.append(child)
+            placed.add(child)
+    ordered.extend(num for num in sequence if num not in placed)
+    return ordered
+
+
 class SlotsMixin:
     """Roster (sequence.json), backup Keychain, aliases, disabled flags, slot numbers."""
 
@@ -1009,6 +1040,44 @@ class SlotsMixin:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
         return self._account_kind(account_num)
 
+    def _credit_parent_in(self, data: dict, account_num: str) -> str | None:
+        """Slot of the subscription account a key is API credit for, from loaded data."""
+        record = data.get("accounts", {}).get(str(account_num), {})
+        link = record.get("creditFor")
+        if record.get("kind") != "api_key" or not isinstance(link, dict):
+            return None
+        email = link.get("email")
+        if not isinstance(email, str):
+            return None
+        parent = self._find_account_slot(
+            data, email, link.get("organizationUuid", "") or ""
+        )
+        if parent is None or parent == str(account_num):
+            return None
+        if data["accounts"][parent].get("kind") == "api_key":
+            return None
+        return parent
+
+    def _credit_orphans(self, data: dict, parent_num: str) -> list[str]:
+        """Keys whose link resolves to ``parent_num`` in loaded data."""
+        return [
+            n for n in data["accounts"]
+            if self._credit_parent_in(data, n) == parent_num
+        ]
+
+    @staticmethod
+    def _print_credit_orphans(orphans: list[str], parent_email: str) -> None:
+        for num in sorted(orphans, key=int):
+            print(dimmed(
+                f"  Slot {num} (API credit for {parent_email}) is now a standalone key "
+                "until that account is added again."
+            ))
+
+    def credit_parent_for(self, account_num: str) -> str | None:
+        """Parent slot for a linked API key; ``None`` when unlinked or the parent is gone."""
+        data = self._get_sequence_data() or {}
+        return self._credit_parent_in(data, str(account_num))
+
     def sequence_data(self) -> dict | None:
         """Public roster read of ``sequence.json``. None only when it does not exist."""
         return self._get_sequence_data()
@@ -1292,7 +1361,7 @@ class SlotsMixin:
                         print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
                     choice = input("Enter account number to remove: ").strip()
                     if not choice.isdigit() or choice not in matches:
-                        print(dimmed("Cancelled"))
+                        print(dimmed("Canceled"))
                         return
                     identifier = choice
 
@@ -1325,7 +1394,7 @@ class SlotsMixin:
                 f"Account-{account_num} ({email})? [y/N] "
             )
             if confirm.lower() != "y":
-                print(dimmed("Cancelled"))
+                print(dimmed("Canceled"))
                 return
 
         with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as lease_guard:
@@ -1342,6 +1411,7 @@ class SlotsMixin:
                     "it moved or was replaced. Nothing was removed."
                 )
             email = live_email
+            orphans = self._credit_orphans(data, account_num)
             self._delete_account_files(account_num, email)
             del data["accounts"][account_num]
             data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
@@ -1350,5 +1420,6 @@ class SlotsMixin:
             self._logger.info(f"Removed account {account_num}: {email}")
 
         print(f"{accent('Removed')} Account-{account_num} ({email})")
+        self._print_credit_orphans(orphans, email)
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))

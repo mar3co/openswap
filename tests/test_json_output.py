@@ -667,3 +667,9 @@ class TestAccountRowDisabled:
     def test_disabled_absent_by_default(self):
         row = account_row(1, "a@example.com", "", "", False, None)
         assert "disabled" not in row
+
+
+def test_account_row_credit_for_is_additive():
+    from openswap.json_output import account_row
+    assert "creditFor" not in account_row(1, "a@x", "", "", False, None)
+    assert account_row(2, "k@x", "", "", False, "api key", credit_for=1)["creditFor"] == 1

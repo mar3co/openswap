@@ -345,7 +345,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "credit-return"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -524,6 +524,7 @@ _parse_reset_ts = poll_policy.parse_reset_ts
 # Strategies that rank by soonest reset of a chosen window (weekly or 5h)
 # rather than most headroom. Event trigger stays "consume-first" for both.
 CONSUME_STRATEGIES = frozenset({"consume-first", "soonest-5h"})
+COOLDOWN_TRIGGERS = ("proactive", "consume-first", "credit-return")
 
 
 def _window_reset_ts(
@@ -615,12 +616,13 @@ def _ref(number: str, email: str) -> dict:
 def record_manual_switch(backup_dir: Path, *, now: float | None = None) -> None:
     """Stamp ``lastSwitchAt`` so the engine's cooldown covers a hand switch.
 
-    A hand switch from the extra does not go through
+    A hand switch from the extra or the CLI does not go through
     ``AutoSwitchEngine._perform``, so without this the next tick can undo
     it (especially consume-first).
-    Only ``lastSwitchAt`` is written; ``lastSwitchFrom`` / ``lastSwitchTo``
-    stay as the engine left them so the no-return bar still treats a hand
-    switch as "already undid the move".
+    Only ``lastSwitchAt`` is written and ``creditPlacedOn`` cleared (the user
+    now owns whatever is active); ``lastSwitchFrom`` / ``lastSwitchTo`` stay
+    as the engine left them so the no-return bar still treats a hand switch
+    as "already undid the move".
     """
     path = backup_dir / STATE_FILENAME
     lock = FileLock(path.parent / ".autoswitch_state.lock")
@@ -632,6 +634,7 @@ def record_manual_switch(backup_dir: Path, *, now: float | None = None) -> None:
         state = raw if isinstance(raw, dict) else {}
         state["schemaVersion"] = STATE_SCHEMA_VERSION
         state["lastSwitchAt"] = time.time() if now is None else float(now)
+        state.pop("creditPlacedOn", None)
         atomic_write_json(path, state)
 
 
@@ -882,20 +885,28 @@ class AutoSwitchEngine:
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
-        if (
-            self.switcher.account_kind_for(current) == "api_key"
-            and not settings.include_api_key_accounts
-        ):
-            self._emit(
-                NoSwitchEvent(
-                    reason="active-api-key",
-                    detail="API-key accounts have no quota to watch",
-                )
-            )
-            return TickOutcome.NO_ACTION
-
         active_headroom = headroom.get(current)
-        if active_headroom is not None:
+        if self.switcher.account_kind_for(current) == "api_key":
+            if not (
+                self._key_eligible(current, settings)
+                or str(state.get("creditPlacedOn")) == current
+            ):
+                self._unhealthy_ticks = 0
+                self._idle_hold_since = None
+                self._emit(
+                    NoSwitchEvent(
+                        reason="active-api-key",
+                        detail="API-key accounts have no quota to watch",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            # On API credit: a key has no window to read, so unhealthy
+            # counting never applies. Leave only for a subscription below
+            # the threshold (`_rank_candidates`, trigger "credit-return").
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            trigger = "credit-return"
+        elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
@@ -968,7 +979,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in COOLDOWN_TRIGGERS and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -986,9 +997,16 @@ class AutoSwitchEngine:
         # in this census of what exists. See `_no_return_account` for the
         # incident, the scoping, and the release.
         api_key_candidates = (
-            [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
-            if settings.include_api_key_accounts
-            else []
+            []
+            if trigger == "credit-return"
+            else self._order_keys(
+                [
+                    n for n in candidates
+                    if self.switcher.account_kind_for(n) == "api_key"
+                    and self._key_eligible(n, settings)
+                ],
+                leaving=current,
+            )
         )
         if (
             trigger == "consume-first"
@@ -1014,13 +1032,19 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
         if not oauth_candidates and not api_key_candidates:
+            if trigger == "credit-return":
+                return self._hold_on_credit(
+                    "no subscription account in rotation"
+                )
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
-        consume_first = settings.strategy in CONSUME_STRATEGIES
+        consume_first = (
+            settings.strategy in CONSUME_STRATEGIES and trigger != "credit-return"
+        )
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1139,14 +1163,28 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
-            # Last resort when we must move: metered API-key accounts
-            # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+        if (
+            not ordered
+            and api_key_candidates
+            and (
+                trigger == "at-limit"
+                or (trigger == "failover" and (any_known or not oauth_candidates))
+            )
+        ):
+            # Paid credit is the last resort only when no subscription has
+            # known room: at-limit, or a failover where a subscription was
+            # measured this tick or none is in rotation.
             ordered = api_key_candidates
 
+        if not ordered and trigger == "credit-return":
+            return self._hold_on_credit(
+                f"no subscription account below {pct_label(settings.threshold)}%"
+                if any_known
+                else "no subscription has readable usage"
+            )
+
         if not ordered:
-            if not any_known:
+            if not any_known and oauth_candidates:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
                 self._emit(
@@ -1198,7 +1236,7 @@ class AutoSwitchEngine:
             candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
             truly_exhausted = all(
                 h is not None and h <= 0 for h in candidate_headrooms
-            )
+            ) and not api_key_candidates
             if not truly_exhausted:
                 self._emit(
                     NoSwitchEvent(
@@ -1303,6 +1341,10 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.ERROR
+        if trigger == "credit-return":
+            return self._hold_on_credit(
+                "every subscription target was refused at freshen"
+            )
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
@@ -1340,7 +1382,7 @@ class AutoSwitchEngine:
         `not recovered` return below fires before the ratio leg is read, and
         `recovered` is False because account 1 was 4 pts at departure too.
         The engine then holds the worse account until the at-limit escape.
-        Both sides are `str`-normalised: `lastSwitchTo` is a `str` from
+        Both sides are `str`-normalized: `lastSwitchTo` is a `str` from
         `_perform` and `lastSwitchFrom` an `int` from `account_ref`. A state
         record written before `lastSwitchTo` existed has no such key and
         cannot prove the engine moved away, so it KEEPS the bar — the same
@@ -1559,7 +1601,7 @@ class AutoSwitchEngine:
         # swept fleets, both directions. `leftTrigger` records the actual
         # trigger so this never has to guess again; a record written before
         # this field existed has no such key, so fall back to the old
-        # two-null inference for it (unchanged behaviour for pre-upgrade
+        # two-null inference for it (unchanged behavior for pre-upgrade
         # state).
         left_trigger = state.get("leftTrigger")
         is_failover_snapshot = (
@@ -1774,7 +1816,7 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if trigger in COOLDOWN_TRIGGERS:
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
@@ -1856,7 +1898,7 @@ class AutoSwitchEngine:
                 #
                 # Scoped to the SAME triggers as the gate above: at-limit and
                 # failover skip that gate deliberately, because there we are
-                # escaping a dead account rather than optimising a return time.
+                # escaping a dead account rather than optimizing a return time.
                 # `recovery_ts` in BOTH tiers. Tier 1 hard-coded 0.0 there,
                 # which threw away a fact already in hand: two peers with equal
                 # headroom past the horizon then tied, and the tie fell through
@@ -2055,10 +2097,11 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in COOLDOWN_TRIGGERS and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
+            lands_on_key = self.switcher.account_kind_for(number) == "api_key"
             if getattr(self.switcher, "provider", None) == "codex":
                 result = self.switcher.switch_to(
                     number, json_output=True, automatic=True
@@ -2077,6 +2120,13 @@ class AutoSwitchEngine:
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
+            # Ownership of a key landing, distinct from lastSwitchTo: a hand
+            # switch clears it (record_manual_switch) but must leave the
+            # no-return bar's lastSwitchTo/lastSwitchFrom alone.
+            if lands_on_key:
+                state["creditPlacedOn"] = number
+            else:
+                state.pop("creditPlacedOn", None)
             # WHERE we came from, so the next tick can refuse to undo this,
             # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
             # cannot fake. See `_left_account_recovered` for why the present
@@ -2114,6 +2164,33 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _key_eligible(self, num: str, settings: AutoSwitchSettings) -> bool:
+        """A linked key is eligible by the link; an unlinked one needs the global flag."""
+        return (
+            self.switcher.credit_parent_for(num) is not None
+            or settings.include_api_key_accounts
+        )
+
+    def _order_keys(self, keys: list[str], *, leaving: str) -> list[str]:
+        """The left account's own key first, then other linked keys, then unlinked."""
+        def rank(num: str) -> tuple[int, int]:
+            parent = self.switcher.credit_parent_for(num)
+            if parent == leaving:
+                group = 0
+            elif parent is not None:
+                group = 1
+            else:
+                group = 2
+            return (group, int(num))
+
+        return sorted(keys, key=rank)
+
+    def _hold_on_credit(self, detail: str) -> TickOutcome:
+        """Staying on paid credit is a correct outcome, not a block: a
+        subscription window can roll over on any tick."""
+        self._emit(NoSwitchEvent(reason="on-api-credit", detail=detail))
+        return TickOutcome.NO_ACTION
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]
