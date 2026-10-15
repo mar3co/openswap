@@ -599,6 +599,23 @@ class TestCLI:
         upgrade_fn.assert_called_once_with()
         switcher_cls.assert_not_called()
 
+    def test_upgrade_in_the_app_prints_the_brew_command(self, frozen_app, monkeypatch, capsys):
+        """The cask's app never pulls or reinstalls itself."""
+        import openswap.update_check as uc
+
+        def _refuse(*a, **k):
+            raise AssertionError(f"frozen upgrade ran a subprocess: {a}")
+
+        monkeypatch.setattr(uc.subprocess, "run", _refuse)
+        monkeypatch.setattr("openswap.bundle.installed_by_homebrew", lambda home=None: True)
+        with patch("openswap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["openswap", "upgrade"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        switcher_cls.assert_not_called()
+        assert "brew upgrade --cask openswap" in capsys.readouterr().out
+
     def test_menubar_flag_dispatches(self, monkeypatch):
         called = {}
 

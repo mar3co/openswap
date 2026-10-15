@@ -127,3 +127,76 @@ class TestCheckForUpdate:
     def test_never_nags(self):
         assert check_for_update("0.3.2") is None
         assert check_for_update("9.9.9") is None
+
+
+class TestFrozenApp:
+    """The cask's app upgrades through Homebrew and never runs git or uv."""
+
+    def _no_subprocess(self, monkeypatch):
+        def _refuse(*a, **k):
+            raise AssertionError(f"frozen upgrade ran a subprocess: {a}")
+
+        import openswap.update_check as uc
+
+        monkeypatch.setattr(uc.subprocess, "run", _refuse)
+        monkeypatch.setattr(uc.subprocess, "Popen", _refuse)
+
+    def test_homebrew_install_names_the_brew_command(self, frozen_app, monkeypatch, capsys):
+        from openswap import bundle
+        from openswap.update_check import run_self_upgrade
+
+        self._no_subprocess(monkeypatch)
+        monkeypatch.setattr(bundle, "installed_by_homebrew", lambda home=None: True)
+        assert run_self_upgrade() == 0
+        out = capsys.readouterr().out
+        assert (
+            "OpenSwap was installed with Homebrew. Upgrade with: brew upgrade --cask openswap"
+            in out
+        )
+
+    def test_copy_outside_homebrew_points_at_the_release_page(
+        self, frozen_app, monkeypatch, capsys
+    ):
+        from openswap import bundle
+        from openswap.update_check import RELEASES_URL, run_self_upgrade
+
+        self._no_subprocess(monkeypatch)
+        monkeypatch.setattr(bundle, "installed_by_homebrew", lambda home=None: False)
+        assert run_self_upgrade() == 0
+        out = capsys.readouterr().out
+        assert RELEASES_URL in out
+        assert "brew upgrade" not in out
+
+    def test_restart_widget_agent_is_none_without_a_legacy_host(self, frozen_app, monkeypatch):
+        import openswap.launch_agent as la
+        from openswap.update_check import restart_widget_agent
+
+        def _refuse(*a, **k):
+            raise AssertionError("frozen restart must not drive launchctl")
+
+        monkeypatch.setattr(la, "_launchctl", _refuse)
+        assert restart_widget_agent() is None
+
+    def test_restart_widget_agent_reports_a_legacy_host_without_touching_it(
+        self, frozen_app, monkeypatch
+    ):
+        import plistlib
+        from pathlib import Path
+
+        import openswap.launch_agent as la
+        import openswap.widget_install as wi
+        from openswap.update_check import restart_widget_agent
+
+        host = Path.home() / "Applications" / "OpenSwap.app"
+        (host / "Contents").mkdir(parents=True)
+        (host / "Contents" / "Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleIdentifier": "com.opensoft.openswap.widget"})
+        )
+
+        def _refuse(*a, **k):
+            raise AssertionError("frozen restart must not rewrite or kick the host")
+
+        monkeypatch.setattr(la, "_launchctl", _refuse)
+        monkeypatch.setattr(wi, "install_launch_agent", _refuse)
+        detail = restart_widget_agent()
+        assert detail is not None and str(host) in detail
