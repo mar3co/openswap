@@ -375,10 +375,15 @@ def run(switcher, codex=None) -> int:
                 }
             finally:
                 self._refreshing = False
+                # A card edit made while this pass was already running is only
+                # visible to the queued pass (_refresh_pending), so leave its
+                # reload request for that pass rather than spending it here.
+                edit_landed = self._reload_after_refresh and not self._refresh_pending
+                if edit_landed:
+                    self._reload_after_refresh = False
                 if (previous_states != self._account_states or
                         previous_slots != tuple(row[0] for row in self.snapshot.get("accounts", []))
-                        or self._reload_after_refresh):
-                    self._reload_after_refresh = False
+                        or edit_landed):
                     self._hold_reload_pending = True
 
         def _config_mtime_or_none(self):

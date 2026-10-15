@@ -4106,5 +4106,8 @@ def test_card_menu_edits_reload_the_open_popover_once_the_refresh_lands():
     # the 1s tick honors (hold_panel_reload_plan), and clears it.
     worker = text[text.index("def _worker(self, full):") : text.index("def _config_mtime_or_none")]
     tail = worker[worker.index("finally:") :]
-    assert "or self._reload_after_refresh" in tail
+    # An edit queued behind an in-flight pass keeps its request for the
+    # queued pass; the running worker must not spend it on the old snapshot.
+    assert "edit_landed = self._reload_after_refresh and not self._refresh_pending" in tail
+    assert "or edit_landed" in tail
     assert "self._reload_after_refresh = False" in tail and "self._hold_reload_pending = True" in tail
