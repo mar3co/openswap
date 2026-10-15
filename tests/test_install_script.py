@@ -52,6 +52,8 @@ BREW_STUB = r'''#!/bin/sh
 echo "brew $*" >> "$STUB_LOG"
 case "$1" in
   --prefix) echo "$STUB_DIR/brew-prefix" ;;
+  list) [ -x "$STUB_DIR/brew-prefix/bin/openswap" ] ;;
+  upgrade) exit "${FAIL_BREW_UPGRADE:-0}" ;;
   install)
     [ -n "${FAIL_BREW_INSTALL:-}" ] && exit 1
     mkdir -p "$STUB_DIR/brew-prefix/bin"
@@ -321,6 +323,25 @@ class TestHomebrewPath:
         assert not any(c.startswith(("git", "uv", "curl", "xcode-select")) for c in calls)
         assert "supported" in proc.stdout
         assert "OPENSWAP_DIR" in proc.stdout
+        assert not any(c.startswith("brew upgrade") for c in calls)
+
+    def test_rerun_with_the_cask_installed_upgrades_it(self, tmp_path):
+        run_installer(tmp_path, brew=True)
+        (tmp_path / "calls.log").unlink()
+        proc, calls = run_installer(tmp_path, brew=True)
+        assert proc.returncode == 0, proc.stderr
+        assert "brew list --cask openswap" in calls
+        assert "brew upgrade --cask mar3co/openswap/openswap" in calls
+        assert not any(c.startswith("brew install") for c in calls)
+        assert "brew-openswap setup" in calls
+
+    def test_failed_cask_upgrade_stops_before_setup(self, tmp_path):
+        run_installer(tmp_path, brew=True)
+        (tmp_path / "calls.log").unlink()
+        proc, calls = run_installer(tmp_path, brew=True, env={"FAIL_BREW_UPGRADE": "1"})
+        assert proc.returncode == 1
+        assert "brew upgrade --cask" in proc.stderr
+        assert not any("setup" in c for c in calls)
 
     def test_openswap_dir_keeps_the_checkout_path_for_developers(self, tmp_path):
         target = _fake_checkout(tmp_path / "mine")

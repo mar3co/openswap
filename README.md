@@ -24,7 +24,7 @@ No Homebrew? One command installs from source:
 curl -fsSL https://raw.githubusercontent.com/mar3co/openswap/main/install.sh | bash
 ```
 
-On a Mac with Homebrew the same script installs the cask above. Without it, the script installs [uv](https://docs.astral.sh/uv/) if you do not have it (uv brings its own Python), clones OpenSwap to `~/.openswap`, and runs setup. On a brand-new Mac, macOS first asks to install its Command Line Tools; run the command again once that finishes. Re-run it any time to update; it pulls instead of cloning, then runs setup again. `openswap upgrade` does the same from the terminal.
+On a Mac with Homebrew the same script installs the cask above, or upgrades it when it is already installed. Without it, the script installs [uv](https://docs.astral.sh/uv/) if you do not have it (uv brings its own Python), clones OpenSwap to `~/.openswap`, and runs setup. On a brand-new Mac, macOS first asks to install its Command Line Tools; run the command again once that finishes. Re-run it any time to update; it pulls instead of cloning, then runs setup again. `openswap upgrade` does the same from the terminal.
 
 Already have a checkout? `OPENSWAP_DIR=/path/to/openswap bash install.sh` installs from it (with or without Homebrew).
 

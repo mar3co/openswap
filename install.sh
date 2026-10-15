@@ -7,8 +7,8 @@
 # supported path. Otherwise it installs uv if needed (uv brings its own
 # Python), clones this repo to ~/.openswap (or installs from $OPENSWAP_DIR),
 # and installs the openswap tool. Either way it then saves the Claude account
-# you are logged into and starts the menu bar extra. Safe to re-run:
-# ~/.openswap is pulled instead of cloned.
+# you are logged into and starts the menu bar extra. Safe to re-run: an
+# installed cask is upgraded, and ~/.openswap is pulled instead of cloned.
 #
 # Everything lives in main(), invoked inside a group whose closing brace is
 # the last token, so a download that stops anywhere short of that runs nothing.
@@ -27,9 +27,15 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 is_checkout() { [ -e "$1/.git" ] && [ -f "$1/src/openswap/__init__.py" ]; }
 
 install_cask() {
-  say "Homebrew found: installing the OpenSwap app with brew install --cask $CASK (the supported install)"
   say "To install from a git checkout instead, set OPENSWAP_DIR"
-  brew install --cask "$CASK" || fail "brew install --cask $CASK failed (see above). Fix that, then run this installer again."
+  # Re-running the installer updates, like the clone path's pull.
+  if brew list --cask openswap >/dev/null 2>&1; then
+    say "Homebrew found and OpenSwap is installed: brew upgrade --cask $CASK"
+    brew upgrade --cask "$CASK" || fail "brew upgrade --cask $CASK failed (see above). Fix that, then run this installer again."
+  else
+    say "Homebrew found: installing the OpenSwap app with brew install --cask $CASK (the supported install)"
+    brew install --cask "$CASK" || fail "brew install --cask $CASK failed (see above). Fix that, then run this installer again."
+  fi
   # Run the cask's own command: an older uv install's ~/.local/bin/openswap
   # may come first on PATH, and its setup would not move anything over.
   local prefix
