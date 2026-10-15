@@ -139,11 +139,14 @@ class _Recorder:
         self.calls: list[list[str]] = []
         self.pluginkit_out = pluginkit_out
         self.pluginkit_rc = pluginkit_rc
+        self.remove_rc: int | None = None  # `pluginkit -r` only, when set
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
         import subprocess
 
+        if argv[0] == "pluginkit" and argv[1] == "-r" and self.remove_rc is not None:
+            return subprocess.CompletedProcess(argv, self.remove_rc, "", "remove failed")
         if argv[0] == "pluginkit":
             return subprocess.CompletedProcess(argv, self.pluginkit_rc, self.pluginkit_out, "")
         return subprocess.CompletedProcess(argv, 0, "", "")
@@ -336,3 +339,48 @@ def test_old_host_and_build_cache_go_together(frozen_darwin, tmp_path):
     assert ["pluginkit", "-r", str(built)] in calls
     assert frozen_darwin["trashed"] == [old]
     assert not (tmp_path / "Library" / "Caches" / "openswap-widget").exists()
+
+
+def test_old_host_is_kept_when_unregistering_its_appex_fails(frozen_darwin, tmp_path, monkeypatch):
+    """A copy left registered beside the bundled one is a second provider."""
+    old = _old_host(tmp_path)
+    old_appex = old / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex"
+    runs = frozen_darwin["runs"]
+    runs.remove_rc = 1
+    # Still listed after the failed -r (a tmp path, so not via pluginkit's
+    # macOS-path output: that keeps this true on Windows CI).
+    registered = [str(old_appex)]
+    monkeypatch.setattr(wi, "_appex_registrations", lambda: registered)
+    with pytest.raises(ClaudeSwitchError, match="could not unregister"):
+        wi.retire_legacy_host(home=tmp_path, uid=501)
+    assert frozen_darwin["trashed"] == []
+    assert old.is_dir()
+    # The bundled appex was registered first; the old one was never booted out.
+    assert runs.calls[0][:2] == ["pluginkit", "-a"]
+    assert not any(c[0] == "launchctl" for c in runs.calls)
+
+    runs.remove_rc = None
+    registered.clear()
+    assert wi.retire_legacy_host(home=tmp_path, uid=501) == old
+    assert frozen_darwin["trashed"] == [old]
+
+
+def test_a_nonzero_remove_of_an_unregistered_copy_is_not_a_failure(frozen_darwin, tmp_path):
+    """pluginkit documents no exit status for an unknown path: check the registry."""
+    old = _old_host(tmp_path)
+    built = _built_host(tmp_path)
+    runs = frozen_darwin["runs"]
+    runs.remove_rc = 1
+    assert wi.retire_legacy_host(home=tmp_path, uid=501) == old
+    assert ["pluginkit", "-m", "-D", "-v", "-i", "com.opensoft.openswap.widget.extension"] in runs.calls
+    assert frozen_darwin["trashed"] == [old]
+    assert not built.exists()
+
+
+def test_the_build_cache_is_kept_when_its_appex_stays_registered(frozen_darwin, tmp_path, monkeypatch):
+    built = _built_host(tmp_path)
+    frozen_darwin["runs"].remove_rc = 1
+    monkeypatch.setattr(wi, "_appex_registrations", lambda: [str(built)])
+    with pytest.raises(ClaudeSwitchError, match="could not unregister"):
+        wi.retire_legacy_host(home=tmp_path, uid=501)
+    assert built.is_dir()

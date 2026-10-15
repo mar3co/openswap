@@ -322,6 +322,27 @@ def _move_to_trash(path: Path) -> None:
     raise ClaudeSwitchError(f"Could not move {path} to the Trash: {reason}")
 
 
+def _unregister_appex(appex: Path) -> None:
+    """``pluginkit -r`` a copy of the appex, failing if it stays registered.
+
+    pluginkit documents no exit status for removing a path it does not know,
+    so a nonzero exit is checked against the registry: a copy that is not
+    listed was not registered, and a later run of the migration must not
+    fail on it.
+    """
+    proc = _pluginkit("-r", str(appex))
+    if proc.returncode == 0:
+        return
+    still = set(_appex_registrations())
+    if str(appex) not in still and str(appex.resolve()) not in still:
+        return
+    detail = (proc.stderr or proc.stdout or "").strip()
+    raise ClaudeSwitchError(
+        f"pluginkit could not unregister {appex} (exit {proc.returncode})"
+        + (f": {detail}" if detail else "")
+    )
+
+
 def derived_data_path(home: Path | None = None) -> Path:
     """xcodebuild's derived data for a source install's widget build."""
     root = home if home is not None else Path.home()
@@ -338,8 +359,8 @@ def retire_legacy_host(
 
     Two apps carrying the same appex id give WidgetKit two providers, so the
     old host goes: its LaunchAgent is booted out and its plist removed, its
-    appex unregistered, and the app moved to the Trash (recoverable, unlike
-    ``rmtree``). The xcodebuild product in the derived-data cache carries the
+    appex unregistered (if that fails, nothing else is removed), and the app
+    moved to the Trash (recoverable, unlike ``rmtree``). The xcodebuild product in the derived-data cache carries the
     same appex, so it is unregistered too and that cache (ours, and nothing
     else) is deleted.
 
@@ -359,13 +380,15 @@ def retire_legacy_host(
             raise ClaudeSwitchError("The widget extension is missing from this app.")
         _pluginkit_or_raise("register", "-a", str(appex))
     if old is not None:
+        # Unregister before anything else goes: a copy left registered beside
+        # the bundled one is a second provider, so a failure stops here.
+        _unregister_appex(old / "Contents" / "PlugIns" / bundle.APPEX_NAME)
         uninstall_launch_agent(home=home, uid=uid)
-        _pluginkit("-r", str(old / "Contents" / "PlugIns" / bundle.APPEX_NAME))
         _move_to_trash(old)
     built = cache / "Build" / "Products" / "Release" / f"{HOST_PRODUCT}.app"
     built_appex = built / "Contents" / "PlugIns" / bundle.APPEX_NAME
     if built_appex.is_dir():
-        _pluginkit("-r", str(built_appex))
+        _unregister_appex(built_appex)
     try:
         shutil.rmtree(cache)
     except FileNotFoundError:

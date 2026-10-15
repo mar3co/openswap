@@ -27,8 +27,8 @@ The cask's `OpenSwap.app` (`com.opensoft.openswap`) is one notarized bundle, lai
 `openswap setup`, the frozen extra's start-up, and `openswap widget --install` in the app retire the old host when `~/Applications/OpenSwap.app` has bundle id `com.opensoft.openswap.widget`, or when the source build's derived data `~/Library/Caches/openswap-widget` is still there (its `Build/Products/Release/OpenSwap.app` carries the same appex id):
 
 1. `pluginkit -a` the bundled appex first. If that fails nothing is removed, so the next run tries again.
-2. Boot out LaunchAgent `com.opensoft.openswap.widget` and remove its plist, `pluginkit -r` the old host's appex, and move the app to the Trash (`NSFileManager trashItemAtURL`, recoverable).
-3. `pluginkit -r` the build product's appex and delete `~/Library/Caches/openswap-widget` (that directory only; it is OpenSwap's own build cache).
+2. `pluginkit -r` the old host's appex, then boot out LaunchAgent `com.opensoft.openswap.widget`, remove its plist, and move the app to the Trash (`NSFileManager trashItemAtURL`, recoverable). If `-r` exits nonzero and the copy is still listed by `pluginkit -m -D -v -i`, nothing is removed and the step fails (a copy that is not listed was not registered, which is fine).
+3. `pluginkit -r` the build product's appex (same check) and delete `~/Library/Caches/openswap-widget` (that directory only; it is OpenSwap's own build cache).
 
 An app with any other bundle id (the cask's own, installed with `--appdir ~/Applications`) is left alone.
 
