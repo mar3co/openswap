@@ -4064,6 +4064,11 @@ def test_panel_second_tab_toggle_and_copy_follow_the_mode():
     toggle = build[build.index('if provider == "chatgpt" and desktop_tab:') : build.index("auto_label = _label(")]
     assert '"Suggest switches"' in toggle and "self._on_toggle_chatgpt_auto" in toggle
     assert "self._codex_enabled()" in toggle and "self._on_toggle_codex_auto" in toggle
+    # Codex rotation rides on the Claude auto-switch engine, so the Codex tab's
+    # toggle is hidden (no callback) and reads off until that master is on,
+    # exactly like the Settings row (settings_page_rows gates on it too).
+    assert "auto_cb = self._on_toggle_codex_auto if master else None" in toggle
+    assert "auto_on = master and" in toggle and "master = bool(self._auto_enabled())" in toggle
     # The desktop status line only belongs to the desktop-app tab.
     assert 'if (provider == "chatgpt" and desktop_tab) else ""' in build
     assert "'paused'" not in build and '"selected"' not in build

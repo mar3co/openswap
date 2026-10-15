@@ -1548,9 +1548,13 @@ class MenuBarPanel:
             auto_cb = self._on_toggle_chatgpt_auto
         elif provider == "chatgpt":
             # Codex tab: live Codex CLI rotation, the same meaning as Claude's.
+            # Like the Settings row, it exists only while the Claude auto-switch
+            # master is on: the Codex engine rides on that parent engine, so
+            # without it the stored codexEnabled flag runs nothing.
             auto_text = "Auto-switch"
-            auto_on = bool(self._codex_enabled()) if callable(self._codex_enabled) else False
-            auto_cb = self._on_toggle_codex_auto
+            master = bool(self._auto_enabled())
+            auto_on = master and (bool(self._codex_enabled()) if callable(self._codex_enabled) else False)
+            auto_cb = self._on_toggle_codex_auto if master else None
         else:
             auto_text = "Auto-switch"
             auto_on = bool(self._auto_enabled())
