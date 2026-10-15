@@ -8,6 +8,7 @@ outside ``tmp_path``.
 
 from __future__ import annotations
 
+import os
 import plistlib
 import shutil
 import subprocess
@@ -34,7 +35,7 @@ def mac(frozen_app, tmp_path, monkeypatch):
     # A real uv install on this Mac must not show up as a leftover shim.
     for name in ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME", "UV_INSTALL_DIR", "XDG_DATA_HOME"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
 
     seen: dict[str, list] = {"install": [], "launchctl": [], "pluginkit": [], "trash": [], "reload": []}
 
@@ -222,7 +223,7 @@ def test_uv_tool_outside_local_bin_is_reported(mac, monkeypatch, where):
     if where == "XDG_DATA_HOME":
         monkeypatch.setenv(where, str(bin_dir.parent / "share"))
     elif where == "PATH":
-        monkeypatch.setenv(where, f"/usr/bin:{bin_dir}")
+        monkeypatch.setenv(where, os.pathsep.join(["/usr/bin", str(bin_dir)]))
     else:
         monkeypatch.setenv(where, str(bin_dir))
     notes: list[str] = []
@@ -234,7 +235,7 @@ def test_one_notice_for_a_shim_found_twice(mac, monkeypatch):
     local_bin = mac["home"] / ".local" / "bin"
     local_bin.mkdir(parents=True)
     (local_bin / "openswap").write_text("#!/bin/sh\n")
-    monkeypatch.setenv("PATH", f"{local_bin}:/usr/bin")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(local_bin), "/usr/bin"]))
     notes: list[str] = []
     _migrate(mac, notes)
     assert len(notes) == 1

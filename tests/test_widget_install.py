@@ -211,10 +211,11 @@ def test_frozen_uninstall_only_unregisters_and_keeps_the_bundle(frozen_darwin, t
 
 
 def test_frozen_status_reports_each_registered_copy(frozen_darwin, tmp_path):
-    app = frozen_darwin["app"]
+    # pluginkit prints macOS paths; a literal one keeps this true on Windows CI.
+    appex = "/Applications/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex"
     frozen_darwin["runs"].pluginkit_out = (
         "+    com.opensoft.openswap.widget.extension(1.0)\tAAAA\t2026-10-01 10:00:00 +0000\t"
-        f"{app}/Contents/PlugIns/OpenSwapWidgetExtension.appex\n"
+        f"{appex}\n"
     )
     state = wi.widget_status(home=tmp_path)
     assert frozen_darwin["runs"].calls == [
@@ -222,7 +223,7 @@ def test_frozen_status_reports_each_registered_copy(frozen_darwin, tmp_path):
     ]
     assert state["bundled"] is True
     assert state["registered"] is True
-    assert state["registrations"] == [f"{app}/Contents/PlugIns/OpenSwapWidgetExtension.appex"]
+    assert state["registrations"] == [appex]
 
 
 def test_frozen_status_with_nothing_registered(frozen_darwin, tmp_path):
