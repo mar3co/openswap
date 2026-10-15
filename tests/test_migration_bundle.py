@@ -86,6 +86,22 @@ def _old_host(home: Path, bundle_id: str = "com.opensoft.openswap.widget") -> Pa
     return app
 
 
+def _changes(mac) -> list[list[str]]:
+    """launchctl calls that change something (``print`` only reads)."""
+    return [call for call in mac["seen"]["launchctl"] if call[0] != "print"]
+
+
+def _bootstraps(mac) -> list[list[str]]:
+    return [call for call in mac["seen"]["launchctl"] if call[0] == "bootstrap"]
+
+
+def _app_copy(folder: Path) -> Path:
+    exe = folder / "OpenSwap.app" / "Contents" / "MacOS" / "OpenSwap"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"")
+    return exe
+
+
 def _migrate(mac, notes: list[str] | None = None) -> list[str]:
     return bundle.migrate_from_uv_install(
         home=mac["home"], uid=UID, notify=None if notes is None else notes.append
@@ -106,9 +122,8 @@ def test_opened_from_finder_stops_the_uv_extra_without_starting_another(mac, mon
     _menubar_plist(mac["home"], UV_SCRIPT)
     monkeypatch.setattr(launch_agent, "is_loaded", lambda label=launch_agent.LABEL, uid=None: label == launch_agent.LABEL)
     assert _migrate(mac) == ["menubar plist"]
-    assert mac["seen"]["install"] == []
     assert ["bootout", f"gui/{UID}/{launch_agent.LABEL}"] in mac["seen"]["launchctl"]
-    assert not any(call[0] == "bootstrap" for call in mac["seen"]["launchctl"])
+    assert _bootstraps(mac) == []
     assert _program(launch_agent.plist_path(home=mac["home"])) == str(mac["exe"])
 
 
@@ -116,14 +131,14 @@ def test_login_item_already_on_the_bundle_is_left_alone(mac):
     plist = _menubar_plist(mac["home"], str(mac["exe"]))
     before = plist.read_bytes()
     assert _migrate(mac) == []
-    assert mac["seen"]["install"] == []
+    assert _changes(mac) == []
     assert plist.read_bytes() == before
 
 
 def test_no_login_item_is_not_created(mac):
     """`openswap setup` installs the login item; the migration only moves one."""
     assert _migrate(mac) == []
-    assert mac["seen"]["install"] == []
+    assert _changes(mac) == []
     assert not launch_agent.plist_path(home=mac["home"]).exists()
 
 
@@ -132,8 +147,7 @@ def test_inside_the_agent_only_the_plist_is_rewritten(mac, monkeypatch):
     plist = _menubar_plist(mac["home"], UV_SCRIPT)
     monkeypatch.setenv("XPC_SERVICE_NAME", launch_agent.LABEL)
     assert _migrate(mac) == ["menubar plist"]
-    assert mac["seen"]["install"] == []
-    assert mac["seen"]["launchctl"] == []
+    assert _changes(mac) == []
     assert _program(plist) == str(mac["exe"])
 
 
@@ -143,6 +157,83 @@ def test_unreadable_login_item_is_rewritten(mac):
     plist.write_bytes(b"not a plist")
     assert _migrate(mac) == ["menubar plist"]
     assert _program(plist) == str(mac["exe"])
+
+
+def test_python_dash_m_login_item_is_repointed(mac):
+    plist = launch_agent.plist_path(home=mac["home"])
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(
+        launch_agent.build_plist(["/Users/x/.venv/bin/python3", "-m", "openswap"], home=mac["home"])
+    )
+    assert _migrate(mac) == ["menubar plist"]
+    assert _program(plist) == str(mac["exe"])
+
+
+def test_a_login_item_on_another_copy_of_the_app_is_left_alone(mac, tmp_path, monkeypatch):
+    """Opening a copy from Downloads (or a dev build) must not take over the cask's agent."""
+    cask_exe = _app_copy(tmp_path / "Applications")
+    plist = _menubar_plist(mac["home"], str(cask_exe))
+    before = plist.read_bytes()
+    monkeypatch.setattr(
+        launch_agent, "is_loaded", lambda label=launch_agent.LABEL, uid=None: label == launch_agent.LABEL
+    )
+    assert _migrate(mac) == []
+    assert plist.read_bytes() == before
+    assert ["bootout", f"gui/{UID}/{launch_agent.LABEL}"] not in mac["seen"]["launchctl"]
+
+
+def test_a_login_item_on_a_deleted_copy_of_the_app_is_repointed(mac, tmp_path):
+    gone = tmp_path / "Downloads" / "OpenSwap.app" / "Contents" / "MacOS" / "OpenSwap"
+    plist = _menubar_plist(mac["home"], str(gone))
+    assert _migrate(mac) == ["menubar plist"]
+    assert _program(plist) == str(mac["exe"])
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "/private/var/folders/xy/T/AppTranslocation/0A1B2C3D/d/OpenSwap.app",
+        "/Volumes/OpenSwap 0.2.0/OpenSwap.app",
+    ],
+    ids=["translocated", "disk-image"],
+)
+def test_a_temporary_copy_migrates_nothing(mac, monkeypatch, where):
+    """Those paths vanish: pinning the login item to one would break it."""
+    plist = _menubar_plist(mac["home"], UV_SCRIPT)
+    _old_host(mac["home"])
+    legacy = launch_agent.plist_path("com.cswap.menubar", mac["home"])
+    legacy.write_bytes(b"")
+    monkeypatch.setattr(bundle, "app_path", lambda: Path(where))
+    assert bundle.runs_from_temporary_location() is True
+    assert _migrate(mac) == []
+    assert _program(plist) == UV_SCRIPT
+    assert legacy.exists()
+    assert mac["seen"]["launchctl"] == []
+    assert mac["seen"]["pluginkit"] == [] and mac["seen"]["trash"] == []
+
+
+def test_an_installed_app_is_not_a_temporary_copy(frozen_app):
+    assert bundle.runs_from_temporary_location() is False
+    assert bundle.runs_from_temporary_location(Path("/Applications/OpenSwap.app")) is False
+
+
+@pytest.mark.parametrize("in_agent", [False, True], ids=["finder", "agent"])
+def test_the_older_label_is_retired_whenever_migrating(mac, monkeypatch, in_agent):
+    """Even with no current login item, and even from inside the agent."""
+    legacy = launch_agent.plist_path("com.cswap.menubar", mac["home"])
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"")
+    if in_agent:
+        monkeypatch.setenv("XPC_SERVICE_NAME", launch_agent.LABEL)
+    assert _migrate(mac) == ["legacy menubar"]
+    assert not legacy.exists()
+    assert _migrate(mac) == []
+
+
+def test_a_loaded_older_label_is_booted_out(mac, monkeypatch):
+    monkeypatch.setattr(launch_agent, "is_loaded", lambda label=launch_agent.LABEL, uid=None: label == "com.cswap.menubar")
+    assert _migrate(mac) == ["legacy menubar"]
+    assert ["bootout", f"gui/{UID}/com.cswap.menubar"] in mac["seen"]["launchctl"]
 
 
 # --- 2. old widget host ------------------------------------------------------
@@ -259,10 +350,12 @@ def test_second_run_is_a_no_op(mac):
     _old_host(home)
     first = _migrate(mac)
     assert first == ["menubar plist", "widget host"]
-    calls = {key: len(value) for key, value in mac["seen"].items()}
+    changes = len(_changes(mac))
+    calls = {key: len(value) for key, value in mac["seen"].items() if key != "launchctl"}
 
     assert _migrate(mac) == []
-    assert {key: len(value) for key, value in mac["seen"].items()} == calls
+    assert len(_changes(mac)) == changes
+    assert {key: len(value) for key, value in mac["seen"].items() if key != "launchctl"} == calls
 
 
 def test_not_frozen_does_nothing(tmp_path, monkeypatch):

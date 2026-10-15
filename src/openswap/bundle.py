@@ -113,6 +113,56 @@ def _links_to(link: Path, target: Path | None) -> bool:
         return False
 
 
+def runs_from_temporary_location(app: Path | None = None) -> bool:
+    """Whether this copy is one macOS or the user is only passing through.
+
+    A quarantined app opened from Downloads runs from a randomized
+    ``/AppTranslocation/`` path, and a disk image mounts under ``/Volumes/``.
+    Either path is gone soon, so nothing may be pinned to it.
+    """
+    app = app if app is not None else app_path()
+    if app is None:
+        return False
+    text = app.as_posix()
+    return "/AppTranslocation/" in text or text.startswith("/Volumes/")
+
+
+def is_app_executable(program: str) -> bool:
+    """Whether ``program`` is ``…/<Name>.app/Contents/MacOS/OpenSwap``: some
+    copy of this app, as opposed to a uv console script or interpreter."""
+    parts = Path(program).parts
+    return (
+        len(parts) >= 4
+        and parts[-1] == EXECUTABLE_NAME
+        and parts[-2] == "MacOS"
+        and parts[-3] == "Contents"
+        and parts[-4].endswith(".app")
+    )
+
+
+def _runs_uv(program: object, exe: Path) -> bool:
+    """Whether a LaunchAgent's ``ProgramArguments`` should move to ``exe``.
+
+    Yes for the uv install (a console script, or ``python -m openswap``), an
+    unreadable value, or a copy of the app that no longer exists. No for this
+    app, and for any other copy of the app that is still there: a cask agent
+    must not be taken over by a copy run from Downloads or a dev build.
+    """
+    if not (isinstance(program, list) and program and isinstance(program[0], str)):
+        return True
+    first = program[0]
+    if first == str(exe):
+        return False
+    return not (is_app_executable(first) and Path(first).exists())
+
+
+def _plist_program(plist: Path) -> object:
+    try:
+        return plistlib.loads(plist.read_bytes()).get("ProgramArguments")
+    except (OSError, plistlib.InvalidFileException, ValueError, AttributeError):
+        return None
+
+
 def migrate_from_uv_install(
     home: Path | None = None,
     uid: int | None = None,
@@ -126,19 +176,29 @@ def migrate_from_uv_install(
     and the rest still run. Returns what changed; empty when nothing needed
     doing, which is every run after the first.
 
-    1. The menu bar LaunchAgent is pointed at this app's executable.
-    2. The Swift widget host a uv install built into ``~/Applications`` is
+    Nothing happens from a translocated or mounted copy
+    (:func:`runs_from_temporary_location`): it would pin paths that vanish.
+
+    1. ``com.cswap.menubar`` (an older label) is booted out and its plist
+       removed.
+    2. A menu bar LaunchAgent that runs the uv install is pointed at this
+       app's executable.
+    3. The Swift widget host a uv install built into ``~/Applications`` is
        retired, so one appex id has one provider.
-    3. A leftover ``~/.local/bin/openswap`` is reported, not removed: it is
-       the user's uv tool, and ``~/.openswap`` stays theirs too.
+    4. A leftover ``openswap`` on PATH is reported, not removed: it is the
+       user's uv tool, and ``~/.openswap`` stays theirs too.
     """
     exe = executable()
     if exe is None or sys.platform != "darwin":
+        return []
+    if runs_from_temporary_location():
+        _logger.info("OpenSwap.app runs from %s; not migrating from it", app_path())
         return []
     home = home if home is not None else Path.home()
     say = notify or _logger.info
     changed: list[str] = []
     steps = (
+        ("old menu bar login item", lambda: _retire_legacy_menubar_labels(home, uid)),
         ("menu bar login item", lambda: _repoint_menubar_agent(exe, home, uid)),
         ("widget host", lambda: _retire_widget_host(home, uid)),
         ("uv install check", lambda: _report_uv_install(exe, home, say)),
@@ -157,27 +217,34 @@ def migrate_from_uv_install(
     return changed
 
 
+def _retire_legacy_menubar_labels(home: Path, uid: int | None) -> str | None:
+    from openswap import launch_agent
+
+    retired = False
+    for old in launch_agent.LEGACY_LABELS:
+        if os.environ.get("XPC_SERVICE_NAME") == old:
+            continue  # this process is that job; its next start is not ours
+        if launch_agent.plist_path(old, home).exists() or launch_agent.is_loaded(old, uid):
+            launch_agent.uninstall(old, home=home, uid=uid)
+            retired = True
+    return "legacy menubar" if retired else None
+
+
 def _repoint_menubar_agent(exe: Path, home: Path, uid: int | None) -> str | None:
     from openswap import launch_agent
 
     plist = launch_agent.plist_path(home=home)
     if not plist.is_file():
         return None  # never installed: `openswap setup` is how it starts
-    try:
-        program = plistlib.loads(plist.read_bytes()).get("ProgramArguments")
-    except (OSError, plistlib.InvalidFileException, ValueError, AttributeError):
-        program = None
-    if isinstance(program, list) and program and program[0] == str(exe):
+    if not _runs_uv(_plist_program(plist), exe):
         return None
-    # Never bootstrap here. `openswap setup` installs the agent before it
-    # migrates, so only a running extra reaches this line: the agent itself
+    # Never bootstrap here. `openswap setup` bootstraps the agent itself;
+    # the other caller is a running extra: the agent itself
     # (re-bootstrapping would boot it out mid-start) or one opened from Finder
     # or a terminal (bootstrapping would start a second extra beside it).
     # Stop the uv extra unless it is this process, rewrite the plist, and let
     # launchd start the app at the next login.
     if os.environ.get("XPC_SERVICE_NAME") != launch_agent.LABEL:
-        for old in launch_agent.LEGACY_LABELS:
-            launch_agent.uninstall(old, home=home, uid=uid)
         if launch_agent.is_loaded(launch_agent.LABEL, uid):
             launch_agent._launchctl("bootout", launch_agent.service_target(launch_agent.LABEL, uid))
     plist.write_bytes(launch_agent.build_plist([str(exe)], home=home))

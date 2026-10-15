@@ -10,11 +10,12 @@ LaunchAgent `com.opensoft.openswap.menubar` runs `openswap menubar`. Accessory a
 
 ### Moving from a source install
 
-`openswap setup` and the frozen extra's start-up run `bundle.migrate_from_uv_install` (idempotent; each step logs and continues on failure):
+`openswap setup` and the frozen extra's start-up run `bundle.migrate_from_uv_install` (idempotent; each step logs and continues on failure). It does nothing from a copy that runs from an `/AppTranslocation/` path (a quarantined app opened in place) or under `/Volumes/` (a disk image): those paths vanish.
 
-1. A menu bar plist whose `ProgramArguments[0]` is not the bundle executable is rewritten, never re-bootstrapped: only a running extra gets here (`setup` installs the agent first), so starting the agent would run a second one. Opened from Finder or a terminal, it boots out the uv extra first; running as that agent (`XPC_SERVICE_NAME` is the label), it leaves itself alone. The next login starts the app.
-2. The old widget host is retired (see [widget](widget.md#moving-from-a-source-install)).
-3. An `openswap` that is not a link to the app, in uv's tool bin directory (`UV_TOOL_BIN_DIR`, `XDG_BIN_HOME`, `XDG_DATA_HOME/../bin`, `~/.local/bin`), `UV_INSTALL_DIR`, or anywhere on PATH, is reported once: `An older uv install is still on PATH: run uv tool uninstall openswap`. The uv tool and `~/.openswap` are not touched.
+1. The older `com.cswap.menubar` agent is booted out and its plist removed, whenever it is there.
+2. A menu bar plist that runs the uv install (`ProgramArguments[0]` is a console script or interpreter, unreadable, or a copy of the app that no longer exists) is rewritten to the bundle executable. A plist on another copy of the app that still exists (the cask's, while a copy from Downloads or a dev build runs) is left alone. The plist is never re-bootstrapped here: opened from Finder or a terminal, the uv extra is booted out and this extra keeps running; running as that agent (`XPC_SERVICE_NAME` is the label), it leaves itself alone. The next login starts the app.
+3. The old widget host is retired (see [widget](widget.md#moving-from-a-source-install)).
+4. An `openswap` that is not a link to the app, in uv's tool bin directory (`UV_TOOL_BIN_DIR`, `XDG_BIN_HOME`, `XDG_DATA_HOME/../bin`, `~/.local/bin`), `UV_INSTALL_DIR`, or anywhere on PATH, is reported once: `An older uv install is still on PATH: run uv tool uninstall openswap`. The uv tool and `~/.openswap` are not touched.
 
 `openswap upgrade` in the app runs nothing: it prints `brew upgrade --cask openswap` (or the release page for a copy Homebrew did not install).
 
