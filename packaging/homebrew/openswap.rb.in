@@ -53,10 +53,11 @@ cask "openswap" do
     must_succeed: false,
   }
 
+  # Not the worker's label: `launchctl:` removes a job by label alone, and a
+  # uv install's worker shares it. The hook above removes the app's worker.
   zap launchctl: [
         "com.opensoft.openswap.menubar",
         "com.opensoft.openswap.widget",
-        "com.opensoft.openswap.worker",
       ],
       trash:     [
         "~/Library/Application Support/OpenSwap",

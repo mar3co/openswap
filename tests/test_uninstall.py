@@ -108,7 +108,6 @@ def mac(tmp_path, monkeypatch):
     monkeypatch.setattr("openswap.statusline.installed_command", lambda config_home: state["statusline"])
     monkeypatch.setattr("openswap.statusline.hook_program", lambda config_home: None)
     monkeypatch.setattr("openswap.widget_install.uninstall_widget", fake_widget_uninstall)
-    monkeypatch.setattr(uninstall.shutil, "which", lambda name: None)
     return home, agents, seen, state
 
 
@@ -188,6 +187,18 @@ class TestRemoveIntegrations:
         monkeypatch.setattr("openswap.statusline.hook_program", lambda config_home: str(uv))
         removal = uninstall.remove_integrations(home=home, uid=501)
         assert removal.removed == [] and seen["statusline"] == []
+
+    def test_bare_status_line_stays_with_the_install_that_wrote_it(self, mac, frozen_app):
+        home, _, seen, state = mac
+        state["statusline"] = "openswap statusline"  # hook_program is None for it
+        removal = uninstall.remove_integrations(home=home, uid=501)
+        assert removal.removed == [] and seen["statusline"] == []
+
+    def test_uv_install_restores_its_bare_status_line(self, mac):
+        home, _, _, state = mac
+        state["statusline"] = "openswap statusline"
+        removal = uninstall.remove_integrations(home=home, uid=501)
+        assert removal.removed == ["Claude Code status line"]
 
     def test_someone_elses_status_line_is_not_touched(self, mac, frozen_app):
         home, _, seen, state = mac

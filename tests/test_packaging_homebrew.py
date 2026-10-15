@@ -93,12 +93,15 @@ def test_uninstall_runs_the_apps_hook_instead_of_removing_the_login_item():
     assert "\n  uninstall launchctl:" not in cask
 
 
-def test_zap_stops_every_agent_and_trashes_their_logs():
+def test_zap_trashes_every_agents_logs_but_leaves_the_shared_worker_label():
     cask = _render("1.2.3", ARM, INTEL).stdout
     zap = cask[cask.index("  zap ") : cask.index("  caveats")]
     for label in ("menubar", "widget", "worker"):
-        assert f'"com.opensoft.openswap.{label}"' in zap
         assert f'"~/Library/Logs/com.opensoft.openswap.{label}.err"' in zap
+    assert '"com.opensoft.openswap.menubar"' in zap
+    # `launchctl:` removes by label alone; a uv install's worker shares it,
+    # and the hook removes the app's own worker.
+    assert '"com.opensoft.openswap.worker"' not in zap
     assert '"~/Library/Application Support/OpenSwap"' in zap
 
 

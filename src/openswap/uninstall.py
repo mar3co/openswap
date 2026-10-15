@@ -167,15 +167,20 @@ def _remove_worker(home: Path, uid: int | None, force: bool) -> bool:
 
 def _restore_status_line() -> bool:
     """Put back the user's own Claude Code status line, if this install's
-    hook replaced it. A hook that runs another install's openswap stays."""
+    hook replaced it. A hook that runs another install's openswap stays.
+
+    The app always writes its own executable into the hook, so in the app a
+    bare ``openswap statusline`` is not its own: it came from a uv or source
+    install, which may outlive the cask.
+    """
     from openswap import statusline
 
     config_home = paths.get_claude_config_home()
     if statusline.installed_command(config_home) is None:
         return False
     if bundle.is_frozen():
-        named = statusline.hook_program(config_home) or shutil.which("openswap")
-        if named is not None and not _runs_this_app(named):
+        named = statusline.hook_program(config_home)
+        if named is None or not _runs_this_app(named):
             return False
     return bool(statusline.uninstall(config_home, paths.get_backup_root())["restored"])
 
