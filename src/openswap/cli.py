@@ -1353,6 +1353,8 @@ def _uninstall_command(argv: list[str]) -> int:
 
     try:
         bundle.refuse_uv_beside_cask("uninstall OpenSwap")
+        if args.zap:
+            uninstall.refuse_live_sessions()
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         return 1
@@ -1382,8 +1384,8 @@ def _uninstall_command(argv: list[str]) -> int:
     if args.zap:
         try:
             deleted = uninstall.delete_saved_logins()
-            # Homebrew's zap deletes the files; anything else deletes them here.
-            removed_files = [] if brew else uninstall.delete_data()
+            # Homebrew's zap deletes the cask's files; the rest go here.
+            removed_files = uninstall.delete_data(homebrew_zap=brew is not None)
         except ClaudeSwitchError as e:
             error(f"Error: {e}")
             return 1
@@ -1419,13 +1421,22 @@ def _homebrew_uninstall_hook() -> int:
     for failure in removal.failed:
         print(f"Could not remove OpenSwap's {failure}", file=sys.stderr)
     if "--zap" in found[1]:
+        # Homebrew's zap goes ahead either way; a profile Claude still runs on
+        # keeps its Keychain item (delete_saved_logins skips it).
+        try:
+            uninstall.refuse_live_sessions()
+        except ClaudeSwitchError as e:
+            print(f"{e} Its saved login stays in the Keychain.", file=sys.stderr)
         try:
             deleted = uninstall.delete_saved_logins()
+            removed_files = uninstall.delete_data(homebrew_zap=True)
         except ClaudeSwitchError as e:
             print(str(e), file=sys.stderr)
         else:
             if deleted:
                 print(f"Deleted {deleted} saved OpenSwap login{'s' if deleted != 1 else ''} from the Keychain.")
+            for path in removed_files:
+                print(f"Deleted {path}")
     return 0
 
 

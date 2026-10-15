@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from openswap import cli, macos_keychain, uninstall
+from openswap.exceptions import ClaudeSwitchError
 
 BREW_RB = "/opt/homebrew/Library/Homebrew/brew.rb"
 RUBY = "/opt/homebrew/Library/Homebrew/vendor/portable-ruby/current/bin/ruby"
@@ -239,10 +240,33 @@ class TestZapData:
         monkeypatch.setattr(
             "openswap.session.delete_macos_keychain_entry", lambda d: order.append(d.name)
         )
+        monkeypatch.setattr("openswap.session.profile_is_quiescent", lambda d: d.name != "2-b-example-com")
         monkeypatch.setattr(macos_keychain, "delete_all", lambda service: order.append(service) or 0)
         uninstall.delete_saved_logins()
-        assert sorted(order[:2]) == ["1-a-example-com", "2-b-example-com"]
-        assert order[2:] == ["openswap", "claude-swap"]
+        # A profile Claude still runs on keeps its login.
+        assert order == ["1-a-example-com", "openswap", "claude-swap"]
+
+    def _profiles(self, monkeypatch, tmp_path, scans):
+        sessions = tmp_path / "OpenSwap" / "sessions"
+        for name in scans:
+            (sessions / name).mkdir(parents=True)
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path / "OpenSwap")
+        monkeypatch.setattr("openswap.session.scan_live_sessions", lambda d: scans[d.name])
+
+    def test_live_session_refuses_a_zap(self, monkeypatch, tmp_path):
+        live = type("S", (), {"pid": 4242})()
+        self._profiles(monkeypatch, tmp_path, {"1-a": ([], 0), "2-b": ([live], 0)})
+        with pytest.raises(ClaudeSwitchError, match=r"2-b \(PID 4242\)"):
+            uninstall.refuse_live_sessions()
+
+    def test_unreadable_session_records_refuse_a_zap(self, monkeypatch, tmp_path):
+        self._profiles(monkeypatch, tmp_path, {"1-a": ([], 2)})
+        with pytest.raises(ClaudeSwitchError, match="1-a"):
+            uninstall.refuse_live_sessions()
+
+    def test_idle_profiles_allow_a_zap(self, monkeypatch, tmp_path):
+        self._profiles(monkeypatch, tmp_path, {"1-a": ([], 0)})
+        uninstall.refuse_live_sessions()
 
     def test_data_paths_match_what_exists(self, tmp_path, monkeypatch):
         home = tmp_path / "home"
@@ -253,11 +277,29 @@ class TestZapData:
         (logs / "com.opensoft.openswap.menubar.err").write_text("x")
         (logs / "com.opensoft.openswap.worker.log").write_text("x")
         (logs / "com.other.app.log").write_text("x")
+        legacy = home / ".claude-swap-backup"
+        legacy.mkdir()
         monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: legacy)
         found = uninstall.data_paths(home)
-        assert found == [backup, logs / "com.opensoft.openswap.worker.log", logs / "com.opensoft.openswap.menubar.err"]
+        assert found == [
+            backup,
+            logs / "com.opensoft.openswap.worker.log",
+            logs / "com.opensoft.openswap.menubar.err",
+            legacy,
+        ]
+        # Homebrew's zap trashes the rest; the pre-XDG folder is not on its list.
+        assert uninstall.data_paths(home, homebrew_zap=True) == [legacy]
         assert uninstall.delete_data(home) == found
-        assert not backup.exists() and (logs / "com.other.app.log").exists()
+        assert not backup.exists() and not legacy.exists()
+        assert (logs / "com.other.app.log").exists()
+
+    def test_legacy_root_that_holds_the_backup_root_is_not_deleted_twice(self, tmp_path, monkeypatch):
+        legacy = tmp_path / ".claude-swap-backup"
+        (legacy / "OpenSwap").mkdir(parents=True)
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: legacy / "OpenSwap")
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: legacy)
+        assert uninstall.data_paths(tmp_path, homebrew_zap=True) == []
 
 
 class TestKeychainDeleteAll:
@@ -281,8 +323,8 @@ class TestKeychainDeleteAll:
 class TestUninstallCommand:
     @pytest.fixture
     def harness(self, monkeypatch, tmp_path):
-        seen: dict = {"remove": [], "logins": 0, "data": 0, "exec": None}
-        state = {"brew": None, "failed": [], "command": None}
+        seen: dict = {"remove": [], "logins": 0, "data": [], "exec": None}
+        state = {"brew": None, "failed": [], "command": None, "live": None}
 
         def fake_remove(home=None, uid=None, force=False):
             seen["remove"].append(force)
@@ -292,9 +334,13 @@ class TestUninstallCommand:
             seen["logins"] += 1
             return 3
 
-        def fake_data(home=None):
-            seen["data"] += 1
+        def fake_data(home=None, *, homebrew_zap=False):
+            seen["data"].append(homebrew_zap)
             return [tmp_path / "data"]
+
+        def fake_refuse():
+            if state["live"]:
+                raise ClaudeSwitchError(state["live"])
 
         def fake_exec(path, argv):
             seen["exec"] = argv
@@ -305,6 +351,7 @@ class TestUninstallCommand:
         monkeypatch.setattr(uninstall, "delete_data", fake_data)
         monkeypatch.setattr(uninstall, "homebrew_brew", lambda: state["brew"])
         monkeypatch.setattr(uninstall, "homebrew_command", lambda: state["command"])
+        monkeypatch.setattr(uninstall, "refuse_live_sessions", fake_refuse)
         monkeypatch.setattr(cli.os, "execv", fake_exec)
         return seen, state
 
@@ -333,8 +380,16 @@ class TestUninstallCommand:
         seen, state = harness
         state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
         assert self._run(monkeypatch, "--homebrew-hook") == 0
-        assert seen["logins"] == 1 and seen["data"] == 0  # brew's zap trashes the files
+        assert seen["logins"] == 1 and seen["data"] == [True]  # brew's zap trashes the rest
         assert "Deleted 3 saved OpenSwap logins" in capsys.readouterr().out
+
+    def test_hook_zap_with_a_live_session_warns_and_goes_on(self, harness, monkeypatch, capsys):
+        seen, state = harness
+        state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
+        state["live"] = "Claude is running on session profile 1-a (PID 7)."
+        assert self._run(monkeypatch, "--homebrew-hook") == 0
+        assert seen["logins"] == 1
+        assert "Its saved login stays in the Keychain." in capsys.readouterr().err
 
     def test_hook_failure_still_exits_zero(self, harness, monkeypatch, capsys):
         _, state = harness
@@ -358,7 +413,15 @@ class TestUninstallCommand:
         state["brew"] = Path("/opt/homebrew/bin/brew")
         assert self._run(monkeypatch, "--zap", "--yes") == 0
         assert seen["exec"] == ["/opt/homebrew/bin/brew", "uninstall", "--cask", "--zap", "openswap"]
-        assert seen["logins"] == 1 and seen["data"] == 0
+        assert seen["logins"] == 1 and seen["data"] == [True]
+
+    def test_zap_refuses_while_a_session_is_live(self, harness, monkeypatch, capsys):
+        seen, state = harness
+        state["brew"] = Path("/opt/homebrew/bin/brew")
+        state["live"] = "Claude is running on session profile 1-a (PID 7). Exit it, then retry."
+        assert self._run(monkeypatch, "--zap", "--yes") == 1
+        assert seen["remove"] == [] and seen["logins"] == 0 and seen["exec"] is None
+        assert "PID 7" in capsys.readouterr().err
 
     def test_zap_needs_a_yes_without_a_terminal(self, harness, monkeypatch, capsys):
         seen, _ = harness
@@ -385,7 +448,7 @@ class TestUninstallCommand:
     def test_uv_install_finishes_with_uv(self, harness, monkeypatch, capsys):
         seen, _ = harness
         assert self._run(monkeypatch, "--zap", "--yes") == 0
-        assert seen["data"] == 1 and seen["exec"] is None
+        assert seen["data"] == [False] and seen["exec"] is None
         assert "uv tool uninstall openswap" in capsys.readouterr().out
 
     def test_uv_beside_the_cask_is_refused(self, harness, monkeypatch, capsys, tmp_path):

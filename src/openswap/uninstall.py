@@ -226,13 +226,13 @@ def delete_saved_logins() -> int:
     """
     from openswap import macos_keychain
     from openswap.credentials import LEGACY_BACKUP_SECURITY_SERVICE, SECURITY_SERVICE
-    from openswap.session import delete_macos_keychain_entry
+    from openswap.session import delete_macos_keychain_entry, profile_is_quiescent
 
-    sessions = paths.get_backup_root() / "sessions"
-    if sessions.is_dir():
-        for profile in sessions.iterdir():
-            if profile.is_dir():
-                delete_macos_keychain_entry(profile)
+    for profile in _session_profiles():
+        # A Claude still running on the profile keeps its login. Only
+        # `brew uninstall --zap` gets here past refuse_live_sessions.
+        if profile_is_quiescent(profile):
+            delete_macos_keychain_entry(profile)
     deleted = 0
     for service in (SECURITY_SERVICE, LEGACY_BACKUP_SECURITY_SERVICE):
         try:
@@ -242,24 +242,64 @@ def delete_saved_logins() -> int:
     return deleted
 
 
-def data_paths(home: Path | None = None) -> list[Path]:
-    """The files a zap deletes, matching the cask's ``zap trash:`` list."""
+def _session_profiles() -> list[Path]:
+    sessions = paths.get_backup_root() / "sessions"
+    if not sessions.is_dir():
+        return []
+    return sorted(profile for profile in sessions.iterdir() if profile.is_dir())
+
+
+def refuse_live_sessions() -> None:
+    """Raise while a session-mode Claude runs on a profile a zap would delete.
+
+    As ``purge`` does: deleting a profile and its Keychain item from under a
+    live Claude is unsafe, and a record that cannot be read is no proof that
+    nothing runs.
+    """
+    from openswap.session import scan_live_sessions
+
+    live, unreadable = [], []
+    for profile in _session_profiles():
+        found, bad = scan_live_sessions(profile)
+        if found:
+            live.append(f"{profile.name} (PID {', '.join(str(s.pid) for s in found)})")
+        elif bad:
+            unreadable.append(profile.name)
+    if live:
+        raise ClaudeSwitchError(
+            f"Claude is running on session profile {'; '.join(live)}. Exit it, then retry."
+        )
+    if unreadable:
+        raise ClaudeSwitchError(
+            f"Could not read the session records of {', '.join(unreadable)}, so whether "
+            "Claude is running there is unknown. Repair or remove them, then retry."
+        )
+
+
+def data_paths(home: Path | None = None, *, homebrew_zap: bool = False) -> list[Path]:
+    """The files a zap deletes: the cask's ``zap trash:`` list plus the
+    pre-XDG backup root, which purge also removes. With ``homebrew_zap``,
+    only what Homebrew's zap leaves behind."""
     home = home if home is not None else Path.home()
     logs = home / "Library" / "Logs"
-    found = [
-        paths.get_backup_root(),
+    backup = paths.get_backup_root()
+    found = [] if homebrew_zap else [
+        backup,
         home / "Library" / "Containers" / bundle.APPEX_ID,
         *sorted(logs.glob("com.opensoft.openswap.*.log")),
         *sorted(logs.glob("com.opensoft.openswap.*.err")),
     ]
+    legacy = paths.get_legacy_backup_root()
+    if not (legacy.is_relative_to(backup) or backup.is_relative_to(legacy)):
+        found.append(legacy)
     return [path for path in found if path.exists() or path.is_symlink()]
 
 
-def delete_data(home: Path | None = None) -> list[Path]:
-    """Delete :func:`data_paths`, for a zap without Homebrew. Returns what was
-    deleted; raises on the first path that will not go."""
+def delete_data(home: Path | None = None, *, homebrew_zap: bool = False) -> list[Path]:
+    """Delete :func:`data_paths`. Returns what was deleted; raises on the
+    first path that will not go."""
     deleted = []
-    for path in data_paths(home):
+    for path in data_paths(home, homebrew_zap=homebrew_zap):
         try:
             if path.is_dir() and not path.is_symlink():
                 shutil.rmtree(path)
