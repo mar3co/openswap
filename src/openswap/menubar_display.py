@@ -2184,6 +2184,9 @@ def provider_cards(cards: list[dict], provider: str, *, desktop: bool = True) ->
         if str(shown.get("title", "")).startswith("Codex · "):
             shown["title"] = str(shown["title"])[len("Codex · ") :]
         shown["provider"] = "chatgpt"
+        # The account's real rotation flag, kept apart from the desktop-only
+        # restriction below so the card menu toggles the right thing.
+        shown["account_disabled"] = bool(shown.get("disabled"))
         # Desktop-only restrictions must not change widget/CLI behavior.
         if desktop and shown.get("api_key"):
             shown["disabled"] = True
@@ -2811,6 +2814,13 @@ CARD_MENU_TOGGLE_DISABLED = "toggle_disabled"
 CARD_MENU_REMOVE = "remove"
 
 
+def account_disabled(card: dict) -> bool:
+    """The account's stored disabled flag, ignoring a tab-only ``disabled`` mark."""
+    if "account_disabled" in card:
+        return bool(card["account_disabled"])
+    return bool(card.get("disabled"))
+
+
 def card_menu_items(card: dict, provider: str, *, desktop: bool = True) -> list[tuple[str, str]]:
     """``(action, label)`` rows for an account card's ··· menu.
 
@@ -2819,7 +2829,7 @@ def card_menu_items(card: dict, provider: str, *, desktop: bool = True) -> list[
     disable flag only ever holds a slot out of auto-rotation, so on the
     desktop-app tab the row says so instead of pretending to pause ChatGPT.
     """
-    disabled = bool(card.get("disabled"))
+    disabled = account_disabled(card)
     if provider == "chatgpt" and desktop:
         toggle = "Back in rotation" if disabled else "Hold out of rotation"
     else:
@@ -2835,7 +2845,9 @@ def card_title_suffix(card: dict, provider: str, *, desktop: bool = True) -> str
     """Parenthetical after a disabled card's title; empty for an enabled one."""
     if not card.get("disabled"):
         return ""
-    if card.get("api_key"):
+    if card.get("api_key") and not (provider == "chatgpt" and not desktop):
+        # Claude and the desktop-app tab: the key is usable from the CLI only.
+        # The Codex tab *is* the CLI, so a disabled key there is just disabled.
         return "CLI only"
     if provider == "chatgpt" and desktop:
         return "out of rotation"

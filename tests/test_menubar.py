@@ -2971,7 +2971,9 @@ def test_provider_cards_filters_and_transforms_shared_codex_without_mutating():
     original = [dict(card) for card in cards]
     assert [card["num"] for card in menubar.provider_cards(cards, "claude")] == ["1"]
     chatgpt = menubar.provider_cards(cards, "chatgpt")
-    assert chatgpt == [{"provider": "chatgpt", "title": "plus", "num": "codex:1"}]
+    assert chatgpt == [
+        {"provider": "chatgpt", "title": "plus", "num": "codex:1", "account_disabled": False}
+    ]
     assert cards == original
     assert menubar.provider_cards(cards, "other") == []
 
@@ -3988,8 +3990,30 @@ def test_api_key_rows_stay_switchable_on_the_codex_tab():
     cards = [{"provider": "codex", "title": "Codex · key", "num": "codex:3", "api_key": True}]
     desktop = menubar.provider_cards(cards, "chatgpt")[0]
     assert desktop["disabled"] is True and "CLI-only" in desktop["note"]
+    # The desktop-only mark never masquerades as the stored rotation flag.
+    assert desktop["account_disabled"] is False
     cli = menubar.provider_cards(cards, "chatgpt", desktop=False)[0]
     assert "disabled" not in cli and "note" not in cli
+    assert cli["account_disabled"] is False
+
+
+def test_card_menu_toggles_the_stored_flag_not_the_tab_mark():
+    # A Codex API key on the desktop-app tab is marked disabled for the tab
+    # only; its menu must still offer to hold it out of rotation.
+    card = {"provider": "chatgpt", "api_key": True, "disabled": True, "account_disabled": False}
+    assert menubar.account_disabled(card) is False
+    assert menubar.card_menu_items(card, "chatgpt")[1] == ("toggle_disabled", "Hold out of rotation")
+    assert menubar.card_menu_items({**card, "account_disabled": True}, "chatgpt")[1] == (
+        "toggle_disabled", "Back in rotation"
+    )
+    # Claude cards carry no tab mark, so the plain flag is the stored one.
+    assert menubar.account_disabled({"disabled": True}) is True
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    body = text[text.index("def _popup_card_menu") : text.index("def _fit_status_item")]
+    assert "_make_toggle_disabled(num, account_disabled(card))" in body
+    # provider_cards relabels Codex rows "chatgpt" before the panel sees them.
+    assert 'card.get("provider") in ("codex", "chatgpt")' in body
+    assert '_reg.pop(getattr(menu, "_menuitem", None), None)' in body
 
 
 def test_card_badge_and_suffix_follow_the_tab_mode():
@@ -4005,6 +4029,9 @@ def test_card_badge_and_suffix_follow_the_tab_mode():
     assert menubar.card_title_suffix(disabled, "chatgpt") == "out of rotation"
     assert menubar.card_title_suffix(disabled, "chatgpt", desktop=False) == "disabled"
     assert menubar.card_title_suffix({"disabled": True, "api_key": True}, "chatgpt") == "CLI only"
+    assert menubar.card_title_suffix({"disabled": True, "api_key": True}, "claude") == "CLI only"
+    # The Codex tab is the CLI: a disabled key there is simply disabled.
+    assert menubar.card_title_suffix({"disabled": True, "api_key": True}, "chatgpt", desktop=False) == "disabled"
     assert menubar.card_title_suffix({"disabled": False}, "chatgpt") == ""
 
 
@@ -4045,9 +4072,14 @@ def test_panel_second_tab_toggle_and_copy_follow_the_mode():
 def test_codex_tab_click_switches_codex_cli_instead_of_asking_to_enable():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     click = text[text.index("def _on_panel_account_click") : text.index("def _slot_needs_relogin")]
-    off = click[click.index("if not self.settings.chatgpt_switching_enabled") : click.index("if self._slot_needs_relogin")]
+    # Expired logins are refused in both modes, before any switch path.
+    assert click.index("if self._slot_needs_relogin(num):") < click.index("if not desktop_tab:")
+    off = click[click.index("if not desktop_tab:") : click.index("if not self._chatgpt_switching_persisted():")]
     assert "self._on_account_click(num, close_panel=True)" in off
-    assert "_offer_enable_chatgpt_switching" not in click
+    # The tab's mode comes from the in-memory setting the panel also reads; a
+    # persisted mismatch falls back to the Settings offer, never a CLI switch.
+    assert "desktop_tab = self.settings.chatgpt_switching_enabled" in click
+    assert "_offer_enable_chatgpt_switching" in click
     toggle = text[text.index("def _toggle_codex_auto") : text.index("def _popup_overflow")]
     assert "autoswitch.codexEnabled" in toggle and "_reload_main_panel_if_shown" in toggle
     assert "on_toggle_codex_auto=lambda *_a: self._toggle_codex_auto()" in text

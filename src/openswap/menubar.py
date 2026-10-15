@@ -1661,11 +1661,12 @@ def run(switcher, codex=None) -> int:
             num = card.get("num")
             actions = {
                 CARD_MENU_RENAME: self._make_rename(num, card.get("email") or "", card.get("alias") or None),
-                CARD_MENU_TOGGLE_DISABLED: self._make_toggle_disabled(num, bool(card.get("disabled"))),
+                CARD_MENU_TOGGLE_DISABLED: self._make_toggle_disabled(num, account_disabled(card)),
                 CARD_MENU_REMOVE: self._make_remove(num),
             }
             menu = rumps.MenuItem("Account")
-            ui_provider = "chatgpt" if card.get("provider") == "codex" else "claude"
+            # provider_cards already relabels Codex rows "chatgpt" for the tab.
+            ui_provider = "chatgpt" if card.get("provider") in ("codex", "chatgpt") else "claude"
             for action, label in card_menu_items(
                 card, ui_provider, desktop=chatgpt_tab_desktop(self.settings),
             ):
@@ -1682,6 +1683,8 @@ def run(switcher, codex=None) -> int:
                 # process-global dict and never drops it.
                 _reg = getattr(rumps.rumps.NSApp, "_ns_to_py_and_callback", None)
                 if _reg is not None:
+                    # The parent registers itself too, callback or not.
+                    _reg.pop(getattr(menu, "_menuitem", None), None)
                     for item in menu._menu.itemArray():
                         _reg.pop(item, None)
 
@@ -2180,16 +2183,26 @@ def run(switcher, codex=None) -> int:
             if provider != "codex":
                 self._on_account_click(num, close_panel=True)
                 return
-            if not self.settings.chatgpt_switching_enabled or not self._chatgpt_switching_persisted():
+            desktop_tab = self.settings.chatgpt_switching_enabled
+            if self._slot_needs_relogin(num):
+                # Neither mode should make an expired login live: Codex's
+                # switch_to only checks that the stored auth parses.
+                self._show_error(
+                    "This ChatGPT OAuth session expired. Sign in again with Codex, then try again."
+                    if desktop_tab
+                    else "This Codex OAuth session expired. Sign in again with Codex, then try again."
+                )
+                return
+            if not desktop_tab:
                 # Codex tab: select this login for Codex CLI, same confirm and
                 # toast as a Claude card. Nothing touches the ChatGPT app.
                 self._on_account_click(num, close_panel=True)
                 return
-            if self._slot_needs_relogin(num):
-                self._show_error(
-                    "This ChatGPT OAuth session expired. Sign in again with "
-                    "Codex, then try again."
-                )
+            if not self._chatgpt_switching_persisted():
+                # The tab shows ChatGPT mode but the stored preference says
+                # off (another instance or the CLI changed it): do not quietly
+                # rewrite the shared login under a running ChatGPT.
+                self._offer_enable_chatgpt_switching()
                 return
             choices = dict(desktop_switch_choices(self.snapshot))
             if slot not in choices:
