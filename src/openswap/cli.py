@@ -1383,11 +1383,18 @@ def _uninstall_command(argv: list[str]) -> int:
 
     if args.zap:
         try:
+            # purge rechecks live sessions, leases and the worker under the
+            # locks session setup takes, then deletes saved accounts and the
+            # backup folders: a session that went live during the prompt is
+            # refused here, not deleted from under Claude.
+            ClaudeAccountSwitcher().purge(assume_yes=True)
+            # What purge does not track (the worker's pairing, strays).
             deleted = uninstall.delete_saved_logins()
             # Homebrew's zap deletes the cask's files; the rest go here.
             removed_files = uninstall.delete_data(homebrew_zap=brew is not None)
-        except ClaudeSwitchError as e:
+        except (ClaudeSwitchError, OSError) as e:
             error(f"Error: {e}")
+            error("OpenSwap is still installed. Fix that, then run: openswap uninstall --zap")
             return 1
         if deleted:
             print(f"Deleted {deleted} saved login{'s' if deleted != 1 else ''} from the Keychain.")

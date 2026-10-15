@@ -1376,6 +1376,33 @@ class TestGuards:
             seeded_switcher.purge()
         assert seeded_switcher.backup_dir.exists()
 
+    def test_purge_assume_yes_skips_only_the_prompt(self, seeded_switcher, monkeypatch):
+        """`openswap uninstall --zap` asks first; purge must still refuse."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        make_live(session_dir)
+        monkeypatch.setattr(
+            "builtins.input", lambda *a: pytest.fail("assume_yes must not prompt")
+        )
+        with pytest.raises(SessionError, match="Exit them first"):
+            seeded_switcher.purge(assume_yes=True)
+        assert seeded_switcher.backup_dir.exists()
+
+    def test_purge_assume_yes_deletes_without_asking(
+        self, seeded_switcher, monkeypatch, block_real_keychain
+    ):
+        monkeypatch.setattr(
+            "builtins.input", lambda *a: pytest.fail("assume_yes must not prompt")
+        )
+        monkeypatch.setattr(
+            "openswap.worker.launch_agent.status",
+            lambda: {"loaded": False, "installed": False},
+        )
+        (seeded_switcher.backup_dir / "sessions" / "x").mkdir(parents=True)
+        seeded_switcher.purge(assume_yes=True)
+        assert not (seeded_switcher.backup_dir / "sessions").exists()
+
     def test_purge_sweeps_session_keychain_entries(
         self, seeded_switcher, monkeypatch, block_real_keychain
     ):

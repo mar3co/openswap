@@ -382,8 +382,14 @@ class TestKeychainDeleteAll:
 class TestUninstallCommand:
     @pytest.fixture
     def harness(self, monkeypatch, tmp_path):
-        seen: dict = {"remove": [], "logins": 0, "data": [], "exec": None}
-        state = {"brew": None, "failed": [], "command": None, "live": None}
+        seen: dict = {"remove": [], "logins": 0, "data": [], "exec": None, "purge": []}
+        state = {"brew": None, "failed": [], "command": None, "live": None, "purge": None}
+
+        class FakeSwitcher:
+            def purge(self, assume_yes=False):
+                seen["purge"].append(assume_yes)
+                if state["purge"]:
+                    raise ClaudeSwitchError(state["purge"])
 
         def fake_remove(home=None, uid=None, force=False):
             seen["remove"].append(force)
@@ -411,6 +417,7 @@ class TestUninstallCommand:
         monkeypatch.setattr(uninstall, "homebrew_brew", lambda: state["brew"])
         monkeypatch.setattr(uninstall, "homebrew_command", lambda: state["command"])
         monkeypatch.setattr(uninstall, "refuse_live_sessions", fake_refuse)
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", FakeSwitcher)
         monkeypatch.setattr(cli.os, "execv", fake_exec)
         return seen, state
 
@@ -462,7 +469,7 @@ class TestUninstallCommand:
         state["brew"] = brew = Path("/opt/homebrew/bin/brew")
         assert self._run(monkeypatch) == 0
         assert seen["exec"] == [str(brew), "uninstall", "--cask", "openswap"]
-        assert seen["remove"] == [False] and seen["logins"] == 0
+        assert seen["remove"] == [False] and seen["logins"] == 0 and seen["purge"] == []
         out = capsys.readouterr().out
         assert "Removed the menu bar login item." in out
         assert "brew uninstall --cask openswap" in out
@@ -472,7 +479,19 @@ class TestUninstallCommand:
         state["brew"] = brew = Path("/opt/homebrew/bin/brew")
         assert self._run(monkeypatch, "--zap", "--yes") == 0
         assert seen["exec"] == [str(brew), "uninstall", "--cask", "--zap", "openswap"]
+        assert seen["purge"] == [True]
         assert seen["logins"] == 1 and seen["data"] == [True]
+
+    def test_zap_stops_when_purge_refuses_after_the_prompt(self, harness, monkeypatch, capsys):
+        """A session that went live while the prompt waited is caught by
+        purge's own check, under the locks session setup takes."""
+        seen, state = harness
+        state["brew"] = Path("/opt/homebrew/bin/brew")
+        state["purge"] = "Live session-mode Claude instance(s) found: 1-a (PID 7)."
+        assert self._run(monkeypatch, "--zap", "--yes") == 1
+        assert seen["logins"] == 0 and seen["data"] == [] and seen["exec"] is None
+        err = capsys.readouterr().err
+        assert "PID 7" in err and "still installed" in err
 
     def test_zap_refuses_while_a_session_is_live(self, harness, monkeypatch, capsys):
         seen, state = harness
@@ -507,6 +526,7 @@ class TestUninstallCommand:
     def test_uv_install_finishes_with_uv(self, harness, monkeypatch, capsys):
         seen, _ = harness
         assert self._run(monkeypatch, "--zap", "--yes") == 0
+        assert seen["purge"] == [True]
         assert seen["data"] == [False] and seen["exec"] is None
         assert "uv tool uninstall openswap" in capsys.readouterr().out
 
