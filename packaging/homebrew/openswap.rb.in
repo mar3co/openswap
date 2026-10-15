@@ -70,12 +70,19 @@ cask "openswap" do
         "~/Library/Logs/com.opensoft.openswap.worker.log",
       ]
 
-  # An older uv install's ~/.local/bin/openswap can come first on PATH, and
-  # its setup would point the login item back at uv: name this cask's own
-  # command on a Mac that has one.
+  # The user runs the first `openswap` on their PATH (HOMEBREW_PATH; brew's
+  # own PATH is not theirs). An older uv install's can come before this
+  # cask's, wherever uv put it, and its setup refuses or points the login
+  # item back at uv, so name this cask's command whenever another one
+  # would answer first.
   caveats do
+    ours = "#{HOMEBREW_PREFIX}/bin/openswap"
+    first = ENV.fetch("HOMEBREW_PATH", "").split(File::PATH_SEPARATOR)
+               .reject(&:empty?)
+               .map { |dir| File.join(dir, "openswap") }
+               .find { |path| File.file?(path) && File.executable?(path) }
     openswap = "openswap"
-    openswap = "#{HOMEBREW_PREFIX}/bin/openswap" if File.exist?(File.expand_path("~/.local/bin/openswap"))
+    openswap = ours if first && !(File.exist?(ours) && File.realpath(first) == File.realpath(ours))
     <<~EOS
       Finish setting up (saves your Claude login, adds OpenSwap to the menu bar):
         #{openswap} setup

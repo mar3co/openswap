@@ -110,3 +110,13 @@ def test_caveats_are_one_step():
     caveats = cask[cask.index("  caveats do") :]
     assert caveats.count(" setup") == 1
     assert "uninstall" not in caveats and "uv tool" not in caveats
+
+
+def test_caveats_name_the_casks_command_when_another_comes_first_on_path():
+    """uv can put its shim in UV_TOOL_BIN_DIR, XDG_BIN_HOME or UV_INSTALL_DIR,
+    so the caveat walks the user's PATH instead of checking ~/.local/bin."""
+    cask = _render("1.2.3", ARM, INTEL).stdout
+    caveats = cask[cask.index("  caveats do") :]
+    assert 'ENV.fetch("HOMEBREW_PATH"' in caveats
+    assert '"#{HOMEBREW_PREFIX}/bin/openswap"' in caveats
+    assert ".local/bin" not in caveats
