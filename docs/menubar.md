@@ -6,6 +6,23 @@ Entry: `openswap menubar` → `openswap.menubar.run`. Optional extra: `rumps`.
 
 LaunchAgent `com.opensoft.openswap.menubar` runs `openswap menubar`. Accessory activation policy (no Dock icon). `NSApp.appearance` is left `None` so the extra inherits System Settings → Appearance.
 
+`launch_agent.resolve_program()` picks what the plist runs. In the cask's app it is the in-bundle `OpenSwap.app/Contents/MacOS/OpenSwap`, not the `openswap` symlink Homebrew puts on PATH: the app path survives `brew upgrade` (the cask's postflight kickstarts the agent onto the new build), and launchd starting the bundle binary keeps the LaunchServices identity notifications need. A source install pins the uv console script `~/.local/bin/openswap`. The frozen app started with no arguments and no terminal (Finder, `open`) runs the extra.
+
+### Moving from a source install
+
+`openswap setup` (before it installs the login item, so the app it then bootstraps never races a half-migrated Mac) and the frozen extra's start-up run `bundle.migrate_from_uv_install` (idempotent; each step logs and continues on failure). It does nothing from a copy that runs from an `/AppTranslocation/` path (a quarantined app opened in place) or under `/Volumes/` (a disk image): those paths vanish.
+
+1. The older `com.cswap.menubar` agent is booted out and its plist removed, whenever it is there.
+2. A menu bar plist that runs the uv install (`ProgramArguments[0]` is a console script or interpreter, unreadable, or a copy of the app that no longer exists) is rewritten to the bundle executable. A plist on another copy of the app that still exists (the cask's, while a copy from Downloads or a dev build runs) is left alone. The plist is never re-bootstrapped here: opened from Finder or a terminal, the uv extra is booted out and this extra keeps running; running as that agent (`XPC_SERVICE_NAME` is the label), it leaves itself alone. The next login starts the app.
+3. The Remote tasks worker plist (`com.opensoft.openswap.worker`), when it runs the uv install by the same rule, gets the bundle executable with its own `worker …` arguments and other keys kept, and PATH led by the bundle's directory. A loaded worker is booted out and bootstrapped again on the app (unless this process is the worker); one that is not loaded starts from the app next time.
+4. A Claude Code status-line hook (`statusLine.command` in Claude's `settings.json`) that names another openswap path is pointed at the bundle executable (any prefix before it is kept; the wrap state is untouched). A bare `openswap statusline` and a link to the app are left alone. In the app, `statusline --install` writes the bundle executable too.
+5. The old widget host is retired (see [widget](widget.md#moving-from-a-source-install)).
+6. An `openswap` that is not a link to the app, in uv's tool bin directory (`UV_TOOL_BIN_DIR`, `XDG_BIN_HOME`, `XDG_DATA_HOME/../bin`, `~/.local/bin`), `UV_INSTALL_DIR`, or anywhere on PATH, is reported once: `An older uv install is still on PATH: run uv tool uninstall openswap`. If a step above failed and the login item, worker, or status line still runs another openswap, the report names it and says to keep the uv tool until it is moved instead. The uv tool and `~/.openswap` are not touched.
+
+`openswap upgrade` in the app runs nothing: it prints `brew upgrade --cask openswap` (or the release page for a copy Homebrew did not install).
+
+The other way round, a uv `openswap` that comes first on PATH would undo the move. When the cask is installed (an `openswap` Caskroom exists under `/opt/homebrew` or `/usr/local`; checked on disk), the uv install's `setup`, `upgrade`, `widget --install`, and `menubar --install-service` refuse (`bundle.refuse_uv_beside_cask`), naming `<prefix>/bin/openswap` and `uv tool uninstall openswap`. Its other commands still work, and a source install on a Mac without the cask is unaffected.
+
 After `rumps` attaches the status item, a short timer steals the click for the popover (`menubar_panel.MenuBarPanel`) and sets autosave name `com.opensoft.openswap.menubar`.
 
 ## Split: pure vs AppKit
@@ -61,7 +78,7 @@ Settings-page strategies: **Most quota left** (`best`), **Burn weekly first** (`
 
 ## Notifications
 
-`rumps.notification` needs a bundle id. `ensure_notification_identity` writes a tiny `Info.plist` next to the uv interpreter (`com.opensoft.openswap.menubar`) if missing.
+`rumps.notification` needs a bundle id. In the cask's app that is the bundle's own (`com.opensoft.openswap`). A source install has none, so `ensure_notification_identity` writes a tiny `Info.plist` next to the uv interpreter (`com.opensoft.openswap.menubar`) if missing.
 
 After an experimental ChatGPT desktop switch completes, the extra sends a
 silent **ChatGPT reopened** notification asking the operator to check the

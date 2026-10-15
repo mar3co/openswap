@@ -1127,17 +1127,23 @@ The menu bar extra must be running so the widget has live usage numbers.
     group.add_argument(
         "--install",
         action="store_true",
-        help="Build the widget app, copy it to ~/Applications, and start it",
+        help=(
+            "Register the widget in OpenSwap.app (a source install builds it "
+            "into ~/Applications with Xcode first)"
+        ),
     )
     group.add_argument(
         "--uninstall",
         action="store_true",
-        help="Stop the widget host and remove ~/Applications/OpenSwap.app",
+        help=(
+            "Unregister the widget (a source install also stops its host and "
+            "removes ~/Applications/OpenSwap.app)"
+        ),
     )
     group.add_argument(
         "--status",
         action="store_true",
-        help="Report whether the widget app and its LaunchAgent are present",
+        help="Report whether the widget is installed and registered",
     )
     args = parser.parse_args(argv)
     from openswap.widget_install import (
@@ -1160,12 +1166,22 @@ The menu bar extra must be running so the widget has live usage numbers.
             return 0
         if args.uninstall:
             result = uninstall_widget()
-            if result.get("removed_app") or result.get("removed_plist") or result.get("was_loaded"):
+            if result.get("unregistered"):
+                print("Widget unregistered.")
+            elif result.get("removed_app") or result.get("removed_plist") or result.get("was_loaded"):
                 print("Widget removed.")
             else:
                 print("Widget was not installed.")
             return 0
         state = widget_status()
+        if state.get("bundled"):
+            if not state["registered"]:
+                print(f"Widget: not registered ({state['app']})")
+                print(dimmed("Register it with: openswap widget --install"))
+                return 0
+            for where in state["registrations"]:
+                print(f"Widget: registered ({where})")
+            return 0
         app_state = "present" if state["app_installed"] else "missing"
         print(f"Widget app: {app_state} ({state['app']})")
         if not state["installed"] and not state["loaded"]:
@@ -1206,6 +1222,11 @@ def _setup_command(argv: list[str]) -> int:
     lock timeout, ...) still installs the extra but exits 1, because "log in"
     is the wrong advice for it. A failed capture is reported after the extra
     so its hint is the last thing the user reads.
+
+    In the cask's app it first moves a uv install over
+    (``bundle.migrate_from_uv_install``): that stops the uv extra and rewrites
+    the login item, and the install below then bootstraps the app. Migrating
+    after the install would race the new extra's own start-up migration.
     """
     parser = argparse.ArgumentParser(
         prog="openswap setup",
@@ -1215,10 +1236,17 @@ def _setup_command(argv: list[str]) -> int:
         ),
     )
     parser.parse_args(argv)
-    from openswap import launch_agent
+    from openswap import bundle, launch_agent
     from openswap.exceptions import NotLoggedInError
     from openswap.update_check import restart_widget_agent
 
+    try:
+        bundle.refuse_uv_beside_cask("set up the menu bar extra")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        return 1
+
+    migration_notes: list[str] = []
     saved = False
     not_saved: tuple[str, str, int] | None = None  # (reason, hint, exit code)
     try:
@@ -1233,6 +1261,7 @@ def _setup_command(argv: list[str]) -> int:
             # OSError: the backup store itself is unwritable. The extra is
             # still worth installing; the store problem is the user's fix.
             not_saved = (str(e), "When that is fixed, run: openswap add", 1)
+        bundle.migrate_from_uv_install(notify=migration_notes.append)
         result = launch_agent.install()
         widget_detail = restart_widget_agent()
         pid = _wait_for_pid(launch_agent, result["label"])
@@ -1259,9 +1288,13 @@ def _setup_command(argv: list[str]) -> int:
     else:
         warning("Menu bar extra was installed but is not running yet.")
     print(dimmed(f"  log: {result['stderr_log']}"))
+    for note in migration_notes:
+        warning(note)
     if widget_detail:
         warning(f"Widget host did not restart: {widget_detail}")
         print(dimmed("Run: openswap widget --install"))
+    elif bundle.is_frozen():
+        print(dimmed("Desktop widget: openswap widget --install"))
     else:
         print(dimmed("Desktop widget (needs Xcode): openswap widget --install"))
     if not_saved is None:
@@ -1391,9 +1424,10 @@ def _menubar_service(args) -> int:
     non-returning call — folding the service paths inline would leave the
     reader tracing which branches fall through to launching the app.
     """
-    from openswap import launch_agent
+    from openswap import bundle, launch_agent
 
     if args.install_service:
+        bundle.refuse_uv_beside_cask("install the menu bar service")
         result = launch_agent.install()
         print(f"Menu bar service installed ({result['label']}).")
         print(f"  plist: {result['plist']}")
@@ -1969,6 +2003,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
             if args.install_service or args.uninstall_service or args.service_status:
                 sys.exit(_menubar_service(args))
+            # The cask's app moves a uv install over on every start; once
+            # done it is a no-op, and it logs rather than raises.
+            from openswap import bundle
+
+            if bundle.is_frozen():
+                bundle.migrate_from_uv_install()
             # menubar is import-safe without the extra; a missing rumps
             # surfaces from run() as a ClaudeSwitchError with the install hint.
             from openswap.codex.engine import CodexEngine

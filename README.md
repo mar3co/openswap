@@ -9,15 +9,26 @@ OpenSwap is a standalone MIT descendant of [claude-swap](https://github.com/real
 
 ## Install
 
-One command. Needs a Mac.
+Needs a Mac (macOS 14 or later). With [Homebrew](https://brew.sh):
+
+```bash
+brew install --cask mar3co/openswap/openswap
+openswap setup
+```
+
+That installs `OpenSwap.app` (signed and notarized; the menu bar extra, the widget, and the `openswap` command in one app) and starts the extra in your menu bar, now and at every login. If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) is logged in, setup saves that account; otherwise the extra still starts and you add accounts later. Update with `brew upgrade --cask openswap` (`openswap upgrade` prints that command). OpenSwap is not on PyPI.
+
+No Homebrew? One command installs from source:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mar3co/openswap/main/install.sh | bash
 ```
 
-It installs [uv](https://docs.astral.sh/uv/) if you do not have it (uv brings its own Python), clones OpenSwap to `~/.openswap`, and starts the extra in your menu bar. If [Claude Code](https://docs.anthropic.com/en/docs/claude-code) is logged in, setup saves that account; otherwise the extra still starts and you add accounts later. On a brand-new Mac, macOS first asks to install its Command Line Tools; run the command again once that finishes. Re-run it any time to update; it pulls instead of cloning, then runs setup again. `openswap upgrade` updates from the terminal. Homebrew cask comes later. OpenSwap is not on PyPI.
+On a Mac with Homebrew the same script installs the cask above, or upgrades it when it is already installed. Without it, the script installs [uv](https://docs.astral.sh/uv/) if you do not have it (uv brings its own Python), clones OpenSwap to `~/.openswap`, and runs setup. On a brand-new Mac, macOS first asks to install its Command Line Tools; run the command again once that finishes. Re-run it any time to update; it pulls instead of cloning, then runs setup again. `openswap upgrade` does the same from the terminal.
 
-Already have a checkout? `OPENSWAP_DIR=/path/to/openswap bash install.sh` installs from it.
+Already have a checkout? `OPENSWAP_DIR=/path/to/openswap bash install.sh` installs from it (with or without Homebrew).
+
+Moving from the source install to the cask: run `$(brew --prefix)/bin/openswap setup` (the uv `openswap` may come first on PATH; with the cask installed it refuses `setup`, `upgrade`, `widget --install` and `menubar --install-service` and names the cask's command). Setup points the login item, the Remote tasks worker, and the status line at the app and retires the old widget host. It leaves the uv tool in place and tells you to run `uv tool uninstall openswap`; `~/.openswap` is yours to delete. Widgets placed with the old host may need adding again.
 
 ## Quick start
 
@@ -41,8 +52,10 @@ Walkthrough: [Getting started](https://github.com/mar3co/openswap/wiki/Getting-S
 
 ```bash
 openswap setup                        # save the current login, start the extra at login (the installer ran this)
-openswap widget --install             # Desktop / Notification Center (this checkout + Xcode)
+openswap widget --install             # Desktop / Notification Center
 ```
+
+The widget ships inside the cask's app, so `openswap widget --install` only registers it; no Xcode needed. A source install builds it with Xcode instead.
 
 Click the extra for usage bars, then a card to switch. **Add account** on the Claude page (also **More › Add account › Sign in with Claude…**) refreshes the current login's saved copy (or asks first if OpenSwap hasn't saved it), runs the Claude browser sign-in, and saves whoever signs in (a new card, or a refresh of one already saved); Claude Code switches to that account. Auto-switch waits five minutes before it can move you again. Popover Settings separates **General** display controls from **Automation** for Claude, ChatGPT, and Codex, with one shared quota policy and an optional kickoff schedule for accounts that report a 5-hour window, and **Remote** for the local worker. Add the widget from Edit Widgets (search **OpenSwap**). The popover header and widget host use the OpenSoft mark. Right-click the widget to choose all accounts, combined remaining, or one account.
 
@@ -88,7 +101,7 @@ The command-line executable is `openswap`.
 | `openswap worker live status` | Show whether remote jobs really run (`enable --evidence FILE`, `disable`) |
 | `openswap menubar` | macOS extra |
 | `openswap widget --install` | macOS widget |
-| `openswap upgrade` | Pull the checkout and reinstall |
+| `openswap upgrade` | Pull the checkout and reinstall (the cask: prints `brew upgrade --cask openswap`) |
 | `openswap statusline --install` | Opt-in: wrap Claude Code status line |
 | `openswap statusline --codex` | Paint the live Codex account label (no config.toml wrap) |
 

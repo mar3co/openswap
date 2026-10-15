@@ -52,12 +52,17 @@ cask "openswap" do
         "~/Library/Logs/com.opensoft.openswap.widget.log",
       ]
 
+  # Full paths: an older uv install's ~/.local/bin/openswap can come first on
+  # PATH, and its setup would point the login item back at uv.
   caveats <<~EOS
     Save your Claude login and start the menu bar extra at login:
-      openswap setup
+      #{HOMEBREW_PREFIX}/bin/openswap setup
+
+    If you used the uv install before, setup moves it over; then run
+      uv tool uninstall openswap
 
     Before `brew uninstall --cask openswap`, run
-      openswap menubar --uninstall-service
+      #{HOMEBREW_PREFIX}/bin/openswap menubar --uninstall-service
     or uninstall with --zap, so launchd is not left pointing at a removed app.
   EOS
 end

@@ -3,16 +3,19 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/mar3co/openswap/main/install.sh | bash
 #
-# Installs uv if needed (uv brings its own Python), clones this repo to
-# ~/.openswap (or installs from $OPENSWAP_DIR), installs the openswap tool,
-# saves the Claude account you are logged into, and starts the menu bar extra.
-# Safe to re-run: ~/.openswap is pulled instead of cloned.
+# With Homebrew (and no $OPENSWAP_DIR) it installs the OpenSwap app cask, the
+# supported path. Otherwise it installs uv if needed (uv brings its own
+# Python), clones this repo to ~/.openswap (or installs from $OPENSWAP_DIR),
+# and installs the openswap tool. Either way it then saves the Claude account
+# you are logged into and starts the menu bar extra. Safe to re-run: an
+# installed cask is upgraded, and ~/.openswap is pulled instead of cloned.
 #
 # Everything lives in main(), invoked inside a group whose closing brace is
 # the last token, so a download that stops anywhere short of that runs nothing.
 set -euo pipefail
 
 REPO_URL="${OPENSWAP_REPO:-https://github.com/mar3co/openswap.git}"
+CASK="mar3co/openswap/openswap"
 INSTALL_DIR="${OPENSWAP_DIR:-$HOME/.openswap}"
 UV_INSTALLER="https://astral.sh/uv/install.sh"
 
@@ -23,9 +26,107 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 # .git is a file in a worktree, so -e rather than -d.
 is_checkout() { [ -e "$1/.git" ] && [ -f "$1/src/openswap/__init__.py" ]; }
 
+OLD_WIDGET_HOST_ID="com.opensoft.openswap.widget"
+
+# Where `brew install --cask` puts the app: the last --appdir in
+# HOMEBREW_CASK_OPTS, else /Applications. Runs in a subshell ($(...)), so
+# `set -f` only stops the word split below from globbing.
+cask_appdir() {
+  set -f
+  local dir="/Applications" next="" word
+  for word in ${HOMEBREW_CASK_OPTS:-}; do
+    if [ -n "$next" ]; then
+      dir="$word"
+      next=""
+      continue
+    fi
+    case "$word" in
+      --appdir=*) dir="${word#--appdir=}" ;;
+      --appdir) next=1 ;;
+    esac
+  done
+  dir="${dir#[\"\']}"
+  dir="${dir%[\"\']}"
+  case "$dir" in
+    "~") dir="$HOME" ;;
+    "~/"*) dir="$HOME/${dir#'~/'}" ;;
+    '${HOME}'*) dir="$HOME${dir#'${HOME}'}" ;;
+    '$HOME'*) dir="$HOME${dir#'$HOME'}" ;;
+  esac
+  while [ "${dir%/}" != "$dir" ] && [ "$dir" != "/" ]; do dir="${dir%/}"; done
+  printf '%s\n' "$dir"
+}
+
+# A source install's widget host is ~/Applications/OpenSwap.app with the old
+# bundle id. With the cask's appdir set to ~/Applications it sits where the
+# cask puts the app, and brew refuses to overwrite it, so retire it first,
+# the way the app's own migration would: boot out its agent, unregister its
+# widget, and move it to the Trash (never delete it). Any other app there is
+# left alone.
+retire_old_widget_host() {
+  local app="$HOME/Applications/OpenSwap.app"
+  [ -d "$app" ] || return 0
+  local bundle_id
+  bundle_id="$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
+  [ "$bundle_id" = "$OLD_WIDGET_HOST_ID" ] || return 0
+  say "Moving the old OpenSwap widget host to the Trash so the app can install at $app"
+  # A copy left registered would be a second widget provider beside the app's,
+  # and once it is in the Trash nothing retries, so stop here instead. A failed
+  # remove of a copy pluginkit no longer lists is fine; an unreadable list is not.
+  local appex="$app/Contents/PlugIns/OpenSwapWidgetExtension.appex"
+  if ! pluginkit -r "$appex" >/dev/null 2>&1; then
+    local listed
+    listed="$(pluginkit -m -D -v -i com.opensoft.openswap.widget.extension 2>/dev/null)" \
+      || fail "Could not unregister the old widget at $appex, and pluginkit could not list widgets to check. Run: pluginkit -r \"$appex\", then run this installer again."
+    case "$listed" in
+      *"$appex"*) fail "Could not unregister the old widget at $appex. Run: pluginkit -r \"$appex\", then run this installer again." ;;
+    esac
+  fi
+  launchctl bootout "gui/$(id -u)/$OLD_WIDGET_HOST_ID" >/dev/null 2>&1 || true
+  rm -f "$HOME/Library/LaunchAgents/$OLD_WIDGET_HOST_ID.plist"
+  local trash="$HOME/.Trash"
+  local dest="$trash/OpenSwap.app"
+  local n=1
+  mkdir -p "$trash" || fail "Could not create $trash; move $app to the Trash yourself, then run this installer again."
+  while [ -e "$dest" ] || [ -L "$dest" ]; do
+    n=$((n + 1))
+    dest="$trash/OpenSwap $n.app"
+  done
+  mv "$app" "$dest" || fail "Could not move $app to the Trash; move it there yourself, then run this installer again."
+}
+
+install_cask() {
+  say "To install from a git checkout instead, set OPENSWAP_DIR"
+  # Re-running the installer updates, like the clone path's pull.
+  if brew list --cask openswap >/dev/null 2>&1; then
+    say "Homebrew found and OpenSwap is installed: brew upgrade --cask $CASK"
+    brew upgrade --cask "$CASK" || fail "brew upgrade --cask $CASK failed (see above). Fix that, then run this installer again."
+  else
+    say "Homebrew found: installing the OpenSwap app with brew install --cask $CASK (the supported install)"
+    if [ "$(cask_appdir)" = "$HOME/Applications" ]; then
+      retire_old_widget_host
+    fi
+    brew install --cask "$CASK" || fail "brew install --cask $CASK failed (see above). Fix that, then run this installer again."
+  fi
+  # Run the cask's own command: an older uv install's ~/.local/bin/openswap
+  # may come first on PATH, and its setup would not move anything over.
+  local prefix
+  prefix="$(brew --prefix)" || fail "brew --prefix failed (see above)."
+  [ -x "$prefix/bin/openswap" ] || fail "brew reported success but $prefix/bin/openswap is missing."
+  say "Saving your Claude account and starting the menu bar extra"
+  "$prefix/bin/openswap" setup
+}
+
 main() {
   [ "$(uname -s)" = "Darwin" ] || fail "OpenSwap ships for macOS only."
   [ "$(id -u)" != 0 ] || fail "Run this installer as your normal user, not with sudo."
+
+  # Developers set OPENSWAP_DIR to install from a checkout; everyone else with
+  # Homebrew gets the app.
+  if [ -z "${OPENSWAP_DIR:-}" ] && command -v brew >/dev/null 2>&1; then
+    install_cask
+    return
+  fi
 
   # /usr/bin/git is a shim that opens the Command Line Tools dialog when run,
   # so a plain `command -v git` cannot tell whether git is really there.

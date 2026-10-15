@@ -48,6 +48,43 @@ echo "curl $*" >> "$STUB_LOG"
 cat "$STUB_DIR/uv-installer.sh"
 '''
 
+BREW_STUB = r'''#!/bin/sh
+echo "brew $*" >> "$STUB_LOG"
+case "$1" in
+  --prefix) echo "$STUB_DIR/brew-prefix" ;;
+  list) [ -x "$STUB_DIR/brew-prefix/bin/openswap" ] ;;
+  upgrade) exit "${FAIL_BREW_UPGRADE:-0}" ;;
+  install)
+    [ -n "${FAIL_BREW_INSTALL:-}" ] && exit 1
+    mkdir -p "$STUB_DIR/brew-prefix/bin"
+    printf '#!/bin/sh\necho "brew-openswap $*" >> "$STUB_LOG"\nexit "${FAIL_SETUP:-0}"\n' > "$STUB_DIR/brew-prefix/bin/openswap"
+    chmod +x "$STUB_DIR/brew-prefix/bin/openswap"
+    ;;
+esac
+'''
+
+# `defaults read <bundle>/Contents/Info CFBundleIdentifier`, from the plist
+# XML plistlib writes; launchctl and pluginkit only record. Stubs come first on
+# PATH, so the real tools never run (and Linux CI has none of them).
+DEFAULTS_STUB = r'''#!/bin/sh
+echo "defaults $*" >> "$STUB_LOG"
+[ -f "$2.plist" ] || exit 1
+grep -A1 "<key>$3</key>" "$2.plist" | sed -n 's:.*<string>\(.*\)</string>.*:\1:p'
+'''
+
+RECORD_STUB = r'''#!/bin/sh
+echo "$(basename "$0") $*" >> "$STUB_LOG"
+[ "$(basename "$0")" = launchctl ] && [ -n "${FAIL_LAUNCHCTL:-}" ] && exit 3
+if [ "$(basename "$0")" = pluginkit ]; then
+  [ "$1" = -r ] && [ -n "${FAIL_PLUGINKIT_REMOVE:-}" ] && exit 1
+  if [ "$1" = -m ]; then
+    [ -n "${FAIL_PLUGINKIT_LIST:-}" ] && exit 1
+    printf '%s\n' "${PLUGINKIT_LIST:-}"
+  fi
+fi
+exit 0
+'''
+
 UV_INSTALLER = r'''#!/bin/sh
 [ -n "${FAIL_UV_INSTALLER:-}" ] && exit 1
 [ -n "${UV_INSTALLER_NOOP:-}" ] && exit 0
@@ -76,6 +113,7 @@ def run_installer(
     clt: bool = True,
     uv: bool = True,
     bin_on_path: bool = True,
+    brew: bool = False,
     env: dict[str, str] | None = None,
     script_text: str | None = None,
 ) -> tuple[subprocess.CompletedProcess, list[str]]:
@@ -99,6 +137,11 @@ def run_installer(
     (stubs / "uv.stub").write_text(UV_STUB)
     if uv:
         _write(stubs / "uv", UV_STUB)
+    if brew:
+        _write(stubs / "brew", BREW_STUB)
+    _write(stubs / "defaults", DEFAULTS_STUB)
+    _write(stubs / "launchctl", RECORD_STUB)
+    _write(stubs / "pluginkit", RECORD_STUB)
 
     path = [str(stubs)]
     if bin_on_path:
@@ -290,3 +333,177 @@ class TestInstallScript:
         assert proc.returncode == 1
         assert "xcode-select --reset" in proc.stderr
         assert "dialog" not in proc.stderr
+
+
+class TestHomebrewPath:
+    """With Homebrew the installer installs the app cask instead of cloning."""
+
+    def test_homebrew_installs_the_cask_and_runs_its_setup(self, tmp_path):
+        proc, calls = run_installer(tmp_path, brew=True)
+        assert proc.returncode == 0, proc.stderr
+        assert "brew install --cask mar3co/openswap/openswap" in calls
+        # The cask's own command, not whatever `openswap` comes first on PATH.
+        assert "brew-openswap setup" in calls
+        assert "openswap setup" not in calls
+        assert not any(c.startswith(("git", "uv", "curl", "xcode-select")) for c in calls)
+        assert "supported" in proc.stdout
+        assert "OPENSWAP_DIR" in proc.stdout
+        assert not any(c.startswith("brew upgrade") for c in calls)
+
+    def test_rerun_with_the_cask_installed_upgrades_it(self, tmp_path):
+        run_installer(tmp_path, brew=True)
+        (tmp_path / "calls.log").unlink()
+        proc, calls = run_installer(tmp_path, brew=True)
+        assert proc.returncode == 0, proc.stderr
+        assert "brew list --cask openswap" in calls
+        assert "brew upgrade --cask mar3co/openswap/openswap" in calls
+        assert not any(c.startswith("brew install") for c in calls)
+        assert "brew-openswap setup" in calls
+
+    def test_failed_cask_upgrade_stops_before_setup(self, tmp_path):
+        run_installer(tmp_path, brew=True)
+        (tmp_path / "calls.log").unlink()
+        proc, calls = run_installer(tmp_path, brew=True, env={"FAIL_BREW_UPGRADE": "1"})
+        assert proc.returncode == 1
+        assert "brew upgrade --cask" in proc.stderr
+        assert not any("setup" in c for c in calls)
+
+    def test_openswap_dir_keeps_the_checkout_path_for_developers(self, tmp_path):
+        target = _fake_checkout(tmp_path / "mine")
+        proc, calls = run_installer(tmp_path, brew=True, env={"OPENSWAP_DIR": str(target)})
+        assert proc.returncode == 0, proc.stderr
+        assert not any(c.startswith("brew") for c in calls)
+        assert "uv tool install --force --editable .[menubar]" in calls
+        assert "openswap setup" in calls
+
+    def test_failed_cask_install_stops_before_setup(self, tmp_path):
+        proc, calls = run_installer(tmp_path, brew=True, env={"FAIL_BREW_INSTALL": "1"})
+        assert proc.returncode == 1
+        assert "brew install --cask" in proc.stderr
+        assert not any("setup" in c for c in calls)
+        assert not any(c.startswith(("git", "uv")) for c in calls)
+
+    def test_setup_failure_is_the_exit_status(self, tmp_path):
+        proc, calls = run_installer(tmp_path, brew=True, env={"FAIL_SETUP": "3"})
+        assert proc.returncode == 3
+        assert "brew-openswap setup" in calls
+
+    def test_piped_script_installs_the_cask(self, tmp_path):
+        proc, calls = run_installer(tmp_path, brew=True, script_text=SCRIPT.read_text())
+        assert proc.returncode == 0, proc.stderr
+        assert "brew-openswap setup" in calls
+
+
+def _host_app(home: Path, bundle_id: str = "com.opensoft.openswap.widget") -> Path:
+    import plistlib
+
+    app = home / "Applications" / "OpenSwap.app"
+    (app / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex").mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": bundle_id}))
+    return app
+
+
+class TestOldWidgetHostBeforeTheCask:
+    """With appdir ~/Applications the old host would block `brew install --cask`."""
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"FAIL_PLUGINKIT_REMOVE": "1", "PLUGINKIT_LIST": "STILL"},
+            {"FAIL_PLUGINKIT_REMOVE": "1", "FAIL_PLUGINKIT_LIST": "1"},
+        ],
+        ids=["still-registered", "registry-unreadable"],
+    )
+    def test_old_host_stays_when_its_widget_will_not_unregister(self, tmp_path, env):
+        """Once it is in the Trash nothing retries, so a registered copy stops the installer."""
+        home = tmp_path / "home"
+        app = _host_app(home)
+        appex = f"{app}/Contents/PlugIns/OpenSwapWidgetExtension.appex"
+        env = {k: (f"+    com.opensoft.openswap.widget.extension(1.0)\t{appex}" if v == "STILL" else v) for k, v in env.items()}
+        proc, calls = run_installer(tmp_path, brew=True, env={"HOMEBREW_CASK_OPTS": "--appdir=~/Applications", **env})
+        assert proc.returncode != 0
+        assert "Could not unregister the old widget" in proc.stderr + proc.stdout
+        assert app.is_dir()
+        assert not any(c.startswith(("brew install", "launchctl bootout")) for c in calls)
+
+    def test_a_failed_remove_of_an_unlisted_widget_still_proceeds(self, tmp_path):
+        home = tmp_path / "home"
+        app = _host_app(home)
+        proc, calls = run_installer(
+            tmp_path, brew=True,
+            env={"HOMEBREW_CASK_OPTS": "--appdir=~/Applications", "FAIL_PLUGINKIT_REMOVE": "1", "PLUGINKIT_LIST": ""},
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert not app.exists()
+        assert "brew install --cask mar3co/openswap/openswap" in calls
+
+    @pytest.mark.parametrize(
+        "opts",
+        [
+            "--appdir=~/Applications",
+            "--appdir=$HOME/Applications/",
+            "--no-quarantine --appdir ~/Applications",
+            '--appdir="~/Applications"',
+        ],
+    )
+    def test_old_host_is_retired_to_the_trash_before_brew(self, tmp_path, opts):
+        home = tmp_path / "home"
+        app = _host_app(home)
+        agent = home / "Library" / "LaunchAgents" / "com.opensoft.openswap.widget.plist"
+        agent.parent.mkdir(parents=True)
+        agent.write_text("")
+        proc, calls = run_installer(tmp_path, brew=True, env={"HOMEBREW_CASK_OPTS": opts})
+        assert proc.returncode == 0, proc.stderr
+        assert "launchctl bootout gui/501/com.opensoft.openswap.widget" in calls
+        assert f"pluginkit -r {app}/Contents/PlugIns/OpenSwapWidgetExtension.appex" in calls
+        assert calls.index("launchctl bootout gui/501/com.opensoft.openswap.widget") < calls.index(
+            "brew install --cask mar3co/openswap/openswap"
+        )
+        assert not agent.exists()
+        assert not app.exists()
+        assert (home / ".Trash" / "OpenSwap.app" / "Contents" / "Info.plist").is_file()
+
+    def test_the_trash_copy_never_overwrites_one_already_there(self, tmp_path):
+        home = tmp_path / "home"
+        _host_app(home)
+        earlier = home / ".Trash" / "OpenSwap.app"
+        earlier.mkdir(parents=True)
+        (earlier / "keep").write_text("mine")
+        (home / ".Trash" / "OpenSwap 2.app").mkdir()
+        proc, _ = run_installer(tmp_path, brew=True, env={"HOMEBREW_CASK_OPTS": "--appdir=~/Applications"})
+        assert proc.returncode == 0, proc.stderr
+        assert (earlier / "keep").read_text() == "mine"
+        assert (home / ".Trash" / "OpenSwap 3.app" / "Contents" / "Info.plist").is_file()
+
+    def test_a_not_loaded_agent_does_not_stop_the_install(self, tmp_path):
+        _host_app(tmp_path / "home")
+        proc, calls = run_installer(
+            tmp_path,
+            brew=True,
+            env={"HOMEBREW_CASK_OPTS": "--appdir=~/Applications", "FAIL_LAUNCHCTL": "1"},
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "brew-openswap setup" in calls
+
+    def test_an_app_with_another_bundle_id_is_never_touched(self, tmp_path):
+        app = _host_app(tmp_path / "home", bundle_id="com.example.other")
+        proc, calls = run_installer(tmp_path, brew=True, env={"HOMEBREW_CASK_OPTS": "--appdir=~/Applications"})
+        assert app.is_dir()
+        assert not any(c.startswith(("launchctl", "pluginkit")) for c in calls)
+
+    def test_the_default_appdir_leaves_the_old_host_to_the_app(self, tmp_path):
+        """In /Applications nothing is in the way; the app's migration retires it."""
+        app = _host_app(tmp_path / "home")
+        proc, calls = run_installer(tmp_path, brew=True)
+        assert proc.returncode == 0, proc.stderr
+        assert app.is_dir()
+        assert not any(c.startswith(("launchctl", "pluginkit")) for c in calls)
+
+    def test_an_upgrade_does_not_retire_anything(self, tmp_path):
+        run_installer(tmp_path, brew=True)
+        (tmp_path / "calls.log").unlink()
+        app = _host_app(tmp_path / "home")
+        proc, calls = run_installer(tmp_path, brew=True, env={"HOMEBREW_CASK_OPTS": "--appdir=~/Applications"})
+        assert proc.returncode == 0, proc.stderr
+        assert app.is_dir()
+        assert "brew upgrade --cask mar3co/openswap/openswap" in calls

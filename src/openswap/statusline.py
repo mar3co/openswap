@@ -328,8 +328,15 @@ def is_our_command(command: str | None) -> bool:
     except ValueError:
         return False
     if len(parts) >= 2 and parts[-1] == "statusline":
-        return Path(parts[-2]).name == "openswap"
+        return Path(parts[-2]).name == "openswap" or _is_app_executable(parts[-2])
     return False
+
+
+def _is_app_executable(program: str) -> bool:
+    """``…/OpenSwap.app/Contents/MacOS/OpenSwap``, which the app's hook runs."""
+    from openswap.bundle import is_app_executable
+
+    return is_app_executable(program)
 
 
 def _is_legacy_command(command: str | None) -> bool:
@@ -351,6 +358,14 @@ def _is_legacy_command(command: str | None) -> bool:
 
 
 def paint_command() -> str:
+    from openswap import bundle
+
+    # The app pins its own executable: launchd starts the extra as
+    # `…/Contents/MacOS/OpenSwap`, so argv[0] is not named openswap there,
+    # and PATH may still find an older uv install first.
+    exe = bundle.executable()
+    if exe is not None:
+        return f"{shlex.quote(str(exe))} statusline"
     argv0 = Path(sys.argv[0])
     if argv0.name == "openswap":
         try:
@@ -361,6 +376,63 @@ def paint_command() -> str:
     if found:
         return f"{shlex.quote(found)} statusline"
     return PAINT_COMMAND
+
+
+def hook_program(config_home: Path) -> str | None:
+    """The openswap path the installed status-line hook names, if any.
+
+    None when there is no hook, it is not OpenSwap's, or it is the bare
+    ``openswap statusline`` (PATH decides which openswap runs).
+    """
+    settings_file = config_home / "settings.json"
+    if not settings_file.exists():
+        return None
+    block = _read_json(settings_file).get("statusLine")
+    current = block.get("command") if isinstance(block, dict) else None
+    if not isinstance(current, str) or not is_our_command(current):
+        return None
+    try:
+        parts = shlex.split(current.strip())
+    except ValueError:
+        return None
+    program = parts[-2] if len(parts) >= 2 else ""
+    return program if os.sep in program or "/" in program else None
+
+
+def _same_program(a: str, b: Path) -> bool:
+    try:
+        return Path(a).resolve() == b.resolve()
+    except (OSError, RuntimeError):
+        return Path(a) == b
+
+
+def runs_other_program(config_home: Path, program: Path) -> bool:
+    """Whether the installed hook names an openswap other than ``program``."""
+    current = hook_program(config_home)
+    return current is not None and not _same_program(current, program)
+
+
+def repoint_command(config_home: Path, *, program: Path) -> bool:
+    """Point an installed hook that names another openswap at ``program``.
+
+    For the move from a uv install to the app: ``…/.local/bin/openswap
+    statusline`` becomes ``…/OpenSwap.app/Contents/MacOS/OpenSwap
+    statusline``. Anything before the program (an env prefix) is kept, a
+    bare ``openswap statusline`` and a hook already on ``program`` (or a
+    link to it) are left alone, and the wrap state is untouched.
+    """
+    if not runs_other_program(config_home, program):
+        return False
+    settings_file = config_home / "settings.json"
+    settings = _read_json_for_write(settings_file)
+    block = settings.get("statusLine")
+    if not isinstance(block, dict) or not isinstance(block.get("command"), str):
+        return False
+    parts = shlex.split(block["command"].strip())
+    block["command"] = shlex.join([*parts[:-2], str(program), "statusline"])
+    settings["statusLine"] = block
+    _write_json(settings_file, settings)
+    return True
 
 
 def migrate_legacy_command(

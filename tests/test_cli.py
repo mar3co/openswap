@@ -599,6 +599,23 @@ class TestCLI:
         upgrade_fn.assert_called_once_with()
         switcher_cls.assert_not_called()
 
+    def test_upgrade_in_the_app_prints_the_brew_command(self, frozen_app, monkeypatch, capsys):
+        """The cask's app never pulls or reinstalls itself."""
+        import openswap.update_check as uc
+
+        def _refuse(*a, **k):
+            raise AssertionError(f"frozen upgrade ran a subprocess: {a}")
+
+        monkeypatch.setattr(uc.subprocess, "run", _refuse)
+        monkeypatch.setattr("openswap.bundle.installed_by_homebrew", lambda home=None: True)
+        with patch("openswap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["openswap", "upgrade"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        switcher_cls.assert_not_called()
+        assert "brew upgrade --cask openswap" in capsys.readouterr().out
+
     def test_menubar_flag_dispatches(self, monkeypatch):
         called = {}
 
@@ -623,6 +640,34 @@ class TestCLI:
             cli.main()
         assert exc.value.code == 0
         assert called.get("ran") is True
+
+    @pytest.mark.parametrize("frozen", [True, False], ids=["app", "uv"])
+    def test_menubar_start_migrates_only_in_the_app(self, monkeypatch, request, frozen):
+        order: list[str] = []
+
+        class _FakeSwitcher:
+            def __init__(self, *a, **k):
+                pass
+            def _is_running_in_container(self):
+                return False
+
+        if frozen:
+            request.getfixturevalue("frozen_app")
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", _FakeSwitcher)
+        monkeypatch.setattr(sys, "argv", ["openswap", "menubar"])
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(
+            "openswap.bundle.migrate_from_uv_install", lambda **k: order.append("migrate") or []
+        )
+        monkeypatch.setattr(
+            "openswap.menubar.run", lambda switcher, codex=None: order.append("run") or 0, raising=False
+        )
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0
+        assert order == (["migrate", "run"] if frozen else ["run"])
 
     def test_menubar_subcommand_dispatches(self, monkeypatch):
         """Bare `openswap menubar` should route exactly like `openswap --menubar`."""
@@ -1397,6 +1442,85 @@ class TestAutoCommand:
         assert "present" in out
         assert "99" in out
 
+    def test_uv_widget_install_beside_the_cask_refuses(self, monkeypatch, capsys, tmp_path):
+        """Building the old host again would give the appex two providers."""
+        room = tmp_path / "Caskroom" / "openswap"
+        room.mkdir(parents=True)
+        monkeypatch.setattr("openswap.bundle.CASKROOMS", (room,))
+        monkeypatch.setattr("openswap.widget_install.sys.platform", "darwin")
+        monkeypatch.setattr(
+            "openswap.widget_install.project_dir", lambda: pytest.fail("must not build")
+        )
+        with patch.object(sys, "argv", ["openswap", "widget", "--install"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 1
+        assert "installed with Homebrew" in capsys.readouterr().err
+
+    def test_uv_install_service_beside_the_cask_refuses(self, monkeypatch, capsys, tmp_path):
+        room = tmp_path / "Caskroom" / "openswap"
+        room.mkdir(parents=True)
+        monkeypatch.setattr("openswap.bundle.CASKROOMS", (room,))
+        monkeypatch.setattr(
+            "openswap.launch_agent.install", lambda *a, **k: pytest.fail("must not install")
+        )
+        from argparse import Namespace
+
+        from openswap.exceptions import ClaudeSwitchError
+
+        with pytest.raises(ClaudeSwitchError, match="installed with Homebrew"):
+            cli._menubar_service(
+                Namespace(install_service=True, uninstall_service=False, service_status=False)
+            )
+
+    def test_widget_uninstall_in_the_app_says_unregistered(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "openswap.widget_install.uninstall_widget",
+            lambda: {"unregistered": True, "removed_app": False},
+        )
+        with patch.object(sys, "argv", ["openswap", "widget", "--uninstall"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 0
+        assert "Widget unregistered" in capsys.readouterr().out
+
+    def test_widget_status_in_the_app_lists_registrations(self, monkeypatch, capsys):
+        appex = "/Applications/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex"
+        monkeypatch.setattr(
+            "openswap.widget_install.widget_status",
+            lambda: {
+                "bundled": True,
+                "app": "/Applications/OpenSwap.app",
+                "registered": True,
+                "registrations": [appex],
+            },
+        )
+        with patch.object(sys, "argv", ["openswap", "widget", "--status"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert f"registered ({appex})" in out
+        assert "host service" not in out
+
+    def test_widget_status_in_the_app_when_unregistered(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "openswap.widget_install.widget_status",
+            lambda: {
+                "bundled": True,
+                "app": "/Applications/OpenSwap.app",
+                "registered": False,
+                "registrations": [],
+            },
+        )
+        with patch.object(sys, "argv", ["openswap", "widget", "--status"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "not registered" in out
+        assert "openswap widget --install" in out
+
     def test_switcher_error_exits_1(self, temp_home, capsys):
         from openswap.exceptions import ConfigError
 
@@ -1760,6 +1884,52 @@ class TestSetupCommand:
         tail = out.strip().splitlines()[-2:]
         assert message in tail[0]
         assert "openswap add" in tail[1]
+
+    def test_setup_runs_the_uv_migration_before_installing_the_extra(self, monkeypatch, capsys):
+        order: list[str] = []
+        seen = self._harness(monkeypatch, ["openswap", "setup"])
+        from openswap import launch_agent
+
+        install = launch_agent.install
+        monkeypatch.setattr(launch_agent, "install", lambda: order.append("install") or install())
+
+        def fake_migrate(home=None, uid=None, notify=None):
+            order.append("migrate")
+            notify("An older uv install is still on PATH: run uv tool uninstall openswap")
+            return []
+
+        monkeypatch.setattr("openswap.bundle.migrate_from_uv_install", fake_migrate)
+        assert self._run() == 0
+        # Migrating after the install would race the new extra's own
+        # start-up migration.
+        assert order == ["migrate", "install"]
+        assert seen["widget"] == 1
+        out = capsys.readouterr().out
+        assert "run uv tool uninstall openswap" in out
+        assert out.index("Menu bar extra running") < out.index("uv tool uninstall")
+
+    def test_uv_setup_beside_the_cask_refuses_before_touching_anything(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        """A uv openswap earlier on PATH would re-pin the login item to uv."""
+        seen = self._harness(monkeypatch, ["openswap", "setup"])
+        room = tmp_path / "homebrew" / "Caskroom" / "openswap"
+        room.mkdir(parents=True)
+        monkeypatch.setattr("openswap.bundle.CASKROOMS", (room,))
+        assert self._run() == 1
+        assert seen == {"add": 0, "install": 0, "widget": 0}
+        err = capsys.readouterr().err
+        assert "installed with Homebrew" in err
+        assert str(tmp_path / "homebrew" / "bin" / "openswap") in err
+        assert "uv tool uninstall openswap" in err
+
+    def test_setup_in_the_app_does_not_ask_for_xcode(self, monkeypatch, capsys, frozen_app):
+        self._harness(monkeypatch, ["openswap", "setup"])
+        monkeypatch.setattr("openswap.bundle.migrate_from_uv_install", lambda **k: [])
+        assert self._run() == 0
+        out = capsys.readouterr().out
+        assert "Desktop widget: openswap widget --install" in out
+        assert "Xcode" not in out
 
     def test_extra_that_did_not_come_up_is_not_called_running(self, monkeypatch, capsys):
         self._harness(monkeypatch, ["openswap", "setup"], pid=None)

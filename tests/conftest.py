@@ -896,6 +896,42 @@ def _deterministic_color(monkeypatch):
     monkeypatch.setenv("TERM", "dumb")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_homebrew_cask(monkeypatch):
+    """A cask installed on the test Mac must not change what the suite sees.
+
+    ``openswap.bundle`` checks ``/opt/homebrew`` and ``/usr/local`` on disk
+    (the cask refuses uv flows when it is installed). Point both at a prefix
+    that never exists; tests that need a cask set their own.
+    """
+    from openswap import bundle
+
+    prefix = Path(tempfile.gettempdir()) / "openswap-tests-no-homebrew"
+    monkeypatch.setattr(bundle, "BREW_PREFIXES", (prefix,))
+    monkeypatch.setattr(bundle, "CASKROOMS", (prefix / "Caskroom" / "openswap",))
+    monkeypatch.setattr(bundle, "BREW_BINARIES", (prefix / "bin" / "openswap",))
+
+
+@pytest.fixture
+def frozen_app(tmp_path: Path, monkeypatch) -> Path:
+    """Pretend this process is the frozen ``OpenSwap.app`` (plan 008).
+
+    Lays out a fake bundle under ``tmp_path`` (executable, reload helper,
+    widget appex) and points ``sys.frozen`` / ``sys.executable`` at it.
+    Returns the resolved ``.app`` path, which is what ``openswap.bundle``
+    reports.
+    """
+    app = tmp_path / "OpenSwap.app"
+    macos = app / "Contents" / "MacOS"
+    macos.mkdir(parents=True)
+    (macos / "OpenSwap").write_bytes(b"")
+    (macos / "openswap-widget-reload").write_bytes(b"")
+    (app / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex").mkdir(parents=True)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(macos / "OpenSwap"))
+    return app.resolve()
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items):
     """Pin every real-Keychain test to ONE xdist worker.

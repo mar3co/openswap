@@ -1,4 +1,8 @@
-"""Upgrade this git checkout. OpenSwap is not on PyPI."""
+"""Upgrade OpenSwap. It is not on PyPI.
+
+The cask's app is upgraded by Homebrew, so the frozen app only says how. A uv
+install upgrades its git checkout in place.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +17,8 @@ from urllib.request import url2pathname
 INSTALL_COMMAND = (
     "curl -fsSL https://raw.githubusercontent.com/mar3co/openswap/main/install.sh | bash"
 )
+BREW_UPGRADE_COMMAND = "brew upgrade --cask openswap"
+RELEASES_URL = "https://github.com/mar3co/openswap/releases/latest"
 
 
 def _looks_like_openswap_checkout(root: Path) -> bool:
@@ -148,10 +154,22 @@ def restart_widget_agent() -> str | None:
 
     Returns launchctl's failure detail, or None when it restarted or there is
     no widget host to restart.
+
+    The frozen app has no host of its own, and its bundle path must never be
+    written into the host's LaunchAgent (that would start a second extra), so
+    it only reports a uv install's host that is still there for the
+    migration to retire.
     """
+    from openswap import bundle
     from openswap import launch_agent
     from openswap import widget_install
     from openswap.exceptions import ClaudeSwitchError
+
+    if bundle.is_frozen():
+        old = widget_install.legacy_host()
+        if old is None:
+            return None
+        return f"the old widget host is still installed at {old}"
 
     # Rewrite the old job instead of restarting it: its legacy label and plist
     # should disappear as part of the upgrade.
@@ -178,9 +196,26 @@ def restart_widget_agent() -> str | None:
 
 
 def run_self_upgrade() -> int:
-    """git pull this checkout, reinstall the editable tool, refresh agents."""
+    """git pull this checkout, reinstall the editable tool, refresh agents.
+
+    The frozen app runs none of that: it names the Homebrew command (or the
+    release page for a copy Homebrew did not install) and returns.
+    """
+    from openswap import bundle
     from openswap.exceptions import ClaudeSwitchError
     from openswap.printer import error
+
+    if bundle.is_frozen():
+        if bundle.installed_by_homebrew():
+            print(f"OpenSwap was installed with Homebrew. Upgrade with: {BREW_UPGRADE_COMMAND}")
+        else:
+            print(f"Download the latest OpenSwap from {RELEASES_URL}")
+        return 0
+    try:
+        bundle.refuse_uv_beside_cask("upgrade itself")
+    except ClaudeSwitchError as exc:
+        error(str(exc))
+        return 1
 
     root = _checkout_root()
     if root is None:
