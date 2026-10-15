@@ -159,7 +159,13 @@ def _remove_worker(home: Path, uid: int | None, force: bool) -> bool:
         return False
     # disable_worker stops a running task first and turns Remote tasks off, so
     # a reinstall does not find the worker enabled with no LaunchAgent.
-    stopped, _, diagnostic = disable_worker(paths.get_backup_root())
+    try:
+        stopped, _, diagnostic = disable_worker(paths.get_backup_root())
+    except Exception as e:
+        # A failed migration or lifecycle lock: the same as not stopping.
+        if not force:
+            raise
+        stopped, diagnostic = False, str(e)
     if stopped:
         return True
     if not force:

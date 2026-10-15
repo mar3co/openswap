@@ -83,6 +83,8 @@ def mac(tmp_path, monkeypatch):
 
     def fake_disable(backup_root):
         seen["disable"].append(backup_root)
+        if state["disable_ok"] == "raise":
+            raise ClaudeSwitchError("lifecycle lock unavailable")
         if state["disable_ok"]:
             (agents / "com.opensoft.openswap.worker.plist").unlink(missing_ok=True)
             return True, {}, None
@@ -190,6 +192,25 @@ class TestRemoveIntegrations:
         removal = uninstall.remove_integrations(home=home, uid=501, force=True)
         assert removal.removed == ["Remote tasks worker"] and removal.failed == []
         assert seen["worker"] == ["uninstall"]
+
+    def test_force_boots_out_a_worker_whose_disable_raises(self, mac, frozen_app):
+        """The app is about to go; a plist on it must not survive."""
+        home, agents, seen, state = mac
+        exe = str(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+        _plist(agents / "com.opensoft.openswap.worker.plist", [exe, "worker", "run"])
+        state["disable_ok"] = "raise"
+        removal = uninstall.remove_integrations(home=home, uid=501, force=True)
+        assert removal.removed == ["Remote tasks worker"] and removal.failed == []
+        assert seen["worker"] == ["uninstall"]
+
+    def test_disable_that_raises_is_a_failure_without_force(self, mac, frozen_app):
+        home, agents, seen, state = mac
+        exe = str(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+        _plist(agents / "com.opensoft.openswap.worker.plist", [exe, "worker", "run"])
+        state["disable_ok"] = "raise"
+        removal = uninstall.remove_integrations(home=home, uid=501)
+        assert removal.failed == ["Remote tasks worker: lifecycle lock unavailable"]
+        assert seen["worker"] == []
 
     def test_status_line_on_this_app_is_restored(self, mac, frozen_app, monkeypatch):
         home, _, _, state = mac
@@ -438,9 +459,9 @@ class TestUninstallCommand:
 
     def test_cask_install_hands_off_to_brew(self, harness, monkeypatch, capsys):
         seen, state = harness
-        state["brew"] = Path("/opt/homebrew/bin/brew")
+        state["brew"] = brew = Path("/opt/homebrew/bin/brew")
         assert self._run(monkeypatch) == 0
-        assert seen["exec"] == ["/opt/homebrew/bin/brew", "uninstall", "--cask", "openswap"]
+        assert seen["exec"] == [str(brew), "uninstall", "--cask", "openswap"]
         assert seen["remove"] == [False] and seen["logins"] == 0
         out = capsys.readouterr().out
         assert "Removed the menu bar login item." in out
@@ -448,9 +469,9 @@ class TestUninstallCommand:
 
     def test_zap_with_brew(self, harness, monkeypatch):
         seen, state = harness
-        state["brew"] = Path("/opt/homebrew/bin/brew")
+        state["brew"] = brew = Path("/opt/homebrew/bin/brew")
         assert self._run(monkeypatch, "--zap", "--yes") == 0
-        assert seen["exec"] == ["/opt/homebrew/bin/brew", "uninstall", "--cask", "--zap", "openswap"]
+        assert seen["exec"] == [str(brew), "uninstall", "--cask", "--zap", "openswap"]
         assert seen["logins"] == 1 and seen["data"] == [True]
 
     def test_zap_refuses_while_a_session_is_live(self, harness, monkeypatch, capsys):
