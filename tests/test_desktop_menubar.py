@@ -74,6 +74,7 @@ def app(monkeypatch, tmp_path):
         "_request_chatgpt_capability", "_chatgpt_capability_worker",
         "_on_chatgpt_view_active", "_begin_desktop_transaction",
         "_chatgpt_desktop_status", "_reload_main_panel_if_shown",
+        "_toggle_codex_auto",
     }
     thread = Mock()
     record = Mock()
@@ -102,7 +103,10 @@ def app(monkeypatch, tmp_path):
         "settings_path": settings_path,
         "SETTINGS_SECTION_AUTOMATION": "automation",
         "MAIN_PAGE": "main",
+        "chatgpt_suggestions_effective": menubar.chatgpt_suggestions_effective,
+        "load_settings": lambda _dir: SimpleNamespace(codex_enabled=instance_codex_enabled[0]),
     }
+    instance_codex_enabled = [False]
     instance = extract_class(menubar.__file__, "MenuBarApp", wanted, namespace)()
     instance.codex = Mock()
     instance.switcher = Mock()
@@ -131,9 +135,11 @@ def app(monkeypatch, tmp_path):
     instance._desktop_app = Mock(name="shared_desktop_app")
     instance._desktop_app_lock = threading.Lock()
     instance._hold_reload_pending = False
-    for name in ("_show_error", "_stop_codex_engine", "_stop_chatgpt_auto_monitor",
-                 "_start_chatgpt_auto_monitor", "rebuild_menu", "refresh_async", "_animate_swap"):
+    for name in ("_show_error", "_stop_codex_engine", "_ensure_codex_engine",
+                 "_stop_chatgpt_auto_monitor", "_start_chatgpt_auto_monitor",
+                 "rebuild_menu", "refresh_async", "_animate_swap"):
         setattr(instance, name, Mock())
+    instance._test_stored_codex_enabled = instance_codex_enabled
     instance._alert = Mock(return_value=1)
     instance._codex_enabled = Mock(return_value=False)
     instance._test_thread = thread
@@ -372,6 +378,48 @@ def test_real_run_wires_submenu_and_completion_timer(tmp_path, monkeypatch):
     live_app.on_sync_tick(None)
     live_app._show_error.assert_called_once_with("synthetic failure")
     assert not live_app._desktop_switching
+
+
+def test_codex_tab_refuses_an_expired_login_before_switching(app):
+    app.settings.chatgpt_switching_enabled = False
+    app.settings.save(app._test_settings_path)
+    app._slot_needs_relogin.return_value = True
+    app._on_panel_account_click(f"{CODEX_NUM_PREFIX}2")
+    app._on_account_click.assert_not_called()
+    app.codex.switch_to.assert_not_called()
+    message = app._show_error.call_args.args[0]
+    assert message.startswith("This Codex OAuth session expired")
+
+
+def test_chatgpt_mode_with_stored_off_offers_settings_not_a_cli_switch(app):
+    # In-memory on (the tab renders ChatGPT mode), but the stored file says
+    # off: never rewrite the shared login under a running ChatGPT.
+    menubar.MenuBarSettings(chatgpt_switching_enabled=False).save(app._test_settings_path)
+    app._on_panel_account_click(f"{CODEX_NUM_PREFIX}2")
+    app._on_account_click.assert_not_called()
+    app._test_thread.assert_not_called()
+    assert app._alert.call_args.kwargs["ok"] == "Enable in Settings"
+    app._panel._show_settings.assert_called()
+
+
+def test_toggle_codex_auto_flips_the_stored_flag_and_the_engine(app):
+    app._test_stored_codex_enabled[0] = False
+    app._reload_main_panel_if_shown = Mock()
+    assert app._toggle_codex_auto() is True
+    assert app._test_setting.call_args.args[1:] == ("autoswitch.codexEnabled", "true")
+    app._ensure_codex_engine.assert_called_once()
+    app._reload_main_panel_if_shown.assert_called()
+    app._test_stored_codex_enabled[0] = True
+    assert app._toggle_codex_auto() is True
+    assert app._test_setting.call_args.args[1:] == ("autoswitch.codexEnabled", "false")
+    app._stop_codex_engine.assert_called_once()
+    # Live rotation cannot start while ChatGPT suggestions are effective.
+    app._test_setting.reset_mock()
+    app._codex_enabled.return_value = False
+    app.settings.chatgpt_auto_enabled = True
+    assert app._toggle_codex_auto() is False
+    app._test_setting.assert_not_called()
+    assert "suggestions" in app._show_error.call_args.args[0].lower() or "Auto-switch" in app._show_error.call_args.args[0]
 
 
 def test_parent_off_turns_the_tab_into_a_codex_cli_switcher(app):
