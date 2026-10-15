@@ -117,7 +117,7 @@ _SUBCOMMAND_FLAGS = {
 # on a mistype (`openswap acount`) or a worker verb typed without `worker`
 # (`openswap account`, `openswap pair`).
 _KNOWN_VERBS = frozenset({
-    *_SUBCOMMAND_FLAGS, "switch", "auto", "codex", "widget", "statusline", "setup", "config",
+    *_SUBCOMMAND_FLAGS, "switch", "auto", "codex", "widget", "statusline", "setup", "uninstall", "config",
     "unclaimed", "alias", "swap", "move", "worker", "tui", "watch", "run", "map", "unmap",
 })
 # The worker verbs an owner is likely to type at the top level.
@@ -1284,26 +1284,149 @@ def _setup_command(argv: list[str]) -> int:
         return 130
 
     if pid:
-        print(f"Menu bar extra running (pid {pid}). Look for openswap in the menu bar.")
+        print("OpenSwap is running in your menu bar and starts at login.")
     else:
-        warning("Menu bar extra was installed but is not running yet.")
-    print(dimmed(f"  log: {result['stderr_log']}"))
+        warning("OpenSwap will start at login, but it is not running yet.")
+        print(dimmed(f"  log: {result['stderr_log']}"))
     for note in migration_notes:
         warning(note)
+    next_steps = []
+    if not_saved is None:
+        next_steps.append("Add another account: log into it in Claude Code, then run openswap add")
     if widget_detail:
         warning(f"Widget host did not restart: {widget_detail}")
         print(dimmed("Run: openswap widget --install"))
     elif bundle.is_frozen():
-        print(dimmed("Desktop widget: openswap widget --install"))
+        next_steps.append("Add the desktop widget: openswap widget --install")
     else:
-        print(dimmed("Desktop widget (needs Xcode): openswap widget --install"))
+        next_steps.append("Add the desktop widget (needs Xcode): openswap widget --install")
+    if next_steps:
+        print()
+        print(dimmed("Next:"))
+        for step in next_steps:
+            print(dimmed(f"  {step}"))
     if not_saved is None:
-        print(dimmed("Log into another Claude account, then run: openswap add"))
         return 0
     reason, hint, code = not_saved
     warning(f"Claude account not saved: {reason}")
     print(dimmed(hint))
     return code
+
+
+def _uninstall_command(argv: list[str]) -> int:
+    """Handle ``openswap uninstall [--zap] [--yes]``.
+
+    Removes the login item, the Remote tasks worker, the Claude Code status
+    line and the widget, then the app: through ``brew uninstall`` when
+    Homebrew installed it (which runs the cask's hook, finding nothing left).
+    ``--zap`` also deletes saved accounts, settings and logs.
+
+    ``--homebrew-hook`` is the cask's ``uninstall script``. Homebrew runs it
+    on upgrade and reinstall too, so it removes nothing unless the brew
+    command that started it is an uninstall, and it always exits 0.
+    """
+    parser = argparse.ArgumentParser(
+        prog="openswap uninstall",
+        description=(
+            "Remove OpenSwap from this Mac: the menu bar login item, the Remote "
+            "tasks worker, the Claude Code status line, the widget, and the app. "
+            "Your saved accounts stay unless you pass --zap."
+        ),
+    )
+    parser.add_argument(
+        "--zap",
+        action="store_true",
+        help="also delete saved accounts, settings and logs",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="do not ask before deleting (with --zap)",
+    )
+    parser.add_argument("--homebrew-hook", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    from openswap import bundle, uninstall
+
+    if args.homebrew_hook:
+        return _homebrew_uninstall_hook()
+
+    try:
+        bundle.refuse_uv_beside_cask("uninstall OpenSwap")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        return 1
+    brew = uninstall.homebrew_brew()
+    if args.zap and not args.yes:
+        if not sys.stdin.isatty():
+            error("Error: --zap deletes your saved accounts. Pass --yes to confirm.")
+            return 2
+        warning("--zap also deletes your saved accounts, settings and logs. This cannot be undone.")
+        try:
+            answer = input("Delete them? [y/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() != "y":
+            print(dimmed("Cancelled"))
+            return 1
+
+    removal = uninstall.remove_integrations()
+    for name in removal.removed:
+        print(f"Removed the {name}.")
+    if removal.failed:
+        for failure in removal.failed:
+            error(f"Could not remove the {failure}")
+        error("OpenSwap is still installed. Fix that, then run: openswap uninstall")
+        return 1
+
+    if args.zap:
+        try:
+            deleted = uninstall.delete_saved_logins()
+            # Homebrew's zap deletes the files; anything else deletes them here.
+            removed_files = [] if brew else uninstall.delete_data()
+        except ClaudeSwitchError as e:
+            error(f"Error: {e}")
+            return 1
+        if deleted:
+            print(f"Deleted {deleted} saved login{'s' if deleted != 1 else ''} from the Keychain.")
+        for path in removed_files:
+            print(f"Deleted {path}")
+
+    if brew is not None:
+        command = [str(brew), "uninstall", "--cask", *(["--zap"] if args.zap else []), "openswap"]
+        print(f"Removing the app: brew {' '.join(command[1:])}")
+        sys.stdout.flush()
+        os.execv(command[0], command)
+    app = bundle.app_path()
+    if app is not None:
+        print(f"To finish, move {app} to the Trash.")
+    else:
+        print("To finish, run: uv tool uninstall openswap")
+    return 0
+
+
+def _homebrew_uninstall_hook() -> int:
+    from openswap import uninstall
+
+    found = uninstall.homebrew_command()
+    if found is None or found[0] not in uninstall.UNINSTALL_COMMANDS:
+        # An upgrade or reinstall: the login item stays, and the cask's
+        # postflight restarts the extra on the new app.
+        return 0
+    removal = uninstall.remove_integrations(force=True)
+    for name in removal.removed:
+        print(f"Removed OpenSwap's {name}.")
+    for failure in removal.failed:
+        print(f"Could not remove OpenSwap's {failure}", file=sys.stderr)
+    if "--zap" in found[1]:
+        try:
+            deleted = uninstall.delete_saved_logins()
+        except ClaudeSwitchError as e:
+            print(str(e), file=sys.stderr)
+        else:
+            if deleted:
+                print(f"Deleted {deleted} saved OpenSwap login{'s' if deleted != 1 else ''} from the Keychain.")
+    return 0
 
 
 def _statusline_command(argv: list[str]) -> int:
@@ -1497,6 +1620,10 @@ def main() -> None:
         from openswap.worker.cli import main as worker_main
 
         sys.exit(worker_main(sys.argv[2:]))
+    # Also before migration: the cask's uninstall hook runs this on every
+    # brew upgrade and must not touch state on the way through.
+    if len(sys.argv) > 1 and sys.argv[1] == "uninstall":
+        sys.exit(_uninstall_command(sys.argv[2:]))
     _migrate_legacy_cswap_state()
     _use_native_tls()
     argv = sys.argv[1:]
@@ -1611,6 +1738,7 @@ Other:
   %(prog)s config [set KEY VALUE]     show or change shared policy (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s purge                      remove all openswap data
+  %(prog)s uninstall [--zap]          remove OpenSwap from this Mac (--zap: and its data)
   %(prog)s help                       show this help""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Flags combine with subcommands:

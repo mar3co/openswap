@@ -378,6 +378,18 @@ def paint_command() -> str:
     return PAINT_COMMAND
 
 
+def installed_command(config_home: Path) -> str | None:
+    """The status-line command when it is OpenSwap's (current or legacy)."""
+    settings_file = config_home / "settings.json"
+    if not settings_file.exists():
+        return None
+    block = _read_json(settings_file).get("statusLine")
+    current = block.get("command") if isinstance(block, dict) else None
+    if not isinstance(current, str):
+        return None
+    return current if is_our_command(current) or _is_legacy_command(current) else None
+
+
 def hook_program(config_home: Path) -> str | None:
     """The openswap path the installed status-line hook names, if any.
 

@@ -1838,9 +1838,9 @@ class TestSetupCommand:
         assert self._run() == 0
         assert seen == {"add": 1, "install": 1, "widget": 1}
         out = capsys.readouterr().out
-        assert "Menu bar extra running (pid 4242)" in out
-        assert "/tmp/e.log" in out
-        assert "Log into another Claude account, then run: openswap add" in out
+        assert "OpenSwap is running in your menu bar and starts at login." in out
+        assert "pid" not in out and "/tmp/e.log" not in out  # only when it did not start
+        assert "Add another account: log into it in Claude Code, then run openswap add" in out
 
     def test_not_logged_in_still_installs_service_and_says_so_last(self, monkeypatch, capsys):
         from openswap.exceptions import NotLoggedInError
@@ -1853,8 +1853,8 @@ class TestSetupCommand:
         assert self._run() == 0
         assert seen == {"add": 1, "install": 1, "widget": 1}
         out = capsys.readouterr().out
-        assert "Menu bar extra running (pid 4242)" in out
-        assert "another Claude account" not in out
+        assert "OpenSwap is running in your menu bar" in out
+        assert "Add another account" not in out
         tail = out.strip().splitlines()[-2:]
         assert "No active Claude account" in tail[0]
         assert "Log into Claude Code, then run: openswap add" in tail[1]
@@ -1879,7 +1879,7 @@ class TestSetupCommand:
         assert self._run() == 1
         assert seen == {"add": 1, "install": 1, "widget": 1}
         out = capsys.readouterr().out
-        assert "Menu bar extra running (pid 4242)" in out
+        assert "OpenSwap is running in your menu bar" in out
         assert "Log into Claude Code" not in out
         tail = out.strip().splitlines()[-2:]
         assert message in tail[0]
@@ -1906,7 +1906,7 @@ class TestSetupCommand:
         assert seen["widget"] == 1
         out = capsys.readouterr().out
         assert "run uv tool uninstall openswap" in out
-        assert out.index("Menu bar extra running") < out.index("uv tool uninstall")
+        assert out.index("OpenSwap is running") < out.index("uv tool uninstall")
 
     def test_uv_setup_beside_the_cask_refuses_before_touching_anything(
         self, monkeypatch, capsys, tmp_path
@@ -1928,14 +1928,14 @@ class TestSetupCommand:
         monkeypatch.setattr("openswap.bundle.migrate_from_uv_install", lambda **k: [])
         assert self._run() == 0
         out = capsys.readouterr().out
-        assert "Desktop widget: openswap widget --install" in out
+        assert "Add the desktop widget: openswap widget --install" in out
         assert "Xcode" not in out
 
     def test_extra_that_did_not_come_up_is_not_called_running(self, monkeypatch, capsys):
         self._harness(monkeypatch, ["openswap", "setup"], pid=None)
         assert self._run() == 0
         out = capsys.readouterr().out
-        assert "Menu bar extra running" not in out
+        assert "OpenSwap is running" not in out
         assert "not running yet" in out
         assert "/tmp/e.log" in out
 
@@ -1971,7 +1971,7 @@ class TestSetupCommand:
         self._harness(monkeypatch, ["openswap", "setup"], widget_detail="kickstart exit 113")
         assert self._run() == 0
         out = capsys.readouterr().out
-        assert "Menu bar extra running (pid 4242)" in out
+        assert "OpenSwap is running in your menu bar" in out
         assert "kickstart exit 113" in out
         assert out.count("openswap widget --install") == 1
 
