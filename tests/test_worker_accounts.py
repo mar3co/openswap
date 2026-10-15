@@ -606,15 +606,15 @@ def test_status_json_is_unchanged_when_paired_but_off(root, monkeypatch, capsys)
 # --- menu bar: paired, worker off ------------------------------------------------------
 
 
-def _general_rows(**kwargs):
+def _remote_rows(**kwargs):
     return menubar.settings_page_rows(
         menubar.MenuBarSettings(), strategy="best", threshold=90,
-        section=menubar.SETTINGS_SECTION_GENERAL, **kwargs,
+        section=menubar.SETTINGS_SECTION_REMOTE, **kwargs,
     )
 
 
 def test_menu_says_paired_worker_off_right_under_the_enable_switch():
-    rows = _general_rows(worker_paired=True, worker_enabled=False)
+    rows = _remote_rows(worker_paired=True, worker_enabled=False)
     ids = [row["id"] for row in rows]
     assert ids.index("remote_tasks_paired_off") == ids.index("remote_tasks_enabled") + 1
     hint = rows[ids.index("remote_tasks_paired_off")]
@@ -630,7 +630,7 @@ def test_menu_says_paired_worker_off_right_under_the_enable_switch():
      "worker_status": {"operation": "worker_enable_or_disable"}},
 ])
 def test_menu_has_no_paired_off_line_otherwise(kwargs):
-    assert "remote_tasks_paired_off" not in [row["id"] for row in _general_rows(**kwargs)]
+    assert "remote_tasks_paired_off" not in [row["id"] for row in _remote_rows(**kwargs)]
 
 
 # --- menu bar account picker ---------------------------------------------------------
@@ -645,7 +645,7 @@ def test_menu_account_row_marks_pin_and_offers_claude(root):
     rows = menubar.settings_page_rows(
         menubar.MenuBarSettings(), strategy="best", threshold=90,
         worker_status={"account_picker": _picker(root)},
-        section=menubar.SETTINGS_SECTION_GENERAL,
+        section=menubar.SETTINGS_SECTION_REMOTE,
     )
     ids = [row["id"] for row in rows]
     assert ids.index("remote_tasks_enabled") < ids.index("remote_tasks_account") < ids.index("remote_tasks_status")
@@ -680,7 +680,7 @@ def menubar_display_row(picker):
     rows = menubar.settings_page_rows(
         menubar.MenuBarSettings(), strategy="best", threshold=90,
         worker_status={} if picker is None else {"account_picker": picker},
-        section=menubar.SETTINGS_SECTION_GENERAL,
+        section=menubar.SETTINGS_SECTION_REMOTE,
     )
     return next(row for row in rows if row["id"] == "remote_tasks_account")
 

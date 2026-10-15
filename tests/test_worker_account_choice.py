@@ -308,7 +308,7 @@ def _web_choice_row(root):
     rows = menubar.settings_page_rows(
         menubar.MenuBarSettings(), strategy="best", threshold=90,
         worker_status={"account_picker": cli.worker_account_choices(root).to_dict()},
-        section=menubar.SETTINGS_SECTION_GENERAL,
+        section=menubar.SETTINGS_SECTION_REMOTE,
     )
     ids = [row["id"] for row in rows]
     assert ids.index("remote_tasks_account") + 1 == ids.index("remote_tasks_web_choice")
@@ -338,7 +338,7 @@ def test_menu_web_choice_row_marks_allowed_and_default(root):
 def test_menu_web_choice_row_placeholder_and_removed_account(root):
     rows = menubar.settings_page_rows(
         menubar.MenuBarSettings(), strategy="best", threshold=90, worker_status={},
-        section=menubar.SETTINGS_SECTION_GENERAL,
+        section=menubar.SETTINGS_SECTION_REMOTE,
     )
     loading = next(row for row in rows if row["id"] == "remote_tasks_web_choice")
     assert loading["disabled"] is True

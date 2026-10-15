@@ -254,6 +254,7 @@ def test_settings_page_constants():
     assert menubar.SETTINGS_SECTIONS == (
         ("general", "General"),
         ("automation", "Automation"),
+        ("remote", "Remote"),
     )
 
 
@@ -276,11 +277,27 @@ def test_settings_page_sections_separate_display_from_provider_automation():
         has_codex=True,
         section=menubar.SETTINGS_SECTION_AUTOMATION,
     )
+    remote = menubar.settings_page_rows(
+        settings,
+        strategy="best",
+        threshold=90,
+        has_codex=True,
+        worker_paired=True,
+        section=menubar.SETTINGS_SECTION_REMOTE,
+    )
 
     general_ids = {row["id"] for row in general}
     automation_by_id = {row["id"]: row for row in automation}
+    remote_ids = {row["id"] for row in remote}
     assert "show_account_name" in general_ids
     assert "auto_switch_enabled" not in general_ids
+    assert not any(row_id.startswith("remote_tasks") for row_id in general_ids)
+    assert "group_remote_tasks" not in general_ids
+    assert remote_ids == {
+        "group_remote_tasks", "remote_tasks_setup", "remote_tasks_enabled",
+        "remote_tasks_paired_off", "remote_tasks_account", "remote_tasks_web_choice",
+        "remote_tasks_status", "remote_tasks_paused", "remote_tasks_stop",
+    }
     assert automation_by_id["auto_switch_enabled"]["label"] == (
         "Auto-switch Claude accounts"
     )
@@ -302,6 +319,7 @@ def test_settings_page_sections_separate_display_from_provider_automation():
         row["section"] == menubar.SETTINGS_SECTION_AUTOMATION
         for row in automation
     )
+    assert all(row["section"] == menubar.SETTINGS_SECTION_REMOTE for row in remote)
 
 
 def test_remote_tasks_settings_are_opt_in_redacted_and_stop_targets_job_id():
@@ -321,7 +339,7 @@ def test_remote_tasks_settings_are_opt_in_redacted_and_stop_targets_job_id():
             },
             "queue_depth": 1,
         },
-        section=menubar.SETTINGS_SECTION_GENERAL,
+        section=menubar.SETTINGS_SECTION_REMOTE,
     )
     by_id = {row["id"]: row for row in rows}
 
@@ -338,7 +356,7 @@ def test_remote_tasks_settings_are_opt_in_redacted_and_stop_targets_job_id():
         menubar.MenuBarSettings(),
         strategy="best",
         threshold=90,
-        section=menubar.SETTINGS_SECTION_GENERAL,
+        section=menubar.SETTINGS_SECTION_REMOTE,
     )
     off = {row["id"]: row for row in off_rows}
     assert off["remote_tasks_enabled"]["value"] is False
@@ -355,7 +373,7 @@ def test_remote_tasks_settings_are_opt_in_redacted_and_stop_targets_job_id():
             "provider": {"available": True, "diagnostic_code": None},
             "active_job": {"job_id": "job-local-8", "state": "succeeded"},
         },
-        section=menubar.SETTINGS_SECTION_GENERAL,
+        section=menubar.SETTINGS_SECTION_REMOTE,
     )
     available = {row["id"]: row for row in available_rows}
     assert "provider available" in available["remote_tasks_status"]["value"]
