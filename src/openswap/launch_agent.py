@@ -8,13 +8,18 @@ restarts it if it crashes, and needs no ``.app`` bundle.
 Two decisions here are worth stating, because both differ from the obvious
 approach:
 
-*The plist pins the console script, not ``sys.executable``.* A LaunchAgent
-outlives upgrades, and the two paths age differently: ``uv tool upgrade`` (and
-``openswap upgrade``) rebuilds the tool's virtualenv — ``sys.executable`` points
-inside that virtualenv and can be replaced — while the console script keeps its
-path across upgrades. Pinning the script means an upgraded openswap needs a
-``launchctl kickstart``, not a reinstalled service. ``sys.executable -m
-openswap`` stays as the fallback for installs that expose no console script.
+*The plist pins a path that survives upgrades, not ``sys.executable``.* A
+LaunchAgent outlives upgrades. In the cask's ``OpenSwap.app`` that path is
+the bundle's own ``Contents/MacOS/OpenSwap``, not the ``openswap`` symlink
+Homebrew puts on PATH: ``brew upgrade`` replaces the app at the same path, and
+launchd starting the bundle binary keeps the LaunchServices identity the
+notification guard expects. In a uv install it is the console script:
+``uv tool upgrade`` (and ``openswap upgrade``) rebuilds the tool's virtualenv —
+``sys.executable`` points inside that virtualenv and can be replaced — while
+the console script keeps its path across upgrades. Either way an upgraded
+openswap needs a ``launchctl kickstart``, not a reinstalled service.
+``sys.executable -m openswap`` stays as the fallback for installs that expose
+no console script.
 
 *Logs go to ``~/Library/Logs``, not ``/tmp``.* ``/tmp`` is world-writable and
 periodically purged, so a crash log can vanish before anyone reads it, and a
@@ -34,6 +39,7 @@ import sys
 import time
 from pathlib import Path
 
+from openswap import bundle
 from openswap.exceptions import ClaudeSwitchError
 
 LABEL = "com.opensoft.openswap.menubar"
@@ -84,9 +90,10 @@ def domain_target(uid: int | None = None) -> str:
 def resolve_program() -> list[str]:
     """Argv prefix that launchd should run, minus the subcommand.
 
-    Prefers the installed console script (stable across upgrades, see the
-    module docstring) and falls back to running the package through the
-    interpreter that is executing right now.
+    The frozen app pins its own in-bundle executable. Otherwise this prefers
+    the installed console script (stable across upgrades, see the module
+    docstring) and falls back to running the package through the interpreter
+    that is executing right now.
 
     The path is made absolute but deliberately NOT resolved: a `uv tool
     install` puts a symlink at ``~/.local/bin/openswap`` pointing into the tool's
@@ -94,6 +101,10 @@ def resolve_program() -> list[str]:
     into the plist — the very path this module avoids pinning, since a
     reinstall recreates the virtualenv while the symlink keeps its name.
     """
+    exe = bundle.executable()
+    if exe is not None and exe.is_file():
+        return [str(exe)]
+
     names = ("openswap",)
     candidate = sys.argv[0] if sys.argv and sys.argv[0] else None
     if candidate is not None:

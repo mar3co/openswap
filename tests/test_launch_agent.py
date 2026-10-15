@@ -164,6 +164,30 @@ def test_resolve_program_ignores_an_argv0_that_is_not_openswap(tmp_path):
             assert launch_agent.resolve_program() == [str(found)]
 
 
+def test_resolve_program_pins_the_in_bundle_executable_when_frozen(frozen_app, tmp_path):
+    """From a terminal argv[0] is the cask's symlink; the plist must not keep it.
+
+    The bundle path is stable across `brew upgrade`, and launchd starting the
+    bundle binary keeps the app's LaunchServices identity.
+    """
+    link = tmp_path / "bin" / "openswap"
+    link.parent.mkdir()
+    link.symlink_to(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+    with patch.object(launch_agent.sys, "argv", [str(link)]):
+        with patch.object(launch_agent.shutil, "which", return_value=str(link)):
+            assert launch_agent.resolve_program() == [
+                str(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+            ]
+
+
+def test_build_plist_runs_the_bundle_when_frozen(frozen_app, tmp_path):
+    parsed = plistlib.loads(launch_agent.build_plist(home=tmp_path))
+    assert parsed["ProgramArguments"] == [
+        str(frozen_app / "Contents" / "MacOS" / "OpenSwap"),
+        "menubar",
+    ]
+
+
 # --- install ---------------------------------------------------------------
 
 
