@@ -1854,7 +1854,7 @@ class TestSetupCommand:
         assert message in tail[0]
         assert "openswap add" in tail[1]
 
-    def test_setup_runs_the_uv_migration_after_installing_the_extra(self, monkeypatch, capsys):
+    def test_setup_runs_the_uv_migration_before_installing_the_extra(self, monkeypatch, capsys):
         order: list[str] = []
         seen = self._harness(monkeypatch, ["openswap", "setup"])
         from openswap import launch_agent
@@ -1869,7 +1869,9 @@ class TestSetupCommand:
 
         monkeypatch.setattr("openswap.bundle.migrate_from_uv_install", fake_migrate)
         assert self._run() == 0
-        assert order == ["install", "migrate"]
+        # Migrating after the install would race the new extra's own
+        # start-up migration.
+        assert order == ["migrate", "install"]
         assert seen["widget"] == 1
         out = capsys.readouterr().out
         assert "run uv tool uninstall openswap" in out

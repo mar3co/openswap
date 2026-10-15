@@ -1223,9 +1223,10 @@ def _setup_command(argv: list[str]) -> int:
     is the wrong advice for it. A failed capture is reported after the extra
     so its hint is the last thing the user reads.
 
-    In the cask's app it also moves a uv install over
-    (``bundle.migrate_from_uv_install``), after the extra is installed so the
-    login item already points at the app.
+    In the cask's app it first moves a uv install over
+    (``bundle.migrate_from_uv_install``): that stops the uv extra and rewrites
+    the login item, and the install below then bootstraps the app. Migrating
+    after the install would race the new extra's own start-up migration.
     """
     parser = argparse.ArgumentParser(
         prog="openswap setup",
@@ -1254,8 +1255,8 @@ def _setup_command(argv: list[str]) -> int:
             # OSError: the backup store itself is unwritable. The extra is
             # still worth installing; the store problem is the user's fix.
             not_saved = (str(e), "When that is fixed, run: openswap add", 1)
-        result = launch_agent.install()
         bundle.migrate_from_uv_install(notify=migration_notes.append)
+        result = launch_agent.install()
         widget_detail = restart_widget_agent()
         pid = _wait_for_pid(launch_agent, result["label"])
     except ClaudeSwitchError as e:

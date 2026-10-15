@@ -10,7 +10,7 @@ LaunchAgent `com.opensoft.openswap.menubar` runs `openswap menubar`. Accessory a
 
 ### Moving from a source install
 
-`openswap setup` and the frozen extra's start-up run `bundle.migrate_from_uv_install` (idempotent; each step logs and continues on failure). It does nothing from a copy that runs from an `/AppTranslocation/` path (a quarantined app opened in place) or under `/Volumes/` (a disk image): those paths vanish.
+`openswap setup` (before it installs the login item, so the app it then bootstraps never races a half-migrated Mac) and the frozen extra's start-up run `bundle.migrate_from_uv_install` (idempotent; each step logs and continues on failure). It does nothing from a copy that runs from an `/AppTranslocation/` path (a quarantined app opened in place) or under `/Volumes/` (a disk image): those paths vanish.
 
 1. The older `com.cswap.menubar` agent is booted out and its plist removed, whenever it is there.
 2. A menu bar plist that runs the uv install (`ProgramArguments[0]` is a console script or interpreter, unreadable, or a copy of the app that no longer exists) is rewritten to the bundle executable. A plist on another copy of the app that still exists (the cask's, while a copy from Downloads or a dev build runs) is left alone. The plist is never re-bootstrapped here: opened from Finder or a terminal, the uv extra is booted out and this extra keeps running; running as that agent (`XPC_SERVICE_NAME` is the label), it leaves itself alone. The next login starts the app.
