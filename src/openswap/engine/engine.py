@@ -286,8 +286,11 @@ class Engine(
             os.chmod(temp_path, 0o600)
         shutil.move(str(temp_path), str(path))
 
-    def purge(self) -> None:
+    def purge(self, assume_yes: bool = False) -> None:
         """Remove all traces of openswap from the system.
+
+        ``assume_yes`` skips the prompt for a caller that already asked
+        (``openswap uninstall --zap``); every refusal below still applies.
 
         This removes:
         - All stored account credentials (``.enc`` files on Linux/WSL/Windows; on
@@ -366,10 +369,11 @@ class Engine(
         print(dimmed("Note: This does NOT affect your current Claude Code login."))
         print()
 
-        confirm = input("Are you sure you want to purge all data? [y/N] ")
-        if confirm.lower() != "y":
-            print(dimmed("Cancelled"))
-            return
+        if not assume_yes:
+            confirm = input("Are you sure you want to purge all data? [y/N] ")
+            if confirm.lower() != "y":
+                print(dimmed("Cancelled"))
+                return
 
         # Confirmation stays outside the locks. Hold the lifecycle lock across
         # status checks and deletion so a concurrent enable/run cannot start a

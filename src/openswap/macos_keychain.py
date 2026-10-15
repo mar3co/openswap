@@ -224,3 +224,37 @@ def delete_password(service: str, account: str) -> None:
         f"security delete-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"
     )
+
+
+# More items than any one service plausibly holds; stops a Keychain that keeps
+# reporting success without deleting from looping forever.
+_DELETE_ALL_LIMIT = 1000
+
+
+def delete_all(service: str) -> int:
+    """Delete every generic-password item of ``service``, whatever its account.
+
+    ``delete-generic-password`` without ``-a`` deletes the first match, so this
+    repeats it until "not found" (rc 44). Returns how many were deleted.
+    Raises :class:`KeychainError` on any other exit, a timeout, or the limit.
+    """
+    for deleted in range(_DELETE_ALL_LIMIT):
+        try:
+            result = subprocess.run(
+                [_SECURITY, "delete-generic-password", "-s", service],
+                capture_output=True,
+                text=True,
+                timeout=_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise KeychainError(
+                f"security delete-generic-password timed out after {_TIMEOUT}s"
+            ) from e
+        if result.returncode == _NOT_FOUND_RC:
+            return deleted
+        if result.returncode != 0:
+            raise KeychainError(
+                f"security delete-generic-password failed (rc={result.returncode}): "
+                f"{result.stderr.strip()}"
+            )
+    raise KeychainError(f"more than {_DELETE_ALL_LIMIT} Keychain items for {service}")

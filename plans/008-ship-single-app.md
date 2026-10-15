@@ -85,6 +85,10 @@ built widget host.
   `brew upgrade`, which would delete the login item. A `postflight_steps`
   step kickstarts `com.opensoft.openswap.menubar` instead; `zap` removes both
   LaunchAgents, `Application Support/OpenSwap`, the appex container, and logs.
+  (Later: an `uninstall script:` runs `OpenSwap uninstall --homebrew-hook`,
+  which reads the brew command from its parent processes and removes the
+  login item, worker and status line only on an uninstall. See
+  docs/menubar.md.)
 
 ## Scope
 

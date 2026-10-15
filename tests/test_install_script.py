@@ -346,8 +346,10 @@ class TestHomebrewPath:
         assert "brew-openswap setup" in calls
         assert "openswap setup" not in calls
         assert not any(c.startswith(("git", "uv", "curl", "xcode-select")) for c in calls)
-        assert "supported" in proc.stdout
-        assert "OPENSWAP_DIR" in proc.stdout
+        assert "Installing OpenSwap (brew install --cask mar3co/openswap/openswap)" in proc.stdout
+        assert "Setting up OpenSwap" in proc.stdout
+        # The checkout path is for developers; the README documents it.
+        assert "OPENSWAP_DIR" not in proc.stdout
         assert not any(c.startswith("brew upgrade") for c in calls)
 
     def test_rerun_with_the_cask_installed_upgrades_it(self, tmp_path):

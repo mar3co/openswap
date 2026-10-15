@@ -96,13 +96,12 @@ retire_old_widget_host() {
 }
 
 install_cask() {
-  say "To install from a git checkout instead, set OPENSWAP_DIR"
   # Re-running the installer updates, like the clone path's pull.
   if brew list --cask openswap >/dev/null 2>&1; then
-    say "Homebrew found and OpenSwap is installed: brew upgrade --cask $CASK"
+    say "Updating OpenSwap (brew upgrade --cask $CASK)"
     brew upgrade --cask "$CASK" || fail "brew upgrade --cask $CASK failed (see above). Fix that, then run this installer again."
   else
-    say "Homebrew found: installing the OpenSwap app with brew install --cask $CASK (the supported install)"
+    say "Installing OpenSwap (brew install --cask $CASK)"
     if [ "$(cask_appdir)" = "$HOME/Applications" ]; then
       retire_old_widget_host
     fi
@@ -113,7 +112,7 @@ install_cask() {
   local prefix
   prefix="$(brew --prefix)" || fail "brew --prefix failed (see above)."
   [ -x "$prefix/bin/openswap" ] || fail "brew reported success but $prefix/bin/openswap is missing."
-  say "Saving your Claude account and starting the menu bar extra"
+  say "Setting up OpenSwap"
   "$prefix/bin/openswap" setup
 }
 
@@ -190,7 +189,7 @@ main() {
       ;;
   esac
 
-  say "Saving your Claude account and starting the menu bar extra"
+  say "Setting up OpenSwap"
   local status=0
   "$bin_dir/openswap" setup || status=$?
 

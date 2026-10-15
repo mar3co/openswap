@@ -78,3 +78,45 @@ def test_release_workflow_builds_both_architectures():
     assert "- arch: arm64" in workflow
     assert "- arch: x86_64" in workflow
     assert "-arm64.zip" in workflow and "-x86_64.zip" in workflow
+
+
+def test_uninstall_runs_the_apps_hook_instead_of_removing_the_login_item():
+    """Homebrew runs the uninstall stanza on upgrade too; `launchctl:` there
+    would drop the login item on every `brew upgrade`."""
+    cask = _render("1.2.3", ARM, INTEL).stdout
+    stanza = cask[cask.index("  uninstall script: {") : cask.index("  zap ")]
+    assert "uninstall --homebrew-hook" in stanza
+    assert '"#{appdir}/OpenSwap.app/Contents/MacOS/OpenSwap"' in stanza
+    # A missing app is nothing to clean up, not a failed `brew uninstall`.
+    assert '[ -x "$0" ] || exit 0' in stanza
+    assert "must_succeed: false" in stanza
+    assert "\n  uninstall launchctl:" not in cask
+
+
+def test_zap_trashes_every_agents_logs_but_leaves_the_shared_worker_label():
+    cask = _render("1.2.3", ARM, INTEL).stdout
+    zap = cask[cask.index("  zap ") : cask.index("  caveats")]
+    for label in ("menubar", "widget", "worker"):
+        assert f'"~/Library/Logs/com.opensoft.openswap.{label}.err"' in zap
+    assert '"com.opensoft.openswap.menubar"' in zap
+    # `launchctl:` removes by label alone; a uv install's worker shares it,
+    # and the hook removes the app's own worker.
+    assert '"com.opensoft.openswap.worker"' not in zap
+    assert '"~/Library/Application Support/OpenSwap"' in zap
+
+
+def test_caveats_are_one_step():
+    cask = _render("1.2.3", ARM, INTEL).stdout
+    caveats = cask[cask.index("  caveats do") :]
+    assert caveats.count(" setup") == 1
+    assert "uninstall" not in caveats and "uv tool" not in caveats
+
+
+def test_caveats_name_the_casks_command_when_another_comes_first_on_path():
+    """uv can put its shim in UV_TOOL_BIN_DIR, XDG_BIN_HOME or UV_INSTALL_DIR,
+    so the caveat walks the user's PATH instead of checking ~/.local/bin."""
+    cask = _render("1.2.3", ARM, INTEL).stdout
+    caveats = cask[cask.index("  caveats do") :]
+    assert 'ENV.fetch("HOMEBREW_PATH"' in caveats
+    assert '"#{HOMEBREW_PREFIX}/bin/openswap"' in caveats
+    assert ".local/bin" not in caveats
