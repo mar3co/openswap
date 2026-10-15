@@ -70,9 +70,20 @@ retire_old_widget_host() {
   bundle_id="$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
   [ "$bundle_id" = "$OLD_WIDGET_HOST_ID" ] || return 0
   say "Moving the old OpenSwap widget host to the Trash so the app can install at $app"
+  # A copy left registered would be a second widget provider beside the app's,
+  # and once it is in the Trash nothing retries, so stop here instead. A failed
+  # remove of a copy pluginkit no longer lists is fine; an unreadable list is not.
+  local appex="$app/Contents/PlugIns/OpenSwapWidgetExtension.appex"
+  if ! pluginkit -r "$appex" >/dev/null 2>&1; then
+    local listed
+    listed="$(pluginkit -m -D -v -i com.opensoft.openswap.widget.extension 2>/dev/null)" \
+      || fail "Could not unregister the old widget at $appex, and pluginkit could not list widgets to check. Run: pluginkit -r \"$appex\", then run this installer again."
+    case "$listed" in
+      *"$appex"*) fail "Could not unregister the old widget at $appex. Run: pluginkit -r \"$appex\", then run this installer again." ;;
+    esac
+  fi
   launchctl bootout "gui/$(id -u)/$OLD_WIDGET_HOST_ID" >/dev/null 2>&1 || true
   rm -f "$HOME/Library/LaunchAgents/$OLD_WIDGET_HOST_ID.plist"
-  pluginkit -r "$app/Contents/PlugIns/OpenSwapWidgetExtension.appex" >/dev/null 2>&1 || true
   local trash="$HOME/.Trash"
   local dest="$trash/OpenSwap.app"
   local n=1

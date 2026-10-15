@@ -75,6 +75,13 @@ grep -A1 "<key>$3</key>" "$2.plist" | sed -n 's:.*<string>\(.*\)</string>.*:\1:p
 RECORD_STUB = r'''#!/bin/sh
 echo "$(basename "$0") $*" >> "$STUB_LOG"
 [ "$(basename "$0")" = launchctl ] && [ -n "${FAIL_LAUNCHCTL:-}" ] && exit 3
+if [ "$(basename "$0")" = pluginkit ]; then
+  [ "$1" = -r ] && [ -n "${FAIL_PLUGINKIT_REMOVE:-}" ] && exit 1
+  if [ "$1" = -m ]; then
+    [ -n "${FAIL_PLUGINKIT_LIST:-}" ] && exit 1
+    printf '%s\n' "${PLUGINKIT_LIST:-}"
+  fi
+fi
 exit 0
 '''
 
@@ -398,6 +405,37 @@ def _host_app(home: Path, bundle_id: str = "com.opensoft.openswap.widget") -> Pa
 
 class TestOldWidgetHostBeforeTheCask:
     """With appdir ~/Applications the old host would block `brew install --cask`."""
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"FAIL_PLUGINKIT_REMOVE": "1", "PLUGINKIT_LIST": "STILL"},
+            {"FAIL_PLUGINKIT_REMOVE": "1", "FAIL_PLUGINKIT_LIST": "1"},
+        ],
+        ids=["still-registered", "registry-unreadable"],
+    )
+    def test_old_host_stays_when_its_widget_will_not_unregister(self, tmp_path, env):
+        """Once it is in the Trash nothing retries, so a registered copy stops the installer."""
+        home = tmp_path / "home"
+        app = _host_app(home)
+        appex = f"{app}/Contents/PlugIns/OpenSwapWidgetExtension.appex"
+        env = {k: (f"+    com.opensoft.openswap.widget.extension(1.0)\t{appex}" if v == "STILL" else v) for k, v in env.items()}
+        proc, calls = run_installer(tmp_path, brew=True, env={"HOMEBREW_CASK_OPTS": "--appdir=~/Applications", **env})
+        assert proc.returncode != 0
+        assert "Could not unregister the old widget" in proc.stderr + proc.stdout
+        assert app.is_dir()
+        assert not any(c.startswith(("brew install", "launchctl bootout")) for c in calls)
+
+    def test_a_failed_remove_of_an_unlisted_widget_still_proceeds(self, tmp_path):
+        home = tmp_path / "home"
+        app = _host_app(home)
+        proc, calls = run_installer(
+            tmp_path, brew=True,
+            env={"HOMEBREW_CASK_OPTS": "--appdir=~/Applications", "FAIL_PLUGINKIT_REMOVE": "1", "PLUGINKIT_LIST": ""},
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert not app.exists()
+        assert "brew install --cask mar3co/openswap/openswap" in calls
 
     @pytest.mark.parametrize(
         "opts",
