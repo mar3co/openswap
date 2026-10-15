@@ -54,7 +54,7 @@ def test_run_reports_exit_code_and_ansi_stripped_output_tail():
     (result,) = results
     assert result.returncode == 0
     assert result.timed_out is False
-    assert result.cancelled is False
+    assert result.canceled is False
     assert result.output_tail == "Opening browser\nLogin successful"
 
 
@@ -86,12 +86,12 @@ def test_run_times_out_and_terminates_the_cli():
     assert result.returncode is None
 
 
-def test_cancel_terminates_and_reports_cancelled_not_failed():
+def test_cancel_terminates_and_reports_canceled_not_failed():
     run, results, done = _run("sleep 30")
     run.cancel()
     assert done.wait(5)
     (result,) = results
-    assert result.cancelled is True
+    assert result.canceled is True
     assert result.timed_out is False
     assert result.returncode is None
 
@@ -117,7 +117,7 @@ SLOT = ("a@x.com", "org-1")
 @pytest.mark.parametrize(
     "result, live, expected",
     [
-        (LoginResult(None, False, True, ""), SLOT, "cancelled"),
+        (LoginResult(None, False, True, ""), SLOT, "canceled"),
         # The dead token can still be Claude Code's active login when the
         # sign-in starts, so a match never excuses a timeout or failure.
         (LoginResult(None, True, False, ""), SLOT, "timed_out"),

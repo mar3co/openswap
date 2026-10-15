@@ -41,14 +41,14 @@ def remove_legacy_login_command(root: Path | None = None) -> None:
 class LoginResult:
     returncode: int | None
     timed_out: bool
-    cancelled: bool
+    canceled: bool
     output_tail: str
 
 
 def new_login_outcome(result: LoginResult, *, live: tuple[str, str] | None) -> str:
-    """cancelled | timed_out | failed | no_login | signed_in, for any account."""
-    if result.cancelled:
-        return "cancelled"
+    """canceled | timed_out | failed | no_login | signed_in, for any account."""
+    if result.canceled:
+        return "canceled"
     if result.timed_out:
         return "timed_out"
     if result.returncode != 0:
@@ -64,7 +64,7 @@ def login_outcome(
     live: tuple[str, str] | None,
     slot: tuple[str, str] | None,
 ) -> str:
-    """cancelled | timed_out | failed | no_login | mismatch | signed_in.
+    """canceled | timed_out | failed | no_login | mismatch | signed_in.
 
     The live login is checked only after a clean exit: a slot whose dead
     token is still Claude Code's active login matches before the sign-in
@@ -97,7 +97,7 @@ class ClaudeLoginRun:
         self._clock = clock
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
-        self._cancelled = False
+        self._canceled = False
 
     def start(self) -> threading.Thread:
         thread = threading.Thread(
@@ -108,7 +108,7 @@ class ClaudeLoginRun:
 
     def cancel(self) -> None:
         with self._lock:
-            self._cancelled = True
+            self._canceled = True
             proc = self._proc
         if proc is not None:
             _terminate(proc)
@@ -129,7 +129,7 @@ class ClaudeLoginRun:
         )
         with self._lock:
             self._proc = proc
-            if self._cancelled:
+            if self._canceled:
                 _terminate(proc)
         tail = _Tail()
         reader = threading.Thread(
@@ -148,9 +148,9 @@ class ClaudeLoginRun:
         if not reader.is_alive() and proc.stdout is not None:
             proc.stdout.close()
         with self._lock:
-            cancelled = self._cancelled
-        returncode = None if timed_out or cancelled else proc.returncode
-        return LoginResult(returncode, timed_out, cancelled, tail.text())
+            canceled = self._canceled
+        returncode = None if timed_out or canceled else proc.returncode
+        return LoginResult(returncode, timed_out, canceled, tail.text())
 
 
 class _Tail:

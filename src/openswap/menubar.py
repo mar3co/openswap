@@ -2529,7 +2529,7 @@ def run(switcher, codex=None) -> int:
         def _drain_claude_login_result(self):
             with self._event_lock:
                 pending, self._claude_login_results = self._claude_login_results, []
-                # A run cancelled by a later click reports too; only the
+                # A run canceled by a later click reports too; only the
                 # current run's result counts.
                 results = [r for run, r in pending if run is self._claude_login]
                 if not results:
@@ -2548,7 +2548,7 @@ def run(switcher, codex=None) -> int:
                 "claude login for %s: %s (returncode=%s timed_out=%s)\n%s",
                 name, outcome, result.returncode, result.timed_out, result.output_tail,
             )
-            if outcome == "cancelled":
+            if outcome == "canceled":
                 return
             if outcome == "timed_out":
                 self._show_error(claude_login_timed_out_message(name))
@@ -2572,7 +2572,7 @@ def run(switcher, codex=None) -> int:
                 "claude login for a new account: %s (returncode=%s timed_out=%s)\n%s",
                 outcome, result.returncode, result.timed_out, result.output_tail,
             )
-            if outcome == "cancelled":
+            if outcome == "canceled":
                 return
             if outcome == "timed_out":
                 self._show_error(claude_add_timed_out_message())

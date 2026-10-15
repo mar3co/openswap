@@ -2826,7 +2826,7 @@ def test_claude_login_copy_names_the_browser_and_the_retry():
     assert "no account signed in" in menubar.claude_login_no_login_message("personal")
 
 
-def test_claude_login_result_is_drained_before_auto_capture_and_cancelled_on_quit():
+def test_claude_login_result_is_drained_before_auto_capture_and_canceled_on_quit():
     text = Path(menubar.__file__).read_text()
     tick = text[text.index("def on_sync_tick") : text.index("def _consume_widget_command")]
     assert tick.index("_drain_claude_login_result()") < tick.index("_maybe_auto_capture_relogin()")
@@ -3737,7 +3737,7 @@ def test_claude_add_drain_alerts_without_saving(result, live, expected):
     assert "Add account" in app.errors[-1]
 
 
-def test_claude_add_drain_is_silent_when_cancelled():
+def test_claude_add_drain_is_silent_when_canceled():
     from openswap.claude_login import LoginResult
 
     app = _claude_add_app()
