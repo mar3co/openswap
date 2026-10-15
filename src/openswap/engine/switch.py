@@ -377,7 +377,7 @@ class SwitchMixin:
             if current_creds is None:
                 raise CredentialReadError("Failed to read credentials for current account")
             if not current_creds:
-                raise CredentialReadError("No credentials found for current account")
+                raise CredentialMissingError("No credentials found for current account")
             self._reject_live_api_key_capture(current_creds)
             current_creds = self._reject_foreign_credential_capture(
                 current_creds, current_email, current_org_uuid,
@@ -519,7 +519,7 @@ class SwitchMixin:
         if current_creds is None:
             raise CredentialReadError("Failed to read credentials for current account")
         if not current_creds:
-            raise CredentialReadError("No credentials found for current account")
+            raise CredentialMissingError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
         current_creds = self._reject_foreign_credential_capture(
             current_creds, current_email, current_org_uuid, current_account_uuid

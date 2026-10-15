@@ -188,7 +188,7 @@ def test_add_refuses_a_foreign_credential_on_refresh_in_place(
 
     Not a corner: the menu bar's "Refresh current credentials"
     (`on_refresh_creds`) and "From current login" (`on_add_login`), and the
-    extra's "Add current login", all call `add_account` with no slot and take
+    extra's "Save current login", all call `add_account` with no slot and take
     this branch. `openswap`'s auto-add does
     NOT -- it fires only when the active account is unmanaged, and this branch
     requires that it IS managed, the same predicate on the same two arguments.

@@ -33,6 +33,9 @@ def test_login_argv():
         "/opt/homebrew/bin/claude", "auth", "login", "--claudeai",
         "--email", "a@x.com",
     ]
+    assert login_argv("/opt/homebrew/bin/claude", None) == [
+        "/opt/homebrew/bin/claude", "auth", "login", "--claudeai",
+    ]
 
 
 def test_remove_legacy_login_command_tolerates_absence(tmp_path):

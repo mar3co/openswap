@@ -18,6 +18,7 @@ from openswap import macos_keychain
 from openswap.exceptions import (
     AccountNotFoundError,
     ConfigError,
+    CredentialMissingError,
     CredentialReadError,
     LockError,
     NotLoggedInError,
@@ -340,6 +341,7 @@ __all__ = [
     'AccountNotFoundError',
     'ConfigError',
     'NotLoggedInError',
+    'CredentialMissingError',
     'CredentialReadError',
     'LockError',
     'SessionError',

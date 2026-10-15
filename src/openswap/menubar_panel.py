@@ -916,10 +916,12 @@ class MenuBarPanel:
         worker_status=None,
         on_worker_view_active=None,
         worker_paired=None,
+        on_add_claude=None,
     ):
         self._on_switch = on_switch
         self._on_rotate = on_rotate
         self._on_best = on_best
+        self._on_add_claude = on_add_claude
         self._on_toggle_auto = on_toggle_auto
         self._on_toggle_chatgpt_auto = on_toggle_chatgpt_auto
         self._on_review_chatgpt_switch = on_review_chatgpt_switch
@@ -1810,7 +1812,12 @@ class MenuBarPanel:
             self._add_button(
                 root, "Best", NSMakeRect(PAD + 70, fy + 8, 54, 22), self._on_best, font_small
             )
-            settings_x = PAD + 134
+            add = self._add_button(
+                root, "Add account", NSMakeRect(PAD + 132, fy + 8, 86, 22),
+                lambda _s: self._on_add_claude(), font_small,
+            )
+            add.setEnabled_(self._on_add_claude is not None)
+            settings_x = PAD + 226
         else:
             if desktop_status:
                 root.addSubview_(_label(desktop_status, font_small, pal["muted"], NSMakeRect(PAD, fy - running_h - RUNNING_LINE_H, inner_w, RUNNING_LINE_H)))

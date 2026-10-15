@@ -15,8 +15,13 @@ import threading
 import time
 from datetime import datetime
 
-from openswap.claude_login import ClaudeLoginRun, login_outcome, remove_legacy_login_command
-from openswap.exceptions import ClaudeSwitchError, CredentialReadError
+from openswap.claude_login import (
+    ClaudeLoginRun,
+    login_outcome,
+    new_login_outcome,
+    remove_legacy_login_command,
+)
+from openswap.exceptions import ClaudeSwitchError, CredentialMissingError, CredentialReadError
 from openswap.menubar_display import *  # noqa: F403
 from openswap.codex.desktop_app import DesktopApp, DesktopCapability, capability_is_fresh
 from openswap.menubar_display import (  # noqa: F401  tests poke these
@@ -1382,6 +1387,7 @@ def run(switcher, codex=None) -> int:
                 on_switch=self._on_panel_account_click,
                 on_rotate=lambda *_a: self._switch(None)(None),
                 on_best=lambda *_a: self._switch("best")(None),
+                on_add_claude=lambda: self.on_add_claude_login(None),
                 on_toggle_auto=lambda *_a: self.on_toggle_autoswitch(None),
                 on_toggle_chatgpt_auto=lambda *_a: self.on_toggle_chatgpt_auto(None),
                 on_review_chatgpt_switch=self._review_chatgpt_switch,
@@ -1418,6 +1424,8 @@ def run(switcher, codex=None) -> int:
                 return
             if action == "retry":
                 self.refresh_async()
+            elif action == "start" and provider == "claude":
+                self.on_add_claude_login(None)
             elif action in ("add", "start"):
                 if provider == "chatgpt":
                     self._on_login_action("start")
@@ -1725,6 +1733,7 @@ def run(switcher, codex=None) -> int:
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
+            menu.add(rumps.MenuItem("Sign in with Claude…", callback=self.on_add_claude_login))
             menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
             if self.codex is not None:
                 menu.add(rumps.MenuItem("Sign in with ChatGPT…", callback=lambda _sender: self._on_login_action("start")))
@@ -2404,13 +2413,8 @@ def run(switcher, codex=None) -> int:
                 return
             try:
                 self.switcher.add_account(slot=None)
-            except CredentialReadError:
-                self._alert(
-                    title="openswap",
-                    message="Couldn't read the active credential. If the menu bar is running "
-                            "as a background/login agent, macOS blocks its Keychain access — "
-                            "quit and relaunch it from a Terminal with: openswap menubar",
-                )
+            except CredentialReadError as e:
+                self._alert_credential_read_error(e)
                 return
             except ClaudeSwitchError as e:
                 self._show_error(str(e))
@@ -2422,30 +2426,100 @@ def run(switcher, codex=None) -> int:
                 self._panel.close()
             return True
 
-        def _open_claude_login(self, num, plan: ReloginClickPlan):
-            claude_bin = resolve_claude_bin()
-            if not claude_bin:
-                self._show_error(
-                    "'claude' was not found. Install Claude Code, then try again."
-                )
-                return
-            # A second click restarts the sign-in (the browser tab may be gone).
-            if self._claude_login is not None:
-                self._claude_login.cancel()
-            run = ClaudeLoginRun(
-                claude_bin, plan.login_email,
-                on_done=lambda result: self._on_claude_login_done(run, result),
+        def _alert_credential_read_error(self, error):
+            # Almost always a launchd/login-agent Keychain block: the active
+            # credential lives in the macOS Keychain, which a background agent
+            # can't read (the security call times out). Point at the fix.
+            self._alert(
+                title="openswap",
+                message=f"Couldn't read the active credential ({error}). If the menu bar "
+                        "is running as a background/login agent, macOS blocks its Keychain "
+                        "access — quit and relaunch it from a Terminal with: openswap menubar",
             )
-            with self._event_lock:
-                self._claude_login = run
-                self._claude_login_num = str(num)
-            run.start()
+
+        def _open_claude_login(self, num, plan: ReloginClickPlan):
+            claude_bin = self._claude_bin()
+            if claude_bin is None:
+                return
+            self._start_claude_login(claude_bin, plan.login_email, num=str(num))
             self._notify(
                 NotificationCopy(
                     title=f"Sign in as {plan.slot_name}",
                     body=relogin_login_opened_message(plan.slot_name),
                 )
             )
+
+        def on_add_claude_login(self, _sender):
+            claude_bin = self._claude_bin()
+            if claude_bin is None or not self._keep_outgoing_claude_login():
+                return
+            self._start_claude_login(claude_bin, None, num=None)
+            self._notify(
+                NotificationCopy(
+                    title="Sign in with Claude", body=claude_add_opened_message()
+                )
+            )
+
+        def _keep_outgoing_claude_login(self) -> bool:
+            """Save the live login before the sign-in replaces it; False to stop.
+
+            Claude Code may have rotated its refresh token since the slot's
+            backup was written, and the sign-in overwrites the only current copy.
+            The read is strict: a torn config must not pass for "logged out".
+            """
+            from openswap.worker.leases import AccountLeaseError
+
+            try:
+                live = self.switcher._get_current_identity_triple(strict=True)
+                if live is None:
+                    return True
+                if self.switcher.current_account_number() is None:
+                    message = claude_add_unsaved_live_message(live[0])
+                else:
+                    self.switcher.add_account(slot=None)
+                    return True
+            except CredentialMissingError as e:
+                # Nothing to protect, so this falls to the confirm below.
+                self.switcher._logger.warning("claude add: backup failed: %s", e)
+                message = claude_add_backup_failed_message(str(e))
+            except CredentialReadError as e:
+                self.switcher._logger.warning("claude add: backup failed: %s", e)
+                self._alert_credential_read_error(e)
+                return False
+            except AccountLeaseError as e:
+                # A worker job is using this login; signing in would pull it away.
+                self._show_error(str(e))
+                return False
+            except ClaudeSwitchError as e:
+                self.switcher._logger.warning("claude add: backup failed: %s", e)
+                message = claude_add_backup_failed_message(str(e))
+            return self._alert(
+                title="Sign out of Claude Code's current login?", message=message,
+                ok="Continue", cancel="Cancel",
+            ) == 1
+
+        def _claude_bin(self) -> str | None:
+            claude_bin = resolve_claude_bin()
+            if not claude_bin:
+                self._show_error(
+                    "'claude' was not found. Install Claude Code, then try again."
+                )
+                return None
+            return claude_bin
+
+        def _start_claude_login(self, claude_bin, email, *, num):
+            """Start a browser sign-in; ``num`` None adds whoever signs in."""
+            # A second click restarts the sign-in (the browser tab may be gone).
+            if self._claude_login is not None:
+                self._claude_login.cancel()
+            run = ClaudeLoginRun(
+                claude_bin, email,
+                on_done=lambda result: self._on_claude_login_done(run, result),
+            )
+            with self._event_lock:
+                self._claude_login = run
+                self._claude_login_num = num
+            run.start()
 
         def _on_claude_login_done(self, run, result):
             # Worker thread: hand the result to the main-thread tick.
@@ -2464,6 +2538,9 @@ def run(switcher, codex=None) -> int:
                 num = self._claude_login_num
                 self._claude_login = None
                 self._claude_login_num = None
+            if num is None:
+                self._finish_claude_add(result)
+                return
             name = self._name_for_num(num)
             live = self.switcher.live_identity()
             outcome = login_outcome(result, live=live, slot=self._slot_identity(num))
@@ -2487,6 +2564,48 @@ def run(switcher, codex=None) -> int:
                 # Captured here, not left to the tick: auto-capture may already
                 # have saved this slot's old, dead credential and won't look again.
                 self._auto_captured_nums.add(num)
+
+        def _finish_claude_add(self, result):
+            live = self.switcher.live_identity()
+            outcome = new_login_outcome(result, live=live)
+            self.switcher._logger.debug(
+                "claude login for a new account: %s (returncode=%s timed_out=%s)\n%s",
+                outcome, result.returncode, result.timed_out, result.output_tail,
+            )
+            if outcome == "cancelled":
+                return
+            if outcome == "timed_out":
+                self._show_error(claude_add_timed_out_message())
+                return
+            if outcome == "failed":
+                self._show_error(claude_add_failed_message(result.output_tail))
+                return
+            if outcome == "no_login":
+                self._show_error(claude_add_no_login_message())
+                return
+            try:
+                num = self.switcher.current_account_number()
+                self.switcher.add_account(slot=None)
+            except CredentialReadError as e:
+                self.switcher._logger.warning("claude add: capture failed: %s", e)
+                if isinstance(e, CredentialMissingError):
+                    self._show_error(str(e))
+                else:
+                    self._alert_credential_read_error(e)
+                return
+            except ClaudeSwitchError as e:
+                self.switcher._logger.warning("claude add: capture failed: %s", e)
+                self._show_error(str(e))
+                return
+            if num is None:
+                self._notify(notification_copy_for_claude_added(live[0], existed=False))
+            else:
+                # Saved here, not left to the tick: a signed-out slot is now captured.
+                self._auto_captured_nums.add(num)
+                self._notify(
+                    notification_copy_for_claude_added(self._name_for_num(num), existed=True)
+                )
+            self.refresh_async()
 
         def _drain_relogin_notifies(self):
             with self._event_lock:
@@ -2698,16 +2817,8 @@ def run(switcher, codex=None) -> int:
                 return
             try:
                 self.switcher.add_account(slot=None)
-            except CredentialReadError:
-                # Almost always a launchd/login-agent Keychain block: the active
-                # credential lives in the macOS Keychain, which a background agent
-                # can't read (the security call times out). Point at the fix.
-                self._alert(
-                    title="openswap",
-                    message="Couldn't read the active credential. If the menu bar is running "
-                            "as a background/login agent, macOS blocks its Keychain access — "
-                            "quit and relaunch it from a Terminal with: openswap menubar",
-                )
+            except CredentialReadError as e:
+                self._alert_credential_read_error(e)
                 return
             except ClaudeSwitchError as e:
                 self._alert(title="openswap", message=str(e))

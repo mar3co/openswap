@@ -24,8 +24,9 @@ _TAIL_CHARS = 2000
 DEFAULT_TIMEOUT_S = 600.0
 
 
-def login_argv(claude_bin: str, email: str) -> list[str]:
-    return [claude_bin, "auth", "login", "--claudeai", "--email", email]
+def login_argv(claude_bin: str, email: str | None) -> list[str]:
+    argv = [claude_bin, "auth", "login", "--claudeai"]
+    return argv + ["--email", email] if email else argv
 
 
 def remove_legacy_login_command(root: Path | None = None) -> None:
@@ -44,6 +45,19 @@ class LoginResult:
     output_tail: str
 
 
+def new_login_outcome(result: LoginResult, *, live: tuple[str, str] | None) -> str:
+    """cancelled | timed_out | failed | no_login | signed_in, for any account."""
+    if result.cancelled:
+        return "cancelled"
+    if result.timed_out:
+        return "timed_out"
+    if result.returncode != 0:
+        return "failed"
+    if live is None:
+        return "no_login"
+    return "signed_in"
+
+
 def login_outcome(
     result: LoginResult,
     *,
@@ -57,17 +71,10 @@ def login_outcome(
     even starts, so a match alone proves nothing. A clean exit only means
     *someone* signed in; the slot is captured only when that someone is it.
     """
-    if result.cancelled:
-        return "cancelled"
-    if result.timed_out:
-        return "timed_out"
-    if result.returncode != 0:
-        return "failed"
-    if live is None:
-        return "no_login"
-    if live != slot:
+    outcome = new_login_outcome(result, live=live)
+    if outcome == "signed_in" and live != slot:
         return "mismatch"
-    return "signed_in"
+    return outcome
 
 
 class ClaudeLoginRun:
@@ -76,7 +83,7 @@ class ClaudeLoginRun:
     def __init__(
         self,
         claude_bin: str,
-        email: str,
+        email: str | None,
         *,
         on_done,
         timeout: float = DEFAULT_TIMEOUT_S,

@@ -19,6 +19,12 @@ class CredentialReadError(CredentialError):
     pass
 
 
+class CredentialMissingError(CredentialReadError):
+    """The credential store was read and holds no login."""
+
+    pass
+
+
 class CredentialWriteError(CredentialError):
     """Failed to write credentials."""
 

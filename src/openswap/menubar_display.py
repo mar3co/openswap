@@ -1691,12 +1691,15 @@ def claude_login_no_login_message(slot_name: str) -> str:
     )
 
 
-def claude_login_failed_message(slot_name: str, output_tail: str) -> str:
+def _last_line_detail(output_tail: str) -> str:
     detail = output_tail.strip().splitlines()[-1] if output_tail.strip() else ""
-    detail = f"\n\n{detail}" if detail else ""
+    return f"\n\n{detail}" if detail else ""
+
+
+def claude_login_failed_message(slot_name: str, output_tail: str) -> str:
     return (
         f"Claude Code could not sign in as {slot_name}. Click {slot_name} "
-        f"again to retry.{detail}"
+        f"again to retry.{_last_line_detail(output_tail)}"
     )
 
 
@@ -1705,6 +1708,57 @@ def claude_login_timed_out_message(slot_name: str) -> str:
         f"The sign-in as {slot_name} was not finished in time. Click "
         f"{slot_name} again to retry."
     )
+
+
+def claude_add_opened_message() -> str:
+    return (
+        "Sign in to Claude Code in the browser window that opened. "
+        "OpenSwap adds the account when you're done."
+    )
+
+
+def notification_copy_for_claude_added(name: str, *, existed: bool) -> NotificationCopy:
+    if existed:
+        return NotificationCopy(
+            title=f"{name} is already added",
+            body="Its login was updated, and Claude Code is using it now.",
+        )
+    return NotificationCopy(title=f"{name} added", body="Claude Code is using it now.")
+
+
+def claude_add_unsaved_live_message(email: str) -> str:
+    return (
+        f"Claude Code is signed in as {email}, which OpenSwap hasn't saved. "
+        "Signing in to another account signs it out. To keep it, cancel and "
+        "save it first (Save current login, or More › Add account › From "
+        "current login)."
+    )
+
+
+def claude_add_backup_failed_message(error: str) -> str:
+    return (
+        "OpenSwap couldn't save Claude Code's current login before signing in "
+        f"to another account ({error}). If you continue, that account may need "
+        "to sign in again later."
+    )
+
+
+def claude_add_no_login_message() -> str:
+    return (
+        "The sign-in finished, but Claude Code has no account signed in. "
+        "Click Add account to retry."
+    )
+
+
+def claude_add_failed_message(output_tail: str) -> str:
+    return (
+        "Claude Code could not sign in. Click Add account to retry."
+        f"{_last_line_detail(output_tail)}"
+    )
+
+
+def claude_add_timed_out_message() -> str:
+    return "The sign-in was not finished in time. Click Add account to retry."
 
 
 def resolve_claude_bin(
@@ -2151,10 +2205,15 @@ def provider_empty_state(provider: str, state: str = "ready") -> dict:
             "secondary_button": "Save current login",
             "hint": "",
         }
-    body = "Sign in to Claude Code, then save your login."
-    return {"title": f"Add your first {name} account", "body": body,
-            "action": "add", "button": "Add current login",
-            "hint": "Saves the login to OpenSwap. Does not switch accounts."}
+    return {
+        "title": f"Add your first {name} account",
+        "body": "Sign in through your browser, or save the login Claude Code already has.",
+        "action": "start",
+        "button": "Sign in with Claude",
+        "secondary_action": "add",
+        "secondary_button": "Save current login",
+        "hint": "",
+    }
 
 
 def provider_shared_copy(provider: str) -> str:
