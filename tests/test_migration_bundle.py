@@ -8,16 +8,19 @@ outside ``tmp_path``.
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from openswap import bundle, launch_agent
+from openswap import bundle, launch_agent, statusline
 from openswap import widget_install as wi
+from openswap.worker import launch_agent as worker_agent
 from openswap.exceptions import ClaudeSwitchError
 
 UID = 501
@@ -37,14 +40,25 @@ def mac(frozen_app, tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
 
-    seen: dict[str, list] = {"install": [], "launchctl": [], "pluginkit": [], "trash": [], "reload": []}
+    seen: dict[str, list] = {"launchctl": [], "pluginkit": [], "trash": [], "reload": []}
 
-    def fake_install(label=launch_agent.LABEL, home=None, program=None, uid=None):
-        seen["install"].append(program)
-        target = launch_agent.plist_path(label, home)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(launch_agent.build_plist(program, label, home))
-        return {"label": label}
+    def fake_install(*args, **kwargs):
+        # The migration rewrites plists; bootstrapping the menu bar agent is
+        # `openswap setup`'s job.
+        raise AssertionError("the migration must not install the menu bar agent")
+
+    worker = {"loaded": False}
+
+    def fake_worker_launchctl(*args):
+        seen["launchctl"].append(list(args))
+        if args[0] == "print":
+            return subprocess.CompletedProcess(["launchctl", *args], 0 if worker["loaded"] else 1, "", "")
+        if args[0] == "bootout":
+            worker["loaded"] = False
+        elif args[0] == "bootstrap":
+            worker["loaded"] = worker.get("bootstrap_rc", 0) == 0
+            return subprocess.CompletedProcess(["launchctl", *args], worker.get("bootstrap_rc", 0), "", "")
+        return subprocess.CompletedProcess(["launchctl", *args], 0, "", "")
 
     def fake_launchctl(*args):
         seen["launchctl"].append(list(args))
@@ -65,7 +79,14 @@ def mac(frozen_app, tmp_path, monkeypatch):
     monkeypatch.setattr(wi, "is_loaded", lambda *a, **k: False)
     monkeypatch.setattr(wi, "_pluginkit", fake_pluginkit)
     monkeypatch.setattr(wi, "_move_to_trash", fake_trash)
-    return {"home": home, "app": frozen_app, "exe": frozen_app / "Contents/MacOS/OpenSwap", "seen": seen}
+    monkeypatch.setattr(worker_agent, "_launchctl", fake_worker_launchctl)
+    return {
+        "home": home,
+        "app": frozen_app,
+        "exe": frozen_app / "Contents/MacOS/OpenSwap",
+        "seen": seen,
+        "worker": worker,
+    }
 
 
 def _menubar_plist(home: Path, program: str) -> Path:
@@ -234,6 +255,136 @@ def test_a_loaded_older_label_is_booted_out(mac, monkeypatch):
     monkeypatch.setattr(launch_agent, "is_loaded", lambda label=launch_agent.LABEL, uid=None: label == "com.cswap.menubar")
     assert _migrate(mac) == ["legacy menubar"]
     assert ["bootout", f"gui/{UID}/com.cswap.menubar"] in mac["seen"]["launchctl"]
+
+
+# --- Remote tasks worker -----------------------------------------------------
+
+
+def _worker_plist(home: Path, program: list[str]) -> Path:
+    plist = worker_agent.plist_path(home)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_bytes(worker_agent.build_plist(program, home))
+    return plist
+
+
+def test_uv_worker_is_repointed_keeping_its_arguments_and_keys(mac):
+    plist = _worker_plist(mac["home"], ["/Users/x/.venv/bin/python3", "-m", "openswap"])
+    assert _migrate(mac) == ["worker plist"]
+    data = plistlib.loads(plist.read_bytes())
+    assert data["ProgramArguments"] == [str(mac["exe"]), "worker", "run", "--managed"]
+    assert data["Label"] == worker_agent.LABEL
+    assert data["KeepAlive"] == {"SuccessfulExit": False}
+    assert data["EnvironmentVariables"]["PATH"].split(os.pathsep)[0] == str(mac["exe"].parent)
+    assert _bootstraps(mac) == []  # not loaded: the next start runs the app
+    assert _migrate(mac) == []
+
+
+def test_a_running_uv_worker_is_restarted_on_the_app(mac):
+    plist = _worker_plist(mac["home"], [UV_SCRIPT])
+    mac["worker"]["loaded"] = True
+    assert _migrate(mac) == ["worker agent"]
+    target = f"gui/{UID}/{worker_agent.LABEL}"
+    assert ["bootout", target] in mac["seen"]["launchctl"]
+    assert _bootstraps(mac) == [["bootstrap", f"gui/{UID}", str(plist)]]
+    assert plistlib.loads(plist.read_bytes())["ProgramArguments"][0] == str(mac["exe"])
+
+
+def test_inside_the_worker_only_its_plist_is_rewritten(mac, monkeypatch):
+    plist = _worker_plist(mac["home"], [UV_SCRIPT])
+    mac["worker"]["loaded"] = True
+    monkeypatch.setenv("XPC_SERVICE_NAME", worker_agent.LABEL)
+    assert _migrate(mac) == ["worker plist"]
+    assert _changes(mac) == []
+    assert plistlib.loads(plist.read_bytes())["ProgramArguments"][0] == str(mac["exe"])
+
+
+@pytest.mark.parametrize("on", ["bundle", "other-copy"])
+def test_a_worker_on_the_app_is_left_alone(mac, tmp_path, on):
+    program = str(mac["exe"]) if on == "bundle" else str(_app_copy(tmp_path / "Applications"))
+    plist = _worker_plist(mac["home"], [program])
+    before = plist.read_bytes()
+    mac["worker"]["loaded"] = True
+    assert _migrate(mac) == []
+    assert plist.read_bytes() == before
+    assert _changes(mac) == []
+
+
+def test_a_worker_that_will_not_restart_is_reported(mac):
+    _worker_plist(mac["home"], [UV_SCRIPT])
+    mac["worker"]["loaded"] = True
+    mac["worker"]["bootstrap_rc"] = 5
+    notes: list[str] = []
+    assert _migrate(mac, notes) == []
+    assert any("Remote tasks worker" in n and "openswap worker enable" in n for n in notes)
+
+
+# --- Claude Code status line -------------------------------------------------
+
+
+def _hook(home: Path, command: str) -> Path:
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"statusLine": {"type": "command", "command": command}, "model": "x"}))
+    return settings
+
+
+def _hook_command(settings: Path) -> str:
+    return json.loads(settings.read_text())["statusLine"]["command"]
+
+
+def test_a_uv_status_line_hook_is_repointed(mac):
+    settings = _hook(mac["home"], f"{UV_SCRIPT} statusline")
+    assert _migrate(mac) == ["status line"]
+    assert _hook_command(settings) == shlex.join([str(mac["exe"]), "statusline"])
+    assert json.loads(settings.read_text())["model"] == "x"
+    # The app's hook is still recognised as OpenSwap's, so --install does not wrap it.
+    assert statusline.is_our_command(_hook_command(settings))
+    assert _migrate(mac) == []
+
+
+def test_a_status_line_env_prefix_is_kept(mac):
+    settings = _hook(mac["home"], f"NO_COLOR=1 {UV_SCRIPT} statusline")
+    _migrate(mac)
+    assert _hook_command(settings) == shlex.join(["NO_COLOR=1", str(mac["exe"]), "statusline"])
+
+
+@pytest.mark.parametrize("command", ["openswap statusline", "ccstatusline --compact"])
+def test_bare_or_foreign_status_lines_are_left_alone(mac, command):
+    settings = _hook(mac["home"], command)
+    before = settings.read_text()
+    assert _migrate(mac) == []
+    assert settings.read_text() == before
+
+
+def test_a_status_line_through_a_link_to_the_app_is_left_alone(mac):
+    link = mac["home"] / "bin" / "openswap"
+    link.parent.mkdir()
+    link.symlink_to(mac["exe"])
+    settings = _hook(mac["home"], f"{link} statusline")
+    before = settings.read_text()
+    assert _migrate(mac) == []
+    assert settings.read_text() == before
+
+
+def test_uv_notice_is_held_back_while_something_still_runs_uv(mac, monkeypatch):
+    """`uv tool uninstall` would break whatever still runs the uv binary."""
+    _worker_plist(mac["home"], [UV_SCRIPT])
+    _hook(mac["home"], f"{UV_SCRIPT} statusline")
+    shim = mac["home"] / ".local" / "bin" / "openswap"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("#!/bin/sh\n")
+
+    def refuse(*args, **kwargs):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(bundle, "_repoint_worker_agent", refuse)
+    monkeypatch.setattr(statusline, "repoint_command", refuse)
+    notes: list[str] = []
+    _migrate(mac, notes)
+    held = notes[-1]
+    assert held != bundle.UV_INSTALL_NOTICE
+    assert "Remote tasks worker" in held and "Claude Code status line" in held
+    assert "Keep it" in held
 
 
 # --- 2. old widget host ------------------------------------------------------

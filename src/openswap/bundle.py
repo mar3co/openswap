@@ -183,10 +183,15 @@ def migrate_from_uv_install(
        removed.
     2. A menu bar LaunchAgent that runs the uv install is pointed at this
        app's executable.
-    3. The Swift widget host a uv install built into ``~/Applications`` is
+    3. The Remote tasks worker LaunchAgent, when it runs the uv install, is
+       pointed at this app with its own arguments kept.
+    4. A Claude Code status-line hook that names another openswap is pointed
+       at this app.
+    5. The Swift widget host a uv install built into ``~/Applications`` is
        retired, so one appex id has one provider.
-    4. A leftover ``openswap`` on PATH is reported, not removed: it is the
-       user's uv tool, and ``~/.openswap`` stays theirs too.
+    6. A leftover ``openswap`` on PATH is reported, not removed: it is the
+       user's uv tool, and ``~/.openswap`` stays theirs too. While anything
+       above still runs it (a step failed), the report says to keep it.
     """
     exe = executable()
     if exe is None or sys.platform != "darwin":
@@ -200,6 +205,8 @@ def migrate_from_uv_install(
     steps = (
         ("old menu bar login item", lambda: _retire_legacy_menubar_labels(home, uid)),
         ("menu bar login item", lambda: _repoint_menubar_agent(exe, home, uid)),
+        ("Remote tasks worker", lambda: _repoint_worker_agent(exe, home, uid)),
+        ("Claude Code status line", lambda: _repoint_status_line(exe, home)),
         ("widget host", lambda: _retire_widget_host(home, uid)),
         ("uv install check", lambda: _report_uv_install(exe, home, say)),
     )
@@ -251,6 +258,77 @@ def _repoint_menubar_agent(exe: Path, home: Path, uid: int | None) -> str | None
     return "menubar plist"
 
 
+def _repoint_worker_agent(exe: Path, home: Path, uid: int | None) -> str | None:
+    """Rewrite the worker plist the way ``worker.launch_agent.install`` writes
+    it, keeping the plist's own worker arguments and other keys."""
+    from openswap import launch_agent
+    from openswap.exceptions import ClaudeSwitchError
+    from openswap.worker import launch_agent as worker_agent
+
+    plist = worker_agent.plist_path(home)
+    if not plist.is_file():
+        return None  # the worker is opt-in: `openswap worker enable` installs it
+    program = _plist_program(plist)
+    if not _runs_uv(program, exe):
+        return None
+    try:
+        data = plistlib.loads(plist.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        data = None
+    if isinstance(data, dict) and isinstance(program, list) and "worker" in program:
+        data["ProgramArguments"] = [str(exe), *program[program.index("worker"):]]
+        env = data.get("EnvironmentVariables")
+        env = dict(env) if isinstance(env, dict) else {}
+        env["PATH"] = launch_agent._path_env([str(exe)])
+        data["EnvironmentVariables"] = env
+        plist.write_bytes(plistlib.dumps(data))
+    else:
+        plist.write_bytes(worker_agent.build_plist([str(exe)], home))
+    if os.environ.get("XPC_SERVICE_NAME") == worker_agent.LABEL or not worker_agent._is_loaded(uid):
+        return "worker plist"  # not running, or this is it: next start uses the app
+    worker_agent._launchctl("bootout", worker_agent._service_target(uid))
+    if not worker_agent._wait_until_unloaded(uid):
+        raise ClaudeSwitchError("the uv worker did not stop; the app runs it from the next login")
+    booted = worker_agent._launchctl("bootstrap", worker_agent._domain_target(uid), str(plist))
+    if booted.returncode != 0:
+        raise ClaudeSwitchError(
+            f"launchctl bootstrap failed (exit {booted.returncode}); run: openswap worker enable"
+        )
+    return "worker agent"
+
+
+def _claude_config_home(home: Path) -> Path:
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(env) if env else home / ".claude"
+
+
+def _repoint_status_line(exe: Path, home: Path) -> str | None:
+    from openswap import statusline
+
+    changed = statusline.repoint_command(_claude_config_home(home), program=exe)
+    return "status line" if changed else None
+
+
+def _still_on_uv(exe: Path, home: Path) -> list[str]:
+    """What still runs another openswap after the steps above (one failed)."""
+    from openswap import launch_agent, statusline
+    from openswap.worker import launch_agent as worker_agent
+
+    pinned = []
+    for name, plist in (
+        ("menu bar login item", launch_agent.plist_path(home=home)),
+        ("Remote tasks worker", worker_agent.plist_path(home)),
+    ):
+        if plist.is_file() and _runs_uv(_plist_program(plist), exe):
+            pinned.append(name)
+    try:
+        if statusline.runs_other_program(_claude_config_home(home), exe):
+            pinned.append("Claude Code status line")
+    except Exception:
+        pinned.append("Claude Code status line")
+    return pinned
+
+
 def _retire_widget_host(home: Path, uid: int | None) -> str | None:
     from openswap import widget_install
 
@@ -286,6 +364,14 @@ def _report_uv_install(exe: Path, home: Path, say: Callable[[str], object]) -> N
                 continue  # linked to this app, like the cask's own symlink
         except (OSError, RuntimeError):
             pass
-        say(UV_INSTALL_NOTICE)
+        pinned = _still_on_uv(exe, home)
+        if pinned:
+            say(
+                f"An older uv install is still on PATH, and the {' and the '.join(pinned)} "
+                "still run it. Keep it until they point at OpenSwap.app "
+                "(run openswap setup from the app again), then run uv tool uninstall openswap"
+            )
+        else:
+            say(UV_INSTALL_NOTICE)
         return None
     return None

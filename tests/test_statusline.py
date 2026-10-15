@@ -863,3 +863,16 @@ class TestCodexCLI:
         assert "settings.json" in help_text
         assert "config.toml" not in help_text.lower()
         assert "--codex" in help_text
+
+
+def test_the_app_pins_its_own_executable_and_recognises_that_hook(frozen_app, tmp_path):
+    """From launchd argv[0] is `…/MacOS/OpenSwap`, and PATH may find uv first."""
+    import shlex
+
+    exe = frozen_app / "Contents" / "MacOS" / "OpenSwap"
+    with patch.object(sl.sys, "argv", [str(exe)]), \
+         patch.object(sl.shutil, "which", return_value="/Users/x/.local/bin/openswap"):
+        command = sl.paint_command()
+    assert command == f"{shlex.quote(str(exe))} statusline"
+    assert sl.is_our_command(command)
+    assert not sl.is_our_command("/Applications/Other.app/Contents/MacOS/Other statusline")
