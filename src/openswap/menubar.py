@@ -179,6 +179,10 @@ def run(switcher, codex=None) -> int:
             self._hold_slot = None
             self._tick_slot = None
             self._hold_reload_pending = False
+            # Set by card-menu edits (rename, disable/enable): the next refresh
+            # that lands reloads the open main page even though the slot list
+            # and provider states are unchanged.
+            self._reload_after_refresh = False
             self._event_lock = threading.Lock()
             self._panel = None
             self._status_icon_animator = None
@@ -371,8 +375,15 @@ def run(switcher, codex=None) -> int:
                 }
             finally:
                 self._refreshing = False
+                # A card edit made while this pass was already running is only
+                # visible to the queued pass (_refresh_pending), so leave its
+                # reload request for that pass rather than spending it here.
+                edit_landed = self._reload_after_refresh and not self._refresh_pending
+                if edit_landed:
+                    self._reload_after_refresh = False
                 if (previous_states != self._account_states or
-                        previous_slots != tuple(row[0] for row in self.snapshot.get("accounts", []))):
+                        previous_slots != tuple(row[0] for row in self.snapshot.get("accounts", []))
+                        or edit_landed):
                     self._hold_reload_pending = True
 
         def _config_mtime_or_none(self):
@@ -1393,6 +1404,8 @@ def run(switcher, codex=None) -> int:
                 on_review_chatgpt_switch=self._review_chatgpt_switch,
                 chatgpt_switch_pending=lambda: self._pending_chatgpt_switch is not None,
                 on_more=self._popup_overflow,
+                on_card_menu=self._popup_card_menu,
+                on_toggle_codex_auto=lambda *_a: self._toggle_codex_auto(),
                 auto_enabled=lambda: self.settings.auto_switch_enabled,
                 snapshot=lambda: self.snapshot,
                 threshold=self._threshold,
@@ -1599,23 +1612,8 @@ def run(switcher, codex=None) -> int:
             elif row_id == "strategy":
                 self._make_strategy(value)(None)
             elif row_id == "codex_enabled":
-                if (not self._codex_enabled()) and chatgpt_suggestions_effective(self.settings):
-                    self._show_error("Turn off ChatGPT Auto-switch before enabling live Codex rotation.")
+                if not self._toggle_codex_auto():
                     return
-                try:
-                    current = load_settings(self.switcher.backup_dir).codex_enabled
-                    set_setting(
-                        self.switcher.backup_dir,
-                        "autoswitch.codexEnabled",
-                        "false" if current else "true",
-                    )
-                except Exception as e:
-                    self._show_error(f"Couldn't set Codex auto-switch: {e}")
-                    return
-                if current:
-                    self._stop_codex_engine()
-                else:
-                    self._ensure_codex_engine()
             elif row_id == "kickoff_enabled":
                 self.on_toggle_kickoff(None)
             elif row_id == "kickoff_time":
@@ -1633,6 +1631,28 @@ def run(switcher, codex=None) -> int:
             ):
                 panel.reload()
 
+        def _toggle_codex_auto(self) -> bool:
+            """Flip live Codex CLI rotation (Settings row and the Codex tab's footer toggle)."""
+            if (not self._codex_enabled()) and chatgpt_suggestions_effective(self.settings):
+                self._show_error("Turn off ChatGPT Auto-switch before enabling live Codex rotation.")
+                return False
+            try:
+                current = load_settings(self.switcher.backup_dir).codex_enabled
+                set_setting(
+                    self.switcher.backup_dir,
+                    "autoswitch.codexEnabled",
+                    "false" if current else "true",
+                )
+            except Exception as e:
+                self._show_error(f"Couldn't set Codex auto-switch: {e}")
+                return False
+            if current:
+                self._stop_codex_engine()
+            else:
+                self._ensure_codex_engine()
+            self._reload_main_panel_if_shown()
+            return True
+
         def _popup_overflow(self, sender=None):
             menu = self.menu._menu
             view = sender if sender is not None else self._nsapp.nsstatusitem.button()
@@ -1644,6 +1664,40 @@ def run(switcher, codex=None) -> int:
             except Exception:
                 pass
             menu.popUpMenuPositioningItem_atLocation_inView_(None, loc, view)
+
+        def _popup_card_menu(self, card, view):
+            """Rename / Disable / Remove for one account, under its card's ··· button."""
+            if view is None:
+                return
+            num = card.get("num")
+            actions = {
+                CARD_MENU_RENAME: self._make_rename(num, card.get("email") or "", card.get("alias") or None),
+                CARD_MENU_TOGGLE_DISABLED: self._make_toggle_disabled(num, account_disabled(card)),
+                CARD_MENU_REMOVE: self._make_remove(num),
+            }
+            menu = rumps.MenuItem("Account")
+            # provider_cards already relabels Codex rows "chatgpt" for the tab.
+            ui_provider = "chatgpt" if card.get("provider") in ("codex", "chatgpt") else "claude"
+            for action, label in card_menu_items(
+                card, ui_provider, desktop=chatgpt_tab_desktop(self.settings),
+            ):
+                menu.add(rumps.MenuItem(label, callback=actions[action]))
+            loc = (0, 0)
+            try:
+                loc = (0, view.bounds().size.height)
+            except Exception:
+                pass
+            try:
+                menu._menu.popUpMenuPositioningItem_atLocation_inView_(None, loc, view)
+            finally:
+                # Same leak as rebuild_menu: rumps registers every callback in a
+                # process-global dict and never drops it.
+                _reg = getattr(rumps.rumps.NSApp, "_ns_to_py_and_callback", None)
+                if _reg is not None:
+                    # The parent registers itself too, callback or not.
+                    _reg.pop(getattr(menu, "_menuitem", None), None)
+                    for item in menu._menu.itemArray():
+                        _reg.pop(item, None)
 
         def _fit_status_item(self, title: str | None = None):
             nsapp = getattr(self, "_nsapp", None)
@@ -1705,17 +1759,25 @@ def run(switcher, codex=None) -> int:
                 self.menu = [rumps.MenuItem("Restarting ChatGPT…", callback=None)]
                 return
             # Overflow menu (popover More…): account switching and settings live
-            # in the popover, so this list is management only.
+            # in the popover, so this list is management only. With the popover
+            # attached, Rotate / Best sit in its footer and Rename / Disable /
+            # Remove hang off each card's ··· button, so they stay out of here;
+            # the full list remains for the menu-only fallback.
+            fallback = self._panel is None
             self.menu = [
-                rumps.MenuItem("Claude: rotate to next", callback=self._switch(None)),
-                rumps.MenuItem("Claude: switch to best", callback=self._switch("best")),
+                *([
+                    rumps.MenuItem("Claude: rotate to next", callback=self._switch(None)),
+                    rumps.MenuItem("Claude: switch to best", callback=self._switch("best")),
+                ] if fallback else []),
                 rumps.MenuItem("Claude: next available", callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
-                *([self._desktop_menu(rumps)] if self._panel is None else []),
-                self._rename_menu(rumps),
-                self._disable_menu(rumps),
-                self._remove_menu(rumps),
+                *([
+                    self._desktop_menu(rumps),
+                    self._rename_menu(rumps),
+                    self._disable_menu(rumps),
+                    self._remove_menu(rumps),
+                ] if fallback else []),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
                 None,
@@ -2126,24 +2188,36 @@ def run(switcher, codex=None) -> int:
             self._on_account_click(num, close_panel=False)
 
         def _on_panel_account_click(self, num):
-            """The ChatGPT tab has one guarded desktop/shared-login action."""
+            """Second-tab row click: Codex CLI switch, or the guarded desktop relaunch."""
             from openswap.codex import split_provider_num
             provider, slot = split_provider_num(num)
             if provider != "codex":
                 self._on_account_click(num, close_panel=True)
                 return
+            desktop_tab = self.settings.chatgpt_switching_enabled
             if self._slot_needs_relogin(num):
+                # Neither mode should make an expired login live: Codex's
+                # switch_to only checks that the stored auth parses.
                 self._show_error(
-                    "This ChatGPT OAuth session expired. Sign in again with "
-                    "Codex, then try again."
+                    "This ChatGPT OAuth session expired. Sign in again with Codex, then try again."
+                    if desktop_tab
+                    else "This Codex OAuth session expired. Sign in again with Codex, then try again."
                 )
+                return
+            if not desktop_tab:
+                # Codex tab: select this login for Codex CLI, same confirm and
+                # toast as a Claude card. Nothing touches the ChatGPT app.
+                self._on_account_click(num, close_panel=True)
+                return
+            if not self._chatgpt_switching_persisted():
+                # The tab shows ChatGPT mode but the stored preference says
+                # off (another instance or the CLI changed it): do not quietly
+                # rewrite the shared login under a running ChatGPT.
+                self._offer_enable_chatgpt_switching()
                 return
             choices = dict(desktop_switch_choices(self.snapshot))
             if slot not in choices:
                 self._show_error("Choose an enabled ChatGPT OAuth account. API keys are only supported by the Codex CLI.")
-                return
-            if not self.settings.chatgpt_switching_enabled or not self._chatgpt_switching_persisted():
-                self._offer_enable_chatgpt_switching()
                 return
             self._make_desktop_switch(slot, choices[slot])(None)
 
@@ -2697,7 +2771,7 @@ def run(switcher, codex=None) -> int:
                 else:
                     ok = self._guard(lambda: engine.unset_alias(n))
                 if ok:
-                    self.refresh_async()
+                    self._refresh_and_reload_cards()
             return cb
 
         def _make_remove(self, num):
@@ -2738,10 +2812,21 @@ def run(switcher, codex=None) -> int:
                         lambda: self.switcher.set_account_disabled(str(num), target)
                     )
                 if ok:
-                    self.refresh_async()
+                    self._refresh_and_reload_cards()
                     if provider == "codex" and not target:
                         self._ensure_codex_engine()
             return cb
+
+        def _refresh_and_reload_cards(self):
+            """Refresh, then rebuild the open main page once the snapshot lands.
+
+            The worker only flags a reload for slot-list or provider-state
+            changes; an alias or disabled flag edited from a card's ··· menu
+            changes neither, yet the card's title, suffix, opacity and
+            clickability all come from it.
+            """
+            self._reload_after_refresh = True
+            self.refresh_async()
 
         def on_add_login(self, _sender):
             if self._guard(self.switcher.add_account):

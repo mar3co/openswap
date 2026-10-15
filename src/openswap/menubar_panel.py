@@ -104,6 +104,10 @@ from openswap.menubar import (
     provider_shared_copy,
     provider_tab_title,
     resolve_popover_theme,
+    card_badge_text,
+    card_menu_items,
+    card_title_suffix,
+    chatgpt_tab_desktop,
     settings_header_frames,
     settings_page_rows,
     STALE_PARENT,
@@ -111,6 +115,7 @@ from openswap.menubar import (
     token_entry_state,
     window_suffix,
     trailing_header_frames,
+    trailing_row_frames,
 )
 from openswap.theme import (
     ACCENT,
@@ -189,6 +194,11 @@ SETTINGS_WIDE_POPUP_LABEL_W = 72.0
 SETTINGS_BACK_W = 64.0
 SETTINGS_BACK_H = 22.0
 SETTINGS_TABS_H = 40.0
+HEADER_ICON_SIZE = 24.0
+CARD_MENU_W = 24.0
+CARD_MENU_H = 20.0
+FOOTER_BTN_H = 22.0
+FOOTER_GAP = 8.0
 CARD_GAP = 8.0
 CARD_PAD = 11.0
 CARD_RADIUS = 10.0
@@ -727,6 +737,7 @@ class _CardView(NSView):
         self.card = card
         self.on_switch = on_switch
         self._hover = False
+        self.menu_button = None
         return self
 
     def isFlipped(self):
@@ -792,10 +803,15 @@ class _CardView(NSView):
 
     def hitTest_(self, point):
         # Labels sit on top of the card; route every hit to the card so a
-        # click anywhere on the row switches.
-        if objc.super(_CardView, self).hitTest_(point) is not None:
-            return self
-        return None
+        # click anywhere on the row switches. The ··· button is the one
+        # exception: it opens the account menu instead of switching.
+        hit = objc.super(_CardView, self).hitTest_(point)
+        if hit is None:
+            return None
+        menu_button = getattr(self, "menu_button", None)
+        if menu_button is not None and (hit is menu_button or hit.isDescendantOf_(menu_button)):
+            return hit
+        return self
 
     def mouseUp_(self, event):
         if event.clickCount() > 1:
@@ -917,8 +933,12 @@ class MenuBarPanel:
         on_worker_view_active=None,
         worker_paired=None,
         on_add_claude=None,
+        on_card_menu=None,
+        on_toggle_codex_auto=None,
     ):
         self._on_switch = on_switch
+        self._on_card_menu = on_card_menu
+        self._on_toggle_codex_auto = on_toggle_codex_auto
         self._on_rotate = on_rotate
         self._on_best = on_best
         self._on_add_claude = on_add_claude
@@ -1205,6 +1225,16 @@ class MenuBarPanel:
         finally:
             self._hold_overflow(False)
 
+    def _card_menu(self, card, sender):
+        """Pop the per-account menu (Rename / Disable / Remove) under its ··· button."""
+        if self._on_card_menu is None:
+            return
+        self._hold_overflow(True)
+        try:
+            self._on_card_menu(card, sender)
+        finally:
+            self._hold_overflow(False)
+
     def _select_provider(self, provider: str) -> None:
         if provider not in ("claude", "chatgpt"):
             return
@@ -1342,6 +1372,35 @@ class MenuBarPanel:
         root.addSubview_(btn)
         return btn
 
+    def _add_icon_button(self, root, symbol, fallback, frame, cb, tooltip, *, bordered=False):
+        """A bezel-less SF Symbol button (gear, ellipsis); text fallback pre-11."""
+        btn = NSButton.alloc().initWithFrame_(frame)
+        image = None
+        try:
+            image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, tooltip)
+        except Exception:
+            image = None
+        if image is not None:
+            btn.setImage_(image)
+            btn.setImagePosition_(NSImageOnly)
+            btn.setTitle_("")
+        else:
+            btn.setTitle_(fallback)
+            btn.setImagePosition_(NSNoImage)
+        btn.setBezelStyle_(1)
+        btn.setBordered_(bordered)
+        btn.setControlSize_(1)
+        btn.setToolTip_(tooltip)
+        try:
+            btn.setContentTintColor_(_colors()["muted"])
+        except Exception:
+            pass
+        btn.setAccessibilityLabel_(tooltip)
+        btn.setTarget_(self._tramp(cb))
+        btn.setAction_("act:")
+        root.addSubview_(btn)
+        return btn
+
     def _alloc_switch(self, on: bool, callback):
         if NSSwitch is not None:
             ctl = NSSwitch.alloc().initWithFrame_(NSMakeRect(0, 0, 54, 24))
@@ -1379,12 +1438,15 @@ class MenuBarPanel:
         snap = self._snapshot()
         all_cards = panel_accounts(snap)
         provider = self._selected_provider
-        cards = provider_cards(all_cards, provider)
+        settings = self._settings() if callable(self._settings) else None
+        if settings is None:
+            settings = MenuBarSettings()
+        # One setting decides whether the second tab is Codex CLI or the
+        # ChatGPT desktop app: title, click, toggle, badge and menu follow it.
+        desktop_tab = chatgpt_tab_desktop(settings)
+        cards = provider_cards(all_cards, provider, desktop=desktop_tab)
         if provider == "chatgpt":
-            settings = self._settings() if callable(self._settings) else None
             cap = self._chatgpt_capability() if callable(self._chatgpt_capability) else None
-            if settings is None:
-                settings = MenuBarSettings()
             if cap is None:
                 cap = DesktopCapability("checking", "checking")
             cards = apply_chatgpt_activation(
@@ -1403,16 +1465,16 @@ class MenuBarPanel:
         elif current_login_model["stage"] != "ready":
             self._login_alias = ""
         self._login_alias_field = None
-        empty = provider_empty_state(provider, self._account_state(provider)) if not cards else None
+        empty = provider_empty_state(provider, self._account_state(provider), desktop=desktop_tab) if not cards else None
         if login_view:
             empty = None
-        shared_copy = provider_shared_copy(provider)
+        shared_copy = provider_shared_copy(provider, desktop=desktop_tab)
         hold_line = snap.get("hold_line") or ""
         if provider != "claude" or not self._auto_enabled():
             hold_line = ""
         running_line = (snap.get("running_line") or "") if provider == "claude" else ""
         codex_running_line = (snap.get("codex_running_line") or "") if provider == "chatgpt" else ""
-        desktop_status = str(self._desktop_status() or "") if provider == "chatgpt" else ""
+        desktop_status = str(self._desktop_status() or "") if (provider == "chatgpt" and desktop_tab) else ""
         if empty or login_view:
             shared_copy = hold_line = running_line = codex_running_line = desktop_status = ""
         pal = _colors()
@@ -1434,7 +1496,11 @@ class MenuBarPanel:
         n_running = (1 if running_line else 0) + (1 if codex_running_line else 0)
         running_h = RUNNING_LINE_H * n_running
         status_h = RUNNING_LINE_H if desktop_status else 0.0
-        height = PAD + HEADER_H + TAB_H + hold_h + info_h + 4 + body_h + PAD + running_h + status_h + FOOTER_H
+        # Settings / More live in the header, so an empty roster needs no
+        # footer row at all.
+        show_footer = bool(cards)
+        footer_h = FOOTER_H if show_footer else 0.0
+        height = PAD + HEADER_H + TAB_H + hold_h + info_h + 4 + body_h + PAD + running_h + status_h + footer_h
         root = _RootView.alloc().initWithHover_(self._on_hover)
         root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, height))
         root.setMaterial_(NSVisualEffectMaterialMenu)
@@ -1460,41 +1526,49 @@ class MenuBarPanel:
                 NSMakeRect(PAD + (24 if mark is not None else 0), PAD, 86, 20),
             )
         )
-        auto_label = _label(
-            "Auto-switch",
-            font_small,
-            pal["muted"],
-            NSMakeRect(0, 0, 80, 18),
+        # Settings (gear) and More (ellipsis) are quiet icon buttons hugging
+        # the top-right, so the footer keeps only account actions.
+        gear_f, more_f = trailing_header_frames(
+            PANEL_WIDTH, PAD,
+            (HEADER_ICON_SIZE, HEADER_ICON_SIZE), (HEADER_ICON_SIZE, HEADER_ICON_SIZE),
         )
+        self._add_icon_button(
+            root, "gearshape", "⚙", NSMakeRect(*gear_f), self._show_settings, "Settings",
+        )
+        self._add_icon_button(
+            root, "ellipsis.circle", "…", NSMakeRect(*more_f), self._more, "More",
+        )
+
+        # Auto-switch lives in the footer next to Rotate / Best, the actions it
+        # governs. Built here so the footer only has to place it.
+        if provider == "chatgpt" and desktop_tab:
+            # Desktop-app tab: the toggle is ChatGPT switch suggestions.
+            auto_text = "Suggest switches"
+            auto_on = bool(getattr(settings, "chatgpt_auto_enabled", False))
+            auto_cb = self._on_toggle_chatgpt_auto
+        elif provider == "chatgpt":
+            # Codex tab: live Codex CLI rotation, the same meaning as Claude's.
+            # Like the Settings row, it exists only while the Claude auto-switch
+            # master is on: the Codex engine rides on that parent engine, so
+            # without it the stored codexEnabled flag runs nothing.
+            auto_text = "Auto-switch"
+            master = bool(self._auto_enabled())
+            auto_on = master and (bool(self._codex_enabled()) if callable(self._codex_enabled) else False)
+            auto_cb = self._on_toggle_codex_auto if master else None
+        else:
+            auto_text = "Auto-switch"
+            auto_on = bool(self._auto_enabled())
+            auto_cb = self._on_toggle_auto
+        auto_label = _label(auto_text, font_small, pal["muted"], NSMakeRect(0, 0, 110, 18))
         auto_label.sizeToFit()
-        ls = auto_label.frame().size
-        chatgpt_auto = bool(
-            getattr(self._settings() if callable(self._settings) else None,
-                    "chatgpt_auto_enabled", False)
-        )
-        auto = self._alloc_switch(
-            chatgpt_auto if provider == "chatgpt" else bool(self._auto_enabled()),
-            self._on_toggle_chatgpt_auto if provider == "chatgpt" else self._on_toggle_auto,
-        )
-        cs = auto.frame().size
-        lab_f, ctl_f = trailing_header_frames(
-            PANEL_WIDTH, PAD, (ls.width, ls.height), (cs.width, cs.height)
-        )
-        auto_label.setFrame_(NSMakeRect(*lab_f))
-        auto.setFrame_(NSMakeRect(*ctl_f))
-        if provider == "chatgpt":
-            settings = self._settings() if callable(self._settings) else None
-            auto.setEnabled_(bool(getattr(settings, "chatgpt_switching_enabled", False)))
-        if ((provider == "claude" and cards) or
-                (provider == "chatgpt" and self._on_toggle_chatgpt_auto is not None)):
-            root.addSubview_(auto_label)
-            root.addSubview_(auto)
+        auto = self._alloc_switch(auto_on, auto_cb)
+        show_auto = bool(cards) and auto_cb is not None
 
         inner_w = PANEL_WIDTH - PAD * 2
         y = PAD + HEADER_H
         tab_w = (inner_w - TAB_GAP) / 2.0
         for index, tab_provider in enumerate(("claude", "chatgpt")):
-            title = provider_tab_title(all_cards, tab_provider)
+            title = provider_tab_title(all_cards, tab_provider, desktop=desktop_tab)
             tab = self._add_button(
                 root,
                 title,
@@ -1655,18 +1729,27 @@ class MenuBarPanel:
                     card_view.setAlphaValue_(0.45)
 
                 title = card["title"]
-                if card.get("disabled"):
-                    title = (
-                        f"{title}  (CLI only)"
-                        if card.get("api_key")
-                        else f"{title}  ({'paused' if provider == 'chatgpt' else 'disabled'})"
-                    )
+                suffix = card_title_suffix(card, provider, desktop=desktop_tab)
+                if suffix:
+                    title = f"{title}  ({suffix})"
                 action_required = bool(card.get("action_required"))
+                badge_text = card_badge_text(card, provider, desktop=desktop_tab)
                 badge_w = (
                     86 if action_required else (58 if provider == "chatgpt" else 48)
                 )
                 title_w = inner_w - CARD_PAD * 2 - 8
-                if card.get("active") or action_required:
+                trailing_x = inner_w - CARD_PAD
+                if self._on_card_menu is not None:
+                    menu_btn = self._add_icon_button(
+                        card_view, "ellipsis", "···",
+                        NSMakeRect(trailing_x - CARD_MENU_W + 4, CARD_PAD - 1, CARD_MENU_W, CARD_MENU_H),
+                        lambda _s, c=card: self._card_menu(c, _s),
+                        f"Account actions for {card['title']}",
+                    )
+                    card_view.menu_button = menu_btn
+                    trailing_x -= CARD_MENU_W + 4
+                    title_w -= CARD_MENU_W + 4
+                if badge_text:
                     title_w -= badge_w + 8
                 card_view.addSubview_(
                     _label(
@@ -1676,29 +1759,22 @@ class MenuBarPanel:
                         NSMakeRect(CARD_PAD + 6, CARD_PAD, title_w, TITLE_H),
                     )
                 )
-                if card.get("active") or action_required:
-                    badge_text = (
-                        (
-                            "repair login"
-                            if card.get("needs_restore") or card.get("needs_reconcile")
-                            else "sign in needed"
-                        )
-                        if action_required
-                        else ("selected" if provider == "chatgpt" else "active")
-                    )
+                if badge_text:
                     badge = _label(
                         badge_text,
                         font_small,
                         pal["warn"] if action_required else pal["accent"],
-                        NSMakeRect(inner_w - CARD_PAD - badge_w, CARD_PAD + 1, badge_w, TITLE_H),
+                        NSMakeRect(trailing_x - badge_w, CARD_PAD + 1, badge_w, TITLE_H),
                         align="right",
                     )
                     if action_required:
                         badge.setToolTip_(card.get("note") or "OAuth sign-in required.")
-                    elif provider == "chatgpt":
+                    elif provider == "chatgpt" and desktop_tab:
                         badge.setToolTip_(
                             "Selected in the shared credential file. Verify the account in ChatGPT after switching."
                         )
+                    elif provider == "chatgpt":
+                        badge.setToolTip_("Selected in the shared Codex credential file.")
                     card_view.addSubview_(badge)
 
                 subtitle = card.get("subtitle") or ""
@@ -1780,7 +1856,7 @@ class MenuBarPanel:
                 y += card_h + CARD_GAP
 
         # Footer
-        fy = height - FOOTER_H
+        fy = height - footer_h
         extra = RUNNING_LINE_H if (running_line and codex_running_line) else 0.0
         if running_line:
             root.addSubview_(
@@ -1800,48 +1876,53 @@ class MenuBarPanel:
                     NSMakeRect(PAD, fy - RUNNING_LINE_H, inner_w, RUNNING_LINE_H),
                 )
             )
+        if desktop_status and not show_footer:
+            root.addSubview_(_label(desktop_status, font_small, pal["muted"], NSMakeRect(PAD, fy - running_h - RUNNING_LINE_H, inner_w, RUNNING_LINE_H)))
+        if not show_footer:
+            return root
         hairline = _FillView.alloc().initWithColor_(pal["hairline"])
         hairline.setFrame_(NSMakeRect(PAD, fy, inner_w, 1))
         root.addSubview_(hairline)
 
-        settings_x = PAD
+        # Footer row: Rotate / Best lead on the left; Auto-switch and the
+        # provider's add / review buttons pack against the right edge.
+        row_y = fy + (FOOTER_H - FOOTER_BTN_H) / 2.0
+        trailing: list = []
         if provider == "claude" and cards:
             self._add_button(
-                root, "Rotate", NSMakeRect(PAD, fy + 8, 62, 22), self._on_rotate, font_small
+                root, "Rotate", NSMakeRect(PAD, row_y, 62, FOOTER_BTN_H), self._on_rotate, font_small
             )
             self._add_button(
-                root, "Best", NSMakeRect(PAD + 70, fy + 8, 54, 22), self._on_best, font_small
+                root, "Best", NSMakeRect(PAD + 70, row_y, 54, FOOTER_BTN_H), self._on_best, font_small
             )
             add = self._add_button(
-                root, "Add account", NSMakeRect(PAD + 132, fy + 8, 86, 22),
+                root, "Add account", NSMakeRect(0, row_y, 90, FOOTER_BTN_H),
                 lambda _s: self._on_add_claude(), font_small,
             )
             add.setEnabled_(self._on_add_claude is not None)
-            settings_x = PAD + 226
+            trailing.append(add)
         else:
             if desktop_status:
                 root.addSubview_(_label(desktop_status, font_small, pal["muted"], NSMakeRect(PAD, fy - running_h - RUNNING_LINE_H, inner_w, RUNNING_LINE_H)))
             if provider == "chatgpt" and cards:
-                add = self._add_button(root, "Add account", NSMakeRect(PAD, fy + 8, 90, 22), lambda _s: self._login_action("start"), font_small)
+                if self._chatgpt_switch_pending() and self._on_review_chatgpt_switch is not None:
+                    trailing.append(self._add_button(
+                        root, "Review switch", NSMakeRect(0, row_y, 100, FOOTER_BTN_H),
+                        self._on_review_chatgpt_switch, font_small,
+                    ))
+                add = self._add_button(root, "Add account", NSMakeRect(0, row_y, 90, FOOTER_BTN_H), lambda _s: self._login_action("start"), font_small)
                 add.setEnabled_(self._on_login_action is not None)
-                settings_x = PAD + 96
-                if self._chatgpt_switch_pending():
-                    settings_x = PAD + 202
-                    if self._on_review_chatgpt_switch is not None:
-                        self._add_button(root, "Review switch", NSMakeRect(PAD + 96, fy + 8, 100, 22), self._on_review_chatgpt_switch, font_small)
-        self._add_button(
-            root, "Settings",
-            NSMakeRect(settings_x, fy + 8, 72, 22),
-            self._show_settings,
-            font_small,
+                trailing.append(add)
+        controls = ([auto_label, auto] if show_auto else []) + trailing
+        frames = trailing_row_frames(
+            PANEL_WIDTH, PAD,
+            [(v.frame().size.width, v.frame().size.height) for v in controls],
+            row_y=fy, row_h=FOOTER_H, gap=FOOTER_GAP,
         )
-        self._add_button(
-            root,
-            "More",
-            NSMakeRect(PANEL_WIDTH - PAD - 62, fy + 8, 62, 22),
-            self._more,
-            font_small,
-        )
+        for view, frame in zip(controls, frames):
+            view.setFrame_(NSMakeRect(*frame))
+            if view.superview() is None:
+                root.addSubview_(view)
 
         return root
 
