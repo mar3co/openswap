@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from pathlib import Path
 import struct
 from unittest.mock import patch
@@ -286,7 +288,10 @@ def _built_host(home: Path) -> Path:
     return appex
 
 
-def test_frozen_install_registers_before_retiring_the_old_host(frozen_darwin, tmp_path):
+def test_frozen_install_registers_before_retiring_the_old_host(frozen_darwin, tmp_path, monkeypatch):
+    # install_widget takes no uid, so the old host's bootout asks os.getuid(),
+    # which Windows CI does not have.
+    monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
     old = _old_host(tmp_path)
     wi.install_widget(home=tmp_path)
     bundled = str(frozen_darwin["app"] / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex")
@@ -384,3 +389,55 @@ def test_the_build_cache_is_kept_when_its_appex_stays_registered(frozen_darwin, 
     with pytest.raises(ClaudeSwitchError, match="could not unregister"):
         wi.retire_legacy_host(home=tmp_path, uid=501)
     assert built.is_dir()
+
+
+# --- failing closed ----------------------------------------------------------
+
+
+def test_an_unreadable_registry_keeps_the_old_copy(frozen_darwin, tmp_path):
+    """`pluginkit -r` failed and `-m` cannot answer: that is not "unregistered"."""
+    frozen_darwin["runs"].remove_rc = 1
+    frozen_darwin["runs"].pluginkit_rc = 1
+    with pytest.raises(ClaudeSwitchError, match="could not list registrations"):
+        wi._unregister_appex(_old_host(tmp_path) / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex")
+
+
+def test_frozen_status_reports_an_unreadable_registry(frozen_darwin, tmp_path):
+    frozen_darwin["runs"].pluginkit_rc = 1
+    with pytest.raises(ClaudeSwitchError, match="could not list"):
+        wi.widget_status(home=tmp_path)
+
+
+@pytest.fixture
+def source_darwin(monkeypatch):
+    """A uv install on macOS; the host agent's removal is recorded, not run."""
+    monkeypatch.delattr(wi.sys, "frozen", raising=False)
+    monkeypatch.setattr(wi.sys, "platform", "darwin")
+    monkeypatch.setattr(wi, "uninstall_launch_agent", lambda **k: {"removed_plist": False, "was_loaded": False})
+
+
+def test_source_uninstall_removes_the_old_host(source_darwin, tmp_path):
+    app = _old_host(tmp_path)
+    assert wi.uninstall_widget(home=tmp_path)["removed_app"] is True
+    assert not app.exists()
+
+
+def test_source_uninstall_never_deletes_another_app_at_that_path(source_darwin, tmp_path):
+    """With the cask's appdir at ~/Applications, that path is the cask's app."""
+    import plistlib
+
+    app = tmp_path / "Applications" / "OpenSwap.app"
+    (app / "Contents").mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": "com.opensoft.openswap"}))
+    assert wi.uninstall_widget(home=tmp_path)["removed_app"] is False
+    assert app.is_dir()
+
+
+def test_source_uninstall_is_refused_beside_the_cask(source_darwin, tmp_path, monkeypatch):
+    from openswap import bundle
+
+    monkeypatch.setattr(bundle, "cask_prefix", lambda: Path("/opt/homebrew"))
+    app = _old_host(tmp_path)
+    with pytest.raises(ClaudeSwitchError, match="installed with Homebrew"):
+        wi.uninstall_widget(home=tmp_path)
+    assert app.is_dir()

@@ -274,7 +274,9 @@ def test_uv_worker_is_repointed_keeping_its_arguments_and_keys(mac):
     assert data["ProgramArguments"] == [str(mac["exe"]), "worker", "run", "--managed"]
     assert data["Label"] == worker_agent.LABEL
     assert data["KeepAlive"] == {"SuccessfulExit": False}
-    assert data["EnvironmentVariables"]["PATH"].split(os.pathsep)[0] == str(mac["exe"].parent)
+    # launchd's PATH is ':'-joined on macOS; compare the prefix so a Windows
+    # tmp path's drive colon does not split it.
+    assert data["EnvironmentVariables"]["PATH"].startswith(str(mac["exe"].parent) + ":")
     assert _bootstraps(mac) == []  # not loaded: the next start runs the app
     assert _migrate(mac) == []
 

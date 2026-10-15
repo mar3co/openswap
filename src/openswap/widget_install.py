@@ -333,10 +333,14 @@ def _unregister_appex(appex: Path) -> None:
     proc = _pluginkit("-r", str(appex))
     if proc.returncode == 0:
         return
-    still = set(_appex_registrations())
-    if str(appex) not in still and str(appex.resolve()) not in still:
+    listed = _appex_registrations()
+    # A registry that cannot be read proves nothing: fail closed, so the old
+    # copy is kept and the next run retries.
+    if listed is not None and str(appex) not in listed and str(appex.resolve()) not in listed:
         return
     detail = (proc.stderr or proc.stdout or "").strip()
+    if listed is None:
+        detail = f"{detail}; pluginkit could not list registrations to check".lstrip("; ")
     raise ClaudeSwitchError(
         f"pluginkit could not unregister {appex} (exit {proc.returncode})"
         + (f": {detail}" if detail else "")
@@ -487,9 +491,13 @@ def install_widget(
 def uninstall_widget(home: Path | None = None, uid: int | None = None) -> dict:
     """Remove the built widget host, or unregister the frozen app's appex.
 
-    The frozen app is the cask's to remove; this never deletes it.
+    The frozen app is the cask's to remove; this never deletes it. A uv
+    install beside the cask is refused, and only an app carrying the old
+    host's bundle id is ever deleted: with the cask's appdir set to
+    ``~/Applications`` that path is the cask's own app.
     """
     _require_macos()
+    bundle.refuse_uv_beside_cask("remove the widget")
     if bundle.is_frozen():
         appex = bundle.appex()
         if appex is None:
@@ -504,7 +512,7 @@ def uninstall_widget(home: Path | None = None, uid: int | None = None) -> dict:
         }
     agent = uninstall_launch_agent(home=home, uid=uid)
     app = widget_app_path(home)
-    removed_app = app.exists()
+    removed_app = app.exists() and _bundle_id(app) == HOST_BUNDLE_ID
     if removed_app:
         try:
             shutil.rmtree(app)
@@ -515,16 +523,17 @@ def uninstall_widget(home: Path | None = None, uid: int | None = None) -> dict:
     return {**agent, "removed_app": removed_app, "app": str(app)}
 
 
-def _appex_registrations() -> list[str]:
+def _appex_registrations() -> list[str] | None:
     """One entry per registered copy of the appex: its path when pluginkit
-    prints one, else the line itself.
+    prints one, else the line itself. None when pluginkit could not answer,
+    which is not the same as "nothing registered".
 
     ``-D`` lists every physical copy; without it pluginkit returns only the
     last instance of the highest version, which hides a duplicate provider.
     """
     proc = _pluginkit("-m", "-D", "-v", "-i", bundle.APPEX_ID)
     if proc.returncode != 0:
-        return []
+        return None
     found: list[str] = []
     for line in (proc.stdout or "").splitlines():
         if not line.strip():
@@ -538,6 +547,8 @@ def widget_status(home: Path | None = None, uid: int | None = None) -> dict:
     _require_macos()
     if bundle.is_frozen():
         registrations = _appex_registrations()
+        if registrations is None:
+            raise ClaudeSwitchError("pluginkit could not list the widget's registrations.")
         return {
             "bundled": True,
             "app": str(bundle.app_path()),
