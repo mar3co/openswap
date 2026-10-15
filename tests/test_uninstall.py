@@ -382,10 +382,17 @@ class TestKeychainDeleteAll:
 class TestUninstallCommand:
     @pytest.fixture
     def harness(self, monkeypatch, tmp_path):
-        seen: dict = {"remove": [], "logins": 0, "data": [], "exec": None, "purge": []}
-        state = {"brew": None, "failed": [], "command": None, "live": None, "purge": None}
+        seen: dict = {"remove": [], "logins": 0, "data": [], "exec": None, "purge": [], "order": []}
+        state = {"brew": None, "failed": [], "command": None, "live": None, "purge": None, "collision": False}
 
         class FakeSwitcher:
+            def __init__(self):
+                seen["order"].append("engine")
+                if state["collision"]:
+                    from openswap.exceptions import MigrationError
+
+                    raise MigrationError("Both legacy and new backup paths exist.")
+
             def purge(self, assume_yes=False):
                 seen["purge"].append(assume_yes)
                 if state["purge"]:
@@ -404,6 +411,7 @@ class TestUninstallCommand:
             return [tmp_path / "data"]
 
         def fake_refuse():
+            seen["order"].append("refuse")
             if state["live"]:
                 raise ClaudeSwitchError(state["live"])
 
@@ -418,6 +426,10 @@ class TestUninstallCommand:
         monkeypatch.setattr(uninstall, "homebrew_command", lambda: state["command"])
         monkeypatch.setattr(uninstall, "refuse_live_sessions", fake_refuse)
         monkeypatch.setattr(cli, "ClaudeAccountSwitcher", FakeSwitcher)
+        monkeypatch.setattr(uninstall, "legacy_roots", lambda: [tmp_path / ".claude-swap-backup"])
+        monkeypatch.setattr(
+            uninstall, "delete_session_logins", lambda roots=None: seen["order"].append(("sessions", roots))
+        )
         monkeypatch.setattr(cli.os, "execv", fake_exec)
         return seen, state
 
@@ -481,6 +493,23 @@ class TestUninstallCommand:
         assert seen["exec"] == [str(brew), "uninstall", "--cask", "--zap", "openswap"]
         assert seen["purge"] == [True]
         assert seen["logins"] == 1 and seen["data"] == [True]
+
+    def test_zap_clears_legacy_profiles_before_opening_the_data(self, harness, monkeypatch, tmp_path):
+        """The Engine's migration moves the pre-XDG folder and with it the
+        paths its profiles' Keychain items are named from."""
+        seen, _ = harness
+        assert self._run(monkeypatch, "--zap", "--yes") == 0
+        assert seen["order"][:3] == ["refuse", ("sessions", [tmp_path / ".claude-swap-backup"]), "engine"]
+
+    def test_zap_with_colliding_data_folders_deletes_both_without_purge(self, harness, monkeypatch):
+        """No openswap command can open colliding folders, so nothing can be
+        set up under them; the zap deletes both after the live check."""
+        seen, state = harness
+        state["collision"] = True
+        assert self._run(monkeypatch, "--zap", "--yes") == 0
+        assert seen["purge"] == []
+        assert seen["order"].count("refuse") == 2
+        assert seen["logins"] == 1 and seen["data"] == [False]
 
     def test_zap_stops_when_purge_refuses_after_the_prompt(self, harness, monkeypatch, capsys):
         """A session that went live while the prompt waited is caught by

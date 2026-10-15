@@ -1382,12 +1382,26 @@ def _uninstall_command(argv: list[str]) -> int:
         return 1
 
     if args.zap:
+        from openswap.exceptions import MigrationError
+
         try:
-            # purge rechecks live sessions, leases and the worker under the
-            # locks session setup takes, then deletes saved accounts and the
-            # backup folders: a session that went live during the prompt is
-            # refused here, not deleted from under Claude.
-            ClaudeAccountSwitcher().purge(assume_yes=True)
+            # Opening the data below can move the pre-XDG folder, and its
+            # profiles' Keychain items are named from their old paths.
+            uninstall.delete_session_logins(uninstall.legacy_roots())
+            try:
+                switcher = ClaudeAccountSwitcher()
+            except MigrationError:
+                # Both folders hold data, so no openswap command (session
+                # setup included) can open them: delete both without purge.
+                switcher = None
+            if switcher is not None:
+                # purge rechecks live sessions, leases and the worker under
+                # the locks session setup takes, then deletes saved accounts
+                # and the backup folders: a session that went live during
+                # the prompt is refused here, not deleted from under Claude.
+                switcher.purge(assume_yes=True)
+            else:
+                uninstall.refuse_live_sessions()
             # What purge does not track (the worker's pairing, strays).
             deleted = uninstall.delete_saved_logins()
             # Homebrew's zap deletes the cask's files; the rest go here.

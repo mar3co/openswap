@@ -237,13 +237,8 @@ def delete_saved_logins() -> int:
     """
     from openswap import macos_keychain
     from openswap.credentials import LEGACY_BACKUP_SECURITY_SERVICE, SECURITY_SERVICE
-    from openswap.session import delete_macos_keychain_entry, profile_is_quiescent
 
-    for profile in _session_profiles():
-        # A Claude still running on the profile keeps its login. Only
-        # `brew uninstall --zap` gets here past refuse_live_sessions.
-        if profile_is_quiescent(profile):
-            delete_macos_keychain_entry(profile)
+    delete_session_logins()
     deleted = 0
     for service in (SECURITY_SERVICE, LEGACY_BACKUP_SECURITY_SERVICE):
         try:
@@ -251,6 +246,25 @@ def delete_saved_logins() -> int:
         except macos_keychain.KEYCHAIN_ERRORS as e:
             raise ClaudeSwitchError(f"Could not delete the saved logins from the Keychain: {e}") from e
     return deleted
+
+
+def delete_session_logins(roots: list[Path] | None = None) -> None:
+    """Delete the Keychain item of each idle session profile under ``roots``
+    (default: every root a zap deletes).
+
+    A Claude still running on a profile keeps its login; only `brew
+    uninstall --zap` gets here past refuse_live_sessions.
+    """
+    from openswap.session import delete_macos_keychain_entry, profile_is_quiescent
+
+    for profile in _session_profiles(roots):
+        if profile_is_quiescent(profile):
+            delete_macos_keychain_entry(profile)
+
+
+def legacy_roots() -> list[Path]:
+    """The pre-XDG backup root, when it is a separate folder."""
+    return _data_roots()[1:]
 
 
 def _data_roots() -> list[Path]:
@@ -263,10 +277,10 @@ def _data_roots() -> list[Path]:
     return [backup, legacy]
 
 
-def _session_profiles() -> list[Path]:
-    """Session profiles in every root a zap deletes."""
+def _session_profiles(roots: list[Path] | None = None) -> list[Path]:
+    """Session profiles under ``roots``, by default every root a zap deletes."""
     found = []
-    for root in _data_roots():
+    for root in _data_roots() if roots is None else roots:
         sessions = root / "sessions"
         if sessions.is_dir():
             found.extend(sorted(p for p in sessions.iterdir() if p.is_dir()))
