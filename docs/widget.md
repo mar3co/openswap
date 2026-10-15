@@ -32,6 +32,8 @@ The cask's `OpenSwap.app` (`com.opensoft.openswap`) is one notarized bundle, lai
 
 An app with any other bundle id (the cask's own, installed with `--appdir ~/Applications`) is left alone.
 
+With the cask's appdir set to `~/Applications` (`HOMEBREW_CASK_OPTS=--appdir=~/Applications`), the old host sits where the cask installs the app and `brew install --cask` refuses to overwrite it. `install.sh` therefore retires it before a fresh `brew install` when that is the appdir: same bundle-id check, `launchctl bootout` (a not-loaded agent is fine), remove its plist, `pluginkit -r` its appex, and `mv` it into `~/.Trash` under a name that does not overwrite an earlier copy (`OpenSwap 2.app`, ...). It never deletes the app.
+
 The appex id is unchanged but its parent app's bundle id changes from `com.opensoft.openswap.widget` to `com.opensoft.openswap`, so desktop and Notification Center widgets placed with the old host may go blank and need adding again (plan 007 check 4 records what actually happens).
 
 ## Build (source install)

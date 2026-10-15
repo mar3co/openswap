@@ -26,6 +26,64 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 # .git is a file in a worktree, so -e rather than -d.
 is_checkout() { [ -e "$1/.git" ] && [ -f "$1/src/openswap/__init__.py" ]; }
 
+OLD_WIDGET_HOST_ID="com.opensoft.openswap.widget"
+
+# Where `brew install --cask` puts the app: the last --appdir in
+# HOMEBREW_CASK_OPTS, else /Applications. Runs in a subshell ($(...)), so
+# `set -f` only stops the word split below from globbing.
+cask_appdir() {
+  set -f
+  local dir="/Applications" next="" word
+  for word in ${HOMEBREW_CASK_OPTS:-}; do
+    if [ -n "$next" ]; then
+      dir="$word"
+      next=""
+      continue
+    fi
+    case "$word" in
+      --appdir=*) dir="${word#--appdir=}" ;;
+      --appdir) next=1 ;;
+    esac
+  done
+  dir="${dir#[\"\']}"
+  dir="${dir%[\"\']}"
+  case "$dir" in
+    "~") dir="$HOME" ;;
+    "~/"*) dir="$HOME/${dir#'~/'}" ;;
+    '${HOME}'*) dir="$HOME${dir#'${HOME}'}" ;;
+    '$HOME'*) dir="$HOME${dir#'$HOME'}" ;;
+  esac
+  while [ "${dir%/}" != "$dir" ] && [ "$dir" != "/" ]; do dir="${dir%/}"; done
+  printf '%s\n' "$dir"
+}
+
+# A source install's widget host is ~/Applications/OpenSwap.app with the old
+# bundle id. With the cask's appdir set to ~/Applications it sits where the
+# cask puts the app, and brew refuses to overwrite it, so retire it first,
+# the way the app's own migration would: boot out its agent, unregister its
+# widget, and move it to the Trash (never delete it). Any other app there is
+# left alone.
+retire_old_widget_host() {
+  local app="$HOME/Applications/OpenSwap.app"
+  [ -d "$app" ] || return 0
+  local bundle_id
+  bundle_id="$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
+  [ "$bundle_id" = "$OLD_WIDGET_HOST_ID" ] || return 0
+  say "Moving the old OpenSwap widget host to the Trash so the app can install at $app"
+  launchctl bootout "gui/$(id -u)/$OLD_WIDGET_HOST_ID" >/dev/null 2>&1 || true
+  rm -f "$HOME/Library/LaunchAgents/$OLD_WIDGET_HOST_ID.plist"
+  pluginkit -r "$app/Contents/PlugIns/OpenSwapWidgetExtension.appex" >/dev/null 2>&1 || true
+  local trash="$HOME/.Trash"
+  local dest="$trash/OpenSwap.app"
+  local n=1
+  mkdir -p "$trash" || fail "Could not create $trash; move $app to the Trash yourself, then run this installer again."
+  while [ -e "$dest" ] || [ -L "$dest" ]; do
+    n=$((n + 1))
+    dest="$trash/OpenSwap $n.app"
+  done
+  mv "$app" "$dest" || fail "Could not move $app to the Trash; move it there yourself, then run this installer again."
+}
+
 install_cask() {
   say "To install from a git checkout instead, set OPENSWAP_DIR"
   # Re-running the installer updates, like the clone path's pull.
@@ -34,6 +92,9 @@ install_cask() {
     brew upgrade --cask "$CASK" || fail "brew upgrade --cask $CASK failed (see above). Fix that, then run this installer again."
   else
     say "Homebrew found: installing the OpenSwap app with brew install --cask $CASK (the supported install)"
+    if [ "$(cask_appdir)" = "$HOME/Applications" ]; then
+      retire_old_widget_host
+    fi
     brew install --cask "$CASK" || fail "brew install --cask $CASK failed (see above). Fix that, then run this installer again."
   fi
   # Run the cask's own command: an older uv install's ~/.local/bin/openswap
