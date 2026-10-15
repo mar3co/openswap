@@ -20,7 +20,10 @@ def _panel():
         "SETTINGS_PAGE": "settings",
         "SETTINGS_SECTION_GENERAL": "general",
         "SETTINGS_SECTION_AUTOMATION": "automation",
-        "SETTINGS_SECTIONS": (("general", "General"), ("automation", "Automation")),
+        "SETTINGS_SECTION_REMOTE": "remote",
+        "SETTINGS_SECTIONS": (
+            ("general", "General"), ("automation", "Automation"), ("remote", "Remote")
+        ),
     }
     panel_type = extract_class(
         Path(menubar.__file__).with_name("menubar_panel.py"), "MenuBarPanel", methods, namespace
@@ -72,6 +75,22 @@ def test_settings_sections_are_navigation_only():
 
     assert panel._settings_section == "automation"
     panel.reload.assert_called_once()
+    for action in actions.values():
+        action.assert_not_called()
+
+
+def test_remote_section_refreshes_worker_status_and_others_do_not():
+    panel, actions = _panel()
+    panel._on_worker_view_active = Mock()
+    panel._show_settings()
+    panel._on_worker_view_active.assert_not_called()
+    panel._select_settings_section("automation")
+    panel._on_worker_view_active.assert_not_called()
+    panel._select_settings_section("remote")
+    assert panel._settings_section == "remote"
+    panel._on_worker_view_active.assert_called_once()
+    panel._select_settings_section("general")
+    panel._on_worker_view_active.assert_called_once()
     for action in actions.values():
         action.assert_not_called()
 

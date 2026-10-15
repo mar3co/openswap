@@ -446,7 +446,7 @@ def run(switcher, codex=None) -> int:
                 panel is not None
                 and panel.is_shown()
                 and getattr(panel, "_page", None) == SETTINGS_PAGE
-                and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_GENERAL
+                and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_REMOTE
                 and time.monotonic() - self._worker_last_refresh_at >= 4.0
             ):
                 self._worker_view_active()
@@ -878,7 +878,7 @@ def run(switcher, codex=None) -> int:
                 panel is not None
                 and panel.is_shown()
                 and getattr(panel, "_page", None) == SETTINGS_PAGE
-                and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_GENERAL
+                and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_REMOTE
             ):
                 panel.reload()
 

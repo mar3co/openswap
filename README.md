@@ -44,7 +44,7 @@ openswap setup                        # save the current login, start the extra 
 openswap widget --install             # Desktop / Notification Center (this checkout + Xcode)
 ```
 
-Click the extra for usage bars, then a card to switch. Auto-switch waits five minutes before it can move you again. Popover Settings separates **General** display controls from **Automation** for Claude, ChatGPT, and Codex, with one shared quota policy and an optional kickoff schedule for accounts that report a 5-hour window. Add the widget from Edit Widgets (search **OpenSwap**). The popover header and widget host use the OpenSoft mark. Right-click the widget to choose all accounts, combined remaining, or one account.
+Click the extra for usage bars, then a card to switch. Auto-switch waits five minutes before it can move you again. Popover Settings separates **General** display controls from **Automation** for Claude, ChatGPT, and Codex, with one shared quota policy and an optional kickoff schedule for accounts that report a 5-hour window, and **Remote** for the local worker. Add the widget from Edit Widgets (search **OpenSwap**). The popover header and widget host use the OpenSoft mark. Right-click the widget to choose all accounts, combined remaining, or one account.
 
 [Menu bar](https://github.com/mar3co/openswap/wiki/Menu-Bar) · [Widget](https://github.com/mar3co/openswap/wiki/Desktop-Widget) · [Kickoff](https://github.com/mar3co/openswap/wiki/Five-Hour-Kickoff)
 
@@ -72,7 +72,7 @@ The command-line executable is `openswap`.
 | `openswap codex desktop` | Experimental ChatGPT preflight, switch, and recovery (`switch` and `recover` need `--confirm-restart --confirm-idle`) |
 | `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
 | `openswap worker pair <url> <code>` | Remote tasks (opt-in): pair with a control service, then the guided setup: start the worker, pick an account, pick the folders where remote sessions work (`~/GitHub` is suggested) |
-| `openswap worker setup` | Rerun the guided setup on a paired Mac (also Settings → General → **Set up Remote tasks…**) |
+| `openswap worker setup` | Rerun the guided setup on a paired Mac (also Settings → Remote → **Set up Remote tasks…**) |
 | `openswap worker enable` | Start the Remote tasks worker (LaunchAgent) so a paired Mac heartbeats and shows online |
 | `openswap worker account [slot]` | List or pin the Codex or Claude account remote jobs run on (`claude:4`, `codex:2`) |
 | `openswap worker account allow <slot>` | Allow an account for a per-job choice by the control service (`disallow`, `label`) |
@@ -93,7 +93,7 @@ The command-line executable is `openswap`.
 | `openswap statusline --codex` | Paint the live Codex account label (no config.toml wrap) |
 
 Remote tasks are off by default, and jobs do not run until you pass the live check and enable live execution on this Mac; the pairing, account and folder setup is described in [the worker protocol doc](docs/worker-protocol.md#choosing-the-account-and-research-folders) and the live steps in [Running jobs live](docs/worker-protocol.md#running-jobs-live-codex).
-Pairing does not start the worker: the portal shows the Mac Offline until you run `openswap worker enable` (or turn on Settings → General → **Enable local worker**). On a terminal, `pair` asks whether to start it now; `openswap worker status` says so while the Mac is paired but the worker is off.
+Pairing does not start the worker: the portal shows the Mac Offline until you run `openswap worker enable` (or turn on Settings → Remote → **Enable local worker**). On a terminal, `pair` asks whether to start it now; `openswap worker status` says so while the Mac is paired but the worker is off.
 
 `openswap help` lists the main commands. Full list: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
 

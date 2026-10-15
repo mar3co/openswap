@@ -522,7 +522,7 @@ performs no network or Keychain access. The production adapter refuses jobs
 Pairing does not start the worker or choose an account or folder, so right
 after pairing `openswap worker pair` walks the owner through the remaining
 steps, in this order; `openswap worker setup` runs the same steps again on a
-paired Mac, and the menu bar's Settings → General → Remote tasks → **Set up
+paired Mac, and the menu bar's Settings → Remote → **Set up
 Remote tasks…** button runs them in dialogs (pairing first, from the pasted
 `openswap worker pair <url> <code>` command, when the Mac is not paired yet).
 Every step calls the same function as its own command, and nothing in them can
@@ -820,7 +820,7 @@ roster metadata only (slot, email, alias, account or organization ID), never
 auth files or tokens. Pin and workspace changes take the worker lifecycle
 lock; pinning also resolves the slot under both providers' account locks, so
 `remove`, `swap` and `move` cannot interleave. The menu bar's Settings →
-General → Remote tasks → **Account** popup uses the same function and lists
+Remote → **Account** popup uses the same function and lists
 both providers ("Codex N · …", "Claude N · …").
 
 The worker re-reads the pin for every launch, before it takes the account

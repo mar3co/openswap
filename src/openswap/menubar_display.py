@@ -254,9 +254,11 @@ SETUP_TOKEN_PREFIX = "sk-ant-oat"
 MAIN_PAGE = "main"
 SETTINGS_SECTION_GENERAL = "general"
 SETTINGS_SECTION_AUTOMATION = "automation"
+SETTINGS_SECTION_REMOTE = "remote"
 SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = (
     (SETTINGS_SECTION_GENERAL, "General"),
     (SETTINGS_SECTION_AUTOMATION, "Automation"),
+    (SETTINGS_SECTION_REMOTE, "Remote"),
 )
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.opensoft.openswap.menubar"
@@ -477,58 +479,6 @@ def settings_page_rows(
             "kind": "group",
             "style": "section",
             "section": SETTINGS_SECTION_GENERAL,
-            "id": "group_remote_tasks",
-            "label": "Remote tasks",
-        },
-        {
-            # The guided steps of `openswap worker pair`/`setup`, in dialogs.
-            "kind": "button",
-            "section": SETTINGS_SECTION_GENERAL,
-            "id": "remote_tasks_setup",
-            "label": "Set up Remote tasks…",
-            "title": "Set Up",
-            "value": None,
-            "disabled": (worker_status or {}).get("operation") is not None,
-        },
-        {
-            "kind": "toggle",
-            "section": SETTINGS_SECTION_GENERAL,
-            "id": "remote_tasks_enabled",
-            "label": "Enable local worker",
-            "value": bool(worker_enabled),
-        },
-        _remote_tasks_account_row((worker_status or {}).get("account_picker")),
-        _remote_tasks_web_choice_row((worker_status or {}).get("account_picker")),
-        {
-            "kind": "status",
-            "section": SETTINGS_SECTION_GENERAL,
-            "id": "remote_tasks_status",
-            "label": "Status",
-            "value": _remote_tasks_status_copy(
-                worker_status or {}, enabled=worker_enabled, paused=worker_paused,
-            ),
-        },
-        {
-            "kind": "toggle",
-            "section": SETTINGS_SECTION_GENERAL,
-            "id": "remote_tasks_paused",
-            "label": "Pause admission",
-            "value": bool(worker_paused),
-            "disabled": not worker_enabled,
-        },
-        {
-            "kind": "button",
-            "section": SETTINGS_SECTION_GENERAL,
-            "id": "remote_tasks_stop",
-            "label": "Active job",
-            "title": "Stop",
-            "value": _worker_active_job_id(worker_status or {}),
-            "disabled": _worker_active_job_id(worker_status or {}) is None,
-        },
-        {
-            "kind": "group",
-            "style": "section",
-            "section": SETTINGS_SECTION_GENERAL,
             "id": "group_behavior",
             "label": "Behavior",
         },
@@ -548,18 +498,6 @@ def settings_page_rows(
             "value": settings.refresh_interval,
         },
     ]
-    if worker_paired and not worker_enabled and (
-        (worker_status or {}).get("operation") != "worker_enable_or_disable"
-    ):
-        # Pairing never starts the worker; say so right under its switch.
-        hint_at = next(i for i, row in enumerate(general) if row["id"] == "remote_tasks_enabled") + 1
-        general.insert(hint_at, {
-            "kind": "group",
-            "style": "hint",
-            "section": SETTINGS_SECTION_GENERAL,
-            "id": "remote_tasks_paired_off",
-            "label": REMOTE_TASKS_PAIRED_OFF_NOTE,
-        })
     title_controls = {"show_account_name", "title_pct_5h", "title_pct_7d", "title_scoped"}
     if settings.menu_bar_provider == "logo":
         general = [row for row in general if row["id"] not in title_controls]
@@ -576,6 +514,73 @@ def settings_page_rows(
                 "ChatGPT: shared Codex login and usage. App sign-in is unverified; "
                 "these aren’t ChatGPT message limits."
             ),
+        })
+
+    remote = [
+        {
+            "kind": "group",
+            "style": "section",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "group_remote_tasks",
+            "label": "Remote tasks",
+        },
+        {
+            # The guided steps of `openswap worker pair`/`setup`, in dialogs.
+            "kind": "button",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_setup",
+            "label": "Set up Remote tasks…",
+            "title": "Set Up",
+            "value": None,
+            "disabled": (worker_status or {}).get("operation") is not None,
+        },
+        {
+            "kind": "toggle",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_enabled",
+            "label": "Enable local worker",
+            "value": bool(worker_enabled),
+        },
+        _remote_tasks_account_row((worker_status or {}).get("account_picker")),
+        _remote_tasks_web_choice_row((worker_status or {}).get("account_picker")),
+        {
+            "kind": "status",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_status",
+            "label": "Status",
+            "value": _remote_tasks_status_copy(
+                worker_status or {}, enabled=worker_enabled, paused=worker_paused,
+            ),
+        },
+        {
+            "kind": "toggle",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_paused",
+            "label": "Pause admission",
+            "value": bool(worker_paused),
+            "disabled": not worker_enabled,
+        },
+        {
+            "kind": "button",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_stop",
+            "label": "Active job",
+            "title": "Stop",
+            "value": _worker_active_job_id(worker_status or {}),
+            "disabled": _worker_active_job_id(worker_status or {}) is None,
+        },
+    ]
+    if worker_paired and not worker_enabled and (
+        (worker_status or {}).get("operation") != "worker_enable_or_disable"
+    ):
+        # Pairing never starts the worker; say so right under its switch.
+        hint_at = next(i for i, row in enumerate(remote) if row["id"] == "remote_tasks_enabled") + 1
+        remote.insert(hint_at, {
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_paired_off",
+            "label": REMOTE_TASKS_PAIRED_OFF_NOTE,
         })
 
     automation = [
@@ -737,7 +742,7 @@ def settings_page_rows(
                 ),
             }
         )
-    rows = general + automation
+    rows = general + automation + remote
     if section is not None:
         valid_sections = {value for value, _label in SETTINGS_SECTIONS}
         if section not in valid_sections:
@@ -764,7 +769,7 @@ def _remote_tasks_account_row(picker) -> dict:
     """
     row = {
         "kind": "popup",
-        "section": SETTINGS_SECTION_GENERAL,
+        "section": SETTINGS_SECTION_REMOTE,
         "id": "remote_tasks_account",
         "label": "Account",
         "wide": True,
@@ -819,7 +824,7 @@ def _remote_tasks_web_choice_row(picker) -> dict:
     """
     row = {
         "kind": "popup",
-        "section": SETTINGS_SECTION_GENERAL,
+        "section": SETTINGS_SECTION_REMOTE,
         "id": "remote_tasks_web_choice",
         "label": "Web choice",
         "wide": True,
