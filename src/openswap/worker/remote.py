@@ -22,8 +22,8 @@ from openswap.worker.journal import AdmissionError, JournalError
 from openswap.worker.models import JobState, RemoteAuthorization, SafeEventKind
 from openswap.worker.protocol import (
     AdvertisedAccount, Artifact, Claim, HEARTBEAT_SECONDS, MAX_ARTIFACT, MAX_BODY, MAX_REPORTED_FOLDERS,
-    ProtocolError,
-    ReportedFolder, TERMINAL, capability_features, fields, integer, timestamp, validate_url,
+    ProtocolError, ROTATE_BEFORE_SECONDS,
+    ReportedFolder, TERMINAL, capability_features, fields, integer, text, timestamp, validate_url,
 )
 
 STATES = frozenset(state.value for state in JobState)
@@ -37,7 +37,10 @@ APPROVAL = "waiting_for_approval"
 WIRE_DIAGNOSTICS = {"workspace_refused": "provider_unavailable", "origin_refused": "provider_unavailable"}
 # What this worker advertises with `capabilities` after each registration. The
 # set never changes at runtime in this release.
-WORKER_FEATURES = ("origin",)
+WORKER_FEATURES = ("origin", "key_rotation")
+# After a failed rotation (lost response, refused, Keychain failure) the next
+# attempt waits this long; the old key keeps working meanwhile.
+ROTATION_BACKOFF_SECONDS = 3600.0
 # How often the readiness report rescans folders of repos when nothing changed.
 FOLDER_RESCAN_SECONDS = 30.0
 # Validation failures the service (or the local export check) reports for one
@@ -49,7 +52,7 @@ ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifa
 SERVICE_ERRORS = frozenset({"revoked", "unauthorized", "device_expired", "lease_lost", "stale_epoch", "offline_worker",
                             "invalid_code", "invalid_request", "forbidden", "not_found", "invalid_state",
                             "unsupported_version", "idempotency_conflict", "cursor_conflict", "queue_full",
-                            "body_too_large", "service_unavailable", *ARTIFACT_REJECTIONS})
+                            "body_too_large", "service_unavailable", "rotation_too_soon", *ARTIFACT_REJECTIONS})
 # Connectivity states that only a new enrollment (re-pair) can leave.
 FINAL = frozenset({"revoked", "expired"})
 
@@ -120,7 +123,10 @@ class NoRedirect(HTTPRedirectHandler):
 class Transport:
     def __init__(self, url: str, key: str | None = None):
         self.url = validate_url(url)
-        self.key = key
+        self._key = key
+        # A key rotation swaps the key while other threads send requests: each
+        # request reads it once, so it carries one key or the other in full.
+        self._key_lock = threading.Lock()
         handlers = [ProxyHandler({}), NoRedirect()]
         if self.url.startswith("https:"):
             import truststore
@@ -132,8 +138,9 @@ class Transport:
         if len(encoded) > MAX_BODY:
             raise ProtocolError("body_too_large", 413)
         headers = {"Content-Type": "application/json"}
-        if self.key:
-            headers["Authorization"] = f"Bearer {self.key}"
+        key = self.key
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
         request = Request(f"{self.url}/v1/{operation}", encoded, headers, method="POST")
         try:
             with self.opener.open(request, timeout=5) as response:
@@ -146,6 +153,20 @@ class Transport:
         except (URLError, TimeoutError, OSError):
             raise ProtocolError("service_unavailable", 503) from None
         return result
+
+    @property
+    def key(self) -> str | None:
+        with self._key_lock:
+            return self._key
+
+    @key.setter
+    def key(self, value: str | None) -> None:
+        with self._key_lock:
+            self._key = value
+
+    def set_key(self, value: str) -> None:
+        """Swap the key in place (a rotation); requests already sent keep the old one."""
+        self.key = value
 
     @staticmethod
     def _read(response):
@@ -322,6 +343,16 @@ class RemoteClient:
         self._capabilities_unsupported_epoch = None
         recorded = self.journal.capabilities()
         self._origin_epoch = recorded[0] if recorded is not None and "origin" in recorded[1] else None
+        # Optional key rotation extension. ``key_expires_at`` is the current key's
+        # expiry and ``key_store(previous_key, worker_id, device_key, expires_at)``
+        # saves a rotated key durably and then calls ``adopt_key``; both are set by
+        # whoever owns the enrollment (``ConfiguredRemote``). A client without a
+        # store has nowhere durable to put a new key, so it never rotates.
+        self.key_expires_at = None
+        self.key_store = None
+        self._rotation_epoch = recorded[0] if recorded is not None and "key_rotation" in recorded[1] else None
+        self._rotation_unsupported_epoch = None
+        self._rotation_retry_at = None  # time.monotonic() before which no rotation is asked for
         self.runtime.remote_launch_guard = self.launch_allowed
         self.runtime.remote_account_ref = self.requested_account_ref
 
@@ -468,9 +499,84 @@ class RemoteClient:
                 return  # a feature this worker never advertised: malformed, resend
             self.journal.record_capabilities(epoch, accepted)
             self._origin_epoch = epoch if "origin" in accepted else None
+            self._rotation_epoch = epoch if "key_rotation" in accepted else None
             self._capabilities_sent = epoch
         except Exception:
             return
+
+    def rotation_accepted(self) -> bool:
+        """Whether this registration advertised "key_rotation" and the service accepted it."""
+        epoch = self.worker_epoch
+        return epoch is not None and self._rotation_epoch == epoch != self._rotation_unsupported_epoch
+
+    def key_renewal(self) -> bool | None:
+        """For status: whether the key renews itself (True), will not (False: the backend
+        lacks rotation), or None while this registration has not found out yet."""
+        epoch = self.worker_epoch
+        if epoch is None:
+            return None
+        if epoch in (self._rotation_unsupported_epoch, self._capabilities_unsupported_epoch):
+            return False
+        if self._capabilities_sent == epoch:
+            return self.rotation_accepted()
+        return None
+
+    def adopt_key(self, device_key: str, expires_at: datetime) -> None:
+        """Send every later request with a rotated key. Called by ``key_store`` once the
+        key is saved; never re-registers, so the worker epoch and claims are kept."""
+        set_key = getattr(self.transport, "set_key", None)
+        if callable(set_key):
+            set_key(device_key)
+        else:
+            self.transport.key = device_key
+        self.key_expires_at = expires_at
+
+    def rotate_key_if_due(self) -> bool:
+        """Swap the device key for a new one once ``ROTATE_BEFORE_SECONDS`` or less of it is left.
+
+        At most one request per call, only after a registration whose
+        ``key_rotation`` the service accepted, and never within
+        ``ROTATION_BACKOFF_SECONDS`` of a failure. Never raises. A lost
+        response, a refusal or a failed save keeps the old key, which the
+        service still accepts because the new one is only pending; the retry
+        replaces that pending key. A 404 stops it until the next registration.
+        Returns whether a new key was adopted.
+        """
+        try:
+            epoch, expires, store = self.worker_epoch, self.key_expires_at, self.key_store
+            if (store is None or expires is None or not self.worker_id or not self.rotation_accepted()
+                    or (self._rotation_retry_at is not None and time.monotonic() < self._rotation_retry_at)):
+                return False
+            if (expires - self._server_now()).total_seconds() > ROTATE_BEFORE_SECONDS:
+                return False
+            previous_key = self.transport.key
+            try:
+                response = self.transport.request("rotate_key", {"worker_epoch": epoch})
+            except ProtocolError as exc:
+                if exc.status == 404 and exc.code in {"unsupported_version", "not_found"}:
+                    self._rotation_unsupported_epoch = epoch
+                    return False
+                if exc.code in {"revoked", "unauthorized", "device_expired"}:
+                    self._connectivity(exc)
+                self._rotation_retry_at = time.monotonic() + ROTATION_BACKOFF_SECONDS
+                return False
+            try:
+                data = fields(response, {"worker_id", "device_key", "expires_at"})
+                worker_id, device_key = text(data["worker_id"]), text(data["device_key"])
+                expires_at = timestamp(data["expires_at"])
+                if worker_id != self.worker_id or device_key == previous_key or expires_at <= self._server_now():
+                    raise ProtocolError("invalid_response")
+            except ProtocolError:
+                self._rotation_retry_at = time.monotonic() + ROTATION_BACKOFF_SECONDS
+                return False
+            if not store(previous_key, worker_id, device_key, expires_at):
+                self._rotation_retry_at = time.monotonic() + ROTATION_BACKOFF_SECONDS
+                return False
+            self._rotation_retry_at = None
+            return True
+        except Exception:
+            self._rotation_retry_at = time.monotonic() + ROTATION_BACKOFF_SECONDS
+            return False
 
     def _advertisement(self, policy) -> tuple[AdvertisedAccount, ...]:
         """The allowlist as advertised: opaque references, labels and the default flag only."""
@@ -727,6 +833,9 @@ class RemoteClient:
                 online = self.state == "online"
             if online and not self.stop_event.is_set():
                 self.sync_readiness(policy)
+                # Optional key rotation, last for the same reason: bounded by one
+                # request and a Keychain write, and never raises.
+                self.rotate_key_if_due()
 
     def _sync_jobs(self, policy):
         try:

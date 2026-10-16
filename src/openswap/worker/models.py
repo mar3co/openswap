@@ -251,6 +251,10 @@ class WorkerSnapshot:
     remote_last_seen_at: datetime | None = None
     # The most recently finished job (its origin shows in status when idle).
     last_job: JobSnapshot | None = None
+    # Key rotation: whether the device key renews itself (None: not known yet),
+    # and the current key's expiry. Neither is secret.
+    remote_key_renews: bool | None = None
+    remote_key_expires_at: datetime | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -266,6 +270,8 @@ class WorkerSnapshot:
             "lease_quarantined": self.lease_quarantined,
             "remote_last_seen_at": _iso(self.remote_last_seen_at) if self.remote_last_seen_at else None,
             "last_job": self.last_job.to_dict() if self.last_job else None,
+            "remote_key_renews": self.remote_key_renews,
+            "remote_key_expires_at": _iso(self.remote_key_expires_at) if self.remote_key_expires_at else None,
         }
 
 
