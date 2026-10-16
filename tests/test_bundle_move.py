@@ -151,9 +151,35 @@ def test_a_move_copies_lifts_quarantine_and_leaves_no_staging(fs):
     assert target == fs["apps"] / "OpenSwap.app"
     assert bundle.bundle_version(target) == "0.2.0"
     assert app.exists()  # the source is left for the eject or the user
-    staging = fs["apps"] / ".OpenSwap.app.openswap-move"
-    assert fs["calls"]["quarantine"] == [staging]
-    assert not staging.exists()
+    [staging] = fs["calls"]["quarantine"]
+    assert staging.parent.parent == fs["apps"] and staging.name == "OpenSwap.app"
+    assert staging.parent.name.startswith(".OpenSwap.app.openswap-move-")
+    assert _leftovers(fs) == []
+
+
+def _leftovers(fs):
+    return [p.name for p in fs["apps"].glob(".OpenSwap.app.openswap-move*")]
+
+
+def test_each_attempt_stages_in_its_own_folder_and_touches_no_collision(fs):
+    """Two people moving at once never share a staging path; a stray folder
+    under the hidden name is nobody's to delete."""
+    stray = fs["apps"] / ".OpenSwap.app.openswap-move-stray"
+    stray.mkdir(parents=True)
+    (stray / "keep").write_text("x")
+    app = _app(fs["image"])
+    bundle.copy_to_applications(app, bundle.move_plan(app, fs["apps"]))
+    assert (stray / "keep").read_text() == "x"
+    assert _leftovers(fs) == [stray.name]
+
+
+@pytest.mark.parametrize("older, newer", [
+    ("1.0rc1", "1.0"), ("1.0a1", "1.0b1"), ("1.0b2", "1.0rc1"), ("1.0", "1.0.1"),
+    ("0.9.9", "0.10.0"), ("1.0-beta.1", "1.0"), ("v1.0", "1.1"),
+])
+def test_versions_order_with_pre_releases_below_their_release(older, newer):
+    assert bundle._version_key(older) < bundle._version_key(newer)
+    assert bundle._version_key(newer) == bundle._version_key(newer)
 
 
 def test_a_replace_trashes_the_old_copy_only_after_the_new_one_is_complete(fs):
@@ -188,7 +214,7 @@ def test_a_failed_final_rename_puts_the_old_app_back(fs, monkeypatch):
     real_rename = Path.rename
 
     def rename(self, target):
-        if self.name.endswith(".openswap-move"):
+        if self.parent.name.startswith(".OpenSwap.app.openswap-move-"):
             raise OSError("rename refused")
         return real_rename(self, target)
 
@@ -197,7 +223,7 @@ def test_a_failed_final_rename_puts_the_old_app_back(fs, monkeypatch):
         bundle.copy_to_applications(app, plan)
     assert bundle.bundle_version(fs["apps"] / "OpenSwap.app") == "0.1.0"
     assert not (fs["apps"] / "OpenSwap (old).app").exists()
-    assert not (fs["apps"] / ".OpenSwap.app.openswap-move").exists()
+    assert _leftovers(fs) == []
     assert fs["calls"]["trash"] == []
 
 
@@ -229,7 +255,7 @@ def test_quarantine_that_will_not_clear_fails_the_move(fs, monkeypatch):
     with pytest.raises(ClaudeSwitchError, match="quarantine"):
         bundle.copy_to_applications(app, plan)
     assert not (fs["apps"] / "OpenSwap.app").exists()
-    assert not (fs["apps"] / ".OpenSwap.app.openswap-move").exists()
+    assert _leftovers(fs) == []
 
 
 def test_quarantine_already_absent_is_fine(fs, monkeypatch):
@@ -265,7 +291,7 @@ def test_a_failed_copy_leaves_the_old_app_and_no_half_copy(fs, monkeypatch):
     with pytest.raises(ClaudeSwitchError, match="Could not copy OpenSwap"):
         bundle.copy_to_applications(app, plan)
     assert bundle.bundle_version(fs["apps"] / "OpenSwap.app") == "0.1.0"
-    assert not (fs["apps"] / ".OpenSwap.app.openswap-move").exists()
+    assert _leftovers(fs) == []
     assert fs["calls"]["trash"] == []
 
 
@@ -282,7 +308,7 @@ def test_a_failed_trash_leaves_the_old_app_beside_the_new_one(fs, monkeypatch):
     target = bundle.copy_to_applications(app, plan)
     assert bundle.bundle_version(target) == "0.2.0"
     assert bundle.bundle_version(fs["apps"] / "OpenSwap (old).app") == "0.1.0"
-    assert not (fs["apps"] / ".OpenSwap.app.openswap-move").exists()
+    assert _leftovers(fs) == []
 
 
 def test_a_copy_that_appeared_meanwhile_is_not_overwritten(fs):

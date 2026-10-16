@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -185,8 +186,23 @@ def bundle_version(app: Path) -> str | None:
     return version if isinstance(version, str) and version else None
 
 
-def _version_key(version: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in re.findall(r"\d+", version))
+def _version_key(version: str) -> tuple:
+    """Order versions so a pre-release sorts below its release: ``1.0rc1`` <
+    ``1.0`` < ``1.0.1``, and ``1.0a1`` < ``1.0b2`` < ``1.0rc1``. The release
+    part is the leading dotted numbers; anything after it is the pre-release
+    tag, compared as (word, number) pairs."""
+    match = re.match(r"\s*v?(\d+(?:\.\d+)*)(.*)$", version)
+    if match is None:
+        return ((), 0, ())
+    release = tuple(int(part) for part in match.group(1).split("."))
+    tail = match.group(2).strip(" .-_")
+    if not tail:
+        return (release, 1, ())
+    pre = tuple(
+        (word.lower(), int(number or 0))
+        for word, number in re.findall(r"([A-Za-z]+)[.\-_]?(\d*)", tail)
+    )
+    return (release, 0, pre)
 
 
 def _translocated_original(app: Path) -> Path | None:
@@ -410,15 +426,20 @@ def copy_to_applications(app: Path, plan: dict) -> Path:
     if action not in ("move", "replace"):
         raise ClaudeSwitchError("Nothing to move.")
     target = Path(plan["target"])
-    staging = target.with_name(f".{APP_NAME}.openswap-move")
+    # A folder of this attempt's own (mkdtemp is atomic), so two people
+    # moving at once never share a staging path, and nothing already there
+    # under a like name is touched.
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        if staging.exists():
-            shutil.rmtree(staging)
+        work = Path(tempfile.mkdtemp(prefix=f".{APP_NAME}.openswap-move-", dir=target.parent))
+    except OSError as e:
+        raise ClaudeSwitchError(f"Could not copy OpenSwap to {target.parent}: {e}") from e
+    staging = work / APP_NAME
+    try:
         _ditto(app, staging)
         _drop_quarantine(staging)
     except (OSError, subprocess.SubprocessError, ClaudeSwitchError) as e:
-        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
         raise ClaudeSwitchError(f"Could not copy OpenSwap to {target.parent}: {e}") from e
     old = None
     if target.exists():
@@ -426,7 +447,7 @@ def copy_to_applications(app: Path, plan: dict) -> Path:
         if action != "replace" or _homebrew_owns(target) or (
             existing and mine and _version_key(existing) >= _version_key(mine)
         ):
-            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(work, ignore_errors=True)
             raise ClaudeSwitchError(
                 f"OpenSwap{f' {existing}' if existing else ''} is already in {target.parent}."
             )
@@ -434,18 +455,19 @@ def copy_to_applications(app: Path, plan: dict) -> Path:
             old = _spare_name(target.with_name(f"{target.stem} (old){target.suffix}"))
             target.rename(old)
         except OSError as e:
-            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(work, ignore_errors=True)
             raise ClaudeSwitchError(f"Could not set aside the old OpenSwap: {e}") from e
     try:
         staging.rename(target)
     except OSError as e:
-        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
         if old is not None:
             try:
                 old.rename(target)  # the working install comes back
             except OSError:
                 _logger.error("could not put %s back at %s", old, target, exc_info=True)
         raise ClaudeSwitchError(f"Could not put OpenSwap in {target.parent}: {e}") from e
+    shutil.rmtree(work, ignore_errors=True)
     if old is not None:
         from openswap.widget_install import _move_to_trash
 
