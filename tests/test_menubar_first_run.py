@@ -99,7 +99,7 @@ def _status_line_app(tmp_path: Path, monkeypatch):
     errors: list[str] = []
     scope = {"ClaudeSwitchError": ClaudeSwitchError}
     app = extract_class(
-        menubar.__file__, "MenuBarApp", {"_status_line_installed", "_toggle_status_line"}, scope
+        menubar.__file__, "MenuBarApp", {"_status_line_state", "_toggle_status_line"}, scope
     )()
     backup = tmp_path / "OpenSwap"
     backup.mkdir()
@@ -124,16 +124,16 @@ def test_status_line_toggle_wraps_and_restores_through_the_shared_function(tmp_p
     monkeypatch.setattr(
         statusline, "set_installed", lambda *a: calls.append(a) or real(*a)
     )
-    assert app._status_line_installed() is False
+    assert app._status_line_state() == "off"
 
     app._toggle_status_line()
     settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
     assert settings["statusLine"]["command"] == "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap statusline"
-    assert app._status_line_installed() is True
+    assert app._status_line_state() == "on"
 
     app._toggle_status_line()
     assert "statusLine" not in json.loads((claude / "settings.json").read_text(encoding="utf-8"))
-    assert app._status_line_installed() is False
+    assert app._status_line_state() == "off"
     assert calls == [(claude, backup, True), (claude, backup, False)]
     assert errors == []
 
@@ -145,7 +145,7 @@ def test_status_line_toggle_flips_what_is_on_disk_now(tmp_path, monkeypatch):
 
     statusline.set_installed(claude, backup, True)
     app._toggle_status_line()
-    assert app._status_line_installed() is False
+    assert app._status_line_state() == "off"
 
 
 def test_status_line_toggle_reports_an_unreadable_settings_file(tmp_path, monkeypatch):
@@ -604,4 +604,61 @@ def test_the_toggle_turns_off_from_a_temporary_copy(tmp_path, monkeypatch):
     monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: True)
     app._toggle_status_line()
     assert errors == []
-    assert app._status_line_installed() is False
+    assert app._status_line_state() == "off"
+
+
+
+# ---- a status line hook for another OpenSwap (plan 020 step 6, revised) -----
+
+
+def test_a_hook_for_another_openswap_shows_off_with_a_hint():
+    rows = _general(status_line=False, status_line_other=True)
+    ids = [row["id"] for row in rows]
+    toggle = rows[ids.index("claude_status_line")]
+    assert toggle["value"] is False and toggle["disabled"] is False
+    hint = rows[ids.index("claude_status_line") + 1]
+    assert hint["id"] == "claude_status_line_hint"
+    assert hint["label"] == menubar.STATUS_LINE_OTHER_HINT
+    assert "another OpenSwap" in hint["label"]
+
+
+def test_a_temporary_copy_says_to_move_before_it_can_repoint():
+    rows = _general(
+        status_line=False, status_line_other=True, login_item={"enabled": False, "temporary": True}
+    )
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["claude_status_line"]["disabled"] is True
+    assert by_id["claude_status_line_hint"]["label"] == menubar.STATUS_LINE_MOVE_HINT
+
+
+def _hook(claude: Path, command: str) -> None:
+    (claude / "settings.json").write_text(
+        json.dumps({"statusLine": {"type": "command", "command": command}}), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    "hook",
+    [
+        "/Users/x/.local/bin/openswap statusline",  # a uv install's
+        "openswap statusline",  # bare: PATH decides which openswap runs
+    ],
+    ids=["another-program", "bare"],
+)
+def test_a_hook_for_another_program_reads_as_other_and_turning_on_repoints_it(
+    tmp_path, monkeypatch, hook
+):
+    from openswap import statusline
+
+    app, claude, backup, errors = _status_line_app(tmp_path, monkeypatch)
+    _hook(claude, hook)
+    statusline.save_wrap(backup, inner_command="~/.claude/statusline.sh", created=False)
+    assert app._status_line_state() == "other"
+
+    app._toggle_status_line()
+    assert errors == []
+    settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
+    assert settings["statusLine"]["command"] == "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap statusline"
+    assert app._status_line_state() == "on"
+    # The wrapped command survives the repoint.
+    assert statusline.load_wrap(backup)["innerCommand"] == "~/.claude/statusline.sh"

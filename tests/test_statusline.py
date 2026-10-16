@@ -965,3 +965,81 @@ class TestTemporaryCopy:
         from openswap import paths
 
         assert sl.is_installed(paths.get_claude_config_home()) is False
+
+
+
+class TestAnotherOpenSwap:
+    """A hook for another program is not this one, and turning it on repoints it
+    (plan 020 step 6, revised)."""
+
+    APP = "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap"
+
+    def _setup(self, tmp_path: Path, monkeypatch, hook: str):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        (claude / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command", "command": hook, "padding": 1}}),
+            encoding="utf-8",
+        )
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        sl.save_wrap(backup, inner_command="~/.claude/statusline.sh", created=False)
+        monkeypatch.setattr(sl, "paint_command", lambda: f"{self.APP} statusline")
+        return claude, backup
+
+    @pytest.mark.parametrize(
+        "hook",
+        ["/Users/x/.local/bin/openswap statusline", "openswap statusline"],
+        ids=["another-program", "bare"],
+    )
+    def test_is_not_this_program(self, tmp_path: Path, monkeypatch, hook):
+        claude, _backup = self._setup(tmp_path, monkeypatch, hook)
+        assert sl.is_installed(claude) is True
+        assert sl.runs_this_program(claude) is False
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need extra privileges on Windows")
+    def test_this_program_or_a_link_to_it(self, tmp_path: Path, monkeypatch):
+        app = tmp_path / "OpenSwap.app" / "Contents" / "MacOS" / "OpenSwap"
+        app.parent.mkdir(parents=True)
+        app.write_bytes(b"")
+        link = tmp_path / "bin" / "openswap"
+        link.parent.mkdir()
+        link.symlink_to(app)
+        claude, _backup = self._setup(tmp_path, monkeypatch, f"{link} statusline")
+        monkeypatch.setattr(sl, "paint_command", lambda: f"{app} statusline")
+        assert sl.runs_this_program(claude) is True
+
+    def test_turning_on_repoints_and_keeps_the_wrap_and_the_prefix(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._setup(
+            tmp_path, monkeypatch, "FOO=1 /Users/x/.local/bin/openswap statusline"
+        )
+        result = sl.set_installed(claude, backup, True)
+        assert result == {"already": False, "created": False, "migrated": False, "repointed": True}
+        block = json.loads((claude / "settings.json").read_text(encoding="utf-8"))["statusLine"]
+        assert block == {"type": "command", "command": f"FOO=1 {self.APP} statusline", "padding": 1}
+        assert sl.load_wrap(backup) == {"innerCommand": "~/.claude/statusline.sh", "created": False}
+        assert sl.runs_this_program(claude) is True
+        # Then it is ours: a second call changes nothing.
+        assert sl.set_installed(claude, backup, True)["already"] is True
+
+    def test_a_bare_command_is_left_alone_when_nothing_better_can_be_pinned(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._setup(tmp_path, monkeypatch, "openswap statusline")
+        monkeypatch.setattr(sl, "paint_command", lambda: sl.PAINT_COMMAND)
+        assert sl.runs_this_program(claude) is True
+        assert sl.set_installed(claude, backup, True)["already"] is True
+
+    def test_the_cli_install_repoints_too(self, temp_home: Path, monkeypatch, capsys):
+        from openswap import paths
+        from openswap.cli import _statusline_command
+
+        claude = paths.get_claude_config_home()
+        claude.mkdir(parents=True, exist_ok=True)
+        (claude / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command", "command": "openswap statusline"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(sl, "paint_command", lambda: f"{self.APP} statusline")
+        assert _statusline_command(["--install"]) == 0
+        assert "now runs this OpenSwap" in capsys.readouterr().out
+        block = json.loads((claude / "settings.json").read_text(encoding="utf-8"))["statusLine"]
+        assert block["command"] == f"{self.APP} statusline"

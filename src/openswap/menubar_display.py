@@ -431,6 +431,7 @@ def settings_page_rows(
     worker_paired: bool = False,
     login_item: dict | None = None,
     status_line: bool = False,
+    status_line_other: bool = False,
     bundled_widget: bool = False,
     section: str | None = None,
 ) -> list[dict]:
@@ -452,10 +453,11 @@ def settings_page_rows(
 
     General ends with **This Mac**: what ``openswap setup`` and its
     neighbours set up from a terminal. After Open at login,
-    ``status_line`` is whether Claude Code's status line is OpenSwap's (read
-    from disk when the page is built); ``bundled_widget`` is true in the app
-    at a stable location, which registers its widget at start-up, so only
-    adding it is left.
+    ``status_line`` is whether Claude Code's status line runs this OpenSwap
+    and ``status_line_other`` whether it runs another one (both read from
+    disk when the page is built); ``bundled_widget`` is true in the app at a
+    stable location, which registers its widget at start-up, so only adding
+    it is left.
     """
     general = [
         {
@@ -547,6 +549,7 @@ def settings_page_rows(
     general.extend(this_mac_rows(login_item))
     general.extend(_this_mac_setup_rows(
         status_line=status_line,
+        status_line_other=status_line_other,
         bundled_widget=bundled_widget,
         temporary=bool(isinstance(login_item, dict) and login_item.get("temporary")),
     ))
@@ -795,6 +798,7 @@ def settings_page_rows(
 
 OPEN_AT_LOGIN_MOVE_HINT = "Move OpenSwap to Applications to open it at login."
 STATUS_LINE_MOVE_HINT = "Move OpenSwap to Applications to turn on the status line."
+STATUS_LINE_OTHER_HINT = "The status line uses another OpenSwap. Turn this on to use this one."
 OPEN_AT_LOGIN_AFTER_QUIT_HINT = (
     "OpenSwap stays open until you quit it, and won’t open at the next login."
 )
@@ -872,13 +876,20 @@ def this_mac_rows(login_item: dict | None) -> list[dict]:
 
 
 def _this_mac_setup_rows(
-    *, status_line: bool, bundled_widget: bool, temporary: bool = False
+    *,
+    status_line: bool,
+    bundled_widget: bool,
+    status_line_other: bool = False,
+    temporary: bool = False,
 ) -> list[dict]:
     """General › This Mac after Open at login: the rest of the terminal's setup.
 
-    From a translocated or mounted copy (``temporary``, the same fact Open at
-    login reads) the status line cannot be turned on: the hook would pin a
-    path that disappears. Turning it off stays possible.
+    The status line toggle is on only when the hook runs this OpenSwap. One
+    for another OpenSwap (a bare ``openswap statusline`` PATH may send to an
+    older uv install, or another copy) shows as off with a hint; turning it
+    on repoints it. From a translocated or mounted copy (``temporary``, the
+    same fact Open at login reads) the status line cannot be turned on: the
+    hook would pin a path that disappears. Turning it off stays possible.
     """
     # Lazy: widget_install pulls in widget_snapshot, which imports menubar.
     from openswap.widget_install import ADD_WIDGET_HINT
@@ -896,14 +907,19 @@ def _this_mac_setup_rows(
             "disabled": blocked,
         },
     ]
+    note = ""
     if blocked:
+        note = STATUS_LINE_MOVE_HINT
+    elif status_line_other and not status_line:
+        note = STATUS_LINE_OTHER_HINT
+    if note:
         rows.append({
             "kind": "group",
             "style": "hint",
             "section": SETTINGS_SECTION_GENERAL,
             "id": "claude_status_line_hint",
-            "label": STATUS_LINE_MOVE_HINT,
-            "lines": _hint_lines(STATUS_LINE_MOVE_HINT),
+            "label": note,
+            "lines": _hint_lines(note),
         })
     if bundled_widget:
         rows.append({

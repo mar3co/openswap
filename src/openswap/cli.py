@@ -1495,7 +1495,10 @@ def _statusline_command(argv: list[str]) -> int:
     group.add_argument(
         "--install",
         action="store_true",
-        help="Wrap ~/.claude/settings.json statusLine (creates one if missing)",
+        help=(
+            "Wrap ~/.claude/settings.json statusLine (creates one if missing, "
+            "and points another OpenSwap's hook at this one)"
+        ),
     )
     group.add_argument(
         "--uninstall",
@@ -1534,6 +1537,9 @@ def _statusline_command(argv: list[str]) -> int:
             return 1
         if result.get("already"):
             print("Claude Code status line already wraps OpenSwap.")
+            return 0
+        if result.get("repointed"):
+            print("Claude Code status line now runs this OpenSwap.")
             return 0
         if result.get("created"):
             print("Claude Code status line installed (account name only).")

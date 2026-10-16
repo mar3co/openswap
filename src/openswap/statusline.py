@@ -494,12 +494,62 @@ def _write_json(path: Path, data: dict) -> None:
         raise
 
 
+def _command_program(command: str | None) -> str | None:
+    """The program an OpenSwap hook runs: the word before ``statusline``."""
+    if not isinstance(command, str):
+        return None
+    try:
+        parts = shlex.split(command.strip())
+    except ValueError:
+        return None
+    return parts[-2] if len(parts) >= 2 else None
+
+
+def _is_path(program: str) -> bool:
+    return os.sep in program or "/" in program
+
+
+def _runs_same_program(hook: str | None, command: str) -> bool:
+    """Whether an OpenSwap ``hook`` runs the program ``command`` pins.
+
+    A bare ``openswap`` in the hook is another program when ``command`` names
+    a path: PATH may send it to an older uv install. When ``command`` is bare
+    itself (no openswap was found to pin), any OpenSwap hook counts.
+    """
+    ours = _command_program(command)
+    theirs = _command_program(hook)
+    if ours is None or theirs is None:
+        return False
+    if not _is_path(ours):
+        return True
+    return _is_path(theirs) and _same_program(theirs, Path(ours))
+
+
+def runs_this_program(config_home: Path) -> bool:
+    """Whether Claude Code's status line is OpenSwap's and runs the program
+    :func:`paint_command` pins, or a link to it (the app's toggle).
+
+    A hook for another program, a bare ``openswap statusline`` included, is
+    not this one: :func:`set_installed` repoints it.
+    """
+    current = installed_command(config_home)
+    return is_our_command(current) and _runs_same_program(current, paint_command())
+
+
 def install(
     config_home: Path,
     backup_root: Path,
     *,
     command: str = PAINT_COMMAND,
 ) -> dict:
+    """Wrap Claude Code's status line with ``command``.
+
+    A hook that is already OpenSwap's and runs ``command``'s program is left
+    alone (``already``). One that runs another program (a bare
+    ``openswap statusline``, or another copy) is pointed at ``command``,
+    keeping any prefix before the program and the wrap state
+    (``repointed``).
+    """
     settings_file = config_home / "settings.json"
     # Read both files before writing either: a torn OpenSwap settings.json
     # must not leave Claude already wrapped.
@@ -511,7 +561,13 @@ def install(
         raw_cmd = block.get("command")
         current = raw_cmd if isinstance(raw_cmd, str) else None
         if is_our_command(current):
-            return {"already": True, "created": False, "migrated": False}
+            if _runs_same_program(current, command):
+                return {"already": True, "created": False, "migrated": False}
+            parts = shlex.split(current.strip())
+            block["command"] = shlex.join([*parts[:-2], *shlex.split(command)])
+            settings["statusLine"] = block
+            _write_json(settings_file, settings)
+            return {"already": False, "created": False, "migrated": False, "repointed": True}
         if _is_legacy_command(current):
             block["command"] = command
             settings["statusLine"] = block
@@ -532,7 +588,8 @@ def install(
 
 
 def is_installed(config_home: Path) -> bool:
-    """Whether Claude Code's status line is OpenSwap's (the app's toggle)."""
+    """Whether Claude Code's status line is OpenSwap's, for any program.
+    The app's toggle is :func:`runs_this_program`."""
     return installed_command(config_home) is not None
 
 
@@ -541,7 +598,8 @@ def set_installed(config_home: Path, backup_root: Path, enabled: bool) -> dict:
 
     The one path behind ``openswap statusline --install/--uninstall`` and
     the app's Settings toggle, so both write the same hook: it always pins
-    :func:`paint_command`. Returns :func:`install`'s or :func:`uninstall`'s
+    :func:`paint_command`, and turning it on repoints an OpenSwap hook that
+    runs another program. Returns :func:`install`'s or :func:`uninstall`'s
     result.
 
     Turning it on from a translocated or mounted copy of the app raises

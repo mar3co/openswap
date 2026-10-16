@@ -1020,7 +1020,7 @@ class MenuBarPanel:
         self._worker_status = worker_status or (lambda: {})
         self._worker_paired = worker_paired or (lambda: False)
         self._login_item = login_item
-        self._status_line = status_line or (lambda: False)
+        self._status_line = status_line or (lambda: "off")  # "on" | "other" | "off"
         self._bundled_widget = bundled_widget or (lambda: False)
         # None, or the facts for the first-run welcome page while it is due.
         self._welcome = welcome or (lambda: None)
@@ -2030,9 +2030,9 @@ class MenuBarPanel:
         except Exception:
             login_item = None
         try:
-            status_line = bool(self._status_line())
+            status_line = self._status_line()
         except Exception:
-            status_line = False
+            status_line = "off"
         try:
             bundled_widget = bool(self._bundled_widget())
         except Exception:
@@ -2048,7 +2048,8 @@ class MenuBarPanel:
             worker_status=worker_status,
             worker_paired=worker_paired,
             login_item=login_item,
-            status_line=status_line,
+            status_line=status_line == "on",
+            status_line_other=status_line == "other",
             bundled_widget=bundled_widget,
             section=self._settings_section,
         )

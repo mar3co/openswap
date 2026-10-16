@@ -1501,7 +1501,7 @@ def run(switcher, codex=None) -> int:
                 on_worker_view_active=self._worker_view_active,
                 worker_paired=lambda: self._worker_policy.control_service_url is not None,
                 login_item=self._login_item_state,
-                status_line=self._status_line_installed,
+                status_line=self._status_line_state,
                 bundled_widget=_bundled_widget,
                 welcome=self._welcome_state,
                 on_welcome_continue=self._on_welcome_continue,
@@ -1931,27 +1931,35 @@ def run(switcher, codex=None) -> int:
             ):
                 panel.reload()
 
-        def _status_line_installed(self) -> bool:
+        def _status_line_state(self) -> str:
+            """``"on"``: Claude Code's status line runs this OpenSwap.
+            ``"other"``: an OpenSwap hook for another program (a bare
+            ``openswap statusline``, or another copy). ``"off"``: neither."""
             from openswap import paths
-            from openswap.statusline import is_installed
+            from openswap.statusline import is_installed, runs_this_program
 
+            config_home = paths.get_claude_config_home()
             try:
-                return is_installed(paths.get_claude_config_home())
+                if runs_this_program(config_home):
+                    return "on"
+                return "other" if is_installed(config_home) else "off"
             except Exception:
                 self.switcher._logger.debug("status line read failed", exc_info=True)
-                return False
+                return "off"
 
         def _toggle_status_line(self) -> None:
             """Settings › This Mac: `openswap statusline --install/--uninstall`.
 
             Flips what is on disk now, not what the page showed: the CLI may
-            have changed it since the page was built. From a translocated or
-            mounted copy, turning it on is refused (the row is disabled too).
+            have changed it since the page was built. A hook for another
+            OpenSwap shows as off, so this turns it on, which repoints it. From
+            a translocated or mounted copy, turning it on is refused (the row
+            is disabled too).
             """
             from openswap import paths
             from openswap.statusline import set_installed
 
-            enable = not self._status_line_installed()
+            enable = self._status_line_state() != "on"
             try:
                 set_installed(paths.get_claude_config_home(), self.switcher.backup_dir, enable)
             except (ClaudeSwitchError, OSError) as e:
