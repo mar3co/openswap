@@ -121,10 +121,13 @@ launchd job running, open the app from Finder, from Spotlight and with
 `open -a OpenSwap`. Record whether a second status item appears.
 
 - Before anything else, a copy launchd did not start (Finder, Spotlight,
-  a terminal `openswap menubar`) whose login item runs this program hands
-  over to it: `launch_agent.start_login_item()` (Step 2) starts the job and
-  this copy exits 0 once the job's pid exists. This covers a login item
-  that is on but not running, for example after Quit
+  a terminal `openswap menubar`) whose login item runs this program and has
+  no running process hands over to it: `launch_agent.start_login_item()`
+  (Step 2) starts the job and this copy exits 0 once the job's pid exists.
+  When the job is already running, skip the hand-over and take the lock
+  path below, so the running copy is told to show its popover. The
+  hand-over covers a login item that is on but not running, for example
+  after Quit
   (`KeepAlive: {SuccessfulExit: false}` does not restart a clean exit).
   Without it the Finder copy would hold the lock, and the cask's upgrade
   kickstart would start a launchd copy that waits behind the old build. If
@@ -147,7 +150,8 @@ launchd job running, open the app from Finder, from Spotlight and with
 
 **Verify**: unit tests for the lock (two file descriptions in one process
 conflict under `flock`), the wait-only-when-launchd rule, the start-up
-hand-over (login item on and idle, on and running, off, running another
+hand-over (login item on and idle; on and running, which posts the show
+notification and never calls `start_login_item`; off; running another
 program), and the notification name. Manual: open the app three ways while
 the job runs; one status item, and the popover opens each time. Quit, then
 open the app from Finder: `launchctl print` shows the job running it.
