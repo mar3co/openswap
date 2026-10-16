@@ -420,21 +420,40 @@ def _install_bundled_widget(home: Path | None = None, uid: int | None = None) ->
     return {"app": str(app), "label": "", "plist": ""}
 
 
+def _lists_appex(registrations: list[str], appex: Path) -> bool:
+    wanted = {str(appex)}
+    try:
+        wanted.add(str(appex.resolve()))
+    except (OSError, RuntimeError):
+        pass
+    return any(entry in wanted for entry in registrations)
+
+
 def register_on_start(home: Path | None = None, uid: int | None = None) -> bool:
-    """Register the bundled appex when the app starts and it is not registered.
+    """Register the bundled appex when the app starts, unless it already is.
 
     The same registration as ``openswap widget --install``, so a cask install
-    opened from Finder offers the widget without a terminal. Only the frozen
-    app does this, and never from a translocated or mounted copy: that path
-    is gone soon, and registering it would leave a dead provider. Never
-    raises; a failure is logged, not shown. Returns whether it registered.
+    opened from Finder offers the widget without a terminal. "Already" means
+    this bundle's own appex is listed: ``registered`` alone is true when only
+    an old or copied app with the same extension id is. When pluginkit cannot
+    list registrations it registers anyway (``pluginkit -a`` is idempotent).
+
+    Only the frozen app does this, and never from a translocated or mounted
+    copy: that path is gone soon, and registering it would leave a dead
+    provider. Never raises; a failure is logged, not shown. Returns whether
+    it registered.
     """
     if sys.platform != "darwin" or not bundle.is_frozen():
         return False
     if bundle.runs_from_temporary_location():
         return False
+    appex = bundle.appex()
     try:
-        if widget_status(home=home, uid=uid)["registered"]:
+        try:
+            registrations = widget_status(home=home, uid=uid)["registrations"]
+        except ClaudeSwitchError:
+            registrations = None
+        if appex is not None and registrations is not None and _lists_appex(registrations, appex):
             return False
         _install_bundled_widget(home=home, uid=uid)
     except Exception:
