@@ -124,6 +124,16 @@ lease.
   the old one. A second `rotate_key` sent with the old key replaces the
   pending key, which covers a retry after a lost response. No more than one
   pending key exists per worker.
+- **Requests already in flight.** The worker's heartbeat, claim-renewal and
+  synchronization threads share one transport. A request sent with the old key
+  can therefore still be in flight when another thread's request promotes the
+  new key. So after promotion the old hash moves to `previous_key_hash` and is
+  still accepted for 2 minutes, then dropped. Without this, the straggler would
+  get `unauthorized`, which the worker treats as a revocation
+  (`openswap.worker.remote`).
+- **Registration is untouched.** `rotate_key` and promotion never register,
+  never bump `worker_epoch` and never touch claims or leases. A rotation must
+  not interrupt a running job the way a new registration does.
 - **Rate.** Replacing a pending key is always allowed, because that is how a
   retry after a lost response works. After a pending key is promoted, the next
   rotation is refused for one hour with 409 `rotation_too_soon`. That is a new
@@ -132,15 +142,18 @@ lease.
 - **Audit.** Write `worker.key_rotated` when the pending key is created and
   `worker.key_promoted` when it becomes current. Neither row contains a key.
   The `last_seen_at` handling matches renewal.
-- **Revocation.** Revoking a worker clears `pending_key_hash` as well.
+- **Revocation.** Revoking a worker also clears `pending_key_hash` and
+  `previous_key_hash`.
 
 **Migration.** Add one forward migration, after the newest one at the time
 (today `20261014120000_worker_origin.sql`). It does the following:
 
 - adds `pending_key_hash` (unique, sha256 hex) and `pending_key_expires_at`
-  (the new key's 30-day expiry, which becomes `key_expires_at` on promotion) to
+  (the new key's 30-day expiry, which becomes `key_expires_at` on promotion),
+  plus `previous_key_hash` and `previous_key_until` for the 2-minute grace, to
   `remote_workers`;
-- updates `worker_protocol_auth` to accept a pending key and promote it;
+- updates `worker_protocol_auth` to accept a pending key and promote it, and to
+  accept the previous key until `previous_key_until`;
 - adds a `rotate_key` branch to `worker_protocol_call`;
 - adds `key_rotation` to the features the capabilities branch accepts.
 
@@ -149,6 +162,8 @@ the repo's earlier forward migrations do. pgTAP covers these cases:
 
 - rotate, then authenticate with the new key, which promotes it;
 - an old-key retry replaces the pending key;
+- the old key works for 2 minutes after promotion, then gets `unauthorized`;
+- rotation and promotion leave `worker_epoch`, claims and leases unchanged;
 - a revoked worker cannot rotate;
 - an expired key cannot rotate;
 - the hourly limit after a promotion, and that it never blocks a retry;
@@ -171,18 +186,34 @@ Mac. Docs go in `docs/remote-workers.md`.
   registration where the backend accepted it, the remote loop rotates when 7
   days or fewer remain. It asks at most once per pass and backs off for an hour
   after a failure. Rotation never holds back heartbeats, claims or launches.
-- **Saving the new key.** A new `pairing.rotate(root, url)` does the work under
-  the existing pairing lock:
-  1. It loads the enrollment, calls `rotate_key` and checks that the response
-     is a closed object.
-  2. It refuses a response whose `worker_id` differs from the configured one.
-  3. It writes the new key to the Keychain item before the key is used. If the
-     Keychain write fails, it keeps the old key; the server still accepts the
-     old key because the new one is only pending.
-  4. Once the new key is saved, the worker's next request promotes it.
+- **Saving the new key without re-registering.** Today a changed key re-registers:
+  `ConfiguredRemote._resolve` (`openswap.worker.remote_state`) compares the
+  whole `Enrollment`, key included. When it differs, it builds a new
+  `RemoteClient`, and that client registers again. A new registration bumps the
+  worker epoch and interrupts every claimed or running job. So rotation runs
+  inside the active client and updates everything in place:
+  1. The remote client calls `rotate_key` with its current transport and
+     epoch. It checks that the response is a closed object, and refuses a
+     `worker_id` that differs from its own.
+  2. Under the pairing lock, a new `pairing.store_rotated_key(root, url,
+     enrollment)` writes the new key to the Keychain item. It first checks that
+     the item still holds the key the client started with. If the owner
+     unpaired or reconnected meanwhile, it writes nothing. If the Keychain
+     write fails, the client keeps the old key; the server still accepts it
+     because the new one is only pending.
+  3. Under `ConfiguredRemote._client_lock`, the client swaps the key on its
+     transport, and `ConfiguredRemote.identity` is set to the new
+     `(url, enrollment)` in the same step. The next `_resolve` and
+     `launch_allowed` then see an unchanged identity, and the client is kept.
+     The transport reads its key once per request, under a small lock, so each
+     request carries one key or the other in full.
+  4. The next request from any thread promotes the new key. A request already
+     in flight with the old key is covered by the server's 2-minute grace.
 
-  Like a renewal today, it never drops the saved status: the worker ID and
-  service are unchanged.
+  Any other key change still rebuilds the client, as today. That covers an
+  unpair and pair, and the reconnect in S2, whose old key may already be dead.
+  Rotation keeps the saved status, because the worker ID, service and
+  registration are unchanged.
 - **Reference server.** Implement `rotate_key` with the same pending-key rules,
   so the client is tested end to end on loopback.
 - **Status.** Status and the menu say "Key renews automatically" or "Key
@@ -257,6 +288,14 @@ lifetime and single use. It is issued with the same per-owner limits as the
   it was paired. Older clients never send a verifier, and they keep the exact
   closed response shape that `fields()` in `openswap.worker.protocol` checks.
 - **Name.** The new worker's display name defaults to the code's `label`.
+- **Reconnect keeps the old key until the new one is used.** Today the
+  renewal branch of `pair` replaces `key_hash` as soon as the code is
+  consumed. If the Mac then failed to save the new key, a Mac whose old key
+  still worked would be cut off. So a renewal code redeemed with a verifier
+  stores the new key as `pending_key_hash`, using the same pending, promotion
+  and grace rules as `rotate_key` from O1. The old key keeps working until the
+  new key is first used. A renewal code redeemed without a verifier (the pasted
+  flow) keeps today's immediate replacement, so older clients see no change.
 
 **Migration.** Add one forward migration. It adds `code_challenge`,
 `redirect_uri` and `label` (all nullable) to `remote_worker_pair_codes`, plus
@@ -265,7 +304,10 @@ the `pair` branch changes. pgTAP covers these cases:
 - the verifier match, mismatch and missing cases, and that a failure consumes
   nothing;
 - a verifier sent on a code without a challenge;
-- a renewal through connect keeps the worker ID;
+- a renewal through connect keeps the worker ID, leaves the new key pending,
+  keeps the old key working until the new key is used, and promotes on first
+  use;
+- a pasted renewal code still replaces the key at once;
 - a revoked worker is refused;
 - the code still expires after 10 minutes;
 - the redirect URI and challenge never leave service-only tables.
@@ -299,8 +341,12 @@ OpenSwap", with the command steps kept behind the same disclosure.
   - A reconnect calls a new `pairing.reconnect(root, url, code, code_verifier=…)`.
     It replaces the key for the configured URL in one locked transaction,
     without the `unpair_before_pairing` refusal. It refuses a returned
-    `worker_id` that differs from the configured one, and keeps the old key if
-    anything fails.
+    `worker_id` that differs from the configured one.
+  - **When a reconnect fails partway.** If saving the new key fails after
+    redemption, the Mac keeps its old key. While that key is still live it
+    keeps working, because O2 leaves the server's new key pending. When the
+    old key has already expired, nothing usable is left. Then the Mac says to
+    run Connect again, and the new code replaces the unused pending key.
 - **The browser tab.** It gets a small page: "Paired. You can close this tab
   and go back to OpenSwap" when redemption succeeded, or the error and the
   next step when it failed. That page is sent only after redemption, so the tab
@@ -341,7 +387,7 @@ without rotation.
 | Owner selects Cancel in the portal | The Mac gets `access_denied`, stops and says so. |
 | App quits or crashes after approval, before redemption | The listener is gone and the code goes unused, then expires. Nothing is paired. Run Connect again. |
 | Redemption fails (network, a refused code) | The tab and the dialog show the error. The code stays unconsumed unless the server consumed it. Run Connect again. |
-| Keychain or settings write fails | Same as today's `_pair`: no orphaned key and no half-configured URL. |
+| Keychain or settings write fails | A new pairing behaves like today's `_pair`: no orphaned key and no half-configured URL. A reconnect keeps the old key, which still works while it is live because the server's new key is only pending. |
 | Two Connects at once | The pairing lock refuses the second with `pairing_in_progress`. |
 
 **Several Macs, and pairing the same Mac again.**
@@ -378,7 +424,10 @@ composed scripts, as for plan 017 and plan 018.
 - **Pairing.** `pair` with a verifier accepts the response's extra labels;
   without a verifier it still refuses them. `reconnect` refuses a different
   `worker_id` and keeps the old key on every failure.
-- **Rotation.** It starts at 7 days left and not before. A lost response
+- **Rotation.** It keeps the same `RemoteClient` and worker epoch. A job
+  that is running when the key rotates finishes and uploads normally. A
+  concurrent unpair during rotation wins, and nothing is written. It starts at
+  7 days left and not before. A lost response
   recovers. A Keychain write failure keeps the old key. A 404 stops it until
   the next registration. It never blocks a heartbeat. It is refused when
   revoked.
