@@ -297,6 +297,12 @@ def run(switcher, codex=None) -> int:
                     install()
                 except Exception:
                     self.switcher._logger.warning("%s hook failed", name, exc_info=True)
+            # Continue on the welcome page from a translocated or mounted
+            # copy: not again this run, and welcome_done stays unsaved.
+            self._welcome_dismissed = False
+            # A login item change started by the welcome page's Continue: its
+            # failure is shown as an alert, since the page went on to the cards.
+            self._login_item_from_welcome = False
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -710,7 +716,7 @@ def run(switcher, codex=None) -> int:
             if (
                 panel is not None
                 and panel.is_shown()
-                and getattr(panel, "_page", None) == MAIN_PAGE
+                and getattr(panel, "_page", None) in (MAIN_PAGE, WELCOME_PAGE)
             ):
                 if getattr(panel, "_selected_provider", None) == "chatgpt":
                     self._on_chatgpt_view_active()
@@ -1497,6 +1503,8 @@ def run(switcher, codex=None) -> int:
                 login_item=self._login_item_state,
                 status_line=self._status_line_installed,
                 bundled_widget=_bundled_widget,
+                welcome=self._welcome_state,
+                on_welcome_continue=self._on_welcome_continue,
             )
             self._panel.attach(nsitem)
             # Requests left before the observers existed: `openswap setup`
@@ -1508,6 +1516,7 @@ def run(switcher, codex=None) -> int:
             if self._show_popover_pending:
                 self._show_popover_pending = False
                 self.show_popover()
+            self._welcome_on_start()
 
         def _on_show_request(self):
             """The show notification, and start-up: consume the show request
@@ -1548,6 +1557,68 @@ def run(switcher, codex=None) -> int:
                 return
             if not panel.is_shown():
                 panel.toggle()
+
+        # ---- first run: the welcome page (plan 020) ----------------------
+        def _welcome_state(self):
+            """Facts for the welcome page while it is due, else None.
+
+            Due in the app until Continue saves ``welcome_done``. Closing the
+            popover without Continue changes nothing, so the next open shows
+            it again. A uv install never shows it: `openswap setup` is that path.
+            """
+            from openswap import bundle, launch_agent
+
+            if not bundle.is_frozen() or self.settings.welcome_done or self._welcome_dismissed:
+                return None
+            try:
+                login_item = bool(launch_agent.login_item_enabled())
+            except Exception:
+                self.switcher._logger.debug("login item read failed", exc_info=True)
+                login_item = False
+            return {"temporary": bundle.runs_from_temporary_location(), "login_item": login_item}
+
+        def _welcome_on_start(self):
+            """Open the popover once, by itself, on the welcome page.
+
+            An LSUIElement app shows no window, so without this a first launch
+            from Finder looks like nothing happened.
+            """
+            from openswap import bundle
+
+            action = welcome_on_start(
+                self.settings,
+                frozen=bundle.is_frozen(),
+                temporary=bundle.runs_from_temporary_location(),
+                login_item_runs_this_app=bundle.login_item_runs_this_app(),
+            )
+            if action == "done":
+                # `openswap setup` already set this app up; nothing to ask.
+                self.settings.welcome_done = True
+                try:
+                    self.settings.save(settings_path)
+                except OSError:
+                    self.switcher._logger.debug("could not save welcome_done", exc_info=True)
+            elif action == "show":
+                self.show_popover()
+
+        def _on_welcome_continue(self, open_at_login):
+            """Save ``welcome_done``, then apply the switch (a hand-over last)."""
+            from openswap import bundle
+
+            if bundle.runs_from_temporary_location():
+                # Nothing may be pinned to a path that vanishes. The copy moved
+                # to Applications shows the welcome page again.
+                self._welcome_dismissed = True
+                return
+            self.settings.welcome_done = True
+            try:
+                self.settings.save(settings_path)
+            except OSError as e:
+                self._show_error(f"Couldn't save settings: {e}")
+            self._login_item_from_welcome = True
+            self._apply_login_item(bool(open_at_login))
+            if not self._login_item_busy:
+                self._login_item_from_welcome = False  # it did not start
 
         def _on_empty_action(self, provider, action):
             if self._desktop_switching or self._refreshing:
@@ -1827,12 +1898,19 @@ def run(switcher, codex=None) -> int:
             if result is None:
                 return
             self._login_item_busy = False
+            from_welcome, self._login_item_from_welcome = self._login_item_from_welcome, False
             if result.get("outcome") == "handoff":
                 # set_login_item returned once launchd's copy was up; it is
                 # waiting for this copy's menu bar lock, so quit now.
                 self.on_quit(None)
                 return
             self._login_item_last = result
+            if from_welcome and result.get("error"):
+                # Continue went on to the cards, where the hint under the
+                # switch in Settings would go unseen.
+                self._show_error(
+                    OPEN_AT_LOGIN_BLOCKED_HINT if result.get("blocked") else result["error"]
+                )
             panel = self._panel
             if (
                 panel is not None

@@ -259,6 +259,7 @@ def _remote_task_origin(origin) -> str:
     return f" from {label} ({origin['kind']})" if label else f" from {origin['kind']}"
 SETTINGS_PAGE = "settings"
 TOKEN_PAGE = "token"
+WELCOME_PAGE = "welcome"
 SETUP_TOKEN_PREFIX = "sk-ant-oat"
 MAIN_PAGE = "main"
 CHATGPT_SWITCHING_HINT = (
@@ -373,6 +374,9 @@ class MenuBarSettings:
     kickoff_hour: int = 7
     kickoff_minute: int = 0
     kickoff_last_date: str = ""  # local YYYY-MM-DD of the last kickoff run
+    # The app's first-run welcome page was finished (Continue), or
+    # `openswap setup` had already set up the login item.
+    welcome_done: bool = False
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -2369,6 +2373,77 @@ def provider_empty_state(provider: str, state: str = "ready", *, desktop: bool =
         "secondary_action": "add",
         "secondary_button": "Save current login",
         "hint": "",
+    }
+
+
+WELCOME_TITLE = "Welcome to OpenSwap"
+WELCOME_BODY = (
+    "OpenSwap shows each account’s usage in the menu bar and switches "
+    "Claude Code and Codex accounts in one click."
+)
+WELCOME_OPEN_AT_LOGIN = "Open at login"
+WELCOME_LOGIN_HINT = "Keeps OpenSwap in the menu bar after you restart."
+WELCOME_LOGIN_ON_HINT = "OpenSwap already opens at login."
+WELCOME_MOVE_HINT = "Move OpenSwap to Applications first to open it at login."
+
+
+def welcome_on_start(
+    settings: MenuBarSettings,
+    *,
+    frozen: bool,
+    temporary: bool,
+    login_item_runs_this_app: bool,
+) -> str:
+    """What the app does about the welcome page when it starts.
+
+    ``"show"``: open the popover once, by itself, on the welcome page (an
+    LSUIElement app shows no window, so a first launch would look like
+    nothing happened). ``"done"``: ``openswap setup`` already pointed the
+    login item at this app, so save ``welcome_done`` and show nothing.
+    ``"none"``: a uv install (``openswap setup`` is its path), a finished
+    welcome, or a translocated or mounted copy.
+    """
+    if not frozen or settings.welcome_done or temporary:
+        return "none"
+    if login_item_runs_this_app:
+        return "done"
+    return "show"
+
+
+def welcome_page_model(
+    *,
+    claude_accounts: int,
+    claude_state: str = "ready",
+    temporary: bool = False,
+    login_item: bool = False,
+    open_at_login: bool = True,
+) -> dict:
+    """The first-run welcome page. No AppKit.
+
+    ``account`` is the Claude empty state (Sign in with Claude, Save current
+    login) until an account is saved, else None. The **Open at login**
+    switch starts on (``open_at_login`` is the user's pick so far); from a
+    translocated or mounted copy it is off and disabled, since nothing may
+    be pinned to that path. Continue applies it.
+    """
+    account = None
+    if claude_accounts <= 0:
+        account = provider_empty_state("claude", claude_state)
+    if temporary:
+        hint = WELCOME_MOVE_HINT
+    elif login_item:
+        hint = WELCOME_LOGIN_ON_HINT
+    else:
+        hint = WELCOME_LOGIN_HINT
+    return {
+        "title": WELCOME_TITLE,
+        "body": WELCOME_BODY,
+        "account": account,
+        "open_at_login_label": WELCOME_OPEN_AT_LOGIN,
+        "open_at_login": bool(open_at_login) and not temporary,
+        "open_at_login_disabled": bool(temporary),
+        "hint": hint,
+        "button": "Continue",
     }
 
 

@@ -221,6 +221,7 @@ def app(monkeypatch, tmp_path):
     )
     instance._event_lock = threading.Lock()
     instance._login_item_busy = False
+    instance._login_item_from_welcome = False  # phase 2: only Settings' toggle here
     instance._login_item_result = None
     instance._login_item_last = {}
     instance._show_popover_pending = False
