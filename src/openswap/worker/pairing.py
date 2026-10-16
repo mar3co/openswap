@@ -130,11 +130,15 @@ def _display_label(value: object) -> str | None:
 
     Labels are display-only and arrive after the service has consumed the code
     and issued the key, so an odd one (a long workspace name, a control
-    character, a non-string) must never fail the pairing: control characters
-    are dropped and the rest is cut to ``MAX_PAIR_LABEL``."""
+    character, a non-string) must never fail the pairing. Like Connect's
+    ``clean_label``: whitespace collapses to single spaces, every other control
+    or format character (Unicode ``C*``, including bidi overrides that could
+    reorder the text around it) is dropped, and the rest is cut to ``MAX_PAIR_LABEL``."""
     if not isinstance(value, str):
         return None
-    label = "".join(c for c in value if unicodedata.category(c) != "Cc").strip()[:MAX_PAIR_LABEL].strip()
+    spaced = "".join(" " if c.isspace() else c for c in value)
+    printable = "".join(c for c in spaced if not unicodedata.category(c).startswith("C"))
+    label = " ".join(printable.split())[:MAX_PAIR_LABEL].strip()
     return label or None
 
 

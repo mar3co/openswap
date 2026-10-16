@@ -475,6 +475,9 @@ def test_pair_with_a_verifier_refuses_unknown_fields(tmp_path, keychain):
 @pytest.mark.parametrize("extra, shown", [
     ({"workspace_label": "Bad\x07name"}, "Badname"), ({"workspace_label": ""}, None),
     ({"workspace_label": 3}, None), ({"workspace_label": "W" * 500}, "W" * 200),
+    ({"workspace_label": "Acme\u202egnp.exe"}, "Acmegnp.exe"),  # no bidi override reorders it
+    ({"workspace_label": "Ac\u200bme\ufeff"}, "Acme"), ({"workspace_label": " Two\n\tlines "}, "Two lines"),
+    ({"workspace_label": "\u2066\u2069"}, None),
 ])
 def test_odd_labels_never_fail_a_pairing(tmp_path, keychain, extra, shown):
     # The code is already consumed and the key issued: a label is only for display.
