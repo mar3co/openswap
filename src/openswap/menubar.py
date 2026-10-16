@@ -1918,12 +1918,11 @@ def run(switcher, codex=None) -> int:
                 self.on_quit(None)
                 return
             self._login_item_last = result
-            if from_welcome and result.get("error"):
-                # Continue went on to the cards, where the hint under the
-                # switch in Settings would go unseen.
-                self._show_error(
-                    OPEN_AT_LOGIN_BLOCKED_HINT if result.get("blocked") else result["error"]
-                )
+            if from_welcome and not result.get("outcome"):
+                # Continue went on to the cards, where Settings' hint (an
+                # error) or warning (a failed start: no outcome, no error)
+                # would go unseen.
+                self._show_error(result.get("error") or OPEN_AT_LOGIN_FAILED_ALERT)
             panel = self._panel
             if (
                 panel is not None

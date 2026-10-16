@@ -2407,6 +2407,12 @@ WELCOME_BODY = (
 WELCOME_OPEN_AT_LOGIN = "Open at login"
 WELCOME_LOGIN_HINT = "Keeps OpenSwap in the menu bar after you restart."
 WELCOME_LOGIN_ON_HINT = "OpenSwap already opens at login."
+# Continue's alert for a login item launchd did not start (Settings shows a
+# warning row with a Login Items button for the same thing).
+OPEN_AT_LOGIN_FAILED_ALERT = (
+    f"{OPEN_AT_LOGIN_FAILED}. If it is off in System Settings › General › "
+    "Login Items, turn it on there."
+)
 
 
 def welcome_on_start(

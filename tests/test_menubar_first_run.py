@@ -270,12 +270,13 @@ def welcome_app(tmp_path, monkeypatch):
         "threading": threading,
         "welcome_on_start": menubar.welcome_on_start,
         "SETTINGS_PAGE": menubar.SETTINGS_PAGE,
-        "OPEN_AT_LOGIN_BLOCKED_HINT": menubar.OPEN_AT_LOGIN_BLOCKED_HINT,
+        "OPEN_AT_LOGIN_FAILED_ALERT": menubar.OPEN_AT_LOGIN_FAILED_ALERT,
     }
     app = extract_class(menubar.__file__, "MenuBarApp", _WELCOME_METHODS, scope)()
     events: list = []
     app.settings = menubar.MenuBarSettings()
     app.switcher = SimpleNamespace(
+        backup_dir=tmp_path,
         _logger=SimpleNamespace(
             debug=lambda *a, **k: None,
             info=lambda *a, **k: None,
@@ -432,7 +433,8 @@ def test_a_login_item_launchd_would_not_start_points_at_login_items(welcome_app,
     w.login["result"] = launch_agent.LoginItemNotStarted("launchd did not start OpenSwap")
     w.app._on_welcome_continue(True)
     _drain(w.app)
-    assert w.events == [("error", menubar.OPEN_AT_LOGIN_BLOCKED_HINT)]
+    assert w.events == [("error", menubar.OPEN_AT_LOGIN_FAILED_ALERT)]
+    assert w.events[0][1].startswith("macOS isn’t starting OpenSwap at login.")
 
 
 def test_a_settings_toggle_failure_is_not_an_alert(welcome_app, frozen_app):
