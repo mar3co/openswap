@@ -116,6 +116,27 @@ def run(switcher, codex=None) -> int:
             "Install with: uv tool install --force --editable '.[menubar]'"
         ) from e
 
+    # One extra at a time, decided before the status item exists. Held for
+    # the life of this process: the local keeps the file open until run()
+    # returns or the process exits.
+    from openswap import launch_agent
+    from openswap.menubar_instance import AlreadyRunning, claim, hand_over_to_login_item
+
+    as_login_item = launch_agent.runs_as_login_item()
+    try:
+        instance_lock = claim(
+            switcher.backup_dir, as_login_item=as_login_item, logger=switcher._logger
+        )
+    except AlreadyRunning as e:
+        return e.exit_code
+    # The login item is the copy that should run: start it and step aside.
+    if not as_login_item and hand_over_to_login_item(
+        switcher.backup_dir, logger=switcher._logger
+    ):
+        if instance_lock is not None:
+            instance_lock.release()
+        return 0
+
     # rumps never sets an activation policy, so under a framework Python the
     # process launches as a regular app and parks a "Python" icon in the Dock
     # for as long as the menu bar runs. Accessory keeps the status item and
@@ -231,6 +252,21 @@ def run(switcher, codex=None) -> int:
             self._auto_capturing = False
             self._auto_captured_nums: set[str] = set()
             self._auto_capture_failed_for: tuple[str, str] | None = None
+            self._show_popover_pending = False
+            self._show_requests = None
+            self._login_item_busy = False
+            self._login_item_result = None
+            self._login_item_last: dict = {}
+            # Opening the app again, or another copy starting, shows the
+            # popover instead of a second status item (menubar_instance).
+            try:
+                from openswap.menubar_instance import SHOW_NOTIFICATION
+                from openswap.menubar_panel import handle_reopen, observe_show_requests
+
+                handle_reopen(rumps.rumps.NSApp, self.show_popover)
+                self._show_requests = observe_show_requests(SHOW_NOTIFICATION, self.show_popover)
+            except Exception:
+                self.switcher._logger.warning("show-popover hooks failed", exc_info=True)
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -472,6 +508,7 @@ def run(switcher, codex=None) -> int:
             self._drain_desktop_result()
             self._drain_worker_result()
             self._drain_guided_setup()
+            self._drain_login_item_result()
             panel = self._panel
             if (
                 panel is not None
@@ -1427,8 +1464,27 @@ def run(switcher, codex=None) -> int:
                 worker_status=lambda: self._worker_status_cache,
                 on_worker_view_active=self._worker_view_active,
                 worker_paired=lambda: self._worker_policy.control_service_url is not None,
+                login_item=self._login_item_state,
             )
             self._panel.attach(nsitem)
+            from openswap.menubar_instance import consume_show_on_start
+
+            # A copy that handed over to this one asked for the popover.
+            if consume_show_on_start(self.switcher.backup_dir):
+                self._show_popover_pending = True
+            if self._show_popover_pending:
+                self._show_popover_pending = False
+                self.show_popover()
+
+        def show_popover(self):
+            """Open the popover: the app was opened again, or another copy asked."""
+            panel = self._panel
+            if panel is None:
+                # Not attached yet (the first moments after start): open it then.
+                self._show_popover_pending = True
+                return
+            if not panel.is_shown():
+                panel.toggle()
 
         def _on_empty_action(self, provider, action):
             if self._desktop_switching or self._refreshing:
@@ -1579,6 +1635,11 @@ def run(switcher, codex=None) -> int:
                 return  # the summary item: nothing to toggle
             if row_id == "remote_tasks_setup":
                 self._run_guided_setup()
+            elif row_id == "open_at_login":
+                self._toggle_login_item()
+            elif row_id == "open_at_login_settings":
+                subprocess.run(["open", LOGIN_ITEMS_SETTINGS_URL], check=False)
+                return
             elif row_id in {
                 "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_stop",
                 "remote_tasks_account", "remote_tasks_web_choice",
@@ -1623,6 +1684,87 @@ def run(switcher, codex=None) -> int:
                 return
             else:
                 return
+            panel = self._panel
+            if (
+                panel is not None
+                and panel.is_shown()
+                and getattr(panel, "_page", None) == SETTINGS_PAGE
+            ):
+                panel.reload()
+
+        def _login_item_state(self) -> dict:
+            """General › This Mac, read each time Settings is built."""
+            from openswap import bundle, launch_agent
+
+            try:
+                enabled = launch_agent.login_item_enabled()
+            except OSError:
+                enabled = False
+            return {
+                **self._login_item_last,
+                "enabled": enabled,
+                "temporary": bundle.runs_from_temporary_location(),
+                "busy": self._login_item_busy,
+            }
+
+        def _toggle_login_item(self):
+            """Settings › Open at login."""
+            from openswap import launch_agent
+
+            try:
+                enabled = not launch_agent.login_item_enabled()
+            except OSError:
+                return
+            self._apply_login_item(enabled)
+
+        def _apply_login_item(self, enabled):
+            """``launch_agent.set_login_item(enabled)`` off the main thread (it
+            runs launchctl and waits for launchd's pid). The 1 s tick applies
+            the outcome (_drain_login_item_result): quits on a hand-over, else
+            shows it under the switch. Ignored while one is running."""
+            from openswap import bundle
+
+            if self._login_item_busy or bundle.runs_from_temporary_location():
+                return
+            self._login_item_busy = True
+            self._login_item_last = {}
+            threading.Thread(
+                target=self._login_item_worker, args=(enabled,), daemon=True
+            ).start()
+
+        def _login_item_worker(self, enabled):
+            from openswap import launch_agent
+
+            log = self.switcher._logger
+            try:
+                outcome = launch_agent.set_login_item(enabled)
+                log.info("Open at login %s: %s", "on" if enabled else "off", outcome)
+                result = {"outcome": outcome}
+            except launch_agent.LoginItemNotStarted as e:
+                log.warning("Open at login: launchd did not start the login item: %s", e)
+                result = {"error": str(e), "blocked": True}
+            except ClaudeSwitchError as e:
+                log.warning("Open at login failed: %s", e)
+                result = {"error": str(e)}
+            except Exception:
+                log.error("Open at login failed", exc_info=True)
+                result = {"error": "Couldn’t change Open at login. See openswap.log."}
+            with self._event_lock:
+                self._login_item_result = result
+
+        def _drain_login_item_result(self):
+            with self._event_lock:
+                result = self._login_item_result
+                self._login_item_result = None
+            if result is None:
+                return
+            self._login_item_busy = False
+            if result.get("outcome") == "handoff":
+                # set_login_item returned once launchd's copy was up; it is
+                # waiting for this copy's menu bar lock, so quit now.
+                self.on_quit(None)
+                return
+            self._login_item_last = result
             panel = self._panel
             if (
                 panel is not None
@@ -2922,6 +3064,14 @@ def run(switcher, codex=None) -> int:
                 self._claude_login.cancel()
             self._stop_chatgpt_auto_monitor(clear_pending=True)
             self._stop_engine()
+            # Open at login was turned off from this job: unload it on the way
+            # out so the cask's kickstart cannot revive it. A no-op otherwise.
+            try:
+                from openswap import launch_agent
+
+                launch_agent.unload_own_job()
+            except Exception:
+                self.switcher._logger.warning("could not unload the login item", exc_info=True)
             rumps.quit_application()
 
         def on_toggle_name(self, _sender):

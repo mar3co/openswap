@@ -425,9 +425,13 @@ def settings_page_rows(
     worker_paused: bool = False,
     worker_status: dict | None = None,
     worker_paired: bool = False,
+    login_item: dict | None = None,
     section: str | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
+
+    ``login_item`` feeds General › This Mac (see :func:`this_mac_rows`); it
+    is read when the page is built, not stored in ``MenuBarSettings``.
 
     Each dict: ``{"kind": "toggle"|"choice"|"group"|"popup", "id": str, "label": str, ...}``.
     Choice and popup rows include ``options`` ``(value, label)`` and the current
@@ -527,6 +531,7 @@ def settings_page_rows(
                 "these aren’t ChatGPT message limits."
             ),
         })
+    general.extend(this_mac_rows(login_item))
 
     remote = [
         {
@@ -767,6 +772,82 @@ def settings_page_rows(
         if section not in valid_sections:
             section = SETTINGS_SECTION_GENERAL
         rows = [row for row in rows if row["section"] == section]
+    return rows
+
+
+OPEN_AT_LOGIN_MOVE_HINT = "Move OpenSwap to Applications to open it at login."
+OPEN_AT_LOGIN_AFTER_QUIT_HINT = (
+    "OpenSwap stays open until you quit it, and won’t open at the next login."
+)
+OPEN_AT_LOGIN_BLOCKED_HINT = (
+    "macOS did not start OpenSwap. If it is off in System Settings › General › "
+    "Login Items, turn it on there."
+)
+LOGIN_ITEMS_SETTINGS_URL = "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
+# Roughly what one line of an 11 pt hint holds across the popover.
+_HINT_LINE_CHARS = 60
+
+
+def _hint_lines(text: str) -> int:
+    return max(2, -(-len(text) // _HINT_LINE_CHARS))
+
+
+def this_mac_rows(login_item: dict | None) -> list[dict]:
+    """General › This Mac: the Open at login toggle and what it last did.
+
+    ``login_item`` keys, all optional: ``enabled`` (the login item's plist
+    exists), ``temporary`` (a translocated or mounted copy: the toggle is
+    off-limits), ``busy`` (a change is running), ``outcome`` (the last
+    ``launch_agent.set_login_item`` result), ``error`` (its message when it
+    raised) and ``blocked`` (launchd did not start the job it wrote).
+    """
+    state = login_item if isinstance(login_item, dict) else {}
+    temporary = bool(state.get("temporary"))
+    rows = [
+        {
+            "kind": "group",
+            "style": "section",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "group_this_mac",
+            "label": "This Mac",
+        },
+        {
+            "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "open_at_login",
+            "label": "Open at login",
+            "value": bool(state.get("enabled")),
+            "disabled": temporary or bool(state.get("busy")),
+        },
+    ]
+    if temporary:
+        note = OPEN_AT_LOGIN_MOVE_HINT
+    elif state.get("blocked"):
+        note = OPEN_AT_LOGIN_BLOCKED_HINT
+    elif state.get("error"):
+        note = _bounded_text(state.get("error"), 240)
+    elif state.get("outcome") == "disabled_after_quit":
+        note = OPEN_AT_LOGIN_AFTER_QUIT_HINT
+    else:
+        note = ""
+    if note:
+        rows.append({
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "open_at_login_hint",
+            "label": note,
+            "lines": _hint_lines(note),
+        })
+    if state.get("blocked") and not temporary:
+        rows.append({
+            "kind": "button",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "open_at_login_settings",
+            "label": "Login Items",
+            "title": "Open",
+            "value": LOGIN_ITEMS_SETTINGS_URL,
+        })
     return rows
 
 

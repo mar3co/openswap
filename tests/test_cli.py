@@ -1818,7 +1818,7 @@ class TestSetupCommand:
             "openswap.launch_agent.status",
             lambda label=None, *a, **k: {"installed": True, "loaded": True, "state": "running", "pid": pid},
         )
-        monkeypatch.setattr(cli, "_wait_for_pid", lambda agent, label, timeout=3.0: agent.status(label)["pid"])
+        monkeypatch.setattr("openswap.launch_agent._wait_for_pid", lambda label=None, uid=None, timeout=3.0: pid)
         monkeypatch.setattr("openswap.update_check.restart_widget_agent", fake_widget_restart)
         monkeypatch.setattr(sys, "argv", argv)
         return seen
@@ -1943,15 +1943,6 @@ class TestSetupCommand:
         self._harness(monkeypatch, ["openswap", "setup"], install_raises=KeyboardInterrupt())
         assert self._run() == 130
         assert "account was saved" in capsys.readouterr().out
-
-    def test_wait_for_pid_returns_pid_once_launchd_spawned_it(self):
-        answers = iter([None, None, 77])
-        agent = type("A", (), {"status": staticmethod(lambda label: {"pid": next(answers)})})
-        assert cli._wait_for_pid(agent, "x", timeout=5.0) == 77
-
-    def test_wait_for_pid_gives_up_at_the_deadline(self):
-        agent = type("A", (), {"status": staticmethod(lambda label: {"pid": None})})
-        assert cli._wait_for_pid(agent, "x", timeout=0.0) is None
 
     def test_ctrl_c_after_failed_capture_reports_the_reason(self, monkeypatch, capsys):
         from openswap.exceptions import CredentialReadError

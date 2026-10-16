@@ -66,6 +66,7 @@ from Foundation import (
     NSAttributedString,
     NSDistributedNotificationCenter,
     NSMakeRect,
+    NSNotificationSuspensionBehaviorDeliverImmediately,
     NSObject,
     NSPointInRect,
     NSRunLoop,
@@ -523,6 +524,38 @@ class _Trampoline(NSObject):
             cb(sender)
 
 
+def observe_show_requests(name: str, callback):
+    """Call ``callback()`` on the main thread whenever another copy posts the
+    distributed notification ``name``. Keep the returned observer alive."""
+    observer = _Trampoline.alloc().initWithCallback_(lambda _note: callback())
+    # DeliverImmediately: an accessory app is never active, and AppKit would
+    # otherwise hold the request until it was.
+    NSDistributedNotificationCenter.defaultCenter().addObserver_selector_name_object_suspensionBehavior_(
+        observer, "act:", name, None, NSNotificationSuspensionBehaviorDeliverImmediately
+    )
+    return observer
+
+
+def handle_reopen(delegate_class, callback) -> None:
+    """Give rumps' app delegate ``applicationShouldHandleReopen:hasVisibleWindows:``.
+
+    LaunchServices sends a running app a reopen event when it is opened again
+    from Finder, Spotlight or ``open -a``. rumps' delegate does not handle it,
+    so nothing visible happened. Added before ``App.run`` sets the delegate,
+    because NSApplication reads which methods its delegate has at that point.
+    """
+
+    def applicationShouldHandleReopen_hasVisibleWindows_(self, _app, _visible):
+        callback()
+        return False  # handled: no default window to restore
+
+    objc.classAddMethods(delegate_class, [objc.selector(
+        applicationShouldHandleReopen_hasVisibleWindows_,
+        selector=b"applicationShouldHandleReopen:hasVisibleWindows:",
+        signature=b"Z@:@Z",
+    )])
+
+
 class _TokenField(NSTextField):
     """Text field that takes Cmd+A/C/X/V/Z in the accessory app's popover."""
 
@@ -932,6 +965,7 @@ class MenuBarPanel:
         worker_status=None,
         on_worker_view_active=None,
         worker_paired=None,
+        login_item=None,
         on_add_claude=None,
         on_card_menu=None,
         on_toggle_codex_auto=None,
@@ -970,6 +1004,7 @@ class MenuBarPanel:
         self._worker_paused = worker_paused or (lambda: False)
         self._worker_status = worker_status or (lambda: {})
         self._worker_paired = worker_paired or (lambda: False)
+        self._login_item = login_item
         self._on_worker_view_active = on_worker_view_active
         self._login_alias = ""
         self._login_alias_field = None
@@ -1961,6 +1996,10 @@ class MenuBarPanel:
             worker_paired = bool(self._worker_paired())
         except Exception:
             worker_paired = False
+        try:
+            login_item = self._login_item() if callable(self._login_item) else None
+        except Exception:
+            login_item = None
         rows = settings_page_rows(
             settings,
             strategy=strategy,
@@ -1971,6 +2010,7 @@ class MenuBarPanel:
             worker_paused=worker_paused,
             worker_status=worker_status,
             worker_paired=worker_paired,
+            login_item=login_item,
             section=self._settings_section,
         )
 
@@ -1995,7 +2035,9 @@ class MenuBarPanel:
         def _row_height(row) -> float:
             kind = row.get("kind")
             if kind == "group":
-                return 34.0 if row.get("style") == "hint" else SETTINGS_GROUP_H
+                if row.get("style") == "hint":
+                    return 34.0 + 14.0 * max(0, int(row.get("lines") or 2) - 2)
+                return SETTINGS_GROUP_H
             if kind == "status":
                 return 44.0
             if kind == "toggle":

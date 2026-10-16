@@ -1197,20 +1197,6 @@ The menu bar extra must be running so the widget has live usage numbers.
         return 1
 
 
-def _wait_for_pid(launch_agent, label: str, timeout: float = 3.0) -> int | None:
-    """The extra's pid once launchd has spawned it, or None if it has not by
-    ``timeout``. bootstrap returns before the process exists, so a plain
-    status read right after it would report a healthy job as absent."""
-    import time
-
-    deadline = time.monotonic() + timeout
-    while True:
-        pid = launch_agent.status(label)["pid"]
-        if pid or time.monotonic() >= deadline:
-            return pid
-        time.sleep(0.2)
-
-
 def _setup_command(argv: list[str]) -> int:
     """Handle ``openswap setup``: save the live Claude login, start the extra.
 
@@ -1264,7 +1250,7 @@ def _setup_command(argv: list[str]) -> int:
         bundle.migrate_from_uv_install(notify=migration_notes.append)
         result = launch_agent.install()
         widget_detail = restart_widget_agent()
-        pid = _wait_for_pid(launch_agent, result["label"])
+        pid = launch_agent._wait_for_pid(result["label"])
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         if saved:
