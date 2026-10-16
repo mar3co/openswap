@@ -367,6 +367,27 @@ def test_run_hands_over_to_an_idle_login_item_and_lets_go_of_the_lock(
     lock.release()
 
 
+def test_run_steps_aside_for_a_starting_login_item_without_starting_it_again(
+    tmp_path, monkeypatch, login_item, capsys
+):
+    """This copy won the lock, but launchd's copy has a pid: it is starting
+    (an app open racing login or a kickstart) and waits for the lock."""
+    posts = _fake_gui(monkeypatch)
+    monkeypatch.setattr(launch_agent, "runs_as_login_item", lambda: False)
+    login_item.running_pid = 777
+
+    assert menubar.run(types.SimpleNamespace(backup_dir=tmp_path, _logger=None)) == 0
+    assert "start" not in login_item.events
+    # A show request for the waiting copy, which consumes it once attached.
+    assert posts == [SHOW_NOTIFICATION]
+    assert show_request_path(tmp_path).exists()
+    assert "pid 777" in capsys.readouterr().out
+    # The lock is free for it.
+    lock = menubar_lock(tmp_path)
+    assert lock is not None
+    lock.release()
+
+
 def test_the_login_item_itself_never_hands_over_and_clears_a_failed_start(
     tmp_path, monkeypatch, login_item
 ):
