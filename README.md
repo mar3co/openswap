@@ -32,14 +32,14 @@ On a Mac with Homebrew the same script installs the cask above, or upgrades it w
 
 Already have a checkout? `OPENSWAP_DIR=/path/to/openswap bash install.sh` installs from it (with or without Homebrew).
 
-To uninstall:
+To uninstall, choose **More… › Uninstall OpenSwap…** in the menu bar, or run:
 
 ```bash
 openswap uninstall          # or: brew uninstall --cask openswap
 openswap uninstall --zap    # also delete saved accounts, settings and logs
 ```
 
-Either way OpenSwap stops and removes its menu bar login item and the Remote tasks worker, puts back your own Claude Code status line if it wrapped it, and then removes the app. Your saved accounts stay unless you zap (`brew uninstall --zap --cask openswap` does the same, including the saved logins in the Keychain). `brew upgrade` and `brew reinstall` keep all of it. A source install's `openswap uninstall` removes the same things and ends by naming `uv tool uninstall openswap`.
+Either way OpenSwap stops and removes its menu bar login item and the Remote tasks worker, puts back your own Claude Code status line if it wrapped it, and then removes the app. Your saved accounts stay unless you zap (`brew uninstall --zap --cask openswap` does the same, including the saved logins in the Keychain). `brew upgrade` and `brew reinstall` keep all of it. A source install's `openswap uninstall` removes the same things and ends by naming `uv tool uninstall openswap`. From the menu bar, **Also delete saved accounts, settings and logs** is the zap; OpenSwap quits and does the rest in the background, logging to `~/Library/Logs/com.opensoft.openswap.uninstall.log` (opened if a step fails), and a copy not installed by Homebrew moves itself to the Trash.
 
 Moving from the source install to the cask: run `$(brew --prefix)/bin/openswap setup` (the uv `openswap` may come first on PATH; with the cask installed it refuses `setup`, `upgrade`, `widget --install` and `menubar --install-service` and names the cask's command). Setup points the login item, the Remote tasks worker, and the status line at the app and retires the old widget host. It leaves the uv tool in place and tells you to run `uv tool uninstall openswap`; `~/.openswap` is yours to delete. Widgets placed with the old host may need adding again.
 

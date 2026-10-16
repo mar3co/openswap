@@ -8,15 +8,24 @@ here; nothing touches a real LaunchAgent or file outside ``tmp_path``.
 
 from __future__ import annotations
 
+import json
 import plistlib
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from openswap import cli, macos_keychain, uninstall
+from openswap import cli, launch_agent, macos_keychain, menubar_instance, uninstall
 from openswap.exceptions import ClaudeSwitchError
+from openswap.menubar_display import MenuBarSettings, menubar_settings_path
+
+# The mac fixture fakes launch_agent.uninstall; a test that needs the real
+# one (to see the bootout) puts this back.
+REAL_LAUNCH_AGENT_UNINSTALL = launch_agent.uninstall
 
 BREW_RB = "/opt/homebrew/Library/Homebrew/brew.rb"
 RUBY = "/opt/homebrew/Library/Homebrew/vendor/portable-ruby/current/bin/ruby"
@@ -260,6 +269,253 @@ class TestRemoveIntegrations:
         assert removal.failed == [] and "widget" not in removal.removed
 
 
+class TestUndoPhaseOneAndTwo:
+    """What plan 020's first two phases add outside the zapped data, undone
+    by an uninstall without zap, and safe to run twice."""
+
+    @staticmethod
+    def _launchd(monkeypatch, loaded: set[str]) -> list[tuple[str, ...]]:
+        calls: list[tuple[str, ...]] = []
+
+        def fake(*args):
+            calls.append(args)
+            label = args[-1].rsplit("/", 1)[-1]
+            if args[0] == "print":
+                return subprocess.CompletedProcess(args, 0 if label in loaded else 113, "", "")
+            if args[0] == "bootout":
+                loaded.discard(label)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr("openswap.launch_agent.uninstall", REAL_LAUNCH_AGENT_UNINSTALL)
+        monkeypatch.setattr(launch_agent, "_launchctl", fake)
+        monkeypatch.setattr(launch_agent, "_require_macos", lambda: None)
+        return calls
+
+    @pytest.mark.parametrize("with_plist", [True, False])
+    def test_a_loaded_login_item_is_booted_out(self, mac, frozen_app, monkeypatch, with_plist):
+        """launch_agent.uninstall boots the job out, not only deletes the
+        plist; a job left loaded after Open at login was turned off from it
+        (no plist) goes too."""
+        home, agents, _, _ = mac
+        plist = agents / f"{launch_agent.LABEL}.plist"
+        if with_plist:
+            _plist(plist, [str(frozen_app / "Contents" / "MacOS" / "OpenSwap")])
+        calls = self._launchd(monkeypatch, {launch_agent.LABEL})
+        removal = uninstall.remove_integrations(home=home, uid=501)
+        assert ("bootout", f"gui/501/{launch_agent.LABEL}") in calls
+        assert removal.removed == ["menu bar login item"] and not plist.exists()
+        calls.clear()
+        again = uninstall.remove_integrations(home=home, uid=501)
+        assert again.removed == [] and again.failed == []
+        assert not any(call[0] == "bootout" for call in calls)
+
+    @staticmethod
+    def _runtime_files(backup: Path) -> list[Path]:
+        backup.mkdir(parents=True, exist_ok=True)
+        files = [
+            menubar_instance.lock_path(backup),
+            menubar_instance.show_request_path(backup),
+            menubar_instance.handoff_request_path(backup),
+            launch_agent.login_item_status_path(backup),
+        ]
+        for path in files:
+            path.write_text("x")
+        return files
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the menu bar lock is a flock")
+    def test_runtime_files_go_once_no_extra_holds_the_lock(self, mac, frozen_app):
+        home, _, _, _ = mac
+        backup = uninstall.paths.get_backup_root()
+        files = self._runtime_files(backup)
+        removal = uninstall.remove_integrations(home=home, uid=501)
+        assert removal.failed == [] and removal.removed == []  # transient: not reported
+        assert not any(path.exists() for path in files)
+        assert uninstall.remove_integrations(home=home, uid=501).failed == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the menu bar lock is a flock")
+    def test_runtime_files_stay_while_another_extra_runs(self, mac, frozen_app):
+        """A uv install's extra beside the cask owns them, and unlinking its
+        held lock would let a second extra lock a new file."""
+        home, _, _, _ = mac
+        backup = uninstall.paths.get_backup_root()
+        files = self._runtime_files(backup)
+        held = menubar_instance.menubar_lock(backup)
+        try:
+            assert uninstall.remove_integrations(home=home, uid=501).failed == []
+            assert all(path.exists() for path in files)
+        finally:
+            held.release()
+
+    def test_no_data_folder_is_created_for_them(self, mac, frozen_app):
+        home, _, _, _ = mac
+        backup = uninstall.paths.get_backup_root()
+        assert not backup.exists()
+        assert uninstall.remove_integrations(home=home, uid=501).failed == []
+        assert not backup.exists()
+
+    def test_the_app_offers_its_welcome_again_after_a_reinstall(self, mac, frozen_app):
+        """welcome_done says the login item was decided; the uninstall just
+        removed it. Other settings stay without zap."""
+        home, _, _, _ = mac
+        path = menubar_settings_path(uninstall.paths.get_backup_root())
+        path.parent.mkdir(parents=True)
+        MenuBarSettings(welcome_done=True, show_account_name=False).save(path)
+        assert uninstall.remove_integrations(home=home, uid=501).failed == []
+        kept = MenuBarSettings.load(path)
+        assert kept.welcome_done is False and kept.show_account_name is False
+        assert uninstall.remove_integrations(home=home, uid=501).failed == []
+
+    def test_a_source_install_leaves_the_apps_welcome_alone(self, mac):
+        home, _, _, _ = mac
+        path = menubar_settings_path(uninstall.paths.get_backup_root())
+        path.parent.mkdir(parents=True)
+        MenuBarSettings(welcome_done=True).save(path)
+        uninstall.remove_integrations(home=home, uid=501)
+        assert MenuBarSettings.load(path).welcome_done is True
+
+    def test_the_bundled_widget_registration_is_undone(self, mac, frozen_app):
+        """The app's start-up registration (register_on_start) and
+        `widget --install` register the same bundled appex this unregisters."""
+        home, _, seen, _ = mac
+        uninstall.remove_integrations(home=home, uid=501)
+        assert seen["widget"] == ["uninstall"]
+
+    def test_the_status_line_the_toggle_pinned_is_restored(self, mac, frozen_app, monkeypatch):
+        """The Settings toggle and `statusline --install` both pin
+        paint_command(), this app's executable."""
+        home, _, seen, state = mac
+        exe = frozen_app / "Contents" / "MacOS" / "OpenSwap"
+        state["statusline"] = f"{exe} statusline"
+        monkeypatch.setattr("openswap.statusline.hook_program", lambda config_home: str(exe))
+        assert uninstall.remove_integrations(home=home, uid=501).removed == ["Claude Code status line"]
+        assert len(seen["statusline"]) == 1
+
+    def test_a_second_uninstall_from_the_app_finds_nothing_and_succeeds(
+        self, mac, frozen_app, monkeypatch
+    ):
+        """So "choose Uninstall OpenSwap… again" works after a failure."""
+        home, agents, _, _ = mac
+        exe = str(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+        _plist(agents / "com.opensoft.openswap.menubar.plist", [exe])
+        _plist(agents / "com.opensoft.openswap.worker.plist", [exe, "worker", "run", "--managed"])
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(uninstall, "homebrew_brew", lambda: None)
+
+        def trash(path):
+            if path.exists():
+                shutil.rmtree(path)
+
+        monkeypatch.setattr("openswap.widget_install._move_to_trash", trash)
+        for attempt in range(2):
+            lines: list[tuple[str, bool]] = []
+            assert uninstall.run(False, lambda line, error=False: lines.append((line, error)), from_app=True) == 0
+            assert not any(error for _, error in lines)
+            removed = [line for line, _ in lines if line.startswith("Removed the ")]
+            assert removed == (
+                ["Removed the menu bar login item.", "Removed the Remote tasks worker."] if attempt == 0 else []
+            )
+        assert not frozen_app.exists() and not any(agents.iterdir())
+
+
+class TestStatusLineUndoWithTheRealHook:
+    """The status line through the real statusline module. Turning the
+    toggle on may refuse to rewrite an unusual hook (statusline._with_command);
+    an uninstall never rewrites one: it puts back the user's own line in
+    place of a hook this app runs, or leaves another program's as written."""
+
+    @pytest.fixture
+    def claude(self, tmp_path, monkeypatch, frozen_app):
+        from openswap import statusline
+
+        config = tmp_path / "claude-config"
+        config.mkdir()
+        monkeypatch.setattr("openswap.paths.get_claude_config_home", lambda: config)
+        statusline.save_wrap(uninstall.paths.get_backup_root(), inner_command="my-line", created=False)
+        exe = shlex.quote(str(frozen_app / "Contents" / "MacOS" / "OpenSwap"))
+
+        def hook(command=None):
+            settings = config / "settings.json"
+            if command is not None:
+                settings.write_text(json.dumps({"statusLine": {"type": "command", "command": command}}))
+            return json.loads(settings.read_text()).get("statusLine", {}).get("command")
+
+        return hook, exe
+
+    @pytest.mark.parametrize("form", [
+        "{exe} statusline",
+        "echo ready&&{exe} statusline",  # an operator with no spaces
+        "FOO=$(true) {exe} statusline",  # a prefix the toggle will not rewrite
+    ])
+    def test_a_hook_this_app_runs_gives_back_the_users_line(self, claude, form):
+        hook, exe = claude
+        hook(form.format(exe=exe))
+        assert uninstall._restore_status_line() is True
+        assert hook() == "my-line"
+        assert uninstall._restore_status_line() is False  # twice: nothing left
+
+    def test_another_openswaps_unusual_hook_is_left_as_written(self, claude, tmp_path):
+        hook, _ = claude
+        uv = tmp_path / "uv-bin" / "openswap"
+        uv.parent.mkdir()
+        uv.write_text("#!/bin/sh\n")
+        written = f"FOO=$(true) {shlex.quote(str(uv))} statusline"
+        hook(written)
+        assert uninstall._restore_status_line() is False
+        assert hook() == written
+
+
+class TestNoRelaunchAndExplicitPaths:
+    def test_a_clean_quit_is_not_relaunched_while_the_child_works(self, tmp_path):
+        """Uninstall OpenSwap… quits through on_quit, a clean exit. KeepAlive
+        restarts only a failed exit and nothing else in the plist starts the
+        job, so launchd cannot bring the extra back while the child removes
+        it. (unload_own_job leaves a job with its plist alone:
+        test_launch_agent.)"""
+        exe = "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap"
+        plist = plistlib.loads(launch_agent.build_plist([exe], home=tmp_path))
+        assert plist["KeepAlive"] == {"SuccessfulExit": False}
+        assert not {"StartInterval", "StartCalendarInterval", "WatchPaths", "QueueDirectories",
+                    "StartOnMount"} & plist.keys()
+        from openswap import menubar
+
+        text = Path(menubar.__file__).read_text(encoding="utf-8")
+        action = text[text.index("def on_uninstall") : text.index("def on_toggle_name")]
+        assert action.rstrip().endswith("self.on_quit(None)")
+
+    def test_brew_is_the_cask_prefixs_own_not_one_on_path(self, frozen_app, monkeypatch, tmp_path):
+        prefix = tmp_path / "homebrew"
+        brew = prefix / "bin" / "brew"
+        brew.parent.mkdir(parents=True)
+        brew.write_text("#!/bin/sh\n")
+        brew.chmod(0o755)
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: True)
+        monkeypatch.setattr(uninstall.bundle, "cask_prefix", lambda: prefix)
+        assert uninstall.homebrew_brew() == brew and brew.is_absolute()
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: False)
+        assert uninstall.homebrew_brew() is None
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no execute bit")
+    def test_a_brew_that_cannot_run_is_not_used(self, frozen_app, monkeypatch, tmp_path):
+        prefix = tmp_path / "homebrew"
+        brew = prefix / "bin" / "brew"
+        brew.parent.mkdir(parents=True)
+        brew.write_text("")
+        brew.chmod(0o644)
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: True)
+        monkeypatch.setattr(uninstall.bundle, "cask_prefix", lambda: prefix)
+        assert uninstall.homebrew_brew() is None
+
+    def test_every_program_the_child_runs_is_an_absolute_path(self, frozen_app, monkeypatch):
+        """The extra's PATH (launchd's, or Finder's bare one) is never asked."""
+        assert Path(uninstall.app_command(True)[0]).is_absolute()
+        ran = []
+        monkeypatch.setattr(uninstall.subprocess, "run", lambda argv, **k: ran.append(argv))
+        uninstall._open("-R", str(frozen_app))
+        uninstall.show_app_log()
+        assert [argv[0] for argv in ran] == ["/usr/bin/open", "/usr/bin/open"]
+
+
 class TestZapData:
     def test_delete_saved_logins_covers_both_services(self, monkeypatch, tmp_path):
         calls = []
@@ -315,8 +571,18 @@ class TestZapData:
     def test_live_session_refuses_a_zap(self, monkeypatch, tmp_path):
         live = type("S", (), {"pid": 4242})()
         self._profiles(monkeypatch, tmp_path, {"1-a": ([], 0), "2-b": ([live], 0)})
-        with pytest.raises(ClaudeSwitchError, match=r"2-b \(PID 4242\)"):
+        with pytest.raises(ClaudeSwitchError) as exc:
             uninstall.refuse_live_sessions()
+        assert str(exc.value) == "Claude Code is running on session profile 2-b (PID 4242). Quit it, then try again."
+
+    def test_live_sessions_on_several_profiles_are_named_together(self, monkeypatch, tmp_path):
+        a, b = type("S", (), {"pid": 7})(), type("S", (), {"pid": 8})()
+        self._profiles(monkeypatch, tmp_path, {"1-a": ([a], 0), "2-b": ([b], 0)})
+        with pytest.raises(ClaudeSwitchError) as exc:
+            uninstall.refuse_live_sessions()
+        assert str(exc.value) == (
+            "Claude Code is running on session profiles 1-a (PID 7); 2-b (PID 8). Quit them, then try again."
+        )
 
     def test_unreadable_session_records_refuse_a_zap(self, monkeypatch, tmp_path):
         self._profiles(monkeypatch, tmp_path, {"1-a": ([], 2)})
@@ -425,7 +691,7 @@ class TestUninstallCommand:
         monkeypatch.setattr(uninstall, "homebrew_brew", lambda: state["brew"])
         monkeypatch.setattr(uninstall, "homebrew_command", lambda: state["command"])
         monkeypatch.setattr(uninstall, "refuse_live_sessions", fake_refuse)
-        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", FakeSwitcher)
+        monkeypatch.setattr("openswap.engine.Engine", FakeSwitcher)
         monkeypatch.setattr(uninstall, "legacy_roots", lambda: [tmp_path / ".claude-swap-backup"])
         monkeypatch.setattr(
             uninstall, "delete_session_logins", lambda roots=None: seen["order"].append(("sessions", roots))
@@ -464,7 +730,7 @@ class TestUninstallCommand:
     def test_hook_zap_with_a_live_session_warns_and_goes_on(self, harness, monkeypatch, capsys):
         seen, state = harness
         state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
-        state["live"] = "Claude is running on session profile 1-a (PID 7)."
+        state["live"] = "Claude Code is running on session profile 1-a (PID 7). Quit it, then try again."
         assert self._run(monkeypatch, "--homebrew-hook") == 0
         assert seen["logins"] == 1
         assert "Its saved login stays in the Keychain." in capsys.readouterr().err
@@ -525,7 +791,7 @@ class TestUninstallCommand:
     def test_zap_refuses_while_a_session_is_live(self, harness, monkeypatch, capsys):
         seen, state = harness
         state["brew"] = Path("/opt/homebrew/bin/brew")
-        state["live"] = "Claude is running on session profile 1-a (PID 7). Exit it, then retry."
+        state["live"] = "Claude Code is running on session profile 1-a (PID 7). Quit it, then try again."
         assert self._run(monkeypatch, "--zap", "--yes") == 1
         assert seen["remove"] == [] and seen["logins"] == 0 and seen["exec"] is None
         assert "PID 7" in capsys.readouterr().err
@@ -567,3 +833,305 @@ class TestUninstallCommand:
         assert self._run(monkeypatch) == 1
         assert seen["remove"] == []
         assert "installed with Homebrew" in capsys.readouterr().err
+
+    # uninstall.run is the command's body after its checks and prompt.
+
+    @staticmethod
+    def _say():
+        lines: list[tuple[str, bool]] = []
+        return lines, lambda line, error=False: lines.append((line, error))
+
+    @pytest.mark.parametrize("zap", [False, True])
+    def test_run_removes_then_hands_off_to_brew(self, harness, zap):
+        seen, state = harness
+        state["brew"] = brew = Path("/opt/homebrew/bin/brew")
+        lines, say = self._say()
+        with pytest.raises(SystemExit):
+            uninstall.run(zap, say)
+        assert seen["remove"] == [False]
+        assert seen["exec"] == [str(brew), "uninstall", "--cask", *(["--zap"] if zap else []), "openswap"]
+        assert seen["purge"] == ([True] if zap else [])
+        assert seen["logins"] == int(zap) and seen["data"] == ([True] if zap else [])
+        assert ("Removed the menu bar login item.", False) in lines
+        assert (("Deleted 3 saved logins from the Keychain.", False) in lines) == zap
+
+    @pytest.mark.parametrize("zap", [False, True])
+    def test_run_without_brew_names_what_is_left(self, harness, zap, frozen_app):
+        seen, _ = harness
+        lines, say = self._say()
+        assert uninstall.run(zap, say) == 0
+        assert seen["exec"] is None and seen["data"] == ([False] if zap else [])
+        assert lines[-1] == (f"To finish, move {frozen_app} to the Trash.", False)
+
+    @pytest.mark.parametrize("zap", [False, True])
+    def test_run_stops_on_a_failed_removal(self, harness, zap):
+        seen, state = harness
+        state["brew"] = Path("/opt/homebrew/bin/brew")
+        state["failed"] = ["Remote tasks worker: it did not stop"]
+        lines, say = self._say()
+        assert uninstall.run(zap, say) == 1
+        assert seen["exec"] is None and seen["purge"] == [] and seen["logins"] == 0
+        assert lines[-1] == (
+            f"OpenSwap is still installed. Fix that, then run: openswap uninstall{' --zap' if zap else ''}",
+            True,
+        )
+
+    def test_run_from_the_app_says_how_to_try_again(self, harness):
+        _, state = harness
+        state["failed"] = ["Remote tasks worker: it did not stop"]
+        lines, say = self._say()
+        assert uninstall.run(True, say, from_app=True) == 1
+        assert lines[-1] == (
+            "OpenSwap is still installed. Fix the error above, then open OpenSwap and choose "
+            "Uninstall OpenSwap… again.",
+            True,
+        )
+
+    def test_run_from_the_app_trashes_a_copy_not_installed_by_homebrew(
+        self, harness, monkeypatch, frozen_app
+    ):
+        trashed = []
+        monkeypatch.setattr("openswap.widget_install._move_to_trash", trashed.append)
+        monkeypatch.setattr(uninstall, "_open", lambda *a: pytest.fail("revealed"))
+        lines, say = self._say()
+        assert uninstall.run(False, say, from_app=True) == 0
+        assert trashed == [frozen_app]
+        assert lines[-1] == (f"Moved {frozen_app} to the Trash.", False)
+
+    def test_run_from_the_app_keeps_a_cask_app_brew_cannot_remove(
+        self, harness, monkeypatch, frozen_app, tmp_path
+    ):
+        """Trashing it would leave the cask registered with no app and its
+        uninstall hook never run; nothing is removed instead."""
+        seen, _ = harness  # homebrew_brew() is None: brew is missing or cannot run
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: True)
+        monkeypatch.setattr(uninstall.bundle, "cask_prefix", lambda: tmp_path / "homebrew")
+        monkeypatch.setattr("openswap.widget_install._move_to_trash", lambda path: pytest.fail("trashed"))
+        lines, say = self._say()
+        assert uninstall.run(True, say, from_app=True) == 1
+        assert seen["remove"] == [] and seen["purge"] == [] and seen["exec"] is None
+        brew = tmp_path / "homebrew" / "bin" / "brew"
+        assert lines == [
+            (f"Error: Homebrew installed OpenSwap, but {brew} cannot run, so nothing was removed.", True),
+            ("Fix Homebrew, then open OpenSwap and choose Uninstall OpenSwap… again, "
+             "or run: brew uninstall --cask openswap", True),
+        ]
+
+    def test_run_from_the_app_reveals_a_copy_it_cannot_trash(self, harness, monkeypatch, frozen_app):
+        def refuse(path):
+            raise ClaudeSwitchError(f"Could not move {path} to the Trash: permission denied")
+
+        opened = []
+        monkeypatch.setattr("openswap.widget_install._move_to_trash", refuse)
+        monkeypatch.setattr(uninstall, "_open", lambda *a: opened.append(a))
+        lines, say = self._say()
+        assert uninstall.run(False, say, from_app=True) == 0
+        assert opened == [("-R", str(frozen_app))]
+        assert (f"Could not move {frozen_app} to the Trash: permission denied", True) in lines
+
+    def test_run_from_the_app_opens_the_log_when_brew_fails(self, harness, monkeypatch, tmp_path):
+        seen, state = harness
+        state["brew"] = brew = Path("/opt/homebrew/bin/brew")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+        _, say = self._say()
+        with pytest.raises(SystemExit):
+            uninstall.run(True, say, from_app=True)
+        sh, flag, script, *command = seen["exec"]
+        assert (sh, flag) == ("/bin/sh", "-c")
+        assert command == [str(brew), "uninstall", "--cask", "--zap", "openswap"]
+        log = tmp_path / "home" / "Library" / "Logs" / "com.opensoft.openswap.uninstall.log"
+        assert script == f'"$0" "$@" || exec /usr/bin/open {shlex.quote(str(log))}'
+
+    def test_run_from_a_source_install_names_uv(self, harness):
+        lines, say = self._say()
+        assert uninstall.run(False, say, from_app=True) == 0
+        assert lines[-1] == ("To finish, run: uv tool uninstall openswap", False)
+
+    def test_from_app_waits_for_the_app_and_trashes_it(self, harness, monkeypatch, capsys, frozen_app):
+        seen, _ = harness
+        order = []
+        monkeypatch.setattr(uninstall, "wait_for_app_to_quit", lambda: order.append("wait") or True)
+        monkeypatch.setattr(uninstall, "show_app_log", lambda: order.append("log"))
+        monkeypatch.setattr("openswap.widget_install._move_to_trash", lambda path: order.append("trash"))
+        assert self._run(monkeypatch, "--yes", "--from-app") == 0
+        assert order == ["wait", "trash"] and seen["remove"] == [False]
+        assert f"Moved {frozen_app} to the Trash." in capsys.readouterr().out
+
+    def test_from_app_failure_opens_the_log(self, harness, monkeypatch, capsys):
+        seen, state = harness
+        state["live"] = "Claude Code is running on session profile 1-a (PID 7). Quit it, then try again."
+        order = []
+        monkeypatch.setattr(uninstall, "wait_for_app_to_quit", lambda: order.append("wait") or True)
+        monkeypatch.setattr(uninstall, "show_app_log", lambda: order.append("log"))
+        assert self._run(monkeypatch, "--yes", "--zap", "--from-app") == 1
+        assert order == ["wait", "log"] and seen["remove"] == []
+        assert "PID 7" in capsys.readouterr().err
+
+    def test_from_app_removes_nothing_while_the_app_still_runs(self, harness, monkeypatch, capsys):
+        """A running extra's engines could recreate what a zap deletes."""
+        seen, _ = harness
+        order = []
+        monkeypatch.setattr(uninstall, "wait_for_app_to_quit", lambda: order.append("wait") or False)
+        monkeypatch.setattr(uninstall, "show_app_log", lambda: order.append("log"))
+        monkeypatch.setattr(uninstall, "refuse_live_sessions", lambda: pytest.fail("went on"))
+        assert self._run(monkeypatch, "--yes", "--zap", "--from-app") == 1
+        assert order == ["wait", "log"]
+        assert seen["remove"] == [] and seen["purge"] == [] and seen["data"] == [] and seen["exec"] is None
+        err = capsys.readouterr().err
+        assert "did not quit within 30 seconds, so nothing was removed." in err
+        assert "Quit OpenSwap, then open it and choose Uninstall OpenSwap… again." in err
+
+    def test_terminal_command_never_trashes_or_waits(self, harness, monkeypatch, capsys, frozen_app):
+        monkeypatch.setattr(uninstall, "wait_for_app_to_quit", lambda: pytest.fail("waited"))
+        monkeypatch.setattr("openswap.widget_install._move_to_trash", lambda path: pytest.fail("trashed"))
+        assert self._run(monkeypatch) == 0
+        assert f"To finish, move {frozen_app} to the Trash." in capsys.readouterr().out
+
+
+class TestStartFromApp:
+    """The menu bar never removes anything itself: removing the login item
+    would boot it out. It starts ``openswap uninstall`` and quits."""
+
+    @pytest.fixture
+    def popen(self, monkeypatch):
+        started = []
+
+        class FakePopen:
+            def __init__(self, argv, **kwargs):
+                started.append((argv, kwargs))
+
+        monkeypatch.setattr(uninstall.subprocess, "Popen", FakePopen)
+        monkeypatch.setattr(uninstall, "remove_integrations", lambda **k: pytest.fail("removed in-process"))
+        return started
+
+    def test_starts_the_app_executable_detached_with_a_log(self, popen, frozen_app, monkeypatch, tmp_path):
+        monkeypatch.setenv("XPC_SERVICE_NAME", "com.opensoft.openswap.menubar")
+        home = tmp_path / "home"
+        command = uninstall.start_from_app(True, home=home)
+        exe = str(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+        assert command == [exe, "uninstall", "--yes", "--zap", "--from-app"]
+        (argv, kwargs), = popen
+        assert argv == command
+        assert kwargs["start_new_session"] is True
+        assert kwargs["stdin"] is subprocess.DEVNULL and kwargs["stderr"] is subprocess.STDOUT
+        log = home / "Library" / "Logs" / "com.opensoft.openswap.uninstall.log"
+        assert kwargs["stdout"].name == str(log)
+        assert "XPC_SERVICE_NAME" not in kwargs["env"]
+        assert kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+        assert log.read_text().strip().endswith(" ".join(command))
+
+    def test_without_zap(self, popen, frozen_app, tmp_path):
+        command = uninstall.start_from_app(False, home=tmp_path)
+        assert command[1:] == ["uninstall", "--yes", "--from-app"]
+
+    def test_source_install_runs_its_console_script(self, popen, monkeypatch, tmp_path):
+        monkeypatch.setattr("openswap.launch_agent.resolve_program", lambda: [UV_SCRIPT])
+        command = uninstall.start_from_app(False, home=tmp_path)
+        assert command == [UV_SCRIPT, "uninstall", "--yes", "--from-app"]
+        assert "PYINSTALLER_RESET_ENVIRONMENT" not in popen[0][1]["env"]
+
+    def test_the_uninstall_log_survives_a_zap(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        logs = home / "Library" / "Logs"
+        logs.mkdir(parents=True)
+        (logs / "com.opensoft.openswap.uninstall.log").write_text("x")
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: home / "none")
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: home / "none")
+        assert uninstall.data_paths(home) == []
+
+    def test_waits_until_the_app_has_quit(self, monkeypatch):
+        parents = iter([700, 700, 700, 1])
+        monkeypatch.setattr(uninstall.os, "getppid", lambda: next(parents))
+        monkeypatch.setattr(uninstall.time, "sleep", lambda s: None)
+        assert uninstall.wait_for_app_to_quit() is True
+
+    def test_gives_up_waiting_after_the_timeout(self, monkeypatch):
+        monkeypatch.setattr(uninstall.os, "getppid", lambda: 700)
+        clock = iter([0.0, 10.0, 31.0])
+        monkeypatch.setattr(uninstall.time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(uninstall.time, "sleep", lambda s: None)
+        assert uninstall.wait_for_app_to_quit(timeout=30.0) is False
+
+
+class TestAppDialog:
+    def test_cask_install(self, frozen_app, monkeypatch):
+        # Whether brew can run now does not change what the app is: the child
+        # refuses then (test_run_from_the_app_keeps_a_cask_app_brew_cannot_remove).
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: True)
+        monkeypatch.setattr(uninstall, "homebrew_brew", lambda: None)
+        dialog = uninstall.app_dialog()
+        assert dialog["title"] == "Uninstall OpenSwap?" and dialog["ok"] == "Uninstall"
+        assert dialog["checkbox"] == "Also delete saved accounts, settings and logs"
+        assert "• OpenSwap.app, through Homebrew" in dialog["message"]
+        assert "\n\nClaude Code and Codex stay signed in. Your saved accounts stay unless you select the " \
+            "checkbox below. Deleting them cannot be undone." in dialog["message"]
+        assert "uv tool" not in dialog["message"]
+
+    def test_copy_not_installed_by_homebrew(self, frozen_app, monkeypatch):
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: False)
+        assert "• OpenSwap.app, moved to the Trash" in uninstall.app_dialog()["message"]
+
+    def test_source_install(self):
+        message = uninstall.app_dialog()["message"]
+        assert ".app" not in message
+        assert message.endswith("run “uv tool uninstall openswap” afterwards.")
+
+
+class TestMenuAction:
+    @pytest.fixture
+    def app(self, monkeypatch):
+        from openswap import menubar
+        from tests.menubar_harness import extract_class
+
+        app = extract_class(
+            menubar.__file__, "MenuBarApp", {"on_uninstall"}, {"ClaudeSwitchError": ClaudeSwitchError}
+        )()
+        app.calls = []
+        app.answer = SimpleNamespace(clicked=1, text="", checked=False)
+        app._confirm = lambda **kw: app.calls.append(("confirm", kw)) or app.answer
+        app._alert = lambda **kw: app.calls.append(("alert", kw["message"])) or 1
+        app.on_quit = lambda sender: app.calls.append("quit")
+        monkeypatch.setattr(uninstall, "app_dialog", lambda: {"title": "Uninstall OpenSwap?", "ok": "Uninstall"})
+        monkeypatch.setattr(uninstall, "start_from_app", lambda zap: app.calls.append(("start", zap)))
+        monkeypatch.setattr(uninstall, "remove_integrations", lambda **k: pytest.fail("removed in-process"))
+        monkeypatch.setattr(uninstall, "refuse_live_sessions", lambda: app.calls.append("refuse"))
+        return app
+
+    @pytest.mark.parametrize("zap", [False, True])
+    def test_confirm_starts_the_child_then_quits(self, app, zap):
+        app.answer = SimpleNamespace(clicked=1, text="", checked=zap)
+        app.on_uninstall(None)
+        (kind, shown), *rest = app.calls
+        assert kind == "confirm" and shown["destructive"] is True and shown["cancel"] is True
+        assert rest == [*(["refuse"] if zap else []), ("start", zap), "quit"]
+
+    def test_cancel_does_nothing(self, app):
+        app.answer = SimpleNamespace(clicked=0, text="", checked=True)
+        app.on_uninstall(None)
+        assert [c[0] for c in app.calls] == ["confirm"]
+
+    def test_a_live_session_stops_a_zap_with_an_alert(self, app, monkeypatch):
+        def refuse():
+            raise ClaudeSwitchError("Claude Code is running on session profile 1-a (PID 7). Quit it, then try again.")
+
+        monkeypatch.setattr(uninstall, "refuse_live_sessions", refuse)
+        app.answer = SimpleNamespace(clicked=1, text="", checked=True)
+        app.on_uninstall(None)
+        assert app.calls[1:] == [("alert", "Claude Code is running on session profile 1-a (PID 7). Quit it, then try again.")]
+
+    def test_a_child_that_cannot_start_keeps_the_app_running(self, app, monkeypatch):
+        def fail(zap):
+            raise PermissionError("Operation not permitted")
+
+        monkeypatch.setattr(uninstall, "start_from_app", fail)
+        app.on_uninstall(None)
+        assert app.calls[-1] == ("alert", "OpenSwap could not start the uninstall: Operation not permitted")
+
+    def test_the_overflow_menu_offers_it(self):
+        from openswap import menubar
+
+        text = Path(menubar.__file__).read_text(encoding="utf-8")
+        rebuild = text[text.index("def rebuild_menu") : text.index("def _add_menu")]
+        item = 'rumps.MenuItem("Uninstall OpenSwap…", callback=self.on_uninstall)'
+        assert item in rebuild
+        assert rebuild.index(item) < rebuild.index('rumps.MenuItem("Quit"')
