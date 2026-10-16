@@ -182,7 +182,16 @@ def set_login_item(enabled: bool, *, home=None, uid=None) -> str: ...
 `resolve_program()`; only then may a copy hand over (a plist for another
 copy of the app must not start it). `start_login_item` kickstarts the job
 when it is loaded and bootstraps the plist when it is not, then returns
-launchd's pid (`_wait_for_pid`), or None when none appeared.
+launchd's pid (`_wait_for_pid`). A job may be mid-unload: the start-up
+migration (`bundle._repoint_menubar_agent`) boots out a uv extra just
+before this runs. So when the kickstart fails or no pid appears, it waits
+for the job to unload (`_wait_until_unloaded`) and bootstraps the plist
+once. It returns None only when that fails too. `_repoint_menubar_agent`
+also waits for its own bootout to finish before it rewrites the plist.
+
+Every start that fails records why in `<backup_root>/login_item_status.json`
+(time and launchctl's detail). Any successful start clears it, and the
+launchd job clears it when it starts. Step 3 reads it.
 
 `set_login_item` returns what happened, so the UI can say it. What it does
 depends on which process calls it:
@@ -206,10 +215,10 @@ nothing loaded, while a plain Quit with login on keeps today's behaviour
 (loaded, not running, started again at the next login).
 
 Check on macOS 14 and 15 what happens when the user switched OpenSwap off in
-System Settings › General › Login Items ("Allow in the Background"). If
-`bootstrap` fails there or the job never starts, report it as "Turned off in
-System Settings" with a button that opens
-`x-apple.systempreferences:com.apple.LoginItems-Settings.extension`.
+System Settings › General › Login Items ("Allow in the Background"), and
+whether `launchctl print` shows it. Whatever the signal, it ends up as a
+failed start in `login_item_status.json`, and Step 3 shows it. Don't wait
+for a toggle change to report it.
 
 **Verify**: `tests/test_launch_agent.py` covers each cell of the table with a
 fake `_launchctl` and `XPC_SERVICE_NAME` set or unset, including "never
@@ -223,6 +232,12 @@ lock-timeout path call it in exactly those cases.
   Mac**, with an **Open at login** toggle (`id: open_at_login`). Its value
   comes from `login_item_enabled()`, read when the page is built, not from
   `MenuBarSettings`.
+- While the toggle is on and `login_item_status.json` records a failed
+  start, and this copy is not the launchd job, a warning row follows the
+  toggle. It reads "macOS isn't starting OpenSwap at login" with an
+  **Open Login Items** button
+  (`x-apple.systempreferences:com.apple.LoginItems-Settings.extension`). The
+  toggle never claims it works when macOS refused the last start.
 - From a temporary location the toggle is disabled and a hint row says to
   move the app to Applications.
 - The controller calls `set_login_item` off the main thread and shows the
@@ -231,7 +246,10 @@ lock-timeout path call it in exactly those cases.
 - Works in a uv install too (it pins the console script, as `setup` does).
 
 **Verify**: `settings_page_rows` tests for the new rows, the temporary-location
-case and the section filter. Manual on the notarized build: install with
+case, the failed-start warning (shown only when on, failed, and not the
+launchd job), and the section filter. `start_login_item` tests: a kickstart
+that fails while the job unloads falls back to one bootstrap; failures write
+the status file and a start clears it. Manual on the notarized build: install with
 `brew install --cask`, skip `openswap setup`, open the app, switch the toggle
 on. `launchctl print gui/$(id -u)/com.opensoft.openswap.menubar` shows the
 bundle path, there is one status item, it is back after logging out and in,
