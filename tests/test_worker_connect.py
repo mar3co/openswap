@@ -277,6 +277,71 @@ def test_listener_cancel_closes_it():
     assert box == {"error": "connect_cancelled"} and listener.closed
 
 
+
+def test_listener_accepts_a_callback_carrying_large_cookies():
+    # Browsers send every cookie they hold for 127.0.0.1, whatever the port.
+    state = connect.new_state()
+    listener = connect.CallbackListener(state, timeout=20)
+    thread, box = _waiting(listener)
+    with socket.create_connection(("127.0.0.1", listener.port), timeout=10) as client:
+        client.sendall(f"GET /openswap/callback?code=pair_1&state={state} HTTP/1.1\r\n"
+                       f"Host: 127.0.0.1\r\nCookie: big={'x' * 20_000}\r\n\r\n".encode())
+        thread.join(10)
+        assert box["query"]["code"] == ["pair_1"]
+        listener.respond(True, "Paired", "You can close this tab.")
+        assert client.recv(64).startswith(b"HTTP/1.1 200")
+
+
+def test_a_slow_local_client_cannot_hold_cancel_or_the_deadline():
+    listener = connect.CallbackListener(connect.new_state(), timeout=20)
+    thread, box = _waiting(listener)
+    with socket.create_connection(("127.0.0.1", listener.port), timeout=10) as client:
+        client.sendall(b"G")  # and nothing more for now
+        time.sleep(0.3)
+        started = time.monotonic()
+        listener.cancel()
+        thread.join(5)
+        assert box == {"error": "connect_cancelled"} and time.monotonic() - started < 2
+    listener = connect.CallbackListener(connect.new_state(), timeout=1)
+    started = time.monotonic()
+    with socket.create_connection(("127.0.0.1", listener.port), timeout=10) as client:
+        dripping = threading.Event()
+
+        def drip():
+            while not dripping.is_set():
+                try:
+                    client.sendall(b"G")
+                except OSError:
+                    return
+                dripping.wait(0.1)
+        dripper = threading.Thread(target=drip, daemon=True)
+        dripper.start()
+        try:
+            with pytest.raises(ProtocolError, match="connect_timed_out"):
+                listener.wait()
+        finally:
+            dripping.set()
+    assert time.monotonic() - started < connect.REQUEST_TIMEOUT + 3  # one connection's bound, not forever
+
+
+def test_discovery_against_something_that_is_not_http_is_unavailable():
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+
+    def answer():
+        conn, _ = server.accept()
+        with conn:
+            conn.recv(4096)
+            conn.sendall(b"SSH-2.0-OpenSSH_9.0\r\n")
+    threading.Thread(target=answer, daemon=True).start()
+    try:
+        with pytest.raises(ProtocolError, match="service_unavailable"):
+            connect.discover(f"http://127.0.0.1:{server.getsockname()[1]}")
+    finally:
+        server.close()
+
+
 # --- discovery ---------------------------------------------------------------------------------
 
 

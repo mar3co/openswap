@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import html
+import http.client
 import json
 from pathlib import Path
 import secrets
@@ -59,7 +60,11 @@ WAIT_SECONDS = 600.0
 REQUEST_TIMEOUT = 5.0
 MAX_DOCUMENT = 16_384
 MAX_LABEL = 64
+# The request line must fit in this; the rest of the head (a browser sends every
+# cookie it holds for 127.0.0.1, whatever the port) is read up to MAX_HEAD_DRAIN
+# so closing the connection does not reset it, then ignored.
 MAX_REQUEST_HEAD = 8192
+MAX_HEAD_DRAIN = 262_144
 # A paired Mac whose key ends within this window reconnects instead of
 # refusing as already paired (the same 7 days key rotation starts at).
 RECONNECT_WINDOW = timedelta(days=7)
@@ -185,7 +190,8 @@ def discover(url: str, *, opener=None) -> str:
     except ProtocolError:
         # A redirect (NoRedirect) is not a discovery document.
         raise ProtocolError("connect_unsupported") from None
-    except (URLError, TimeoutError, OSError):
+    except (URLError, TimeoutError, OSError, http.client.HTTPException):
+        # HTTPException: something that is not an HTTP server answered.
         raise ProtocolError("service_unavailable", 503) from None
     if len(raw) > MAX_DOCUMENT:
         raise ProtocolError("connect_unsupported")
@@ -301,21 +307,41 @@ class CallbackListener:
         finally:
             self._close_server()
 
-    def _handle(self, conn: socket.socket) -> dict[str, list[str]] | None:
+    def _read_head(self, conn: socket.socket) -> bytes | None:
+        """The request head, read within ``REQUEST_TIMEOUT`` overall (a slow client
+        cannot hold the one waiting thread), or None on cancel or a socket error.
+        Cancel is honoured between reads."""
+        until = time.monotonic() + REQUEST_TIMEOUT
+        raw = b""
         try:
-            conn.settimeout(REQUEST_TIMEOUT)
-            raw = b""
-            while b"\r\n\r\n" not in raw and len(raw) <= MAX_REQUEST_HEAD:
-                chunk = conn.recv(4096)
+            while b"\r\n\r\n" not in raw and len(raw) <= MAX_HEAD_DRAIN:
+                if b"\r\n" not in raw and len(raw) > MAX_REQUEST_HEAD:
+                    break  # no request line within its bound: answered as a bad request
+                if self._cancelled.is_set():
+                    return None
+                remaining = until - time.monotonic()
+                if remaining <= 0:
+                    break
+                conn.settimeout(min(_POLL_SECONDS, remaining))
+                try:
+                    chunk = conn.recv(16_384)
+                except TimeoutError:
+                    continue
                 if not chunk:
                     break
                 raw += chunk
         except OSError:
+            return None
+        return raw
+
+    def _handle(self, conn: socket.socket) -> dict[str, list[str]] | None:
+        raw = self._read_head(conn)
+        if raw is None:
             conn.close()
             return None
-        line = raw.split(b"\r\n", 1)[0].decode("latin-1")
-        parts = line.split(" ")
-        if len(parts) != 3 or not parts[2].startswith("HTTP/") or len(raw) > MAX_REQUEST_HEAD:
+        line, complete, _rest = raw.partition(b"\r\n")
+        parts = line.decode("latin-1").split(" ")
+        if not complete or len(line) > MAX_REQUEST_HEAD or len(parts) != 3 or not parts[2].startswith("HTTP/"):
             _send(conn, 400, "Bad request", "OpenSwap did not understand this request.")
             return None
         method, target = parts[0], parts[1]
