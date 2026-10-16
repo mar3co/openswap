@@ -31,6 +31,7 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 016  | App-aware ChatGPT switching | P1 | M | 014, 015, PR #49 | DONE |
 | 020  | Set up OpenSwap fully from the app or the terminal | P1 | L | 008, PR #107 | DONE; manual checks on a notarized build still open before release |
 | 021  | Setup wizard and Move to Applications | P1 | L | 020, PR #114 | DONE; manual checks on a notarized build still open before release |
+| 022  | Pair a Mac by signing in to OpenTag, and rotate device keys in place | P1 | L | 017, 018 | PROPOSED |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED. Feature proposals use PROPOSED until accepted; 017 is accepted and tracked in its progress log.
 
@@ -54,6 +55,12 @@ cask's upgrade kickstart misses it. 020 gives the app Open at login (the
 same LaunchAgent `openswap setup` writes), a first-run page, widget and
 status-line setup, and Uninstall, all through the functions the CLI uses.
 Three phases; each merges on its own.
+
+022 was written 2026-10-16 (planned at `259cacd`). Pairing needs a pasted
+one-use code and every device key expires after 30 days. 022 adds an optional
+`rotate_key` operation so an online Mac renews itself, and a **Connect to
+OpenTag…** sign-in that returns a PKCE-bound pair code to a loopback listener.
+Four phases in two repos; the rotation pair ships without the sign-in pair.
 
 001 and 006 share no files and may run in parallel. 002–005 all touch the extra
 and/or widget; run them only after 001 is merged into the executor’s base.
