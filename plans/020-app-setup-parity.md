@@ -148,7 +148,8 @@ launchd job running, open the app from Finder, from Spotlight and with
   logs are.
 - Add `menubar_lock(backup_dir)` (in `menubar.py` or a small new module):
   an exclusive `fcntl.flock` on `<backup_root>/menubar.lock`, taken in
-  `menubar.run` before the status item exists.
+  `menubar.run` before the status item exists. The holder writes its pid
+  into the file, so the CLI can tell whether launchd's copy owns it.
 - The launchd job (`XPC_SERVICE_NAME == LABEL`) waits up to 10 s for the
   lock (it may be starting during a hand-over, Step 2). Any other copy does
   not wait: it leaves a show request and exits 0. A terminal
@@ -235,8 +236,20 @@ depends on which process calls it:
 | The launchd job itself | Write the plist when it is missing or runs another program; no `launchctl` | Delete the plist; this copy keeps running. On Quit it calls `unload_own_job()` before it exits, so the job is not left loaded for the cask's `kickstart -k` to revive. It does not come back at the next login |
 | A copy opened from Finder, Spotlight or `openswap menubar` | Write the plist, `start_login_item()` (`_wait_for_pid` moves here from `cli.py`), then return `"handoff"`: the caller quits and launchd's copy takes the lock | Boot out the job if it is loaded (it is not this process), delete the plist |
 
-The CLI keeps `install()` and `uninstall()` as they are; they already run
-outside the extra. Refuse with a clear message from a translocated or mounted
+The CLI keeps `install()` and `uninstall()`; they already run outside the
+extra. One addition: after `install()` bootstraps the job (`openswap setup`,
+`menubar --install-service`), it posts
+`com.opensoft.openswap.menubar.handoff` and leaves a hand-over request file
+(`<backup_root>/menubar.handoff-request`, read the way show requests are).
+This is for an extra launchd did not start that still holds the lock: one
+opened from Finder while Open at login was off. That extra re-runs the
+Step 1 check when the request arrives. Its login item now runs its
+program and the job has a pid, so it leaves a show request and quits,
+releasing the lock to launchd's copy. Without this the new job waits
+behind the lock and loops under `KeepAlive`. Setup then waits up to 15 s
+for the pid in `menubar.lock` to be launchd's. It prints its usual success
+line only then. Otherwise it warns that OpenSwap is still running outside
+its login item and says to quit it from the menu bar. Refuse with a clear message from a translocated or mounted
 copy (`bundle.runs_from_temporary_location()`): "Move OpenSwap to Applications
 first." Never boot out the calling process from inside the call.
 
@@ -270,7 +283,9 @@ loaded with another program or whose program cannot be read.
 fake `_launchctl` and `XPC_SERVICE_NAME` set or unset, including "never
 boots out itself", the temporary-location refusal, and `unload_own_job()`
 (detached, new session, only when the plist is gone). Quit and the
-lock-timeout path call it in exactly those cases.
+lock-timeout path call it in exactly those cases. `openswap setup` with a Finder
+extra holding the lock: the request makes it quit, and setup reports
+success only once launchd's pid holds the lock (warns otherwise).
 
 ### Step 3: Open at login in Settings
 
@@ -350,7 +365,14 @@ for frozen and source installs.
 - **Claude Code status line** toggle in This Mac: `statusline.install()` /
   `uninstall()` with `paint_command()`, the same calls `openswap statusline
   --install/--uninstall` makes (move the shared part into one function both
-  call). The value is `statusline.installed_command(...) is not None`.
+  call). The toggle is on only when the installed hook runs this program
+  (`statusline.hook_program()` is `paint_command()`'s program, or a link to
+  it). An OpenSwap hook for another program, including a bare `openswap
+  statusline` that PATH may send to an older uv install, shows as off,
+  with a hint that the status line uses another OpenSwap. Turning it on
+  then rewrites that hook to `paint_command()` and keeps the wrap state,
+  instead of `install()`'s early `already` return. `openswap statusline
+  --install` gets the same repair, since it calls the same function.
   From a temporary location, turning it on is disabled with the same hint
   as Open at login: `paint_command()` would pin a path that disappears and
   break every status-line render. Turning it off stays possible.
@@ -361,7 +383,9 @@ for frozen and source installs.
   run" paragraph), `docs/widget.md`: describe both paths in the same terms.
 
 **Verify**: settings model tests for the toggle (including on-disabled,
-off-allowed from a temporary location), a CLI test that the shared
+off-allowed from a temporary location, and a hook for another program or a
+bare command shown as off), a test that turning it on repoints such a hook
+and keeps the wrap state, a CLI test that the shared
 function is what `statusline --install` calls,
 `tests/test_packaging_homebrew.py` for the caveat. `brew style` and
 `brew audit --cask --strict` on the rendered cask in a local tap.
