@@ -1820,6 +1820,8 @@ class SnapshotMixin:
 
                 print()
                 print(bolded("Running instances:"))
+                # Pad labels to the longest so the folders line up.
+                width = max((len(label) for label, _ in groups), default=0)
                 for (label, cwd), counts in groups.items():
                     parts = []
                     s = counts["sessions"]
@@ -1827,7 +1829,7 @@ class SnapshotMixin:
                         parts.append(f"{s} session{'s' if s > 1 else ''}")
                     if counts["ide"]:
                         parts.append("IDE")
-                    print(f"  {dimmed('●')} {muted(label)}   {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
+                    print(f"  {dimmed('●')} {muted(label.ljust(width))}  {muted(cwd)}  {dimmed(f'({", ".join(parts)})')}")
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 

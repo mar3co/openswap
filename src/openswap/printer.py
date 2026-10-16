@@ -248,12 +248,21 @@ _IDE_SHORT_NAMES: dict[str, str] = {
 
 
 def entrypoint_label(entrypoint: str) -> str:
-    """Return a human-readable label for a Claude Code entrypoint."""
+    """Return a human-readable label for a Claude Code entrypoint.
+
+    A session file can hold ``"entrypoint": null`` (or another non-string);
+    it gets the missing key's empty label, so callers can always measure it.
+    """
+    if not isinstance(entrypoint, str):
+        return ""
     return _ENTRYPOINT_LABELS.get(entrypoint, entrypoint)
 
 
 def ide_short_name(ide_name: str) -> str:
-    """Return a short display name for an IDE."""
+    """Return a short display name for an IDE (``Unknown IDE`` for a
+    non-string ``ideName``, as for a missing one)."""
+    if not isinstance(ide_name, str):
+        return "Unknown IDE"
     return _IDE_SHORT_NAMES.get(ide_name, ide_name)
 
 

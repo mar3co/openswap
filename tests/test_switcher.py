@@ -1555,6 +1555,75 @@ class TestListAccountsUsage:
         assert "  2: account2@example.com" in output
         assert "(account2@example.com)" not in output
 
+    def test_list_lines_up_running_instance_folders(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """Labels of different lengths (CLI, Desktop, VS Code) are padded so
+        every folder starts in the same column."""
+        from types import SimpleNamespace
+
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        sessions = [
+            SimpleNamespace(entrypoint="cli", cwd="/work/openswap"),
+            SimpleNamespace(entrypoint="cli", cwd="/work/openswap"),
+            SimpleNamespace(entrypoint="claude-desktop", cwd="/work/opentag"),
+        ]
+        ides = [SimpleNamespace(ide_name="Visual Studio Code", workspace_folders=["/work/site"])]
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=active_creds), \
+             patch("openswap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
+             patch("openswap.engine.snapshot.get_running_instances", return_value=(sessions, ides)):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out.split("Running instances:\n", 1)[1]
+        rows = [line for line in output.splitlines() if "●" in line]
+        assert [row.split("/work/")[1] for row in rows] == [
+            "openswap  (2 sessions)",
+            "opentag  (1 session)",
+            "site  (IDE)",
+        ]
+        assert len({row.index("/work/") for row in rows}) == 1
+        assert rows[0].startswith("  ● CLI      /work/")
+
+    def test_list_keeps_running_instances_with_null_labels(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """A session file with ``"entrypoint": null`` or an IDE lock with
+        ``"ideName": null`` must not hide the other instances."""
+        from types import SimpleNamespace
+
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        sessions = [
+            SimpleNamespace(entrypoint="cli", cwd="/work/openswap"),
+            SimpleNamespace(entrypoint=None, cwd="/work/odd"),
+        ]
+        ides = [SimpleNamespace(ide_name=None, workspace_folders=["/work/site"])]
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=active_creds), \
+             patch("openswap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
+             patch("openswap.engine.snapshot.get_running_instances", return_value=(sessions, ides)):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out.split("Running instances:\n", 1)[1]
+        rows = [line for line in output.splitlines() if "●" in line]
+        assert [row.split("/work/")[1] for row in rows] == [
+            "openswap  (1 session)",
+            "odd  (1 session)",
+            "site  (IDE)",
+        ]
+        assert len({row.index("/work/") for row in rows}) == 1
+        assert rows[2].startswith("  ● Unknown IDE  /work/")
+
     def test_list_shows_usage_null_reset(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):

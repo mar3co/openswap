@@ -24,7 +24,7 @@ from openswap.process_detection import (
     list_sessions,
     parse_process_table,
 )
-from openswap.printer import abbreviate_path, entrypoint_label, format_age
+from openswap.printer import abbreviate_path, entrypoint_label, format_age, ide_short_name
 
 
 # --- get_claude_dir ---
@@ -351,6 +351,20 @@ class TestEntrypointLabel:
     )
     def test_known_and_unknown(self, entrypoint, expected):
         assert entrypoint_label(entrypoint) == expected
+
+    @pytest.mark.parametrize("entrypoint", [None, 7, ["cli"]])
+    def test_non_string_is_blank(self, entrypoint):
+        assert entrypoint_label(entrypoint) == ""
+
+
+class TestIdeShortName:
+    def test_known_and_unknown(self):
+        assert ide_short_name("Visual Studio Code") == "VS Code"
+        assert ide_short_name("Cursor") == "Cursor"
+
+    @pytest.mark.parametrize("ide_name", [None, 7, ["Cursor"]])
+    def test_non_string_is_unknown(self, ide_name):
+        assert ide_short_name(ide_name) == "Unknown IDE"
 
 
 class TestAbbreviatePath:
