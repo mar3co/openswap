@@ -332,7 +332,10 @@ def remote_reconnect_label(snapshot: dict, *, now: datetime | None = None) -> st
     saved expiry is read even while the worker is off, because the key keeps
     aging then; nothing here reads the Keychain.
     """
-    if snapshot.get("remote_connectivity") == "expired":
+    connectivity = snapshot.get("remote_connectivity")
+    if connectivity == "revoked":
+        return None  # a removed Mac can only be unpaired, never reconnected
+    if connectivity == "expired":
         return "Key expired · Reconnect this Mac"
     expires = _remote_key_expiry(snapshot)
     if expires is None:

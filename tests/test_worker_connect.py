@@ -1130,3 +1130,24 @@ def test_reconnect_survives_an_expiry_seen_while_on_and_then_turning_off(tmp_pat
     update_worker_settings(tmp_path, enabled=False)
     snapshot = read_worker_snapshot(tmp_path).to_dict()
     assert menubar.remote_reconnect_label(snapshot) == "Key expired · Reconnect this Mac"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_a_removed_mac_is_never_offered_reconnect(tmp_path, enabled):
+    from openswap.settings import update_worker_settings
+    from openswap.worker.remote_state import read_key_status, save_status
+    from openswap.worker.runtime import read_worker_snapshot
+
+    url = "https://control.example"
+    configure_worker_service(tmp_path, url, "worker")
+    update_worker_settings(tmp_path, enabled=enabled)
+    for expires in (datetime.now(timezone.utc) - timedelta(hours=1), datetime.now(timezone.utc) + timedelta(days=3)):
+        # A revoked status keeps the saved key fields (see _kept_key).
+        save_status(tmp_path, url, "revoked", None, "worker", key_renews=False, key_expires_at=expires)
+        assert read_key_status(tmp_path) == (None, None)
+        snapshot = read_worker_snapshot(tmp_path).to_dict()
+        assert menubar.remote_reconnect_label(snapshot) is None
+        assert menubar.remote_key_copy(snapshot) == ""
+        assert cli._key_status(snapshot) is None
+    assert menubar.remote_reconnect_label({"remote_connectivity": "revoked",
+                                           "remote_key_expires_at": expires.isoformat()}) is None
