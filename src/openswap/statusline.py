@@ -429,9 +429,10 @@ def repoint_command(config_home: Path, *, program: Path) -> bool:
 
     For the move from a uv install to the app: ``…/.local/bin/openswap
     statusline`` becomes ``…/OpenSwap.app/Contents/MacOS/OpenSwap
-    statusline``. Anything before the program (an env prefix) is kept, a
-    bare ``openswap statusline`` and a hook already on ``program`` (or a
-    link to it) are left alone, and the wrap state is untouched.
+    statusline``. Anything before the program (an env prefix, a shell
+    command joined with ``&&``) is kept as written, a bare ``openswap
+    statusline`` and a hook already on ``program`` (or a link to it) are
+    left alone, and the wrap state is untouched.
     """
     if not runs_other_program(config_home, program):
         return False
@@ -440,8 +441,10 @@ def repoint_command(config_home: Path, *, program: Path) -> bool:
     block = settings.get("statusLine")
     if not isinstance(block, dict) or not isinstance(block.get("command"), str):
         return False
-    parts = shlex.split(block["command"].strip())
-    block["command"] = shlex.join([*parts[:-2], str(program), "statusline"])
+    repointed = _with_command(block["command"], f"{shlex.quote(str(program))} statusline")
+    if repointed is None:
+        return False  # left as written rather than risk breaking it
+    block["command"] = repointed
     settings["statusLine"] = block
     _write_json(settings_file, settings)
     return True
@@ -505,6 +508,35 @@ def _command_program(command: str | None) -> str | None:
     return parts[-2] if len(parts) >= 2 else None
 
 
+def _with_command(hook: str, command: str) -> str | None:
+    """``hook`` with its trailing ``<program> statusline`` replaced by
+    ``command``, keeping everything before the program as written: shell
+    operators (``echo ready && …``), env prefixes and quoting survive, where
+    re-joining shlex tokens would quote ``&&`` into an argument.
+
+    None when that tail cannot be found exactly: then nothing is rewritten.
+    """
+    program = _command_program(hook)
+    head = hook.rstrip()
+    if program is None or not head.endswith("statusline"):
+        return None
+    head = head[: -len("statusline")]
+    if not head or not head[-1].isspace():
+        return None
+    head = head.rstrip()
+    # The program is the shortest whitespace-started suffix that parses as
+    # exactly that one word (it may be quoted or contain escaped spaces).
+    for start in range(len(head) - 1, -1, -1):
+        if start > 0 and not head[start - 1].isspace():
+            continue
+        try:
+            if shlex.split(head[start:]) == [program]:
+                return head[:start] + command
+        except ValueError:
+            continue
+    return None
+
+
 def _is_path(program: str) -> bool:
     return os.sep in program or "/" in program
 
@@ -547,8 +579,9 @@ def install(
     A hook that is already OpenSwap's and runs ``command``'s program is left
     alone (``already``). One that runs another program (a bare
     ``openswap statusline``, or another copy) is pointed at ``command``,
-    keeping any prefix before the program and the wrap state
-    (``repointed``).
+    keeping everything before the program as written and the wrap state
+    (``repointed``); a hook whose program cannot be found exactly raises
+    ConfigError rather than being rewritten.
     """
     settings_file = config_home / "settings.json"
     # Read both files before writing either: a torn OpenSwap settings.json
@@ -563,8 +596,13 @@ def install(
         if is_our_command(current):
             if _runs_same_program(current, command):
                 return {"already": True, "created": False, "migrated": False}
-            parts = shlex.split(current.strip())
-            block["command"] = shlex.join([*parts[:-2], *shlex.split(command)])
+            repointed = _with_command(current, command)
+            if repointed is None:
+                raise ConfigError(
+                    "Claude Code's status line runs another OpenSwap in a form this "
+                    f"cannot rewrite safely. Edit {settings_file} to run: {command}"
+                )
+            block["command"] = repointed
             settings["statusLine"] = block
             _write_json(settings_file, settings)
             return {"already": False, "created": False, "migrated": False, "repointed": True}

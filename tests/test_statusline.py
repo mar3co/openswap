@@ -1043,3 +1043,73 @@ class TestAnotherOpenSwap:
         assert "now runs this OpenSwap" in capsys.readouterr().out
         block = json.loads((claude / "settings.json").read_text(encoding="utf-8"))["statusLine"]
         assert block["command"] == f"{self.APP} statusline"
+
+
+class TestRepointKeepsTheHookAsWritten:
+    """Repointing replaces only the trailing `<program> statusline`: shell
+    composition before it must stay shell syntax (Codex review on #109)."""
+
+    APP = "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap"
+
+    def _install_over(self, tmp_path: Path, monkeypatch, hook: str):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        (claude / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command", "command": hook}}), encoding="utf-8"
+        )
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        monkeypatch.setattr(sl, "paint_command", lambda: f"{self.APP} statusline")
+        return claude, backup
+
+    def _command(self, claude: Path) -> str:
+        return json.loads((claude / "settings.json").read_text(encoding="utf-8"))["statusLine"]["command"]
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "echo ready && ",
+            "cd ~/x; ",
+            "FOO=1 BAR='a b' ",
+            "  ",
+        ],
+        ids=["and", "semicolon", "quoted-env", "spaces"],
+    )
+    def test_the_prefix_is_kept_verbatim(self, tmp_path: Path, monkeypatch, prefix):
+        claude, backup = self._install_over(tmp_path, monkeypatch, f"{prefix}/Users/x/.local/bin/openswap statusline")
+        assert sl.set_installed(claude, backup, True)["repointed"] is True
+        assert self._command(claude) == f"{prefix}{self.APP} statusline"
+
+    def test_a_quoted_program_with_a_space_is_replaced_whole(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._install_over(
+            tmp_path, monkeypatch, "echo hi && '/Users/x/My Tools/openswap' statusline  "
+        )
+        sl.set_installed(claude, backup, True)
+        assert self._command(claude) == f"echo hi && {self.APP} statusline"
+
+    def test_an_escaped_space_in_the_program_is_replaced_whole(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._install_over(tmp_path, monkeypatch, r"/Users/x/My\ Tools/openswap statusline")
+        sl.set_installed(claude, backup, True)
+        assert self._command(claude) == f"{self.APP} statusline"
+
+    def test_a_hook_it_cannot_take_apart_is_left_alone_and_reported(self, tmp_path: Path, monkeypatch):
+        hook = "/Users/x/.local/bin/openswap 'statusline'"
+        claude, backup = self._install_over(tmp_path, monkeypatch, hook)
+        assert sl.is_our_command(hook)
+        with pytest.raises(ConfigError, match="cannot rewrite safely"):
+            sl.set_installed(claude, backup, True)
+        assert self._command(claude) == hook
+
+    def test_the_move_from_a_uv_install_keeps_operators_too(self, tmp_path: Path):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        (claude / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command",
+                                       "command": "echo ready && /Users/x/.local/bin/openswap statusline"}}),
+            encoding="utf-8",
+        )
+        import shlex
+
+        program = Path(self.APP)
+        assert sl.repoint_command(claude, program=program) is True
+        assert self._command(claude) == f"echo ready && {shlex.quote(str(program))} statusline"
