@@ -441,6 +441,80 @@ zap.
 - Manual on the notarized build: Steps 1, 3, 4 and 7, and one
   `brew upgrade --cask openswap` across a release, on a clean user account.
 
+## Manual checks before release
+
+Run these on the notarized build, on a clean test user. Each phase's PR
+(#110, #109, #111) listed them as not done. Tick each one here when it
+passes.
+
+Phase 1 (#110):
+
+- [ ] Step 1, before the change: with the job running, open the app from
+      Finder, Spotlight and `open -a OpenSwap`. Record whether a second
+      status item appears.
+- [ ] Step 1: open the app those three ways while the job runs. Expect one
+      status item, and the popover opens each time.
+- [ ] Step 1: Quit, then open the app from Finder. `launchctl print
+      gui/$(id -u)/com.opensoft.openswap.menubar` shows the job running it,
+      and its popover opens.
+- [ ] Step 2, on macOS 14 and 15: switch OpenSwap off in System Settings ›
+      General › Login Items ("Allow in the Background"). Check whether
+      `launchctl print` shows it, whether bootstrap fails or no pid appears,
+      and that the failure lands in `login_item_status.json` and shows as
+      the Settings warning.
+- [ ] Step 3: `brew install --cask openswap`, skip `openswap setup`, open
+      the app, switch the toggle on. `launchctl print` shows the bundle
+      path, there is one status item, it is back after logging out and in,
+      and `brew reinstall --cask openswap` restarts it with a new pid.
+- [ ] Turn the toggle off from the launchd copy, then Quit. `launchctl
+      print` no longer finds the job, and it does not open at the next
+      login.
+
+Phase 2 (#109):
+
+- [ ] Step 4: cask install, open the app. The welcome page opens. Continue
+      with the switch on leaves one launchd-started extra; with it off, no
+      plist.
+- [ ] Step 4: after `openswap setup`, opening the app shows no welcome page.
+- [ ] Step 5: on a fresh cask install, the widget shows up in Edit Widgets
+      (search OpenSwap) without running `openswap widget --install`.
+- [ ] Step 6: toggle the Claude Code status line in Settings and check
+      `~/.claude/settings.json` and Claude Code's status line. `openswap
+      statusline --uninstall` afterwards shows the toggle off.
+- [ ] One `brew upgrade --cask openswap` across a release.
+
+Phase 3 (#111):
+
+- [ ] Cask install, then More… › Uninstall OpenSwap… without zap. `brew
+      list --cask` no longer shows openswap, no `com.opensoft.openswap.*`
+      plist is left in `~/Library/LaunchAgents`, saved accounts and Keychain
+      items remain, and `~/Library/Logs/com.opensoft.openswap.uninstall.log`
+      shows the run. `menubar.lock`, `menubar.show-request`,
+      `menubar.handoff-request` and `login_item_status.json` are gone from
+      the backup root.
+- [ ] After that, reinstall the cask and open the app: the welcome page
+      opens again.
+- [ ] The same with zap. The `openswap` and `claude-swap` Keychain items and
+      `~/Library/Application Support/OpenSwap` are gone, Claude Code and
+      Codex stay signed in, and the uninstall log stays.
+- [ ] Zap ticked while a session-mode Claude Code runs: the alert shows, and
+      the app keeps running.
+- [ ] With the extra as the launchd job, the detached child survives the
+      extra quitting and the bootout of the login item, and launchd does
+      not restart the extra while it works. `PYINSTALLER_RESET_ENVIRONMENT`
+      gives the child a clean bootloader.
+- [ ] A copy outside Homebrew (for example in `~/Applications`) moves
+      itself to the Trash. A root-owned or read-only copy is revealed in
+      Finder instead.
+- [ ] A forced `brew uninstall` failure opens the log in Console.
+- [ ] Uninstall again after a failure (for example a worker that will not
+      stop): the second run finishes.
+- [ ] A source install's Uninstall from the menu bar removes its login item
+      and leaves the uv tool.
+- [ ] The dialog renders correctly in light and dark mode, the checkbox
+      works with VoiceOver, and Uninstall shows in red with Return on
+      Cancel.
+
 ## Done criteria
 
 - [ ] Opening the app with no terminal, clicking Continue, and logging out
