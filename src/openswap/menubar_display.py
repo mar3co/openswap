@@ -307,10 +307,15 @@ def remote_key_copy(snapshot: dict, *, now: datetime | None = None) -> str:
         return ""
     if parsed.tzinfo is None:
         return ""
-    days = (parsed - (now or datetime.now(timezone.utc))).days
+    left = parsed - (now or datetime.now(timezone.utc))
+    if left.total_seconds() <= 0:
+        return "Key expired. This Mac can't take tasks until you re-pair it from the portal."
+    days = left.days
     when = "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
     return (f"Key expires {when}. This server can't renew it automatically: "
             "re-pair this Mac from the portal before then.")
+
+
 MISSING_LOGIN_CARD_NOTE = "Action required · Sign in with Claude Code."
 RECONCILE_CARD_NOTE = "Action required · Login mismatch. Click for details."
 _CLAUDE_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")

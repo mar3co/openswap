@@ -2945,11 +2945,15 @@ def _key_status(snapshot: dict, *, now=None):
         expires = timestamp(snapshot.get("remote_key_expires_at"))
     except ProtocolError:
         return None
-    days = (expires - (now or datetime.now(timezone.utc))).days
+    left = expires - (now or datetime.now(timezone.utc))
+    fix = ("choose Re-pair this Mac in the portal, then `openswap worker unpair` "
+           "and run the pair command it shows.")
+    if left.total_seconds() <= 0:
+        return (f"{printer.mark(False)} Key", f"expired; this Mac can't take tasks until it is re-paired. To re-pair, {fix}")
+    days = left.days
     when = "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
     return (f"{printer.mark(None if days > 7 else False)} Key",
-            f"expires {when}; this server can't renew it automatically. To renew, choose "
-            "Re-pair this Mac in the portal, then `openswap worker unpair` and run the pair command it shows.")
+            f"expires {when}; this server can't renew it automatically. To renew, {fix}")
 
 
 def _format_status(snapshot: dict) -> str:

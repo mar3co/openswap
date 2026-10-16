@@ -47,9 +47,11 @@ def save_status(root, url, state, seen, worker_id=None, received=None, *, key_re
 def read_key_status(root):
     """``(renews, expires_at)`` for the configured enrollment's key, from the saved
     status: ``renews`` is True (rotates itself), False (the backend lacks rotation)
-    or None (unknown). Like ``read_status``: no Keychain, sockets or writes."""
+    or None (unknown). Like ``read_status``: no Keychain, sockets or writes.
+    Unlike it, a disabled worker still reports its key: the key keeps aging
+    while the worker is off, so its expiry warning must stay visible."""
     policy = load_worker_settings(root)
-    if not policy.enabled or policy.control_service_url is None:
+    if policy.control_service_url is None:
         return None, None
     try:
         data = json.loads(root.joinpath(*STATUS_FILE).read_text(encoding="utf-8"))

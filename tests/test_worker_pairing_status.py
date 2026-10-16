@@ -987,4 +987,26 @@ def test_status_says_the_key_renews_or_when_it_expires():
     unpaired = settings_page_rows(MenuBarSettings(), strategy="best", threshold=90, section=SETTINGS_SECTION_REMOTE,
                                   worker_enabled=True, worker_paired=False, worker_status=lacking)
     assert "remote_tasks_key" not in [row["id"] for row in unpaired]
+    # A key whose saved expiry has passed says so; it never claims time is left.
+    gone = {**lacking, "remote_key_expires_at": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()}
+    text = cli._format_status(gone)
+    assert "✗ Key" in text and "expired; this Mac can't take tasks" in text and "less than a day" not in text
+    assert remote_key_copy(gone).startswith("Key expired.")
+    long_gone = {**lacking, "remote_key_expires_at": (datetime.now(timezone.utc) - timedelta(days=9)).isoformat()}
+    assert "expired;" in cli._format_status(long_gone) and remote_key_copy(long_gone).startswith("Key expired.")
+
+
+def test_key_status_stays_visible_while_the_worker_is_off(tmp_path):
+    from openswap.worker.remote_state import read_key_status
+
+    url = "https://control.example"
+    expires = datetime.now(timezone.utc) + timedelta(days=5)
+    configure_worker_service(tmp_path, url, "worker")
+    update_worker_settings(tmp_path, enabled=True)
+    save_status(tmp_path, url, "online", datetime.now(timezone.utc), "worker",
+                key_renews=False, key_expires_at=expires)
+    update_worker_settings(tmp_path, enabled=False)
+    assert read_key_status(tmp_path) == (False, expires)
+    configure_worker_service(tmp_path, None)
+    assert read_key_status(tmp_path) == (None, None)  # unpaired: nothing to report
 
