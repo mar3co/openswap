@@ -96,6 +96,7 @@ from openswap.menubar import (
     SETTINGS_SECTION_REMOTE,
     SETTINGS_SECTIONS,
     TOKEN_PAGE,
+    WELCOME_PAGE,
     apply_chatgpt_activation,
     DesktopCapability,
     panel_accounts,
@@ -114,6 +115,7 @@ from openswap.menubar import (
     STALE_PARENT,
     parent_link_choice,
     token_entry_state,
+    welcome_page_model,
     window_suffix,
     trailing_header_frames,
     trailing_row_frames,
@@ -485,6 +487,15 @@ def _wrap(label):
     cell.setScrollable_(False)
     cell.setWraps_(True)
     cell.setLineBreakMode_(NSLineBreakByWordWrapping)
+
+
+def _wrapped_label(text, font, color, x, y, width):
+    """A wrapping label sized to its text; returns (label, height)."""
+    label = _label(text, font, color, NSMakeRect(x, y, width, 10000))
+    _wrap(label)
+    height = float(int(label.cell().cellSizeForBounds_(NSMakeRect(0, 0, width, 10000)).height + 1))
+    label.setFrame_(NSMakeRect(x, y, width, height))
+    return label, height
 
 
 class _PopupButton(NSPopUpButton):
@@ -969,6 +980,10 @@ class MenuBarPanel:
         on_add_claude=None,
         on_card_menu=None,
         on_toggle_codex_auto=None,
+        status_line=None,
+        bundled_widget=None,
+        welcome=None,
+        on_welcome_continue=None,
     ):
         self._on_switch = on_switch
         self._on_card_menu = on_card_menu
@@ -1005,6 +1020,12 @@ class MenuBarPanel:
         self._worker_status = worker_status or (lambda: {})
         self._worker_paired = worker_paired or (lambda: False)
         self._login_item = login_item
+        self._status_line = status_line or (lambda: "off")  # "on" | "other" | "off"
+        self._bundled_widget = bundled_widget or (lambda: False)
+        # None, or the facts for the first-run welcome page while it is due.
+        self._welcome = welcome or (lambda: None)
+        self._on_welcome_continue = on_welcome_continue
+        self._welcome_open_at_login = True  # the switch starts on
         self._on_worker_view_active = on_worker_view_active
         self._login_alias = ""
         self._login_alias_field = None
@@ -1103,6 +1124,9 @@ class MenuBarPanel:
             self.close()
             return
         self._sync_popover_appearance()
+        if self._welcome_facts() is not None:
+            # Until Continue, every open starts on the welcome page.
+            self._page = WELCOME_PAGE
         self.reload()
         if self._selected_provider == "chatgpt" and self._on_chatgpt_view_active is not None:
             self._on_chatgpt_view_active()
@@ -1470,6 +1494,11 @@ class MenuBarPanel:
             return self._build_settings()
         if self._page == TOKEN_PAGE:
             return self._build_token_page()
+        if self._page == WELCOME_PAGE:
+            facts = self._welcome_facts()
+            if facts is not None:
+                return self._build_welcome(facts)
+            self._page = MAIN_PAGE
         snap = self._snapshot()
         all_cards = panel_accounts(snap)
         provider = self._selected_provider
@@ -2000,6 +2029,14 @@ class MenuBarPanel:
             login_item = self._login_item() if callable(self._login_item) else None
         except Exception:
             login_item = None
+        try:
+            status_line = self._status_line()
+        except Exception:
+            status_line = "off"
+        try:
+            bundled_widget = bool(self._bundled_widget())
+        except Exception:
+            bundled_widget = False
         rows = settings_page_rows(
             settings,
             strategy=strategy,
@@ -2011,6 +2048,9 @@ class MenuBarPanel:
             worker_status=worker_status,
             worker_paired=worker_paired,
             login_item=login_item,
+            status_line=status_line == "on",
+            status_line_other=status_line == "other",
+            bundled_widget=bundled_widget,
             section=self._settings_section,
         )
 
@@ -2217,6 +2257,129 @@ class MenuBarPanel:
                     by += SETTINGS_BTN_H + SETTINGS_BTN_GAP_Y
             y += h + SETTINGS_ROW_GAP
 
+        return root
+
+    def _welcome_facts(self):
+        try:
+            facts = self._welcome()
+        except Exception:
+            return None
+        return facts if isinstance(facts, dict) else None
+
+    def _welcome_switch(self, sender) -> None:
+        try:
+            self._welcome_open_at_login = bool(sender.state())
+        except Exception:
+            self._welcome_open_at_login = not self._welcome_open_at_login
+
+    def _welcome_continue(self, _sender=None) -> None:
+        facts = self._welcome_facts() or {}
+        choice = bool(self._welcome_open_at_login) and not facts.get("temporary")
+        self._page = MAIN_PAGE
+        if self._on_welcome_continue is not None:
+            self._on_welcome_continue(choice)
+        if self.is_shown():
+            self.reload()
+
+    def _build_welcome(self, facts):
+        """First run: what OpenSwap does, the Claude account step, Open at
+        login (on), and Continue. Nothing is written before Continue."""
+        pal = _colors()
+        font_title = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+        font_heading = NSFont.systemFontOfSize_weight_(12, NSFontWeightSemibold)
+        font_body = NSFont.systemFontOfSize_weight_(12, NSFontWeightRegular)
+        font_small = NSFont.systemFontOfSize_weight_(11, NSFontWeightRegular)
+        inner_w = PANEL_WIDTH - PAD * 2
+        snap = self._snapshot()
+        claude_accounts = len(provider_cards(panel_accounts(snap), "claude"))
+        model = welcome_page_model(
+            claude_accounts=claude_accounts,
+            claude_state=self._account_state("claude"),
+            temporary=bool(facts.get("temporary")),
+            login_item=bool(facts.get("login_item")),
+            open_at_login=self._welcome_open_at_login,
+        )
+
+        root = _RootView.alloc().initWithHover_(self._on_hover)
+        root.setMaterial_(NSVisualEffectMaterialMenu)
+        root.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        root.setState_(NSVisualEffectStateActive)
+
+        # Header: the mark and the title, and More so Quit stays in reach.
+        mark = _brand_mark(NSMakeRect(PAD, PAD + 1, 18, 18), pal["fg"])
+        if mark is not None:
+            root.addSubview_(mark)
+        title_x = PAD + (24 if mark is not None else 0)
+        root.addSubview_(
+            _label(model["title"], font_title, pal["fg"], NSMakeRect(title_x, PAD, inner_w - 60, 20))
+        )
+        _gear_f, more_f = trailing_header_frames(
+            PANEL_WIDTH, PAD,
+            (HEADER_ICON_SIZE, HEADER_ICON_SIZE), (HEADER_ICON_SIZE, HEADER_ICON_SIZE),
+        )
+        self._add_icon_button(
+            root, "ellipsis.circle", "…", NSMakeRect(*more_f), self._more, "More",
+        )
+        hairline = _FillView.alloc().initWithColor_(pal["hairline"])
+        hairline.setFrame_(NSMakeRect(PAD, PAD + HEADER_H - 4, inner_w, 1))
+        root.addSubview_(hairline)
+
+        y = PAD + HEADER_H + 4
+        body, h = _wrapped_label(model["body"], font_body, pal["fg"], PAD, y, inner_w)
+        root.addSubview_(body)
+        y += h + 14
+
+        account = model["account"]
+        if account is not None:
+            root.addSubview_(
+                _label(account["title"], font_heading, pal["fg"], NSMakeRect(PAD, y, inner_w, 18))
+            )
+            y += 20
+            text, h = _wrapped_label(account["body"], font_small, pal["muted"], PAD, y, inner_w)
+            root.addSubview_(text)
+            y += h + 8
+            buttons = []
+            if account.get("action"):
+                buttons.append((account["button"], account["action"]))
+            if account.get("action") and account.get("secondary_action"):
+                buttons.append((account.get("secondary_button") or "Save current login", account["secondary_action"]))
+            for label, action in buttons:
+                btn = self._add_button(
+                    root, label, NSMakeRect(PAD, y, inner_w, 32),
+                    lambda _s, a=action: self._empty_action("claude", a), font_body,
+                )
+                btn.setEnabled_(self._on_empty_action is not None)
+                y += 32 + 6
+            y += 8
+
+        # Open at login: a settings-style row, then its hint.
+        root.addSubview_(
+            _label(model["open_at_login_label"], font_body, pal["fg"], NSMakeRect(PAD, y + 5, inner_w - 70, 20))
+        )
+        sw = self._alloc_switch(bool(model["open_at_login"]), self._welcome_switch)
+        sw.setEnabled_(not model["open_at_login_disabled"])
+        cs = sw.frame().size
+        sw.setFrame_(
+            NSMakeRect(
+                PANEL_WIDTH - PAD - cs.width,
+                y + (SETTINGS_TOGGLE_H - cs.height) / 2,
+                cs.width,
+                cs.height,
+            )
+        )
+        root.addSubview_(sw)
+        y += SETTINGS_TOGGLE_H
+        hint, h = _wrapped_label(model["hint"], font_small, pal["muted"], PAD, y, inner_w)
+        root.addSubview_(hint)
+        y += h + 14
+
+        cont = self._add_button(
+            root, model["button"], NSMakeRect(PAD, y, inner_w, 40), self._welcome_continue, font_body,
+        )
+        cont.setKeyEquivalent_("\r")
+        cont.setEnabled_(self._on_welcome_continue is not None)
+        y += 40 + PAD
+        root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, y))
         return root
 
     def _build_token_page(self):

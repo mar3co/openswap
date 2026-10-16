@@ -16,11 +16,13 @@ needs an app around it, and there are two:
 
 from __future__ import annotations
 
+import logging
 import os
 import plistlib
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from openswap import bundle
@@ -48,6 +50,11 @@ SCHEME = "OpenSwapWidget"
 HOST_PRODUCT = "OpenSwap"
 # The separately built Swift host. The cask's app is `com.opensoft.openswap`.
 HOST_BUNDLE_ID = "com.opensoft.openswap.widget"
+# What the app (Settings) and `openswap setup` tell the user once the bundled
+# appex registers itself at start-up.
+ADD_WIDGET_HINT = "Add the widget: Edit Widgets, search OpenSwap"
+
+_logger = logging.getLogger("openswap")
 
 
 def _require_macos() -> None:
@@ -411,6 +418,56 @@ def _install_bundled_widget(home: Path | None = None, uid: int | None = None) ->
     retire_legacy_host(home=home, uid=uid, registered=True)
     notify_widget_reload()
     return {"app": str(app), "label": "", "plist": ""}
+
+
+def _lists_appex(registrations: list[str], appex: Path) -> bool:
+    wanted = {str(appex)}
+    try:
+        wanted.add(str(appex.resolve()))
+    except (OSError, RuntimeError):
+        pass
+    return any(entry in wanted for entry in registrations)
+
+
+def register_on_start(home: Path | None = None, uid: int | None = None) -> bool:
+    """Register the bundled appex when the app starts, unless it already is.
+
+    The same registration as ``openswap widget --install``, so a cask install
+    opened from Finder offers the widget without a terminal. "Already" means
+    this bundle's own appex is listed: ``registered`` alone is true when only
+    an old or copied app with the same extension id is. When pluginkit cannot
+    list registrations it registers anyway (``pluginkit -a`` is idempotent).
+
+    Only the frozen app does this, and never from a translocated or mounted
+    copy: that path is gone soon, and registering it would leave a dead
+    provider. Never raises; a failure is logged, not shown. Returns whether
+    it registered.
+    """
+    if sys.platform != "darwin" or not bundle.is_frozen():
+        return False
+    if bundle.runs_from_temporary_location():
+        return False
+    appex = bundle.appex()
+    try:
+        try:
+            registrations = widget_status(home=home, uid=uid)["registrations"]
+        except ClaudeSwitchError:
+            registrations = None
+        if appex is not None and registrations is not None and _lists_appex(registrations, appex):
+            return False
+        _install_bundled_widget(home=home, uid=uid)
+    except Exception:
+        _logger.warning("Could not register the OpenSwap widget", exc_info=True)
+        return False
+    _logger.info("Registered the OpenSwap widget")
+    return True
+
+
+def register_on_start_in_background() -> threading.Thread:
+    """:func:`register_on_start` off the caller's thread (pluginkit is slow)."""
+    thread = threading.Thread(target=register_on_start, name="openswap-widget-register", daemon=True)
+    thread.start()
+    return thread
 
 
 def install_widget(

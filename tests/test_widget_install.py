@@ -441,3 +441,91 @@ def test_source_uninstall_is_refused_beside_the_cask(source_darwin, tmp_path, mo
     with pytest.raises(ClaudeSwitchError, match="installed with Homebrew"):
         wi.uninstall_widget(home=tmp_path)
     assert app.is_dir()
+
+
+# ---- start-up registration (plan 020 step 5) --------------------------------
+
+_LIST = ["pluginkit", "-m", "-D", "-v", "-i", "com.opensoft.openswap.widget.extension"]
+
+
+def _listed(*paths) -> str:
+    return "".join(
+        f"+    com.opensoft.openswap.widget.extension(1.0)\tAAAA\t2026-10-01 10:00:00 +0000\t{path}\n"
+        for path in paths
+    )
+
+
+def _appex(frozen_darwin) -> Path:
+    return frozen_darwin["app"] / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex"
+
+
+def test_start_up_registers_the_appex_when_nothing_is_registered(frozen_darwin, tmp_path):
+    assert wi.register_on_start(home=tmp_path) is True
+    # The same registration as `openswap widget --install`, after the check.
+    assert frozen_darwin["runs"].calls == [_LIST, ["pluginkit", "-a", str(_appex(frozen_darwin))]]
+
+
+def test_start_up_registers_when_only_another_copy_is(frozen_darwin, tmp_path):
+    """`registered` alone is true for an old or copied app with the same id."""
+    frozen_darwin["runs"].pluginkit_out = _listed(
+        "/Users/x/Downloads/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex"
+    )
+    assert wi.register_on_start(home=tmp_path) is True
+    assert frozen_darwin["runs"].calls[-1] == ["pluginkit", "-a", str(_appex(frozen_darwin))]
+
+
+def test_start_up_leaves_this_bundles_registration_alone(frozen_darwin, tmp_path, monkeypatch):
+    # The parsed list, not pluginkit's lines: on Windows CI the fixture's
+    # bundle path is not the `/…` path pluginkit prints (parsing has its own tests).
+    monkeypatch.setattr(wi, "_appex_registrations", lambda: [
+        "/Users/x/Downloads/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex",
+        str(_appex(frozen_darwin)),
+    ])
+    assert wi.register_on_start(home=tmp_path) is False
+    assert frozen_darwin["runs"].calls == []  # no `pluginkit -a`
+
+
+def test_start_up_registers_when_pluginkit_cannot_list(frozen_darwin, tmp_path, monkeypatch):
+    """`pluginkit -a` is idempotent, so an unanswered list is no reason to skip."""
+    real = frozen_darwin["runs"]
+
+    def list_fails(argv, **kwargs):
+        if argv[:2] == ["pluginkit", "-m"]:
+            import subprocess
+
+            return subprocess.CompletedProcess(argv, 1, "", "no answer")
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(wi.subprocess, "run", list_fails)
+    assert wi.register_on_start(home=tmp_path) is True
+    assert real.calls == [["pluginkit", "-a", str(_appex(frozen_darwin))]]
+
+
+def test_start_up_never_registers_from_a_temporary_location(frozen_darwin, tmp_path, monkeypatch):
+    monkeypatch.setattr(wi.bundle, "runs_from_temporary_location", lambda app=None: True)
+    assert wi.register_on_start(home=tmp_path) is False
+    assert frozen_darwin["runs"].calls == []
+
+
+def test_start_up_registration_is_the_apps_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(wi.sys, "platform", "darwin")
+    monkeypatch.delattr(wi.sys, "frozen", raising=False)
+    monkeypatch.setattr(wi, "_pluginkit", lambda *a: pytest.fail("a uv install registers nothing at start-up"))
+    assert wi.register_on_start(home=tmp_path) is False
+
+
+def test_start_up_registration_logs_a_failure_and_never_raises(frozen_darwin, tmp_path, caplog):
+    frozen_darwin["runs"].pluginkit_rc = 1  # the list and the registration both fail
+    with caplog.at_level("WARNING", logger="openswap"):
+        assert wi.register_on_start(home=tmp_path) is False
+    assert "Could not register the OpenSwap widget" in caplog.text
+    assert frozen_darwin["runs"].calls[-1] == ["pluginkit", "-a", str(_appex(frozen_darwin))]
+
+
+def test_start_up_registration_runs_off_the_callers_thread(monkeypatch):
+    import threading
+
+    seen: list[str] = []
+    monkeypatch.setattr(wi, "register_on_start", lambda: seen.append(threading.current_thread().name))
+    wi.register_on_start_in_background().join(timeout=5)
+    assert seen == ["openswap-widget-register"]

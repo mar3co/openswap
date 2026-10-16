@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 from openswap.codex.auth import parse_auth
-from openswap.exceptions import ConfigError
+from openswap.exceptions import ClaudeSwitchError, ConfigError
 from openswap.fsutil import replace_with_retry
 from openswap.settings import (
     SETTINGS_SCHEMA_VERSION,
@@ -403,11 +403,7 @@ def hook_program(config_home: Path) -> str | None:
     current = block.get("command") if isinstance(block, dict) else None
     if not isinstance(current, str) or not is_our_command(current):
         return None
-    try:
-        parts = shlex.split(current.strip())
-    except ValueError:
-        return None
-    program = parts[-2] if len(parts) >= 2 else ""
+    program = _command_program(current) or ""
     return program if os.sep in program or "/" in program else None
 
 
@@ -429,9 +425,10 @@ def repoint_command(config_home: Path, *, program: Path) -> bool:
 
     For the move from a uv install to the app: ``…/.local/bin/openswap
     statusline`` becomes ``…/OpenSwap.app/Contents/MacOS/OpenSwap
-    statusline``. Anything before the program (an env prefix) is kept, a
-    bare ``openswap statusline`` and a hook already on ``program`` (or a
-    link to it) are left alone, and the wrap state is untouched.
+    statusline``. Anything before the program (an env prefix, a shell
+    command joined with ``&&``) is kept as written, a bare ``openswap
+    statusline`` and a hook already on ``program`` (or a link to it) are
+    left alone, and the wrap state is untouched.
     """
     if not runs_other_program(config_home, program):
         return False
@@ -440,8 +437,10 @@ def repoint_command(config_home: Path, *, program: Path) -> bool:
     block = settings.get("statusLine")
     if not isinstance(block, dict) or not isinstance(block.get("command"), str):
         return False
-    parts = shlex.split(block["command"].strip())
-    block["command"] = shlex.join([*parts[:-2], str(program), "statusline"])
+    repointed = _with_command(block["command"], f"{shlex.quote(str(program))} statusline")
+    if repointed is None:
+        return False  # left as written rather than risk breaking it
+    block["command"] = repointed
     settings["statusLine"] = block
     _write_json(settings_file, settings)
     return True
@@ -494,12 +493,114 @@ def _write_json(path: Path, data: dict) -> None:
         raise
 
 
+_SHELL_PUNCTUATION = "();<>|&"
+# Shell syntax before the program that this does not take apart: command
+# substitution, subshells, redirects, comments and line continuations. A hook
+# using any of it is left as written, not repointed (_with_command).
+_UNSAFE_PREFIX_CHARS = frozenset("$`()<>#\n")
+
+
+def _shell_words(command: str) -> list[str] | None:
+    """A shell command's words, with control operators (``&&``, ``;``,
+    ``|``) split off even when no space separates them
+    (``echo ready&&/x/openswap``). None when it does not parse."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _command_program(command: str | None) -> str | None:
+    """The program an OpenSwap hook runs: the word before ``statusline``."""
+    if not isinstance(command, str):
+        return None
+    words = _shell_words(command.strip())
+    return words[-2] if words and len(words) >= 2 else None
+
+
+def _with_command(hook: str, command: str) -> str | None:
+    """``hook`` with its trailing ``<program> statusline`` replaced by
+    ``command``, keeping everything before the program as written: shell
+    operators (``echo ready && …``), env prefixes and quoting survive, where
+    re-joining shlex tokens would quote ``&&`` into an argument.
+
+    Only a plain prefix is taken apart: words, env assignments, quoting and
+    the ``&&``, ``||``, ``;``, ``|`` and ``&`` operators. One with ``$``, a
+    backtick, parentheses, a redirect, a comment or a newline is left alone.
+    None when the prefix is not plain or the tail cannot be found exactly:
+    then nothing is rewritten.
+    """
+    words = _shell_words(hook)
+    head = hook.rstrip()
+    if not words or len(words) < 2 or words[-1] != "statusline" or not head.endswith("statusline"):
+        return None
+    program = words[-2]
+    head = head[: -len("statusline")]
+    if not head or not head[-1].isspace():
+        return None
+    head = head.rstrip()
+    # The program is the shortest suffix that parses as exactly that one word
+    # (it may be quoted or contain escaped spaces) and starts after a space,
+    # a shell operator (`ready&&/x/openswap`), or at the start.
+    for start in range(len(head) - 1, -1, -1):
+        if start > 0 and not (head[start - 1].isspace() or head[start - 1] in _SHELL_PUNCTUATION):
+            continue
+        if _shell_words(head[start:]) == [program]:
+            prefix = head[:start]
+            if _UNSAFE_PREFIX_CHARS.intersection(prefix):
+                return None
+            return prefix + command
+    return None
+
+
+def _is_path(program: str) -> bool:
+    return os.sep in program or "/" in program
+
+
+def _runs_same_program(hook: str | None, command: str) -> bool:
+    """Whether an OpenSwap ``hook`` runs the program ``command`` pins.
+
+    A bare ``openswap`` in the hook is another program when ``command`` names
+    a path: PATH may send it to an older uv install. When ``command`` is bare
+    itself (no openswap was found to pin), any OpenSwap hook counts.
+    """
+    ours = _command_program(command)
+    theirs = _command_program(hook)
+    if ours is None or theirs is None:
+        return False
+    if not _is_path(ours):
+        return True
+    return _is_path(theirs) and _same_program(theirs, Path(ours))
+
+
+def runs_this_program(config_home: Path) -> bool:
+    """Whether Claude Code's status line is OpenSwap's and runs the program
+    :func:`paint_command` pins, or a link to it (the app's toggle).
+
+    A hook for another program, a bare ``openswap statusline`` included, is
+    not this one: :func:`set_installed` repoints it.
+    """
+    current = installed_command(config_home)
+    return is_our_command(current) and _runs_same_program(current, paint_command())
+
+
 def install(
     config_home: Path,
     backup_root: Path,
     *,
     command: str = PAINT_COMMAND,
 ) -> dict:
+    """Wrap Claude Code's status line with ``command``.
+
+    A hook that is already OpenSwap's and runs ``command``'s program is left
+    alone (``already``). One that runs another program (a bare
+    ``openswap statusline``, or another copy) is pointed at ``command``,
+    keeping everything before the program as written and the wrap state
+    (``repointed``); a hook whose program cannot be found exactly raises
+    ConfigError rather than being rewritten.
+    """
     settings_file = config_home / "settings.json"
     # Read both files before writing either: a torn OpenSwap settings.json
     # must not leave Claude already wrapped.
@@ -511,7 +612,18 @@ def install(
         raw_cmd = block.get("command")
         current = raw_cmd if isinstance(raw_cmd, str) else None
         if is_our_command(current):
-            return {"already": True, "created": False, "migrated": False}
+            if _runs_same_program(current, command):
+                return {"already": True, "created": False, "migrated": False}
+            repointed = _with_command(current, command)
+            if repointed is None:
+                raise ConfigError(
+                    "Claude Code's status line runs another OpenSwap in a form this "
+                    f"cannot rewrite safely. Edit {settings_file} to run: {command}"
+                )
+            block["command"] = repointed
+            settings["statusLine"] = block
+            _write_json(settings_file, settings)
+            return {"already": False, "created": False, "migrated": False, "repointed": True}
         if _is_legacy_command(current):
             block["command"] = command
             settings["statusLine"] = block
@@ -529,6 +641,36 @@ def install(
     save_wrap(backup_root, inner_command=inner, created=created)
     _write_json(settings_file, settings)
     return {"already": False, "created": created, "migrated": False}
+
+
+def is_installed(config_home: Path) -> bool:
+    """Whether Claude Code's status line is OpenSwap's, for any program.
+    The app's toggle is :func:`runs_this_program`."""
+    return installed_command(config_home) is not None
+
+
+def set_installed(config_home: Path, backup_root: Path, enabled: bool) -> dict:
+    """Wrap Claude Code's status line, or restore it.
+
+    The one path behind ``openswap statusline --install/--uninstall`` and
+    the app's Settings toggle, so both write the same hook: it always pins
+    :func:`paint_command`, and turning it on repoints an OpenSwap hook that
+    runs another program. Returns :func:`install`'s or :func:`uninstall`'s
+    result.
+
+    Turning it on from a translocated or mounted copy of the app raises
+    ClaudeSwitchError: the pinned path would disappear and break every
+    status-line render. Turning it off works from anywhere.
+    """
+    if enabled:
+        from openswap import bundle
+
+        if bundle.runs_from_temporary_location():
+            from openswap.launch_agent import MOVE_TO_APPLICATIONS
+
+            raise ClaudeSwitchError(MOVE_TO_APPLICATIONS)
+        return install(config_home, backup_root, command=paint_command())
+    return uninstall(config_home, backup_root)
 
 
 def uninstall(config_home: Path, backup_root: Path) -> dict:

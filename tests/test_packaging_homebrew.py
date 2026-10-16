@@ -112,6 +112,18 @@ def test_caveats_are_one_step():
     assert "uninstall" not in caveats and "uv tool" not in caveats
 
 
+def test_caveats_offer_the_app_and_the_terminal():
+    """Both paths finish setting up (plan 020): the app's welcome page, or
+    `openswap setup`."""
+    cask = _render("1.2.3", ARM, INTEL).stdout
+    caveats = cask[cask.index("  caveats do") :]
+    text = caveats[caveats.index("<<~EOS\n") + len("<<~EOS\n") : caveats.index("    EOS\n")]
+    assert text.splitlines() == [
+        "      Open OpenSwap from Applications to finish setting up, or run:",
+        "        #{openswap} setup",
+    ]
+
+
 def test_caveats_name_the_casks_command_when_another_comes_first_on_path():
     """uv can put its shim in UV_TOOL_BIN_DIR, XDG_BIN_HOME or UV_INSTALL_DIR,
     so the caveat walks the user's PATH instead of checking ~/.local/bin."""

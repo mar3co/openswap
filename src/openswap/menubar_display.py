@@ -259,6 +259,7 @@ def _remote_task_origin(origin) -> str:
     return f" from {label} ({origin['kind']})" if label else f" from {origin['kind']}"
 SETTINGS_PAGE = "settings"
 TOKEN_PAGE = "token"
+WELCOME_PAGE = "welcome"
 SETUP_TOKEN_PREFIX = "sk-ant-oat"
 MAIN_PAGE = "main"
 CHATGPT_SWITCHING_HINT = (
@@ -373,6 +374,9 @@ class MenuBarSettings:
     kickoff_hour: int = 7
     kickoff_minute: int = 0
     kickoff_last_date: str = ""  # local YYYY-MM-DD of the last kickoff run
+    # The app's first-run welcome page was finished (Continue), or
+    # `openswap setup` had already set up the login item.
+    welcome_done: bool = False
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -426,6 +430,9 @@ def settings_page_rows(
     worker_status: dict | None = None,
     worker_paired: bool = False,
     login_item: dict | None = None,
+    status_line: bool = False,
+    status_line_other: bool = False,
+    bundled_widget: bool = False,
     section: str | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
@@ -443,6 +450,14 @@ def settings_page_rows(
     Claude, ChatGPT desktop selection, and Codex CLI rotation are named
     independently. ChatGPT suggestions and live Codex rotation are mutually
     exclusive in the controller; the model makes that relationship visible.
+
+    General ends with **This Mac**: what ``openswap setup`` and its
+    neighbours set up from a terminal. After Open at login,
+    ``status_line`` is whether Claude Code's status line runs this OpenSwap
+    and ``status_line_other`` whether it runs another one (both read from
+    disk when the page is built); ``bundled_widget`` is true in the app at a
+    stable location, which registers its widget at start-up, so only adding
+    it is left.
     """
     general = [
         {
@@ -532,6 +547,12 @@ def settings_page_rows(
             ),
         })
     general.extend(this_mac_rows(login_item))
+    general.extend(_this_mac_setup_rows(
+        status_line=status_line,
+        status_line_other=status_line_other,
+        bundled_widget=bundled_widget,
+        temporary=bool(isinstance(login_item, dict) and login_item.get("temporary")),
+    ))
 
     remote = [
         {
@@ -776,6 +797,8 @@ def settings_page_rows(
 
 
 OPEN_AT_LOGIN_MOVE_HINT = "Move OpenSwap to Applications to open it at login."
+STATUS_LINE_MOVE_HINT = "Move OpenSwap to Applications to turn on the status line."
+STATUS_LINE_OTHER_HINT = "The status line uses another OpenSwap. Turn this on to use this one."
 OPEN_AT_LOGIN_AFTER_QUIT_HINT = (
     "OpenSwap stays open until you quit it, and won’t open at the next login."
 )
@@ -848,6 +871,64 @@ def this_mac_rows(login_item: dict | None) -> list[dict]:
             "id": "open_at_login_hint",
             "label": note,
             "lines": _hint_lines(note),
+        })
+    return rows
+
+
+def _this_mac_setup_rows(
+    *,
+    status_line: bool,
+    bundled_widget: bool,
+    status_line_other: bool = False,
+    temporary: bool = False,
+) -> list[dict]:
+    """General › This Mac after Open at login: the rest of the terminal's setup.
+
+    The status line toggle is on only when the hook runs this OpenSwap. One
+    for another OpenSwap (a bare ``openswap statusline`` PATH may send to an
+    older uv install, or another copy) shows as off with a hint; turning it
+    on repoints it. From a translocated or mounted copy (``temporary``, the
+    same fact Open at login reads) the status line cannot be turned on: the
+    hook would pin a path that disappears. Turning it off stays possible.
+    """
+    # Lazy: widget_install pulls in widget_snapshot, which imports menubar.
+    from openswap.widget_install import ADD_WIDGET_HINT
+
+    blocked = bool(temporary) and not status_line
+    rows = [
+        {
+            # `openswap statusline --install/--uninstall`, through the same
+            # statusline.set_installed.
+            "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "claude_status_line",
+            "label": "Claude Code status line",
+            "value": bool(status_line),
+            "disabled": blocked,
+        },
+    ]
+    note = ""
+    if blocked:
+        note = STATUS_LINE_MOVE_HINT
+    elif status_line_other and not status_line:
+        note = STATUS_LINE_OTHER_HINT
+    if note:
+        rows.append({
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "claude_status_line_hint",
+            "label": note,
+            "lines": _hint_lines(note),
+        })
+    if bundled_widget:
+        rows.append({
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "widget_hint",
+            "label": ADD_WIDGET_HINT,
+            "lines": _hint_lines(ADD_WIDGET_HINT),
         })
     return rows
 
@@ -2331,6 +2412,84 @@ def provider_empty_state(provider: str, state: str = "ready", *, desktop: bool =
         "secondary_action": "add",
         "secondary_button": "Save current login",
         "hint": "",
+    }
+
+
+WELCOME_TITLE = "Welcome to OpenSwap"
+WELCOME_BODY = (
+    "OpenSwap shows each account’s usage in the menu bar and switches "
+    "Claude Code and Codex accounts in one click."
+)
+WELCOME_OPEN_AT_LOGIN = "Open at login"
+WELCOME_LOGIN_HINT = "Keeps OpenSwap in the menu bar after you restart."
+WELCOME_LOGIN_ON_HINT = "OpenSwap already opens at login."
+# Continue's alert for a login item launchd did not start (Settings shows a
+# warning row with a Login Items button for the same thing).
+OPEN_AT_LOGIN_FAILED_ALERT = (
+    f"{OPEN_AT_LOGIN_FAILED}. If it is off in System Settings › General › "
+    "Login Items, turn it on there."
+)
+
+
+def welcome_on_start(
+    settings: MenuBarSettings,
+    *,
+    frozen: bool,
+    temporary: bool,
+    login_item_runs_this: bool,
+) -> str:
+    """What the app does about the welcome page when it starts.
+
+    ``"show"``: open the popover once, by itself, on the welcome page (an
+    LSUIElement app shows no window, so a first launch would look like
+    nothing happened). ``"done"``: ``openswap setup`` already pointed the
+    login item at this app (``launch_agent.login_item_runs_this``), so save
+    ``welcome_done`` and show nothing.
+    ``"none"``: a uv install (``openswap setup`` is its path), a finished
+    welcome, or a translocated or mounted copy.
+    """
+    if not frozen or settings.welcome_done or temporary:
+        return "none"
+    if login_item_runs_this:
+        return "done"
+    return "show"
+
+
+def welcome_page_model(
+    *,
+    claude_accounts: int,
+    claude_state: str = "ready",
+    temporary: bool = False,
+    login_item: bool = False,
+    open_at_login: bool = True,
+) -> dict:
+    """The first-run welcome page. No AppKit.
+
+    ``account`` is the Claude empty state (Sign in with Claude, Save current
+    login) until an account is saved, else None. ``login_item`` is whether
+    the login item already runs this app. The **Open at login**
+    switch starts on (``open_at_login`` is the user's pick so far); from a
+    translocated or mounted copy it is off and disabled, since nothing may
+    be pinned to that path. Continue applies it.
+    """
+    account = None
+    if claude_accounts <= 0:
+        account = provider_empty_state("claude", claude_state)
+    if temporary:
+        hint = OPEN_AT_LOGIN_MOVE_HINT  # the same words as Settings' switch
+    elif login_item:
+        hint = WELCOME_LOGIN_ON_HINT
+    else:
+        hint = WELCOME_LOGIN_HINT
+    return {
+        "title": WELCOME_TITLE,
+        "body": WELCOME_BODY,
+        "account": account,
+        "open_at_login_label": WELCOME_OPEN_AT_LOGIN,
+        "open_at_login": bool(open_at_login) and not temporary,
+        "open_at_login_disabled": bool(temporary),
+        "hint": hint,
+        "button": "Continue",
     }
 
 

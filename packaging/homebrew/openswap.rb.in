@@ -70,11 +70,13 @@ cask "openswap" do
         "~/Library/Logs/com.opensoft.openswap.worker.log",
       ]
 
-  # The user runs the first `openswap` on their PATH (HOMEBREW_PATH; brew's
-  # own PATH is not theirs). An older uv install's can come before this
-  # cask's, wherever uv put it, and its setup refuses or points the login
-  # item back at uv, so name this cask's command whenever another one
-  # would answer first.
+  # The app finishes setting up on its own (a welcome page with Open at
+  # login), and `openswap setup` does the same from a terminal. The user
+  # runs the first `openswap` on their PATH (HOMEBREW_PATH; brew's own PATH
+  # is not theirs). An older uv install's can come before this cask's,
+  # wherever uv put it, and its setup refuses or points the login item back
+  # at uv, so name this cask's command whenever another one would answer
+  # first.
   caveats do
     ours = "#{HOMEBREW_PREFIX}/bin/openswap"
     first = ENV.fetch("HOMEBREW_PATH", "").split(File::PATH_SEPARATOR)
@@ -84,7 +86,7 @@ cask "openswap" do
     openswap = "openswap"
     openswap = ours if first && !(File.exist?(ours) && File.realpath(first) == File.realpath(ours))
     <<~EOS
-      Finish setting up (saves your Claude login, adds OpenSwap to the menu bar):
+      Open OpenSwap from Applications to finish setting up, or run:
         #{openswap} setup
     EOS
   end

@@ -1307,7 +1307,10 @@ def _setup_command(argv: list[str]) -> int:
         warning(f"Widget host did not restart: {widget_detail}")
         print(dimmed("Run: openswap widget --install"))
     elif bundle.is_frozen():
-        next_steps.append("Add the desktop widget: openswap widget --install")
+        # The app registers its widget when it starts; only adding it is left.
+        from openswap.widget_install import ADD_WIDGET_HINT
+
+        next_steps.append(ADD_WIDGET_HINT)
     else:
         next_steps.append("Add the desktop widget (needs Xcode): openswap widget --install")
     if next_steps:
@@ -1492,7 +1495,10 @@ def _statusline_command(argv: list[str]) -> int:
     group.add_argument(
         "--install",
         action="store_true",
-        help="Wrap ~/.claude/settings.json statusLine (creates one if missing)",
+        help=(
+            "Wrap ~/.claude/settings.json statusLine (creates one if missing, "
+            "and points another OpenSwap's hook at this one)"
+        ),
     )
     group.add_argument(
         "--uninstall",
@@ -1525,12 +1531,15 @@ def _statusline_command(argv: list[str]) -> int:
 
     if args.install:
         try:
-            result = sl.install(config_home, backup, command=sl.paint_command())
+            result = sl.set_installed(config_home, backup, True)
         except (ClaudeSwitchError, OSError) as e:
             error(f"Error: {e}")
             return 1
         if result.get("already"):
             print("Claude Code status line already wraps OpenSwap.")
+            return 0
+        if result.get("repointed"):
+            print("Claude Code status line now runs this OpenSwap.")
             return 0
         if result.get("created"):
             print("Claude Code status line installed (account name only).")
@@ -1541,7 +1550,7 @@ def _statusline_command(argv: list[str]) -> int:
 
     if args.uninstall:
         try:
-            result = sl.uninstall(config_home, backup)
+            result = sl.set_installed(config_home, backup, False)
         except (ClaudeSwitchError, OSError) as e:
             error(f"Error: {e}")
             return 1
@@ -2180,11 +2189,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             if args.install_service or args.uninstall_service or args.service_status:
                 sys.exit(_menubar_service(args))
             # The cask's app moves a uv install over on every start; once
-            # done it is a no-op, and it logs rather than raises.
+            # done it is a no-op, and it logs rather than raises. Then it
+            # registers its widget if macOS has not (after the migration,
+            # which may retire the old widget host first).
             from openswap import bundle
 
             if bundle.is_frozen():
                 bundle.migrate_from_uv_install()
+                from openswap.widget_install import register_on_start_in_background
+
+                register_on_start_in_background()
             # menubar is import-safe without the extra; a missing rumps
             # surfaces from run() as a ClaudeSwitchError with the install hint.
             from openswap.codex.engine import CodexEngine

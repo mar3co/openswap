@@ -103,6 +103,7 @@ def app(monkeypatch, tmp_path):
         "settings_path": settings_path,
         "SETTINGS_SECTION_AUTOMATION": "automation",
         "MAIN_PAGE": "main",
+        "WELCOME_PAGE": "welcome",
         "chatgpt_suggestions_effective": menubar.chatgpt_suggestions_effective,
         "load_settings": lambda _dir: SimpleNamespace(codex_enabled=instance_codex_enabled[0]),
     }

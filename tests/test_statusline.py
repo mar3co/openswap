@@ -876,3 +876,281 @@ def test_the_app_pins_its_own_executable_and_recognises_that_hook(frozen_app, tm
     assert command == f"{shlex.quote(str(exe))} statusline"
     assert sl.is_our_command(command)
     assert not sl.is_our_command("/Applications/Other.app/Contents/MacOS/Other statusline")
+
+
+class TestSharedToggle:
+    """`statusline --install/--uninstall` and the app's Settings toggle (plan 020)."""
+
+    def test_set_installed_wraps_with_the_pinned_command_and_restores(self, tmp_path: Path, monkeypatch):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        (claude / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command", "command": "~/.claude/statusline.sh"}}),
+            encoding="utf-8",
+        )
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        monkeypatch.setattr(sl, "paint_command", lambda: "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap statusline")
+        assert sl.is_installed(claude) is False
+
+        assert sl.set_installed(claude, backup, True) == {"already": False, "created": False, "migrated": False}
+        settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
+        assert settings["statusLine"]["command"] == "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap statusline"
+        assert sl.is_installed(claude) is True
+
+        assert sl.set_installed(claude, backup, False) == {"restored": True}
+        settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
+        assert settings["statusLine"]["command"] == "~/.claude/statusline.sh"
+        assert sl.is_installed(claude) is False
+
+    def test_a_missing_settings_file_is_not_installed(self, tmp_path: Path):
+        assert sl.is_installed(tmp_path / ".claude") is False
+
+    @pytest.mark.parametrize("flag, enabled", [("--install", True), ("--uninstall", False)])
+    def test_the_cli_goes_through_the_shared_function(self, temp_home: Path, monkeypatch, capsys, flag, enabled):
+        from openswap.cli import _statusline_command
+
+        calls: list[tuple] = []
+
+        def fake_set_installed(config_home, backup_root, on):
+            calls.append((config_home, backup_root, on))
+            return {"already": False, "created": True, "migrated": False} if on else {"restored": True}
+
+        monkeypatch.setattr(sl, "set_installed", fake_set_installed)
+        monkeypatch.setattr(sl, "install", lambda *a, **k: pytest.fail("call set_installed"))
+        monkeypatch.setattr(sl, "uninstall", lambda *a, **k: pytest.fail("call set_installed"))
+        assert _statusline_command([flag]) == 0
+        from openswap import paths
+
+        assert calls == [(paths.get_claude_config_home(), paths.get_backup_root(), enabled)]
+        out = capsys.readouterr().out
+        assert ("installed" if enabled else "restored") in out
+
+
+class TestTemporaryCopy:
+    """A translocated or mounted app must not pin its path (plan 020)."""
+
+    def _setup(self, tmp_path: Path, monkeypatch):
+        from openswap import bundle
+
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        monkeypatch.setattr(sl, "paint_command", lambda: "/Volumes/OpenSwap/OpenSwap.app/Contents/MacOS/OpenSwap statusline")
+        monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: True)
+        return claude, backup
+
+    def test_turning_on_is_refused_and_writes_nothing(self, tmp_path: Path, monkeypatch):
+        from openswap.exceptions import ClaudeSwitchError
+
+        claude, backup = self._setup(tmp_path, monkeypatch)
+        with pytest.raises(ClaudeSwitchError, match="Move OpenSwap to Applications first."):
+            sl.set_installed(claude, backup, True)
+        assert not (claude / "settings.json").exists()
+
+    def test_turning_off_still_works(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._setup(tmp_path, monkeypatch)
+        sl.install(claude, backup, command="/Applications/OpenSwap.app/Contents/MacOS/OpenSwap statusline")
+        assert sl.set_installed(claude, backup, False) == {"restored": True}
+        assert sl.is_installed(claude) is False
+
+    def test_the_cli_reports_the_refusal(self, temp_home: Path, monkeypatch, capsys):
+        from openswap import bundle
+        from openswap.cli import _statusline_command
+
+        monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: True)
+        assert _statusline_command(["--install"]) == 1
+        assert "Move OpenSwap to Applications first." in capsys.readouterr().err
+        from openswap import paths
+
+        assert sl.is_installed(paths.get_claude_config_home()) is False
+
+
+
+class TestAnotherOpenSwap:
+    """A hook for another program is not this one, and turning it on repoints it
+    (plan 020 step 6, revised)."""
+
+    APP = "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap"
+
+    def _setup(self, tmp_path: Path, monkeypatch, hook: str):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        (claude / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command", "command": hook, "padding": 1}}),
+            encoding="utf-8",
+        )
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        sl.save_wrap(backup, inner_command="~/.claude/statusline.sh", created=False)
+        monkeypatch.setattr(sl, "paint_command", lambda: f"{self.APP} statusline")
+        return claude, backup
+
+    @pytest.mark.parametrize(
+        "hook",
+        ["/Users/x/.local/bin/openswap statusline", "openswap statusline"],
+        ids=["another-program", "bare"],
+    )
+    def test_is_not_this_program(self, tmp_path: Path, monkeypatch, hook):
+        claude, _backup = self._setup(tmp_path, monkeypatch, hook)
+        assert sl.is_installed(claude) is True
+        assert sl.runs_this_program(claude) is False
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need extra privileges on Windows")
+    def test_this_program_or_a_link_to_it(self, tmp_path: Path, monkeypatch):
+        app = tmp_path / "OpenSwap.app" / "Contents" / "MacOS" / "OpenSwap"
+        app.parent.mkdir(parents=True)
+        app.write_bytes(b"")
+        link = tmp_path / "bin" / "openswap"
+        link.parent.mkdir()
+        link.symlink_to(app)
+        claude, _backup = self._setup(tmp_path, monkeypatch, f"{link} statusline")
+        monkeypatch.setattr(sl, "paint_command", lambda: f"{app} statusline")
+        assert sl.runs_this_program(claude) is True
+
+    def test_turning_on_repoints_and_keeps_the_wrap_and_the_prefix(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._setup(
+            tmp_path, monkeypatch, "FOO=1 /Users/x/.local/bin/openswap statusline"
+        )
+        result = sl.set_installed(claude, backup, True)
+        assert result == {"already": False, "created": False, "migrated": False, "repointed": True}
+        block = json.loads((claude / "settings.json").read_text(encoding="utf-8"))["statusLine"]
+        assert block == {"type": "command", "command": f"FOO=1 {self.APP} statusline", "padding": 1}
+        assert sl.load_wrap(backup) == {"innerCommand": "~/.claude/statusline.sh", "created": False}
+        assert sl.runs_this_program(claude) is True
+        # Then it is ours: a second call changes nothing.
+        assert sl.set_installed(claude, backup, True)["already"] is True
+
+    def test_a_bare_command_is_left_alone_when_nothing_better_can_be_pinned(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._setup(tmp_path, monkeypatch, "openswap statusline")
+        monkeypatch.setattr(sl, "paint_command", lambda: sl.PAINT_COMMAND)
+        assert sl.runs_this_program(claude) is True
+        assert sl.set_installed(claude, backup, True)["already"] is True
+
+    def test_the_cli_install_repoints_too(self, temp_home: Path, monkeypatch, capsys):
+        from openswap import paths
+        from openswap.cli import _statusline_command
+
+        claude = paths.get_claude_config_home()
+        claude.mkdir(parents=True, exist_ok=True)
+        (claude / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command", "command": "openswap statusline"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(sl, "paint_command", lambda: f"{self.APP} statusline")
+        assert _statusline_command(["--install"]) == 0
+        assert "now runs this OpenSwap" in capsys.readouterr().out
+        block = json.loads((claude / "settings.json").read_text(encoding="utf-8"))["statusLine"]
+        assert block["command"] == f"{self.APP} statusline"
+
+
+class TestRepointKeepsTheHookAsWritten:
+    """Repointing replaces only the trailing `<program> statusline`: shell
+    composition before it must stay shell syntax (Codex review on #109)."""
+
+    APP = "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap"
+
+    def _install_over(self, tmp_path: Path, monkeypatch, hook: str):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        (claude / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command", "command": hook}}), encoding="utf-8"
+        )
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        monkeypatch.setattr(sl, "paint_command", lambda: f"{self.APP} statusline")
+        return claude, backup
+
+    def _command(self, claude: Path) -> str:
+        return json.loads((claude / "settings.json").read_text(encoding="utf-8"))["statusLine"]["command"]
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "echo ready && ",
+            "cd ~/x; ",
+            "FOO=1 BAR='a b' ",
+            "  ",
+            # Operators need no spaces around them (Codex review on #109).
+            "echo ready&&",
+            "cd ~/x;",
+            "true||",
+            "date | ",
+        ],
+        ids=["and", "semicolon", "quoted-env", "spaces",
+             "and-adjacent", "semicolon-adjacent", "or-adjacent", "pipe"],
+    )
+    def test_the_prefix_is_kept_verbatim(self, tmp_path: Path, monkeypatch, prefix):
+        claude, backup = self._install_over(tmp_path, monkeypatch, f"{prefix}/Users/x/.local/bin/openswap statusline")
+        assert sl.set_installed(claude, backup, True)["repointed"] is True
+        assert self._command(claude) == f"{prefix}{self.APP} statusline"
+
+    def test_a_quoted_program_with_a_space_is_replaced_whole(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._install_over(
+            tmp_path, monkeypatch, "echo hi && '/Users/x/My Tools/openswap' statusline  "
+        )
+        sl.set_installed(claude, backup, True)
+        assert self._command(claude) == f"echo hi && {self.APP} statusline"
+
+    def test_an_operator_inside_a_quoted_program_is_part_of_it(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._install_over(tmp_path, monkeypatch, "echo hi&&'/Users/x/a&b/openswap' statusline")
+        assert sl._command_program("echo hi&&'/Users/x/a&b/openswap' statusline") == "/Users/x/a&b/openswap"
+        sl.set_installed(claude, backup, True)
+        assert self._command(claude) == f"echo hi&&{self.APP} statusline"
+
+    def test_an_escaped_space_in_the_program_is_replaced_whole(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._install_over(tmp_path, monkeypatch, r"/Users/x/My\ Tools/openswap statusline")
+        sl.set_installed(claude, backup, True)
+        assert self._command(claude) == f"{self.APP} statusline"
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "(cd ~/x)&&",
+            "echo $(date) && ",
+            "echo `date` && ",
+            "FOO=$HOME ",
+            "echo > /tmp/log; ",
+            "cat < /dev/null; ",
+            "# note\n",
+            "echo a \\\n && ",
+            "echo a\n",
+        ],
+        ids=["subshell", "command-substitution", "backticks", "variable", "redirect-out",
+             "redirect-in", "comment", "line-continuation", "newline"],
+    )
+    def test_shell_syntax_it_does_not_take_apart_is_left_as_written(self, tmp_path: Path, monkeypatch, prefix):
+        """Refused rather than parsed: the user is told the exact command."""
+        hook = f"{prefix}/Users/x/.local/bin/openswap statusline"
+        claude, backup = self._install_over(tmp_path, monkeypatch, hook)
+        if not sl.is_our_command(hook):
+            pytest.skip("not recognized as OpenSwap's hook, so never repointed")
+        with pytest.raises(ConfigError) as err:
+            sl.set_installed(claude, backup, True)
+        assert f"to run: {self.APP} statusline" in str(err.value)
+        assert self._command(claude) == hook
+        assert sl.repoint_command(claude, program=Path(self.APP)) is False
+        assert self._command(claude) == hook
+
+    def test_a_hook_it_cannot_take_apart_is_left_alone_and_reported(self, tmp_path: Path, monkeypatch):
+        hook = "/Users/x/.local/bin/openswap 'statusline'"
+        claude, backup = self._install_over(tmp_path, monkeypatch, hook)
+        assert sl.is_our_command(hook)
+        with pytest.raises(ConfigError, match="cannot rewrite safely"):
+            sl.set_installed(claude, backup, True)
+        assert self._command(claude) == hook
+
+    def test_the_move_from_a_uv_install_keeps_operators_too(self, tmp_path: Path):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        (claude / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command",
+                                       "command": "echo ready && /Users/x/.local/bin/openswap statusline"}}),
+            encoding="utf-8",
+        )
+        import shlex
+
+        program = Path(self.APP)
+        assert sl.repoint_command(claude, program=program) is True
+        assert self._command(claude) == f"echo ready && {shlex.quote(str(program))} statusline"

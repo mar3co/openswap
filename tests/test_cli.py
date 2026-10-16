@@ -660,6 +660,10 @@ class TestCLI:
             "openswap.bundle.migrate_from_uv_install", lambda **k: order.append("migrate") or []
         )
         monkeypatch.setattr(
+            "openswap.widget_install.register_on_start_in_background",
+            lambda: order.append("widget"),
+        )
+        monkeypatch.setattr(
             "openswap.menubar.run", lambda switcher, codex=None: order.append("run") or 0, raising=False
         )
         monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
@@ -667,7 +671,9 @@ class TestCLI:
         with pytest.raises(SystemExit) as exc:
             cli.main()
         assert exc.value.code == 0
-        assert order == (["migrate", "run"] if frozen else ["run"])
+        # The widget registers after the migration, which may retire the old
+        # widget host first.
+        assert order == (["migrate", "widget", "run"] if frozen else ["run"])
 
     def test_menubar_subcommand_dispatches(self, monkeypatch):
         """Bare `openswap menubar` should route exactly like `openswap --menubar`."""
@@ -1960,13 +1966,22 @@ class TestSetupCommand:
         assert str(tmp_path / "homebrew" / "bin" / "openswap") in err
         assert "uv tool uninstall openswap" in err
 
-    def test_setup_in_the_app_does_not_ask_for_xcode(self, monkeypatch, capsys, frozen_app):
+    def test_setup_in_the_app_points_at_edit_widgets(self, monkeypatch, capsys, frozen_app):
+        """The app registers its widget when it starts; only adding it is left."""
         self._harness(monkeypatch, ["openswap", "setup"])
         monkeypatch.setattr("openswap.bundle.migrate_from_uv_install", lambda **k: [])
         assert self._run() == 0
         out = capsys.readouterr().out
-        assert "Add the desktop widget: openswap widget --install" in out
+        assert "  Add the widget: Edit Widgets, search OpenSwap" in out
+        assert "widget --install" not in out
         assert "Xcode" not in out
+
+    def test_setup_from_source_still_builds_the_widget_with_xcode(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"])
+        assert self._run() == 0
+        out = capsys.readouterr().out
+        assert "Add the desktop widget (needs Xcode): openswap widget --install" in out
+        assert "Edit Widgets" not in out
 
     def test_extra_that_did_not_come_up_is_not_called_running(self, monkeypatch, capsys):
         self._harness(monkeypatch, ["openswap", "setup"], pid=None)

@@ -100,6 +100,14 @@ def desktop_switch_confirm_copy(name, *, pause_auto=False, process_state="runnin
     )
 
 
+def _bundled_widget() -> bool:
+    """Whether this is the app at a stable location, which registers its
+    widget at start-up (``widget_install.register_on_start``)."""
+    from openswap import bundle
+
+    return bundle.is_frozen() and not bundle.runs_from_temporary_location()
+
+
 def run(switcher, codex=None) -> int:
     """Entry point for ``openswap menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -289,6 +297,12 @@ def run(switcher, codex=None) -> int:
                     install()
                 except Exception:
                     self.switcher._logger.warning("%s hook failed", name, exc_info=True)
+            # Continue on the welcome page from a translocated or mounted
+            # copy: not again this run, and welcome_done stays unsaved.
+            self._welcome_dismissed = False
+            # A login item change started by the welcome page's Continue: its
+            # failure is shown as an alert, since the page went on to the cards.
+            self._login_item_from_welcome = False
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -702,7 +716,7 @@ def run(switcher, codex=None) -> int:
             if (
                 panel is not None
                 and panel.is_shown()
-                and getattr(panel, "_page", None) == MAIN_PAGE
+                and getattr(panel, "_page", None) in (MAIN_PAGE, WELCOME_PAGE)
             ):
                 if getattr(panel, "_selected_provider", None) == "chatgpt":
                     self._on_chatgpt_view_active()
@@ -1487,6 +1501,10 @@ def run(switcher, codex=None) -> int:
                 on_worker_view_active=self._worker_view_active,
                 worker_paired=lambda: self._worker_policy.control_service_url is not None,
                 login_item=self._login_item_state,
+                status_line=self._status_line_state,
+                bundled_widget=_bundled_widget,
+                welcome=self._welcome_state,
+                on_welcome_continue=self._on_welcome_continue,
             )
             self._panel.attach(nsitem)
             # Requests left before the observers existed: `openswap setup`
@@ -1494,6 +1512,11 @@ def run(switcher, codex=None) -> int:
             # that handed over to this one.
             if self._on_handoff_request():
                 return
+            # Settle the welcome page before any request opens the popover: a
+            # copy `openswap setup` started (its login item runs this app) is
+            # done with it, so a show request left by the copy it took over
+            # from opens the cards, not the welcome page.
+            self._welcome_on_start()
             self._on_show_request()
             if self._show_popover_pending:
                 self._show_popover_pending = False
@@ -1538,6 +1561,81 @@ def run(switcher, codex=None) -> int:
                 return
             if not panel.is_shown():
                 panel.toggle()
+
+        # ---- first run: the welcome page (plan 020) ----------------------
+        def _welcome_state(self):
+            """Facts for the welcome page while it is due, else None.
+
+            Due in the app until Continue saves ``welcome_done``. Closing the
+            popover without Continue changes nothing, so the next open shows
+            it again. A uv install never shows it: `openswap setup` is that path.
+            """
+            from openswap import bundle
+
+            if not bundle.is_frozen() or self.settings.welcome_done or self._welcome_dismissed:
+                return None
+            return {
+                "temporary": bundle.runs_from_temporary_location(),
+                "login_item": self._login_item_runs_this(),
+            }
+
+        def _login_item_runs_this(self) -> bool:
+            """Whether the login item starts this program (not merely exists:
+            a plist for another copy of the app is not this app's login item)."""
+            from openswap import launch_agent
+
+            try:
+                return bool(launch_agent.login_item_runs_this())
+            except Exception:
+                self.switcher._logger.debug("login item read failed", exc_info=True)
+                return False
+
+        def _welcome_on_start(self):
+            """Open the popover once, by itself, on the welcome page.
+
+            An LSUIElement app shows no window, so without this a first launch
+            from Finder looks like nothing happened.
+            """
+            from openswap import bundle
+
+            action = welcome_on_start(
+                self.settings,
+                frozen=bundle.is_frozen(),
+                temporary=bundle.runs_from_temporary_location(),
+                login_item_runs_this=self._login_item_runs_this(),
+            )
+            if action == "done":
+                # `openswap setup` already set this app up; nothing to ask.
+                self.settings.welcome_done = True
+                try:
+                    self.settings.save(settings_path)
+                except OSError:
+                    self.switcher._logger.debug("could not save welcome_done", exc_info=True)
+            elif action == "show":
+                self.show_popover()
+
+        def _on_welcome_continue(self, open_at_login):
+            """Save ``welcome_done``, then apply the switch (a hand-over last)."""
+            from openswap import bundle
+
+            if bundle.runs_from_temporary_location():
+                # Nothing may be pinned to a path that vanishes. The copy moved
+                # to Applications shows the welcome page again.
+                self._welcome_dismissed = True
+                return
+            self.settings.welcome_done = True
+            try:
+                self.settings.save(settings_path)
+            except OSError as e:
+                self._show_error(f"Couldn't save settings: {e}")
+            if not open_at_login and not self._login_item_runs_this():
+                # Off, and no login item of this app's to turn off: a plist for
+                # another copy (the cask's, while a dev build runs) is left alone.
+                return
+            self._login_item_from_welcome = True
+            self._apply_login_item(bool(open_at_login))
+            if not self._login_item_busy:
+                self._login_item_from_welcome = False  # it did not start
 
         def _on_empty_action(self, provider, action):
             if self._desktop_switching or self._refreshing:
@@ -1730,6 +1828,8 @@ def run(switcher, codex=None) -> int:
                     return
             elif row_id == "kickoff_enabled":
                 self.on_toggle_kickoff(None)
+            elif row_id == "claude_status_line":
+                self._toggle_status_line()
             elif row_id == "kickoff_time":
                 self.on_kickoff_time(value)
                 # The popup already shows the pick; do not rebuild the page
@@ -1815,12 +1915,18 @@ def run(switcher, codex=None) -> int:
             if result is None:
                 return
             self._login_item_busy = False
+            from_welcome, self._login_item_from_welcome = self._login_item_from_welcome, False
             if result.get("outcome") == "handoff":
                 # set_login_item returned once launchd's copy was up; it is
                 # waiting for this copy's menu bar lock, so quit now.
                 self.on_quit(None)
                 return
             self._login_item_last = result
+            if from_welcome and not result.get("outcome"):
+                # Continue went on to the cards, where Settings' hint (an
+                # error) or warning (a failed start: no outcome, no error)
+                # would go unseen.
+                self._show_error(result.get("error") or OPEN_AT_LOGIN_FAILED_ALERT)
             panel = self._panel
             if (
                 panel is not None
@@ -1828,6 +1934,40 @@ def run(switcher, codex=None) -> int:
                 and getattr(panel, "_page", None) == SETTINGS_PAGE
             ):
                 panel.reload()
+
+        def _status_line_state(self) -> str:
+            """``"on"``: Claude Code's status line runs this OpenSwap.
+            ``"other"``: an OpenSwap hook for another program (a bare
+            ``openswap statusline``, or another copy). ``"off"``: neither."""
+            from openswap import paths
+            from openswap.statusline import is_installed, runs_this_program
+
+            config_home = paths.get_claude_config_home()
+            try:
+                if runs_this_program(config_home):
+                    return "on"
+                return "other" if is_installed(config_home) else "off"
+            except Exception:
+                self.switcher._logger.debug("status line read failed", exc_info=True)
+                return "off"
+
+        def _toggle_status_line(self) -> None:
+            """Settings › This Mac: `openswap statusline --install/--uninstall`.
+
+            Flips what is on disk now, not what the page showed: the CLI may
+            have changed it since the page was built. A hook for another
+            OpenSwap shows as off, so this turns it on, which repoints it. From
+            a translocated or mounted copy, turning it on is refused (the row
+            is disabled too).
+            """
+            from openswap import paths
+            from openswap.statusline import set_installed
+
+            enable = self._status_line_state() != "on"
+            try:
+                set_installed(paths.get_claude_config_home(), self.switcher.backup_dir, enable)
+            except (ClaudeSwitchError, OSError) as e:
+                self._show_error(f"Couldn't change the Claude Code status line: {e}")
 
         def _toggle_codex_auto(self) -> bool:
             """Flip live Codex CLI rotation (Settings row and the Codex tab's footer toggle)."""
