@@ -55,6 +55,7 @@ BUTTON_H = 36.0
 SMALL_BUTTON_H = 30.0
 GAP = 10.0
 LOCKUP_MARK = 22.0  # the mark's side in the wordmark
+ACCOUNTS_SHOWN = 6  # account rows before "and N more", so the footer stays on screen
 
 
 class _WizardButton(_DialogButton):
@@ -437,9 +438,12 @@ class SetupWizard:
                                 x=x, width=w - size.width - 12)
             return y - top
         if kind == "accounts":
-            items = row["items"]
+            items = list(row["items"])
+            more = max(0, len(items) - ACCOUNTS_SHOWN)
+            if more:
+                items = items[:ACCOUNTS_SHOWN]
             line = 22.0
-            box_h = 16 + line * len(items)
+            box_h = 16 + line * (len(items) + (1 if more else 0))
             box = _Box.alloc().initWithFrame_(NSMakeRect(PAD, y, CONTENT, box_h))
             surface.addSubview_(box)
             ly = y + 8
@@ -453,6 +457,10 @@ class SetupWizard:
                 field.setFrameSize_((CONTENT - 44, line))
                 surface.addSubview_(field)
                 ly += line
+            if more:
+                field = _label(f"and {more} more", _font(13), NSColor.secondaryLabelColor(), CONTENT - 44)
+                field.setFrameOrigin_((PAD + 32, ly + 1))
+                surface.addSubview_(field)
             return box_h
         if kind == "summary":
             items = row["items"]

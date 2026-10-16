@@ -162,8 +162,79 @@ def test_a_replace_trashes_the_old_copy_only_after_the_new_one_is_complete(fs):
     plan = bundle.move_plan(app, fs["apps"])
     target = bundle.copy_to_applications(app, plan)
     assert bundle.bundle_version(target) == "0.2.0"
-    assert fs["calls"]["trash"] == [target]
-    assert bundle.bundle_version(fs["trash"] / "OpenSwap.app") == "0.1.0"
+    old = fs["apps"] / "OpenSwap (old).app"
+    assert fs["calls"]["trash"] == [old]
+    assert bundle.bundle_version(fs["trash"] / "OpenSwap (old).app") == "0.1.0"
+    assert not old.exists()
+
+
+def test_a_failed_final_rename_puts_the_old_app_back(fs, monkeypatch):
+    _app(fs["apps"], "0.1.0")
+    app = _app(fs["image"], "0.2.0")
+    plan = bundle.move_plan(app, fs["apps"])
+    real_rename = Path.rename
+
+    def rename(self, target):
+        if self.name.endswith(".openswap-move"):
+            raise OSError("rename refused")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", rename)
+    with pytest.raises(ClaudeSwitchError, match="rename refused"):
+        bundle.copy_to_applications(app, plan)
+    assert bundle.bundle_version(fs["apps"] / "OpenSwap.app") == "0.1.0"
+    assert not (fs["apps"] / "OpenSwap (old).app").exists()
+    assert not (fs["apps"] / ".OpenSwap.app.openswap-move").exists()
+    assert fs["calls"]["trash"] == []
+
+
+def test_a_copy_that_became_newer_meanwhile_is_not_replaced(fs):
+    _app(fs["apps"], "0.1.0")
+    app = _app(fs["image"], "0.2.0")
+    plan = bundle.move_plan(app, fs["apps"])  # replace, at the time
+    shutil.rmtree(fs["apps"] / "OpenSwap.app")
+    _app(fs["apps"], "0.3.0")  # installed while the window was open
+    with pytest.raises(ClaudeSwitchError, match="0.3.0 is already in"):
+        bundle.copy_to_applications(app, plan)
+    assert bundle.bundle_version(fs["apps"] / "OpenSwap.app") == "0.3.0"
+    assert fs["calls"]["trash"] == []
+
+
+def test_quarantine_that_will_not_clear_fails_the_move(fs, monkeypatch):
+    import subprocess
+
+    monkeypatch.undo()  # the fixture's fake; use the real _drop_quarantine
+    monkeypatch.setattr(bundle, "_ditto", lambda s, d: shutil.copytree(s, d, symlinks=True))
+    monkeypatch.setattr(bundle, "CASKROOMS", (fs["tmp"] / "no-caskroom",))
+
+    def xattr(argv, **kwargs):  # -d "fails", -p still finds it
+        return subprocess.CompletedProcess(argv, 0 if argv[1] == "-p" else 1, b"", b"Operation not permitted")
+
+    monkeypatch.setattr(bundle.subprocess, "run", xattr)
+    app = _app(fs["image"])
+    plan = bundle.move_plan(app, fs["apps"])
+    with pytest.raises(ClaudeSwitchError, match="quarantine"):
+        bundle.copy_to_applications(app, plan)
+    assert not (fs["apps"] / "OpenSwap.app").exists()
+    assert not (fs["apps"] / ".OpenSwap.app.openswap-move").exists()
+
+
+def test_quarantine_already_absent_is_fine(fs, monkeypatch):
+    import subprocess
+
+    monkeypatch.undo()  # the fixture's fake; use the real _drop_quarantine
+    monkeypatch.setattr(bundle, "_ditto", lambda s, d: shutil.copytree(s, d, symlinks=True))
+    monkeypatch.setattr(bundle, "CASKROOMS", (fs["tmp"] / "no-caskroom",))
+    calls = []
+
+    def xattr(argv, **kwargs):  # -d exits 1 for "no such xattr"; -p agrees
+        calls.append(argv[1])
+        return subprocess.CompletedProcess(argv, 1, b"", b"No such xattr")
+
+    monkeypatch.setattr(bundle.subprocess, "run", xattr)
+    app = _app(fs["image"])
+    assert bundle.copy_to_applications(app, bundle.move_plan(app, fs["apps"])).exists()
+    assert calls == ["-dr", "-p"]
 
 
 def test_a_failed_copy_leaves_the_old_app_and_no_half_copy(fs, monkeypatch):
@@ -185,7 +256,8 @@ def test_a_failed_copy_leaves_the_old_app_and_no_half_copy(fs, monkeypatch):
     assert fs["calls"]["trash"] == []
 
 
-def test_a_failed_trash_keeps_the_old_app(fs, monkeypatch):
+def test_a_failed_trash_leaves_the_old_app_beside_the_new_one(fs, monkeypatch):
+    """The new app is installed either way; the old one stays visible."""
     _app(fs["apps"], "0.1.0")
     app = _app(fs["image"], "0.2.0")
     plan = bundle.move_plan(app, fs["apps"])
@@ -194,9 +266,9 @@ def test_a_failed_trash_keeps_the_old_app(fs, monkeypatch):
         raise ClaudeSwitchError(f"Could not move {path} to the Trash: denied")
 
     monkeypatch.setattr("openswap.widget_install._move_to_trash", refuse)
-    with pytest.raises(ClaudeSwitchError, match="denied"):
-        bundle.copy_to_applications(app, plan)
-    assert bundle.bundle_version(fs["apps"] / "OpenSwap.app") == "0.1.0"
+    target = bundle.copy_to_applications(app, plan)
+    assert bundle.bundle_version(target) == "0.2.0"
+    assert bundle.bundle_version(fs["apps"] / "OpenSwap (old).app") == "0.1.0"
     assert not (fs["apps"] / ".OpenSwap.app.openswap-move").exists()
 
 
@@ -204,7 +276,7 @@ def test_a_copy_that_appeared_meanwhile_is_not_overwritten(fs):
     app = _app(fs["image"])
     plan = bundle.move_plan(app, fs["apps"])
     _app(fs["apps"], "0.3.0")  # appeared after the plan
-    with pytest.raises(ClaudeSwitchError, match="already there"):
+    with pytest.raises(ClaudeSwitchError, match="0.3.0 is already in"):
         bundle.copy_to_applications(app, plan)
     assert bundle.bundle_version(fs["apps"] / "OpenSwap.app") == "0.3.0"
 
@@ -232,6 +304,14 @@ def test_relaunch_waits_for_this_process_in_a_detached_shell(monkeypatch):
     assert started["kwargs"]["start_new_session"] is True
     assert 'kill -0 "$1"' in bundle.RELAUNCH_SCRIPT
     assert bundle.RELAUNCH_SCRIPT.index("/usr/bin/open") < bundle.RELAUNCH_SCRIPT.index("hdiutil detach")
+
+
+def test_eject_detaches_a_disk_image_and_ignores_none(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bundle.subprocess, "run", lambda argv, **k: calls.append(argv))
+    bundle.eject(None)
+    bundle.eject(Path("/Volumes/OpenSwap"))
+    assert calls == [["/usr/bin/hdiutil", "detach", "/Volumes/OpenSwap", "-quiet"]]
 
 
 def test_relaunch_without_a_disk_image_ejects_nothing(monkeypatch):

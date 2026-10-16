@@ -102,6 +102,9 @@ already call.
 - `welcome_on_start` returns `"move"` for a frozen copy at a temporary
   location, finished or not: opening a newer DMG is then also how a Finder
   install updates.
+- A DMG copy opened while the installed copy runs loses the menu bar lock;
+  it leaves a move request with its path, and the running copy opens the
+  wizard on Move with that copy as the source, replacing itself.
 
 ### Where the code goes
 

@@ -132,10 +132,13 @@ def run(switcher, codex=None) -> int:
     from openswap import launch_agent
     from openswap.menubar_instance import AlreadyRunning, claim, hand_over_to_login_item
 
+    from openswap import bundle as _bundle
+
     as_login_item = launch_agent.runs_as_login_item()
     try:
         instance_lock = claim(
-            switcher.backup_dir, as_login_item=as_login_item, logger=switcher._logger
+            switcher.backup_dir, as_login_item=as_login_item, logger=switcher._logger,
+            move_from=_bundle.app_path() if _bundle.runs_from_temporary_location() else None,
         )
     except AlreadyRunning as e:
         return e.exit_code
@@ -308,6 +311,9 @@ def run(switcher, codex=None) -> int:
             self._wizard_choices = None
             self._wizard_move = None
             self._wizard_seen = None
+            # Another copy at a temporary location (a newer DMG opened while
+            # this one runs) asked to be moved: the wizard's Move source.
+            self._wizard_source = None
             # A login item change started by the wizard's Finish: its failure
             # is shown as an alert, since the wizard has closed; a hand-over
             # leaves a show request so the login item's copy opens the popover.
@@ -1533,10 +1539,14 @@ def run(switcher, codex=None) -> int:
         def _on_show_request(self):
             """The show notification, and start-up: consume the show request
             and open the popover when it is fresh (menubar_instance)."""
-            from openswap.menubar_instance import consume_show_request
+            from openswap.menubar_instance import consume_move_request, consume_show_request
 
             if consume_show_request(self.switcher.backup_dir):
-                self.show_popover()
+                source = consume_move_request(self.switcher.backup_dir)
+                if source is not None:
+                    self._open_setup_wizard(source=source)
+                else:
+                    self.show_popover()
 
         def _on_handoff_request(self):
             """The hand-over notification, and start-up: ``openswap setup`` or
@@ -1643,12 +1653,14 @@ def run(switcher, codex=None) -> int:
             if not self._login_item_busy:
                 self._login_item_from_welcome = False  # it did not start
 
-        def _open_setup_wizard(self, step=None):
+        def _open_setup_wizard(self, step=None, source=None):
             """Show the setup wizard (``setup_wizard``) on ``step``, or on its
-            first step. Each opening starts from fresh choices."""
+            first step. Each opening starts from fresh choices. ``source`` is
+            another copy's app to offer Move for (a move request)."""
             from openswap.setup_wizard import initial_choices, wizard_steps
 
             self._wizard_move = None
+            self._wizard_source = source
             facts = self._wizard_facts()
             if self._wizard is None:
                 try:
@@ -1710,9 +1722,9 @@ def run(switcher, codex=None) -> int:
             from openswap import bundle
             from openswap.setup_wizard import WizardFacts
 
-            temporary = bundle.runs_from_temporary_location()
+            temporary = self._wizard_source is not None or bundle.runs_from_temporary_location()
             if temporary and self._wizard_move is None:
-                app = bundle.app_path()
+                app = self._wizard_source or bundle.app_path()
                 try:
                     self._wizard_move = bundle.move_plan(app, bundle.applications_dir())
                 except Exception as e:
@@ -1797,11 +1809,33 @@ def run(switcher, codex=None) -> int:
             from openswap import bundle
 
             plan = self._wizard_move or {}
+            source = self._wizard_source or bundle.app_path()
+            # The plan was made when the window opened; Applications may have
+            # changed since (another install, a deleted copy). Plan again and,
+            # when the answer differs, show that instead of acting on the old one.
+            try:
+                fresh = bundle.move_plan(source, Path(plan["destination"]))
+            except (OSError, KeyError, ValueError) as e:
+                self._show_error(f"Couldn’t check Applications: {e}")
+                return
+            if fresh.get("action") != plan.get("action") or fresh.get("target") != plan.get("target"):
+                self._wizard_move = fresh
+                self._wizard_render()
+                return
+            plan = fresh
             try:
                 if action == "move":
-                    target = bundle.copy_to_applications(bundle.app_path(), plan)
+                    target = bundle.copy_to_applications(source, plan)
                 else:
                     target = Path(plan["target"])
+                    if self._wizard_source is not None:
+                        # The copy already there is this one, running: nothing
+                        # to open but the popover. The DMG is done with.
+                        bundle.eject(plan.get("eject"))
+                        self._wizard.close()
+                        self._wizard_step = None
+                        self.show_popover()
+                        return
             except (ClaudeSwitchError, KeyError) as e:
                 self._show_error(str(e))
                 self._wizard_move = None

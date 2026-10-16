@@ -198,6 +198,7 @@ def _remove_menubar_state() -> bool:
         for path in (
             menubar_instance.show_request_path(backup),
             menubar_instance.handoff_request_path(backup),
+            menubar_instance.move_request_path(backup),
             launch_agent.login_item_status_path(backup),
             *([lock_file] if lock is not None else []),
         ):

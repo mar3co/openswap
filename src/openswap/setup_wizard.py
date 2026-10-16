@@ -306,7 +306,7 @@ def _login_page(facts: WizardFacts, choices: WizardChoices) -> dict:
 
 def terminal_command(executable: str) -> str:
     """The line that puts this app's ``openswap`` command on PATH."""
-    return f"ln -s {shlex.quote(executable)} ~/.local/bin/openswap"
+    return f"mkdir -p ~/.local/bin && ln -sf {shlex.quote(executable)} ~/.local/bin/openswap"
 
 
 def _extras_page(facts: WizardFacts, choices: WizardChoices) -> dict:

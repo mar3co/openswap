@@ -87,6 +87,7 @@ def wiz(monkeypatch, tmp_path):
     app._wizard_choices = None
     app._wizard_move = None
     app._wizard_seen = None
+    app._wizard_source = None
     app._login_item_runs_this = lambda: False
     app._status_line_state = lambda: "off"
     app._on_empty_action = lambda provider, action: events.append(("empty", provider, action))
@@ -304,6 +305,83 @@ def test_a_failed_move_is_reported_and_nothing_quits(wiz, temporary, monkeypatch
     assert wiz.events == [("error", "Could not copy OpenSwap to /Applications: disk full")]
     assert temporary.relaunches == []
     assert wiz.app._wizard_step == setup_wizard.MOVE  # still there to retry
+
+
+def test_a_plan_that_went_stale_is_shown_again_not_acted_on(wiz, temporary, monkeypatch):
+    from openswap import bundle
+
+    wiz.app._open_setup_wizard()
+    assert _page(wiz)["primary"]["title"] == "Move to Applications"
+    # Someone installed a newer copy while the window was open.
+    temporary.plan.update(action="open_existing", existing_version="0.9.0")
+    monkeypatch.setattr(bundle, "move_plan", lambda app, dest: dict(temporary.plan))
+    wiz.app._on_wizard_action("move")
+    assert temporary.copies == [] and temporary.relaunches == []
+    assert wiz.events == []
+    assert _page(wiz)["primary"]["title"] == "Open Installed Copy"
+    assert wiz.app._wizard_step == setup_wizard.MOVE
+
+
+def test_open_existing_whose_copy_vanished_replans(wiz, temporary, monkeypatch):
+    from openswap import bundle
+
+    temporary.plan.update(action="open_existing", existing_version="0.3.0")
+    monkeypatch.setattr(bundle, "move_plan", lambda app, dest: dict(temporary.plan))
+    wiz.app._open_setup_wizard()
+    temporary.plan.update(action="move", existing_version=None)  # deleted meanwhile
+    monkeypatch.setattr(bundle, "move_plan", lambda app, dest: dict(temporary.plan))
+    wiz.app._on_wizard_action("open_existing")
+    assert temporary.relaunches == [] and wiz.events == []
+    assert _page(wiz)["primary"]["title"] == "Move to Applications"
+
+
+def test_a_move_request_from_a_newer_dmg_replaces_the_running_copy(wiz, frozen_app, monkeypatch):
+    """The installed copy holds the lock; a DMG copy that lost it leaves a
+    move request, and this copy offers Replace with that DMG as the source."""
+    from openswap import bundle
+
+    monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: False)
+    source = Path("/Volumes/OpenSwap/OpenSwap.app")
+    plan = {
+        "action": "replace", "source": "disk_image", "eject": Path("/Volumes/OpenSwap"),
+        "destination": str(frozen_app.parent), "target": str(frozen_app),
+        "existing_version": "0.1.0", "homebrew": False,
+    }
+    planned, copies, relaunches = [], [], []
+    monkeypatch.setattr(bundle, "move_plan", lambda app, dest: planned.append(app) or dict(plan))
+    monkeypatch.setattr(bundle, "applications_dir", lambda: frozen_app.parent)
+    monkeypatch.setattr(bundle, "copy_to_applications", lambda app, p: copies.append(app) or Path(p["target"]))
+    monkeypatch.setattr(bundle, "relaunch_after_exit", lambda app, pid, eject=None: relaunches.append((app, eject)))
+    wiz.app._open_setup_wizard(source=source)
+    assert wiz.app._wizard_step == setup_wizard.MOVE
+    assert planned == [source]
+    assert _page(wiz)["primary"]["title"] == "Replace and Open"
+    wiz.app._on_wizard_action("move")
+    assert copies == [source]
+    assert relaunches == [(frozen_app, Path("/Volumes/OpenSwap"))]
+    assert wiz.events == ["quit"]
+
+
+def test_a_move_request_from_an_older_dmg_just_opens_the_popover(wiz, frozen_app, monkeypatch):
+    from openswap import bundle
+
+    monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: False)
+    source = Path("/Volumes/OpenSwap/OpenSwap.app")
+    plan = {
+        "action": "open_existing", "source": "disk_image", "eject": Path("/Volumes/OpenSwap"),
+        "destination": str(frozen_app.parent), "target": str(frozen_app),
+        "existing_version": "0.2.0", "homebrew": False,
+    }
+    ejected = []
+    monkeypatch.setattr(bundle, "move_plan", lambda app, dest: dict(plan))
+    monkeypatch.setattr(bundle, "applications_dir", lambda: frozen_app.parent)
+    monkeypatch.setattr(bundle, "eject", ejected.append)
+    wiz.app._open_setup_wizard(source=source)
+    assert _page(wiz)["primary"]["title"] == "Open Installed Copy"
+    wiz.app._on_wizard_action("open_existing")
+    assert wiz.events == ["show_popover"]  # no quit: this is the installed copy
+    assert ejected == [Path("/Volumes/OpenSwap")]
+    assert not wiz.window.visible
 
 
 def test_an_unplannable_move_says_why(wiz, temporary, monkeypatch):

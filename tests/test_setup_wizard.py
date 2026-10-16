@@ -245,7 +245,7 @@ def test_a_finder_install_without_the_command_gets_the_link_line():
     exe = "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap"
     facts = WizardFacts(command_on_path=False, command=exe)
     command = _rows(wizard_page(EXTRAS, facts, WizardChoices()), "command")[0]
-    assert command["command"] == f"ln -s {exe} ~/.local/bin/openswap"
+    assert command["command"] == f"mkdir -p ~/.local/bin && ln -sf {exe} ~/.local/bin/openswap"
     # Homebrew links it already.
     facts = WizardFacts(command_on_path=False, command=exe, homebrew=True)
     assert _rows(wizard_page(EXTRAS, facts, WizardChoices()), "command") == []
@@ -253,7 +253,7 @@ def test_a_finder_install_without_the_command_gets_the_link_line():
 
 def test_the_terminal_command_quotes_a_path_with_spaces():
     assert terminal_command("/Users/a b/OpenSwap.app/Contents/MacOS/OpenSwap") == (
-        "ln -s '/Users/a b/OpenSwap.app/Contents/MacOS/OpenSwap' ~/.local/bin/openswap"
+        "mkdir -p ~/.local/bin && ln -sf '/Users/a b/OpenSwap.app/Contents/MacOS/OpenSwap' ~/.local/bin/openswap"
     )
 
 

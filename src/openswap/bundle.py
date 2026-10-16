@@ -336,11 +336,38 @@ def _ditto(source: Path, destination: Path) -> None:
 
 def _drop_quarantine(app: Path) -> None:
     """Finder lifts quarantine when a person moves an app; a copy made here
-    must do the same, or macOS translocates it again."""
+    must do the same, or macOS translocates it again. Raises
+    ClaudeSwitchError when the attribute is still on the bundle afterwards
+    (``xattr -d`` exits nonzero for an absent attribute too, so the check is
+    on what is left, not on its exit status)."""
+    from openswap.exceptions import ClaudeSwitchError
+
     subprocess.run(
         ["/usr/bin/xattr", "-dr", QUARANTINE_XATTR, str(app)],
         check=False, capture_output=True, timeout=60,
     )
+    left = subprocess.run(
+        ["/usr/bin/xattr", "-p", QUARANTINE_XATTR, str(app)],
+        check=False, capture_output=True, timeout=60,
+    )
+    if left.returncode == 0:
+        raise ClaudeSwitchError(
+            f"Could not clear the quarantine flag on {app.name}: "
+            f"{left.stderr.decode(errors='replace').strip() or 'xattr failed'}"
+        )
+
+
+def eject(volume: Path | str | None) -> None:
+    """Eject a disk image's mount point; nothing for None. Best effort."""
+    if not volume:
+        return
+    try:
+        subprocess.run(
+            ["/usr/bin/hdiutil", "detach", str(volume), "-quiet"],
+            check=False, capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def copy_to_applications(app: Path, plan: dict) -> Path:
@@ -348,8 +375,11 @@ def copy_to_applications(app: Path, plan: dict) -> Path:
 
     The copy is made beside the target under a hidden name, then renamed
     into place, so a failure never leaves a half-copied ``OpenSwap.app``.
-    ``replace`` trashes the old copy only once the new one is complete.
-    Raises ClaudeSwitchError.
+    ``replace`` first checks the copy there again (it may have changed while
+    the window was open or during the copy): Homebrew's, or this version or
+    newer, is kept and the move refused. The old copy is set aside as
+    ``OpenSwap (old).app`` until the new one is in place, put back if that
+    fails, and moved to the Trash once it succeeds. Raises ClaudeSwitchError.
     """
     from openswap.exceptions import ClaudeSwitchError
 
@@ -364,25 +394,45 @@ def copy_to_applications(app: Path, plan: dict) -> Path:
             shutil.rmtree(staging)
         _ditto(app, staging)
         _drop_quarantine(staging)
-    except (OSError, subprocess.SubprocessError) as e:
+    except (OSError, subprocess.SubprocessError, ClaudeSwitchError) as e:
         shutil.rmtree(staging, ignore_errors=True)
         raise ClaudeSwitchError(f"Could not copy OpenSwap to {target.parent}: {e}") from e
+    old = None
     if target.exists():
-        if action != "replace" or _homebrew_owns(target):
+        existing, mine = bundle_version(target), bundle_version(app)
+        if action != "replace" or _homebrew_owns(target) or (
+            existing and mine and _version_key(existing) >= _version_key(mine)
+        ):
             shutil.rmtree(staging, ignore_errors=True)
-            raise ClaudeSwitchError(f"{target} is already there.")
-        from openswap.widget_install import _move_to_trash
-
+            raise ClaudeSwitchError(
+                f"OpenSwap{f' {existing}' if existing else ''} is already in {target.parent}."
+            )
+        old = target.with_name(f"{target.stem} (old){target.suffix}")
         try:
-            _move_to_trash(target)
-        except ClaudeSwitchError:
+            if old.exists():
+                shutil.rmtree(old)
+            target.rename(old)
+        except OSError as e:
             shutil.rmtree(staging, ignore_errors=True)
-            raise
+            raise ClaudeSwitchError(f"Could not set aside the old OpenSwap: {e}") from e
     try:
         staging.rename(target)
     except OSError as e:
         shutil.rmtree(staging, ignore_errors=True)
+        if old is not None:
+            try:
+                old.rename(target)  # the working install comes back
+            except OSError:
+                _logger.error("could not put %s back at %s", old, target, exc_info=True)
         raise ClaudeSwitchError(f"Could not put OpenSwap in {target.parent}: {e}") from e
+    if old is not None:
+        from openswap.widget_install import _move_to_trash
+
+        try:
+            _move_to_trash(old)
+        except ClaudeSwitchError:
+            # The new app is in place; the old one stays beside it, visible.
+            _logger.warning("could not trash %s", old, exc_info=True)
     return target
 
 
