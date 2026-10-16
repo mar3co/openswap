@@ -773,6 +773,13 @@ class TestCLI:
         monkeypatch.setattr(sys, "argv", argv)
         monkeypatch.setattr(sys, "platform", "darwin")
         monkeypatch.setattr("openswap.menubar.run", _fake_menubar, raising=False)
+        monkeypatch.setattr("openswap.launch_agent._wait_for_pid", lambda label=None, uid=None, timeout=3.0: 4242)
+        self.service_holder = 4242
+        monkeypatch.setattr(
+            "openswap.menubar_instance.hand_over_from_cli",
+            lambda backup_dir, pid, **k: self.service_holder,
+        )
+        monkeypatch.setattr("openswap.menubar_instance.process_alive", lambda p: True)
         monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
         monkeypatch.setattr(
             "openswap.launch_agent.install",
@@ -818,6 +825,23 @@ class TestCLI:
         # The service flags must not also start a foreground menu bar.
         assert seen["menubar_ran"] is False
         assert "installed" in capsys.readouterr().out
+
+    def test_menubar_install_service_names_an_extra_that_kept_the_lock(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["openswap", "menubar", "--install-service"])
+        self.service_holder = 999
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0
+        out = capsys.readouterr()
+        assert "installed" in out.out
+        assert "still running outside its login item" in out.out + out.err
+
+    def test_menubar_install_service_is_quiet_once_launchd_holds_the_lock(self, monkeypatch, capsys):
+        self._service_harness(monkeypatch, ["openswap", "menubar", "--install-service"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        out = capsys.readouterr()
+        assert "outside its login item" not in out.out + out.err
 
     def test_menubar_uninstall_service_routes_to_launch_agent(self, monkeypatch, capsys):
         seen = self._service_harness(monkeypatch, ["openswap", "menubar", "--uninstall-service"])
@@ -1780,11 +1804,17 @@ class TestSetupCommand:
     """``openswap setup``: capture the live login, then start the extra."""
 
     def _harness(
-        self, monkeypatch, argv, *, add_raises=None, install_raises=None, widget_detail=None, pid=4242
+        self, monkeypatch, argv, *, add_raises=None, install_raises=None, widget_detail=None, pid=4242,
+        lock_holder="launchd",
     ):
+        """``lock_holder``: who holds the menu bar lock once setup stops
+        waiting: "launchd" (its pid), another pid, or None."""
         seen: dict = {"add": 0, "install": 0, "widget": 0}
+        self.handoffs: list = []
 
         class FakeSwitcher:
+            backup_dir = Path("/tmp/openswap-data")
+
             def __init__(self, debug=False):
                 pass
 
@@ -1818,7 +1848,14 @@ class TestSetupCommand:
             "openswap.launch_agent.status",
             lambda label=None, *a, **k: {"installed": True, "loaded": True, "state": "running", "pid": pid},
         )
-        monkeypatch.setattr(cli, "_wait_for_pid", lambda agent, label, timeout=3.0: agent.status(label)["pid"])
+        monkeypatch.setattr("openswap.launch_agent._wait_for_pid", lambda label=None, uid=None, timeout=3.0: pid)
+
+        def fake_hand_over(backup_dir, launchd_pid, **_k):
+            self.handoffs.append((backup_dir, launchd_pid))
+            return launchd_pid if lock_holder == "launchd" else lock_holder
+
+        monkeypatch.setattr("openswap.menubar_instance.hand_over_from_cli", fake_hand_over)
+        monkeypatch.setattr("openswap.menubar_instance.process_alive", lambda p: True)
         monkeypatch.setattr("openswap.update_check.restart_widget_agent", fake_widget_restart)
         monkeypatch.setattr(sys, "argv", argv)
         return seen
@@ -1939,19 +1976,42 @@ class TestSetupCommand:
         assert "not running yet" in out
         assert "/tmp/e.log" in out
 
+    def test_running_is_claimed_only_once_launchds_copy_holds_the_lock(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"])
+        assert self._run() == 0
+        assert self.handoffs == [(Path("/tmp/openswap-data"), 4242)]
+        out = capsys.readouterr()
+        assert "OpenSwap is running in your menu bar and starts at login." in out.out
+        assert "outside its login item" not in out.out + out.err
+
+    def test_an_extra_opened_from_finder_that_kept_the_lock_is_named(self, monkeypatch, capsys):
+        """Open at login was off and a Finder copy ran; it did not step aside
+        within the wait, so launchd's copy is looping behind its lock."""
+        self._harness(monkeypatch, ["openswap", "setup"], lock_holder=999)
+        assert self._run() == 0
+        out = capsys.readouterr()
+        text = out.out + out.err
+        assert "OpenSwap is running in your menu bar" not in text
+        assert "still running outside its login item" in text
+        assert "Quit OpenSwap from the menu bar" in text
+
+    def test_a_lock_holder_that_already_quit_is_not_blamed(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"], lock_holder=999)
+        monkeypatch.setattr("openswap.menubar_instance.process_alive", lambda p: False)
+        assert self._run() == 0
+        out = capsys.readouterr()
+        assert "outside its login item" not in out.out + out.err
+        assert "not running yet" in out.out + out.err
+
+    def test_no_hand_over_request_when_launchd_has_no_pid(self, monkeypatch, capsys):
+        self._harness(monkeypatch, ["openswap", "setup"], pid=None)
+        assert self._run() == 0
+        assert self.handoffs == []
+
     def test_ctrl_c_after_capture_says_the_account_was_saved(self, monkeypatch, capsys):
         self._harness(monkeypatch, ["openswap", "setup"], install_raises=KeyboardInterrupt())
         assert self._run() == 130
         assert "account was saved" in capsys.readouterr().out
-
-    def test_wait_for_pid_returns_pid_once_launchd_spawned_it(self):
-        answers = iter([None, None, 77])
-        agent = type("A", (), {"status": staticmethod(lambda label: {"pid": next(answers)})})
-        assert cli._wait_for_pid(agent, "x", timeout=5.0) == 77
-
-    def test_wait_for_pid_gives_up_at_the_deadline(self):
-        agent = type("A", (), {"status": staticmethod(lambda label: {"pid": None})})
-        assert cli._wait_for_pid(agent, "x", timeout=0.0) is None
 
     def test_ctrl_c_after_failed_capture_reports_the_reason(self, monkeypatch, capsys):
         from openswap.exceptions import CredentialReadError

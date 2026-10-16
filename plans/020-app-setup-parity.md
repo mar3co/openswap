@@ -151,9 +151,17 @@ launchd job running, open the app from Finder, from Spotlight and with
   `menubar.run` before the status item exists. The holder writes its pid
   into the file, so the CLI can tell whether launchd's copy owns it.
 - The launchd job (`XPC_SERVICE_NAME == LABEL`) waits up to 10 s for the
-  lock (it may be starting during a hand-over, Step 2). Any other copy does
-  not wait: it leaves a show request and exits 0. A terminal
-  `openswap menubar` also prints "OpenSwap is already running in the menu bar."
+  lock (it may be starting during a hand-over, Step 2). Any other copy
+  never waits for the lock itself: it leaves a show request, then watches
+  for up to 2 s, because the holder may be between Quit and exit, where it
+  answers nothing and its clean exit is not restarted:
+  - it exits 0 once the holder consumes the request;
+  - it takes the lock and runs if the lock comes free, and its own request
+    then opens its popover;
+  - otherwise it exits 0.
+
+  A terminal `openswap menubar` that exits also prints "OpenSwap is
+  already running in the menu bar."
 - A show request: write `<backup_root>/menubar.show-request`, then post the
   distributed notification `com.opensoft.openswap.menubar.show`. The lock
   holder consumes the file in two places: on that notification, and once
@@ -181,10 +189,12 @@ start, which boots the job out, keeps the plist and the recorded failure,
 and keeps this copy running; off; running another program), the show request
 (consumed once whether the notification or start-up gets there first,
 ignored when stale, honoured when it arrives before the holder's observer
-is attached), and the notification name. Manual: open the app three ways while
-the job runs; one status item, and the popover opens each time. Quit, then
-open the app from Finder: `launchctl print` shows the job running it, and
-its popover opens.
+is attached), the 2 s watch after a lost lock (exits at once when the
+holder consumes the request, runs when the holder quits meanwhile, exits
+after 2 s when the holder stays silent), and the notification name.
+Manual: open the app three ways while the job runs; one status item, and
+the popover opens each time. Quit, then open the app from Finder:
+`launchctl print` shows the job running it, and its popover opens.
 
 ### Step 2: one function that turns login on and off
 

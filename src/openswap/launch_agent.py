@@ -31,6 +31,7 @@ functions refuse rather than half-work elsewhere.
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import shutil
@@ -57,6 +58,24 @@ _BASE_PATH_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 # assuming bootout was synchronous (Homebrew's services code does the same).
 _UNLOAD_TIMEOUT_SECONDS = 5.0
 _UNLOAD_POLL_SECONDS = 0.1
+
+# How long a copy handing over to the login item waits for launchd to spawn
+# it. bootstrap returns before the process exists.
+_HANDOFF_PID_TIMEOUT_SECONDS = 5.0
+
+MOVE_TO_APPLICATIONS = "Move OpenSwap to Applications first."
+
+# Why the last start of the login item failed, in the data folder. Settings
+# reads it; any successful start, and the job itself at start-up, clear it.
+STATUS_FILENAME = "login_item_status.json"
+
+
+class LoginItemNotStarted(ClaudeSwitchError):
+    """launchd did not start the login item that :func:`set_login_item` wrote.
+
+    Its own type so the app can point at System Settings › Login Items, where
+    a user may have switched OpenSwap off in the background.
+    """
 
 
 def _require_macos() -> None:
@@ -191,20 +210,52 @@ def _wait_until_unloaded(
     return True
 
 
+def _wait_for_pid(
+    label: str = LABEL,
+    uid: int | None = None,
+    timeout: float = 3.0,
+) -> int | None:
+    """The job's pid once launchd has spawned it, or None if it has not by
+    ``timeout``. bootstrap returns before the process exists, so a plain
+    status read right after it would report a healthy job as absent."""
+    deadline = time.monotonic() + timeout
+    while True:
+        pid = status(label, uid)["pid"]
+        if pid or time.monotonic() >= deadline:
+            return pid
+        time.sleep(0.2)
+
+
 def is_loaded(label: str = LABEL, uid: int | None = None) -> bool:
     """Whether launchd currently knows about the service."""
     return _launchctl("print", service_target(label, uid)).returncode == 0
 
 
 def status(label: str = LABEL, uid: int | None = None, home: Path | None = None) -> dict:
-    """Installed / loaded / running state, plus the pid when there is one."""
+    """Installed / loaded / running state, plus the pid when there is one.
+
+    ``program`` is the argv launchd loaded for the job (its ``arguments``),
+    which can differ from the plist on disk: launchd keeps the definition it
+    loaded. None when not loaded or not reported.
+    """
     _require_macos()
     printed = _launchctl("print", service_target(label, uid))
     loaded = printed.returncode == 0
     state: str | None = None
     pid: int | None = None
+    arguments: list[str] | None = None
+    collecting: list[str] | None = None
     if loaded:
         for line in printed.stdout.splitlines():
+            if collecting is not None:
+                # The job's `arguments = {` block: one argument per deeper line.
+                if line.startswith("\t\t"):
+                    collecting.append(line.strip())
+                    continue
+                if line.strip() == "}":
+                    arguments, collecting = collecting, None
+                    continue
+                collecting = None  # malformed: leave the program unknown
             # `launchctl print` nests sub-dictionaries — pid-local endpoints,
             # inherited environment — and those repeat keys the job itself
             # uses, `state` among them. The job's own fields are the ones at a
@@ -218,12 +269,15 @@ def status(label: str = LABEL, uid: int | None = None, home: Path | None = None)
                 raw = stripped.removeprefix("pid = ").strip()
                 if raw.isdigit():
                     pid = int(raw)
+            elif arguments is None and stripped == "arguments = {":
+                collecting = []
     return {
         "label": label,
         "installed": plist_path(label, home).exists(),
         "loaded": loaded,
         "state": state,
         "pid": pid,
+        "program": arguments or None,
         "plist": str(plist_path(label, home)),
     }
 
@@ -309,3 +363,265 @@ def uninstall(
         raise ClaudeSwitchError(f"Could not remove the launch agent: {e}") from e
 
     return {"label": label, "was_loaded": was_loaded, "removed_plist": existed}
+
+
+def runs_as_login_item() -> bool:
+    """Whether this process is the menu bar LaunchAgent itself.
+
+    launchd puts the job's label in ``XPC_SERVICE_NAME``; a copy opened from
+    Finder, Spotlight or a terminal has none (or another one).
+    """
+    return os.environ.get("XPC_SERVICE_NAME") == LABEL
+
+
+def login_item_enabled(home: Path | None = None) -> bool:
+    """Whether OpenSwap opens at login.
+
+    The plist on disk is the setting (plan 020, Decision 1), so ``setup``,
+    ``uninstall``, ``brew uninstall`` and the app's toggle always agree.
+    """
+    return plist_path(LABEL, home).exists()
+
+
+def login_item_runs_this(home: Path | None = None) -> bool:
+    """Whether the login item runs this copy (``resolve_program()``).
+
+    Only then may a copy hand over to it: a plist for another copy of the app
+    (the cask's, while a dev build runs) must not be started from this one.
+    """
+    return bundle._plist_program(plist_path(LABEL, home)) == [*resolve_program(), "menubar"]
+
+
+def login_item_status_path(backup_dir: Path | None = None) -> Path:
+    if backup_dir is None:
+        from openswap.paths import get_backup_root
+
+        backup_dir = get_backup_root()
+    return Path(backup_dir) / STATUS_FILENAME
+
+
+def last_start_failure(backup_dir: Path | None = None) -> dict | None:
+    """``{"failed_at": epoch seconds, "detail": str}`` for the last start of
+    the login item that failed, or None when the last one worked."""
+    try:
+        data = json.loads(login_item_status_path(backup_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("failed_at"), (int, float)):
+        return None
+    return data
+
+
+def clear_start_failure(backup_dir: Path | None = None) -> None:
+    try:
+        login_item_status_path(backup_dir).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _record_start_failure(detail: str, backup_dir: Path | None = None) -> None:
+    path = login_item_status_path(backup_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"failed_at": time.time(), "detail": detail}) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _launchctl_failure(verb: str, result: subprocess.CompletedProcess) -> str:
+    detail = (result.stderr or result.stdout or "").strip()
+    return f"launchctl {verb} failed (exit {result.returncode})" + (f": {detail}" if detail else "")
+
+
+def _started_pid(result: subprocess.CompletedProcess, uid: int | None) -> int | None:
+    if result.returncode != 0:
+        return None
+    return _wait_for_pid(LABEL, uid, timeout=_HANDOFF_PID_TIMEOUT_SECONDS)
+
+
+def _loaded_runs_plist(state: dict, home: Path | None) -> bool | None:
+    """Whether the definition launchd loaded runs what the plist says: True,
+    False, or None when ``launchctl print`` did not report its arguments."""
+    if not state.get("program"):
+        return None
+    return state["program"] == bundle._plist_program(plist_path(LABEL, home))
+
+
+def running_login_item_pid(*, home: Path | None = None, uid: int | None = None) -> int | None:
+    """The login item's pid while it runs (it may still be starting), only
+    when launchd loaded it with the program the plist names. Another or an
+    unreported program could be an old executable still running under the
+    label, and handing over to it would hand over to the old program."""
+    _require_macos()
+    state = status(LABEL, uid, home)
+    if state["pid"] and _loaded_runs_plist(state, home) is True:
+        return state["pid"]
+    return None
+
+
+def start_login_item(
+    *,
+    home: Path | None = None,
+    uid: int | None = None,
+    backup_dir: Path | None = None,
+) -> int | None:
+    """Start the login item and return launchd's pid, or None if it would not start.
+
+    A running or loaded job is used only when its loaded program matches the
+    plist's ``ProgramArguments``: a running one is left alone and an idle one
+    kickstarted. launchd keeps the definition it loaded, and
+    ``set_login_item`` or the migration may have changed the plist under it,
+    so a kickstart would start the old program, and a running pid could be
+    the old executable. When they differ, or ``launchctl print`` does not
+    say, the job is booted out (it is not this process), waited for, and the
+    plist bootstrapped, as ``install`` does. A job that is not loaded is
+    bootstrapped.
+
+    The job may still be unloading: the start-up migration
+    (``bundle._repoint_menubar_agent``) boots out a uv extra just before
+    this runs. So when that first start fails or no pid appears, it waits
+    for the job to unload and bootstraps the plist once more.
+
+    A start that still fails is recorded in ``login_item_status.json``
+    (:func:`last_start_failure`) for Settings to show, and a job left loaded
+    without a process is booted out again, so a late start cannot wait behind
+    this copy's menu bar lock and be relaunched by ``KeepAlive`` every time
+    it gives up; the plist stays for the next login. A start that works
+    clears the record. Never call it from the job itself.
+    """
+    _require_macos()
+    state = status(LABEL, uid, home)
+    current = _loaded_runs_plist(state, home) is True
+    if state["pid"] and current:
+        clear_start_failure(backup_dir)
+        return state["pid"]
+    target_plist = str(plist_path(LABEL, home))
+    if state["loaded"] and current:
+        verb, first = "kickstart", _launchctl("kickstart", service_target(LABEL, uid))
+    else:
+        if state["loaded"]:
+            _launchctl("bootout", service_target(LABEL, uid))
+            _wait_until_unloaded(LABEL, uid)
+        verb, first = "bootstrap", _launchctl("bootstrap", domain_target(uid), target_plist)
+    pid = _started_pid(first, uid)
+    if pid is None:
+        failures = [
+            _launchctl_failure(verb, first) if first.returncode else f"no process after launchctl {verb}"
+        ]
+        _wait_until_unloaded(LABEL, uid)
+        retry = _launchctl("bootstrap", domain_target(uid), target_plist)
+        pid = _started_pid(retry, uid)
+        if pid is None:
+            failures.append(
+                _launchctl_failure("bootstrap", retry) if retry.returncode else "no process after launchctl bootstrap"
+            )
+            if is_loaded(LABEL, uid):
+                _launchctl("bootout", service_target(LABEL, uid))
+            _record_start_failure("; then ".join(failures), backup_dir)
+            return None
+    clear_start_failure(backup_dir)
+    return pid
+
+
+def unload_own_job(*, home: Path | None = None, uid: int | None = None) -> bool:
+    """From the launchd job on its way out, after Open at login was turned off.
+
+    Turning login off from the job only deletes the plist, so the job stays
+    loaded, and the cask's ``kickstart -k`` would revive it behind another
+    copy. This starts ``launchctl bootout`` for the job as a detached process
+    (a new session, so launchd stopping the job's process group does not take
+    it along) and returns at once; the caller exits right after. It does
+    nothing (False) unless this process is the job and its plist is gone, so a
+    plain Quit with login on keeps the job loaded for the next login.
+    """
+    if sys.platform != "darwin" or not runs_as_login_item():
+        return False
+    if plist_path(LABEL, home).exists():
+        return False
+    try:
+        subprocess.Popen(
+            ["launchctl", "bootout", service_target(LABEL, uid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    return True
+
+
+def set_login_item(
+    enabled: bool,
+    *,
+    home: Path | None = None,
+    uid: int | None = None,
+    backup_dir: Path | None = None,
+) -> str:
+    """Turn Open at login on or off from a running extra.
+
+    Returns what happened, for the app to say:
+
+    - ``"unchanged"``: it already was that way.
+    - ``"enabled"``: the login item now runs this program. Only from the
+      launchd job itself, which is already the copy that should run.
+    - ``"handoff"``: launchd's copy is up; the caller should quit so it can
+      take the menu bar lock.
+    - ``"disabled"``: the job is gone and does not start at the next login.
+    - ``"disabled_after_quit"``: from the job itself; this copy keeps running
+      until Quit (which calls :func:`unload_own_job`) or logout, and does not
+      come back at the next login.
+
+    It never boots out the calling process: the job only rewrites or deletes
+    its plist, and only another copy talks to launchctl. ``install`` and
+    ``uninstall`` stay the CLI's, which never runs inside the extra.
+
+    Raises ClaudeSwitchError from a translocated or mounted copy, from a uv
+    install beside the cask, and when launchctl fails. ``LoginItemNotStarted``
+    means launchd did not start the job this wrote; ``start_login_item`` has
+    recorded why (:func:`last_start_failure`).
+    """
+    _require_macos()
+    if bundle.runs_from_temporary_location():
+        raise ClaudeSwitchError(MOVE_TO_APPLICATIONS)
+    target_plist = plist_path(LABEL, home)
+    is_job = runs_as_login_item()
+
+    if not enabled:
+        if is_job:
+            if not target_plist.exists():
+                return "unchanged"
+            try:
+                target_plist.unlink(missing_ok=True)
+            except OSError as e:
+                raise ClaudeSwitchError(f"Could not remove the launch agent: {e}") from e
+            return "disabled_after_quit"
+        if not target_plist.exists() and not is_loaded(LABEL, uid):
+            return "unchanged"
+        uninstall(LABEL, home=home, uid=uid)
+        return "disabled"
+
+    bundle.refuse_uv_beside_cask("open at login")
+    program = resolve_program()
+    stale = bundle._plist_program(target_plist) != [*program, "menubar"]
+    if stale:
+        out_log, _err_log = log_paths(LABEL, home)
+        try:
+            target_plist.parent.mkdir(parents=True, exist_ok=True)
+            out_log.parent.mkdir(parents=True, exist_ok=True)
+            target_plist.write_bytes(build_plist(program, LABEL, home))
+        except OSError as e:
+            raise ClaudeSwitchError(f"Could not write the launch agent: {e}") from e
+    if is_job:
+        # launchd already runs this copy; the plist is read again at login.
+        return "enabled" if stale else "unchanged"
+
+    # Another copy: launchd's copy is the one that should run, so start it
+    # and hand over. The job waits for this copy's menu bar lock. A job still
+    # loaded from a plist this replaced is reloaded, not kickstarted.
+    if start_login_item(home=home, uid=uid, backup_dir=backup_dir) is None:
+        failure = last_start_failure(backup_dir) or {}
+        raise LoginItemNotStarted(failure.get("detail") or "launchd did not start OpenSwap")
+    return "handoff"

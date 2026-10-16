@@ -141,11 +141,43 @@ def test_uv_login_item_is_repointed_at_the_bundle(mac):
 def test_opened_from_finder_stops_the_uv_extra_without_starting_another(mac, monkeypatch):
     """This process is already the extra; bootstrapping would run a second one."""
     _menubar_plist(mac["home"], UV_SCRIPT)
-    monkeypatch.setattr(launch_agent, "is_loaded", lambda label=launch_agent.LABEL, uid=None: label == launch_agent.LABEL)
+    loaded = {"checks_after_bootout": None}
+
+    def is_loaded(label=launch_agent.LABEL, uid=None):
+        if label != launch_agent.LABEL:
+            return False
+        if ["bootout", f"gui/{UID}/{launch_agent.LABEL}"] not in mac["seen"]["launchctl"]:
+            return True
+        # launchd lists the job for two more looks while it tears it down.
+        n = loaded["checks_after_bootout"] = (loaded["checks_after_bootout"] or 0) + 1
+        return n <= 2
+
+    monkeypatch.setattr(launch_agent, "is_loaded", is_loaded)
+    monkeypatch.setattr(launch_agent.time, "sleep", lambda _s: None)
     assert _migrate(mac) == ["menubar plist"]
     assert ["bootout", f"gui/{UID}/{launch_agent.LABEL}"] in mac["seen"]["launchctl"]
     assert _bootstraps(mac) == []
     assert _program(launch_agent.plist_path(home=mac["home"])) == str(mac["exe"])
+    # It waited for the teardown: a hand-over to the login item can follow
+    # at once (menubar_instance), and must not race a half-unloaded job.
+    assert loaded["checks_after_bootout"] == 3
+
+
+def test_a_uv_extra_that_will_not_stop_keeps_its_plist(mac, monkeypatch):
+    """Rewritten while the uv extra is still running, the plist would let the
+    start-up hand-over take that extra's pid for the app's and quit; once
+    the bootout landed nothing would be running."""
+    plist = _menubar_plist(mac["home"], UV_SCRIPT)
+    monkeypatch.setattr(launch_agent, "is_loaded", lambda label=launch_agent.LABEL, uid=None: label == launch_agent.LABEL)
+    clock = [0.0]
+    monkeypatch.setattr(launch_agent.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(launch_agent.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    notes: list[str] = []
+    assert "menubar plist" not in _migrate(mac, notes)
+    assert ["bootout", f"gui/{UID}/{launch_agent.LABEL}"] in mac["seen"]["launchctl"]
+    assert _program(plist) == UV_SCRIPT
+    assert any("menu bar login item" in note and "still stopping" in note for note in notes)
+    assert launch_agent.login_item_runs_this(home=mac["home"]) is False
 
 
 def test_login_item_already_on_the_bundle_is_left_alone(mac):

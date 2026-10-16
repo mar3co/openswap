@@ -23,6 +23,7 @@ from openswap.exceptions import ClaudeSwitchError
 
 PROGRAM = ["/Users/x/.local/bin/openswap"]
 UID = 501
+_RUNS_FROM_TEMPORARY_LOCATION = launch_agent.bundle.runs_from_temporary_location
 
 
 @pytest.fixture(autouse=True)
@@ -455,8 +456,546 @@ def test_status_keeps_multi_word_launchd_states(tmp_path):
     assert result["state"] == "spawn scheduled"
 
 
+def test_status_reads_the_loaded_programs_arguments(tmp_path):
+    printed = (
+        "gui/501/com.opensoft.openswap.menubar = {\n"
+        "\tactive count = 0\n"
+        "\tpath = /Users/x/Library/LaunchAgents/com.opensoft.openswap.menubar.plist\n"
+        "\tstate = not running\n"
+        "\n"
+        "\tprogram = /Applications/OpenSwap.app/Contents/MacOS/OpenSwap\n"
+        "\targuments = {\n"
+        "\t\t/Applications/OpenSwap.app/Contents/MacOS/OpenSwap\n"
+        "\t\tmenubar\n"
+        "\t}\n"
+        "\n"
+        "\tenvironment = {\n"
+        "\t\tPATH => /usr/bin:/bin\n"
+        "\t}\n"
+        "}\n"
+    )
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(0, stdout=printed)})
+        result = launch_agent.status(home=tmp_path, uid=UID)
+    assert result["program"] == ["/Applications/OpenSwap.app/Contents/MacOS/OpenSwap", "menubar"]
+    assert result["state"] == "not running"
+
+
+def test_status_leaves_the_program_unknown_without_an_arguments_block(tmp_path):
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(0, stdout="\tstate = running\n\tpid = 12\n")})
+        assert launch_agent.status(home=tmp_path, uid=UID)["program"] is None
+        run.side_effect = _router({"print": _completed(1)})
+        assert launch_agent.status(home=tmp_path, uid=UID)["program"] is None
+
+
 def test_status_ignores_a_non_numeric_pid_line(tmp_path):
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout="\tpid = (none)\n")})
         result = launch_agent.status(home=tmp_path, uid=UID)
     assert result["pid"] is None
+
+
+# --- waiting for launchd's pid ---------------------------------------------
+
+
+def test_wait_for_pid_returns_pid_once_launchd_spawned_it(tmp_path):
+    answers = iter([None, None, 77])
+    with patch.object(launch_agent, "status", lambda label, uid=None: {"pid": next(answers)}):
+        with patch.object(launch_agent.time, "sleep"):
+            assert launch_agent._wait_for_pid("x", UID, timeout=5.0) == 77
+
+
+def test_wait_for_pid_gives_up_at_the_deadline(tmp_path):
+    with patch.object(launch_agent, "status", lambda label, uid=None: {"pid": None}):
+        assert launch_agent._wait_for_pid("x", UID, timeout=0.0) is None
+
+
+# --- Open at login from a running extra (plan 020, Step 2) -----------------
+
+
+class FakeLaunchd:
+    """Answers launchctl for the one menu bar job the way launchd would, and
+    records each call's arguments."""
+
+    def __init__(self, *, loaded=False, pid=None, bootstrap_rc=0, spawns=True):
+        self.loaded = loaded
+        self.pid = pid
+        self.bootstrap_rc = bootstrap_rc
+        self.kickstart_rc = 0
+        self.spawns = spawns
+        # How many more `print`s still see the job after a bootout (launchd
+        # finishing the teardown).
+        self.unloading = 0
+        # The argv launchd loaded, as `launchctl print` reports it; set from
+        # the plist at bootstrap. None prints no `arguments` block.
+        self.loaded_program: list[str] | None = None
+        self.calls: list[list[str]] = []
+        self.data = Path()
+
+    def __call__(self, argv, **kwargs):
+        assert argv[0] == "launchctl"
+        self.calls.append(argv[1:])
+        sub = argv[1]
+        if sub == "print":
+            if self.unloading:
+                self.unloading -= 1
+                return _completed(0, stdout="\tstate = exited\n")
+            if not self.loaded:
+                return _completed(113, stderr="Could not find service")
+            pid_line = f"\tpid = {self.pid}\n" if self.pid else ""
+            program = ""
+            if self.loaded_program:
+                program = (
+                    f"\tprogram = {self.loaded_program[0]}\n\targuments = {{\n"
+                    + "".join(f"\t\t{arg}\n" for arg in self.loaded_program)
+                    + "\t}\n"
+                )
+            return _completed(0, stdout=f"\tstate = running\n{program}{pid_line}")
+        if sub == "bootout":
+            self.loaded, self.pid, self.loaded_program = False, None, None
+        elif sub == "bootstrap":
+            if self.bootstrap_rc:
+                return _completed(self.bootstrap_rc, stderr="Bootstrap failed: 5: Input/output error")
+            self.loaded = True
+            self.loaded_program = plistlib.loads(Path(argv[3]).read_bytes())["ProgramArguments"]
+            self.pid = 4242 if self.spawns else None
+        elif sub == "kickstart":
+            if not self.loaded or self.kickstart_rc:
+                return _completed(self.kickstart_rc or 113, stderr="Could not find service")
+            self.pid = self.pid or (4242 if self.spawns else None)
+        return _completed(0)
+
+    @property
+    def subcommands(self) -> list[str]:
+        return [call[0] for call in self.calls]
+
+
+@pytest.fixture
+def launchd(monkeypatch, tmp_path):
+    """A Finder-opened copy of a uv install, no cask, launchd faked."""
+    fake = FakeLaunchd()
+    fake.data = tmp_path / "data"
+    monkeypatch.setattr("openswap.paths.get_backup_root", lambda: fake.data)
+    monkeypatch.setattr(launch_agent.subprocess, "run", fake)
+    monkeypatch.setattr(launch_agent, "resolve_program", lambda: list(PROGRAM))
+    monkeypatch.setattr(launch_agent.bundle, "runs_from_temporary_location", lambda app=None: False)
+    monkeypatch.setattr(launch_agent.bundle, "cask_prefix", lambda: None)
+    # A clock that moves only when the code sleeps: every wait is instant
+    # and still reaches its deadline.
+    clock = [1000.0]
+    monkeypatch.setattr(launch_agent.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(launch_agent.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    return fake
+
+
+def _as_the_login_item(monkeypatch):
+    monkeypatch.setenv("XPC_SERVICE_NAME", launch_agent.LABEL)
+
+
+def _write_plist(home: Path, program: list[str]) -> Path:
+    path = launch_agent.plist_path(home=home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(launch_agent.build_plist(program, home=home))
+    return path
+
+
+def _plist_program(home: Path) -> list[str]:
+    return plistlib.loads(launch_agent.plist_path(home=home).read_bytes())["ProgramArguments"]
+
+
+def test_login_item_enabled_is_whether_the_plist_exists(tmp_path):
+    assert launch_agent.login_item_enabled(home=tmp_path) is False
+    _write_plist(tmp_path, PROGRAM)
+    assert launch_agent.login_item_enabled(home=tmp_path) is True
+
+
+def test_runs_as_login_item_reads_launchds_service_name(monkeypatch):
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    assert launch_agent.runs_as_login_item() is False
+    monkeypatch.setenv("XPC_SERVICE_NAME", "application.com.apple.Terminal.1234")
+    assert launch_agent.runs_as_login_item() is False
+    monkeypatch.setenv("XPC_SERVICE_NAME", launch_agent.LABEL)
+    assert launch_agent.runs_as_login_item() is True
+
+
+def test_job_turning_on_writes_a_missing_plist_without_launchctl(launchd, monkeypatch, tmp_path):
+    _as_the_login_item(monkeypatch)
+    assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "enabled"
+    assert _plist_program(tmp_path) == [*PROGRAM, "menubar"]
+    assert launchd.calls == []
+
+
+def test_job_turning_on_repoints_a_plist_that_runs_another_program(launchd, monkeypatch, tmp_path):
+    _as_the_login_item(monkeypatch)
+    _write_plist(tmp_path, ["/Users/x/old/openswap"])
+    assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "enabled"
+    assert _plist_program(tmp_path) == [*PROGRAM, "menubar"]
+    assert launchd.calls == []
+
+
+def test_job_turning_on_leaves_a_plist_that_already_runs_it(launchd, monkeypatch, tmp_path):
+    _as_the_login_item(monkeypatch)
+    path = _write_plist(tmp_path, PROGRAM)
+    before = path.stat().st_mtime_ns
+    assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "unchanged"
+    assert path.stat().st_mtime_ns == before
+    assert launchd.calls == []
+
+
+def test_job_turning_off_deletes_the_plist_and_keeps_running(launchd, monkeypatch, tmp_path):
+    """Booting out the job would SIGTERM this very process (a STOP condition)."""
+    _as_the_login_item(monkeypatch)
+    launchd.loaded, launchd.pid = True, os.getpid()
+    _write_plist(tmp_path, PROGRAM)
+    assert launch_agent.set_login_item(False, home=tmp_path, uid=UID) == "disabled_after_quit"
+    assert not launch_agent.plist_path(home=tmp_path).exists()
+    assert launchd.calls == []
+
+
+def test_job_turning_off_without_a_plist_is_unchanged(launchd, monkeypatch, tmp_path):
+    _as_the_login_item(monkeypatch)
+    launchd.loaded = True
+    assert launch_agent.set_login_item(False, home=tmp_path, uid=UID) == "unchanged"
+    assert launchd.calls == []
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("plist_program", [None, PROGRAM, ["/Users/x/old/openswap"]])
+def test_the_job_never_boots_itself_out(launchd, monkeypatch, tmp_path, enabled, plist_program):
+    _as_the_login_item(monkeypatch)
+    launchd.loaded, launchd.pid = True, os.getpid()
+    if plist_program is not None:
+        _write_plist(tmp_path, plist_program)
+    launch_agent.set_login_item(enabled, home=tmp_path, uid=UID)
+    assert "bootout" not in launchd.subcommands
+    assert "bootstrap" not in launchd.subcommands
+
+
+def test_other_copy_turning_on_hands_over_to_launchd(launchd, tmp_path):
+    assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "handoff"
+    plist = launch_agent.plist_path(home=tmp_path)
+    assert _plist_program(tmp_path) == [*PROGRAM, "menubar"]
+    assert ["bootstrap", f"gui/{UID}", str(plist)] in launchd.calls
+    assert "bootout" not in launchd.subcommands
+    # It returned only once launchd had a pid, so the caller can quit.
+    assert launchd.subcommands[-1] == "print"
+    assert launchd.pid == 4242
+
+
+def test_other_copy_turning_on_restarts_a_loaded_job_from_the_new_plist(launchd, tmp_path):
+    # Loaded from the old plist, a kickstart would start the old program.
+    launchd.loaded = True
+    _write_plist(tmp_path, ["/Users/x/old/openswap"])
+    assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "handoff"
+    assert _plist_program(tmp_path) == [*PROGRAM, "menubar"]
+    assert launchd.subcommands.index("bootout") < launchd.subcommands.index("bootstrap")
+    assert "kickstart" not in launchd.subcommands
+
+
+def test_other_copy_turning_on_kickstarts_an_idle_job_that_already_runs_it(launchd, tmp_path):
+    # Loaded but not running: the user quit it (a clean exit is not restarted).
+    launchd.loaded, launchd.loaded_program = True, [*PROGRAM, "menubar"]
+    _write_plist(tmp_path, PROGRAM)
+    assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "handoff"
+    assert ["kickstart", f"gui/{UID}/{launch_agent.LABEL}"] in launchd.calls
+    assert "bootout" not in launchd.subcommands
+    assert "bootstrap" not in launchd.subcommands
+
+
+def test_other_copy_turning_on_while_the_job_waits_for_the_lock(launchd, tmp_path):
+    launchd.loaded, launchd.pid, launchd.loaded_program = True, 999, [*PROGRAM, "menubar"]
+    _write_plist(tmp_path, PROGRAM)
+    assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "handoff"
+    assert set(launchd.subcommands) == {"print"}
+
+
+def test_other_copy_turning_on_reports_a_failed_bootstrap(launchd, tmp_path):
+    launchd.bootstrap_rc = 5
+    with pytest.raises(launch_agent.LoginItemNotStarted, match="Input/output error") as raised:
+        launch_agent.set_login_item(True, home=tmp_path, uid=UID)
+    assert isinstance(raised.value, ClaudeSwitchError)
+    # Settings reads the same reason back.
+    assert "Input/output error" in launch_agent.last_start_failure()["detail"]
+
+
+def test_other_copy_turning_on_stops_a_job_that_never_started(launchd, monkeypatch, tmp_path):
+    """Left loaded, a late start would wait on this copy's lock, exit 1, and
+    be relaunched by KeepAlive for as long as this copy runs."""
+    monkeypatch.setattr(launch_agent, "_HANDOFF_PID_TIMEOUT_SECONDS", 0.0)
+    launchd.spawns = False
+    with pytest.raises(launch_agent.LoginItemNotStarted, match="no process"):
+        launch_agent.set_login_item(True, home=tmp_path, uid=UID)
+    assert "bootstrap" in launchd.subcommands
+    assert launchd.subcommands[-1] == "bootout"
+    assert launchd.loaded is False
+
+
+def test_other_copy_turning_off_boots_out_the_job_and_deletes_the_plist(launchd, tmp_path):
+    launchd.loaded = True
+    _write_plist(tmp_path, PROGRAM)
+    assert launch_agent.set_login_item(False, home=tmp_path, uid=UID) == "disabled"
+    assert ["bootout", f"gui/{UID}/{launch_agent.LABEL}"] in launchd.calls
+    assert not launch_agent.plist_path(home=tmp_path).exists()
+
+
+def test_other_copy_turning_off_a_plist_that_was_never_loaded(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    assert launch_agent.set_login_item(False, home=tmp_path, uid=UID) == "disabled"
+    assert "bootout" not in launchd.subcommands
+    assert not launch_agent.plist_path(home=tmp_path).exists()
+
+
+def test_other_copy_turning_off_with_nothing_installed_is_unchanged(launchd, tmp_path):
+    assert launch_agent.set_login_item(False, home=tmp_path, uid=UID) == "unchanged"
+    assert "bootout" not in launchd.subcommands
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("as_job", [True, False])
+def test_set_login_item_refuses_a_translocated_or_mounted_copy(
+    launchd, monkeypatch, tmp_path, enabled, as_job
+):
+    if as_job:
+        _as_the_login_item(monkeypatch)
+    monkeypatch.setattr(launch_agent.bundle, "runs_from_temporary_location", lambda app=None: True)
+    plist = _write_plist(tmp_path, PROGRAM) if not enabled else launch_agent.plist_path(home=tmp_path)
+    with pytest.raises(ClaudeSwitchError, match="Move OpenSwap to Applications first"):
+        launch_agent.set_login_item(enabled, home=tmp_path, uid=UID)
+    assert plist.exists() is (not enabled)
+    assert launchd.calls == []
+
+
+def test_temporary_location_is_read_from_the_running_bundle(launchd, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        launch_agent.bundle, "runs_from_temporary_location", _RUNS_FROM_TEMPORARY_LOCATION
+    )
+    translocated = Path("/private/var/folders/xy/T/AppTranslocation/ABC/d/OpenSwap.app")
+    monkeypatch.setattr(launch_agent.bundle, "app_path", lambda: translocated)
+    with pytest.raises(ClaudeSwitchError, match="Move OpenSwap to Applications first"):
+        launch_agent.set_login_item(True, home=tmp_path, uid=UID)
+    assert launchd.calls == []
+
+
+def test_a_uv_copy_beside_the_cask_will_not_turn_login_on(launchd, monkeypatch, tmp_path):
+    # It would pin the login item back to uv (bundle.refuse_uv_beside_cask).
+    monkeypatch.setattr(launch_agent.bundle, "cask_prefix", lambda: Path("/opt/homebrew"))
+    with pytest.raises(ClaudeSwitchError, match="uv install will not open at login"):
+        launch_agent.set_login_item(True, home=tmp_path, uid=UID)
+    assert not launch_agent.plist_path(home=tmp_path).exists()
+    assert launchd.calls == []
+
+
+def test_set_login_item_refuses_off_macos(tmp_path):
+    with patch.object(launch_agent.sys, "platform", "linux"):
+        with pytest.raises(ClaudeSwitchError, match="only available on macOS"):
+            launch_agent.set_login_item(True, home=tmp_path, uid=UID)
+
+
+# --- handing over to the login item (plan 020, Steps 1 and 2) ---------------
+
+
+def test_login_item_runs_this_compares_the_plists_program(launchd, tmp_path):
+    assert launch_agent.login_item_runs_this(home=tmp_path) is False
+    _write_plist(tmp_path, ["/Applications/Other.app/Contents/MacOS/OpenSwap"])
+    assert launch_agent.login_item_runs_this(home=tmp_path) is False
+    _write_plist(tmp_path, PROGRAM)
+    assert launch_agent.login_item_runs_this(home=tmp_path) is True
+
+
+def test_start_login_item_leaves_a_running_job_alone(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.pid, launchd.loaded_program = True, 999, [*PROGRAM, "menubar"]
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 999
+    assert launchd.subcommands == ["print"]
+
+
+def test_start_login_item_kickstarts_a_loaded_idle_job_that_runs_the_plist(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.loaded_program = True, [*PROGRAM, "menubar"]
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    assert ["kickstart", f"gui/{UID}/{launch_agent.LABEL}"] in launchd.calls
+    assert "bootstrap" not in launchd.subcommands
+    assert "bootout" not in launchd.subcommands
+
+
+def test_start_login_item_reloads_a_job_loaded_with_another_program(launchd, tmp_path):
+    """launchd keeps the definition it loaded: a kickstart would start the old one."""
+    plist = _write_plist(tmp_path, PROGRAM)
+    launchd.loaded = True
+    launchd.loaded_program = ["/Applications/Old.app/Contents/MacOS/OpenSwap", "menubar"]
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    subs = launchd.subcommands
+    assert "kickstart" not in subs
+    assert subs.index("bootout") < subs.index("bootstrap")
+    assert ["bootstrap", f"gui/{UID}", str(plist)] in launchd.calls
+    assert launchd.loaded_program == [*PROGRAM, "menubar"]
+
+
+def test_start_login_item_reloads_a_job_whose_program_it_cannot_read(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.loaded_program = True, None  # print without `arguments`
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    assert "kickstart" not in launchd.subcommands
+    assert launchd.subcommands.index("bootout") < launchd.subcommands.index("bootstrap")
+    assert launchd.loaded_program == [*PROGRAM, "menubar"]
+
+
+def test_start_login_item_replaces_a_starting_job_that_runs_another_program(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.pid = True, 999
+    launchd.loaded_program = ["/Applications/Old.app/Contents/MacOS/OpenSwap", "menubar"]
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    assert launchd.loaded_program == [*PROGRAM, "menubar"]
+    assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) == 4242
+
+
+def test_running_login_item_pid_ignores_a_job_loaded_with_another_program(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.pid = True, 999
+    launchd.loaded_program = ["/Applications/Old.app/Contents/MacOS/OpenSwap", "menubar"]
+    assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) is None
+    launchd.loaded_program = [*PROGRAM, "menubar"]
+    assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) == 999
+    launchd.loaded_program = None  # cannot tell: it may be the old executable
+    assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) is None
+
+
+def test_start_login_item_reloads_a_running_job_whose_program_it_cannot_read(launchd, tmp_path):
+    """The pid could belong to an executable loaded before the plist changed."""
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.pid, launchd.loaded_program = True, 999, None
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    assert launchd.subcommands.index("bootout") < launchd.subcommands.index("bootstrap")
+    assert launchd.loaded_program == [*PROGRAM, "menubar"]
+
+
+def test_turning_on_over_another_copys_loaded_plist_hands_over_to_the_new_program(launchd, tmp_path):
+    """The cask's app is loaded but stopped; this copy takes the login item over."""
+    other = ["/Applications/OpenSwap.app/Contents/MacOS/OpenSwap"]
+    _write_plist(tmp_path, other)
+    launchd.loaded, launchd.loaded_program = True, [*other, "menubar"]
+    assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "handoff"
+    assert "kickstart" not in launchd.subcommands
+    assert launchd.loaded_program == [*PROGRAM, "menubar"]
+    assert _plist_program(tmp_path) == [*PROGRAM, "menubar"]
+
+
+def test_start_login_item_bootstraps_a_plist_launchd_does_not_know(launchd, tmp_path):
+    plist = _write_plist(tmp_path, PROGRAM)
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    assert ["bootstrap", f"gui/{UID}", str(plist)] in launchd.calls
+
+
+def test_start_login_item_records_why_launchctl_refused(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.bootstrap_rc = 5
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) is None
+    # The first bootstrap, then the one retry.
+    assert launchd.subcommands.count("bootstrap") == 2
+    failure = launch_agent.last_start_failure()
+    assert failure["detail"].startswith("launchctl bootstrap failed (exit 5)")
+    assert "; then launchctl bootstrap failed" in failure["detail"]
+    assert isinstance(failure["failed_at"], float)
+    assert launch_agent.login_item_status_path() == launchd.data / "login_item_status.json"
+
+
+def test_start_login_item_unloads_a_job_that_never_came_up(launchd, monkeypatch, tmp_path):
+    monkeypatch.setattr(launch_agent, "_HANDOFF_PID_TIMEOUT_SECONDS", 0.0)
+    plist = _write_plist(tmp_path, PROGRAM)
+    launchd.spawns = False
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) is None
+    assert launchd.subcommands[-1] == "bootout"
+    assert plist.exists()  # it still opens at the next login
+    assert "no process after launchctl bootstrap" in launch_agent.last_start_failure()["detail"]
+
+
+def test_a_kickstart_that_fails_while_the_job_unloads_falls_back_to_one_bootstrap(launchd, tmp_path):
+    """The start-up migration booted out a uv extra just before: launchd
+    still lists the job for a moment, and kickstart refuses it."""
+    plist = _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.kickstart_rc = True, 37
+    launchd.loaded_program = [*PROGRAM, "menubar"]
+
+    def bootout_in_progress(argv, **kwargs):
+        if argv[1] == "kickstart":
+            launchd.loaded, launchd.unloading = False, 2  # gone after two more looks
+        return FakeLaunchd.__call__(launchd, argv, **kwargs)
+
+    with patch.object(launch_agent.subprocess, "run", side_effect=bootout_in_progress):
+        assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    subs = launchd.subcommands
+    assert subs.index("kickstart") < subs.index("bootstrap")
+    assert subs.count("bootstrap") == 1
+    assert ["bootstrap", f"gui/{UID}", str(plist)] in launchd.calls
+    assert launch_agent.last_start_failure() is None
+
+
+def test_a_start_that_works_clears_the_recorded_failure(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launch_agent._record_start_failure("launchctl bootstrap failed (exit 5)")
+    assert launch_agent.last_start_failure() is not None
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    assert launch_agent.last_start_failure() is None
+    assert not launch_agent.login_item_status_path().exists()
+
+
+def test_a_running_job_also_clears_the_recorded_failure(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.pid, launchd.loaded_program = True, 999, [*PROGRAM, "menubar"]
+    launch_agent._record_start_failure("old")
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 999
+    assert launch_agent.last_start_failure() is None
+
+
+@pytest.mark.parametrize("text", ["", "not json", "[]", '{"detail": "no time"}'])
+def test_an_unreadable_status_file_is_no_failure(launchd, text):
+    path = launch_agent.login_item_status_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(text)
+    assert launch_agent.last_start_failure() is None
+
+
+@pytest.fixture
+def popen(monkeypatch):
+    started = []
+    monkeypatch.setattr(
+        launch_agent.subprocess, "Popen", lambda argv, **kwargs: started.append((argv, kwargs))
+    )
+    return started
+
+
+def test_unload_own_job_detaches_a_bootout_once_login_is_off(launchd, monkeypatch, popen, tmp_path):
+    _as_the_login_item(monkeypatch)
+    assert launch_agent.unload_own_job(home=tmp_path, uid=UID) is True
+    [(argv, kwargs)] = popen
+    assert argv == ["launchctl", "bootout", f"gui/{UID}/{launch_agent.LABEL}"]
+    # A new session: launchd stopping this job's process group must not
+    # take the bootout along with it.
+    assert kwargs["start_new_session"] is True
+    assert launchd.calls == []  # started, not waited for: the caller exits next
+
+
+def test_unload_own_job_keeps_the_job_loaded_while_login_is_on(launchd, monkeypatch, popen, tmp_path):
+    _as_the_login_item(monkeypatch)
+    _write_plist(tmp_path, PROGRAM)
+    assert launch_agent.unload_own_job(home=tmp_path, uid=UID) is False
+    assert popen == []
+
+
+def test_unload_own_job_does_nothing_outside_the_job(launchd, popen, tmp_path):
+    assert launch_agent.unload_own_job(home=tmp_path, uid=UID) is False
+    assert popen == []
+
+
+def test_turning_login_off_from_the_job_then_quitting_leaves_nothing_loaded(
+    launchd, monkeypatch, popen, tmp_path
+):
+    _as_the_login_item(monkeypatch)
+    launchd.loaded, launchd.pid = True, os.getpid()
+    _write_plist(tmp_path, PROGRAM)
+    assert launch_agent.set_login_item(False, home=tmp_path, uid=UID) == "disabled_after_quit"
+    assert popen == []  # the call itself never boots out this process
+    assert launch_agent.unload_own_job(home=tmp_path, uid=UID) is True
+    assert popen[0][0][:2] == ["launchctl", "bootout"]

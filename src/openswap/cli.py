@@ -1197,18 +1197,25 @@ The menu bar extra must be running so the widget has live usage numbers.
         return 1
 
 
-def _wait_for_pid(launch_agent, label: str, timeout: float = 3.0) -> int | None:
-    """The extra's pid once launchd has spawned it, or None if it has not by
-    ``timeout``. bootstrap returns before the process exists, so a plain
-    status read right after it would report a healthy job as absent."""
-    import time
+def _login_item_holds_the_lock(backup_dir, pid: int | None) -> int | None:
+    """After ``install()`` started the login item: ask an extra launchd did
+    not start (opened from Finder while Open at login was off) to step aside,
+    and wait until launchd's copy holds the menu bar lock. Returns the pid
+    holding it then: ``pid`` on success, another live pid when that extra is
+    still running, or None."""
+    if not pid:
+        return None
+    from openswap import menubar_instance
 
-    deadline = time.monotonic() + timeout
-    while True:
-        pid = launch_agent.status(label)["pid"]
-        if pid or time.monotonic() >= deadline:
-            return pid
-        time.sleep(0.2)
+    holder = menubar_instance.hand_over_from_cli(backup_dir, pid)
+    if holder != pid and holder is not None and not menubar_instance.process_alive(holder):
+        return None  # a stale pid from an extra that has since quit
+    return holder
+
+
+def _say_another_copy_runs() -> None:
+    warning("OpenSwap starts at login, but it is still running outside its login item.")
+    print(dimmed("Quit OpenSwap from the menu bar (More › Quit); the login item then takes over."))
 
 
 def _setup_command(argv: list[str]) -> int:
@@ -1264,7 +1271,8 @@ def _setup_command(argv: list[str]) -> int:
         bundle.migrate_from_uv_install(notify=migration_notes.append)
         result = launch_agent.install()
         widget_detail = restart_widget_agent()
-        pid = _wait_for_pid(launch_agent, result["label"])
+        pid = launch_agent._wait_for_pid(result["label"])
+        holder = _login_item_holds_the_lock(switcher.backup_dir, pid)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         if saved:
@@ -1283,8 +1291,10 @@ def _setup_command(argv: list[str]) -> int:
             print(dimmed(not_saved[1]))
         return 130
 
-    if pid:
+    if pid and holder == pid:
         print("OpenSwap is running in your menu bar and starts at login.")
+    elif pid and holder is not None:
+        _say_another_copy_runs()
     else:
         warning("OpenSwap will start at login, but it is not running yet.")
         print(dimmed(f"  log: {result['stderr_log']}"))
@@ -1593,6 +1603,12 @@ def _menubar_service(args) -> int:
                 "upgrade to point launchd at the new build."
             )
         )
+        from openswap.paths import get_backup_root
+
+        pid = launch_agent._wait_for_pid(result["label"])
+        holder = _login_item_holds_the_lock(get_backup_root(), pid)
+        if pid and holder is not None and holder != pid:
+            _say_another_copy_runs()
         return 0
 
     if args.uninstall_service:
