@@ -284,6 +284,9 @@ def _repoint_menubar_agent(exe: Path, home: Path, uid: int | None) -> str | None
     if os.environ.get("XPC_SERVICE_NAME") != launch_agent.LABEL:
         if launch_agent.is_loaded(launch_agent.LABEL, uid):
             launch_agent._launchctl("bootout", launch_agent.service_target(launch_agent.LABEL, uid))
+            # A hand-over to the login item may come right after this
+            # (menubar_instance): let launchd finish the teardown first.
+            launch_agent._wait_until_unloaded(launch_agent.LABEL, uid)
     plist.write_bytes(launch_agent.build_plist([str(exe)], home=home))
     return "menubar plist"
 

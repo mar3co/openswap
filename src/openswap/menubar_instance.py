@@ -11,11 +11,19 @@ before the status item exists. flock belongs to the open file description, so
 the lock lasts exactly as long as the process that holds it, and a crash can
 never leave it stale.
 
+A show request is ``<backup_root>/menubar.show-request`` plus the distributed
+notification ``com.opensoft.openswap.menubar.show``. The lock holder consumes
+the file on the notification and again once its popover and observer are
+attached at start-up, and opens the popover when the file is under 30 s old.
+The file carries the request across the moments a notification alone would
+miss: a holder that has the lock but no observer yet, or a launchd copy that
+has not started yet.
+
 A copy that gets the lock while the login item runs this program but is not
 running (after Quit: ``KeepAlive`` does not restart a clean exit) hands over
-to it: it starts the job and exits once launchd has a pid. Otherwise it would
-keep the lock, and the cask's upgrade kickstart would start a launchd copy
-that waits behind the old build.
+to it: it leaves a show request, starts the job and exits once launchd has a
+pid. Otherwise it would keep the lock, and the cask's upgrade kickstart would
+start a launchd copy that waits behind the old build.
 
 The job waits a while for the lock, because during a hand-over it starts
 while the old copy is still quitting. If it still cannot get the lock it
@@ -34,11 +42,11 @@ from openswap import launch_agent
 from openswap.locking import FileLock
 
 LOCK_FILENAME = "menubar.lock"
-SHOW_ON_START_FILENAME = "menubar.show-on-start"
+SHOW_REQUEST_FILENAME = "menubar.show-request"
 SHOW_NOTIFICATION = "com.opensoft.openswap.menubar.show"
 ALREADY_RUNNING = "OpenSwap is already running in the menu bar."
 LOGIN_ITEM_WAIT_SECONDS = 10.0
-SHOW_ON_START_MAX_AGE_SECONDS = 30.0
+SHOW_REQUEST_MAX_AGE_SECONDS = 30.0
 
 
 class AlreadyRunning(Exception):
@@ -53,8 +61,8 @@ def lock_path(backup_dir: Path) -> Path:
     return Path(backup_dir) / LOCK_FILENAME
 
 
-def show_on_start_path(backup_dir: Path) -> Path:
-    return Path(backup_dir) / SHOW_ON_START_FILENAME
+def show_request_path(backup_dir: Path) -> Path:
+    return Path(backup_dir) / SHOW_REQUEST_FILENAME
 
 
 def menubar_lock(backup_dir: Path, wait: float = 0.0) -> FileLock | None:
@@ -64,8 +72,8 @@ def menubar_lock(backup_dir: Path, wait: float = 0.0) -> FileLock | None:
     return lock if lock.acquire(timeout=wait) else None
 
 
-def post_show_request() -> None:
-    """Ask the running extra to open its popover."""
+def post_show_notification() -> None:
+    """Tell the lock holder a show request is waiting."""
     from Foundation import NSDistributedNotificationCenter
 
     # deliverImmediately: an accessory app is never active, and AppKit holds
@@ -79,7 +87,7 @@ def claim(
     backup_dir: Path,
     *,
     as_login_item: bool,
-    post: Callable[[], None] = post_show_request,
+    post: Callable[[], None] = post_show_notification,
     say: Callable[[str], object] = print,
     unload: Callable[[], bool] | None = None,
     logger=None,
@@ -90,8 +98,8 @@ def claim(
     (``launch_agent.runs_as_login_item()``): it waits up to
     ``LOGIN_ITEM_WAIT_SECONDS``, then exits 1 for ``KeepAlive`` to retry, or 0
     when ``unload`` (``launch_agent.unload_own_job``) unloaded its job because
-    Open at login is off. Any other copy does not wait: it posts the show
-    request and exits 0.
+    Open at login is off. Any other copy does not wait: it leaves a show
+    request (``post`` is the notification half) and exits 0.
 
     Returns None, and the extra runs unguarded, only when the lock file
     itself cannot be opened: a broken data folder must not cost the user
@@ -117,58 +125,72 @@ def claim(
             file=sys.stderr,
         )
         raise AlreadyRunning(1)
-    try:
-        post()
-    except Exception:
-        if logger is not None:
-            logger.warning("could not ask the running extra to show itself", exc_info=True)
+    leave_show_request(backup_dir, post=post, logger=logger)
     say(ALREADY_RUNNING)
     raise AlreadyRunning(0)
 
 
-def request_show_on_start(backup_dir: Path) -> None:
-    """Ask the next extra to start to open its popover once it can.
+def leave_show_request(
+    backup_dir: Path,
+    *,
+    post: Callable[[], None] = post_show_notification,
+    logger=None,
+) -> None:
+    """Ask the lock holder, now or once it starts, to open its popover."""
+    path = show_request_path(backup_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{time.time()}\n", encoding="utf-8")
+    except OSError:
+        if logger is not None:
+            logger.warning("could not write the show request", exc_info=True)
+    try:
+        post()
+    except Exception:
+        if logger is not None:
+            logger.warning("could not post the show request", exc_info=True)
 
-    A file, not the show notification: posted now, the notification could
-    arrive before the new copy listens.
-    """
-    path = show_on_start_path(backup_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{time.time()}\n", encoding="utf-8")
 
-
-def consume_show_on_start(backup_dir: Path, now: float | None = None) -> bool:
-    """Remove the show-on-start request; True when it is under 30 s old."""
-    path = show_on_start_path(backup_dir)
+def consume_show_request(backup_dir: Path, now: float | None = None) -> bool:
+    """Remove the show request; True when it is under 30 s old. One request
+    opens the popover once, whichever of the notification and start-up gets
+    to it first."""
+    path = show_request_path(backup_dir)
     try:
         age = (time.time() if now is None else now) - path.stat().st_mtime
     except OSError:
         return False
     try:
-        path.unlink(missing_ok=True)
+        path.unlink()
+    except FileNotFoundError:
+        return False  # the other path took it between the stat and here
     except OSError:
         pass
-    return -SHOW_ON_START_MAX_AGE_SECONDS < age < SHOW_ON_START_MAX_AGE_SECONDS
+    return -SHOW_REQUEST_MAX_AGE_SECONDS < age < SHOW_REQUEST_MAX_AGE_SECONDS
 
 
 def hand_over_to_login_item(
     backup_dir: Path,
     *,
+    post: Callable[[], None] = post_show_notification,
     say: Callable[[str], object] = print,
     logger=None,
 ) -> bool:
     """From a copy launchd did not start that holds the menu bar lock: when
-    the login item runs this program, start it and return True once launchd
-    has a pid. The caller then exits 0 and the job takes the lock.
+    the login item runs this program, leave a show request, start the job
+    and return True once launchd has a pid. The caller then exits 0 and the
+    job takes the lock. A job that is already running (starting up, or
+    waiting for this lock) is not started again.
 
     False, and this copy runs as before, when the login item is off, runs
-    another program, or did not start (logged).
+    another program, or did not start (logged, and recorded by
+    ``start_login_item`` for Settings).
     """
     try:
         if not launch_agent.login_item_runs_this():
             return False
-        request_show_on_start(backup_dir)
-        pid = launch_agent.start_login_item()
+        leave_show_request(backup_dir, post=post, logger=logger)
+        pid = launch_agent.status()["pid"] or launch_agent.start_login_item(backup_dir=backup_dir)
     except Exception:
         if logger is not None:
             logger.warning("could not hand over to the login item; running here", exc_info=True)

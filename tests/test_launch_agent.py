@@ -489,14 +489,22 @@ class FakeLaunchd:
         self.loaded = loaded
         self.pid = pid
         self.bootstrap_rc = bootstrap_rc
+        self.kickstart_rc = 0
         self.spawns = spawns
+        # How many more `print`s still see the job after a bootout (launchd
+        # finishing the teardown).
+        self.unloading = 0
         self.calls: list[list[str]] = []
+        self.data = Path()
 
     def __call__(self, argv, **kwargs):
         assert argv[0] == "launchctl"
         self.calls.append(argv[1:])
         sub = argv[1]
         if sub == "print":
+            if self.unloading:
+                self.unloading -= 1
+                return _completed(0, stdout="\tstate = exited\n")
             if not self.loaded:
                 return _completed(113, stderr="Could not find service")
             pid_line = f"\tpid = {self.pid}\n" if self.pid else ""
@@ -509,8 +517,8 @@ class FakeLaunchd:
             self.loaded = True
             self.pid = 4242 if self.spawns else None
         elif sub == "kickstart":
-            if not self.loaded:
-                return _completed(113, stderr="Could not find service")
+            if not self.loaded or self.kickstart_rc:
+                return _completed(self.kickstart_rc or 113, stderr="Could not find service")
             self.pid = self.pid or (4242 if self.spawns else None)
         return _completed(0)
 
@@ -520,14 +528,20 @@ class FakeLaunchd:
 
 
 @pytest.fixture
-def launchd(monkeypatch):
+def launchd(monkeypatch, tmp_path):
     """A Finder-opened copy of a uv install, no cask, launchd faked."""
     fake = FakeLaunchd()
+    fake.data = tmp_path / "data"
+    monkeypatch.setattr("openswap.paths.get_backup_root", lambda: fake.data)
     monkeypatch.setattr(launch_agent.subprocess, "run", fake)
     monkeypatch.setattr(launch_agent, "resolve_program", lambda: list(PROGRAM))
     monkeypatch.setattr(launch_agent.bundle, "runs_from_temporary_location", lambda app=None: False)
     monkeypatch.setattr(launch_agent.bundle, "cask_prefix", lambda: None)
-    monkeypatch.setattr(launch_agent.time, "sleep", lambda _seconds: None)
+    # A clock that moves only when the code sleeps: every wait is instant
+    # and still reaches its deadline.
+    clock = [1000.0]
+    monkeypatch.setattr(launch_agent.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(launch_agent.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
     return fake
 
@@ -658,6 +672,8 @@ def test_other_copy_turning_on_reports_a_failed_bootstrap(launchd, tmp_path):
     with pytest.raises(launch_agent.LoginItemNotStarted, match="Input/output error") as raised:
         launch_agent.set_login_item(True, home=tmp_path, uid=UID)
     assert isinstance(raised.value, ClaudeSwitchError)
+    # Settings reads the same reason back.
+    assert "Input/output error" in launch_agent.last_start_failure()["detail"]
 
 
 def test_other_copy_turning_on_stops_a_job_that_never_started(launchd, monkeypatch, tmp_path):
@@ -665,7 +681,7 @@ def test_other_copy_turning_on_stops_a_job_that_never_started(launchd, monkeypat
     be relaunched by KeepAlive for as long as this copy runs."""
     monkeypatch.setattr(launch_agent, "_HANDOFF_PID_TIMEOUT_SECONDS", 0.0)
     launchd.spawns = False
-    with pytest.raises(launch_agent.LoginItemNotStarted, match="did not start"):
+    with pytest.raises(launch_agent.LoginItemNotStarted, match="no process"):
         launch_agent.set_login_item(True, home=tmp_path, uid=UID)
     assert "bootstrap" in launchd.subcommands
     assert launchd.subcommands[-1] == "bootout"
@@ -763,11 +779,17 @@ def test_start_login_item_bootstraps_a_plist_launchd_does_not_know(launchd, tmp_
     assert ["bootstrap", f"gui/{UID}", str(plist)] in launchd.calls
 
 
-def test_start_login_item_raises_when_launchctl_refuses(launchd, tmp_path):
+def test_start_login_item_records_why_launchctl_refused(launchd, tmp_path):
     _write_plist(tmp_path, PROGRAM)
     launchd.bootstrap_rc = 5
-    with pytest.raises(launch_agent.LoginItemNotStarted, match="bootstrap failed"):
-        launch_agent.start_login_item(home=tmp_path, uid=UID)
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) is None
+    # The first bootstrap, then the one retry.
+    assert launchd.subcommands.count("bootstrap") == 2
+    failure = launch_agent.last_start_failure()
+    assert failure["detail"].startswith("launchctl bootstrap failed (exit 5)")
+    assert "; then launchctl bootstrap failed" in failure["detail"]
+    assert isinstance(failure["failed_at"], float)
+    assert launch_agent.login_item_status_path() == launchd.data / "login_item_status.json"
 
 
 def test_start_login_item_unloads_a_job_that_never_came_up(launchd, monkeypatch, tmp_path):
@@ -777,6 +799,51 @@ def test_start_login_item_unloads_a_job_that_never_came_up(launchd, monkeypatch,
     assert launch_agent.start_login_item(home=tmp_path, uid=UID) is None
     assert launchd.subcommands[-1] == "bootout"
     assert plist.exists()  # it still opens at the next login
+    assert "no process after launchctl bootstrap" in launch_agent.last_start_failure()["detail"]
+
+
+def test_a_kickstart_that_fails_while_the_job_unloads_falls_back_to_one_bootstrap(launchd, tmp_path):
+    """The start-up migration booted out a uv extra just before: launchd
+    still lists the job for a moment, and kickstart refuses it."""
+    plist = _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.kickstart_rc = True, 37
+
+    def bootout_in_progress(argv, **kwargs):
+        if argv[1] == "kickstart":
+            launchd.loaded, launchd.unloading = False, 2  # gone after two more looks
+        return FakeLaunchd.__call__(launchd, argv, **kwargs)
+
+    with patch.object(launch_agent.subprocess, "run", side_effect=bootout_in_progress):
+        assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    subs = launchd.subcommands
+    assert subs.index("kickstart") < subs.index("bootstrap")
+    assert subs.count("bootstrap") == 1
+    assert ["bootstrap", f"gui/{UID}", str(plist)] in launchd.calls
+    assert launch_agent.last_start_failure() is None
+
+
+def test_a_start_that_works_clears_the_recorded_failure(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launch_agent._record_start_failure("launchctl bootstrap failed (exit 5)")
+    assert launch_agent.last_start_failure() is not None
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    assert launch_agent.last_start_failure() is None
+    assert not launch_agent.login_item_status_path().exists()
+
+
+def test_a_running_job_also_clears_the_recorded_failure(launchd, tmp_path):
+    launchd.loaded, launchd.pid = True, 999
+    launch_agent._record_start_failure("old")
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 999
+    assert launch_agent.last_start_failure() is None
+
+
+@pytest.mark.parametrize("text", ["", "not json", "[]", '{"detail": "no time"}'])
+def test_an_unreadable_status_file_is_no_failure(launchd, text):
+    path = launch_agent.login_item_status_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(text)
+    assert launch_agent.last_start_failure() is None
 
 
 @pytest.fixture

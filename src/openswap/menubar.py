@@ -129,6 +129,9 @@ def run(switcher, codex=None) -> int:
         )
     except AlreadyRunning as e:
         return e.exit_code
+    if as_login_item:
+        # launchd started this copy, so the last failed start is history.
+        launch_agent.clear_start_failure(switcher.backup_dir)
     # The login item is the copy that should run: start it and step aside.
     if not as_login_item and hand_over_to_login_item(
         switcher.backup_dir, logger=switcher._logger
@@ -264,7 +267,7 @@ def run(switcher, codex=None) -> int:
                 from openswap.menubar_panel import handle_reopen, observe_show_requests
 
                 handle_reopen(rumps.rumps.NSApp, self.show_popover)
-                self._show_requests = observe_show_requests(SHOW_NOTIFICATION, self.show_popover)
+                self._show_requests = observe_show_requests(SHOW_NOTIFICATION, self._on_show_request)
             except Exception:
                 self.switcher._logger.warning("show-popover hooks failed", exc_info=True)
             self.rebuild_menu()
@@ -1467,13 +1470,19 @@ def run(switcher, codex=None) -> int:
                 login_item=self._login_item_state,
             )
             self._panel.attach(nsitem)
-            from openswap.menubar_instance import consume_show_on_start
-
-            # A copy that handed over to this one asked for the popover.
-            if consume_show_on_start(self.switcher.backup_dir):
-                self._show_popover_pending = True
+            # A show request left before the observer existed: another copy
+            # that lost the lock, or one that handed over to this one.
+            self._on_show_request()
             if self._show_popover_pending:
                 self._show_popover_pending = False
+                self.show_popover()
+
+        def _on_show_request(self):
+            """The show notification, and start-up: consume the show request
+            and open the popover when it is fresh (menubar_instance)."""
+            from openswap.menubar_instance import consume_show_request
+
+            if consume_show_request(self.switcher.backup_dir):
                 self.show_popover()
 
         def show_popover(self):
@@ -1637,7 +1646,7 @@ def run(switcher, codex=None) -> int:
                 self._run_guided_setup()
             elif row_id == "open_at_login":
                 self._toggle_login_item()
-            elif row_id == "open_at_login_settings":
+            elif row_id == "open_at_login_failed":
                 subprocess.run(["open", LOGIN_ITEMS_SETTINGS_URL], check=False)
                 return
             elif row_id in {
@@ -1705,6 +1714,8 @@ def run(switcher, codex=None) -> int:
                 "enabled": enabled,
                 "temporary": bundle.runs_from_temporary_location(),
                 "busy": self._login_item_busy,
+                "start_failed": launch_agent.last_start_failure(self.switcher.backup_dir) is not None,
+                "as_login_item": launch_agent.runs_as_login_item(),
             }
 
         def _toggle_login_item(self):
@@ -1737,12 +1748,13 @@ def run(switcher, codex=None) -> int:
 
             log = self.switcher._logger
             try:
-                outcome = launch_agent.set_login_item(enabled)
+                outcome = launch_agent.set_login_item(enabled, backup_dir=self.switcher.backup_dir)
                 log.info("Open at login %s: %s", "on" if enabled else "off", outcome)
                 result = {"outcome": outcome}
             except launch_agent.LoginItemNotStarted as e:
+                # Recorded in login_item_status.json; the warning row says it.
                 log.warning("Open at login: launchd did not start the login item: %s", e)
-                result = {"error": str(e), "blocked": True}
+                result = {}
             except ClaudeSwitchError as e:
                 log.warning("Open at login failed: %s", e)
                 result = {"error": str(e)}

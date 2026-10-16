@@ -31,6 +31,7 @@ functions refuse rather than half-work elsewhere.
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import shutil
@@ -63,6 +64,10 @@ _UNLOAD_POLL_SECONDS = 0.1
 _HANDOFF_PID_TIMEOUT_SECONDS = 5.0
 
 MOVE_TO_APPLICATIONS = "Move OpenSwap to Applications first."
+
+# Why the last start of the login item failed, in the data folder. Settings
+# reads it; any successful start, and the job itself at start-up, clear it.
+STATUS_FILENAME = "login_item_status.json"
 
 
 class LoginItemNotStarted(ClaudeSwitchError):
@@ -368,35 +373,103 @@ def login_item_runs_this(home: Path | None = None) -> bool:
     return bundle._plist_program(plist_path(LABEL, home)) == [*resolve_program(), "menubar"]
 
 
-def start_login_item(*, home: Path | None = None, uid: int | None = None) -> int | None:
-    """Start the login item and return launchd's pid, or None if none appeared.
+def login_item_status_path(backup_dir: Path | None = None) -> Path:
+    if backup_dir is None:
+        from openswap.paths import get_backup_root
+
+        backup_dir = get_backup_root()
+    return Path(backup_dir) / STATUS_FILENAME
+
+
+def last_start_failure(backup_dir: Path | None = None) -> dict | None:
+    """``{"failed_at": epoch seconds, "detail": str}`` for the last start of
+    the login item that failed, or None when the last one worked."""
+    try:
+        data = json.loads(login_item_status_path(backup_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("failed_at"), (int, float)):
+        return None
+    return data
+
+
+def clear_start_failure(backup_dir: Path | None = None) -> None:
+    try:
+        login_item_status_path(backup_dir).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _record_start_failure(detail: str, backup_dir: Path | None = None) -> None:
+    path = login_item_status_path(backup_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"failed_at": time.time(), "detail": detail}) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _launchctl_failure(verb: str, result: subprocess.CompletedProcess) -> str:
+    detail = (result.stderr or result.stdout or "").strip()
+    return f"launchctl {verb} failed (exit {result.returncode})" + (f": {detail}" if detail else "")
+
+
+def _started_pid(result: subprocess.CompletedProcess, uid: int | None) -> int | None:
+    if result.returncode != 0:
+        return None
+    return _wait_for_pid(LABEL, uid, timeout=_HANDOFF_PID_TIMEOUT_SECONDS)
+
+
+def start_login_item(
+    *,
+    home: Path | None = None,
+    uid: int | None = None,
+    backup_dir: Path | None = None,
+) -> int | None:
+    """Start the login item and return launchd's pid, or None if it would not start.
 
     A running job is left alone, a loaded one is kickstarted, and otherwise
-    the plist is bootstrapped. A job that does not come up in time is booted
-    out again, so a late start cannot wait behind this copy's menu bar lock
-    and be relaunched by ``KeepAlive`` every time it gives up; the plist stays
-    for the next login. Never call it from the job itself. Raises
-    LoginItemNotStarted when launchctl fails.
+    the plist is bootstrapped. The job may still be unloading: the start-up
+    migration (``bundle._repoint_menubar_agent``) boots out a uv extra just
+    before this runs. So when that first start fails or no pid appears, it
+    waits for the job to unload and bootstraps the plist once more.
+
+    A start that still fails is recorded in ``login_item_status.json``
+    (:func:`last_start_failure`) for Settings to show, and a job left loaded
+    without a process is booted out again, so a late start cannot wait behind
+    this copy's menu bar lock and be relaunched by ``KeepAlive`` every time
+    it gives up; the plist stays for the next login. A start that works
+    clears the record. Never call it from the job itself.
     """
     _require_macos()
     state = status(LABEL, uid, home)
     if state["pid"]:
+        clear_start_failure(backup_dir)
         return state["pid"]
+    target_plist = str(plist_path(LABEL, home))
     if state["loaded"]:
-        started = _launchctl("kickstart", service_target(LABEL, uid))
-        verb = "kickstart"
+        verb, first = "kickstart", _launchctl("kickstart", service_target(LABEL, uid))
     else:
-        started = _launchctl("bootstrap", domain_target(uid), str(plist_path(LABEL, home)))
-        verb = "bootstrap"
-    if started.returncode != 0:
-        detail = (started.stderr or started.stdout or "").strip()
-        raise LoginItemNotStarted(
-            f"launchctl {verb} failed (exit {started.returncode})"
-            + (f": {detail}" if detail else "")
-        )
-    pid = _wait_for_pid(LABEL, uid, timeout=_HANDOFF_PID_TIMEOUT_SECONDS)
+        verb, first = "bootstrap", _launchctl("bootstrap", domain_target(uid), target_plist)
+    pid = _started_pid(first, uid)
     if pid is None:
-        _launchctl("bootout", service_target(LABEL, uid))
+        failures = [
+            _launchctl_failure(verb, first) if first.returncode else f"no process after launchctl {verb}"
+        ]
+        _wait_until_unloaded(LABEL, uid)
+        retry = _launchctl("bootstrap", domain_target(uid), target_plist)
+        pid = _started_pid(retry, uid)
+        if pid is None:
+            failures.append(
+                _launchctl_failure("bootstrap", retry) if retry.returncode else "no process after launchctl bootstrap"
+            )
+            if is_loaded(LABEL, uid):
+                _launchctl("bootout", service_target(LABEL, uid))
+            _record_start_failure("; then ".join(failures), backup_dir)
+            return None
+    clear_start_failure(backup_dir)
     return pid
 
 
@@ -433,6 +506,7 @@ def set_login_item(
     *,
     home: Path | None = None,
     uid: int | None = None,
+    backup_dir: Path | None = None,
 ) -> str:
     """Turn Open at login on or off from a running extra.
 
@@ -454,7 +528,8 @@ def set_login_item(
 
     Raises ClaudeSwitchError from a translocated or mounted copy, from a uv
     install beside the cask, and when launchctl fails. ``LoginItemNotStarted``
-    means launchd did not start the job this wrote.
+    means launchd did not start the job this wrote; ``start_login_item`` has
+    recorded why (:func:`last_start_failure`).
     """
     _require_macos()
     if bundle.runs_from_temporary_location():
@@ -498,7 +573,10 @@ def set_login_item(
     if stale and is_loaded(LABEL, uid):
         _launchctl("bootout", service_target(LABEL, uid))
         if not _wait_until_unloaded(LABEL, uid):
-            raise LoginItemNotStarted("the previous login item was still shutting down")
-    if start_login_item(home=home, uid=uid) is None:
-        raise LoginItemNotStarted("launchd did not start OpenSwap")
+            detail = "the previous login item was still shutting down"
+            _record_start_failure(detail, backup_dir)
+            raise LoginItemNotStarted(detail)
+    if start_login_item(home=home, uid=uid, backup_dir=backup_dir) is None:
+        failure = last_start_failure(backup_dir) or {}
+        raise LoginItemNotStarted(failure.get("detail") or "launchd did not start OpenSwap")
     return "handoff"

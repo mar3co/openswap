@@ -7,12 +7,14 @@ The page model is pure; the controller methods are lifted out of
 
 from __future__ import annotations
 
+import sys
 import threading
+import time
 import types
 
 import pytest
 
-from openswap import bundle, launch_agent, menubar
+from openswap import bundle, launch_agent, menubar, menubar_instance
 from openswap.exceptions import ClaudeSwitchError
 from tests.menubar_harness import extract_class
 
@@ -59,8 +61,8 @@ def test_open_at_login_value_comes_from_the_login_item_not_menubar_settings():
     "section", [menubar.SETTINGS_SECTION_AUTOMATION, menubar.SETTINGS_SECTION_REMOTE]
 )
 def test_this_mac_rows_only_appear_under_general(section):
-    ids = {row["id"] for row in _rows({"enabled": True, "blocked": True}, section=section)}
-    assert not ids & {"group_this_mac", "open_at_login", "open_at_login_hint", "open_at_login_settings"}
+    ids = {row["id"] for row in _rows({"enabled": True, "start_failed": True}, section=section)}
+    assert not ids & {"group_this_mac", "open_at_login", "open_at_login_hint", "open_at_login_failed"}
 
 
 def test_the_unfiltered_model_keeps_this_mac_in_general():
@@ -73,14 +75,14 @@ def test_the_unfiltered_model_keeps_this_mac_in_general():
 
 
 def test_a_temporary_copy_cannot_switch_it_and_says_why():
-    rows = _rows({"enabled": False, "temporary": True, "blocked": True})
+    rows = _rows({"enabled": False, "temporary": True, "start_failed": True})
     by_id = _by_id(rows)
     assert by_id["open_at_login"]["disabled"] is True
     hint = by_id["open_at_login_hint"]
     assert hint["style"] == "hint"
     assert hint["label"] == menubar.OPEN_AT_LOGIN_MOVE_HINT
     assert "Applications" in hint["label"]
-    assert "open_at_login_settings" not in by_id
+    assert "open_at_login_failed" not in by_id
     assert [row["id"] for row in rows][-1] == "open_at_login_hint"
 
 
@@ -100,22 +102,35 @@ def test_other_outcomes_need_no_hint(outcome):
     assert "open_at_login_hint" not in _by_id(_rows({"enabled": True, "outcome": outcome}))
 
 
-def test_a_job_launchd_would_not_start_points_at_login_items():
-    rows = _rows({"enabled": True, "error": "launchd did not start OpenSwap", "blocked": True})
-    by_id = _by_id(rows)
-    assert by_id["open_at_login_hint"]["label"] == menubar.OPEN_AT_LOGIN_BLOCKED_HINT
-    button = by_id["open_at_login_settings"]
-    assert button["kind"] == "button"
-    assert button["value"] == menubar.LOGIN_ITEMS_SETTINGS_URL
-    assert button["value"] == "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
-    assert [row["id"] for row in rows][-1] == "open_at_login_settings"
+def test_a_failed_start_puts_a_warning_right_after_the_switch():
+    rows = _rows({"enabled": True, "start_failed": True, "as_login_item": False})
+    ids = [row["id"] for row in rows]
+    assert ids[-3:] == ["group_this_mac", "open_at_login", "open_at_login_failed"]
+    warning = _by_id(rows)["open_at_login_failed"]
+    assert warning["kind"] == "button"
+    assert warning["label"] == "macOS isn’t starting OpenSwap at login"
+    assert warning["title"] == "Open Login Items"
+    assert warning["value"] == menubar.LOGIN_ITEMS_SETTINGS_URL
+    assert warning["value"] == "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"enabled": False, "start_failed": True},  # off: nothing claims to work
+        {"enabled": True, "start_failed": False},  # the last start worked
+        {"enabled": True, "start_failed": True, "as_login_item": True},  # launchd started this copy
+    ],
+)
+def test_the_failed_start_warning_needs_on_failed_and_not_the_job(state):
+    assert "open_at_login_failed" not in _by_id(_rows(state))
 
 
 def test_other_errors_are_shown_as_is_with_room_for_them():
     short = _by_id(_rows({"enabled": False, "error": "Move OpenSwap to Applications first."}))
     assert short["open_at_login_hint"]["label"] == "Move OpenSwap to Applications first."
     assert short["open_at_login_hint"]["lines"] == 2
-    assert "open_at_login_settings" not in short
+    assert "open_at_login_failed" not in short
     long_error = (
         "OpenSwap is installed with Homebrew, so this uv install will not open at login. "
         "Use /opt/homebrew/bin/openswap (or OpenSwap.app) instead, "
@@ -130,6 +145,7 @@ def test_other_errors_are_shown_as_is_with_room_for_them():
 
 
 METHODS = {
+    "_on_show_request",
     "_login_item_state",
     "_toggle_login_item",
     "_apply_login_item",
@@ -178,7 +194,7 @@ class _Panel:
 
 
 @pytest.fixture
-def app(monkeypatch):
+def app(monkeypatch, tmp_path):
     threads = _Threads()
     opened = []
     scope = dict(vars(menubar))
@@ -187,6 +203,7 @@ def app(monkeypatch):
     instance = extract_class(menubar.__file__, "MenuBarApp", METHODS, scope)()
     logged = []
     instance.switcher = types.SimpleNamespace(
+        backup_dir=tmp_path,
         _logger=types.SimpleNamespace(
             info=lambda *a, **k: logged.append(("info", a)),
             warning=lambda *a, **k: logged.append(("warning", a)),
@@ -206,13 +223,14 @@ def app(monkeypatch):
     instance.logged = logged
     monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: False)
     monkeypatch.setattr(launch_agent, "login_item_enabled", lambda home=None: False)
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
     return instance
 
 
 def _set_login_item(monkeypatch, outcome=None, raises=None):
     calls = []
 
-    def fake(enabled, *, home=None, uid=None):
+    def fake(enabled, *, home=None, uid=None, backup_dir=None):
         calls.append(enabled)
         if raises is not None:
             raise raises
@@ -226,7 +244,20 @@ def test_the_switch_reads_the_plist_every_time_the_page_is_built(app, monkeypatc
     assert app._login_item_state()["enabled"] is False
     monkeypatch.setattr(launch_agent, "login_item_enabled", lambda home=None: True)
     state = app._login_item_state()
-    assert state == {"enabled": True, "temporary": False, "busy": False}
+    assert state == {
+        "enabled": True, "temporary": False, "busy": False,
+        "start_failed": False, "as_login_item": False,
+    }
+
+
+def test_the_page_reads_a_failed_start_from_the_status_file(app, monkeypatch, tmp_path):
+    monkeypatch.setattr(launch_agent, "login_item_enabled", lambda home=None: True)
+    launch_agent._record_start_failure("launchctl kickstart failed (exit 37)", tmp_path)
+    state = app._login_item_state()
+    assert state["start_failed"] is True
+    assert "open_at_login_failed" in _by_id(_rows(state))
+    monkeypatch.setenv("XPC_SERVICE_NAME", launch_agent.LABEL)
+    assert app._login_item_state()["as_login_item"] is True
 
 
 def test_switching_on_runs_off_the_main_thread_then_quits_for_launchds_copy(app, monkeypatch):
@@ -265,19 +296,25 @@ def test_switching_off_from_the_login_item_shows_the_after_quit_hint(app, monkey
     assert hint["label"] == menubar.OPEN_AT_LOGIN_AFTER_QUIT_HINT
 
 
-def test_a_job_launchd_did_not_start_is_reported_with_the_settings_button(app, monkeypatch):
-    _set_login_item(monkeypatch, raises=launch_agent.LoginItemNotStarted("launchd did not start OpenSwap"))
+def test_a_job_launchd_did_not_start_is_reported_by_the_warning_row(app, monkeypatch, tmp_path):
+    def not_started(enabled, *, home=None, uid=None, backup_dir=None):
+        # start_login_item records the reason before set_login_item raises.
+        launch_agent._record_start_failure("no process after launchctl bootstrap", backup_dir)
+        raise launch_agent.LoginItemNotStarted("no process after launchctl bootstrap")
+
+    monkeypatch.setattr(launch_agent, "set_login_item", not_started)
     app._toggle_login_item()
+    monkeypatch.setattr(launch_agent, "login_item_enabled", lambda home=None: True)  # the plist was written
     app.threads.run_all()
     app._drain_login_item_result()
 
     assert app.quits == 0
-    state = app._login_item_state()
-    assert state["blocked"] is True
-    assert "open_at_login_settings" in _by_id(_rows(state))
+    rows = _by_id(_rows(app._login_item_state()))
+    assert "open_at_login_failed" in rows
+    assert "open_at_login_hint" not in rows  # one message, not two
     assert any(level == "warning" for level, _args in app.logged)
 
-    app._on_setting("open_at_login_settings", menubar.LOGIN_ITEMS_SETTINGS_URL)
+    app._on_setting("open_at_login_failed", menubar.LOGIN_ITEMS_SETTINGS_URL)
     assert app.opened == [["open", menubar.LOGIN_ITEMS_SETTINGS_URL]]
 
 
@@ -288,7 +325,6 @@ def test_a_refusal_is_shown_as_its_message(app, monkeypatch):
     app._drain_login_item_result()
     state = app._login_item_state()
     assert state["error"] == "Move OpenSwap to Applications first."
-    assert "blocked" not in state
 
 
 def test_an_unexpected_failure_is_logged_and_shown_plainly(app, monkeypatch):
@@ -301,7 +337,7 @@ def test_an_unexpected_failure_is_logged_and_shown_plainly(app, monkeypatch):
 
 
 def test_a_new_change_clears_the_last_note(app, monkeypatch):
-    app._login_item_last = {"error": "old", "blocked": True}
+    app._login_item_last = {"error": "old"}
     _set_login_item(monkeypatch, outcome="disabled")
     app._toggle_login_item()
     assert "error" not in app._login_item_state()
@@ -390,13 +426,73 @@ def test_quit_unloads_the_job_only_through_unload_own_job(monkeypatch):
     assert logged == ["could not unload the login item"]
 
 
-def test_the_extra_opens_the_popover_on_both_kinds_of_show_request():
+def test_the_extra_listens_for_show_requests_and_reopen_events():
     from pathlib import Path
 
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     assert "handle_reopen(rumps.rumps.NSApp, self.show_popover)" in text
-    assert "observe_show_requests(SHOW_NOTIFICATION, self.show_popover)" in text
-    attach = text[text.index("def _attach_panel_once") : text.index("def show_popover")]
-    assert "_show_popover_pending" in attach
-    # The copy that handed over asked for the popover through a file.
-    assert "consume_show_on_start(self.switcher.backup_dir)" in attach
+    assert "observe_show_requests(SHOW_NOTIFICATION, self._on_show_request)" in text
+
+
+def test_the_show_notification_opens_the_popover_once_per_request(app, tmp_path):
+    app._panel = _Panel(shown=False)
+    menubar_instance.leave_show_request(tmp_path, post=lambda: None)
+    app._on_show_request()
+    assert app._panel.toggles == 1
+    # A second notification for the same request (or a stray one) does nothing.
+    app._panel.shown = False
+    app._on_show_request()
+    assert app._panel.toggles == 1
+
+
+def test_a_stale_show_request_does_not_open_the_popover(app, tmp_path, monkeypatch):
+    app._panel = _Panel(shown=False)
+    menubar_instance.leave_show_request(tmp_path, post=lambda: None)
+    real = menubar_instance.consume_show_request
+    monkeypatch.setattr(
+        menubar_instance, "consume_show_request", lambda backup_dir: real(backup_dir, now=time.time() + 31)
+    )
+    app._on_show_request()
+    assert app._panel.toggles == 0
+
+
+def _attach(app, monkeypatch):
+    """Run _attach_panel_once with a stand-in for the AppKit panel module."""
+    panel = _Panel(shown=False)
+    fake_panel = types.ModuleType("openswap.menubar_panel")
+    fake_panel.MenuBarPanel = lambda **_kwargs: panel
+    fake_panel.pin_status_item = lambda item: None
+    fake_panel.fit_status_item = lambda item: None
+    panel.attach = lambda item: None
+    monkeypatch.setitem(sys.modules, "openswap.menubar_panel", fake_panel)
+    attach_type = extract_class(
+        menubar.__file__, "MenuBarApp", {"_attach_panel_once", "_on_show_request", "show_popover"},
+        dict(vars(menubar)),
+    )
+
+    class App(attach_type):
+        def __getattr__(self, name):  # every other callback the panel is wired to
+            return lambda *a, **k: None
+
+    attached = App()
+    attached.switcher = app.switcher
+    attached._nsapp = types.SimpleNamespace(nsstatusitem=object())
+    attached._panel = None
+    attached._show_popover_pending = False
+    attached._attach_panel_once(types.SimpleNamespace(stop=lambda: None))
+    return attached, panel
+
+
+def test_a_request_left_before_the_observer_existed_opens_the_popover_at_start_up(app, monkeypatch, tmp_path):
+    """Another copy lost the lock (or handed over) before this one listened."""
+    menubar_instance.leave_show_request(tmp_path, post=lambda: None)
+    attached, panel = _attach(app, monkeypatch)
+    assert panel.toggles == 1
+    assert not menubar_instance.show_request_path(tmp_path).exists()
+    # The notification that comes in afterwards finds the request gone.
+    attached._on_show_request()
+    assert panel.toggles == 1
+
+
+def test_start_up_without_a_request_leaves_the_popover_closed(app, monkeypatch):
+    assert _attach(app, monkeypatch)[1].toggles == 0

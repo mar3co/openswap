@@ -2174,18 +2174,20 @@ class MenuBarPanel:
                 _wrap(value_label)
                 root.addSubview_(value_label)
             elif kind == "button":
+                title = row.get("title") or "Action"
+                button_w = max(70.0, _button_width(title, font_small))
                 root.addSubview_(
                     _label(
                         row.get("label") or "",
                         font_body,
                         pal["fg"],
-                        NSMakeRect(PAD, y + 5, inner_w - 78, 20),
+                        NSMakeRect(PAD, y + 5, inner_w - button_w - 8, 20),
                     )
                 )
                 button = self._add_button(
                     root,
-                    row.get("title") or "Action",
-                    NSMakeRect(PANEL_WIDTH - PAD - 70, y + 2, 70, 26),
+                    title,
+                    NSMakeRect(PANEL_WIDTH - PAD - button_w, y + 2, button_w, 26),
                     lambda _s, rid=row["id"], v=row.get("value"): self._emit_setting(rid, v),
                     font_small,
                 )

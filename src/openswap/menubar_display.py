@@ -779,10 +779,7 @@ OPEN_AT_LOGIN_MOVE_HINT = "Move OpenSwap to Applications to open it at login."
 OPEN_AT_LOGIN_AFTER_QUIT_HINT = (
     "OpenSwap stays open until you quit it, and won’t open at the next login."
 )
-OPEN_AT_LOGIN_BLOCKED_HINT = (
-    "macOS did not start OpenSwap. If it is off in System Settings › General › "
-    "Login Items, turn it on there."
-)
+OPEN_AT_LOGIN_FAILED = "macOS isn’t starting OpenSwap at login"
 LOGIN_ITEMS_SETTINGS_URL = "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
 # Roughly what one line of an 11 pt hint holds across the popover.
 _HINT_LINE_CHARS = 60
@@ -799,10 +796,16 @@ def this_mac_rows(login_item: dict | None) -> list[dict]:
     exists), ``temporary`` (a translocated or mounted copy: the toggle is
     off-limits), ``busy`` (a change is running), ``outcome`` (the last
     ``launch_agent.set_login_item`` result), ``error`` (its message when it
-    raised) and ``blocked`` (launchd did not start the job it wrote).
+    raised), ``start_failed`` (``login_item_status.json`` records a failed
+    start) and ``as_login_item`` (this copy is the launchd job).
+
+    While the toggle is on and the last start failed, a copy launchd did not
+    start shows a warning with a button to Login Items: the toggle alone
+    would claim it works when macOS refused it.
     """
     state = login_item if isinstance(login_item, dict) else {}
     temporary = bool(state.get("temporary"))
+    enabled = bool(state.get("enabled"))
     rows = [
         {
             "kind": "group",
@@ -816,14 +819,21 @@ def this_mac_rows(login_item: dict | None) -> list[dict]:
             "section": SETTINGS_SECTION_GENERAL,
             "id": "open_at_login",
             "label": "Open at login",
-            "value": bool(state.get("enabled")),
+            "value": enabled,
             "disabled": temporary or bool(state.get("busy")),
         },
     ]
+    if enabled and state.get("start_failed") and not state.get("as_login_item"):
+        rows.append({
+            "kind": "button",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "open_at_login_failed",
+            "label": OPEN_AT_LOGIN_FAILED,
+            "title": "Open Login Items",
+            "value": LOGIN_ITEMS_SETTINGS_URL,
+        })
     if temporary:
         note = OPEN_AT_LOGIN_MOVE_HINT
-    elif state.get("blocked"):
-        note = OPEN_AT_LOGIN_BLOCKED_HINT
     elif state.get("error"):
         note = _bounded_text(state.get("error"), 240)
     elif state.get("outcome") == "disabled_after_quit":
@@ -838,15 +848,6 @@ def this_mac_rows(login_item: dict | None) -> list[dict]:
             "id": "open_at_login_hint",
             "label": note,
             "lines": _hint_lines(note),
-        })
-    if state.get("blocked") and not temporary:
-        rows.append({
-            "kind": "button",
-            "section": SETTINGS_SECTION_GENERAL,
-            "id": "open_at_login_settings",
-            "label": "Login Items",
-            "title": "Open",
-            "value": LOGIN_ITEMS_SETTINGS_URL,
         })
     return rows
 
