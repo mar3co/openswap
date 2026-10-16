@@ -212,6 +212,17 @@ Rewriting it then would let the hand-over take the dying uv extra's pid for
 the app's and quit, leaving nothing running once the bootout lands. The
 migration logs the error, this copy runs, and the next start migrates.
 
+It kickstarts only when the loaded job runs what the plist says. launchd
+keeps the definition it loaded, and the plist can change under it:
+`set_login_item` replaces a plist for another copy, and the migration
+rewrites the plist of a job that is still loaded. A kickstart would then
+start the old program, perhaps another copy of the app, and this copy
+would hand over to it. So `start_login_item` compares the loaded program
+(the `program` and `arguments` that `launchctl print` reports) with the
+plist's `ProgramArguments`. When they differ, or when it cannot tell, it
+boots the job out, waits for it to unload, and bootstraps the plist, the
+way `install()` does.
+
 Every start that fails records why in `<backup_root>/login_item_status.json`
 (time and launchctl's detail). Any successful start clears it, and the
 launchd job clears it when it starts. Step 3 reads it.
@@ -252,7 +263,10 @@ whether `launchctl print` shows it. Whatever the signal, it ends up as a
 failed start in `login_item_status.json`, and Step 3 shows it. Don't wait
 for a toggle change to report it.
 
-**Verify**: `tests/test_launch_agent.py` covers each cell of the table with a
+**Verify**: `start_login_item` kickstarts a loaded job whose program
+matches the plist, and reloads (bootout, wait, bootstrap) one that is
+loaded with another program or whose program cannot be read.
+`tests/test_launch_agent.py` covers each cell of the table with a
 fake `_launchctl` and `XPC_SERVICE_NAME` set or unset, including "never
 boots out itself", the temporary-location refusal, and `unload_own_job()`
 (detached, new session, only when the plist is gone). Quit and the
