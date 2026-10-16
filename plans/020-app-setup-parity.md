@@ -206,7 +206,11 @@ migration (`bundle._repoint_menubar_agent`) boots out a uv extra just
 before this runs. So when the kickstart fails or no pid appears, it waits
 for the job to unload (`_wait_until_unloaded`) and bootstraps the plist
 once. It returns None only when that fails too. `_repoint_menubar_agent`
-also waits for its own bootout to finish before it rewrites the plist.
+also waits for its own bootout to finish before it rewrites the plist. If
+the uv extra has not unloaded in time, it raises and keeps the uv plist.
+Rewriting it then would let the hand-over take the dying uv extra's pid for
+the app's and quit, leaving nothing running once the bootout lands. The
+migration logs the error, this copy runs, and the next start migrates.
 
 Every start that fails records why in `<backup_root>/login_item_status.json`
 (time and launchctl's detail). Any successful start clears it, and the
