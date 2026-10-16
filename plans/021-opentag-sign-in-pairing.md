@@ -128,7 +128,11 @@ lease.
   synchronization threads share one transport. A request sent with the old key
   can therefore still be in flight when another thread's request promotes the
   new key. So after promotion the old hash moves to `previous_key_hash` and is
-  still accepted for 2 minutes, then dropped. Without this, the straggler would
+  still accepted for 2 minutes, then dropped. The grace never outlives the old
+  key: `previous_key_until` is the earlier of the promotion time plus 2
+  minutes and the old `key_expires_at`. If the old key has already expired,
+  for example after a Connect renewal of an expired Mac, the previous slot
+  stays empty. Without this, the straggler would
   get `unauthorized`, which the worker treats as a revocation
   (`openswap.worker.remote`).
 - **Registration is untouched.** `rotate_key` and promotion never register,
@@ -171,6 +175,8 @@ the repo's earlier forward migrations do. pgTAP covers these cases:
 - a pasted renewal while a pending or previous key exists leaves only the new
   key working: both old slots get `unauthorized` and cannot promote;
 - the old key works for 2 minutes after promotion, then gets `unauthorized`;
+- promoting over an expired key leaves the previous slot empty, and a grace
+  that would pass the old key's expiry ends at that expiry;
 - rotation and promotion leave `worker_epoch`, claims and leases unchanged;
 - a revoked worker cannot rotate;
 - an expired key cannot rotate;
