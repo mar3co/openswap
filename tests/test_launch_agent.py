@@ -805,7 +805,8 @@ def test_login_item_runs_this_compares_the_plists_program(launchd, tmp_path):
 
 
 def test_start_login_item_leaves_a_running_job_alone(launchd, tmp_path):
-    launchd.loaded, launchd.pid = True, 999
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.pid, launchd.loaded_program = True, 999, [*PROGRAM, "menubar"]
     assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 999
     assert launchd.subcommands == ["print"]
 
@@ -857,8 +858,17 @@ def test_running_login_item_pid_ignores_a_job_loaded_with_another_program(launch
     assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) is None
     launchd.loaded_program = [*PROGRAM, "menubar"]
     assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) == 999
-    launchd.loaded_program = None  # cannot tell: a running job is left alone
-    assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) == 999
+    launchd.loaded_program = None  # cannot tell: it may be the old executable
+    assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) is None
+
+
+def test_start_login_item_reloads_a_running_job_whose_program_it_cannot_read(launchd, tmp_path):
+    """The pid could belong to an executable loaded before the plist changed."""
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.pid, launchd.loaded_program = True, 999, None
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    assert launchd.subcommands.index("bootout") < launchd.subcommands.index("bootstrap")
+    assert launchd.loaded_program == [*PROGRAM, "menubar"]
 
 
 def test_turning_on_over_another_copys_loaded_plist_hands_over_to_the_new_program(launchd, tmp_path):
@@ -932,7 +942,8 @@ def test_a_start_that_works_clears_the_recorded_failure(launchd, tmp_path):
 
 
 def test_a_running_job_also_clears_the_recorded_failure(launchd, tmp_path):
-    launchd.loaded, launchd.pid = True, 999
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.pid, launchd.loaded_program = True, 999, [*PROGRAM, "menubar"]
     launch_agent._record_start_failure("old")
     assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 999
     assert launch_agent.last_start_failure() is None

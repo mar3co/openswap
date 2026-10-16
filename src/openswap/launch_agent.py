@@ -450,12 +450,13 @@ def _loaded_runs_plist(state: dict, home: Path | None) -> bool | None:
 
 
 def running_login_item_pid(*, home: Path | None = None, uid: int | None = None) -> int | None:
-    """The login item's pid while it runs (it may still be starting), unless
-    launchd loaded it with another program than the plist names: handing
-    over to that would hand over to the old program."""
+    """The login item's pid while it runs (it may still be starting), only
+    when launchd loaded it with the program the plist names. Another or an
+    unreported program could be an old executable still running under the
+    label, and handing over to it would hand over to the old program."""
     _require_macos()
     state = status(LABEL, uid, home)
-    if state["pid"] and _loaded_runs_plist(state, home) is not False:
+    if state["pid"] and _loaded_runs_plist(state, home) is True:
         return state["pid"]
     return None
 
@@ -468,14 +469,15 @@ def start_login_item(
 ) -> int | None:
     """Start the login item and return launchd's pid, or None if it would not start.
 
-    A running job that runs what the plist says is left alone. A loaded job
-    is kickstarted only when its loaded program matches the plist's
-    ``ProgramArguments``: launchd keeps the definition it loaded, and
-    ``set_login_item`` or the migration may have changed the plist under
-    it, so a kickstart would start the old program. When they differ, or
-    ``launchctl print`` does not say, the job is booted out (it is not this
-    process), waited for, and the plist bootstrapped, as ``install`` does.
-    A job that is not loaded is bootstrapped.
+    A running or loaded job is used only when its loaded program matches the
+    plist's ``ProgramArguments``: a running one is left alone and an idle one
+    kickstarted. launchd keeps the definition it loaded, and
+    ``set_login_item`` or the migration may have changed the plist under it,
+    so a kickstart would start the old program, and a running pid could be
+    the old executable. When they differ, or ``launchctl print`` does not
+    say, the job is booted out (it is not this process), waited for, and the
+    plist bootstrapped, as ``install`` does. A job that is not loaded is
+    bootstrapped.
 
     The job may still be unloading: the start-up migration
     (``bundle._repoint_menubar_agent``) boots out a uv extra just before
@@ -491,8 +493,8 @@ def start_login_item(
     """
     _require_macos()
     state = status(LABEL, uid, home)
-    current = _loaded_runs_plist(state, home)
-    if state["pid"] and current is not False:
+    current = _loaded_runs_plist(state, home) is True
+    if state["pid"] and current:
         clear_start_failure(backup_dir)
         return state["pid"]
     target_plist = str(plist_path(LABEL, home))
