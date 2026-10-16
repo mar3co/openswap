@@ -290,6 +290,20 @@ def move_source(app: Path) -> dict:
     return {"source": "download", "eject": None}
 
 
+def move_source_app(app: Path | None = None) -> Path | None:
+    """The app to hand to a move request: a translocated copy's original in
+    Downloads (its randomized ``/AppTranslocation/`` mount can vanish once
+    this process exits), else the app itself. None when not frozen."""
+    app = app if app is not None else app_path()
+    if app is None:
+        return None
+    if "/AppTranslocation/" in app.as_posix():
+        original = _translocated_original(app)
+        if original is not None and original.is_dir():
+            return original
+    return app
+
+
 def _homebrew_owns(app: Path, home: Path | None = None) -> bool:
     """Whether the cask installed ``app`` (as :func:`installed_by_homebrew`
     asks of this process's own app)."""

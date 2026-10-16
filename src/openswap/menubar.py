@@ -138,7 +138,7 @@ def run(switcher, codex=None) -> int:
     try:
         instance_lock = claim(
             switcher.backup_dir, as_login_item=as_login_item, logger=switcher._logger,
-            move_from=_bundle.app_path() if _bundle.runs_from_temporary_location() else None,
+            move_from=_bundle.move_source_app() if _bundle.runs_from_temporary_location() else None,
         )
     except AlreadyRunning as e:
         return e.exit_code

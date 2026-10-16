@@ -81,6 +81,20 @@ def test_a_translocated_download_ejects_nothing(monkeypatch):
     assert bundle.move_source(app) == {"source": "download", "eject": None}
 
 
+def test_a_move_request_names_the_download_not_the_translocated_mount(tmp_path, monkeypatch):
+    original = tmp_path / "Downloads" / "OpenSwap.app"
+    original.mkdir(parents=True)
+    translocated = Path("/private/var/folders/x/AppTranslocation/ABC/d/OpenSwap.app")
+    monkeypatch.setattr(bundle, "_translocated_original", lambda app: original)
+    assert bundle.move_source_app(translocated) == original
+    # A disk image copy is not translocated: it names itself.
+    image = Path("/Volumes/OpenSwap/OpenSwap.app")
+    assert bundle.move_source_app(image) == image
+    # An original that is already gone falls back to the mount.
+    monkeypatch.setattr(bundle, "_translocated_original", lambda app: tmp_path / "gone.app")
+    assert bundle.move_source_app(translocated) == translocated
+
+
 def test_an_unknown_translocated_original_is_a_download(monkeypatch):
     monkeypatch.setattr(bundle, "_translocated_original", lambda app: None)
     app = Path("/private/var/folders/x/AppTranslocation/ABC/d/OpenSwap.app")
