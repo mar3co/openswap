@@ -168,6 +168,19 @@ def test_a_replace_trashes_the_old_copy_only_after_the_new_one_is_complete(fs):
     assert not old.exists()
 
 
+def test_an_existing_old_copy_is_kept_not_deleted(fs):
+    """A leftover from an earlier update (or the user's own app by that
+    name) stays; the set-aside copy takes the next free name."""
+    _app(fs["apps"], "0.1.0")
+    _app(fs["apps"], "0.0.9", name="OpenSwap (old).app")
+    app = _app(fs["image"], "0.2.0")
+    target = bundle.copy_to_applications(app, bundle.move_plan(app, fs["apps"]))
+    assert bundle.bundle_version(target) == "0.2.0"
+    assert bundle.bundle_version(fs["apps"] / "OpenSwap (old).app") == "0.0.9"
+    assert fs["calls"]["trash"] == [fs["apps"] / "OpenSwap (old) 2.app"]
+    assert bundle.bundle_version(fs["trash"] / "OpenSwap (old) 2.app") == "0.1.0"
+
+
 def test_a_failed_final_rename_puts_the_old_app_back(fs, monkeypatch):
     _app(fs["apps"], "0.1.0")
     app = _app(fs["image"], "0.2.0")

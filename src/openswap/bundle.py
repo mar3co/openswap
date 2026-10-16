@@ -370,6 +370,29 @@ def eject(volume: Path | str | None) -> None:
         pass
 
 
+def app_is(path: Path) -> bool:
+    """Whether this process's app is the bundle at ``path``."""
+    app = app_path()
+    if app is None:
+        return False
+    try:
+        return app.resolve() == Path(path).resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def _spare_name(path: Path) -> Path:
+    """``path`` when nothing is there, else ``… 2``, ``… 3``: never delete
+    what is already at the name."""
+    if not path.exists():
+        return path
+    for n in range(2, 100):
+        candidate = path.with_name(f"{path.stem} {n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise OSError(f"no free name beside {path}")
+
+
 def copy_to_applications(app: Path, plan: dict) -> Path:
     """Carry out a ``move`` or ``replace`` plan; returns the new app's path.
 
@@ -407,10 +430,8 @@ def copy_to_applications(app: Path, plan: dict) -> Path:
             raise ClaudeSwitchError(
                 f"OpenSwap{f' {existing}' if existing else ''} is already in {target.parent}."
             )
-        old = target.with_name(f"{target.stem} (old){target.suffix}")
         try:
-            if old.exists():
-                shutil.rmtree(old)
+            old = _spare_name(target.with_name(f"{target.stem} (old){target.suffix}"))
             target.rename(old)
         except OSError as e:
             shutil.rmtree(staging, ignore_errors=True)

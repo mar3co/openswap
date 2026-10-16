@@ -1828,9 +1828,11 @@ def run(switcher, codex=None) -> int:
                     target = bundle.copy_to_applications(source, plan)
                 else:
                     target = Path(plan["target"])
-                    if self._wizard_source is not None:
+                    if self._wizard_source is not None and bundle.app_is(target):
                         # The copy already there is this one, running: nothing
-                        # to open but the popover. The DMG is done with.
+                        # to open but the popover. The DMG is done with. (A
+                        # DMG copy that won the lock on a retry consumes its
+                        # own request; it is not the installed copy.)
                         bundle.eject(plan.get("eject"))
                         self._wizard.close()
                         self._wizard_step = None

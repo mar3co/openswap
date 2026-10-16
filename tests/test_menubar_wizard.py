@@ -384,6 +384,28 @@ def test_a_move_request_from_an_older_dmg_just_opens_the_popover(wiz, frozen_app
     assert not wiz.window.visible
 
 
+def test_a_dmg_copy_that_won_the_lock_still_opens_the_installed_copy(wiz, frozen_app, monkeypatch):
+    """It consumed its own move request on a lock retry: it is not the
+    installed copy, so Open Installed Copy relaunches that one and quits."""
+    from openswap import bundle
+
+    monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: True)
+    installed = frozen_app.parent / "Applications" / "OpenSwap.app"
+    plan = {
+        "action": "open_existing", "source": "disk_image", "eject": Path("/Volumes/OpenSwap"),
+        "destination": str(installed.parent), "target": str(installed),
+        "existing_version": "0.3.0", "homebrew": False,
+    }
+    relaunches = []
+    monkeypatch.setattr(bundle, "move_plan", lambda app, dest: dict(plan))
+    monkeypatch.setattr(bundle, "applications_dir", lambda: installed.parent)
+    monkeypatch.setattr(bundle, "relaunch_after_exit", lambda app, pid, eject=None: relaunches.append((app, eject)))
+    wiz.app._open_setup_wizard(source=frozen_app)  # its own path
+    wiz.app._on_wizard_action("open_existing")
+    assert relaunches == [(installed, Path("/Volumes/OpenSwap"))]
+    assert wiz.events == ["quit"]
+
+
 def test_an_unplannable_move_says_why(wiz, temporary, monkeypatch):
     from openswap import bundle
 
