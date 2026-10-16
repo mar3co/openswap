@@ -8,6 +8,8 @@ real distributed notification or starts a status item.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -47,6 +49,32 @@ def test_two_holders_conflict_even_inside_one_process(tmp_path):
     again = menubar_lock(tmp_path)
     assert again is not None
     again.release()
+
+
+def test_the_holder_writes_its_pid_and_a_losing_copy_leaves_it(tmp_path):
+    held = menubar_lock(tmp_path)
+    try:
+        assert menubar_instance.lock_holder_pid(tmp_path) == os.getpid()
+        assert menubar_lock(tmp_path) is None  # opening it to try must not truncate it
+        assert menubar_instance.lock_holder_pid(tmp_path) == os.getpid()
+    finally:
+        held.release()
+
+
+@pytest.mark.parametrize("text", [None, "", "not a pid\n"])
+def test_no_holder_pid_without_a_readable_one(tmp_path, text):
+    if text is not None:
+        lock_path(tmp_path).write_text(text)
+    assert menubar_instance.lock_holder_pid(tmp_path) is None
+
+
+def test_process_alive():
+    assert menubar_instance.process_alive(os.getpid()) is True
+    done = subprocess.run(["true"], check=True)
+    assert done.returncode == 0
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    assert menubar_instance.process_alive(gone.pid) is False
 
 
 def test_a_free_lock_is_claimed_without_asking_anyone(tmp_path):
@@ -213,7 +241,7 @@ def login_item(monkeypatch):
 
 
 def _logger(logged):
-    return types.SimpleNamespace(warning=lambda *a, **k: logged.append(a[0]))
+    return types.SimpleNamespace(warning=lambda msg, *args, **k: logged.append(msg % args))
 
 
 def test_an_idle_login_item_that_runs_this_copy_takes_over(tmp_path, login_item):
@@ -278,6 +306,96 @@ def test_a_show_request_still_posts_when_the_file_cannot_be_written(tmp_path):
     leave_show_request(blocker, post=lambda: posted.append(1), logger=_logger(logged))
     assert posted == [1]
     assert logged == ["could not write the show request"]
+
+
+# --- the CLI's hand-over request ----------------------------------------------
+
+
+def test_a_handoff_request_is_a_file_then_a_notification_read_once(tmp_path):
+    posted = []
+    menubar_instance.leave_handoff_request(
+        tmp_path, post=lambda: posted.append(menubar_instance.handoff_request_path(tmp_path).exists())
+    )
+    assert posted == [True]
+    assert menubar_instance.consume_handoff_request(tmp_path) is True
+    assert menubar_instance.consume_handoff_request(tmp_path) is False
+    menubar_instance.leave_handoff_request(tmp_path, post=lambda: None)
+    later = menubar_instance.handoff_request_path(tmp_path).stat().st_mtime + 31
+    assert menubar_instance.consume_handoff_request(tmp_path, now=later) is False
+
+
+def test_the_handoff_notification_name(monkeypatch):
+    posts = []
+
+    class Center:
+        def postNotificationName_object_userInfo_deliverImmediately_(self, *args):
+            posts.append(args)
+
+    foundation = types.ModuleType("Foundation")
+    foundation.NSDistributedNotificationCenter = types.SimpleNamespace(defaultCenter=Center)
+    monkeypatch.setitem(sys.modules, "Foundation", foundation)
+    menubar_instance.post_handoff_notification()
+    assert menubar_instance.HANDOFF_NOTIFICATION == "com.opensoft.openswap.menubar.handoff"
+    assert posts == [(menubar_instance.HANDOFF_NOTIFICATION, None, None, True)]
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(menubar_instance.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(menubar_instance.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    return clock
+
+
+def test_the_cli_waits_until_launchds_copy_holds_the_lock(tmp_path, monkeypatch, fake_clock):
+    holders = iter([999, 999, None, 4242])
+    monkeypatch.setattr(menubar_instance, "lock_holder_pid", lambda backup_dir: next(holders))
+    posted = []
+    assert menubar_instance.hand_over_from_cli(tmp_path, 4242, post=lambda: posted.append(1)) == 4242
+    assert posted == [1]
+    assert menubar_instance.handoff_request_path(tmp_path).exists()
+    assert fake_clock[0] < menubar_instance.CLI_HANDOFF_WAIT_SECONDS
+
+
+def test_the_cli_gives_up_after_15_seconds_and_names_the_holder(tmp_path, monkeypatch, fake_clock):
+    monkeypatch.setattr(menubar_instance, "lock_holder_pid", lambda backup_dir: 999)
+    assert menubar_instance.hand_over_from_cli(tmp_path, 4242, post=lambda: None) == 999
+    assert fake_clock[0] >= menubar_instance.CLI_HANDOFF_WAIT_SECONDS == 15.0
+
+
+def test_a_real_holder_is_seen_by_the_cli(tmp_path, fake_clock):
+    held = menubar_lock(tmp_path)
+    try:
+        assert menubar_instance.hand_over_from_cli(tmp_path, os.getpid(), post=lambda: None) == os.getpid()
+    finally:
+        held.release()
+
+
+@pytest.mark.parametrize(
+    "as_job, runs_this, pid, expected",
+    [
+        (False, True, 4242, 4242),  # step aside
+        (True, True, 4242, None),  # the job never steps aside for itself
+        (False, False, 4242, None),  # the login item runs another program
+        (False, True, None, None),  # launchd's copy is not up
+    ],
+)
+def test_login_item_waiting(monkeypatch, as_job, runs_this, pid, expected):
+    monkeypatch.setattr(launch_agent, "runs_as_login_item", lambda: as_job)
+    monkeypatch.setattr(launch_agent, "login_item_runs_this", lambda home=None: runs_this)
+    monkeypatch.setattr(launch_agent, "running_login_item_pid", lambda **k: pid)
+    assert menubar_instance.login_item_waiting() == expected
+
+
+def test_login_item_waiting_logs_a_failed_check(monkeypatch):
+    def boom(home=None):
+        raise OSError("launchctl missing")
+
+    monkeypatch.setattr(launch_agent, "runs_as_login_item", lambda: False)
+    monkeypatch.setattr(launch_agent, "login_item_runs_this", boom)
+    logged = []
+    assert menubar_instance.login_item_waiting(logger=_logger(logged)) is None
+    assert logged == ["could not check the login item"]
 
 
 # --- menubar.run --------------------------------------------------------------

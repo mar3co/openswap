@@ -257,17 +257,21 @@ def run(switcher, codex=None) -> int:
             self._auto_capture_failed_for: tuple[str, str] | None = None
             self._show_popover_pending = False
             self._show_requests = None
+            self._handoff_requests = None
             self._login_item_busy = False
             self._login_item_result = None
             self._login_item_last: dict = {}
             # Opening the app again, or another copy starting, shows the
             # popover instead of a second status item (menubar_instance).
             try:
-                from openswap.menubar_instance import SHOW_NOTIFICATION
+                from openswap.menubar_instance import HANDOFF_NOTIFICATION, SHOW_NOTIFICATION
                 from openswap.menubar_panel import handle_reopen, observe_show_requests
 
                 handle_reopen(rumps.rumps.NSApp, self.show_popover)
                 self._show_requests = observe_show_requests(SHOW_NOTIFICATION, self._on_show_request)
+                self._handoff_requests = observe_show_requests(
+                    HANDOFF_NOTIFICATION, self._on_handoff_request
+                )
             except Exception:
                 self.switcher._logger.warning("show-popover hooks failed", exc_info=True)
             self.rebuild_menu()
@@ -1470,8 +1474,11 @@ def run(switcher, codex=None) -> int:
                 login_item=self._login_item_state,
             )
             self._panel.attach(nsitem)
-            # A show request left before the observer existed: another copy
-            # that lost the lock, or one that handed over to this one.
+            # Requests left before the observers existed: `openswap setup`
+            # starting the login item, another copy that lost the lock, or one
+            # that handed over to this one.
+            if self._on_handoff_request():
+                return
             self._on_show_request()
             if self._show_popover_pending:
                 self._show_popover_pending = False
@@ -1484,6 +1491,28 @@ def run(switcher, codex=None) -> int:
 
             if consume_show_request(self.switcher.backup_dir):
                 self.show_popover()
+
+        def _on_handoff_request(self):
+            """The hand-over notification, and start-up: ``openswap setup`` or
+            ``menubar --install-service`` started the login item while this
+            copy, which launchd did not start, holds the lock. When launchd's
+            copy is up, leave it a show request and quit, so it can take the
+            lock instead of looping under KeepAlive. True when quitting."""
+            from openswap.menubar_instance import (
+                consume_handoff_request,
+                leave_show_request,
+                login_item_waiting,
+            )
+
+            if not consume_handoff_request(self.switcher.backup_dir):
+                return False
+            pid = login_item_waiting(logger=self.switcher._logger)
+            if pid is None:
+                return False
+            self.switcher._logger.info("Handing the menu bar over to the login item (pid %s)", pid)
+            leave_show_request(self.switcher.backup_dir, logger=self.switcher._logger)
+            self.on_quit(None)
+            return True
 
         def show_popover(self):
             """Open the popover: the app was opened again, or another copy asked."""

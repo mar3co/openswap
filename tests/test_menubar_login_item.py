@@ -146,6 +146,7 @@ def test_other_errors_are_shown_as_is_with_room_for_them():
 
 METHODS = {
     "_on_show_request",
+    "_on_handoff_request",
     "_login_item_state",
     "_toggle_login_item",
     "_apply_login_item",
@@ -515,7 +516,8 @@ def _attach(app, monkeypatch):
     panel.attach = lambda item: None
     monkeypatch.setitem(sys.modules, "openswap.menubar_panel", fake_panel)
     attach_type = extract_class(
-        menubar.__file__, "MenuBarApp", {"_attach_panel_once", "_on_show_request", "show_popover"},
+        menubar.__file__, "MenuBarApp",
+        {"_attach_panel_once", "_on_show_request", "_on_handoff_request", "show_popover"},
         dict(vars(menubar)),
     )
 
@@ -528,6 +530,8 @@ def _attach(app, monkeypatch):
     attached._nsapp = types.SimpleNamespace(nsstatusitem=object())
     attached._panel = None
     attached._show_popover_pending = False
+    attached.quits = 0
+    attached.on_quit = lambda _sender: setattr(attached, "quits", attached.quits + 1)
     attached._attach_panel_once(types.SimpleNamespace(stop=lambda: None))
     return attached, panel
 
@@ -541,6 +545,57 @@ def test_a_request_left_before_the_observer_existed_opens_the_popover_at_start_u
     # The notification that comes in afterwards finds the request gone.
     attached._on_show_request()
     assert panel.toggles == 1
+
+
+# --- stepping aside for `openswap setup` ---------------------------------------
+
+
+def test_a_handoff_request_makes_a_finder_extra_quit(app, monkeypatch, tmp_path):
+    """Open at login was off; `openswap setup` then started launchd's copy,
+    which waits for this copy's lock."""
+    monkeypatch.setattr(menubar_instance, "login_item_waiting", lambda logger=None: 4242)
+    menubar_instance.leave_handoff_request(tmp_path, post=lambda: None)
+    assert app._on_handoff_request() is True
+    assert app.quits == 1
+    # launchd's copy opens its popover once it has the lock.
+    assert menubar_instance.show_request_path(tmp_path).exists()
+    assert not menubar_instance.handoff_request_path(tmp_path).exists()
+
+
+def test_an_extra_stays_when_launchds_copy_is_not_up(app, monkeypatch, tmp_path):
+    monkeypatch.setattr(menubar_instance, "login_item_waiting", lambda logger=None: None)
+    menubar_instance.leave_handoff_request(tmp_path, post=lambda: None)
+    assert app._on_handoff_request() is False
+    assert app.quits == 0
+    assert not menubar_instance.show_request_path(tmp_path).exists()
+
+
+def test_no_request_no_check(app, monkeypatch):
+    monkeypatch.setattr(
+        menubar_instance, "login_item_waiting", lambda logger=None: pytest.fail("checked without a request")
+    )
+    assert app._on_handoff_request() is False
+    assert app.quits == 0
+
+
+def test_a_handoff_request_left_before_the_observer_existed_is_honoured_at_start_up(
+    app, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(menubar_instance, "login_item_waiting", lambda logger=None: 4242)
+    menubar_instance.leave_handoff_request(tmp_path, post=lambda: None)
+    menubar_instance.leave_show_request(tmp_path, post=lambda: None)
+    attached, panel = _attach(app, monkeypatch)
+    assert attached.quits == 1
+    # It quits instead of showing; the show request waits for launchd's copy.
+    assert panel.toggles == 0
+    assert menubar_instance.show_request_path(tmp_path).exists()
+
+
+def test_the_extra_listens_for_handoff_requests():
+    from pathlib import Path
+
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
+    assert "observe_show_requests(\n                    HANDOFF_NOTIFICATION, self._on_handoff_request" in text
 
 
 def test_start_up_without_a_request_leaves_the_popover_closed(app, monkeypatch):
