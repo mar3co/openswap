@@ -147,3 +147,45 @@ def _unpair(root: Path, url: str | None = None) -> bool:
     except macos_keychain.KEYCHAIN_ERRORS:
         raise ProtocolError("device_key_unavailable") from None
     return removed
+
+
+def store_rotated_key(root: Path, url: str, enrollment: Enrollment, *, previous_key: str) -> bool:
+    """Save a key that ``rotate_key`` returned, in place of ``previous_key``.
+
+    Runs under the pairing lock, and writes only while settings still name
+    ``url`` for this worker and the Keychain item still holds ``previous_key``:
+    an unpair, a re-pair or a reconnect that landed since the client read its
+    key wins, and nothing is written (returns False). The URL, the worker ID
+    and the saved status are kept, because the enrollment is the same one with
+    a new key. A Keychain failure raises ``device_key_unavailable`` and the
+    item keeps the old key, which the service still accepts while the new one
+    is only pending.
+    """
+    require_macos()
+    return _locked(root, _store_rotated_key, url, enrollment, previous_key=previous_key)
+
+
+def _store_rotated_key(root: Path, url: str, enrollment: Enrollment, *, previous_key: str) -> bool:
+    url = validate_url(url)
+    policy = load_worker_settings(root)
+    if policy.control_service_url != url or policy.control_service_worker_id not in {None, enrollment.worker_id}:
+        return False
+    if enrollment.expires_at <= datetime.now(timezone.utc):
+        return False
+    try:
+        raw = macos_keychain.get_password(SERVICE, account_name(url))
+        if raw is None:
+            return False
+        saved = json.loads(raw)
+        if (not isinstance(saved, dict) or saved.get("worker_id") != enrollment.worker_id
+                or saved.get("device_key") != previous_key):
+            return False
+        macos_keychain.set_password(SERVICE, account_name(url), json.dumps({
+            "worker_id": enrollment.worker_id, "device_key": enrollment.device_key,
+            "expires_at": enrollment.expires_at.isoformat(),
+        }))
+    except macos_keychain.KEYCHAIN_ERRORS:
+        raise ProtocolError("device_key_unavailable") from None
+    except (ValueError, TypeError, RecursionError):
+        return False
+    return True

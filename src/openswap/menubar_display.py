@@ -285,6 +285,33 @@ RESTORE_CARD_NOTE = "Click to restore the saved Claude login."
 REMOTE_TASKS_PAIRED_OFF_NOTE = (
     "Paired, worker off · Turn on Enable local worker so this Mac can accept approved tasks."
 )
+REMOTE_KEY_RENEWS_NOTE = "Key renews automatically."
+
+
+def remote_key_copy(snapshot: dict, *, now: datetime | None = None) -> str:
+    """The device key line for the Remote section, or ``""`` when nothing is known.
+
+    "Key renews automatically" when the registration rotates its key; "Key
+    expires in N days" only when the backend lacks rotation, with the fix.
+    """
+    renews = snapshot.get("remote_key_renews")
+    if renews is True:
+        return REMOTE_KEY_RENEWS_NOTE
+    if renews is not False:
+        return ""
+    expires = snapshot.get("remote_key_expires_at")
+    if not isinstance(expires, str) or len(expires) > 40:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        return ""
+    days = (parsed - (now or datetime.now(timezone.utc))).days
+    when = "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
+    return (f"Key expires {when}. This server can't renew it automatically: "
+            "re-pair this Mac from the portal before then.")
 MISSING_LOGIN_CARD_NOTE = "Action required · Sign in with Claude Code."
 RECONCILE_CARD_NOTE = "Action required · Login mismatch. Click for details."
 _CLAUDE_PATH_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
@@ -619,6 +646,18 @@ def settings_page_rows(
             "section": SETTINGS_SECTION_REMOTE,
             "id": "remote_tasks_paired_off",
             "label": REMOTE_TASKS_PAIRED_OFF_NOTE,
+        })
+    key_note = remote_key_copy(worker_status or {}) if worker_paired else ""
+    if key_note:
+        # The device key's renewal, right under the status it belongs to.
+        key_at = next(i for i, row in enumerate(remote) if row["id"] == "remote_tasks_status") + 1
+        remote.insert(key_at, {
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_key",
+            "label": key_note,
+            "lines": _hint_lines(key_note),
         })
 
     automation = [

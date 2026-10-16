@@ -2929,6 +2929,29 @@ def _live_off_step(root: Path, settings) -> str:
     return pinned_note
 
 
+def _key_status(snapshot: dict, *, now=None):
+    """The ``Key`` row: renews automatically, or (only when the backend lacks rotation)
+    when it expires and how to renew it. None while nothing is known."""
+    from datetime import datetime, timezone
+
+    from openswap.worker.protocol import ProtocolError, timestamp
+
+    renews = snapshot.get("remote_key_renews")
+    if renews is True:
+        return (f"{printer.mark(True)} Key", "renews automatically")
+    if renews is not False:
+        return None
+    try:
+        expires = timestamp(snapshot.get("remote_key_expires_at"))
+    except ProtocolError:
+        return None
+    days = (expires - (now or datetime.now(timezone.utc))).days
+    when = "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
+    return (f"{printer.mark(None if days > 7 else False)} Key",
+            f"expires {when}; this server can't renew it automatically. To renew, choose "
+            "Re-pair this Mac in the portal, then `openswap worker unpair` and run the pair command it shows.")
+
+
 def _format_status(snapshot: dict) -> str:
     """The human ``openswap worker status``: one aligned row per fact, each marked and worded."""
     enabled = snapshot.get("enabled") is True
@@ -2955,8 +2978,11 @@ def _format_status(snapshot: dict) -> str:
         (f"{printer.mark(None if not running else not paused)} Taking tasks", taking),
         (f"{printer.mark(True if available else None)} Live tasks", live),
         (f"{printer.mark(service_ok)} Service", f"{remote} (seen {seen})" if seen else remote),
-        (f"{printer.mark(None)} Task", job),
     ]
+    key = _key_status(snapshot)
+    if key is not None:
+        rows.append(key)
+    rows.append((f"{printer.mark(None)} Task", job))
     # Where the running task came from, else the last finished one (never its text).
     last = snapshot.get("last_job")
     if isinstance(active, dict):
