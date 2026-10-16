@@ -13,7 +13,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from openswap.worker.protocol import Artifact, ProtocolError, Submission
+from openswap.worker.protocol import Artifact, ProtocolError, Submission, timestamp
 from openswap.worker.models import JobSubmission, JobState, SafeEvent, SafeEventKind
 from openswap.worker.refserver import ControlStore, make_server
 from openswap.worker.refserver import cli as refserver_cli
@@ -618,3 +618,214 @@ def test_cancel_requested_event_after_heartbeat_loss_still_sets_the_flag(service
     job = store.request("job", {"job_id": claim["job_id"]}, key)
     assert (job["state"], job["cancel_requested"]) == ("interrupted", True)
     assert store.request("heartbeat", {"worker_epoch": epoch}, key)["cancel_job_ids"] == [claim["job_id"]]
+
+
+# --- optional key rotation -------------------------------------------------------------------
+
+def _advertise_rotation(store, key, epoch):
+    assert store.request("capabilities", {"worker_epoch": epoch, "features": ["key_rotation"]},
+                         key) == {"features": ["key_rotation"]}
+
+
+def _rotate(store, key, epoch):
+    return store.request("rotate_key", {"worker_epoch": epoch}, key)
+
+
+def _key_slots(store, worker_id):
+    with closing(store.connect()) as db:
+        row = db.execute("SELECT pending_hash,previous_hash,previous_until FROM devices WHERE id=?",
+                         (worker_id,)).fetchone()
+    return tuple(row)
+
+
+def test_rotated_key_is_pending_until_first_use_and_leaves_epoch_and_claims_alone(service):
+    store, ticks, worker_id, key, epoch = service
+    _advertise_rotation(store, key, epoch)
+    submit(service)
+    claim = store.request("poll", {"worker_epoch": epoch}, key)["claim"]
+    rotated = _rotate(store, key, epoch)
+    assert set(rotated) == {"worker_id", "device_key", "expires_at"}
+    assert rotated["worker_id"] == worker_id and rotated["device_key"] != key
+    assert timestamp(rotated["expires_at"]).timestamp() == pytest.approx(ticks[0] + 30 * 86400, abs=0.001)
+    new_key = rotated["device_key"]
+    # Pending: the old key is still the current one.
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
+    assert _key_slots(store, worker_id)[0] is not None
+    # The first request with the new key promotes it: same epoch, same claim, same lease.
+    store.request("heartbeat", {"worker_epoch": epoch}, new_key)
+    assert store.request("renew", fence(service, claim), new_key)["state"] == "claimed"
+    assert store.request("job", {"job_id": claim["job_id"]}, new_key)["epoch"] == claim["epoch"]
+    pending, previous, _ = _key_slots(store, worker_id)
+    assert pending is None and previous is not None
+    # A straggler still carrying the old key is accepted for the 2-minute grace...
+    ticks[0] += 119
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
+    store.request("heartbeat", {"worker_epoch": epoch}, new_key)
+    # ...and refused after it.
+    ticks[0] += 2
+    with pytest.raises(ProtocolError, match="unauthorized"):
+        store.request("heartbeat", {"worker_epoch": epoch}, key)
+    store.request("heartbeat", {"worker_epoch": epoch}, new_key)
+    assert store.request("register", {}, new_key)["worker_epoch"] == epoch + 1  # nothing registered before
+
+
+def test_new_key_lasts_thirty_days_from_rotation(service):
+    store, ticks, worker_id, key, epoch = service
+    _advertise_rotation(store, key, epoch)
+    ticks[0] += 25 * 86400
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
+    new_key = _rotate(store, key, epoch)["device_key"]
+    store.request("heartbeat", {"worker_epoch": epoch}, new_key)
+    ticks[0] += 29 * 86400  # past the old key's expiry, inside the new one's
+    store.request("heartbeat", {"worker_epoch": epoch}, new_key)
+    ticks[0] += 86400
+    with pytest.raises(ProtocolError, match="device_expired"):
+        store.request("heartbeat", {"worker_epoch": epoch}, new_key)
+
+
+def test_retry_after_a_lost_rotation_replaces_the_pending_key(service):
+    store, _, worker_id, key, epoch = service
+    _advertise_rotation(store, key, epoch)
+    lost = _rotate(store, key, epoch)["device_key"]  # the response never arrived
+    retried = _rotate(store, key, epoch)["device_key"]  # the old key still works, and retries
+    assert retried != lost
+    with pytest.raises(ProtocolError, match="unauthorized"):
+        store.request("heartbeat", {"worker_epoch": epoch}, lost)
+    store.request("heartbeat", {"worker_epoch": epoch}, retried)
+    with pytest.raises(ProtocolError, match="unauthorized"):
+        store.request("heartbeat", {"worker_epoch": epoch}, lost)  # it never promotes later either
+
+
+def test_rotation_is_refused_for_an_hour_after_a_promotion_but_never_for_a_retry(service):
+    store, ticks, _, key, epoch = service
+    _advertise_rotation(store, key, epoch)
+    for _ in range(3):  # replacing a pending key is always allowed
+        pending = _rotate(store, key, epoch)["device_key"]
+    store.request("heartbeat", {"worker_epoch": epoch}, pending)
+    with pytest.raises(ProtocolError, match="rotation_too_soon") as refused:
+        _rotate(store, pending, epoch)
+    assert refused.value.status == 409
+    ticks[0] += 3599
+    with pytest.raises(ProtocolError, match="rotation_too_soon"):
+        _rotate(store, pending, epoch)
+    ticks[0] += 1
+    store.request("heartbeat", {"worker_epoch": epoch}, pending)
+    assert _rotate(store, pending, epoch)["device_key"] not in {key, pending}
+
+
+def test_rotation_needs_the_feature_and_the_current_epoch(service):
+    store, _, _, key, epoch = service
+    with pytest.raises(ProtocolError, match="invalid_request"):
+        _rotate(store, key, epoch)  # this registration never advertised key_rotation
+    _advertise_rotation(store, key, epoch)
+    with pytest.raises(ProtocolError, match="invalid_request"):
+        store.request("rotate_key", {"worker_epoch": epoch, "extra": 1}, key)
+    with pytest.raises(ProtocolError, match="stale_epoch"):
+        _rotate(store, key, epoch + 1)
+    epoch = store.request("register", {}, key)["worker_epoch"]
+    with pytest.raises(ProtocolError, match="invalid_request"):
+        _rotate(store, key, epoch)  # a new registration advertises again
+
+
+def test_revoked_or_expired_workers_cannot_rotate_and_revocation_clears_both_slots(service):
+    store, ticks, worker_id, key, epoch = service
+    _advertise_rotation(store, key, epoch)
+    promoted = _rotate(store, key, epoch)["device_key"]
+    store.request("heartbeat", {"worker_epoch": epoch}, promoted)  # the old key moves to the grace slot
+    ticks[0] += 3600
+    store.request("heartbeat", {"worker_epoch": epoch}, promoted)
+    pending = _rotate(store, promoted, epoch)["device_key"]
+    store.revoke(worker_id)
+    assert _key_slots(store, worker_id) == (None, None, None)
+    with pytest.raises(ProtocolError, match="revoked"):
+        _rotate(store, promoted, epoch)
+    with pytest.raises(ProtocolError, match="unauthorized"):
+        store.request("heartbeat", {"worker_epoch": epoch}, pending)  # cannot promote either
+    other = ControlStore(store.path.parent / "other.sqlite3", clock=lambda: ticks[0])
+    other_key = other.request("pair", {"code": other.issue_code()})["device_key"]
+    other_epoch = other.request("register", {}, other_key)["worker_epoch"]
+    _advertise_rotation(other, other_key, other_epoch)
+    ticks[0] += 30 * 86400
+    with pytest.raises(ProtocolError, match="device_expired"):
+        _rotate(other, other_key, other_epoch)
+
+
+def test_pasted_renewal_ends_the_previous_keys_grace(service):
+    store, _, worker_id, key, epoch = service
+    _advertise_rotation(store, key, epoch)
+    promoted = _rotate(store, key, epoch)["device_key"]
+    store.request("heartbeat", {"worker_epoch": epoch}, promoted)
+    store.request("heartbeat", {"worker_epoch": epoch}, key)  # inside the grace
+    renewed = store.request("pair", {"code": store.issue_code(worker_id)})["device_key"]
+    assert _key_slots(store, worker_id) == (None, None, None)
+    for stale in (key, promoted):
+        with pytest.raises(ProtocolError, match="unauthorized"):
+            store.request("register", {}, stale)
+    store.request("register", {}, renewed)
+
+
+def test_pasted_renewal_leaves_an_unused_pending_key_dead(service):
+    store, _, worker_id, key, epoch = service
+    _advertise_rotation(store, key, epoch)
+    pending = _rotate(store, key, epoch)["device_key"]
+    renewed = store.request("pair", {"code": store.issue_code(worker_id)})["device_key"]
+    with pytest.raises(ProtocolError, match="unauthorized"):
+        store.request("register", {}, pending)  # never promotes over the renewed key
+    store.request("register", {}, renewed)
+
+
+def test_grace_never_outlives_the_old_keys_expiry(service):
+    store, ticks, worker_id, key, epoch = service
+    _advertise_rotation(store, key, epoch)
+    ticks[0] += 30 * 86400 - 60  # the old key has a minute left
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
+    new_key = _rotate(store, key, epoch)["device_key"]
+    store.request("heartbeat", {"worker_epoch": epoch}, new_key)
+    _, previous, until = _key_slots(store, worker_id)
+    assert previous is not None and until == ticks[0] + 60  # not promotion + 120
+    ticks[0] += 59
+    store.request("heartbeat", {"worker_epoch": epoch}, key)
+    ticks[0] += 1
+    with pytest.raises(ProtocolError, match="unauthorized"):
+        store.request("heartbeat", {"worker_epoch": epoch}, key)
+
+
+def test_promoting_over_an_expired_key_leaves_no_previous_slot(service):
+    store, ticks, worker_id, key, epoch = service
+    _advertise_rotation(store, key, epoch)
+    ticks[0] += 30 * 86400 - 10
+    pending = _rotate(store, key, epoch)["device_key"]
+    ticks[0] += 20  # the old key expires before the new one is first used
+    with pytest.raises(ProtocolError, match="device_expired"):
+        store.request("heartbeat", {"worker_epoch": epoch}, key)
+    store.request("heartbeat", {"worker_epoch": epoch}, pending)
+    assert _key_slots(store, worker_id) == (None, None, None)
+    with pytest.raises(ProtocolError, match="unauthorized"):
+        store.request("heartbeat", {"worker_epoch": epoch}, key)  # never revived by the grace
+
+
+def test_pending_key_from_a_superseded_registration_still_promotes(service):
+    store, _, _, key, epoch = service
+    _advertise_rotation(store, key, epoch)
+    pending = _rotate(store, key, epoch)["device_key"]
+    newer = store.request("register", {}, key)["worker_epoch"]
+    store.request("heartbeat", {"worker_epoch": newer}, pending)
+    assert store.request("register", {}, pending)["worker_epoch"] == newer + 1
+
+
+def test_existing_database_gains_the_key_rotation_columns(tmp_path):
+    path = tmp_path / "private" / "server.sqlite3"
+    path.parent.mkdir(mode=0o700)
+    with closing(sqlite3.connect(path)) as db, db:  # a devices table from before the extension
+        db.execute("CREATE TABLE devices (id TEXT PRIMARY KEY, key_hash TEXT UNIQUE NOT NULL, expiry REAL NOT NULL, "
+                   "revoked INTEGER NOT NULL DEFAULT 0, epoch INTEGER NOT NULL DEFAULT 0, seen REAL)")
+    os.chmod(path, 0o600)
+    store = ControlStore(path)
+    with closing(store.connect()) as db:
+        columns = {r[1] for r in db.execute("PRAGMA table_info(devices)")}
+    assert {"pending_hash", "pending_expiry", "previous_hash", "previous_until", "promoted_at"} <= columns
+    ControlStore(path)  # reopening is idempotent
+    key = store.request("pair", {"code": store.issue_code()})["device_key"]
+    epoch = store.request("register", {}, key)["worker_epoch"]
+    _advertise_rotation(store, key, epoch)
+    assert _rotate(store, key, epoch)["device_key"]

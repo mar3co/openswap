@@ -80,7 +80,7 @@ def test_loopback_pair_cli_submit_fake_run_events_and_artifact(tmp_path, keychai
             assert adapter.starts == 1
             # The worker advertised `origin` at registration, so a job may say where it came
             # from; the claim carries it unchanged and the local record keeps it.
-            assert store.capabilities(enrollment.worker_id) == ["origin"]
+            assert store.capabilities(enrollment.worker_id) == ["origin", "key_rotation"]
             assert cli.main([*arguments, "--origin-kind", "assistant", "--origin-label", "ChatGPT"],
                             backup_root=root) == 0
             origin_job = json.loads(capsys.readouterr().out)["job_id"]
@@ -187,6 +187,82 @@ def test_configured_background_polling_loop(tmp_path, keychain, capsys, monkeypa
             if polling is not None:
                 polling.join(WAIT)
                 assert not polling.is_alive()
+            server.shutdown()
+            serving.join(WAIT)
+            assert not serving.is_alive()
+
+
+def test_loopback_key_rotation_survives_a_lost_response_then_promotes(tmp_path, keychain, capsys):
+    """S1's exit test: over real HTTP, a rotate_key answer is dropped, the old key still
+    works, the retry's key is saved and adopted in place, and its first use promotes it."""
+    from openswap.worker.remote import ROTATION_BACKOFF_SECONDS
+
+    store = ControlStore(tmp_path / "service" / "db")
+    lost, delivered = [], []
+    with make_server(store, port=0) as server:
+        serving = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        serving.start()
+        url = f"http://127.0.0.1:{server.server_port}"
+        root = tmp_path / "local"
+        try:
+            assert cli.main(["pair", url, store.issue_code()], backup_root=root) == 0
+            original = load_enrollment(url)
+            # Seven days or fewer left, as the Mac saved it: rotation is due at once.
+            item = ("openswap", pairing.account_name(url))
+            saved = json.loads(keychain[item])
+            saved["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+            keychain[item] = json.dumps(saved)
+            update_worker_settings(root, enabled=True)
+            runtime = WorkerRuntime(root, adapter=FakeAdapter(),
+                                    account_identity=stable_account_identity("codex", "synthetic-rotation"))
+
+            class DroppingTransport(Transport):
+                calls = []
+
+                def request(self, operation, data):
+                    self.calls.append(operation)
+                    response = super().request(operation, data)
+                    if operation == "rotate_key":
+                        if not lost:
+                            lost.append(response["device_key"])
+                            raise ProtocolError("service_unavailable", 503)  # the answer never arrives
+                        delivered.append(response["device_key"])
+                    return response
+            clients = []
+
+            def factory(runtime, origin, key, *, worker_id=""):
+                clients.append(RemoteClient(runtime, origin, key, worker_id=worker_id,
+                                            transport=DroppingTransport(origin, key)))
+                return clients[-1]
+            configured = ConfiguredRemote(runtime, client_factory=factory)
+            configured.tick()
+            client = configured.client
+            epoch = client.worker_epoch
+            assert client.state == "online" and store.capabilities(original.worker_id) == ["origin", "key_rotation"]
+            assert lost and json.loads(keychain[item])["device_key"] == original.device_key
+            configured.tick()
+            assert client.state == "online"  # the old key still works
+            client._rotation_retry_at -= ROTATION_BACKOFF_SECONDS  # an hour later
+            configured.tick()
+            assert delivered and load_enrollment(url).device_key == delivered[0] == client.transport.key
+            with pytest.raises(ProtocolError, match="unauthorized"):
+                Transport(url, lost[0]).request("heartbeat", {"worker_epoch": epoch})
+            configured.tick()  # the first request with the new key promotes it
+            assert client.state == "online" and configured.client is client and len(clients) == 1
+            assert client.worker_epoch == epoch and DroppingTransport.calls.count("register") == 1
+            # A straggler with the old key is still inside the 2-minute grace.
+            Transport(url, original.device_key).request("heartbeat", {"worker_epoch": epoch})
+            # The new key runs jobs end to end.
+            capsys.readouterr()
+            assert cli.main(["submit-test", "--url", url, "--task", "After rotation", "--workspace-id", "research",
+                             "--runtime-limit", "60", "--expires-in", "600",
+                             "--i-understand-this-is-a-test-tool"], backup_root=root) == 0
+            job_id = json.loads(capsys.readouterr().out)["job_id"]
+            configured.tick()
+            assert runtime.reconcile_once().state == JobState.SUCCEEDED
+            configured.tick()
+            assert Transport(url, delivered[0]).request("job", {"job_id": job_id})["state"] == "succeeded"
+        finally:
             server.shutdown()
             serving.join(WAIT)
             assert not serving.is_alive()

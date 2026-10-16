@@ -647,3 +647,366 @@ def test_pairing_that_changes_nothing_keeps_the_configured_status(tmp_path, keyc
     pairing.unpair(tmp_path)
     assert not (tmp_path / "worker" / "remote-status.json").exists()
 
+
+# --- optional key rotation on the Mac -----------------------------------------------------
+
+ROTATION_URL = "http://127.0.0.1:8765"
+
+
+class RotationRig:
+    """A worker paired with a reference store (no sockets), driven by ConfiguredRemote.
+
+    ``days_left`` sets the key's expiry as the Mac saved it, so rotation is due
+    without moving the service's clock (which would interrupt running jobs).
+    """
+    def __init__(self, tmp_path, keychain, *, days_left=None, reject_rotation=None, drop_rotation=False):
+        from tests.test_worker_remote import FakeAdapter, StoreTransport
+        from openswap.worker.leases import stable_account_identity
+        from openswap.worker.refserver import ControlStore
+        from openswap.worker.remote import RemoteClient
+        from openswap.worker.runtime import WorkerRuntime
+
+        self.keychain = keychain
+        self.ticks = [datetime.now(timezone.utc).timestamp()]
+        self.store = ControlStore(tmp_path / "service" / "db", clock=lambda: self.ticks[0])
+        self.responses = []  # every rotate_key answer the store gave, delivered or not
+        serve = self.store.request
+
+        def recorded(operation, value, key=None):
+            result = serve(operation, value, key)
+            if operation == "rotate_key":
+                self.responses.append(result)
+            return result
+        self.store.request = recorded
+        self.root = tmp_path / "local"
+        self.worker_id = pairing.pair(self.root, ROTATION_URL, self.store.issue_code(),
+                                      transport=StoreTransport(self.store, None))
+        update_worker_settings(self.root, enabled=True)
+        self.original_key = self.saved()["device_key"]
+        if days_left is not None:
+            saved = self.saved()
+            saved["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=days_left)).isoformat()
+            self.keychain[("openswap", pairing.account_name(ROTATION_URL))] = json.dumps(saved)
+        self.adapter = FakeAdapter()
+        self.runtime = WorkerRuntime(self.root, adapter=self.adapter,
+                                     account_identity=stable_account_identity("codex", "synthetic-rotation"))
+        self.clients, self.transports = [], []
+
+        def factory(runtime, url, key, *, worker_id=""):
+            transport = StoreTransport(self.store, key)
+            if reject_rotation is not None:
+                transport.reject["rotate_key"] = reject_rotation
+            if drop_rotation:
+                transport.drop_response = "rotate_key"
+            client = RemoteClient(runtime, url, key, worker_id=worker_id, transport=transport)
+            self.clients.append(client)
+            self.transports.append(transport)
+            return client
+        self.configured = ConfiguredRemote(self.runtime, client_factory=factory)
+
+    def saved(self):
+        return json.loads(self.keychain[("openswap", pairing.account_name(ROTATION_URL))])
+
+    @property
+    def client(self):
+        return self.clients[-1]
+
+    @property
+    def calls(self):
+        return [call for transport in self.transports for call in transport.calls]
+
+    def submit(self, idem="rotation-job"):
+        from openswap.worker.models import JobSubmission
+        from openswap.worker.protocol import Submission
+
+        job = JobSubmission(idem, "codex", "Research", "research", "research",
+                            datetime.fromtimestamp(self.ticks[0] + 600, timezone.utc), 60)
+        return self.store.request("submit", Submission(self.worker_id, job).to_dict(),
+                                  self.client.transport.key)["job_id"]
+
+
+def _slots(store, worker_id):
+    from contextlib import closing
+
+    with closing(store.connect()) as db:
+        return tuple(db.execute("SELECT pending_hash,previous_hash FROM devices WHERE id=?", (worker_id,)).fetchone())
+
+
+def test_rotation_starts_at_seven_days_left_and_not_before(tmp_path, keychain):
+    rig = RotationRig(tmp_path, keychain)
+    rig.configured.tick()
+    assert rig.client.state == "online" and rig.client.rotation_accepted()
+    assert "rotate_key" not in rig.calls  # 30 days left
+    rig.ticks[0] += 23 * 86400 - 120  # the service's clock: a little over 7 days left
+    rig.configured.tick()
+    assert "rotate_key" not in rig.calls and rig.saved()["device_key"] == rig.original_key
+    rig.ticks[0] += 240  # now a little under 7 days
+    rig.configured.tick()
+    assert rig.calls.count("rotate_key") == 1
+    assert rig.saved()["device_key"] == rig.responses[-1]["device_key"] != rig.original_key
+    rig.configured.tick()
+    assert rig.calls.count("rotate_key") == 1  # the new key has 30 days: nothing more to do
+
+
+def test_rotation_keeps_the_client_the_epoch_and_the_saved_status(tmp_path, keychain):
+    from openswap.worker.remote_state import read_key_status
+
+    rig = RotationRig(tmp_path, keychain, days_left=6)
+    rig.configured.tick()  # registers, then rotates in the same pass
+    client, epoch = rig.client, rig.client.worker_epoch
+    new_key = rig.responses[-1]["device_key"]
+    assert rig.calls.count("rotate_key") == 1
+    assert client.transport.key == new_key == rig.saved()["device_key"]
+    assert rig.configured.identity == (ROTATION_URL, pairing.load_enrollment(ROTATION_URL))
+    assert _slots(rig.store, rig.worker_id)[0] is not None  # pending until first used
+    status = (tmp_path / "local" / "worker" / "remote-status.json").read_text()
+    rig.configured.tick()  # the heartbeat with the new key promotes it
+    assert _slots(rig.store, rig.worker_id)[0] is None
+    assert rig.configured.client is client and len(rig.clients) == 1
+    assert client.worker_epoch == epoch and rig.calls.count("register") == 1
+    assert json.loads(status)["service"] == json.loads(
+        (tmp_path / "local" / "worker" / "remote-status.json").read_text())["service"]
+    assert read_status(rig.root)[0] == RemoteConnectivity.ONLINE
+    renews, expires = read_key_status(rig.root)
+    assert renews is True and expires == pairing.load_enrollment(ROTATION_URL).expires_at
+    assert read_worker_snapshot(rig.root).remote_key_renews is True
+    # A straggler request still carrying the old key lands inside the grace.
+    rig.store.request("heartbeat", {"worker_epoch": epoch}, rig.original_key)
+
+
+def test_lost_rotation_response_keeps_the_old_key_and_the_retry_replaces_the_pending_one(tmp_path, keychain):
+    from openswap.worker.remote import ROTATION_BACKOFF_SECONDS
+
+    rig = RotationRig(tmp_path, keychain, days_left=6, drop_rotation=True)
+    rig.configured.tick()
+    lost = rig.responses[-1]["device_key"]  # the store answered; the answer never arrived
+    assert rig.calls.count("rotate_key") == 1
+    assert rig.saved()["device_key"] == rig.client.transport.key == rig.original_key
+    rig.configured.tick()
+    assert rig.client.state == "online"  # the old key still works
+    assert rig.calls.count("rotate_key") == 1  # backed off for an hour
+    rig.client._rotation_retry_at -= ROTATION_BACKOFF_SECONDS
+    rig.configured.tick()
+    retried = rig.responses[-1]["device_key"]
+    assert rig.calls.count("rotate_key") == 2 and retried != lost
+    assert rig.saved()["device_key"] == rig.client.transport.key == retried
+    with pytest.raises(ProtocolError, match="unauthorized"):
+        rig.store.request("heartbeat", {"worker_epoch": rig.client.worker_epoch}, lost)
+    rig.configured.tick()
+    assert rig.client.state == "online" and len(rig.clients) == 1 and rig.calls.count("register") == 1
+
+
+def test_keychain_write_failure_keeps_the_old_key(tmp_path, keychain, monkeypatch):
+    from openswap.worker.remote import ROTATION_BACKOFF_SECONDS
+
+    rig = RotationRig(tmp_path, keychain, days_left=6)
+    working = macos_keychain.set_password
+    monkeypatch.setattr(macos_keychain, "set_password",
+                        lambda *_: (_ for _ in ()).throw(macos_keychain.KeychainError("locked")))
+    rig.configured.tick()
+    assert rig.calls.count("rotate_key") == 1
+    assert rig.saved()["device_key"] == rig.client.transport.key == rig.original_key
+    rig.configured.tick()
+    assert rig.client.state == "online"  # the server's new key is only pending
+    monkeypatch.setattr(macos_keychain, "set_password", working)
+    rig.client._rotation_retry_at -= ROTATION_BACKOFF_SECONDS
+    rig.configured.tick()
+    assert rig.saved()["device_key"] == rig.client.transport.key == rig.responses[-1]["device_key"]
+    assert len(rig.clients) == 1 and rig.calls.count("register") == 1
+
+
+@pytest.mark.parametrize("change", ["unpair", "repair"])
+def test_a_concurrent_unpair_or_repair_wins_over_rotation(tmp_path, keychain, change):
+    from tests.test_worker_remote import StoreTransport
+
+    rig = RotationRig(tmp_path, keychain, days_left=6)
+
+    def saver(root, url, enrollment, *, previous_key):
+        # The owner's command lands between the rotate_key answer and the save.
+        pairing.unpair(root)
+        if change == "repair":
+            pairing.pair(root, url, rig.store.issue_code(), transport=StoreTransport(rig.store, None))
+        return pairing.store_rotated_key(root, url, enrollment, previous_key=previous_key)
+    rig.configured.key_saver = saver
+    rig.configured.tick()
+    assert rig.calls.count("rotate_key") == 1
+    assert rig.clients[0].transport.key == rig.original_key  # nothing adopted
+    if change == "unpair":
+        assert not keychain
+        assert load_worker_settings(rig.root).control_service_url is None
+    else:
+        assert rig.saved()["worker_id"] != rig.worker_id  # the new pairing, untouched
+        assert rig.saved()["device_key"] != rig.responses[-1]["device_key"]
+    rig.configured.tick()
+    assert rig.configured.client is not rig.clients[0]  # the old enrollment is gone either way
+
+
+def test_a_job_running_across_a_rotation_finishes_and_uploads(tmp_path, keychain):
+    from openswap.worker.models import JobState
+
+    rig = RotationRig(tmp_path, keychain)
+    rig.configured.tick()
+    job_id = rig.submit()
+    rig.configured.tick()  # claims and admits it
+    rig.adapter.finish.clear()
+    results = []
+    runner = threading.Thread(target=lambda: results.append(rig.runtime.reconcile_once()))
+    runner.start()
+    try:
+        assert rig.adapter.entered.wait(15)
+        client, epoch = rig.client, rig.client.worker_epoch
+        client.key_expires_at = datetime.now(timezone.utc) + timedelta(days=6)  # time has passed
+        rig.configured.tick()
+        assert rig.calls.count("rotate_key") == 1
+        assert client.transport.key == rig.saved()["device_key"] != rig.original_key
+        rig.configured.tick()  # promotes the new key while the job still runs
+        assert _slots(rig.store, rig.worker_id)[0] is None
+    finally:
+        rig.adapter.finish.set()
+        runner.join(15)
+    assert results[0].state == JobState.SUCCEEDED
+    rig.configured.tick()
+    key = rig.saved()["device_key"]
+    assert rig.store.request("job", {"job_id": job_id}, key)["state"] == "succeeded"
+    assert [a["name"] for a in rig.store.request("artifacts", {"job_id": job_id}, key)["artifacts"]] == ["result.md"]
+    assert rig.configured.client is client and client.worker_epoch == epoch
+    assert rig.calls.count("register") == 1 and rig.adapter.starts == 1
+    assert client.journal.pending() == []
+
+
+@pytest.mark.parametrize("code", ["unsupported_version", "not_found"])
+def test_a_404_stops_rotation_until_the_next_registration(tmp_path, keychain, code):
+    rig = RotationRig(tmp_path, keychain, days_left=6, reject_rotation=ProtocolError(code, 404))
+    rig.configured.tick()
+    assert rig.calls.count("rotate_key") == 1
+    rig.client._rotation_retry_at = None
+    rig.configured.tick()
+    rig.configured.tick()
+    assert rig.calls.count("rotate_key") == 1  # not asked again for this registration
+    assert rig.client.key_renewal() is False
+    snapshot = read_worker_snapshot(rig.root).to_dict()
+    assert snapshot["remote_key_renews"] is False
+    assert "expires in 5 days" in cli._format_status(snapshot)
+    # A new registration (the service superseded this one) asks again.
+    rig.store.request("register", {}, rig.original_key)
+    rig.configured.tick()  # stale_epoch: registers again on the next pass
+    rig.configured.tick()
+    assert rig.calls.count("register") == 2 and rig.calls.count("rotate_key") == 2
+    assert rig.saved()["device_key"] == rig.responses[-1]["device_key"]
+    assert len(rig.clients) == 1
+
+
+def test_a_revoked_worker_cannot_rotate(tmp_path, keychain):
+    rig = RotationRig(tmp_path, keychain)
+    rig.configured.tick()
+    rig.store.revoke(rig.worker_id)
+    rig.client.key_expires_at = datetime.now(timezone.utc) + timedelta(days=6)
+    assert rig.client.rotate_key_if_due() is False
+    assert rig.calls[-1] == "rotate_key"
+    assert rig.client.state == "revoked"
+    assert rig.saved()["device_key"] == rig.original_key and not rig.responses
+
+
+def test_rotation_never_holds_back_a_heartbeat(tmp_path, keychain):
+    rig = RotationRig(tmp_path, keychain, days_left=6)
+    saved, release = threading.Event(), threading.Event()
+
+    def slow_saver(root, url, enrollment, *, previous_key):
+        stored = pairing.store_rotated_key(root, url, enrollment, previous_key=previous_key)
+        saved.set()
+        release.wait(15)  # the Keychain item holds the new key; the identity is not swapped yet
+        return stored
+    rig.configured.key_saver = slow_saver
+    rig.configured._heartbeat_pass()
+    syncing = threading.Thread(target=rig.configured._sync_pass)
+    syncing.start()
+    try:
+        assert saved.wait(15)
+        beating = threading.Thread(target=rig.configured._heartbeat_pass)
+        beating.start()
+        beating.join(10)
+        assert not beating.is_alive()
+        # The heartbeat read the new key from the Keychain mid-rotation, and kept the client.
+        assert rig.configured.client is rig.clients[0] and len(rig.clients) == 1
+    finally:
+        release.set()
+        syncing.join(15)
+    assert rig.client.transport.key == rig.saved()["device_key"] != rig.original_key
+    rig.configured._heartbeat_pass()
+    assert len(rig.clients) == 1 and rig.calls.count("register") == 1 and rig.client.state == "online"
+
+
+def test_store_rotated_key_writes_only_over_the_key_the_client_started_with(tmp_path, keychain):
+    url = "https://control.example"
+    pairing.pair(tmp_path, url, "one-use", transport=PairTransport())
+    update_worker_settings(tmp_path, enabled=True)
+    seen = datetime.now(timezone.utc)
+    save_status(tmp_path, url, "online", seen, "worker")
+    expires = datetime.now(timezone.utc) + timedelta(days=30)
+    rotated = pairing.Enrollment("worker", "rotated-device-key", expires)
+    assert pairing.store_rotated_key(tmp_path, url, rotated, previous_key="some-other-key") is False
+    assert pairing.store_rotated_key(tmp_path, "https://elsewhere.example", rotated,
+                                     previous_key="synthetic-device-key") is False
+    assert pairing.store_rotated_key(tmp_path, url, pairing.Enrollment("someone-else", "k", expires),
+                                     previous_key="synthetic-device-key") is False
+    assert pairing.store_rotated_key(tmp_path, url, pairing.Enrollment("worker", "k", seen),
+                                     previous_key="synthetic-device-key") is False  # already expired
+    assert pairing.load_enrollment(url).device_key == "synthetic-device-key"
+    assert pairing.store_rotated_key(tmp_path, url, rotated, previous_key="synthetic-device-key") is True
+    assert pairing.load_enrollment(url) == rotated
+    assert read_status(tmp_path, now=seen) == (RemoteConnectivity.ONLINE, seen)  # status kept
+    assert load_worker_settings(tmp_path).control_service_url == url
+    pairing.unpair(tmp_path)
+    assert pairing.store_rotated_key(tmp_path, url, rotated, previous_key="rotated-device-key") is False
+    assert not keychain
+
+
+def test_status_says_the_key_renews_or_when_it_expires():
+    from openswap.menubar_display import (
+        SETTINGS_SECTION_REMOTE, MenuBarSettings, remote_key_copy, settings_page_rows,
+    )
+
+    base = {"enabled": True, "paused": False, "process_state": "running", "provider": {"available": False},
+            "remote_connectivity": "online"}
+    assert "Key" not in cli._format_status(base)  # not known yet
+    assert remote_key_copy(base) == ""
+    renews = {**base, "remote_key_renews": True, "remote_key_expires_at": "2026-11-01T00:00:00Z"}
+    assert "✓ Key           renews automatically" in cli._format_status(renews)
+    assert remote_key_copy(renews) == "Key renews automatically."
+    expires = (datetime.now(timezone.utc) + timedelta(days=12, hours=1)).isoformat()
+    lacking = {**base, "remote_key_renews": False, "remote_key_expires_at": expires}
+    text = cli._format_status(lacking)
+    assert "expires in 12 days" in text and "Re-pair this Mac" in text
+    menu = remote_key_copy(lacking)
+    assert menu.startswith("Key expires in 12 days.") and "re-pair this Mac" in menu
+    rows = settings_page_rows(MenuBarSettings(), strategy="best", threshold=90, section=SETTINGS_SECTION_REMOTE,
+                              worker_enabled=True, worker_paired=True, worker_status=lacking)
+    ids = [row["id"] for row in rows]
+    assert ids.index("remote_tasks_key") == ids.index("remote_tasks_status") + 1
+    assert rows[ids.index("remote_tasks_key")]["label"] == menu
+    unpaired = settings_page_rows(MenuBarSettings(), strategy="best", threshold=90, section=SETTINGS_SECTION_REMOTE,
+                                  worker_enabled=True, worker_paired=False, worker_status=lacking)
+    assert "remote_tasks_key" not in [row["id"] for row in unpaired]
+    # A key whose saved expiry has passed says so; it never claims time is left.
+    gone = {**lacking, "remote_key_expires_at": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()}
+    text = cli._format_status(gone)
+    assert "✗ Key" in text and "expired; this Mac can't take tasks" in text and "less than a day" not in text
+    assert remote_key_copy(gone).startswith("Key expired.")
+    long_gone = {**lacking, "remote_key_expires_at": (datetime.now(timezone.utc) - timedelta(days=9)).isoformat()}
+    assert "expired;" in cli._format_status(long_gone) and remote_key_copy(long_gone).startswith("Key expired.")
+
+
+def test_key_status_stays_visible_while_the_worker_is_off(tmp_path):
+    from openswap.worker.remote_state import read_key_status
+
+    url = "https://control.example"
+    expires = datetime.now(timezone.utc) + timedelta(days=5)
+    configure_worker_service(tmp_path, url, "worker")
+    update_worker_settings(tmp_path, enabled=True)
+    save_status(tmp_path, url, "online", datetime.now(timezone.utc), "worker",
+                key_renews=False, key_expires_at=expires)
+    update_worker_settings(tmp_path, enabled=False)
+    assert read_key_status(tmp_path) == (False, expires)
+    configure_worker_service(tmp_path, None)
+    assert read_key_status(tmp_path) == (None, None)  # unpaired: nothing to report
+

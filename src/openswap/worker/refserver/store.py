@@ -16,8 +16,9 @@ from contextlib import closing
 from openswap.worker.models import SafeEventKind
 from openswap.worker.protocol import (
     Artifact, DEVICE_TTL_SECONDS, FEATURES, HEARTBEAT_SECONDS, LEASE_SECONDS, MAX_ARTIFACTS,
-    MISSED_HEARTBEATS, ProtocolError, Submission, TERMINAL, advertised_accounts, capability_features,
-    event_from_dict, execution_mode, fields, integer, reported_folders, text, stamp as wire_stamp,
+    MISSED_HEARTBEATS, PREVIOUS_KEY_GRACE_SECONDS, ProtocolError, ROTATION_INTERVAL_SECONDS, Submission,
+    TERMINAL, advertised_accounts, capability_features, event_from_dict, execution_mode, fields, integer,
+    reported_folders, text, stamp as wire_stamp,
 )
 
 # Jobs whose cancel flag a reconnecting worker must still enforce.
@@ -93,6 +94,15 @@ class ControlStore:
                 db.execute("ALTER TABLE jobs ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
             if "device" not in {r[1] for r in db.execute("PRAGMA table_info(codes)")}:
                 db.execute("ALTER TABLE codes ADD COLUMN device TEXT")
+            # Key rotation extension: one pending key (current once first used), and the
+            # key it replaced, still accepted until previous_until. promoted_at rate-limits.
+            columns = {r[1] for r in db.execute("PRAGMA table_info(devices)")}
+            for column, kind in (("pending_hash", "TEXT"), ("pending_expiry", "REAL"), ("previous_hash", "TEXT"),
+                                 ("previous_until", "REAL"), ("promoted_at", "REAL")):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE devices ADD COLUMN {column} {kind}")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS devices_pending_hash ON devices(pending_hash)")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS devices_previous_hash ON devices(previous_hash)")
         if os.name != "nt":
             os.chmod(self.path, 0o600)
 
@@ -143,16 +153,22 @@ class ControlStore:
         return None if row is None else json.loads(row[0])
 
     @staticmethod
-    def _origin_advertised(db, device) -> bool:
-        """Whether the worker's current registration advertised "origin" (and it was accepted)."""
+    def _advertised(db, device, feature) -> bool:
+        """Whether the worker's current registration advertised ``feature`` (and it was accepted)."""
         row = db.execute("SELECT features FROM capabilities WHERE device=? AND epoch=?",
                          (device["id"], device["epoch"])).fetchone()
-        return row is not None and "origin" in json.loads(row[0])
+        return row is not None and feature in json.loads(row[0])
+
+    @classmethod
+    def _origin_advertised(cls, db, device) -> bool:
+        return cls._advertised(db, device, "origin")
 
     def revoke(self, worker_id: str) -> None:
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            if not db.execute("UPDATE devices SET revoked=1 WHERE id=?", (worker_id,)).rowcount:
+            # Revocation also drops a pending key and the grace of a previous one.
+            if not db.execute("UPDATE devices SET revoked=1,pending_hash=NULL,pending_expiry=NULL,"
+                              "previous_hash=NULL,previous_until=NULL WHERE id=?", (worker_id,)).rowcount:
                 raise ProtocolError("not_found", 404)
             db.execute("DELETE FROM advertised_accounts WHERE device=?", (worker_id,))
             db.execute("DELETE FROM account_choice_epochs WHERE device=?", (worker_id,))
@@ -168,19 +184,52 @@ class ControlStore:
                    "(SELECT id FROM devices WHERE seen IS NULL OR seen<=?)",
                    (now - HEARTBEAT_SECONDS * MISSED_HEARTBEATS,))
 
-    @staticmethod
-    def _device(db, key, now):
+    @classmethod
+    def _device(cls, db, key, now):
         """Authenticate a device key; read-only, so it runs before any write lock or sweep."""
+        return cls._authenticate(db, key, now)[0]
+
+    @staticmethod
+    def _authenticate(db, key, now):
+        """``(device, slot)`` for a device key: its ``current`` key, a ``pending`` rotated
+        key (promoted by the caller before the operation runs), or the ``previous`` key
+        inside its grace after a promotion. Read-only."""
         if not key or len(key) > 200:
             raise ProtocolError("unauthorized", 401)
-        device = db.execute("SELECT * FROM devices WHERE key_hash=?", (digest(key),)).fetchone()
+        hashed = digest(key)
+        slot = "current"
+        device = db.execute("SELECT * FROM devices WHERE key_hash=?", (hashed,)).fetchone()
+        if device is None:
+            slot = "pending"
+            device = db.execute("SELECT * FROM devices WHERE pending_hash=? AND pending_expiry>?",
+                                (hashed, now)).fetchone()
+        if device is None:
+            slot = "previous"
+            device = db.execute("SELECT * FROM devices WHERE previous_hash=? AND previous_until>?",
+                                (hashed, now)).fetchone()
         if device is None:
             raise ProtocolError("unauthorized", 401)
         if device["revoked"]:
             raise ProtocolError("revoked", 403)
-        if device["expiry"] <= now:
+        if slot == "current" and device["expiry"] <= now:
             raise ProtocolError("device_expired", 401)
-        return device
+        return device, slot
+
+    @staticmethod
+    def _promote(db, key, now):
+        """Make a pending key current. The key it replaces stays accepted for the grace
+        period, never past its own expiry, and not at all once it has expired. Never
+        registers or touches the worker epoch, claims or leases."""
+        device = db.execute("SELECT * FROM devices WHERE pending_hash=? AND pending_expiry>? AND revoked=0",
+                            (digest(key), now)).fetchone()
+        if device is None:
+            return
+        live = device["expiry"] > now
+        db.execute("UPDATE devices SET previous_hash=?,previous_until=?,key_hash=pending_hash,"
+                   "expiry=pending_expiry,pending_hash=NULL,pending_expiry=NULL,promoted_at=? WHERE id=?",
+                   (device["key_hash"] if live else None,
+                    min(now + PREVIOUS_KEY_GRACE_SECONDS, device["expiry"]) if live else None,
+                    now, device["id"]))
 
     def request(self, operation: str, value: object, key: str | None = None) -> dict:
         # A refused request has not touched the database, so a retry is safe.
@@ -196,7 +245,11 @@ class ControlStore:
         try:
             now = self.clock()
             if operation != "pair":
-                self._device(db, key, now)
+                if self._authenticate(db, key, now)[1] == "pending":
+                    # The first request with a rotated key promotes it, whatever it asks.
+                    db.execute("BEGIN IMMEDIATE")
+                    self._promote(db, key, now)
+                    db.commit()
             self._sweep(db, now)
             db.commit()
             db.execute("BEGIN IMMEDIATE")
@@ -212,7 +265,10 @@ class ControlStore:
                     # Renewal: rotate the key in place; a worker revoked since the code was issued stays revoked.
                     worker_id = row[1]
                     # Like registration, rotation clears liveness: only a heartbeat with the new key restores it.
-                    if not db.execute("UPDATE devices SET key_hash=?,expiry=?,seen=NULL WHERE id=? AND revoked=0",
+                    # It replaces every key: a pending or previous key must not outlive it.
+                    if not db.execute("UPDATE devices SET key_hash=?,expiry=?,seen=NULL,pending_hash=NULL,"
+                                      "pending_expiry=NULL,previous_hash=NULL,previous_until=NULL,promoted_at=NULL "
+                                      "WHERE id=? AND revoked=0",
                                       (digest(device_key), now + DEVICE_TTL_SECONDS, worker_id)).rowcount:
                         raise ProtocolError("invalid_code")
                 else:
@@ -333,6 +389,22 @@ class ControlStore:
             db.execute("INSERT OR REPLACE INTO capabilities VALUES (?,?,?)",
                        (device["id"], device["epoch"], json.dumps(accepted)))
             return {"features": accepted}
+        if op == "rotate_key":
+            # Optional key rotation extension: a new pending key, current once first used.
+            data = fields(value, {"worker_epoch"})
+            self._epoch(data, device)
+            if not self._advertised(db, device, "key_rotation"):
+                raise ProtocolError("invalid_request")
+            # Replacing a pending key (a retry after a lost response) is always allowed;
+            # a new rotation within an hour of the last promotion is not.
+            if (device["pending_hash"] is None and device["promoted_at"] is not None
+                    and now < device["promoted_at"] + ROTATION_INTERVAL_SECONDS):
+                raise ProtocolError("rotation_too_soon", 409)
+            device_key = secrets.token_urlsafe(32)
+            expiry = now + DEVICE_TTL_SECONDS
+            db.execute("UPDATE devices SET pending_hash=?,pending_expiry=? WHERE id=?",
+                       (digest(device_key), expiry, device["id"]))
+            return {"worker_id": device["id"], "device_key": device_key, "expires_at": stamp(expiry)}
         if op == "submit":
             submission = Submission.from_dict(value, allow_account_ref=True, allow_origin=True)
             if submission.worker_id != device["id"]:

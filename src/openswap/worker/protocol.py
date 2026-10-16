@@ -330,7 +330,12 @@ def execution_mode(value: object) -> str:
 MAX_FEATURES = 20
 _FEATURE = re.compile(r"[a-z0-9_-]{1,64}")
 # The features this release defines. A backend answers with the subset it accepts.
-FEATURES = frozenset({"origin"})
+FEATURES = frozenset({"origin", "key_rotation"})
+# Optional key rotation extension: a worker rotates once this little of its key's
+# life is left, and after a promotion the old key is still accepted this long.
+ROTATE_BEFORE_SECONDS = 7 * 86400
+PREVIOUS_KEY_GRACE_SECONDS = 120
+ROTATION_INTERVAL_SECONDS = 3600
 MAX_ORIGIN_LABEL = 100
 
 
