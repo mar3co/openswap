@@ -126,11 +126,15 @@ launchd job running, open the app from Finder, from Spotlight and with
   `launch_agent.start_login_item()` (Step 2) starts the job, and this copy
   exits 0, releasing the lock, once the job's pid exists. The job waits for
   the lock. First it leaves a show request (below), so opening the app shows
-  the popover here too. A running job already holds the lock, so a copy
-  that finds it running never gets this far: it leaves a show request
-  instead. Checking after the lock also means a Finder copy never starts a
-  job while a terminal copy holds the lock. The hand-over covers a login
-  item that is on but not running, for example after Quit
+  the popover here too. A job that is up holds the lock, so a copy that
+  finds it running never gets this far: it leaves a show request instead.
+  If this copy holds the lock and the job still has a pid, that job is a
+  starting copy waiting for the lock (an app open racing login or a
+  kickstart). This copy then hands over without calling
+  `start_login_item`: it leaves a show request and exits, releasing the
+  lock to that copy. Checking after the lock also means a Finder copy never
+  starts a job while a terminal copy holds the lock. The hand-over covers a
+  login item that is on but not running, for example after Quit
   (`KeepAlive: {SuccessfulExit: false}` does not restart a clean exit).
   Without it the Finder copy would hold the lock, and the cask's upgrade
   kickstart would start a launchd copy that waits behind the old build. If
@@ -165,7 +169,9 @@ launchd job running, open the app from Finder, from Spotlight and with
 conflict under `flock`), the wait-only-when-launchd rule, the start-up
 hand-over (login item on and idle, which leaves a show request before
 starting the job; on and running, which leaves a show request and never
-calls `start_login_item`; off; running another program), the show request
+calls `start_login_item`; on with a pid while this copy holds the lock,
+which leaves a show request and exits without `start_login_item`; off;
+running another program), the show request
 (consumed once whether the notification or start-up gets there first,
 ignored when stale, honoured when it arrives before the holder's observer
 is attached), and the notification name. Manual: open the app three ways while
