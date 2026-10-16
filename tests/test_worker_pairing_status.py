@@ -970,6 +970,79 @@ def test_a_stalled_rotation_never_makes_a_launch_wait(tmp_path, keychain):
         syncing.join(15)
 
 
+
+def test_a_rotation_ending_during_the_launch_check_still_admits_the_launch(tmp_path, keychain):
+    from types import SimpleNamespace
+
+    rig = RotationRig(tmp_path, keychain, days_left=6)
+    rig.configured._heartbeat_pass()
+    rig.runtime.get = lambda job_id: SimpleNamespace(idempotency_key="remote:job")
+    rig.client.launch_allowed = lambda job_id: True
+    real, rotated = rig.configured.enrollment_loader, []
+
+    def loader(url):
+        enrollment = real(url)  # still the key the client started with
+        if not rotated:
+            rotated.append(True)
+            rig.configured._sync_pass()  # the rotation finishes before the guard compares
+        return enrollment
+    rig.configured.enrollment_loader = loader
+    assert rig.configured.launch_allowed("job") is True
+    assert rig.saved()["device_key"] != rig.original_key  # it did rotate
+    assert rig.configured.launch_allowed("job") is True  # and the new key matches afterwards
+    rig.configured.enrollment_loader = lambda url: pairing.Enrollment(
+        rig.worker_id, rig.original_key, datetime.now(timezone.utc) + timedelta(days=6))
+    assert rig.configured.launch_allowed("job") is False  # the replaced key, read later, is refused
+
+
+def test_a_re_pair_during_a_stalled_rotation_rebuilds_the_client(tmp_path, keychain):
+    from tests.test_worker_remote import StoreTransport
+
+    rig = RotationRig(tmp_path, keychain, days_left=6)
+    entered, release = threading.Event(), threading.Event()
+
+    def stalled_saver(root, url, enrollment, *, previous_key):
+        entered.set()
+        release.wait(15)  # waiting on the pairing lock while the owner re-pairs
+        return pairing.store_rotated_key(root, url, enrollment, previous_key=previous_key)
+    rig.configured.key_saver = stalled_saver
+    rig.configured._heartbeat_pass()
+    old = rig.client
+    syncing = threading.Thread(target=rig.configured._sync_pass)
+    syncing.start()
+    try:
+        assert entered.wait(15)
+        pairing.unpair(rig.root)
+        new_worker = pairing.pair(rig.root, ROTATION_URL, rig.store.issue_code(),
+                                  transport=StoreTransport(rig.store, None))
+        update_worker_settings(rig.root, enabled=True)
+        assert new_worker != rig.worker_id
+        client = rig.configured._resolve()
+        assert client is not old and client.worker_id == new_worker
+    finally:
+        release.set()
+        syncing.join(15)
+    assert rig.saved()["worker_id"] == new_worker  # the stalled rotation wrote nothing over it
+
+
+def test_a_restart_with_the_service_down_keeps_the_saved_key_renewal(tmp_path, keychain):
+    from openswap.worker.remote import RemoteClient
+    from openswap.worker.remote_state import read_key_status
+
+    rig = RotationRig(tmp_path, keychain)
+    rig.configured.tick()
+    renews, expires = read_key_status(rig.root)
+    assert renews is True and expires is not None
+
+    class Unreachable:
+        def request(self, operation, data):
+            raise ProtocolError("service_unavailable", 503)
+    restarted = ConfiguredRemote(rig.runtime, client_factory=lambda runtime, url, key, *, worker_id="":
+                                 RemoteClient(runtime, url, key, worker_id=worker_id, transport=Unreachable()))
+    restarted.tick()
+    assert read_key_status(rig.root) == (True, expires)  # not wiped to "unknown"
+
+
 def test_a_status_written_without_a_client_keeps_the_saved_key_fields(tmp_path, keychain):
     from openswap.worker.remote_state import read_key_status
 
