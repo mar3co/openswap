@@ -1723,7 +1723,7 @@ def _migration_message(exc: ClaudeSwitchError) -> str:
 
 
 _WORKER_COMMANDS = (
-    "setup", "pair", "unpair", "status", "enable", "disable", "pause", "stop", "account", "workspace",
+    "setup", "connect", "pair", "unpair", "status", "enable", "disable", "pause", "stop", "account", "workspace",
     "worktrees", "permissions", "origins", "codex", "claude", "live", "live-check", "lease", "run",
     "submit-test", "refserver",
 )
@@ -1904,9 +1904,19 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     run = commands.add_parser("run", help="run the background worker process")
     # Passed only by the LaunchAgent: a manual run refuses while it is loaded.
     run.add_argument("--managed", action="store_true", help=argparse.SUPPRESS)
+    connect_parser = commands.add_parser(
+        "connect", help="pair this Mac by approving it in your browser (or reconnect an expired key)",
+        description="Opens OpenTag in your browser: sign in, pick the workspace and select Pair this Mac. "
+                    "On a paired Mac whose key has expired (or ends within 7 days) it reconnects, keeping "
+                    "the worker ID and jobs. Over SSH, use `openswap worker pair <url> <code>` instead.",
+    )
+    connect_parser.add_argument("url", nargs="?", default=None,
+                                help="the server (default: OpenTag, https://opentag.me)")
+    connect_parser.add_argument("--no-browser", action="store_true",
+                                help="print the address instead of opening it (open it in a browser on this Mac)")
     pair_parser = commands.add_parser("pair", help="pair this Mac with the pairing command from OpenTag")
-    pair_parser.add_argument("url")
-    pair_parser.add_argument("code")
+    pair_parser.add_argument("url", nargs="?", default=None)
+    pair_parser.add_argument("code", nargs="?", default=None)
     setup_parser = commands.add_parser(
         "setup", help="guided setup: the worker, the account and the folders tasks work in",
         description="The steps `pair` runs after pairing: start the worker, pick the account, pick the "
@@ -2109,6 +2119,15 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         print(f"Retry with {retry} to reuse the same submission.", file=sys.stderr)
         return 1
 
+    if args.command == "connect":
+        return _connect_command(root, args)
+    if args.command == "pair" and (args.url is None or args.code is None):
+        print("Pairing with a code needs the whole command from OpenTag's Workers page: "
+              "`openswap worker pair <url> <code>`.\n"
+              + printer.next_step("`openswap worker connect` pairs without a code: approve this Mac in "
+                                  "your browser."),
+              file=sys.stderr)
+        return 2
     if args.command in {"pair", "unpair"}:
         from openswap.worker.pairing import pair, unpair
         from openswap.worker.protocol import ProtocolError
@@ -2165,7 +2184,8 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             return 1
         if not paired:
             print("Not paired yet. " + printer.next_step(
-                "run the pairing command from OpenTag's Workers page: `openswap worker pair <url> <code>`."),
+                "`openswap worker connect` (approve this Mac in your browser), or the pairing command "
+                "from OpenTag's Workers page: `openswap worker pair <url> <code>`."),
                 file=sys.stderr)
             return 1
         _guided_setup(root, advanced=args.advanced)
@@ -2635,6 +2655,72 @@ def _choice_payload(choice) -> dict | None:
         "number": choice.number, "email": choice.email, "alias": choice.alias,
         "account_ref": choice.account_ref,
     }
+
+
+def _over_ssh() -> bool:
+    return any(os.environ.get(name) for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"))
+
+
+def _connect_command(root: Path, args) -> int:
+    """`openswap worker connect [url] [--no-browser]`: Connect in the terminal."""
+    from openswap.worker import connect
+    from openswap.worker.protocol import ProtocolError
+
+    server = args.url or connect.DEFAULT_SERVER
+    if _over_ssh():
+        # The browser redirects to this Mac's loopback address, which a browser
+        # on another machine cannot reach.
+        print("Connect needs a browser on this Mac, and this is an SSH session. Get a code from the "
+              f"Workers page and run `{connect.pair_command(server)}` instead.", file=sys.stderr)
+        return 1
+    try:
+        _migrate_legacy_before_worker_state_change(root)
+    except ClaudeSwitchError as exc:
+        print(_migration_message(exc), file=sys.stderr)
+        return 1
+
+    def show(url: str) -> bool:
+        if args.no_browser or not connect.open_in_browser(url):
+            print("Open this address in a browser on this Mac:")
+            print(f"  {url}")
+        else:
+            print("Opened OpenTag in your browser.")
+        return True
+
+    flow = connect.ConnectFlow(root, args.url, open_browser=show)
+    try:
+        flow.start()
+        verb = "Reconnect" if flow.target.reconnect else "Pair this Mac"
+        print(f"Sign in if asked, pick the workspace and select {verb}. Waiting up to 10 minutes "
+              "(Ctrl-C cancels)…")
+        result = flow.finish()
+    except KeyboardInterrupt:
+        flow.cancel()
+        flow.close()
+        print("\nCancelled. Nothing was paired.", file=sys.stderr)
+        return 130
+    except connect.AlreadyPaired as exc:
+        until = exc.expires_at.astimezone().strftime("%Y-%m-%d")
+        print(f"{printer.MARK_OK} This Mac is already paired with {exc.url} (key valid until {until}). "
+              "Nothing to do.")
+        return 0
+    except ProtocolError as exc:
+        target = flow.target.url if flow.target is not None else server
+        print(f"Could not connect ({exc.code}). {connect.next_step(exc.code, target)}", file=sys.stderr)
+        return 1
+    except (OSError, RuntimeError, ValueError):
+        flow.close()
+        print("Could not connect: the worker settings are unavailable.", file=sys.stderr)
+        return 1
+    if result.reconnected:
+        print(f"{printer.MARK_OK} Reconnected this Mac ({result.worker_id}). It keeps its worker ID and jobs.")
+        return 0
+    print(f"{printer.MARK_OK} Paired with {result.workspace_label or result.url} ({result.worker_id}).")
+    try:
+        _guided_setup(root)
+    except Exception:
+        print("Next: `openswap worker setup` to finish setting up.")
+    return 0
 
 
 def _interactive_terminal() -> bool:

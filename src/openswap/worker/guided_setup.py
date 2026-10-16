@@ -825,11 +825,14 @@ class DialogPrompts:
 
     interactive = True
 
-    def __init__(self, alert, prompt, title: str = "Set up Remote tasks", *, choose_folder=None):
+    def __init__(self, alert, prompt, title: str = "Set up Remote tasks", *, choose_folder=None, wait=None):
         self._alert, self._prompt, self.title = alert, prompt, title
         # ``choose_folder(title=, message=)`` opens the native folder chooser and
         # returns a path or None; without one, folders are typed into a prompt.
         self._choose_folder = choose_folder
+        # ``wait(title=, message=, done=)`` shows one dialog with Cancel until the
+        # ``done`` event is set; it returns True when the owner cancelled.
+        self._wait = wait
         self._lines: list[str] = []
 
     def say(self, text: str) -> None:
@@ -862,6 +865,16 @@ class DialogPrompts:
     def flush(self) -> None:
         if self._lines:
             self._alert(title=self.title, message=self._message(""), ok="Done")
+
+    def waiting(self, title: str, message: str, *, cancel: Callable[[], None], done: threading.Event) -> None:
+        """One dialog with Cancel until ``done`` is set; Cancel calls ``cancel``."""
+        if done.is_set():
+            return
+        if self._wait is None:
+            # No dismissable dialog on this front end: nothing to show while waiting.
+            return
+        if self._wait(title=title, message=self._message(message), done=done) and not done.is_set():
+            cancel()
 
 
 PAIRING_QUESTION = (
@@ -914,6 +927,26 @@ class ThreadedPrompts:
 
     def flush(self) -> None:
         self._call("flush")
+
+    def waiting(self, title: str, message: str, *, cancel: Callable[[], None]) -> Callable[[], None]:
+        """Show one dialog with Cancel while the worker thread keeps working.
+
+        Unlike the other prompts this returns at once. Cancel in the dialog calls
+        ``cancel`` (from the UI thread). The returned ``close()`` dismisses the
+        dialog and returns once it is gone, so the next prompt never opens on
+        top of it.
+        """
+        done, gone = threading.Event(), threading.Event()
+        request = {"call": ("waiting", (title, message), {"cancel": cancel, "done": done}),
+                   "done": gone, "result": None}
+        with self._lock:
+            self._pending = request
+
+        def close() -> None:
+            done.set()
+            gone.wait()
+
+        return close
 
     def serve(self) -> None:
         """On the UI thread: show the dialog the worker thread is waiting on, if any."""
@@ -978,6 +1011,59 @@ def pair_interactively(root: Path, ui: Prompts) -> bool:
         if outcome != "retry":
             return outcome == "paired"
     return False
+
+
+CONNECT_TITLE = "Connect to OpenTag"
+CONNECT_WAITING = "Finish in your browser…"
+
+
+def connect_waiting_message(reconnect: bool) -> str:
+    return ("Your browser opened OpenTag. Sign in if asked, pick the workspace and select "
+            f"{'Reconnect' if reconnect else 'Pair this Mac'}. OpenSwap waits up to 10 minutes.")
+
+
+def connect_once(flow, ui) -> tuple[str, str]:
+    """Run a Connect flow (``openswap.worker.connect.ConnectFlow``) off the UI thread.
+
+    While the browser is open the owner sees one dialog, "Finish in your
+    browser…", whose Cancel closes the listener. Returns ``(outcome, message)``:
+    ``"paired"`` (a new pairing: run the guided setup next), ``"reconnected"``
+    or ``"failed"``.
+    """
+    from openswap.worker import connect
+    from openswap.worker.protocol import ProtocolError
+
+    try:
+        _cli()._migrate_legacy_before_worker_state_change(flow.root)
+        flow.start()
+    except connect.AlreadyPaired as exc:
+        return "failed", f"This Mac is already paired with {exc.url}."
+    except ProtocolError as exc:
+        return "failed", _connect_failure(exc.code, flow)
+    except (ClaudeSwitchError, OSError, RuntimeError, ValueError):
+        flow.close()
+        return "failed", "Could not connect: settings unavailable."
+    close = ui.waiting(CONNECT_WAITING, connect_waiting_message(flow.target.reconnect), cancel=flow.cancel)
+    try:
+        result = flow.finish()
+    except ProtocolError as exc:
+        return "failed", _connect_failure(exc.code, flow)
+    except (ClaudeSwitchError, OSError, RuntimeError, ValueError):
+        return "failed", "Could not connect: settings unavailable."
+    finally:
+        close()
+    if result.reconnected:
+        return "reconnected", f"{printer.MARK_OK} Reconnected this Mac ({result.worker_id}). It keeps its jobs."
+    where = result.workspace_label or result.url
+    return "paired", f"{printer.MARK_OK} Paired with {where} ({result.worker_id})."
+
+
+def _connect_failure(code: str, flow) -> str:
+    from openswap.worker import connect
+
+    target = getattr(flow, "target", None)
+    step = connect.next_step(code, target.url if target is not None else None)
+    return step if code in {"connect_cancelled", "access_denied"} else f"Could not connect ({code}). {step}"
 
 
 def parse_pairing_command(text: str) -> tuple[str, str] | None:

@@ -12,10 +12,14 @@ from openswap import macos_keychain
 from openswap.exceptions import LockError
 from openswap.locking import FileLock
 from openswap.settings import configure_worker_service, load_worker_settings
-from openswap.worker.protocol import ProtocolError, fields, text, timestamp, validate_url
+from openswap.worker.protocol import ProtocolError, fields, owner_label, text, timestamp, validate_url
 from openswap.worker.remote import Transport
 
 SERVICE = "openswap"
+# Connect extension: labels a `pair` response carries only when the request
+# sent a `code_verifier`. A pasted code keeps the exact closed shape.
+CONNECT_LABELS = frozenset({"workspace_label", "owner_label"})
+MAX_PAIR_LABEL = 200
 
 
 @dataclass(frozen=True)
@@ -75,24 +79,45 @@ def _drop_status(root: Path):
         pass
 
 
-def pair(root: Path, url: str, code: str, *, transport=None) -> str:
-    """Invoking this local command is the owner's explicit pairing approval."""
+class PairedWorker(str):
+    """The paired worker ID. A pairing redeemed with a ``code_verifier`` (Connect)
+    also carries the service's ``workspace_label`` and ``owner_label``, if sent."""
+
+    workspace_label: str | None
+    owner_label: str | None
+
+    def __new__(cls, worker_id: str, workspace_label: str | None = None, owner_label: str | None = None):
+        value = super().__new__(cls, worker_id)
+        value.workspace_label, value.owner_label = workspace_label, owner_label
+        return value
+
+
+def pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str | None = None) -> PairedWorker:
+    """Invoking this local command is the owner's explicit pairing approval.
+
+    ``code_verifier`` is the PKCE verifier of a Connect flow (never logged or
+    stored); only then may the response add ``workspace_label`` and ``owner_label``.
+    """
     require_macos()
-    return _locked(root, _pair, url, code, transport=transport)
+    return _locked(root, _pair, url, code, transport=transport, code_verifier=code_verifier)
 
 
-def _pair(root: Path, url: str, code: str, *, transport=None) -> str:
-    url = validate_url(url)
-    # A live enrollment (settings name a URL) must be unpaired first. With no
-    # configured URL, any item left at this account is an orphan from a reset
-    # or an interrupted pairing, and the new key simply replaces it.
-    if load_worker_settings(root).control_service_url is not None:
-        raise ProtocolError("unpair_before_pairing")
-    result = (transport or Transport(url)).request("pair", {"code": text(code)})
-    data = fields(result, {"worker_id", "device_key", "expires_at"})
+def _redeem(url: str, code: str, transport, code_verifier: str | None) -> tuple[Enrollment, dict]:
+    request = {"code": text(code)}
+    if code_verifier is not None:
+        request["code_verifier"] = text(code_verifier, 128)
+    result = (transport or Transport(url)).request("pair", request)
+    data = fields(result, {"worker_id", "device_key", "expires_at"},
+                  CONNECT_LABELS if code_verifier is not None else frozenset())
     enrollment = Enrollment(text(data["worker_id"]), text(data["device_key"]), timestamp(data["expires_at"]))
     if enrollment.expires_at <= datetime.now(timezone.utc):
         raise ProtocolError("device_expired", 401)
+    labels = {name: owner_label(data[name], MAX_PAIR_LABEL) for name in CONNECT_LABELS
+              if data.get(name) is not None}
+    return enrollment, labels
+
+
+def _store(url: str, enrollment: Enrollment) -> None:
     try:
         macos_keychain.set_password(SERVICE, account_name(url), json.dumps({
             "worker_id": enrollment.worker_id, "device_key": enrollment.device_key,
@@ -100,6 +125,17 @@ def _pair(root: Path, url: str, code: str, *, transport=None) -> str:
         }))
     except macos_keychain.KEYCHAIN_ERRORS:
         raise ProtocolError("device_key_unavailable") from None
+
+
+def _pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str | None = None) -> PairedWorker:
+    url = validate_url(url)
+    # A live enrollment (settings name a URL) must be unpaired first. With no
+    # configured URL, any item left at this account is an orphan from a reset
+    # or an interrupted pairing, and the new key simply replaces it.
+    if load_worker_settings(root).control_service_url is not None:
+        raise ProtocolError("unpair_before_pairing")
+    enrollment, labels = _redeem(url, code, transport, code_verifier)
+    _store(url, enrollment)
     try:
         configure_worker_service(root, url, enrollment.worker_id)
     except (OSError, RuntimeError, ValueError):
@@ -110,7 +146,37 @@ def _pair(root: Path, url: str, code: str, *, transport=None) -> str:
             pass
         raise ProtocolError("pairing_settings_unavailable") from None
     _drop_status(root)
-    return enrollment.worker_id
+    return PairedWorker(enrollment.worker_id, labels.get("workspace_label"), labels.get("owner_label"))
+
+
+def reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport=None) -> PairedWorker:
+    """Replace the configured enrollment's key with one from a Connect renewal code.
+
+    Unlike ``pair`` there is no ``unpair_before_pairing`` refusal: the URL and
+    worker ID stay as configured, and only the Keychain item is updated in place
+    (``security add-generic-password -U``), under the pairing lock. A response
+    for another worker ID, or any failure, leaves the old key untouched; the
+    service keeps the new key pending until it is first used, so a Mac whose old
+    key is still live keeps working.
+    """
+    require_macos()
+    return _locked(root, _reconnect, url, code, code_verifier=code_verifier, transport=transport)
+
+
+def _reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport=None) -> PairedWorker:
+    url = validate_url(url)
+    policy = load_worker_settings(root)
+    configured = policy.control_service_url
+    if configured is None or account_name(configured) != account_name(url):
+        raise ProtocolError("not_paired_with_this_server")
+    if policy.control_service_worker_id is None:
+        raise ProtocolError("worker_id_unknown")
+    enrollment, labels = _redeem(url, code, transport, text(code_verifier, 128))
+    if enrollment.worker_id != policy.control_service_worker_id:
+        raise ProtocolError("worker_mismatch")
+    _store(url, enrollment)
+    _drop_status(root)
+    return PairedWorker(enrollment.worker_id, labels.get("workspace_label"), labels.get("owner_label"))
 
 
 def unpair(root: Path, url: str | None = None) -> bool:
