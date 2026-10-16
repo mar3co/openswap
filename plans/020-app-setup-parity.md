@@ -120,6 +120,17 @@ First check how macOS behaves today, on the notarized build: with the
 launchd job running, open the app from Finder, from Spotlight and with
 `open -a OpenSwap`. Record whether a second status item appears.
 
+- Before anything else, a copy launchd did not start (Finder, Spotlight,
+  a terminal `openswap menubar`) whose login item runs this program hands
+  over to it: `launch_agent.start_login_item()` (Step 2) starts the job and
+  this copy exits 0 once the job's pid exists. This covers a login item
+  that is on but not running, for example after Quit
+  (`KeepAlive: {SuccessfulExit: false}` does not restart a clean exit).
+  Without it the Finder copy would hold the lock, and the cask's upgrade
+  kickstart would start a launchd copy that waits behind the old build. If
+  the hand-over fails, log it and carry on as below. A terminal
+  `openswap menubar` prints that it started the login item, and where the
+  logs are.
 - Add `menubar_lock(backup_dir)` (in `menubar.py` or a small new module):
   an exclusive `fcntl.flock` on `<backup_root>/menubar.lock`, taken in
   `menubar.run` before the status item exists.
@@ -135,9 +146,11 @@ launchd job running, open the app from Finder, from Spotlight and with
   retries it.
 
 **Verify**: unit tests for the lock (two file descriptions in one process
-conflict under `flock`), the wait-only-when-launchd rule, and the
-notification name. Manual: open the app three ways while the job runs; one
-status item, and the popover opens each time.
+conflict under `flock`), the wait-only-when-launchd rule, the start-up
+hand-over (login item on and idle, on and running, off, running another
+program), and the notification name. Manual: open the app three ways while
+the job runs; one status item, and the popover opens each time. Quit, then
+open the app from Finder: `launchctl print` shows the job running it.
 
 ### Step 2: one function that turns login on and off
 
@@ -145,8 +158,16 @@ Add to `launch_agent.py`:
 
 ```python
 def login_item_enabled(home=None) -> bool: ...
+def login_item_runs_this(home=None) -> bool: ...
+def start_login_item(*, home=None, uid=None) -> int | None: ...
 def set_login_item(enabled: bool, *, home=None, uid=None) -> str: ...
 ```
+
+`login_item_runs_this` is true when the plist's program is
+`resolve_program()`; only then may a copy hand over (a plist for another
+copy of the app must not start it). `start_login_item` kickstarts the job
+when it is loaded and bootstraps the plist when it is not, then returns
+launchd's pid (`_wait_for_pid`), or None when none appeared.
 
 `set_login_item` returns what happened, so the UI can say it. What it does
 depends on which process calls it:
@@ -154,7 +175,7 @@ depends on which process calls it:
 | Caller | Turn on | Turn off |
 |---|---|---|
 | The launchd job itself | Write the plist when it is missing or runs another program; no `launchctl` | Delete the plist; this copy keeps running until Quit or logout and does not come back at the next login |
-| A copy opened from Finder, Spotlight or `openswap menubar` | Write the plist, `bootstrap`, wait for launchd's pid (`_wait_for_pid` in `cli.py`, moved here), then return `"handoff"`: the caller quits and launchd's copy takes the lock | Boot out the job if it is loaded (it is not this process), delete the plist |
+| A copy opened from Finder, Spotlight or `openswap menubar` | Write the plist, `start_login_item()` (`_wait_for_pid` moves here from `cli.py`), then return `"handoff"`: the caller quits and launchd's copy takes the lock | Boot out the job if it is loaded (it is not this process), delete the plist |
 
 The CLI keeps `install()` and `uninstall()` as they are; they already run
 outside the extra. Refuse with a clear message from a translocated or mounted
@@ -218,16 +239,21 @@ leaves one launchd-started extra; with it off, no plist.
 ### Step 5: the widget registers itself
 
 - On start, frozen and from a stable location, run the bundled registration
-  in the background when `widget_status()["registered"]` is false. Log a
-  failure; do not alert.
+  in the background unless this bundle's own appex (`bundle.appex()`,
+  resolved) is among the paths `widget_status()["registrations"]` lists.
+  `registered` alone is not enough: it is true when only an old or copied
+  app with the same extension id is registered. When pluginkit cannot
+  answer, register anyway (`pluginkit -a` is idempotent). Log a failure; do
+  not alert.
 - Settings › General › This Mac gets a hint row: "Add the widget: Edit
   Widgets, search OpenSwap" (frozen only).
 - `openswap setup` drops "Add the desktop widget: openswap widget --install"
   for the frozen app and prints the Edit Widgets hint instead. A source
   install keeps the Xcode line. `openswap widget --install` keeps working.
 
-**Verify**: a test that start-up calls the registration only when not
-registered and never from a temporary location; `test_cli.py` setup output
+**Verify**: a test that start-up registers when nothing is registered,
+when only another copy's appex is, and when pluginkit fails; skips when this
+bundle's appex is listed; and never runs from a temporary location; `test_cli.py` setup output
 for frozen and source installs.
 
 ### Step 6: status line toggle, caveat and docs
