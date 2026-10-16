@@ -285,8 +285,15 @@ def _repoint_menubar_agent(exe: Path, home: Path, uid: int | None) -> str | None
         if launch_agent.is_loaded(launch_agent.LABEL, uid):
             launch_agent._launchctl("bootout", launch_agent.service_target(launch_agent.LABEL, uid))
             # A hand-over to the login item may come right after this
-            # (menubar_instance): let launchd finish the teardown first.
-            launch_agent._wait_until_unloaded(launch_agent.LABEL, uid)
+            # (menubar_instance): let launchd finish the teardown first. If
+            # it has not, keep the uv plist: rewritten, the hand-over would
+            # take the dying uv extra's pid for the app's and quit, leaving
+            # nothing running once the bootout lands. This copy runs instead,
+            # and the next start moves the login item.
+            if not launch_agent._wait_until_unloaded(launch_agent.LABEL, uid):
+                from openswap.exceptions import ClaudeSwitchError
+
+                raise ClaudeSwitchError("the uv menu bar extra is still stopping; this copy runs instead")
     plist.write_bytes(launch_agent.build_plist([str(exe)], home=home))
     return "menubar plist"
 

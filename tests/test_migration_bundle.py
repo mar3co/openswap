@@ -163,6 +163,23 @@ def test_opened_from_finder_stops_the_uv_extra_without_starting_another(mac, mon
     assert loaded["checks_after_bootout"] == 3
 
 
+def test_a_uv_extra_that_will_not_stop_keeps_its_plist(mac, monkeypatch):
+    """Rewritten while the uv extra is still running, the plist would let the
+    start-up hand-over take that extra's pid for the app's and quit; once
+    the bootout landed nothing would be running."""
+    plist = _menubar_plist(mac["home"], UV_SCRIPT)
+    monkeypatch.setattr(launch_agent, "is_loaded", lambda label=launch_agent.LABEL, uid=None: label == launch_agent.LABEL)
+    clock = [0.0]
+    monkeypatch.setattr(launch_agent.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(launch_agent.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    notes: list[str] = []
+    assert "menubar plist" not in _migrate(mac, notes)
+    assert ["bootout", f"gui/{UID}/{launch_agent.LABEL}"] in mac["seen"]["launchctl"]
+    assert _program(plist) == UV_SCRIPT
+    assert any("menu bar login item" in note and "still stopping" in note for note in notes)
+    assert launch_agent.login_item_runs_this(home=mac["home"]) is False
+
+
 def test_login_item_already_on_the_bundle_is_left_alone(mac):
     plist = _menubar_plist(mac["home"], str(mac["exe"]))
     before = plist.read_bytes()
