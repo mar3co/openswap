@@ -120,24 +120,71 @@ First check how macOS behaves today, on the notarized build: with the
 launchd job running, open the app from Finder, from Spotlight and with
 `open -a OpenSwap`. Record whether a second status item appears.
 
+- Right after it takes the lock (below), a copy launchd did not start
+  (Finder, Spotlight, a terminal `openswap menubar`) whose login item runs
+  this program and has no running process hands over to it:
+  `launch_agent.start_login_item()` (Step 2) starts the job, and this copy
+  exits 0, releasing the lock, once the job's pid exists. The job waits for
+  the lock. First it leaves a show request (below), so opening the app shows
+  the popover here too. A job that is up holds the lock, so a copy that
+  finds it running never gets this far: it leaves a show request instead.
+  If this copy holds the lock and the job still has a pid, that job is a
+  starting copy waiting for the lock (an app open racing login or a
+  kickstart). This copy then hands over without calling
+  `start_login_item`: it leaves a show request and exits, releasing the
+  lock to that copy. Checking after the lock also means a Finder copy never
+  starts a job while a terminal copy holds the lock. The hand-over covers a
+  login item that is on but not running, for example after Quit
+  (`KeepAlive: {SuccessfulExit: false}` does not restart a clean exit).
+  Without it the Finder copy would hold the lock, and the cask's upgrade
+  kickstart would start a launchd copy that waits behind the old build. If
+  the hand-over fails (`start_login_item` returns None), boot out the job
+  before carrying on as below. It is not this process, and a start that
+  launchd only delayed (throttling a job that crashed recently) would
+  otherwise come up later, wait behind this copy's lock, and loop under
+  `KeepAlive`. The plist stays, so login still starts it next time, and the
+  failure stays recorded for Step 3's warning. A terminal
+  `openswap menubar` prints that it started the login item, and where the
+  logs are.
 - Add `menubar_lock(backup_dir)` (in `menubar.py` or a small new module):
   an exclusive `fcntl.flock` on `<backup_root>/menubar.lock`, taken in
-  `menubar.run` before the status item exists.
+  `menubar.run` before the status item exists. The holder writes its pid
+  into the file, so the CLI can tell whether launchd's copy owns it.
 - The launchd job (`XPC_SERVICE_NAME == LABEL`) waits up to 10 s for the
   lock (it may be starting during a hand-over, Step 2). Any other copy does
-  not wait: it posts the distributed notification
-  `com.opensoft.openswap.menubar.show` and exits 0. A terminal
+  not wait: it leaves a show request and exits 0. A terminal
   `openswap menubar` also prints "OpenSwap is already running in the menu bar."
-- The running extra opens its popover on that notification, and on a
-  reopen event (`applicationShouldHandleReopen:hasVisibleWindows:` on rumps'
-  delegate), so opening the app again always shows it.
-- If the job cannot get the lock in 10 s it exits 1; launchd's `KeepAlive`
-  retries it.
+- A show request: write `<backup_root>/menubar.show-request`, then post the
+  distributed notification `com.opensoft.openswap.menubar.show`. The lock
+  holder consumes the file in two places: on that notification, and once
+  its popover and observer are attached at start-up. If the file was under
+  30 s old it opens the popover. The holder may have the lock but no
+  observer yet, or may not be started yet (a hand-over), and the file
+  carries the request across either gap, which a notification alone cannot.
+  Consuming deletes the file, so one request shows the popover once.
+- The running extra also opens its popover on a reopen event
+  (`applicationShouldHandleReopen:hasVisibleWindows:` on rumps' delegate),
+  so opening the app again always shows it.
+- If the job cannot get the lock in 10 s it exits 1, and launchd's
+  `KeepAlive` retries it. Exception: when its plist is gone (Open at login
+  was turned off), it unloads its own job (`unload_own_job()`, Step 2) and
+  exits 0. Otherwise a `kickstart -k` from the cask would revive the job
+  behind another copy and `KeepAlive` would restart it in a loop.
 
 **Verify**: unit tests for the lock (two file descriptions in one process
-conflict under `flock`), the wait-only-when-launchd rule, and the
-notification name. Manual: open the app three ways while the job runs; one
-status item, and the popover opens each time.
+conflict under `flock`), the wait-only-when-launchd rule, the start-up
+hand-over (login item on and idle, which leaves a show request before
+starting the job; on and running, which leaves a show request and never
+calls `start_login_item`; on with a pid while this copy holds the lock,
+which leaves a show request and exits without `start_login_item`; a failed
+start, which boots the job out, keeps the plist and the recorded failure,
+and keeps this copy running; off; running another program), the show request
+(consumed once whether the notification or start-up gets there first,
+ignored when stale, honoured when it arrives before the holder's observer
+is attached), and the notification name. Manual: open the app three ways while
+the job runs; one status item, and the popover opens each time. Quit, then
+open the app from Finder: `launchctl print` shows the job running it, and
+its popover opens.
 
 ### Step 2: one function that turns login on and off
 
@@ -145,31 +192,100 @@ Add to `launch_agent.py`:
 
 ```python
 def login_item_enabled(home=None) -> bool: ...
+def login_item_runs_this(home=None) -> bool: ...
+def start_login_item(*, home=None, uid=None) -> int | None: ...
+def unload_own_job(*, home=None, uid=None) -> bool: ...
 def set_login_item(enabled: bool, *, home=None, uid=None) -> str: ...
 ```
+
+`login_item_runs_this` is true when the plist's program is
+`resolve_program()`; only then may a copy hand over (a plist for another
+copy of the app must not start it). `start_login_item` kickstarts the job
+when it is loaded and bootstraps the plist when it is not, then returns
+launchd's pid (`_wait_for_pid`). A job may be mid-unload: the start-up
+migration (`bundle._repoint_menubar_agent`) boots out a uv extra just
+before this runs. So when the kickstart fails or no pid appears, it waits
+for the job to unload (`_wait_until_unloaded`) and bootstraps the plist
+once. It returns None only when that fails too. `_repoint_menubar_agent`
+also waits for its own bootout to finish before it rewrites the plist. If
+the uv extra has not unloaded in time, it raises and keeps the uv plist.
+Rewriting it then would let the hand-over take the dying uv extra's pid for
+the app's and quit, leaving nothing running once the bootout lands. The
+migration logs the error, this copy runs, and the next start migrates.
+
+It kickstarts only when the loaded job runs what the plist says. launchd
+keeps the definition it loaded, and the plist can change under it:
+`set_login_item` replaces a plist for another copy, and the migration
+rewrites the plist of a job that is still loaded. A kickstart would then
+start the old program, perhaps another copy of the app, and this copy
+would hand over to it. So `start_login_item` compares the loaded program
+(the `program` and `arguments` that `launchctl print` reports) with the
+plist's `ProgramArguments`. When they differ, or when it cannot tell, it
+boots the job out, waits for it to unload, and bootstraps the plist, the
+way `install()` does.
+
+Every start that fails records why in `<backup_root>/login_item_status.json`
+(time and launchctl's detail). Any successful start clears it, and the
+launchd job clears it when it starts. Step 3 reads it.
 
 `set_login_item` returns what happened, so the UI can say it. What it does
 depends on which process calls it:
 
 | Caller | Turn on | Turn off |
 |---|---|---|
-| The launchd job itself | Write the plist when it is missing or runs another program; no `launchctl` | Delete the plist; this copy keeps running until Quit or logout and does not come back at the next login |
-| A copy opened from Finder, Spotlight or `openswap menubar` | Write the plist, `bootstrap`, wait for launchd's pid (`_wait_for_pid` in `cli.py`, moved here), then return `"handoff"`: the caller quits and launchd's copy takes the lock | Boot out the job if it is loaded (it is not this process), delete the plist |
+| The launchd job itself | Write the plist when it is missing or runs another program; no `launchctl` | Delete the plist; this copy keeps running. On Quit it calls `unload_own_job()` before it exits, so the job is not left loaded for the cask's `kickstart -k` to revive. It does not come back at the next login |
+| A copy opened from Finder, Spotlight or `openswap menubar` | Write the plist, `start_login_item()` (`_wait_for_pid` moves here from `cli.py`), then return `"handoff"`: the caller quits and launchd's copy takes the lock | Boot out the job if it is loaded (it is not this process), delete the plist |
 
-The CLI keeps `install()` and `uninstall()` as they are; they already run
-outside the extra. Refuse with a clear message from a translocated or mounted
+The CLI keeps `install()` and `uninstall()`; they already run outside the
+extra. One addition: after `install()` bootstraps the job (`openswap setup`,
+`menubar --install-service`), it posts
+`com.opensoft.openswap.menubar.handoff` and leaves a hand-over request file
+(`<backup_root>/menubar.handoff-request`, read the way show requests are).
+This is for an extra launchd did not start that still holds the lock: one
+opened from Finder while Open at login was off. That extra re-runs the
+Step 1 check when the request arrives. Its login item now runs its
+program and the job has a pid, so it leaves a show request and quits,
+releasing the lock to launchd's copy. Without this the new job waits
+behind the lock and loops under `KeepAlive`. Setup then waits up to 15 s
+for the pid in `menubar.lock` to be launchd's. It prints its usual success
+line only then. Otherwise it warns that OpenSwap is still running outside
+its login item and says to quit it from the menu bar. Refuse with a clear message from a translocated or mounted
 copy (`bundle.runs_from_temporary_location()`): "Move OpenSwap to Applications
-first." Never boot out the calling process.
+first." Never boot out the calling process from inside the call.
+
+`unload_own_job()` is for the launchd job on its way out. It starts
+`launchctl bootout gui/<uid>/<label>` as a detached process
+(`start_new_session=True`, so launchd stopping the job's process group does
+not take it along) and returns; the caller exits right after. It runs only
+when the plist is gone, so turning login off and then quitting leaves
+nothing loaded, while a plain Quit with login on keeps today's behaviour
+(loaded, not running, started again at the next login).
+
+The rule depends on the plist, not on which process turned login off, so
+it covers every launchd-started copy. Between turning login off and
+quitting, the job is still loaded, and a `brew upgrade` in that window has
+its `kickstart -k` restart the running extra on the new build. That is the
+right result: the extra was running and stays running, now upgraded. The
+restarted copy still has no plist, so its Quit unloads the job, and it is
+gone at logout either way. The cask's kickstart cannot be gated on the
+plist, because `postflight_steps` run with `deny_read_home`.
 
 Check on macOS 14 and 15 what happens when the user switched OpenSwap off in
-System Settings › General › Login Items ("Allow in the Background"). If
-`bootstrap` fails there or the job never starts, report it as "Turned off in
-System Settings" with a button that opens
-`x-apple.systempreferences:com.apple.LoginItems-Settings.extension`.
+System Settings › General › Login Items ("Allow in the Background"), and
+whether `launchctl print` shows it. Whatever the signal, it ends up as a
+failed start in `login_item_status.json`, and Step 3 shows it. Don't wait
+for a toggle change to report it.
 
-**Verify**: `tests/test_launch_agent.py` covers each cell of the table with a
+**Verify**: `start_login_item` kickstarts a loaded job whose program
+matches the plist, and reloads (bootout, wait, bootstrap) one that is
+loaded with another program or whose program cannot be read.
+`tests/test_launch_agent.py` covers each cell of the table with a
 fake `_launchctl` and `XPC_SERVICE_NAME` set or unset, including "never
-boots out itself" and the temporary-location refusal.
+boots out itself", the temporary-location refusal, and `unload_own_job()`
+(detached, new session, only when the plist is gone). Quit and the
+lock-timeout path call it in exactly those cases. `openswap setup` with a Finder
+extra holding the lock: the request makes it quit, and setup reports
+success only once launchd's pid holds the lock (warns otherwise).
 
 ### Step 3: Open at login in Settings
 
@@ -177,6 +293,12 @@ boots out itself" and the temporary-location refusal.
   Mac**, with an **Open at login** toggle (`id: open_at_login`). Its value
   comes from `login_item_enabled()`, read when the page is built, not from
   `MenuBarSettings`.
+- While the toggle is on and `login_item_status.json` records a failed
+  start, and this copy is not the launchd job, a warning row follows the
+  toggle. It reads "macOS isn't starting OpenSwap at login" with an
+  **Open Login Items** button
+  (`x-apple.systempreferences:com.apple.LoginItems-Settings.extension`). The
+  toggle never claims it works when macOS refused the last start.
 - From a temporary location the toggle is disabled and a hint row says to
   move the app to Applications.
 - The controller calls `set_login_item` off the main thread and shows the
@@ -185,7 +307,10 @@ boots out itself" and the temporary-location refusal.
 - Works in a uv install too (it pins the console script, as `setup` does).
 
 **Verify**: `settings_page_rows` tests for the new rows, the temporary-location
-case and the section filter. Manual on the notarized build: install with
+case, the failed-start warning (shown only when on, failed, and not the
+launchd job), and the section filter. `start_login_item` tests: a kickstart
+that fails while the job unloads falls back to one bootstrap; failures write
+the status file and a start clears it. Manual on the notarized build: install with
 `brew install --cask`, skip `openswap setup`, open the app, switch the toggle
 on. `launchctl print gui/$(id -u)/com.opensoft.openswap.menubar` shows the
 bundle path, there is one status item, it is back after logging out and in,
@@ -218,16 +343,21 @@ leaves one launchd-started extra; with it off, no plist.
 ### Step 5: the widget registers itself
 
 - On start, frozen and from a stable location, run the bundled registration
-  in the background when `widget_status()["registered"]` is false. Log a
-  failure; do not alert.
+  in the background unless this bundle's own appex (`bundle.appex()`,
+  resolved) is among the paths `widget_status()["registrations"]` lists.
+  `registered` alone is not enough: it is true when only an old or copied
+  app with the same extension id is registered. When pluginkit cannot
+  answer, register anyway (`pluginkit -a` is idempotent). Log a failure; do
+  not alert.
 - Settings › General › This Mac gets a hint row: "Add the widget: Edit
   Widgets, search OpenSwap" (frozen only).
 - `openswap setup` drops "Add the desktop widget: openswap widget --install"
   for the frozen app and prints the Edit Widgets hint instead. A source
   install keeps the Xcode line. `openswap widget --install` keeps working.
 
-**Verify**: a test that start-up calls the registration only when not
-registered and never from a temporary location; `test_cli.py` setup output
+**Verify**: a test that start-up registers when nothing is registered,
+when only another copy's appex is, and when pluginkit fails; skips when this
+bundle's appex is listed; and never runs from a temporary location; `test_cli.py` setup output
 for frozen and source installs.
 
 ### Step 6: status line toggle, caveat and docs
@@ -235,14 +365,27 @@ for frozen and source installs.
 - **Claude Code status line** toggle in This Mac: `statusline.install()` /
   `uninstall()` with `paint_command()`, the same calls `openswap statusline
   --install/--uninstall` makes (move the shared part into one function both
-  call). The value is `statusline.installed_command(...) is not None`.
+  call). The toggle is on only when the installed hook runs this program
+  (`statusline.hook_program()` is `paint_command()`'s program, or a link to
+  it). An OpenSwap hook for another program, including a bare `openswap
+  statusline` that PATH may send to an older uv install, shows as off,
+  with a hint that the status line uses another OpenSwap. Turning it on
+  then rewrites that hook to `paint_command()` and keeps the wrap state,
+  instead of `install()`'s early `already` return. `openswap statusline
+  --install` gets the same repair, since it calls the same function.
+  From a temporary location, turning it on is disabled with the same hint
+  as Open at login: `paint_command()` would pin a path that disappears and
+  break every status-line render. Turning it off stays possible.
 - Cask caveat: "Open OpenSwap from Applications to finish setting up, or
   run: openswap setup". Keep the HOMEBREW_PATH logic that names the cask's
   command when another `openswap` comes first.
 - README Install and Quick start, `docs/menubar.md` (Process, a new "First
   run" paragraph), `docs/widget.md`: describe both paths in the same terms.
 
-**Verify**: settings model tests for the toggle, a CLI test that the shared
+**Verify**: settings model tests for the toggle (including on-disabled,
+off-allowed from a temporary location, and a hook for another program or a
+bare command shown as off), a test that turning it on repoints such a hook
+and keeps the wrap state, a CLI test that the shared
 function is what `statusline --install` calls,
 `tests/test_packaging_homebrew.py` for the caveat. `brew style` and
 `brew audit --cask --strict` on the rendered cask in a local tap.
