@@ -10,7 +10,7 @@ Python cannot host WidgetKit. Split:
 
 The widget is `AppIntentConfiguration` (`OpenSwapWidgetIntent`). Right-click → Edit Widget sets layout (all accounts, combined remaining, one account), which windows (5h, 7d, both), and the account picker for one-account. Those choices live on the widget instance, not in extra Settings.
 
-Sources: `macos/OpenSwapWidget/`. Install: `openswap widget --install` (`widget_install.py`).
+Sources: `macos/OpenSwapWidget/`. Install: the cask's app registers its widget when it starts (below); `openswap widget --install` (`widget_install.py`) does the same by hand, and builds it in a source install. Either way the user then adds it: Edit Widgets, search OpenSwap (`ADD_WIDGET_HINT`, shown by `openswap setup` in the app and in Settings › General › This Mac).
 
 ## Cask app (bundle)
 
@@ -20,7 +20,7 @@ The cask's `OpenSwap.app` (`com.opensoft.openswap`) is one notarized bundle, lai
 - `Contents/MacOS/openswap-widget-reload`: the reload helper (target `OpenSwapWidgetReload`)
 - `Contents/PlugIns/OpenSwapWidgetExtension.appex`: the widget (`com.opensoft.openswap.widget.extension`)
 
-`openswap.bundle` finds it from the resolved `sys.executable`. In the app nothing is built: `openswap widget --install` runs `pluginkit -a` on the bundled appex, retires an old source-install host (below), and runs the helper once. `--uninstall` is `pluginkit -r` only and never deletes the app (that is `brew uninstall`). `--status` lists each registered copy from `pluginkit -m -D -v -i com.opensoft.openswap.widget.extension`; more than one means two providers (without `-D` pluginkit reports only the last instance of the highest version, so a duplicate would not show). There is no widget LaunchAgent and nothing to wake.
+`openswap.bundle` finds it from the resolved `sys.executable`. In the app nothing is built. Each start of the frozen extra (after `bundle.migrate_from_uv_install`, which may retire an old host first) runs `widget_install.register_on_start` on a background thread: when `widget_status()` lists no registration it does what `openswap widget --install` does. It never runs from a translocated or mounted copy (`bundle.runs_from_temporary_location`), whose path is gone soon, and a failure is logged, never shown. `openswap widget --install` runs `pluginkit -a` on the bundled appex, retires an old source-install host (below), and runs the helper once. `--uninstall` is `pluginkit -r` only and never deletes the app (that is `brew uninstall`). `--status` lists each registered copy from `pluginkit -m -D -v -i com.opensoft.openswap.widget.extension`; more than one means two providers (without `-D` pluginkit reports only the last instance of the highest version, so a duplicate would not show). There is no widget LaunchAgent and nothing to wake.
 
 ### Moving from a source install
 
