@@ -494,6 +494,10 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 _SHELL_PUNCTUATION = "();<>|&"
+# Shell syntax before the program that this does not take apart: command
+# substitution, subshells, redirects, comments and line continuations. A hook
+# using any of it is left as written, not repointed (_with_command).
+_UNSAFE_PREFIX_CHARS = frozenset("$`()<>#\n")
 
 
 def _shell_words(command: str) -> list[str] | None:
@@ -522,7 +526,11 @@ def _with_command(hook: str, command: str) -> str | None:
     operators (``echo ready && …``), env prefixes and quoting survive, where
     re-joining shlex tokens would quote ``&&`` into an argument.
 
-    None when that tail cannot be found exactly: then nothing is rewritten.
+    Only a plain prefix is taken apart: words, env assignments, quoting and
+    the ``&&``, ``||``, ``;``, ``|`` and ``&`` operators. One with ``$``, a
+    backtick, parentheses, a redirect, a comment or a newline is left alone.
+    None when the prefix is not plain or the tail cannot be found exactly:
+    then nothing is rewritten.
     """
     words = _shell_words(hook)
     head = hook.rstrip()
@@ -540,7 +548,10 @@ def _with_command(hook: str, command: str) -> str | None:
         if start > 0 and not (head[start - 1].isspace() or head[start - 1] in _SHELL_PUNCTUATION):
             continue
         if _shell_words(head[start:]) == [program]:
-            return head[:start] + command
+            prefix = head[:start]
+            if _UNSAFE_PREFIX_CHARS.intersection(prefix):
+                return None
+            return prefix + command
     return None
 
 

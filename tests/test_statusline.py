@@ -1076,10 +1076,10 @@ class TestRepointKeepsTheHookAsWritten:
             "echo ready&&",
             "cd ~/x;",
             "true||",
-            "(cd ~/x)&&",
+            "date | ",
         ],
         ids=["and", "semicolon", "quoted-env", "spaces",
-             "and-adjacent", "semicolon-adjacent", "or-adjacent", "subshell-adjacent"],
+             "and-adjacent", "semicolon-adjacent", "or-adjacent", "pipe"],
     )
     def test_the_prefix_is_kept_verbatim(self, tmp_path: Path, monkeypatch, prefix):
         claude, backup = self._install_over(tmp_path, monkeypatch, f"{prefix}/Users/x/.local/bin/openswap statusline")
@@ -1103,6 +1103,35 @@ class TestRepointKeepsTheHookAsWritten:
         claude, backup = self._install_over(tmp_path, monkeypatch, r"/Users/x/My\ Tools/openswap statusline")
         sl.set_installed(claude, backup, True)
         assert self._command(claude) == f"{self.APP} statusline"
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "(cd ~/x)&&",
+            "echo $(date) && ",
+            "echo `date` && ",
+            "FOO=$HOME ",
+            "echo > /tmp/log; ",
+            "cat < /dev/null; ",
+            "# note\n",
+            "echo a \\\n && ",
+            "echo a\n",
+        ],
+        ids=["subshell", "command-substitution", "backticks", "variable", "redirect-out",
+             "redirect-in", "comment", "line-continuation", "newline"],
+    )
+    def test_shell_syntax_it_does_not_take_apart_is_left_as_written(self, tmp_path: Path, monkeypatch, prefix):
+        """Refused rather than parsed: the user is told the exact command."""
+        hook = f"{prefix}/Users/x/.local/bin/openswap statusline"
+        claude, backup = self._install_over(tmp_path, monkeypatch, hook)
+        if not sl.is_our_command(hook):
+            pytest.skip("not recognized as OpenSwap's hook, so never repointed")
+        with pytest.raises(ConfigError) as err:
+            sl.set_installed(claude, backup, True)
+        assert f"to run: {self.APP} statusline" in str(err.value)
+        assert self._command(claude) == hook
+        assert sl.repoint_command(claude, program=Path(self.APP)) is False
+        assert self._command(claude) == hook
 
     def test_a_hook_it_cannot_take_apart_is_left_alone_and_reported(self, tmp_path: Path, monkeypatch):
         hook = "/Users/x/.local/bin/openswap 'statusline'"

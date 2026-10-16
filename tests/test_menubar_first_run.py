@@ -754,3 +754,18 @@ def test_a_first_launch_opens_once_on_the_welcome_page(frozen_app, tmp_path, mon
     # One open, while the welcome is still due; the request finds it shown.
     assert opened_with == [False]
     assert not path.exists()
+
+
+def test_a_hook_the_toggle_cannot_repoint_is_an_alert_and_stays_as_written(tmp_path, monkeypatch):
+    """Shell syntax the rewrite does not take apart: the toggle reports the
+    exact command to use, changes nothing, and the page still reads `other`."""
+    app, claude, _backup, errors = _status_line_app(tmp_path, monkeypatch)
+    hook = "echo $(date) && /Users/x/.local/bin/openswap statusline"
+    _hook(claude, hook)
+    assert app._status_line_state() == "other"
+    app._toggle_status_line()
+    assert len(errors) == 1
+    assert errors[0].startswith("Couldn't change the Claude Code status line:")
+    assert "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap statusline" in errors[0]
+    assert json.loads((claude / "settings.json").read_text(encoding="utf-8"))["statusLine"]["command"] == hook
+    assert app._status_line_state() == "other"
