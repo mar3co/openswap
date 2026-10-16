@@ -1072,8 +1072,14 @@ class TestRepointKeepsTheHookAsWritten:
             "cd ~/x; ",
             "FOO=1 BAR='a b' ",
             "  ",
+            # Operators need no spaces around them (Codex review on #109).
+            "echo ready&&",
+            "cd ~/x;",
+            "true||",
+            "(cd ~/x)&&",
         ],
-        ids=["and", "semicolon", "quoted-env", "spaces"],
+        ids=["and", "semicolon", "quoted-env", "spaces",
+             "and-adjacent", "semicolon-adjacent", "or-adjacent", "subshell-adjacent"],
     )
     def test_the_prefix_is_kept_verbatim(self, tmp_path: Path, monkeypatch, prefix):
         claude, backup = self._install_over(tmp_path, monkeypatch, f"{prefix}/Users/x/.local/bin/openswap statusline")
@@ -1086,6 +1092,12 @@ class TestRepointKeepsTheHookAsWritten:
         )
         sl.set_installed(claude, backup, True)
         assert self._command(claude) == f"echo hi && {self.APP} statusline"
+
+    def test_an_operator_inside_a_quoted_program_is_part_of_it(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._install_over(tmp_path, monkeypatch, "echo hi&&'/Users/x/a&b/openswap' statusline")
+        assert sl._command_program("echo hi&&'/Users/x/a&b/openswap' statusline") == "/Users/x/a&b/openswap"
+        sl.set_installed(claude, backup, True)
+        assert self._command(claude) == f"echo hi&&{self.APP} statusline"
 
     def test_an_escaped_space_in_the_program_is_replaced_whole(self, tmp_path: Path, monkeypatch):
         claude, backup = self._install_over(tmp_path, monkeypatch, r"/Users/x/My\ Tools/openswap statusline")

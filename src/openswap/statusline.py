@@ -403,11 +403,7 @@ def hook_program(config_home: Path) -> str | None:
     current = block.get("command") if isinstance(block, dict) else None
     if not isinstance(current, str) or not is_our_command(current):
         return None
-    try:
-        parts = shlex.split(current.strip())
-    except ValueError:
-        return None
-    program = parts[-2] if len(parts) >= 2 else ""
+    program = _command_program(current) or ""
     return program if os.sep in program or "/" in program else None
 
 
@@ -497,15 +493,27 @@ def _write_json(path: Path, data: dict) -> None:
         raise
 
 
+_SHELL_PUNCTUATION = "();<>|&"
+
+
+def _shell_words(command: str) -> list[str] | None:
+    """A shell command's words, with control operators (``&&``, ``;``,
+    ``|``) split off even when no space separates them
+    (``echo ready&&/x/openswap``). None when it does not parse."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
 def _command_program(command: str | None) -> str | None:
     """The program an OpenSwap hook runs: the word before ``statusline``."""
     if not isinstance(command, str):
         return None
-    try:
-        parts = shlex.split(command.strip())
-    except ValueError:
-        return None
-    return parts[-2] if len(parts) >= 2 else None
+    words = _shell_words(command.strip())
+    return words[-2] if words and len(words) >= 2 else None
 
 
 def _with_command(hook: str, command: str) -> str | None:
@@ -516,24 +524,23 @@ def _with_command(hook: str, command: str) -> str | None:
 
     None when that tail cannot be found exactly: then nothing is rewritten.
     """
-    program = _command_program(hook)
+    words = _shell_words(hook)
     head = hook.rstrip()
-    if program is None or not head.endswith("statusline"):
+    if not words or len(words) < 2 or words[-1] != "statusline" or not head.endswith("statusline"):
         return None
+    program = words[-2]
     head = head[: -len("statusline")]
     if not head or not head[-1].isspace():
         return None
     head = head.rstrip()
-    # The program is the shortest whitespace-started suffix that parses as
-    # exactly that one word (it may be quoted or contain escaped spaces).
+    # The program is the shortest suffix that parses as exactly that one word
+    # (it may be quoted or contain escaped spaces) and starts after a space,
+    # a shell operator (`ready&&/x/openswap`), or at the start.
     for start in range(len(head) - 1, -1, -1):
-        if start > 0 and not head[start - 1].isspace():
+        if start > 0 and not (head[start - 1].isspace() or head[start - 1] in _SHELL_PUNCTUATION):
             continue
-        try:
-            if shlex.split(head[start:]) == [program]:
-                return head[:start] + command
-        except ValueError:
-            continue
+        if _shell_words(head[start:]) == [program]:
+            return head[:start] + command
     return None
 
 
