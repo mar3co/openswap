@@ -188,7 +188,7 @@ def test_welcome_done_is_persisted_and_defaults_off(tmp_path):
 def test_welcome_on_start(frozen, done, temporary, login_item, expected):
     settings = menubar.MenuBarSettings(welcome_done=done)
     assert menubar.welcome_on_start(
-        settings, frozen=frozen, temporary=temporary, login_item_runs_this_app=login_item
+        settings, frozen=frozen, temporary=temporary, login_item_runs_this=login_item
     ) == expected
 
 
@@ -245,6 +245,7 @@ def test_welcome_keeps_the_users_pick_for_the_switch():
 
 _WELCOME_METHODS = {
     "_welcome_state",
+    "_login_item_runs_this",
     "_welcome_on_start",
     "_on_welcome_continue",
     # Phase 1's Open at login path, which Continue goes through.
@@ -292,7 +293,7 @@ def welcome_app(tmp_path, monkeypatch):
     app._show_error = lambda message: events.append(("error", message))
     app.show_popover = lambda: events.append("show_popover")
     app.on_quit = lambda _sender: events.append("quit")
-    login = {"enabled": False, "set": [], "result": "enabled"}
+    login = {"runs_this": False, "set": [], "result": "enabled"}
 
     def set_login_item(enabled, **_k):
         login["set"].append((enabled, path.exists() and json.loads(path.read_text())["welcome_done"]))
@@ -300,15 +301,18 @@ def welcome_app(tmp_path, monkeypatch):
             raise login["result"]
         return login["result"]
 
-    monkeypatch.setattr(launch_agent, "login_item_enabled", lambda home=None: login["enabled"], raising=False)
+    def runs_this(home=None):
+        if isinstance(login["runs_this"], Exception):
+            raise login["runs_this"]
+        return login["runs_this"]
+
+    # A plist that exists but runs another program is not "already on".
+    monkeypatch.setattr(launch_agent, "login_item_enabled", lambda home=None: True, raising=False)
+    monkeypatch.setattr(launch_agent, "login_item_runs_this", runs_this, raising=False)
     monkeypatch.setattr(launch_agent, "set_login_item", set_login_item, raising=False)
     temporary = {"value": False}
     monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: temporary["value"])
-    runs_here = {"value": False}
-    monkeypatch.setattr(bundle, "login_item_runs_this_app", lambda home=None: runs_here["value"])
-    return SimpleNamespace(
-        app=app, events=events, path=path, login=login, temporary=temporary, runs_here=runs_here
-    )
+    return SimpleNamespace(app=app, events=events, path=path, login=login, temporary=temporary)
 
 
 def _drain(app):
@@ -330,7 +334,7 @@ def test_first_launch_opens_the_popover_on_the_welcome_page(welcome_app, frozen_
 
 def test_after_openswap_setup_the_welcome_is_done_without_showing(welcome_app, frozen_app):
     w = welcome_app
-    w.runs_here["value"] = True
+    w.login["runs_this"] = True
     w.app._welcome_on_start()
     assert w.events == []
     assert json.loads(w.path.read_text())["welcome_done"] is True
@@ -356,9 +360,20 @@ def test_a_temporary_copy_does_not_open_by_itself(welcome_app, frozen_app):
     assert w.app._welcome_state() == {"temporary": True, "login_item": False}
 
 
-def test_welcome_state_reports_the_login_item(welcome_app, frozen_app):
-    welcome_app.login["enabled"] = True
+def test_welcome_state_reports_a_login_item_that_runs_this_app(welcome_app, frozen_app):
+    # login_item_enabled() is true in the fixture: a plist for another copy
+    # of the app is not this app's login item.
+    assert welcome_app.app._welcome_state() == {"temporary": False, "login_item": False}
+    welcome_app.login["runs_this"] = True
     assert welcome_app.app._welcome_state() == {"temporary": False, "login_item": True}
+
+
+def test_an_unreadable_login_item_is_not_this_apps(welcome_app, frozen_app):
+    w = welcome_app
+    w.login["runs_this"] = OSError("Permission denied")
+    assert w.app._welcome_state() == {"temporary": False, "login_item": False}
+    w.app._welcome_on_start()
+    assert w.events == ["show_popover"]
 
 
 @pytest.mark.parametrize("choice", [True, False])

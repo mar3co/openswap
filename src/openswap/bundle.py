@@ -415,23 +415,3 @@ def _report_uv_install(exe: Path, home: Path, say: Callable[[str], object]) -> N
             say(UV_INSTALL_NOTICE)
         return None
     return None
-
-
-def login_item_runs_this_app(home: Path | None = None) -> bool:
-    """Whether the menu bar login item starts this copy of the app.
-
-    True once ``openswap setup`` ran from it (or the move from a uv install
-    pointed the plist here): the app's welcome page then has nothing to ask.
-    """
-    exe = executable()
-    if exe is None:
-        return False
-    from openswap import launch_agent
-
-    program = _plist_program(launch_agent.plist_path(home=home))
-    if not (isinstance(program, list) and program and isinstance(program[0], str)):
-        return False
-    try:
-        return Path(program[0]).resolve() == exe.resolve()
-    except (OSError, RuntimeError):
-        return program[0] == str(exe)

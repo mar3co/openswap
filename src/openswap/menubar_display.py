@@ -2392,20 +2392,21 @@ def welcome_on_start(
     *,
     frozen: bool,
     temporary: bool,
-    login_item_runs_this_app: bool,
+    login_item_runs_this: bool,
 ) -> str:
     """What the app does about the welcome page when it starts.
 
     ``"show"``: open the popover once, by itself, on the welcome page (an
     LSUIElement app shows no window, so a first launch would look like
     nothing happened). ``"done"``: ``openswap setup`` already pointed the
-    login item at this app, so save ``welcome_done`` and show nothing.
+    login item at this app (``launch_agent.login_item_runs_this``), so save
+    ``welcome_done`` and show nothing.
     ``"none"``: a uv install (``openswap setup`` is its path), a finished
     welcome, or a translocated or mounted copy.
     """
     if not frozen or settings.welcome_done or temporary:
         return "none"
-    if login_item_runs_this_app:
+    if login_item_runs_this:
         return "done"
     return "show"
 
@@ -2421,7 +2422,8 @@ def welcome_page_model(
     """The first-run welcome page. No AppKit.
 
     ``account`` is the Claude empty state (Sign in with Claude, Save current
-    login) until an account is saved, else None. The **Open at login**
+    login) until an account is saved, else None. ``login_item`` is whether
+    the login item already runs this app. The **Open at login**
     switch starts on (``open_at_login`` is the user's pick so far); from a
     translocated or mounted copy it is off and disabled, since nothing may
     be pinned to that path. Continue applies it.

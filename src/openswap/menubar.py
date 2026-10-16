@@ -1566,16 +1566,25 @@ def run(switcher, codex=None) -> int:
             popover without Continue changes nothing, so the next open shows
             it again. A uv install never shows it: `openswap setup` is that path.
             """
-            from openswap import bundle, launch_agent
+            from openswap import bundle
 
             if not bundle.is_frozen() or self.settings.welcome_done or self._welcome_dismissed:
                 return None
+            return {
+                "temporary": bundle.runs_from_temporary_location(),
+                "login_item": self._login_item_runs_this(),
+            }
+
+        def _login_item_runs_this(self) -> bool:
+            """Whether the login item starts this program (not merely exists:
+            a plist for another copy of the app is not this app's login item)."""
+            from openswap import launch_agent
+
             try:
-                login_item = bool(launch_agent.login_item_enabled())
+                return bool(launch_agent.login_item_runs_this())
             except Exception:
                 self.switcher._logger.debug("login item read failed", exc_info=True)
-                login_item = False
-            return {"temporary": bundle.runs_from_temporary_location(), "login_item": login_item}
+                return False
 
         def _welcome_on_start(self):
             """Open the popover once, by itself, on the welcome page.
@@ -1589,7 +1598,7 @@ def run(switcher, codex=None) -> int:
                 self.settings,
                 frozen=bundle.is_frozen(),
                 temporary=bundle.runs_from_temporary_location(),
-                login_item_runs_this_app=bundle.login_item_runs_this_app(),
+                login_item_runs_this=self._login_item_runs_this(),
             )
             if action == "done":
                 # `openswap setup` already set this app up; nothing to ask.
