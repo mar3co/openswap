@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, fields, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from openswap import pace
@@ -287,6 +287,22 @@ REMOTE_TASKS_PAIRED_OFF_NOTE = (
 REMOTE_KEY_RENEWS_NOTE = "Key renews automatically."
 
 
+def _remote_key_expiry(snapshot: dict) -> datetime | None:
+    """The saved expiry of the paired Mac's device key, or None when unknown."""
+    expires = snapshot.get("remote_key_expires_at")
+    if not isinstance(expires, str) or len(expires) > 40:
+        return None
+    try:
+        parsed = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _days_phrase(days: int) -> str:
+    return "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
+
+
 def remote_key_copy(snapshot: dict, *, now: datetime | None = None) -> str:
     """The device key line for the Remote section, or ``""`` when nothing is known.
 
@@ -298,22 +314,40 @@ def remote_key_copy(snapshot: dict, *, now: datetime | None = None) -> str:
         return REMOTE_KEY_RENEWS_NOTE
     if renews is not False:
         return ""
-    expires = snapshot.get("remote_key_expires_at")
-    if not isinstance(expires, str) or len(expires) > 40:
+    expires = _remote_key_expiry(snapshot)
+    if expires is None:
         return ""
-    try:
-        parsed = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-    except ValueError:
-        return ""
-    if parsed.tzinfo is None:
-        return ""
-    left = parsed - (now or datetime.now(timezone.utc))
+    left = expires - (now or datetime.now(timezone.utc))
     if left.total_seconds() <= 0:
-        return "Key expired. This Mac can't take tasks until you re-pair it from the portal."
-    days = left.days
-    when = "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
-    return (f"Key expires {when}. This server can't renew it automatically: "
-            "re-pair this Mac from the portal before then.")
+        return "Key expired. This Mac can't take tasks until you reconnect it."
+    return (f"Key expires {_days_phrase(left.days)}. This server can't renew it automatically: "
+            "reconnect this Mac before then.")
+
+
+def remote_reconnect_label(snapshot: dict, *, now: datetime | None = None) -> str | None:
+    """The Reconnect button's label when the paired Mac should reconnect, else None.
+
+    Due when the worker reported its key expired, or when the saved expiry has
+    passed or is within ``RECONNECT_WINDOW`` without automatic rotation. The
+    saved expiry is read even while the worker is off, because the key keeps
+    aging then; nothing here reads the Keychain.
+    """
+    if snapshot.get("remote_connectivity") == "expired":
+        return "Key expired · Reconnect this Mac"
+    expires = _remote_key_expiry(snapshot)
+    if expires is None:
+        return None
+    left = expires - (now or datetime.now(timezone.utc))
+    if left.total_seconds() <= 0:
+        return "Key expired · Reconnect this Mac"
+    if snapshot.get("remote_key_renews") is not True and left <= RECONNECT_WINDOW:
+        return f"Key expires {_days_phrase(left.days)} · Reconnect this Mac"
+    return None
+
+
+# Matches openswap.worker.connect.RECONNECT_WINDOW (not imported: this module
+# stays free of worker imports at load).
+RECONNECT_WINDOW = timedelta(days=7)
 
 
 MISSING_LOGIN_CARD_NOTE = "Action required · Sign in with Claude Code."
@@ -475,12 +509,13 @@ def remote_connect_rows(paired: bool, worker_status: dict) -> list[dict]:
                 "disabled": busy,
             },
         ]
-    if worker_status.get("remote_connectivity") == "expired":
+    reconnect = remote_reconnect_label(worker_status)
+    if reconnect is not None:
         return [{
             "kind": "button",
             "section": SETTINGS_SECTION_REMOTE,
             "id": "remote_tasks_reconnect",
-            "label": "Key expired · Reconnect this Mac",
+            "label": reconnect,
             "title": "Reconnect",
             "value": None,
             "disabled": busy,

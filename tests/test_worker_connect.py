@@ -400,13 +400,22 @@ def test_pair_without_a_verifier_keeps_the_closed_shape(tmp_path, keychain):
     assert not keychain and load_worker_settings(tmp_path).control_service_url is None
 
 
-@pytest.mark.parametrize("extra", [{"workspace_label": "Bad\x07"}, {"owner_label": ""}, {"surprise": 1},
-                                   {"workspace_label": 3}])
-def test_pair_with_a_verifier_refuses_bad_or_unknown_labels(tmp_path, keychain, extra):
+def test_pair_with_a_verifier_refuses_unknown_fields(tmp_path, keychain):
     with pytest.raises(ProtocolError, match="invalid_request"):
-        pairing.pair(tmp_path, "http://localhost", "pair_1", transport=LabelTransport(_pair_response(**extra)),
+        pairing.pair(tmp_path, "http://localhost", "pair_1", transport=LabelTransport(_pair_response(surprise=1)),
                      code_verifier=RFC_VERIFIER)
     assert not keychain
+
+
+@pytest.mark.parametrize("extra, shown", [
+    ({"workspace_label": "Bad\x07name"}, "Badname"), ({"workspace_label": ""}, None),
+    ({"workspace_label": 3}, None), ({"workspace_label": "W" * 500}, "W" * 200),
+])
+def test_odd_labels_never_fail_a_pairing(tmp_path, keychain, extra, shown):
+    # The code is already consumed and the key issued: a label is only for display.
+    worker = pairing.pair(tmp_path, "http://localhost", "pair_1", transport=LabelTransport(_pair_response(**extra)),
+                          code_verifier=RFC_VERIFIER)
+    assert worker.workspace_label == shown and keychain
 
 
 # --- reconnect ---------------------------------------------------------------------------------
@@ -434,7 +443,11 @@ def test_reconnect_replaces_the_key_in_place(tmp_path, keychain):
     assert pairing.load_enrollment(URL).device_key == "new-device-key"
     policy = load_worker_settings(tmp_path)
     assert (policy.control_service_url, policy.control_service_worker_id) == (URL, "worker-1")
-    assert not (tmp_path / "worker" / "remote-status.json").exists()
+    # The old status is gone; the new one holds only the new key's expiry.
+    status = json.loads((tmp_path / "worker" / "remote-status.json").read_text())
+    assert status["state"] == "offline" and status["last_seen_at"] is None
+    assert status["key_expires_at"] == pairing.load_enrollment(URL).expires_at.isoformat()
+    assert "new-device-key" not in json.dumps(status)
 
 
 @pytest.mark.parametrize("transport, code", [
@@ -787,7 +800,7 @@ def test_menu_offers_connect_on_an_unpaired_mac():
     assert busy["remote_tasks_connect"]["disabled"] and busy["remote_tasks_connect_other"]["disabled"]
 
 
-def test_menu_offers_reconnect_only_when_the_key_expired():
+def test_menu_offers_reconnect_when_the_key_expired():
     paired = {row["id"] for row in _remote_rows(worker_paired=True, worker_status={"remote_connectivity": "online"})}
     assert not paired & {"remote_tasks_connect", "remote_tasks_connect_other", "remote_tasks_reconnect"}
     rows = {row["id"]: row for row in _remote_rows(worker_paired=True,
@@ -796,6 +809,42 @@ def test_menu_offers_reconnect_only_when_the_key_expired():
     revoked = {row["id"] for row in _remote_rows(worker_paired=True,
                                                  worker_status={"remote_connectivity": "revoked"})}
     assert "remote_tasks_reconnect" not in revoked
+
+
+def test_menu_offers_reconnect_from_the_saved_expiry_while_the_worker_is_off():
+    from datetime import datetime, timedelta, timezone
+
+    def rows(**status):
+        return {row["id"]: row for row in _remote_rows(
+            worker_paired=True, worker_status={"remote_connectivity": "disabled", **status})}
+
+    now = datetime.now(timezone.utc)
+    expired = rows(remote_key_expires_at=(now - timedelta(days=2)).isoformat())
+    assert expired["remote_tasks_reconnect"]["label"] == "Key expired · Reconnect this Mac"
+    soon = rows(remote_key_expires_at=(now + timedelta(days=3, hours=1)).isoformat())
+    assert soon["remote_tasks_reconnect"]["label"] == "Key expires in 3 days · Reconnect this Mac"
+    rotating = rows(remote_key_renews=True, remote_key_expires_at=(now + timedelta(days=3)).isoformat())
+    assert "remote_tasks_reconnect" not in rotating  # rotation renews it; no need to reconnect
+    plenty = rows(remote_key_expires_at=(now + timedelta(days=20)).isoformat())
+    assert "remote_tasks_reconnect" not in plenty
+    assert "remote_tasks_reconnect" not in rows()  # nothing saved yet
+
+
+def test_pairing_saves_the_key_expiry_for_status(tmp_path, monkeypatch):
+    from openswap.worker.remote_state import read_key_status
+
+    store = {}
+    monkeypatch.setattr(pairing.macos_keychain, "set_password", lambda service, account, value: store.update({account: value}))
+    monkeypatch.setattr(pairing.macos_keychain, "get_password", lambda service, account: store.get(account))
+    monkeypatch.setattr(pairing, "require_macos", lambda: None)
+    expires = datetime.now(timezone.utc) + timedelta(days=30)
+
+    class Pair:
+        def request(self, operation, data):
+            return {"worker_id": "worker", "device_key": "k", "expires_at": expires.isoformat()}
+
+    pairing.pair(tmp_path, "https://control.example", "one-use", transport=Pair())
+    assert read_key_status(tmp_path) == (None, expires)  # off and never run: expiry still known
 
 
 class _Dialogs:

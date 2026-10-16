@@ -976,9 +976,9 @@ def test_status_says_the_key_renews_or_when_it_expires():
     expires = (datetime.now(timezone.utc) + timedelta(days=12, hours=1)).isoformat()
     lacking = {**base, "remote_key_renews": False, "remote_key_expires_at": expires}
     text = cli._format_status(lacking)
-    assert "expires in 12 days" in text and "Re-pair this Mac" in text
+    assert "expires in 12 days" in text and "openswap worker connect" in text
     menu = remote_key_copy(lacking)
-    assert menu.startswith("Key expires in 12 days.") and "re-pair this Mac" in menu
+    assert menu.startswith("Key expires in 12 days.") and "reconnect this Mac" in menu
     rows = settings_page_rows(MenuBarSettings(), strategy="best", threshold=90, section=SETTINGS_SECTION_REMOTE,
                               worker_enabled=True, worker_paired=True, worker_status=lacking)
     ids = [row["id"] for row in rows]

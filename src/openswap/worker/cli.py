@@ -3032,14 +3032,14 @@ def _key_status(snapshot: dict, *, now=None):
     except ProtocolError:
         return None
     left = expires - (now or datetime.now(timezone.utc))
-    fix = ("choose Re-pair this Mac in the portal, then `openswap worker unpair` "
-           "and run the pair command it shows.")
+    fix = ("run `openswap worker connect` (on a server without Connect, choose Re-pair this Mac "
+           "in its portal, then `openswap worker unpair` and run the pair command it shows).")
     if left.total_seconds() <= 0:
-        return (f"{printer.mark(False)} Key", f"expired; this Mac can't take tasks until it is re-paired. To re-pair, {fix}")
+        return (f"{printer.mark(False)} Key", f"expired; this Mac can't take tasks until it reconnects. To reconnect, {fix}")
     days = left.days
     when = "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
     return (f"{printer.mark(None if days > 7 else False)} Key",
-            f"expires {when}; this server can't renew it automatically. To renew, {fix}")
+            f"expires {when}; this server can't renew it automatically. To reconnect, {fix}")
 
 
 def _format_status(snapshot: dict) -> str:

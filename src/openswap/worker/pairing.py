@@ -7,12 +7,13 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import unicodedata
 
 from openswap import macos_keychain
 from openswap.exceptions import LockError
 from openswap.locking import FileLock
 from openswap.settings import configure_worker_service, load_worker_settings
-from openswap.worker.protocol import ProtocolError, fields, owner_label, text, timestamp, validate_url
+from openswap.worker.protocol import ProtocolError, fields, text, timestamp, validate_url
 from openswap.worker.remote import Transport
 
 SERVICE = "openswap"
@@ -112,9 +113,21 @@ def _redeem(url: str, code: str, transport, code_verifier: str | None) -> tuple[
     enrollment = Enrollment(text(data["worker_id"]), text(data["device_key"]), timestamp(data["expires_at"]))
     if enrollment.expires_at <= datetime.now(timezone.utc):
         raise ProtocolError("device_expired", 401)
-    labels = {name: owner_label(data[name], MAX_PAIR_LABEL) for name in CONNECT_LABELS
-              if data.get(name) is not None}
-    return enrollment, labels
+    labels = {name: _display_label(data.get(name)) for name in CONNECT_LABELS}
+    return enrollment, {name: label for name, label in labels.items() if label is not None}
+
+
+def _display_label(value: object) -> str | None:
+    """A response label made safe to show, or None.
+
+    Labels are display-only and arrive after the service has consumed the code
+    and issued the key, so an odd one (a long workspace name, a control
+    character, a non-string) must never fail the pairing: control characters
+    are dropped and the rest is cut to ``MAX_PAIR_LABEL``."""
+    if not isinstance(value, str):
+        return None
+    label = "".join(c for c in value if unicodedata.category(c) != "Cc").strip()[:MAX_PAIR_LABEL].strip()
+    return label or None
 
 
 def _store(url: str, enrollment: Enrollment) -> None:
@@ -125,6 +138,19 @@ def _store(url: str, enrollment: Enrollment) -> None:
         }))
     except macos_keychain.KEYCHAIN_ERRORS:
         raise ProtocolError("device_key_unavailable") from None
+
+
+def _record_key(root: Path, url: str, enrollment: Enrollment):
+    """Start the new enrollment's saved status with its key expiry (never the key),
+    so status and the menu know when it ends even before the worker first runs,
+    or while it stays off. A failed write only loses that hint."""
+    from openswap.worker.remote_state import save_status
+
+    try:
+        save_status(Path(root), url, "offline", None, enrollment.worker_id,
+                    key_expires_at=enrollment.expires_at)
+    except (OSError, RuntimeError, ValueError):
+        pass
 
 
 def _pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str | None = None) -> PairedWorker:
@@ -146,6 +172,7 @@ def _pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str
             pass
         raise ProtocolError("pairing_settings_unavailable") from None
     _drop_status(root)
+    _record_key(root, url, enrollment)
     return PairedWorker(enrollment.worker_id, labels.get("workspace_label"), labels.get("owner_label"))
 
 
@@ -176,6 +203,7 @@ def _reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport
         raise ProtocolError("worker_mismatch")
     _store(url, enrollment)
     _drop_status(root)
+    _record_key(root, url, enrollment)
     return PairedWorker(enrollment.worker_id, labels.get("workspace_label"), labels.get("owner_label"))
 
 
