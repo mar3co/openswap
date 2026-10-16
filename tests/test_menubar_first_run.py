@@ -224,7 +224,7 @@ def test_welcome_from_a_temporary_location_cannot_open_at_login():
     model = menubar.welcome_page_model(claude_accounts=0, temporary=True, open_at_login=True)
     assert model["open_at_login"] is False
     assert model["open_at_login_disabled"] is True
-    assert "Move OpenSwap to Applications" in model["hint"]
+    assert model["hint"] == menubar.OPEN_AT_LOGIN_MOVE_HINT  # as in Settings
     assert model["account"] is not None
 
 
@@ -376,15 +376,32 @@ def test_an_unreadable_login_item_is_not_this_apps(welcome_app, frozen_app):
     assert w.events == ["show_popover"]
 
 
-@pytest.mark.parametrize("choice", [True, False])
-def test_continue_saves_welcome_done_then_applies_the_switch(welcome_app, frozen_app, choice):
+def test_continue_saves_welcome_done_then_turns_login_on(welcome_app, frozen_app):
     w = welcome_app
-    w.app._on_welcome_continue(choice)
+    w.app._on_welcome_continue(True)
     _drain(w.app)
     # set_login_item ran after welcome_done was on disk.
-    assert w.login["set"] == [(choice, True)]
+    assert w.login["set"] == [(True, True)]
     assert w.app._welcome_state() is None
     assert w.events == []
+
+
+def test_continue_with_the_switch_off_turns_off_only_this_apps_login_item(welcome_app, frozen_app):
+    w = welcome_app
+    w.login["runs_this"] = True
+    w.app._on_welcome_continue(False)
+    _drain(w.app)
+    assert w.login["set"] == [(False, True)]
+
+
+def test_continue_with_the_switch_off_leaves_another_copys_login_item(welcome_app, frozen_app):
+    """login_item_enabled() is true here, but the plist runs another copy (the
+    cask's, while a dev build runs): turning it off would remove that one."""
+    w = welcome_app
+    w.app._on_welcome_continue(False)
+    assert w.login["set"] == []
+    assert w.app._login_item_busy is False
+    assert json.loads(w.path.read_text())["welcome_done"] is True
 
 
 def test_continue_hands_over_last(welcome_app, frozen_app):

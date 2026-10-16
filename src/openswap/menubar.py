@@ -1624,6 +1624,10 @@ def run(switcher, codex=None) -> int:
                 self.settings.save(settings_path)
             except OSError as e:
                 self._show_error(f"Couldn't save settings: {e}")
+            if not open_at_login and not self._login_item_runs_this():
+                # Off, and no login item of this app's to turn off: a plist for
+                # another copy (the cask's, while a dev build runs) is left alone.
+                return
             self._login_item_from_welcome = True
             self._apply_login_item(bool(open_at_login))
             if not self._login_item_busy:

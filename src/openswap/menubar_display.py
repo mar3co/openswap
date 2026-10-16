@@ -2384,7 +2384,6 @@ WELCOME_BODY = (
 WELCOME_OPEN_AT_LOGIN = "Open at login"
 WELCOME_LOGIN_HINT = "Keeps OpenSwap in the menu bar after you restart."
 WELCOME_LOGIN_ON_HINT = "OpenSwap already opens at login."
-WELCOME_MOVE_HINT = "Move OpenSwap to Applications first to open it at login."
 
 
 def welcome_on_start(
@@ -2432,7 +2431,7 @@ def welcome_page_model(
     if claude_accounts <= 0:
         account = provider_empty_state("claude", claude_state)
     if temporary:
-        hint = WELCOME_MOVE_HINT
+        hint = OPEN_AT_LOGIN_MOVE_HINT  # the same words as Settings' switch
     elif login_item:
         hint = WELCOME_LOGIN_ON_HINT
     else:
