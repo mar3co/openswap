@@ -13,7 +13,10 @@
 # Every run ends with $DIST/OpenSwap-<version>-<arch>.zip and its .sha256. The zip is
 # made with ditto after stapling, so it is the file to ship: a plain copy of
 # the .app folder (actions/upload-artifact, cp without -R) drops the execute
-# bits and symlinks and breaks the signature.
+# bits and symlinks and breaks the signature. Beside it goes
+# OpenSwap-<version>-<arch>.dmg and its .sha256: the same app next to a link
+# to /Applications, for installing without Homebrew. A signed build signs the
+# DMG; a notarized one also notarizes and staples it. The cask uses the zip.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -43,6 +46,7 @@ esac
 # arch the running Python cannot produce instead of freezing the wrong one.
 export OPENSWAP_ARCH="$ARCH"
 RELEASE_ZIP="$DIST/OpenSwap-$VERSION-$ARCH.zip"
+RELEASE_DMG="$DIST/OpenSwap-$VERSION-$ARCH.dmg"
 
 # Every Mach-O in the bundle must run on $ARCH: the cask serves this zip to
 # that CPU only, so one wheel or helper built for the other arch would ship a
@@ -64,13 +68,73 @@ check_arch() {
   echo "every Mach-O in $APP runs on $ARCH"
 }
 
-# Zip the finished app for shipping. Called on every exit path, so an
-# unsigned PR build uploads the same shape of file a release does.
+checksum() {
+  (cd "$DIST" && shasum -a 256 "$(basename "$1")" > "$(basename "$1").sha256")
+  echo "packaged $1 ($(cut -d' ' -f1 < "$1.sha256"))"
+}
+
+# Submit one file to Apple and wait. notarytool can exit 0 on an Invalid
+# result, which would surface later as a bare stapler error, so check the
+# status here and print Apple's log instead. Needs NOTARY_AUTH.
+notarize() {
+  local file="$1" json status id
+  json="$WORK/notary-$(basename "$file").json"
+  xcrun notarytool submit "$file" --wait --output-format json "${NOTARY_AUTH[@]}" \
+    > "$json" || true
+  cat "$json"
+  status="$(plutil -extract status raw -o - "$json" 2>/dev/null || true)"
+  if [[ "$status" != "Accepted" ]]; then
+    id="$(plutil -extract id raw -o - "$json" 2>/dev/null || true)"
+    echo "notarization status for $(basename "$file"): ${status:-unknown}" >&2
+    if [[ -n "$id" ]]; then
+      xcrun notarytool log "$id" "${NOTARY_AUTH[@]}" >&2 || true
+    fi
+    exit 1
+  fi
+}
+
+# The disk image a person installs from: the finished app next to a link to
+# /Applications, so the window says "drag here". ditto keeps the signature
+# and the stapled ticket. hdiutil on CI runners sometimes fails with
+# "Resource busy", so it gets three tries.
+make_dmg() {
+  local root="$WORK/dmg-root" attempt
+  rm -rf "$root" "$RELEASE_DMG" "$RELEASE_DMG.sha256"
+  mkdir -p "$root"
+  ditto "$APP" "$root/OpenSwap.app"
+  ln -s /Applications "$root/Applications"
+  for attempt in 1 2 3; do
+    if hdiutil create -volname OpenSwap -srcfolder "$root" -fs HFS+ \
+      -format UDZO -ov "$RELEASE_DMG"; then
+      break
+    fi
+    if [[ "$attempt" == 3 ]]; then
+      echo "hdiutil could not create $RELEASE_DMG" >&2
+      exit 1
+    fi
+    sleep 5
+  done
+  rm -rf "$root"
+}
+
+# Zip the finished app and build its DMG for shipping. Called on every exit
+# path, so an unsigned PR build uploads the same files a release does. With
+# an identity the DMG is signed; `package notarize` also notarizes and
+# staples it, which changes the file, so its checksum is written last.
 package() {
   rm -f "$RELEASE_ZIP" "$RELEASE_ZIP.sha256"
   ditto -c -k --keepParent "$APP" "$RELEASE_ZIP"
-  (cd "$DIST" && shasum -a 256 "$(basename "$RELEASE_ZIP")" > "$(basename "$RELEASE_ZIP").sha256")
-  echo "packaged $RELEASE_ZIP ($(cut -d' ' -f1 < "$RELEASE_ZIP.sha256"))"
+  checksum "$RELEASE_ZIP"
+  make_dmg
+  if [[ -n "$IDENTITY" ]]; then
+    codesign --force --timestamp --sign "$IDENTITY" "$RELEASE_DMG"
+  fi
+  if [[ "${1:-}" == "notarize" ]]; then
+    notarize "$RELEASE_DMG"
+    xcrun stapler staple "$RELEASE_DMG"
+    spctl --assess --type open --context context:primary-signature --verbose=2 "$RELEASE_DMG"
+  fi
+  checksum "$RELEASE_DMG"
 }
 
 cd "$WIDGET"
@@ -195,22 +259,8 @@ else
   exit 0
 fi
 
-# notarytool can exit 0 on an Invalid result, which would surface later as a
-# bare stapler error. Check the status here and print Apple's log instead.
-SUBMIT_JSON="$WORK/notary-submit.json"
-xcrun notarytool submit "$ZIP" --wait --output-format json "${NOTARY_AUTH[@]}" \
-  > "$SUBMIT_JSON" || true
-cat "$SUBMIT_JSON"
-NOTARY_STATUS="$(plutil -extract status raw -o - "$SUBMIT_JSON" 2>/dev/null || true)"
-if [[ "$NOTARY_STATUS" != "Accepted" ]]; then
-  NOTARY_ID="$(plutil -extract id raw -o - "$SUBMIT_JSON" 2>/dev/null || true)"
-  echo "notarization status: ${NOTARY_STATUS:-unknown}" >&2
-  if [[ -n "$NOTARY_ID" ]]; then
-    xcrun notarytool log "$NOTARY_ID" "${NOTARY_AUTH[@]}" >&2 || true
-  fi
-  exit 1
-fi
+notarize "$ZIP"
 
 xcrun stapler staple "$APP"
 spctl --assess --type execute --verbose=2 "$APP"
-package
+package notarize

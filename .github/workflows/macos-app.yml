@@ -4,7 +4,7 @@ name: macOS app
 # notarize when repository secrets are present. Pull requests always freeze
 # unsigned (do not expose the production certificate to PR code). Tag builds
 # require the certificate and end in a draft GitHub release carrying both
-# zips, their checksums, and the rendered Homebrew cask. Publishing that draft
+# zips, both DMGs, their checksums, and the rendered Homebrew cask. Publishing that draft
 # is a person's call; the homebrew-tap workflow then copies the cask into the
 # tap.
 
@@ -129,6 +129,19 @@ jobs:
           lipo -archs "$EXE" | grep -qw "$OPENSWAP_ARCH"
           "$EXE" --version
 
+      # The DMG a person installs from without Homebrew: it mounts, and holds
+      # the same app next to a link to /Applications.
+      - name: DMG holds the app and an Applications link
+        run: |
+          version="$(awk -F'"' '/^version = /{print $2; exit}' pyproject.toml)"
+          DMG="packaging/macos/dist/OpenSwap-${version}-${OPENSWAP_ARCH}.dmg"
+          MNT="$RUNNER_TEMP/dmg-run"
+          mkdir -p "$MNT"
+          hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG"
+          trap 'hdiutil detach "$MNT" || true' EXIT
+          test "$(readlink "$MNT/Applications")" = /Applications
+          "$MNT/OpenSwap.app/Contents/MacOS/OpenSwap" --version
+
       # build.sh exits 0 when it cannot sign, so a green run is not by itself
       # proof of a shippable app. Assert it on the one path that ships, against
       # the zip that ships: unpack it the way a download would be and assess
@@ -146,15 +159,33 @@ jobs:
           spctl --assess --type execute --verbose=2 "$APP"
           "$APP/Contents/MacOS/OpenSwap" --version
 
+      # The same for the DMG: the image itself is signed, notarized and
+      # stapled, and the app inside it passes on its own.
+      - name: Tag DMGs must be signed, notarized, and stapled
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          DMG="packaging/macos/dist/OpenSwap-${GITHUB_REF_NAME#v}-${OPENSWAP_ARCH}.dmg"
+          codesign --verify --verbose=2 "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+          MNT="$RUNNER_TEMP/dmg-check"
+          mkdir -p "$MNT"
+          hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG"
+          trap 'hdiutil detach "$MNT" || true' EXIT
+          codesign --verify --deep --strict --verbose=2 "$MNT/OpenSwap.app"
+          spctl --assess --type execute --verbose=2 "$MNT/OpenSwap.app"
+
       # The zip, not the .app folder: upload-artifact drops execute bits and
       # symlinks, which leaves a bundle that neither launches nor verifies.
-      - name: Upload OpenSwap zip
+      - name: Upload OpenSwap zip and DMG
         uses: actions/upload-artifact@v4
         with:
           name: OpenSwap-app-${{ matrix.arch }}
           path: |
             packaging/macos/dist/OpenSwap-*-${{ matrix.arch }}.zip
             packaging/macos/dist/OpenSwap-*-${{ matrix.arch }}.zip.sha256
+            packaging/macos/dist/OpenSwap-*-${{ matrix.arch }}.dmg
+            packaging/macos/dist/OpenSwap-*-${{ matrix.arch }}.dmg.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -180,6 +211,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           for arch in arm64 x86_64; do
             (cd dist && sha256sum -c "OpenSwap-${version}-${arch}.zip.sha256")
+            (cd dist && sha256sum -c "OpenSwap-${version}-${arch}.dmg.sha256")
           done
           arm64="$(cut -d' ' -f1 < "dist/OpenSwap-${version}-arm64.zip.sha256")"
           x86_64="$(cut -d' ' -f1 < "dist/OpenSwap-${version}-x86_64.zip.sha256")"
@@ -197,4 +229,8 @@ jobs:
             "dist/OpenSwap-${version}-arm64.zip.sha256" \
             "dist/OpenSwap-${version}-x86_64.zip" \
             "dist/OpenSwap-${version}-x86_64.zip.sha256" \
+            "dist/OpenSwap-${version}-arm64.dmg" \
+            "dist/OpenSwap-${version}-arm64.dmg.sha256" \
+            "dist/OpenSwap-${version}-x86_64.dmg" \
+            "dist/OpenSwap-${version}-x86_64.dmg.sha256" \
             dist/openswap.rb
