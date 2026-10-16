@@ -124,10 +124,8 @@ launchd job running, open the app from Finder, from Spotlight and with
   a terminal `openswap menubar`) whose login item runs this program and has
   no running process hands over to it: `launch_agent.start_login_item()`
   (Step 2) starts the job and this copy exits 0 once the job's pid exists.
-  First it writes `<backup_root>/menubar.show-on-start`. The new copy
-  removes that file once its popover is attached, and opens the popover if
-  the file is less than 30 s old, so opening the app shows it here too. A
-  notification posted now could arrive before the new copy listens.
+  First it leaves a show request (below), so opening the app shows the
+  popover here too.
   When the job is already running, skip the hand-over and take the lock
   path below, so the running copy is told to show its popover. The
   hand-over covers a login item that is on but not running, for example
@@ -143,12 +141,19 @@ launchd job running, open the app from Finder, from Spotlight and with
   `menubar.run` before the status item exists.
 - The launchd job (`XPC_SERVICE_NAME == LABEL`) waits up to 10 s for the
   lock (it may be starting during a hand-over, Step 2). Any other copy does
-  not wait: it posts the distributed notification
-  `com.opensoft.openswap.menubar.show` and exits 0. A terminal
+  not wait: it leaves a show request and exits 0. A terminal
   `openswap menubar` also prints "OpenSwap is already running in the menu bar."
-- The running extra opens its popover on that notification, and on a
-  reopen event (`applicationShouldHandleReopen:hasVisibleWindows:` on rumps'
-  delegate), so opening the app again always shows it.
+- A show request: write `<backup_root>/menubar.show-request`, then post the
+  distributed notification `com.opensoft.openswap.menubar.show`. The lock
+  holder consumes the file in two places: on that notification, and once
+  its popover and observer are attached at start-up. If the file was under
+  30 s old it opens the popover. The holder may have the lock but no
+  observer yet, or may not be started yet (a hand-over), and the file
+  carries the request across either gap, which a notification alone cannot.
+  Consuming deletes the file, so one request shows the popover once.
+- The running extra also opens its popover on a reopen event
+  (`applicationShouldHandleReopen:hasVisibleWindows:` on rumps' delegate),
+  so opening the app again always shows it.
 - If the job cannot get the lock in 10 s it exits 1, and launchd's
   `KeepAlive` retries it. Exception: when its plist is gone (Open at login
   was turned off), it unloads its own job (`unload_own_job()`, Step 2) and
@@ -157,11 +162,12 @@ launchd job running, open the app from Finder, from Spotlight and with
 
 **Verify**: unit tests for the lock (two file descriptions in one process
 conflict under `flock`), the wait-only-when-launchd rule, the start-up
-hand-over (login item on and idle, which writes the show-on-start file
-before starting the job; on and running, which posts the show notification
-and never calls `start_login_item`; off; running another program), the
-show-on-start file (consumed once, ignored when stale), and the
-notification name. Manual: open the app three ways while
+hand-over (login item on and idle, which leaves a show request before
+starting the job; on and running, which leaves a show request and never
+calls `start_login_item`; off; running another program), the show request
+(consumed once whether the notification or start-up gets there first,
+ignored when stale, honoured when it arrives before the holder's observer
+is attached), and the notification name. Manual: open the app three ways while
 the job runs; one status item, and the popover opens each time. Quit, then
 open the app from Finder: `launchctl print` shows the job running it, and
 its popover opens.
