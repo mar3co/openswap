@@ -388,6 +388,41 @@ def test_run_steps_aside_for_a_starting_login_item_without_starting_it_again(
     lock.release()
 
 
+def test_a_failed_hand_over_unloads_the_job_and_this_copy_runs_on(tmp_path, monkeypatch):
+    """launchd accepts the kickstart but throttles a job that crashed recently,
+    so no pid appears. Left loaded, the delayed start would come up later,
+    wait behind this copy's lock and loop under KeepAlive."""
+    from tests.test_launch_agent import FakeLaunchd
+
+    program = ["/Users/x/.local/bin/openswap"]
+    home, data = tmp_path / "home", tmp_path / "data"
+    launchd = FakeLaunchd(loaded=True, spawns=False)
+    clock = [1000.0]
+    monkeypatch.setattr(launch_agent.sys, "platform", "darwin")
+    monkeypatch.setattr(launch_agent.os, "getuid", lambda: 501, raising=False)
+    monkeypatch.setattr(launch_agent.subprocess, "run", launchd)
+    monkeypatch.setattr(launch_agent, "resolve_program", lambda: list(program))
+    monkeypatch.setattr(launch_agent.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(launch_agent.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr(launch_agent, "runs_as_login_item", lambda: False)
+    plist = launch_agent.plist_path()
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(launch_agent.build_plist(program))
+    _fake_gui(monkeypatch)
+
+    # This copy carries on: past the lock and the hand-over, into the GUI.
+    with pytest.raises(AssertionError, match="status item was set up"):
+        menubar.run(types.SimpleNamespace(backup_dir=data, _logger=None))
+
+    assert "kickstart" in launchd.subcommands
+    assert launchd.subcommands[-1] == "bootout"
+    assert launchd.loaded is False
+    assert plist.exists()  # login still starts it next time
+    failure = launch_agent.last_start_failure(data)
+    assert failure is not None and "no process after launchctl kickstart" in failure["detail"]
+
+
 def test_the_login_item_itself_never_hands_over_and_clears_a_failed_start(
     tmp_path, monkeypatch, login_item
 ):
