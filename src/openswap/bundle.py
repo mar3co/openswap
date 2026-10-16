@@ -164,13 +164,14 @@ def runs_from_temporary_location(app: Path | None = None) -> bool:
 # ---- Move to Applications (plan 021) --------------------------------------
 
 APP_NAME = "OpenSwap.app"
+_SYSTEM_APPLICATIONS = Path("/Applications")
 QUARANTINE_XATTR = "com.apple.quarantine"
 
 
 def applications_dir(home: Path | None = None) -> Path:
     """Where Move to Applications puts the app: ``/Applications`` when this
     user can write it (an admin), else ``~/Applications``."""
-    system = Path("/Applications")
+    system = _SYSTEM_APPLICATIONS
     if os.access(system, os.W_OK):
         return system
     return (home or Path.home()) / "Applications"
@@ -343,6 +344,23 @@ def move_plan(app: Path, dest_dir: Path, *, home: Path | None = None) -> dict:
         "action": "move",
     }
     if not target.exists():
+        # Nothing here, but a copy in the other Applications folder (an
+        # admin's in /Applications when this user's is ~/Applications, or
+        # the reverse) that is Homebrew's or as new is the one to open.
+        mine = bundle_version(app)
+        for folder in (_SYSTEM_APPLICATIONS, (home or Path.home()) / "Applications"):
+            other = folder / APP_NAME
+            if folder == dest_dir or not other.exists():
+                continue
+            version = bundle_version(other)
+            if _homebrew_owns(other, home) or (
+                version and mine and _version_key(version) >= _version_key(mine)
+            ):
+                plan.update(
+                    action="open_existing", destination=str(folder), target=str(other),
+                    existing_version=version, homebrew=_homebrew_owns(other, home),
+                )
+                return plan
         return plan
     existing = bundle_version(target)
     plan["existing_version"] = existing
@@ -490,6 +508,15 @@ def copy_to_applications(app: Path, plan: dict) -> Path:
         except ClaudeSwitchError:
             # The new app is in place; the old one stays beside it, visible.
             _logger.warning("could not trash %s", old, exc_info=True)
+    # A login item that ran a copy elsewhere (an admin's in /Applications
+    # when this one landed in ~/Applications) now runs this one.
+    from openswap import launch_agent
+
+    try:
+        if launch_agent.repoint_login_item(target / "Contents" / "MacOS" / EXECUTABLE_NAME):
+            _logger.info("login item now runs %s", target)
+    except OSError:
+        _logger.warning("could not repoint the login item at %s", target, exc_info=True)
     return target
 
 

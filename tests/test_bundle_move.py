@@ -45,6 +45,10 @@ def fs(tmp_path, monkeypatch):
     monkeypatch.setattr("openswap.widget_install._move_to_trash", move_to_trash)
     monkeypatch.setattr(bundle, "CASKROOMS", (tmp_path / "no-caskroom",))
     monkeypatch.setattr(bundle, "_disk_image_mounts", lambda: set())
+    from openswap import launch_agent
+
+    calls["repoint"] = []
+    monkeypatch.setattr(launch_agent, "repoint_login_item", lambda exe, home=None: calls["repoint"].append(exe) or False)
     return {"tmp": tmp_path, "image": image, "apps": apps, "trash": trash, "calls": calls}
 
 
@@ -148,6 +152,39 @@ def test_homebrews_copy_is_never_replaced_even_when_older(fs, monkeypatch):
     plan = bundle.move_plan(_app(fs["image"], "0.2.0"), apps, home=home)
     assert plan["action"] == "open_existing"
     assert plan["homebrew"] is True
+
+
+def test_a_newer_copy_in_the_other_applications_folder_is_opened(fs, monkeypatch):
+    """A non-admin's update would land in ~/Applications; the admin's copy
+    in /Applications that is as new is the one to open instead."""
+    home = fs["tmp"] / "home"
+    mine = home / "Applications"
+    mine.mkdir(parents=True)
+    system = fs["tmp"] / "System-Applications"
+    _app(system, "0.3.0")
+    monkeypatch.setattr(bundle, "_SYSTEM_APPLICATIONS", system)
+    plan = bundle.move_plan(_app(fs["image"], "0.2.0"), mine, home=home)
+    assert plan["action"] == "open_existing"
+    assert plan["target"] == str(system / "OpenSwap.app")
+    assert plan["existing_version"] == "0.3.0"
+
+
+def test_an_older_copy_in_the_other_folder_does_not_stop_a_move(fs, monkeypatch):
+    home = fs["tmp"] / "home"
+    mine = home / "Applications"
+    mine.mkdir(parents=True)
+    system = fs["tmp"] / "System-Applications"
+    _app(system, "0.1.0")
+    monkeypatch.setattr(bundle, "_SYSTEM_APPLICATIONS", system)
+    plan = bundle.move_plan(_app(fs["image"], "0.2.0"), mine, home=home)
+    assert plan["action"] == "move"
+    assert plan["target"] == str(mine / "OpenSwap.app")
+
+
+def test_a_move_repoints_the_login_item_at_the_new_copy(fs):
+    app = _app(fs["image"])
+    target = bundle.copy_to_applications(app, bundle.move_plan(app, fs["apps"]))
+    assert fs["calls"]["repoint"] == [target / "Contents" / "MacOS" / "OpenSwap"]
 
 
 def test_applications_falls_back_to_the_home_folder(monkeypatch, tmp_path):
