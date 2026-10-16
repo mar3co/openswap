@@ -1512,11 +1512,15 @@ def run(switcher, codex=None) -> int:
             # that handed over to this one.
             if self._on_handoff_request():
                 return
+            # Settle the welcome page before any request opens the popover: a
+            # copy `openswap setup` started (its login item runs this app) is
+            # done with it, so a show request left by the copy it took over
+            # from opens the cards, not the welcome page.
+            self._welcome_on_start()
             self._on_show_request()
             if self._show_popover_pending:
                 self._show_popover_pending = False
                 self.show_popover()
-            self._welcome_on_start()
 
         def _on_show_request(self):
             """The show notification, and start-up: consume the show request

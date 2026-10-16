@@ -662,3 +662,95 @@ def test_a_hook_for_another_program_reads_as_other_and_turning_on_repoints_it(
     assert app._status_line_state() == "on"
     # The wrapped command survives the repoint.
     assert statusline.load_wrap(backup)["innerCommand"] == "~/.claude/statusline.sh"
+
+
+# ---- start-up order: the welcome is settled before a show request ------------
+
+
+def _attach_at_start(tmp_path, monkeypatch, *, runs_this):
+    """Run the real _attach_panel_once with a stand-in AppKit panel module.
+
+    Returns the app and the list of ``welcome_done`` values seen each time
+    the popover opened (the panel decides its page from that at toggle).
+    """
+    import sys as _sys
+    import threading
+    import types
+
+    from openswap import bundle, launch_agent
+
+    monkeypatch.setattr(launch_agent, "login_item_runs_this", lambda home=None: runs_this)
+    monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: False)
+    path = tmp_path / "menubar_settings.json"
+    opened_with: list[bool] = []
+
+    class _FakePanel:
+        def __init__(self):
+            self.shown = False
+
+        def attach(self, _item):
+            pass
+
+        def is_shown(self):
+            return self.shown
+
+        def toggle(self):
+            opened_with.append(attached.settings.welcome_done)
+            self.shown = not self.shown
+
+    fake_module = types.ModuleType("openswap.menubar_panel")
+    fake_module.MenuBarPanel = lambda **_kwargs: _FakePanel()
+    fake_module.pin_status_item = lambda item: None
+    fake_module.fit_status_item = lambda item: None
+    monkeypatch.setitem(_sys.modules, "openswap.menubar_panel", fake_module)
+    scope = dict(vars(menubar))
+    scope["settings_path"] = path
+    attach_type = extract_class(
+        menubar.__file__,
+        "MenuBarApp",
+        {
+            "_attach_panel_once", "_on_show_request", "_on_handoff_request", "show_popover",
+            "_welcome_on_start", "_login_item_runs_this",
+        },
+        scope,
+    )
+
+    class App(attach_type):
+        def __getattr__(self, name):  # every other callback the panel is wired to
+            return lambda *a, **k: None
+
+    attached = App()
+    attached.switcher = SimpleNamespace(
+        backup_dir=tmp_path,
+        _logger=SimpleNamespace(debug=lambda *a, **k: None, info=lambda *a, **k: None,
+                                warning=lambda *a, **k: None),
+    )
+    attached.settings = menubar.MenuBarSettings()
+    attached._nsapp = SimpleNamespace(nsstatusitem=object())
+    attached._panel = None
+    attached._show_popover_pending = False
+    attached._event_lock = threading.Lock()
+    return attached, opened_with, path
+
+
+def test_a_copy_setup_started_opens_a_left_show_request_on_the_cards(frozen_app, tmp_path, monkeypatch):
+    """`openswap setup` took over from a Finder copy, which left a show request:
+    the welcome is done before that request opens the popover."""
+    from openswap import menubar_instance
+
+    attached, opened_with, path = _attach_at_start(tmp_path, monkeypatch, runs_this=True)
+    menubar_instance.leave_show_request(tmp_path, post=lambda: None)
+    attached._attach_panel_once(SimpleNamespace(stop=lambda: None))
+    assert opened_with == [True]  # the popover opened, after welcome_done
+    assert json.loads(path.read_text())["welcome_done"] is True
+
+
+def test_a_first_launch_opens_once_on_the_welcome_page(frozen_app, tmp_path, monkeypatch):
+    from openswap import menubar_instance
+
+    attached, opened_with, path = _attach_at_start(tmp_path, monkeypatch, runs_this=False)
+    menubar_instance.leave_show_request(tmp_path, post=lambda: None)
+    attached._attach_panel_once(SimpleNamespace(stop=lambda: None))
+    # One open, while the welcome is still due; the request finds it shown.
+    assert opened_with == [False]
+    assert not path.exists()
