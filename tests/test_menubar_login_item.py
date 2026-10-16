@@ -397,9 +397,7 @@ def test_show_popover_before_the_panel_attaches_waits_for_it(app):
     assert app._show_popover_pending is True
 
 
-def test_quit_unloads_the_job_only_through_unload_own_job(monkeypatch):
-    """Quit calls it every time; it decides (job, plist gone) and never raises."""
-    quits, unloads = [], []
+def _quitting_app(quits, logged):
     scope = dict(vars(menubar))
     scope["rumps"] = types.SimpleNamespace(quit_application=lambda: quits.append(1))
     app = extract_class(menubar.__file__, "MenuBarApp", {"on_quit"}, scope)()
@@ -408,10 +406,61 @@ def test_quit_unloads_the_job_only_through_unload_own_job(monkeypatch):
     app._claude_login = None
     app._stop_chatgpt_auto_monitor = lambda clear_pending: None
     app._stop_engine = lambda: None
-    logged = []
     app.switcher = types.SimpleNamespace(
         _logger=types.SimpleNamespace(warning=lambda *a, **k: logged.append(a[0]))
     )
+    return app
+
+
+@pytest.fixture
+def launchd_copy(monkeypatch, tmp_path):
+    """This process as a launchd-started extra, with the real unload_own_job:
+    only the detached bootout it would start is recorded."""
+    monkeypatch.setattr(launch_agent.sys, "platform", "darwin")
+    monkeypatch.setattr(launch_agent.os, "getuid", lambda: 501, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("XPC_SERVICE_NAME", launch_agent.LABEL)
+    started = []
+    monkeypatch.setattr(
+        launch_agent.subprocess, "Popen", lambda argv, **kwargs: started.append((argv, kwargs))
+    )
+    return started
+
+
+def test_a_fresh_launchd_copy_with_no_plist_unloads_its_job_on_quit(launchd_copy):
+    """Login was turned off by an earlier copy; then the cask's kickstart -k
+    (or KeepAlive) started this one. The rule is the plist, not who turned
+    login off, so its Quit still leaves nothing loaded."""
+    quits, logged = [], []
+    assert not launch_agent.login_item_enabled()
+    _quitting_app(quits, logged).on_quit(None)
+    [(argv, kwargs)] = launchd_copy
+    assert argv == ["launchctl", "bootout", f"gui/501/{launch_agent.LABEL}"]
+    assert kwargs["start_new_session"] is True
+    assert quits == [1] and logged == []
+
+
+def test_a_launchd_copy_with_login_on_stays_loaded_after_quit(launchd_copy, tmp_path):
+    plist = launch_agent.plist_path(home=tmp_path)
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(launch_agent.build_plist(["/Users/x/.local/bin/openswap"], home=tmp_path))
+    quits = []
+    _quitting_app(quits, []).on_quit(None)
+    assert launchd_copy == [] and quits == [1]
+
+
+def test_a_copy_launchd_did_not_start_never_unloads_on_quit(launchd_copy, monkeypatch):
+    monkeypatch.delenv("XPC_SERVICE_NAME")
+    quits = []
+    _quitting_app(quits, []).on_quit(None)
+    assert launchd_copy == [] and quits == [1]
+
+
+def test_quit_unloads_the_job_only_through_unload_own_job(monkeypatch):
+    """Quit calls it every time; it decides (job, plist gone) and never raises."""
+    quits, unloads, logged = [], [], []
+    app = _quitting_app(quits, logged)
 
     monkeypatch.setattr(launch_agent, "unload_own_job", lambda **k: unloads.append(1) or True)
     app.on_quit(None)
