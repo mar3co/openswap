@@ -265,20 +265,25 @@ def run(switcher, codex=None) -> int:
             # popover instead of a second status item (menubar_instance). Each
             # hook is set up on its own, so one failing leaves the others.
             from openswap.menubar_instance import HANDOFF_NOTIFICATION, SHOW_NOTIFICATION
-            from openswap.menubar_panel import handle_reopen, observe_show_requests
 
-            hooks = (
-                # rumps' app delegate class (`App.run` installs an instance).
-                ("reopen", lambda: handle_reopen(rumps.rumps.NSApp, self.show_popover)),
-                ("show request", lambda: setattr(
-                    self, "_show_requests",
-                    observe_show_requests(SHOW_NOTIFICATION, self._on_show_request),
-                )),
-                ("hand-over request", lambda: setattr(
-                    self, "_handoff_requests",
-                    observe_show_requests(HANDOFF_NOTIFICATION, self._on_handoff_request),
-                )),
-            )
+            try:
+                from openswap.menubar_panel import handle_reopen, observe_show_requests
+            except Exception:
+                self.switcher._logger.warning("show-popover hooks unavailable", exc_info=True)
+                hooks = ()
+            else:
+                hooks = (
+                    # rumps' app delegate class (`App.run` installs an instance).
+                    ("reopen", lambda: handle_reopen(rumps.rumps.NSApp, self.show_popover)),
+                    ("show request", lambda: setattr(
+                        self, "_show_requests",
+                        observe_show_requests(SHOW_NOTIFICATION, self._on_show_request),
+                    )),
+                    ("hand-over request", lambda: setattr(
+                        self, "_handoff_requests",
+                        observe_show_requests(HANDOFF_NOTIFICATION, self._on_handoff_request),
+                    )),
+                )
             for name, install in hooks:
                 try:
                     install()
