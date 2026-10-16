@@ -124,6 +124,10 @@ launchd job running, open the app from Finder, from Spotlight and with
   a terminal `openswap menubar`) whose login item runs this program and has
   no running process hands over to it: `launch_agent.start_login_item()`
   (Step 2) starts the job and this copy exits 0 once the job's pid exists.
+  First it writes `<backup_root>/menubar.show-on-start`. The new copy
+  removes that file once its popover is attached, and opens the popover if
+  the file is less than 30 s old, so opening the app shows it here too. A
+  notification posted now could arrive before the new copy listens.
   When the job is already running, skip the hand-over and take the lock
   path below, so the running copy is told to show its popover. The
   hand-over covers a login item that is on but not running, for example
@@ -153,11 +157,14 @@ launchd job running, open the app from Finder, from Spotlight and with
 
 **Verify**: unit tests for the lock (two file descriptions in one process
 conflict under `flock`), the wait-only-when-launchd rule, the start-up
-hand-over (login item on and idle; on and running, which posts the show
-notification and never calls `start_login_item`; off; running another
-program), and the notification name. Manual: open the app three ways while
+hand-over (login item on and idle, which writes the show-on-start file
+before starting the job; on and running, which posts the show notification
+and never calls `start_login_item`; off; running another program), the
+show-on-start file (consumed once, ignored when stale), and the
+notification name. Manual: open the app three ways while
 the job runs; one status item, and the popover opens each time. Quit, then
-open the app from Finder: `launchctl print` shows the job running it.
+open the app from Finder: `launchctl print` shows the job running it, and
+its popover opens.
 
 ### Step 2: one function that turns login on and off
 
