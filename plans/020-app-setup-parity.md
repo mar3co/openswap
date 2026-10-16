@@ -145,8 +145,11 @@ launchd job running, open the app from Finder, from Spotlight and with
 - The running extra opens its popover on that notification, and on a
   reopen event (`applicationShouldHandleReopen:hasVisibleWindows:` on rumps'
   delegate), so opening the app again always shows it.
-- If the job cannot get the lock in 10 s it exits 1; launchd's `KeepAlive`
-  retries it.
+- If the job cannot get the lock in 10 s it exits 1, and launchd's
+  `KeepAlive` retries it. Exception: when its plist is gone (Open at login
+  was turned off), it unloads its own job (`unload_own_job()`, Step 2) and
+  exits 0. Otherwise a `kickstart -k` from the cask would revive the job
+  behind another copy and `KeepAlive` would restart it in a loop.
 
 **Verify**: unit tests for the lock (two file descriptions in one process
 conflict under `flock`), the wait-only-when-launchd rule, the start-up
@@ -164,6 +167,7 @@ Add to `launch_agent.py`:
 def login_item_enabled(home=None) -> bool: ...
 def login_item_runs_this(home=None) -> bool: ...
 def start_login_item(*, home=None, uid=None) -> int | None: ...
+def unload_own_job(*, home=None, uid=None) -> bool: ...
 def set_login_item(enabled: bool, *, home=None, uid=None) -> str: ...
 ```
 
@@ -178,13 +182,21 @@ depends on which process calls it:
 
 | Caller | Turn on | Turn off |
 |---|---|---|
-| The launchd job itself | Write the plist when it is missing or runs another program; no `launchctl` | Delete the plist; this copy keeps running until Quit or logout and does not come back at the next login |
+| The launchd job itself | Write the plist when it is missing or runs another program; no `launchctl` | Delete the plist; this copy keeps running. On Quit it calls `unload_own_job()` before it exits, so the job is not left loaded for the cask's `kickstart -k` to revive. It does not come back at the next login |
 | A copy opened from Finder, Spotlight or `openswap menubar` | Write the plist, `start_login_item()` (`_wait_for_pid` moves here from `cli.py`), then return `"handoff"`: the caller quits and launchd's copy takes the lock | Boot out the job if it is loaded (it is not this process), delete the plist |
 
 The CLI keeps `install()` and `uninstall()` as they are; they already run
 outside the extra. Refuse with a clear message from a translocated or mounted
 copy (`bundle.runs_from_temporary_location()`): "Move OpenSwap to Applications
-first." Never boot out the calling process.
+first." Never boot out the calling process from inside the call.
+
+`unload_own_job()` is for the launchd job on its way out. It starts
+`launchctl bootout gui/<uid>/<label>` as a detached process
+(`start_new_session=True`, so launchd stopping the job's process group does
+not take it along) and returns; the caller exits right after. It runs only
+when the plist is gone, so turning login off and then quitting leaves
+nothing loaded, while a plain Quit with login on keeps today's behaviour
+(loaded, not running, started again at the next login).
 
 Check on macOS 14 and 15 what happens when the user switched OpenSwap off in
 System Settings › General › Login Items ("Allow in the Background"). If
@@ -194,7 +206,9 @@ System Settings" with a button that opens
 
 **Verify**: `tests/test_launch_agent.py` covers each cell of the table with a
 fake `_launchctl` and `XPC_SERVICE_NAME` set or unset, including "never
-boots out itself" and the temporary-location refusal.
+boots out itself", the temporary-location refusal, and `unload_own_job()`
+(detached, new session, only when the plist is gone). Quit and the
+lock-timeout path call it in exactly those cases.
 
 ### Step 3: Open at login in Settings
 
