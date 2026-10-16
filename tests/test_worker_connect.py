@@ -986,8 +986,10 @@ def test_menu_reconnect_keeps_the_worker_and_skips_the_setup(tmp_path, keychain,
     configure_worker_service(tmp_path, stub.url, "worker-1")
     keychain[("openswap", pairing.account_name(stub.url))] = json.dumps(
         {"worker_id": "worker-1", "device_key": "old-device-key", "expires_at": _later(-1)})
-    monkeypatch.setattr(connect, "open_in_browser", FakeBrowser(stub))
     dialogs = _Dialogs([1])
+    # The browser follows the page only once the waiting dialog is up, as the owner
+    # would; otherwise a fast flow can end before the dialog is ever shown.
+    monkeypatch.setattr(connect, "open_in_browser", FakeBrowser(stub, gate=dialogs.waiting_shown))
     app = _menu(tmp_path, dialogs, wait=dialogs.wait_until_done)
     app._on_setting("remote_tasks_reconnect", None)
     _settle(app)
