@@ -151,13 +151,15 @@ def _local_snapshot_from_store(
 
 
 def _with_remote_status(snapshot, backup_root, *, now=None):
-    from openswap.worker.remote_state import read_status
+    from openswap.worker.remote_state import read_key_status, read_status
     state, seen = read_status(Path(backup_root), now=now)
     # A stopped/stale local worker cannot be online just because it wrote a
     # recent service heartbeat before exit. Revocation remains visible.
     if snapshot.process_state != WorkerProcessState.RUNNING and state == RemoteConnectivity.ONLINE:
         state = RemoteConnectivity.OFFLINE
-    return replace(snapshot, remote_connectivity=state, remote_last_seen_at=seen)
+    renews, key_expires_at = read_key_status(Path(backup_root))
+    return replace(snapshot, remote_connectivity=state, remote_last_seen_at=seen,
+                   remote_key_renews=renews, remote_key_expires_at=key_expires_at)
 
 
 def _snapshot_from_store(backup_root, **kwargs):

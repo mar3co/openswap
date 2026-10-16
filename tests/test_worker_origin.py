@@ -300,11 +300,11 @@ def _reconciled(transport):
 
 def test_registration_advertises_origin_once(origin_setup):
     remote, _, _, store, _, paired, transport, _ = origin_setup
-    assert _sent(transport) == [{"worker_epoch": remote.worker_epoch, "features": ["origin"]}]
-    assert store.capabilities(paired["worker_id"]) == ["origin"]
+    assert _sent(transport) == [{"worker_epoch": remote.worker_epoch, "features": ["origin", "key_rotation"]}]
+    assert store.capabilities(paired["worker_id"]) == ["origin", "key_rotation"]
     assert remote.origin_accepted()
     # Recorded durably for this enrollment and registration.
-    assert remote.journal.capabilities() == (remote.worker_epoch, ("origin",))
+    assert remote.journal.capabilities() == (remote.worker_epoch, ("origin", "key_rotation"))
     for _ in range(3):
         remote.tick()
     assert len(_sent(transport)) == 1  # the set never changes at runtime: sent once per registration
@@ -312,7 +312,7 @@ def test_registration_advertises_origin_once(origin_setup):
     remote.tick()
     remote.tick()
     assert len(_sent(transport)) == 2 and _sent(transport)[-1]["worker_epoch"] == remote.worker_epoch
-    assert remote.origin_accepted() and remote.journal.capabilities() == (remote.worker_epoch, ("origin",))
+    assert remote.origin_accepted() and remote.journal.capabilities() == (remote.worker_epoch, ("origin", "key_rotation"))
 
 
 @pytest.mark.parametrize("code", ["unsupported_version", "not_found"])

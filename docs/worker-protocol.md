@@ -30,7 +30,9 @@ in the Mac's login Keychain under service `openswap`. Keys expire 30 days after
 enrollment. To renew, the operator issues a renewal code for the existing
 worker ID; pairing with it (after a local unpair) rotates that worker's key and
 expiry in place and keeps its ID, so its jobs, events and artifacts stay
-reachable, and the old key stops working. A revoked worker cannot be renewed. Never log keys, codes, prompts, or request bodies.
+reachable, and the old key stops working. A revoked worker cannot be renewed.
+A backend implementing the optional key rotation extension (below) lets a
+worker renew its own live key without any of this. Never log keys, codes, prompts, or request bodies.
 The backend derives owner identity from authentication. The reference server
 has one owner: its operator. A key is scoped to its enrolled worker and that
 worker's jobs, events and artifacts; it cannot select another worker. A more
@@ -381,8 +383,9 @@ unknown operation (404 `unsupported_version`).
 
 `features` holds 0–20 unique strings, each 1–64 characters of lowercase ASCII
 letters, digits, `_` and `-`. A backend ignores a feature it does not know;
-v1 defines only `"origin"`. The response's `features` is the subset of the
-request the backend accepts (in v1, `["origin"]` or `[]`). The request
+v1 defines `"origin"` and `"key_rotation"` (see
+[Optional key rotation](#optional-key-rotation-v1-extension)). The response's
+`features` is the subset of the request the backend accepts. The request
 atomically replaces the worker's whole advertised set. It carries the current
 worker epoch like any other mutation and returns `stale_epoch` from a
 superseded registration. The worker sends it after each new registration, and
@@ -440,13 +443,98 @@ unreadable or invalid setting refuses every kind. Jobs the Mac starts itself
 request or remote message can change the list; see
 [Where tasks come from](#where-tasks-come-from).
 
+## Optional key rotation (v1 extension)
+
+Without this extension a device key dies 30 days after enrollment, and the
+owner renews it by hand (a renewal code, `unpair`, then `pair`). With it, a
+worker that still holds a live key swaps it for a new one with a new 30-day
+expiry and keeps its worker ID. A Mac that stays online never expires.
+
+The extension is additive. A worker advertises it as the `"key_rotation"`
+feature of `capabilities` (see
+[Optional submission origin](#optional-submission-origin-v1-extension)) and
+uses the operation only after a registration whose `capabilities` the backend
+acknowledged with that feature. A backend that does not implement it ignores
+the feature, and rejects the operation like any unknown operation (404
+`unsupported_version`).
+
+| Operation | Request fields | Success response |
+| --- | --- | --- |
+| `rotate_key` | `worker_epoch` | `worker_id`, `device_key`, `expires_at` |
+
+The name is chosen so it is never confused with `renew`, which renews a job
+lease. The response is a closed object: the authenticated worker's own ID, a
+new key (random, 256 bits or stronger, at most 200 characters) and that key's
+expiry, 30 days after the rotation. The worker refuses any other shape, and a
+`worker_id` that is not its own, as a malformed response.
+
+**Who may rotate.** The request is authenticated with the current key, and
+only while that key is live: `revoked` and `device_expired` are refused
+exactly as for any other operation, so a revoked or expired worker can never
+rotate. It carries the current worker epoch like any other mutation and
+returns `stale_epoch` from a superseded registration. A backend refuses it
+with 400 `invalid_request` when the current registration did not advertise
+`"key_rotation"`.
+
+**The pending key.** The backend stores the new key's hash as the worker's
+one *pending* key, with its own expiry, and the old key stays the current
+one. The first request of any operation that authenticates with the pending
+key promotes it: it becomes current (its expiry becomes the worker's key
+expiry) and the old key is dropped. So a lost response is harmless: the old
+key keeps working, and a second `rotate_key` sent with it replaces the pending
+key, whose predecessor can then never authenticate or promote. A worker has at
+most one pending key. A pending key promotes even when the registration that
+asked for it has since been superseded, and even after the current key has
+expired.
+
+**The previous key.** A worker's threads share one key, so a request sent
+with the old key can still be in flight when another thread's request
+promotes the new one. After a promotion the old key is therefore still
+accepted, as the *previous* key, until `previous_key_until`: the earlier of
+the promotion time plus **2 minutes** and the old key's own expiry. When the
+old key has already expired at promotion, no previous key is kept. Without the
+grace the straggler would get `unauthorized`, which a worker treats as a
+revocation.
+
+**What rotation never does.** `rotate_key` and promotion never register,
+never change `worker_epoch` and never touch claims, leases, jobs, events or
+artifacts. A job running during a rotation finishes and uploads normally.
+
+**Rate.** Replacing a pending key is always allowed, because that is how a
+retry after a lost response works. Within one hour after a promotion, a new
+`rotate_key` is refused with 409 `rotation_too_soon`; that code is sent only to
+workers that advertised `"key_rotation"`. Rotating early only moves the expiry
+later, so the limit stops churn, not abuse.
+
+**Other key changes.** A pasted renewal code (`pair` with a renewal code)
+replaces every key: it sets the new current key and clears the pending and
+previous keys in the same transaction, so an old pending key can never promote
+over the newly issued one. Revocation also clears both.
+
+**The worker.** The reference client rotates when 7 days or fewer of its key
+are left (judged on the service's clock), after a registration where the
+backend accepted `"key_rotation"`. It asks at most once per synchronization
+pass, last in the pass, and waits an hour after any failure (a lost response,
+a refusal such as `rotation_too_soon`, or a failure to save the key). A 404
+`unsupported_version` (or 404 `not_found`, from reference servers predating
+this extension) records that the backend cannot rotate, and the worker stops
+asking until its next registration. Rotation never holds back heartbeats,
+claims or launches. A new key is saved before it is used: the worker writes it
+to the login Keychain item, under the pairing lock and only if the item still
+holds the key it started with (an `unpair` or a re-pair that landed meanwhile
+wins, and nothing is written), then switches every later request to it. If
+the save fails, it keeps the old key, which still works because the new one is
+only pending. The registration, the worker ID and the saved status are kept;
+see [Local enrollment and status](#local-enrollment-and-status).
+
 ## Errors, persistence, and operating the reference service
 
 Errors are JSON `{"error":"code"}` without exception details. HTTP 400:
 `invalid_request`, `invalid_code`, `hash_mismatch`, `invalid_state`; 401:
 `unauthorized`, `device_expired`; 403: `revoked`, `forbidden`; 404: `not_found`,
 `unsupported_version`; 409: `offline_worker`, `idempotency_conflict`,
-`stale_epoch`, `lease_lost`, `cursor_conflict`, `artifact_conflict`, `queue_full`;
+`stale_epoch`, `lease_lost`, `cursor_conflict`, `artifact_conflict`, `queue_full`,
+`rotation_too_soon` (key rotation extension only);
 413: `body_too_large`, `artifact_too_large`, `artifact_limit`; 500/503:
 `service_unavailable`. The worker surfaces exactly these codes and reports any
 other error body as `service_unavailable`, so service text never reaches the
@@ -512,7 +600,14 @@ both write the durable status from the client's shared connectivity. The
 registration (worker epoch) is replaced only when the enrollment changes or is
 gone/expired locally; a locked Keychain, a transport fault or a failed status
 write reports `offline` and keeps it, since re-registering interrupts the
-service-side jobs of the registration it replaces. With no configured URL it
+service-side jobs of the registration it replaces. A key rotation is the one
+key change that keeps the registration: the running client saves the new key
+and adopts it in place, so the worker epoch, running jobs and the saved status
+stay as they were. Any other key change (an `unpair` and `pair`, a renewal
+code) still starts a new registration. `worker status` and the menu bar say
+"Key renews automatically" when the registration rotates its key, and "Key
+expires in N days" with the way to renew it only when the backend lacks
+rotation. With no configured URL it
 performs no network or Keychain access. The production adapter refuses jobs
 (`live_adapter_disabled`) until the owner enables live execution; see
 [Running jobs live](#running-jobs-live-codex).
