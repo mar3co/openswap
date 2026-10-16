@@ -248,6 +248,18 @@ def test_an_unusable_lock_file_runs_unguarded_rather_than_not_at_all(tmp_path):
     assert logged and "running without it" in logged[0]
 
 
+def test_without_flock_the_extra_runs_unguarded(tmp_path, monkeypatch):
+    """Windows has no fcntl. The extra is macOS-only, but tests drive the real
+    menubar.run there (test_desktop_menubar), and it must not crash."""
+    monkeypatch.setitem(sys.modules, "fcntl", None)  # `import fcntl` raises ImportError
+    with pytest.raises(OSError, match="flock is not available"):
+        menubar_lock(tmp_path)
+    logged = []
+    logger = types.SimpleNamespace(warning=lambda *a, **k: logged.append(a[0]))
+    assert claim(tmp_path, as_login_item=False, post=lambda: None, say=print, logger=logger) is None
+    assert logged and "running without it" in logged[0]
+
+
 def test_the_show_request_is_the_named_distributed_notification(monkeypatch):
     posts = []
 

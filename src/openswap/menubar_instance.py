@@ -113,9 +113,14 @@ def menubar_lock(backup_dir: Path, wait: float = 0.0) -> MenubarLock | None:
     when the lock file cannot be opened or locked.
 
     The file is opened without truncating it: a copy that loses the race must
-    not erase the holder's pid.
+    not erase the holder's pid. Where there is no ``flock`` (Windows; the
+    extra itself is macOS-only) it raises OSError too, and :func:`claim`
+    runs unguarded.
     """
-    import fcntl
+    try:
+        import fcntl
+    except ImportError as e:
+        raise OSError("flock is not available on this platform") from e
 
     path = lock_path(backup_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
