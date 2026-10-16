@@ -1,6 +1,6 @@
 # OpenSwap feature proposal: pair a Mac by signing in to OpenTag
 
-Status: PROPOSED 2026-10-16. Depends on plan 017 (pairing, worker protocol)
+Status: IN PROGRESS 2026-10-16 (accepted with every default; S1 and S2 under way). Depends on plan 017 (pairing, worker protocol)
 and reuses parts of plan 018 (OpenTag's sign-in and consent pages). Facts about
 OpenTag were read from `mar3co/opentag` `main` at `9f350ab`. Recheck them
 before phase O2, because migrations that are already merged cannot be edited.
@@ -494,6 +494,12 @@ composed scripts, as for plan 017 and plan 018.
 - Connect in the reference server, which has no human sign-in.
 
 ## Open decisions for the owner
+
+Decided 2026-10-16: the owner took the default for all five questions below.
+Connect offers OpenTag with **Use another server…** beside it; keys keep 30
+days and rotate at 7 days left; **Pair this Mac** needs no recent sign-in; an
+unpaired Mac keeps no install ID; and the portal hides the pasted command
+behind **Pair with a command instead**.
 
 1. **Default server.** Should the app offer OpenTag (the portal origin, today
    `https://opentag.me`) as the default for Connect, or always ask for a URL?
