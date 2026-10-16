@@ -898,6 +898,25 @@ class TestUninstallCommand:
         assert trashed == [frozen_app]
         assert lines[-1] == (f"Moved {frozen_app} to the Trash.", False)
 
+    def test_run_from_the_app_keeps_a_cask_app_brew_cannot_remove(
+        self, harness, monkeypatch, frozen_app, tmp_path
+    ):
+        """Trashing it would leave the cask registered with no app and its
+        uninstall hook never run; nothing is removed instead."""
+        seen, _ = harness  # homebrew_brew() is None: brew is missing or cannot run
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: True)
+        monkeypatch.setattr(uninstall.bundle, "cask_prefix", lambda: tmp_path / "homebrew")
+        monkeypatch.setattr("openswap.widget_install._move_to_trash", lambda path: pytest.fail("trashed"))
+        lines, say = self._say()
+        assert uninstall.run(True, say, from_app=True) == 1
+        assert seen["remove"] == [] and seen["purge"] == [] and seen["exec"] is None
+        brew = tmp_path / "homebrew" / "bin" / "brew"
+        assert lines == [
+            (f"Error: Homebrew installed OpenSwap, but {brew} cannot run, so nothing was removed.", True),
+            ("Fix Homebrew, then open OpenSwap and choose Uninstall OpenSwap… again, "
+             "or run: brew uninstall --cask openswap", True),
+        ]
+
     def test_run_from_the_app_reveals_a_copy_it_cannot_trash(self, harness, monkeypatch, frozen_app):
         def refuse(path):
             raise ClaudeSwitchError(f"Could not move {path} to the Trash: permission denied")
@@ -1036,7 +1055,10 @@ class TestStartFromApp:
 
 class TestAppDialog:
     def test_cask_install(self, frozen_app, monkeypatch):
-        monkeypatch.setattr(uninstall, "homebrew_brew", lambda: Path("/opt/homebrew/bin/brew"))
+        # Whether brew can run now does not change what the app is: the child
+        # refuses then (test_run_from_the_app_keeps_a_cask_app_brew_cannot_remove).
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: True)
+        monkeypatch.setattr(uninstall, "homebrew_brew", lambda: None)
         dialog = uninstall.app_dialog()
         assert dialog["title"] == "Uninstall OpenSwap?" and dialog["ok"] == "Uninstall"
         assert dialog["checkbox"] == "Also delete saved accounts, settings and logs"
@@ -1046,7 +1068,7 @@ class TestAppDialog:
         assert "uv tool" not in dialog["message"]
 
     def test_copy_not_installed_by_homebrew(self, frozen_app, monkeypatch):
-        monkeypatch.setattr(uninstall, "homebrew_brew", lambda: None)
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: False)
         assert "• OpenSwap.app, moved to the Trash" in uninstall.app_dialog()["message"]
 
     def test_source_install(self):

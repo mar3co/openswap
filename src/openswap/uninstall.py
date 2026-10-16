@@ -465,6 +465,18 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
         if from_app else f"Fix that, then run: openswap uninstall{' --zap' if zap else ''}"
     )
     brew = homebrew_brew()
+    if from_app and brew is None and bundle.installed_by_homebrew():
+        # Trashing the app would leave the cask registered with no app, and
+        # its uninstall hook would never run: stop before removing anything.
+        prefix = bundle.cask_prefix()
+        where = prefix / "bin" / "brew" if prefix is not None else "brew"
+        say(f"Error: Homebrew installed OpenSwap, but {where} cannot run, so nothing was removed.", error=True)
+        say(
+            "Fix Homebrew, then open OpenSwap and choose Uninstall OpenSwap… again, "
+            "or run: brew uninstall --cask openswap",
+            error=True,
+        )
+        return 1
     removal = remove_integrations()
     for name in removal.removed:
         say(f"Removed the {name}.")
@@ -566,7 +578,7 @@ def app_dialog() -> dict[str, str]:
     if app is None:
         after = "\n\nTo remove the openswap command too, run “uv tool uninstall openswap” afterwards."
     else:
-        lines.append(f"• {app.name}, {'through Homebrew' if homebrew_brew() else 'moved to the Trash'}")
+        lines.append(f"• {app.name}, {'through Homebrew' if bundle.installed_by_homebrew() else 'moved to the Trash'}")
         after = ""
     return {
         "title": "Uninstall OpenSwap?",
