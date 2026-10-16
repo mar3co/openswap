@@ -456,6 +456,39 @@ def test_status_keeps_multi_word_launchd_states(tmp_path):
     assert result["state"] == "spawn scheduled"
 
 
+def test_status_reads_the_loaded_programs_arguments(tmp_path):
+    printed = (
+        "gui/501/com.opensoft.openswap.menubar = {\n"
+        "\tactive count = 0\n"
+        "\tpath = /Users/x/Library/LaunchAgents/com.opensoft.openswap.menubar.plist\n"
+        "\tstate = not running\n"
+        "\n"
+        "\tprogram = /Applications/OpenSwap.app/Contents/MacOS/OpenSwap\n"
+        "\targuments = {\n"
+        "\t\t/Applications/OpenSwap.app/Contents/MacOS/OpenSwap\n"
+        "\t\tmenubar\n"
+        "\t}\n"
+        "\n"
+        "\tenvironment = {\n"
+        "\t\tPATH => /usr/bin:/bin\n"
+        "\t}\n"
+        "}\n"
+    )
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(0, stdout=printed)})
+        result = launch_agent.status(home=tmp_path, uid=UID)
+    assert result["program"] == ["/Applications/OpenSwap.app/Contents/MacOS/OpenSwap", "menubar"]
+    assert result["state"] == "not running"
+
+
+def test_status_leaves_the_program_unknown_without_an_arguments_block(tmp_path):
+    with patch.object(launch_agent.subprocess, "run") as run:
+        run.side_effect = _router({"print": _completed(0, stdout="\tstate = running\n\tpid = 12\n")})
+        assert launch_agent.status(home=tmp_path, uid=UID)["program"] is None
+        run.side_effect = _router({"print": _completed(1)})
+        assert launch_agent.status(home=tmp_path, uid=UID)["program"] is None
+
+
 def test_status_ignores_a_non_numeric_pid_line(tmp_path):
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(0, stdout="\tpid = (none)\n")})
@@ -494,6 +527,9 @@ class FakeLaunchd:
         # How many more `print`s still see the job after a bootout (launchd
         # finishing the teardown).
         self.unloading = 0
+        # The argv launchd loaded, as `launchctl print` reports it; set from
+        # the plist at bootstrap. None prints no `arguments` block.
+        self.loaded_program: list[str] | None = None
         self.calls: list[list[str]] = []
         self.data = Path()
 
@@ -508,13 +544,21 @@ class FakeLaunchd:
             if not self.loaded:
                 return _completed(113, stderr="Could not find service")
             pid_line = f"\tpid = {self.pid}\n" if self.pid else ""
-            return _completed(0, stdout=f"\tstate = running\n{pid_line}")
+            program = ""
+            if self.loaded_program:
+                program = (
+                    f"\tprogram = {self.loaded_program[0]}\n\targuments = {{\n"
+                    + "".join(f"\t\t{arg}\n" for arg in self.loaded_program)
+                    + "\t}\n"
+                )
+            return _completed(0, stdout=f"\tstate = running\n{program}{pid_line}")
         if sub == "bootout":
-            self.loaded, self.pid = False, None
+            self.loaded, self.pid, self.loaded_program = False, None, None
         elif sub == "bootstrap":
             if self.bootstrap_rc:
                 return _completed(self.bootstrap_rc, stderr="Bootstrap failed: 5: Input/output error")
             self.loaded = True
+            self.loaded_program = plistlib.loads(Path(argv[3]).read_bytes())["ProgramArguments"]
             self.pid = 4242 if self.spawns else None
         elif sub == "kickstart":
             if not self.loaded or self.kickstart_rc:
@@ -652,7 +696,7 @@ def test_other_copy_turning_on_restarts_a_loaded_job_from_the_new_plist(launchd,
 
 def test_other_copy_turning_on_kickstarts_an_idle_job_that_already_runs_it(launchd, tmp_path):
     # Loaded but not running: the user quit it (a clean exit is not restarted).
-    launchd.loaded = True
+    launchd.loaded, launchd.loaded_program = True, [*PROGRAM, "menubar"]
     _write_plist(tmp_path, PROGRAM)
     assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "handoff"
     assert ["kickstart", f"gui/{UID}/{launch_agent.LABEL}"] in launchd.calls
@@ -661,7 +705,7 @@ def test_other_copy_turning_on_kickstarts_an_idle_job_that_already_runs_it(launc
 
 
 def test_other_copy_turning_on_while_the_job_waits_for_the_lock(launchd, tmp_path):
-    launchd.loaded, launchd.pid = True, 999
+    launchd.loaded, launchd.pid, launchd.loaded_program = True, 999, [*PROGRAM, "menubar"]
     _write_plist(tmp_path, PROGRAM)
     assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "handoff"
     assert set(launchd.subcommands) == {"print"}
@@ -766,11 +810,66 @@ def test_start_login_item_leaves_a_running_job_alone(launchd, tmp_path):
     assert launchd.subcommands == ["print"]
 
 
-def test_start_login_item_kickstarts_a_loaded_idle_job(launchd, tmp_path):
-    launchd.loaded = True
+def test_start_login_item_kickstarts_a_loaded_idle_job_that_runs_the_plist(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.loaded_program = True, [*PROGRAM, "menubar"]
     assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
     assert ["kickstart", f"gui/{UID}/{launch_agent.LABEL}"] in launchd.calls
     assert "bootstrap" not in launchd.subcommands
+    assert "bootout" not in launchd.subcommands
+
+
+def test_start_login_item_reloads_a_job_loaded_with_another_program(launchd, tmp_path):
+    """launchd keeps the definition it loaded: a kickstart would start the old one."""
+    plist = _write_plist(tmp_path, PROGRAM)
+    launchd.loaded = True
+    launchd.loaded_program = ["/Applications/Old.app/Contents/MacOS/OpenSwap", "menubar"]
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    subs = launchd.subcommands
+    assert "kickstart" not in subs
+    assert subs.index("bootout") < subs.index("bootstrap")
+    assert ["bootstrap", f"gui/{UID}", str(plist)] in launchd.calls
+    assert launchd.loaded_program == [*PROGRAM, "menubar"]
+
+
+def test_start_login_item_reloads_a_job_whose_program_it_cannot_read(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.loaded_program = True, None  # print without `arguments`
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    assert "kickstart" not in launchd.subcommands
+    assert launchd.subcommands.index("bootout") < launchd.subcommands.index("bootstrap")
+    assert launchd.loaded_program == [*PROGRAM, "menubar"]
+
+
+def test_start_login_item_replaces_a_starting_job_that_runs_another_program(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.pid = True, 999
+    launchd.loaded_program = ["/Applications/Old.app/Contents/MacOS/OpenSwap", "menubar"]
+    assert launch_agent.start_login_item(home=tmp_path, uid=UID) == 4242
+    assert launchd.loaded_program == [*PROGRAM, "menubar"]
+    assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) == 4242
+
+
+def test_running_login_item_pid_ignores_a_job_loaded_with_another_program(launchd, tmp_path):
+    _write_plist(tmp_path, PROGRAM)
+    launchd.loaded, launchd.pid = True, 999
+    launchd.loaded_program = ["/Applications/Old.app/Contents/MacOS/OpenSwap", "menubar"]
+    assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) is None
+    launchd.loaded_program = [*PROGRAM, "menubar"]
+    assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) == 999
+    launchd.loaded_program = None  # cannot tell: a running job is left alone
+    assert launch_agent.running_login_item_pid(home=tmp_path, uid=UID) == 999
+
+
+def test_turning_on_over_another_copys_loaded_plist_hands_over_to_the_new_program(launchd, tmp_path):
+    """The cask's app is loaded but stopped; this copy takes the login item over."""
+    other = ["/Applications/OpenSwap.app/Contents/MacOS/OpenSwap"]
+    _write_plist(tmp_path, other)
+    launchd.loaded, launchd.loaded_program = True, [*other, "menubar"]
+    assert launch_agent.set_login_item(True, home=tmp_path, uid=UID) == "handoff"
+    assert "kickstart" not in launchd.subcommands
+    assert launchd.loaded_program == [*PROGRAM, "menubar"]
+    assert _plist_program(tmp_path) == [*PROGRAM, "menubar"]
 
 
 def test_start_login_item_bootstraps_a_plist_launchd_does_not_know(launchd, tmp_path):
@@ -807,6 +906,7 @@ def test_a_kickstart_that_fails_while_the_job_unloads_falls_back_to_one_bootstra
     still lists the job for a moment, and kickstart refuses it."""
     plist = _write_plist(tmp_path, PROGRAM)
     launchd.loaded, launchd.kickstart_rc = True, 37
+    launchd.loaded_program = [*PROGRAM, "menubar"]
 
     def bootout_in_progress(argv, **kwargs):
         if argv[1] == "kickstart":

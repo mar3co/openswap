@@ -190,7 +190,7 @@ def hand_over_to_login_item(
         if not launch_agent.login_item_runs_this():
             return False
         leave_show_request(backup_dir, post=post, logger=logger)
-        pid = launch_agent.status()["pid"] or launch_agent.start_login_item(backup_dir=backup_dir)
+        pid = launch_agent.running_login_item_pid() or launch_agent.start_login_item(backup_dir=backup_dir)
     except Exception:
         if logger is not None:
             logger.warning("could not hand over to the login item; running here", exc_info=True)

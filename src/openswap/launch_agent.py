@@ -232,14 +232,30 @@ def is_loaded(label: str = LABEL, uid: int | None = None) -> bool:
 
 
 def status(label: str = LABEL, uid: int | None = None, home: Path | None = None) -> dict:
-    """Installed / loaded / running state, plus the pid when there is one."""
+    """Installed / loaded / running state, plus the pid when there is one.
+
+    ``program`` is the argv launchd loaded for the job (its ``arguments``),
+    which can differ from the plist on disk: launchd keeps the definition it
+    loaded. None when not loaded or not reported.
+    """
     _require_macos()
     printed = _launchctl("print", service_target(label, uid))
     loaded = printed.returncode == 0
     state: str | None = None
     pid: int | None = None
+    arguments: list[str] | None = None
+    collecting: list[str] | None = None
     if loaded:
         for line in printed.stdout.splitlines():
+            if collecting is not None:
+                # The job's `arguments = {` block: one argument per deeper line.
+                if line.startswith("\t\t"):
+                    collecting.append(line.strip())
+                    continue
+                if line.strip() == "}":
+                    arguments, collecting = collecting, None
+                    continue
+                collecting = None  # malformed: leave the program unknown
             # `launchctl print` nests sub-dictionaries — pid-local endpoints,
             # inherited environment — and those repeat keys the job itself
             # uses, `state` among them. The job's own fields are the ones at a
@@ -253,12 +269,15 @@ def status(label: str = LABEL, uid: int | None = None, home: Path | None = None)
                 raw = stripped.removeprefix("pid = ").strip()
                 if raw.isdigit():
                     pid = int(raw)
+            elif arguments is None and stripped == "arguments = {":
+                collecting = []
     return {
         "label": label,
         "installed": plist_path(label, home).exists(),
         "loaded": loaded,
         "state": state,
         "pid": pid,
+        "program": arguments or None,
         "plist": str(plist_path(label, home)),
     }
 
@@ -422,6 +441,25 @@ def _started_pid(result: subprocess.CompletedProcess, uid: int | None) -> int | 
     return _wait_for_pid(LABEL, uid, timeout=_HANDOFF_PID_TIMEOUT_SECONDS)
 
 
+def _loaded_runs_plist(state: dict, home: Path | None) -> bool | None:
+    """Whether the definition launchd loaded runs what the plist says: True,
+    False, or None when ``launchctl print`` did not report its arguments."""
+    if not state.get("program"):
+        return None
+    return state["program"] == bundle._plist_program(plist_path(LABEL, home))
+
+
+def running_login_item_pid(*, home: Path | None = None, uid: int | None = None) -> int | None:
+    """The login item's pid while it runs (it may still be starting), unless
+    launchd loaded it with another program than the plist names: handing
+    over to that would hand over to the old program."""
+    _require_macos()
+    state = status(LABEL, uid, home)
+    if state["pid"] and _loaded_runs_plist(state, home) is not False:
+        return state["pid"]
+    return None
+
+
 def start_login_item(
     *,
     home: Path | None = None,
@@ -430,11 +468,19 @@ def start_login_item(
 ) -> int | None:
     """Start the login item and return launchd's pid, or None if it would not start.
 
-    A running job is left alone, a loaded one is kickstarted, and otherwise
-    the plist is bootstrapped. The job may still be unloading: the start-up
-    migration (``bundle._repoint_menubar_agent``) boots out a uv extra just
-    before this runs. So when that first start fails or no pid appears, it
-    waits for the job to unload and bootstraps the plist once more.
+    A running job that runs what the plist says is left alone. A loaded job
+    is kickstarted only when its loaded program matches the plist's
+    ``ProgramArguments``: launchd keeps the definition it loaded, and
+    ``set_login_item`` or the migration may have changed the plist under
+    it, so a kickstart would start the old program. When they differ, or
+    ``launchctl print`` does not say, the job is booted out (it is not this
+    process), waited for, and the plist bootstrapped, as ``install`` does.
+    A job that is not loaded is bootstrapped.
+
+    The job may still be unloading: the start-up migration
+    (``bundle._repoint_menubar_agent``) boots out a uv extra just before
+    this runs. So when that first start fails or no pid appears, it waits
+    for the job to unload and bootstraps the plist once more.
 
     A start that still fails is recorded in ``login_item_status.json``
     (:func:`last_start_failure`) for Settings to show, and a job left loaded
@@ -445,13 +491,17 @@ def start_login_item(
     """
     _require_macos()
     state = status(LABEL, uid, home)
-    if state["pid"]:
+    current = _loaded_runs_plist(state, home)
+    if state["pid"] and current is not False:
         clear_start_failure(backup_dir)
         return state["pid"]
     target_plist = str(plist_path(LABEL, home))
-    if state["loaded"]:
+    if state["loaded"] and current:
         verb, first = "kickstart", _launchctl("kickstart", service_target(LABEL, uid))
     else:
+        if state["loaded"]:
+            _launchctl("bootout", service_target(LABEL, uid))
+            _wait_until_unloaded(LABEL, uid)
         verb, first = "bootstrap", _launchctl("bootstrap", domain_target(uid), target_plist)
     pid = _started_pid(first, uid)
     if pid is None:
@@ -567,15 +617,8 @@ def set_login_item(
         return "enabled" if stale else "unchanged"
 
     # Another copy: launchd's copy is the one that should run, so start it
-    # and hand over. The job waits for this copy's menu bar lock. A job
-    # still loaded from the old plist would kickstart the old program, so it
-    # is booted out (it is not this process) and bootstrapped from the new one.
-    if stale and is_loaded(LABEL, uid):
-        _launchctl("bootout", service_target(LABEL, uid))
-        if not _wait_until_unloaded(LABEL, uid):
-            detail = "the previous login item was still shutting down"
-            _record_start_failure(detail, backup_dir)
-            raise LoginItemNotStarted(detail)
+    # and hand over. The job waits for this copy's menu bar lock. A job still
+    # loaded from a plist this replaced is reloaded, not kickstarted.
     if start_login_item(home=home, uid=uid, backup_dir=backup_dir) is None:
         failure = last_start_failure(backup_dir) or {}
         raise LoginItemNotStarted(failure.get("detail") or "launchd did not start OpenSwap")

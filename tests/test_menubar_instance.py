@@ -195,9 +195,9 @@ def login_item(monkeypatch):
         state.events.append("runs_this")
         return state.runs_this
 
-    def status(*_a, **_k):
+    def running_pid(*_a, **_k):
         state.events.append("status")
-        return {"pid": state.running_pid}
+        return state.running_pid
 
     def start(*, home=None, uid=None, backup_dir=None):
         state.events.append("start")
@@ -206,7 +206,7 @@ def login_item(monkeypatch):
         return state.pid
 
     monkeypatch.setattr(launch_agent, "login_item_runs_this", runs_this)
-    monkeypatch.setattr(launch_agent, "status", status)
+    monkeypatch.setattr(launch_agent, "running_login_item_pid", running_pid)
     monkeypatch.setattr(launch_agent, "start_login_item", start)
     monkeypatch.setattr(launch_agent, "log_paths", lambda *a, **k: (Path("/L/o.log"), Path("/L/e.err")))
     return state
@@ -397,6 +397,7 @@ def test_a_failed_hand_over_unloads_the_job_and_this_copy_runs_on(tmp_path, monk
     program = ["/Users/x/.local/bin/openswap"]
     home, data = tmp_path / "home", tmp_path / "data"
     launchd = FakeLaunchd(loaded=True, spawns=False)
+    launchd.loaded_program = [*program, "menubar"]  # loaded from this plist: kickstart
     clock = [1000.0]
     monkeypatch.setattr(launch_agent.sys, "platform", "darwin")
     monkeypatch.setattr(launch_agent.os, "getuid", lambda: 501, raising=False)
