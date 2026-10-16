@@ -687,6 +687,8 @@ class RotationRig:
             saved = self.saved()
             saved["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=days_left)).isoformat()
             self.keychain[("openswap", pairing.account_name(ROTATION_URL))] = json.dumps(saved)
+            # Recorded as pairing records a new key's expiry, so the saved status agrees.
+            pairing._record_key(self.root, ROTATION_URL, pairing.load_enrollment(ROTATION_URL))
         self.adapter = FakeAdapter()
         self.runtime = WorkerRuntime(self.root, adapter=self.adapter,
                                      account_identity=stable_account_identity("codex", "synthetic-rotation"))

@@ -218,16 +218,24 @@ class ConfiguredRemote:
             seen = client.last_seen_at
             # The heartbeat's local send time: the service timestamp less the measured offset.
             received = seen - getattr(client, "_skew", timedelta(0)) if seen else None
+            kept = _kept_key(self.runtime.backup_root, client.url, client.worker_id or None)
             renewal = getattr(client, "key_renewal", None)
             renews = renewal() if callable(renewal) else None
             if renews is None:
                 # Not found out yet by this registration (a restart while the
                 # service is unreachable): keep what an earlier one learned.
-                renews = _kept_key(self.runtime.backup_root, client.url,
-                                   client.worker_id or None).get("key_renews")
+                renews = kept.get("key_renews")
+            # A worker's key expiry only ever moves later (a rotation or a
+            # Connect reconnect issues a fresh key), so never write back an
+            # earlier one: a pass that started before a reconnect saved the new
+            # key's expiry would otherwise restore the old one.
+            expires = getattr(client, "key_expires_at", None)
+            saved = kept.get("key_expires_at")
+            if saved is not None and (expires is None or saved > expires):
+                expires = saved
             save_status(self.runtime.backup_root, client.url, client.state, seen,
                         client.worker_id or None, received, key_renews=renews,
-                        key_expires_at=getattr(client, "key_expires_at", None))
+                        key_expires_at=expires)
 
     def _resolve(self):
         """Re-read policy and enrollment; return the client to drive this pass, or None.

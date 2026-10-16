@@ -1154,3 +1154,19 @@ def test_a_removed_mac_is_never_offered_reconnect(tmp_path, enabled):
         assert cli._key_status(snapshot) is None
     assert menubar.remote_reconnect_label({"remote_connectivity": "revoked",
                                            "remote_key_expires_at": expires.isoformat()}) is None
+
+
+def test_a_save_from_before_a_reconnect_never_restores_the_old_expiry(tmp_path):
+    from openswap.worker.remote_state import ConfiguredRemote, read_key_status, save_status
+
+    url = "https://control.example"
+    configure_worker_service(tmp_path, url, "worker")
+    old = datetime.now(timezone.utc) + timedelta(days=3)
+    renewed = datetime.now(timezone.utc) + timedelta(days=30)
+    # Reconnect saved the new key's expiry (pairing._record_key)...
+    save_status(tmp_path, url, "offline", None, "worker", key_expires_at=renewed)
+    # ...while a pass of the running worker still held the old enrollment.
+    stale = SimpleNamespace(url=url, worker_id="worker", state="online", last_seen_at=None,
+                            key_expires_at=old, key_renewal=lambda: False)
+    ConfiguredRemote(SimpleNamespace(backup_root=tmp_path, remote_launch_guard=None))._save(stale)
+    assert read_key_status(tmp_path) == (False, renewed)
