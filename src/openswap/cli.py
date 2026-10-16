@@ -1372,9 +1372,16 @@ def _uninstall_command(argv: list[str]) -> int:
     reconfigure = getattr(sys.stdout, "reconfigure", None)
     if reconfigure is not None:
         reconfigure(line_buffering=True)
-    if not uninstall.wait_for_app_to_quit():
-        warning("OpenSwap did not quit in time; going on.")
-    code = _uninstall(args.zap, args.yes, from_app=True)
+    if uninstall.wait_for_app_to_quit():
+        code = _uninstall(args.zap, args.yes, from_app=True)
+    else:
+        # Still running, its engines could recreate what a zap deletes.
+        error(
+            f"Error: OpenSwap did not quit within {uninstall.APP_QUIT_TIMEOUT:.0f} seconds, "
+            "so nothing was removed."
+        )
+        error("Quit OpenSwap, then open it and choose Uninstall OpenSwap… again.")
+        code = 1
     if code:
         uninstall.show_app_log()
     return code

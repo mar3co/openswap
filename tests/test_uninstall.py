@@ -688,12 +688,25 @@ class TestUninstallCommand:
         seen, state = harness
         state["live"] = "Claude Code is running on session profile 1-a (PID 7). Quit it, then try again."
         order = []
-        monkeypatch.setattr(uninstall, "wait_for_app_to_quit", lambda: order.append("wait") or False)
+        monkeypatch.setattr(uninstall, "wait_for_app_to_quit", lambda: order.append("wait") or True)
         monkeypatch.setattr(uninstall, "show_app_log", lambda: order.append("log"))
         assert self._run(monkeypatch, "--yes", "--zap", "--from-app") == 1
         assert order == ["wait", "log"] and seen["remove"] == []
-        captured = capsys.readouterr()
-        assert "did not quit in time" in captured.out and "PID 7" in captured.err
+        assert "PID 7" in capsys.readouterr().err
+
+    def test_from_app_removes_nothing_while_the_app_still_runs(self, harness, monkeypatch, capsys):
+        """A running extra's engines could recreate what a zap deletes."""
+        seen, _ = harness
+        order = []
+        monkeypatch.setattr(uninstall, "wait_for_app_to_quit", lambda: order.append("wait") or False)
+        monkeypatch.setattr(uninstall, "show_app_log", lambda: order.append("log"))
+        monkeypatch.setattr(uninstall, "refuse_live_sessions", lambda: pytest.fail("went on"))
+        assert self._run(monkeypatch, "--yes", "--zap", "--from-app") == 1
+        assert order == ["wait", "log"]
+        assert seen["remove"] == [] and seen["purge"] == [] and seen["data"] == [] and seen["exec"] is None
+        err = capsys.readouterr().err
+        assert "did not quit within 30 seconds, so nothing was removed." in err
+        assert "Quit OpenSwap, then open it and choose Uninstall OpenSwap… again." in err
 
     def test_terminal_command_never_trashes_or_waits(self, harness, monkeypatch, capsys, frozen_app):
         monkeypatch.setattr(uninstall, "wait_for_app_to_quit", lambda: pytest.fail("waited"))
