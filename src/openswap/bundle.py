@@ -21,6 +21,9 @@ from __future__ import annotations
 import logging
 import os
 import plistlib
+import re
+import shutil
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -155,6 +158,253 @@ def runs_from_temporary_location(app: Path | None = None) -> bool:
         return False
     text = app.as_posix()
     return "/AppTranslocation/" in text or text.startswith("/Volumes/")
+
+
+# ---- Move to Applications (plan 021) --------------------------------------
+
+APP_NAME = "OpenSwap.app"
+QUARANTINE_XATTR = "com.apple.quarantine"
+
+
+def applications_dir(home: Path | None = None) -> Path:
+    """Where Move to Applications puts the app: ``/Applications`` when this
+    user can write it (an admin), else ``~/Applications``."""
+    system = Path("/Applications")
+    if os.access(system, os.W_OK):
+        return system
+    return (home or Path.home()) / "Applications"
+
+
+def bundle_version(app: Path) -> str | None:
+    """``CFBundleShortVersionString`` of an app on disk, or None."""
+    try:
+        info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    version = info.get("CFBundleShortVersionString") if isinstance(info, dict) else None
+    return version if isinstance(version, str) and version else None
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", version))
+
+
+def _translocated_original(app: Path) -> Path | None:
+    """Where a translocated app really is (``SecTranslocate``), or None.
+
+    macOS runs a quarantined app from a randomized read-only copy; the
+    original is in Downloads or on a mounted disk image. Best effort.
+    """
+    try:
+        import ctypes
+
+        security = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        create = cf.CFURLCreateFromFileSystemRepresentation
+        create.restype = ctypes.c_void_p
+        create.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+        original_for = security.SecTranslocateCreateOriginalPathForURL
+        original_for.restype = ctypes.c_void_p
+        original_for.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        represent = cf.CFURLGetFileSystemRepresentation
+        represent.restype = ctypes.c_bool
+        represent.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_char_p, ctypes.c_long]
+        release = cf.CFRelease
+        release.argtypes = [ctypes.c_void_p]
+    except (OSError, AttributeError):
+        return None
+    raw = os.fsencode(str(app))
+    url = create(None, raw, len(raw), True)
+    if not url:
+        return None
+    try:
+        original = original_for(url, None)
+    finally:
+        release(url)
+    if not original:
+        return None
+    try:
+        buffer = ctypes.create_string_buffer(4096)
+        if not represent(original, True, buffer, len(buffer)):
+            return None
+        return Path(os.fsdecode(buffer.value))
+    finally:
+        release(original)
+
+
+def _disk_image_mounts() -> set[Path]:
+    """Mount points of the disk images ``hdiutil`` has attached."""
+    try:
+        out = subprocess.run(
+            ["/usr/bin/hdiutil", "info", "-plist"],
+            capture_output=True, timeout=10, check=False,
+        ).stdout
+        data = plistlib.loads(out)
+    except (OSError, subprocess.TimeoutExpired, plistlib.InvalidFileException, ValueError):
+        return set()
+    mounts: set[Path] = set()
+    for image in data.get("images", []) if isinstance(data, dict) else []:
+        for entity in image.get("system-entities", []) if isinstance(image, dict) else []:
+            point = entity.get("mount-point") if isinstance(entity, dict) else None
+            if isinstance(point, str) and point:
+                mounts.add(Path(point))
+    return mounts
+
+
+def _volume_of(path: Path) -> Path | None:
+    parts = path.parts
+    if len(parts) > 2 and parts[1] == "Volumes":
+        return Path("/", "Volumes", parts[2])
+    return None
+
+
+def move_source(app: Path) -> dict:
+    """Where a temporary copy runs from: ``source`` is ``disk_image``,
+    ``download`` (translocated from a download) or ``volume`` (another disk);
+    ``eject`` is the disk image's mount point to eject afterwards, never a
+    real disk."""
+    location = app
+    if "/AppTranslocation/" in app.as_posix():
+        location = _translocated_original(app) or app
+    volume = _volume_of(location)
+    if volume is not None and volume in _disk_image_mounts():
+        return {"source": "disk_image", "eject": volume}
+    if volume is not None:
+        return {"source": "volume", "eject": None}
+    return {"source": "download", "eject": None}
+
+
+def _homebrew_owns(app: Path, home: Path | None = None) -> bool:
+    """Whether the cask installed ``app`` (as :func:`installed_by_homebrew`
+    asks of this process's own app)."""
+    if not any(room.is_dir() for room in CASKROOMS):
+        return False
+    appdirs = {Path("/Applications"), (home or Path.home()) / "Applications"}
+    try:
+        parent = app.parent.resolve()
+    except (OSError, RuntimeError):
+        parent = app.parent
+    for appdir in appdirs:
+        try:
+            if parent == appdir.resolve():
+                return True
+        except (OSError, RuntimeError):
+            continue
+    exe = app / "Contents" / "MacOS" / EXECUTABLE_NAME
+    return any(_links_to(link, exe) for link in BREW_BINARIES)
+
+
+def move_plan(app: Path, dest_dir: Path, *, home: Path | None = None) -> dict:
+    """What Move to Applications would do for ``app``.
+
+    ``action``: ``move`` (nothing there), ``replace`` (an older copy, not
+    Homebrew's, goes to the Trash), or ``open_existing`` (Homebrew's copy, or
+    one of this version or newer). Also ``source``, ``eject``,
+    ``destination`` (the folder), ``target`` (the app path there),
+    ``existing_version`` and ``homebrew``.
+    """
+    target = dest_dir / APP_NAME
+    plan = {
+        **move_source(app),
+        "destination": str(dest_dir),
+        "target": str(target),
+        "existing_version": None,
+        "homebrew": False,
+        "action": "move",
+    }
+    if not target.exists():
+        return plan
+    existing = bundle_version(target)
+    plan["existing_version"] = existing
+    if _homebrew_owns(target, home):
+        plan.update(action="open_existing", homebrew=True)
+        return plan
+    mine = bundle_version(app)
+    if existing and mine and _version_key(existing) >= _version_key(mine):
+        plan["action"] = "open_existing"
+    else:
+        plan["action"] = "replace"
+    return plan
+
+
+def _ditto(source: Path, destination: Path) -> None:
+    subprocess.run(
+        ["/usr/bin/ditto", str(source), str(destination)],
+        check=True, capture_output=True, timeout=600,
+    )
+
+
+def _drop_quarantine(app: Path) -> None:
+    """Finder lifts quarantine when a person moves an app; a copy made here
+    must do the same, or macOS translocates it again."""
+    subprocess.run(
+        ["/usr/bin/xattr", "-dr", QUARANTINE_XATTR, str(app)],
+        check=False, capture_output=True, timeout=60,
+    )
+
+
+def copy_to_applications(app: Path, plan: dict) -> Path:
+    """Carry out a ``move`` or ``replace`` plan; returns the new app's path.
+
+    The copy is made beside the target under a hidden name, then renamed
+    into place, so a failure never leaves a half-copied ``OpenSwap.app``.
+    ``replace`` trashes the old copy only once the new one is complete.
+    Raises ClaudeSwitchError.
+    """
+    from openswap.exceptions import ClaudeSwitchError
+
+    action = plan.get("action")
+    if action not in ("move", "replace"):
+        raise ClaudeSwitchError("Nothing to move.")
+    target = Path(plan["target"])
+    staging = target.with_name(f".{APP_NAME}.openswap-move")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if staging.exists():
+            shutil.rmtree(staging)
+        _ditto(app, staging)
+        _drop_quarantine(staging)
+    except (OSError, subprocess.SubprocessError) as e:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise ClaudeSwitchError(f"Could not copy OpenSwap to {target.parent}: {e}") from e
+    if target.exists():
+        if action != "replace" or _homebrew_owns(target):
+            shutil.rmtree(staging, ignore_errors=True)
+            raise ClaudeSwitchError(f"{target} is already there.")
+        from openswap.widget_install import _move_to_trash
+
+        try:
+            _move_to_trash(target)
+        except ClaudeSwitchError:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+    try:
+        staging.rename(target)
+    except OSError as e:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise ClaudeSwitchError(f"Could not put OpenSwap in {target.parent}: {e}") from e
+    return target
+
+
+RELAUNCH_SCRIPT = (
+    'while /bin/kill -0 "$1" 2>/dev/null; do /bin/sleep 0.2; done; '
+    '/usr/bin/open "$2"; '
+    'if [ -n "$3" ]; then /usr/bin/hdiutil detach "$3" -quiet || true; fi'
+)
+
+
+def relaunch_after_exit(app: Path, pid: int, eject: Path | None = None) -> None:
+    """Open ``app`` once process ``pid`` has exited, then eject ``eject``.
+
+    A detached shell does it, because the caller quits right after: the new
+    copy must not start while this one still holds the menu bar lock, and a
+    disk image cannot be ejected while an app runs from it.
+    """
+    subprocess.Popen(
+        ["/bin/sh", "-c", RELAUNCH_SCRIPT, "openswap-move", str(pid), str(app), str(eject or "")],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def is_app_executable(program: str) -> bool:

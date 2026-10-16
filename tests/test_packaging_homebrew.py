@@ -113,7 +113,7 @@ def test_caveats_are_one_step():
 
 
 def test_caveats_offer_the_app_and_the_terminal():
-    """Both paths finish setting up (plan 020): the app's welcome page, or
+    """Both paths finish setting up (plans 020, 021): the app's setup wizard, or
     `openswap setup`."""
     cask = _render("1.2.3", ARM, INTEL).stdout
     caveats = cask[cask.index("  caveats do") :]

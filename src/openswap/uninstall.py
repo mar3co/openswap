@@ -128,7 +128,7 @@ def remove_integrations(
     steps = (
         ("menu bar login item", lambda: _remove_menubar_agent(home, uid)),
         ("menu bar's runtime files", _remove_menubar_state),
-        ("welcome page state", _reset_welcome),
+        ("setup wizard state", _reset_welcome),
         ("Remote tasks worker", lambda: _remove_worker(home, uid, force)),
         ("Claude Code status line", _restore_status_line),
         ("widget", lambda: _remove_widget(home, uid)),
@@ -212,11 +212,11 @@ def _remove_menubar_state() -> bool:
 
 
 def _reset_welcome() -> bool:
-    """Show the app's welcome page again after a reinstall.
+    """Open the app's setup wizard again after a reinstall.
 
     ``welcome_done`` says the login item was decided, and the uninstall has
     just removed it: kept, a reinstalled app opened from Finder would skip the
-    welcome and never offer Open at login. Only the app shows the welcome.
+    wizard and never offer Open at login. Only the app shows the wizard.
     Returns False, as for the runtime files.
     """
     if not bundle.is_frozen():
