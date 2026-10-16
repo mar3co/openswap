@@ -294,22 +294,23 @@ def remote_key_copy(snapshot: dict, *, now: datetime | None = None) -> str:
     expires in N days" only when the backend lacks rotation, with the fix.
     """
     renews = snapshot.get("remote_key_renews")
+    parsed = None
+    expires = snapshot.get("remote_key_expires_at")
+    if isinstance(expires, str) and len(expires) <= 40:
+        try:
+            parsed = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.tzinfo is None:
+            parsed = None
+    left = parsed - (now or datetime.now(timezone.utc)) if parsed is not None else None
+    # Expired wins over "renews automatically": a lapsed key renews nothing.
+    if left is not None and left.total_seconds() <= 0:
+        return "Key expired. This Mac can't take tasks until you re-pair it from the portal."
     if renews is True:
         return REMOTE_KEY_RENEWS_NOTE
-    if renews is not False:
+    if renews is not False or left is None:
         return ""
-    expires = snapshot.get("remote_key_expires_at")
-    if not isinstance(expires, str) or len(expires) > 40:
-        return ""
-    try:
-        parsed = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-    except ValueError:
-        return ""
-    if parsed.tzinfo is None:
-        return ""
-    left = parsed - (now or datetime.now(timezone.utc))
-    if left.total_seconds() <= 0:
-        return "Key expired. This Mac can't take tasks until you re-pair it from the portal."
     days = left.days
     when = "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
     return (f"Key expires {when}. This server can't renew it automatically: "
