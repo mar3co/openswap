@@ -42,7 +42,6 @@ from AppKit import (
     NSWindowStyleMaskFullSizeContentView,
     NSWindowStyleMaskTitled,
     NSWindowTitleHidden,
-    NSWorkspace,
 )
 from Foundation import NSAttributedString, NSMakeRect, NSObject
 
@@ -323,20 +322,6 @@ class SetupWizard:
         word.setFrameOrigin_((x + LOCKUP_MARK + 8, y + (LOCKUP_MARK - size.height) / 2))
         surface.addSubview_(word)
 
-    def _app_icon(self):
-        """The app's own icon in the frozen app; the OpenSoft mark otherwise."""
-        from openswap import bundle
-
-        app = bundle.app_path()
-        if app is not None:
-            return NSWorkspace.sharedWorkspace().iconForFile_(str(app))
-        image = NSImage.alloc().initWithContentsOfFile_(
-            str(Path(__file__).with_name("assets") / "opensoft-symbol-64.png")
-        )
-        if image is not None:
-            image.setTemplate_(True)
-        return image
-
     def _build(self, page):
         surface = _WizardSurface.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, 480))
         surface.primary = None
@@ -350,14 +335,6 @@ class SetupWizard:
             dots.setAccessibilityLabel_(f"Step {progress[0]} of {progress[1]}")
             surface.addSubview_(dots)
         y += 50
-
-        if page.get("icon"):
-            icon = NSImageView.alloc().initWithFrame_(NSMakeRect(PAD - 4, y - 6, 72, 72))
-            icon.setImage_(self._app_icon())
-            icon.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-            icon.setAccessibilityElement_(False)
-            surface.addSubview_(icon)
-            y += 76
 
         y += self._text(surface, page["title"], y, size=22, weight=NSFontWeightSemibold)
         if page.get("body"):

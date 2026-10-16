@@ -181,7 +181,6 @@ def _welcome_page() -> dict:
     return {
         "title": "Welcome to OpenSwap",
         "body": "OpenSwap manages your Claude Code and Codex accounts from the menu bar.",
-        "icon": True,
         "rows": [
             {
                 "kind": "features",
@@ -377,8 +376,8 @@ def wizard_page(step: str, facts: WizardFacts, choices: WizardChoices) -> dict:
     (``{"title", "action", "enabled"}`` or None: the one filled, accent
     button; an ``actions`` row item marked ``primary`` takes that role
     instead), ``secondary`` (a filled gray button, or None), ``skip`` (a
-    plain text button, or None), ``back`` (a plain text button), ``icon``
-    (the app icon above the title) and ``progress`` (``(n, total)`` or None).
+    plain text button, or None), ``back`` (a plain text button) and
+    ``progress`` (``(n, total)`` or None).
     """
     if step not in wizard_steps(facts):
         step = wizard_steps(facts)[0]
@@ -397,5 +396,4 @@ def wizard_page(step: str, facts: WizardFacts, choices: WizardChoices) -> dict:
     page["step"] = step
     page["progress"] = _progress(step, facts)
     page.setdefault("skip", None)
-    page.setdefault("icon", False)
     return page

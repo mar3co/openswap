@@ -148,7 +148,6 @@ def test_welcome_names_what_openswap_does_and_starts():
     assert len(items) == 3 and all(len(i) == 3 for i in items)  # symbol, title, text
     assert page["primary"] == {"title": "Get Started", "action": ACTION_NEXT, "enabled": True}
     assert page["back"] is False
-    assert page["icon"] is True
 
 
 def test_no_claude_account_offers_sign_in_and_save_and_can_skip():
