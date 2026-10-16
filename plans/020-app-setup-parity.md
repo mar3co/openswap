@@ -220,6 +220,15 @@ when the plist is gone, so turning login off and then quitting leaves
 nothing loaded, while a plain Quit with login on keeps today's behaviour
 (loaded, not running, started again at the next login).
 
+The rule depends on the plist, not on which process turned login off, so
+it covers every launchd-started copy. Between turning login off and
+quitting, the job is still loaded, and a `brew upgrade` in that window has
+its `kickstart -k` restart the running extra on the new build. That is the
+right result: the extra was running and stays running, now upgraded. The
+restarted copy still has no plist, so its Quit unloads the job, and it is
+gone at logout either way. The cask's kickstart cannot be gated on the
+plist, because `postflight_steps` run with `deny_read_home`.
+
 Check on macOS 14 and 15 what happens when the user switched OpenSwap off in
 System Settings › General › Login Items ("Allow in the Background"), and
 whether `launchctl print` shows it. Whatever the signal, it ends up as a
@@ -311,13 +320,17 @@ for frozen and source installs.
   `uninstall()` with `paint_command()`, the same calls `openswap statusline
   --install/--uninstall` makes (move the shared part into one function both
   call). The value is `statusline.installed_command(...) is not None`.
+  From a temporary location, turning it on is disabled with the same hint
+  as Open at login: `paint_command()` would pin a path that disappears and
+  break every status-line render. Turning it off stays possible.
 - Cask caveat: "Open OpenSwap from Applications to finish setting up, or
   run: openswap setup". Keep the HOMEBREW_PATH logic that names the cask's
   command when another `openswap` comes first.
 - README Install and Quick start, `docs/menubar.md` (Process, a new "First
   run" paragraph), `docs/widget.md`: describe both paths in the same terms.
 
-**Verify**: settings model tests for the toggle, a CLI test that the shared
+**Verify**: settings model tests for the toggle (including on-disabled,
+off-allowed from a temporary location), a CLI test that the shared
 function is what `statusline --install` calls,
 `tests/test_packaging_homebrew.py` for the caveat. `brew style` and
 `brew audit --cask --strict` on the rendered cask in a local tap.
