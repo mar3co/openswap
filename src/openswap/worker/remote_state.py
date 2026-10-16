@@ -13,9 +13,6 @@ from openswap.worker.protocol import HEARTBEAT_SECONDS, MISSED_HEARTBEATS, Proto
 from openswap.worker.remote import RemoteClient
 from openswap.worker.pairing import Enrollment, load_enrollment, store_rotated_key
 
-# How long a launch check waits for a key rotation in this process to finish
-# saving: longer than the pairing lock's timeout plus a Keychain write.
-
 
 def _identity(url, worker_id):
     # Scoped to the paired worker as well as the URL: a re-pair of the same URL
@@ -116,10 +113,11 @@ class ConfiguredRemote:
     A key rotation (``RemoteClient.rotate_key_if_due``) is the one key change
     that keeps the client: ``_store_rotated`` saves the new key to the Keychain,
     then swaps the client's transport key and the identity in one step under
-    the client lock. While it runs, and when one finished between a Keychain
-    read and the identity check, ``_resolve`` keeps the client instead of
-    rebuilding it, and the launch check also accepts the exact key that rotation
-    is saving, without waiting for it.
+    the client lock. ``_resolve`` and the launch check accept, besides the
+    current identity, only the exact key a rotation is saving now and the exact
+    key a rotation that ended during their Keychain read replaced. They never
+    wait for a rotation, and any other key (an unpair and re-pair, even of the
+    same worker) rebuilds the client or refuses the launch.
     """
     def __init__(self, runtime, *, client_factory=RemoteClient, enrollment_loader=load_enrollment,
                  key_saver=store_rotated_key):
@@ -130,18 +128,19 @@ class ConfiguredRemote:
         self.stop_event = threading.Event()
         self._status_lock = threading.Lock()  # a status write reflects the state read for it
         self._client_lock = threading.Lock()  # client and identity change together
-        # Key rotation bookkeeping, guarded by the client lock: rotations saving
-        # now, and a generation bumped whenever one ends.
-        self._rotating = 0
+        # Key rotation bookkeeping, guarded by the client lock: a generation
+        # bumped whenever a rotation ends, the identities rotations are saving
+        # now, and the one the last adopted rotation replaced.
         self._key_generation = 0
-        self._incoming = set()  # (url, enrollment) a rotation is saving right now
+        self._incoming = set()
+        self._replaced = None
         runtime.remote_launch_guard = self.launch_allowed
 
     def launch_allowed(self, job_id):
         if not self.runtime.get(job_id).idempotency_key.startswith("remote:"):
             return True
         with self._client_lock:
-            client = self.client
+            client, generation = self.client, self._key_generation
         if self.stop_event.is_set() or client is None:
             return False
         # Re-read authorization in Keychain before every launch; a removed or
@@ -156,17 +155,25 @@ class ConfiguredRemote:
         if enrollment is None:
             return False
         # The captured client must still be the active one, and the Keychain must
-        # hold its enrollment, or the exact key a rotation in this process is
-        # saving for it right now. An unpair and re-pair of the same URL while the
-        # loader ran changes the client or the enrollment, and is refused. A
-        # rotation never makes a launch wait: it is matched, not waited out.
+        # hold its enrollment (see ``_rotation_match``). An unpair and re-pair of
+        # the same URL while the loader ran changes the client or the enrollment,
+        # and is refused. A rotation never makes a launch wait: it is matched,
+        # not waited out.
         with self._client_lock:
             current = self.client is client
             ours = (client.url, enrollment)
-            matches = ours == self.identity or ours in self._incoming
+            matches = ours == self.identity or self._rotation_match(ours, generation)
         if not current or not matches:
             return False
         return client.launch_allowed(job_id)
+
+    def _rotation_match(self, identity, generation):
+        """Whether ``identity``, read from the Keychain while the key generation was
+        ``generation``, is a key a rotation in this process accounts for: the one
+        it is saving now, or the one a rotation that ended since then replaced.
+        Called with the client lock held."""
+        return identity in self._incoming or (
+            self._key_generation != generation and identity == self._replaced)
 
     def _store_rotated(self, client, previous_key, worker_id, device_key, expires_at):
         """``key_store`` for ``client``: save a rotated key, then adopt it in place.
@@ -179,7 +186,6 @@ class ConfiguredRemote:
         with self._client_lock:
             if self.client is not client or self.stop_event.is_set():
                 return False
-            self._rotating += 1
             self._incoming.add((client.url, enrollment))
         try:
             try:
@@ -192,17 +198,16 @@ class ConfiguredRemote:
                 if self.client is not client:
                     return False  # the next pass builds a client for whatever the Keychain holds
                 client.adopt_key(device_key, expires_at)
-                self.identity = (client.url, enrollment)
+                self._replaced, self.identity = self.identity, (client.url, enrollment)
             return True
         finally:
             with self._client_lock:
-                self._rotating -= 1
                 self._key_generation += 1
                 self._incoming.discard((client.url, enrollment))
 
     def _set_client(self, client, identity):
         with self._client_lock:
-            self.client, self.identity = client, identity
+            self.client, self.identity, self._replaced = client, identity, None
 
     def _save(self, client):
         with self._status_lock:
@@ -210,9 +215,14 @@ class ConfiguredRemote:
             # The heartbeat's local send time: the service timestamp less the measured offset.
             received = seen - getattr(client, "_skew", timedelta(0)) if seen else None
             renewal = getattr(client, "key_renewal", None)
+            renews = renewal() if callable(renewal) else None
+            if renews is None:
+                # Not found out yet by this registration (a restart while the
+                # service is unreachable): keep what an earlier one learned.
+                renews = _kept_key(self.runtime.backup_root, client.url,
+                                   client.worker_id or None).get("key_renews")
             save_status(self.runtime.backup_root, client.url, client.state, seen,
-                        client.worker_id or None, received,
-                        key_renews=renewal() if callable(renewal) else None,
+                        client.worker_id or None, received, key_renews=renews,
                         key_expires_at=getattr(client, "key_expires_at", None))
 
     def _resolve(self):
@@ -263,10 +273,10 @@ class ConfiguredRemote:
         with self._client_lock:
             current = self.client
             same = identity == self.identity
-            rotated = self._rotating or self._key_generation != generation
+            rotated = current is not None and self._rotation_match(identity, generation)
         if same:
             return current
-        if rotated and current is not None and current.url == url:
+        if rotated:
             # A key rotation in this process saved a new key around this read:
             # keep the registration, and look again on the next pass.
             return current
