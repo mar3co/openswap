@@ -209,6 +209,10 @@ class SetupWizard:
         if primary is not None:
             window.setDefaultButtonCell_(primary.cell())
             window.makeFirstResponder_(primary)
+        else:
+            # Or Return would press the last page's button, which is gone.
+            window.setDefaultButtonCell_(None)
+            window.makeFirstResponder_(None)
 
     def close(self) -> None:
         self._window.orderOut_(None)

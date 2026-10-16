@@ -187,23 +187,37 @@ def bundle_version(app: Path) -> str | None:
     return version if isinstance(version, str) and version else None
 
 
+_VERSION = re.compile(
+    r"""\s*v?(?P<release>\d+(?:\.\d+)*)
+    (?:[.\-_]?(?P<pre>a|b|c|rc|alpha|beta|pre|preview)[.\-_]?(?P<pre_n>\d*))?
+    (?:[.\-_]?(?P<post>post|rev|r)[.\-_]?(?P<post_n>\d*))?
+    (?:[.\-_]?dev[.\-_]?(?P<dev_n>\d*))?\s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_PRE_RANK = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2, "pre": 2, "preview": 2}
+
+
 def _version_key(version: str) -> tuple:
-    """Order versions so a pre-release sorts below its release: ``1.0rc1`` <
-    ``1.0`` < ``1.0.1``, and ``1.0a1`` < ``1.0b2`` < ``1.0rc1``. The release
-    part is the leading dotted numbers; anything after it is the pre-release
-    tag, compared as (word, number) pairs."""
-    match = re.match(r"\s*v?(\d+(?:\.\d+)*)(.*)$", version)
+    """Order versions the way PEP 440 does, as far as the app's own
+    versions go: ``1.0.dev1 < 1.0a1 < 1.0a1.post1 < 1.0b1 < 1.0rc1 < 1.0 <
+    1.0.post1 < 1.0.1``, and ``1.0a1.dev1 < 1.0a1``. ``alpha``, ``beta``,
+    ``c``, ``pre`` and ``preview`` are the usual spellings of ``a``, ``b``
+    and ``rc``. A string that is not a version sorts below every version."""
+    match = _VERSION.match(version or "")
     if match is None:
-        return ((), 0, ())
-    release = tuple(int(part) for part in match.group(1).split("."))
-    tail = match.group(2).strip(" .-_")
-    if not tail:
-        return (release, 1, ())
-    pre = tuple(
-        (word.lower(), int(number or 0))
-        for word, number in re.findall(r"([A-Za-z]+)[.\-_]?(\d*)", tail)
-    )
-    return (release, 0, pre)
+        return ((), -2, (-1,), (0, 0))
+    release = tuple(int(part) for part in match.group("release").split("."))
+    pre = match.group("pre")
+    dev = match.group("dev_n")
+    if pre:
+        pre_key = (_PRE_RANK[pre.lower()], int(match.group("pre_n") or 0))
+    elif dev is not None and match.group("post") is None:
+        pre_key = (-1,)  # a dev release comes before any pre-release
+    else:
+        pre_key = (3,)  # the release itself, or a post-release of it
+    post_key = (int(match.group("post_n") or 0),) if match.group("post") else (-1,)
+    dev_key = (0, int(dev or 0)) if dev is not None else (1,)
+    return (release, pre_key, post_key, dev_key)
 
 
 def _translocated_original(app: Path) -> Path | None:

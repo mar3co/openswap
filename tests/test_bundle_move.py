@@ -227,10 +227,29 @@ def test_each_attempt_stages_in_its_own_folder_and_touches_no_collision(fs):
 @pytest.mark.parametrize("older, newer", [
     ("1.0rc1", "1.0"), ("1.0a1", "1.0b1"), ("1.0b2", "1.0rc1"), ("1.0", "1.0.1"),
     ("0.9.9", "0.10.0"), ("1.0-beta.1", "1.0"), ("v1.0", "1.1"),
+    # dev and post releases, as PEP 440 orders them
+    ("1.0.dev1", "1.0a1"), ("1.0.dev2", "1.0.dev10"), ("1.0a1.dev1", "1.0a1"),
+    ("1.0a1", "1.0a1.post1"), ("1.0", "1.0.post1"), ("1.0.post1", "1.0.1"),
+    ("1.0.post1", "1.0.post2"), ("1.0rc1", "1.0.post1"), ("1.0.dev1", "1.0"),
+    # spellings
+    ("1.0alpha1", "1.0beta1"), ("1.0beta1", "1.0c1"), ("1.0pre1", "1.0"), ("1.0preview2", "1.0"),
+    ("1.0.rev1", "1.0.post2"),
 ])
 def test_versions_order_with_pre_releases_below_their_release(older, newer):
     assert bundle._version_key(older) < bundle._version_key(newer)
     assert bundle._version_key(newer) == bundle._version_key(newer)
+
+
+def test_equal_versions_in_different_spellings_compare_equal():
+    assert bundle._version_key("1.0alpha1") == bundle._version_key("1.0a1")
+    assert bundle._version_key("1.0.beta.2") == bundle._version_key("1.0b2")
+    assert bundle._version_key("1.0-rc1") == bundle._version_key("1.0c1")
+    assert bundle._version_key("v1.0") == bundle._version_key("1.0")
+
+
+def test_a_string_that_is_not_a_version_sorts_below_every_version():
+    assert bundle._version_key("nightly") < bundle._version_key("0.0.1.dev0")
+    assert bundle._version_key("") < bundle._version_key("0")
 
 
 def test_a_replace_trashes_the_old_copy_only_after_the_new_one_is_complete(fs):
