@@ -480,8 +480,14 @@ def test_the_extra_listens_for_show_requests_and_reopen_events():
     from pathlib import Path
 
     text = Path(menubar.__file__).read_text(encoding="utf-8")
+    # rumps.rumps.NSApp is rumps' NSObject delegate class, not the shared
+    # NSApplication: rumps' App.run does `NSApp.alloc().init()` and
+    # `setDelegate_` with it, and the panel registers menu callbacks on it.
     assert "handle_reopen(rumps.rumps.NSApp, self.show_popover)" in text
     assert "observe_show_requests(SHOW_NOTIFICATION, self._on_show_request)" in text
+    # One failing hook must not take the others down with it.
+    init = text[text.index("def __init__(self):") : text.index("self.rebuild_menu()")]
+    assert init.count("install()") == 1 and "for name, install in hooks" in init
 
 
 def test_the_show_notification_opens_the_popover_once_per_request(app, tmp_path):
@@ -595,7 +601,7 @@ def test_the_extra_listens_for_handoff_requests():
     from pathlib import Path
 
     text = Path(menubar.__file__).read_text(encoding="utf-8")
-    assert "observe_show_requests(\n                    HANDOFF_NOTIFICATION, self._on_handoff_request" in text
+    assert "observe_show_requests(HANDOFF_NOTIFICATION, self._on_handoff_request)" in text
 
 
 def test_start_up_without_a_request_leaves_the_popover_closed(app, monkeypatch):
