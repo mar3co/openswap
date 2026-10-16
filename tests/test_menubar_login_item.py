@@ -354,7 +354,7 @@ def test_a_new_change_clears_the_last_note(app, monkeypatch):
 
 
 def test_apply_sets_the_asked_value_not_a_flip(app, monkeypatch):
-    # The welcome page's Continue applies its switch as is (plan 020, Step 4).
+    # The setup wizard's Finish applies its switch as is (plans 020, 021).
     monkeypatch.setattr(launch_agent, "login_item_enabled", lambda home=None: True)
     calls = _set_login_item(monkeypatch, outcome="handoff")
     app._apply_login_item(True)
@@ -492,7 +492,7 @@ def test_the_extra_listens_for_show_requests_and_reopen_events():
     # rumps.rumps.NSApp is rumps' NSObject delegate class, not the shared
     # NSApplication: rumps' App.run does `NSApp.alloc().init()` and
     # `setDelegate_` with it, and the panel registers menu callbacks on it.
-    assert "handle_reopen(rumps.rumps.NSApp, self.show_popover)" in text
+    assert "handle_reopen(rumps.rumps.NSApp, self._on_reopen)" in text
     assert "observe_show_requests(SHOW_NOTIFICATION, self._on_show_request)" in text
     # One failing hook must not take the others down with it.
     init = text[text.index("def __init__(self):") : text.index("self.rebuild_menu()")]

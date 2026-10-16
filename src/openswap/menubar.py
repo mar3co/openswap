@@ -9,11 +9,13 @@ popover keep importing from this module. ``rumps`` is imported only in
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 from openswap.claude_login import (
     ClaudeLoginRun,
@@ -130,10 +132,13 @@ def run(switcher, codex=None) -> int:
     from openswap import launch_agent
     from openswap.menubar_instance import AlreadyRunning, claim, hand_over_to_login_item
 
+    from openswap import bundle as _bundle
+
     as_login_item = launch_agent.runs_as_login_item()
     try:
         instance_lock = claim(
-            switcher.backup_dir, as_login_item=as_login_item, logger=switcher._logger
+            switcher.backup_dir, as_login_item=as_login_item, logger=switcher._logger,
+            move_from=_bundle.move_source_app() if _bundle.runs_from_temporary_location() else None,
         )
     except AlreadyRunning as e:
         return e.exit_code
@@ -282,7 +287,7 @@ def run(switcher, codex=None) -> int:
             else:
                 hooks = (
                     # rumps' app delegate class (`App.run` installs an instance).
-                    ("reopen", lambda: handle_reopen(rumps.rumps.NSApp, self.show_popover)),
+                    ("reopen", lambda: handle_reopen(rumps.rumps.NSApp, self._on_reopen)),
                     ("show request", lambda: setattr(
                         self, "_show_requests",
                         observe_show_requests(SHOW_NOTIFICATION, self._on_show_request),
@@ -297,11 +302,21 @@ def run(switcher, codex=None) -> int:
                     install()
                 except Exception:
                     self.switcher._logger.warning("%s hook failed", name, exc_info=True)
-            # Continue on the welcome page from a translocated or mounted
-            # copy: not again this run, and welcome_done stays unsaved.
-            self._welcome_dismissed = False
-            # A login item change started by the welcome page's Continue: its
-            # failure is shown as an alert, since the page went on to the cards.
+            # The setup wizard (plan 021): its window once opened, the step it
+            # shows, the picks it applies at Finish, the Move plan for a copy
+            # at a temporary location (read once per opening), and what the
+            # account steps last showed, so the tick redraws only on change.
+            self._wizard = None
+            self._wizard_step = None
+            self._wizard_choices = None
+            self._wizard_move = None
+            self._wizard_seen = None
+            # Another copy at a temporary location (a newer DMG opened while
+            # this one runs) asked to be moved: the wizard's Move source.
+            self._wizard_source = None
+            # A login item change started by the wizard's Finish: its failure
+            # is shown as an alert, since the wizard has closed; a hand-over
+            # leaves a show request so the login item's copy opens the popover.
             self._login_item_from_welcome = False
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
@@ -572,6 +587,7 @@ def run(switcher, codex=None) -> int:
             self._apply_hold_line()
             self._drain_relogin_notifies()
             self._drain_claude_login_result()
+            self._wizard_tick()
             self._maybe_auto_capture_relogin()
             self._drain_kickoff_results()
             self._maybe_kickoff()
@@ -716,7 +732,7 @@ def run(switcher, codex=None) -> int:
             if (
                 panel is not None
                 and panel.is_shown()
-                and getattr(panel, "_page", None) in (MAIN_PAGE, WELCOME_PAGE)
+                and getattr(panel, "_page", None) == MAIN_PAGE
             ):
                 if getattr(panel, "_selected_provider", None) == "chatgpt":
                     self._on_chatgpt_view_active()
@@ -1503,8 +1519,6 @@ def run(switcher, codex=None) -> int:
                 login_item=self._login_item_state,
                 status_line=self._status_line_state,
                 bundled_widget=_bundled_widget,
-                welcome=self._welcome_state,
-                on_welcome_continue=self._on_welcome_continue,
             )
             self._panel.attach(nsitem)
             # Requests left before the observers existed: `openswap setup`
@@ -1512,10 +1526,10 @@ def run(switcher, codex=None) -> int:
             # that handed over to this one.
             if self._on_handoff_request():
                 return
-            # Settle the welcome page before any request opens the popover: a
+            # Settle the setup wizard before any request opens the popover: a
             # copy `openswap setup` started (its login item runs this app) is
             # done with it, so a show request left by the copy it took over
-            # from opens the cards, not the welcome page.
+            # from opens the cards, not the wizard.
             self._welcome_on_start()
             self._on_show_request()
             if self._show_popover_pending:
@@ -1525,10 +1539,14 @@ def run(switcher, codex=None) -> int:
         def _on_show_request(self):
             """The show notification, and start-up: consume the show request
             and open the popover when it is fresh (menubar_instance)."""
-            from openswap.menubar_instance import consume_show_request
+            from openswap.menubar_instance import consume_move_request, consume_show_request
 
             if consume_show_request(self.switcher.backup_dir):
-                self.show_popover()
+                source = consume_move_request(self.switcher.backup_dir)
+                if source is not None:
+                    self._open_setup_wizard(source=source)
+                else:
+                    self.show_popover()
 
         def _on_handoff_request(self):
             """The hand-over notification, and start-up: ``openswap setup`` or
@@ -1562,23 +1580,20 @@ def run(switcher, codex=None) -> int:
             if not panel.is_shown():
                 panel.toggle()
 
-        # ---- first run: the welcome page (plan 020) ----------------------
-        def _welcome_state(self):
-            """Facts for the welcome page while it is due, else None.
-
-            Due in the app until Continue saves ``welcome_done``. Closing the
-            popover without Continue changes nothing, so the next open shows
-            it again. A uv install never shows it: `openswap setup` is that path.
-            """
+        def _on_reopen(self):
+            """The app was opened again while running: the setup wizard while
+            it is due (a temporary copy, or setup not finished), else the
+            popover."""
             from openswap import bundle
 
-            if not bundle.is_frozen() or self.settings.welcome_done or self._welcome_dismissed:
-                return None
-            return {
-                "temporary": bundle.runs_from_temporary_location(),
-                "login_item": self._login_item_runs_this(),
-            }
+            if bundle.is_frozen() and (
+                bundle.runs_from_temporary_location() or not self.settings.welcome_done
+            ):
+                self._open_setup_wizard()
+            else:
+                self.show_popover()
 
+        # ---- first run: the setup wizard (plans 020, 021) ------------------
         def _login_item_runs_this(self) -> bool:
             """Whether the login item starts this program (not merely exists:
             a plist for another copy of the app is not this app's login item)."""
@@ -1591,10 +1606,12 @@ def run(switcher, codex=None) -> int:
                 return False
 
         def _welcome_on_start(self):
-            """Open the popover once, by itself, on the welcome page.
+            """Open the setup wizard once, by itself, when it is due.
 
             An LSUIElement app shows no window, so without this a first launch
-            from Finder looks like nothing happened.
+            from Finder looks like nothing happened. A copy at a temporary
+            location opens it on Move, set up or not: opening a newer DMG is
+            also how a Finder install updates.
             """
             from openswap import bundle
 
@@ -1611,17 +1628,16 @@ def run(switcher, codex=None) -> int:
                     self.settings.save(settings_path)
                 except OSError:
                     self.switcher._logger.debug("could not save welcome_done", exc_info=True)
-            elif action == "show":
-                self.show_popover()
+            elif action in ("show", "move"):
+                self._open_setup_wizard()
 
         def _on_welcome_continue(self, open_at_login):
             """Save ``welcome_done``, then apply the switch (a hand-over last)."""
             from openswap import bundle
 
             if bundle.runs_from_temporary_location():
-                # Nothing may be pinned to a path that vanishes. The copy moved
-                # to Applications shows the welcome page again.
-                self._welcome_dismissed = True
+                # Nothing may be pinned to a path that vanishes; the wizard
+                # only offers Move there, so this is never reached from it.
                 return
             self.settings.welcome_done = True
             try:
@@ -1636,6 +1652,226 @@ def run(switcher, codex=None) -> int:
             self._apply_login_item(bool(open_at_login))
             if not self._login_item_busy:
                 self._login_item_from_welcome = False  # it did not start
+
+        def _open_setup_wizard(self, step=None, source=None):
+            """Show the setup wizard (``setup_wizard``) on ``step``, or on its
+            first step. Each opening starts from fresh choices. ``source`` is
+            another copy's app to offer Move for (a move request)."""
+            from openswap.setup_wizard import initial_choices, wizard_steps
+
+            self._wizard_move = None
+            self._wizard_source = source
+            facts = self._wizard_facts()
+            if self._wizard is None:
+                try:
+                    from openswap.menubar_wizard import make_setup_wizard
+
+                    self._wizard = make_setup_wizard(self._on_wizard_action)
+                except Exception:
+                    self.switcher._logger.warning("setup wizard unavailable", exc_info=True)
+                    self.show_popover()
+                    return
+            self._wizard_choices = initial_choices(facts)
+            steps = wizard_steps(facts)
+            self._wizard_step = step if step in steps else steps[0]
+            self._wizard_seen = self._wizard_account_signature()
+            self._wizard.show(self._wizard_page(facts))
+
+        def _wizard_page(self, facts=None):
+            from openswap.setup_wizard import wizard_page
+
+            facts = facts if facts is not None else self._wizard_facts()
+            return wizard_page(self._wizard_step, facts, self._wizard_choices)
+
+        def _wizard_render(self):
+            if self._wizard is not None and self._wizard_step is not None:
+                self._wizard_seen = self._wizard_account_signature()
+                self._wizard.render(self._wizard_page())
+
+        def _wizard_cards(self):
+            cards = panel_accounts(self.snapshot)
+            claude = tuple(
+                (str(c.get("title") or ""), str(c.get("subtitle") or ""))
+                for c in provider_cards(cards, "claude")
+            )
+            codex = tuple(
+                (str(c.get("title") or ""), str(c.get("subtitle") or ""))
+                for c in provider_cards(cards, "chatgpt")
+            )
+            return claude, codex
+
+        def _codex_signing_in(self) -> bool:
+            return self._login_ui_state.get("stage") in ("starting", "waiting", "saving")
+
+        def _wizard_account_signature(self):
+            """What the account steps show, to redraw them when it changes."""
+            claude, codex = self._wizard_cards()
+            return (
+                claude, codex,
+                self._account_states.get("claude", "error"),
+                self._account_states.get("chatgpt", "error"),
+                self._claude_login is not None,
+                self._codex_signing_in(),
+            )
+
+        def _wizard_facts(self):
+            """Everything a wizard page reads, from the same sources Settings
+            and the popover use."""
+            import shutil as _shutil
+
+            from openswap import bundle
+            from openswap.setup_wizard import WizardFacts
+
+            temporary = self._wizard_source is not None or bundle.runs_from_temporary_location()
+            if temporary and self._wizard_move is None:
+                app = self._wizard_source or bundle.app_path()
+                try:
+                    self._wizard_move = bundle.move_plan(app, bundle.applications_dir())
+                except Exception as e:
+                    self.switcher._logger.warning("Move to Applications plan failed", exc_info=True)
+                    self._wizard_move = {"action": "error", "error": str(e)}
+            claude, codex = self._wizard_cards()
+            exe = bundle.executable()
+            on_path = _shutil.which("openswap")
+            try:
+                command_on_path = bool(on_path) and exe is not None and (
+                    Path(on_path).resolve() == exe.resolve()
+                )
+            except (OSError, RuntimeError):
+                command_on_path = False
+            return WizardFacts(
+                temporary=temporary,
+                move=self._wizard_move,
+                claude_accounts=claude,
+                claude_state=self._account_states.get("claude", "error"),
+                claude_signing_in=self._claude_login is not None,
+                claude_installed=resolve_claude_bin() is not None,
+                codex_available=self._has_codex(),
+                codex_accounts=codex,
+                codex_state=self._account_states.get("chatgpt", "error"),
+                codex_signing_in=self._codex_signing_in(),
+                login_item=self._login_item_runs_this(),
+                status_line=self._status_line_state(),
+                widget=bundle.is_frozen() and not temporary,
+                homebrew=bundle.installed_by_homebrew(),
+                command_on_path=command_on_path,
+                command=str(exe) if exe is not None else "",
+            )
+
+        def _on_wizard_action(self, action):
+            """A wizard button or switch (``setup_wizard.ACTION_*``)."""
+            from openswap.setup_wizard import ACCOUNT_ACTIONS, next_step, previous_step
+
+            if self._wizard is None or self._wizard_step is None:
+                return
+            if action == "close":
+                self._wizard.close()
+                self._wizard_step = None
+                return
+            if action in ("next", "back"):
+                facts = self._wizard_facts()
+                move = next_step if action == "next" else previous_step
+                self._wizard_step = move(self._wizard_step, facts)
+                self._wizard.render(self._wizard_page(facts))
+                return
+            if action == "toggle_open_at_login":
+                self._wizard_choices.open_at_login = not self._wizard_choices.open_at_login
+            elif action == "toggle_status_line":
+                self._wizard_choices.status_line = not self._wizard_choices.status_line
+            elif action in ACCOUNT_ACTIONS:
+                # The popover's empty-state actions: a browser sign-in, or
+                # saving the login Claude Code (or Codex) already has.
+                self._on_empty_action(*ACCOUNT_ACTIONS[action])
+            elif action in ("move", "open_existing"):
+                self._wizard_move_app(action)
+                return
+            elif action == "finish":
+                self._wizard_finish()
+                return
+            self._wizard_render()
+
+        def _wizard_tick(self):
+            """Redraw an account step when its roster or sign-in changed (a
+            browser sign-in finishes on its own time)."""
+            from openswap.setup_wizard import CLAUDE, CODEX
+
+            if self._wizard is None or self._wizard_step not in (CLAUDE, CODEX):
+                return
+            if not self._wizard.is_visible():
+                return
+            if self._wizard_account_signature() != self._wizard_seen:
+                self._wizard_render()
+
+        def _wizard_move_app(self, action):
+            """Move: copy into Applications (or open the copy already there),
+            then quit; a detached shell opens it once this copy is gone and
+            ejects the disk image."""
+            from openswap import bundle
+
+            plan = self._wizard_move or {}
+            source = self._wizard_source or bundle.app_path()
+            # The plan was made when the window opened; Applications may have
+            # changed since (another install, a deleted copy). Plan again and,
+            # when the answer differs, show that instead of acting on the old one.
+            try:
+                fresh = bundle.move_plan(source, Path(plan["destination"]))
+            except (OSError, KeyError, ValueError) as e:
+                self._show_error(f"Couldn’t check Applications: {e}")
+                return
+            if fresh.get("action") != plan.get("action") or fresh.get("target") != plan.get("target"):
+                self._wizard_move = fresh
+                self._wizard_render()
+                return
+            plan = fresh
+            try:
+                if action == "move":
+                    target = bundle.copy_to_applications(source, plan)
+                else:
+                    target = Path(plan["target"])
+                    if self._wizard_source is not None and bundle.app_is(target):
+                        # The copy already there is this one, running: nothing
+                        # to open but the popover. The DMG is done with. (A
+                        # DMG copy that won the lock on a retry consumes its
+                        # own request; it is not the installed copy.)
+                        bundle.eject(plan.get("eject"))
+                        self._wizard.close()
+                        self._wizard_step = None
+                        self.show_popover()
+                        return
+            except (ClaudeSwitchError, KeyError) as e:
+                self._show_error(str(e))
+                self._wizard_move = None
+                self._wizard_render()
+                return
+            self.switcher._logger.info("Moved to %s; reopening from there", target)
+            try:
+                bundle.relaunch_after_exit(target, os.getpid(), plan.get("eject"))
+            except OSError as e:
+                self._show_error(f"OpenSwap is in {target.parent}, but couldn’t reopen from there: {e}")
+                return
+            self._wizard.close()
+            self._wizard_step = None
+            self.on_quit(None)
+
+        def _wizard_finish(self):
+            """Open OpenSwap: apply the status line, then save
+            ``welcome_done`` and apply Open at login (a hand-over last)."""
+            from openswap import paths
+            from openswap.statusline import set_installed
+
+            choices = self._wizard_choices
+            self._wizard.close()
+            self._wizard_step = None
+            if choices.status_line != (self._status_line_state() == "on"):
+                try:
+                    set_installed(
+                        paths.get_claude_config_home(), self.switcher.backup_dir, choices.status_line,
+                    )
+                except (ClaudeSwitchError, OSError) as e:
+                    self._show_error(f"Couldn't change the Claude Code status line: {e}")
+            self._on_welcome_continue(choices.open_at_login)
+            if not self._login_item_busy:
+                self.show_popover()
 
         def _on_empty_action(self, provider, action):
             if self._desktop_switching or self._refreshing:
@@ -1791,6 +2027,14 @@ def run(switcher, codex=None) -> int:
             elif row_id == "open_at_login_failed":
                 subprocess.run(["open", LOGIN_ITEMS_SETTINGS_URL], check=False)
                 return
+            elif row_id == "setup_assistant":
+                from openswap.setup_wizard import WELCOME
+
+                panel = self._panel
+                if panel is not None and panel.is_shown():
+                    panel.toggle()
+                self._open_setup_wizard(WELCOME)
+                return
             elif row_id in {
                 "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_stop",
                 "remote_tasks_account", "remote_tasks_web_choice",
@@ -1918,9 +2162,16 @@ def run(switcher, codex=None) -> int:
             from_welcome, self._login_item_from_welcome = self._login_item_from_welcome, False
             if result.get("outcome") == "handoff":
                 # set_login_item returned once launchd's copy was up; it is
-                # waiting for this copy's menu bar lock, so quit now.
+                # waiting for this copy's menu bar lock, so quit now. After the
+                # wizard, that copy opens its popover, as this one would have.
+                if from_welcome:
+                    from openswap.menubar_instance import leave_show_request
+
+                    leave_show_request(self.switcher.backup_dir, logger=self.switcher._logger)
                 self.on_quit(None)
                 return
+            if from_welcome and result.get("outcome"):
+                self.show_popover()
             self._login_item_last = result
             if from_welcome and not result.get("outcome"):
                 # Continue went on to the cards, where Settings' hint (an

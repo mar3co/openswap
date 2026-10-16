@@ -259,7 +259,6 @@ def _remote_task_origin(origin) -> str:
     return f" from {label} ({origin['kind']})" if label else f" from {origin['kind']}"
 SETTINGS_PAGE = "settings"
 TOKEN_PAGE = "token"
-WELCOME_PAGE = "welcome"
 SETUP_TOKEN_PREFIX = "sk-ant-oat"
 MAIN_PAGE = "main"
 CHATGPT_SWITCHING_HINT = (
@@ -401,8 +400,8 @@ class MenuBarSettings:
     kickoff_hour: int = 7
     kickoff_minute: int = 0
     kickoff_last_date: str = ""  # local YYYY-MM-DD of the last kickoff run
-    # The app's first-run welcome page was finished (Continue), or
-    # `openswap setup` had already set up the login item.
+    # The app's setup wizard was finished (Open OpenSwap), or `openswap
+    # setup` had already set up the login item. The name predates the wizard.
     welcome_done: bool = False
 
     @classmethod
@@ -968,6 +967,16 @@ def _this_mac_setup_rows(
             "id": "widget_hint",
             "label": ADD_WIDGET_HINT,
             "lines": _hint_lines(ADD_WIDGET_HINT),
+        })
+        # The app at a stable location (the same fact as the widget hint):
+        # the setup wizard again, from Welcome (plan 021).
+        rows.append({
+            "kind": "button",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "setup_assistant",
+            "label": "Setup assistant",
+            "title": "Open",
+            "value": None,
         })
     return rows
 
@@ -2454,15 +2463,7 @@ def provider_empty_state(provider: str, state: str = "ready", *, desktop: bool =
     }
 
 
-WELCOME_TITLE = "Welcome to OpenSwap"
-WELCOME_BODY = (
-    "OpenSwap shows each account’s usage in the menu bar and switches "
-    "Claude Code and Codex accounts in one click."
-)
-WELCOME_OPEN_AT_LOGIN = "Open at login"
-WELCOME_LOGIN_HINT = "Keeps OpenSwap in the menu bar after you restart."
-WELCOME_LOGIN_ON_HINT = "OpenSwap already opens at login."
-# Continue's alert for a login item launchd did not start (Settings shows a
+# Finish's alert for a login item launchd did not start (Settings shows a
 # warning row with a Login Items button for the same thing).
 OPEN_AT_LOGIN_FAILED_ALERT = (
     f"{OPEN_AT_LOGIN_FAILED}. If it is off in System Settings › General › "
@@ -2477,59 +2478,26 @@ def welcome_on_start(
     temporary: bool,
     login_item_runs_this: bool,
 ) -> str:
-    """What the app does about the welcome page when it starts.
+    """What the app does about the setup wizard (plan 021) when it starts.
 
-    ``"show"``: open the popover once, by itself, on the welcome page (an
-    LSUIElement app shows no window, so a first launch would look like
-    nothing happened). ``"done"``: ``openswap setup`` already pointed the
-    login item at this app (``launch_agent.login_item_runs_this``), so save
-    ``welcome_done`` and show nothing.
-    ``"none"``: a uv install (``openswap setup`` is its path), a finished
-    welcome, or a translocated or mounted copy.
+    ``"move"``: a copy at a temporary location (a disk image, or translocated
+    from a download) opens the wizard on Move, set up or not, since opening
+    a newer DMG is also how a Finder install updates. ``"show"``: open the
+    wizard (an LSUIElement app shows no window, so a first launch would look
+    like nothing happened). ``"done"``: ``openswap setup`` already pointed
+    the login item at this app (``launch_agent.login_item_runs_this``), so
+    save ``welcome_done`` and show nothing. ``"none"``: a uv install
+    (``openswap setup`` is its path), or a finished setup.
     """
-    if not frozen or settings.welcome_done or temporary:
+    if not frozen:
+        return "none"
+    if temporary:
+        return "move"
+    if settings.welcome_done:
         return "none"
     if login_item_runs_this:
         return "done"
     return "show"
-
-
-def welcome_page_model(
-    *,
-    claude_accounts: int,
-    claude_state: str = "ready",
-    temporary: bool = False,
-    login_item: bool = False,
-    open_at_login: bool = True,
-) -> dict:
-    """The first-run welcome page. No AppKit.
-
-    ``account`` is the Claude empty state (Sign in with Claude, Save current
-    login) until an account is saved, else None. ``login_item`` is whether
-    the login item already runs this app. The **Open at login**
-    switch starts on (``open_at_login`` is the user's pick so far); from a
-    translocated or mounted copy it is off and disabled, since nothing may
-    be pinned to that path. Continue applies it.
-    """
-    account = None
-    if claude_accounts <= 0:
-        account = provider_empty_state("claude", claude_state)
-    if temporary:
-        hint = OPEN_AT_LOGIN_MOVE_HINT  # the same words as Settings' switch
-    elif login_item:
-        hint = WELCOME_LOGIN_ON_HINT
-    else:
-        hint = WELCOME_LOGIN_HINT
-    return {
-        "title": WELCOME_TITLE,
-        "body": WELCOME_BODY,
-        "account": account,
-        "open_at_login_label": WELCOME_OPEN_AT_LOGIN,
-        "open_at_login": bool(open_at_login) and not temporary,
-        "open_at_login_disabled": bool(temporary),
-        "hint": hint,
-        "button": "Continue",
-    }
 
 
 def provider_shared_copy(provider: str, *, desktop: bool = True) -> str:

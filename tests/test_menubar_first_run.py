@@ -1,7 +1,8 @@
-"""First run, widget and status line from the app (plan 020, phase 2).
+"""First run, widget and status line from the app (plans 020 and 021).
 
-No rumps or AppKit: the Settings and welcome models are pure, and controller
-methods are lifted out of ``MenuBarApp`` with ``tests.menubar_harness``.
+No rumps or AppKit: the Settings model is pure, the setup wizard's pages are
+covered in ``tests/test_setup_wizard.py``, and controller methods are lifted
+out of ``MenuBarApp`` with ``tests.menubar_harness``.
 """
 
 from __future__ import annotations
@@ -45,21 +46,25 @@ def test_status_line_toggle_shows_what_is_on_disk(installed):
     assert row["section"] == menubar.SETTINGS_SECTION_GENERAL
 
 
-def test_this_mac_ends_general_with_the_status_line_then_the_widget_hint():
+def test_this_mac_ends_general_with_the_status_line_the_widget_hint_and_setup():
     rows = _general(status_line=False, bundled_widget=True)
     tail = _this_mac(rows)
     assert rows[-len(tail):] == tail  # the last group of General
-    assert [row["id"] for row in tail][-2:] == ["claude_status_line", "widget_hint"]
-    hint = tail[-1]
+    assert [row["id"] for row in tail][-3:] == ["claude_status_line", "widget_hint", "setup_assistant"]
+    hint = tail[-2]
     assert hint["kind"] == "group" and hint["style"] == "hint"
     assert hint["label"] == "Add the widget: Edit Widgets, search OpenSwap"
+    setup = tail[-1]
+    assert setup["kind"] == "button"
+    assert (setup["label"], setup["title"]) == ("Setup assistant", "Open")
 
 
-def test_widget_hint_is_the_apps_only():
-    """A uv install builds its widget with Xcode (`openswap widget --install`),
-    and a translocated copy registers nothing."""
+def test_widget_hint_and_setup_are_the_apps_only():
+    """A uv install builds its widget with Xcode (`openswap widget --install`)
+    and sets up with `openswap setup`; a translocated copy pins nothing."""
     ids = {row["id"] for row in _general(bundled_widget=False)}
     assert "widget_hint" not in ids
+    assert "setup_assistant" not in ids
     assert "claude_status_line" in ids
 
 
@@ -74,7 +79,7 @@ def test_this_mac_stays_out_of_the_other_sections():
             section=section,
         )
         ids = {row["id"] for row in rows}
-        assert not ids & {"group_this_mac", "claude_status_line", "widget_hint"}
+        assert not ids & {"group_this_mac", "claude_status_line", "widget_hint", "setup_assistant"}
 
 
 def test_bundled_widget_means_the_app_at_a_stable_location(frozen_app, monkeypatch):
@@ -157,7 +162,7 @@ def test_status_line_toggle_reports_an_unreadable_settings_file(tmp_path, monkey
     assert (claude / "settings.json").read_text(encoding="utf-8") == "{not json"
 
 
-# ---- the welcome page (plan 020 step 4) -------------------------------------
+# ---- when the setup wizard opens (plans 020 step 4, 021) --------------------
 
 
 def test_welcome_done_is_persisted_and_defaults_off(tmp_path):
@@ -178,11 +183,15 @@ def test_welcome_done_is_persisted_and_defaults_off(tmp_path):
         # `openswap setup` already ran: the login item runs this app.
         (True, False, False, True, "done"),
         (True, True, False, False, "none"),
-        # A translocated or mounted copy pins nothing and opens nothing.
-        (True, False, True, False, "none"),
+        # A disk image or download copy opens on Move, set up or not: a
+        # newer DMG is how a Finder install updates.
+        (True, False, True, False, "move"),
+        (True, True, True, False, "move"),
+        (True, True, True, True, "move"),
         # A uv install never shows it; `openswap setup` is that path.
         (False, False, False, False, "none"),
         (False, False, False, True, "none"),
+        (False, False, True, False, "none"),
     ],
 )
 def test_welcome_on_start(frozen, done, temporary, login_item, expected):
@@ -192,63 +201,14 @@ def test_welcome_on_start(frozen, done, temporary, login_item, expected):
     ) == expected
 
 
-def test_welcome_with_no_accounts_offers_the_claude_account_step():
-    model = menubar.welcome_page_model(claude_accounts=0)
-    assert model["title"] == "Welcome to OpenSwap"
-    assert model["body"]
-    assert model["account"] == menubar.provider_empty_state("claude")
-    assert model["account"]["button"] == "Sign in with Claude"
-    assert model["account"]["secondary_button"] == "Save current login"
-    # Open at login starts on, and nothing is written until Continue.
-    assert model["open_at_login_label"] == "Open at login"
-    assert model["open_at_login"] is True
-    assert model["open_at_login_disabled"] is False
-    assert model["hint"] == "Keeps OpenSwap in the menu bar after you restart."
-    assert model["button"] == "Continue"
-
-
-def test_welcome_with_accounts_drops_the_account_step():
-    model = menubar.welcome_page_model(claude_accounts=2)
-    assert model["account"] is None
-    assert model["open_at_login"] is True
-
-
-@pytest.mark.parametrize("state", ["loading", "error"])
-def test_welcome_never_mistakes_an_unread_roster_for_an_empty_one(state):
-    model = menubar.welcome_page_model(claude_accounts=0, claude_state=state)
-    assert model["account"] == menubar.provider_empty_state("claude", state)
-    assert model["account"]["button"] != "Sign in with Claude"
-
-
-def test_welcome_from_a_temporary_location_cannot_open_at_login():
-    model = menubar.welcome_page_model(claude_accounts=0, temporary=True, open_at_login=True)
-    assert model["open_at_login"] is False
-    assert model["open_at_login_disabled"] is True
-    assert model["hint"] == menubar.OPEN_AT_LOGIN_MOVE_HINT  # as in Settings
-    assert model["account"] is not None
-
-
-def test_welcome_when_the_login_item_is_already_on():
-    model = menubar.welcome_page_model(claude_accounts=1, login_item=True)
-    assert model["open_at_login"] is True
-    assert model["open_at_login_disabled"] is False
-    assert model["hint"] == "OpenSwap already opens at login."
-
-
-def test_welcome_keeps_the_users_pick_for_the_switch():
-    model = menubar.welcome_page_model(claude_accounts=1, open_at_login=False)
-    assert model["open_at_login"] is False
-    assert model["open_at_login_disabled"] is False
-
-
-# ---- the welcome page's controller ------------------------------------------
+# ---- the wizard's controller ---------------------------------------------------
 
 _WELCOME_METHODS = {
-    "_welcome_state",
     "_login_item_runs_this",
     "_welcome_on_start",
     "_on_welcome_continue",
-    # Phase 1's Open at login path, which Continue goes through.
+    "_on_reopen",
+    # Phase 1's Open at login path, which Finish goes through.
     "_apply_login_item",
     "_login_item_worker",
     "_drain_login_item_result",
@@ -257,11 +217,12 @@ _WELCOME_METHODS = {
 
 @pytest.fixture
 def welcome_app(tmp_path, monkeypatch):
-    """MenuBarApp's welcome methods over a fake app; the frozen bundle is
-    faked per test (``frozen_app``) or left off (a uv install)."""
+    """MenuBarApp's first-run methods over a fake app; the frozen bundle is
+    faked per test (``frozen_app``) or left off (a uv install). Opening the
+    wizard is recorded, not drawn."""
     import threading
 
-    from openswap import bundle, launch_agent
+    from openswap import bundle, launch_agent, menubar_instance
 
     path = tmp_path / "menubar_settings.json"
     scope = {
@@ -284,7 +245,6 @@ def welcome_app(tmp_path, monkeypatch):
             error=lambda *a, **k: None,
         )
     )
-    app._welcome_dismissed = False
     app._login_item_from_welcome = False
     app._login_item_busy = False
     app._login_item_last = {}
@@ -293,7 +253,12 @@ def welcome_app(tmp_path, monkeypatch):
     app._event_lock = threading.Lock()
     app._show_error = lambda message: events.append(("error", message))
     app.show_popover = lambda: events.append("show_popover")
+    app._open_setup_wizard = lambda step=None: events.append(("wizard", step))
     app.on_quit = lambda _sender: events.append("quit")
+    monkeypatch.setattr(
+        menubar_instance, "leave_show_request",
+        lambda backup_dir, **_k: events.append("show_request"),
+    )
     login = {"runs_this": False, "set": [], "result": "enabled"}
 
     def set_login_item(enabled, **_k):
@@ -325,69 +290,74 @@ def _drain(app):
     app._drain_login_item_result()
 
 
-def test_first_launch_opens_the_popover_on_the_welcome_page(welcome_app, frozen_app):
+def _done(w) -> bool:
+    return w.path.exists() and json.loads(w.path.read_text())["welcome_done"] is True
+
+
+def test_first_launch_opens_the_wizard(welcome_app, frozen_app):
     w = welcome_app
     w.app._welcome_on_start()
-    assert w.events == ["show_popover"]
-    assert not w.path.exists()  # nothing written until Continue
-    assert w.app._welcome_state() == {"temporary": False, "login_item": False}
+    assert w.events == [("wizard", None)]
+    assert not w.path.exists()  # nothing written until Finish
 
 
-def test_after_openswap_setup_the_welcome_is_done_without_showing(welcome_app, frozen_app):
+def test_after_openswap_setup_the_wizard_is_done_without_showing(welcome_app, frozen_app):
     w = welcome_app
     w.login["runs_this"] = True
     w.app._welcome_on_start()
     assert w.events == []
-    assert json.loads(w.path.read_text())["welcome_done"] is True
-    assert w.app._welcome_state() is None
+    assert _done(w)
 
 
-def test_a_uv_install_never_shows_the_welcome(welcome_app, monkeypatch):
+def test_a_uv_install_never_shows_the_wizard(welcome_app, monkeypatch):
     import sys
 
     monkeypatch.delattr(sys, "frozen", raising=False)
     w = welcome_app
     w.app._welcome_on_start()
-    assert w.events == []
-    assert w.app._welcome_state() is None
+    w.app._on_reopen()
+    assert w.events == ["show_popover"]
 
 
-def test_a_temporary_copy_does_not_open_by_itself(welcome_app, frozen_app):
+@pytest.mark.parametrize("done", [False, True])
+def test_a_temporary_copy_opens_the_wizard_on_move(welcome_app, frozen_app, done):
     w = welcome_app
     w.temporary["value"] = True
+    w.app.settings.welcome_done = done
     w.app._welcome_on_start()
-    assert w.events == []
-    # Opened by hand, it still shows the page, with Open at login disabled.
-    assert w.app._welcome_state() == {"temporary": True, "login_item": False}
-
-
-def test_welcome_state_reports_a_login_item_that_runs_this_app(welcome_app, frozen_app):
-    # login_item_enabled() is true in the fixture: a plist for another copy
-    # of the app is not this app's login item.
-    assert welcome_app.app._welcome_state() == {"temporary": False, "login_item": False}
-    welcome_app.login["runs_this"] = True
-    assert welcome_app.app._welcome_state() == {"temporary": False, "login_item": True}
+    assert w.events == [("wizard", None)]
+    assert w.login["set"] == []
 
 
 def test_an_unreadable_login_item_is_not_this_apps(welcome_app, frozen_app):
     w = welcome_app
     w.login["runs_this"] = OSError("Permission denied")
-    assert w.app._welcome_state() == {"temporary": False, "login_item": False}
     w.app._welcome_on_start()
-    assert w.events == ["show_popover"]
+    assert w.events == [("wizard", None)]
 
 
-def test_continue_saves_welcome_done_then_turns_login_on(welcome_app, frozen_app):
+def test_reopening_brings_the_wizard_back_until_it_is_finished(welcome_app, frozen_app):
+    w = welcome_app
+    w.app._on_reopen()
+    assert w.events == [("wizard", None)]
+    w.app.settings.welcome_done = True
+    w.app._on_reopen()
+    assert w.events[-1] == "show_popover"
+    w.temporary["value"] = True
+    w.app._on_reopen()
+    assert w.events[-1] == ("wizard", None)
+
+
+def test_finish_saves_welcome_done_then_turns_login_on_and_opens_the_popover(welcome_app, frozen_app):
     w = welcome_app
     w.app._on_welcome_continue(True)
     _drain(w.app)
     # set_login_item ran after welcome_done was on disk.
     assert w.login["set"] == [(True, True)]
-    assert w.app._welcome_state() is None
-    assert w.events == []
+    assert w.events == ["show_popover"]
 
 
-def test_continue_with_the_switch_off_turns_off_only_this_apps_login_item(welcome_app, frozen_app):
+def test_finish_with_the_switch_off_turns_off_only_this_apps_login_item(welcome_app, frozen_app):
     w = welcome_app
     w.login["runs_this"] = True
     w.app._on_welcome_continue(False)
@@ -395,33 +365,41 @@ def test_continue_with_the_switch_off_turns_off_only_this_apps_login_item(welcom
     assert w.login["set"] == [(False, True)]
 
 
-def test_continue_with_the_switch_off_leaves_another_copys_login_item(welcome_app, frozen_app):
+def test_finish_with_the_switch_off_leaves_another_copys_login_item(welcome_app, frozen_app):
     """login_item_enabled() is true here, but the plist runs another copy (the
     cask's, while a dev build runs): turning it off would remove that one."""
     w = welcome_app
     w.app._on_welcome_continue(False)
     assert w.login["set"] == []
     assert w.app._login_item_busy is False
-    assert json.loads(w.path.read_text())["welcome_done"] is True
+    assert _done(w)
 
 
-def test_continue_hands_over_last(welcome_app, frozen_app):
+def test_finish_hands_over_last_and_asks_the_login_item_for_the_popover(welcome_app, frozen_app):
     w = welcome_app
     w.login["result"] = "handoff"
     w.app._on_welcome_continue(True)
     _drain(w.app)
-    assert json.loads(w.path.read_text())["welcome_done"] is True
+    assert _done(w)
+    assert w.events == ["show_request", "quit"]
+
+
+def test_a_settings_hand_over_leaves_no_show_request(welcome_app, frozen_app):
+    w = welcome_app
+    w.login["result"] = "handoff"
+    w.app._apply_login_item(True)
+    _drain(w.app)
     assert w.events == ["quit"]
 
 
-def test_a_refused_login_item_is_an_alert_and_the_welcome_stays_done(welcome_app, frozen_app):
-    """Continue went on to the cards, so Settings' hint alone would go unseen."""
+def test_a_refused_login_item_is_an_alert_and_setup_stays_done(welcome_app, frozen_app):
+    """The wizard has closed, so Settings' hint alone would go unseen."""
     w = welcome_app
     w.login["result"] = ClaudeSwitchError("Move OpenSwap to Applications first.")
     w.app._on_welcome_continue(True)
     _drain(w.app)
     assert w.events == [("error", "Move OpenSwap to Applications first.")]
-    assert json.loads(w.path.read_text())["welcome_done"] is True
+    assert _done(w)
     # Settings' This Mac still shows it under the switch.
     assert w.app._login_item_last == {"error": "Move OpenSwap to Applications first."}
 
@@ -438,7 +416,7 @@ def test_a_login_item_launchd_would_not_start_points_at_login_items(welcome_app,
 
 
 def test_a_settings_toggle_failure_is_not_an_alert(welcome_app, frozen_app):
-    """Only a change the welcome page started; Settings shows its own hint."""
+    """Only a change the wizard started; Settings shows its own hint."""
     w = welcome_app
     w.login["result"] = ClaudeSwitchError("boom")
     w.app._apply_login_item(True)
@@ -447,104 +425,23 @@ def test_a_settings_toggle_failure_is_not_an_alert(welcome_app, frozen_app):
     assert w.app._login_item_last == {"error": "boom"}
 
 
-def test_continue_from_a_temporary_copy_pins_nothing(welcome_app, frozen_app):
-    """The copy moved to Applications shows the welcome page again."""
+def test_finish_from_a_temporary_copy_pins_nothing(welcome_app, frozen_app):
+    """The wizard only offers Move there; even so, nothing is pinned."""
     w = welcome_app
     w.temporary["value"] = True
     w.app._on_welcome_continue(True)
     assert w.login["set"] == []
     assert not w.path.exists()
-    assert w.app._welcome_state() is None  # not again in this run
 
 
-def test_closing_without_continue_changes_nothing(welcome_app, frozen_app):
+def test_closing_without_finishing_changes_nothing(welcome_app, frozen_app):
     w = welcome_app
     w.app._welcome_on_start()
-    # No Continue: the next open is still the welcome page.
-    assert w.app._welcome_state() is not None
     assert not w.path.exists()
     assert w.login["set"] == []
-
-
-# ---- the welcome page in the panel (no AppKit) ------------------------------
-
-
-def _welcome_panel(facts, on_continue=None):
-    from unittest.mock import Mock
-
-    methods = {
-        "__init__", "toggle", "close", "_release_token_field", "is_shown",
-        "_welcome_facts", "_welcome_switch", "_welcome_continue",
-    }
-    namespace = {
-        "MAIN_PAGE": menubar.MAIN_PAGE,
-        "WELCOME_PAGE": menubar.WELCOME_PAGE,
-        "SETTINGS_SECTION_GENERAL": menubar.SETTINGS_SECTION_GENERAL,
-    }
-    panel_type = extract_class(
-        Path(menubar.__file__).with_name("menubar_panel.py"), "MenuBarPanel", methods, namespace
-    )
-    state = {"facts": facts, "shown": False, "reloads": []}
-    panel = panel_type(
-        on_switch=Mock(), on_rotate=Mock(), on_best=Mock(), on_toggle_auto=Mock(),
-        on_more=Mock(), auto_enabled=lambda: False, snapshot=lambda: {}, threshold=lambda: 90,
-        welcome=lambda: state["facts"], on_welcome_continue=on_continue,
-    )
-    popover = Mock()
-    popover.isShown.side_effect = lambda: state["shown"]
-    popover.performClose_.side_effect = lambda _s: state.update(shown=False)
-    panel._popover = popover
-    panel._item = Mock(button=lambda: None)
-    panel._sync_popover_appearance = lambda: None
-    panel._clear_dismiss_watchers = lambda: None
-    panel.reload = lambda: state["reloads"].append(panel._page)
-    return panel, state
-
-
-def test_every_open_starts_on_the_welcome_page_until_continue():
-    panel, state = _welcome_panel({"temporary": False, "login_item": False})
-    panel.toggle()
-    assert panel._page == menubar.WELCOME_PAGE
-    state["shown"] = True
-    panel.toggle()  # close without Continue
-    assert panel._page == menubar.MAIN_PAGE
-    panel.toggle()
-    assert panel._page == menubar.WELCOME_PAGE
-
-
-def test_without_a_due_welcome_the_popover_opens_on_the_cards():
-    panel, _state = _welcome_panel(None)
-    panel.toggle()
-    assert panel._page == menubar.MAIN_PAGE
-
-
-def test_continue_passes_the_switch_and_returns_to_the_cards():
-    picks: list[bool] = []
-    panel, state = _welcome_panel({"temporary": False, "login_item": False}, picks.append)
-    panel.toggle()
-    state["shown"] = True
-    panel._welcome_continue()
-    assert picks == [True]  # the switch starts on
-    assert panel._page == menubar.MAIN_PAGE
-    assert state["reloads"][-1] == menubar.MAIN_PAGE
-
-    panel._welcome_switch(SimpleNamespace(state=lambda: 0))
-    panel._welcome_continue()
-    assert picks == [True, False]
-
-
-def test_continue_from_a_temporary_copy_never_asks_for_the_login_item():
-    picks: list[bool] = []
-    panel, _state = _welcome_panel({"temporary": True, "login_item": False}, picks.append)
-    panel._welcome_continue()
-    assert picks == [False]
-
-
-def test_a_failing_welcome_read_is_no_welcome():
-    panel, _state = _welcome_panel(None)
-    panel._welcome = lambda: 1 / 0
-    panel.toggle()
-    assert panel._page == menubar.MAIN_PAGE
+    # The next launch opens it again.
+    w.app._welcome_on_start()
+    assert w.events == [("wizard", None), ("wizard", None)]
 
 
 # ---- the status line from a temporary copy (plan 020 step 6, revised) -------
@@ -671,7 +568,7 @@ def _attach_at_start(tmp_path, monkeypatch, *, runs_this):
     """Run the real _attach_panel_once with a stand-in AppKit panel module.
 
     Returns the app and the list of ``welcome_done`` values seen each time
-    the popover opened (the panel decides its page from that at toggle).
+    the popover opened.
     """
     import sys as _sys
     import threading
@@ -735,7 +632,7 @@ def _attach_at_start(tmp_path, monkeypatch, *, runs_this):
 
 def test_a_copy_setup_started_opens_a_left_show_request_on_the_cards(frozen_app, tmp_path, monkeypatch):
     """`openswap setup` took over from a Finder copy, which left a show request:
-    the welcome is done before that request opens the popover."""
+    setup is done before that request opens the popover."""
     from openswap import menubar_instance
 
     attached, opened_with, path = _attach_at_start(tmp_path, monkeypatch, runs_this=True)
@@ -745,14 +642,13 @@ def test_a_copy_setup_started_opens_a_left_show_request_on_the_cards(frozen_app,
     assert json.loads(path.read_text())["welcome_done"] is True
 
 
-def test_a_first_launch_opens_once_on_the_welcome_page(frozen_app, tmp_path, monkeypatch):
-    from openswap import menubar_instance
-
+def test_a_first_launch_opens_the_wizard(frozen_app, tmp_path, monkeypatch):
     attached, opened_with, path = _attach_at_start(tmp_path, monkeypatch, runs_this=False)
-    menubar_instance.leave_show_request(tmp_path, post=lambda: None)
+    wizard = []
+    attached._open_setup_wizard = lambda step=None: wizard.append(step)
     attached._attach_panel_once(SimpleNamespace(stop=lambda: None))
-    # One open, while the welcome is still due; the request finds it shown.
-    assert opened_with == [False]
+    assert wizard == [None]
+    assert opened_with == []  # the popover waits for the wizard
     assert not path.exists()
 
 
