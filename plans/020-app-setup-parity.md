@@ -138,7 +138,12 @@ launchd job running, open the app from Finder, from Spotlight and with
   (`KeepAlive: {SuccessfulExit: false}` does not restart a clean exit).
   Without it the Finder copy would hold the lock, and the cask's upgrade
   kickstart would start a launchd copy that waits behind the old build. If
-  the hand-over fails, log it and carry on as below. A terminal
+  the hand-over fails (`start_login_item` returns None), boot out the job
+  before carrying on as below. It is not this process, and a start that
+  launchd only delayed (throttling a job that crashed recently) would
+  otherwise come up later, wait behind this copy's lock, and loop under
+  `KeepAlive`. The plist stays, so login still starts it next time, and the
+  failure stays recorded for Step 3's warning. A terminal
   `openswap menubar` prints that it started the login item, and where the
   logs are.
 - Add `menubar_lock(backup_dir)` (in `menubar.py` or a small new module):
@@ -170,8 +175,9 @@ conflict under `flock`), the wait-only-when-launchd rule, the start-up
 hand-over (login item on and idle, which leaves a show request before
 starting the job; on and running, which leaves a show request and never
 calls `start_login_item`; on with a pid while this copy holds the lock,
-which leaves a show request and exits without `start_login_item`; off;
-running another program), the show request
+which leaves a show request and exits without `start_login_item`; a failed
+start, which boots the job out, keeps the plist and the recorded failure,
+and keeps this copy running; off; running another program), the show request
 (consumed once whether the notification or start-up gets there first,
 ignored when stale, honoured when it arrives before the holder's observer
 is attached), and the notification name. Manual: open the app three ways while
