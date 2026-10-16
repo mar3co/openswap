@@ -120,16 +120,17 @@ First check how macOS behaves today, on the notarized build: with the
 launchd job running, open the app from Finder, from Spotlight and with
 `open -a OpenSwap`. Record whether a second status item appears.
 
-- Before anything else, a copy launchd did not start (Finder, Spotlight,
-  a terminal `openswap menubar`) whose login item runs this program and has
-  no running process hands over to it: `launch_agent.start_login_item()`
-  (Step 2) starts the job and this copy exits 0 once the job's pid exists.
-  First it leaves a show request (below), so opening the app shows the
-  popover here too.
-  When the job is already running, skip the hand-over and take the lock
-  path below, so the running copy is told to show its popover. The
-  hand-over covers a login item that is on but not running, for example
-  after Quit
+- Right after it takes the lock (below), a copy launchd did not start
+  (Finder, Spotlight, a terminal `openswap menubar`) whose login item runs
+  this program and has no running process hands over to it:
+  `launch_agent.start_login_item()` (Step 2) starts the job, and this copy
+  exits 0, releasing the lock, once the job's pid exists. The job waits for
+  the lock. First it leaves a show request (below), so opening the app shows
+  the popover here too. A running job already holds the lock, so a copy
+  that finds it running never gets this far: it leaves a show request
+  instead. Checking after the lock also means a Finder copy never starts a
+  job while a terminal copy holds the lock. The hand-over covers a login
+  item that is on but not running, for example after Quit
   (`KeepAlive: {SuccessfulExit: false}` does not restart a clean exit).
   Without it the Finder copy would hold the lock, and the cask's upgrade
   kickstart would start a launchd copy that waits behind the old build. If
