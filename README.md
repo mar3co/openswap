@@ -17,7 +17,7 @@ brew install --cask mar3co/openswap/openswap
 
 That installs `OpenSwap.app` (signed and notarized; the menu bar extra, the widget, and the `openswap` command in one app). Then finish setting up from the app or from a terminal; both do the same thing:
 
-- **From the app:** open OpenSwap from Applications. The menu bar popover opens on a welcome page: sign in with Claude or save the login [Claude Code](https://docs.anthropic.com/en/docs/claude-code) already has, leave **Open at login** on, and click **Continue**.
+- **From the app:** open OpenSwap from Applications. A setup window walks you through it: sign in with Claude or save the login [Claude Code](https://docs.anthropic.com/en/docs/claude-code) already has (and Codex, if you use it), leave **Open at login** on, choose the extras, and click **Open OpenSwap**. Settings › General › **Setup assistant** opens it again later.
 - **From a terminal:** run `openswap setup`. It saves the Claude account you are logged into (or warns and carries on when there is none) and starts the extra.
 
 Either way OpenSwap is in your menu bar now and at every login, through the same login item, and the app registers its widget when it starts. Settings › General › **This Mac** keeps the login item and the Claude Code status line switchable later. Update with `brew upgrade --cask openswap` (`openswap upgrade` prints that command). OpenSwap is not on PyPI.
@@ -47,7 +47,7 @@ Moving from the source install to the cask: run `$(brew --prefix)/bin/openswap s
 
 ## Quick start
 
-If Claude Code was logged in, `openswap setup` (or **Save current login** on the welcome page) saved that account. To add another, click **Add account** on the extra's Claude page (**Sign in with Claude** when it has no accounts yet) and sign in through your browser (Claude Code ends up on the new account). From a terminal, run `claude auth login` with the other account, then:
+If Claude Code was logged in, `openswap setup` (or **Save Current Login** in the setup window) saved that account. To add another, click **Add account** on the extra's Claude page (**Sign in with Claude** when it has no accounts yet) and sign in through your browser (Claude Code ends up on the new account). From a terminal, run `claude auth login` with the other account, then:
 
 ```bash
 openswap add
@@ -66,7 +66,7 @@ Walkthrough: [Getting started](https://github.com/mar3co/openswap/wiki/Getting-S
 ## macOS extras
 
 ```bash
-openswap setup                        # save the current login, start the extra at login (the app's welcome page does the same)
+openswap setup                        # save the current login, start the extra at login (the app's setup window does the same)
 openswap widget --install             # Desktop / Notification Center (the app registers it by itself)
 openswap statusline --install         # account name in Claude Code's status line (Settings › This Mac too)
 ```

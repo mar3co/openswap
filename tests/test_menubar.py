@@ -1810,8 +1810,7 @@ def test_apply_hold_line_reloads_open_main_panel_only_when_copy_changes():
     reload_fn = text[
         text.index("def _reload_main_panel_if_shown") : text.index("def _worker_view_active")
     ]
-    # The welcome page's account step follows the roster like the cards do.
-    assert "in (MAIN_PAGE, WELCOME_PAGE)" in reload_fn
+    assert '== MAIN_PAGE' in reload_fn
     assert "SETTINGS_PAGE" not in reload_fn
     assert "is_shown()" in reload_fn
     assert "panel.reload()" in reload_fn

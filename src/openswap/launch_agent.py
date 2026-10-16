@@ -383,6 +383,25 @@ def login_item_enabled(home: Path | None = None) -> bool:
     return plist_path(LABEL, home).exists()
 
 
+def repoint_login_item(exe: Path, home: Path | None = None) -> bool:
+    """Point a login item that runs another copy of the app at ``exe``.
+
+    After Move to Applications installs a copy somewhere else than the one
+    the login item runs (a non-admin's update lands in ``~/Applications``
+    while the old copy sits in ``/Applications``), the old copy would be
+    back at the next login. Only a plist that runs some copy of the app is
+    rewritten; a uv install's is left alone. True when it was rewritten.
+    """
+    plist = plist_path(LABEL, home)
+    program = bundle._plist_program(plist)
+    if not (isinstance(program, list) and program and isinstance(program[0], str)):
+        return False
+    if program[0] == str(exe) or not bundle.is_app_executable(program[0]):
+        return False
+    plist.write_bytes(build_plist([str(exe)], LABEL, home))
+    return True
+
+
 def login_item_runs_this(home: Path | None = None) -> bool:
     """Whether the login item runs this copy (``resolve_program()``).
 

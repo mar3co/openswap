@@ -54,6 +54,10 @@ from openswap import launch_agent
 LOCK_FILENAME = "menubar.lock"
 SHOW_REQUEST_FILENAME = "menubar.show-request"
 HANDOFF_REQUEST_FILENAME = "menubar.handoff-request"
+# A copy at a temporary location (a disk image, a download) that lost the
+# lock: the holder opens its setup wizard on Move with this copy as the
+# source, so opening a newer DMG while the app runs still updates it.
+MOVE_REQUEST_FILENAME = "menubar.move-request"
 SHOW_NOTIFICATION = "com.opensoft.openswap.menubar.show"
 HANDOFF_NOTIFICATION = "com.opensoft.openswap.menubar.handoff"
 ALREADY_RUNNING = "OpenSwap is already running in the menu bar."
@@ -86,6 +90,10 @@ def show_request_path(backup_dir: Path) -> Path:
 
 def handoff_request_path(backup_dir: Path) -> Path:
     return Path(backup_dir) / HANDOFF_REQUEST_FILENAME
+
+
+def move_request_path(backup_dir: Path) -> Path:
+    return Path(backup_dir) / MOVE_REQUEST_FILENAME
 
 
 class MenubarLock:
@@ -192,8 +200,13 @@ def claim(
     say: Callable[[str], object] = print,
     unload: Callable[[], bool] | None = None,
     logger=None,
+    move_from: Path | None = None,
 ) -> MenubarLock | None:
     """Take the menu bar lock for this process, or raise AlreadyRunning.
+
+    ``move_from`` is this copy's app when it runs from a temporary location:
+    a holder then gets a move request beside the show request, and opens its
+    wizard on Move with that copy as the source instead of its popover.
 
     ``as_login_item`` is whether this process is the launchd job
     (``launch_agent.runs_as_login_item()``): it waits up to
@@ -230,6 +243,8 @@ def claim(
             file=sys.stderr,
         )
         raise AlreadyRunning(1)
+    if move_from is not None:
+        leave_move_request(backup_dir, move_from, logger=logger)
     leave_show_request(backup_dir, post=post, logger=logger)
     deadline = time.monotonic() + HOLDER_ANSWER_SECONDS
     while time.monotonic() < deadline:
@@ -278,6 +293,32 @@ def leave_handoff_request(
 ) -> None:
     """Ask an extra launchd did not start to step aside for the login item."""
     _leave_request(handoff_request_path(backup_dir), "hand-over", post, logger)
+
+
+def leave_move_request(backup_dir: Path, app: Path, *, logger=None) -> None:
+    """Ask the lock holder to offer Move to Applications for ``app`` (written
+    before the show request, which carries the notification)."""
+    path = move_request_path(backup_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{time.time()}\n{app}\n", encoding="utf-8")
+    except OSError:
+        if logger is not None:
+            logger.warning("could not write the move request", exc_info=True)
+
+
+def consume_move_request(backup_dir: Path, now: float | None = None) -> Path | None:
+    """Remove the move request; its app when it is under 30 s old and still
+    there, else None."""
+    path = move_request_path(backup_dir)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    if not _consume_request(path, now) or len(lines) < 2:
+        return None
+    app = Path(lines[1])
+    return app if app.is_dir() else None
 
 
 def consume_show_request(backup_dir: Path, now: float | None = None) -> bool:
