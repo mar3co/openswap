@@ -417,6 +417,45 @@ class MenuBarSettings:
         atomic_write_json(path, asdict(self))
 
 
+def remote_connect_rows(paired: bool, worker_status: dict) -> list[dict]:
+    """Connect to OpenTag… on an unpaired Mac (with Use another server…), and
+    Reconnect on a paired Mac whose key has expired. No rows otherwise; the
+    pasted command stays under Set up Remote tasks…."""
+    busy = worker_status.get("operation") is not None
+    if not paired:
+        return [
+            {
+                "kind": "button",
+                "section": SETTINGS_SECTION_REMOTE,
+                "id": "remote_tasks_connect",
+                "label": "Connect to OpenTag…",
+                "title": "Connect",
+                "value": None,
+                "disabled": busy,
+            },
+            {
+                "kind": "button",
+                "section": SETTINGS_SECTION_REMOTE,
+                "id": "remote_tasks_connect_other",
+                "label": "Use another server…",
+                "title": "Enter URL",
+                "value": None,
+                "disabled": busy,
+            },
+        ]
+    if worker_status.get("remote_connectivity") == "expired":
+        return [{
+            "kind": "button",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_reconnect",
+            "label": "Key expired · Reconnect this Mac",
+            "title": "Reconnect",
+            "value": None,
+            "disabled": busy,
+        }]
+    return []
+
+
 def settings_page_rows(
     settings: MenuBarSettings,
     *,
@@ -607,6 +646,7 @@ def settings_page_rows(
             "disabled": _worker_active_job_id(worker_status or {}) is None,
         },
     ]
+    remote[1:1] = remote_connect_rows(worker_paired, worker_status or {})
     if worker_paired and not worker_enabled and (
         (worker_status or {}).get("operation") != "worker_enable_or_disable"
     ):

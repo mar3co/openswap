@@ -52,7 +52,9 @@ from AppKit import (
     NSWindowTitleHidden,
     NSWorkspace,
 )
-from Foundation import NSAttributedString, NSMakeRect, NSMutableParagraphStyle
+from Foundation import (
+    NSAttributedString, NSMakeRect, NSMutableParagraphStyle, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer,
+)
 
 
 DIALOG_WIDTH = 440.0
@@ -422,3 +424,42 @@ def make_dialog_alert(**kwargs):
 
 def make_dialog_prompt(*, default_text="", **kwargs):
     return BrandDialog(default_text=default_text, **kwargs)
+
+
+# What ``run_waiting_dialog``'s dialog returns when its work ended (not a button).
+WAITING_DONE = -2
+
+
+class _WaitPoller(NSObject):
+    """Timer target: ends a waiting dialog's modal session once ``done`` is set."""
+
+    def initWithDialog_done_(self, dialog, done):
+        self = objc.super(_WaitPoller, self).init()
+        if self is None:
+            return None
+        self._dialog, self._done = dialog, done
+        return self
+
+    def poll_(self, _timer):
+        if self._done.is_set():
+            self._dialog.finish(WAITING_DONE)
+
+
+def run_waiting_dialog(*, title, message, done, cancel="Cancel", run=None) -> bool:
+    """A dialog with only ``cancel`` that also closes by itself once ``done`` is set.
+
+    The poll timer runs in the common modes, so it fires inside the dialog's
+    modal session. ``run`` wraps the modal call (the menu bar's ``_dialog``).
+    Returns True when the owner pressed ``cancel`` before ``done`` was set.
+    """
+    if done.is_set():
+        return False
+    dialog = BrandDialog(title=title, message=message, ok=cancel)
+    poller = _WaitPoller.alloc().initWithDialog_done_(dialog, done)
+    timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(0.2, poller, "poll:", None, True)
+    NSRunLoop.mainRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
+    try:
+        clicked = (run or (lambda modal: modal()))(dialog.runModal)
+    finally:
+        timer.invalidate()
+    return clicked != WAITING_DONE and not done.is_set()
