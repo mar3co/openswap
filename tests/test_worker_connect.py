@@ -1010,3 +1010,27 @@ def test_menu_connect_without_a_connect_page_points_to_the_pasted_command(tmp_pa
         assert "connect_unsupported" in final and "openswap worker pair" in final
     finally:
         server.close()
+
+
+def test_reconnect_survives_an_expiry_seen_while_on_and_then_turning_off(tmp_path):
+    from types import SimpleNamespace
+
+    from openswap.settings import update_worker_settings
+    from openswap.worker.remote_state import ConfiguredRemote, read_key_status, save_status
+    from openswap.worker.runtime import read_worker_snapshot
+
+    url = "https://control.example"
+    lapsed = datetime.now(timezone.utc) - timedelta(hours=1)
+    configure_worker_service(tmp_path, url, "worker")
+    update_worker_settings(tmp_path, enabled=True)
+    save_status(tmp_path, url, "online", datetime.now(timezone.utc), "worker", key_renews=False, key_expires_at=lapsed)
+
+    def expired(_url):
+        raise ProtocolError("device_expired", 401)
+
+    configured = ConfiguredRemote(SimpleNamespace(backup_root=tmp_path), enrollment_loader=expired)
+    assert configured._resolve() is None  # writes "expired" without a client
+    assert read_key_status(tmp_path) == (False, lapsed)  # the key fields survive that write
+    update_worker_settings(tmp_path, enabled=False)
+    snapshot = read_worker_snapshot(tmp_path).to_dict()
+    assert menubar.remote_reconnect_label(snapshot) == "Key expired · Reconnect this Mac"
