@@ -724,6 +724,35 @@ def test_owner_cancel_in_the_portal_stops_the_mac(tmp_path, keychain):
         server.close()
 
 
+
+@pytest.mark.parametrize("reconnect", [False, True])
+def test_cancel_during_redemption_saves_nothing(tmp_path, keychain, stub, reconnect):
+    from openswap.worker.remote import Transport
+
+    old = json.dumps({"worker_id": "worker-1", "device_key": "old-device-key", "expires_at": _later(-1)})
+    if reconnect:
+        configure_worker_service(tmp_path, stub.url, "worker-1")
+        keychain[("openswap", pairing.account_name(stub.url))] = old
+    flows = []
+
+    class CancelledMidway:
+        def request(self, operation, data):
+            flows[0].cancel()  # the owner presses Cancel while the code is being redeemed
+            return Transport(stub.url).request(operation, data)
+    browser = FakeBrowser(stub)
+    flows.append(connect.ConnectFlow(tmp_path, None if reconnect else stub.url, open_browser=browser,
+                                     transport=CancelledMidway()))
+    with pytest.raises(ProtocolError, match="connect_cancelled"):
+        flows[0].run()
+    assert len(stub.pair_requests) == 1
+    if reconnect:
+        assert keychain[("openswap", pairing.account_name(stub.url))] == old  # the new key stays unused
+        assert load_worker_settings(tmp_path).control_service_worker_id == "worker-1"
+    else:
+        assert not keychain and load_worker_settings(tmp_path).control_service_url is None
+    assert browser.answered.wait(10) and browser.status == 400 and "cancelled in OpenSwap" in browser.page
+
+
 def test_a_refused_redemption_shows_the_error_in_the_tab(tmp_path, keychain):
     server = StubOpenTag(pair_error="invalid_code")
     try:

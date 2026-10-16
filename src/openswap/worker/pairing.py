@@ -93,14 +93,22 @@ class PairedWorker(str):
         return value
 
 
-def pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str | None = None) -> PairedWorker:
+def pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str | None = None,
+         cancelled=None) -> PairedWorker:
     """Invoking this local command is the owner's explicit pairing approval.
 
     ``code_verifier`` is the PKCE verifier of a Connect flow (never logged or
     stored); only then may the response add ``workspace_label`` and ``owner_label``.
+    ``cancelled`` (Connect's Cancel) is checked before the code is redeemed and
+    again before the key is saved; the save is the point of no return.
     """
     require_macos()
-    return _locked(root, _pair, url, code, transport=transport, code_verifier=code_verifier)
+    return _locked(root, _pair, url, code, transport=transport, code_verifier=code_verifier, cancelled=cancelled)
+
+
+def _check_cancelled(cancelled) -> None:
+    if cancelled is not None and cancelled():
+        raise ProtocolError("connect_cancelled")
 
 
 def _redeem(url: str, code: str, transport, code_verifier: str | None) -> tuple[Enrollment, dict]:
@@ -153,14 +161,17 @@ def _record_key(root: Path, url: str, enrollment: Enrollment):
         pass
 
 
-def _pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str | None = None) -> PairedWorker:
+def _pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str | None = None,
+          cancelled=None) -> PairedWorker:
     url = validate_url(url)
     # A live enrollment (settings name a URL) must be unpaired first. With no
     # configured URL, any item left at this account is an orphan from a reset
     # or an interrupted pairing, and the new key simply replaces it.
     if load_worker_settings(root).control_service_url is not None:
         raise ProtocolError("unpair_before_pairing")
+    _check_cancelled(cancelled)
     enrollment, labels = _redeem(url, code, transport, code_verifier)
+    _check_cancelled(cancelled)
     _store(url, enrollment)
     try:
         configure_worker_service(root, url, enrollment.worker_id)
@@ -176,7 +187,7 @@ def _pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str
     return PairedWorker(enrollment.worker_id, labels.get("workspace_label"), labels.get("owner_label"))
 
 
-def reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport=None) -> PairedWorker:
+def reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport=None, cancelled=None) -> PairedWorker:
     """Replace the configured enrollment's key with one from a Connect renewal code.
 
     Unlike ``pair`` there is no ``unpair_before_pairing`` refusal: the URL and
@@ -184,13 +195,14 @@ def reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport=
     (``security add-generic-password -U``), under the pairing lock. A response
     for another worker ID, or any failure, leaves the old key untouched; the
     service keeps the new key pending until it is first used, so a Mac whose old
-    key is still live keeps working.
+    key is still live keeps working. ``cancelled`` is checked as in ``pair``.
     """
     require_macos()
-    return _locked(root, _reconnect, url, code, code_verifier=code_verifier, transport=transport)
+    return _locked(root, _reconnect, url, code, code_verifier=code_verifier, transport=transport,
+                   cancelled=cancelled)
 
 
-def _reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport=None) -> PairedWorker:
+def _reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport=None, cancelled=None) -> PairedWorker:
     url = validate_url(url)
     policy = load_worker_settings(root)
     configured = policy.control_service_url
@@ -198,9 +210,11 @@ def _reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport
         raise ProtocolError("not_paired_with_this_server")
     if policy.control_service_worker_id is None:
         raise ProtocolError("worker_id_unknown")
+    _check_cancelled(cancelled)
     enrollment, labels = _redeem(url, code, transport, text(code_verifier, 128))
     if enrollment.worker_id != policy.control_service_worker_id:
         raise ProtocolError("worker_mismatch")
+    _check_cancelled(cancelled)
     _store(url, enrollment)
     _drop_status(root)
     _record_key(root, url, enrollment)

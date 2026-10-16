@@ -526,16 +526,20 @@ class ConnectFlow:
                 listener.respond(False, "Not paired", "OpenTag sent no usable code. Start Connect again in OpenSwap.")
                 raise ProtocolError("invalid_callback")
             verifier, self._verifier = self._verifier, None
+            # Cancel still counts until the key is saved (``cancelled``).
             try:
                 if self.target.reconnect:
                     worker = pairing.reconnect(self.root, self.target.url, code[0], code_verifier=verifier,
-                                               transport=self._transport)
+                                               transport=self._transport, cancelled=self._cancelled.is_set)
                 else:
                     worker = pairing.pair(self.root, self.target.url, code[0], code_verifier=verifier,
-                                          transport=self._transport)
+                                          transport=self._transport, cancelled=self._cancelled.is_set)
             except ProtocolError as exc:
-                listener.respond(False, "Not paired", f"OpenSwap could not finish ({exc.code}). "
-                                 + next_step(exc.code, self.target.url))
+                if exc.code == "connect_cancelled":
+                    listener.respond(False, "Not paired", "You cancelled in OpenSwap. Nothing was saved on this Mac.")
+                else:
+                    listener.respond(False, "Not paired", f"OpenSwap could not finish ({exc.code}). "
+                                     + next_step(exc.code, self.target.url))
                 raise
             except Exception:
                 listener.respond(False, "Not paired", "OpenSwap could not save the pairing. Start Connect again.")
