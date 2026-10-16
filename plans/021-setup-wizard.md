@@ -15,6 +15,9 @@
 - **Risk**: MED (replaces the first-run surface; copies the app on disk)
 - **Depends on**: 020 (welcome page, Open at login from the app), PR #114 (DMG)
 - **Planned at**: commit `fcfb8a9`, 2026-10-16
+- **Shipped**: 2026-10-16 in #115 (`dddc6f2`), after #114 (`259cacd`) added the
+  DMG. The items under "Manual checks before release" have not been run yet;
+  run them on a notarized build before the next release.
 
 ## Why this matters
 
