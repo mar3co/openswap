@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 from openswap.codex.auth import parse_auth
-from openswap.exceptions import ConfigError
+from openswap.exceptions import ClaudeSwitchError, ConfigError
 from openswap.fsutil import replace_with_retry
 from openswap.settings import (
     SETTINGS_SCHEMA_VERSION,
@@ -543,8 +543,18 @@ def set_installed(config_home: Path, backup_root: Path, enabled: bool) -> dict:
     the app's Settings toggle, so both write the same hook: it always pins
     :func:`paint_command`. Returns :func:`install`'s or :func:`uninstall`'s
     result.
+
+    Turning it on from a translocated or mounted copy of the app raises
+    ClaudeSwitchError: the pinned path would disappear and break every
+    status-line render. Turning it off works from anywhere.
     """
     if enabled:
+        from openswap import bundle
+
+        if bundle.runs_from_temporary_location():
+            from openswap.launch_agent import MOVE_TO_APPLICATIONS
+
+            raise ClaudeSwitchError(MOVE_TO_APPLICATIONS)
         return install(config_home, backup_root, command=paint_command())
     return uninstall(config_home, backup_root)
 

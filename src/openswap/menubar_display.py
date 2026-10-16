@@ -545,7 +545,11 @@ def settings_page_rows(
             ),
         })
     general.extend(this_mac_rows(login_item))
-    general.extend(_this_mac_setup_rows(status_line=status_line, bundled_widget=bundled_widget))
+    general.extend(_this_mac_setup_rows(
+        status_line=status_line,
+        bundled_widget=bundled_widget,
+        temporary=bool(isinstance(login_item, dict) and login_item.get("temporary")),
+    ))
 
     remote = [
         {
@@ -790,6 +794,7 @@ def settings_page_rows(
 
 
 OPEN_AT_LOGIN_MOVE_HINT = "Move OpenSwap to Applications to open it at login."
+STATUS_LINE_MOVE_HINT = "Move OpenSwap to Applications to turn on the status line."
 OPEN_AT_LOGIN_AFTER_QUIT_HINT = (
     "OpenSwap stays open until you quit it, and won’t open at the next login."
 )
@@ -866,11 +871,19 @@ def this_mac_rows(login_item: dict | None) -> list[dict]:
     return rows
 
 
-def _this_mac_setup_rows(*, status_line: bool, bundled_widget: bool) -> list[dict]:
-    """General › This Mac after Open at login: the rest of the terminal's setup."""
+def _this_mac_setup_rows(
+    *, status_line: bool, bundled_widget: bool, temporary: bool = False
+) -> list[dict]:
+    """General › This Mac after Open at login: the rest of the terminal's setup.
+
+    From a translocated or mounted copy (``temporary``, the same fact Open at
+    login reads) the status line cannot be turned on: the hook would pin a
+    path that disappears. Turning it off stays possible.
+    """
     # Lazy: widget_install pulls in widget_snapshot, which imports menubar.
     from openswap.widget_install import ADD_WIDGET_HINT
 
+    blocked = bool(temporary) and not status_line
     rows = [
         {
             # `openswap statusline --install/--uninstall`, through the same
@@ -880,8 +893,18 @@ def _this_mac_setup_rows(*, status_line: bool, bundled_widget: bool) -> list[dic
             "id": "claude_status_line",
             "label": "Claude Code status line",
             "value": bool(status_line),
+            "disabled": blocked,
         },
     ]
+    if blocked:
+        rows.append({
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "claude_status_line_hint",
+            "label": STATUS_LINE_MOVE_HINT,
+            "lines": _hint_lines(STATUS_LINE_MOVE_HINT),
+        })
     if bundled_widget:
         rows.append({
             "kind": "group",

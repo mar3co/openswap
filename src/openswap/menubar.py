@@ -1946,7 +1946,8 @@ def run(switcher, codex=None) -> int:
             """Settings › This Mac: `openswap statusline --install/--uninstall`.
 
             Flips what is on disk now, not what the page showed: the CLI may
-            have changed it since the page was built.
+            have changed it since the page was built. From a translocated or
+            mounted copy, turning it on is refused (the row is disabled too).
             """
             from openswap import paths
             from openswap.statusline import set_installed

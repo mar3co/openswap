@@ -543,3 +543,63 @@ def test_a_failing_welcome_read_is_no_welcome():
     panel._welcome = lambda: 1 / 0
     panel.toggle()
     assert panel._page == menubar.MAIN_PAGE
+
+
+# ---- the status line from a temporary copy (plan 020 step 6, revised) -------
+
+
+def _status_rows(installed, temporary):
+    rows = _general(status_line=installed, login_item={"enabled": False, "temporary": temporary})
+    ids = [row["id"] for row in rows]
+    return rows, ids
+
+
+def test_a_temporary_copy_cannot_turn_the_status_line_on():
+    """paint_command() would pin a path that disappears."""
+    rows, ids = _status_rows(installed=False, temporary=True)
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["claude_status_line"]["value"] is False
+    assert by_id["claude_status_line"]["disabled"] is True
+    at = ids.index("claude_status_line")
+    hint = rows[at + 1]
+    assert hint["id"] == "claude_status_line_hint"
+    assert hint["style"] == "hint"
+    assert hint["label"] == menubar.STATUS_LINE_MOVE_HINT
+    assert hint["label"].startswith("Move OpenSwap to Applications")
+    # Open at login says the same thing above it.
+    assert by_id["open_at_login_hint"]["label"] == menubar.OPEN_AT_LOGIN_MOVE_HINT
+
+
+def test_a_temporary_copy_can_still_turn_the_status_line_off():
+    rows, ids = _status_rows(installed=True, temporary=True)
+    toggle = {row["id"]: row for row in rows}["claude_status_line"]
+    assert toggle["value"] is True and toggle["disabled"] is False
+    assert "claude_status_line_hint" not in ids
+
+
+@pytest.mark.parametrize("installed", [True, False])
+def test_a_stable_copy_switches_the_status_line_both_ways(installed):
+    rows, ids = _status_rows(installed=installed, temporary=False)
+    assert {row["id"]: row for row in rows}["claude_status_line"]["disabled"] is False
+    assert "claude_status_line_hint" not in ids
+
+
+def test_the_toggle_refuses_to_turn_on_from_a_temporary_copy(tmp_path, monkeypatch):
+    from openswap import bundle
+
+    app, claude, _backup, errors = _status_line_app(tmp_path, monkeypatch)
+    monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: True)
+    app._toggle_status_line()
+    assert errors == ["Couldn't change the Claude Code status line: Move OpenSwap to Applications first."]
+    assert not (claude / "settings.json").exists()
+
+
+def test_the_toggle_turns_off_from_a_temporary_copy(tmp_path, monkeypatch):
+    from openswap import bundle, statusline
+
+    app, claude, backup, errors = _status_line_app(tmp_path, monkeypatch)
+    statusline.set_installed(claude, backup, True)
+    monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: True)
+    app._toggle_status_line()
+    assert errors == []
+    assert app._status_line_installed() is False

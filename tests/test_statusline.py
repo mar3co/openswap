@@ -925,3 +925,43 @@ class TestSharedToggle:
         assert calls == [(paths.get_claude_config_home(), paths.get_backup_root(), enabled)]
         out = capsys.readouterr().out
         assert ("installed" if enabled else "restored") in out
+
+
+class TestTemporaryCopy:
+    """A translocated or mounted app must not pin its path (plan 020)."""
+
+    def _setup(self, tmp_path: Path, monkeypatch):
+        from openswap import bundle
+
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        monkeypatch.setattr(sl, "paint_command", lambda: "/Volumes/OpenSwap/OpenSwap.app/Contents/MacOS/OpenSwap statusline")
+        monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: True)
+        return claude, backup
+
+    def test_turning_on_is_refused_and_writes_nothing(self, tmp_path: Path, monkeypatch):
+        from openswap.exceptions import ClaudeSwitchError
+
+        claude, backup = self._setup(tmp_path, monkeypatch)
+        with pytest.raises(ClaudeSwitchError, match="Move OpenSwap to Applications first."):
+            sl.set_installed(claude, backup, True)
+        assert not (claude / "settings.json").exists()
+
+    def test_turning_off_still_works(self, tmp_path: Path, monkeypatch):
+        claude, backup = self._setup(tmp_path, monkeypatch)
+        sl.install(claude, backup, command="/Applications/OpenSwap.app/Contents/MacOS/OpenSwap statusline")
+        assert sl.set_installed(claude, backup, False) == {"restored": True}
+        assert sl.is_installed(claude) is False
+
+    def test_the_cli_reports_the_refusal(self, temp_home: Path, monkeypatch, capsys):
+        from openswap import bundle
+        from openswap.cli import _statusline_command
+
+        monkeypatch.setattr(bundle, "runs_from_temporary_location", lambda app=None: True)
+        assert _statusline_command(["--install"]) == 1
+        assert "Move OpenSwap to Applications first." in capsys.readouterr().err
+        from openswap import paths
+
+        assert sl.is_installed(paths.get_claude_config_home()) is False
