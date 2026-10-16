@@ -29,6 +29,7 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 014  | ChatGPT auto-switch with confirmed restart | P2 | M | 012, 013 | DONE; unattended restarts remain unsupported |
 | 015  | Desktop recovery and quiet completion feedback | P1 | M | — | DONE; profile detection still blocked |
 | 016  | App-aware ChatGPT switching | P1 | M | 014, 015, PR #49 | DONE |
+| 020  | Set up OpenSwap fully from the app or the terminal | P1 | L | 008, PR #107 | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED. Feature proposals use PROPOSED until accepted; 017 is accepted and tracked in its progress log.
 
@@ -45,6 +46,13 @@ GitHub Actions `.github/workflows/macos-app.yml` signs once secrets exist).
 (versioned zip, draft release, rendered cask, tap workflow) landed with it
 because it needs no Apple credentials. The code rewiring still waits for a
 notarized CI artifact that records `spctl` `source=Notarized Developer ID`.
+
+020 was written 2026-10-15 (planned at `43d90ea`). An app opened from
+Finder never adds itself to login, so it is gone after a restart and the
+cask's upgrade kickstart misses it. 020 gives the app Open at login (the
+same LaunchAgent `openswap setup` writes), a first-run page, widget and
+status-line setup, and Uninstall, all through the functions the CLI uses.
+Three phases; each merges on its own.
 
 001 and 006 share no files and may run in parallel. 002–005 all touch the extra
 and/or widget; run them only after 001 is merged into the executor’s base.
