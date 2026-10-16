@@ -307,19 +307,19 @@ def remote_key_copy(snapshot: dict, *, now: datetime | None = None) -> str:
     """The device key line for the Remote section, or ``""`` when nothing is known.
 
     "Key renews automatically" when the registration rotates its key; "Key
-    expires in N days" only when the backend lacks rotation, with the fix.
+    expires in N days" only when the backend lacks rotation, with the fix. An
+    expired key reads as expired whatever the server supports.
     """
     renews = snapshot.get("remote_key_renews")
+    expires = _remote_key_expiry(snapshot)
+    left = expires - (now or datetime.now(timezone.utc)) if expires is not None else None
+    # Expired wins over "renews automatically": a lapsed key renews nothing.
+    if left is not None and left.total_seconds() <= 0:
+        return "Key expired. This Mac can't take tasks until you reconnect it."
     if renews is True:
         return REMOTE_KEY_RENEWS_NOTE
-    if renews is not False:
+    if renews is not False or left is None:
         return ""
-    expires = _remote_key_expiry(snapshot)
-    if expires is None:
-        return ""
-    left = expires - (now or datetime.now(timezone.utc))
-    if left.total_seconds() <= 0:
-        return "Key expired. This Mac can't take tasks until you reconnect it."
     return (f"Key expires {_days_phrase(left.days)}. This server can't renew it automatically: "
             "reconnect this Mac before then.")
 

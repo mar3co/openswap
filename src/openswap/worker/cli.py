@@ -3023,19 +3023,21 @@ def _key_status(snapshot: dict, *, now=None):
     from openswap.worker.protocol import ProtocolError, timestamp
 
     renews = snapshot.get("remote_key_renews")
-    if renews is True:
-        return (f"{printer.mark(True)} Key", "renews automatically")
-    if renews is not False:
-        return None
     try:
         expires = timestamp(snapshot.get("remote_key_expires_at"))
     except ProtocolError:
-        return None
-    left = expires - (now or datetime.now(timezone.utc))
+        expires = None
+    left = expires - (now or datetime.now(timezone.utc)) if expires is not None else None
     fix = ("run `openswap worker connect` (on a server without Connect, choose Re-pair this Mac "
            "in its portal, then `openswap worker unpair` and run the pair command it shows).")
-    if left.total_seconds() <= 0:
+    # An expired key is reported as expired whatever the server supports: once
+    # it has lapsed, nothing renews it automatically.
+    if left is not None and left.total_seconds() <= 0:
         return (f"{printer.mark(False)} Key", f"expired; this Mac can't take tasks until it reconnects. To reconnect, {fix}")
+    if renews is True:
+        return (f"{printer.mark(True)} Key", "renews automatically")
+    if renews is not False or left is None:
+        return None
     days = left.days
     when = "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
     return (f"{printer.mark(None if days > 7 else False)} Key",

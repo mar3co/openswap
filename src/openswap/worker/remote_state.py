@@ -15,7 +15,6 @@ from openswap.worker.pairing import Enrollment, load_enrollment, store_rotated_k
 
 # How long a launch check waits for a key rotation in this process to finish
 # saving: longer than the pairing lock's timeout plus a Keychain write.
-ROTATION_SETTLE_SECONDS = 20.0
 
 
 def _identity(url, worker_id):
@@ -42,6 +41,23 @@ def save_status(root, url, state, seen, worker_id=None, received=None, *, key_re
         "key_renews": key_renews if isinstance(key_renews, bool) else None,
         "key_expires_at": key_expires_at.isoformat() if key_expires_at else None,
     })
+
+
+def _kept_key(root, url, worker_id) -> dict:
+    """The key fields already saved for this enrollment, as ``save_status`` keywords.
+
+    Paths that write a status without a client (an expired or unreadable key, a
+    missing Keychain item) keep what the last client learned, so the expiry and
+    its guidance stay visible exactly when they matter."""
+    try:
+        data = json.loads(root.joinpath(*STATUS_FILE).read_text(encoding="utf-8"))
+        if data["service"] != _identity(url, worker_id):
+            return {}
+        renews, expires = data.get("key_renews"), data.get("key_expires_at")
+        return {"key_renews": renews if isinstance(renews, bool) else None,
+                "key_expires_at": timestamp(expires) if expires else None}
+    except (OSError, KeyError, TypeError, ValueError, AttributeError, ProtocolError):
+        return {}
 
 
 def read_key_status(root):
@@ -102,7 +118,8 @@ class ConfiguredRemote:
     then swaps the client's transport key and the identity in one step under
     the client lock. While it runs, and when one finished between a Keychain
     read and the identity check, ``_resolve`` keeps the client instead of
-    rebuilding it and the launch check reads the enrollment again.
+    rebuilding it, and the launch check also accepts the exact key that rotation
+    is saving, without waiting for it.
     """
     def __init__(self, runtime, *, client_factory=RemoteClient, enrollment_loader=load_enrollment,
                  key_saver=store_rotated_key):
@@ -117,40 +134,39 @@ class ConfiguredRemote:
         # now, and a generation bumped whenever one ends.
         self._rotating = 0
         self._key_generation = 0
-        self._rotation_settled = threading.Condition(self._client_lock)
+        self._incoming = set()  # (url, enrollment) a rotation is saving right now
         runtime.remote_launch_guard = self.launch_allowed
 
     def launch_allowed(self, job_id):
         if not self.runtime.get(job_id).idempotency_key.startswith("remote:"):
             return True
-        # Two reads at most: a key rotation that lands between the Keychain read
-        # and the identity check changes both, so the check is made once more.
-        for _ in range(2):
-            with self._client_lock:
-                # A rotation saves the key and then swaps the identity: wait it out.
-                self._rotation_settled.wait_for(lambda: not self._rotating, timeout=ROTATION_SETTLE_SECONDS)
-                client, identity, generation = self.client, self.identity, self._key_generation
-            if self.stop_event.is_set() or client is None:
-                return False
-            # Re-read authorization in Keychain before every launch; a removed or
-            # locked key cannot rely on a copy cached by a prior heartbeat.
-            policy = load_worker_settings(self.runtime.backup_root)
-            if policy.control_service_url != client.url:
-                return False
-            try:
-                enrollment = self.enrollment_loader(client.url)
-                # The captured client must still be the active one for this exact enrollment:
-                # an unpair and re-pair of the same URL while the loader ran replaces both.
-                with self._client_lock:
-                    current = self.client is client and self.identity == identity
-                    rotated = self._rotating or self._key_generation != generation
-                if enrollment is not None and current and identity == (client.url, enrollment):
-                    return client.launch_allowed(job_id)
-                if not rotated:
-                    return False
-            except ProtocolError:
-                return False
-        return False
+        with self._client_lock:
+            client = self.client
+        if self.stop_event.is_set() or client is None:
+            return False
+        # Re-read authorization in Keychain before every launch; a removed or
+        # locked key cannot rely on a copy cached by a prior heartbeat.
+        policy = load_worker_settings(self.runtime.backup_root)
+        if policy.control_service_url != client.url:
+            return False
+        try:
+            enrollment = self.enrollment_loader(client.url)
+        except ProtocolError:
+            return False
+        if enrollment is None:
+            return False
+        # The captured client must still be the active one, and the Keychain must
+        # hold its enrollment, or the exact key a rotation in this process is
+        # saving for it right now. An unpair and re-pair of the same URL while the
+        # loader ran changes the client or the enrollment, and is refused. A
+        # rotation never makes a launch wait: it is matched, not waited out.
+        with self._client_lock:
+            current = self.client is client
+            ours = (client.url, enrollment)
+            matches = ours == self.identity or ours in self._incoming
+        if not current or not matches:
+            return False
+        return client.launch_allowed(job_id)
 
     def _store_rotated(self, client, previous_key, worker_id, device_key, expires_at):
         """``key_store`` for ``client``: save a rotated key, then adopt it in place.
@@ -164,6 +180,7 @@ class ConfiguredRemote:
             if self.client is not client or self.stop_event.is_set():
                 return False
             self._rotating += 1
+            self._incoming.add((client.url, enrollment))
         try:
             try:
                 saved = self.key_saver(self.runtime.backup_root, client.url, enrollment, previous_key=previous_key)
@@ -181,7 +198,7 @@ class ConfiguredRemote:
             with self._client_lock:
                 self._rotating -= 1
                 self._key_generation += 1
-                self._rotation_settled.notify_all()
+                self._incoming.discard((client.url, enrollment))
 
     def _set_client(self, client, identity):
         with self._client_lock:
@@ -229,14 +246,16 @@ class ConfiguredRemote:
                 seen = client.last_seen_at if client is not None else None
                 self._set_client(None, None)
                 with self._status_lock:
-                    save_status(root, url, state, seen, policy.control_service_worker_id)
+                    save_status(root, url, state, seen, policy.control_service_worker_id,
+                                **_kept_key(root, url, policy.control_service_worker_id))
             return None
         if enrollment is None:
             # Unpaired (the key is gone) while settings still name the URL.
             seen = self.client.last_seen_at if self.client is not None else None
             self._set_client(None, None)
             with self._status_lock:
-                save_status(root, url, "offline", seen, policy.control_service_worker_id)
+                save_status(root, url, "offline", seen, policy.control_service_worker_id,
+                            **_kept_key(root, url, policy.control_service_worker_id))
             return None
         # Enrollment compares by value (a re-pair changes it) but its
         # repr omits the key, so the identity is safe to print.

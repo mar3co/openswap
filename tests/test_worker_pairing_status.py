@@ -936,6 +936,59 @@ def test_rotation_never_holds_back_a_heartbeat(tmp_path, keychain):
     assert len(rig.clients) == 1 and rig.calls.count("register") == 1 and rig.client.state == "online"
 
 
+def test_a_stalled_rotation_never_makes_a_launch_wait(tmp_path, keychain):
+    from types import SimpleNamespace
+
+    rig = RotationRig(tmp_path, keychain, days_left=6)
+    saved, release = threading.Event(), threading.Event()
+
+    def slow_saver(root, url, enrollment, *, previous_key):
+        stored = pairing.store_rotated_key(root, url, enrollment, previous_key=previous_key)
+        saved.set()
+        release.wait(15)  # the Keychain holds the new key; the identity is not swapped yet
+        return stored
+    rig.configured.key_saver = slow_saver
+    rig.configured._heartbeat_pass()
+    rig.runtime.get = lambda job_id: SimpleNamespace(idempotency_key="remote:job")
+    rig.client.launch_allowed = lambda job_id: True
+    syncing = threading.Thread(target=rig.configured._sync_pass)
+    syncing.start()
+    try:
+        assert saved.wait(15)
+        results = []
+        started = time.monotonic()
+        guard = threading.Thread(target=lambda: results.append(rig.configured.launch_allowed("job")))
+        guard.start()
+        guard.join(5)
+        assert not guard.is_alive() and time.monotonic() - started < 2  # matched, not waited out
+        assert results == [True]  # the Keychain holds exactly the key being rotated in
+        keychain[("openswap", pairing.account_name(ROTATION_URL))] = json.dumps(
+            {**rig.saved(), "device_key": "someone-elses-key"})
+        assert rig.configured.launch_allowed("job") is False  # any other key is refused
+    finally:
+        release.set()
+        syncing.join(15)
+
+
+def test_a_status_written_without_a_client_keeps_the_saved_key_fields(tmp_path, keychain):
+    from openswap.worker.remote_state import read_key_status
+
+    rig = RotationRig(tmp_path, keychain, reject_rotation=None)
+    rig.configured.tick()
+    renews, expires = read_key_status(rig.root)
+    assert expires is not None
+    saved = rig.saved()
+    saved["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    keychain[("openswap", pairing.account_name(ROTATION_URL))] = json.dumps(saved)
+    rig.configured.tick()  # the key lapsed locally: the client ends and "expired" is saved
+    assert read_status(rig.root)[0] == RemoteConnectivity.EXPIRED
+    assert read_key_status(rig.root) == (renews, expires)  # still known, for the guidance
+    later = {"enabled": True, "paused": False, "process_state": "running", "provider": {"available": False},
+             "remote_connectivity": "expired", "remote_key_renews": True,
+             "remote_key_expires_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()}
+    assert "expired;" in cli._format_status(later)  # expired wins over "renews automatically"
+
+
 def test_store_rotated_key_writes_only_over_the_key_the_client_started_with(tmp_path, keychain):
     url = "https://control.example"
     pairing.pair(tmp_path, url, "one-use", transport=PairTransport())
