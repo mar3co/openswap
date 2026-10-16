@@ -100,6 +100,7 @@ The command-line executable is `openswap`.
 | `openswap codex move` | Assign a Codex account to a slot |
 | `openswap codex desktop` | Experimental ChatGPT preflight, switch, and recovery (`switch` and `recover` need `--confirm-restart --confirm-idle`) |
 | `openswap config` | Shared settings (`autoswitch.*`, including `autoswitch.codexEnabled`) |
+| `openswap worker connect [url]` | Remote tasks (opt-in): pair this Mac by approving it in your browser (OpenTag by default), then the same guided setup as `pair`; on an expired key it reconnects and keeps the worker ID |
 | `openswap worker pair <url> <code>` | Remote tasks (opt-in): pair with a control service, then the guided setup: start the worker, pick an account, pick the folders where remote sessions work (`~/GitHub` is suggested) |
 | `openswap worker setup` | Rerun the guided setup on a paired Mac (also Settings → Remote → **Set up Remote tasks…**) |
 | `openswap worker enable` | Start the Remote tasks worker (LaunchAgent) so a paired Mac heartbeats and shows online |

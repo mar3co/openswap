@@ -47,7 +47,7 @@ Enrollment does not enable local execution or select an account/workspace.
 
 | Operation | Request fields | Success response |
 | --- | --- | --- |
-| `pair` | `code` (string, at most 200 characters) | `worker_id`, `device_key`, `expires_at` |
+| `pair` | `code` (string, at most 200 characters); optional `code_verifier` (see [Connect to OpenTag](#connect-to-opentag-optional)) | `worker_id`, `device_key`, `expires_at` |
 | `register` | none (`{}`) | `worker_id`, `worker_epoch` (positive integer), `heartbeat_seconds` (5), `lease_seconds` (20) |
 | `heartbeat` | `worker_epoch` | `last_seen_at`, `cancel_job_ids` (array of IDs) |
 | `submit` | submission object below | `job_id`, `state` |
@@ -246,6 +246,109 @@ reconciled outcome is unaffected and the claim completes without it. Only
 transport, lease and authorization failures defer the upload for retry.
 Operator and owner must ensure selected results contain no provider secrets.
 The service supplies metadata lists and bounded authenticated downloads.
+
+## Connect to OpenTag (optional)
+
+Plan 022 adds a way to pair without copying a code: the owner starts Connect on
+the Mac (`openswap worker connect`, or Settings → Remote → **Connect to
+OpenTag…** in the menu bar), approves the Mac in the browser, and the browser
+hands a pair code back to the Mac on a loopback address. The flow borrows the
+shape of RFC 8252 (an authorization code with PKCE, returned to a loopback
+redirect) but is not OAuth: the code is an ordinary pair code, redeemed through
+`pair`. A backend without it keeps working with the pasted command, which
+also stays the way to pair over SSH and with the reference server.
+
+**Discovery.** The Mac reads `GET <origin>/.well-known/openswap-worker`, with
+the same timeout, proxy, redirect and URL rules as every other request. The
+document is a closed object:
+
+```json
+{"protocol": "v1", "connect_endpoint": "https://<origin>/workers/connect"}
+```
+
+`protocol` is exactly `"v1"`. `connect_endpoint` is an absolute URL on the
+same origin as the service URL, with a path and no query or fragment; one on
+another origin is refused (`connect_endpoint_refused`). A 404, a redirect, an
+unknown field or any other malformed document means the backend has no Connect
+page (`connect_unsupported`), and the Mac points the owner to
+`openswap worker pair <url> <code>`.
+
+**The connect page.** The Mac opens `connect_endpoint` in the owner's browser
+with these query parameters:
+
+| Parameter | Value |
+| --- | --- |
+| `redirect_uri` | `http://127.0.0.1:<port>/openswap/callback`, the Mac's one-shot listener (the OS picks the port) |
+| `state` | 16 random bytes, base64url (22 characters), echoed back unchanged |
+| `code_challenge` | `BASE64URL(SHA256(code_verifier))` without padding (RFC 7636 S256) |
+| `code_challenge_method` | `S256` |
+| `label` | the Mac's Computer Name (`scutil --get ComputerName`), at most 64 printable characters; self-asserted |
+| `worker_id` | only for a reconnect: the worker this Mac is already enrolled as |
+
+The `code_verifier` is 32 random bytes, base64url (43 characters). It never
+leaves the Mac except in the `pair` request, and it is never logged or written
+to disk. On approval the page redirects to
+`<redirect_uri>?code=<pair code>&state=<state>`. When the owner cancels it
+redirects to `<redirect_uri>?error=access_denied&state=<state>`. The page never
+redirects anywhere but the loopback address, and it refuses a `redirect_uri`
+whose host is not `127.0.0.1` or `[::1]`, whose path is not
+`/openswap/callback` or whose port is outside 1024–65535.
+
+**The listener.** It binds `127.0.0.1` only and accepts only
+`GET /openswap/callback`; any other path or method gets an error page and the
+listener keeps waiting. A request whose `state` is missing or wrong gets an
+error page and the listener keeps waiting, so another web page cannot hand the
+Mac a code from its own account. The first request with the right `state`
+closes the listener. Its browser tab gets a result page only after the code has
+been redeemed, so it never says "paired" when the Mac is not. The wait ends
+after 10 minutes (a pair code's lifetime) or when the owner cancels on the Mac.
+
+**`pair` with a verifier.** The request may carry an optional
+`code_verifier` (43–128 characters):
+
+```json
+{"code": "pair_…", "code_verifier": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"}
+```
+
+- A code issued by the connect page stores the challenge. Redeeming it needs a
+  verifier whose S256 matches; a missing or wrong verifier returns
+  `invalid_code` and consumes nothing. A code without a challenge (the pasted
+  flow) refuses a verifier.
+- Only when the request carried a verifier may the response add
+  `workspace_label` and `owner_label` (each 1–200 characters with no control
+  characters, or null), so the Mac can say where it was paired. Without a
+  verifier the response keeps the exact closed shape, and a worker refuses
+  either field as `invalid_request`.
+- A renewal code issued for a reconnect (`worker_id` set) keeps the worker ID.
+  Redeemed with a verifier, the new key stays pending on the server until it is
+  first used, so the old key keeps working if the Mac fails to save the new
+  one.
+
+**On the Mac.** Connect takes `<backup root>/.worker-connect.lock` without
+waiting before discovery and holds it until redemption ends or the flow is
+cancelled; a second Connect (the app and a terminal, or two terminals) is
+refused at once with `connect_in_progress`, before it opens a listener or a
+page. This lock is separate from the pairing lock, so a waiting Connect never
+blocks `unpair` or key rotation; redemption takes the pairing lock briefly. A
+process that crashes releases the lock with its file descriptor.
+
+- On an unpaired Mac Connect pairs as a new worker, like
+  `openswap worker pair`, then runs the [guided setup](#guided-setup-after-pairing).
+  The default server is OpenTag (`https://opentag.me`); `openswap worker
+  connect <url>` or the menu's **Use another server…** names another.
+- On a paired Mac whose key has expired, or ends within 7 days, Connect
+  reconnects: it sends `worker_id`, and in one transaction under the pairing
+  lock replaces the key for the configured URL (without the
+  `unpair_before_pairing` refusal). A returned `worker_id` that differs is
+  refused (`worker_mismatch`), and any failure keeps the old key.
+- On a healthy paired Mac Connect says the Mac is already paired and stops.
+- After a deliberate `unpair`, Connect pairs as a new worker: an unpaired Mac
+  keeps no worker ID.
+
+`openswap worker connect --no-browser` prints the address instead of opening
+it; it still has to be opened in a browser on the same Mac, because the
+redirect goes to that Mac's loopback address. Over SSH `connect` refuses and
+points to `openswap worker pair <url> <code>`.
 
 ## Optional per-job account choice (v1 extension)
 
@@ -525,6 +628,8 @@ steps, in this order; `openswap worker setup` runs the same steps again on a
 paired Mac, and the menu bar's Settings → Remote → **Set up
 Remote tasks…** button runs them in dialogs (pairing first, from the pasted
 `openswap worker pair <url> <code>` command, when the Mac is not paired yet).
+A new pairing through [Connect](#connect-to-opentag-optional)
+(`openswap worker connect`, or **Connect to OpenTag…**) runs the same steps.
 Every step calls the same function as its own command, and nothing in them can
 fail pairing: a step that fails prints its command and the next step still
 runs.
