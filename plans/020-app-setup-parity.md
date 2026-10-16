@@ -16,6 +16,10 @@
 - **Risk**: MED (changes how the login item is written and who owns it)
 - **Depends on**: 008 (single app, cask), PR #107 (`openswap uninstall`)
 - **Planned at**: commit `43d90ea`, 2026-10-15
+- **Shipped**: 2026-10-16. Phase 1 in #110 (`970d2b7`), Phase 2 in #109
+  (`074885b`), Phase 3 in #111 (`c09d08b`). The items under "Manual checks
+  before release" have not been run yet; run them on a notarized build before
+  the next release.
 
 ## Why this matters
 
@@ -527,7 +531,7 @@ Phase 3 (#111):
 - [ ] `uv run pytest` passes; cask style and audit pass
 - [ ] README, `docs/menubar.md`, `docs/widget.md` and the cask caveat
       describe both paths
-- [ ] `plans/README.md` row updated
+- [x] `plans/README.md` row updated
 
 ## STOP conditions
 

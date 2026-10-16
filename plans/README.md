@@ -29,7 +29,7 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 014  | ChatGPT auto-switch with confirmed restart | P2 | M | 012, 013 | DONE; unattended restarts remain unsupported |
 | 015  | Desktop recovery and quiet completion feedback | P1 | M | — | DONE; profile detection still blocked |
 | 016  | App-aware ChatGPT switching | P1 | M | 014, 015, PR #49 | DONE |
-| 020  | Set up OpenSwap fully from the app or the terminal | P1 | L | 008, PR #107 | TODO |
+| 020  | Set up OpenSwap fully from the app or the terminal | P1 | L | 008, PR #107 | DONE; manual checks on a notarized build still open before release |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED. Feature proposals use PROPOSED until accepted; 017 is accepted and tracked in its progress log.
 
