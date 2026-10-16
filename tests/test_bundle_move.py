@@ -322,9 +322,10 @@ def test_relaunch_waits_for_this_process_in_a_detached_shell(monkeypatch):
 def test_eject_detaches_a_disk_image_and_ignores_none(monkeypatch):
     calls = []
     monkeypatch.setattr(bundle.subprocess, "run", lambda argv, **k: calls.append(argv))
+    volume = Path("/Volumes/OpenSwap")
     bundle.eject(None)
-    bundle.eject(Path("/Volumes/OpenSwap"))
-    assert calls == [["/usr/bin/hdiutil", "detach", "/Volumes/OpenSwap", "-quiet"]]
+    bundle.eject(volume)
+    assert calls == [["/usr/bin/hdiutil", "detach", str(volume), "-quiet"]]
 
 
 def test_relaunch_without_a_disk_image_ejects_nothing(monkeypatch):
