@@ -15,6 +15,7 @@ from AppKit import (
     NSApplication,
     NSBackingStoreBuffered,
     NSBezelStyleRounded,
+    NSButton,
     NSBezierPath,
     NSColor,
     NSControlSizeLarge,
@@ -22,6 +23,8 @@ from AppKit import (
     NSControlStateValueOn,
     NSFocusRingTypeExterior,
     NSFont,
+    NSFontAttributeName,
+    NSForegroundColorAttributeName,
     NSFontWeightMedium,
     NSFontWeightRegular,
     NSFontWeightSemibold,
@@ -38,8 +41,9 @@ from AppKit import (
     NSWindowStyleMaskFullSizeContentView,
     NSWindowStyleMaskTitled,
     NSWindowTitleHidden,
+    NSWorkspace,
 )
-from Foundation import NSMakeRect, NSObject
+from Foundation import NSAttributedString, NSMakeRect, NSObject
 
 from openswap.menubar_dialog import _DialogButton, _DialogSurface, _label
 from openswap.setup_wizard import ACTION_CLOSE, ACTION_COPY_COMMAND
@@ -58,6 +62,29 @@ class _WizardButton(_DialogButton):
 
 class _WizardSwitch(NSSwitch):
     """An NSSwitch that carries the action it reports."""
+
+
+class _TextButton(NSButton):
+    """Back and Skip: a plain label that acts like a button, no fill."""
+
+    def drawRect_(self, rect):
+        ink = NSColor.secondaryLabelColor() if self.isEnabled() else NSColor.tertiaryLabelColor()
+        if self.isHighlighted():
+            ink = NSColor.labelColor()
+        title = NSAttributedString.alloc().initWithString_attributes_(self.title(), {
+            NSFontAttributeName: self.font(), NSForegroundColorAttributeName: ink,
+        })
+        size = title.size()
+        title.drawAtPoint_((
+            (self.bounds().size.width - size.width) / 2,
+            (self.bounds().size.height - size.height) / 2,
+        ))
+
+    def drawFocusRingMask(self):
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(self.bounds(), 6, 6).fill()
+
+    def focusRingMaskBounds(self):
+        return self.bounds()
 
 
 class _Box(NSView):
@@ -194,9 +221,12 @@ class SetupWizard:
         sender.setNeedsDisplay_(True)
 
     # ---- drawing ------------------------------------------------------------
-    def _button(self, surface, title, action, *, primary=False, small=False, text=None):
+    def _button(self, surface, title, action, *, primary=False, small=False, text=None, plain=False):
+        """A footer or content button. ``primary`` is the one accent-filled
+        button on the page (Return presses it); ``plain`` is text only."""
         height = SMALL_BUTTON_H if small else BUTTON_H
-        button = _WizardButton.alloc().initWithFrame_(NSMakeRect(0, 0, 100, height))
+        cls = _TextButton if plain else _WizardButton
+        button = cls.alloc().initWithFrame_(NSMakeRect(0, 0, 100, height))
         button.setTitle_(title)
         button.setBezelStyle_(NSBezelStyleRounded)
         button.setBordered_(False)
@@ -210,8 +240,12 @@ class SetupWizard:
         button.wizard_text = text
         if primary:
             button.setKeyEquivalent_("\r")
+            surface.primary = button
         button.sizeToFit()
-        width = max(96.0 if not small else 80.0, button.frame().size.width + 24)
+        if plain:
+            width = button.frame().size.width + 16
+        else:
+            width = max(96.0 if not small else 80.0, button.frame().size.width + 24)
         button.setFrameSize_((width, height))
         surface.addSubview_(button)
         return button
@@ -223,8 +257,23 @@ class SetupWizard:
         surface.addSubview_(field)
         return field.frame().size.height
 
+    def _app_icon(self):
+        """The app's own icon in the frozen app; the OpenSoft mark otherwise."""
+        from openswap import bundle
+
+        app = bundle.app_path()
+        if app is not None:
+            return NSWorkspace.sharedWorkspace().iconForFile_(str(app))
+        image = NSImage.alloc().initWithContentsOfFile_(
+            str(Path(__file__).with_name("assets") / "opensoft-symbol-64.png")
+        )
+        if image is not None:
+            image.setTemplate_(True)
+        return image
+
     def _build(self, page):
         surface = _DialogSurface.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, 480))
+        surface.primary = None
         y = PAD - 4
         mark = NSImageView.alloc().initWithFrame_(NSMakeRect(PAD, y, 26, 26))
         image = NSImage.alloc().initWithContentsOfFile_(
@@ -249,6 +298,14 @@ class SetupWizard:
             surface.addSubview_(dots)
         y += 50
 
+        if page.get("icon"):
+            icon = NSImageView.alloc().initWithFrame_(NSMakeRect(PAD - 4, y - 6, 72, 72))
+            icon.setImage_(self._app_icon())
+            icon.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            icon.setAccessibilityElement_(False)
+            surface.addSubview_(icon)
+            y += 76
+
         y += self._text(surface, page["title"], y, size=22, weight=NSFontWeightSemibold)
         if page.get("body"):
             y += 8
@@ -260,28 +317,33 @@ class SetupWizard:
         y += 32
         surface.footer_y = y
         footer_y = y + 20
+        # Right to left: the accent primary, a gray secondary, a text Skip.
+        # Back is text on the left. `surface.primary` may already be an
+        # actions item (the account steps).
         primary_spec = page.get("primary")
         secondary_spec = page.get("secondary")
+        skip_spec = page.get("skip")
         x = WIDTH - PAD
-        surface.primary = None
         if primary_spec:
             button = self._button(surface, primary_spec["title"], primary_spec["action"], primary=True)
             button.setEnabled_(bool(primary_spec.get("enabled", True)))
-            width = button.frame().size.width
-            x -= width
+            x -= button.frame().size.width
             button.setFrameOrigin_((x, footer_y))
             x -= GAP
-            surface.primary = button
         if secondary_spec:
             button = self._button(surface, secondary_spec["title"], secondary_spec["action"])
-            if not primary_spec:
+            if surface.primary is None:
                 button.setKeyEquivalent_("\r")
-            width = button.frame().size.width
-            x -= width
+            x -= button.frame().size.width
+            button.setFrameOrigin_((x, footer_y))
+            x -= GAP
+        if skip_spec:
+            button = self._button(surface, skip_spec["title"], skip_spec["action"], plain=True)
+            x -= button.frame().size.width
             button.setFrameOrigin_((x, footer_y))
         if page.get("back"):
-            button = self._button(surface, "Back", "back")
-            button.setFrameOrigin_((PAD, footer_y))
+            button = self._button(surface, "‹ Back", "back", plain=True)
+            button.setFrameOrigin_((PAD - 8, footer_y))
         height = footer_y + BUTTON_H + 20
         surface.setFrameSize_((WIDTH, height))
         return surface, height
@@ -308,7 +370,10 @@ class SetupWizard:
         if kind == "actions":
             x = PAD
             for item in row["items"]:
-                button = self._button(surface, item["title"], item["action"], small=True)
+                button = self._button(
+                    surface, item["title"], item["action"], small=True,
+                    primary=bool(item.get("primary")),
+                )
                 button.setEnabled_(bool(item.get("enabled", True)))
                 width = button.frame().size.width
                 if x > PAD and x + width > WIDTH - PAD:
@@ -379,22 +444,19 @@ class SetupWizard:
             y += self._text(surface, row["title"], y, size=13, weight=NSFontWeightSemibold)
             y += 2
             y += self._text(surface, row["text"], y, size=12, color=NSColor.secondaryLabelColor())
-            y += 8
-            copy_w = 80.0
-            text_w = CONTENT - copy_w - 8 - 20
+            y += 6
+            copy_w = 64.0
             field = _label(
                 row["command"], NSFont.monospacedSystemFontOfSize_weight_(11, NSFontWeightRegular),
-                NSColor.labelColor(), text_w,
+                NSColor.secondaryLabelColor(), CONTENT - copy_w - 12,
             )
             field.setSelectable_(True)
-            box_h = max(SMALL_BUTTON_H, field.frame().size.height + 14)
-            box = _Box.alloc().initWithFrame_(NSMakeRect(PAD, y, CONTENT - copy_w - 8, box_h))
-            surface.addSubview_(box)
-            field.setFrameOrigin_((PAD + 10, y + (box_h - field.frame().size.height) / 2))
+            line_h = max(SMALL_BUTTON_H, field.frame().size.height)
+            field.setFrameOrigin_((PAD, y + (line_h - field.frame().size.height) / 2))
             surface.addSubview_(field)
             button = self._button(surface, "Copy", row["action"], small=True, text=row["command"])
             button.setFrame_(NSMakeRect(WIDTH - PAD - copy_w, y, copy_w, SMALL_BUTTON_H))
-            y += box_h
+            y += line_h
             return y - top
         return 0.0
 

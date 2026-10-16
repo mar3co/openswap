@@ -188,6 +188,7 @@ def _welcome_page() -> dict:
     return {
         "title": "Welcome to OpenSwap",
         "body": "OpenSwap keeps your Claude Code and Codex accounts in the menu bar.",
+        "icon": True,
         "rows": [
             {
                 "kind": "features",
@@ -269,7 +270,10 @@ def _account_page(provider: str, facts: WizardFacts) -> dict:
             ))
             sign_in = "Open Sign-in Again"
         rows.append({"kind": "actions", "items": [
-            {"title": sign_in, "action": f"{provider}_start", "enabled": True},
+            # The page's one filled, accent button until an account is saved;
+            # Continue takes that role afterwards.
+            {"title": sign_in, "action": f"{provider}_start", "enabled": True,
+             "primary": not accounts},
             {
                 "title": "Save Current Login",
                 "action": f"{provider}_add" if claude else f"{provider}_capture",
@@ -280,12 +284,9 @@ def _account_page(provider: str, facts: WizardFacts) -> dict:
         "title": title,
         "body": body,
         "rows": rows,
-        "primary": {
-            "title": "Continue" if accounts else "Skip for Now",
-            "action": ACTION_NEXT,
-            "enabled": True,
-        },
+        "primary": {"title": "Continue", "action": ACTION_NEXT, "enabled": True} if accounts else None,
         "secondary": None,
+        "skip": None if accounts else {"title": "Skip for Now", "action": ACTION_NEXT},
         "back": True,
     }
 
@@ -382,7 +383,7 @@ def _done_page(facts: WizardFacts, choices: WizardChoices) -> dict:
         "rows": [{"kind": "summary", "items": summary}],
         "primary": {"title": "Open OpenSwap", "action": ACTION_FINISH, "enabled": True},
         "secondary": None,
-        "back": True,
+        "back": False,
     }
 
 
@@ -390,8 +391,11 @@ def wizard_page(step: str, facts: WizardFacts, choices: WizardChoices) -> dict:
     """Everything the window draws for ``step``.
 
     ``title``, ``body``, ``rows`` (each a dict with a ``kind``), ``primary``
-    (``{"title", "action", "enabled"}`` or None), ``secondary`` (or None),
-    ``back`` and ``progress`` (``(n, total)`` or None).
+    (``{"title", "action", "enabled"}`` or None: the one filled, accent
+    button; an ``actions`` row item marked ``primary`` takes that role
+    instead), ``secondary`` (a filled gray button, or None), ``skip`` (a
+    plain text button, or None), ``back`` (a plain text button), ``icon``
+    (the app icon above the title) and ``progress`` (``(n, total)`` or None).
     """
     if step not in wizard_steps(facts):
         step = wizard_steps(facts)[0]
@@ -409,4 +413,6 @@ def wizard_page(step: str, facts: WizardFacts, choices: WizardChoices) -> dict:
         page = _done_page(facts, choices)
     page["step"] = step
     page["progress"] = _progress(step, facts)
+    page.setdefault("skip", None)
+    page.setdefault("icon", False)
     return page

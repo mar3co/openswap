@@ -147,13 +147,18 @@ def test_welcome_names_what_openswap_does_and_starts():
     assert len(_rows(page, "features")[0]["items"]) == 3
     assert page["primary"] == {"title": "Get Started", "action": ACTION_NEXT, "enabled": True}
     assert page["back"] is False
+    assert page["icon"] is True
 
 
 def test_no_claude_account_offers_sign_in_and_save_and_can_skip():
     page = wizard_page(CLAUDE, WizardFacts(), WizardChoices())
     assert page["title"] == "Add your Claude account"
-    assert _actions(page) == ["claude_start", "claude_add"]
-    assert page["primary"]["title"] == "Skip for Now"
+    items = _rows(page, "actions")[0]["items"]
+    assert [i["action"] for i in items] == ["claude_start", "claude_add"]
+    # Sign in is the one accent button; Skip is plain text in the footer.
+    assert items[0]["primary"] is True and "primary" not in items[1]
+    assert page["primary"] is None
+    assert page["skip"] == {"title": "Skip for Now", "action": ACTION_NEXT}
     assert page["back"] is True
 
 
@@ -163,14 +168,18 @@ def test_saved_claude_accounts_are_listed_and_continue():
     assert page["title"] == "Your Claude accounts"
     assert _rows(page, "accounts")[0]["items"] == [("work", "you@acme.com"), ("you@example.com", "")]
     assert page["primary"]["title"] == "Continue"
+    assert page["skip"] is None
     assert "claude_start" in _actions(page)
+    assert _rows(page, "accounts")  # Continue is the accent button now
+    assert _rows(page, "actions")[0]["items"][0]["primary"] is False
 
 
 def test_a_sign_in_in_progress_says_where_to_finish_it():
     page = wizard_page(CLAUDE, WizardFacts(claude_signing_in=True), WizardChoices())
     assert "browser" in _notes(page)
     items = _rows(page, "actions")[0]["items"]
-    assert items[0] == {"title": "Open Sign-in Again", "action": "claude_start", "enabled": True}
+    assert items[0] == {"title": "Open Sign-in Again", "action": "claude_start", "enabled": True,
+                        "primary": True}
     assert items[1]["enabled"] is False  # Save Current Login waits
 
 
@@ -186,7 +195,8 @@ def test_without_claude_code_there_is_nothing_to_sign_in_with():
     page = wizard_page(CLAUDE, WizardFacts(claude_installed=False), WizardChoices())
     assert "isn’t installed" in _notes(page)
     assert _actions(page) == []
-    assert page["primary"]["action"] == ACTION_NEXT
+    assert page["primary"] is None
+    assert page["skip"]["action"] == ACTION_NEXT
 
 
 def test_codex_offers_chatgpt_sign_in_and_capture():
@@ -257,6 +267,7 @@ def test_done_summarizes_the_choices_and_finishes():
         ("Claude Code status line", "On"),
     ]
     assert page["primary"]["action"] == ACTION_FINISH
+    assert page["back"] is False  # nobody goes back from "all set"
 
 
 def test_every_account_button_is_an_action_the_app_knows():
@@ -271,3 +282,23 @@ def test_every_account_button_is_an_action_the_app_knows():
             seen.update(_actions(wizard_page(step, facts, WizardChoices())))
     assert seen <= set(ACCOUNT_ACTIONS)
     assert {"claude_start", "claude_add", "claude_retry", "codex_start", "codex_capture"} <= seen
+
+
+def test_every_page_has_at_most_one_accent_button():
+    """One filled accent button per page: the footer's primary, or the
+    actions item marked primary, never both."""
+    cases = [
+        (MOVE, WizardFacts(temporary=True, move={"action": "move"})),
+        (WELCOME, WizardFacts()), (CLAUDE, WizardFacts()),
+        (CLAUDE, WizardFacts(claude_accounts=(("a", ""),))),
+        (CLAUDE, WizardFacts(claude_signing_in=True)),
+        (CODEX, WizardFacts(codex_available=True)),
+        (LOGIN, WizardFacts()), (EXTRAS, WizardFacts()), (DONE, WizardFacts()),
+    ]
+    for step, facts in cases:
+        page = wizard_page(step, facts, WizardChoices())
+        accent = int(page["primary"] is not None) + sum(
+            int(bool(item.get("primary")))
+            for row in _rows(page, "actions") for item in row["items"]
+        )
+        assert accent == 1, (step, accent)
