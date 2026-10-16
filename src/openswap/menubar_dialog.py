@@ -22,6 +22,8 @@ from AppKit import (
     NSButton,
     NSColor,
     NSControlSizeLarge,
+    NSControlStateValueOff,
+    NSControlStateValueOn,
     NSEventModifierFlagCommand,
     NSEventModifierFlagControl,
     NSEventModifierFlagOption,
@@ -65,6 +67,7 @@ ACTION_GAP = 10.0
 class DialogResponse:
     clicked: int
     text: str
+    checked: bool = False
 
 
 class _DialogSurface(NSView):
@@ -189,11 +192,15 @@ def _label(text, font, color, width, *, spaced=False):
 
 
 class BrandDialog:
-    """One reusable modal surface; 1 confirms, 0 cancels, -1 is the third action."""
+    """One reusable modal surface; 1 confirms, 0 cancels, -1 is the third action.
+
+    ``checkbox`` adds an option below the message, unchecked; :meth:`run`
+    reports it in ``DialogResponse.checked``.
+    """
 
     def __init__(
         self, *, title=None, message="", ok=None, cancel=None, other=None,
-        default_text=None, secure=False, destructive=False,
+        default_text=None, secure=False, destructive=False, checkbox=None,
     ):
         shown_title = str(title or "OpenSwap")
         if shown_title.casefold() == "openswap":
@@ -201,6 +208,7 @@ class BrandDialog:
         self._result = 0
         self._running = False
         self.textfield = None
+        self.checkbox = None
         self._window = _DialogPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, DIALOG_WIDTH, 320),
             NSWindowStyleMaskTitled | NSWindowStyleMaskFullSizeContentView,
@@ -317,6 +325,17 @@ class BrandDialog:
                 surface.addSubview_(body)
                 y += body_height
 
+        if checkbox:
+            y += 16
+            box = NSButton.checkboxWithTitle_target_action_(str(checkbox), None, None)
+            box.setFont_(NSFont.systemFontOfSize_(13))
+            box.setState_(NSControlStateValueOff)
+            box.sizeToFit()
+            box.setFrameOrigin_((DIALOG_PADDING, y))
+            surface.addSubview_(box)
+            self.checkbox = box
+            y += box.frame().size.height
+
         if default_text is not None:
             y += 20
             field_class = NSSecureTextField if secure else NSTextField
@@ -356,11 +375,10 @@ class BrandDialog:
                 action_x += width + ACTION_GAP
         window.setContentSize_((DIALOG_WIDTH, y + footer_height))
         surface.setFrameSize_((DIALOG_WIDTH, y + footer_height))
-        if self.textfield is not None:
-            self.textfield.setNextKeyView_(self.buttons[0])
-        for current, following in zip(self.buttons, self.buttons[1:]):
+        chain = [view for view in (self.checkbox, self.textfield) if view is not None] + self.buttons
+        for current, following in zip(chain, chain[1:]):
             current.setNextKeyView_(following)
-        self.buttons[-1].setNextKeyView_(self.textfield or self.buttons[0])
+        chain[-1].setNextKeyView_(chain[0])
 
     def window(self):
         return self._window
@@ -391,7 +409,11 @@ class BrandDialog:
 
     def run(self):
         clicked = self.runModal()
-        return DialogResponse(clicked, str(self.textfield.stringValue()) if self.textfield else "")
+        return DialogResponse(
+            clicked,
+            str(self.textfield.stringValue()) if self.textfield else "",
+            self.checkbox is not None and self.checkbox.state() == NSControlStateValueOn,
+        )
 
 
 def make_dialog_alert(**kwargs):

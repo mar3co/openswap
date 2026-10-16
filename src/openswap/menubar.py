@@ -2120,6 +2120,8 @@ def run(switcher, codex=None) -> int:
                 self._history_menu(rumps),
                 None,
                 rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
+                None,
+                rumps.MenuItem("Uninstall OpenSwap…", callback=self.on_uninstall),
                 rumps.MenuItem("Quit", callback=self.on_quit),
             ]
             if self._panel is not None:
@@ -2409,6 +2411,13 @@ def run(switcher, codex=None) -> int:
 
             prompt = make_dialog_prompt(**kwargs)
             return self._dialog(prompt.run)
+
+        def _confirm(self, **kwargs):
+            """An alert whose answer carries its checkbox (``DialogResponse``)."""
+            from openswap.menubar_dialog import make_dialog_alert
+
+            alert = make_dialog_alert(**kwargs)
+            return self._dialog(alert.run)
 
         def _choose_folder(self, *, title: str, message: str) -> str | None:
             """The native folder chooser (Finder-style browse and search); None on Cancel."""
@@ -3269,6 +3278,37 @@ def run(switcher, codex=None) -> int:
             except Exception:
                 self.switcher._logger.warning("could not unload the login item", exc_info=True)
             rumps.quit_application()
+
+        def on_uninstall(self, _sender):
+            """More… › Uninstall OpenSwap…: confirm, start ``openswap
+            uninstall`` in a detached child, and quit.
+
+            Removing the login item boots this extra out, so nothing is
+            removed in this process; the child waits for it to quit first.
+            """
+            from openswap import bundle, uninstall
+
+            try:
+                bundle.refuse_uv_beside_cask("uninstall OpenSwap")
+            except ClaudeSwitchError as e:
+                self._alert(title="Could not uninstall", message=str(e))
+                return
+            answer = self._confirm(**uninstall.app_dialog(), cancel=True, destructive=True)
+            if answer.clicked != 1:
+                return
+            if answer.checked:
+                try:
+                    uninstall.refuse_live_sessions()
+                except ClaudeSwitchError as e:
+                    self._alert(title="Cannot delete saved accounts yet", message=str(e))
+                    return
+            try:
+                uninstall.start_from_app(answer.checked)
+            except OSError as e:
+                self._alert(title="Could not uninstall",
+                            message=f"OpenSwap could not start the uninstall: {e}")
+                return
+            self.on_quit(None)
 
         def on_toggle_name(self, _sender):
             self.settings.show_account_name = not self.settings.show_account_name

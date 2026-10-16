@@ -1358,21 +1358,39 @@ def _uninstall_command(argv: list[str]) -> int:
         help="do not ask before deleting (with --zap)",
     )
     parser.add_argument("--homebrew-hook", action="store_true", help=argparse.SUPPRESS)
+    # The child the menu bar's Uninstall OpenSwap… starts before it quits.
+    parser.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    from openswap import bundle, uninstall
+    from openswap import uninstall
 
     if args.homebrew_hook:
         return _homebrew_uninstall_hook()
+    if not args.from_app:
+        return _uninstall(args.zap, args.yes)
+    # Its output goes to a log, in order; nobody watches it, so a failure
+    # opens the log.
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(line_buffering=True)
+    if not uninstall.wait_for_app_to_quit():
+        warning("OpenSwap did not quit in time; going on.")
+    code = _uninstall(args.zap, args.yes, from_app=True)
+    if code:
+        uninstall.show_app_log()
+    return code
+
+
+def _uninstall(zap: bool, assume_yes: bool, *, from_app: bool = False) -> int:
+    from openswap import bundle, uninstall
 
     try:
         bundle.refuse_uv_beside_cask("uninstall OpenSwap")
-        if args.zap:
+        if zap:
             uninstall.refuse_live_sessions()
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         return 1
-    brew = uninstall.homebrew_brew()
-    if args.zap and not args.yes:
+    if zap and not assume_yes:
         if not sys.stdin.isatty():
             error("Error: --zap deletes your saved accounts. Pass --yes to confirm.")
             return 2
@@ -1384,61 +1402,11 @@ def _uninstall_command(argv: list[str]) -> int:
         if answer.strip().lower() != "y":
             print(dimmed("Cancelled"))
             return 1
+    return uninstall.run(zap, _uninstall_say, from_app=from_app)
 
-    removal = uninstall.remove_integrations()
-    for name in removal.removed:
-        print(f"Removed the {name}.")
-    if removal.failed:
-        for failure in removal.failed:
-            error(f"Could not remove the {failure}")
-        error("OpenSwap is still installed. Fix that, then run: openswap uninstall")
-        return 1
 
-    if args.zap:
-        from openswap.exceptions import MigrationError
-
-        try:
-            # Opening the data below can move the pre-XDG folder, and its
-            # profiles' Keychain items are named from their old paths.
-            uninstall.delete_session_logins(uninstall.legacy_roots())
-            try:
-                switcher = ClaudeAccountSwitcher()
-            except MigrationError:
-                # Both folders hold data, so no openswap command (session
-                # setup included) can open them: delete both without purge.
-                switcher = None
-            if switcher is not None:
-                # purge rechecks live sessions, leases and the worker under
-                # the locks session setup takes, then deletes saved accounts
-                # and the backup folders: a session that went live during
-                # the prompt is refused here, not deleted from under Claude.
-                switcher.purge(assume_yes=True)
-            else:
-                uninstall.refuse_live_sessions()
-            # What purge does not track (the worker's pairing, strays).
-            deleted = uninstall.delete_saved_logins()
-            # Homebrew's zap deletes the cask's files; the rest go here.
-            removed_files = uninstall.delete_data(homebrew_zap=brew is not None)
-        except (ClaudeSwitchError, OSError) as e:
-            error(f"Error: {e}")
-            error("OpenSwap is still installed. Fix that, then run: openswap uninstall --zap")
-            return 1
-        if deleted:
-            print(f"Deleted {deleted} saved login{'s' if deleted != 1 else ''} from the Keychain.")
-        for path in removed_files:
-            print(f"Deleted {path}")
-
-    if brew is not None:
-        command = [str(brew), "uninstall", "--cask", *(["--zap"] if args.zap else []), "openswap"]
-        print(f"Removing the app: brew {' '.join(command[1:])}")
-        sys.stdout.flush()
-        os.execv(command[0], command)
-    app = bundle.app_path()
-    if app is not None:
-        print(f"To finish, move {app} to the Trash.")
-    else:
-        print("To finish, run: uv tool uninstall openswap")
-    return 0
+def _uninstall_say(line: str, error: bool = False) -> None:
+    (printer.error if error else print)(line)
 
 
 def _homebrew_uninstall_hook() -> int:

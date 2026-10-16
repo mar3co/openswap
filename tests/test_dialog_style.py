@@ -154,3 +154,21 @@ def test_prompt_commits_field_editor_text_and_supports_select_all():
     response = _run_with_action(dialog, edit)
     assert response.clicked == 1
     assert response.text == "After"
+
+
+def test_checkbox_starts_unchecked_and_is_reported():
+    dialog = make_dialog_alert(title="Uninstall OpenSwap?", message="Removes what it set up.",
+                               checkbox="Also delete saved accounts, settings and logs",
+                               ok="Uninstall", cancel=True, destructive=True)
+    box = dialog.checkbox.frame()
+    assert dialog.checkbox.state() == AppKit.NSControlStateValueOff
+    assert dialog.body.frame().origin.y + dialog.body.frame().size.height < box.origin.y
+    assert box.origin.y + box.size.height < dialog.surface.footer_y
+    assert box.origin.x + box.size.width <= DIALOG_WIDTH
+    assert dialog.checkbox.nextKeyView() == dialog.buttons[0]
+    assert dialog.buttons[-1].nextKeyView() == dialog.checkbox
+    dialog.runModal = lambda: 1
+    assert dialog.run().checked is False
+    dialog.checkbox.performClick_(None)
+    assert dialog.run().checked is True
+    assert make_dialog_alert(message="No option.").checkbox is None

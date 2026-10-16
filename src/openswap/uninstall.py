@@ -11,15 +11,25 @@ Homebrew runs a cask's whole ``uninstall`` stanza on ``brew upgrade`` and
 remove the login item: every upgrade would drop it. Its hook runs
 ``OpenSwap uninstall --homebrew-hook`` instead, and :func:`homebrew_command`
 reads which brew command started it. Only an uninstall removes anything.
+
+:func:`run` is ``openswap uninstall`` after its checks and prompt. The menu
+bar's **Uninstall OpenSwap…** starts the same command in a detached child
+(:func:`start_from_app`) and quits: removing the login item boots the extra
+out, so none of the work may run inside it.
 """
 
 from __future__ import annotations
 
 import os
 import plistlib
+import shlex
 import shutil
 import subprocess
+import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from openswap import bundle, paths
@@ -32,6 +42,15 @@ _BREW_RB = "/Library/Homebrew/brew.rb"
 # Homebrew's Ruby is the hook's parent. A few more levels allow for a wrapper
 # (env, sudo) without walking the whole process tree.
 _MAX_ANCESTORS = 5
+
+# The hidden flag on the child the menu bar starts, and where its output goes.
+FROM_APP_FLAG = "--from-app"
+APP_LOG_NAME = "com.opensoft.openswap.uninstall.log"
+# How long that child waits for the menu bar app to quit before going on.
+APP_QUIT_TIMEOUT = 30.0
+
+# ``say(line)`` reports progress; ``say(line, error=True)`` a failure.
+Say = Callable[..., None]
 
 
 @dataclass
@@ -321,10 +340,12 @@ def data_paths(home: Path | None = None, *, homebrew_zap: bool = False) -> list[
     home = home if home is not None else Path.home()
     logs = home / "Library" / "Logs"
     backup, *legacy = _data_roots()
+    # Not the uninstall's own log: an uninstall the app started is writing
+    # it, and it is the only record of a step that fails after this one.
     found = [] if homebrew_zap else [
         backup,
         home / "Library" / "Containers" / bundle.APPEX_ID,
-        *sorted(logs.glob("com.opensoft.openswap.*.log")),
+        *sorted(p for p in logs.glob("com.opensoft.openswap.*.log") if p.name != APP_LOG_NAME),
         *sorted(logs.glob("com.opensoft.openswap.*.err")),
     ]
     found.extend(legacy)
@@ -354,3 +375,204 @@ def homebrew_brew() -> Path | None:
     prefix = bundle.cask_prefix()
     brew = None if prefix is None else prefix / "bin" / "brew"
     return brew if brew is not None and os.access(brew, os.X_OK) else None
+
+
+def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
+    """Remove OpenSwap: ``openswap uninstall [--zap]`` after its checks and
+    prompt.
+
+    Removes the integrations, then with ``zap`` the saved accounts, settings
+    and logs, then the app: it execs ``brew uninstall --cask`` when Homebrew
+    installed it (whose hook finds nothing left) and does not return.
+    Otherwise it names what is left for the user to remove.
+
+    ``from_app`` marks the child that the menu bar's Uninstall OpenSwap…
+    starts. Nobody reads that child's output, so a copy not installed by
+    Homebrew moves itself to the Trash as the last step, and a failed
+    ``brew uninstall`` opens the log.
+    """
+    retry = (
+        "open OpenSwap and choose Uninstall OpenSwap… again"
+        if from_app else f"run: openswap uninstall{' --zap' if zap else ''}"
+    )
+    brew = homebrew_brew()
+    removal = remove_integrations()
+    for name in removal.removed:
+        say(f"Removed the {name}.")
+    if removal.failed:
+        for failure in removal.failed:
+            say(f"Could not remove the {failure}", error=True)
+        say(f"OpenSwap is still installed. Fix that, then {retry}", error=True)
+        return 1
+
+    if zap:
+        from openswap.engine import Engine
+        from openswap.exceptions import MigrationError
+
+        try:
+            # Opening the data below can move the pre-XDG folder, and its
+            # profiles' Keychain items are named from their old paths.
+            delete_session_logins(legacy_roots())
+            try:
+                engine = Engine()
+            except MigrationError:
+                # Both folders hold data, so no openswap command (session
+                # setup included) can open them: delete both without purge.
+                engine = None
+            if engine is not None:
+                # purge rechecks live sessions, leases and the worker under
+                # the locks session setup takes, then deletes saved accounts
+                # and the backup folders: a session that went live during
+                # the prompt is refused here, not deleted from under Claude.
+                engine.purge(assume_yes=True)
+            else:
+                refuse_live_sessions()
+            # What purge does not track (the worker's pairing, strays).
+            deleted = delete_saved_logins()
+            # Homebrew's zap deletes the cask's files; the rest go here.
+            removed_files = delete_data(homebrew_zap=brew is not None)
+        except (ClaudeSwitchError, OSError) as e:
+            say(f"Error: {e}", error=True)
+            say(f"OpenSwap is still installed. Fix that, then {retry}", error=True)
+            return 1
+        if deleted:
+            say(f"Deleted {deleted} saved login{'s' if deleted != 1 else ''} from the Keychain.")
+        for path in removed_files:
+            say(f"Deleted {path}")
+
+    if brew is not None:
+        command = [str(brew), "uninstall", "--cask", *(["--zap"] if zap else []), "openswap"]
+        say(f"Removing the app: brew {' '.join(command[1:])}")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if from_app:
+            # brew deletes the bundle this process runs from, so a shell (not
+            # this process) waits for it and opens the log if it fails.
+            script = f'"$0" "$@" || exec /usr/bin/open {shlex.quote(str(app_log_path()))}'
+            command = ["/bin/sh", "-c", script, *command]
+        os.execv(command[0], command)
+    app = bundle.app_path()
+    if app is None:
+        say("To finish, run: uv tool uninstall openswap")
+    elif from_app:
+        _trash_app(app, say)
+    else:
+        say(f"To finish, move {app} to the Trash.")
+    return 0
+
+
+def _trash_app(app: Path, say: Say) -> None:
+    """Move this app to the Trash, or reveal it in Finder when that fails so
+    the user can finish by hand."""
+    from openswap.widget_install import _move_to_trash
+
+    try:
+        _move_to_trash(app)
+    except ClaudeSwitchError as e:
+        say(str(e), error=True)
+        say(f"To finish, move {app} to the Trash.")
+        _open("-R", str(app))
+        return
+    say(f"Moved {app} to the Trash.")
+
+
+def _open(*args: str) -> None:
+    try:
+        subprocess.run(["/usr/bin/open", *args], check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def app_dialog() -> dict[str, str]:
+    """The menu bar's Uninstall OpenSwap… confirmation, for this install:
+    keyword arguments for its dialog."""
+    lines = [
+        "OpenSwap quits, then removes what it set up:",
+        "• the menu bar login item",
+        "• the Remote tasks worker",
+        "• the Claude Code status line (your own comes back)",
+        "• the widget",
+    ]
+    app = bundle.app_path()
+    if app is None:
+        after = "\n\nTo remove the openswap command too, run uv tool uninstall openswap afterwards."
+    else:
+        lines.append(f"• {app.name}, {'through Homebrew' if homebrew_brew() else 'moved to the Trash'}")
+        after = ""
+    return {
+        "title": "Uninstall OpenSwap?",
+        "message": "\n".join(lines) + (
+            "\n\nClaude Code stays signed in. Your saved accounts stay unless you tick "
+            "the box below; deleting them cannot be undone."
+        ) + after,
+        "checkbox": "Also delete saved accounts, settings and logs",
+        "ok": "Uninstall",
+    }
+
+
+def app_log_path(home: Path | None = None) -> Path:
+    """Where the uninstall the menu bar starts writes its output."""
+    return (home if home is not None else Path.home()) / "Library" / "Logs" / APP_LOG_NAME
+
+
+def show_app_log() -> None:
+    """Open the uninstall's log (in Console), for a failure nobody saw."""
+    _open(str(app_log_path()))
+
+
+def app_command(zap: bool) -> list[str]:
+    """The child the menu bar starts: this app's own executable, or the
+    console script a source install's login item would run."""
+    from openswap import launch_agent
+
+    return [
+        *launch_agent.resolve_program(), "uninstall", "--yes",
+        *(["--zap"] if zap else []), FROM_APP_FLAG,
+    ]
+
+
+def start_from_app(zap: bool, *, home: Path | None = None) -> list[str]:
+    """Start :func:`app_command` detached from the menu bar app, which quits
+    next; returns the command. Raises OSError when it cannot start.
+
+    The child gets a new session, so it is not in the launchd job's process
+    group and outlives the extra, and no ``XPC_SERVICE_NAME``: it is not the
+    login item, whatever started the extra.
+    """
+    home = home if home is not None else Path.home()
+    command = app_command(zap)
+    log = app_log_path(home)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    env = {key: value for key, value in os.environ.items() if key != "XPC_SERVICE_NAME"}
+    if bundle.is_frozen():
+        # A fresh bootloader, not one that reuses this process's PyInstaller state.
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    with open(log, "a", encoding="utf-8") as out:
+        out.write(f"\n{datetime.now().isoformat(timespec='seconds')} {' '.join(command)}\n")
+        out.flush()
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            cwd=home,
+            env=env,
+            start_new_session=True,
+        )
+    return command
+
+
+def wait_for_app_to_quit(timeout: float = APP_QUIT_TIMEOUT) -> bool:
+    """Wait for the menu bar app that started this process to quit.
+
+    Removing the login item while it runs would boot it out mid-quit, and a
+    zap could race its last writes. Its exit reparents this process, which
+    changes the parent pid. False when it is still running after ``timeout``.
+    """
+    parent = os.getppid()
+    deadline = time.monotonic() + timeout
+    while parent > 1 and os.getppid() == parent:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
