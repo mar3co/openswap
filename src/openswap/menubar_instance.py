@@ -62,6 +62,9 @@ SHOW_REQUEST_MAX_AGE_SECONDS = 30.0
 # How long setup waits for launchd's copy to hold the lock after a hand-over
 # request: the job's own lock wait is 10 s, plus its start-up.
 CLI_HANDOFF_WAIT_SECONDS = 15.0
+# How long a copy that lost the lock watches for the holder to take its show
+# request, in case the holder is quitting and the lock is about to come free.
+HOLDER_ANSWER_SECONDS = 2.0
 _LOCK_POLL_SECONDS = 0.1
 
 
@@ -191,8 +194,12 @@ def claim(
     (``launch_agent.runs_as_login_item()``): it waits up to
     ``LOGIN_ITEM_WAIT_SECONDS``, then exits 1 for ``KeepAlive`` to retry, or 0
     when ``unload`` (``launch_agent.unload_own_job``) unloaded its job because
-    Open at login is off. Any other copy does not wait: it leaves a show
-    request (``post`` is the notification half) and exits 0.
+    Open at login is off. Any other copy does not wait for the lock: it leaves
+    a show request (``post`` is the notification half) and exits 0 once the
+    holder takes it. The holder may be on its way out (between Quit and exit),
+    and then nobody would answer and nothing would be left running, so for up
+    to ``HOLDER_ANSWER_SECONDS`` it also tries the lock again, and runs if the
+    lock comes free (its own show request then opens its popover).
 
     Returns None, and the extra runs unguarded, only when the lock file
     itself cannot be opened: a broken data folder must not cost the user
@@ -219,6 +226,17 @@ def claim(
         )
         raise AlreadyRunning(1)
     leave_show_request(backup_dir, post=post, logger=logger)
+    deadline = time.monotonic() + HOLDER_ANSWER_SECONDS
+    while time.monotonic() < deadline:
+        time.sleep(_LOCK_POLL_SECONDS)
+        if not show_request_path(backup_dir).exists():
+            break  # the holder took it: it is alive and showing its popover
+        try:
+            lock = menubar_lock(backup_dir)
+        except OSError:
+            break
+        if lock is not None:
+            return lock  # the holder quit meanwhile: run here instead
     say(ALREADY_RUNNING)
     raise AlreadyRunning(0)
 

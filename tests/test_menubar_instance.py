@@ -35,6 +35,16 @@ from openswap.menubar_instance import (
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="the extra is macOS-only (flock)")
 
 
+@pytest.fixture(autouse=True)
+def _instant_waits(monkeypatch):
+    """Lock waits and the holder watch run on a clock that moves only when
+    the code sleeps, so they cost no real time."""
+    clock = [0.0]
+    monkeypatch.setattr(menubar_instance.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(menubar_instance.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    return clock
+
+
 def test_the_lock_lives_in_the_data_folder(tmp_path):
     assert lock_path(tmp_path) == tmp_path / "menubar.lock"
 
@@ -106,11 +116,55 @@ def test_another_copy_does_not_wait_it_asks_the_running_one_to_show(tmp_path, mo
     finally:
         held.release()
     assert raised.value.exit_code == 0
-    assert waits == [0.0]
+    # Never a wait for the lock itself, only quick retries while watching.
+    assert set(waits) == {0.0}
     # A show request: the file is written before the notification goes out.
     assert posted == [True]
     assert said == [ALREADY_RUNNING]
     assert ALREADY_RUNNING == "OpenSwap is already running in the menu bar."
+
+
+def test_a_holder_that_takes_the_show_request_lets_this_copy_go_at_once(tmp_path, _instant_waits):
+    held = menubar_lock(tmp_path)
+    try:
+        with pytest.raises(AlreadyRunning) as raised:
+            claim(
+                tmp_path, as_login_item=False, say=lambda _m: None,
+                # The holder's notification handler consumes the request.
+                post=lambda: menubar_instance.consume_show_request(tmp_path),
+            )
+    finally:
+        held.release()
+    assert raised.value.exit_code == 0
+    assert _instant_waits[0] < menubar_instance.HOLDER_ANSWER_SECONDS
+
+
+def test_a_holder_that_quits_meanwhile_leaves_the_menu_bar_to_this_copy(tmp_path):
+    """It was between Quit and exit: it never answers, and its clean exit is
+    not restarted, so this copy must run rather than leave nothing."""
+    held = menubar_lock(tmp_path)
+    said = []
+    lock = claim(tmp_path, as_login_item=False, say=said.append, post=held.release)
+    assert lock is not None
+    try:
+        assert menubar_instance.lock_holder_pid(tmp_path) == os.getpid()
+        assert said == []
+        # Its own request opens its popover once it attaches.
+        assert show_request_path(tmp_path).exists()
+    finally:
+        lock.release()
+
+
+def test_a_holder_that_stays_silent_is_given_two_seconds(tmp_path, _instant_waits):
+    held = menubar_lock(tmp_path)
+    try:
+        with pytest.raises(AlreadyRunning) as raised:
+            claim(tmp_path, as_login_item=False, say=lambda _m: None, post=lambda: None)
+    finally:
+        held.release()
+    assert raised.value.exit_code == 0
+    assert menubar_instance.HOLDER_ANSWER_SECONDS == 2.0
+    assert _instant_waits[0] >= menubar_instance.HOLDER_ANSWER_SECONDS
 
 
 def test_the_launchd_job_waits_then_exits_1_for_keepalive_to_retry(tmp_path, monkeypatch, capsys):
