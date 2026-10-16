@@ -323,13 +323,15 @@ def refuse_live_sessions() -> None:
         elif bad:
             unreadable.append(profile.name)
     if live:
+        several = len(live) > 1
         raise ClaudeSwitchError(
-            f"Claude is running on session profile {'; '.join(live)}. Exit it, then retry."
+            f"Claude Code is running on session profile{'s' if several else ''} "
+            f"{'; '.join(live)}. Quit {'them' if several else 'it'}, then try again."
         )
     if unreadable:
         raise ClaudeSwitchError(
             f"Could not read the session records of {', '.join(unreadable)}, so whether "
-            "Claude is running there is unknown. Repair or remove them, then retry."
+            "Claude Code is running there is unknown. Repair or remove them, then try again."
         )
 
 
@@ -391,9 +393,9 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
     Homebrew moves itself to the Trash as the last step, and a failed
     ``brew uninstall`` opens the log.
     """
-    retry = (
-        "open OpenSwap and choose Uninstall OpenSwap… again"
-        if from_app else f"run: openswap uninstall{' --zap' if zap else ''}"
+    still_installed = "OpenSwap is still installed. " + (
+        "Fix the error above, then open OpenSwap and choose Uninstall OpenSwap… again."
+        if from_app else f"Fix that, then run: openswap uninstall{' --zap' if zap else ''}"
     )
     brew = homebrew_brew()
     removal = remove_integrations()
@@ -402,7 +404,7 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
     if removal.failed:
         for failure in removal.failed:
             say(f"Could not remove the {failure}", error=True)
-        say(f"OpenSwap is still installed. Fix that, then {retry}", error=True)
+        say(still_installed, error=True)
         return 1
 
     if zap:
@@ -433,7 +435,7 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
             removed_files = delete_data(homebrew_zap=brew is not None)
         except (ClaudeSwitchError, OSError) as e:
             say(f"Error: {e}", error=True)
-            say(f"OpenSwap is still installed. Fix that, then {retry}", error=True)
+            say(still_installed, error=True)
             return 1
         if deleted:
             say(f"Deleted {deleted} saved login{'s' if deleted != 1 else ''} from the Keychain.")
@@ -495,15 +497,15 @@ def app_dialog() -> dict[str, str]:
     ]
     app = bundle.app_path()
     if app is None:
-        after = "\n\nTo remove the openswap command too, run uv tool uninstall openswap afterwards."
+        after = "\n\nTo remove the openswap command too, run “uv tool uninstall openswap” afterwards."
     else:
         lines.append(f"• {app.name}, {'through Homebrew' if homebrew_brew() else 'moved to the Trash'}")
         after = ""
     return {
         "title": "Uninstall OpenSwap?",
         "message": "\n".join(lines) + (
-            "\n\nClaude Code stays signed in. Your saved accounts stay unless you tick "
-            "the box below; deleting them cannot be undone."
+            "\n\nClaude Code and Codex stay signed in. Your saved accounts stay unless you "
+            "select the checkbox below. Deleting them cannot be undone."
         ) + after,
         "checkbox": "Also delete saved accounts, settings and logs",
         "ok": "Uninstall",

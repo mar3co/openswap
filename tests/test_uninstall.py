@@ -317,8 +317,18 @@ class TestZapData:
     def test_live_session_refuses_a_zap(self, monkeypatch, tmp_path):
         live = type("S", (), {"pid": 4242})()
         self._profiles(monkeypatch, tmp_path, {"1-a": ([], 0), "2-b": ([live], 0)})
-        with pytest.raises(ClaudeSwitchError, match=r"2-b \(PID 4242\)"):
+        with pytest.raises(ClaudeSwitchError) as exc:
             uninstall.refuse_live_sessions()
+        assert str(exc.value) == "Claude Code is running on session profile 2-b (PID 4242). Quit it, then try again."
+
+    def test_live_sessions_on_several_profiles_are_named_together(self, monkeypatch, tmp_path):
+        a, b = type("S", (), {"pid": 7})(), type("S", (), {"pid": 8})()
+        self._profiles(monkeypatch, tmp_path, {"1-a": ([a], 0), "2-b": ([b], 0)})
+        with pytest.raises(ClaudeSwitchError) as exc:
+            uninstall.refuse_live_sessions()
+        assert str(exc.value) == (
+            "Claude Code is running on session profiles 1-a (PID 7); 2-b (PID 8). Quit them, then try again."
+        )
 
     def test_unreadable_session_records_refuse_a_zap(self, monkeypatch, tmp_path):
         self._profiles(monkeypatch, tmp_path, {"1-a": ([], 2)})
@@ -466,7 +476,7 @@ class TestUninstallCommand:
     def test_hook_zap_with_a_live_session_warns_and_goes_on(self, harness, monkeypatch, capsys):
         seen, state = harness
         state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
-        state["live"] = "Claude is running on session profile 1-a (PID 7)."
+        state["live"] = "Claude Code is running on session profile 1-a (PID 7). Quit it, then try again."
         assert self._run(monkeypatch, "--homebrew-hook") == 0
         assert seen["logins"] == 1
         assert "Its saved login stays in the Keychain." in capsys.readouterr().err
@@ -527,7 +537,7 @@ class TestUninstallCommand:
     def test_zap_refuses_while_a_session_is_live(self, harness, monkeypatch, capsys):
         seen, state = harness
         state["brew"] = Path("/opt/homebrew/bin/brew")
-        state["live"] = "Claude is running on session profile 1-a (PID 7). Exit it, then retry."
+        state["live"] = "Claude Code is running on session profile 1-a (PID 7). Quit it, then try again."
         assert self._run(monkeypatch, "--zap", "--yes") == 1
         assert seen["remove"] == [] and seen["logins"] == 0 and seen["exec"] is None
         assert "PID 7" in capsys.readouterr().err
@@ -612,6 +622,17 @@ class TestUninstallCommand:
             True,
         )
 
+    def test_run_from_the_app_says_how_to_try_again(self, harness):
+        _, state = harness
+        state["failed"] = ["Remote tasks worker: it did not stop"]
+        lines, say = self._say()
+        assert uninstall.run(True, say, from_app=True) == 1
+        assert lines[-1] == (
+            "OpenSwap is still installed. Fix the error above, then open OpenSwap and choose "
+            "Uninstall OpenSwap… again.",
+            True,
+        )
+
     def test_run_from_the_app_trashes_a_copy_not_installed_by_homebrew(
         self, harness, monkeypatch, frozen_app
     ):
@@ -665,7 +686,7 @@ class TestUninstallCommand:
 
     def test_from_app_failure_opens_the_log(self, harness, monkeypatch, capsys):
         seen, state = harness
-        state["live"] = "Claude is running on session profile 1-a (PID 7). Exit it, then retry."
+        state["live"] = "Claude Code is running on session profile 1-a (PID 7). Quit it, then try again."
         order = []
         monkeypatch.setattr(uninstall, "wait_for_app_to_quit", lambda: order.append("wait") or False)
         monkeypatch.setattr(uninstall, "show_app_log", lambda: order.append("log"))
@@ -753,6 +774,8 @@ class TestAppDialog:
         assert dialog["title"] == "Uninstall OpenSwap?" and dialog["ok"] == "Uninstall"
         assert dialog["checkbox"] == "Also delete saved accounts, settings and logs"
         assert "• OpenSwap.app, through Homebrew" in dialog["message"]
+        assert "\n\nClaude Code and Codex stay signed in. Your saved accounts stay unless you select the " \
+            "checkbox below. Deleting them cannot be undone." in dialog["message"]
         assert "uv tool" not in dialog["message"]
 
     def test_copy_not_installed_by_homebrew(self, frozen_app, monkeypatch):
@@ -762,7 +785,7 @@ class TestAppDialog:
     def test_source_install(self):
         message = uninstall.app_dialog()["message"]
         assert ".app" not in message
-        assert message.endswith("run uv tool uninstall openswap afterwards.")
+        assert message.endswith("run “uv tool uninstall openswap” afterwards.")
 
 
 class TestMenuAction:
@@ -800,12 +823,12 @@ class TestMenuAction:
 
     def test_a_live_session_stops_a_zap_with_an_alert(self, app, monkeypatch):
         def refuse():
-            raise ClaudeSwitchError("Claude is running on session profile 1-a (PID 7). Exit it, then retry.")
+            raise ClaudeSwitchError("Claude Code is running on session profile 1-a (PID 7). Quit it, then try again.")
 
         monkeypatch.setattr(uninstall, "refuse_live_sessions", refuse)
         app.answer = SimpleNamespace(clicked=1, text="", checked=True)
         app.on_uninstall(None)
-        assert app.calls[1:] == [("alert", "Claude is running on session profile 1-a (PID 7). Exit it, then retry.")]
+        assert app.calls[1:] == [("alert", "Claude Code is running on session profile 1-a (PID 7). Quit it, then try again.")]
 
     def test_a_child_that_cannot_start_keeps_the_app_running(self, app, monkeypatch):
         def fail(zap):
