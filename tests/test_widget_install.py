@@ -474,13 +474,15 @@ def test_start_up_registers_when_only_another_copy_is(frozen_darwin, tmp_path):
     assert frozen_darwin["runs"].calls[-1] == ["pluginkit", "-a", str(_appex(frozen_darwin))]
 
 
-def test_start_up_leaves_this_bundles_registration_alone(frozen_darwin, tmp_path):
-    frozen_darwin["runs"].pluginkit_out = _listed(
+def test_start_up_leaves_this_bundles_registration_alone(frozen_darwin, tmp_path, monkeypatch):
+    # The parsed list, not pluginkit's lines: on Windows CI the fixture's
+    # bundle path is not the `/…` path pluginkit prints (parsing has its own tests).
+    monkeypatch.setattr(wi, "_appex_registrations", lambda: [
         "/Users/x/Downloads/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex",
         str(_appex(frozen_darwin)),
-    )
+    ])
     assert wi.register_on_start(home=tmp_path) is False
-    assert frozen_darwin["runs"].calls == [_LIST]
+    assert frozen_darwin["runs"].calls == []  # no `pluginkit -a`
 
 
 def test_start_up_registers_when_pluginkit_cannot_list(frozen_darwin, tmp_path, monkeypatch):
