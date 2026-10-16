@@ -22,7 +22,9 @@ That installs `OpenSwap.app` (signed and notarized; the menu bar extra, the widg
 
 Either way OpenSwap is in your menu bar now and at every login, through the same login item, and the app registers its widget when it starts. Settings › General › **This Mac** keeps the login item and the Claude Code status line switchable later. Update with `brew upgrade --cask openswap` (`openswap upgrade` prints that command). OpenSwap is not on PyPI.
 
-No Homebrew? One command installs from source:
+No Homebrew? Download the DMG for your Mac from the [latest release](https://github.com/mar3co/openswap/releases/latest) (`arm64` for Apple silicon, `x86_64` for Intel), open it, drag OpenSwap into Applications, and open it from there. It is the same signed and notarized app, and it finishes setting up the same way. Two things differ from the cask: there is no `openswap` command on your PATH (link it yourself if you want it, for example `ln -s /Applications/OpenSwap.app/Contents/MacOS/OpenSwap ~/.local/bin/openswap` when `~/.local/bin` is on your PATH), and updates come from the releases page (`openswap upgrade` says so). **More… › Uninstall OpenSwap…** moves this copy to the Trash itself.
+
+To install from source instead, one command does it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mar3co/openswap/main/install.sh | bash

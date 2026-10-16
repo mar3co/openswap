@@ -73,6 +73,27 @@ def test_ci_import_signing_keychain_requires_p12():
     assert "SIGNING_APPLICATION_P12_BASE64" in combined
 
 
+def test_release_ships_a_dmg_beside_each_zip():
+    """build.sh makes a DMG holding the app and an /Applications link; a
+    notarized build notarizes and staples it before its checksum; the tag
+    workflow checks it and attaches both arches' DMGs to the draft."""
+    build = (PACKAGING / "build.sh").read_text(encoding="utf-8")
+    assert 'RELEASE_DMG="$DIST/OpenSwap-$VERSION-$ARCH.dmg"' in build
+    assert 'ln -s /Applications "$root/Applications"' in build
+    assert "package notarize" in build
+    notarized = build.split('if [[ "${1:-}" == "notarize" ]]; then', 1)[1]
+    staple = notarized.index('xcrun stapler staple "$RELEASE_DMG"')
+    assert notarized.index('notarize "$RELEASE_DMG"') < staple
+    assert staple < notarized.index('checksum "$RELEASE_DMG"')
+
+    workflow = (ROOT / ".github" / "workflows" / "macos-app.yml").read_text(encoding="utf-8")
+    assert 'xcrun stapler validate "$DMG"' in workflow
+    assert "packaging/macos/dist/OpenSwap-*-${{ matrix.arch }}.dmg" in workflow
+    for arch in ("arm64", "x86_64"):
+        assert f'"dist/OpenSwap-${{version}}-{arch}.dmg"' in workflow
+        assert f'"dist/OpenSwap-${{version}}-{arch}.dmg.sha256"' in workflow
+
+
 def test_build_sh_unsigned_path_is_success_not_a_stop():
     """Local Macs without a signing identity still produce a freeze."""
     text = (PACKAGING / "build.sh").read_text(encoding="utf-8")
