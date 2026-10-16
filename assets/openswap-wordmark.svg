@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 176 32" width="176" height="32" role="img" aria-label="OpenSwap">
+  <!-- The OpenSwap wordmark: the OpenSoft mark and "OpenSwap" in one weight,
+       tight tracking. The word is set in the system sans (SF Pro on a Mac,
+       Public Sans elsewhere); the mark is the only drawn shape. -->
+  <g fill="#0a0a0a">
+    <path d="M16 3 A10 10 0 0 0 16 23 L16 19 A6 6 0 0 1 16 7 Z"/>
+    <path d="M16 9 A10 10 0 0 1 16 29 L16 25 A6 6 0 0 0 16 13 Z"/>
+  </g>
+  <text x="36" y="22.5" fill="#0a0a0a" font-family="-apple-system, 'SF Pro Text', 'Public Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="21" font-weight="600" letter-spacing="-0.4">OpenSwap</text>
+</svg>

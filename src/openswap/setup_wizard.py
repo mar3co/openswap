@@ -186,11 +186,11 @@ def _welcome_page() -> dict:
             {
                 "kind": "features",
                 "items": [
-                    ("See your usage",
+                    ("gauge.with.needle", "See your usage",
                      "How much of each account you’ve used, in the menu bar and a widget."),
-                    ("Switch in one click",
+                    ("arrow.left.arrow.right", "Switch in one click",
                      "Switch Claude Code or Codex to another account without signing out."),
-                    ("Or let OpenSwap switch for you",
+                    ("sparkles", "Or let OpenSwap switch for you",
                      "It can move to the next account before one hits its limit."),
                 ],
             },
@@ -291,6 +291,7 @@ def _login_page(facts: WizardFacts, choices: WizardChoices) -> dict:
         "rows": [
             {
                 "kind": "switch",
+                "symbol": "power",
                 "action": ACTION_TOGGLE_OPEN_AT_LOGIN,
                 "label": "Open OpenSwap at login",
                 "value": bool(choices.open_at_login),
@@ -320,6 +321,7 @@ def _extras_page(facts: WizardFacts, choices: WizardChoices) -> dict:
     rows: list[dict] = [
         {
             "kind": "switch",
+            "symbol": "text.alignleft",
             "action": ACTION_TOGGLE_STATUS_LINE,
             "label": "Show your account in Claude Code’s status line",
             "value": bool(choices.status_line),
@@ -328,10 +330,11 @@ def _extras_page(facts: WizardFacts, choices: WizardChoices) -> dict:
         },
     ]
     if facts.widget:
-        rows.append({"kind": "item", "title": "Widget", "text": WIDGET_HINT})
+        rows.append({"kind": "item", "symbol": "square.grid.2x2", "title": "Widget", "text": WIDGET_HINT})
     if not facts.homebrew and not facts.command_on_path and facts.command:
         rows.append({
             "kind": "command",
+            "symbol": "terminal",
             "title": "Terminal command",
             "text": "To use the openswap command in Terminal, run:",
             "command": terminal_command(facts.command),

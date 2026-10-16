@@ -144,7 +144,8 @@ def test_a_failed_plan_offers_only_not_now():
 def test_welcome_names_what_openswap_does_and_starts():
     page = wizard_page(WELCOME, WizardFacts(), WizardChoices())
     assert page["title"] == "Welcome to OpenSwap"
-    assert len(_rows(page, "features")[0]["items"]) == 3
+    items = _rows(page, "features")[0]["items"]
+    assert len(items) == 3 and all(len(i) == 3 for i in items)  # symbol, title, text
     assert page["primary"] == {"title": "Get Started", "action": ACTION_NEXT, "enabled": True}
     assert page["back"] is False
     assert page["icon"] is True

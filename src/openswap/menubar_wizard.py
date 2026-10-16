@@ -31,6 +31,7 @@ from AppKit import (
     NSImage,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
+    NSKernAttributeName,
     NSPasteboard,
     NSPasteboardTypeString,
     NSSwitch,
@@ -54,6 +55,7 @@ CONTENT = WIDTH - PAD * 2
 BUTTON_H = 36.0
 SMALL_BUTTON_H = 30.0
 GAP = 10.0
+LOCKUP_MARK = 22.0  # the mark's side in the wordmark
 
 
 class _WizardButton(_DialogButton):
@@ -267,12 +269,59 @@ class SetupWizard:
         surface.addSubview_(button)
         return button
 
+    def _symbol(self, surface, name, x, y, *, size=16.0):
+        """A subtle SF Symbol in the secondary label color; nothing when the
+        system has no such symbol."""
+        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+        if image is None:
+            return
+        view = NSImageView.alloc().initWithFrame_(NSMakeRect(x, y, size, size))
+        view.setImage_(image)
+        view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        view.setContentTintColor_(NSColor.secondaryLabelColor())
+        view.setAccessibilityElement_(False)
+        surface.addSubview_(view)
+
+    def _lead(self, surface, row, y):
+        """Draw a row's symbol, if any; return where its text starts."""
+        if row.get("symbol"):
+            self._symbol(surface, row["symbol"], PAD, y, size=16)
+            return PAD + 26, CONTENT - 26
+        return PAD, CONTENT
+
     def _text(self, surface, text, y, *, size=13, weight=NSFontWeightRegular,
               color=None, x=PAD, width=CONTENT, spaced=False):
         field = _label(str(text), _font(size, weight), color or NSColor.labelColor(), width, spaced=spaced)
         field.setFrameOrigin_((x, y))
         surface.addSubview_(field)
         return field.frame().size.height
+
+    def _lockup(self, surface, x, y):
+        """The OpenSwap wordmark: the OpenSoft mark, then "OpenSwap" in one
+        weight with tight tracking, as the sibling products set theirs."""
+        mark = NSImageView.alloc().initWithFrame_(NSMakeRect(x, y, LOCKUP_MARK, LOCKUP_MARK))
+        image = NSImage.alloc().initWithContentsOfFile_(
+            str(Path(__file__).with_name("assets") / "opensoft-symbol-64.png")
+        )
+        if image is not None:
+            image.setTemplate_(True)
+            mark.setImage_(image)
+        mark.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        mark.setContentTintColor_(NSColor.labelColor())
+        mark.setAccessibilityElement_(False)
+        surface.addSubview_(mark)
+        word = NSTextField.labelWithString_("")
+        word.setAttributedStringValue_(NSAttributedString.alloc().initWithString_attributes_(
+            "OpenSwap", {
+                NSFontAttributeName: _font(15, NSFontWeightSemibold),
+                NSForegroundColorAttributeName: NSColor.labelColor(),
+                NSKernAttributeName: -0.4,
+            },
+        ))
+        word.sizeToFit()
+        size = word.frame().size
+        word.setFrameOrigin_((x + LOCKUP_MARK + 8, y + (LOCKUP_MARK - size.height) / 2))
+        surface.addSubview_(word)
 
     def _app_icon(self):
         """The app's own icon in the frozen app; the OpenSoft mark otherwise."""
@@ -292,20 +341,7 @@ class SetupWizard:
         surface = _WizardSurface.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, 480))
         surface.primary = None
         y = PAD - 4
-        mark = NSImageView.alloc().initWithFrame_(NSMakeRect(PAD, y, 26, 26))
-        image = NSImage.alloc().initWithContentsOfFile_(
-            str(Path(__file__).with_name("assets") / "opensoft-symbol-64.png")
-        )
-        if image is not None:
-            image.setTemplate_(True)
-            mark.setImage_(image)
-        mark.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-        mark.setContentTintColor_(NSColor.labelColor())
-        mark.setAccessibilityElement_(False)
-        surface.addSubview_(mark)
-        brand = _label("OpenSwap", _font(12, NSFontWeightMedium), NSColor.secondaryLabelColor(), 160)
-        brand.setFrameOrigin_((PAD + 36, y + (26 - brand.frame().size.height) / 2))
-        surface.addSubview_(brand)
+        self._lockup(surface, PAD, y)
         progress = page.get("progress")
         if progress:
             dots = _Dots.alloc().initWithFrame_(NSMakeRect(0, 0, progress[1] * 14, 8))
@@ -372,17 +408,20 @@ class SetupWizard:
             return self._text(surface, row["text"], y, size=12, color=color)
         if kind == "features":
             top = y
-            for title, text in row["items"]:
-                y += self._text(surface, title, y, size=13, weight=NSFontWeightSemibold)
+            for symbol, title, text in row["items"]:
+                self._symbol(surface, symbol, PAD, y + 1, size=18)
+                x, w = PAD + 30, CONTENT - 30
+                y += self._text(surface, title, y, size=13, weight=NSFontWeightSemibold, x=x, width=w)
                 y += 2
-                y += self._text(surface, text, y, size=12, color=NSColor.secondaryLabelColor())
+                y += self._text(surface, text, y, size=12, color=NSColor.secondaryLabelColor(), x=x, width=w)
                 y += 12
             return y - top - 12
         if kind == "item":
             top = y
-            y += self._text(surface, row["title"], y, size=13, weight=NSFontWeightSemibold)
+            x, w = self._lead(surface, row, y)
+            y += self._text(surface, row["title"], y, size=13, weight=NSFontWeightSemibold, x=x, width=w)
             y += 2
-            y += self._text(surface, row["text"], y, size=12, color=NSColor.secondaryLabelColor())
+            y += self._text(surface, row["text"], y, size=12, color=NSColor.secondaryLabelColor(), x=x, width=w)
             return y - top
         if kind == "actions":
             x = PAD
@@ -410,14 +449,15 @@ class SetupWizard:
             switch.setAccessibilityLabel_(row["label"])
             switch.sizeToFit()
             size = switch.frame().size
-            label_h = self._text(surface, row["label"], y + 2, size=13, width=CONTENT - size.width - 12)
+            x, w = self._lead(surface, row, y + 1)
+            label_h = self._text(surface, row["label"], y + 2, size=13, x=x, width=w - size.width - 12)
             switch.setFrameOrigin_((WIDTH - PAD - size.width, y))
             surface.addSubview_(switch)
             y += max(label_h + 2, size.height)
             if row.get("hint"):
                 y += 4
                 y += self._text(surface, row["hint"], y, size=12, color=NSColor.secondaryLabelColor(),
-                                width=CONTENT - size.width - 12)
+                                x=x, width=w - size.width - 12)
             return y - top
         if kind == "accounts":
             items = row["items"]
@@ -458,18 +498,19 @@ class SetupWizard:
             return box_h
         if kind == "command":
             top = y
-            y += self._text(surface, row["title"], y, size=13, weight=NSFontWeightSemibold)
+            x, w = self._lead(surface, row, y)
+            y += self._text(surface, row["title"], y, size=13, weight=NSFontWeightSemibold, x=x, width=w)
             y += 2
-            y += self._text(surface, row["text"], y, size=12, color=NSColor.secondaryLabelColor())
+            y += self._text(surface, row["text"], y, size=12, color=NSColor.secondaryLabelColor(), x=x, width=w)
             y += 6
             copy_w = 64.0
             field = _label(
                 row["command"], NSFont.monospacedSystemFontOfSize_weight_(11, NSFontWeightRegular),
-                NSColor.secondaryLabelColor(), CONTENT - copy_w - 12,
+                NSColor.secondaryLabelColor(), w - copy_w - 12,
             )
             field.setSelectable_(True)
             line_h = max(SMALL_BUTTON_H, field.frame().size.height)
-            field.setFrameOrigin_((PAD, y + (line_h - field.frame().size.height) / 2))
+            field.setFrameOrigin_((x, y + (line_h - field.frame().size.height) / 2))
             surface.addSubview_(field)
             button = self._button(surface, "Copy", row["action"], small=True, text=row["command"])
             button.setFrame_(NSMakeRect(WIDTH - PAD - copy_w, y, copy_w, SMALL_BUTTON_H))
