@@ -15,6 +15,7 @@ import types
 from pathlib import Path
 
 import pytest
+import time
 
 from openswap import launch_agent, menubar, menubar_instance
 from openswap.exceptions import ClaudeSwitchError
@@ -637,3 +638,47 @@ def test_run_takes_the_lock_before_the_app_and_its_engines_exist():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     run = text[text.index("def run(") : text.index("class MenuBarApp")]
     assert run.index("claim(") < run.index("setActivationPolicy_")
+
+
+# --- move requests (plan 021) ------------------------------------------------
+
+
+def test_a_temporary_copy_that_loses_the_lock_leaves_a_move_request(tmp_path, _instant_waits):
+    held = menubar_lock(tmp_path)
+    source = tmp_path / "OpenSwap.app"
+    source.mkdir()
+    seen = {}
+
+    def holder_handles():
+        # The holder's handler: the show request, then the move request.
+        seen["show"] = menubar_instance.consume_show_request(tmp_path)
+        seen["move"] = menubar_instance.consume_move_request(tmp_path)
+
+    try:
+        with pytest.raises(AlreadyRunning):
+            claim(tmp_path, as_login_item=False, say=lambda _m: None, post=holder_handles, move_from=source)
+    finally:
+        held.release()
+    assert seen == {"show": True, "move": source}
+    assert not menubar_instance.move_request_path(tmp_path).exists()
+
+
+def test_a_stable_copy_leaves_no_move_request(tmp_path, _instant_waits):
+    held = menubar_lock(tmp_path)
+    try:
+        with pytest.raises(AlreadyRunning):
+            claim(tmp_path, as_login_item=False, say=lambda _m: None,
+                  post=lambda: menubar_instance.consume_show_request(tmp_path))
+    finally:
+        held.release()
+    assert menubar_instance.consume_move_request(tmp_path) is None
+
+
+def test_a_move_request_is_dropped_when_stale_or_its_app_is_gone(tmp_path):
+    source = tmp_path / "OpenSwap.app"
+    source.mkdir()
+    menubar_instance.leave_move_request(tmp_path, source)
+    assert menubar_instance.consume_move_request(tmp_path, now=time.time() + 31) is None
+    menubar_instance.leave_move_request(tmp_path, tmp_path / "gone.app")
+    assert menubar_instance.consume_move_request(tmp_path) is None
+    assert menubar_instance.consume_move_request(tmp_path) is None  # consumed once
