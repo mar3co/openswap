@@ -8,6 +8,7 @@ here; nothing touches a real LaunchAgent or file outside ``tmp_path``.
 
 from __future__ import annotations
 
+import json
 import plistlib
 import shlex
 import shutil
@@ -414,6 +415,53 @@ class TestUndoPhaseOneAndTwo:
                 ["Removed the menu bar login item.", "Removed the Remote tasks worker."] if attempt == 0 else []
             )
         assert not frozen_app.exists() and not any(agents.iterdir())
+
+
+class TestStatusLineUndoWithTheRealHook:
+    """The status line through the real statusline module. Turning the
+    toggle on may refuse to rewrite an unusual hook (statusline._with_command);
+    an uninstall never rewrites one: it puts back the user's own line in
+    place of a hook this app runs, or leaves another program's as written."""
+
+    @pytest.fixture
+    def claude(self, tmp_path, monkeypatch, frozen_app):
+        from openswap import statusline
+
+        config = tmp_path / "claude-config"
+        config.mkdir()
+        monkeypatch.setattr("openswap.paths.get_claude_config_home", lambda: config)
+        statusline.save_wrap(uninstall.paths.get_backup_root(), inner_command="my-line", created=False)
+        exe = shlex.quote(str(frozen_app / "Contents" / "MacOS" / "OpenSwap"))
+
+        def hook(command=None):
+            settings = config / "settings.json"
+            if command is not None:
+                settings.write_text(json.dumps({"statusLine": {"type": "command", "command": command}}))
+            return json.loads(settings.read_text()).get("statusLine", {}).get("command")
+
+        return hook, exe
+
+    @pytest.mark.parametrize("form", [
+        "{exe} statusline",
+        "echo ready&&{exe} statusline",  # an operator with no spaces
+        "FOO=$(true) {exe} statusline",  # a prefix the toggle will not rewrite
+    ])
+    def test_a_hook_this_app_runs_gives_back_the_users_line(self, claude, form):
+        hook, exe = claude
+        hook(form.format(exe=exe))
+        assert uninstall._restore_status_line() is True
+        assert hook() == "my-line"
+        assert uninstall._restore_status_line() is False  # twice: nothing left
+
+    def test_another_openswaps_unusual_hook_is_left_as_written(self, claude, tmp_path):
+        hook, _ = claude
+        uv = tmp_path / "uv-bin" / "openswap"
+        uv.parent.mkdir()
+        uv.write_text("#!/bin/sh\n")
+        written = f"FOO=$(true) {shlex.quote(str(uv))} statusline"
+        hook(written)
+        assert uninstall._restore_status_line() is False
+        assert hook() == written
 
 
 class TestNoRelaunchAndExplicitPaths:
