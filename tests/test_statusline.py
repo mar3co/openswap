@@ -876,3 +876,52 @@ def test_the_app_pins_its_own_executable_and_recognises_that_hook(frozen_app, tm
     assert command == f"{shlex.quote(str(exe))} statusline"
     assert sl.is_our_command(command)
     assert not sl.is_our_command("/Applications/Other.app/Contents/MacOS/Other statusline")
+
+
+class TestSharedToggle:
+    """`statusline --install/--uninstall` and the app's Settings toggle (plan 020)."""
+
+    def test_set_installed_wraps_with_the_pinned_command_and_restores(self, tmp_path: Path, monkeypatch):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        (claude / "settings.json").write_text(
+            json.dumps({"statusLine": {"type": "command", "command": "~/.claude/statusline.sh"}}),
+            encoding="utf-8",
+        )
+        backup = tmp_path / "OpenSwap"
+        backup.mkdir()
+        monkeypatch.setattr(sl, "paint_command", lambda: "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap statusline")
+        assert sl.is_installed(claude) is False
+
+        assert sl.set_installed(claude, backup, True) == {"already": False, "created": False, "migrated": False}
+        settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
+        assert settings["statusLine"]["command"] == "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap statusline"
+        assert sl.is_installed(claude) is True
+
+        assert sl.set_installed(claude, backup, False) == {"restored": True}
+        settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
+        assert settings["statusLine"]["command"] == "~/.claude/statusline.sh"
+        assert sl.is_installed(claude) is False
+
+    def test_a_missing_settings_file_is_not_installed(self, tmp_path: Path):
+        assert sl.is_installed(tmp_path / ".claude") is False
+
+    @pytest.mark.parametrize("flag, enabled", [("--install", True), ("--uninstall", False)])
+    def test_the_cli_goes_through_the_shared_function(self, temp_home: Path, monkeypatch, capsys, flag, enabled):
+        from openswap.cli import _statusline_command
+
+        calls: list[tuple] = []
+
+        def fake_set_installed(config_home, backup_root, on):
+            calls.append((config_home, backup_root, on))
+            return {"already": False, "created": True, "migrated": False} if on else {"restored": True}
+
+        monkeypatch.setattr(sl, "set_installed", fake_set_installed)
+        monkeypatch.setattr(sl, "install", lambda *a, **k: pytest.fail("call set_installed"))
+        monkeypatch.setattr(sl, "uninstall", lambda *a, **k: pytest.fail("call set_installed"))
+        assert _statusline_command([flag]) == 0
+        from openswap import paths
+
+        assert calls == [(paths.get_claude_config_home(), paths.get_backup_root(), enabled)]
+        out = capsys.readouterr().out
+        assert ("installed" if enabled else "restored") in out

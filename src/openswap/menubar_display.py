@@ -426,6 +426,8 @@ def settings_page_rows(
     worker_status: dict | None = None,
     worker_paired: bool = False,
     login_item: dict | None = None,
+    status_line: bool = False,
+    bundled_widget: bool = False,
     section: str | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
@@ -443,6 +445,13 @@ def settings_page_rows(
     Claude, ChatGPT desktop selection, and Codex CLI rotation are named
     independently. ChatGPT suggestions and live Codex rotation are mutually
     exclusive in the controller; the model makes that relationship visible.
+
+    General ends with **This Mac**: what ``openswap setup`` and its
+    neighbours set up from a terminal. After Open at login,
+    ``status_line`` is whether Claude Code's status line is OpenSwap's (read
+    from disk when the page is built); ``bundled_widget`` is true in the app
+    at a stable location, which registers its widget at start-up, so only
+    adding it is left.
     """
     general = [
         {
@@ -532,6 +541,7 @@ def settings_page_rows(
             ),
         })
     general.extend(this_mac_rows(login_item))
+    general.extend(_this_mac_setup_rows(status_line=status_line, bundled_widget=bundled_widget))
 
     remote = [
         {
@@ -848,6 +858,34 @@ def this_mac_rows(login_item: dict | None) -> list[dict]:
             "id": "open_at_login_hint",
             "label": note,
             "lines": _hint_lines(note),
+        })
+    return rows
+
+
+def _this_mac_setup_rows(*, status_line: bool, bundled_widget: bool) -> list[dict]:
+    """General › This Mac after Open at login: the rest of the terminal's setup."""
+    # Lazy: widget_install pulls in widget_snapshot, which imports menubar.
+    from openswap.widget_install import ADD_WIDGET_HINT
+
+    rows = [
+        {
+            # `openswap statusline --install/--uninstall`, through the same
+            # statusline.set_installed.
+            "kind": "toggle",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "claude_status_line",
+            "label": "Claude Code status line",
+            "value": bool(status_line),
+        },
+    ]
+    if bundled_widget:
+        rows.append({
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_GENERAL,
+            "id": "widget_hint",
+            "label": ADD_WIDGET_HINT,
+            "lines": _hint_lines(ADD_WIDGET_HINT),
         })
     return rows
 

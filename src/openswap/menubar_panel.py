@@ -969,6 +969,8 @@ class MenuBarPanel:
         on_add_claude=None,
         on_card_menu=None,
         on_toggle_codex_auto=None,
+        status_line=None,
+        bundled_widget=None,
     ):
         self._on_switch = on_switch
         self._on_card_menu = on_card_menu
@@ -1005,6 +1007,8 @@ class MenuBarPanel:
         self._worker_status = worker_status or (lambda: {})
         self._worker_paired = worker_paired or (lambda: False)
         self._login_item = login_item
+        self._status_line = status_line or (lambda: False)
+        self._bundled_widget = bundled_widget or (lambda: False)
         self._on_worker_view_active = on_worker_view_active
         self._login_alias = ""
         self._login_alias_field = None
@@ -2000,6 +2004,14 @@ class MenuBarPanel:
             login_item = self._login_item() if callable(self._login_item) else None
         except Exception:
             login_item = None
+        try:
+            status_line = bool(self._status_line())
+        except Exception:
+            status_line = False
+        try:
+            bundled_widget = bool(self._bundled_widget())
+        except Exception:
+            bundled_widget = False
         rows = settings_page_rows(
             settings,
             strategy=strategy,
@@ -2011,6 +2023,8 @@ class MenuBarPanel:
             worker_status=worker_status,
             worker_paired=worker_paired,
             login_item=login_item,
+            status_line=status_line,
+            bundled_widget=bundled_widget,
             section=self._settings_section,
         )
 

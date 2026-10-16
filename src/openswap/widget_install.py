@@ -16,11 +16,13 @@ needs an app around it, and there are two:
 
 from __future__ import annotations
 
+import logging
 import os
 import plistlib
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from openswap import bundle
@@ -48,6 +50,11 @@ SCHEME = "OpenSwapWidget"
 HOST_PRODUCT = "OpenSwap"
 # The separately built Swift host. The cask's app is `com.opensoft.openswap`.
 HOST_BUNDLE_ID = "com.opensoft.openswap.widget"
+# What the app (Settings) and `openswap setup` tell the user once the bundled
+# appex registers itself at start-up.
+ADD_WIDGET_HINT = "Add the widget: Edit Widgets, search OpenSwap"
+
+_logger = logging.getLogger("openswap")
 
 
 def _require_macos() -> None:
@@ -411,6 +418,37 @@ def _install_bundled_widget(home: Path | None = None, uid: int | None = None) ->
     retire_legacy_host(home=home, uid=uid, registered=True)
     notify_widget_reload()
     return {"app": str(app), "label": "", "plist": ""}
+
+
+def register_on_start(home: Path | None = None, uid: int | None = None) -> bool:
+    """Register the bundled appex when the app starts and it is not registered.
+
+    The same registration as ``openswap widget --install``, so a cask install
+    opened from Finder offers the widget without a terminal. Only the frozen
+    app does this, and never from a translocated or mounted copy: that path
+    is gone soon, and registering it would leave a dead provider. Never
+    raises; a failure is logged, not shown. Returns whether it registered.
+    """
+    if sys.platform != "darwin" or not bundle.is_frozen():
+        return False
+    if bundle.runs_from_temporary_location():
+        return False
+    try:
+        if widget_status(home=home, uid=uid)["registered"]:
+            return False
+        _install_bundled_widget(home=home, uid=uid)
+    except Exception:
+        _logger.warning("Could not register the OpenSwap widget", exc_info=True)
+        return False
+    _logger.info("Registered the OpenSwap widget")
+    return True
+
+
+def register_on_start_in_background() -> threading.Thread:
+    """:func:`register_on_start` off the caller's thread (pluginkit is slow)."""
+    thread = threading.Thread(target=register_on_start, name="openswap-widget-register", daemon=True)
+    thread.start()
+    return thread
 
 
 def install_widget(

@@ -100,6 +100,14 @@ def desktop_switch_confirm_copy(name, *, pause_auto=False, process_state="runnin
     )
 
 
+def _bundled_widget() -> bool:
+    """Whether this is the app at a stable location, which registers its
+    widget at start-up (``widget_install.register_on_start``)."""
+    from openswap import bundle
+
+    return bundle.is_frozen() and not bundle.runs_from_temporary_location()
+
+
 def run(switcher, codex=None) -> int:
     """Entry point for ``openswap menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -1487,6 +1495,8 @@ def run(switcher, codex=None) -> int:
                 on_worker_view_active=self._worker_view_active,
                 worker_paired=lambda: self._worker_policy.control_service_url is not None,
                 login_item=self._login_item_state,
+                status_line=self._status_line_installed,
+                bundled_widget=_bundled_widget,
             )
             self._panel.attach(nsitem)
             # Requests left before the observers existed: `openswap setup`
@@ -1730,6 +1740,8 @@ def run(switcher, codex=None) -> int:
                     return
             elif row_id == "kickoff_enabled":
                 self.on_toggle_kickoff(None)
+            elif row_id == "claude_status_line":
+                self._toggle_status_line()
             elif row_id == "kickoff_time":
                 self.on_kickoff_time(value)
                 # The popup already shows the pick; do not rebuild the page
@@ -1828,6 +1840,31 @@ def run(switcher, codex=None) -> int:
                 and getattr(panel, "_page", None) == SETTINGS_PAGE
             ):
                 panel.reload()
+
+        def _status_line_installed(self) -> bool:
+            from openswap import paths
+            from openswap.statusline import is_installed
+
+            try:
+                return is_installed(paths.get_claude_config_home())
+            except Exception:
+                self.switcher._logger.debug("status line read failed", exc_info=True)
+                return False
+
+        def _toggle_status_line(self) -> None:
+            """Settings › This Mac: `openswap statusline --install/--uninstall`.
+
+            Flips what is on disk now, not what the page showed: the CLI may
+            have changed it since the page was built.
+            """
+            from openswap import paths
+            from openswap.statusline import set_installed
+
+            enable = not self._status_line_installed()
+            try:
+                set_installed(paths.get_claude_config_home(), self.switcher.backup_dir, enable)
+            except (ClaudeSwitchError, OSError) as e:
+                self._show_error(f"Couldn't change the Claude Code status line: {e}")
 
         def _toggle_codex_auto(self) -> bool:
             """Flip live Codex CLI rotation (Settings row and the Codex tab's footer toggle)."""

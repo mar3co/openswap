@@ -531,6 +531,24 @@ def install(
     return {"already": False, "created": created, "migrated": False}
 
 
+def is_installed(config_home: Path) -> bool:
+    """Whether Claude Code's status line is OpenSwap's (the app's toggle)."""
+    return installed_command(config_home) is not None
+
+
+def set_installed(config_home: Path, backup_root: Path, enabled: bool) -> dict:
+    """Wrap Claude Code's status line, or restore it.
+
+    The one path behind ``openswap statusline --install/--uninstall`` and
+    the app's Settings toggle, so both write the same hook: it always pins
+    :func:`paint_command`. Returns :func:`install`'s or :func:`uninstall`'s
+    result.
+    """
+    if enabled:
+        return install(config_home, backup_root, command=paint_command())
+    return uninstall(config_home, backup_root)
+
+
 def uninstall(config_home: Path, backup_root: Path) -> dict:
     settings_file = config_home / "settings.json"
     settings = _read_json_for_write(settings_file)

@@ -40,8 +40,11 @@ def _by_id(rows):
 def test_this_mac_closes_the_general_section(provider):
     rows = _rows({"enabled": True}, menu_bar_provider=provider)
     ids = [row["id"] for row in rows]
-    assert ids[-2:] == ["group_this_mac", "open_at_login"]
-    group, toggle = rows[-2:]
+    at = ids.index("group_this_mac")
+    # The last group of General: Open at login, then the rest of setup
+    # (phase 2's status line toggle; the widget hint only in the app).
+    assert ids[at:] == ["group_this_mac", "open_at_login", "claude_status_line"]
+    group, toggle = rows[at:at + 2]
     assert group["kind"] == "group" and group["style"] == "section"
     assert group["label"] == "This Mac"
     assert toggle["kind"] == "toggle" and toggle["label"] == "Open at login"
@@ -83,7 +86,10 @@ def test_a_temporary_copy_cannot_switch_it_and_says_why():
     assert hint["label"] == menubar.OPEN_AT_LOGIN_MOVE_HINT
     assert "Applications" in hint["label"]
     assert "open_at_login_failed" not in by_id
-    assert [row["id"] for row in rows][-1] == "open_at_login_hint"
+    ids = [row["id"] for row in rows]
+    assert ids[ids.index("open_at_login"):][:3] == [
+        "open_at_login", "open_at_login_hint", "claude_status_line",
+    ]
 
 
 def test_a_change_in_flight_disables_the_switch():
@@ -105,7 +111,9 @@ def test_other_outcomes_need_no_hint(outcome):
 def test_a_failed_start_puts_a_warning_right_after_the_switch():
     rows = _rows({"enabled": True, "start_failed": True, "as_login_item": False})
     ids = [row["id"] for row in rows]
-    assert ids[-3:] == ["group_this_mac", "open_at_login", "open_at_login_failed"]
+    at = ids.index("group_this_mac")
+    # Phase 2's rows follow the warning.
+    assert ids[at:at + 4] == ["group_this_mac", "open_at_login", "open_at_login_failed", "claude_status_line"]
     warning = _by_id(rows)["open_at_login_failed"]
     assert warning["kind"] == "button"
     assert warning["label"] == "macOS isn’t starting OpenSwap at login"

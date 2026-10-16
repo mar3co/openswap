@@ -441,3 +441,69 @@ def test_source_uninstall_is_refused_beside_the_cask(source_darwin, tmp_path, mo
     with pytest.raises(ClaudeSwitchError, match="installed with Homebrew"):
         wi.uninstall_widget(home=tmp_path)
     assert app.is_dir()
+
+
+# ---- start-up registration (plan 020 step 5) --------------------------------
+
+_LISTED = (
+    "+    com.opensoft.openswap.widget.extension(1.0)\tAAAA\t2026-10-01 10:00:00 +0000\t"
+    "/Applications/OpenSwap.app/Contents/PlugIns/OpenSwapWidgetExtension.appex\n"
+)
+_LIST = ["pluginkit", "-m", "-D", "-v", "-i", "com.opensoft.openswap.widget.extension"]
+
+
+def test_start_up_registers_the_appex_when_macos_has_not(frozen_darwin, tmp_path):
+    appex = frozen_darwin["app"] / "Contents" / "PlugIns" / "OpenSwapWidgetExtension.appex"
+    assert wi.register_on_start(home=tmp_path) is True
+    # The same registration as `openswap widget --install`, after the check.
+    assert frozen_darwin["runs"].calls == [_LIST, ["pluginkit", "-a", str(appex)]]
+
+
+def test_start_up_leaves_a_registered_widget_alone(frozen_darwin, tmp_path):
+    frozen_darwin["runs"].pluginkit_out = _LISTED
+    assert wi.register_on_start(home=tmp_path) is False
+    assert frozen_darwin["runs"].calls == [_LIST]
+
+
+def test_start_up_never_registers_from_a_temporary_location(frozen_darwin, tmp_path, monkeypatch):
+    monkeypatch.setattr(wi.bundle, "runs_from_temporary_location", lambda app=None: True)
+    assert wi.register_on_start(home=tmp_path) is False
+    assert frozen_darwin["runs"].calls == []
+
+
+def test_start_up_registration_is_the_apps_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(wi.sys, "platform", "darwin")
+    monkeypatch.delattr(wi.sys, "frozen", raising=False)
+    monkeypatch.setattr(wi, "_pluginkit", lambda *a: pytest.fail("a uv install registers nothing at start-up"))
+    assert wi.register_on_start(home=tmp_path) is False
+
+
+@pytest.mark.parametrize("rc_for", ["list", "register"])
+def test_start_up_registration_logs_a_failure_and_never_raises(
+    frozen_darwin, tmp_path, caplog, monkeypatch, rc_for
+):
+    if rc_for == "list":
+        frozen_darwin["runs"].pluginkit_rc = 1
+    else:
+        real = frozen_darwin["runs"]
+
+        def refuse_register(argv, **kwargs):
+            if argv[:2] == ["pluginkit", "-a"]:
+                import subprocess
+
+                return subprocess.CompletedProcess(argv, 1, "", "denied")
+            return real(argv, **kwargs)
+
+        monkeypatch.setattr(wi.subprocess, "run", refuse_register)
+    with caplog.at_level("WARNING", logger="openswap"):
+        assert wi.register_on_start(home=tmp_path) is False
+    assert "Could not register the OpenSwap widget" in caplog.text
+
+
+def test_start_up_registration_runs_off_the_callers_thread(monkeypatch):
+    import threading
+
+    seen: list[str] = []
+    monkeypatch.setattr(wi, "register_on_start", lambda: seen.append(threading.current_thread().name))
+    wi.register_on_start_in_background().join(timeout=5)
+    assert seen == ["openswap-widget-register"]
