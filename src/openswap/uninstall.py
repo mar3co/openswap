@@ -109,6 +109,11 @@ def remove_integrations(
 ) -> Removal:
     """Remove the login item, the worker, the status line, and the widget.
 
+    Also, quietly: the menu bar's lock, show and hand-over requests, and the
+    login item's last start failure, and in the app the finished welcome
+    page, so a reinstall offers Open at login again. Each step finds nothing
+    to do when its part is already gone, so a second run succeeds.
+
     Never raises: a part that fails is reported in ``failed`` and the rest
     still run. The app only removes what runs a copy of OpenSwap.app, so
     uninstalling the cask leaves a uv install's login item alone. A uv or
@@ -122,6 +127,8 @@ def remove_integrations(
     removal = Removal()
     steps = (
         ("menu bar login item", lambda: _remove_menubar_agent(home, uid)),
+        ("menu bar's runtime files", _remove_menubar_state),
+        ("welcome page state", _reset_welcome),
         ("Remote tasks worker", lambda: _remove_worker(home, uid, force)),
         ("Claude Code status line", _restore_status_line),
         ("widget", lambda: _remove_widget(home, uid)),
@@ -164,6 +171,66 @@ def _remove_menubar_agent(home: Path, uid: int | None) -> bool:
         result = launch_agent.uninstall(label, home=home, uid=uid)
         removed = removed or result["was_loaded"] or result["removed_plist"]
     return removed
+
+
+def _remove_menubar_state() -> bool:
+    """Delete the menu bar's transient files from the backup root: its lock,
+    show and hand-over requests, and the login item's last start failure.
+
+    Only while no extra holds the lock: one that still runs (a uv install's,
+    beside the cask) owns them, and unlinking a held lock would let a second
+    extra lock a new file at the same path. Returns False: nothing the user
+    set up, so nothing to report.
+    """
+    from openswap import launch_agent, menubar_instance
+
+    backup = paths.get_backup_root()
+    lock_file = menubar_instance.lock_path(backup)
+    lock = None
+    if lock_file.exists():
+        try:
+            lock = menubar_instance.menubar_lock(backup)
+        except OSError:
+            return False  # no flock here, or the file cannot be opened
+        if lock is None:
+            return False
+    try:
+        for path in (
+            menubar_instance.show_request_path(backup),
+            menubar_instance.handoff_request_path(backup),
+            launch_agent.login_item_status_path(backup),
+            *([lock_file] if lock is not None else []),
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    finally:
+        if lock is not None:
+            lock.release()
+    return False
+
+
+def _reset_welcome() -> bool:
+    """Show the app's welcome page again after a reinstall.
+
+    ``welcome_done`` says the login item was decided, and the uninstall has
+    just removed it: kept, a reinstalled app opened from Finder would skip the
+    welcome and never offer Open at login. Only the app shows the welcome.
+    Returns False, as for the runtime files.
+    """
+    if not bundle.is_frozen():
+        return False
+    from openswap.menubar_display import MenuBarSettings, menubar_settings_path
+
+    path = menubar_settings_path(paths.get_backup_root())
+    if not path.is_file():
+        return False
+    settings = MenuBarSettings.load(path)
+    if settings.welcome_done:
+        settings.welcome_done = False
+        settings.save(path)
+    return False
 
 
 def _remove_worker(home: Path, uid: int | None, force: bool) -> bool:

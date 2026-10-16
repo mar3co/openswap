@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import plistlib
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -17,8 +18,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from openswap import cli, macos_keychain, uninstall
+from openswap import cli, launch_agent, macos_keychain, menubar_instance, uninstall
 from openswap.exceptions import ClaudeSwitchError
+from openswap.menubar_display import MenuBarSettings, menubar_settings_path
+
+# The mac fixture fakes launch_agent.uninstall; a test that needs the real
+# one (to see the bootout) puts this back.
+REAL_LAUNCH_AGENT_UNINSTALL = launch_agent.uninstall
 
 BREW_RB = "/opt/homebrew/Library/Homebrew/brew.rb"
 RUBY = "/opt/homebrew/Library/Homebrew/vendor/portable-ruby/current/bin/ruby"
@@ -260,6 +266,206 @@ class TestRemoveIntegrations:
         monkeypatch.setattr("openswap.widget_install.uninstall_widget", failing)
         removal = uninstall.remove_integrations(home=home, uid=501)
         assert removal.failed == [] and "widget" not in removal.removed
+
+
+class TestUndoPhaseOneAndTwo:
+    """What plan 020's first two phases add outside the zapped data, undone
+    by an uninstall without zap, and safe to run twice."""
+
+    @staticmethod
+    def _launchd(monkeypatch, loaded: set[str]) -> list[tuple[str, ...]]:
+        calls: list[tuple[str, ...]] = []
+
+        def fake(*args):
+            calls.append(args)
+            label = args[-1].rsplit("/", 1)[-1]
+            if args[0] == "print":
+                return subprocess.CompletedProcess(args, 0 if label in loaded else 113, "", "")
+            if args[0] == "bootout":
+                loaded.discard(label)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        monkeypatch.setattr("openswap.launch_agent.uninstall", REAL_LAUNCH_AGENT_UNINSTALL)
+        monkeypatch.setattr(launch_agent, "_launchctl", fake)
+        monkeypatch.setattr(launch_agent, "_require_macos", lambda: None)
+        return calls
+
+    @pytest.mark.parametrize("with_plist", [True, False])
+    def test_a_loaded_login_item_is_booted_out(self, mac, frozen_app, monkeypatch, with_plist):
+        """launch_agent.uninstall boots the job out, not only deletes the
+        plist; a job left loaded after Open at login was turned off from it
+        (no plist) goes too."""
+        home, agents, _, _ = mac
+        plist = agents / f"{launch_agent.LABEL}.plist"
+        if with_plist:
+            _plist(plist, [str(frozen_app / "Contents" / "MacOS" / "OpenSwap")])
+        calls = self._launchd(monkeypatch, {launch_agent.LABEL})
+        removal = uninstall.remove_integrations(home=home, uid=501)
+        assert ("bootout", f"gui/501/{launch_agent.LABEL}") in calls
+        assert removal.removed == ["menu bar login item"] and not plist.exists()
+        calls.clear()
+        again = uninstall.remove_integrations(home=home, uid=501)
+        assert again.removed == [] and again.failed == []
+        assert not any(call[0] == "bootout" for call in calls)
+
+    @staticmethod
+    def _runtime_files(backup: Path) -> list[Path]:
+        backup.mkdir(parents=True, exist_ok=True)
+        files = [
+            menubar_instance.lock_path(backup),
+            menubar_instance.show_request_path(backup),
+            menubar_instance.handoff_request_path(backup),
+            launch_agent.login_item_status_path(backup),
+        ]
+        for path in files:
+            path.write_text("x")
+        return files
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the menu bar lock is a flock")
+    def test_runtime_files_go_once_no_extra_holds_the_lock(self, mac, frozen_app):
+        home, _, _, _ = mac
+        backup = uninstall.paths.get_backup_root()
+        files = self._runtime_files(backup)
+        removal = uninstall.remove_integrations(home=home, uid=501)
+        assert removal.failed == [] and removal.removed == []  # transient: not reported
+        assert not any(path.exists() for path in files)
+        assert uninstall.remove_integrations(home=home, uid=501).failed == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the menu bar lock is a flock")
+    def test_runtime_files_stay_while_another_extra_runs(self, mac, frozen_app):
+        """A uv install's extra beside the cask owns them, and unlinking its
+        held lock would let a second extra lock a new file."""
+        home, _, _, _ = mac
+        backup = uninstall.paths.get_backup_root()
+        files = self._runtime_files(backup)
+        held = menubar_instance.menubar_lock(backup)
+        try:
+            assert uninstall.remove_integrations(home=home, uid=501).failed == []
+            assert all(path.exists() for path in files)
+        finally:
+            held.release()
+
+    def test_no_data_folder_is_created_for_them(self, mac, frozen_app):
+        home, _, _, _ = mac
+        backup = uninstall.paths.get_backup_root()
+        assert not backup.exists()
+        assert uninstall.remove_integrations(home=home, uid=501).failed == []
+        assert not backup.exists()
+
+    def test_the_app_offers_its_welcome_again_after_a_reinstall(self, mac, frozen_app):
+        """welcome_done says the login item was decided; the uninstall just
+        removed it. Other settings stay without zap."""
+        home, _, _, _ = mac
+        path = menubar_settings_path(uninstall.paths.get_backup_root())
+        path.parent.mkdir(parents=True)
+        MenuBarSettings(welcome_done=True, show_account_name=False).save(path)
+        assert uninstall.remove_integrations(home=home, uid=501).failed == []
+        kept = MenuBarSettings.load(path)
+        assert kept.welcome_done is False and kept.show_account_name is False
+        assert uninstall.remove_integrations(home=home, uid=501).failed == []
+
+    def test_a_source_install_leaves_the_apps_welcome_alone(self, mac):
+        home, _, _, _ = mac
+        path = menubar_settings_path(uninstall.paths.get_backup_root())
+        path.parent.mkdir(parents=True)
+        MenuBarSettings(welcome_done=True).save(path)
+        uninstall.remove_integrations(home=home, uid=501)
+        assert MenuBarSettings.load(path).welcome_done is True
+
+    def test_the_bundled_widget_registration_is_undone(self, mac, frozen_app):
+        """The app's start-up registration (register_on_start) and
+        `widget --install` register the same bundled appex this unregisters."""
+        home, _, seen, _ = mac
+        uninstall.remove_integrations(home=home, uid=501)
+        assert seen["widget"] == ["uninstall"]
+
+    def test_the_status_line_the_toggle_pinned_is_restored(self, mac, frozen_app, monkeypatch):
+        """The Settings toggle and `statusline --install` both pin
+        paint_command(), this app's executable."""
+        home, _, seen, state = mac
+        exe = frozen_app / "Contents" / "MacOS" / "OpenSwap"
+        state["statusline"] = f"{exe} statusline"
+        monkeypatch.setattr("openswap.statusline.hook_program", lambda config_home: str(exe))
+        assert uninstall.remove_integrations(home=home, uid=501).removed == ["Claude Code status line"]
+        assert len(seen["statusline"]) == 1
+
+    def test_a_second_uninstall_from_the_app_finds_nothing_and_succeeds(
+        self, mac, frozen_app, monkeypatch
+    ):
+        """So "choose Uninstall OpenSwap… again" works after a failure."""
+        home, agents, _, _ = mac
+        exe = str(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+        _plist(agents / "com.opensoft.openswap.menubar.plist", [exe])
+        _plist(agents / "com.opensoft.openswap.worker.plist", [exe, "worker", "run", "--managed"])
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(uninstall, "homebrew_brew", lambda: None)
+
+        def trash(path):
+            if path.exists():
+                shutil.rmtree(path)
+
+        monkeypatch.setattr("openswap.widget_install._move_to_trash", trash)
+        for attempt in range(2):
+            lines: list[tuple[str, bool]] = []
+            assert uninstall.run(False, lambda line, error=False: lines.append((line, error)), from_app=True) == 0
+            assert not any(error for _, error in lines)
+            removed = [line for line, _ in lines if line.startswith("Removed the ")]
+            assert removed == (
+                ["Removed the menu bar login item.", "Removed the Remote tasks worker."] if attempt == 0 else []
+            )
+        assert not frozen_app.exists() and not any(agents.iterdir())
+
+
+class TestNoRelaunchAndExplicitPaths:
+    def test_a_clean_quit_is_not_relaunched_while_the_child_works(self, tmp_path):
+        """Uninstall OpenSwap… quits through on_quit, a clean exit. KeepAlive
+        restarts only a failed exit and nothing else in the plist starts the
+        job, so launchd cannot bring the extra back while the child removes
+        it. (unload_own_job leaves a job with its plist alone:
+        test_launch_agent.)"""
+        exe = "/Applications/OpenSwap.app/Contents/MacOS/OpenSwap"
+        plist = plistlib.loads(launch_agent.build_plist([exe], home=tmp_path))
+        assert plist["KeepAlive"] == {"SuccessfulExit": False}
+        assert not {"StartInterval", "StartCalendarInterval", "WatchPaths", "QueueDirectories",
+                    "StartOnMount"} & plist.keys()
+        from openswap import menubar
+
+        text = Path(menubar.__file__).read_text(encoding="utf-8")
+        action = text[text.index("def on_uninstall") : text.index("def on_toggle_name")]
+        assert action.rstrip().endswith("self.on_quit(None)")
+
+    def test_brew_is_the_cask_prefixs_own_not_one_on_path(self, frozen_app, monkeypatch, tmp_path):
+        prefix = tmp_path / "homebrew"
+        brew = prefix / "bin" / "brew"
+        brew.parent.mkdir(parents=True)
+        brew.write_text("#!/bin/sh\n")
+        brew.chmod(0o755)
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: True)
+        monkeypatch.setattr(uninstall.bundle, "cask_prefix", lambda: prefix)
+        assert uninstall.homebrew_brew() == brew and brew.is_absolute()
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: False)
+        assert uninstall.homebrew_brew() is None
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no execute bit")
+    def test_a_brew_that_cannot_run_is_not_used(self, frozen_app, monkeypatch, tmp_path):
+        prefix = tmp_path / "homebrew"
+        brew = prefix / "bin" / "brew"
+        brew.parent.mkdir(parents=True)
+        brew.write_text("")
+        brew.chmod(0o644)
+        monkeypatch.setattr(uninstall.bundle, "installed_by_homebrew", lambda home=None: True)
+        monkeypatch.setattr(uninstall.bundle, "cask_prefix", lambda: prefix)
+        assert uninstall.homebrew_brew() is None
+
+    def test_every_program_the_child_runs_is_an_absolute_path(self, frozen_app, monkeypatch):
+        """The extra's PATH (launchd's, or Finder's bare one) is never asked."""
+        assert Path(uninstall.app_command(True)[0]).is_absolute()
+        ran = []
+        monkeypatch.setattr(uninstall.subprocess, "run", lambda argv, **k: ran.append(argv))
+        uninstall._open("-R", str(frozen_app))
+        uninstall.show_app_log()
+        assert [argv[0] for argv in ran] == ["/usr/bin/open", "/usr/bin/open"]
 
 
 class TestZapData:
