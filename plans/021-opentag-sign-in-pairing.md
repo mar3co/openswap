@@ -144,6 +144,12 @@ lease.
   The `last_seen_at` handling matches renewal.
 - **Revocation.** Revoking a worker also clears `pending_key_hash` and
   `previous_key_hash`.
+- **A pasted renewal replaces every key.** The renewal branch of `pair`
+  (a pasted renewal code) sets the new `key_hash`. In the same transaction it
+  must clear `pending_key_hash`, `pending_key_expires_at`, `previous_key_hash`
+  and `previous_key_until`. Otherwise someone holding an old pending key could
+  still sign in after the renewal, promote that key and lock out the newly
+  issued one. So O1's migration changes the `pair` branch too.
 
 **Migration.** Add one forward migration, after the newest one at the time
 (today `20261014120000_worker_origin.sql`). It does the following:
@@ -162,6 +168,8 @@ the repo's earlier forward migrations do. pgTAP covers these cases:
 
 - rotate, then authenticate with the new key, which promotes it;
 - an old-key retry replaces the pending key;
+- a pasted renewal while a pending or previous key exists leaves only the new
+  key working: both old slots get `unauthorized` and cannot promote;
 - the old key works for 2 minutes after promotion, then gets `unauthorized`;
 - rotation and promotion leave `worker_epoch`, claims and leases unchanged;
 - a revoked worker cannot rotate;
@@ -294,8 +302,12 @@ lifetime and single use. It is issued with the same per-owner limits as the
   still worked would be cut off. So a renewal code redeemed with a verifier
   stores the new key as `pending_key_hash`, using the same pending, promotion
   and grace rules as `rotate_key` from O1. The old key keeps working until the
-  new key is first used. A renewal code redeemed without a verifier (the pasted
-  flow) keeps today's immediate replacement, so older clients see no change.
+  new key is first used. The new pending key takes the one pending slot,
+  replacing any older one, and clears `previous_key_hash`. The pending key
+  works even when the current key has already expired, because its expiry is
+  `pending_key_expires_at`. A renewal code redeemed without a verifier (the
+  pasted flow) keeps today's immediate replacement, so older clients see no
+  change. It also clears both old slots, as O1 requires.
 
 **Migration.** Add one forward migration. It adds `code_challenge`,
 `redirect_uri` and `label` (all nullable) to `remote_worker_pair_codes`, plus
@@ -307,7 +319,12 @@ the `pair` branch changes. pgTAP covers these cases:
 - a renewal through connect keeps the worker ID, leaves the new key pending,
   keeps the old key working until the new key is used, and promotes on first
   use;
-- a pasted renewal code still replaces the key at once;
+- a pasted renewal code still replaces the key at once and clears both old
+  slots;
+- a connect renewal replaces an older pending key, and that older key no
+  longer works;
+- a connect renewal for a Mac whose current key has expired works once the
+  new pending key is used;
 - a revoked worker is refused;
 - the code still expires after 10 minutes;
 - the redirect URI and challenge never leave service-only tables.
