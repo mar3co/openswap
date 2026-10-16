@@ -321,6 +321,14 @@ OpenSwap", with the command steps kept behind the same disclosure.
 
 **A new module, `openswap.worker.connect`.** It holds the connect flow:
 
+- **Lock.** Take `<backup root>/.worker-connect.lock` without waiting before
+  discovery, and hold it until redemption ends or the flow is cancelled. If
+  the lock is held, refuse with `connect_in_progress`. This must be a lock of
+  its own: holding the pairing lock for up to 10 minutes would block unpair
+  and key rotation. Redemption still takes the pairing lock briefly, as `pair`
+  does today. A process that crashes releases the lock with its file
+  descriptor.
+
 - **Discover.** Read `<origin>/.well-known/openswap-worker`, with the same
   bounded timeout and URL rules as the worker transport (`validate_url`). A
   `connect_endpoint` on a different origin is refused.
@@ -388,7 +396,7 @@ without rotation.
 | App quits or crashes after approval, before redemption | The listener is gone and the code goes unused, then expires. Nothing is paired. Run Connect again. |
 | Redemption fails (network, a refused code) | The tab and the dialog show the error. The code stays unconsumed unless the server consumed it. Run Connect again. |
 | Keychain or settings write fails | A new pairing behaves like today's `_pair`: no orphaned key and no half-configured URL. A reconnect keeps the old key, which still works while it is live because the server's new key is only pending. |
-| Two Connects at once | The pairing lock refuses the second with `pairing_in_progress`. |
+| Two Connects at once (app and CLI, or two terminals) | The connect lock is taken before discovery. The second Connect is refused at once with `connect_in_progress`, before it opens a listener or a browser page. |
 
 **Several Macs, and pairing the same Mac again.**
 
@@ -414,6 +422,8 @@ composed scripts, as for plan 017 and plan 018.
 
 ## Test plan (OpenSwap)
 
+- **Connect lock.** A second Connect is refused before it opens a listener,
+  and a crashed holder frees the lock.
 - **Listener.** It binds only to `127.0.0.1`, accepts one request, refuses a
   wrong `state` and keeps waiting, refuses other paths and methods, and closes
   on timeout and on Cancel.
