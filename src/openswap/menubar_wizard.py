@@ -87,6 +87,23 @@ class _TextButton(NSButton):
         return self.bounds()
 
 
+class _WizardSurface(_DialogSurface):
+    """White content over a grey footer (the dialog surface does the
+    reverse, which reads as a grey sheet in light mode)."""
+
+    def drawRect_(self, rect):
+        NSColor.controlBackgroundColor().setFill()
+        NSBezierPath.fillRect_(self.bounds())
+        footer = getattr(self, "footer_y", None)
+        if footer is not None:
+            NSColor.windowBackgroundColor().setFill()
+            NSBezierPath.fillRect_(NSMakeRect(
+                0, footer, self.bounds().size.width, self.bounds().size.height - footer,
+            ))
+            NSColor.separatorColor().setFill()
+            NSBezierPath.fillRect_(NSMakeRect(0, footer, self.bounds().size.width, 0.5))
+
+
 class _Box(NSView):
     """A rounded, lightly filled group behind accounts, commands and summaries."""
 
@@ -272,7 +289,7 @@ class SetupWizard:
         return image
 
     def _build(self, page):
-        surface = _DialogSurface.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, 480))
+        surface = _WizardSurface.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, 480))
         surface.primary = None
         y = PAD - 4
         mark = NSImageView.alloc().initWithFrame_(NSMakeRect(PAD, y, 26, 26))

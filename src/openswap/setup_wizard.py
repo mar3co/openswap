@@ -46,7 +46,7 @@ ACCOUNT_ACTIONS = {
 }
 
 BREW_UPGRADE = "brew upgrade --cask openswap"
-WIDGET_HINT = "Open Notification Center or right-click the desktop, choose Edit Widgets, and search for OpenSwap."
+WIDGET_HINT = "Right-click your desktop, choose Edit Widgets, and search for OpenSwap."
 
 
 @dataclass(frozen=True)
@@ -138,42 +138,35 @@ def _move_page(facts: WizardFacts) -> dict:
     plan = facts.move or {}
     source = plan.get("source")
     if source == "disk_image":
-        body = (
-            "OpenSwap is running from its disk image. Move it to Applications "
-            "so it can open at login and keep its widget."
-        )
+        body = "OpenSwap is running from the disk image. Move it to Applications to finish setting up."
     else:
-        body = (
-            "OpenSwap is running from a temporary copy macOS made of your "
-            "download. Move it to Applications so it can open at login and "
-            "keep its widget."
-        )
+        body = "OpenSwap is running from your download. Move it to Applications to finish setting up."
     rows: list[dict] = []
     destination = plan.get("destination") or "Applications"
     action = plan.get("action")
     primary = {"title": "Move to Applications", "action": ACTION_MOVE, "enabled": True}
     if action == "error":
-        rows.append(_note(f"OpenSwap can’t be moved: {plan.get('error') or 'unknown error'}", "warning"))
-        rows.append(_note("Drag OpenSwap into Applications in Finder, then open it from there."))
+        rows.append(_note(f"Couldn’t move OpenSwap: {plan.get('error') or 'unknown error'}", "warning"))
+        rows.append(_note("Drag it into your Applications folder in Finder, then open it from there."))
         primary = None
     elif action == "open_existing" and plan.get("homebrew"):
-        rows.append(_note(f"OpenSwap is already installed with Homebrew in {destination}."))
-        rows.append(_note(f"Homebrew keeps that copy up to date: {BREW_UPGRADE}"))
+        rows.append(_note(f"Homebrew already installed OpenSwap in {destination}."))
+        rows.append(_note(f"To update it, run: {BREW_UPGRADE}"))
         primary = {"title": "Open Installed Copy", "action": ACTION_OPEN_EXISTING, "enabled": True}
     elif action == "open_existing":
         version = plan.get("existing_version")
         what = f"OpenSwap {version}" if version else "OpenSwap"
-        rows.append(_note(f"{what} is already in {destination}, and it is this version or newer."))
+        rows.append(_note(f"{what} is already in {destination}, and it’s up to date."))
         primary = {"title": "Open Installed Copy", "action": ACTION_OPEN_EXISTING, "enabled": True}
     elif action == "replace":
         version = plan.get("existing_version")
-        what = f"An older OpenSwap ({version})" if version else "An older OpenSwap"
-        rows.append(_note(f"{what} is in {destination}. It goes to the Trash."))
+        what = f"An older version ({version})" if version else "An older version"
+        rows.append(_note(f"{what} is already in {destination}. It will be moved to the Trash."))
         primary = {"title": "Replace and Open", "action": ACTION_MOVE, "enabled": True}
     else:
-        rows.append(_note(f"OpenSwap goes to {destination} and opens from there."))
+        rows.append(_note(f"OpenSwap will be copied to {destination} and opened from there."))
     if source == "disk_image" and primary is not None:
-        rows.append(_note("The disk image is ejected afterwards."))
+        rows.append(_note("The disk image will be ejected when it’s done."))
     return {
         "title": "Move OpenSwap to Applications",
         "body": body,
@@ -187,21 +180,21 @@ def _move_page(facts: WizardFacts) -> dict:
 def _welcome_page() -> dict:
     return {
         "title": "Welcome to OpenSwap",
-        "body": "OpenSwap keeps your Claude Code and Codex accounts in the menu bar.",
+        "body": "OpenSwap manages your Claude Code and Codex accounts from the menu bar.",
         "icon": True,
         "rows": [
             {
                 "kind": "features",
                 "items": [
-                    ("See usage at a glance",
-                     "Each account’s five-hour and weekly limits, in the menu bar and a widget."),
+                    ("See your usage",
+                     "How much of each account you’ve used, in the menu bar and a widget."),
                     ("Switch in one click",
-                     "Move Claude Code or Codex to another account without signing out."),
-                    ("Switch automatically",
-                     "Auto-switch moves on before an account runs out."),
+                     "Switch Claude Code or Codex to another account without signing out."),
+                    ("Or let OpenSwap switch for you",
+                     "It can move to the next account before one hits its limit."),
                 ],
             },
-            _note("Setup takes about a minute. Nothing changes until you choose it."),
+            _note("This takes about a minute. Nothing changes until you say so."),
         ],
         "primary": {"title": "Get Started", "action": ACTION_NEXT, "enabled": True},
         "secondary": None,
@@ -218,22 +211,20 @@ def _account_page(provider: str, facts: WizardFacts) -> dict:
     rows: list[dict] = []
     if accounts:
         title = f"Your {name} accounts"
-        body = (
-            "OpenSwap saved these. Add another now, or later from the menu bar."
-        )
+        body = "These are saved. Add another now, or later from the menu bar."
         rows.append({"kind": "accounts", "items": [tuple(a) for a in accounts]})
     elif claude:
         title = "Add your Claude account"
         body = (
-            "Sign in through your browser, or save the login Claude Code "
-            "already has. You can add more accounts any time from the menu bar."
+            "Sign in with your browser, or save the account Claude Code is "
+            "already signed in to. You can add more later from the menu bar."
         )
     else:
         title = "Add a Codex account"
         body = (
-            "Optional. If you use the Codex CLI, OpenSwap can switch its "
-            "accounts too. Sign in through your browser, or save the login "
-            "Codex already has."
+            "Optional. If you use Codex, OpenSwap can switch its accounts too. "
+            "Sign in with your browser, or save the account Codex is already "
+            "signed in to."
         )
 
     enabled = True
@@ -241,24 +232,21 @@ def _account_page(provider: str, facts: WizardFacts) -> dict:
         rows.append(_note(f"Loading your saved {name} accounts…"))
         enabled = False
     elif state == "error":
-        rows.append(_note(
-            f"Couldn’t read the {name} account list. Your saved logins are unchanged.",
-            "warning",
-        ))
+        rows.append(_note(f"Couldn’t load your {name} accounts. Nothing was changed.", "warning"))
         rows.append({"kind": "actions", "items": [
             {"title": "Try Again", "action": f"{provider}_retry", "enabled": True},
         ]})
         enabled = False
     elif state == "unavailable":
         rows.append(_note(
-            "The shared Codex account store isn’t available. Restart OpenSwap to reconnect it.",
+            "Codex’s account list isn’t available right now. Restart OpenSwap and try again.",
             "warning",
         ))
         enabled = False
     if claude and not facts.claude_installed:
         rows.append(_note(
-            "Claude Code isn’t installed. Install it, then add accounts here "
-            "or from the menu bar.",
+            "Claude Code isn’t installed. Install it first, then add your "
+            "account here or from the menu bar.",
             "warning",
         ))
         enabled = False
@@ -266,7 +254,7 @@ def _account_page(provider: str, facts: WizardFacts) -> dict:
         sign_in = "Sign in with Claude" if claude else "Sign in with ChatGPT"
         if signing_in:
             rows.append(_note(
-                "Finish signing in in your browser. The account appears here when it’s saved."
+                "Finish signing in in your browser. Your account will show up here when it’s done."
             ))
             sign_in = "Open Sign-in Again"
         rows.append({"kind": "actions", "items": [
@@ -295,11 +283,11 @@ def _login_page(facts: WizardFacts, choices: WizardChoices) -> dict:
     hint = (
         "OpenSwap already opens at login."
         if facts.login_item
-        else "Keeps OpenSwap in the menu bar after you restart your Mac."
+        else "Starts OpenSwap when you log in to your Mac."
     )
     return {
         "title": "Open at login",
-        "body": "OpenSwap works from the menu bar, so it’s most useful when it’s always there.",
+        "body": "OpenSwap lives in the menu bar, so it’s most useful when it’s always running.",
         "rows": [
             {
                 "kind": "switch",
@@ -324,18 +312,16 @@ def terminal_command(executable: str) -> str:
 def _extras_page(facts: WizardFacts, choices: WizardChoices) -> dict:
     if facts.status_line == "other" and not choices.status_line:
         status_hint = (
-            "Claude Code’s status line runs another OpenSwap. Turning this on points it here."
+            "Claude Code’s status line is using another copy of OpenSwap. "
+            "Turn this on to use this one."
         )
     else:
-        status_hint = (
-            "Adds the account name next to the usage percentages. Your own "
-            "status line keeps working."
-        )
+        status_hint = "Adds the account name next to your usage. Your own status line keeps working."
     rows: list[dict] = [
         {
             "kind": "switch",
             "action": ACTION_TOGGLE_STATUS_LINE,
-            "label": "Show the account in Claude Code’s status line",
+            "label": "Show your account in Claude Code’s status line",
             "value": bool(choices.status_line),
             "disabled": False,
             "hint": status_hint,
@@ -347,10 +333,7 @@ def _extras_page(facts: WizardFacts, choices: WizardChoices) -> dict:
         rows.append({
             "kind": "command",
             "title": "Terminal command",
-            "text": (
-                "To use openswap in a terminal, link it into a folder on your "
-                "PATH, for example:"
-            ),
+            "text": "To use the openswap command in Terminal, run:",
             "command": terminal_command(facts.command),
             "action": ACTION_COPY_COMMAND,
         })
@@ -376,10 +359,7 @@ def _done_page(facts: WizardFacts, choices: WizardChoices) -> dict:
     summary.append(("Claude Code status line", "On" if choices.status_line else "Off"))
     return {
         "title": "You’re all set",
-        "body": (
-            "OpenSwap lives in your menu bar. Click its icon to see each "
-            "account’s usage and switch accounts."
-        ),
+        "body": "OpenSwap is in your menu bar. Click its icon to see your accounts and switch between them.",
         "rows": [{"kind": "summary", "items": summary}],
         "primary": {"title": "Open OpenSwap", "action": ACTION_FINISH, "enabled": True},
         "secondary": None,

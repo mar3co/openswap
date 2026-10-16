@@ -238,7 +238,7 @@ def test_extras_offer_the_status_line_and_the_widget():
 
 def test_a_hook_for_another_openswap_says_turning_on_points_it_here():
     page = wizard_page(EXTRAS, WizardFacts(status_line="other"), WizardChoices())
-    assert "another OpenSwap" in _rows(page, "switch")[0]["hint"]
+    assert "another copy of OpenSwap" in _rows(page, "switch")[0]["hint"]
 
 
 def test_a_finder_install_without_the_command_gets_the_link_line():
