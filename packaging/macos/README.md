@@ -79,10 +79,17 @@ the submission before failing, so the reason is in the job log.
    carries the project's own version and CI syncs with `--locked`), and
    rename `## Unreleased` in `CHANGELOG.md` to `## <version> (YYYY-MM-DD)`.
    `test_the_current_version_has_notes` fails a bump without that section.
-2. Once it merges, push an annotated tag `v<version>` on the merge commit
-   (`git tag -a v<version> -m "OpenSwap <version>"`). The workflow fails if
-   the tag and the pyproject version disagree, or if `CHANGELOG.md` has no
-   section for the version.
+2. Once it merges, tag the merge commit and push the tag (pushing it is what
+   starts the build):
+
+   ```bash
+   git fetch origin
+   git tag -a v<version> <merge-sha> -m "OpenSwap <version>"   # or origin/main if nothing merged since
+   git push origin refs/tags/v<version>
+   ```
+
+   The workflow fails if the tag and the pyproject version disagree, or if
+   `CHANGELOG.md` has no section for the version.
 3. `macOS app` builds, signs, notarizes, unpacks the zip and assesses that
    copy on each architecture. Once both legs pass, it drafts a GitHub release
    with `OpenSwap-<version>-arm64.zip`, `OpenSwap-<version>-x86_64.zip`,
