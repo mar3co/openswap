@@ -1217,25 +1217,40 @@ class SnapshotMixin:
 
         Probes run only where this pass may fetch at all (``probe``, the same
         gate as the backup probe) and only when the cached verdict is due;
-        every other pass reads the cache. A roster-only paint has no key to
-        fingerprint and keeps the plain "api key" sentinel.
+        every other pass reads the cache. A roster-only paint (the extra's
+        store-only refresh while auto-switch runs) never reads an idle key,
+        so it takes the verdict of the key last seen in that slot.
         """
         from openswap import api_key_health
 
-        keys = {
-            num: info[5]
+        candidates = {
+            num: info
             for num, info in info_by_num.items()
             if sentinels.get(num) == USAGE_API_KEY
-            and info[5] is not UNREAD_CREDENTIALS
-            and looks_like_api_key(info[5])
         }
-        if not keys:
+        if not candidates:
             return
+        keys = {
+            num: info[5]
+            for num, info in candidates.items()
+            if info[5] is not UNREAD_CREDENTIALS and looks_like_api_key(info[5])
+        }
         health = api_key_health.KeyHealth(self.backup_dir / "cache")
         due = [key for key in keys.values() if probe and health.due(key)]
         fresh = health.check_all(due) if due else {}
-        for num, key in keys.items():
-            verdict = fresh[key] if key in fresh else health.verdict(key)
+        if keys:
+            health.remember_slots({
+                api_key_health.slot_id(candidates[num][1], candidates[num][3]): key
+                for num, key in keys.items()
+            })
+        for num, info in candidates.items():
+            if num in keys:
+                key = keys[num]
+                verdict = fresh[key] if key in fresh else health.verdict(key)
+            elif info[5] is UNREAD_CREDENTIALS:
+                verdict = health.slot_verdict(api_key_health.slot_id(info[1], info[3]))
+            else:
+                continue
             if verdict == api_key_health.VERDICT_REVOKED:
                 sentinels[num] = USAGE_API_KEY_REVOKED
             elif verdict == api_key_health.VERDICT_NO_CREDIT:

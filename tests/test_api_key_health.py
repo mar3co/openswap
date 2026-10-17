@@ -341,6 +341,38 @@ class TestCollector:
         assert s._collect_usage_entries(self._info())["2"].sentinel == USAGE_API_KEY_REVOKED
         assert s._collect_usage_entries(self._info(OTHER_KEY))["2"].sentinel == USAGE_API_KEY
 
+    def test_roster_only_paint_keeps_the_slots_dead_verdict(self, temp_home, monkeypatch):
+        from openswap.engine.notes import UNREAD_CREDENTIALS
+
+        monkeypatch.setattr(api_key_health, "probe", lambda key: VERDICT_REVOKED)
+        s = self._switcher()
+        s._collect_usage_entries(self._info())
+        unread = self._info(UNREAD_CREDENTIALS)
+        monkeypatch.setattr(s, "_account_kind", lambda num: "api_key")
+        entries = s._collect_usage_entries(unread, fetch=set())
+        assert entries["2"].sentinel == USAGE_API_KEY_REVOKED
+
+    def test_roster_only_paint_without_a_recorded_key_is_plain(self, temp_home, monkeypatch):
+        from openswap.engine.notes import UNREAD_CREDENTIALS
+
+        s = self._switcher()
+        monkeypatch.setattr(s, "_account_kind", lambda num: "api_key")
+        entries = s._collect_usage_entries(self._info(UNREAD_CREDENTIALS), fetch=set())
+        assert entries["2"].sentinel == USAGE_API_KEY
+
+    def test_replacing_the_key_clears_the_slots_dead_verdict(self, temp_home, monkeypatch):
+        from openswap.engine.notes import UNREAD_CREDENTIALS
+
+        monkeypatch.setattr(api_key_health, "probe", lambda key: VERDICT_REVOKED)
+        s = self._switcher()
+        s.add_account_from_token(KEY, slot=2)
+        email = s._get_sequence_data()["accounts"]["2"]["email"]
+        info = [(2, email, "", "", False, KEY, "")]
+        s._collect_usage_entries(info)
+        s.add_account_from_token(OTHER_KEY, slot=2, assume_yes=True)
+        unread = [(2, email, "", "", False, UNREAD_CREDENTIALS, "")]
+        assert s._collect_usage_entries(unread, fetch=set())["2"].sentinel == USAGE_API_KEY
+
     def test_oauth_slot_is_never_probed(self, temp_home, monkeypatch):
         calls = []
         monkeypatch.setattr(api_key_health, "probe", lambda key: calls.append(key))

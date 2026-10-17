@@ -112,6 +112,17 @@ def _error_message(e: urllib.error.HTTPError) -> str:
     return message if isinstance(message, str) else ""
 
 
+def _verdict_of(entry: object) -> str | None:
+    verdict = entry.get("verdict") if isinstance(entry, dict) else None
+    return verdict if verdict in (VERDICT_OK, VERDICT_REVOKED, VERDICT_NO_CREDIT) else None
+
+
+def slot_id(email: str, org_uuid: str) -> str:
+    """The cache's name for a roster slot: its identity, never its number
+    (``swap`` and ``move`` renumber slots)."""
+    return f"{email}\x00{org_uuid or ''}"
+
+
 class KeyHealth:
     """Cached verdicts per key fingerprint, probed when due."""
 
@@ -123,9 +134,35 @@ class KeyHealth:
     def verdict(self, key: str) -> str | None:
         """The cached verdict for ``key`` (any age), or None."""
         fp = credential_fingerprint(key)
-        entry = self._read().get(fp) if fp else None
-        verdict = entry.get("verdict") if isinstance(entry, dict) else None
-        return verdict if verdict in (VERDICT_OK, VERDICT_REVOKED, VERDICT_NO_CREDIT) else None
+        return _verdict_of(self._read().get(fp)) if fp else None
+
+    def slot_verdict(self, slot: str) -> str | None:
+        """The cached verdict for the key last seen in ``slot``, or None.
+
+        For roster-only passes, which never read an idle key: the slot's
+        fingerprint is recorded by :meth:`remember_slots` on passes that do.
+        """
+        keys, slots = self._read_all()
+        fp = slots.get(slot)
+        return _verdict_of(keys.get(fp)) if isinstance(fp, str) else None
+
+    def remember_slots(self, keys_by_slot: dict[str, str]) -> None:
+        """Record which key each slot holds (by fingerprint); writes only on change."""
+        wanted = {
+            slot: fp
+            for slot, key in keys_by_slot.items()
+            if (fp := credential_fingerprint(key))
+        }
+        if all(self._read_all()[1].get(slot) == fp for slot, fp in wanted.items()):
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with FileLock(self._path.with_name(CACHE_NAME + ".lock"), timeout=5.0):
+                keys, slots = self._read_all()
+                slots.update(wanted)
+                self._write(keys, slots)
+        except (LockError, OSError):
+            pass  # a later pass that reads the keys records it
 
     def due(self, key: str) -> bool:
         """Whether ``key`` should be probed now."""
@@ -167,7 +204,7 @@ class KeyHealth:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with FileLock(self._path.with_name(CACHE_NAME + ".lock"), timeout=5.0):
-                data = self._read()
+                data, slots = self._read_all()
                 for fp, result in results.items():
                     previous = data.get(fp) if isinstance(data.get(fp), dict) else {}
                     verdict = result if result is not None else previous.get("verdict")
@@ -178,7 +215,7 @@ class KeyHealth:
                         entry["inconclusive"] = True
                     data[fp] = entry
                     verdicts[by_fp[fp]] = verdict
-                self._write(data)
+                self._write(data, slots)
         except (LockError, OSError):
             # Unrecorded this pass (the next one probes again), but this
             # pass still acts on what it just learned, and an inconclusive
@@ -191,14 +228,23 @@ class KeyHealth:
         return verdicts
 
     def _read(self) -> dict:
+        return self._read_all()[0]
+
+    def _read_all(self) -> tuple[dict, dict]:
+        """``(keys, slots)``: verdicts by fingerprint, fingerprint by slot."""
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, ValueError, UnicodeDecodeError):
-            return {}
-        keys = raw.get("keys") if isinstance(raw, dict) else None
-        return dict(keys) if isinstance(keys, dict) else {}
+            return {}, {}
+        if not isinstance(raw, dict):
+            return {}, {}
+        keys, slots = raw.get("keys"), raw.get("slots")
+        return (
+            dict(keys) if isinstance(keys, dict) else {},
+            dict(slots) if isinstance(slots, dict) else {},
+        )
 
-    def _write(self, keys: dict) -> None:
+    def _write(self, keys: dict, slots: dict) -> None:
         now = self._clock()
         keys = {
             fp: entry
@@ -207,11 +253,15 @@ class KeyHealth:
             and isinstance(entry.get("checkedAt"), (int, float))
             and now - entry["checkedAt"] < PRUNE_AFTER_S
         }
+        slots = {
+            slot: fp for slot, fp in slots.items()
+            if isinstance(slot, str) and isinstance(fp, str)
+        }
         try:
             fd, tmp = tempfile.mkstemp(dir=self._path.parent, prefix=".api_key_health.")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump({"keys": keys}, f)
+                    json.dump({"keys": keys, "slots": slots}, f)
                 replace_with_retry(tmp, self._path)
             except BaseException:
                 try:
