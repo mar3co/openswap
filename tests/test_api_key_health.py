@@ -181,6 +181,29 @@ class TestKeyHealth:
         assert health.check(KEY) == VERDICT_OK
         assert health.verdict(KEY) == VERDICT_OK
 
+    def test_one_batch_records_every_key(self, tmp_path):
+        verdicts = {KEY: VERDICT_REVOKED, OTHER_KEY: VERDICT_NO_CREDIT}
+        health = KeyHealth(tmp_path, prober=verdicts.get, clock=Clock())
+        assert health.check_all([KEY, OTHER_KEY]) == verdicts
+        assert health.verdict(KEY) == VERDICT_REVOKED
+        assert health.verdict(OTHER_KEY) == VERDICT_NO_CREDIT
+
+    def test_batch_keeps_a_concurrent_writers_verdict(self, tmp_path):
+        clock = Clock()
+        KeyHealth(tmp_path, prober=lambda k: VERDICT_REVOKED, clock=clock).check(OTHER_KEY)
+        KeyHealth(tmp_path, prober=lambda k: VERDICT_OK, clock=clock).check(KEY)
+        health = KeyHealth(tmp_path, clock=clock)
+        assert health.verdict(OTHER_KEY) == VERDICT_REVOKED
+        assert health.verdict(KEY) == VERDICT_OK
+
+    def test_lock_contention_still_returns_the_fresh_verdicts(self, tmp_path):
+        from openswap.exceptions import LockError
+
+        health = KeyHealth(tmp_path, prober=lambda k: VERDICT_REVOKED, clock=Clock())
+        with patch.object(api_key_health.FileLock, "__enter__", side_effect=LockError("busy")):
+            assert health.check_all([KEY]) == {KEY: VERDICT_REVOKED}
+        assert health.verdict(KEY) is None
+
     def test_cache_never_holds_the_key(self, tmp_path):
         health, _ = self._health(tmp_path, [VERDICT_REVOKED])
         health.check(KEY)
@@ -265,6 +288,21 @@ class TestCollector:
             s._collect_usage_entries(self._info(), fetch=set())["2"].sentinel
             == USAGE_API_KEY_REVOKED
         )
+
+    def test_two_dead_keys_in_one_pass_both_stick(self, temp_home, monkeypatch):
+        verdicts = {KEY: VERDICT_REVOKED, OTHER_KEY: VERDICT_NO_CREDIT}
+        monkeypatch.setattr(api_key_health, "probe", verdicts.get)
+        s = self._switcher()
+        info = [
+            (2, "api-key-2@token.local", "", "", False, KEY, ""),
+            (3, "api-key-3@token.local", "", "", False, OTHER_KEY, ""),
+        ]
+        entries = s._collect_usage_entries(info)
+        assert entries["2"].sentinel == USAGE_API_KEY_REVOKED
+        assert entries["3"].sentinel == USAGE_API_KEY_NO_CREDIT
+        again = s._collect_usage_entries(info, fetch=set())
+        assert again["2"].sentinel == USAGE_API_KEY_REVOKED
+        assert again["3"].sentinel == USAGE_API_KEY_NO_CREDIT
 
     def test_probe_waits_for_its_ttl(self, temp_home, monkeypatch):
         calls = []

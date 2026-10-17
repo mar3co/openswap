@@ -1212,6 +1212,7 @@ class AutoSwitchEngine:
             # Paid credit is the last resort only when no subscription has
             # known room: at-limit, or a failover where a subscription was
             # measured this tick or none is in rotation.
+            api_key_candidates = self._working_keys(api_key_candidates, usage)
             ordered = api_key_candidates
 
         if not ordered and dead_key:
@@ -2228,6 +2229,22 @@ class AutoSwitchEngine:
             return (group, int(num))
 
         return sorted(keys, key=rank)
+
+    def _working_keys(
+        self, keys: list[str], usage: dict[str, dict | str | None]
+    ) -> list[str]:
+        """``keys`` minus any whose probe failed, read just before landing on one.
+
+        A collection that did not escalate (the post-idle-hold failover off an
+        expired token, for one) leaves idle keys unread, painted as plain
+        "api key" whatever the probe cache says. Load exactly these slots so
+        a cached or fresh dead verdict applies before a key is chosen.
+        """
+        entries = self.switcher.usage_entries_by_account(fetch=set(keys))
+        for num in keys:
+            if num in entries:
+                usage[num] = entries[num].decision_value()
+        return [num for num in keys if usage.get(num) not in DEAD_API_KEY_SENTINELS]
 
     def _hold_on_dead_key(self, detail: str) -> TickOutcome:
         """Nowhere to go from a key that no longer works: a block the user

@@ -22,7 +22,7 @@ low" itself. The token page and the docs say so instead.
 Verdicts live in ``<backup_root>/cache/api_key_health.json`` keyed by the
 key's content fingerprint (``oauth.credential_fingerprint``), never the key:
 a replaced key is a new fingerprint and is probed afresh. The file is a cache;
-losing a concurrent write only costs one extra probe.
+writes are serialized by a file lock next to it.
 """
 
 from __future__ import annotations
@@ -34,9 +34,12 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from openswap.exceptions import LockError
 from openswap.fsutil import replace_with_retry
+from openswap.locking import FileLock
 from openswap.oauth import credential_fingerprint
 
 _logger = logging.getLogger(__name__)
@@ -139,24 +142,44 @@ class KeyHealth:
         return self._clock() - checked >= ttl
 
     def check(self, key: str) -> str | None:
-        """Probe ``key`` and record the outcome; returns the verdict now in force.
+        """Probe ``key`` and record the outcome; returns the verdict now in force."""
+        return self.check_all([key]).get(key)
 
-        An inconclusive probe keeps the previous verdict but still stamps the
+    def check_all(self, keys: list[str]) -> dict[str, str | None]:
+        """Probe ``keys`` in parallel and record every outcome in one write.
+
+        Returns each key's verdict now in force, so the caller never depends
+        on rereading a file another collector may be replacing. The
+        read-modify-write runs under a file lock: two passes (the extra and
+        the auto engine) probing different keys keep both verdicts. An
+        inconclusive probe keeps the previous verdict but still stamps the
         attempt, so a dead network is not hammered every pass.
         """
-        fp = credential_fingerprint(key)
-        if not fp:
-            return None
-        result = (self._prober or probe)(key)
-        data = self._read()
-        previous = data.get(fp) if isinstance(data.get(fp), dict) else {}
-        verdict = result if result is not None else previous.get("verdict")
-        entry = {"checkedAt": self._clock()}
-        if verdict is not None:
-            entry["verdict"] = verdict
-        data[fp] = entry
-        self._write(data)
-        return verdict
+        by_fp = {fp: key for key in keys if (fp := credential_fingerprint(key))}
+        if not by_fp:
+            return {}
+        prober = self._prober or probe
+        with ThreadPoolExecutor(max_workers=len(by_fp)) as executor:
+            results = dict(zip(by_fp, executor.map(prober, by_fp.values())))
+        verdicts: dict[str, str | None] = {}
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with FileLock(self._path.with_name(CACHE_NAME + ".lock"), timeout=5.0):
+                data = self._read()
+                for fp, result in results.items():
+                    previous = data.get(fp) if isinstance(data.get(fp), dict) else {}
+                    verdict = result if result is not None else previous.get("verdict")
+                    entry = {"checkedAt": self._clock()}
+                    if verdict is not None:
+                        entry["verdict"] = verdict
+                    data[fp] = entry
+                    verdicts[by_fp[fp]] = verdict
+                self._write(data)
+        except (LockError, OSError):
+            # Unrecorded this pass (the next one probes again), but this
+            # pass still acts on what it just learned.
+            verdicts = {by_fp[fp]: result for fp, result in results.items()}
+        return verdicts
 
     def _read(self) -> dict:
         try:
@@ -176,7 +199,6 @@ class KeyHealth:
             and now - entry["checkedAt"] < PRUNE_AFTER_S
         }
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=self._path.parent, prefix=".api_key_health.")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:

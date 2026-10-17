@@ -1232,12 +1232,10 @@ class SnapshotMixin:
         if not keys:
             return
         health = api_key_health.KeyHealth(self.backup_dir / "cache")
-        due = [num for num, key in keys.items() if probe and health.due(key)]
-        if due:
-            with ThreadPoolExecutor(max_workers=len(due)) as executor:
-                list(executor.map(lambda num: health.check(keys[num]), due))
+        due = [key for key in keys.values() if probe and health.due(key)]
+        fresh = health.check_all(due) if due else {}
         for num, key in keys.items():
-            verdict = health.verdict(key)
+            verdict = fresh[key] if key in fresh else health.verdict(key)
             if verdict == api_key_health.VERDICT_REVOKED:
                 sentinels[num] = USAGE_API_KEY_REVOKED
             elif verdict == api_key_health.VERDICT_NO_CREDIT:

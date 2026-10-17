@@ -2276,6 +2276,32 @@ class TestApiKeyAccounts:
         assert h.events[-1].detail == "API key is revoked; switch accounts to keep working"
         assert h.active_number() == 1
 
+    def test_unread_key_is_checked_before_the_engine_lands_on_it(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        # The tick's own collection left the idle key unread ("api key"); the
+        # key-only load right before the fallback finds the cached verdict.
+        tick = {
+            num: _entry_for(value, h.clock.now)
+            for num, value in {"1": _usage(100), "2": "api key"}.items()
+        }
+        loaded = {"2": _entry_for("api key revoked", h.clock.now)}
+        seen = []
+
+        def entries(fetch=None, **_kw):
+            seen.append(fetch)
+            return loaded if fetch == {"2"} else tick
+
+        with patch.object(h.switcher, "usage_entries_by_account", side_effect=entries):
+            outcome = h.engine.tick()
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        assert {"2"} in seen
+
     def test_recovered_key_is_a_target_again(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
