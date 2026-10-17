@@ -217,16 +217,26 @@ _ICONS = {
     "info": '<path d="M12 7.5v5.5M12 16.5v.01"/>',
 }
 _STYLE = """
-:root{--fg:#0a0a0a;--muted:#6e6e73;--line:#e8e8ed;--card:#fff;--bg:#f5f5f7;--ok:#1d8a3a;--bad:#d1342b;--info:#6e6e73}
-@media (prefers-color-scheme:dark){:root{--fg:#f5f5f7;--muted:#a1a1a6;--line:#2c2c2e;--card:#1c1c1e;--bg:#0a0a0a;--ok:#30d158;--bad:#ff453a;--info:#8e8e93}}
+:root{--fg:#0a0a0a;--muted:#6e6e73;--line:#e8e8ed;--card:#fff;--bg:#f5f5f7;--ok:#1d8a3a;--bad:#d1342b;--info:#6e6e73;
+--dot:rgba(10,10,10,.13);--glow:rgba(10,10,10,.07)}
+@media (prefers-color-scheme:dark){:root{--fg:#f5f5f7;--muted:#a1a1a6;--line:#2c2c2e;--card:#1c1c1e;--bg:#0a0a0a;--ok:#30d158;--bad:#ff453a;--info:#8e8e93;
+--dot:rgba(245,245,247,.12);--glow:rgba(245,245,247,.07)}}
 *{box-sizing:border-box}
 html{background:var(--bg)}
-body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;
-padding:32px 16px;color:var(--fg);background:var(--bg);
+body{position:relative;isolation:isolate;overflow-x:hidden;margin:0;min-height:100vh;display:flex;flex-direction:column;
+align-items:center;justify-content:center;padding:32px 16px;color:var(--fg);background:var(--bg);
 font:15px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","Public Sans","Helvetica Neue",Arial,sans-serif;
 -webkit-font-smoothing:antialiased}
-.brand{display:flex;align-items:center;gap:8px;margin-bottom:28px;font-size:17px;font-weight:600;letter-spacing:-.3px}
-.brand svg{width:22px;height:22px}
+/* A faint dot grid fading out from the middle, under a slow soft glow. */
+body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;
+background-image:radial-gradient(var(--dot) 1px,transparent 1px);background-size:22px 22px;
+-webkit-mask-image:radial-gradient(ellipse 70% 60% at 50% 45%,#000 35%,transparent 100%);
+mask-image:radial-gradient(ellipse 70% 60% at 50% 45%,#000 35%,transparent 100%)}
+body::after{content:"";position:fixed;left:50%;top:45%;z-index:-1;width:44rem;height:44rem;border-radius:50%;
+pointer-events:none;transform:translate(-50%,-50%);background:radial-gradient(circle,var(--glow),transparent 62%);
+animation:breathe 9s ease-in-out infinite}
+.brand{display:flex;align-items:center;gap:10px;margin-bottom:28px;font-size:24px;font-weight:650;letter-spacing:-.6px}
+.brand svg{width:32px;height:32px}
 main{width:100%;max-width:400px;padding:36px 28px 28px;text-align:center;background:var(--card);
 border:1px solid var(--line);border-radius:18px;box-shadow:0 1px 2px rgba(0,0,0,.04),0 12px 32px rgba(0,0,0,.06)}
 .status{display:grid;place-items:center;width:52px;height:52px;margin:0 auto 18px;border-radius:50%;color:#fff}
@@ -239,6 +249,17 @@ dl div{display:flex;justify-content:space-between;gap:16px;padding:11px 2px;bord
 dt{color:var(--muted)}dd{margin:0;font-weight:550;text-align:right;overflow-wrap:anywhere}
 .next{margin:20px 0 0;padding:12px 14px;text-align:left;font-size:14px;color:var(--fg);background:var(--bg);border-radius:10px}
 footer{margin-top:22px;font-size:13px;color:var(--muted)}
+/* Entrance: the card rises in, the badge pops and its mark draws itself. */
+main{animation:rise .5s cubic-bezier(.2,.8,.2,1) both}
+.status{animation:pop .45s .15s cubic-bezier(.3,1.5,.5,1) both}
+.status path{stroke-dasharray:24;stroke-dashoffset:24;animation:draw .35s .45s ease-out forwards}
+.brand,footer{animation:fade .6s .1s ease-out both}
+@keyframes rise{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}
+@keyframes pop{from{opacity:0;transform:scale(.6)}to{opacity:1;transform:none}}
+@keyframes draw{to{stroke-dashoffset:0}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+@keyframes breathe{0%,100%{opacity:.7;transform:translate(-50%,-50%) scale(1)}50%{opacity:1;transform:translate(-50%,-50%) scale(1.08)}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important}.status path{stroke-dashoffset:0}}
 """
 # Replaces the callback address (it carries the used pair code and the state)
 # in the address bar and history with a plain one; CSP allows it by hash.
