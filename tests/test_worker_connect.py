@@ -679,6 +679,8 @@ def test_connect_pairs_a_new_mac_end_to_end(tmp_path, keychain, stub, caplog):
     assert stub.tab_answered_at_pair == [False]
     assert browser.answered.wait(10) and browser.status == 200 and "This Mac is paired" in browser.page
     assert "<dd>Acme</dd>" in browser.page and request["code"] not in browser.page
+    # Paired with a server other than OpenTag: the page names that server.
+    assert f"{urlsplit(stub.url).netloc} can now send tasks" in browser.page and "OpenTag can" not in browser.page
     assert load_worker_settings(tmp_path).control_service_url == stub.url
     assert pairing.load_enrollment(stub.url).device_key == "connect-device-key"
     # The verifier and the code are never written or logged.
@@ -1202,3 +1204,36 @@ def test_the_result_response_allows_only_that_script():
     assert csp == [f"Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
                    f"script-src 'sha256-{connect._CLEAN_URL_HASH}'"]
     assert b"<dd>Acme</dd>" in page_bytes and b"You can close this tab." in page_bytes
+
+
+def _raw_response(port, target):
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
+        client.sendall(f"GET {target} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        raw = b""
+        while chunk := client.recv(65536):
+            raw += chunk
+    head, _, body = raw.partition(b"\r\n\r\n")
+    return head.decode(), body.decode()
+
+
+def test_error_pages_carry_no_script_and_a_failed_result_still_clears_the_address():
+    state = connect.new_state()
+    listener = connect.CallbackListener(state, timeout=20)
+    thread, box = _waiting(listener)
+    for target in ("/favicon.ico", f"/openswap/callback?code=c&state={'x' * 22}"):
+        head, body = _raw_response(listener.port, target)
+        assert "script-src" not in head and "<script>" not in body
+    held = {}
+    client = threading.Thread(target=lambda: held.update(
+        zip(("head", "body"), _raw_response(listener.port, f"/openswap/callback?code=c&state={state}"))))
+    client.start()
+    thread.join(10)
+    listener.respond(False, "This Mac wasn't reconnected", "You cancelled in OpenTag. Nothing was changed.")
+    client.join(10)
+    assert held["head"].startswith("HTTP/1.1 400") and f"script-src 'sha256-{connect._CLEAN_URL_HASH}'" in held["head"]
+    assert "This Mac wasn&#x27;t reconnected" in held["body"] and "<script>" in held["body"]
+
+
+def test_a_hostile_kind_falls_back_to_info():
+    body = connect.page("t", "b", kind='"><script>x</script>').decode()
+    assert '<body class="info">' in body and "<script>" not in body

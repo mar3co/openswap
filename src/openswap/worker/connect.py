@@ -219,7 +219,7 @@ _ICONS = {
 _STYLE = """
 :root{--fg:#0a0a0a;--muted:#6e6e73;--line:#e8e8ed;--card:#fff;--bg:#f5f5f7;--ok:#1d8a3a;--bad:#d1342b;--info:#6e6e73;
 --dot:rgba(10,10,10,.13);--glow:rgba(10,10,10,.07)}
-@media (prefers-color-scheme:dark){:root{--fg:#f5f5f7;--muted:#a1a1a6;--line:#2c2c2e;--card:#1c1c1e;--bg:#0a0a0a;--ok:#30d158;--bad:#ff453a;--info:#8e8e93;
+@media (prefers-color-scheme:dark){:root{--fg:#f5f5f7;--muted:#a1a1a6;--line:#2c2c2e;--card:#1c1c1e;--bg:#0a0a0a;--ok:#248a3d;--bad:#ff453a;--info:#8e8e93;
 --dot:rgba(245,245,247,.12);--glow:rgba(245,245,247,.07)}}
 *{box-sizing:border-box}
 html{background:var(--bg)}
@@ -242,6 +242,7 @@ border:1px solid var(--line);border-radius:18px;box-shadow:0 1px 2px rgba(0,0,0,
 .status{display:grid;place-items:center;width:52px;height:52px;margin:0 auto 18px;border-radius:50%;color:#fff}
 .status svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
 .ok .status{background:var(--ok)}.bad .status{background:var(--bad)}.info .status{background:var(--info)}
+h1,p{overflow-wrap:anywhere}
 h1{margin:0 0 8px;font-size:22px;line-height:1.25;font-weight:650;letter-spacing:-.45px}
 p{margin:0;color:var(--muted)}
 dl{margin:24px 0 0;text-align:left;border-top:1px solid var(--line)}
@@ -252,14 +253,14 @@ footer{margin-top:22px;font-size:13px;color:var(--muted)}
 /* Entrance: the card rises in, the badge pops and its mark draws itself. */
 main{animation:rise .5s cubic-bezier(.2,.8,.2,1) both}
 .status{animation:pop .45s .15s cubic-bezier(.3,1.5,.5,1) both}
-.status path{stroke-dasharray:24;stroke-dashoffset:24;animation:draw .35s .45s ease-out forwards}
+.status path{stroke-dasharray:24;animation:draw .35s .45s ease-out both}
 .brand,footer{animation:fade .6s .1s ease-out both}
 @keyframes rise{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}
 @keyframes pop{from{opacity:0;transform:scale(.6)}to{opacity:1;transform:none}}
-@keyframes draw{to{stroke-dashoffset:0}}
+@keyframes draw{from{stroke-dashoffset:24}to{stroke-dashoffset:0}}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 @keyframes breathe{0%,100%{opacity:.7;transform:translate(-50%,-50%) scale(1)}50%{opacity:1;transform:translate(-50%,-50%) scale(1.08)}}
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important}.status path{stroke-dashoffset:0}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important}}
 """
 # Replaces the callback address (it carries the used pair code and the state)
 # in the address bar and history with a plain one; CSP allows it by hash.
@@ -592,12 +593,13 @@ class ConnectFlow:
         if listener is None or self.target is None:
             raise ProtocolError("connect_not_started")
         failed = "This Mac wasn't reconnected" if self.target.reconnect else "This Mac wasn't paired"
+        unchanged = "Nothing was changed." if self.target.reconnect else "Nothing was paired."
         try:
             query = listener.wait()
             code, error = query.get("code", []), query.get("error", [])
             if error:
                 denied = error == ["access_denied"]
-                listener.respond(False, failed, "You cancelled in OpenTag. Nothing was paired."
+                listener.respond(False, failed, f"You cancelled in OpenTag. {unchanged}"
                                  if denied else "OpenTag did not pair this Mac. Start Connect again in OpenSwap.")
                 raise ProtocolError("access_denied" if denied else "connect_refused")
             if len(code) != 1 or not code[0] or len(code[0]) > 200:
@@ -630,7 +632,8 @@ class ConnectFlow:
                                  "OpenSwap saved a fresh key. The worker and its tasks carry on unchanged.",
                                  details=details)
             else:
-                listener.respond(True, "This Mac is paired", "OpenTag can now send tasks to OpenSwap on this Mac.",
+                server = "OpenTag" if self.target.url == validate_url(DEFAULT_SERVER) else urlsplit(self.target.url).netloc
+                listener.respond(True, "This Mac is paired", f"{server} can now send tasks to OpenSwap on this Mac.",
                                  details=details,
                                  next_step="Next, in OpenSwap: turn on the worker, choose an account and add a "
                                            "folder to start taking tasks.")
