@@ -677,7 +677,8 @@ def test_connect_pairs_a_new_mac_end_to_end(tmp_path, keychain, stub, caplog):
     assert connect.code_challenge(request["code_verifier"]) == params["code_challenge"]
     # The tab got its page only after redemption, and it says paired.
     assert stub.tab_answered_at_pair == [False]
-    assert browser.answered.wait(10) and browser.status == 200 and "Paired" in browser.page
+    assert browser.answered.wait(10) and browser.status == 200 and "This Mac is paired" in browser.page
+    assert "<dd>Acme</dd>" in browser.page and request["code"] not in browser.page
     assert load_worker_settings(tmp_path).control_service_url == stub.url
     assert pairing.load_enrollment(stub.url).device_key == "connect-device-key"
     # The verifier and the code are never written or logged.
@@ -697,7 +698,7 @@ def test_connect_reconnects_an_expired_mac_keeping_its_worker_id(tmp_path, keych
     assert result.reconnected and result.worker_id == "worker-1"
     assert stub.connect_params[0]["worker_id"] == "worker-1"
     assert pairing.load_enrollment(stub.url).device_key == "connect-device-key"
-    assert browser.answered.wait(10) and "Reconnected" in browser.page
+    assert browser.answered.wait(10) and "This Mac is reconnected" in browser.page
 
 
 def test_a_reconnect_returning_another_worker_keeps_the_old_key(tmp_path, keychain):
@@ -1170,3 +1171,34 @@ def test_a_save_from_before_a_reconnect_never_restores_the_old_expiry(tmp_path):
                             key_expires_at=old, key_renewal=lambda: False)
     ConfiguredRemote(SimpleNamespace(backup_root=tmp_path, remote_launch_guard=None))._save(stale)
     assert read_key_status(tmp_path) == (False, renewed)
+
+
+def test_the_result_page_is_escaped_and_clears_the_code_from_the_address():
+    import re
+
+    body = connect.page("<b>title</b>", "a & b", kind="ok", details=(("Workspace", "<i>W</i>"), ("Empty", "")),
+                        next_step="next <x>", clean_url=True).decode()
+    assert "<b>title</b>" not in body and "&lt;b&gt;title&lt;/b&gt;" in body and "a &amp; b" in body
+    assert "&lt;i&gt;W&lt;/i&gt;" in body and "Empty" not in body and "next &lt;x&gt;" in body
+    (script,) = re.findall(r"<script>(.*?)</script>", body)
+    assert script == 'history.replaceState(null,"","/openswap/done")'
+    assert base64.b64encode(hashlib.sha256(script.encode()).digest()).decode() == connect._CLEAN_URL_HASH
+    assert "<script>" not in connect.page("Not found", "waiting").decode()  # only the result page swaps it
+
+
+def test_the_result_response_allows_only_that_script():
+    state = connect.new_state()
+    listener = connect.CallbackListener(state, timeout=20)
+    thread, box = _waiting(listener)
+    with socket.create_connection(("127.0.0.1", listener.port), timeout=10) as client:
+        client.sendall(f"GET /openswap/callback?code=pair_1&state={state} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        thread.join(10)
+        listener.respond(True, "This Mac is paired", "Done.", details=(("Workspace", "Acme"),))
+        raw = b""
+        while chunk := client.recv(65536):
+            raw += chunk
+    head, _, page_bytes = raw.partition(b"\r\n\r\n")
+    csp = [line for line in head.decode().split("\r\n") if line.startswith("Content-Security-Policy:")]
+    assert csp == [f"Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
+                   f"script-src 'sha256-{connect._CLEAN_URL_HASH}'"]
+    assert b"<dd>Acme</dd>" in page_bytes and b"You can close this tab." in page_bytes

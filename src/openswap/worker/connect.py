@@ -205,31 +205,84 @@ def discover(url: str, *, opener=None) -> str:
 # --- the one-shot loopback listener ------------------------------------------------------------
 
 
-_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>{title}</title>
-<style>body{{font:16px/1.5 -apple-system,system-ui,sans-serif;max-width:32rem;margin:15vh auto;padding:0 1.5rem;
-color:#1d1d1f;background:#fff}}h1{{font-size:1.4rem}}p{{color:#555}}
-@media (prefers-color-scheme:dark){{body{{color:#f5f5f7;background:#1d1d1f}}p{{color:#aaa}}}}</style>
-</head><body><h1>{title}</h1><p>{body}</p></body></html>
+# The result page: the OpenSwap mark and name, a status, what was paired and the
+# next step, in the brand's monochrome with one status colour. Self-contained:
+# the CSP allows no network loads, only this inline style and the one script.
+_MARK = ('<svg viewBox="0 0 32 32" aria-hidden="true"><path fill="currentColor" '
+         'd="M16 3 A10 10 0 0 0 16 23 L16 19 A6 6 0 0 1 16 7 Z"/><path fill="currentColor" '
+         'd="M16 9 A10 10 0 0 1 16 29 L16 25 A6 6 0 0 0 16 13 Z"/></svg>')
+_ICONS = {
+    "ok": '<path d="M6 12.5l4 4L18 8"/>',
+    "bad": '<path d="M8 8l8 8M16 8l-8 8"/>',
+    "info": '<path d="M12 7.5v5.5M12 16.5v.01"/>',
+}
+_STYLE = """
+:root{--fg:#0a0a0a;--muted:#6e6e73;--line:#e8e8ed;--card:#fff;--bg:#f5f5f7;--ok:#1d8a3a;--bad:#d1342b;--info:#6e6e73}
+@media (prefers-color-scheme:dark){:root{--fg:#f5f5f7;--muted:#a1a1a6;--line:#2c2c2e;--card:#1c1c1e;--bg:#0a0a0a;--ok:#30d158;--bad:#ff453a;--info:#8e8e93}}
+*{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;
+padding:32px 16px;color:var(--fg);background:var(--bg);
+font:15px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","Public Sans","Helvetica Neue",Arial,sans-serif;
+-webkit-font-smoothing:antialiased}
+.brand{display:flex;align-items:center;gap:8px;margin-bottom:28px;font-size:17px;font-weight:600;letter-spacing:-.3px}
+.brand svg{width:22px;height:22px}
+main{width:100%;max-width:400px;padding:36px 28px 28px;text-align:center;background:var(--card);
+border:1px solid var(--line);border-radius:18px;box-shadow:0 1px 2px rgba(0,0,0,.04),0 12px 32px rgba(0,0,0,.06)}
+.status{display:grid;place-items:center;width:52px;height:52px;margin:0 auto 18px;border-radius:50%;color:#fff}
+.status svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.ok .status{background:var(--ok)}.bad .status{background:var(--bad)}.info .status{background:var(--info)}
+h1{margin:0 0 8px;font-size:22px;line-height:1.25;font-weight:650;letter-spacing:-.45px}
+p{margin:0;color:var(--muted)}
+dl{margin:24px 0 0;text-align:left;border-top:1px solid var(--line)}
+dl div{display:flex;justify-content:space-between;gap:16px;padding:11px 2px;border-bottom:1px solid var(--line)}
+dt{color:var(--muted)}dd{margin:0;font-weight:550;text-align:right;overflow-wrap:anywhere}
+.next{margin:20px 0 0;padding:12px 14px;text-align:left;font-size:14px;color:var(--fg);background:var(--bg);border-radius:10px}
+footer{margin-top:22px;font-size:13px;color:var(--muted)}
 """
+# Replaces the callback address (it carries the used pair code and the state)
+# in the address bar and history with a plain one; CSP allows it by hash.
+_CLEAN_URL_SCRIPT = f'history.replaceState(null,"","{CALLBACK_PATH.rsplit("/", 1)[0]}/done")'
+_CLEAN_URL_HASH = base64.b64encode(hashlib.sha256(_CLEAN_URL_SCRIPT.encode()).digest()).decode()
 
 
-def page(title: str, body: str) -> bytes:
-    return _PAGE.format(title=html.escape(title), body=html.escape(body)).encode("utf-8")
+def page(title: str, body: str, *, kind: str = "info", details: tuple[tuple[str, str], ...] = (),
+         next_step: str | None = None, footer: str | None = None, clean_url: bool = False) -> bytes:
+    """A result or error page. Every value is escaped; ``kind`` is ok, bad or info."""
+    e = html.escape
+    rows = "".join(f"<div><dt>{e(name)}</dt><dd>{e(value)}</dd></div>" for name, value in details if value)
+    parts = [
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">",
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+        "<meta name=\"color-scheme\" content=\"light dark\">",
+        f"<title>{e(title)} · OpenSwap</title><style>{_STYLE}</style></head>",
+        f"<body class=\"{kind if kind in _ICONS else 'info'}\">",
+        f"<div class=\"brand\">{_MARK}OpenSwap</div>",
+        "<main><div class=\"status\" aria-hidden=\"true\"><svg viewBox=\"0 0 24 24\">"
+        f"{_ICONS.get(kind, _ICONS['info'])}</svg></div>",
+        f"<h1>{e(title)}</h1><p>{e(body)}</p>",
+        f"<dl>{rows}</dl>" if rows else "",
+        f"<p class=\"next\">{e(next_step)}</p>" if next_step else "",
+        "</main>",
+        f"<footer>{e(footer)}</footer>" if footer else "",
+        f"<script>{_CLEAN_URL_SCRIPT}</script>" if clean_url else "",
+        "</body></html>\n",
+    ]
+    return "".join(parts).encode("utf-8")
 
 
 _REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed"}
 
 
-def _send(conn: socket.socket, status: int, title: str, body: str, extra: str = "") -> None:
-    content = page(title, body)
+def _send(conn: socket.socket, status: int, title: str, body: str, extra: str = "", **look) -> None:
+    content = page(title, body, kind=look.pop("kind", "ok" if status == 200 else "bad"), **look)
+    script = f"; script-src 'sha256-{_CLEAN_URL_HASH}'" if look.get("clean_url") else ""
     head = (f"HTTP/1.1 {status} {_REASONS.get(status, 'Error')}\r\n"
             "Content-Type: text/html; charset=utf-8\r\n"
             f"Content-Length: {len(content)}\r\n"
             "Cache-Control: no-store\r\n"
             "Referrer-Policy: no-referrer\r\n"
-            "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n"
+            f"Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'{script}\r\n"
             "X-Content-Type-Options: nosniff\r\n"
             f"{extra}Connection: close\r\n\r\n")
     try:
@@ -347,7 +400,7 @@ class CallbackListener:
         method, target = parts[0], parts[1]
         address = urlsplit(target)
         if address.path != CALLBACK_PATH:
-            _send(conn, 404, "Not found", "OpenSwap is waiting for OpenTag to send you back here.")
+            _send(conn, 404, "Not found", "OpenSwap is waiting for OpenTag to send you back here.", kind="info")
             return None
         if method != "GET":
             _send(conn, 405, "Not allowed", "OpenSwap accepts only the link OpenTag sends you back with.",
@@ -367,11 +420,14 @@ class CallbackListener:
         self._held = conn
         return query
 
-    def respond(self, ok: bool, title: str, body: str) -> None:
-        """The result page for the held callback request; then its connection closes."""
+    def respond(self, ok: bool, title: str, body: str, *, details: tuple[tuple[str, str], ...] = (),
+                next_step: str | None = None) -> None:
+        """The result page for the held callback request; then its connection closes.
+        The page swaps its address (with the used code and state) for a plain one."""
         conn, self._held = self._held, None
         if conn is not None:
-            _send(conn, 200 if ok else 400, title, body)
+            _send(conn, 200 if ok else 400, title, body, details=details, next_step=next_step,
+                  footer="You can close this tab.", clean_url=True)
 
     def _close_server(self) -> None:
         try:
@@ -514,16 +570,17 @@ class ConnectFlow:
         listener = self._listener
         if listener is None or self.target is None:
             raise ProtocolError("connect_not_started")
+        failed = "This Mac wasn't reconnected" if self.target.reconnect else "This Mac wasn't paired"
         try:
             query = listener.wait()
             code, error = query.get("code", []), query.get("error", [])
             if error:
                 denied = error == ["access_denied"]
-                listener.respond(False, "Not paired", "You cancelled in OpenTag. Nothing was paired."
+                listener.respond(False, failed, "You cancelled in OpenTag. Nothing was paired."
                                  if denied else "OpenTag did not pair this Mac. Start Connect again in OpenSwap.")
                 raise ProtocolError("access_denied" if denied else "connect_refused")
             if len(code) != 1 or not code[0] or len(code[0]) > 200:
-                listener.respond(False, "Not paired", "OpenTag sent no usable code. Start Connect again in OpenSwap.")
+                listener.respond(False, failed, "OpenTag sent no usable code. Start Connect again in OpenSwap.")
                 raise ProtocolError("invalid_callback")
             verifier, self._verifier = self._verifier, None
             # Cancel still counts until the key is saved (``cancelled``).
@@ -536,16 +593,26 @@ class ConnectFlow:
                                           transport=self._transport, cancelled=self._cancelled.is_set)
             except ProtocolError as exc:
                 if exc.code == "connect_cancelled":
-                    listener.respond(False, "Not paired", "You cancelled in OpenSwap. Nothing was saved on this Mac.")
+                    listener.respond(False, failed, "You cancelled in OpenSwap. Nothing was saved on this Mac.")
                 else:
-                    listener.respond(False, "Not paired", f"OpenSwap could not finish ({exc.code}). "
+                    listener.respond(False, failed, f"OpenSwap could not finish ({exc.code}). "
                                      + next_step(exc.code, self.target.url))
                 raise
             except Exception:
-                listener.respond(False, "Not paired", "OpenSwap could not save the pairing. Start Connect again.")
+                listener.respond(False, failed, "OpenSwap could not save the pairing. Start Connect again.")
                 raise
-            listener.respond(True, "Reconnected" if self.target.reconnect else "Paired",
-                             "You can close this tab and go back to OpenSwap.")
+            workspace, owner = getattr(worker, "workspace_label", None), getattr(worker, "owner_label", None)
+            details = (("Workspace", workspace or ""), ("Account", owner or ""),
+                       ("Server", urlsplit(self.target.url).netloc))
+            if self.target.reconnect:
+                listener.respond(True, "This Mac is reconnected",
+                                 "OpenSwap saved a fresh key. The worker and its tasks carry on unchanged.",
+                                 details=details)
+            else:
+                listener.respond(True, "This Mac is paired", "OpenTag can now send tasks to OpenSwap on this Mac.",
+                                 details=details,
+                                 next_step="Next, in OpenSwap: turn on the worker, choose an account and add a "
+                                           "folder to start taking tasks.")
             return ConnectResult(str(worker), self.target.url, self.target.reconnect,
                                  getattr(worker, "workspace_label", None), getattr(worker, "owner_label", None))
         finally:
