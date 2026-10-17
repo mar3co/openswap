@@ -4,7 +4,8 @@ name: macOS app
 # notarize when repository secrets are present. Pull requests always freeze
 # unsigned (do not expose the production certificate to PR code). Tag builds
 # require the certificate and end in a draft GitHub release carrying both
-# zips, both DMGs, their checksums, and the rendered Homebrew cask. Publishing that draft
+# zips, both DMGs, their checksums, and the rendered Homebrew cask, with the
+# tag's CHANGELOG.md section as its notes. Publishing that draft
 # is a person's call; the homebrew-tap workflow then copies the cask into the
 # tap.
 
@@ -76,6 +77,12 @@ jobs:
             echo "Tag ${GITHUB_REF_NAME} does not match pyproject version ${version} (expected v${version})" >&2
             exit 1
           fi
+
+      # The release body is the tag's CHANGELOG.md section. Check it here so a
+      # missing section fails in seconds, not after both builds.
+      - name: Tag has changelog notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python3 packaging/release_notes.py "${GITHUB_REF_NAME#v}" > /dev/null
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -199,6 +206,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tags, to find the previous release for the compare link.
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -218,13 +228,26 @@ jobs:
           bash packaging/homebrew/render-cask.sh "$version" "$arm64" "$x86_64" > dist/openswap.rb
           cat dist/openswap.rb
 
+      # The notes are the tag's CHANGELOG.md section, written for people who
+      # use the app, plus a link to every commit since the previous release.
+      - name: Write release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python3 packaging/release_notes.py "$version" > dist/notes.md
+          previous="$(git describe --tags --abbrev=0 --match 'v*' "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [ -n "$previous" ]; then
+            printf '\n**Every change:** https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$previous" "$GITHUB_REF_NAME" >> dist/notes.md
+          fi
+          cat dist/notes.md
+
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${GITHUB_REF_NAME#v}"
           gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
-            --title "OpenSwap ${version}" --generate-notes \
+            --title "OpenSwap ${version}" --notes-file dist/notes.md \
             "dist/OpenSwap-${version}-arm64.zip" \
             "dist/OpenSwap-${version}-arm64.zip.sha256" \
             "dist/OpenSwap-${version}-x86_64.zip" \
