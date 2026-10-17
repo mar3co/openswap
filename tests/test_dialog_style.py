@@ -90,6 +90,23 @@ def test_a_popup_takes_the_text_fields_place_and_reports_its_row():
     assert response.clicked == 1 and response.choice == 1
 
 
+def test_the_folder_chooser_offers_close_and_reports_it():
+    from openswap.menubar_dialog import choose_folder
+
+    def press_close(modal):
+        panel = modal.self  # the bound panel of a PyObjC selector
+        (close,) = panel.accessoryView().subviews()
+        assert close.title() == "Close Setup"
+        close.performClick_(None)
+        return AppKit.NSModalResponseCancel
+
+    assert choose_folder(title="Set up Remote tasks", message="Folder", close="Close Setup",
+                         run=press_close) == DIALOG_CLOSE
+    plain = choose_folder(title="Set up Remote tasks", message="Folder",
+                          run=lambda modal: modal.self.accessoryView() or AppKit.NSModalResponseCancel)
+    assert plain is None  # no accessory without ``close``; Cancel is None
+
+
 def test_destructive_confirmation_defaults_to_cancel():
     dialog = make_dialog_alert(ok="Remove", cancel=True, destructive=True)
     cancel, remove = dialog.buttons

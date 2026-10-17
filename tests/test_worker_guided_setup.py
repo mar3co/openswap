@@ -1430,6 +1430,8 @@ class _Dialogs:
     def choose_folder(self, **kwargs):
         self.shown.append(("choose_folder", kwargs))
         clicked, text = self.answers.pop(0) if self.answers else (0, "")
+        if clicked == guided_setup.DIALOG_CLOSED:
+            return clicked
         return text if clicked == 1 else None
 
 
@@ -1672,6 +1674,18 @@ def test_menu_setup_approves_a_folder_from_the_native_chooser(root, enable_calls
     assert "Type the path to your code folder, for example ~/GitHub" in chooser["message"]
     (workspace,) = load_worker_settings(root).workspaces
     assert workspace.workspace_id == "notes" and workspace.work_root == notes.resolve()
+
+
+def test_close_setup_in_the_native_chooser_ends_the_setup(root, enable_calls, tmp_path):
+    """On a Mac with no code folder found, the chooser also offers Close Setup."""
+    configure_worker_service(root, URL, "worker-1")
+    dialogs = _Dialogs([0, (0, ""), (guided_setup.DIALOG_CLOSED, "")])
+    app = _menu(root, dialogs)
+    app._on_setting("remote_tasks_setup", None)
+    _settle(app)
+    kind, chooser = dialogs.shown[-1]  # no summary after it
+    assert kind == "choose_folder" and chooser["close"] == guided_setup.CLOSE_SETUP
+    assert _builtin(root) and app.refreshed == 1
 
 
 def test_with_folders_found_the_menu_bar_asks_for_numbers_not_the_chooser(root, enable_calls, research_home):

@@ -528,6 +528,60 @@ def make_dialog_prompt(*, default_text="", choices=None, **kwargs):
     return BrandDialog(default_text=None if choices is not None else default_text, choices=choices, **kwargs)
 
 
+class _ChooserClose(NSObject):
+    """The folder chooser's Close button: remember it, then cancel the panel."""
+
+    def close_(self, _sender):
+        self.closed = True
+        self.panel.cancel_(None)
+
+
+def choose_folder(*, title, message, close=None, run=None):
+    """The native folder chooser (Finder-style browse and search).
+
+    Returns the chosen path, None on Cancel, or ``DIALOG_CLOSE`` when the
+    owner pressed ``close``, a plain button under the browser that ends the
+    whole flow, as in the dialogs. ``run`` wraps the modal call (the menu
+    bar's ``_dialog``).
+    """
+    from AppKit import NSModalResponseOK, NSOpenPanel, NSURL
+    from Foundation import NSHomeDirectory
+
+    panel = NSOpenPanel.openPanel()
+    panel.setTitle_(title)
+    panel.setMessage_(message)
+    panel.setPrompt_("Approve")
+    panel.setCanChooseDirectories_(True)
+    panel.setCanChooseFiles_(False)
+    panel.setCanCreateDirectories_(True)
+    panel.setAllowsMultipleSelection_(False)
+    panel.setDirectoryURL_(NSURL.fileURLWithPath_(NSHomeDirectory()))
+    target = None
+    if close:
+        target = _ChooserClose.alloc().init()
+        target.panel, target.closed = panel, False
+        button = _PlainButton.alloc().initWithFrame_(NSMakeRect(0, 0, 100, ACTION_HEIGHT))
+        button.setTitle_(str(close))
+        button.setBordered_(False)
+        button.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightMedium))
+        button.setTarget_(target)
+        button.setAction_("close:")
+        button.sizeToFit()
+        width = button.frame().size.width + 16
+        accessory = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, width + 24, ACTION_HEIGHT + 12))
+        button.setFrame_(NSMakeRect(12, 6, width, ACTION_HEIGHT))
+        accessory.addSubview_(button)
+        panel.setAccessoryView_(accessory)
+        panel.setAccessoryViewDisclosed_(True)
+    response = (run or (lambda modal: modal()))(panel.runModal)
+    if target is not None and target.closed:
+        return DIALOG_CLOSE
+    if response != NSModalResponseOK:
+        return None
+    urls = panel.URLs()
+    return str(urls[0].path()) if urls and len(urls) else None
+
+
 # What ``run_waiting_dialog``'s dialog returns when its work ended (not a button).
 WAITING_DONE = -2
 

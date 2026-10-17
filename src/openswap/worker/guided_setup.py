@@ -875,7 +875,7 @@ class DialogPrompts:
 
     def __init__(self, alert, prompt, title: str = "Set up Remote tasks", *, choose_folder=None, wait=None):
         self._alert, self._prompt, self.title = alert, prompt, title
-        # ``choose_folder(title=, message=)`` opens the native folder chooser and
+        # ``choose_folder(title=, message=, close=)`` opens the native folder chooser and
         # returns a path or None; without one, folders are typed into a prompt.
         self._choose_folder = choose_folder
         # ``wait(title=, message=, done=)`` shows one dialog with Cancel until the
@@ -925,7 +925,9 @@ class DialogPrompts:
     def choose_folder(self, question: str) -> str | None:
         if self._choose_folder is None:
             return self.ask(question)
-        return self._choose_folder(title=self.title, message=self._message(question))
+        answer = self._choose_folder(title=self.title, message=self._message(question), close=CLOSE_SETUP)
+        self._closing(answer)
+        return answer
 
     def flush(self) -> None:
         if self._lines and not self.closed:
