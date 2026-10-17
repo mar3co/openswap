@@ -88,8 +88,10 @@ the submission before failing, so the reason is in the job log.
    (`.github/workflows/homebrew-tap.yml`) then copies `openswap.rb` into
    `mar3co/homebrew-openswap/Casks/`. It needs repository secret
    `HOMEBREW_TAP_TOKEN` (fine-grained token, Contents read/write on the tap
-   repo only). If the secret is missing or empty the job fails with an
-   error naming it, and the cask is not pushed; fix the secret and re-run
+   repo only). If the secret is missing, empty or cannot push to the tap,
+   the job fails with an error naming it, and the cask is not pushed (write
+   access is checked even when the tap already has the cask); fix the
+   secret and re-run
    the workflow for that tag from the Actions tab
    (`gh workflow run homebrew-tap.yml -f tag=v<version>`), or copy
    `openswap.rb` into the tap by hand.
