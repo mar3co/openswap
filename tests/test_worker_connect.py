@@ -1182,10 +1182,12 @@ def test_the_result_page_is_escaped_and_clears_the_code_from_the_address():
                         next_step="next <x>", clean_url=True).decode()
     assert "<b>title</b>" not in body and "&lt;b&gt;title&lt;/b&gt;" in body and "a &amp; b" in body
     assert "&lt;i&gt;W&lt;/i&gt;" in body and "Empty" not in body and "next &lt;x&gt;" in body
-    (script,) = re.findall(r"<script>(.*?)</script>", body)
-    assert script == 'history.replaceState(null,"","/openswap/done")'
-    assert base64.b64encode(hashlib.sha256(script.encode()).digest()).decode() == connect._CLEAN_URL_HASH
-    assert "<script>" not in connect.page("Not found", "waiting").decode()  # only the result page swaps it
+    sha = lambda text: base64.b64encode(hashlib.sha256(text.encode()).digest()).decode()  # noqa: E731
+    motion, clean = re.findall(r"<script>(.*?)</script>", body)
+    assert clean == 'history.replaceState(null,"","/openswap/done")' and sha(clean) == connect._CLEAN_URL_HASH
+    assert sha(motion) == connect._MOTION_HASH and "pointermove" in motion and "prefers-reduced-motion" in motion
+    # An error page gets the pointer spotlight only; only the result page swaps its address.
+    assert re.findall(r"<script>(.*?)</script>", connect.page("Not found", "waiting").decode()) == [motion]
 
 
 def test_the_result_response_allows_only_that_script():
@@ -1202,7 +1204,7 @@ def test_the_result_response_allows_only_that_script():
     head, _, page_bytes = raw.partition(b"\r\n\r\n")
     csp = [line for line in head.decode().split("\r\n") if line.startswith("Content-Security-Policy:")]
     assert csp == [f"Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
-                   f"script-src 'sha256-{connect._CLEAN_URL_HASH}'"]
+                   f"script-src 'sha256-{connect._MOTION_HASH}' 'sha256-{connect._CLEAN_URL_HASH}'"]
     assert b"<dd>Acme</dd>" in page_bytes and b"You can close this tab." in page_bytes
 
 
@@ -1216,13 +1218,14 @@ def _raw_response(port, target):
     return head.decode(), body.decode()
 
 
-def test_error_pages_carry_no_script_and_a_failed_result_still_clears_the_address():
+def test_error_pages_never_swap_the_address_and_a_failed_result_still_does():
     state = connect.new_state()
     listener = connect.CallbackListener(state, timeout=20)
     thread, box = _waiting(listener)
     for target in ("/favicon.ico", f"/openswap/callback?code=c&state={'x' * 22}"):
         head, body = _raw_response(listener.port, target)
-        assert "script-src" not in head and "<script>" not in body
+        assert f"script-src 'sha256-{connect._MOTION_HASH}'\r\n" in head + "\r\n" and connect._CLEAN_URL_HASH not in head
+        assert "replaceState" not in body
     held = {}
     client = threading.Thread(target=lambda: held.update(
         zip(("head", "body"), _raw_response(listener.port, f"/openswap/callback?code=c&state={state}"))))
@@ -1230,10 +1233,10 @@ def test_error_pages_carry_no_script_and_a_failed_result_still_clears_the_addres
     thread.join(10)
     listener.respond(False, "This Mac wasn't reconnected", "You cancelled in OpenTag. Nothing was changed.")
     client.join(10)
-    assert held["head"].startswith("HTTP/1.1 400") and f"script-src 'sha256-{connect._CLEAN_URL_HASH}'" in held["head"]
-    assert "This Mac wasn&#x27;t reconnected" in held["body"] and "<script>" in held["body"]
+    assert held["head"].startswith("HTTP/1.1 400") and f"script-src 'sha256-{connect._MOTION_HASH}' 'sha256-{connect._CLEAN_URL_HASH}'" in held["head"]
+    assert "This Mac wasn&#x27;t reconnected" in held["body"] and "replaceState" in held["body"]
 
 
 def test_a_hostile_kind_falls_back_to_info():
     body = connect.page("t", "b", kind='"><script>x</script>').decode()
-    assert '<body class="info">' in body and "<script>" not in body
+    assert '<body class="info">' in body and "<script>x</script>" not in body
