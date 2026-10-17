@@ -169,7 +169,19 @@ class KeyHealth:
         fp = credential_fingerprint(key)
         if not fp:
             return False
-        entry = self._read().get(fp)
+        return self._entry_due(self._read().get(fp))
+
+    def slot_due(self, slot: str) -> bool:
+        """Whether the key in ``slot`` should be probed now, without reading it.
+
+        True for a slot whose key was never recorded, so a pass that may
+        probe loads it once and records it.
+        """
+        keys, slots = self._read_all()
+        fp = slots.get(slot)
+        return not isinstance(fp, str) or self._entry_due(keys.get(fp))
+
+    def _entry_due(self, entry: object) -> bool:
         if not isinstance(entry, dict):
             return True
         checked = entry.get("checkedAt")

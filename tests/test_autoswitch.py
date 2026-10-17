@@ -2276,6 +2276,20 @@ class TestApiKeyAccounts:
         assert h.events[-1].detail == "API key is revoked; switch accounts to keep working"
         assert h.active_number() == 1
 
+    def test_only_dead_keys_to_fall_back_on_says_so(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(100), "2": "api key out of credit"})
+        assert outcome is TickOutcome.BLOCKED
+        assert self._no_switch_reasons(h) == ["api-key-dead"]
+        assert h.events[-1].detail == (
+            "every API key to fall back on is revoked or out of credit"
+        )
+
     def test_unread_key_is_checked_before_the_engine_lands_on_it(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")

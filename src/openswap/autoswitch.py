@@ -1029,16 +1029,19 @@ class AutoSwitchEngine:
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
         # incident, the scoping, and the release.
+        eligible_keys = [
+            n for n in candidates
+            if self.switcher.account_kind_for(n) == "api_key"
+            and self._key_eligible(n, settings)
+        ]
+        # Kept apart from the targets so a hold can say the keys are dead
+        # rather than that no other account exists.
+        dead_keys = [n for n in eligible_keys if usage.get(n) in DEAD_API_KEY_SENTINELS]
         api_key_candidates = (
             []
             if trigger == "credit-return"
             else self._order_keys(
-                [
-                    n for n in candidates
-                    if self.switcher.account_kind_for(n) == "api_key"
-                    and self._key_eligible(n, settings)
-                    and usage.get(n) not in DEAD_API_KEY_SENTINELS
-                ],
+                [n for n in eligible_keys if n not in dead_keys],
                 leaving=current,
             )
         )
@@ -1073,6 +1076,10 @@ class AutoSwitchEngine:
             if trigger == "credit-return":
                 return self._hold_on_credit(
                     "no subscription account in rotation"
+                )
+            if dead_keys:
+                return self._hold_on_dead_key(
+                    "every API key to fall back on is revoked or out of credit"
                 )
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.

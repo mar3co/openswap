@@ -1236,6 +1236,18 @@ class SnapshotMixin:
             if info[5] is not UNREAD_CREDENTIALS and looks_like_api_key(info[5])
         }
         health = api_key_health.KeyHealth(self.backup_dir / "cache")
+        if probe:
+            # An idle key that only roster-only passes see (the extra while
+            # auto-switch runs) would otherwise never be rechecked: load just
+            # the slots whose recorded verdict is due.
+            for num, info in candidates.items():
+                if info[5] is not UNREAD_CREDENTIALS or not health.slot_due(
+                    api_key_health.slot_id(info[1], info[3])
+                ):
+                    continue
+                creds, _unreadable = self._read_account_credentials_ex(num, info[1])
+                if looks_like_api_key(creds):
+                    keys[num] = creds
         due = [key for key in keys.values() if probe and health.due(key)]
         fresh = health.check_all(due) if due else {}
         if keys:

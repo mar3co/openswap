@@ -373,6 +373,39 @@ class TestCollector:
         unread = [(2, email, "", "", False, UNREAD_CREDENTIALS, "")]
         assert s._collect_usage_entries(unread, fetch=set())["2"].sentinel == USAGE_API_KEY
 
+    def test_due_idle_key_is_rechecked_on_a_pass_that_may_probe(self, temp_home, monkeypatch):
+        from openswap.engine.notes import UNREAD_CREDENTIALS
+
+        verdicts = [VERDICT_NO_CREDIT, VERDICT_OK]
+        calls = []
+
+        def probe(key):
+            calls.append(key)
+            return verdicts.pop(0)
+
+        monkeypatch.setattr(api_key_health, "probe", probe)
+        s = self._switcher()
+        s.add_account_from_token(KEY, slot=2)
+        email = s._get_sequence_data()["accounts"]["2"]["email"]
+        monkeypatch.setattr(s, "_account_kind", lambda num: "api_key")
+        unread = [(2, email, "", "", False, UNREAD_CREDENTIALS, "")]
+        # First sight: never recorded, so a pass that may probe loads it.
+        assert s._collect_usage_entries(unread, fetch={"1"})["2"].sentinel == USAGE_API_KEY_NO_CREDIT
+        # Not due yet: the roster verdict stands, nothing is read.
+        assert s._collect_usage_entries(unread, fetch={"1"})["2"].sentinel == USAGE_API_KEY_NO_CREDIT
+        assert calls == [KEY]
+        # Past the retry interval the slot is loaded and probed again.
+        cache = s.backup_dir / "cache" / api_key_health.CACHE_NAME
+        data = json.loads(cache.read_text())
+        for entry in data["keys"].values():
+            entry["checkedAt"] -= api_key_health.RETRY_TTL_S
+        cache.write_text(json.dumps(data))
+        assert s._collect_usage_entries(unread, fetch={"1"})["2"].sentinel == USAGE_API_KEY
+        assert calls == [KEY, KEY]
+        # A store-only pass never reads the key.
+        assert s._collect_usage_entries(unread, fetch=set())["2"].sentinel == USAGE_API_KEY
+        assert calls == [KEY, KEY]
+
     def test_oauth_slot_is_never_probed(self, temp_home, monkeypatch):
         calls = []
         monkeypatch.setattr(api_key_health, "probe", lambda key: calls.append(key))
