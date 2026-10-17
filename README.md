@@ -4,6 +4,7 @@ OpenSoft macOS menu bar app for rotating AI coding accounts (Claude Code and Cod
 
 OpenSwap is a standalone MIT descendant of [claude-swap](https://github.com/realiti4/claude-swap) (copyright Onur Cetinkol). It is not the PyPI `claude-swap` package.
 
+**Website:** [opensoft.me/swap](https://opensoft.me/swap)
 **Users:** [Wiki](https://github.com/mar3co/openswap/wiki) (features, install, extra, widget, kickoff)
 **Developers:** [docs/](docs/README.md) (architecture, hacking, tests)
 
@@ -155,3 +156,7 @@ sign-in where enabled. **Save current login** captures an existing login.
 `list`, `status`, and `switch` take `--json` (one object on stdout; notices on
 stderr). `openswap auto --json` is an event stream. Schema version 1; ignore
 unknown fields. Envelope details: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference#json).
+
+---
+
+An OpenSoft project. [opensoft.me](https://opensoft.me)
