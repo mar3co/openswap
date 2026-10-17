@@ -409,7 +409,8 @@ def test_live_check_gates_fold_to_one_line_unless_failed_or_verbose():
 def test_mistyped_worker_command_suggests_the_closest_one(root, capsys):
     assert _run(root, "acount") == 2
     assert capsys.readouterr().err.strip() == (
-        "openswap worker: unknown command 'acount'. Did you mean `openswap worker account`?"
+        "openswap worker: unknown command 'acount'. "
+        "Did you mean `openswap worker account` or `openswap worker connect`?"
     )
     assert _run(root, "zzz") == 2
     assert "Run `openswap worker --help`" in capsys.readouterr().err

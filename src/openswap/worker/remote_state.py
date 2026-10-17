@@ -62,13 +62,17 @@ def read_key_status(root):
     status: ``renews`` is True (rotates itself), False (the backend lacks rotation)
     or None (unknown). Like ``read_status``: no Keychain, sockets or writes.
     Unlike it, a disabled worker still reports its key: the key keeps aging
-    while the worker is off, so its expiry warning must stay visible."""
+    while the worker is off, so its expiry warning must stay visible. A worker the
+    owner removed (saved state ``revoked``) reports nothing: its key can never be
+    renewed or reconnected, only unpaired."""
     policy = load_worker_settings(root)
     if policy.control_service_url is None:
         return None, None
     try:
         data = json.loads(root.joinpath(*STATUS_FILE).read_text(encoding="utf-8"))
         if data["service"] != _identity(policy.control_service_url, policy.control_service_worker_id):
+            return None, None
+        if data.get("state") == RemoteConnectivity.REVOKED.value:
             return None, None
         renews = data.get("key_renews")
         expires = data.get("key_expires_at")
@@ -214,16 +218,24 @@ class ConfiguredRemote:
             seen = client.last_seen_at
             # The heartbeat's local send time: the service timestamp less the measured offset.
             received = seen - getattr(client, "_skew", timedelta(0)) if seen else None
+            kept = _kept_key(self.runtime.backup_root, client.url, client.worker_id or None)
             renewal = getattr(client, "key_renewal", None)
             renews = renewal() if callable(renewal) else None
             if renews is None:
                 # Not found out yet by this registration (a restart while the
                 # service is unreachable): keep what an earlier one learned.
-                renews = _kept_key(self.runtime.backup_root, client.url,
-                                   client.worker_id or None).get("key_renews")
+                renews = kept.get("key_renews")
+            # A worker's key expiry only ever moves later (a rotation or a
+            # Connect reconnect issues a fresh key), so never write back an
+            # earlier one: a pass that started before a reconnect saved the new
+            # key's expiry would otherwise restore the old one.
+            expires = getattr(client, "key_expires_at", None)
+            saved = kept.get("key_expires_at")
+            if saved is not None and (expires is None or saved > expires):
+                expires = saved
             save_status(self.runtime.backup_root, client.url, client.state, seen,
                         client.worker_id or None, received, key_renews=renews,
-                        key_expires_at=getattr(client, "key_expires_at", None))
+                        key_expires_at=expires)
 
     def _resolve(self):
         """Re-read policy and enrollment; return the client to drive this pass, or None.

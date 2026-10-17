@@ -1396,9 +1396,13 @@ def _remote_rows(**kwargs):
 
 
 def test_menu_has_a_set_up_button_first_in_remote_tasks():
-    rows = _remote_rows()
+    # On a paired Mac it leads; on an unpaired one it follows Connect (plan 022).
+    rows = _remote_rows(worker_paired=True)
     ids = [row["id"] for row in rows]
     assert ids.index("group_remote_tasks") + 1 == ids.index("remote_tasks_setup")
+    unpaired = [row["id"] for row in _remote_rows()]
+    assert unpaired[:4] == ["group_remote_tasks", "remote_tasks_connect", "remote_tasks_connect_other",
+                            "remote_tasks_setup"]
     row = rows[ids.index("remote_tasks_setup")]
     assert row["kind"] == "button" and row["label"] == "Set up Remote tasks…" and row["disabled"] is False
     busy = {r["id"]: r for r in _remote_rows(worker_status={"operation": "worker_account_update"})}
