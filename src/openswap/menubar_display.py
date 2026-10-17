@@ -1201,8 +1201,9 @@ def _worker_active_job_id(snapshot: dict) -> str | None:
 POPOVER_AUTO_CLOSE_S = 12.0
 HEADER_TITLE_H = 20.0
 HEADER_CONTROL_GAP = 6.0
-# NSTextField glyphs sit high in their bounds next to a bezeled button.
-HEADER_LABEL_OPTICAL_DY = 3.0
+# A 13pt NSTextField draws its capitals centered this far below the frame's
+# top, so a header label sits at ``row_mid - HEADER_LABEL_CAP_MID``.
+HEADER_LABEL_CAP_MID = 8.5
 SETTINGS_HEADER_GAP = 8.0
 SETTINGS_POPUP_W = 118.0
 # Was 312. The extra's popover is the "dropdown"; 390 is +25%.
@@ -3111,21 +3112,22 @@ def trailing_header_frames(
     *,
     title_h: float = HEADER_TITLE_H,
     gap: float = HEADER_CONTROL_GAP,
+    outset: float = 0.0,
 ) -> tuple[tuple[float, float, float, float], tuple[float, float, float, float]]:
     """Pin a label+control pair to the top-right of the popover header.
 
     Sizes are ``(width, height)``. Returns ``(label_frame, control_frame)``
     as ``(x, y, w, h)`` in a flipped view (origin at the top-left). The
-    control's trailing edge sits ``pad`` from the panel's right edge; both
-    are vertically centered on the title row.
+    control's trailing edge sits ``pad - outset`` from the panel's right edge,
+    so a borderless icon's padding can reach into the margin while its glyph
+    lines up with the content. Both are centered on the title row, even when
+    taller than it, so they share a center line with the title.
     """
     lw, lh = label_wh
     cw, ch = control_wh
-    x = panel_width - pad - (lw + gap + cw)
+    x = panel_width - pad + outset - (lw + gap + cw)
     mid_y = pad + title_h / 2.0
-    ly = max(pad, mid_y - lh / 2.0)
-    cy = max(pad, mid_y - ch / 2.0)
-    return (x, ly, lw, lh), (x + lw + gap, cy, cw, ch)
+    return (x, mid_y - lh / 2.0, lw, lh), (x + lw + gap, mid_y - ch / 2.0, cw, ch)
 
 
 def trailing_row_frames(
@@ -3220,20 +3222,21 @@ def settings_header_frames(
     back_wh: tuple[float, float],
     title_wh: tuple[float, float],
     *,
+    title_h: float = HEADER_TITLE_H,
     gap: float = SETTINGS_HEADER_GAP,
-    optical_dy: float = HEADER_LABEL_OPTICAL_DY,
+    cap_mid: float = HEADER_LABEL_CAP_MID,
 ) -> tuple[tuple[float, float, float, float], tuple[float, float, float, float]]:
-    """Back button + Settings title, sharing the button's vertical center.
+    """Back button + page title on the main header's center line.
 
     Returns ``(back_frame, title_frame)`` as ``(x, y, w, h)`` in a flipped
-    view. ``optical_dy`` nudges the title down so NSTextField glyphs line up
-    with the bezeled button label.
+    view. The button and the title's capitals share the row's center, the
+    same line the main page's "OpenSwap" title sits on, so switching pages
+    does not shift the header.
     """
     bw, bh = back_wh
     tw, th = title_wh
-    mid = pad + bh / 2.0
-    ty = mid - th / 2.0 + optical_dy
-    return (pad, pad, bw, bh), (pad + bw + gap, ty, tw, th)
+    mid = pad + title_h / 2.0
+    return (pad, mid - bh / 2.0, bw, bh), (pad + bw + gap, mid - cap_mid, tw, th)
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
