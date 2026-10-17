@@ -80,6 +80,32 @@ def test_release_workflow_builds_both_architectures():
     assert "-arm64.zip" in workflow and "-x86_64.zip" in workflow
 
 
+def test_tap_workflow_fails_a_release_it_cannot_push():
+    """v0.2.0's push was skipped behind a green run because the secret was
+    empty; a missing or unusable token must fail the job and say how to
+    recover."""
+    workflow = (ROOT / ".github" / "workflows" / "homebrew-tap.yml").read_text(encoding="utf-8")
+    assert "HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}" in workflow
+    assert "::warning::" not in workflow
+    push = workflow[workflow.index("      - name: Push cask to tap") :]
+    assert "\n        if:" not in push.split("run: |", 1)[0]
+    fail = push[push.index("fail() {") : push.index("          }\n")]
+    assert "::error " in fail and "HOMEBREW_TAP_TOKEN" in fail
+    assert "$TAP_REPO/Casks/openswap.rb by hand" in fail
+    assert fail.rstrip().endswith("exit 1")
+    steps = push.splitlines()
+    assert any(
+        '[ "$HAS_TAP_TOKEN" = true ] || fail' in line for line in steps
+    ), "a missing token must fail before the clone"
+    # The tap is public: only a push proves the token can write, so the
+    # dry-run must come before the already-matches exit.
+    assert push.index("git push --dry-run origin HEAD || fail") < push.index("already matches")
+    assert "git push origin HEAD || fail" in push
+    # Published prereleases skip the job; a fixed token re-pushes any tag.
+    assert "!github.event.release.prerelease" in workflow
+    assert "workflow_dispatch:\n    inputs:\n      tag:" in workflow
+
+
 def test_uninstall_runs_the_apps_hook_instead_of_removing_the_login_item():
     """Homebrew runs the uninstall stanza on upgrade too; `launchctl:` there
     would drop the login item on every `brew upgrade`."""

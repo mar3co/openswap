@@ -5,8 +5,13 @@ name: Homebrew tap
 # `brew install --cask mar3co/openswap/openswap` picks it up.
 #
 # Needs repository secret HOMEBREW_TAP_TOKEN: a fine-grained token with
-# Contents read/write on mar3co/homebrew-openswap only. Without it the job
-# prints the manual steps and succeeds, so a release is never blocked on it.
+# Contents read/write on mar3co/homebrew-openswap only. If the token is
+# missing, empty or cannot push to the tap, this job fails (the release itself
+# stays published) with an error naming the secret and the manual copy step,
+# so a skipped push cannot pass green. Write access is checked even when the
+# tap already has this cask. Once the token is fixed, re-run it from the
+# Actions tab with the release's tag (workflow_dispatch). Published
+# prereleases skip it; a manual run pushes whatever tag it is given.
 
 on:
   release:
@@ -33,21 +38,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern openswap.rb --dir .
 
-      - name: No tap token
-        if: ${{ env.HAS_TAP_TOKEN != 'true' }}
-        run: |
-          echo "::warning::HOMEBREW_TAP_TOKEN is not set; copy openswap.rb from release $TAG to $TAP_REPO/Casks/openswap.rb by hand."
-          cat openswap.rb
-
       - name: Push cask to tap
-        if: ${{ env.HAS_TAP_TOKEN == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
-          mkdir -p tap/Casks
-          cp openswap.rb tap/Casks/openswap.rb
+          fail() {
+            msg="$1 The cask for $TAG was not pushed. Set HOMEBREW_TAP_TOKEN (fine-grained token, Contents read/write on $TAP_REPO) and re-run this workflow with tag=$TAG, or copy openswap.rb from release $TAG to $TAP_REPO/Casks/openswap.rb by hand."
+            echo "::error title=Cask not pushed::$msg"
+            {
+              echo "## Cask not pushed"
+              echo
+              echo "$msg"
+              echo
+              echo '```ruby'
+              cat "$GITHUB_WORKSPACE/openswap.rb"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          [ "$HAS_TAP_TOKEN" = true ] || fail "HOMEBREW_TAP_TOKEN is missing or empty."
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap \
+            || fail "HOMEBREW_TAP_TOKEN could not clone $TAP_REPO."
           cd tap
+          # The tap is public, so the clone proves nothing about the token;
+          # a dry-run push needs write access even when nothing would change.
+          git push --dry-run origin HEAD || fail "HOMEBREW_TAP_TOKEN cannot push to $TAP_REPO."
+          mkdir -p Casks
+          cp ../openswap.rb Casks/openswap.rb
           if git diff --quiet -- Casks/openswap.rb && git ls-files --error-unmatch Casks/openswap.rb >/dev/null 2>&1; then
             echo "Casks/openswap.rb already matches $TAG"
             exit 0
@@ -56,4 +73,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Casks/openswap.rb
           git commit -m "openswap ${TAG#v}"
-          git push origin HEAD
+          git push origin HEAD || fail "Pushing to $TAP_REPO failed."
