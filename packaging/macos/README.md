@@ -91,8 +91,7 @@ the submission before failing, so the reason is in the job log.
    repo only). If the secret is missing, empty or cannot push to the tap,
    the job fails with an error naming it, and the cask is not pushed (write
    access is checked even when the tap already has the cask); fix the
-   secret and re-run
-   the workflow for that tag from the Actions tab
+   secret and re-run the workflow for that tag from the Actions tab
    (`gh workflow run homebrew-tap.yml -f tag=v<version>`), or copy
    `openswap.rb` into the tap by hand.
 
