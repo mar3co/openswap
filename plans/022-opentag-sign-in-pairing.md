@@ -1,6 +1,8 @@
 # OpenSwap feature proposal: pair a Mac by signing in to OpenTag
 
-Status: IN PROGRESS 2026-10-16 (accepted with every default; S1 and S2 under way). Depends on plan 017 (pairing, worker protocol)
+Status: DONE 2026-10-16 (accepted with every default). S1 OpenSwap #118, S2 OpenSwap #119,
+O1 OpenTag #185, O2 OpenTag #186. OpenTag's migrations and connect page are merged but
+not yet pushed or deployed. Depends on plan 017 (pairing, worker protocol)
 and reuses parts of plan 018 (OpenTag's sign-in and consent pages). Facts about
 OpenTag were read from `mar3co/opentag` `main` at `9f350ab`. Recheck them
 before phase O2, because migrations that are already merged cannot be edited.
