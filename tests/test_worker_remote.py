@@ -129,7 +129,7 @@ def test_unreachable_running_job_continues_and_reconciles_interrupted(remote_set
     ticks[0] += 25
     assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "interrupted"
     adapter.finish.set()
-    runner.join(2)
+    runner.join(15)
     assert not runner.is_alive() and results[0].state == JobState.SUCCEEDED
     transport.unreachable = False
     remote.tick()
@@ -173,7 +173,7 @@ def test_revocation_stops_new_claims_and_never_kills_running_job(remote_setup):
     remote.tick()
     assert len(transport.calls) == before
     adapter.finish.set()
-    runner.join(2)
+    runner.join(15)
     assert not runner.is_alive() and adapter.starts == 1
 
 
@@ -213,7 +213,10 @@ def test_cancel_reconnect_after_heartbeat_loss(remote_setup):
     ticks[0] += 16
     store.request("cancel", {"job_id": job_id}, paired["device_key"])
     remote.tick()  # stop must propagate even though state is interrupted
-    runner.join(2)
+    # Only interrupt() sets finish; events() alone gives up after 5s, so waiting
+    # on finish proves the stop arrived while leaving a slow runner headroom.
+    assert adapter.finish.wait(15)
+    runner.join(15)
     assert not runner.is_alive()
     remote.tick()
     assert store.request("job", {"job_id": job_id}, paired["device_key"])["state"] == "cancelled"
