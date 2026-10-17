@@ -9,13 +9,11 @@ Return is the primary button; Escape and the close button report ``close``.
 from __future__ import annotations
 
 import weakref
-from pathlib import Path
 
 from AppKit import (
     NSApplication,
     NSBackingStoreBuffered,
     NSBezelStyleRounded,
-    NSButton,
     NSBezierPath,
     NSColor,
     NSControlSizeLarge,
@@ -23,19 +21,15 @@ from AppKit import (
     NSControlStateValueOn,
     NSFocusRingTypeExterior,
     NSFont,
-    NSFontAttributeName,
-    NSForegroundColorAttributeName,
     NSFontWeightMedium,
     NSFontWeightRegular,
     NSFontWeightSemibold,
     NSImage,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
-    NSKernAttributeName,
     NSPasteboard,
     NSPasteboardTypeString,
     NSSwitch,
-    NSTextField,
     NSView,
     NSWindow,
     NSWindowStyleMaskClosable,
@@ -43,9 +37,11 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWindowTitleHidden,
 )
-from Foundation import NSAttributedString, NSMakeRect, NSObject
+from Foundation import NSMakeRect, NSObject
 
-from openswap.menubar_dialog import _DialogButton, _DialogSurface, _label
+from openswap.menubar_dialog import (
+    LOCKUP_SPACE, _DialogButton, _DialogSurface, _label, _PlainButton, draw_lockup,
+)
 from openswap.setup_wizard import ACTION_CLOSE, ACTION_COPY_COMMAND
 
 WIDTH = 540.0
@@ -54,7 +50,6 @@ CONTENT = WIDTH - PAD * 2
 BUTTON_H = 36.0
 SMALL_BUTTON_H = 30.0
 GAP = 10.0
-LOCKUP_MARK = 22.0  # the mark's side in the wordmark
 ACCOUNTS_SHOWN = 6  # account rows before "and N more", so the footer stays on screen
 
 
@@ -64,46 +59,6 @@ class _WizardButton(_DialogButton):
 
 class _WizardSwitch(NSSwitch):
     """An NSSwitch that carries the action it reports."""
-
-
-class _TextButton(NSButton):
-    """Back and Skip: a plain label that acts like a button, no fill."""
-
-    def drawRect_(self, rect):
-        ink = NSColor.secondaryLabelColor() if self.isEnabled() else NSColor.tertiaryLabelColor()
-        if self.isHighlighted():
-            ink = NSColor.labelColor()
-        title = NSAttributedString.alloc().initWithString_attributes_(self.title(), {
-            NSFontAttributeName: self.font(), NSForegroundColorAttributeName: ink,
-        })
-        size = title.size()
-        title.drawAtPoint_((
-            (self.bounds().size.width - size.width) / 2,
-            (self.bounds().size.height - size.height) / 2,
-        ))
-
-    def drawFocusRingMask(self):
-        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(self.bounds(), 6, 6).fill()
-
-    def focusRingMaskBounds(self):
-        return self.bounds()
-
-
-class _WizardSurface(_DialogSurface):
-    """White content over a grey footer (the dialog surface does the
-    reverse, which reads as a grey sheet in light mode)."""
-
-    def drawRect_(self, rect):
-        NSColor.controlBackgroundColor().setFill()
-        NSBezierPath.fillRect_(self.bounds())
-        footer = getattr(self, "footer_y", None)
-        if footer is not None:
-            NSColor.windowBackgroundColor().setFill()
-            NSBezierPath.fillRect_(NSMakeRect(
-                0, footer, self.bounds().size.width, self.bounds().size.height - footer,
-            ))
-            NSColor.separatorColor().setFill()
-            NSBezierPath.fillRect_(NSMakeRect(0, footer, self.bounds().size.width, 0.5))
 
 
 class _Box(NSView):
@@ -248,7 +203,7 @@ class SetupWizard:
         """A footer or content button. ``primary`` is the one accent-filled
         button on the page (Return presses it); ``plain`` is text only."""
         height = SMALL_BUTTON_H if small else BUTTON_H
-        cls = _TextButton if plain else _WizardButton
+        cls = _PlainButton if plain else _WizardButton
         button = cls.alloc().initWithFrame_(NSMakeRect(0, 0, 100, height))
         button.setTitle_(title)
         button.setBezelStyle_(NSBezelStyleRounded)
@@ -300,38 +255,11 @@ class SetupWizard:
         surface.addSubview_(field)
         return field.frame().size.height
 
-    def _lockup(self, surface, x, y):
-        """The OpenSwap wordmark: the OpenSoft mark, then "OpenSwap" in one
-        weight with tight tracking, as the sibling products set theirs."""
-        mark = NSImageView.alloc().initWithFrame_(NSMakeRect(x, y, LOCKUP_MARK, LOCKUP_MARK))
-        image = NSImage.alloc().initWithContentsOfFile_(
-            str(Path(__file__).with_name("assets") / "opensoft-symbol-64.png")
-        )
-        if image is not None:
-            image.setTemplate_(True)
-            mark.setImage_(image)
-        mark.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-        mark.setContentTintColor_(NSColor.labelColor())
-        mark.setAccessibilityElement_(False)
-        surface.addSubview_(mark)
-        word = NSTextField.labelWithString_("")
-        word.setAttributedStringValue_(NSAttributedString.alloc().initWithString_attributes_(
-            "OpenSwap", {
-                NSFontAttributeName: _font(15, NSFontWeightSemibold),
-                NSForegroundColorAttributeName: NSColor.labelColor(),
-                NSKernAttributeName: -0.4,
-            },
-        ))
-        word.sizeToFit()
-        size = word.frame().size
-        word.setFrameOrigin_((x + LOCKUP_MARK + 8, y + (LOCKUP_MARK - size.height) / 2))
-        surface.addSubview_(word)
-
     def _build(self, page):
-        surface = _WizardSurface.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, 480))
+        surface = _DialogSurface.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, 480))
         surface.primary = None
         y = PAD - 4
-        self._lockup(surface, PAD, y)
+        draw_lockup(surface, PAD, y)
         progress = page.get("progress")
         if progress:
             dots = _Dots.alloc().initWithFrame_(NSMakeRect(0, 0, progress[1] * 14, 8))
@@ -339,7 +267,7 @@ class SetupWizard:
             dots.setFrameOrigin_((WIDTH - PAD - progress[1] * 14 + 7, y + 9))
             dots.setAccessibilityLabel_(f"Step {progress[0]} of {progress[1]}")
             surface.addSubview_(dots)
-        y += 50
+        y += LOCKUP_SPACE
 
         y += self._text(surface, page["title"], y, size=22, weight=NSFontWeightSemibold)
         if page.get("body"):

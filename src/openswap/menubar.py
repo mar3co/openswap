@@ -823,6 +823,8 @@ def run(switcher, codex=None) -> int:
                     paired = load_worker_settings(root).control_service_url is not None
                     if paired or guided_setup.pair_interactively(root, ui):
                         guided_setup.run(root, ui)
+                except guided_setup.SetupClosed:
+                    pass
                 except Exception:
                     ui.say("Setup stopped unexpectedly. Run `openswap worker setup` in Terminal to finish.")
                 finally:
@@ -860,6 +862,8 @@ def run(switcher, codex=None) -> int:
                     ui.say(message)
                     if outcome == "paired":
                         guided_setup.run(root, ui)
+                except guided_setup.SetupClosed:
+                    pass
                 except Exception:
                     flow.close()
                     ui.say("Connect stopped unexpectedly. Run `openswap worker connect` in Terminal.")
@@ -2732,23 +2736,11 @@ def run(switcher, codex=None) -> int:
             alert = make_dialog_alert(**kwargs)
             return self._dialog(alert.run)
 
-        def _choose_folder(self, *, title: str, message: str) -> str | None:
-            """The native folder chooser (Finder-style browse and search); None on Cancel."""
-            import AppKit
+        def _choose_folder(self, *, title: str, message: str, close: str | None = None):
+            """The native folder chooser: a path, None on Cancel, or ``DIALOG_CLOSE`` for ``close``."""
+            from openswap.menubar_dialog import choose_folder
 
-            panel = AppKit.NSOpenPanel.openPanel()
-            panel.setTitle_(title)
-            panel.setMessage_(message)
-            panel.setPrompt_("Approve")
-            panel.setCanChooseDirectories_(True)
-            panel.setCanChooseFiles_(False)
-            panel.setCanCreateDirectories_(True)
-            panel.setAllowsMultipleSelection_(False)
-            panel.setDirectoryURL_(AppKit.NSURL.fileURLWithPath_(AppKit.NSHomeDirectory()))
-            if self._dialog(panel.runModal) != AppKit.NSModalResponseOK:
-                return None
-            urls = panel.URLs()
-            return str(urls[0].path()) if urls and len(urls) else None
+            return choose_folder(title=title, message=message, close=close, run=self._dialog)
 
         def _show_error(self, message: str):
             self._alert(title="openswap", message=message)
