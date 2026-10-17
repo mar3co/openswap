@@ -390,11 +390,14 @@ def test_submit_test_cli_surfaces_queue_full_over_http(tmp_path, keychain, capsy
             enrollment = load_enrollment(url)
             transport = Transport(url, enrollment.device_key)
             transport.request("register", {})
-            transport.request("heartbeat", {"worker_epoch": 1})
             expires = datetime.now(timezone.utc) + timedelta(seconds=600)
+            # Heartbeat before every submit: the store runs on the real clock, and
+            # a slow runner can spend the whole offline window filling the queue.
             for index in range(20):  # the reference queue limit per worker
+                transport.request("heartbeat", {"worker_epoch": 1})
                 job = JobSubmission(f"fill-{index}", "codex", "Fill", "research", "research", expires, 60)
                 transport.request("submit", Submission(enrollment.worker_id, job).to_dict())
+            transport.request("heartbeat", {"worker_epoch": 1})
             assert cli.main(["submit-test", "--url", url, "--task", "One too many", "--workspace-id", "research",
                              "--runtime-limit", "60", "--expires-in", "600", "--idempotency-key", "overflow",
                              "--i-understand-this-is-a-test-tool"], backup_root=root) == 1
