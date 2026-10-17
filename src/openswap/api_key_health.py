@@ -11,6 +11,12 @@ with the key answers the question:
   the organization has no credit left. Anthropic does not document whether
   count_tokens checks the balance, so this verdict is only ever taken from
   that explicit error, never inferred.
+- A spend limit reached (``invalid_request_error`` 400 "You have reached your
+  specified [workspace] API usage limits…" for a limit the user set in the
+  Console, or the tier cap's 429 ``enforced_spend_limit_reached``): requests
+  fail until the limit is raised or the month turns over. As with the
+  balance, Anthropic does not say whether count_tokens enforces spend limits,
+  so this too is taken only from the explicit error.
 - Anything else (network, 429, 5xx, a retired probe model): unknown. The
   previous verdict stands and the probe retries later.
 
@@ -47,6 +53,8 @@ _logger = logging.getLogger(__name__)
 VERDICT_OK = "ok"
 VERDICT_REVOKED = "revoked"
 VERDICT_NO_CREDIT = "no-credit"
+VERDICT_SPEND_LIMIT = "spend-limit"
+VERDICTS = (VERDICT_OK, VERDICT_REVOKED, VERDICT_NO_CREDIT, VERDICT_SPEND_LIMIT)
 
 COUNT_TOKENS_URL = "https://api.anthropic.com/v1/messages/count_tokens"
 # Any active model works; a retired one turns every probe into "unknown",
@@ -86,35 +94,56 @@ def probe(key: str) -> str | None:
             resp.read()
         return VERDICT_OK
     except urllib.error.HTTPError as e:
-        return classify_error(e.code, _error_message(e))
+        return classify_error(e.code, *_error_details(e))
     except Exception as e:  # network, timeout, TLS: unknown, retried later
         _logger.debug("API key probe failed: %s", type(e).__name__)
         return None
 
 
-def classify_error(status: int, message: str) -> str | None:
+# The documented spend-limit wordings ("You have reached your specified API
+# usage limits", "...specified workspace API usage limits", and the tier
+# cap's "You have reached your API usage limits") share this phrase; a plain
+# rate limit's message does not.
+_SPEND_LIMIT_PHRASE = "api usage limits"
+_SPEND_LIMIT_CODE = "enforced_spend_limit_reached"
+
+
+def classify_error(status: int, message: str, error_code: str = "") -> str | None:
     """Map an error response to a verdict; None when it proves nothing."""
     if status == 401:
         return VERDICT_REVOKED
-    if status in (400, 402, 403) and "credit balance" in message.lower():
+    lowered = message.lower()
+    if status in (400, 402, 403) and "credit balance" in lowered:
         return VERDICT_NO_CREDIT
+    if status in (400, 429) and (
+        error_code == _SPEND_LIMIT_CODE or _SPEND_LIMIT_PHRASE in lowered
+    ):
+        return VERDICT_SPEND_LIMIT
     _logger.debug("API key probe inconclusive: HTTP %s", status)
     return None
 
 
-def _error_message(e: urllib.error.HTTPError) -> str:
+def _error_details(e: urllib.error.HTTPError) -> tuple[str, str]:
+    """``(message, details.error_code)`` from an error body; empty when absent."""
     try:
         payload = json.loads(e.read().decode())
     except Exception:
-        return ""
+        return "", ""
     error = payload.get("error") if isinstance(payload, dict) else None
-    message = error.get("message") if isinstance(error, dict) else None
-    return message if isinstance(message, str) else ""
+    if not isinstance(error, dict):
+        return "", ""
+    message = error.get("message")
+    details = error.get("details")
+    code = details.get("error_code") if isinstance(details, dict) else None
+    return (
+        message if isinstance(message, str) else "",
+        code if isinstance(code, str) else "",
+    )
 
 
 def _verdict_of(entry: object) -> str | None:
     verdict = entry.get("verdict") if isinstance(entry, dict) else None
-    return verdict if verdict in (VERDICT_OK, VERDICT_REVOKED, VERDICT_NO_CREDIT) else None
+    return verdict if verdict in VERDICTS else None
 
 
 def slot_id(email: str, org_uuid: str) -> str:

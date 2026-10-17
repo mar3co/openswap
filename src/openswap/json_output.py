@@ -28,11 +28,17 @@ USAGE_TOKEN_EXPIRED = "token expired"
 # reported as this sentinel instead of being fetched from the OAuth usage API.
 USAGE_API_KEY = "api key"
 # An API-key account whose last count_tokens probe failed (issue #97,
-# ``openswap.api_key_health``): the key is revoked, or its organization has no
-# credit left. Never a switch target; the engine leaves it when it is active.
+# ``openswap.api_key_health``): the key is revoked, its organization has no
+# credit left, or it reached a Console spend limit. Never a switch target; the
+# engine leaves it when it is active.
 USAGE_API_KEY_REVOKED = "api key revoked"
 USAGE_API_KEY_NO_CREDIT = "api key out of credit"
-DEAD_API_KEY_SENTINELS = (USAGE_API_KEY_REVOKED, USAGE_API_KEY_NO_CREDIT)
+USAGE_API_KEY_SPEND_LIMIT = "api key at spend limit"
+DEAD_API_KEY_SENTINELS = (
+    USAGE_API_KEY_REVOKED,
+    USAGE_API_KEY_NO_CREDIT,
+    USAGE_API_KEY_SPEND_LIMIT,
+)
 # The active account's macOS Keychain was unreadable (locked / denied / timeout)
 # with no plaintext fallback — distinct from a genuinely empty slot, so the user
 # isn't misled into an unnecessary re-login.
@@ -152,8 +158,8 @@ def usage_fields(
     contention, unattributable lineage, or a failed persist; retried
     automatically), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
-    ``USAGE_API_KEY_REVOKED`` / ``USAGE_API_KEY_NO_CREDIT`` sentinels (that
-    key's probe failed), the
+    ``USAGE_API_KEY_REVOKED`` / ``USAGE_API_KEY_NO_CREDIT`` /
+    ``USAGE_API_KEY_SPEND_LIMIT`` sentinels (that key's probe failed), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
     another account; usage suppressed, a switch repairs the drift), the
@@ -170,6 +176,8 @@ def usage_fields(
         return "api_key_revoked", None
     if entry == USAGE_API_KEY_NO_CREDIT:
         return "api_key_no_credit", None
+    if entry == USAGE_API_KEY_SPEND_LIMIT:
+        return "api_key_spend_limit", None
     if entry == USAGE_KEYCHAIN_UNAVAILABLE:
         return "keychain_unavailable", None
     if entry == USAGE_RELOGIN_REQUIRED:

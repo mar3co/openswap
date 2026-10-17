@@ -61,6 +61,8 @@ openswap auto             # switch for you before a window hits 90%
 
 Claude Code on a key linked with `--for` spends credit bought in that key's Claude Console organization. The monthly API credit included with Max and Team plans does not cover Claude Code, so a key whose organization holds only that credit fails with "Credit balance too low".
 
+OpenSwap does not cap what a key spends: it cannot see a key's spend, and a running Claude Code session keeps spending until a request fails. To cap it, create the key in its own Console workspace and set a monthly spend limit on that workspace (Settings › Workspaces › Spend limits; the Default workspace cannot have one). When a key reaches the limit, OpenSwap marks it **API key at its spend limit** and stops using it until the limit is raised or the month resets.
+
 Do not run `/logout` before `openswap add`: current Claude Code may revoke the refresh token you are about to save.
 
 Walkthrough: [Getting started](https://github.com/mar3co/openswap/wiki/Getting-Started). Every feature: [Features](https://github.com/mar3co/openswap/wiki/Features).

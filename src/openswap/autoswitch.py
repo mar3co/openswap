@@ -51,7 +51,9 @@ from openswap.exceptions import ClaudeSwitchError
 from openswap.json_output import (
     DEAD_API_KEY_SENTINELS,
     SCHEMA_VERSION,
+    USAGE_API_KEY_NO_CREDIT,
     USAGE_API_KEY_REVOKED,
+    USAGE_API_KEY_SPEND_LIMIT,
     USAGE_TOKEN_EXPIRED,
 )
 from openswap.locking import FileLock
@@ -505,11 +507,17 @@ class TickOutcome(enum.Enum):
 _refresh_fingerprint = oauth.credential_fingerprint
 
 
+_DEAD_KEY_WORDS = {
+    USAGE_API_KEY_REVOKED: "revoked",
+    USAGE_API_KEY_NO_CREDIT: "out of credit",
+    USAGE_API_KEY_SPEND_LIMIT: "at its spend limit",
+}
+
+
 def _dead_key_word(value: object) -> str | None:
-    """"revoked" / "out of credit" for a failed key probe, else None."""
-    if value not in DEAD_API_KEY_SENTINELS:
-        return None
-    return "revoked" if value == USAGE_API_KEY_REVOKED else "out of credit"
+    """What is wrong with a key whose probe failed ("revoked", "out of
+    credit", "at its spend limit"), else None."""
+    return _DEAD_KEY_WORDS.get(value) if value in DEAD_API_KEY_SENTINELS else None
 
 
 def _window_pcts(
@@ -898,8 +906,9 @@ class AutoSwitchEngine:
             self._check_model_names(quarantined, usage)
 
         active_headroom = headroom.get(current)
-        # The active key failed its probe (issue #97): set to "revoked" or
-        # "out of credit" so the hold copy below can name it.
+        # The active key failed its probe (issue #97): set to "revoked",
+        # "out of credit" or "at its spend limit" so the hold copy below can
+        # name it.
         dead_key = _dead_key_word(usage.get(current))
         if self.switcher.account_kind_for(current) == "api_key":
             if not (
@@ -1079,7 +1088,8 @@ class AutoSwitchEngine:
                 )
             if dead_keys:
                 return self._hold_on_dead_key(
-                    "every API key to fall back on is revoked or out of credit"
+                    "every API key to fall back on is revoked, out of credit "
+                    "or at its spend limit"
                 )
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.

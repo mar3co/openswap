@@ -2177,7 +2177,9 @@ class TestApiKeyAccounts:
 
     # -- dead keys (issue #97) ---------------------------------------------
 
-    @pytest.mark.parametrize("dead", ["api key revoked", "api key out of credit"])
+    @pytest.mark.parametrize(
+        "dead", ["api key revoked", "api key out of credit", "api key at spend limit"]
+    )
     def test_dead_linked_key_is_never_a_target(self, temp_home, dead):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -2251,6 +2253,20 @@ class TestApiKeyAccounts:
         assert h.events[-1].detail == "API key is out of credit and no account has room"
         assert h.switcher.current_account_number() == "2"
 
+    def test_active_key_at_its_spend_limit_names_the_limit(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(100), "2": "api key at spend limit"})
+        assert outcome is TickOutcome.BLOCKED
+        assert self._no_switch_reasons(h) == ["api-key-dead"]
+        assert h.events[-1].detail == (
+            "API key is at its spend limit and no account has room"
+        )
+
     def test_active_dead_key_alone_in_rotation(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -2287,7 +2303,7 @@ class TestApiKeyAccounts:
         assert outcome is TickOutcome.BLOCKED
         assert self._no_switch_reasons(h) == ["api-key-dead"]
         assert h.events[-1].detail == (
-            "every API key to fall back on is revoked or out of credit"
+            "every API key to fall back on is revoked, out of credit or at its spend limit"
         )
 
     def test_unread_key_is_checked_before_the_engine_lands_on_it(self, temp_home):
