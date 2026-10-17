@@ -1410,6 +1410,7 @@ class SwitchMixin:
 
         next_account: str | None = None
         skipped_exhausted: list[str] = []
+        skipped_dead_keys: list[str] = []
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
             if self._disabled_from_data(data, candidate):
@@ -1431,8 +1432,9 @@ class SwitchMixin:
                     )
                 continue
             if strategy == "next-available" and usage.get(candidate) in DEAD_API_KEY_SENTINELS:
-                # A key whose probe failed has no room at all (issue #97).
-                skipped_exhausted.append(candidate)
+                # A key whose probe failed is no target (issue #97), but it
+                # is not at a quota limit either: keep the diagnosis apart.
+                skipped_dead_keys.append(candidate)
                 note = SENTINEL_NOTES[usage[candidate]].split(" — ")[0]
                 if json_output:
                     warnings.append(f"Skipped Account-{candidate} ({note})")
@@ -1466,12 +1468,27 @@ class SwitchMixin:
             next_account = candidate
             break
 
-        # Every rotation target is at its limit. Switching onto an exhausted
-        # account would not help, so stay on the current one instead.
+        if next_account is None and skipped_dead_keys and not skipped_exhausted:
+            message = (
+                "Every other account is an API key that no longer works — "
+                f"staying on Account-{current_num}."
+            )
+            if json_output:
+                return self._switch_noop(
+                    strategy=strategy_label, reason="candidates-unavailable",
+                    to_ref=current_ref, warnings=warnings, message=message,
+                )
+            warning(message)
+            return None
+
+        # Every rotation target is at its limit (or a dead key). Switching onto
+        # one would not help, so stay on the current one instead.
         if next_account is None and skipped_exhausted:
             # With model limits in play the binding window may be a scoped
             # one (the per-skip lines name it), so don't claim "5h/7d".
             limits_label = "usage limits" if models else "5h/7d limit"
+            if skipped_dead_keys:
+                limits_label += " or have an API key that no longer works"
             if json_output:
                 return self._switch_noop(
                     strategy=strategy_label, reason="candidates-exhausted",
