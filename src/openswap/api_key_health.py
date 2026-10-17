@@ -177,8 +177,13 @@ class KeyHealth:
                 self._write(data)
         except (LockError, OSError):
             # Unrecorded this pass (the next one probes again), but this
-            # pass still acts on what it just learned.
-            verdicts = {by_fp[fp]: result for fp, result in results.items()}
+            # pass still acts on what it just learned, and an inconclusive
+            # probe keeps the cached verdict exactly as a recorded one would.
+            cached = self._read()
+            verdicts = {}
+            for fp, result in results.items():
+                previous = cached.get(fp) if isinstance(cached.get(fp), dict) else {}
+                verdicts[by_fp[fp]] = result if result is not None else previous.get("verdict")
         return verdicts
 
     def _read(self) -> dict:

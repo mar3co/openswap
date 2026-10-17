@@ -204,6 +204,16 @@ class TestKeyHealth:
             assert health.check_all([KEY]) == {KEY: VERDICT_REVOKED}
         assert health.verdict(KEY) is None
 
+    def test_lock_contention_keeps_a_cached_dead_verdict(self, tmp_path):
+        from openswap.exceptions import LockError
+
+        clock = Clock()
+        KeyHealth(tmp_path, prober=lambda k: VERDICT_NO_CREDIT, clock=clock).check(KEY)
+        clock.now += RETRY_TTL_S
+        health = KeyHealth(tmp_path, prober=lambda k: None, clock=clock)
+        with patch.object(api_key_health.FileLock, "__enter__", side_effect=LockError("busy")):
+            assert health.check_all([KEY]) == {KEY: VERDICT_NO_CREDIT}
+
     def test_cache_never_holds_the_key(self, tmp_path):
         health, _ = self._health(tmp_path, [VERDICT_REVOKED])
         health.check(KEY)
