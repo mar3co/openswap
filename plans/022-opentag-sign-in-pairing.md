@@ -1,10 +1,11 @@
 # OpenSwap feature proposal: pair a Mac by signing in to OpenTag
 
 Status: IN PROGRESS 2026-10-16 (accepted with every default). All four phases are merged:
-S1 OpenSwap #118, S2 OpenSwap #119, O1 OpenTag #185, O2 OpenTag #186. Two exits stay open:
-O1's conformance job does not yet run a pinned OpenSwap release that rotates, and S2's
-manual pairing and reconnect of a real Mac against a preview deployment has not been run.
-OpenTag's migrations are not yet pushed or deployed. Depends on plan 017 (pairing, worker protocol)
+S1 OpenSwap #118, S2 OpenSwap #119, O1 OpenTag #185, O2 OpenTag #186. OpenTag's migrations
+went to production on 2026-10-17 (OpenTicket #71 pin, then `db:bootstrap:opentag`). S2's exit is
+met: a real Mac paired and then reconnected through Connect against production that day. One exit
+stays open: O1's conformance job does not yet run a pinned OpenSwap release that rotates.
+Depends on plan 017 (pairing, worker protocol)
 and reuses parts of plan 018 (OpenTag's sign-in and consent pages). Facts about
 OpenTag were read from `mar3co/opentag` `main` at `9f350ab`. Recheck them
 before phase O2, because migrations that are already merged cannot be edited.
