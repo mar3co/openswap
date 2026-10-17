@@ -5,8 +5,11 @@ name: Homebrew tap
 # `brew install --cask mar3co/openswap/openswap` picks it up.
 #
 # Needs repository secret HOMEBREW_TAP_TOKEN: a fine-grained token with
-# Contents read/write on mar3co/homebrew-openswap only. Without it the job
-# prints the manual steps and succeeds, so a release is never blocked on it.
+# Contents read/write on mar3co/homebrew-openswap only. A published release
+# without it fails this job (the release itself stays published), naming the
+# secret and the manual copy step, so a skipped push cannot pass green. An
+# empty secret counts as missing. Once the token is fixed, re-run it from the
+# Actions tab with the release's tag (workflow_dispatch). Prereleases skip it.
 
 on:
   release:
@@ -33,11 +36,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern openswap.rb --dir .
 
-      - name: No tap token
+      - name: Require tap token
         if: ${{ env.HAS_TAP_TOKEN != 'true' }}
         run: |
-          echo "::warning::HOMEBREW_TAP_TOKEN is not set; copy openswap.rb from release $TAG to $TAP_REPO/Casks/openswap.rb by hand."
+          msg="HOMEBREW_TAP_TOKEN is missing or empty, so the cask for $TAG was not pushed. Set the secret (fine-grained token, Contents read/write on $TAP_REPO) and re-run this workflow with tag=$TAG, or copy openswap.rb from release $TAG to $TAP_REPO/Casks/openswap.rb by hand."
+          echo "::error title=Cask not pushed::$msg"
+          {
+            echo "## Cask not pushed"
+            echo
+            echo "$msg"
+            echo
+            echo '```ruby'
+            cat openswap.rb
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           cat openswap.rb
+          exit 1
 
       - name: Push cask to tap
         if: ${{ env.HAS_TAP_TOKEN == 'true' }}

@@ -80,6 +80,23 @@ def test_release_workflow_builds_both_architectures():
     assert "-arm64.zip" in workflow and "-x86_64.zip" in workflow
 
 
+def test_tap_workflow_fails_a_release_it_cannot_push():
+    """v0.2.0's push was skipped behind a green run because the secret was
+    empty; a missing token must fail the job and say how to recover."""
+    workflow = (ROOT / ".github" / "workflows" / "homebrew-tap.yml").read_text(encoding="utf-8")
+    assert "HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}" in workflow
+    guard = workflow[workflow.index("      - name: Require tap token") :]
+    guard = guard[: guard.index("      - name: Push cask to tap")]
+    assert "if: ${{ env.HAS_TAP_TOKEN != 'true' }}" in guard
+    assert "::error " in guard and "::warning::" not in workflow
+    assert "HOMEBREW_TAP_TOKEN" in guard
+    assert "$TAP_REPO/Casks/openswap.rb by hand" in guard
+    assert guard.rstrip().endswith("exit 1")
+    # Prereleases skip the job; a fixed token re-pushes any tag by hand.
+    assert "!github.event.release.prerelease" in workflow
+    assert "workflow_dispatch:\n    inputs:\n      tag:" in workflow
+
+
 def test_uninstall_runs_the_apps_hook_instead_of_removing_the_login_item():
     """Homebrew runs the uninstall stanza on upgrade too; `launchctl:` there
     would drop the login item on every `brew upgrade`."""
