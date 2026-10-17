@@ -48,7 +48,12 @@ from openswap.engine.freshen import (
     _SYSTEMIC_STATUSES,
 )
 from openswap.exceptions import ClaudeSwitchError
-from openswap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
+from openswap.json_output import (
+    DEAD_API_KEY_SENTINELS,
+    SCHEMA_VERSION,
+    USAGE_API_KEY_REVOKED,
+    USAGE_TOKEN_EXPIRED,
+)
 from openswap.locking import FileLock
 from openswap.poll_policy import (
     ESCALATION_MARGIN_PCT,
@@ -500,6 +505,13 @@ class TickOutcome(enum.Enum):
 _refresh_fingerprint = oauth.credential_fingerprint
 
 
+def _dead_key_word(value: object) -> str | None:
+    """"revoked" / "out of credit" for a failed key probe, else None."""
+    if value not in DEAD_API_KEY_SENTINELS:
+        return None
+    return "revoked" if value == USAGE_API_KEY_REVOKED else "out of credit"
+
+
 def _window_pcts(
     usage: dict | None, models: tuple[str, ...] = ()
 ) -> dict[str, float]:
@@ -886,6 +898,9 @@ class AutoSwitchEngine:
             self._check_model_names(quarantined, usage)
 
         active_headroom = headroom.get(current)
+        # The active key failed its probe (issue #97): set to "revoked" or
+        # "out of credit" so the hold copy below can name it.
+        dead_key = _dead_key_word(usage.get(current))
         if self.switcher.account_kind_for(current) == "api_key":
             if not (
                 self._key_eligible(current, settings)
@@ -893,6 +908,19 @@ class AutoSwitchEngine:
             ):
                 self._unhealthy_ticks = 0
                 self._idle_hold_since = None
+                if dead_key:
+                    # Picked by hand, outside the engine's care: say why work
+                    # stopped, but leave the choice to the user.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="api-key-dead",
+                            detail=(
+                                f"API key is {dead_key}; switch accounts to "
+                                "keep working"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
                 self._emit(
                     NoSwitchEvent(
                         reason="active-api-key",
@@ -900,12 +928,17 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
-            # On API credit: a key has no window to read, so unhealthy
-            # counting never applies. Leave only for a subscription below
-            # the threshold (`_rank_candidates`, trigger "credit-return").
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
-            trigger = "credit-return"
+            if dead_key:
+                # A dead key has no room at all: escape like an account at its
+                # limit, to any subscription with room, else a working key.
+                trigger = "at-limit"
+            else:
+                # On API credit: a key has no window to read, so unhealthy
+                # counting never applies. Leave only for a subscription below
+                # the threshold (`_rank_candidates`, trigger "credit-return").
+                trigger = "credit-return"
         elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
@@ -1004,6 +1037,7 @@ class AutoSwitchEngine:
                     n for n in candidates
                     if self.switcher.account_kind_for(n) == "api_key"
                     and self._key_eligible(n, settings)
+                    and usage.get(n) not in DEAD_API_KEY_SENTINELS
                 ],
                 leaving=current,
             )
@@ -1032,6 +1066,10 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
         if not oauth_candidates and not api_key_candidates:
+            if dead_key:
+                return self._hold_on_dead_key(
+                    f"API key is {dead_key} and no other account is in rotation"
+                )
             if trigger == "credit-return":
                 return self._hold_on_credit(
                     "no subscription account in rotation"
@@ -1175,6 +1213,11 @@ class AutoSwitchEngine:
             # known room: at-limit, or a failover where a subscription was
             # measured this tick or none is in rotation.
             ordered = api_key_candidates
+
+        if not ordered and dead_key:
+            return self._hold_on_dead_key(
+                f"API key is {dead_key} and no account has room"
+            )
 
         if not ordered and trigger == "credit-return":
             return self._hold_on_credit(
@@ -2185,6 +2228,12 @@ class AutoSwitchEngine:
             return (group, int(num))
 
         return sorted(keys, key=rank)
+
+    def _hold_on_dead_key(self, detail: str) -> TickOutcome:
+        """Nowhere to go from a key that no longer works: a block the user
+        must fix (new key, more credit) unless a subscription recovers."""
+        self._emit(NoSwitchEvent(reason="api-key-dead", detail=detail))
+        return TickOutcome.BLOCKED
 
     def _hold_on_credit(self, detail: str) -> TickOutcome:
         """Staying on paid credit is a correct outcome, not a block: a

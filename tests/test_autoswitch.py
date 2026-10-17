@@ -2175,6 +2175,119 @@ class TestApiKeyAccounts:
         assert h.engine._unhealthy_ticks == 0
         assert h.switcher.current_account_number() == "1"
 
+    # -- dead keys (issue #97) ---------------------------------------------
+
+    @pytest.mark.parametrize("dead", ["api key revoked", "api key out of credit"])
+    def test_dead_linked_key_is_never_a_target(self, temp_home, dead):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(100), "2": dead, "3": _usage(100)})
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
+    def test_working_key_beats_the_left_accounts_dead_key(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "akey@token.local")
+        h.seed(3, "c@example.com")
+        h.seed(4, "ckey@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._mark_api_key(h, 4)
+        self._link(h, 2, 1)
+        self._link(h, 4, 3)
+        usage = {"1": _usage(100), "2": "api key revoked", "3": _usage(100), "4": "api key"}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 4
+
+    def test_active_dead_key_escapes_to_any_subscription_with_room(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        # 95% is above the threshold, so credit-return would hold; a dead key
+        # leaves for it anyway, and inside the cooldown.
+        record_manual_switch(h.switcher.backup_dir, now=h.clock.now)
+        outcome = h.tick_with_usage({"1": _usage(95), "2": "api key out of credit"})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 1
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert "creditPlacedOn" not in h.state()
+
+    def test_active_dead_key_moves_to_a_working_key(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "spare@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._mark_api_key(h, 3)
+        self._link(h, 2, 1)
+        self._link(h, 3, 1)
+        outcome = h.tick_with_usage(
+            {"1": _usage(100), "2": "api key revoked", "3": "api key"}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_active_dead_key_with_nowhere_to_go_says_why(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        outcome = h.tick_with_usage({"1": _usage(100), "2": "api key out of credit"})
+        assert outcome is TickOutcome.BLOCKED
+        assert self._no_switch_reasons(h) == ["api-key-dead"]
+        assert h.events[-1].detail == "API key is out of credit and no account has room"
+        assert h.switcher.current_account_number() == "2"
+
+    def test_active_dead_key_alone_in_rotation(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("key@token.local", 2)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        h.engine._quarantine("1", "a@example.com", "invalid_grant")
+        h.events.clear()
+        assert h.tick_with_usage({"1": _usage(10), "2": "api key revoked"}) is TickOutcome.BLOCKED
+        assert self._no_switch_reasons(h) == ["api-key-dead"]
+        assert h.events[-1].detail == "API key is revoked and no other account is in rotation"
+
+    def test_hand_picked_dead_key_is_named_but_not_left(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        outcome = h.tick_with_usage({"1": "api key revoked", "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert self._no_switch_reasons(h) == ["api-key-dead"]
+        assert h.events[-1].detail == "API key is revoked; switch accounts to keep working"
+        assert h.active_number() == 1
+
+    def test_recovered_key_is_a_target_again(self, temp_home):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        self._link(h, 2, 1)
+        assert h.tick_with_usage({"1": _usage(100), "2": "api key out of credit"}) is not TickOutcome.SWITCHED
+        h.clock.advance(600)
+        assert h.tick_with_usage({"1": _usage(100), "2": "api key"}) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
 
 class TestFreshening:
     def test_near_expiry_target_is_refreshed_and_persisted(self, temp_home):

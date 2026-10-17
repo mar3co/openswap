@@ -1206,6 +1206,43 @@ class SnapshotMixin:
                 executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
             )
 
+    def _apply_api_key_health(
+        self,
+        info_by_num: dict[str, tuple],
+        sentinels: dict[str, str],
+        *,
+        probe: bool,
+    ) -> None:
+        """Overlay a failed key probe on the "api key" sentinel (issue #97).
+
+        Probes run only where this pass may fetch at all (``probe``, the same
+        gate as the backup probe) and only when the cached verdict is due;
+        every other pass reads the cache. A roster-only paint has no key to
+        fingerprint and keeps the plain "api key" sentinel.
+        """
+        from openswap import api_key_health
+
+        keys = {
+            num: info[5]
+            for num, info in info_by_num.items()
+            if sentinels.get(num) == USAGE_API_KEY
+            and info[5] is not UNREAD_CREDENTIALS
+            and looks_like_api_key(info[5])
+        }
+        if not keys:
+            return
+        health = api_key_health.KeyHealth(self.backup_dir / "cache")
+        due = [num for num, key in keys.items() if probe and health.due(key)]
+        if due:
+            with ThreadPoolExecutor(max_workers=len(due)) as executor:
+                list(executor.map(lambda num: health.check(keys[num]), due))
+        for num, key in keys.items():
+            verdict = health.verdict(key)
+            if verdict == api_key_health.VERDICT_REVOKED:
+                sentinels[num] = USAGE_API_KEY_REVOKED
+            elif verdict == api_key_health.VERDICT_NO_CREDIT:
+                sentinels[num] = USAGE_API_KEY_NO_CREDIT
+
     def _collect_usage_entries(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -1243,6 +1280,9 @@ class SnapshotMixin:
             static = self._static_usage_sentinel(info)
             if static is not None:
                 sentinels[num] = static
+        self._apply_api_key_health(
+            info_by_num, sentinels, probe=fetch is None or bool(fetch)
+        )
 
         entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both

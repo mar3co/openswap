@@ -1430,6 +1430,15 @@ class SwitchMixin:
                         f"openswap --add-account --slot {candidate})"
                     )
                 continue
+            if strategy == "next-available" and usage.get(candidate) in DEAD_API_KEY_SENTINELS:
+                # A key whose probe failed has no room at all (issue #97).
+                skipped_exhausted.append(candidate)
+                note = SENTINEL_NOTES[usage[candidate]].split(" — ")[0]
+                if json_output:
+                    warnings.append(f"Skipped Account-{candidate} ({note})")
+                else:
+                    print(f"{accent('Skipping')} Account-{candidate} ({note})")
+                continue
             if strategy == "next-available":
                 headroom = oauth.account_headroom(usage.get(candidate), models)
                 if headroom is not None and headroom <= 0:

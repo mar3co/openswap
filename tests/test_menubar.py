@@ -1116,6 +1116,14 @@ def test_token_entry_state_rejects_garbage():
     assert state["can_add"] is False
 
 
+def test_token_entry_state_warns_included_credit_does_not_cover_claude_code():
+    key = menubar.token_entry_state("sk-ant-api03-abc", _TOKEN_ROWS, _TOKEN_KINDS)
+    assert "doesn't cover" in key["credit_hint"]
+    assert "Max and Team" in key["credit_hint"]
+    for text in ("", "sk-ant-oat01-abc", "hunter2"):
+        assert menubar.token_entry_state(text, _TOKEN_ROWS, _TOKEN_KINDS)["credit_hint"] == ""
+
+
 def test_token_entry_state_strips_whitespace():
     state = menubar.token_entry_state("  sk-ant-api03-abc\n", _TOKEN_ROWS, _TOKEN_KINDS)
     assert state["kind"] == "api_key"
@@ -1258,6 +1266,16 @@ def test_hold_line_on_api_credit():
     assert menubar.hold_line_from_event(
         NoSwitchEvent(reason="on-api-credit"), active_title="API credit", strategy="best",
     ) == "Holding on API credit."
+
+
+def test_hold_line_names_a_dead_api_key():
+    assert menubar.hold_line_from_event(
+        NoSwitchEvent(reason="api-key-dead", detail="API key is revoked and no account has room"),
+        active_title="API credit", strategy="best",
+    ) == "Holding: API key is revoked and no account has room."
+    assert menubar.hold_line_from_event(
+        NoSwitchEvent(reason="api-key-dead"), active_title="API credit", strategy="best",
+    ) == "Holding: this API key no longer works."
 
 
 def test_panel_accounts_uses_last_good_when_display_is_a_sentinel():

@@ -112,6 +112,7 @@ from openswap.menubar import (
     settings_header_frames,
     settings_page_rows,
     STALE_PARENT,
+    TOKEN_CREDIT_HINT,
     parent_link_choice,
     token_entry_state,
     window_suffix,
@@ -2292,7 +2293,12 @@ class MenuBarPanel:
         popup.setFont_(font_body)
         self._fill_parent_popup(popup, state["choices"], snap.get("identities") or {})
         root.addSubview_(popup)
-        y += 28 + 10
+        y += 28 + 6
+        hint_h = float(int(font_small.boundingRectForFont().size.height + 1)) * 3
+        hint = _label(TOKEN_CREDIT_HINT, font_small, pal["muted"], NSMakeRect(PAD + 12, y, field_w, hint_h))
+        _wrap(hint)
+        root.addSubview_(hint)
+        y += hint_h + 10
 
         label_field = _TokenField.alloc().initWithFrame_(NSMakeRect(PAD + 12, y, field_w, 28))
         label_field.setPlaceholderString_("Email label (optional)")
@@ -2321,6 +2327,7 @@ class MenuBarPanel:
             detect.setStringValue_(current["line"])
             parent_label.setHidden_(not current["show_parent"])
             popup.setHidden_(not current["show_parent"])
+            hint.setHidden_(not current["credit_hint"])
             add.setEnabled_(current["can_add"] and self._on_add_token is not None)
 
         self._token_watcher = _TextWatcher.alloc().initWithCallback_(refresh)

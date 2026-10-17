@@ -5,7 +5,7 @@
 - Priority: P2; effort: M; risk: MED; dependencies: none (touches the
   autoswitch ranking, the roster record, the extra's More menu).
 - Planned at: `1a6bfb5`.
-- Status: DONE on branch (pending merge). Implemented on `ym/openswap-api-credit-fallback-300cfc` from `1a6bfb5`. Implementation plan: `plans/019-implementation.md`.
+- Status: DONE. Merged in mar3co/openswap#100 on 2026-10-15 (review fixes in `a39883b`). Implementation plan: `plans/019-implementation.md`. The key validity follow-up (mar3co/openswap#97) landed separately.
 
 ## Why this matters
 
@@ -237,11 +237,19 @@ unchanged.
 
 ## Known limitations and follow-ups
 
-- OpenSwap cannot see a revoked key or an exhausted credit balance. Claude
-  Code reports that error itself; the engine stays on the key until a
-  subscription recovers. Follow-up to file on acceptance of this plan: a
-  cheap validity probe through the token-count endpoint, surfaced as a
-  sentinel like `token expired` (filed as mar3co/openswap#97).
+- Revoked and out-of-credit keys (mar3co/openswap#97, done after merge): a
+  free `count_tokens` probe (`openswap.api_key_health`) marks a key
+  `api key revoked` on a 401 and `api key out of credit` on an error that
+  names the credit balance. Such a key is never a target, and an
+  engine-managed key that goes dead is left like an account at its limit.
+  count_tokens is not documented to check the balance, so out-of-credit
+  detection is best-effort.
+- The monthly API credit included with Max and Team plans (Anthropic's "API
+  credits for Max and Team plans") does not cover Claude Code. A key whose
+  organization holds only that credit authenticates and passes the probe,
+  but Claude Code on it fails with "Credit balance too low". The fallback
+  needs credit bought in the Console; the token page, the `--for` help and
+  the README say so.
 - The link cannot be verified against the key's organization.
 - Extra-usage overflow on the same login (Anthropic's `/extra-usage`) is a
   different mechanism and is not addressed here.
