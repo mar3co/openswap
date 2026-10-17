@@ -33,6 +33,7 @@ from openswap.logging_config import setup_logging
 from openswap.models import (
     AccountSnapshot,
     AccountsSnapshot,
+    alias_key,
     get_timestamp,
     normalize_alias,
 )
@@ -264,7 +265,8 @@ class CodexEngine:
             rec = accounts[text]
             return text, rec.get("email", ""), rec.get("accountId", "") or ""
         alias_hits = [
-            num for num, rec in accounts.items() if rec.get("alias") == text
+            num for num, rec in accounts.items()
+            if rec.get("alias") and alias_key(rec.get("alias")) == alias_key(text)
         ]
         if len(alias_hits) == 1:
             rec = accounts[alias_hits[0]]
@@ -460,7 +462,7 @@ class CodexEngine:
                     )
             if normalized_alias:
                 for existing, rec in accounts.items():
-                    if rec.get("alias") == normalized_alias:
+                    if alias_key(rec.get("alias")) == alias_key(normalized_alias):
                         raise ConfigError(
                             f"Alias '{normalized_alias}' is already used by account {existing}"
                         )
@@ -538,7 +540,7 @@ class CodexEngine:
             if not rec:
                 raise AccountNotFoundError(f"Account-{num} does not exist")
             for other, other_rec in (data.get("accounts") or {}).items():
-                if other != num and other_rec.get("alias") == normalized:
+                if other != num and alias_key(other_rec.get("alias")) == alias_key(normalized):
                     raise ConfigError(
                         f"Alias '{normalized}' is already used by account {other}"
                     )

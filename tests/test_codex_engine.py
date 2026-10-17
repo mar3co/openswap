@@ -243,6 +243,18 @@ def test_alias_and_remove(tmp_path):
     assert not (eng.slots_dir / "1").exists()
 
 
+def test_alias_keeps_its_casing_and_matches_any_case(tmp_path):
+    eng, home = _engine(tmp_path)
+    _login(home, email="a@x.com", account_id="acc-a"); eng.add_account()
+    _login(home, email="b@x.com", account_id="acc-b"); eng.add_account()
+    assert eng.set_alias("1", "WorkMac") == ("1", "WorkMac")
+    assert eng.list_aliases()[0] == ("1", "WorkMac", "a@x.com")
+    assert eng.resolve_account("workmac")[0] == "1"
+    with pytest.raises(ConfigError):
+        eng.set_alias("2", "WORKMAC")
+    assert eng.set_alias("1", "workMac") == ("1", "workMac")
+
+
 def test_snapshot_does_not_clobber_slot_when_live_is_another_account(tmp_path):
     eng, home = _engine(tmp_path)
     _login(home, email="a@x.com", account_id="acc-a", refresh="rt-a")

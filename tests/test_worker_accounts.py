@@ -118,7 +118,7 @@ def test_account_list_json_is_metadata_only(root, capsys):
     assert {row["account_ref"] for row in payload["claude"]} == {CLAUDE_ALICE, CAROL}
 
 
-@pytest.mark.parametrize("selector", ["1", "alice@example.com", "work", ALICE])
+@pytest.mark.parametrize("selector", ["1", "alice@example.com", "work", "WORK", ALICE])
 def test_account_pins_a_codex_slot_by_number_email_alias_or_reference(root, capsys, selector):
     assert _run(root, "account", selector) == 0
     assert "✓ Pinned Codex 1 · alice@example.com (work)." in capsys.readouterr().out

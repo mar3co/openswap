@@ -22,7 +22,7 @@ from openswap.exceptions import (
     TransferError,
 )
 from openswap.fsutil import replace_with_retry
-from openswap.models import Platform, get_timestamp, normalize_alias
+from openswap.models import Platform, alias_key, get_timestamp, normalize_alias
 from openswap.oauth import credential_fingerprint
 from openswap.worker.leases import AccountLeaseStore
 
@@ -421,7 +421,7 @@ def import_accounts(
     # so defer it to the guarded commit section below.
     local_data = switcher._get_sequence_data() or {}
     local_aliases: dict[str, tuple[str, str]] = {
-        (acc.get("alias") or "").lower(): (
+        alias_key(acc.get("alias")): (
             acc.get("email", ""), acc.get("organizationUuid", "") or "",
         )
         for acc in local_data.get("accounts", {}).values()
@@ -461,19 +461,18 @@ def import_accounts(
 
         alias = raw.get("alias") or None
         if alias:
-            alias_key = normalize_alias(alias)  # already validated in pass-1 above
-            if alias_key in seen_aliases:
-                raise TransferError(f"duplicate alias in export: {alias_key}")
-            seen_aliases.add(alias_key)
-            owner = local_aliases.get(alias_key)
+            alias = normalize_alias(alias)  # already validated in pass-1 above
+            folded = alias_key(alias)
+            if folded in seen_aliases:
+                raise TransferError(f"duplicate alias in export: {alias}")
+            seen_aliases.add(folded)
+            owner = local_aliases.get(folded)
             if owner is not None and owner != (email, org_uuid):
                 _eprint(
-                    f"Warning: alias '{alias_key}' for {email} already used by an "
+                    f"Warning: alias '{alias}' for {email} already used by an "
                     "existing account, dropping the imported alias"
                 )
                 alias = None
-            else:
-                alias = alias_key
 
         normalized.append(
             {

@@ -37,7 +37,7 @@ def test_add_oauth_account_is_enabled_and_does_not_touch_live_or_active(tmp_path
 
     record = engine._read_roster()["accounts"][number]
     assert record["disabled"] is False
-    assert record["alias"] == "new"
+    assert record["alias"] == "New"
     assert engine._read_roster()["activeAccountNumber"] == before_active
     assert (engine.home / "auth.json").read_bytes() == before_live
     assert number in engine.switchable_account_numbers()
