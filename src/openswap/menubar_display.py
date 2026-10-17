@@ -2605,6 +2605,14 @@ def sanitize_token_error(message: str) -> str:
 
 STALE_PARENT = "stale-parent"
 
+# Claude Code on a Console key spends that organization's purchased credit:
+# the monthly API credit included with Max and Team plans does not cover
+# Claude Code (Anthropic's "API credits for Max and Team plans" page).
+TOKEN_CREDIT_HINT = (
+    "Claude Code on this key spends credit you bought in the Claude Console. "
+    "The monthly API credit included with Max and Team doesn't cover it."
+)
+
 
 def parent_link_choice(picked, identities: dict):
     """Turn the parent popup's represented ``(num, email, org)`` into the link to send.
@@ -2649,6 +2657,7 @@ def token_entry_state(text: str, accounts: list, kinds: dict | None = None) -> d
         "kind": kind,
         "line": line,
         "show_parent": kind == "api_key",
+        "credit_hint": TOKEN_CREDIT_HINT if kind == "api_key" else "",
         "choices": choices,
         "can_add": kind is not None,
     }
@@ -2849,6 +2858,8 @@ def hold_line_from_event(
         return f"Holding on API credit: {detail}." if detail else "Holding on API credit."
     if reason == "active-api-key":
         return "Holding: API-key accounts have no quota to watch."
+    if reason == "api-key-dead":
+        return f"Holding: {detail}." if detail else "Holding: this API key no longer works."
     if reason == "active-idle":
         return "Holding: Claude Code is idle."
     if reason == "active-usage-unknown":

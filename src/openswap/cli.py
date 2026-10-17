@@ -1857,7 +1857,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "With 'add-token': link this API key to a subscription account as "
             "its API credit. Auto-switch uses it at the limit when no subscription "
             "has known room (on failover only when a subscription was measured or "
-            "none is in rotation), and returns to a subscription once one has room."
+            "none is in rotation), and returns to a subscription once one has room. "
+            "Claude Code on the key spends credit bought in the Claude Console; the "
+            "monthly API credit included with Max and Team doesn't cover it."
         ),
     )
     parser.add_argument(

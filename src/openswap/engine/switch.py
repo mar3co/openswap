@@ -737,6 +737,15 @@ class SwitchMixin:
                 "The linked account changed while adding; nothing was added. Retry."
             )
 
+    def _remember_key_slot(self, email: str, key: str) -> None:
+        """Point the slot at its new key, so a roster-only paint does not keep
+        showing the replaced key's dead verdict (issue #97)."""
+        from openswap import api_key_health
+
+        api_key_health.KeyHealth(self.backup_dir / "cache").remember_slots(
+            {api_key_health.slot_id(email, ""): key}
+        )
+
     def _commit_add_account_from_token(
         self,
         token: str,
@@ -812,6 +821,8 @@ class SwitchMixin:
                 self._usage_store.clear_dead_token(
                     [account_num], {account_num: (email, "")}
                 )
+                if is_api_key:
+                    self._remember_key_slot(email, credentials)
                 seq["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, seq)
             kind_label = "API key" if is_api_key else "token"
@@ -981,6 +992,8 @@ class SwitchMixin:
 
         if prune_identity:
             self._prune_mappings(*prune_identity)
+        if is_api_key:
+            self._remember_key_slot(email, credentials)
         source_label = "API key" if is_api_key else "token"
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         if migrate_from:
@@ -1410,6 +1423,7 @@ class SwitchMixin:
 
         next_account: str | None = None
         skipped_exhausted: list[str] = []
+        skipped_dead_keys: list[str] = []
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
             if self._disabled_from_data(data, candidate):
@@ -1429,6 +1443,16 @@ class SwitchMixin:
                         f"(no stored credentials/config, re-add with "
                         f"openswap --add-account --slot {candidate})"
                     )
+                continue
+            if strategy == "next-available" and usage.get(candidate) in DEAD_API_KEY_SENTINELS:
+                # A key whose probe failed is no target (issue #97), but it
+                # is not at a quota limit either: keep the diagnosis apart.
+                skipped_dead_keys.append(candidate)
+                note = SENTINEL_NOTES[usage[candidate]].split(" — ")[0]
+                if json_output:
+                    warnings.append(f"Skipped Account-{candidate} ({note})")
+                else:
+                    print(f"{accent('Skipping')} Account-{candidate} ({note})")
                 continue
             if strategy == "next-available":
                 headroom = oauth.account_headroom(usage.get(candidate), models)
@@ -1457,12 +1481,27 @@ class SwitchMixin:
             next_account = candidate
             break
 
-        # Every rotation target is at its limit. Switching onto an exhausted
-        # account would not help, so stay on the current one instead.
+        if next_account is None and skipped_dead_keys and not skipped_exhausted:
+            message = (
+                "Every other account is an API key that no longer works — "
+                f"staying on Account-{current_num}."
+            )
+            if json_output:
+                return self._switch_noop(
+                    strategy=strategy_label, reason="candidates-unavailable",
+                    to_ref=current_ref, warnings=warnings, message=message,
+                )
+            warning(message)
+            return None
+
+        # Every rotation target is at its limit (or a dead key). Switching onto
+        # one would not help, so stay on the current one instead.
         if next_account is None and skipped_exhausted:
             # With model limits in play the binding window may be a scoped
             # one (the per-skip lines name it), so don't claim "5h/7d".
             limits_label = "usage limits" if models else "5h/7d limit"
+            if skipped_dead_keys:
+                limits_label += " or have an API key that no longer works"
             if json_output:
                 return self._switch_noop(
                     strategy=strategy_label, reason="candidates-exhausted",

@@ -603,6 +603,22 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_api_key_probe(request, monkeypatch):
+    """Safety net: no test may make a live count_tokens request (issue #97).
+
+    Every collect pass that sees an API-key slot probes it when due. Stub the
+    probe to ``None`` (the documented "unknown" answer, which keeps the plain
+    "api key" sentinel). Tests of the probe patch it themselves or opt out
+    with ``@pytest.mark.no_api_key_probe_fake`` and mock ``urlopen``.
+    """
+    if request.node.get_closest_marker("no_api_key_probe_fake"):
+        yield
+        return
+    monkeypatch.setattr("openswap.api_key_health.probe", lambda key: None)
+    yield
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""

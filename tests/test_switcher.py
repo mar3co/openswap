@@ -6317,6 +6317,52 @@ class TestUsageAwareSwitch:
         assert "Skipping Account-2 (at 5h/7d limit)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
+    def test_skip_exhausted_skips_dead_api_key(self, temp_home: Path, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(0), "2": "api key revoked", "3": self._usage(20)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="next-available")
+
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (API key revoked or invalid)" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_only_dead_keys_left_is_not_called_exhausted(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(0), "2": "api key out of credit"}
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            payload = s.switch(strategy="next-available", json_output=True)
+        assert payload["switched"] is False
+        assert payload["reason"] == "candidates-unavailable"
+        assert "5h/7d" not in payload["message"]
+        assert "API key that no longer works" in payload["message"]
+
+    def test_dead_key_beside_an_exhausted_account_names_both(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(0), "2": "api key revoked", "3": self._usage(100)}
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            payload = s.switch(strategy="next-available", json_output=True)
+        assert payload["reason"] == "candidates-exhausted"
+        assert payload["message"] == (
+            "All other accounts are at their 5h/7d limit or have an API key "
+            "that no longer works — staying on Account-1."
+        )
+
     @staticmethod
     def _model_usage(five_h: float, fable: float) -> dict:
         return {

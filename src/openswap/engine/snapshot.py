@@ -1206,6 +1206,68 @@ class SnapshotMixin:
                 executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
             )
 
+    def _apply_api_key_health(
+        self,
+        info_by_num: dict[str, tuple],
+        sentinels: dict[str, str],
+        *,
+        probe: bool,
+    ) -> None:
+        """Overlay a failed key probe on the "api key" sentinel (issue #97).
+
+        Probes run only where this pass may fetch at all (``probe``, the same
+        gate as the backup probe) and only when the cached verdict is due;
+        every other pass reads the cache. A roster-only paint (the extra's
+        store-only refresh while auto-switch runs) never reads an idle key,
+        so it takes the verdict of the key last seen in that slot.
+        """
+        from openswap import api_key_health
+
+        candidates = {
+            num: info
+            for num, info in info_by_num.items()
+            if sentinels.get(num) == USAGE_API_KEY
+        }
+        if not candidates:
+            return
+        keys = {
+            num: info[5]
+            for num, info in candidates.items()
+            if info[5] is not UNREAD_CREDENTIALS and looks_like_api_key(info[5])
+        }
+        health = api_key_health.KeyHealth(self.backup_dir / "cache")
+        if probe:
+            # An idle key that only roster-only passes see (the extra while
+            # auto-switch runs) would otherwise never be rechecked: load just
+            # the slots whose recorded verdict is due.
+            for num, info in candidates.items():
+                if info[5] is not UNREAD_CREDENTIALS or not health.slot_due(
+                    api_key_health.slot_id(info[1], info[3])
+                ):
+                    continue
+                creds, _unreadable = self._read_account_credentials_ex(num, info[1])
+                if looks_like_api_key(creds):
+                    keys[num] = creds
+        due = [key for key in keys.values() if probe and health.due(key)]
+        fresh = health.check_all(due) if due else {}
+        if keys:
+            health.remember_slots({
+                api_key_health.slot_id(candidates[num][1], candidates[num][3]): key
+                for num, key in keys.items()
+            })
+        for num, info in candidates.items():
+            if num in keys:
+                key = keys[num]
+                verdict = fresh[key] if key in fresh else health.verdict(key)
+            elif info[5] is UNREAD_CREDENTIALS:
+                verdict = health.slot_verdict(api_key_health.slot_id(info[1], info[3]))
+            else:
+                continue
+            if verdict == api_key_health.VERDICT_REVOKED:
+                sentinels[num] = USAGE_API_KEY_REVOKED
+            elif verdict == api_key_health.VERDICT_NO_CREDIT:
+                sentinels[num] = USAGE_API_KEY_NO_CREDIT
+
     def _collect_usage_entries(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
@@ -1243,6 +1305,9 @@ class SnapshotMixin:
             static = self._static_usage_sentinel(info)
             if static is not None:
                 sentinels[num] = static
+        self._apply_api_key_health(
+            info_by_num, sentinels, probe=fetch is None or bool(fetch)
+        )
 
         entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
