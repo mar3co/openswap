@@ -373,6 +373,20 @@ class TestCollector:
         unread = [(2, email, "", "", False, UNREAD_CREDENTIALS, "")]
         assert s._collect_usage_entries(unread, fetch=set())["2"].sentinel == USAGE_API_KEY
 
+    def test_replacing_the_key_in_place_clears_the_slots_dead_verdict(
+        self, temp_home, monkeypatch
+    ):
+        from openswap.engine.notes import UNREAD_CREDENTIALS
+
+        monkeypatch.setattr(api_key_health, "probe", lambda key: VERDICT_REVOKED)
+        s = self._switcher()
+        s.add_account_from_token(KEY, email="key@example.com")
+        s._collect_usage_entries([(1, "key@example.com", "", "", False, KEY, "")])
+        # No --slot, same email: the update-in-place path.
+        s.add_account_from_token(OTHER_KEY, email="key@example.com")
+        unread = [(1, "key@example.com", "", "", False, UNREAD_CREDENTIALS, "")]
+        assert s._collect_usage_entries(unread, fetch=set())["1"].sentinel == USAGE_API_KEY
+
     def test_due_idle_key_is_rechecked_on_a_pass_that_may_probe(self, temp_home, monkeypatch):
         from openswap.engine.notes import UNREAD_CREDENTIALS
 

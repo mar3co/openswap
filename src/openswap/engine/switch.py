@@ -737,6 +737,15 @@ class SwitchMixin:
                 "The linked account changed while adding; nothing was added. Retry."
             )
 
+    def _remember_key_slot(self, email: str, key: str) -> None:
+        """Point the slot at its new key, so a roster-only paint does not keep
+        showing the replaced key's dead verdict (issue #97)."""
+        from openswap import api_key_health
+
+        api_key_health.KeyHealth(self.backup_dir / "cache").remember_slots(
+            {api_key_health.slot_id(email, ""): key}
+        )
+
     def _commit_add_account_from_token(
         self,
         token: str,
@@ -812,6 +821,8 @@ class SwitchMixin:
                 self._usage_store.clear_dead_token(
                     [account_num], {account_num: (email, "")}
                 )
+                if is_api_key:
+                    self._remember_key_slot(email, credentials)
                 seq["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, seq)
             kind_label = "API key" if is_api_key else "token"
@@ -982,13 +993,7 @@ class SwitchMixin:
         if prune_identity:
             self._prune_mappings(*prune_identity)
         if is_api_key:
-            # Point the slot at the new key, so a roster-only paint does not
-            # keep showing the replaced key's dead verdict (issue #97).
-            from openswap import api_key_health
-
-            api_key_health.KeyHealth(self.backup_dir / "cache").remember_slots(
-                {api_key_health.slot_id(email, ""): credentials}
-            )
+            self._remember_key_slot(email, credentials)
         source_label = "API key" if is_api_key else "token"
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         if migrate_from:
