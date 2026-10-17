@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import unicodedata
 
 from openswap import macos_keychain
 from openswap.exceptions import LockError
@@ -16,6 +17,10 @@ from openswap.worker.protocol import ProtocolError, fields, text, timestamp, val
 from openswap.worker.remote import Transport
 
 SERVICE = "openswap"
+# Connect extension: labels a `pair` response carries only when the request
+# sent a `code_verifier`. A pasted code keeps the exact closed shape.
+CONNECT_LABELS = frozenset({"workspace_label", "owner_label"})
+MAX_PAIR_LABEL = 200
 
 
 @dataclass(frozen=True)
@@ -75,24 +80,69 @@ def _drop_status(root: Path):
         pass
 
 
-def pair(root: Path, url: str, code: str, *, transport=None) -> str:
-    """Invoking this local command is the owner's explicit pairing approval."""
+class PairedWorker(str):
+    """The paired worker ID. A pairing redeemed with a ``code_verifier`` (Connect)
+    also carries the service's ``workspace_label`` and ``owner_label``, if sent."""
+
+    workspace_label: str | None
+    owner_label: str | None
+
+    def __new__(cls, worker_id: str, workspace_label: str | None = None, owner_label: str | None = None):
+        value = super().__new__(cls, worker_id)
+        value.workspace_label, value.owner_label = workspace_label, owner_label
+        return value
+
+
+def pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str | None = None,
+         cancelled=None) -> PairedWorker:
+    """Invoking this local command is the owner's explicit pairing approval.
+
+    ``code_verifier`` is the PKCE verifier of a Connect flow (never logged or
+    stored); only then may the response add ``workspace_label`` and ``owner_label``.
+    ``cancelled`` (Connect's Cancel) is checked before the code is redeemed and
+    again before the key is saved; the save is the point of no return.
+    """
     require_macos()
-    return _locked(root, _pair, url, code, transport=transport)
+    return _locked(root, _pair, url, code, transport=transport, code_verifier=code_verifier, cancelled=cancelled)
 
 
-def _pair(root: Path, url: str, code: str, *, transport=None) -> str:
-    url = validate_url(url)
-    # A live enrollment (settings name a URL) must be unpaired first. With no
-    # configured URL, any item left at this account is an orphan from a reset
-    # or an interrupted pairing, and the new key simply replaces it.
-    if load_worker_settings(root).control_service_url is not None:
-        raise ProtocolError("unpair_before_pairing")
-    result = (transport or Transport(url)).request("pair", {"code": text(code)})
-    data = fields(result, {"worker_id", "device_key", "expires_at"})
+def _check_cancelled(cancelled) -> None:
+    if cancelled is not None and cancelled():
+        raise ProtocolError("connect_cancelled")
+
+
+def _redeem(url: str, code: str, transport, code_verifier: str | None) -> tuple[Enrollment, dict]:
+    request = {"code": text(code)}
+    if code_verifier is not None:
+        request["code_verifier"] = text(code_verifier, 128)
+    result = (transport or Transport(url)).request("pair", request)
+    data = fields(result, {"worker_id", "device_key", "expires_at"},
+                  CONNECT_LABELS if code_verifier is not None else frozenset())
     enrollment = Enrollment(text(data["worker_id"]), text(data["device_key"]), timestamp(data["expires_at"]))
     if enrollment.expires_at <= datetime.now(timezone.utc):
         raise ProtocolError("device_expired", 401)
+    labels = {name: _display_label(data.get(name)) for name in CONNECT_LABELS}
+    return enrollment, {name: label for name, label in labels.items() if label is not None}
+
+
+def _display_label(value: object) -> str | None:
+    """A response label made safe to show, or None.
+
+    Labels are display-only and arrive after the service has consumed the code
+    and issued the key, so an odd one (a long workspace name, a control
+    character, a non-string) must never fail the pairing. Like Connect's
+    ``clean_label``: whitespace collapses to single spaces, every other control
+    or format character (Unicode ``C*``, including bidi overrides that could
+    reorder the text around it) is dropped, and the rest is cut to ``MAX_PAIR_LABEL``."""
+    if not isinstance(value, str):
+        return None
+    spaced = "".join(" " if c.isspace() else c for c in value)
+    printable = "".join(c for c in spaced if not unicodedata.category(c).startswith("C"))
+    label = " ".join(printable.split())[:MAX_PAIR_LABEL].strip()
+    return label or None
+
+
+def _store(url: str, enrollment: Enrollment) -> None:
     try:
         macos_keychain.set_password(SERVICE, account_name(url), json.dumps({
             "worker_id": enrollment.worker_id, "device_key": enrollment.device_key,
@@ -100,6 +150,33 @@ def _pair(root: Path, url: str, code: str, *, transport=None) -> str:
         }))
     except macos_keychain.KEYCHAIN_ERRORS:
         raise ProtocolError("device_key_unavailable") from None
+
+
+def _record_key(root: Path, url: str, enrollment: Enrollment):
+    """Start the new enrollment's saved status with its key expiry (never the key),
+    so status and the menu know when it ends even before the worker first runs,
+    or while it stays off. A failed write only loses that hint."""
+    from openswap.worker.remote_state import save_status
+
+    try:
+        save_status(Path(root), url, "offline", None, enrollment.worker_id,
+                    key_expires_at=enrollment.expires_at)
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+
+def _pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str | None = None,
+          cancelled=None) -> PairedWorker:
+    url = validate_url(url)
+    # A live enrollment (settings name a URL) must be unpaired first. With no
+    # configured URL, any item left at this account is an orphan from a reset
+    # or an interrupted pairing, and the new key simply replaces it.
+    if load_worker_settings(root).control_service_url is not None:
+        raise ProtocolError("unpair_before_pairing")
+    _check_cancelled(cancelled)
+    enrollment, labels = _redeem(url, code, transport, code_verifier)
+    _check_cancelled(cancelled)
+    _store(url, enrollment)
     try:
         configure_worker_service(root, url, enrollment.worker_id)
     except (OSError, RuntimeError, ValueError):
@@ -110,7 +187,42 @@ def _pair(root: Path, url: str, code: str, *, transport=None) -> str:
             pass
         raise ProtocolError("pairing_settings_unavailable") from None
     _drop_status(root)
-    return enrollment.worker_id
+    _record_key(root, url, enrollment)
+    return PairedWorker(enrollment.worker_id, labels.get("workspace_label"), labels.get("owner_label"))
+
+
+def reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport=None, cancelled=None) -> PairedWorker:
+    """Replace the configured enrollment's key with one from a Connect renewal code.
+
+    Unlike ``pair`` there is no ``unpair_before_pairing`` refusal: the URL and
+    worker ID stay as configured, and only the Keychain item is updated in place
+    (``security add-generic-password -U``), under the pairing lock. A response
+    for another worker ID, or any failure, leaves the old key untouched; the
+    service keeps the new key pending until it is first used, so a Mac whose old
+    key is still live keeps working. ``cancelled`` is checked as in ``pair``.
+    """
+    require_macos()
+    return _locked(root, _reconnect, url, code, code_verifier=code_verifier, transport=transport,
+                   cancelled=cancelled)
+
+
+def _reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport=None, cancelled=None) -> PairedWorker:
+    url = validate_url(url)
+    policy = load_worker_settings(root)
+    configured = policy.control_service_url
+    if configured is None or account_name(configured) != account_name(url):
+        raise ProtocolError("not_paired_with_this_server")
+    if policy.control_service_worker_id is None:
+        raise ProtocolError("worker_id_unknown")
+    _check_cancelled(cancelled)
+    enrollment, labels = _redeem(url, code, transport, text(code_verifier, 128))
+    if enrollment.worker_id != policy.control_service_worker_id:
+        raise ProtocolError("worker_mismatch")
+    _check_cancelled(cancelled)
+    _store(url, enrollment)
+    _drop_status(root)
+    _record_key(root, url, enrollment)
+    return PairedWorker(enrollment.worker_id, labels.get("workspace_label"), labels.get("owner_label"))
 
 
 def unpair(root: Path, url: str | None = None) -> bool:

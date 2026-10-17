@@ -833,6 +833,64 @@ def run(switcher, codex=None) -> int:
 
             threading.Thread(target=steps, name="openswap-guided-setup", daemon=True).start()
 
+        def _run_connect(self, url=None):
+            """Connect to OpenTag… / Reconnect: pair this Mac by approving it in the browser.
+
+            The flow (``openswap.worker.connect``) runs on a worker thread, as the
+            pasted-command setup does. While the browser is open the owner sees one
+            dialog, "Finish in your browser…", whose Cancel closes the listener.
+            A new pairing then says "Paired with <workspace>" and runs the guided
+            setup; a reconnect only says so.
+            """
+            if self._worker_operation is not None or getattr(self, "_guided_setup", None) is not None:
+                return
+            from openswap.worker import connect, guided_setup
+
+            root = self.switcher.backup_dir
+            ui = guided_setup.ThreadedPrompts(guided_setup.DialogPrompts(
+                self._alert, self._prompt, guided_setup.CONNECT_TITLE,
+                choose_folder=self._choose_folder, wait=self._wait_dialog,
+            ))
+            flow = connect.ConnectFlow(root, url, open_browser=connect.open_in_browser)
+            self._guided_setup = ui
+
+            def steps():
+                try:
+                    outcome, message = guided_setup.connect_once(flow, ui)
+                    ui.say(message)
+                    if outcome == "paired":
+                        guided_setup.run(root, ui)
+                except Exception:
+                    flow.close()
+                    ui.say("Connect stopped unexpectedly. Run `openswap worker connect` in Terminal.")
+                finally:
+                    try:
+                        ui.flush()
+                    finally:
+                        ui.finished = True
+
+            threading.Thread(target=steps, name="openswap-connect", daemon=True).start()
+
+        def _connect_other_server(self):
+            """Use another server…: the only way to Connect to a backend other than OpenTag."""
+            if self._worker_operation is not None or getattr(self, "_guided_setup", None) is not None:
+                return
+            response = self._prompt(
+                title="Use another server",
+                message="The address of the server to pair with, for example https://opentag.example.",
+                default_text="https://", ok="Connect", cancel="Cancel",
+            )
+            url = str(getattr(response, "text", "")).strip()
+            if getattr(response, "clicked", 0) != 1 or url in ("", "https://", "http://"):
+                return
+            self._run_connect(url)
+
+        def _wait_dialog(self, *, title, message, done):
+            """The "Finish in your browser…" dialog: True when the owner cancelled."""
+            from openswap.menubar_dialog import run_waiting_dialog
+
+            return run_waiting_dialog(title=title, message=message, done=done, run=self._dialog)
+
         def _drain_guided_setup(self):
             """On the UI thread: show the setup's pending dialog; refresh when it ends."""
             ui = getattr(self, "_guided_setup", None)
@@ -2022,6 +2080,10 @@ def run(switcher, codex=None) -> int:
                 return  # the summary item: nothing to toggle
             if row_id == "remote_tasks_setup":
                 self._run_guided_setup()
+            elif row_id in ("remote_tasks_connect", "remote_tasks_reconnect"):
+                self._run_connect()
+            elif row_id == "remote_tasks_connect_other":
+                self._connect_other_server()
             elif row_id == "open_at_login":
                 self._toggle_login_item()
             elif row_id == "open_at_login_failed":

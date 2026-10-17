@@ -5,6 +5,7 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -150,7 +151,7 @@ class Transport:
                 result = self._read(exc)
             code = result.get("error", "service_unavailable")
             raise ProtocolError(code if code in SERVICE_ERRORS else "service_unavailable", exc.code) from None
-        except (URLError, TimeoutError, OSError):
+        except (URLError, TimeoutError, OSError, http.client.HTTPException):
             raise ProtocolError("service_unavailable", 503) from None
         return result
 

@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, fields, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from openswap import pace
@@ -287,34 +287,70 @@ REMOTE_TASKS_PAIRED_OFF_NOTE = (
 REMOTE_KEY_RENEWS_NOTE = "Key renews automatically."
 
 
+def _remote_key_expiry(snapshot: dict) -> datetime | None:
+    """The saved expiry of the paired Mac's device key, or None when unknown."""
+    expires = snapshot.get("remote_key_expires_at")
+    if not isinstance(expires, str) or len(expires) > 40:
+        return None
+    try:
+        parsed = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _days_phrase(days: int) -> str:
+    return "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
+
+
 def remote_key_copy(snapshot: dict, *, now: datetime | None = None) -> str:
     """The device key line for the Remote section, or ``""`` when nothing is known.
 
     "Key renews automatically" when the registration rotates its key; "Key
-    expires in N days" only when the backend lacks rotation, with the fix.
+    expires in N days" only when the backend lacks rotation, with the fix. An
+    expired key reads as expired whatever the server supports.
     """
     renews = snapshot.get("remote_key_renews")
-    parsed = None
-    expires = snapshot.get("remote_key_expires_at")
-    if isinstance(expires, str) and len(expires) <= 40:
-        try:
-            parsed = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-        except ValueError:
-            parsed = None
-        if parsed is not None and parsed.tzinfo is None:
-            parsed = None
-    left = parsed - (now or datetime.now(timezone.utc)) if parsed is not None else None
+    expires = _remote_key_expiry(snapshot)
+    left = expires - (now or datetime.now(timezone.utc)) if expires is not None else None
     # Expired wins over "renews automatically": a lapsed key renews nothing.
     if left is not None and left.total_seconds() <= 0:
-        return "Key expired. This Mac can't take tasks until you re-pair it from the portal."
+        return "Key expired. This Mac can't take tasks until you reconnect it."
     if renews is True:
         return REMOTE_KEY_RENEWS_NOTE
     if renews is not False or left is None:
         return ""
-    days = left.days
-    when = "in less than a day" if days < 1 else f"in {days} day{'' if days == 1 else 's'}"
-    return (f"Key expires {when}. This server can't renew it automatically: "
-            "re-pair this Mac from the portal before then.")
+    return (f"Key expires {_days_phrase(left.days)}. This server can't renew it automatically: "
+            "reconnect this Mac before then.")
+
+
+def remote_reconnect_label(snapshot: dict, *, now: datetime | None = None) -> str | None:
+    """The Reconnect button's label when the paired Mac should reconnect, else None.
+
+    Due when the worker reported its key expired, or when the saved expiry has
+    passed or is within ``RECONNECT_WINDOW`` without automatic rotation. The
+    saved expiry is read even while the worker is off, because the key keeps
+    aging then; nothing here reads the Keychain.
+    """
+    connectivity = snapshot.get("remote_connectivity")
+    if connectivity == "revoked":
+        return None  # a removed Mac can only be unpaired, never reconnected
+    if connectivity == "expired":
+        return "Key expired · Reconnect this Mac"
+    expires = _remote_key_expiry(snapshot)
+    if expires is None:
+        return None
+    left = expires - (now or datetime.now(timezone.utc))
+    if left.total_seconds() <= 0:
+        return "Key expired · Reconnect this Mac"
+    if snapshot.get("remote_key_renews") is not True and left <= RECONNECT_WINDOW:
+        return f"Key expires {_days_phrase(left.days)} · Reconnect this Mac"
+    return None
+
+
+# Matches openswap.worker.connect.RECONNECT_WINDOW (not imported: this module
+# stays free of worker imports at load).
+RECONNECT_WINDOW = timedelta(days=7)
 
 
 MISSING_LOGIN_CARD_NOTE = "Action required · Sign in with Claude Code."
@@ -448,6 +484,46 @@ class MenuBarSettings:
     def save(self, path: Path) -> None:
         """Atomically write settings (0600 file, 0700 parent, through a symlink)."""
         atomic_write_json(path, asdict(self))
+
+
+def remote_connect_rows(paired: bool, worker_status: dict) -> list[dict]:
+    """Connect to OpenTag… on an unpaired Mac (with Use another server…), and
+    Reconnect on a paired Mac whose key has expired. No rows otherwise; the
+    pasted command stays under Set up Remote tasks…."""
+    busy = worker_status.get("operation") is not None
+    if not paired:
+        return [
+            {
+                "kind": "button",
+                "section": SETTINGS_SECTION_REMOTE,
+                "id": "remote_tasks_connect",
+                "label": "Connect to OpenTag…",
+                "title": "Connect",
+                "value": None,
+                "disabled": busy,
+            },
+            {
+                "kind": "button",
+                "section": SETTINGS_SECTION_REMOTE,
+                "id": "remote_tasks_connect_other",
+                "label": "Use another server…",
+                "title": "Enter URL",
+                "value": None,
+                "disabled": busy,
+            },
+        ]
+    reconnect = remote_reconnect_label(worker_status)
+    if reconnect is not None:
+        return [{
+            "kind": "button",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_reconnect",
+            "label": reconnect,
+            "title": "Reconnect",
+            "value": None,
+            "disabled": busy,
+        }]
+    return []
 
 
 def settings_page_rows(
@@ -640,6 +716,7 @@ def settings_page_rows(
             "disabled": _worker_active_job_id(worker_status or {}) is None,
         },
     ]
+    remote[1:1] = remote_connect_rows(worker_paired, worker_status or {})
     if worker_paired and not worker_enabled and (
         (worker_status or {}).get("operation") != "worker_enable_or_disable"
     ):

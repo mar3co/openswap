@@ -687,6 +687,8 @@ class RotationRig:
             saved = self.saved()
             saved["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=days_left)).isoformat()
             self.keychain[("openswap", pairing.account_name(ROTATION_URL))] = json.dumps(saved)
+            # Recorded as pairing records a new key's expiry, so the saved status agrees.
+            pairing._record_key(self.root, ROTATION_URL, pairing.load_enrollment(ROTATION_URL))
         self.adapter = FakeAdapter()
         self.runtime = WorkerRuntime(self.root, adapter=self.adapter,
                                      account_identity=stable_account_identity("codex", "synthetic-rotation"))
@@ -1102,9 +1104,9 @@ def test_status_says_the_key_renews_or_when_it_expires():
     expires = (datetime.now(timezone.utc) + timedelta(days=12, hours=1)).isoformat()
     lacking = {**base, "remote_key_renews": False, "remote_key_expires_at": expires}
     text = cli._format_status(lacking)
-    assert "expires in 12 days" in text and "Re-pair this Mac" in text
+    assert "expires in 12 days" in text and "openswap worker connect" in text
     menu = remote_key_copy(lacking)
-    assert menu.startswith("Key expires in 12 days.") and "re-pair this Mac" in menu
+    assert menu.startswith("Key expires in 12 days.") and "reconnect this Mac" in menu
     rows = settings_page_rows(MenuBarSettings(), strategy="best", threshold=90, section=SETTINGS_SECTION_REMOTE,
                               worker_enabled=True, worker_paired=True, worker_status=lacking)
     ids = [row["id"] for row in rows]
