@@ -164,6 +164,18 @@ class TestKeyHealth:
         clock.now += 1
         assert health.due(KEY)
 
+    def test_inconclusive_probe_on_a_healthy_key_retries_soon(self, tmp_path):
+        clock = Clock()
+        health, _ = self._health(tmp_path, [VERDICT_OK, None], clock)
+        health.check(KEY)
+        clock.now += OK_TTL_S
+        assert health.check(KEY) == VERDICT_OK
+        assert health.verdict(KEY) == VERDICT_OK
+        clock.now += RETRY_TTL_S - 1
+        assert not health.due(KEY)
+        clock.now += 1
+        assert health.due(KEY)
+
     def test_inconclusive_probe_keeps_the_previous_verdict(self, tmp_path):
         clock = Clock()
         health, _ = self._health(tmp_path, [VERDICT_NO_CREDIT, None], clock)

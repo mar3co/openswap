@@ -138,7 +138,9 @@ class KeyHealth:
         checked = entry.get("checkedAt")
         if not isinstance(checked, (int, float)):
             return True
-        ttl = OK_TTL_S if entry.get("verdict") == VERDICT_OK else RETRY_TTL_S
+        # An inconclusive last attempt retries soon even under a kept "ok".
+        healthy = entry.get("verdict") == VERDICT_OK and not entry.get("inconclusive")
+        ttl = OK_TTL_S if healthy else RETRY_TTL_S
         return self._clock() - checked >= ttl
 
     def check(self, key: str) -> str | None:
@@ -172,6 +174,8 @@ class KeyHealth:
                     entry = {"checkedAt": self._clock()}
                     if verdict is not None:
                         entry["verdict"] = verdict
+                    if result is None:
+                        entry["inconclusive"] = True
                     data[fp] = entry
                     verdicts[by_fp[fp]] = verdict
                 self._write(data)
