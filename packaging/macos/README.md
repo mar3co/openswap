@@ -75,16 +75,24 @@ the submission before failing, so the reason is in the job log.
 
 ## Releasing
 
-1. Bump `version` in `pyproject.toml`, commit, and push tag `v<version>`.
-   The workflow fails if the tag and the pyproject version disagree.
-2. `macOS app` builds, signs, notarizes, unpacks the zip and assesses that
+1. In one PR, bump `version` in `pyproject.toml`, run `uv lock` (the lock
+   carries the project's own version and CI syncs with `--locked`), and
+   rename `## Unreleased` in `CHANGELOG.md` to `## <version> (YYYY-MM-DD)`.
+   `test_the_current_version_has_notes` fails a bump without that section.
+2. Once it merges, push an annotated tag `v<version>` on the merge commit
+   (`git tag -a v<version> -m "OpenSwap <version>"`). The workflow fails if
+   the tag and the pyproject version disagree, or if `CHANGELOG.md` has no
+   section for the version.
+3. `macOS app` builds, signs, notarizes, unpacks the zip and assesses that
    copy on each architecture. Once both legs pass, it drafts a GitHub release
    with `OpenSwap-<version>-arm64.zip`, `OpenSwap-<version>-x86_64.zip`,
-   their `.sha256` files, and `openswap.rb` rendered from
+   both DMGs, their `.sha256` files, and `openswap.rb` rendered from
    `packaging/homebrew/openswap.rb.in`. The cask's `on_arm` and `on_intel`
    blocks carry each zip's URL and checksum, so Homebrew downloads the one
-   built for the user's CPU.
-3. Check the draft and publish it. `Homebrew tap`
+   built for the user's CPU. The release notes are the version's
+   `CHANGELOG.md` section (`packaging/release_notes.py`) plus a link to
+   every commit since the previous tag.
+4. Check the draft and publish it. `Homebrew tap`
    (`.github/workflows/homebrew-tap.yml`) then copies `openswap.rb` into
    `mar3co/homebrew-openswap/Casks/`. It needs repository secret
    `HOMEBREW_TAP_TOKEN` (fine-grained token, Contents read/write on the tap
