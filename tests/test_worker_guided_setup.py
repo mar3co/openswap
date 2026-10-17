@@ -1423,7 +1423,9 @@ class _Dialogs:
     def prompt(self, **kwargs):
         self.shown.append(("prompt", kwargs))
         clicked, text = self.answers.pop(0) if self.answers else (0, "")
-        return SimpleNamespace(clicked=clicked, text=text)
+        # A popup (the account step): the text is the 1-based row picked, "" keeps the selection.
+        choice = (int(text) - 1 if text else kwargs.get("selected", 0)) if "choices" in kwargs else -1
+        return SimpleNamespace(clicked=clicked, text=text, choice=choice)
 
     def choose_folder(self, **kwargs):
         self.shown.append(("choose_folder", kwargs))
@@ -1488,9 +1490,13 @@ def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root,
     assert "That is not a pairing command" in messages[1]
     assert "✓ Paired this Mac (worker)." in messages[2] and "Start the worker now?" in messages[2]
     assert dialogs.shown[-1][1]["ok"] == "Done" and SUMMARY in messages[-1]
-    # The dialogs carry the same step headers and plain menu rows: no ANSI codes.
+    # The dialogs carry the same step headers, and no ANSI codes.
     assert "Step 1 of 4 · Worker" in messages[2] and "Step 2 of 4 · Account" in messages[3]
-    assert "  • 1  Codex   alice@example.com" in messages[3] and "\x1b[" not in "".join(messages)
+    assert "\x1b[" not in "".join(messages)
+    # The account step is a popup of nicknames, not a numbered list to type from.
+    account = dialogs.shown[3][1]
+    assert account["choices"][0] == "work · alice@example.com · Codex" and account["selected"] == 0
+    assert "  • 1  Codex" not in account["message"] and "default_text" not in account
     assert app.refreshed == 1
 
 
@@ -1512,6 +1518,37 @@ def test_menu_setup_on_a_paired_mac_skips_pairing(root, enable_calls):
     assert "Type the path to your code folder, for example ~/GitHub" in dialogs.shown[2][1]["message"]
     assert "No folder added." in dialogs.shown[3][1]["message"]
     assert enable_calls == [] and _builtin(root)
+
+
+def test_menu_setup_offers_skip_for_a_step_and_close_for_the_whole_setup(root, enable_calls):
+    configure_worker_service(root, URL, "worker-1")
+    dialogs = _Dialogs([0, (guided_setup.DIALOG_CLOSED, "")])  # No to the worker, then Close Setup
+    app = _menu(root, dialogs)
+    app._on_setting("remote_tasks_setup", None)
+    _settle(app)
+    (_, worker), (_, account) = dialogs.shown  # no folder step, no summary
+    assert worker["cancel"] == "No" and account["cancel"] == "Skip"
+    assert worker["close"] == account["close"] == guided_setup.CLOSE_SETUP
+    assert enable_calls == [] and app.refreshed == 1
+
+
+def test_account_options_lead_with_the_nickname_and_tell_twins_apart():
+    work = SimpleNamespace(alias="Work", email="a@x.com", number=1, disabled=False, provider="codex")
+    twin = SimpleNamespace(alias="Work", email="a@x.com", number=3, disabled=False, provider="codex")
+    resting = SimpleNamespace(alias="Work", email="a@x.com", number=4, disabled=True, provider="codex")
+    plain = SimpleNamespace(alias=None, email=None, number=2, disabled=False, provider="claude")
+    assert guided_setup.account_options([work, plain]) == ["Work · a@x.com · Codex", "(no email) · Claude"]
+    assert guided_setup.account_options([work, twin]) == [
+        "Work · a@x.com · Codex · slot 1", "Work · a@x.com · Codex · slot 3"]
+    assert guided_setup.account_options([work, resting])[1] == "Work · a@x.com · Codex · out of rotation"
+
+
+def test_menu_setup_closed_at_pairing_shows_nothing_more(root, keychain):
+    dialogs = _Dialogs([(guided_setup.DIALOG_CLOSED, "openswap worker pair http://localhost code")])
+    app = _menu(root, dialogs)
+    app._on_setting("remote_tasks_setup", None)
+    _settle(app)
+    assert len(dialogs.shown) == 1 and load_worker_settings(root).control_service_url is None
 
 
 def test_menu_setup_reads_several_folders_by_number(root, enable_calls, research_home):

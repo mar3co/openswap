@@ -43,6 +43,11 @@ class Prompts(Protocol):
     def choose_folder(self, question: str) -> str | None:
         """A folder path; "" or ``None`` when the owner is done choosing."""
 
+    # Optional: ``pick(question, options, *, default=0) -> int | None`` shows
+    # ``options`` as a list to choose from (the menu bar's popup) and returns
+    # the chosen index, ``None`` when skipped. Without it, steps number the
+    # options and ``ask`` for the number.
+
 
 def _section(ui, title: str) -> None:
     section = getattr(ui, "section", None)
@@ -231,6 +236,20 @@ def account_menu(choices, pinned=None) -> tuple[list, list[str]]:
     return menu, printer.columns(rows)
 
 
+def account_options(menu) -> list[str]:
+    """One row per account for a popup: the nickname first, then the email and provider."""
+    rows = []
+    for choice in menu:
+        parts = [choice.alias] if choice.alias else []
+        parts += [choice.email or "(no email)", _provider_name(choice)]
+        if choice.disabled:
+            parts.append("out of rotation")
+        rows.append(" · ".join(parts))
+    # The same nickname and email under one provider: the slot tells them apart.
+    return [f"{row} · slot {choice.number}" if rows.count(row) > 1 else row
+            for row, choice in zip(rows, menu)]
+
+
 def confirm_account(root: Path, ui: Prompts) -> None:
     """Show the eligible accounts as a numbered menu; Enter keeps the pinned one."""
     cli = _cli()
@@ -255,15 +274,28 @@ def confirm_account(root: Path, ui: Prompts) -> None:
     # previous account stays selected rather than implying none is pinned.
     later = (f"Kept {_provider_name(pinned)} {pinned.label()}." if pinned is not None
              else f"Skipped. {ACCOUNT_NEXT}")
-    ui.say("Tasks run on the account you pick.")
-    for line in lines:
-        ui.say(line)
     current = next((str(n) for n, c in enumerate(menu, start=1)
                     if pinned is not None and c.account_ref == pinned.account_ref), "")
-    # A number, an email, an alias or `claude:<slot>` all work.
-    question = "Account" if current else f"Account (1-{len(menu)}, Enter skips)"
+    pick = getattr(ui, "pick", None)
+    if pick is not None:
+        # A popup of nicknames, the current account selected; its row is the menu number.
+        options = account_options(menu)
+
+        def answer_once():
+            index = pick("Tasks run on the account you pick.", options,
+                         default=int(current) - 1 if current else 0)
+            return None if index is None else str(index + 1)
+    else:
+        ui.say("Tasks run on the account you pick.")
+        for line in lines:
+            ui.say(line)
+        # A number, an email, an alias or `claude:<slot>` all work.
+        question = "Account" if current else f"Account (1-{len(menu)}, Enter skips)"
+
+        def answer_once():
+            return ui.ask(question, default=current)
     for _attempt in range(_MAX_ATTEMPTS):
-        answer = ui.ask(question, default=current)
+        answer = answer_once()
         if not answer:
             ui.say(later)
             return
@@ -815,15 +847,31 @@ def run(root: Path, ui: Prompts) -> None:
                 ui.say(fallback)
 
 
+class SetupClosed(BaseException):
+    """The owner pressed Close Setup: stop every step that is left.
+
+    A ``BaseException``, so the steps' own ``except Exception`` (which print
+    a fallback command and carry on) never swallow it.
+    """
+
+
+# The menu bar dialogs: Skip (or No) passes one step, Close Setup ends them all.
+CLOSE_SETUP = "Close Setup"
+# What a dialog returns for Close Setup (``menubar_dialog.DIALOG_CLOSE``).
+DIALOG_CLOSED = -3
+
+
 class DialogPrompts:
     """Prompts for the menu bar: ``alert``/``prompt`` are its modal dialog helpers.
 
     Lines said between questions are collected and shown above the next
     question, so the owner sees one dialog per decision; ``flush`` shows what
-    is left (the summary) in a final dialog.
+    is left (the summary) in a final dialog. Every question also offers
+    Close Setup, which raises :class:`SetupClosed`; nothing is shown after it.
     """
 
     interactive = True
+    closed = False
 
     def __init__(self, alert, prompt, title: str = "Set up Remote tasks", *, choose_folder=None, wait=None):
         self._alert, self._prompt, self.title = alert, prompt, title
@@ -846,16 +894,33 @@ class DialogPrompts:
         self._lines = []
         return message
 
+    def _closing(self, clicked) -> None:
+        if clicked == DIALOG_CLOSED:
+            self.closed = True
+            self._lines = []
+            raise SetupClosed()
+
     def confirm(self, question: str, *, default: bool = True) -> bool | None:
-        clicked = self._alert(title=self.title, message=self._message(question), ok="Yes", cancel="No")
+        clicked = self._alert(title=self.title, message=self._message(question), ok="Yes", cancel="No",
+                              close=CLOSE_SETUP)
+        self._closing(clicked)
         return clicked == 1
 
     def ask(self, question: str, *, default: str = "") -> str | None:
         response = self._prompt(title=self.title, message=self._message(question),
-                                default_text=default, ok="Continue", cancel="Skip")
+                                default_text=default, ok="Continue", cancel="Skip", close=CLOSE_SETUP)
+        self._closing(getattr(response, "clicked", 0))
         if getattr(response, "clicked", 0) != 1:
             return None
         return str(getattr(response, "text", "")).strip() or default
+
+    def pick(self, question: str, options, *, default: int = 0) -> int | None:
+        response = self._prompt(title=self.title, message=self._message(question), choices=list(options),
+                                selected=default, ok="Continue", cancel="Skip", close=CLOSE_SETUP)
+        clicked = getattr(response, "clicked", 0)
+        self._closing(clicked)
+        choice = getattr(response, "choice", -1)
+        return choice if clicked == 1 and 0 <= choice < len(options) else None
 
     def choose_folder(self, question: str) -> str | None:
         if self._choose_folder is None:
@@ -863,7 +928,7 @@ class DialogPrompts:
         return self._choose_folder(title=self.title, message=self._message(question))
 
     def flush(self) -> None:
-        if self._lines:
+        if self._lines and not self.closed:
             self._alert(title=self.title, message=self._message(""), ok="Done")
 
     def waiting(self, title: str, message: str, *, cancel: Callable[[], None], done: threading.Event) -> None:
@@ -914,6 +979,8 @@ class ThreadedPrompts:
         with self._lock:
             self._pending = request
         request["done"].wait()
+        if request.get("closed"):
+            raise SetupClosed()
         return request["result"]
 
     def confirm(self, question: str, *, default: bool = True) -> bool | None:
@@ -921,6 +988,9 @@ class ThreadedPrompts:
 
     def ask(self, question: str, *, default: str = "") -> str | None:
         return self._call("ask", question, default=default)
+
+    def pick(self, question: str, options, *, default: int = 0) -> int | None:
+        return self._call("pick", question, options, default=default)
 
     def choose_folder(self, question: str) -> str | None:
         return self._call("choose_folder", question)
@@ -957,6 +1027,9 @@ class ThreadedPrompts:
         name, args, kwargs = request["call"]
         try:
             request["result"] = getattr(self._dialogs, name)(*args, **kwargs)
+        except SetupClosed:
+            # Raised again on the setup thread, which waits in ``_call``.
+            request["closed"] = True
         except Exception:
             request["result"] = None
         finally:

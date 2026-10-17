@@ -14,6 +14,7 @@ AppKit = pytest.importorskip("AppKit")
 from Foundation import NSObject, NSRunLoop, NSTimer
 
 from openswap.menubar_dialog import (
+    DIALOG_CLOSE,
     DIALOG_WIDTH,
     make_dialog_alert,
     make_dialog_prompt,
@@ -62,6 +63,31 @@ def test_buttons_preserve_confirmation_and_cancellation_results():
         assert dialog._result == button.tag()
     dialog.window().cancelOperation_(None)
     assert dialog._result == 0
+
+
+def test_close_sits_left_of_the_actions_and_ends_the_flow():
+    from openswap.worker.guided_setup import DIALOG_CLOSED
+
+    assert DIALOG_CLOSE == DIALOG_CLOSED
+    dialog = make_dialog_prompt(title="Set up Remote tasks", message="Account?", default_text="1",
+                                ok="Continue", cancel="Skip", close="Close Setup")
+    close = dialog.close_button.frame()
+    skip, _continue = (button.frame() for button in dialog.buttons)
+    assert close.origin.y == skip.origin.y > dialog.surface.footer_y
+    assert close.origin.x + close.size.width < skip.origin.x
+    dialog.close_button.performClick_(None)
+    assert dialog._result == DIALOG_CLOSE
+
+
+def test_a_popup_takes_the_text_fields_place_and_reports_its_row():
+    dialog = make_dialog_prompt(title="Set up Remote tasks", message="Account", ok="Continue", cancel="Skip",
+                                choices=["Work · a@x.com · Codex", "Work · a@x.com · Codex"], selected=1)
+    assert dialog.textfield is None and dialog.popup.numberOfItems() == 2  # a repeated row is kept
+    popup = dialog.popup.frame()
+    assert popup.origin.y + popup.size.height < dialog.surface.footer_y
+    assert dialog.popup.nextKeyView() == dialog.buttons[0]
+    response = _run_with_action(dialog, lambda: _press_key(dialog, "\r", 36))
+    assert response.clicked == 1 and response.choice == 1
 
 
 def test_destructive_confirmation_defaults_to_cancel():

@@ -37,8 +37,11 @@ from AppKit import (
     NSImage,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
+    NSKernAttributeName,
     NSLineBreakByWordWrapping,
+    NSMenuItem,
     NSPanel,
+    NSPopUpButton,
     NSParagraphStyleAttributeName,
     NSScrollView,
     NSSecureTextField,
@@ -57,12 +60,20 @@ from Foundation import (
 )
 
 
+# The setup wizard (menubar_wizard) uses the same padding, wordmark, title
+# size, surface and button height, so every OpenSwap window reads as one.
 DIALOG_WIDTH = 440.0
-DIALOG_PADDING = 28.0
+DIALOG_PADDING = 36.0
 DIALOG_CONTENT_WIDTH = DIALOG_WIDTH - DIALOG_PADDING * 2
 DIALOG_INPUT_HEIGHT = 40.0
-ACTION_HEIGHT = 40.0
+POPUP_HEIGHT = 32.0
+ACTION_HEIGHT = 36.0
 ACTION_GAP = 10.0
+FOOTER_GAP = 32.0  # between the content and the footer's top edge
+LOCKUP_MARK = 22.0  # the mark's side in the wordmark
+LOCKUP_SPACE = 50.0  # from the wordmark's top to the title
+# What a dialog returns for its ``close`` action (ends a whole flow, not one step).
+DIALOG_CLOSE = -3
 
 
 @dataclass(frozen=True)
@@ -70,18 +81,21 @@ class DialogResponse:
     clicked: int
     text: str
     checked: bool = False
+    choice: int = -1  # the popup's selected row; -1 without ``choices``
 
 
 class _DialogSurface(NSView):
+    """White content over a grey footer, below ``footer_y``."""
+
     def isFlipped(self):
         return True
 
     def drawRect_(self, rect):
-        NSColor.windowBackgroundColor().setFill()
+        NSColor.controlBackgroundColor().setFill()
         NSBezierPath.fillRect_(self.bounds())
         footer = getattr(self, "footer_y", None)
         if footer is not None:
-            NSColor.controlBackgroundColor().setFill()
+            NSColor.windowBackgroundColor().setFill()
             NSBezierPath.fillRect_(NSMakeRect(
                 0, footer, self.bounds().size.width,
                 self.bounds().size.height - footer,
@@ -116,6 +130,29 @@ class _DialogButton(NSButton):
 
     def drawFocusRingMask(self):
         NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(self.bounds(), 10, 10).fill()
+
+    def focusRingMaskBounds(self):
+        return self.bounds()
+
+
+class _PlainButton(NSButton):
+    """Back, Skip and Close: a plain label that acts like a button, no fill."""
+
+    def drawRect_(self, rect):
+        ink = NSColor.secondaryLabelColor() if self.isEnabled() else NSColor.tertiaryLabelColor()
+        if self.isHighlighted():
+            ink = NSColor.labelColor()
+        title = NSAttributedString.alloc().initWithString_attributes_(self.title(), {
+            NSFontAttributeName: self.font(), NSForegroundColorAttributeName: ink,
+        })
+        size = title.size()
+        title.drawAtPoint_((
+            (self.bounds().size.width - size.width) / 2,
+            (self.bounds().size.height - size.height) / 2,
+        ))
+
+    def drawFocusRingMask(self):
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(self.bounds(), 6, 6).fill()
 
     def focusRingMaskBounds(self):
         return self.bounds()
@@ -193,16 +230,48 @@ def _label(text, font, color, width, *, spaced=False):
     return field
 
 
+def draw_lockup(surface, x, y):
+    """The OpenSwap wordmark: the OpenSoft mark, then "OpenSwap" in one
+    weight with tight tracking, as the sibling products set theirs."""
+    mark = NSImageView.alloc().initWithFrame_(NSMakeRect(x, y, LOCKUP_MARK, LOCKUP_MARK))
+    image = NSImage.alloc().initWithContentsOfFile_(
+        str(Path(__file__).with_name("assets") / "opensoft-symbol-64.png")
+    )
+    if image is not None:
+        image.setTemplate_(True)
+        mark.setImage_(image)
+    mark.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+    mark.setContentTintColor_(NSColor.labelColor())
+    mark.setAccessibilityElement_(False)
+    surface.addSubview_(mark)
+    word = NSTextField.labelWithString_("")
+    word.setAttributedStringValue_(NSAttributedString.alloc().initWithString_attributes_(
+        "OpenSwap", {
+            NSFontAttributeName: NSFont.systemFontOfSize_weight_(15, NSFontWeightSemibold),
+            NSForegroundColorAttributeName: NSColor.labelColor(),
+            NSKernAttributeName: -0.4,
+        },
+    ))
+    word.sizeToFit()
+    size = word.frame().size
+    word.setFrameOrigin_((x + LOCKUP_MARK + 8, y + (LOCKUP_MARK - size.height) / 2))
+    surface.addSubview_(word)
+
+
 class BrandDialog:
     """One reusable modal surface; 1 confirms, 0 cancels, -1 is the third action.
 
     ``checkbox`` adds an option below the message, unchecked; :meth:`run`
-    reports it in ``DialogResponse.checked``.
+    reports it in ``DialogResponse.checked``. ``close`` adds a plain text
+    action on the footer's left, as the setup wizard places Back; it returns
+    ``DIALOG_CLOSE``. ``choices`` shows a popup of those rows (``selected``
+    first) where a prompt has its text field; :meth:`run` reports the row.
     """
 
     def __init__(
         self, *, title=None, message="", ok=None, cancel=None, other=None,
-        default_text=None, secure=False, destructive=False, checkbox=None,
+        default_text=None, secure=False, destructive=False, checkbox=None, close=None,
+        choices=None, selected=0,
     ):
         shown_title = str(title or "OpenSwap")
         if shown_title.casefold() == "openswap":
@@ -211,6 +280,7 @@ class BrandDialog:
         self._running = False
         self.textfield = None
         self.checkbox = None
+        self.popup = None
         self._window = _DialogPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, DIALOG_WIDTH, 320),
             NSWindowStyleMaskTitled | NSWindowStyleMaskFullSizeContentView,
@@ -235,25 +305,11 @@ class BrandDialog:
         surface = _DialogSurface.alloc().initWithFrame_(NSMakeRect(0, 0, DIALOG_WIDTH, 320))
         window.setContentView_(surface)
         self.surface = surface
-        y = DIALOG_PADDING
-        mark = NSImageView.alloc().initWithFrame_(NSMakeRect(DIALOG_PADDING, y, 28, 28))
-        image = NSImage.alloc().initWithContentsOfFile_(
-            str(Path(__file__).with_name("assets") / "opensoft-symbol-64.png")
-        )
-        if image is not None:
-            image.setTemplate_(True)
-            mark.setImage_(image)
-        mark.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-        mark.setContentTintColor_(NSColor.labelColor())
-        mark.setAccessibilityElement_(False)
-        surface.addSubview_(mark)
-        brand = _label("OpenSwap", NSFont.systemFontOfSize_weight_(12, NSFontWeightMedium),
-                       NSColor.secondaryLabelColor(), 160)
-        brand.setFrameOrigin_((DIALOG_PADDING + 38, y + (28 - brand.frame().size.height) / 2))
-        surface.addSubview_(brand)
-        y += 48
+        y = DIALOG_PADDING - 4
+        draw_lockup(surface, DIALOG_PADDING, y)
+        y += LOCKUP_SPACE
 
-        heading = _label(shown_title, NSFont.systemFontOfSize_weight_(20, NSFontWeightSemibold),
+        heading = _label(shown_title, NSFont.systemFontOfSize_weight_(22, NSFontWeightSemibold),
                          NSColor.labelColor(), DIALOG_CONTENT_WIDTH)
         heading.setFrameOrigin_((DIALOG_PADDING, y))
         surface.addSubview_(heading)
@@ -280,7 +336,7 @@ class BrandDialog:
             button.setAction_("clicked:")
             button.setTag_(response)
             button.sizeToFit()
-            widths.append(max(96.0, button.frame().size.width + 16))
+            widths.append(max(96.0, button.frame().size.width + 24))
             if response == 1:
                 # Destructive actions require explicit selection. Return may
                 # dismiss via Cancel, but never silently removes an account.
@@ -295,20 +351,37 @@ class BrandDialog:
                     window.setDefaultButtonCell_(button.cell())
             self.buttons.append(button)
             surface.addSubview_(button)
-        stacked = sum(widths) + ACTION_GAP * (len(widths) - 1) > DIALOG_CONTENT_WIDTH
-        footer_height = 40 + (len(widths) * (ACTION_HEIGHT + ACTION_GAP) - ACTION_GAP
-                              if stacked else ACTION_HEIGHT)
+        self.close_button = None
+        close_width = 0.0
+        if close:
+            button = _PlainButton.alloc().initWithFrame_(NSMakeRect(0, 0, 100, ACTION_HEIGHT))
+            button.setTitle_(str(close))
+            button.setBordered_(False)
+            button.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightMedium))
+            button.setFocusRingType_(NSFocusRingTypeExterior)
+            button.setTarget_(window)
+            button.setAction_("clicked:")
+            button.setTag_(DIALOG_CLOSE)
+            button.sizeToFit()
+            close_width = button.frame().size.width + 16
+            self.close_button = button
+            surface.addSubview_(button)
+        row_width = sum(widths) + ACTION_GAP * (len(widths) - 1)
+        stacked = row_width + (close_width + ACTION_GAP if close else 0) > DIALOG_CONTENT_WIDTH
+        rows = (len(widths) + (1 if close else 0)) if stacked else 1
+        footer_height = 40 + rows * (ACTION_HEIGHT + ACTION_GAP) - ACTION_GAP
 
         if message:
-            y += 12
+            y += 8
             body = _label(str(message), NSFont.systemFontOfSize_(13),
                           NSColor.secondaryLabelColor(), DIALOG_CONTENT_WIDTH, spaced=True)
             body.setSelectable_(True)
             self.body = body
             screen = window.screen()
             max_height = min(640, screen.visibleFrame().size.height - 80) if screen else 640
-            input_space = DIALOG_INPUT_HEIGHT + 20 if default_text is not None else 0
-            body_limit = max(80, max_height - y - input_space - 28 - footer_height)
+            input_space = (DIALOG_INPUT_HEIGHT + 20 if default_text is not None else 0) + (
+                POPUP_HEIGHT + 20 if choices is not None else 0)
+            body_limit = max(80, max_height - y - input_space - FOOTER_GAP - footer_height)
             body_height = body.frame().size.height
             if body_height > body_limit:
                 scroll = NSScrollView.alloc().initWithFrame_(
@@ -361,7 +434,25 @@ class BrandDialog:
             window.setInitialFirstResponder_(field)
             y += DIALOG_INPUT_HEIGHT
 
-        y += 28
+        if choices is not None:
+            y += 20
+            popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+                NSMakeRect(DIALOG_PADDING, y, DIALOG_CONTENT_WIDTH, POPUP_HEIGHT), False,
+            )
+            popup.setControlSize_(NSControlSizeLarge)
+            popup.setFont_(NSFont.systemFontOfSize_(13))
+            for row in choices:
+                # Menu items, not addItemWithTitle_, which drops a repeated title.
+                popup.menu().addItem_(NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(str(row), None, ""))
+            if 0 <= selected < len(choices):
+                popup.selectItemAtIndex_(selected)
+            popup.setAccessibilityLabel_(shown_title)
+            surface.addSubview_(popup)
+            self.popup = popup
+            window.setInitialFirstResponder_(popup)
+            y += POPUP_HEIGHT
+
+        y += FOOTER_GAP
         surface.footer_y = y
         action_y = y + 20
         action_x = DIALOG_PADDING if stacked else (
@@ -375,9 +466,18 @@ class BrandDialog:
                 action_y += ACTION_HEIGHT + ACTION_GAP
             else:
                 action_x += width + ACTION_GAP
+        if self.close_button is not None:
+            # Left of the row, its text aligned with the content above.
+            self.close_button.setFrame_(NSMakeRect(
+                DIALOG_PADDING - 8 if not stacked else DIALOG_PADDING,
+                action_y if stacked else y + 20,
+                DIALOG_CONTENT_WIDTH if stacked else close_width, ACTION_HEIGHT,
+            ))
         window.setContentSize_((DIALOG_WIDTH, y + footer_height))
         surface.setFrameSize_((DIALOG_WIDTH, y + footer_height))
-        chain = [view for view in (self.checkbox, self.textfield) if view is not None] + self.buttons
+        chain = [view for view in (self.checkbox, self.textfield, self.popup, self.close_button)
+                 if view is not None]
+        chain += self.buttons
         for current, following in zip(chain, chain[1:]):
             current.setNextKeyView_(following)
         chain[-1].setNextKeyView_(chain[0])
@@ -415,6 +515,7 @@ class BrandDialog:
             clicked,
             str(self.textfield.stringValue()) if self.textfield else "",
             self.checkbox is not None and self.checkbox.state() == NSControlStateValueOn,
+            int(self.popup.indexOfSelectedItem()) if self.popup is not None else -1,
         )
 
 
@@ -422,8 +523,9 @@ def make_dialog_alert(**kwargs):
     return BrandDialog(**kwargs)
 
 
-def make_dialog_prompt(*, default_text="", **kwargs):
-    return BrandDialog(default_text=default_text, **kwargs)
+def make_dialog_prompt(*, default_text="", choices=None, **kwargs):
+    """A text prompt, or a popup of ``choices`` in place of the text field."""
+    return BrandDialog(default_text=None if choices is not None else default_text, choices=choices, **kwargs)
 
 
 # What ``run_waiting_dialog``'s dialog returns when its work ended (not a button).

@@ -823,6 +823,8 @@ def run(switcher, codex=None) -> int:
                     paired = load_worker_settings(root).control_service_url is not None
                     if paired or guided_setup.pair_interactively(root, ui):
                         guided_setup.run(root, ui)
+                except guided_setup.SetupClosed:
+                    pass
                 except Exception:
                     ui.say("Setup stopped unexpectedly. Run `openswap worker setup` in Terminal to finish.")
                 finally:
@@ -860,6 +862,8 @@ def run(switcher, codex=None) -> int:
                     ui.say(message)
                     if outcome == "paired":
                         guided_setup.run(root, ui)
+                except guided_setup.SetupClosed:
+                    pass
                 except Exception:
                     flow.close()
                     ui.say("Connect stopped unexpectedly. Run `openswap worker connect` in Terminal.")
