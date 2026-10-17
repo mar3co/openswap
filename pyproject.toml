@@ -33,7 +33,7 @@ classifiers = [
 menubar = ["rumps>=0.4.0"]
 
 [project.urls]
-Homepage = "https://github.com/mar3co/openswap"
+Homepage = "https://opensoft.me/swap"
 Repository = "https://github.com/mar3co/openswap"
 Issues = "https://github.com/mar3co/openswap/issues"
 
