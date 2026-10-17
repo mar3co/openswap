@@ -269,17 +269,22 @@ main{animation:rise .5s cubic-bezier(.2,.8,.2,1) both}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important}}
 """
 # The pointer spotlight: eases --mx/--my toward the pointer and the glow
-# (--gx/--gy) a third of the way from the centre toward it, then idles. Nothing
-# runs with Reduce Motion or without a hovering pointer (touch screens).
+# (--gx/--gy) a third of the way from the centre toward it, then idles. It
+# follows the settings live: with Reduce Motion, or without a hovering pointer
+# (touch screens), the handler is detached and the glow goes back to the middle.
 _MOTION_SCRIPT = (
-    '(()=>{if(matchMedia("(prefers-reduced-motion: reduce)").matches||!matchMedia("(hover: hover)").matches)return;'
-    'const s=document.documentElement.style;let tx=0,ty=0,x=0,y=0,f=0,on=0;'
+    '(()=>{const r=matchMedia("(prefers-reduced-motion: reduce)"),h=matchMedia("(hover: hover)"),'
+    's=document.documentElement.style;let tx=0,ty=0,x=0,y=0,f=0,on=0,l=0;'
     'const step=()=>{x+=(tx-x)*.12;y+=(ty-y)*.12;const cx=innerWidth/2,cy=innerHeight*.45;'
     's.setProperty("--mx",x+"px");s.setProperty("--my",y+"px");'
     's.setProperty("--gx",cx+(x-cx)/3+"px");s.setProperty("--gy",cy+(y-cy)/3+"px");'
     'f=Math.abs(tx-x)+Math.abs(ty-y)>.5?requestAnimationFrame(step):0};'
-    'addEventListener("pointermove",e=>{tx=e.clientX;ty=e.clientY;if(!on){on=1;x=tx;y=ty}'
-    'f||(f=requestAnimationFrame(step))},{passive:true})})()'
+    'const mv=e=>{tx=e.clientX;ty=e.clientY;if(!on){on=1;x=tx;y=ty}f||(f=requestAnimationFrame(step))};'
+    'const sync=()=>{const ok=!r.matches&&h.matches;'
+    'if(ok&&!l){addEventListener("pointermove",mv,{passive:true});l=1}'
+    'else if(!ok&&l){removeEventListener("pointermove",mv);cancelAnimationFrame(f);f=on=l=0;'
+    '["--mx","--my","--gx","--gy"].forEach(n=>s.removeProperty(n))}};'
+    'sync();r.addEventListener("change",sync);h.addEventListener("change",sync)})()'
 )
 _MOTION_HASH = base64.b64encode(hashlib.sha256(_MOTION_SCRIPT.encode()).digest()).decode()
 # Replaces the callback address (it carries the used pair code and the state)
