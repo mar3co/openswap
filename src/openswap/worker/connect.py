@@ -218,9 +218,9 @@ _ICONS = {
 }
 _STYLE = """
 :root{--fg:#0a0a0a;--muted:#6e6e73;--line:#e8e8ed;--card:#fff;--bg:#f5f5f7;--ok:#1d8a3a;--bad:#d1342b;--info:#6e6e73;
---dot:rgba(10,10,10,.13);--glow:rgba(10,10,10,.07)}
+--dot:rgba(10,10,10,.13);--dot-hi:rgba(10,10,10,.42);--glow:rgba(10,10,10,.07)}
 @media (prefers-color-scheme:dark){:root{--fg:#f5f5f7;--muted:#a1a1a6;--line:#2c2c2e;--card:#1c1c1e;--bg:#0a0a0a;--ok:#248a3d;--bad:#ff453a;--info:#8e8e93;
---dot:rgba(245,245,247,.12);--glow:rgba(245,245,247,.07)}}
+--dot:rgba(245,245,247,.12);--dot-hi:rgba(245,245,247,.42);--glow:rgba(245,245,247,.07)}}
 *{box-sizing:border-box}
 html{background:var(--bg)}
 body{position:relative;isolation:isolate;overflow-x:hidden;margin:0;min-height:100vh;display:flex;flex-direction:column;
@@ -232,9 +232,15 @@ body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;
 background-image:radial-gradient(var(--dot) 1px,transparent 1px);background-size:22px 22px;
 -webkit-mask-image:radial-gradient(ellipse 70% 60% at 50% 45%,#000 35%,transparent 100%);
 mask-image:radial-gradient(ellipse 70% 60% at 50% 45%,#000 35%,transparent 100%)}
-body::after{content:"";position:fixed;left:50%;top:45%;z-index:-1;width:44rem;height:44rem;border-radius:50%;
+body::after{content:"";position:fixed;left:var(--gx,50%);top:var(--gy,45%);z-index:-1;width:44rem;height:44rem;border-radius:50%;
 pointer-events:none;transform:translate(-50%,-50%);background:radial-gradient(circle,var(--glow),transparent 62%);
 animation:breathe 9s ease-in-out infinite}
+/* With a mouse, the dots near the pointer light up and the glow drifts toward it
+   (the motion script sets --mx/--my and --gx/--gy; off-screen until it moves). */
+.spot{position:fixed;inset:0;z-index:-1;pointer-events:none;
+background-image:radial-gradient(var(--dot-hi) 1.2px,transparent 1.2px);background-size:22px 22px;
+-webkit-mask-image:radial-gradient(circle 150px at var(--mx,-999px) var(--my,-999px),#000,transparent);
+mask-image:radial-gradient(circle 150px at var(--mx,-999px) var(--my,-999px),#000,transparent)}
 .brand{display:flex;align-items:center;gap:10px;margin-bottom:28px;font-size:24px;font-weight:650;letter-spacing:-.6px}
 .brand svg{width:32px;height:32px}
 main{width:100%;max-width:400px;padding:36px 28px 28px;text-align:center;background:var(--card);
@@ -262,6 +268,25 @@ main{animation:rise .5s cubic-bezier(.2,.8,.2,1) both}
 @keyframes breathe{0%,100%{opacity:.7;transform:translate(-50%,-50%) scale(1)}50%{opacity:1;transform:translate(-50%,-50%) scale(1.08)}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important}}
 """
+# The pointer spotlight: eases --mx/--my toward the pointer and the glow
+# (--gx/--gy) a third of the way from the centre toward it, then idles. It
+# follows the settings live: with Reduce Motion, or without a hovering pointer
+# (touch screens), the handler is detached and the glow goes back to the middle.
+_MOTION_SCRIPT = (
+    '(()=>{const r=matchMedia("(prefers-reduced-motion: reduce)"),h=matchMedia("(hover: hover)"),'
+    's=document.documentElement.style;let tx=0,ty=0,x=0,y=0,f=0,on=0,l=0;'
+    'const step=()=>{x+=(tx-x)*.12;y+=(ty-y)*.12;const cx=innerWidth/2,cy=innerHeight*.45;'
+    's.setProperty("--mx",x+"px");s.setProperty("--my",y+"px");'
+    's.setProperty("--gx",cx+(x-cx)/3+"px");s.setProperty("--gy",cy+(y-cy)/3+"px");'
+    'f=Math.abs(tx-x)+Math.abs(ty-y)>.5?requestAnimationFrame(step):0};'
+    'const mv=e=>{tx=e.clientX;ty=e.clientY;if(!on){on=1;x=tx;y=ty}f||(f=requestAnimationFrame(step))};'
+    'const sync=()=>{const ok=!r.matches&&h.matches;'
+    'if(ok&&!l){addEventListener("pointermove",mv,{passive:true});l=1}'
+    'else if(!ok&&l){removeEventListener("pointermove",mv);cancelAnimationFrame(f);f=on=l=0;'
+    '["--mx","--my","--gx","--gy"].forEach(n=>s.removeProperty(n))}};'
+    'sync();r.addEventListener("change",sync);h.addEventListener("change",sync)})()'
+)
+_MOTION_HASH = base64.b64encode(hashlib.sha256(_MOTION_SCRIPT.encode()).digest()).decode()
 # Replaces the callback address (it carries the used pair code and the state)
 # in the address bar and history with a plain one; CSP allows it by hash.
 _CLEAN_URL_SCRIPT = f'history.replaceState(null,"","{CALLBACK_PATH.rsplit("/", 1)[0]}/done")'
@@ -278,7 +303,7 @@ def page(title: str, body: str, *, kind: str = "info", details: tuple[tuple[str,
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
         "<meta name=\"color-scheme\" content=\"light dark\">",
         f"<title>{e(title)} · OpenSwap</title><style>{_STYLE}</style></head>",
-        f"<body class=\"{kind if kind in _ICONS else 'info'}\">",
+        f"<body class=\"{kind if kind in _ICONS else 'info'}\"><div class=\"spot\" aria-hidden=\"true\"></div>",
         f"<div class=\"brand\">{_MARK}OpenSwap</div>",
         "<main><div class=\"status\" aria-hidden=\"true\"><svg viewBox=\"0 0 24 24\">"
         f"{_ICONS.get(kind, _ICONS['info'])}</svg></div>",
@@ -287,6 +312,7 @@ def page(title: str, body: str, *, kind: str = "info", details: tuple[tuple[str,
         f"<p class=\"next\">{e(next_step)}</p>" if next_step else "",
         "</main>",
         f"<footer>{e(footer)}</footer>" if footer else "",
+        f"<script>{_MOTION_SCRIPT}</script>",
         f"<script>{_CLEAN_URL_SCRIPT}</script>" if clean_url else "",
         "</body></html>\n",
     ]
@@ -298,7 +324,8 @@ _REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Al
 
 def _send(conn: socket.socket, status: int, title: str, body: str, extra: str = "", **look) -> None:
     content = page(title, body, kind=look.pop("kind", "ok" if status == 200 else "bad"), **look)
-    script = f"; script-src 'sha256-{_CLEAN_URL_HASH}'" if look.get("clean_url") else ""
+    hashes = [_MOTION_HASH] + ([_CLEAN_URL_HASH] if look.get("clean_url") else [])
+    script = "; script-src " + " ".join(f"'sha256-{h}'" for h in hashes)
     head = (f"HTTP/1.1 {status} {_REASONS.get(status, 'Error')}\r\n"
             "Content-Type: text/html; charset=utf-8\r\n"
             f"Content-Length: {len(content)}\r\n"
