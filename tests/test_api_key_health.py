@@ -17,6 +17,7 @@ from openswap.api_key_health import (
     VERDICT_NO_CREDIT,
     VERDICT_OK,
     VERDICT_REVOKED,
+    VERDICT_SPEND_LIMIT,
     KeyHealth,
     classify_error,
 )
@@ -24,6 +25,7 @@ from openswap.json_output import (
     USAGE_API_KEY,
     USAGE_API_KEY_NO_CREDIT,
     USAGE_API_KEY_REVOKED,
+    USAGE_API_KEY_SPEND_LIMIT,
     usage_fields,
 )
 
@@ -32,6 +34,21 @@ OTHER_KEY = "sk-ant-api03-" + "z9y8x7w6v5" * 4
 CREDIT_MESSAGE = (
     "Your credit balance is too low to access the Anthropic API. "
     "Please go to Plans & Billing to upgrade or purchase credits."
+)
+# The wordings Anthropic documents for a spend limit reached (Rate limits ›
+# Spend limits): one the user set (org or workspace), and the tier cap.
+SPEND_LIMIT_MESSAGE = (
+    "You have reached your specified API usage limits. "
+    "You will regain access on 2026-11-01 at 00:00 UTC."
+)
+WORKSPACE_LIMIT_MESSAGE = (
+    "You have reached your specified workspace API usage limits. "
+    "You will regain access on 2026-11-01 at 00:00 UTC."
+)
+TIER_CAP_MESSAGE = (
+    "You have reached your API usage limits: your organization has crossed its "
+    "monthly API usage threshold, set based on your organization's API tier. "
+    "You will regain access on 2026-11-01 at 00:00 UTC."
 )
 
 
@@ -43,8 +60,13 @@ class Clock:
         return self.now
 
 
-def _http_error(status: int, message: str = "") -> urllib.error.HTTPError:
-    body = json.dumps({"type": "error", "error": {"type": "x", "message": message}})
+def _http_error(
+    status: int, message: str = "", error_code: str | None = None
+) -> urllib.error.HTTPError:
+    error = {"type": "x", "message": message}
+    if error_code is not None:
+        error["details"] = {"error_code": error_code}
+    body = json.dumps({"type": "error", "error": error})
     return urllib.error.HTTPError(
         api_key_health.COUNT_TOKENS_URL, status, "err", {}, io.BytesIO(body.encode())
     )
@@ -58,6 +80,22 @@ class TestClassifyError:
     def test_credit_message_is_no_credit(self, status):
         assert classify_error(status, CREDIT_MESSAGE) == VERDICT_NO_CREDIT
 
+    @pytest.mark.parametrize("message", [SPEND_LIMIT_MESSAGE, WORKSPACE_LIMIT_MESSAGE])
+    def test_spend_limit_the_user_set_is_spend_limit(self, message):
+        assert classify_error(400, message) == VERDICT_SPEND_LIMIT
+
+    def test_tier_spend_cap_is_spend_limit(self):
+        assert classify_error(429, TIER_CAP_MESSAGE) == VERDICT_SPEND_LIMIT
+        # The error code alone is enough, whatever the wording becomes.
+        assert (
+            classify_error(429, "", "enforced_spend_limit_reached") == VERDICT_SPEND_LIMIT
+        )
+
+    def test_rate_limit_is_not_a_spend_limit(self):
+        message = "This request would exceed the rate limit for your organization"
+        assert classify_error(429, message) is None
+        assert classify_error(429, message, "rate_limit_exceeded") is None
+
     @pytest.mark.parametrize(
         "status, message",
         [
@@ -66,6 +104,7 @@ class TestClassifyError:
             (429, "rate limited"),
             (500, "overloaded"),
             (529, CREDIT_MESSAGE),
+            (500, SPEND_LIMIT_MESSAGE),
         ],
     )
     def test_anything_else_proves_nothing(self, status, message):
@@ -111,6 +150,15 @@ class TestProbe:
         with patch("urllib.request.urlopen", side_effect=_http_error(400, CREDIT_MESSAGE)):
             assert api_key_health.probe(KEY) == VERDICT_NO_CREDIT
 
+    def test_spend_cap_error_code_is_read_from_the_body(self):
+        err = _http_error(429, "", "enforced_spend_limit_reached")
+        with patch("urllib.request.urlopen", side_effect=err):
+            assert api_key_health.probe(KEY) == VERDICT_SPEND_LIMIT
+
+    def test_spend_limit_message_is_spend_limit(self):
+        with patch("urllib.request.urlopen", side_effect=_http_error(400, WORKSPACE_LIMIT_MESSAGE)):
+            assert api_key_health.probe(KEY) == VERDICT_SPEND_LIMIT
+
     def test_network_failure_is_unknown(self):
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
             assert api_key_health.probe(KEY) is None
@@ -154,7 +202,9 @@ class TestKeyHealth:
         clock.now += 1
         assert health.due(KEY)
 
-    @pytest.mark.parametrize("verdict", [VERDICT_REVOKED, VERDICT_NO_CREDIT, None])
+    @pytest.mark.parametrize(
+        "verdict", [VERDICT_REVOKED, VERDICT_NO_CREDIT, VERDICT_SPEND_LIMIT, None]
+    )
     def test_dead_or_unknown_key_retries_sooner(self, tmp_path, verdict):
         clock = Clock()
         health, _ = self._health(tmp_path, [verdict], clock)
@@ -253,12 +303,16 @@ class TestSentinels:
     def test_usage_fields_maps_dead_keys(self):
         assert usage_fields(USAGE_API_KEY_REVOKED) == ("api_key_revoked", None)
         assert usage_fields(USAGE_API_KEY_NO_CREDIT) == ("api_key_no_credit", None)
+        assert usage_fields(USAGE_API_KEY_SPEND_LIMIT) == ("api_key_spend_limit", None)
 
     def test_sentinel_notes_name_the_failure(self):
         from openswap.engine.notes import SENTINEL_NOTES
 
         assert SENTINEL_NOTES[USAGE_API_KEY_REVOKED].startswith("API key revoked")
         assert SENTINEL_NOTES[USAGE_API_KEY_NO_CREDIT].startswith("API key out of credit")
+        assert SENTINEL_NOTES[USAGE_API_KEY_SPEND_LIMIT].startswith(
+            "API key at its spend limit"
+        )
 
 
 class TestCollector:
@@ -282,6 +336,7 @@ class TestCollector:
         [
             (VERDICT_REVOKED, USAGE_API_KEY_REVOKED),
             (VERDICT_NO_CREDIT, USAGE_API_KEY_NO_CREDIT),
+            (VERDICT_SPEND_LIMIT, USAGE_API_KEY_SPEND_LIMIT),
             (VERDICT_OK, USAGE_API_KEY),
             (None, USAGE_API_KEY),
         ],

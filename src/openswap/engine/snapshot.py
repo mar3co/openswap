@@ -1236,6 +1236,11 @@ class SnapshotMixin:
             if info[5] is not UNREAD_CREDENTIALS and looks_like_api_key(info[5])
         }
         health = api_key_health.KeyHealth(self.backup_dir / "cache")
+        dead_sentinel = {
+            api_key_health.VERDICT_REVOKED: USAGE_API_KEY_REVOKED,
+            api_key_health.VERDICT_NO_CREDIT: USAGE_API_KEY_NO_CREDIT,
+            api_key_health.VERDICT_SPEND_LIMIT: USAGE_API_KEY_SPEND_LIMIT,
+        }
         if probe:
             # An idle key that only roster-only passes see (the extra while
             # auto-switch runs) would otherwise never be rechecked: load just
@@ -1263,10 +1268,8 @@ class SnapshotMixin:
                 verdict = health.slot_verdict(api_key_health.slot_id(info[1], info[3]))
             else:
                 continue
-            if verdict == api_key_health.VERDICT_REVOKED:
-                sentinels[num] = USAGE_API_KEY_REVOKED
-            elif verdict == api_key_health.VERDICT_NO_CREDIT:
-                sentinels[num] = USAGE_API_KEY_NO_CREDIT
+            if verdict in dead_sentinel:
+                sentinels[num] = dead_sentinel[verdict]
 
     def _collect_usage_entries(
         self,

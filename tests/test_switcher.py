@@ -6333,6 +6333,22 @@ class TestUsageAwareSwitch:
         assert "Skipping Account-2 (API key revoked or invalid)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
+    def test_skip_exhausted_names_a_key_at_its_spend_limit(self, temp_home: Path, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(0), "2": "api key at spend limit", "3": self._usage(20)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="next-available")
+
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (API key at its spend limit)" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
     def test_only_dead_keys_left_is_not_called_exhausted(self, temp_home: Path):
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")

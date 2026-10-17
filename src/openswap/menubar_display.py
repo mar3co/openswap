@@ -2608,9 +2608,13 @@ STALE_PARENT = "stale-parent"
 # Claude Code on a Console key spends that organization's purchased credit:
 # the monthly API credit included with Max and Team plans does not cover
 # Claude Code (Anthropic's "API credits for Max and Team plans" page).
+# OpenSwap cannot see or stop a key's spend, so the cap belongs in the
+# Console: a workspace spend limit, which the key probe then recognizes.
 TOKEN_CREDIT_HINT = (
     "Claude Code on this key spends credit you bought in the Claude Console. "
-    "The monthly API credit included with Max and Team doesn't cover it."
+    "The monthly API credit included with Max and Team doesn't cover it. "
+    "To cap what it can spend, put the key in its own Console workspace with "
+    "a monthly spend limit."
 )
 
 

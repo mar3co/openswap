@@ -1120,6 +1120,7 @@ def test_token_entry_state_warns_included_credit_does_not_cover_claude_code():
     key = menubar.token_entry_state("sk-ant-api03-abc", _TOKEN_ROWS, _TOKEN_KINDS)
     assert "doesn't cover" in key["credit_hint"]
     assert "Max and Team" in key["credit_hint"]
+    assert "spend limit" in key["credit_hint"]
     for text in ("", "sk-ant-oat01-abc", "hunter2"):
         assert menubar.token_entry_state(text, _TOKEN_ROWS, _TOKEN_KINDS)["credit_hint"] == ""
 

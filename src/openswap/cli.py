@@ -1859,7 +1859,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "has known room (on failover only when a subscription was measured or "
             "none is in rotation), and returns to a subscription once one has room. "
             "Claude Code on the key spends credit bought in the Claude Console; the "
-            "monthly API credit included with Max and Team doesn't cover it."
+            "monthly API credit included with Max and Team doesn't cover it. To cap "
+            "its spend, give the key its own Console workspace with a spend limit."
         ),
     )
     parser.add_argument(

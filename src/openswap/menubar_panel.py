@@ -2294,7 +2294,7 @@ class MenuBarPanel:
         self._fill_parent_popup(popup, state["choices"], snap.get("identities") or {})
         root.addSubview_(popup)
         y += 28 + 6
-        hint_h = float(int(font_small.boundingRectForFont().size.height + 1)) * 3
+        hint_h = float(int(font_small.boundingRectForFont().size.height + 1)) * 5
         hint = _label(TOKEN_CREDIT_HINT, font_small, pal["muted"], NSMakeRect(PAD + 12, y, field_w, hint_h))
         _wrap(hint)
         root.addSubview_(hint)
