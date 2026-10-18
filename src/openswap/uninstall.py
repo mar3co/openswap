@@ -503,10 +503,12 @@ def _worker_process_may_run(root: Path) -> bool:
 
 @contextmanager
 def worker_starts_held() -> Iterator[bool]:
-    """Hold the lifecycle lock of each data root with worker state, which
-    every worker start takes, across :func:`job_state_busy` and the deletion
-    it allows: a worker started between the two would use the locks and
-    handles being deleted. Yields False when one cannot be taken, and the
+    """Hold the lifecycle lock of each data root, which every worker start
+    and ``worker enable`` takes, across :func:`job_state_busy` and the
+    deletion it allows: a worker started between the two would use the
+    locks and handles being deleted. Every root, worker state or not, since
+    an enable could create it meanwhile; taking the lock creates the folder,
+    which the zap deletes. Yields False when one cannot be taken, and the
     caller keeps the job state. A held lock whose file the deletion removes
     is still released by its descriptor."""
     from openswap.worker.cli import lifecycle_lock
@@ -514,8 +516,6 @@ def worker_starts_held() -> Iterator[bool]:
     with ExitStack() as stack:
         held = True
         for root in _data_roots():
-            if not (root / "worker").is_dir():
-                continue
             try:
                 stack.enter_context(lifecycle_lock(root))
             except Exception:

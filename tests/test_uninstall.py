@@ -1318,6 +1318,17 @@ class TestJobStateBusy:
                 assert held is False
 
     @pytest.mark.skipif(sys.platform == "win32", reason="the worker's locks are flocks")
+    def test_worker_starts_held_locks_a_root_without_worker_state(self, monkeypatch, tmp_path):
+        """A `worker enable` meanwhile could create it, so it is locked too."""
+        from openswap.locking import FileLock
+
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: tmp_path)
+        with uninstall.worker_starts_held() as held:
+            assert held is True
+            assert not FileLock(tmp_path / "worker" / "lifecycle.lock", timeout=0).acquire(timeout=0)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the worker's locks are flocks")
     def test_worker_process_may_run_reads_the_instance_lock(self, tmp_path):
         from openswap.locking import FileLock
 
