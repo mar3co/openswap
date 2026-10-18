@@ -131,6 +131,33 @@ def test_zap_trashes_every_agents_logs_but_leaves_the_shared_worker_label():
     assert '"~/Library/Application Support/OpenSwap"' in zap
 
 
+def test_zap_trashes_what_openswap_uninstall_zap_deletes(tmp_path, monkeypatch):
+    """`brew uninstall --zap` and a zap without Homebrew leave the same Mac."""
+    import re
+
+    from openswap import uninstall
+
+    cask = _render("1.2.3", ARM, INTEL).stdout
+    trash = cask[cask.index("      trash:") : cask.index("  caveats")]
+    home = tmp_path / "home"
+    listed = [home / entry[2:] for entry in re.findall(r'"(~/[^"]+)"', trash)]
+    for path in listed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.suffix in {".log", ".err", ".plist"}:
+            path.write_text("x")
+        else:
+            path.mkdir()
+    backup = home / "Library" / "Application Support" / "OpenSwap"
+    monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
+    monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: backup)
+    # All but the worker's job state, which the hook deletes once no task runs.
+    job_state = uninstall.job_state_paths(home)
+    for path in job_state:
+        path.mkdir(parents=True)
+        assert path not in listed
+    assert sorted(uninstall.data_paths(home)) == sorted([*listed, *job_state])
+
+
 def test_caveats_are_one_step():
     cask = _render("1.2.3", ARM, INTEL).stdout
     caveats = cask[cask.index("  caveats do") :]

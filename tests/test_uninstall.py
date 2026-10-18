@@ -8,6 +8,7 @@ here; nothing touches a real LaunchAgent or file outside ``tmp_path``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import plistlib
 import shlex
@@ -101,6 +102,8 @@ def mac(tmp_path, monkeypatch):
 
     def fake_worker_uninstall(home=None, uid=None):
         seen["worker"].append("uninstall")
+        if state.get("worker_uninstall_raises"):
+            raise OSError("could not unlink the plist")
         (agents / "com.opensoft.openswap.worker.plist").unlink(missing_ok=True)
         return {"was_loaded": True, "removed_plist": True}
 
@@ -201,6 +204,35 @@ class TestRemoveIntegrations:
         removal = uninstall.remove_integrations(home=home, uid=501, force=True)
         assert removal.removed == ["Remote tasks worker"] and removal.failed == []
         assert seen["worker"] == ["uninstall"]
+        assert removal.job_stop_unconfirmed  # so a zap keeps its job state
+        # And a later zap, after a reinstall, too.
+        assert (home / "Library" / "Application Support" / "com.opensoft.openswap" / "stop-unconfirmed").is_file()
+
+    def test_a_forced_boot_out_that_fails_still_keeps_the_job_state(self, mac, frozen_app):
+        """It can boot the worker out and then fail on the plist: the task may still run."""
+        home, agents, seen, state = mac
+        exe = str(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+        _plist(agents / "com.opensoft.openswap.worker.plist", [exe, "worker", "run"])
+        state["disable_ok"] = False
+        state["worker_uninstall_raises"] = True
+        removal = uninstall.remove_integrations(home=home, uid=501, force=True)
+        assert len(removal.failed) == 1 and removal.failed[0].startswith("Remote tasks worker")
+        assert removal.job_stop_unconfirmed
+        assert (home / "Library" / "Application Support" / "com.opensoft.openswap" / "stop-unconfirmed").is_file()
+
+    def test_a_stop_it_cannot_record_leaves_the_worker_loaded(self, mac, frozen_app):
+        """Then the loaded worker is what shows a later zap that a task may run."""
+        home, agents, seen, state = mac
+        exe = str(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+        _plist(agents / "com.opensoft.openswap.worker.plist", [exe, "worker", "run"])
+        state["disable_ok"] = False
+        support = home / "Library" / "Application Support"
+        support.mkdir(parents=True, exist_ok=True)
+        (support / "com.opensoft.openswap").write_text("not a folder")
+        removal = uninstall.remove_integrations(home=home, uid=501, force=True)
+        assert seen["worker"] == []  # not booted out
+        assert len(removal.failed) == 1 and "stays loaded" in removal.failed[0]
+        assert removal.job_stop_unconfirmed
 
     def test_force_boots_out_a_worker_whose_disable_raises(self, mac, frozen_app):
         """The app is about to go; a plist on it must not survive."""
@@ -211,6 +243,7 @@ class TestRemoveIntegrations:
         removal = uninstall.remove_integrations(home=home, uid=501, force=True)
         assert removal.removed == ["Remote tasks worker"] and removal.failed == []
         assert seen["worker"] == ["uninstall"]
+        assert removal.job_stop_unconfirmed
 
     def test_disable_that_raises_is_a_failure_without_force(self, mac, frozen_app):
         home, agents, seen, state = mac
@@ -602,22 +635,42 @@ class TestZapData:
         (logs / "com.opensoft.openswap.menubar.err").write_text("x")
         (logs / "com.opensoft.openswap.worker.log").write_text("x")
         (logs / "com.other.app.log").write_text("x")
+        # The worker's pinned Claude Code copies and job locks, and their old place.
+        support = home / "Library" / "Application Support" / "com.opensoft.openswap"
+        (support / "claude-cli").mkdir(parents=True)
+        caches = home / "Library" / "Caches" / "com.opensoft.openswap"
+        (caches / "job-locks").mkdir(parents=True)
+        prefs = home / "Library" / "Preferences"
+        prefs.mkdir(parents=True)
+        (prefs / "com.opensoft.openswap.plist").write_text("x")
+        (prefs / "com.opensoft.openswap.menubar.plist").write_text("x")
+        (prefs / "com.other.app.plist").write_text("x")
         legacy = home / ".claude-swap-backup"
         legacy.mkdir()
         monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
         monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: legacy)
         found = uninstall.data_paths(home)
+        # The job state first, while the roots' lifecycle.lock files remain.
         assert found == [
+            support,
+            caches,
             backup,
+            prefs / "com.opensoft.openswap.plist",
+            prefs / "com.opensoft.openswap.menubar.plist",
             logs / "com.opensoft.openswap.worker.log",
             logs / "com.opensoft.openswap.menubar.err",
             legacy,
         ]
-        # Homebrew's zap trashes the rest; the pre-XDG folder is not on its list.
-        assert uninstall.data_paths(home, homebrew_zap=True) == [legacy]
+        # Homebrew's zap trashes the rest; neither the job state (an older
+        # worker's in Caches included) nor the pre-XDG folder is on its list.
+        assert uninstall.data_paths(home, homebrew_zap=True) == [support, caches, legacy]
+        # A task that may still run keeps its handles and locks.
+        kept = uninstall.data_paths(home, keep_job_state=True)
+        assert support not in kept and caches not in kept
+        assert uninstall.data_paths(home, homebrew_zap=True, keep_job_state=True) == [legacy]
         assert uninstall.delete_data(home) == found
-        assert not backup.exists() and not legacy.exists()
-        assert (logs / "com.other.app.log").exists()
+        assert not backup.exists() and not legacy.exists() and not support.exists()
+        assert (logs / "com.other.app.log").exists() and (prefs / "com.other.app.plist").exists()
 
     def test_legacy_root_that_holds_the_backup_root_is_not_deleted_twice(self, tmp_path, monkeypatch):
         legacy = tmp_path / ".claude-swap-backup"
@@ -649,7 +702,8 @@ class TestUninstallCommand:
     @pytest.fixture
     def harness(self, monkeypatch, tmp_path):
         seen: dict = {"remove": [], "logins": 0, "data": [], "exec": None, "purge": [], "order": []}
-        state = {"brew": None, "failed": [], "command": None, "live": None, "purge": None, "collision": False}
+        state = {"brew": None, "failed": [], "command": None, "live": None, "purge": None, "collision": False,
+                 "busy": None, "held": True, "holding": False}
 
         class FakeSwitcher:
             def __init__(self):
@@ -672,8 +726,10 @@ class TestUninstallCommand:
             seen["logins"] += 1
             return 3
 
-        def fake_data(home=None, *, homebrew_zap=False):
+        def fake_data(home=None, *, homebrew_zap=False, keep_job_state=False):
             seen["data"].append(homebrew_zap)
+            seen["kept"] = keep_job_state
+            seen["deleted_while_holding"] = state["holding"]
             return [tmp_path / "data"]
 
         def fake_refuse():
@@ -688,6 +744,20 @@ class TestUninstallCommand:
         monkeypatch.setattr(uninstall, "remove_integrations", fake_remove)
         monkeypatch.setattr(uninstall, "delete_saved_logins", fake_logins)
         monkeypatch.setattr(uninstall, "delete_data", fake_data)
+        def fake_busy(removal, uid=None):
+            seen["checked_while_holding"] = state["holding"]
+            return state["busy"]
+
+        @contextlib.contextmanager
+        def fake_hold():
+            state["holding"] = True
+            try:
+                yield state["held"]
+            finally:
+                state["holding"] = False
+
+        monkeypatch.setattr(uninstall, "job_state_busy", fake_busy)
+        monkeypatch.setattr(uninstall, "worker_starts_held", fake_hold)
         monkeypatch.setattr(uninstall, "homebrew_brew", lambda: state["brew"])
         monkeypatch.setattr(uninstall, "homebrew_command", lambda: state["command"])
         monkeypatch.setattr(uninstall, "refuse_live_sessions", fake_refuse)
@@ -726,6 +796,49 @@ class TestUninstallCommand:
         assert self._run(monkeypatch, "--homebrew-hook") == 0
         assert seen["logins"] == 1 and seen["data"] == [True]  # brew's zap trashes the rest
         assert "Deleted 3 saved OpenSwap logins" in capsys.readouterr().out
+
+    def test_hook_zap_keeps_the_job_state_of_a_task_that_may_run(self, harness, monkeypatch, capsys):
+        """The forced boot-out proves nothing about the task, so its handles stay."""
+        seen, state = harness
+        state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
+        state["busy"] = "the Remote tasks worker was removed before its task was confirmed stopped"
+        assert self._run(monkeypatch, "--homebrew-hook") == 0
+        assert seen["kept"] is True
+        assert "Delete it once no Remote task runs." in capsys.readouterr().out
+
+    @pytest.mark.parametrize("held", [True, False])
+    def test_hook_checks_and_deletes_job_state_under_the_lifecycle_locks(self, harness, monkeypatch, capsys, held):
+        seen, state = harness
+        state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
+        state["held"] = held
+        assert self._run(monkeypatch, "--homebrew-hook") == 0
+        assert seen["deleted_while_holding"] and seen["kept"] is not held
+        assert seen.get("checked_while_holding", False) is held
+
+    def test_hook_names_the_server_when_its_cleanup_fails(self, harness, monkeypatch, capsys):
+        """Homebrew's zap still trashes the settings, so the notice must not depend on the cleanup."""
+        _, state = harness
+        state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
+        monkeypatch.setattr(uninstall, "paired_servers", lambda: ["https://opentag.me"])
+
+        def failing_data(home=None, *, homebrew_zap=False, keep_job_state=False):
+            raise ClaudeSwitchError("Could not delete /x: busy")
+
+        monkeypatch.setattr(uninstall, "delete_data", failing_data)
+        assert self._run(monkeypatch, "--homebrew-hook") == 0
+        out = capsys.readouterr()
+        assert "Could not delete /x: busy" in out.err
+        assert "OpenTag still lists this Mac for Remote tasks." in out.out
+
+    def test_hook_zap_names_the_server_that_still_lists_this_mac(self, harness, monkeypatch, capsys):
+        _, state = harness
+        state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
+        monkeypatch.setattr(uninstall, "paired_servers", lambda: ["https://opentag.me"])
+        assert self._run(monkeypatch, "--homebrew-hook") == 0
+        assert capsys.readouterr().out.endswith(
+            "OpenTag still lists this Mac for Remote tasks. To remove it, open https://opentag.me "
+            "and remove it there.\n"
+        )
 
     def test_hook_zap_with_a_live_session_warns_and_goes_on(self, harness, monkeypatch, capsys):
         seen, state = harness
@@ -854,6 +967,87 @@ class TestUninstallCommand:
         assert seen["logins"] == int(zap) and seen["data"] == ([True] if zap else [])
         assert ("Removed the menu bar login item.", False) in lines
         assert (("Deleted 3 saved logins from the Keychain.", False) in lines) == zap
+
+    @pytest.mark.parametrize("brew", [Path("/opt/homebrew/bin/brew"), None])
+    def test_zap_names_the_server_that_still_lists_this_mac(self, harness, monkeypatch, tmp_path, brew, frozen_app):
+        """Read before purge deletes the settings that name it; said before brew takes over."""
+        seen, state = harness
+        state["brew"] = brew
+        monkeypatch.setattr(
+            uninstall, "paired_servers", lambda: seen["order"].append("server") or ["https://worker.example"]
+        )
+        lines, say = self._say()
+        if brew is None:
+            assert uninstall.run(True, say) == 0
+        else:
+            with pytest.raises(SystemExit):
+                uninstall.run(True, say)
+        assert seen["order"].index("server") < seen["order"].index("engine")
+        notice = ("https://worker.example still lists this Mac for Remote tasks. To remove it, open "
+                  "https://worker.example and remove it there.", False)
+        deleted = lines.index((f"Deleted {tmp_path / 'data'}", False))  # harness's delete_data
+        assert lines.index(notice) == deleted + 1
+        if brew is not None:
+            assert lines[deleted + 2][0].startswith("Removing the app: brew uninstall")
+
+    @pytest.mark.parametrize("settings_gone", [True, False])
+    def test_a_failed_zap_names_the_server_once_purge_deleted_its_settings(self, harness, monkeypatch, settings_gone):
+        """A retry reads no pairing once purge deleted the settings; until then it names it itself."""
+        servers = iter([["https://opentag.me"], [] if settings_gone else ["https://opentag.me"]])
+        monkeypatch.setattr(uninstall, "paired_servers", lambda: next(servers))
+
+        def failing_data(home=None, *, homebrew_zap=False, keep_job_state=False):
+            raise ClaudeSwitchError("Could not delete /x: busy")
+
+        monkeypatch.setattr(uninstall, "delete_data", failing_data)
+        lines, say = self._say()
+        assert uninstall.run(True, say) == 1
+        assert any("OpenTag still lists this Mac" in line for line, _ in lines) == settings_gone
+        assert lines[-1][0].startswith("OpenSwap is still installed.")
+
+    @pytest.mark.parametrize("brew", [Path("/opt/homebrew/bin/brew"), None])
+    def test_zap_keeps_the_job_state_of_a_task_that_may_run(self, harness, brew, frozen_app):
+        seen, state = harness
+        state["brew"] = brew
+        state["busy"] = "a Remote task is still running"
+        lines, say = self._say()
+        if brew is None:
+            assert uninstall.run(True, say) == 0
+        else:
+            with pytest.raises(SystemExit):
+                uninstall.run(True, say)
+        assert seen["kept"] is True
+        assert (f"Kept {uninstall.job_state_paths()[0]}: a Remote task is still running. "
+                "Delete it once no Remote task runs.", False) in lines
+
+    def test_zap_deletes_idle_job_state(self, harness, frozen_app):
+        seen, _ = harness
+        lines, say = self._say()
+        assert uninstall.run(True, say) == 0
+        assert seen["kept"] is False and not any(line.startswith("Kept ") for line, _ in lines)
+        # No worker can start between the check and the deletion.
+        assert seen["checked_while_holding"] and seen["deleted_while_holding"]
+
+    def test_zap_keeps_job_state_when_it_cannot_hold_worker_starts(self, harness, frozen_app):
+        seen, state = harness
+        state["held"] = False
+        lines, say = self._say()
+        assert uninstall.run(True, say) == 0
+        assert seen["kept"] is True and "checked_while_holding" not in seen
+        assert any(line.startswith("Kept ") and uninstall.WORKER_LIFECYCLE_BUSY in line for line, _ in lines)
+
+    def test_zap_names_each_server_it_forgot(self, harness, monkeypatch, frozen_app):
+        monkeypatch.setattr(uninstall, "paired_servers", lambda: ["https://opentag.me", "https://worker.example"])
+        lines, say = self._say()
+        assert uninstall.run(True, say) == 0
+        notices = [line for line, _ in lines if "still lists this Mac" in line]
+        assert [notice.split(" ")[0] for notice in notices] == ["OpenTag", "https://worker.example"]
+
+    def test_no_server_notice_without_zap(self, harness, monkeypatch, frozen_app):
+        monkeypatch.setattr(uninstall, "paired_servers", lambda: ["https://opentag.me"])
+        lines, say = self._say()
+        assert uninstall.run(False, say) == 0
+        assert not any("still lists" in line for line, _ in lines)
 
     @pytest.mark.parametrize("zap", [False, True])
     def test_run_without_brew_names_what_is_left(self, harness, zap, frozen_app):
@@ -1063,8 +1257,9 @@ class TestAppDialog:
         assert dialog["title"] == "Uninstall OpenSwap?" and dialog["ok"] == "Uninstall"
         assert dialog["checkbox"] == "Also delete saved accounts, settings and logs"
         assert "• OpenSwap.app, through Homebrew" in dialog["message"]
-        assert "\n\nClaude Code and Codex stay signed in. Your saved accounts stay unless you select the " \
-            "checkbox below. Deleting them cannot be undone." in dialog["message"]
+        assert "\n\nClaude Code and Codex stay signed in, each to the account it uses now. Remote tasks' " \
+            "results stay in their folders. Your saved accounts stay unless you select the checkbox " \
+            "below. Deleting them cannot be undone." in dialog["message"]
         assert "uv tool" not in dialog["message"]
 
     def test_copy_not_installed_by_homebrew(self, frozen_app, monkeypatch):
@@ -1075,6 +1270,168 @@ class TestAppDialog:
         message = uninstall.app_dialog()["message"]
         assert ".app" not in message
         assert message.endswith("run “uv tool uninstall openswap” afterwards.")
+        assert "pairing" not in message
+
+    def test_two_pairings_are_both_named(self, monkeypatch):
+        monkeypatch.setattr(uninstall, "paired_servers", lambda: ["https://opentag.me", "https://worker.example"])
+        assert ("forgets this Mac's pairing with OpenTag and https://worker.example. Each still lists the Mac "
+                "until you remove it there.") in uninstall.app_dialog()["message"]
+
+    @pytest.mark.parametrize(("url", "name"), [("https://opentag.me", "OpenTag"),
+                                               ("https://worker.example", "https://worker.example")])
+    def test_a_paired_mac_is_told_the_server_keeps_listing_it(self, monkeypatch, url, name):
+        """Nobody reads the log of an uninstall the app starts, so the dialog says it."""
+        monkeypatch.setattr(uninstall, "paired_servers", lambda: [url])
+        message = uninstall.app_dialog()["message"]
+        assert (f"\n\nDeleting saved accounts also forgets this Mac's pairing with {name}. {name} still "
+                "lists the Mac until you remove it there.\n\nTo remove the openswap command") in message
+
+
+class TestJobStateBusy:
+    @pytest.fixture
+    def labels(self, monkeypatch, tmp_path):
+        state = {"labels": set()}
+        monkeypatch.setattr(uninstall, "job_state_paths", lambda home=None: [tmp_path / "support", tmp_path / "caches"])
+        monkeypatch.setattr(uninstall, "_loaded_labels", lambda uid=None: state["labels"])
+        monkeypatch.setattr(uninstall, "_worker_process_may_run", lambda root: False)
+        return state
+
+    def test_idle(self, labels):
+        labels["labels"] = {"com.opensoft.openswap.menubar", "com.apple.Finder"}
+        assert uninstall.job_state_busy(uninstall.Removal()) is None
+
+    def test_a_forced_boot_out_proves_nothing(self, labels):
+        assert "confirmed stopped" in uninstall.job_state_busy(uninstall.Removal(job_stop_unconfirmed=True))
+
+    def test_a_loaded_worker_shares_the_folder(self, labels):
+        """Another install's worker: this per-user folder is its too."""
+        labels["labels"] = {"com.opensoft.openswap.worker"}
+        assert uninstall.job_state_busy(uninstall.Removal()) == "a Remote tasks worker is still loaded"
+
+    def test_a_loaded_job_label(self, labels):
+        labels["labels"] = {"com.opensoft.openswap.worker.job.abc123"}
+        assert uninstall.job_state_busy(uninstall.Removal()) == "a Remote task is still running"
+
+    def test_a_worker_started_by_hand_holds_its_instance_lock(self, labels, monkeypatch, tmp_path):
+        """No label and, while idle, no job: only its process-lifetime lock shows it."""
+        (tmp_path / "worker").mkdir()
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: tmp_path)
+        monkeypatch.setattr(uninstall, "_worker_process_may_run", lambda root: root == tmp_path)
+        assert uninstall.job_state_busy(uninstall.Removal()) == "a Remote tasks worker process is still running"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the worker's locks are flocks")
+    def test_worker_starts_held_takes_each_roots_lifecycle_lock(self, monkeypatch, tmp_path):
+        from openswap.locking import FileLock
+
+        (tmp_path / "worker").mkdir(mode=0o700)
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: tmp_path)
+        monkeypatch.setattr("openswap.worker.cli._LIFECYCLE_LOCK_TIMEOUT_SECONDS", 0.2)
+        lifecycle = tmp_path / "worker" / "lifecycle.lock"
+        with uninstall.worker_starts_held() as held:
+            assert held is True
+            assert not FileLock(lifecycle, timeout=0).acquire(timeout=0)  # a start would wait
+        with FileLock(lifecycle, timeout=0):  # another command is changing Remote tasks
+            with uninstall.worker_starts_held() as held:
+                assert held is False
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the worker's locks are flocks")
+    def test_worker_starts_held_locks_a_root_without_worker_state(self, monkeypatch, tmp_path):
+        """A `worker enable` meanwhile could create it, so it is locked too."""
+        from openswap.locking import FileLock
+
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: tmp_path)
+        with uninstall.worker_starts_held() as held:
+            assert held is True
+            assert not FileLock(tmp_path / "worker" / "lifecycle.lock", timeout=0).acquire(timeout=0)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the worker's locks are flocks")
+    def test_worker_process_may_run_reads_the_instance_lock(self, tmp_path):
+        from openswap.locking import FileLock
+
+        (tmp_path / "worker").mkdir(mode=0o700)
+        assert uninstall._worker_process_may_run(tmp_path) is False
+        with FileLock(tmp_path / "worker" / "instance.lock", timeout=0):
+            assert uninstall._worker_process_may_run(tmp_path) is True
+
+    def test_an_earlier_forced_boot_out_still_keeps_it(self, labels, tmp_path):
+        """The task may outlive a reinstall; only the user deletes the marker."""
+        (tmp_path / "support").mkdir()
+        (tmp_path / "support" / "stop-unconfirmed").write_text("x")
+        assert "earlier uninstall" in uninstall.job_state_busy(uninstall.Removal())
+
+    def test_launchd_that_cannot_say_keeps_it(self, labels):
+        labels["labels"] = None
+        assert "could not say" in uninstall.job_state_busy(uninstall.Removal())
+
+    def test_loaded_labels_read_the_gui_domain(self, monkeypatch):
+        """Named explicitly: from SSH a plain `launchctl list` reads another domain."""
+        out = ("gui/501 = {\n\ttype = gui\n\tsubdomains = {\n\t\tpid/1\n\t}\n\n\tservices = {\n"
+               "\t\t   50860    -15 \tcom.opensoft.openswap.menubar\n"
+               "\t\t       0      0 \tcom.opensoft.openswap.worker.job.abc\n\t}\n\n\tendpoints = {\n"
+               "\t\t     0x0  com.apple.x\n\t}\n}\n")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, out, "")
+
+        monkeypatch.setattr(uninstall.subprocess, "run", fake_run)
+        assert uninstall._loaded_labels(501) == {"com.opensoft.openswap.menubar",
+                                                 "com.opensoft.openswap.worker.job.abc"}
+        assert calls == [["/bin/launchctl", "print", "gui/501"]]
+
+    @pytest.mark.parametrize(("code", "out"), [(113, ""), (0, "gui/501 = {\n\ttype = gui\n}\n"),
+                                               (0, "gui/501 = {\n\tservices = {\n\t\t 0 0 \tx\n")])
+    def test_a_gui_domain_it_cannot_read_names_no_labels(self, monkeypatch, code, out):
+        """No GUI domain, no services block, or a cut-off one: the caller keeps the folder."""
+        monkeypatch.setattr(uninstall.subprocess, "run",
+                            lambda argv, **k: subprocess.CompletedProcess(argv, code, out, ""))
+        assert uninstall._loaded_labels(501) is None
+
+
+class TestPairedServer:
+    def test_reads_the_configured_url(self, monkeypatch, tmp_path):
+        from openswap.settings import configure_worker_service
+
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
+        assert uninstall.paired_servers() == []
+        configure_worker_service(tmp_path, "https://opentag.me")
+        assert uninstall.paired_servers() == ["https://opentag.me"]
+
+    def test_reads_a_pre_xdg_folder_not_yet_migrated(self, monkeypatch, tmp_path):
+        """The zap reads it before Engine() migrates the folder, so look there too."""
+        from openswap.settings import configure_worker_service
+
+        backup, legacy = tmp_path / "OpenSwap", tmp_path / ".claude-swap-backup"
+        legacy.mkdir()
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: legacy)
+        configure_worker_service(legacy, "https://worker.example")
+        assert uninstall.paired_servers() == ["https://worker.example"]
+        assert not backup.exists()  # read without creating anything
+
+    def test_colliding_roots_name_each_server_once(self, monkeypatch, tmp_path):
+        """A zap deletes both folders, so each pairing it forgets is named."""
+        from openswap.settings import configure_worker_service
+
+        backup, legacy = tmp_path / "OpenSwap", tmp_path / ".claude-swap-backup"
+        backup.mkdir()
+        legacy.mkdir()
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: legacy)
+        configure_worker_service(backup, "https://opentag.me")
+        configure_worker_service(legacy, "https://worker.example")
+        assert uninstall.paired_servers() == ["https://opentag.me", "https://worker.example"]
+        configure_worker_service(legacy, "https://opentag.me")
+        assert uninstall.paired_servers() == ["https://opentag.me"]
+
+    def test_unreadable_settings_name_no_server(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
+        monkeypatch.setattr("openswap.settings.load_worker_settings", lambda root: 1 / 0)
+        assert uninstall.paired_servers() == []
 
 
 class TestMenuAction:

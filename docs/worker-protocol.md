@@ -194,6 +194,18 @@ immediately, interrupts its service-side active jobs, and causes the Mac to
 show `revoked`. It does not kill an already running provider: it finishes or
 hits its runtime limit unless the owner cancels locally. Unpair removes the
 local key and URL; server revocation is a separate operator action.
+`openswap uninstall --zap` deletes the key the same way and tells the owner the
+server still lists the Mac. Removing it from the Mac would need an optional
+request, not in this version: an authenticated `unenroll` (`{}` body) that
+revokes the calling worker exactly as an operator revocation does, is
+idempotent for a worker already revoked, and is refused for a worker with an
+admitted claim that is still running (`invalid_state`), so an uninstall cannot
+strand a job. Like key rotation, the worker would advertise it as the
+`"unenroll"` feature of `capabilities` and use it only after a registration
+whose `capabilities` the backend acknowledged with that feature. The worker has
+stopped by the time an uninstall runs, so it would keep that acknowledgment
+with its enrollment and call `unenroll` best-effort, with the usual 5-second
+timeout, before deleting the key.
 
 ## Events and explicit artifacts
 
