@@ -266,7 +266,16 @@ def _remove_worker(home: Path, uid: int | None, force: bool, removal: Removal | 
     # and the task may outlive it either way.
     if removal is not None:
         removal.job_stop_unconfirmed = True
-    _mark_stop_unconfirmed(home, diagnostic)
+    try:
+        _mark_stop_unconfirmed(home, diagnostic)
+    except OSError as e:
+        # Without the marker only the loaded worker shows a later zap that a
+        # task may still run, so it stays: a plist on a missing app costs one
+        # failed start per login.
+        raise ClaudeSwitchError(
+            f"it did not stop ({diagnostic}) and that could not be recorded ({e}), "
+            "so it stays loaded; see openswap worker status"
+        ) from e
     worker_agent.uninstall(home=home, uid=uid)
     return True
 
@@ -468,14 +477,12 @@ STOP_UNCONFIRMED_MARKER = "stop-unconfirmed"
 
 
 def _mark_stop_unconfirmed(home: Path, diagnostic: object) -> None:
+    """Write :data:`STOP_UNCONFIRMED_MARKER`; raises OSError when it cannot."""
     folder = job_state_paths(home)[0]
-    try:
-        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        (folder / STOP_UNCONFIRMED_MARKER).write_text(
-            f"{datetime.now().isoformat(timespec='seconds')} {diagnostic}\n", encoding="utf-8",
-        )
-    except OSError:
-        pass  # the in-memory flag still keeps it for this uninstall
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (folder / STOP_UNCONFIRMED_MARKER).write_text(
+        f"{datetime.now().isoformat(timespec='seconds')} {diagnostic}\n", encoding="utf-8",
+    )
 
 
 def job_state_busy(removal: Removal, uid: int | None = None) -> str | None:

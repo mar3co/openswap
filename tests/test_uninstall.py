@@ -220,6 +220,20 @@ class TestRemoveIntegrations:
         assert removal.job_stop_unconfirmed
         assert (home / "Library" / "Application Support" / "com.opensoft.openswap" / "stop-unconfirmed").is_file()
 
+    def test_a_stop_it_cannot_record_leaves_the_worker_loaded(self, mac, frozen_app):
+        """Then the loaded worker is what shows a later zap that a task may run."""
+        home, agents, seen, state = mac
+        exe = str(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+        _plist(agents / "com.opensoft.openswap.worker.plist", [exe, "worker", "run"])
+        state["disable_ok"] = False
+        support = home / "Library" / "Application Support"
+        support.mkdir(parents=True, exist_ok=True)
+        (support / "com.opensoft.openswap").write_text("not a folder")
+        removal = uninstall.remove_integrations(home=home, uid=501, force=True)
+        assert seen["worker"] == []  # not booted out
+        assert len(removal.failed) == 1 and "stays loaded" in removal.failed[0]
+        assert removal.job_stop_unconfirmed
+
     def test_force_boots_out_a_worker_whose_disable_raises(self, mac, frozen_app):
         """The app is about to go; a plist on it must not survive."""
         home, agents, seen, state = mac
