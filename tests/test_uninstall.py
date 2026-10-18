@@ -101,6 +101,8 @@ def mac(tmp_path, monkeypatch):
 
     def fake_worker_uninstall(home=None, uid=None):
         seen["worker"].append("uninstall")
+        if state.get("worker_uninstall_raises"):
+            raise OSError("could not unlink the plist")
         (agents / "com.opensoft.openswap.worker.plist").unlink(missing_ok=True)
         return {"was_loaded": True, "removed_plist": True}
 
@@ -202,6 +204,17 @@ class TestRemoveIntegrations:
         assert removal.removed == ["Remote tasks worker"] and removal.failed == []
         assert seen["worker"] == ["uninstall"]
         assert removal.job_stop_unconfirmed  # so a zap keeps its job state
+
+    def test_a_forced_boot_out_that_fails_still_keeps_the_job_state(self, mac, frozen_app):
+        """It can boot the worker out and then fail on the plist: the task may still run."""
+        home, agents, seen, state = mac
+        exe = str(frozen_app / "Contents" / "MacOS" / "OpenSwap")
+        _plist(agents / "com.opensoft.openswap.worker.plist", [exe, "worker", "run"])
+        state["disable_ok"] = False
+        state["worker_uninstall_raises"] = True
+        removal = uninstall.remove_integrations(home=home, uid=501, force=True)
+        assert len(removal.failed) == 1 and removal.failed[0].startswith("Remote tasks worker")
+        assert removal.job_stop_unconfirmed
 
     def test_force_boots_out_a_worker_whose_disable_raises(self, mac, frozen_app):
         """The app is about to go; a plist on it must not survive."""

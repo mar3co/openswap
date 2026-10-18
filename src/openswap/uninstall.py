@@ -261,9 +261,11 @@ def _remove_worker(home: Path, uid: int | None, force: bool, removal: Removal | 
         raise ClaudeSwitchError(
             f"it did not stop ({diagnostic}); see openswap worker status"
         )
-    worker_agent.uninstall(home=home, uid=uid)
+    # Before the boot-out: it can succeed and then fail to unlink the plist,
+    # and the task may outlive it either way.
     if removal is not None:
         removal.job_stop_unconfirmed = True
+    worker_agent.uninstall(home=home, uid=uid)
     return True
 
 
