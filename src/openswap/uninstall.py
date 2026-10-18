@@ -341,30 +341,34 @@ def delete_saved_logins() -> int:
     return deleted
 
 
-def paired_server() -> str | None:
-    """The server this Mac's Remote tasks worker is paired with, if any.
+def paired_servers() -> list[str]:
+    """The servers this Mac's Remote tasks worker is paired with, oldest
+    root last, without repeats: usually none or one, but a pre-XDG folder the
+    zap also deletes can name another.
 
     A zap deletes the pairing's key here, but the server still lists the Mac
     (offline) until its owner removes it there: unpairing is local, and the
-    worker protocol has no request for a worker to remove itself. Read it
-    before the zap, which deletes the settings that name it, from every root
+    worker protocol has no request for a worker to remove itself. Read them
+    before the zap, which deletes the settings that name them, from every root
     the zap deletes: opening the data migrates a pre-XDG folder only later.
     """
     from openswap.settings import load_worker_settings
 
+    found: list[str] = []
     for root in _data_roots():
         try:
             url = load_worker_settings(root).control_service_url
         except Exception:
             continue  # unreadable settings: nothing to point the user at
-        if url is not None:
-            return url
-    return None
+        if url is not None and url not in found:
+            found.append(url)
+    return found
 
 
 def job_state_notice(busy: str) -> str:
     """What a zap says when it kept the worker's job state."""
-    return f"Kept {job_state_path()}: {busy}. Delete it once no Remote task runs."
+    kept = " and ".join(str(path) for path in job_state_paths() if path.exists()) or str(job_state_paths()[0])
+    return f"Kept {kept}: {busy}. Delete it once no Remote task runs."
 
 
 def server_name(url: str) -> str:
@@ -447,11 +451,12 @@ def refuse_live_sessions() -> None:
         )
 
 
-def job_state_path(home: Path | None = None) -> Path:
+def job_state_paths(home: Path | None = None) -> list[Path]:
     """The worker's job locks, job handles and pinned Claude Code copies
-    (``containment.default_lock_dir``'s parent)."""
-    home = home if home is not None else Path.home()
-    return home / "Library" / "Application Support" / bundle.APP_ID
+    (``containment.default_lock_dir``'s parent), and the Caches folder an
+    older worker, perhaps another install's still running, keeps them in."""
+    library = (home if home is not None else Path.home()) / "Library"
+    return [library / "Application Support" / bundle.APP_ID, library / "Caches" / bundle.APP_ID]
 
 
 def job_state_busy(removal: Removal, uid: int | None = None) -> str | None:
@@ -526,8 +531,6 @@ def data_paths(
     found = [] if homebrew_zap else [
         backup,
         library / "Containers" / bundle.APPEX_ID,
-        # Where the worker's job locks were before job_state_path.
-        library / "Caches" / bundle.APP_ID,
         # The app's defaults (the status item's position), and a source
         # install's under the bundle id menubar_display gives its Python.
         library / "Preferences" / f"{bundle.APP_ID}.plist",
@@ -536,7 +539,7 @@ def data_paths(
         *sorted(logs.glob("com.opensoft.openswap.*.err")),
     ]
     if not keep_job_state:
-        found.append(job_state_path(home))
+        found.extend(job_state_paths(home))
     found.extend(legacy)
     return [path for path in found if path.exists() or path.is_symlink()]
 
@@ -608,12 +611,12 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
         say(still_installed, error=True)
         return 1
 
-    server = None
+    servers: list[str] = []
     if zap:
         from openswap.engine import Engine
         from openswap.exceptions import MigrationError
 
-        server = paired_server()
+        servers = paired_servers()
         try:
             # Opening the data below can move the pre-XDG folder, and its
             # profiles' Keychain items are named from their old paths.
@@ -639,9 +642,11 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
             removed_files = delete_data(homebrew_zap=brew is not None, keep_job_state=busy is not None)
         except (ClaudeSwitchError, OSError) as e:
             say(f"Error: {e}", error=True)
-            if server is not None and paired_server() is None:
-                # purge got as far as the settings: a retry cannot name it.
-                say(server_notice(server))
+            remaining = paired_servers() if servers else []
+            for url in servers:
+                if url not in remaining:
+                    # purge got as far as its settings: a retry cannot name it.
+                    say(server_notice(url))
             say(still_installed, error=True)
             return 1
         if deleted:
@@ -650,8 +655,8 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
             say(f"Deleted {path}")
         if busy is not None:
             say(job_state_notice(busy))
-        if server is not None:
-            say(server_notice(server))
+        for url in servers:
+            say(server_notice(url))
 
     if brew is not None:
         command = [str(brew), "uninstall", "--cask", *(["--zap"] if zap else []), "openswap"]
@@ -712,13 +717,16 @@ def app_dialog() -> dict[str, str]:
     else:
         lines.append(f"• {app.name}, {'through Homebrew' if bundle.installed_by_homebrew() else 'moved to the Trash'}")
         after = ""
-    server = paired_server()
-    if server is not None:
+    names = [server_name(url) for url in paired_servers()]
+    if names:
         # Nobody reads the uninstall's log, so say it here, before the zap.
-        name = server_name(server)
+        if len(names) == 1:
+            still = f"{names[0]} still lists the Mac"
+        else:
+            still = "Each still lists the Mac"
         after = (
-            f"\n\nDeleting saved accounts also forgets this Mac's pairing with {name}. "
-            f"{name} still lists the Mac until you remove it there."
+            f"\n\nDeleting saved accounts also forgets this Mac's pairing with {' and '.join(names)}. "
+            f"{still} until you remove it there."
         ) + after
     return {
         "title": "Uninstall OpenSwap?",

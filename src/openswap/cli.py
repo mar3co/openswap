@@ -1430,7 +1430,7 @@ def _homebrew_uninstall_hook() -> int:
     for failure in removal.failed:
         print(f"Could not remove OpenSwap's {failure}", file=sys.stderr)
     if "--zap" in found[1]:
-        server = uninstall.paired_server()
+        servers = uninstall.paired_servers()
         # Homebrew's zap goes ahead either way; a profile Claude still runs on
         # keeps its Keychain item (delete_saved_logins skips it).
         try:
@@ -1452,8 +1452,8 @@ def _homebrew_uninstall_hook() -> int:
                 print(uninstall.job_state_notice(busy))
         # Whatever failed above, Homebrew's zap trashes the settings that name
         # the pairing next, so the server is the only record left.
-        if server is not None:
-            print(uninstall.server_notice(server))
+        for url in servers:
+            print(uninstall.server_notice(url))
     return 0
 
 

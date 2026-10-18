@@ -151,10 +151,11 @@ def test_zap_trashes_what_openswap_uninstall_zap_deletes(tmp_path, monkeypatch):
     monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
     monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: backup)
     # All but the worker's job state, which the hook deletes once no task runs.
-    job_state = uninstall.job_state_path(home)
-    job_state.mkdir(parents=True)
-    assert job_state not in listed
-    assert sorted(uninstall.data_paths(home)) == sorted([*listed, job_state])
+    job_state = uninstall.job_state_paths(home)
+    for path in job_state:
+        path.mkdir(parents=True)
+        assert path not in listed
+    assert sorted(uninstall.data_paths(home)) == sorted([*listed, *job_state])
 
 
 def test_caveats_are_one_step():
