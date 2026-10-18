@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openswap.exceptions import ClaudeSwitchError
+from openswap.models import alias_key
 from openswap.settings import AllowlistedAccount
 from openswap.worker.leases import LeaseStateError, stable_account_identity
 
@@ -300,7 +301,7 @@ def resolve_claude_selector(backup_root: Path, selector: str) -> ClaudeAccountEn
             raise AccountPinError("account_not_found")
         return match
     matches = [c for c in accounts if c.number == selector] or [
-        c for c in accounts if c.alias and c.alias == selector
+        c for c in accounts if c.alias and alias_key(c.alias) == alias_key(selector)
     ] or [c for c in accounts if c.email and c.email.lower() == selector.lower()]
     if not matches:
         raise AccountPinError("account_not_found")
@@ -349,7 +350,8 @@ def _names_claude_account(backup_root: Path, selector: str) -> bool:
     forms ``openswap switch`` accepts; it never selects anything.
     """
     return any(
-        selector in {entry.number, entry.email, entry.alias}
+        selector in {entry.number, entry.email}
+        or (entry.alias and alias_key(entry.alias) == alias_key(selector))
         for entry in claude_accounts(backup_root) or ()
     )
 

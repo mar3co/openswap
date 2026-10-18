@@ -403,6 +403,28 @@ class TestAliasTransfer:
                 )
                 assert "alias" not in seq["accounts"][imported_num]
 
+    def test_import_keeps_alias_casing_and_collides_regardless_of_case(self, temp_home: Path):
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="WorkMac")
+        _seed_account(src, 2, "bob@example.com", alias="Dev")
+        out_file = temp_home / "backup.openswap"
+        export_accounts(src, str(out_file))
+
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                _seed_account(dst, 9, "existing@example.com", alias="dev")
+
+                import_accounts(dst, str(out_file))
+
+                accounts = dst._get_sequence_data()["accounts"]
+                by_email = {acc["email"]: acc for acc in accounts.values()}
+                assert by_email["alice@example.com"]["alias"] == "WorkMac"
+                assert "alias" not in by_email["bob@example.com"]
+                assert by_email["existing@example.com"]["alias"] == "dev"
+
     def test_import_reexport_of_same_account_keeps_own_alias(self, temp_home: Path):
         """Re-importing a backup of an account that already carries the same
         alias locally must not be treated as a collision with itself."""

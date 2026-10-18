@@ -65,6 +65,7 @@ from openswap.models import (
     AccountsSnapshot,
     Platform,
     SwitchTransaction,
+    alias_key,
     get_timestamp,
     normalize_alias,
 )
@@ -391,6 +392,7 @@ __all__ = [
     'Platform',
     'SwitchTransaction',
     'get_timestamp',
+    'alias_key',
     'normalize_alias',
     'abbreviate_path',
     'accent',

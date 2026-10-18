@@ -22,16 +22,17 @@ if TYPE_CHECKING:
 #: alias can never collide with a slot number in _resolve_account_identifier),
 #: and not leading with '-' (argparse would treat it as an option, making the
 #: alias impossible to pass back into any command once set).
-_ALIAS_RE = re.compile(r"^[a-z0-9_.-]+$")
+_ALIAS_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def normalize_alias(name: str) -> str:
-    """Lowercase and validate a proposed alias; raise ValueError if invalid.
+    """Trim and validate a proposed alias; raise ValueError if invalid.
 
-    Shared by the CLI (``openswap alias``), ``openswap add --alias``, and import
-    validation so every path enforces identical rules.
+    The casing is kept for display; compare aliases through :func:`alias_key`,
+    which ignores it. Shared by the CLI (``openswap alias``), ``openswap add
+    --alias``, and import validation so every path enforces identical rules.
     """
-    normalized = name.strip().lower()
+    normalized = name.strip()
     if not normalized:
         raise ValueError("alias cannot be empty")
     if normalized.isdigit():
@@ -45,6 +46,11 @@ def normalize_alias(name: str) -> str:
             f"alias '{name}' may only contain letters, digits, '-', '_', and '.'"
         )
     return normalized
+
+
+def alias_key(alias: str | None) -> str:
+    """The form two aliases are compared in: ``Work`` and ``work`` are the same alias."""
+    return (alias or "").lower()
 
 
 class Platform(Enum):

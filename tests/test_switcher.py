@@ -407,17 +407,39 @@ class TestAliasCommand:
         data = switcher._get_sequence_data()
         assert data["accounts"]["2"]["alias"] == "dev"
 
-    def test_set_alias_normalizes_to_lowercase(
+    def test_set_alias_keeps_the_casing_typed(
         self, temp_home: Path, sample_sequence_data: dict
     ):
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
 
-        _, normalized = switcher.set_alias("2", "DEV")
+        _, normalized = switcher.set_alias("2", " WorkMac ")
 
-        assert normalized == "dev"
+        assert normalized == "WorkMac"
         data = switcher._get_sequence_data()
-        assert data["accounts"]["2"]["alias"] == "dev"
+        assert data["accounts"]["2"]["alias"] == "WorkMac"
+        assert switcher._resolve_account_identifier("workmac") == "2"
+
+    def test_set_alias_conflict_ignores_case(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher.set_alias("1", "dev")
+
+        with pytest.raises(ConfigError):
+            switcher.set_alias("2", "DEV")
+
+    def test_set_alias_can_change_only_the_case_of_its_own_alias(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher.set_alias("2", "dev")
+
+        switcher.set_alias("dev", "Dev")
+
+        assert switcher._get_sequence_data()["accounts"]["2"]["alias"] == "Dev"
 
     def test_set_alias_by_email(self, temp_home: Path, sample_sequence_data: dict):
         switcher = ClaudeAccountSwitcher()

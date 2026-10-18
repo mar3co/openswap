@@ -17,7 +17,7 @@ from openswap import __version__
 from openswap.codex.auth import parse_auth
 from openswap.exceptions import AccountNotFoundError, TransferError
 from openswap.fsutil import replace_with_retry
-from openswap.models import Platform, get_timestamp, normalize_alias
+from openswap.models import Platform, alias_key, get_timestamp, normalize_alias
 from openswap.worker.leases import AccountLeaseStore
 
 if TYPE_CHECKING:
@@ -344,7 +344,7 @@ def import_accounts(
                 )
             except TransferError:
                 pass
-        local_aliases[alias.lower()] = owner
+        local_aliases[alias_key(alias)] = owner
     normalized: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, ...]] = set()
     seen_aliases: set[str] = set()
@@ -362,19 +362,18 @@ def import_accounts(
 
         alias = raw.get("alias") or None
         if alias:
-            alias_key = normalize_alias(alias)
-            if alias_key in seen_aliases:
-                raise TransferError(f"duplicate alias in export: {alias_key}")
-            seen_aliases.add(alias_key)
-            owner = local_aliases.get(alias_key)
+            alias = normalize_alias(alias)
+            folded = alias_key(alias)
+            if folded in seen_aliases:
+                raise TransferError(f"duplicate alias in export: {alias}")
+            seen_aliases.add(folded)
+            owner = local_aliases.get(folded)
             if owner is not None and owner != credential_identity:
                 _eprint(
-                    f"Warning: alias '{alias_key}' for {email} already used by an "
+                    f"Warning: alias '{alias}' for {email} already used by an "
                     "existing account, dropping the imported alias"
                 )
                 alias = None
-            else:
-                alias = alias_key
 
         normalized.append(
             {
