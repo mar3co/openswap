@@ -1671,16 +1671,26 @@ def test_trailing_header_frames_hug_the_right_edge():
     assert control[0] + control[2] == 300.0  # panel width minus pad
     assert label[0] + label[2] + menubar.HEADER_CONTROL_GAP == control[0]
     assert label[0] > 12.0
-    assert control[1] == 12.0  # taller than the title row, clamped to pad
+    # Taller than the title row, yet still centered on it.
+    row_mid = 12.0 + menubar.HEADER_TITLE_H / 2.0
+    assert control[1] + control[3] / 2.0 == row_mid
+    assert label[1] + label[3] / 2.0 == row_mid
 
 
-def test_settings_header_frames_center_title_on_back():
+def test_trailing_header_frames_outset_reaches_into_the_margin():
+    _, control = menubar.trailing_header_frames(
+        390.0, 12.0, (28.0, 28.0), (28.0, 28.0), gap=0.0, outset=3.0
+    )
+    assert control[0] + control[2] == 390.0 - 12.0 + 3.0
+
+
+def test_settings_header_frames_share_the_main_header_center_line():
     back, title = menubar.settings_header_frames(12.0, (64.0, 22.0), (54.0, 16.0))
-    assert back == (12.0, 12.0, 64.0, 22.0)
+    row_mid = 12.0 + menubar.HEADER_TITLE_H / 2.0
+    assert back == (12.0, row_mid - 11.0, 64.0, 22.0)
     assert title[0] == 12.0 + 64.0 + menubar.SETTINGS_HEADER_GAP
-    back_mid = back[1] + back[3] / 2.0
-    title_mid = title[1] + title[3] / 2.0
-    assert title_mid == back_mid + menubar.HEADER_LABEL_OPTICAL_DY
+    # The title's capitals, not its frame, sit on the button's center.
+    assert title[1] + menubar.HEADER_LABEL_CAP_MID == back[1] + back[3] / 2.0
 
 
 def test_popover_is_a_quarter_wider():

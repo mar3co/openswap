@@ -61,6 +61,10 @@ try:
     from AppKit import NSSwitch
 except ImportError:  # macOS 14 and older
     NSSwitch = None
+try:
+    from AppKit import NSImageSymbolConfiguration
+except ImportError:  # macOS 10.15 and older
+    NSImageSymbolConfiguration = None
 from Foundation import (
     NSAffineTransform,
     NSAttributedString,
@@ -85,6 +89,8 @@ from openswap.brand_motion import (
     swap_motion_width,
 )
 from openswap.menubar import (
+    HEADER_LABEL_CAP_MID,
+    HEADER_TITLE_H,
     MAIN_PAGE,
     MenuBarSettings,
     PANEL_WIDTH,
@@ -196,7 +202,13 @@ SETTINGS_WIDE_POPUP_LABEL_W = 72.0
 SETTINGS_BACK_W = 64.0
 SETTINGS_BACK_H = 22.0
 SETTINGS_TABS_H = 40.0
-HEADER_ICON_SIZE = 24.0
+# Header gear / ellipsis: a 28pt hit target around a 15pt symbol (~16pt of
+# ink). OUTSET lets the button padding reach into the margin so the glyph's
+# right edge mirrors the brand mark's inset on the left.
+HEADER_ICON_SIZE = 28.0
+HEADER_ICON_POINT = 15.0
+HEADER_ICON_GAP = 0.0
+HEADER_ICON_OUTSET = 3.0
 CARD_MENU_W = 24.0
 CARD_MENU_H = 20.0
 FOOTER_BTN_H = 22.0
@@ -1421,14 +1433,28 @@ class MenuBarPanel:
         root.addSubview_(btn)
         return btn
 
-    def _add_icon_button(self, root, symbol, fallback, frame, cb, tooltip, *, bordered=False):
-        """A bezel-less SF Symbol button (gear, ellipsis); text fallback pre-11."""
+    def _add_icon_button(
+        self, root, symbol, fallback, frame, cb, tooltip, *, bordered=False, point_size=None,
+    ):
+        """A bezel-less SF Symbol button (gear, ellipsis); text fallback pre-11.
+
+        ``point_size`` sizes the symbol explicitly; without it the symbol takes
+        the small control size's default (~12pt of ink).
+        """
         btn = NSButton.alloc().initWithFrame_(frame)
         image = None
         try:
             image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, tooltip)
         except Exception:
             image = None
+        if image is not None and point_size is not None and NSImageSymbolConfiguration is not None:
+            try:
+                config = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+                    point_size, NSFontWeightRegular
+                )
+                image = image.imageWithSymbolConfiguration_(config) or image
+            except Exception:
+                pass
         if image is not None:
             btn.setImage_(image)
             btn.setImagePosition_(NSImageOnly)
@@ -1572,7 +1598,12 @@ class MenuBarPanel:
                 "OpenSwap",
                 font_title,
                 pal["fg"],
-                NSMakeRect(PAD + (24 if mark is not None else 0), PAD, 86, 20),
+                NSMakeRect(
+                    PAD + (24 if mark is not None else 0),
+                    PAD + HEADER_TITLE_H / 2.0 - HEADER_LABEL_CAP_MID,
+                    86,
+                    20,
+                ),
             )
         )
         # Settings (gear) and More (ellipsis) are quiet icon buttons hugging
@@ -1580,12 +1611,15 @@ class MenuBarPanel:
         gear_f, more_f = trailing_header_frames(
             PANEL_WIDTH, PAD,
             (HEADER_ICON_SIZE, HEADER_ICON_SIZE), (HEADER_ICON_SIZE, HEADER_ICON_SIZE),
+            gap=HEADER_ICON_GAP, outset=HEADER_ICON_OUTSET,
         )
         self._add_icon_button(
             root, "gearshape", "⚙", NSMakeRect(*gear_f), self._show_settings, "Settings",
+            point_size=HEADER_ICON_POINT,
         )
         self._add_icon_button(
             root, "ellipsis.circle", "…", NSMakeRect(*more_f), self._more, "More",
+            point_size=HEADER_ICON_POINT,
         )
 
         # Auto-switch lives in the footer next to Rotate / Best, the actions it
