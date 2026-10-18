@@ -205,6 +205,8 @@ class TestRemoveIntegrations:
         assert removal.removed == ["Remote tasks worker"] and removal.failed == []
         assert seen["worker"] == ["uninstall"]
         assert removal.job_stop_unconfirmed  # so a zap keeps its job state
+        # And a later zap, after a reinstall, too.
+        assert (home / "Library" / "Application Support" / "com.opensoft.openswap" / "stop-unconfirmed").is_file()
 
     def test_a_forced_boot_out_that_fails_still_keeps_the_job_state(self, mac, frozen_app):
         """It can boot the worker out and then fail on the plist: the task may still run."""
@@ -216,6 +218,7 @@ class TestRemoveIntegrations:
         removal = uninstall.remove_integrations(home=home, uid=501, force=True)
         assert len(removal.failed) == 1 and removal.failed[0].startswith("Remote tasks worker")
         assert removal.job_stop_unconfirmed
+        assert (home / "Library" / "Application Support" / "com.opensoft.openswap" / "stop-unconfirmed").is_file()
 
     def test_force_boots_out_a_worker_whose_disable_raises(self, mac, frozen_app):
         """The app is about to go; a plist on it must not survive."""
@@ -633,14 +636,15 @@ class TestZapData:
         monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
         monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: legacy)
         found = uninstall.data_paths(home)
+        # The job state first, while the roots' lifecycle.lock files remain.
         assert found == [
+            support,
+            caches,
             backup,
             prefs / "com.opensoft.openswap.plist",
             prefs / "com.opensoft.openswap.menubar.plist",
             logs / "com.opensoft.openswap.worker.log",
             logs / "com.opensoft.openswap.menubar.err",
-            support,
-            caches,
             legacy,
         ]
         # Homebrew's zap trashes the rest; neither the job state (an older
@@ -1271,8 +1275,9 @@ class TestAppDialog:
 
 class TestJobStateBusy:
     @pytest.fixture
-    def labels(self, monkeypatch):
+    def labels(self, monkeypatch, tmp_path):
         state = {"labels": set()}
+        monkeypatch.setattr(uninstall, "job_state_paths", lambda home=None: [tmp_path / "support", tmp_path / "caches"])
         monkeypatch.setattr(uninstall, "_loaded_labels", lambda uid=None: state["labels"])
         monkeypatch.setattr(uninstall, "_worker_process_may_run", lambda root: False)
         return state
@@ -1336,6 +1341,12 @@ class TestJobStateBusy:
         assert uninstall._worker_process_may_run(tmp_path) is False
         with FileLock(tmp_path / "worker" / "instance.lock", timeout=0):
             assert uninstall._worker_process_may_run(tmp_path) is True
+
+    def test_an_earlier_forced_boot_out_still_keeps_it(self, labels, tmp_path):
+        """The task may outlive a reinstall; only the user deletes the marker."""
+        (tmp_path / "support").mkdir()
+        (tmp_path / "support" / "stop-unconfirmed").write_text("x")
+        assert "earlier uninstall" in uninstall.job_state_busy(uninstall.Removal())
 
     def test_launchd_that_cannot_say_keeps_it(self, labels):
         labels["labels"] = None

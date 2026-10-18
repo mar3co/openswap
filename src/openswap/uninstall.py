@@ -266,6 +266,7 @@ def _remove_worker(home: Path, uid: int | None, force: bool, removal: Removal | 
     # and the task may outlive it either way.
     if removal is not None:
         removal.job_stop_unconfirmed = True
+    _mark_stop_unconfirmed(home, diagnostic)
     worker_agent.uninstall(home=home, uid=uid)
     return True
 
@@ -460,6 +461,23 @@ def job_state_paths(home: Path | None = None) -> list[Path]:
     return [library / "Application Support" / bundle.APP_ID, library / "Caches" / bundle.APP_ID]
 
 
+# In the job state, after a forced boot-out: a task may have outlived the
+# worker and every label and lock that would show it, and a later zap (after
+# a reinstall) must still keep the handles that can stop it.
+STOP_UNCONFIRMED_MARKER = "stop-unconfirmed"
+
+
+def _mark_stop_unconfirmed(home: Path, diagnostic: object) -> None:
+    folder = job_state_paths(home)[0]
+    try:
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (folder / STOP_UNCONFIRMED_MARKER).write_text(
+            f"{datetime.now().isoformat(timespec='seconds')} {diagnostic}\n", encoding="utf-8",
+        )
+    except OSError:
+        pass  # the in-memory flag still keeps it for this uninstall
+
+
 def job_state_busy(removal: Removal, uid: int | None = None) -> str | None:
     """Why the worker's job state must stay, or None when a zap may delete it.
 
@@ -467,11 +485,16 @@ def job_state_busy(removal: Removal, uid: int | None = None) -> str | None:
     must not be recreated on new inodes while a task still holds them, so it
     goes only once no task can be running: not after a forced boot-out, nor
     while any worker or job label is loaded (another install's worker shares
-    this per-user folder), nor while a worker process holds its instance lock. Not on the cask's ``zap trash:`` list for that
+    this per-user folder), nor while a worker process holds its instance lock,
+    nor once a forced boot-out left :data:`STOP_UNCONFIRMED_MARKER` in it,
+    however many uninstalls ago: only the user, once the task is gone,
+    deletes that. Not on the cask's ``zap trash:`` list for that
     reason.
     """
     if removal.job_stop_unconfirmed:
         return "the Remote tasks worker was removed before its task was confirmed stopped"
+    if (job_state_paths()[0] / STOP_UNCONFIRMED_MARKER).exists():
+        return "an earlier uninstall removed the Remote tasks worker before its task was confirmed stopped"
     labels = _loaded_labels(uid)
     if labels is None:
         return "launchd could not say whether a Remote task is still running"
@@ -572,7 +595,11 @@ def data_paths(
     backup, *legacy = _data_roots()
     # Not the uninstall's own log: an uninstall the app started is writing
     # it, and it is the only record of a step that fails after this one.
-    found = [] if homebrew_zap else [
+    # The job state first: it goes while the roots' lifecycle.lock files,
+    # which worker_starts_held holds, still exist, so no worker enable can
+    # recreate one and lock a new inode until it is gone.
+    found = [] if keep_job_state else list(job_state_paths(home))
+    found += [] if homebrew_zap else [
         backup,
         library / "Containers" / bundle.APPEX_ID,
         # The app's defaults (the status item's position), and a source
@@ -582,8 +609,6 @@ def data_paths(
         *sorted(p for p in logs.glob("com.opensoft.openswap.*.log") if p.name != APP_LOG_NAME),
         *sorted(logs.glob("com.opensoft.openswap.*.err")),
     ]
-    if not keep_job_state:
-        found.extend(job_state_paths(home))
     found.extend(legacy)
     return [path for path in found if path.exists() or path.is_symlink()]
 
