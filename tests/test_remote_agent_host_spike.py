@@ -1858,6 +1858,7 @@ def test_stalled_scans_never_carry_a_short_run_past_its_deadline(tmp_path, monke
     fake = _executable(tmp_path / "fake-slow-provider", "import time\ntime.sleep(30)\n")
     marks: dict = {}
     real_signal = spike._signal_group
+    real_append = spike._append_jsonl
 
     def stalled_table(timeout_s=None):
         time.sleep(min(timeout_s if timeout_s is not None else 0.0, 2.0))  # ps hangs
@@ -1867,15 +1868,23 @@ def test_stalled_scans_never_carry_a_short_run_past_its_deadline(tmp_path, monke
         marks.setdefault(sig, time.monotonic())
         real_signal(process, sig)
 
+    def recording_append(path, record):
+        real_append(path, record)
+        if record.get("kind") == "launch_intent":
+            # The last step before the runtime budget starts. Timing from here
+            # leaves out the lock and the fsync'd journal writes, which a loaded
+            # runner can stretch but which come before the deadline is set.
+            marks["launch"] = time.monotonic()
+
     monkeypatch.setattr(spike, "_process_table", stalled_table)
     monkeypatch.setattr(spike, "_signal_group", recording_signal)
-    start = time.monotonic()
+    monkeypatch.setattr(spike, "_append_jsonl", recording_append)
     supervise_fake_command(
         [str(fake)], state_dir=tmp_path / "state", timeout_s=0.2, grace_s=0.2, job_id="stall",
     )
     # No scan may start within SCAN_WINDOW_S of the deadline or run past it;
     # only the pre-signal scan (at most SCAN_WINDOW_S) precedes SIGTERM.
-    assert marks[signal.SIGTERM] - start < 0.2 + spike.SCAN_WINDOW_S + 0.25
+    assert marks[signal.SIGTERM] - marks["launch"] < 0.2 + spike.SCAN_WINDOW_S + 0.25
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fake supervision uses POSIX process groups")
