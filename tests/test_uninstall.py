@@ -602,6 +602,16 @@ class TestZapData:
         (logs / "com.opensoft.openswap.menubar.err").write_text("x")
         (logs / "com.opensoft.openswap.worker.log").write_text("x")
         (logs / "com.other.app.log").write_text("x")
+        # The worker's pinned Claude Code copies and job locks, and their old place.
+        support = home / "Library" / "Application Support" / "com.opensoft.openswap"
+        (support / "claude-cli").mkdir(parents=True)
+        caches = home / "Library" / "Caches" / "com.opensoft.openswap"
+        (caches / "job-locks").mkdir(parents=True)
+        prefs = home / "Library" / "Preferences"
+        prefs.mkdir(parents=True)
+        (prefs / "com.opensoft.openswap.plist").write_text("x")
+        (prefs / "com.opensoft.openswap.menubar.plist").write_text("x")
+        (prefs / "com.other.app.plist").write_text("x")
         legacy = home / ".claude-swap-backup"
         legacy.mkdir()
         monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
@@ -609,6 +619,10 @@ class TestZapData:
         found = uninstall.data_paths(home)
         assert found == [
             backup,
+            support,
+            caches,
+            prefs / "com.opensoft.openswap.plist",
+            prefs / "com.opensoft.openswap.menubar.plist",
             logs / "com.opensoft.openswap.worker.log",
             logs / "com.opensoft.openswap.menubar.err",
             legacy,
@@ -616,8 +630,8 @@ class TestZapData:
         # Homebrew's zap trashes the rest; the pre-XDG folder is not on its list.
         assert uninstall.data_paths(home, homebrew_zap=True) == [legacy]
         assert uninstall.delete_data(home) == found
-        assert not backup.exists() and not legacy.exists()
-        assert (logs / "com.other.app.log").exists()
+        assert not backup.exists() and not legacy.exists() and not support.exists()
+        assert (logs / "com.other.app.log").exists() and (prefs / "com.other.app.plist").exists()
 
     def test_legacy_root_that_holds_the_backup_root_is_not_deleted_twice(self, tmp_path, monkeypatch):
         legacy = tmp_path / ".claude-swap-backup"
@@ -726,6 +740,16 @@ class TestUninstallCommand:
         assert self._run(monkeypatch, "--homebrew-hook") == 0
         assert seen["logins"] == 1 and seen["data"] == [True]  # brew's zap trashes the rest
         assert "Deleted 3 saved OpenSwap logins" in capsys.readouterr().out
+
+    def test_hook_zap_names_the_server_that_still_lists_this_mac(self, harness, monkeypatch, capsys):
+        _, state = harness
+        state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
+        monkeypatch.setattr(uninstall, "paired_server", lambda: "https://opentag.me")
+        assert self._run(monkeypatch, "--homebrew-hook") == 0
+        assert capsys.readouterr().out.endswith(
+            "OpenTag still lists this Mac for Remote tasks. To remove it, open https://opentag.me "
+            "and remove it there.\n"
+        )
 
     def test_hook_zap_with_a_live_session_warns_and_goes_on(self, harness, monkeypatch, capsys):
         seen, state = harness
@@ -854,6 +878,34 @@ class TestUninstallCommand:
         assert seen["logins"] == int(zap) and seen["data"] == ([True] if zap else [])
         assert ("Removed the menu bar login item.", False) in lines
         assert (("Deleted 3 saved logins from the Keychain.", False) in lines) == zap
+
+    @pytest.mark.parametrize("brew", [Path("/opt/homebrew/bin/brew"), None])
+    def test_zap_names_the_server_that_still_lists_this_mac(self, harness, monkeypatch, tmp_path, brew, frozen_app):
+        """Read before purge deletes the settings that name it; said before brew takes over."""
+        seen, state = harness
+        state["brew"] = brew
+        monkeypatch.setattr(
+            uninstall, "paired_server", lambda: seen["order"].append("server") or "https://worker.example"
+        )
+        lines, say = self._say()
+        if brew is None:
+            assert uninstall.run(True, say) == 0
+        else:
+            with pytest.raises(SystemExit):
+                uninstall.run(True, say)
+        assert seen["order"].index("server") < seen["order"].index("engine")
+        notice = ("https://worker.example still lists this Mac for Remote tasks. To remove it, open "
+                  "https://worker.example and remove it there.", False)
+        deleted = lines.index((f"Deleted {tmp_path / 'data'}", False))  # harness's delete_data
+        assert lines.index(notice) == deleted + 1
+        if brew is not None:
+            assert lines[deleted + 2][0].startswith("Removing the app: brew uninstall")
+
+    def test_no_server_notice_without_zap(self, harness, monkeypatch, frozen_app):
+        monkeypatch.setattr(uninstall, "paired_server", lambda: "https://opentag.me")
+        lines, say = self._say()
+        assert uninstall.run(False, say) == 0
+        assert not any("still lists" in line for line, _ in lines)
 
     @pytest.mark.parametrize("zap", [False, True])
     def test_run_without_brew_names_what_is_left(self, harness, zap, frozen_app):
@@ -1063,8 +1115,9 @@ class TestAppDialog:
         assert dialog["title"] == "Uninstall OpenSwap?" and dialog["ok"] == "Uninstall"
         assert dialog["checkbox"] == "Also delete saved accounts, settings and logs"
         assert "• OpenSwap.app, through Homebrew" in dialog["message"]
-        assert "\n\nClaude Code and Codex stay signed in. Your saved accounts stay unless you select the " \
-            "checkbox below. Deleting them cannot be undone." in dialog["message"]
+        assert "\n\nClaude Code and Codex stay signed in, each to the account it uses now. Remote tasks' " \
+            "results stay in their folders. Your saved accounts stay unless you select the checkbox " \
+            "below. Deleting them cannot be undone." in dialog["message"]
         assert "uv tool" not in dialog["message"]
 
     def test_copy_not_installed_by_homebrew(self, frozen_app, monkeypatch):
@@ -1075,6 +1128,31 @@ class TestAppDialog:
         message = uninstall.app_dialog()["message"]
         assert ".app" not in message
         assert message.endswith("run “uv tool uninstall openswap” afterwards.")
+        assert "pairing" not in message
+
+    @pytest.mark.parametrize(("url", "name"), [("https://opentag.me", "OpenTag"),
+                                               ("https://worker.example", "https://worker.example")])
+    def test_a_paired_mac_is_told_the_server_keeps_listing_it(self, monkeypatch, url, name):
+        """Nobody reads the log of an uninstall the app starts, so the dialog says it."""
+        monkeypatch.setattr(uninstall, "paired_server", lambda: url)
+        message = uninstall.app_dialog()["message"]
+        assert (f"\n\nDeleting saved accounts also forgets this Mac's pairing with {name}. {name} still "
+                "lists the Mac until you remove it there.\n\nTo remove the openswap command") in message
+
+
+class TestPairedServer:
+    def test_reads_the_configured_url(self, monkeypatch, tmp_path):
+        from openswap.settings import configure_worker_service
+
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
+        assert uninstall.paired_server() is None
+        configure_worker_service(tmp_path, "https://opentag.me")
+        assert uninstall.paired_server() == "https://opentag.me"
+
+    def test_unreadable_settings_name_no_server(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
+        monkeypatch.setattr("openswap.settings.load_worker_settings", lambda root: 1 / 0)
+        assert uninstall.paired_server() is None
 
 
 class TestMenuAction:

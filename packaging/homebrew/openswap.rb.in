@@ -60,7 +60,9 @@ cask "openswap" do
         "com.opensoft.openswap.widget",
       ],
       trash:     [
+        "~/Library/Application Support/com.opensoft.openswap",
         "~/Library/Application Support/OpenSwap",
+        "~/Library/Caches/com.opensoft.openswap",
         "~/Library/Containers/com.opensoft.openswap.widget.extension",
         "~/Library/Logs/com.opensoft.openswap.menubar.err",
         "~/Library/Logs/com.opensoft.openswap.menubar.log",
@@ -68,6 +70,8 @@ cask "openswap" do
         "~/Library/Logs/com.opensoft.openswap.widget.log",
         "~/Library/Logs/com.opensoft.openswap.worker.err",
         "~/Library/Logs/com.opensoft.openswap.worker.log",
+        "~/Library/Preferences/com.opensoft.openswap.menubar.plist",
+        "~/Library/Preferences/com.opensoft.openswap.plist",
       ]
 
   # The app finishes setting up on its own (a welcome page with Open at

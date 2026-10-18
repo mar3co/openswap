@@ -335,6 +335,34 @@ def delete_saved_logins() -> int:
     return deleted
 
 
+def paired_server() -> str | None:
+    """The server this Mac's Remote tasks worker is paired with, if any.
+
+    A zap deletes the pairing's key here, but the server still lists the Mac
+    (offline) until its owner removes it there: unpairing is local, and the
+    worker protocol has no request for a worker to remove itself. Read it
+    before the zap, which deletes the settings that name it.
+    """
+    from openswap.settings import load_worker_settings
+
+    try:
+        return load_worker_settings(paths.get_backup_root()).control_service_url
+    except Exception:
+        return None  # unreadable settings: nothing to point the user at
+
+
+def server_name(url: str) -> str:
+    """``OpenTag`` for the OpenTag portal, else the server's address."""
+    from openswap.worker.connect import DEFAULT_SERVER
+
+    return "OpenTag" if url.rstrip("/") == DEFAULT_SERVER else url
+
+
+def server_notice(url: str) -> str:
+    """What a zap says when it forgot a pairing the server still lists."""
+    return f"{server_name(url)} still lists this Mac for Remote tasks. To remove it, open {url} and remove it there."
+
+
 def delete_session_logins(roots: list[Path] | None = None) -> None:
     """Delete the Keychain item of each idle session profile under ``roots``
     (default: every root a zap deletes).
@@ -408,13 +436,22 @@ def data_paths(home: Path | None = None, *, homebrew_zap: bool = False) -> list[
     pre-XDG backup root, which purge also removes. With ``homebrew_zap``,
     only what Homebrew's zap leaves behind."""
     home = home if home is not None else Path.home()
-    logs = home / "Library" / "Logs"
+    library = home / "Library"
+    logs = library / "Logs"
     backup, *legacy = _data_roots()
     # Not the uninstall's own log: an uninstall the app started is writing
     # it, and it is the only record of a step that fails after this one.
     found = [] if homebrew_zap else [
         backup,
-        home / "Library" / "Containers" / bundle.APPEX_ID,
+        library / "Containers" / bundle.APPEX_ID,
+        # The worker's job locks and handles and its pinned Claude Code
+        # copies; before them the job locks were in Caches.
+        library / "Application Support" / bundle.APP_ID,
+        library / "Caches" / bundle.APP_ID,
+        # The app's defaults (the status item's position), and a source
+        # install's under the bundle id menubar_display gives its Python.
+        library / "Preferences" / f"{bundle.APP_ID}.plist",
+        library / "Preferences" / f"{bundle.APP_ID}.menubar.plist",
         *sorted(p for p in logs.glob("com.opensoft.openswap.*.log") if p.name != APP_LOG_NAME),
         *sorted(logs.glob("com.opensoft.openswap.*.err")),
     ]
@@ -487,10 +524,12 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
         say(still_installed, error=True)
         return 1
 
+    server = None
     if zap:
         from openswap.engine import Engine
         from openswap.exceptions import MigrationError
 
+        server = paired_server()
         try:
             # Opening the data below can move the pre-XDG folder, and its
             # profiles' Keychain items are named from their old paths.
@@ -521,6 +560,8 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
             say(f"Deleted {deleted} saved login{'s' if deleted != 1 else ''} from the Keychain.")
         for path in removed_files:
             say(f"Deleted {path}")
+        if server is not None:
+            say(server_notice(server))
 
     if brew is not None:
         command = [str(brew), "uninstall", "--cask", *(["--zap"] if zap else []), "openswap"]
@@ -581,10 +622,19 @@ def app_dialog() -> dict[str, str]:
     else:
         lines.append(f"• {app.name}, {'through Homebrew' if bundle.installed_by_homebrew() else 'moved to the Trash'}")
         after = ""
+    server = paired_server()
+    if server is not None:
+        # Nobody reads the uninstall's log, so say it here, before the zap.
+        name = server_name(server)
+        after = (
+            f"\n\nDeleting saved accounts also forgets this Mac's pairing with {name}. "
+            f"{name} still lists the Mac until you remove it there."
+        ) + after
     return {
         "title": "Uninstall OpenSwap?",
         "message": "\n".join(lines) + (
-            "\n\nClaude Code and Codex stay signed in. Your saved accounts stay unless you "
+            "\n\nClaude Code and Codex stay signed in, each to the account it uses now. "
+            "Remote tasks' results stay in their folders. Your saved accounts stay unless you "
             "select the checkbox below. Deleting them cannot be undone."
         ) + after,
         "checkbox": "Also delete saved accounts, settings and logs",

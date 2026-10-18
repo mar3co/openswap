@@ -32,6 +32,7 @@ from pathlib import Path
 _logger = logging.getLogger("openswap")
 
 EXECUTABLE_NAME = "OpenSwap"
+APP_ID = "com.opensoft.openswap"  # packaging/macos/openswap.spec's bundle_identifier
 RELOAD_HELPER_NAME = "openswap-widget-reload"
 APPEX_NAME = "OpenSwapWidgetExtension.appex"
 APPEX_ID = "com.opensoft.openswap.widget.extension"

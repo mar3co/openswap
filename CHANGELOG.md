@@ -11,6 +11,17 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Uninstalling with "Also delete saved accounts, settings and logs" (or `--zap`) also deletes the Remote tasks worker's copy of Claude Code, its job files and OpenSwap's preferences, which it used to leave behind.
+
+### Improved
+
+- The Uninstall OpenSwap… dialog says which account Claude Code and Codex stay signed in to, and that Remote tasks' results are kept.
+- Deleting saved accounts while uninstalling tells you that OpenTag still lists this Mac for Remote tasks, so you can remove it there.
+
 ## 0.2.1 (2026-10-17)
 
 ### New
