@@ -15,7 +15,13 @@ opensoft.me/swap/changelog shows this file.
 
 ### Fixed
 
+- Uninstalling with "Also delete saved accounts, settings and logs" (or `--zap`) also deletes OpenSwap's preferences and, once no Remote task is running, the worker's copy of Claude Code and its job files, which it used to leave behind.
 - Account nicknames keep the capital letters you type, like "WorkMac", instead of being lowercased. You can still switch with any casing.
+
+### Improved
+
+- The Uninstall OpenSwap… dialog says which account Claude Code and Codex stay signed in to, and that Remote tasks' results are kept.
+- Deleting saved accounts while uninstalling tells you that OpenTag still lists this Mac for Remote tasks, so you can remove it there.
 
 ## 0.2.1 (2026-10-17)
 

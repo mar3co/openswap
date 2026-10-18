@@ -55,6 +55,10 @@ cask "openswap" do
 
   # Not the worker's label: `launchctl:` removes a job by label alone, and a
   # uv install's worker shares it. The hook above removes the app's worker.
+  # Nor its job state (com.opensoft.openswap in ~/Library/Application
+  # Support, and in ~/Library/Caches for an older worker): a task Homebrew
+  # cannot see may still need its handles and locks, so the hook deletes it
+  # only once none runs.
   zap launchctl: [
         "com.opensoft.openswap.menubar",
         "com.opensoft.openswap.widget",
@@ -68,6 +72,8 @@ cask "openswap" do
         "~/Library/Logs/com.opensoft.openswap.widget.log",
         "~/Library/Logs/com.opensoft.openswap.worker.err",
         "~/Library/Logs/com.opensoft.openswap.worker.log",
+        "~/Library/Preferences/com.opensoft.openswap.menubar.plist",
+        "~/Library/Preferences/com.opensoft.openswap.plist",
       ]
 
   # The app finishes setting up on its own (a welcome page with Open at

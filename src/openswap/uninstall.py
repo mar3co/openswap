@@ -27,7 +27,8 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +58,8 @@ Say = Callable[..., None]
 class Removal:
     removed: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    # The worker was booted out (``force``) without proof its task stopped.
+    job_stop_unconfirmed: bool = False
 
 
 def homebrew_command(pid: int | None = None) -> tuple[str, list[str]] | None:
@@ -129,7 +132,7 @@ def remove_integrations(
         ("menu bar login item", lambda: _remove_menubar_agent(home, uid)),
         ("menu bar's runtime files", _remove_menubar_state),
         ("setup wizard state", _reset_welcome),
-        ("Remote tasks worker", lambda: _remove_worker(home, uid, force)),
+        ("Remote tasks worker", lambda: _remove_worker(home, uid, force, removal)),
         ("Claude Code status line", _restore_status_line),
         ("widget", lambda: _remove_widget(home, uid)),
     )
@@ -234,7 +237,7 @@ def _reset_welcome() -> bool:
     return False
 
 
-def _remove_worker(home: Path, uid: int | None, force: bool) -> bool:
+def _remove_worker(home: Path, uid: int | None, force: bool, removal: Removal | None = None) -> bool:
     from openswap.worker import launch_agent as worker_agent
     from openswap.worker.cli import disable_worker
 
@@ -259,6 +262,20 @@ def _remove_worker(home: Path, uid: int | None, force: bool) -> bool:
         raise ClaudeSwitchError(
             f"it did not stop ({diagnostic}); see openswap worker status"
         )
+    # Before the boot-out: it can succeed and then fail to unlink the plist,
+    # and the task may outlive it either way.
+    if removal is not None:
+        removal.job_stop_unconfirmed = True
+    try:
+        _mark_stop_unconfirmed(home, diagnostic)
+    except OSError as e:
+        # Without the marker only the loaded worker shows a later zap that a
+        # task may still run, so it stays: a plist on a missing app costs one
+        # failed start per login.
+        raise ClaudeSwitchError(
+            f"it did not stop ({diagnostic}) and that could not be recorded ({e}), "
+            "so it stays loaded; see openswap worker status"
+        ) from e
     worker_agent.uninstall(home=home, uid=uid)
     return True
 
@@ -335,6 +352,48 @@ def delete_saved_logins() -> int:
     return deleted
 
 
+def paired_servers() -> list[str]:
+    """The servers this Mac's Remote tasks worker is paired with, oldest
+    root last, without repeats: usually none or one, but a pre-XDG folder the
+    zap also deletes can name another.
+
+    A zap deletes the pairing's key here, but the server still lists the Mac
+    (offline) until its owner removes it there: unpairing is local, and the
+    worker protocol has no request for a worker to remove itself. Read them
+    before the zap, which deletes the settings that name them, from every root
+    the zap deletes: opening the data migrates a pre-XDG folder only later.
+    """
+    from openswap.settings import load_worker_settings
+
+    found: list[str] = []
+    for root in _data_roots():
+        try:
+            url = load_worker_settings(root).control_service_url
+        except Exception:
+            continue  # unreadable settings: nothing to point the user at
+        if url is not None and url not in found:
+            found.append(url)
+    return found
+
+
+def job_state_notice(busy: str) -> str:
+    """What a zap says when it kept the worker's job state."""
+    kept = " and ".join(str(path) for path in job_state_paths() if path.exists()) or str(job_state_paths()[0])
+    return f"Kept {kept}: {busy}. Delete it once no Remote task runs."
+
+
+def server_name(url: str) -> str:
+    """``OpenTag`` for the OpenTag portal, else the server's address."""
+    from openswap.worker.connect import DEFAULT_SERVER
+
+    return "OpenTag" if url.rstrip("/") == DEFAULT_SERVER else url
+
+
+def server_notice(url: str) -> str:
+    """What a zap says when it forgot a pairing the server still lists."""
+    return f"{server_name(url)} still lists this Mac for Remote tasks. To remove it, open {url} and remove it there."
+
+
 def delete_session_logins(roots: list[Path] | None = None) -> None:
     """Delete the Keychain item of each idle session profile under ``roots``
     (default: every root a zap deletes).
@@ -403,18 +462,157 @@ def refuse_live_sessions() -> None:
         )
 
 
-def data_paths(home: Path | None = None, *, homebrew_zap: bool = False) -> list[Path]:
+def job_state_paths(home: Path | None = None) -> list[Path]:
+    """The worker's job locks, job handles and pinned Claude Code copies
+    (``containment.default_lock_dir``'s parent), and the Caches folder an
+    older worker, perhaps another install's still running, keeps them in."""
+    library = (home if home is not None else Path.home()) / "Library"
+    return [library / "Application Support" / bundle.APP_ID, library / "Caches" / bundle.APP_ID]
+
+
+# In the job state, after a forced boot-out: a task may have outlived the
+# worker and every label and lock that would show it, and a later zap (after
+# a reinstall) must still keep the handles that can stop it.
+STOP_UNCONFIRMED_MARKER = "stop-unconfirmed"
+
+
+def _mark_stop_unconfirmed(home: Path, diagnostic: object) -> None:
+    """Write :data:`STOP_UNCONFIRMED_MARKER`; raises OSError when it cannot."""
+    folder = job_state_paths(home)[0]
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (folder / STOP_UNCONFIRMED_MARKER).write_text(
+        f"{datetime.now().isoformat(timespec='seconds')} {diagnostic}\n", encoding="utf-8",
+    )
+
+
+def job_state_busy(removal: Removal, uid: int | None = None) -> str | None:
+    """Why the worker's job state must stay, or None when a zap may delete it.
+
+    Its job handles are what recovery needs to stop a task, and its locks
+    must not be recreated on new inodes while a task still holds them, so it
+    goes only once no task can be running: not after a forced boot-out, nor
+    while any worker or job label is loaded (another install's worker shares
+    this per-user folder), nor while a worker process holds its instance lock,
+    nor once a forced boot-out left :data:`STOP_UNCONFIRMED_MARKER` in it,
+    however many uninstalls ago: only the user, once the task is gone,
+    deletes that. Not on the cask's ``zap trash:`` list for that
+    reason.
+    """
+    if removal.job_stop_unconfirmed:
+        return "the Remote tasks worker was removed before its task was confirmed stopped"
+    if (job_state_paths()[0] / STOP_UNCONFIRMED_MARKER).exists():
+        return "an earlier uninstall removed the Remote tasks worker before its task was confirmed stopped"
+    labels = _loaded_labels(uid)
+    if labels is None:
+        return "launchd could not say whether a Remote task is still running"
+    from openswap.worker.containment import LABEL_PREFIX
+    from openswap.worker.launch_agent import LABEL
+
+    if LABEL in labels:
+        return "a Remote tasks worker is still loaded"
+    if any(label.startswith(LABEL_PREFIX) for label in labels):
+        return "a Remote task is still running"
+    # A worker started by hand (`openswap worker run`) has no label, and an
+    # idle one runs no job, but it can admit a task at any moment.
+    if any((root / "worker").is_dir() and _worker_process_may_run(root) for root in _data_roots()):
+        return "a Remote tasks worker process is still running"
+    return None
+
+
+def _worker_process_may_run(root: Path) -> bool:
+    """Whether a worker process may hold ``root``'s process-lifetime lock.
+    Only meaningful under :func:`worker_starts_held`, as in purge. A failure
+    counts as running."""
+    from openswap.worker.cli import _worker_instance_lock_is_free
+
+    try:
+        return not _worker_instance_lock_is_free(root)
+    except Exception:
+        return True
+
+
+@contextmanager
+def worker_starts_held() -> Iterator[bool]:
+    """Hold the lifecycle lock of each data root, which every worker start
+    and ``worker enable`` takes, across :func:`job_state_busy` and the
+    deletion it allows: a worker started between the two would use the
+    locks and handles being deleted. Every root, worker state or not, since
+    an enable could create it meanwhile; taking the lock creates the folder,
+    which the zap deletes. Yields False when one cannot be taken, and the
+    caller keeps the job state. A held lock whose file the deletion removes
+    is still released by its descriptor."""
+    from openswap.worker.cli import lifecycle_lock
+
+    with ExitStack() as stack:
+        held = True
+        for root in _data_roots():
+            try:
+                stack.enter_context(lifecycle_lock(root))
+            except Exception:
+                held = False
+                break
+        yield held
+
+
+# What a zap says when it could not hold the worker's lifecycle locks.
+WORKER_LIFECYCLE_BUSY = "another OpenSwap command is changing Remote tasks"
+
+
+def _loaded_labels(uid: int | None = None) -> set[str] | None:
+    """The labels loaded in this user's GUI launchd domain, where the agents
+    and their jobs live, or None when it cannot be read.
+
+    Named explicitly: a plain ``launchctl list`` from SSH reads the user or
+    session domain instead, which never shows the GUI domain's services.
+    No GUI domain (nobody logged in) or no services block is also None, so
+    the caller keeps what it would delete.
+    """
+    target = f"gui/{os.getuid() if uid is None else uid}"
+    try:
+        result = subprocess.run(
+            ["/bin/launchctl", "print", target], capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    labels: set[str] = set()
+    inside = False
+    for line in result.stdout.splitlines():
+        if not inside:
+            inside = line == "\tservices = {"
+        elif line == "\t}":
+            return labels
+        elif line.strip():
+            # "\t\t<pid> <status> \t<label>"
+            labels.add(line.rsplit("\t", 1)[-1].strip())
+    return None
+
+
+def data_paths(
+    home: Path | None = None, *, homebrew_zap: bool = False, keep_job_state: bool = False,
+) -> list[Path]:
     """The files a zap deletes: the cask's ``zap trash:`` list plus the
-    pre-XDG backup root, which purge also removes. With ``homebrew_zap``,
-    only what Homebrew's zap leaves behind."""
+    pre-XDG backup root, which purge also removes, and the worker's job
+    state unless ``keep_job_state`` (see :func:`job_state_busy`). With
+    ``homebrew_zap``, only what Homebrew's zap leaves behind."""
     home = home if home is not None else Path.home()
-    logs = home / "Library" / "Logs"
+    library = home / "Library"
+    logs = library / "Logs"
     backup, *legacy = _data_roots()
     # Not the uninstall's own log: an uninstall the app started is writing
     # it, and it is the only record of a step that fails after this one.
-    found = [] if homebrew_zap else [
+    # The job state first: it goes while the roots' lifecycle.lock files,
+    # which worker_starts_held holds, still exist, so no worker enable can
+    # recreate one and lock a new inode until it is gone.
+    found = [] if keep_job_state else list(job_state_paths(home))
+    found += [] if homebrew_zap else [
         backup,
-        home / "Library" / "Containers" / bundle.APPEX_ID,
+        library / "Containers" / bundle.APPEX_ID,
+        # The app's defaults (the status item's position), and a source
+        # install's under the bundle id menubar_display gives its Python.
+        library / "Preferences" / f"{bundle.APP_ID}.plist",
+        library / "Preferences" / f"{bundle.APP_ID}.menubar.plist",
         *sorted(p for p in logs.glob("com.opensoft.openswap.*.log") if p.name != APP_LOG_NAME),
         *sorted(logs.glob("com.opensoft.openswap.*.err")),
     ]
@@ -422,11 +620,13 @@ def data_paths(home: Path | None = None, *, homebrew_zap: bool = False) -> list[
     return [path for path in found if path.exists() or path.is_symlink()]
 
 
-def delete_data(home: Path | None = None, *, homebrew_zap: bool = False) -> list[Path]:
+def delete_data(
+    home: Path | None = None, *, homebrew_zap: bool = False, keep_job_state: bool = False,
+) -> list[Path]:
     """Delete :func:`data_paths`. Returns what was deleted; raises on the
     first path that will not go."""
     deleted = []
-    for path in data_paths(home, homebrew_zap=homebrew_zap):
+    for path in data_paths(home, homebrew_zap=homebrew_zap, keep_job_state=keep_job_state):
         try:
             if path.is_dir() and not path.is_symlink():
                 shutil.rmtree(path)
@@ -487,10 +687,12 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
         say(still_installed, error=True)
         return 1
 
+    servers: list[str] = []
     if zap:
         from openswap.engine import Engine
         from openswap.exceptions import MigrationError
 
+        servers = paired_servers()
         try:
             # Opening the data below can move the pre-XDG folder, and its
             # profiles' Keychain items are named from their old paths.
@@ -512,15 +714,26 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
             # What purge does not track (the worker's pairing, strays).
             deleted = delete_saved_logins()
             # Homebrew's zap deletes the cask's files; the rest go here.
-            removed_files = delete_data(homebrew_zap=brew is not None)
+            with worker_starts_held() as held:
+                busy = job_state_busy(removal) if held else WORKER_LIFECYCLE_BUSY
+                removed_files = delete_data(homebrew_zap=brew is not None, keep_job_state=busy is not None)
         except (ClaudeSwitchError, OSError) as e:
             say(f"Error: {e}", error=True)
+            remaining = paired_servers() if servers else []
+            for url in servers:
+                if url not in remaining:
+                    # purge got as far as its settings: a retry cannot name it.
+                    say(server_notice(url))
             say(still_installed, error=True)
             return 1
         if deleted:
             say(f"Deleted {deleted} saved login{'s' if deleted != 1 else ''} from the Keychain.")
         for path in removed_files:
             say(f"Deleted {path}")
+        if busy is not None:
+            say(job_state_notice(busy))
+        for url in servers:
+            say(server_notice(url))
 
     if brew is not None:
         command = [str(brew), "uninstall", "--cask", *(["--zap"] if zap else []), "openswap"]
@@ -581,10 +794,22 @@ def app_dialog() -> dict[str, str]:
     else:
         lines.append(f"• {app.name}, {'through Homebrew' if bundle.installed_by_homebrew() else 'moved to the Trash'}")
         after = ""
+    names = [server_name(url) for url in paired_servers()]
+    if names:
+        # Nobody reads the uninstall's log, so say it here, before the zap.
+        if len(names) == 1:
+            still = f"{names[0]} still lists the Mac"
+        else:
+            still = "Each still lists the Mac"
+        after = (
+            f"\n\nDeleting saved accounts also forgets this Mac's pairing with {' and '.join(names)}. "
+            f"{still} until you remove it there."
+        ) + after
     return {
         "title": "Uninstall OpenSwap?",
         "message": "\n".join(lines) + (
-            "\n\nClaude Code and Codex stay signed in. Your saved accounts stay unless you "
+            "\n\nClaude Code and Codex stay signed in, each to the account it uses now. "
+            "Remote tasks' results stay in their folders. Your saved accounts stay unless you "
             "select the checkbox below. Deleting them cannot be undone."
         ) + after,
         "checkbox": "Also delete saved accounts, settings and logs",
