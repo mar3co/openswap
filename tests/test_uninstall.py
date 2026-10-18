@@ -1240,6 +1240,7 @@ class TestJobStateBusy:
     def labels(self, monkeypatch):
         state = {"labels": set()}
         monkeypatch.setattr(uninstall, "_loaded_labels", lambda uid=None: state["labels"])
+        monkeypatch.setattr(uninstall, "_worker_process_may_run", lambda root: False)
         return state
 
     def test_idle(self, labels):
@@ -1257,6 +1258,23 @@ class TestJobStateBusy:
     def test_a_loaded_job_label(self, labels):
         labels["labels"] = {"com.opensoft.openswap.worker.job.abc123"}
         assert uninstall.job_state_busy(uninstall.Removal()) == "a Remote task is still running"
+
+    def test_a_worker_started_by_hand_holds_its_instance_lock(self, labels, monkeypatch, tmp_path):
+        """No label and, while idle, no job: only its process-lifetime lock shows it."""
+        (tmp_path / "worker").mkdir()
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: tmp_path)
+        monkeypatch.setattr(uninstall, "_worker_process_may_run", lambda root: root == tmp_path)
+        assert uninstall.job_state_busy(uninstall.Removal()) == "a Remote tasks worker process is still running"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the worker's locks are flocks")
+    def test_worker_process_may_run_reads_the_instance_lock(self, tmp_path):
+        from openswap.locking import FileLock
+
+        (tmp_path / "worker").mkdir(mode=0o700)
+        assert uninstall._worker_process_may_run(tmp_path) is False
+        with FileLock(tmp_path / "worker" / "instance.lock", timeout=0):
+            assert uninstall._worker_process_may_run(tmp_path) is True
 
     def test_launchd_that_cannot_say_keeps_it(self, labels):
         labels["labels"] = None

@@ -466,7 +466,7 @@ def job_state_busy(removal: Removal, uid: int | None = None) -> str | None:
     must not be recreated on new inodes while a task still holds them, so it
     goes only once no task can be running: not after a forced boot-out, nor
     while any worker or job label is loaded (another install's worker shares
-    this per-user folder). Not on the cask's ``zap trash:`` list for that
+    this per-user folder), nor while a worker process holds its instance lock. Not on the cask's ``zap trash:`` list for that
     reason.
     """
     if removal.job_stop_unconfirmed:
@@ -481,7 +481,24 @@ def job_state_busy(removal: Removal, uid: int | None = None) -> str | None:
         return "a Remote tasks worker is still loaded"
     if any(label.startswith(LABEL_PREFIX) for label in labels):
         return "a Remote task is still running"
+    # A worker started by hand (`openswap worker run`) has no label, and an
+    # idle one runs no job, but it can admit a task at any moment.
+    if any((root / "worker").is_dir() and _worker_process_may_run(root) for root in _data_roots()):
+        return "a Remote tasks worker process is still running"
     return None
+
+
+def _worker_process_may_run(root: Path) -> bool:
+    """Whether a worker process may hold ``root``'s process-lifetime lock,
+    checked as purge does: under the lifecycle lock every start takes. A
+    failure counts as running."""
+    from openswap.worker.cli import _worker_instance_lock_is_free, lifecycle_lock
+
+    try:
+        with lifecycle_lock(root):
+            return not _worker_instance_lock_is_free(root)
+    except Exception:
+        return True
 
 
 def _loaded_labels(uid: int | None = None) -> set[str] | None:
