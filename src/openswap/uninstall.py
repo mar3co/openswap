@@ -347,14 +347,19 @@ def paired_server() -> str | None:
     A zap deletes the pairing's key here, but the server still lists the Mac
     (offline) until its owner removes it there: unpairing is local, and the
     worker protocol has no request for a worker to remove itself. Read it
-    before the zap, which deletes the settings that name it.
+    before the zap, which deletes the settings that name it, from every root
+    the zap deletes: opening the data migrates a pre-XDG folder only later.
     """
     from openswap.settings import load_worker_settings
 
-    try:
-        return load_worker_settings(paths.get_backup_root()).control_service_url
-    except Exception:
-        return None  # unreadable settings: nothing to point the user at
+    for root in _data_roots():
+        try:
+            url = load_worker_settings(root).control_service_url
+        except Exception:
+            continue  # unreadable settings: nothing to point the user at
+        if url is not None:
+            return url
+    return None
 
 
 def job_state_notice(busy: str) -> str:

@@ -1284,6 +1284,18 @@ class TestPairedServer:
         configure_worker_service(tmp_path, "https://opentag.me")
         assert uninstall.paired_server() == "https://opentag.me"
 
+    def test_reads_a_pre_xdg_folder_not_yet_migrated(self, monkeypatch, tmp_path):
+        """The zap reads it before Engine() migrates the folder, so look there too."""
+        from openswap.settings import configure_worker_service
+
+        backup, legacy = tmp_path / "OpenSwap", tmp_path / ".claude-swap-backup"
+        legacy.mkdir()
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: backup)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: legacy)
+        configure_worker_service(legacy, "https://worker.example")
+        assert uninstall.paired_server() == "https://worker.example"
+        assert not backup.exists()  # read without creating anything
+
     def test_unreadable_settings_name_no_server(self, monkeypatch, tmp_path):
         monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
         monkeypatch.setattr("openswap.settings.load_worker_settings", lambda root: 1 / 0)
