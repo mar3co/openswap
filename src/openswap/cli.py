@@ -1439,7 +1439,8 @@ def _homebrew_uninstall_hook() -> int:
             print(f"{e} Its saved login stays in the Keychain.", file=sys.stderr)
         try:
             deleted = uninstall.delete_saved_logins()
-            removed_files = uninstall.delete_data(homebrew_zap=True)
+            busy = uninstall.job_state_busy(removal)
+            removed_files = uninstall.delete_data(homebrew_zap=True, keep_job_state=busy is not None)
         except ClaudeSwitchError as e:
             print(str(e), file=sys.stderr)
         else:
@@ -1447,6 +1448,8 @@ def _homebrew_uninstall_hook() -> int:
                 print(f"Deleted {deleted} saved OpenSwap login{'s' if deleted != 1 else ''} from the Keychain.")
             for path in removed_files:
                 print(f"Deleted {path}")
+            if busy is not None:
+                print(uninstall.job_state_notice(busy))
         # Whatever failed above, Homebrew's zap trashes the settings that name
         # the pairing next, so the server is the only record left.
         if server is not None:

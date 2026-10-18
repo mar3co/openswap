@@ -15,7 +15,7 @@ opensoft.me/swap/changelog shows this file.
 
 ### Fixed
 
-- Uninstalling with "Also delete saved accounts, settings and logs" (or `--zap`) also deletes the Remote tasks worker's copy of Claude Code, its job files and OpenSwap's preferences, which it used to leave behind.
+- Uninstalling with "Also delete saved accounts, settings and logs" (or `--zap`) also deletes OpenSwap's preferences and, once no Remote task is running, the worker's copy of Claude Code and its job files, which it used to leave behind.
 
 ### Improved
 
