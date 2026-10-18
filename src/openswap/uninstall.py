@@ -27,7 +27,8 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -489,16 +490,42 @@ def job_state_busy(removal: Removal, uid: int | None = None) -> str | None:
 
 
 def _worker_process_may_run(root: Path) -> bool:
-    """Whether a worker process may hold ``root``'s process-lifetime lock,
-    checked as purge does: under the lifecycle lock every start takes. A
-    failure counts as running."""
-    from openswap.worker.cli import _worker_instance_lock_is_free, lifecycle_lock
+    """Whether a worker process may hold ``root``'s process-lifetime lock.
+    Only meaningful under :func:`worker_starts_held`, as in purge. A failure
+    counts as running."""
+    from openswap.worker.cli import _worker_instance_lock_is_free
 
     try:
-        with lifecycle_lock(root):
-            return not _worker_instance_lock_is_free(root)
+        return not _worker_instance_lock_is_free(root)
     except Exception:
         return True
+
+
+@contextmanager
+def worker_starts_held() -> Iterator[bool]:
+    """Hold the lifecycle lock of each data root with worker state, which
+    every worker start takes, across :func:`job_state_busy` and the deletion
+    it allows: a worker started between the two would use the locks and
+    handles being deleted. Yields False when one cannot be taken, and the
+    caller keeps the job state. A held lock whose file the deletion removes
+    is still released by its descriptor."""
+    from openswap.worker.cli import lifecycle_lock
+
+    with ExitStack() as stack:
+        held = True
+        for root in _data_roots():
+            if not (root / "worker").is_dir():
+                continue
+            try:
+                stack.enter_context(lifecycle_lock(root))
+            except Exception:
+                held = False
+                break
+        yield held
+
+
+# What a zap says when it could not hold the worker's lifecycle locks.
+WORKER_LIFECYCLE_BUSY = "another OpenSwap command is changing Remote tasks"
 
 
 def _loaded_labels(uid: int | None = None) -> set[str] | None:
@@ -655,8 +682,9 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
             # What purge does not track (the worker's pairing, strays).
             deleted = delete_saved_logins()
             # Homebrew's zap deletes the cask's files; the rest go here.
-            busy = job_state_busy(removal)
-            removed_files = delete_data(homebrew_zap=brew is not None, keep_job_state=busy is not None)
+            with worker_starts_held() as held:
+                busy = job_state_busy(removal) if held else WORKER_LIFECYCLE_BUSY
+                removed_files = delete_data(homebrew_zap=brew is not None, keep_job_state=busy is not None)
         except (ClaudeSwitchError, OSError) as e:
             say(f"Error: {e}", error=True)
             remaining = paired_servers() if servers else []

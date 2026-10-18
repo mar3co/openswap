@@ -1439,8 +1439,9 @@ def _homebrew_uninstall_hook() -> int:
             print(f"{e} Its saved login stays in the Keychain.", file=sys.stderr)
         try:
             deleted = uninstall.delete_saved_logins()
-            busy = uninstall.job_state_busy(removal)
-            removed_files = uninstall.delete_data(homebrew_zap=True, keep_job_state=busy is not None)
+            with uninstall.worker_starts_held() as held:
+                busy = uninstall.job_state_busy(removal) if held else uninstall.WORKER_LIFECYCLE_BUSY
+                removed_files = uninstall.delete_data(homebrew_zap=True, keep_job_state=busy is not None)
         except ClaudeSwitchError as e:
             print(str(e), file=sys.stderr)
         else:

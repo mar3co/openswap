@@ -8,6 +8,7 @@ here; nothing touches a real LaunchAgent or file outside ``tmp_path``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import plistlib
 import shlex
@@ -684,7 +685,7 @@ class TestUninstallCommand:
     def harness(self, monkeypatch, tmp_path):
         seen: dict = {"remove": [], "logins": 0, "data": [], "exec": None, "purge": [], "order": []}
         state = {"brew": None, "failed": [], "command": None, "live": None, "purge": None, "collision": False,
-                 "busy": None}
+                 "busy": None, "held": True, "holding": False}
 
         class FakeSwitcher:
             def __init__(self):
@@ -710,6 +711,7 @@ class TestUninstallCommand:
         def fake_data(home=None, *, homebrew_zap=False, keep_job_state=False):
             seen["data"].append(homebrew_zap)
             seen["kept"] = keep_job_state
+            seen["deleted_while_holding"] = state["holding"]
             return [tmp_path / "data"]
 
         def fake_refuse():
@@ -724,7 +726,20 @@ class TestUninstallCommand:
         monkeypatch.setattr(uninstall, "remove_integrations", fake_remove)
         monkeypatch.setattr(uninstall, "delete_saved_logins", fake_logins)
         monkeypatch.setattr(uninstall, "delete_data", fake_data)
-        monkeypatch.setattr(uninstall, "job_state_busy", lambda removal, uid=None: state["busy"])
+        def fake_busy(removal, uid=None):
+            seen["checked_while_holding"] = state["holding"]
+            return state["busy"]
+
+        @contextlib.contextmanager
+        def fake_hold():
+            state["holding"] = True
+            try:
+                yield state["held"]
+            finally:
+                state["holding"] = False
+
+        monkeypatch.setattr(uninstall, "job_state_busy", fake_busy)
+        monkeypatch.setattr(uninstall, "worker_starts_held", fake_hold)
         monkeypatch.setattr(uninstall, "homebrew_brew", lambda: state["brew"])
         monkeypatch.setattr(uninstall, "homebrew_command", lambda: state["command"])
         monkeypatch.setattr(uninstall, "refuse_live_sessions", fake_refuse)
@@ -772,6 +787,15 @@ class TestUninstallCommand:
         assert self._run(monkeypatch, "--homebrew-hook") == 0
         assert seen["kept"] is True
         assert "Delete it once no Remote task runs." in capsys.readouterr().out
+
+    @pytest.mark.parametrize("held", [True, False])
+    def test_hook_checks_and_deletes_job_state_under_the_lifecycle_locks(self, harness, monkeypatch, capsys, held):
+        seen, state = harness
+        state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
+        state["held"] = held
+        assert self._run(monkeypatch, "--homebrew-hook") == 0
+        assert seen["deleted_while_holding"] and seen["kept"] is not held
+        assert seen.get("checked_while_holding", False) is held
 
     def test_hook_names_the_server_when_its_cleanup_fails(self, harness, monkeypatch, capsys):
         """Homebrew's zap still trashes the settings, so the notice must not depend on the cleanup."""
@@ -983,6 +1007,16 @@ class TestUninstallCommand:
         lines, say = self._say()
         assert uninstall.run(True, say) == 0
         assert seen["kept"] is False and not any(line.startswith("Kept ") for line, _ in lines)
+        # No worker can start between the check and the deletion.
+        assert seen["checked_while_holding"] and seen["deleted_while_holding"]
+
+    def test_zap_keeps_job_state_when_it_cannot_hold_worker_starts(self, harness, frozen_app):
+        seen, state = harness
+        state["held"] = False
+        lines, say = self._say()
+        assert uninstall.run(True, say) == 0
+        assert seen["kept"] is True and "checked_while_holding" not in seen
+        assert any(line.startswith("Kept ") and uninstall.WORKER_LIFECYCLE_BUSY in line for line, _ in lines)
 
     def test_zap_names_each_server_it_forgot(self, harness, monkeypatch, frozen_app):
         monkeypatch.setattr(uninstall, "paired_servers", lambda: ["https://opentag.me", "https://worker.example"])
@@ -1266,6 +1300,22 @@ class TestJobStateBusy:
         monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: tmp_path)
         monkeypatch.setattr(uninstall, "_worker_process_may_run", lambda root: root == tmp_path)
         assert uninstall.job_state_busy(uninstall.Removal()) == "a Remote tasks worker process is still running"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the worker's locks are flocks")
+    def test_worker_starts_held_takes_each_roots_lifecycle_lock(self, monkeypatch, tmp_path):
+        from openswap.locking import FileLock
+
+        (tmp_path / "worker").mkdir(mode=0o700)
+        monkeypatch.setattr("openswap.paths.get_backup_root", lambda: tmp_path)
+        monkeypatch.setattr("openswap.paths.get_legacy_backup_root", lambda: tmp_path)
+        monkeypatch.setattr("openswap.worker.cli._LIFECYCLE_LOCK_TIMEOUT_SECONDS", 0.2)
+        lifecycle = tmp_path / "worker" / "lifecycle.lock"
+        with uninstall.worker_starts_held() as held:
+            assert held is True
+            assert not FileLock(lifecycle, timeout=0).acquire(timeout=0)  # a start would wait
+        with FileLock(lifecycle, timeout=0):  # another command is changing Remote tasks
+            with uninstall.worker_starts_held() as held:
+                assert held is False
 
     @pytest.mark.skipif(sys.platform == "win32", reason="the worker's locks are flocks")
     def test_worker_process_may_run_reads_the_instance_lock(self, tmp_path):
