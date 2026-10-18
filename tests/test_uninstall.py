@@ -723,7 +723,7 @@ class TestUninstallCommand:
         monkeypatch.setattr(uninstall, "remove_integrations", fake_remove)
         monkeypatch.setattr(uninstall, "delete_saved_logins", fake_logins)
         monkeypatch.setattr(uninstall, "delete_data", fake_data)
-        monkeypatch.setattr(uninstall, "job_state_busy", lambda removal: state["busy"])
+        monkeypatch.setattr(uninstall, "job_state_busy", lambda removal, uid=None: state["busy"])
         monkeypatch.setattr(uninstall, "homebrew_brew", lambda: state["brew"])
         monkeypatch.setattr(uninstall, "homebrew_command", lambda: state["command"])
         monkeypatch.setattr(uninstall, "refuse_live_sessions", fake_refuse)
@@ -1226,7 +1226,7 @@ class TestJobStateBusy:
     @pytest.fixture
     def labels(self, monkeypatch):
         state = {"labels": set()}
-        monkeypatch.setattr(uninstall, "_loaded_labels", lambda: state["labels"])
+        monkeypatch.setattr(uninstall, "_loaded_labels", lambda uid=None: state["labels"])
         return state
 
     def test_idle(self, labels):
@@ -1249,14 +1249,30 @@ class TestJobStateBusy:
         labels["labels"] = None
         assert "could not say" in uninstall.job_state_busy(uninstall.Removal())
 
-    def test_loaded_labels_parse_launchctl_list(self, monkeypatch):
-        out = "PID\tStatus\tLabel\n-\t0\tcom.opensoft.openswap.menubar\n123\t0\tcom.apple.Finder\n"
+    def test_loaded_labels_read_the_gui_domain(self, monkeypatch):
+        """Named explicitly: from SSH a plain `launchctl list` reads another domain."""
+        out = ("gui/501 = {\n\ttype = gui\n\tsubdomains = {\n\t\tpid/1\n\t}\n\n\tservices = {\n"
+               "\t\t   50860    -15 \tcom.opensoft.openswap.menubar\n"
+               "\t\t       0      0 \tcom.opensoft.openswap.worker.job.abc\n\t}\n\n\tendpoints = {\n"
+               "\t\t     0x0  com.apple.x\n\t}\n}\n")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, out, "")
+
+        monkeypatch.setattr(uninstall.subprocess, "run", fake_run)
+        assert uninstall._loaded_labels(501) == {"com.opensoft.openswap.menubar",
+                                                 "com.opensoft.openswap.worker.job.abc"}
+        assert calls == [["/bin/launchctl", "print", "gui/501"]]
+
+    @pytest.mark.parametrize(("code", "out"), [(113, ""), (0, "gui/501 = {\n\ttype = gui\n}\n"),
+                                               (0, "gui/501 = {\n\tservices = {\n\t\t 0 0 \tx\n")])
+    def test_a_gui_domain_it_cannot_read_names_no_labels(self, monkeypatch, code, out):
+        """No GUI domain, no services block, or a cut-off one: the caller keeps the folder."""
         monkeypatch.setattr(uninstall.subprocess, "run",
-                            lambda *a, **k: subprocess.CompletedProcess(a, 0, out, ""))
-        assert uninstall._loaded_labels() == {"com.opensoft.openswap.menubar", "com.apple.Finder"}
-        monkeypatch.setattr(uninstall.subprocess, "run",
-                            lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "no"))
-        assert uninstall._loaded_labels() is None
+                            lambda argv, **k: subprocess.CompletedProcess(argv, code, out, ""))
+        assert uninstall._loaded_labels(501) is None
 
 
 class TestPairedServer:

@@ -449,7 +449,7 @@ def job_state_path(home: Path | None = None) -> Path:
     return home / "Library" / "Application Support" / bundle.APP_ID
 
 
-def job_state_busy(removal: Removal) -> str | None:
+def job_state_busy(removal: Removal, uid: int | None = None) -> str | None:
     """Why the worker's job state must stay, or None when a zap may delete it.
 
     Its job handles are what recovery needs to stop a task, and its locks
@@ -461,7 +461,7 @@ def job_state_busy(removal: Removal) -> str | None:
     """
     if removal.job_stop_unconfirmed:
         return "the Remote tasks worker was removed before its task was confirmed stopped"
-    labels = _loaded_labels()
+    labels = _loaded_labels(uid)
     if labels is None:
         return "launchd could not say whether a Remote task is still running"
     from openswap.worker.containment import LABEL_PREFIX
@@ -474,18 +474,35 @@ def job_state_busy(removal: Removal) -> str | None:
     return None
 
 
-def _loaded_labels() -> set[str] | None:
-    """The labels loaded in this user's launchd domain, or None when
-    ``launchctl list`` cannot say."""
+def _loaded_labels(uid: int | None = None) -> set[str] | None:
+    """The labels loaded in this user's GUI launchd domain, where the agents
+    and their jobs live, or None when it cannot be read.
+
+    Named explicitly: a plain ``launchctl list`` from SSH reads the user or
+    session domain instead, which never shows the GUI domain's services.
+    No GUI domain (nobody logged in) or no services block is also None, so
+    the caller keeps what it would delete.
+    """
+    target = f"gui/{os.getuid() if uid is None else uid}"
     try:
         result = subprocess.run(
-            ["/bin/launchctl", "list"], capture_output=True, text=True, timeout=5,
+            ["/bin/launchctl", "print", target], capture_output=True, text=True, timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
         return None
-    return {line.split("\t")[-1] for line in result.stdout.splitlines()[1:] if line.strip()}
+    labels: set[str] = set()
+    inside = False
+    for line in result.stdout.splitlines():
+        if not inside:
+            inside = line == "\tservices = {"
+        elif line == "\t}":
+            return labels
+        elif line.strip():
+            # "\t\t<pid> <status> \t<label>"
+            labels.add(line.rsplit("\t", 1)[-1].strip())
+    return None
 
 
 def data_paths(
