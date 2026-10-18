@@ -741,6 +741,21 @@ class TestUninstallCommand:
         assert seen["logins"] == 1 and seen["data"] == [True]  # brew's zap trashes the rest
         assert "Deleted 3 saved OpenSwap logins" in capsys.readouterr().out
 
+    def test_hook_names_the_server_when_its_cleanup_fails(self, harness, monkeypatch, capsys):
+        """Homebrew's zap still trashes the settings, so the notice must not depend on the cleanup."""
+        _, state = harness
+        state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
+        monkeypatch.setattr(uninstall, "paired_server", lambda: "https://opentag.me")
+
+        def failing_data(home=None, *, homebrew_zap=False):
+            raise ClaudeSwitchError("Could not delete /x: busy")
+
+        monkeypatch.setattr(uninstall, "delete_data", failing_data)
+        assert self._run(monkeypatch, "--homebrew-hook") == 0
+        out = capsys.readouterr()
+        assert "Could not delete /x: busy" in out.err
+        assert "OpenTag still lists this Mac for Remote tasks." in out.out
+
     def test_hook_zap_names_the_server_that_still_lists_this_mac(self, harness, monkeypatch, capsys):
         _, state = harness
         state["command"] = ("uninstall", ["--zap", "--cask", "openswap"])
@@ -900,6 +915,21 @@ class TestUninstallCommand:
         assert lines.index(notice) == deleted + 1
         if brew is not None:
             assert lines[deleted + 2][0].startswith("Removing the app: brew uninstall")
+
+    @pytest.mark.parametrize("settings_gone", [True, False])
+    def test_a_failed_zap_names_the_server_once_purge_deleted_its_settings(self, harness, monkeypatch, settings_gone):
+        """A retry reads no pairing once purge deleted the settings; until then it names it itself."""
+        servers = iter(["https://opentag.me", None if settings_gone else "https://opentag.me"])
+        monkeypatch.setattr(uninstall, "paired_server", lambda: next(servers))
+
+        def failing_data(home=None, *, homebrew_zap=False):
+            raise ClaudeSwitchError("Could not delete /x: busy")
+
+        monkeypatch.setattr(uninstall, "delete_data", failing_data)
+        lines, say = self._say()
+        assert uninstall.run(True, say) == 1
+        assert any("OpenTag still lists this Mac" in line for line, _ in lines) == settings_gone
+        assert lines[-1][0].startswith("OpenSwap is still installed.")
 
     def test_no_server_notice_without_zap(self, harness, monkeypatch, frozen_app):
         monkeypatch.setattr(uninstall, "paired_server", lambda: "https://opentag.me")

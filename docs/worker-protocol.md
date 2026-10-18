@@ -200,9 +200,12 @@ request, not in this version: an authenticated `unenroll` (`{}` body) that
 revokes the calling worker exactly as an operator revocation does, is
 idempotent for a worker already revoked, and is refused for a worker with an
 admitted claim that is still running (`invalid_state`), so an uninstall cannot
-strand a job. A backend would advertise it in `capabilities`, and the client
-would call it best-effort, with the usual 5-second timeout, before deleting the
-key.
+strand a job. Like key rotation, the worker would advertise it as the
+`"unenroll"` feature of `capabilities` and use it only after a registration
+whose `capabilities` the backend acknowledged with that feature. The worker has
+stopped by the time an uninstall runs, so it would keep that acknowledgment
+with its enrollment and call `unenroll` best-effort, with the usual 5-second
+timeout, before deleting the key.
 
 ## Events and explicit artifacts
 

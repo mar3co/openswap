@@ -1447,8 +1447,10 @@ def _homebrew_uninstall_hook() -> int:
                 print(f"Deleted {deleted} saved OpenSwap login{'s' if deleted != 1 else ''} from the Keychain.")
             for path in removed_files:
                 print(f"Deleted {path}")
-            if server is not None:
-                print(uninstall.server_notice(server))
+        # Whatever failed above, Homebrew's zap trashes the settings that name
+        # the pairing next, so the server is the only record left.
+        if server is not None:
+            print(uninstall.server_notice(server))
     return 0
 
 

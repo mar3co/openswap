@@ -554,6 +554,9 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
             removed_files = delete_data(homebrew_zap=brew is not None)
         except (ClaudeSwitchError, OSError) as e:
             say(f"Error: {e}", error=True)
+            if server is not None and paired_server() is None:
+                # purge got as far as the settings: a retry cannot name it.
+                say(server_notice(server))
             say(still_installed, error=True)
             return 1
         if deleted:
