@@ -2215,8 +2215,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
-    # in case the dispatch is later refactored to fall through.
-    if not args.purge and not args.upgrade and not args.json:
+    # in case the dispatch is later refactored to fall through. Terminal only:
+    # a script or pipe should never wait on the release check.
+    if not args.purge and not args.upgrade and not args.json and sys.stderr.isatty():
         from openswap.update_check import check_for_update
 
         msg = check_for_update(__version__)

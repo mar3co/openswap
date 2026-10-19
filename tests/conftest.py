@@ -619,6 +619,25 @@ def block_real_api_key_probe(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_release_fetch(request, monkeypatch):
+    """Safety net: no test may ask the live GitHub API for the latest release.
+
+    Every terminal CLI run and the menu bar check it. Stub the fetch to fail,
+    which reads as "no release known". Tests of the fetch opt out with
+    ``@pytest.mark.no_release_fetch_fake`` and mock ``urlopen`` beneath it.
+    """
+    if request.node.get_closest_marker("no_release_fetch_fake"):
+        yield
+        return
+
+    def offline():
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr("openswap.update_check._fetch_latest_tag", offline)
+    yield
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""

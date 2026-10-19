@@ -188,6 +188,8 @@ def run(switcher, codex=None) -> int:
                 "claude": "loading", "chatgpt": "loading" if codex is not None else "unavailable"
             }
             self._dirty = False
+            self._update_found = None  # written by the release-check thread
+            self._update_shown = None
             self._snapshot_at = 0.0
             self._refreshing = False
             self._config_path = switcher._get_claude_config_path()
@@ -329,6 +331,10 @@ def run(switcher, codex=None) -> int:
             # Steal the click for the popover once the status item exists.
             self._attach_timer = rumps.Timer(self._attach_panel_once, 0.15)
             self._attach_timer.start()
+            # Cheap cache reads, ticked well inside the cache's day and retry hour.
+            self.update_timer = rumps.Timer(self.on_update_tick, 900)
+            self.update_timer.start()
+            self.on_update_tick(None)
             self.refresh_async()  # first display fetch
             from openswap.widget_snapshot import wake_widget_host
             wake_widget_host()
@@ -551,6 +557,44 @@ def run(switcher, codex=None) -> int:
         def on_refresh_tick(self, _timer):
             self.refresh_async()
 
+        def on_update_tick(self, _timer):
+            threading.Thread(target=self._update_worker, name="openswap-update-check", daemon=True).start()
+
+        def _update_worker(self):
+            from openswap import __version__
+            from openswap.update_check import newer_release
+
+            try:
+                self._update_found = newer_release(__version__)
+            except Exception:
+                self.switcher._logger.debug("release check failed", exc_info=True)
+
+        def _apply_update_found(self):
+            found = self._update_found
+            if found == self._update_shown:
+                return
+            self._update_shown = found
+            self._dirty = True
+            from openswap.update_check import claim_notification, upgrade_hint
+
+            if found is not None and claim_notification(found):
+                self._notify(NotificationCopy(title=f"OpenSwap {found} is available", body=upgrade_hint()))
+
+        def on_update(self, _sender):
+            from openswap import __version__
+            from openswap.update_check import RELEASES_URL, upgrade_hint
+
+            found = self._update_shown
+            if found is None:
+                return
+            if self._alert(
+                title=f"OpenSwap {found} is available",
+                message=f"You have {__version__}. {upgrade_hint()}",
+                ok="Release Notes", cancel="Close",
+            ) == 1:
+                import webbrowser
+                webbrowser.open(RELEASES_URL)
+
         def on_sync_tick(self, _timer):
             if self._refresh_pending and not self._refreshing:
                 self._refresh_pending = False
@@ -572,6 +616,7 @@ def run(switcher, codex=None) -> int:
             if self._desktop_switching:
                 return
             self._consume_widget_command()
+            self._apply_update_found()
             if self._dirty:
                 self._dirty = False
                 self.rebuild_menu()
@@ -2420,6 +2465,10 @@ def run(switcher, codex=None) -> int:
             # the full list remains for the menu-only fallback.
             fallback = self._panel is None
             self.menu = [
+                *([
+                    rumps.MenuItem(f"Update available: OpenSwap {self._update_shown}…", callback=self.on_update),
+                    None,
+                ] if self._update_shown else []),
                 *([
                     rumps.MenuItem("Claude: rotate to next", callback=self._switch(None)),
                     rumps.MenuItem("Claude: switch to best", callback=self._switch("best")),

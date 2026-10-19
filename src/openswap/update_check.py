@@ -10,6 +10,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import urllib.request
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
@@ -19,6 +21,10 @@ INSTALL_COMMAND = (
 )
 BREW_UPGRADE_COMMAND = "brew upgrade --cask openswap"
 RELEASES_URL = "https://github.com/mar3co/openswap/releases/latest"
+LATEST_RELEASE_API = "https://api.github.com/repos/mar3co/openswap/releases/latest"
+CACHE_TTL = 24 * 3600
+RETRY_TTL = 3600
+NOTICE_WAIT_S = 3.0
 
 
 def _looks_like_openswap_checkout(root: Path) -> bool:
@@ -116,9 +122,113 @@ def _detect_install_method() -> str | None:
     return None
 
 
-def check_for_update(current_version: str) -> str | None:
-    """OpenSwap is not on PyPI; never nag about a wheel there."""
+def _cache_path(name: str) -> Path:
+    from openswap.paths import get_backup_root
+
+    return get_backup_root() / "cache" / name
+
+
+def _fetch_latest_tag() -> str:
+    """Version named by the latest release's tag. Raises when there is none."""
+    from openswap import __version__
+
+    req = urllib.request.Request(
+        LATEST_RELEASE_API,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": f"openswap/{__version__}"},
+    )
+    with urllib.request.urlopen(req, timeout=2) as resp:
+        tag = json.loads(resp.read().decode()).get("tag_name")
+    if not isinstance(tag, str) or not tag:
+        raise ValueError("release has no tag")
+    return tag.removeprefix("v")
+
+
+def latest_release() -> str | None:
+    """Version of the latest published GitHub release, cached for a day.
+
+    A failed fetch keeps the last known answer and is retried after an hour,
+    so a Mac that wakes offline neither forgets an update nor asks every run.
+    The retry window opens before the fetch, so a lookup that stalls past the
+    CLI's wait and dies with the process still counts as a try.
+    """
+    from openswap.cache import MISSING, read_cache, write_cache
+
+    path = _cache_path("update_check.json")
+    cached = read_cache(path, float("inf"), default=None)
+    last = cached.get("latest") if isinstance(cached, dict) else None
+    if isinstance(cached, dict):
+        ttl = CACHE_TTL if cached.get("ok") else RETRY_TTL
+        if read_cache(path, ttl) is not MISSING:
+            return last
+    write_cache(path, {"latest": last, "ok": False})
+    try:
+        latest = _fetch_latest_tag()
+    except Exception:
+        return last
+    write_cache(path, {"latest": latest, "ok": True})
+    return latest
+
+
+def newer_release(current_version: str) -> str | None:
+    """The latest release when it is newer than ``current_version``."""
+    from openswap.bundle import version_key
+
+    latest = latest_release()
+    if latest and version_key(latest) > version_key(current_version):
+        return latest
     return None
+
+
+def upgrade_hint() -> str:
+    """How this install upgrades: Homebrew, the release page, or git and uv."""
+    from openswap import bundle
+
+    if bundle.is_frozen():
+        if bundle.installed_by_homebrew():
+            return f"Upgrade with: {BREW_UPGRADE_COMMAND}"
+        return f"Download it from {RELEASES_URL}"
+    return "Run `openswap upgrade` to update."
+
+
+def check_for_update(current_version: str) -> str | None:
+    """A one-line notice when a newer release exists. Never raises.
+
+    Waits at most ``NOTICE_WAIT_S``: urlopen's timeout does not cover DNS, and
+    a stalled lookup must not hold a finished command open.
+    """
+    notice: list[str] = []
+
+    def check() -> None:
+        try:
+            latest = newer_release(current_version)
+            if latest is not None:
+                notice.append(
+                    f"OpenSwap {latest} is available (you have {current_version}). {upgrade_hint()}"
+                )
+        except Exception:
+            pass
+
+    worker = threading.Thread(target=check, name="openswap-update-check", daemon=True)
+    worker.start()
+    worker.join(NOTICE_WAIT_S)
+    return notice[0] if notice else None
+
+
+def claim_notification(version: str) -> bool:
+    """True the first time ``version`` is announced, so each release notifies once.
+
+    False when that cannot be recorded: better silent than a notice at every login.
+    """
+    from openswap.cache import read_cache, write_cache
+
+    path = _cache_path("update_notified.json")
+    if read_cache(path, float("inf"), default=None) == version:
+        return False
+    try:
+        write_cache(path, version)
+    except OSError:
+        return False
+    return True
 
 
 def _refresh_launch_agents() -> None:

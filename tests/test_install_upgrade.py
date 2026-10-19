@@ -5,18 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from openswap.update_check import INSTALL_COMMAND, check_for_update, run_self_upgrade
 
 
 class TestNoPypi:
-    def test_check_for_update_never_hits_pypi(self, monkeypatch):
-        monkeypatch.setattr(
-            "openswap.update_check._package_is_git_checkout",
-            lambda package_file=None: False,
-        )
-        with patch("urllib.request.urlopen") as mock_urlopen:
+    @pytest.mark.no_release_fetch_fake
+    def test_check_for_update_asks_github_not_pypi(self):
+        from openswap.update_check import LATEST_RELEASE_API
+
+        with patch("urllib.request.urlopen", side_effect=OSError("offline")) as mock_urlopen:
             assert check_for_update("0.3.2") is None
-            mock_urlopen.assert_not_called()
+        assert [c.args[0].full_url for c in mock_urlopen.call_args_list] == [LATEST_RELEASE_API]
 
     def test_run_self_upgrade_pulls_and_reinstalls(self, tmp_path, monkeypatch, capsys):
         repo = tmp_path / "openswap"

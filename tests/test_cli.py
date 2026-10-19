@@ -283,6 +283,20 @@ class TestCLI:
             json_output=False,
         )
 
+    @pytest.mark.parametrize("tty", [True, False])
+    def test_update_notice_only_on_a_terminal(self, tty, capsys):
+        """Scripts and pipes never wait on the release check or see its notice."""
+        with patch("openswap.cli.ClaudeAccountSwitcher"), \
+             patch.object(sys, "argv", ["openswap", "--list"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys.stderr, "isatty", return_value=tty), \
+             patch("openswap.update_check.check_for_update",
+                   return_value="OpenSwap 9.9.9 is available") as check:
+            cli.main()
+
+        assert check.called is tty
+        assert ("OpenSwap 9.9.9 is available" in capsys.readouterr().err) is tty
+
     def test_strategy_best_requires_switch(self, capsys):
         """--strategy should only be accepted alongside --switch."""
         with patch.object(sys, "argv", ["openswap", "--strategy", "best", "--list"]):
