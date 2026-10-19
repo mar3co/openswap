@@ -6,9 +6,6 @@ import json
 import time
 from pathlib import Path
 
-from openswap.paths import get_backup_root
-
-CACHE_DIR = get_backup_root() / "cache"
 
 MISSING = object()
 

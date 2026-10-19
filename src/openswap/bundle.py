@@ -198,7 +198,7 @@ _VERSION = re.compile(
 _PRE_RANK = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2, "pre": 2, "preview": 2}
 
 
-def _version_key(version: str) -> tuple:
+def version_key(version: str) -> tuple:
     """Order versions the way PEP 440 does, as far as the app's own
     versions go: ``1.0.dev1 < 1.0a1 < 1.0a1.post1 < 1.0b1 < 1.0rc1 < 1.0 <
     1.0.post1 < 1.0.1``, and ``1.0a1.dev1 < 1.0a1``. ``alpha``, ``beta``,
@@ -208,6 +208,8 @@ def _version_key(version: str) -> tuple:
     if match is None:
         return ((), -2, (-1,), (0, 0))
     release = tuple(int(part) for part in match.group("release").split("."))
+    while len(release) > 1 and release[-1] == 0:
+        release = release[:-1]  # 1.0 and 1.0.0 are the same release
     pre = match.group("pre")
     dev = match.group("dev_n")
     if pre:
@@ -369,7 +371,7 @@ def move_plan(app: Path, dest_dir: Path, *, home: Path | None = None) -> dict:
                 continue
             version = bundle_version(other)
             if _homebrew_owns(other, home) or (
-                version and mine and _version_key(version) >= _version_key(mine)
+                version and mine and version_key(version) >= version_key(mine)
             ):
                 plan.update(
                     action="open_existing", destination=str(folder), target=str(other),
@@ -383,7 +385,7 @@ def move_plan(app: Path, dest_dir: Path, *, home: Path | None = None) -> dict:
         plan.update(action="open_existing", homebrew=True)
         return plan
     mine = bundle_version(app)
-    if existing and mine and _version_key(existing) >= _version_key(mine):
+    if existing and mine and version_key(existing) >= version_key(mine):
         plan["action"] = "open_existing"
     else:
         plan["action"] = "replace"
@@ -492,7 +494,7 @@ def copy_to_applications(app: Path, plan: dict) -> Path:
     if target.exists():
         existing, mine = bundle_version(target), bundle_version(app)
         if action != "replace" or _homebrew_owns(target) or (
-            existing and mine and _version_key(existing) >= _version_key(mine)
+            existing and mine and version_key(existing) >= version_key(mine)
         ):
             shutil.rmtree(work, ignore_errors=True)
             raise ClaudeSwitchError(
