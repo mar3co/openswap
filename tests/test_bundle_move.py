@@ -237,7 +237,6 @@ def test_each_attempt_stages_in_its_own_folder_and_touches_no_collision(fs):
 ])
 def test_versions_order_with_pre_releases_below_their_release(older, newer):
     assert bundle.version_key(older) < bundle.version_key(newer)
-    assert bundle.version_key(newer) == bundle.version_key(newer)
 
 
 def test_equal_versions_in_different_spellings_compare_equal():
@@ -245,6 +244,7 @@ def test_equal_versions_in_different_spellings_compare_equal():
     assert bundle.version_key("1.0.beta.2") == bundle.version_key("1.0b2")
     assert bundle.version_key("1.0-rc1") == bundle.version_key("1.0c1")
     assert bundle.version_key("v1.0") == bundle.version_key("1.0")
+    assert bundle.version_key("1.0") == bundle.version_key("1.0.0")
 
 
 def test_a_string_that_is_not_a_version_sorts_below_every_version():

@@ -208,6 +208,8 @@ def version_key(version: str) -> tuple:
     if match is None:
         return ((), -2, (-1,), (0, 0))
     release = tuple(int(part) for part in match.group("release").split("."))
+    while len(release) > 1 and release[-1] == 0:
+        release = release[:-1]  # 1.0 and 1.0.0 are the same release
     pre = match.group("pre")
     dev = match.group("dev_n")
     if pre:

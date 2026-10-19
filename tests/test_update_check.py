@@ -299,6 +299,7 @@ class TestCheckForUpdate:
         monkeypatch.setattr("openswap.update_check.newer_release", lambda current: None)
         assert check_for_update("0.2.2") is None
 
+    @pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
     def test_never_raises(self, monkeypatch):
         def boom(current):
             raise RuntimeError("cache dir unwritable")
