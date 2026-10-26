@@ -255,27 +255,26 @@ class DesktopProfiles:
             raise ClaudeDesktopError("The existing Claude profile folder could not be read safely.")
         return True
 
-    def default_available(self) -> bool:
-        return self._default_exists() and not any(p.kind == "default" for p in self.list())
-
-    def add_default(self) -> Profile:
-        """Register/restore the one ordinary Claude profile; never copy its data."""
+    def ensure_default(self) -> Profile | None:
+        """Discover the ordinary profile once; preserve edits and archive state."""
+        existing = next((p for p in self.list(include_archived=True) if p.kind == "default"), None)
+        if existing is not None:
+            return existing
         if not self._default_exists():
-            raise ClaudeDesktopError("Open Claude Desktop and sign in first, then add its existing profile.")
+            return None
         with self._lock():
             rows = self.list(include_archived=True)
             existing = next((p for p in rows if p.kind == "default"), None)
             if existing is not None:
-                profile = replace(existing, archived=False)
-                if profile != existing:
-                    self._save([profile if p.id == profile.id else p for p in rows])
-                return profile
+                return existing
+            if not self._default_exists():
+                return None
             if len(rows) >= 100:
                 raise ClaudeDesktopError("This store already has 100 Claude Desktop profiles.")
             names = {p.name.casefold() for p in rows}
             name = next(n for n in ["Default", *(f"Default ({i})" for i in range(2, 102))] if n.casefold() not in names)
             profile = Profile(uuid.uuid4().hex, name, badge="", kind="default")
-            self._save([*rows, profile])
+            self._save([profile, *rows])
             return profile
 
     def _directories(self, profile: Profile, *, create: bool = False) -> tuple[Path, Path | None]:

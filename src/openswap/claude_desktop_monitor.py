@@ -1,4 +1,4 @@
-"""Background account labels for explicitly added Desktop profiles.
+"""Background account labels for registered Desktop profiles.
 
 Only one worker runs at a time. Main-thread polling applies conditional metadata
 updates; launching/focusing profiles never waits for this worker. File changes

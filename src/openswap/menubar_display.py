@@ -1012,12 +1012,14 @@ def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str]
     disabled = bool(state.get("busy"))
     rows.append({"kind": "profiles_header", "id": "claude_desktop_add", "label": "Profiles",
                  "title": "Add profile" if active else "", "disabled": disabled or bool(state.get("storage_error"))})
-    hint("claude_desktop_separation", "Separate sign-ins, side by side.\nClaude Code switching stays separate.")
+    hint("claude_desktop_separation", "Default is your existing Claude profile. Add profiles for additional sign-ins. Claude Code switching stays separate.")
     if state.get("storage_error"):
         hint("claude_desktop_storage_error_hint", state["storage_error"])
         rows.append({"kind": "button", "id": "claude_desktop_storage_error", "label": "Profile storage",
                      "title": "View details", "disabled": disabled})
     else:
+        if state.get("default_error"):
+            hint("claude_desktop_default_error", state["default_error"])
         rows.append({"kind": "profiles", "id": "claude_desktop_profiles", "items": active, "disabled": disabled})
     if disabled:
         hint("claude_desktop_operation", state.get("operation") or "Working on profile…")
@@ -1051,7 +1053,7 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
         ("open", "Opening profiles", "Open profile brings it forward. Other profiles keep running."),
         ("shortcut", "Shortcuts and icons", "Choose Create shortcut in a profile's menu, then drag it from Finder to the Dock. Claude's running icon stays unchanged."),
         ("signin", "Sign-in", "Sign in inside each profile. Check its account and workspace; Running only means the app is open."),
-        ("details", "Account details", "Add your existing Claude profile as Default, or create a separate one. Email and organization update after sign-in or account changes. Manage automatic updates in Account details."),
+        ("details", "Account details", "Your existing Claude profile appears as Default automatically. Add profile creates an additional sign-in. Email and organization update automatically; macOS may request Keychain access. Manage updates in Account details."),
         ("archive", "Archiving", "Keeps sign-ins, data and open windows. Shortcuts are disabled until restored. Restore does not open the profile."),
         ("limits", "Limitations", "Check the account inside Code and Cowork. Chrome pairing is unavailable. OpenSwap does not verify the account or usage."),
     ):

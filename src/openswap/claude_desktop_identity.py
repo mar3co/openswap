@@ -1,7 +1,7 @@
-"""Account labels from one explicitly registered Claude Desktop cookie store.
+"""Account labels from one registered Claude Desktop cookie store.
 
 No default-profile fallback, Code credentials, writes to Claude's files or token
-refresh. The default profile is read only after the user explicitly adds it.
+refresh. Default is discovered only while Desktop features are enabled.
 Decrypted cookies and the macOS key exist only in memory; only display labels
 and a detection timestamp leave this module. Claude's private bootstrap API and
 Chromium v24 cookie format may change: an unknown shape fails without guessing.

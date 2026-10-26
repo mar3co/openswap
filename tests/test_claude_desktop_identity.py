@@ -108,7 +108,7 @@ def test_default_detection_uses_existing_store_without_falling_back_from_managed
     store, managed, _, app = setup
     store.default_desktop = tmp_path / "existing-Claude"
     store.default_desktop.mkdir()
-    default = store.add_default()
+    default = store.ensure_default()
     desktop = cookie_store(store, default, org=ORG_A)
     before = {p: p.read_bytes() for p in desktop.iterdir()}
     assert identity.detect_account(store, default.id, app=app)["organization"] == "Personal"

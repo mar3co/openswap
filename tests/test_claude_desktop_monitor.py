@@ -1,4 +1,4 @@
-"""Default adoption and automatic identity must preserve logins and user edits."""
+"""Default discovery and automatic identity must preserve logins and user edits."""
 
 import json
 from dataclasses import asdict
@@ -26,54 +26,54 @@ def existing(store):
     (store.default_desktop / "config.json").write_text('{"test": "kept"}')
 
 
-def test_default_is_offered_but_only_added_explicitly(store):
-    assert not store.default_available()
+def test_default_is_discovered_once_without_copying_or_changing_claude_data(store):
+    assert store.ensure_default() is None and not store.root.exists()
     existing(store)
     before = store.default_desktop.stat().st_mode
-    assert store.default_available() and not store.root.exists()
-    profile = store.add_default()
+    profile = store.ensure_default()
     assert profile.name == "Default" and profile.kind == "default" and profile.auto_detect
     assert store.paths(profile) == (store.default_desktop, None)
     assert not (store.root / profile.id).exists()
     assert store.default_desktop.stat().st_mode == before
     assert (store.default_desktop / "config.json").read_text() == '{"test": "kept"}'
-    assert not store.default_available()
-    assert store.add_default() == profile and len(store.list()) == 1
+    saved = store.registry.read_bytes()
+    assert store.ensure_default() == profile and len(store.list()) == 1
+    assert store.registry.read_bytes() == saved
 
 
-def test_default_archive_and_readoption_keep_id_details_and_files(store):
+def test_default_archive_stays_archived_until_explicit_restore(store):
     existing(store)
-    p = store.add_default()
+    p = store.ensure_default()
     store.update(p.id, name="Main", **DETAILS)
-    store.update(p.id, archived=True)
-    assert store.default_available()
-    restored = store.add_default()
+    archived = store.update(p.id, archived=True, auto_detect=False)
+    assert store.ensure_default() == archived and store.list() == []
+    restored = store.update(p.id, archived=False)
     assert restored.id == p.id and restored.name == "Main" and restored.email == DETAILS["email"]
+    assert not restored.auto_detect
     assert store.default_desktop.is_dir() and len(store.list()) == 1
 
 
 def test_default_label_collision_does_not_alias_an_isolated_profile(store):
     existing(store)
     isolated = store.add("Default")
-    default = store.add_default()
+    default = store.ensure_default()
     assert default.name == "Default (2)" and default.id != isolated.id
     assert store.paths(isolated)[0] != store.paths(default)[0]
 
 
 def test_missing_or_linked_default_is_never_recreated_or_followed(store, tmp_path):
-    with pytest.raises(ClaudeDesktopError): store.add_default()
+    assert store.ensure_default() is None
     assert not store.root.exists() and not store.default_desktop.exists()
     actual = tmp_path / "elsewhere"
     actual.mkdir()
     store.default_desktop.symlink_to(actual)
-    with pytest.raises(ClaudeDesktopError): store.default_available()
-    with pytest.raises(ClaudeDesktopError): store.add_default()
+    with pytest.raises(ClaudeDesktopError): store.ensure_default()
     assert list(actual.iterdir()) == []
 
 
 def test_multiple_default_references_fail_closed(store):
     existing(store)
-    store.add_default()
+    store.ensure_default()
     raw = json.loads(store.registry.read_text())
     raw["profiles"].append({**raw["profiles"][0], "id": "f" * 32, "name": "Second"})
     store.registry.write_text(json.dumps(raw))
@@ -104,47 +104,84 @@ def menu(store, answers):
     return controller
 
 
-def test_create_flow_offers_existing_then_reuses_it(store):
+def test_showing_desktop_discovers_default_first_without_opening_or_prompting(store):
     existing(store)
-    controller = menu(store, [SimpleNamespace(clicked=1, choice=0)])
-    controller.add()
-    p = store.list()[0]
-    assert p.kind == "default"
-    controller.open.assert_called_once_with(p.id)
-    assert "Use existing Claude profile (Default)" in controller.prompt.call_args.kwargs["choices"]
-    assert "OpenSwap may request Keychain access" in controller.prompt.call_args.kwargs["message"]
-    controller.monitor.refresh.assert_called_once_with(p.id)
+    extra = store.add("Work")
+    controller = menu(store, [])
+    state = controller.settings_state()
+    default = store.ensure_default()
+    assert [p["id"] for p in state["items"]] == [default.id, extra.id]
+    controller.prompt.assert_not_called()
+    controller.open.assert_not_called()
+    controller.monitor.detector.assert_not_called()
+    saved = store.registry.read_bytes()
+    controller.settings_state()
+    assert store.registry.read_bytes() == saved
 
 
-def test_create_flow_new_choice_creates_separate_empty_storage(store):
+def test_default_discovery_waits_for_enabled_feature_and_existing_directory(store):
+    controller = menu(store, [])
+    controller.enabled = lambda: False
     existing(store)
-    controller = menu(store, [SimpleNamespace(clicked=1, choice=1), SimpleNamespace(clicked=1, text="Client")])
+    assert controller.settings_state()["items"] == [] and not store.root.exists()
+    controller.enabled = lambda: True
+    assert controller.settings_state()["items"][0]["kind"] == "default"
+
+
+def test_default_appears_when_claude_is_first_used_later(store):
+    controller = menu(store, [])
+    assert controller.settings_state()["items"] == []
+    existing(store)
+    assert controller.settings_state()["items"][0]["name"] == "Default"
+
+
+def test_add_profile_always_creates_additional_empty_storage_in_one_step(store):
+    existing(store)
+    controller = menu(store, [SimpleNamespace(clicked=1, text="Client")])
+    default = controller.settings_state()["items"][0]
     controller.add()
-    p = store.list()[0]
-    assert p.kind == "managed" and p.name == "Client" and p.auto_detect
+    p = store.get("Client")
+    assert p.kind == "managed" and p.auto_detect and p.id != default["id"]
     assert list(store.paths(p)[0].iterdir()) == []
     controller.open.assert_called_once_with(p.id)
-    assert controller.prompt.call_args.kwargs["title"] == "Create Claude Desktop profile"
-    assert "After sign-in, OpenSwap may request Keychain access" in controller.prompt.call_args.kwargs["message"]
+    assert controller.prompt.call_count == 1
+    assert "choices" not in controller.prompt.call_args.kwargs
+    assert "additional Claude window" in controller.prompt.call_args.kwargs["message"]
+    assert "OpenSwap may request Keychain access" in controller.prompt.call_args.kwargs["message"]
 
 
-@pytest.mark.parametrize("second", [False, True])
-def test_cancel_either_create_step_keeps_existing_login_and_empty_registry(store, second):
+def test_cancel_add_keeps_default_and_does_not_create_another_profile(store):
     existing(store)
-    answers = ([SimpleNamespace(clicked=1, choice=1)] if second else []) + [SimpleNamespace(clicked=0)]
-    controller = menu(store, answers)
+    controller = menu(store, [SimpleNamespace(clicked=0)])
+    default = controller.settings_state()["items"][0]
+    saved = store.registry.read_bytes()
     controller.add()
-    assert store.list() == [] and not store.root.exists()
+    assert store.registry.read_bytes() == saved
+    assert len(store.list()) == 1 and store.list()[0].id == default["id"]
     assert (store.default_desktop / "config.json").read_text() == '{"test": "kept"}'
     controller.open.assert_not_called()
 
 
-def test_registered_default_is_not_offered_twice(store):
-    existing(store)
-    store.add_default()
-    controller = menu(store, [SimpleNamespace(clicked=0)])
+def test_unreadable_default_does_not_block_additional_profiles(store, tmp_path):
+    actual = tmp_path / "elsewhere"
+    actual.mkdir()
+    store.default_desktop.symlink_to(actual)
+    controller = menu(store, [SimpleNamespace(clicked=1, text="Work")])
+    state = controller.settings_state()
+    assert state["default_error"] and "storage_error" not in state
     controller.add()
-    assert "choices" not in controller.prompt.call_args.kwargs
+    assert store.get("Work").kind == "managed" and list(actual.iterdir()) == []
+
+
+def test_renamed_archived_default_is_not_duplicated_or_unarchived_by_ui(store):
+    existing(store)
+    p = store.ensure_default()
+    store.update(p.id, name="Home", archived=True, auto_detect=False, **DETAILS)
+    controller = menu(store, [])
+    state = controller.settings_state()
+    assert len(state["items"]) == 1 and state["archived"] == 1
+    assert state["items"][0]["name"] == "Home" and not state["items"][0]["auto_detect"]
+    assert state["items"][0]["email"] == DETAILS["email"]
 
 
 @pytest.fixture

@@ -67,12 +67,25 @@ class ClaudeDesktopMenu:
         self.checking = False
         self.monitor.suspend()
 
+    def _profiles(self):
+        self._default_error = ""
+        if self.enabled():
+            try:
+                self.store.ensure_default()
+            except (ClaudeSwitchError, OSError):
+                # Discovery cannot prevent managing separate profiles. Invalid
+                # registry metadata is still surfaced by list() below.
+                self._default_error = "Could not show the existing Claude profile. Check its folder permissions."
+        return sorted(self.store.list(include_archived=True), key=lambda p: p.kind != "default")
+
     def settings_state(self):
         state = {"checking": self.checking, "busy": self.busy or self.blocked(),
                  "operation": self.operation if self.busy else "Waiting for app switch…",
                  "app_message": "Checking Claude Desktop…" if self.checking else self._app_message}
         try:
-            profiles = self.store.list(include_archived=True)
+            profiles = self._profiles()
+            if self._default_error:
+                state["default_error"] = self._default_error
             state.update(profiles=sum(not p.archived for p in profiles),
                          archived=sum(p.archived for p in profiles),
                          items=[{**asdict(p), "status": self._profile_states.get(p.id, ""),
@@ -127,7 +140,7 @@ class ClaudeDesktopMenu:
             return menu
         menu.add(rumps.MenuItem("Add profile…", callback=self.add))
         try:
-            profiles = self.store.list(include_archived=True)
+            profiles = self._profiles()
         except (ClaudeSwitchError, OSError):
             menu.add(rumps.MenuItem("Profile storage needs attention…", callback=self.storage_error))
             return menu
@@ -208,37 +221,15 @@ class ClaudeDesktopMenu:
     def add(self, _=None):
         if self.busy or self.blocked() or not self.enabled():
             return
-        try:
-            available = self.store.default_available()
-        except (ClaudeSwitchError, OSError):
-            available = False  # an unreadable existing profile cannot block creating a separate one
-        if available:
-            response = self.prompt(
-                title="Add Claude Desktop profile",
-                message="Use your existing Claude login or create a separate profile.\n\nOpenSwap may request Keychain access to show your email and organization. If denied, choose Account details → Detect to retry.",
-                choices=["Use existing Claude profile (Default)", "Create a separate profile"], selected=0,
-                ok="Continue", cancel="Cancel",
-            )
-            if response.clicked != 1 or response.choice not in (0, 1):
-                return
-            if self.busy or self.blocked() or not self.enabled():
-                return
-            if response.choice == 0:
-                try:
-                    profile = self.store.add_default()
-                except (ClaudeSwitchError, OSError) as exc:
-                    self._error(exc)
-                    return
-                self.monitor.refresh(profile.id)
-                self.open(profile.id)
-                return
         response = self.prompt(
             title="Create Claude Desktop profile",
-            message="Create a separate Claude window with its own sign-in.\n\nAfter sign-in, OpenSwap may request Keychain access to show your email and organization. If denied, choose Account details → Detect to retry.",
+            message="Create an additional Claude window with its own sign-in.\n\nAfter sign-in, OpenSwap may request Keychain access to show your email and organization. If denied, choose Account details → Detect to retry.",
             input_label="Profile name", placeholder="e.g. Work",
             default_text="", ok="Create and open", cancel="Cancel",
         )
         if response.clicked != 1:
+            return
+        if self.busy or self.blocked() or not self.enabled():
             return
         try:
             profile = self.store.add(response.text)

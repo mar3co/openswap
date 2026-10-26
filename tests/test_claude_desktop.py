@@ -254,7 +254,7 @@ def test_already_running_profile_is_reused_not_restarted(store, app):
 def test_default_profile_focuses_ordinary_claude_and_never_an_isolated_instance(store, app, tmp_path, suffix):
     store.default_desktop = tmp_path / "existing"
     store.default_desktop.mkdir()
-    p = store.add_default()
+    p = store.ensure_default()
     app.run.return_value.stdout = f"42 {app.binary}{suffix}\n43 {app.binary} --user-data-dir=/isolated\n"
     assert store.open(p.id, app=app)["pid"] == 42
     assert app.profile_states(store)[p.id] == "Running"
@@ -264,7 +264,7 @@ def test_default_profile_focuses_ordinary_claude_and_never_an_isolated_instance(
 def test_default_profile_launch_does_not_override_code_or_desktop_storage(store, app, tmp_path):
     store.default_desktop = tmp_path / "existing"
     store.default_desktop.mkdir()
-    p = store.add_default()
+    p = store.ensure_default()
     proc = Mock(pid=42)
     proc.wait.side_effect = [subprocess.TimeoutExpired("Claude", .75), 0]
     app.popen.return_value = proc
@@ -279,7 +279,7 @@ def test_default_profile_launch_does_not_override_code_or_desktop_storage(store,
 def test_external_claude_work_folder_is_not_the_default_profile(store, app, tmp_path, separator):
     store.default_desktop = tmp_path / "Claude"
     store.default_desktop.mkdir()
-    p = store.add_default()
+    p = store.ensure_default()
     app.run.return_value.stdout = f"43 {app.binary} --user-data-dir{separator}{store.default_desktop}-Work\n"
     assert app.profile_states(store)[p.id] == "Not running"
 

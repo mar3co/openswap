@@ -10,11 +10,11 @@ rotation. A profile name is your label, not a verified account identity.
 
 1. Install the official Claude app in `/Applications/Claude.app`.
 2. Turn on **Settings → General → Enable desktop app features**.
-3. Open the **Claude Desktop** tab on the main screen and choose **Add profile**.
-   If Claude already has a profile on this Mac, choose **Use existing Claude
-   profile (Default)** or **Create a separate profile**. A separate profile needs
-   a name, such as Personal or Work, before **Create and open**.
-4. Default reuses your existing Claude window and sign-in. For a separate
+3. Open the **Claude Desktop** tab on the main screen. Your existing Claude
+   profile appears first as **Default**, ready to open. Use **Add profile** only
+   for an additional session: enter a name such as Personal or Work, then choose
+   **Create and open**.
+4. Default reuses your existing Claude window and sign-in. For an additional
    profile, sign in inside its new window. Email and organization appear
    automatically after detection succeeds.
 5. Open that profile's **•••** menu and choose **Create shortcut…**. Choose a number from
@@ -44,12 +44,16 @@ create an Anthropic account or subscription.
 
 ## Default profile and automatic account details
 
-Default is added only through **Add profile → Use existing Claude profile
-(Default)**. OpenSwap never adds it just because it exists. The existing data
+With Desktop features enabled, the profile list discovers the existing Claude
+data folder and shows it as **Default** automatically. Discovery saves a
+reference, without opening Claude or reading credentials. The existing data
 stays in `~/Library/Application Support/Claude`; its permissions and sign-in are
 unchanged. Default uses the normal Claude launch without a separate data folder
-or Code environment overrides. It is saved only once, even if renamed. Adding
-it again after archiving restores the same profile and shortcuts.
+or Code environment overrides. It is saved only once, even if renamed. Archived
+Default profiles stay archived until explicitly restored from Archived profiles.
+If Claude has not created its default folder yet, no empty replacement is made;
+Default appears when the list is next shown after Claude has been used.
+**Add profile** always creates an additional isolated session.
 
 While Desktop features are enabled, OpenSwap watches registered profiles for
 new sign-ins, sign-outs and account/organization changes. Changed profile files
@@ -228,8 +232,8 @@ The inspected Claude Desktop version is **3.6556.2**, bundle
   selected Claude session cookies go to the fixed HTTPS `/api/bootstrap`
   endpoint, with redirects refused and bounded response size/timeouts. The
   selected organization must match an account membership; account or cookie
-  changes during the request reject the result. Default is read only when
-  explicitly registered; a separate profile never falls back to Default or CLI
+  changes during the request reject the result. Default is discovered only with
+  Desktop features enabled; a separate profile never falls back to Default or CLI
   identity. Background results use conditional writes and a final file-change
   check so manual edits and newer logins win. Unknown formats, blocked requests and denied Keychain
   access leave manual labels usable.
@@ -284,6 +288,15 @@ It is running locally with settings and the Homebrew login item preserved.
 The password dialog's displayed requester and real signed-in detection still
 need user verification; this local build is ad hoc signed, not a notarized
 release or proof that Keychain trust persists across release updates.
+
+The automatic-Default follow-up passed **836 focused tests** (the same three
+CI-only tests skipped). Coverage includes discovery only when enabled, late
+creation of Claude's default folder, idempotence, existing names and settings,
+archived defaults, unreadable folders, and the single-step additional-profile
+flow. Native light/dark renders cover the main list, settings/help, errors and
+the simplified create dialog. The refreshed packaged DEV app passed signature
+verification and the native absent-item lookup, then restarted with the saved
+settings and Homebrew login item preserved.
 
 Observed on October 26, 2026: a disposable native launcher was compiled and
 signed, rendered its numbered Claude icon, launched through Finder, preserved
