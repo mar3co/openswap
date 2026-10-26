@@ -815,10 +815,6 @@ class _CardView(NSView):
     def canBecomeKeyView(self):
         return True
 
-    def becomeFirstResponder(self):
-        self.scrollRectToVisible_(self.bounds())
-        return objc.super(_CardView, self).becomeFirstResponder()
-
     def viewDidChangeEffectiveAppearance(self):
         objc.super(_CardView, self).viewDidChangeEffectiveAppearance()
         self.setNeedsDisplay_(True)
@@ -1136,6 +1132,7 @@ class MenuBarPanel:
 
     def close(self) -> None:
         self._page = MAIN_PAGE
+        self._card_scroll = None
         self._release_token_field()
         self._clear_dismiss_watchers()
         if self._popover is not None and self._popover.isShown():
@@ -1549,6 +1546,7 @@ class MenuBarPanel:
         snap = self._snapshot()
         all_cards = panel_accounts(snap)
         provider = self._selected_provider
+        offset = self._take_card_list_offset(provider)
         settings = self._settings() if callable(self._settings) else None
         if settings is None:
             settings = MenuBarSettings()
@@ -1843,15 +1841,16 @@ class MenuBarPanel:
                     )
                     secondary_btn.setEnabled_(self._on_empty_action is not None)
         else:
-            offset = self._take_card_list_offset(provider)
             list_view, card_x = root, PAD
             if scrolls:
-                scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(PAD, y, inner_w, body_h))
+                # The list reaches into the right margin so the overlay
+                # scroller sits beside the cards, not over their ··· buttons.
+                scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(PAD, y, inner_w + PAD, body_h))
                 scroll.setDrawsBackground_(False)
                 scroll.setHasVerticalScroller_(True)
                 scroll.setAutohidesScrollers_(True)
                 scroll.setScrollerStyle_(NSScrollerStyleOverlay)
-                list_view = _FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, inner_w, content_h))
+                list_view = _FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, inner_w + PAD, content_h))
                 scroll.setDocumentView_(list_view)
                 root.addSubview_(scroll)
                 self._card_scroll = scroll
