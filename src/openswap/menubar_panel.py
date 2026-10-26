@@ -43,10 +43,13 @@ from AppKit import (
     NSPopover,
     NSPopoverBehaviorApplicationDefined,
     NSRectEdgeMinY,
+    NSScrollerStyleOverlay,
+    NSScrollView,
     NSSecureTextField,
     NSTextField,
     NSTrackingArea,
     NSTrackingActiveAlways,
+    NSTrackingInVisibleRect,
     NSTrackingMouseEnteredAndExited,
     NSView,
     NSViewController,
@@ -93,6 +96,7 @@ from openswap.menubar import (
     HEADER_TITLE_H,
     MAIN_PAGE,
     MenuBarSettings,
+    PANEL_SCREEN_MARGIN,
     PANEL_WIDTH,
     POPOVER_AUTO_CLOSE_S,
     SETTINGS_PAGE,
@@ -112,6 +116,8 @@ from openswap.menubar import (
     provider_tab_title,
     resolve_popover_theme,
     card_badge_text,
+    card_list_height,
+    kept_card_list_offset,
     card_menu_items,
     card_title_suffix,
     chatgpt_tab_desktop,
@@ -841,7 +847,7 @@ class _CardView(NSView):
         areas = list(self.trackingAreas() or [])
         for area in areas:
             self.removeTrackingArea_(area)
-        options = NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
+        options = NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
         area = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
             self.bounds(), options, self, None
         )
@@ -903,6 +909,13 @@ class _CardView(NSView):
             and not self.card.get("activation_disabled")
         ):
             self.on_switch(self.card["num"])
+
+
+class _FlippedView(NSView):
+    """Holds a scrolling card list, top-down like the rest of the panel."""
+
+    def isFlipped(self):
+        return True
 
 
 class _RootView(NSVisualEffectView):
@@ -1043,6 +1056,8 @@ class MenuBarPanel:
         self._item = None
         self._popover = None
         self._controller = None
+        self._card_scroll = None
+        self._card_scroll_provider = None
         self._tramps: list = []
         self._toggle_tramp = None
         self._appearance_obs = None
@@ -1199,6 +1214,23 @@ class MenuBarPanel:
             )
         except Exception:
             return None
+
+    def _available_panel_height(self) -> float | None:
+        button = self._item.button() if self._item is not None else None
+        window = button.window() if button is not None else None
+        screen = window.screen() if window is not None else None
+        if screen is None:
+            return None
+        return screen.visibleFrame().size.height - PANEL_SCREEN_MARGIN
+
+    def _take_card_list_offset(self, provider: str) -> float:
+        """Where the open popover's card list was scrolled, to keep it there."""
+        scroll, self._card_scroll = self._card_scroll, None
+        return kept_card_list_offset(
+            scroll.contentView().bounds().origin.y if scroll is not None else None,
+            same_provider=provider == self._card_scroll_provider,
+            shown=self.is_shown(),
+        )
 
     def _pointer_over_status_item(self) -> bool:
         rect = self._status_item_screen_rect()
@@ -1513,6 +1545,7 @@ class MenuBarPanel:
         snap = self._snapshot()
         all_cards = panel_accounts(snap)
         provider = self._selected_provider
+        list_offset = self._take_card_list_offset(provider)
         settings = self._settings() if callable(self._settings) else None
         if settings is None:
             settings = MenuBarSettings()
@@ -1575,7 +1608,12 @@ class MenuBarPanel:
         # footer row at all.
         show_footer = bool(cards)
         footer_h = FOOTER_H if show_footer else 0.0
-        height = PAD + HEADER_H + TAB_H + hold_h + info_h + 4 + body_h + PAD + running_h + status_h + footer_h
+        chrome_h = PAD + HEADER_H + TAB_H + hold_h + info_h + 4 + PAD + running_h + status_h + footer_h
+        content_h = body_h
+        scrolls = False
+        if cards and not login_view:
+            body_h, scrolls = card_list_height(content_h, chrome_h, self._available_panel_height())
+        height = chrome_h + body_h
         root = _RootView.alloc().initWithHover_(self._on_hover)
         root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, height))
         root.setMaterial_(NSVisualEffectMaterialMenu)
@@ -1802,12 +1840,27 @@ class MenuBarPanel:
                     )
                     secondary_btn.setEnabled_(self._on_empty_action is not None)
         else:
+            list_view, card_x = root, PAD
+            if scrolls:
+                # The list reaches into the right margin so the overlay
+                # scroller clears the cards' ··· buttons.
+                scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(PAD, y, inner_w + PAD, body_h))
+                scroll.setDrawsBackground_(False)
+                scroll.setHasVerticalScroller_(True)
+                scroll.setAutohidesScrollers_(True)
+                scroll.setScrollerStyle_(NSScrollerStyleOverlay)
+                list_view = _FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, inner_w + PAD, content_h))
+                scroll.setDocumentView_(list_view)
+                root.addSubview_(scroll)
+                self._card_scroll = scroll
+                self._card_scroll_provider = provider
+                card_x, y = 0.0, 0.0
             for card in cards:
                 card_h = _card_height(card)
                 card_view = _CardView.alloc().initWithCard_onSwitch_(
                     card, self._on_switch
                 )
-                card_view.setFrame_(NSMakeRect(PAD, y, inner_w, card_h))
+                card_view.setFrame_(NSMakeRect(card_x, y, inner_w, card_h))
                 if card.get("disabled") or card.get("activation_disabled"):
                     card_view.setAlphaValue_(0.45)
 
@@ -1935,8 +1988,10 @@ class MenuBarPanel:
                     )
                     row_y += ROW_H
 
-                root.addSubview_(card_view)
+                list_view.addSubview_(card_view)
                 y += card_h + CARD_GAP
+            if scrolls:
+                list_view.scrollPoint_((0, list_offset))
 
         # Footer
         fy = height - footer_h
