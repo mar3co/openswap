@@ -23,7 +23,7 @@ rotation. A profile name is your label, not a verified account identity.
 With Desktop features enabled, the main tabs are **Claude Code**, **Claude Desktop**,
 and **Codex**. Turning Desktop features off hides the Claude Desktop tab.
 Each profile has an **Open** button and a **•••** menu for **Create shortcut…**,
-**Rename…**, and **Archive…**. The same actions are available under
+**Account details…**, **Rename…**, and **Archive…**. The same actions are available under
 **More → Claude Desktop profiles**. App checks and **About profiles** help remain
 under **Settings → Desktop → Claude Desktop**. The gear button on the Claude
 Desktop tab opens those settings; Back returns to the profile list.
@@ -33,10 +33,32 @@ it. Other profile windows stay open. Neither opening a profile nor using its
 shortcut changes the default Code login in your terminal or editor. Desktop
 profiles have no automatic rotation, and do not require saved Code accounts.
 
-Claude handles sign-in inside each profile. OpenSwap does not copy credentials
-or import the default Claude profile. The personal/Team/Enterprise selection
+Claude handles sign-in inside each profile. OpenSwap does not transfer credentials
+between profiles or import the default Claude profile. The personal/Team/Enterprise selection
 within one email still happens inside Claude. Creating a profile does not
 create an Anthropic account or subscription.
+
+## Optional account details
+
+Choose **••• → Account details…** on a profile. Email and Organization are
+optional labels shown beneath its name. Enter them yourself, or click **Detect**
+after signing in inside that profile. Review the detected values and choose
+**Save**. Cancel leaves the saved details unchanged; blank fields clear them.
+
+Detection runs only when requested. macOS may ask for access to **Claude Safe
+Storage** in Keychain. OpenSwap reads that profile's saved sign-in and requests
+its account details from Claude. It does not sign in, switch accounts, refresh
+tokens, or change Claude's files. Failed detection keeps the form available for
+manual entry. Opening a profile and checking running status do not read sign-ins.
+
+Detected labels are a **last detected** snapshot, not a live sign-in indicator.
+The dialog and label tooltip show their source; editing either field removes
+the detection timestamp. Detect again after switching accounts inside Claude.
+Code and Cowork identity must still be checked inside those features.
+
+Several profiles can use the **same email**, including different organizations.
+Neither email nor organization is a unique key. Renaming, archiving and restoring
+keep the profile's ID, data, shortcuts and account labels.
 
 ## What the shortcut and icon do
 
@@ -125,14 +147,14 @@ path and respect archived profiles. Launch and shortcut creation require macOS.
 Profile data lives in `~/Library/Application Support/OpenSwap Claude Desktop/`:
 
 - `profiles.json`: versioned labels, stable IDs, archive flags and badge settings;
-  no tokens or Code account associations.
+  optional email/organization labels and a last-detected timestamp; no tokens or Code account associations.
 - `<id>/desktop/`: Claude-owned desktop data, including local sessions.
 - `<id>/code/`: a separate `CLAUDE_CONFIG_DIR` and Keychain namespace.
 
 These private folders can contain conversations and credentials created by
-Claude. Do not share them as a diagnostic attachment. Profile version 1 and the
-unreleased linked-selection version 2 are readable. Their next save upgrades
-metadata to version 3, preserving IDs, data and archives while discarding old
+Claude. Do not share them as a diagnostic attachment. Profile versions 1–3, including the
+unreleased linked-selection version 2, are readable. Their next save upgrades
+metadata to version 4, preserving IDs, data and archives while discarding old
 account-link metadata. No account credentials are changed during migration.
 
 A failed launch keeps the profile. Corrupt/newer metadata and missing data
@@ -163,6 +185,17 @@ The inspected Claude Desktop version is **3.6556.2**, bundle
 - Profile locks serialize management and launch checks. Matching processes are
   reused. Conflicting or uncertain process state is refused; user processes
   are never killed. Launch always reports `identity_verified: false`.
+- On-demand detection supports the inspected Chromium v24 cookie schema and
+  macOS v10 encryption. It checks the signed Claude app, reads only the selected
+  managed profile, and uses a private temporary copy of the original DB/WAL so
+  SQLite cannot create sidecars in Claude's folder. The copy is removed after
+  reading. Decrypted cookies and the Keychain key stay in memory. Only the
+  selected Claude session cookies go to the fixed HTTPS `/api/bootstrap`
+  endpoint, with redirects refused and bounded response size/timeouts. The
+  selected organization must match an account membership; account or cookie
+  changes during the request reject the result. There is no default-profile or
+  CLI identity fallback. Unknown formats, blocked requests and denied Keychain
+  access leave manual labels usable.
 - Shortcuts use Apple's `osacompile` applets. Shell arguments and AppleScript
   strings are escaped independently. Icons are rendered locally from the
   installed app's icon at all ICNS sizes. Only the generated launcher receives
@@ -173,6 +206,9 @@ References: [Apple's script applications](https://developer.apple.com/library/ar
 [Electron data paths](https://www.electronjs.org/docs/latest/api/app), and
 read-only inspection of the installed Claude app. These mechanisms do not
 constitute Anthropic endorsement or authenticated compatibility proof.
+Detection also follows Chromium's [macOS cookie encryption](https://chromium.googlesource.com/chromium/src/+/93d0dcd55046ac06154f4d642c26d7697c4b0304/components/os_crypt/sync/os_crypt_mac.mm)
+and [v24 domain binding](https://chromium.googlesource.com/chromium/src/+/5ea6d65c622a3d5ff75db9dc0257ea3869f31289%5E%21/).
+Claude's bootstrap endpoint is private and may change.
 
 Local tests cover private profile storage, concurrency, corrupt metadata,
 symlinks/hardlinks, publisher refusal, launch reuse and failure, independent
@@ -181,6 +217,15 @@ collisions, failed-update recovery, shell escaping, and CLI/UI dispatch.
 The relevant local regression selection passed **1,937 tests** on October 26,
 2026, covering profile/shortcut commands, settings, menu bar behavior, Code
 switching/rotation, and uninstall preservation.
+
+The account-details follow-up passed **744 focused tests** and **15 native dialog
+tests**. It covers selected-organization matching, same-email profiles, cookie
+isolation and WAL reads, account changes during detection, denied Keychain
+access, malformed responses, redirects, canceled dialogs, manual edits and
+metadata migration. Light/dark native renders cover the new fields and profile
+rows, long labels, archived profiles and scrolling. Only the Keychain item's
+name/account label was checked live; no real sign-in was read or sent during
+these tests.
 
 Observed on October 26, 2026: a disposable native launcher was compiled and
 signed, rendered its numbered Claude icon, launched through Finder, preserved
@@ -211,6 +256,11 @@ compatibility from a successful launch.
 
 Before claiming authenticated account support:
 
+- Detect details in two signed-in profiles, including the same email with
+  different selected organizations. Check Keychain allow/deny, expired sign-in,
+  organization switching, same-profile sign-out/sign-in, and application updates.
+  Automated fixtures and a real CommonCrypto/OpenSSL vector verify the reader;
+  authenticated detection still needs a live profile test.
 - Sign into two different accounts and verify email, organization and restart
   persistence in each profile. Exercise Google, magic-link and organization SSO
   callbacks with another profile/default Claude already running.

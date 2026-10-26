@@ -124,6 +124,20 @@ def test_prompt_preserves_text_and_literal_percent_signs():
     assert dialog.buttons[-1].nextKeyView() == dialog.textfield
 
 
+def test_account_details_fields_share_a_dialog_and_preserve_drafts():
+    dialog = make_dialog_prompt(title="Account details · Work", message="Optional labels.",
+                               fields=[("Email (optional)", "same@example.test"), ("Organization (optional)", "Acme")],
+                               ok="Save", cancel="Cancel", other="Detect")
+    assert dialog.textfield is None and len(dialog.fields) == 2
+    assert dialog.fields[0].nextKeyView() == dialog.fields[1]
+    assert dialog.fields[1].nextKeyView() == dialog.buttons[0]
+    assert dialog.buttons[-1].nextKeyView() == dialog.fields[0]
+    for field in dialog.fields:
+        assert field.frame().origin.y + field.frame().size.height < dialog.surface.footer_y
+    response = _run_with_action(dialog, lambda: dialog.buttons[0].performClick_(None))
+    assert response.clicked == -1 and response.values == ("same@example.test", "Acme")
+
+
 class DialogTestDriver(NSObject):
     def fire_(self, timer):
         try:

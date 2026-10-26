@@ -7,7 +7,7 @@ import threading
 from dataclasses import asdict
 from datetime import datetime
 
-from openswap.claude_desktop import BADGE_COLORS, BUNDLE_ID, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, validate_badge
+from openswap.claude_desktop import BADGE_COLORS, BUNDLE_ID, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, account_label, validate_badge
 from openswap.exceptions import ClaudeSwitchError
 
 
@@ -34,7 +34,7 @@ def has_saved_profiles() -> bool:
 
 class ClaudeDesktopMenu:
     def __init__(self, *, prompt, show_error, changed, notify, store=None, app_factory=None, show_status=None, enabled=None,
-                 blocked=None, shortcut_factory=None, reveal=None, confirm=None):
+                 blocked=None, shortcut_factory=None, reveal=None, confirm=None, detector=None):
         self.store = store or DesktopProfiles()
         self.prompt = prompt
         self.show_error = show_error
@@ -46,6 +46,7 @@ class ClaudeDesktopMenu:
         self.shortcut_factory = shortcut_factory
         self.reveal = reveal or reveal_shortcut
         self.confirm = confirm
+        self.detector = detector
         self.operation = "Opening Claude…"
         self.busy = False
         self._results = queue.SimpleQueue()
@@ -139,6 +140,7 @@ class ClaudeDesktopMenu:
             item.add(rumps.MenuItem("Open profile",
                                    callback=lambda _, p=profile: self.open(p.id)))
             item.add(rumps.MenuItem("Rename…", callback=lambda _, p=profile: self.rename(p)))
+            item.add(rumps.MenuItem("Account details…", callback=lambda _, p=profile: self.details(p)))
             item.add(rumps.MenuItem("Archive…", callback=lambda _, p=profile: self.archive(p)))
             item.add(rumps.MenuItem("Create shortcut…", callback=lambda _, p=profile: self.shortcut(p)))
             self._add_status(item, profile, rumps)
@@ -153,6 +155,9 @@ class ClaudeDesktopMenu:
         label = f"{state} at {checked_at}" if state and checked_at else "Running status not checked"
         item.add(rumps.MenuItem(label, callback=None))
         item.add(rumps.MenuItem("Sign-in: Check inside Claude", callback=None))
+        if profile.email or profile.organization:
+            item.add(rumps.MenuItem(" · ".join(x for x in (profile.email, profile.organization) if x), callback=None))
+            item.add(rumps.MenuItem("Last detected details" if profile.detected_at else "Your account labels", callback=None))
 
     def storage_error(self, _=None):
         try:
@@ -172,7 +177,7 @@ class ClaudeDesktopMenu:
             return self.add()
         if action == "storage_error":
             return self.storage_error()
-        if action not in {"open", "rename", "archive", "restore", "shortcut"}:
+        if action not in {"open", "rename", "archive", "restore", "shortcut", "details"}:
             return
         try:
             profile = self.store.get(identifier, include_archived=action == "restore")
@@ -218,6 +223,72 @@ class ClaudeDesktopMenu:
                                default_text=profile.name, ok="Save", cancel="Cancel")
         if response.clicked == 1:
             self.edit(profile, name=response.text)
+
+    def details(self, profile, *, draft=None, note=""):
+        if self.busy or self.blocked() or not self.enabled():
+            return
+        values = draft or {"email": profile.email, "organization": profile.organization,
+                           "detected_at": profile.detected_at}
+        while True:
+            message = note or "Optional labels. Detect uses this profile's saved sign-in; macOS may ask for Keychain access."
+            if values.get("detected_at"):
+                when = datetime.fromisoformat(values["detected_at"]).astimezone().strftime("%b %d, %H:%M")
+                message += f"\nLast detected {when}. The account may have changed."
+            response = self.prompt(title=f"Account details · {profile.name}", message=message,
+                                   fields=[("Email (optional)", values["email"]),
+                                           ("Organization (optional)", values["organization"])],
+                                   ok="Save", cancel="Cancel", other="Detect")
+            if response.clicked not in (1, -1):
+                return
+            if self.busy or self.blocked() or not self.enabled():
+                return
+            email, organization = response.values
+            detected_at = values.get("detected_at", "") if (email, organization) == (values["email"], values["organization"]) else ""
+            values = {"email": email, "organization": organization, "detected_at": detected_at}
+            if response.clicked == -1:
+                self._detect(profile.id, values)
+                return
+            try:
+                values["email"] = account_label(email, email=True)
+                values["organization"] = account_label(organization)
+            except ClaudeSwitchError as exc:
+                note = str(exc)
+                continue
+            try:
+                # Re-resolve: external CLI edits may archive the profile while
+                # a modal is open. Labels never unarchive or rename it.
+                self.store.get(profile.id)
+                self.store.update(profile.id, **values)
+            except (ClaudeSwitchError, OSError) as exc:
+                self._error(exc)
+                return
+            self.changed()
+            return
+
+    def _detect(self, identifier, draft):
+        if self.busy or self.blocked() or not self.enabled():
+            return
+        from openswap.claude_desktop_identity import DetectionError, detect_account
+        self.busy = True
+        self.operation = "Detecting account…"
+        self.changed()
+
+        def work():
+            result = {"state": "account_details", "identifier": identifier, "draft": draft}
+            try:
+                result["draft"] = (self.detector or detect_account)(self.store, identifier)
+            except DetectionError as exc:
+                result["note"] = str(exc)
+            except Exception:
+                result["note"] = "Could not detect the account. Sign in inside this profile and allow Keychain access, or enter the details yourself."
+            self._results.put((result, None))
+
+        try:
+            threading.Thread(target=work, daemon=True, name="claude-desktop-identity").start()
+        except Exception:
+            self.busy = False
+            self.changed()
+            self.show_error("Could not start account detection. Try again.")
 
     def edit(self, profile, **changes):
         if self.busy or self.blocked() or not self.enabled():
@@ -311,6 +382,15 @@ class ClaudeDesktopMenu:
         self.changed()
         if error is not None:
             self._error(error)
+            return
+        if result.get("state") == "account_details":
+            if not self.enabled() or self.blocked():
+                return
+            try:
+                profile = self.store.get(result["identifier"])
+            except (ClaudeSwitchError, OSError):
+                return
+            self.details(profile, draft=result["draft"], note=result.get("note", ""))
             return
         if result.get("state") == "shortcut_created":
             try:

@@ -1423,7 +1423,7 @@ class MenuBarPanel:
         # Dispatch after the native menu closes so dialogs and reloads cannot
         # replace its anchor or deallocate callbacks during menu tracking.
         tramps = []
-        for title, action in (("Create shortcut…", "shortcut"), ("Rename…", "rename"), ("Archive…", "archive")):
+        for title, action in (("Account details…", "details"), ("Create shortcut…", "shortcut"), ("Rename…", "rename"), ("Archive…", "archive")):
             item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, "act:", "")
             tramp = _Trampoline.alloc().initWithCallback_(lambda _, a=action: selected.append(a))
             tramps.append(tramp)
@@ -2180,7 +2180,7 @@ class MenuBarPanel:
 
         def row_height(row):
             if row["kind"] == "profiles":
-                return 58.0 * len(row["items"]) if row["items"] else 88.0
+                return sum(76.0 if p.get("email") or p.get("organization") else 58.0 for p in row["items"]) if row["items"] else 88.0
             if row["kind"] == "group":
                 return 34.0 + 14.0 * max(0, row.get("lines", 2) - 2)
             return 30.0
@@ -2259,8 +2259,10 @@ class MenuBarPanel:
             button.setEnabled_(enabled)
             return
         icon = NSWorkspace.sharedWorkspace().iconForFile_("/Applications/Claude.app")
+        y = 0.0
         for index, profile in enumerate(items):
-            y = index * 58.0
+            detail = " · ".join(x for x in (profile.get("email"), profile.get("organization")) if x)
+            row_h = 76.0 if detail else 58.0
             if index:
                 line = _FillView.alloc().initWithColor_(pal["hairline"])
                 line.setFrame_(NSMakeRect(12, y, width - 24, 1))
@@ -2287,21 +2289,28 @@ class MenuBarPanel:
             name.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
             name.setToolTip_(profile["name"])
             group.addSubview_(name)
+            if detail:
+                label = _label(detail, font_small, pal["muted"], NSMakeRect(54, y + 30, action_x - 62, 16))
+                label.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+                source = ("Last detected " + profile["detected_at"]) if profile.get("detected_at") else "Entered by you"
+                label.setToolTip_(f"{detail}\n{source}. Check the current account inside Claude.")
+                group.addSubview_(label)
             status = "Archived" if archived else profile.get("status") or "Status not checked"
-            label = _label(status, font_small, pal["muted"], NSMakeRect(54, y + 30, action_x - 62, 16))
+            label = _label(status, font_small, pal["muted"], NSMakeRect(54, y + (48 if detail else 30), action_x - 62, 16))
             label.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
             checked = profile.get("checked_at")
             label.setToolTip_(f"{status}" + (f" · Checked {checked}" if checked else "") + ". Sign-in must be checked inside Claude.")
             group.addSubview_(label)
-            button = self._add_button(group, "Restore" if archived else "Open", NSMakeRect(action_x, y + 16, action_w, 26),
+            button = self._add_button(group, "Restore" if archived else "Open", NSMakeRect(action_x, y + (row_h - 26) / 2, action_w, 26),
                                       lambda _, p=profile: self._desktop_profile_action("restore" if p.get("archived") else "open", p["id"]), font_small)
             button.setAccessibilityLabel_(f"{'Restore' if archived else 'Open'} {profile['name']}")
             button.setEnabled_(enabled)
             if not archived:
-                more = self._add_icon_button(group, "ellipsis", "•••", NSMakeRect(width - 39, y + 16, 27, 26),
+                more = self._add_icon_button(group, "ellipsis", "•••", NSMakeRect(width - 39, y + (row_h - 26) / 2, 27, 26),
                                              lambda sender, pid=profile["id"]: self._desktop_profile_menu(pid, sender),
                                              f"Actions for {profile['name']}", bordered=True)
                 more.setEnabled_(enabled)
+            y += row_h
 
     def _build_settings(self):
         pal = _colors()

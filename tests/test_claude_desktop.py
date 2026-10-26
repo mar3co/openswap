@@ -85,7 +85,7 @@ def test_public_storage_refused(store):
         store.add("Work")
 
 
-@pytest.mark.parametrize("contents", ["{", "[]", '{"version":4,"profiles":[]}',
+@pytest.mark.parametrize("contents", ["{", "[]", '{"version":5,"profiles":[]}',
     '{"version":true,"profiles":[]}', '{"version":1,"profiles":[{}]}'])
 def test_damaged_or_newer_registry_is_not_replaced(store, contents):
     store.add("Personal")
@@ -343,7 +343,7 @@ def test_menu_profile_actions_resolve_stable_ids(menu, store, monkeypatch):
     store.update(p.id, name="Renamed")
     row.children[0].callback(None)
     menu.open.assert_called_once_with(p.id)
-    row.children[2].callback(None)
+    next(item for item in row.children if item.title == "Archive…").callback(None)
     assert store.list() == []
     archived = menu.menu(SimpleNamespace(MenuItem=Item)).children[-1]
     archived.children[0].children[0].callback(None)

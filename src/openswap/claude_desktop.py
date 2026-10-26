@@ -19,6 +19,7 @@ import threading
 import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from xml.parsers.expat import ExpatError
 
@@ -82,6 +83,19 @@ def validate_badge(badge: str, color: str) -> None:
         raise ClaudeDesktopError("Choose one of the available badge colors.")
 
 
+def account_label(value: str, *, email: bool = False) -> str:
+    """Optional display metadata, never an account key or launch constraint."""
+    limit = 320 if email else 128
+    if not isinstance(value, str):
+        raise ClaudeDesktopError("Enter text for the account details, or leave them blank.")
+    value = unicodedata.normalize("NFC", value.strip())
+    if len(value) > limit or any(unicodedata.category(c).startswith("C") for c in value):
+        raise ClaudeDesktopError(f"Keep account details under {limit + 1} characters, without control characters.")
+    if email and value and not re.fullmatch(r"[^\s@]+@[^\s@]+", value):
+        raise ClaudeDesktopError("Enter an email address, or leave it blank.")
+    return value
+
+
 def _validate_legacy_link(value) -> None:
     # Read previews of the old linked-selection format without carrying any
     # account association into the independent launcher. Never use its identity.
@@ -106,6 +120,9 @@ class Profile:
     archived: bool = False
     badge: str = "1"
     color: str = "orange"
+    email: str = ""
+    organization: str = ""
+    detected_at: str = ""
 
 
 class DesktopProfiles:
@@ -139,7 +156,7 @@ class DesktopProfiles:
             if self.registry.stat().st_size > 256_000:
                 raise ValueError
             data = json.loads(self.registry.read_text(encoding="utf-8"))
-            if not isinstance(data, dict) or set(data) != {"version", "profiles"} or type(data["version"]) is not int or data["version"] not in (1, 2, 3):
+            if not isinstance(data, dict) or set(data) != {"version", "profiles"} or type(data["version"]) is not int or data["version"] not in (1, 2, 3, 4):
                 raise ValueError
             rows = data["profiles"]
             if not isinstance(rows, list) or len(rows) > 100:
@@ -147,7 +164,8 @@ class DesktopProfiles:
             profiles = []
             ids, names = set(), set()
             for index, row in enumerate(rows):
-                extra = {1: set(), 2: {"code_account"}, 3: {"badge", "color"}}[data["version"]]
+                extra = {1: set(), 2: {"code_account"}, 3: {"badge", "color"},
+                         4: {"badge", "color", "email", "organization", "detected_at"}}[data["version"]]
                 keys = {"id", "name", "archived"} | extra
                 if not isinstance(row, dict) or set(row) != keys:
                     raise ValueError
@@ -161,9 +179,17 @@ class DesktopProfiles:
                 names.add(name.casefold())
                 if data["version"] == 2:
                     _validate_legacy_link(row["code_account"])
-                badge, color = (row["badge"], row["color"]) if data["version"] == 3 else (str(index + 1), "orange")
+                badge, color = (row["badge"], row["color"]) if data["version"] >= 3 else (str(index + 1), "orange")
                 validate_badge(badge, color)
-                profiles.append(Profile(pid, name, row["archived"], badge, color))
+                email, organization, detected_at = "", "", ""
+                if data["version"] == 4:
+                    email = account_label(row["email"], email=True)
+                    organization = account_label(row["organization"])
+                    detected_at = row["detected_at"]
+                    if email != row["email"] or organization != row["organization"]:
+                        raise ValueError
+                    self._validate_detection_time(detected_at, email, organization)
+                profiles.append(Profile(pid, name, row["archived"], badge, color, email, organization, detected_at))
             return [p for p in profiles if include_archived or not p.archived]
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
             raise ClaudeDesktopError("Claude Desktop profile metadata is invalid. Restore profiles.json from a backup; it has not been replaced.") from exc
@@ -198,7 +224,7 @@ class DesktopProfiles:
         fd, raw = tempfile.mkstemp(prefix=".profiles-", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 3, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
+                json.dump({"version": 4, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -221,8 +247,16 @@ class DesktopProfiles:
             self._save([*rows, profile])
             return profile
 
+    @staticmethod
+    def _validate_detection_time(value, email, organization):
+        if not isinstance(value, str) or len(value) > 40:
+            raise ValueError("Invalid detection time")
+        if value and (not email or not organization or datetime.fromisoformat(value).tzinfo is None):
+            raise ValueError("Invalid detection time")
+
     def update(self, identifier: str, *, name: str | None = None, archived: bool | None = None,
-               badge: str | None = None, color: str | None = None) -> Profile:
+               badge: str | None = None, color: str | None = None, email: str | None = None,
+               organization: str | None = None, detected_at: str | None = None) -> Profile:
         if name is not None:
             name = _name(name)
         if archived is not None and type(archived) is not bool:
@@ -235,9 +269,21 @@ class DesktopProfiles:
             new_badge = current.badge if badge is None else badge
             new_color = current.color if color is None else color
             validate_badge(new_badge, new_color)
+            new_email = current.email if email is None else account_label(email, email=True)
+            new_org = current.organization if organization is None else account_label(organization)
+            # Editing either field removes the detection claim. Renames, badge
+            # changes and archiving preserve it. Empty strings clear details.
+            new_time = current.detected_at if email is None and organization is None else ""
+            if detected_at is not None:
+                new_time = detected_at
+            try:
+                self._validate_detection_time(new_time, new_email, new_org)
+            except ValueError as exc:
+                raise ClaudeDesktopError("Invalid account detection details.") from exc
             updated = replace(current, name=current.name if name is None else name,
                               archived=current.archived if archived is None else archived,
-                              badge=new_badge, color=new_color)
+                              badge=new_badge, color=new_color, email=new_email,
+                              organization=new_org, detected_at=new_time)
             self._save([updated if p.id == current.id else p for p in rows])
             return updated
 
