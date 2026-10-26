@@ -275,6 +275,15 @@ def test_default_profile_launch_does_not_override_code_or_desktop_storage(store,
     assert list(store.default_desktop.iterdir()) == []
 
 
+@pytest.mark.parametrize("separator", ["=", " "])
+def test_external_claude_work_folder_is_not_the_default_profile(store, app, tmp_path, separator):
+    store.default_desktop = tmp_path / "Claude"
+    store.default_desktop.mkdir()
+    p = store.add_default()
+    app.run.return_value.stdout = f"43 {app.binary} --user-data-dir{separator}{store.default_desktop}-Work\n"
+    assert app.profile_states(store)[p.id] == "Not running"
+
+
 @pytest.mark.parametrize("failure", ["process-check", "process-timeout", "ambiguous", "exit-zero", "exit-error", "spawn"])
 def test_launch_failures_keep_profile_and_never_claim_success(store, app, failure):
     p = store.add("Personal")

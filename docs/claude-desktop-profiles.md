@@ -255,7 +255,7 @@ rows, long labels, archived profiles and scrolling. Only the Keychain item's
 name/account label was checked live; no real sign-in was read or sent during
 these tests.
 
-The Default-profile and automatic-update follow-up passed **776 focused tests**
+The Default-profile and automatic-update follow-up passed **778 focused tests**
 and **15 native dialog tests**. Additional coverage includes explicit adoption,
 no credential copying, ordinary-process reuse, default/isolated launch arguments,
 version 4 migration, login/org changes, sign-out, backoff, Keychain denial,

@@ -470,7 +470,7 @@ class ClaudeDesktopApp:
             elif len(argv) == 1 and command.startswith(expected + " ") and "--user-data-dir" not in command and "--type=" not in command:
                 # The ordinary app can receive a launch-services document/URL.
                 matches.append(int(pid))
-            elif (f"--user-data-dir={desktop}" in command or f"--user-data-dir {desktop}" in command) and "--type=" not in command:
+            elif re.search(r"--user-data-dir(?:=| )" + re.escape(str(desktop)) + r"(?:$|\s--)", command) and "--type=" not in command:
                 raise ClaudeDesktopError("Another launch is using this profile folder. Quit that profile in Claude before reopening it here.")
         if len(matches) > 1:
             raise ClaudeDesktopError("Multiple processes are using this profile. Quit them in Claude before reopening it.")
