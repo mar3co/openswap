@@ -110,7 +110,7 @@ class ClaudeDesktopMenu:
 
     def menu(self, rumps):
         menu = rumps.MenuItem("Claude Desktop profiles")
-        menu.add(rumps.MenuItem("Experimental · Separate sign-ins", callback=None))
+        menu.add(rumps.MenuItem("Separate sign-ins", callback=None))
         menu.add(rumps.MenuItem("Checking status…" if self.checking else "Refresh status",
                                 callback=None if self.checking else self.refresh_status))
         if self._checked_at:

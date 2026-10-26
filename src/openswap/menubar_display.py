@@ -687,7 +687,7 @@ def settings_page_rows(
         {"kind": "toggle", "section": SETTINGS_SECTION_GENERAL,
          "id": "desktop_features_enabled", "label": "Enable desktop app features", "value": settings.desktop_features_enabled},
         {"kind": "group", "style": "hint", "section": SETTINGS_SECTION_GENERAL,
-         "id": "desktop_features_hint", "label": "Experimental Claude Desktop profiles and ChatGPT switching. Turning this off keeps profiles, sign-ins and shortcuts.", "lines": 3},
+         "id": "desktop_features_hint", "label": "Claude Desktop profiles and ChatGPT switching. Turning this off keeps profiles, sign-ins and shortcuts.", "lines": 2},
     ])
     general.extend(this_mac_rows(login_item))
     general.extend(_this_mac_setup_rows(
@@ -1039,7 +1039,7 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
         ("shortcut", "Shortcuts and icons", "Choose Create shortcut in a profile's menu, then drag it from Finder to the Dock. Claude's running icon stays unchanged."),
         ("signin", "Sign-in", "Sign in inside each profile. Check its account and workspace; Running only means the app is open."),
         ("archive", "Archiving", "Keeps sign-ins, data and open windows. Shortcuts are disabled until restored. Restore does not open the profile."),
-        ("limits", "Experimental limits", "Code and Cowork in these profiles are experimental. No Chrome pairing. OpenSwap does not verify the account or usage."),
+        ("limits", "Limitations", "Check the account inside Code and Cowork. Chrome pairing is unavailable. OpenSwap does not verify the account or usage."),
     ):
         hint(f"claude_desktop_{key}_hint", f"{title}: {body}" if key != "limits" else body)
     return [{"section": SETTINGS_SECTION_DESKTOP, **row} for row in rows]

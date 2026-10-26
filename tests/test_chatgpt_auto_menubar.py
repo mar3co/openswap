@@ -58,7 +58,7 @@ def _app(monkeypatch, tmp_path):
     app._pending_chatgpt_switch = None
     app._desktop_switching = False
     app._login_session = None
-    app._desktop_status = "Experimental · Switching reopens ChatGPT"
+    app._desktop_status = "Switching reopens ChatGPT"
     app._chatgpt_monitor_notice = ""
     app._chatgpt_auto_retry_at = 0.0
     app._event_lock = threading.Lock()

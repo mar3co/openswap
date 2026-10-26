@@ -1046,7 +1046,7 @@ class MenuBarPanel:
         self._strategy = strategy
         self._has_codex = has_codex
         self._codex_enabled = codex_enabled
-        self._desktop_status = desktop_status or (lambda: "Experimental · Switching reopens ChatGPT")
+        self._desktop_status = desktop_status or (lambda: "Switching reopens ChatGPT")
         self._chatgpt_capability = chatgpt_capability
         self._on_chatgpt_view_active = on_chatgpt_view_active
         self._account_state = account_state or (lambda _provider: "ready")
@@ -2105,7 +2105,7 @@ class MenuBarPanel:
         # Footer
         fy = height - footer_h
         if claude_desktop_h:
-            root.addSubview_(_label("Claude Desktop · Experimental", font_small, pal["muted"],
+            root.addSubview_(_label("Claude Desktop", font_small, pal["muted"],
                                     NSMakeRect(PAD, fy - claude_desktop_h + 6, inner_w - 100, 20)))
             self._add_button(root, "Profiles…", NSMakeRect(PANEL_WIDTH - PAD - 90, fy - claude_desktop_h + 3, 90, FOOTER_BTN_H),
                              self._show_claude_desktop_settings, font_small)
@@ -2422,7 +2422,6 @@ class MenuBarPanel:
                 self._add_desktop_profiles(content, row, NSMakeRect(PAD, y, inner_w, h), pal, font_body, font_small)
             elif kind == "profiles_header":
                 content.addSubview_(_label("Profiles", font_title, pal["fg"], NSMakeRect(PAD, y + 5, 60, 20)))
-                content.addSubview_(_label("Experimental", font_small, pal["muted"], NSMakeRect(PAD + 65, y + 6, 85, 18)))
                 if row.get("title"):
                     button = self._add_button(content, row["title"], NSMakeRect(PANEL_WIDTH - PAD - 100, y + 2, 100, 26),
                                               lambda _: self._desktop_profile_action("add"), font_small)

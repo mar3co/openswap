@@ -32,7 +32,7 @@ PROFILE_NOTICE = (
     "Claude Desktop profiles open side by side and keep separate sign-ins. "
     "Sign in and check the account inside each profile. "
     "Your terminal and editor Claude Code login stays unchanged. "
-    "Profiles are experimental, including Code and Cowork. Chrome pairing is unavailable."
+    "Check the account inside Code and Cowork. Chrome pairing is unavailable."
 )
 
 

@@ -94,7 +94,7 @@ def desktop_switch_confirm_copy(name, *, pause_auto=False, process_state="runnin
         action = "Restarts the entire app and changes the shared Codex login. "
     return (
         title,
-        f"Experimental switch to {name}.\n\n"
+        f"Switch to {name}.\n\n"
         + action
         + "Save and stop all local/remote work; close other Codex clients before continuing.\n\n"
         "After restart, check the account in Chat, Work, and Codex.\n\n"
@@ -229,7 +229,7 @@ def run(switcher, codex=None) -> int:
             self._kickoff_running = False
             self._desktop_switching = False
             self._desktop_result = None
-            self._desktop_status = "Experimental · Switching reopens ChatGPT"
+            self._desktop_status = "Switching reopens ChatGPT"
             from openswap.settings import load_worker_settings
             self._worker_policy = load_worker_settings(switcher.backup_dir)
             self._worker_status_cache = {
@@ -1293,7 +1293,7 @@ def run(switcher, codex=None) -> int:
                     return
                 self._chatgpt_capability = cap
                 if self._desktop_status.startswith("ChatGPT reopened"):
-                    self._desktop_status = "Experimental · Switching reopens ChatGPT"
+                    self._desktop_status = "Switching reopens ChatGPT"
                 self._hold_reload_pending = True
 
         def _begin_desktop_transaction(self, *, consent_generation=None):
@@ -2601,7 +2601,7 @@ def run(switcher, codex=None) -> int:
             return menu
 
         def _desktop_menu(self, rumps):
-            menu = rumps.MenuItem("Switch ChatGPT app (experimental)")
+            menu = rumps.MenuItem("Switch ChatGPT app")
             if self.codex is not None and self._codex_enabled():
                 menu.add(rumps.MenuItem(
                     "Pause Codex auto-switching for testing…",

@@ -49,7 +49,7 @@ def test_changed_suggestion_during_confirmation_never_launches_switch(app):
 def test_desktop_consent_explicitly_covers_restart_idle_and_verification():
     title, body = menubar.desktop_switch_confirm_copy("Work")
     assert "Restart ChatGPT" in title
-    for text in ("Experimental", "Work", "entire app", "shared Codex login",
+    for text in ("Work", "entire app", "shared Codex login",
                  "Save and stop all local/remote work", "close other Codex clients before continuing",
                  "check the account in Chat, Work, and Codex", "auto-switching off"):
         assert text in body
@@ -118,7 +118,7 @@ def app(monkeypatch, tmp_path):
     instance._desktop_switching = False
     instance._login_session = None
     instance._desktop_result = None
-    instance._desktop_status = "Experimental"
+    instance._desktop_status = "Switching reopens ChatGPT"
     instance.snapshot = {"accounts": [_row(f"{CODEX_NUM_PREFIX}2")]}
     instance._on_account_click = Mock()
     instance._slot_needs_relogin = Mock(return_value=False)
@@ -365,7 +365,7 @@ def test_real_run_wires_submenu_and_completion_timer(tmp_path, monkeypatch, desk
     live_app.snapshot["accounts"] = [_row(f"{CODEX_NUM_PREFIX}2")]
     live_app.rebuild_menu()
     if desktop_enabled:
-        submenu = next(item for item in live_app.menu if item and item.title == "Switch ChatGPT app (experimental)")
+        submenu = next(item for item in live_app.menu if item and item.title == "Switch ChatGPT app")
         assert len(submenu.items) == 1
         assert callable(submenu.items[0].callback)
         assert any(item and item.title == "Claude Desktop profiles" for item in live_app.menu)
@@ -373,7 +373,7 @@ def test_real_run_wires_submenu_and_completion_timer(tmp_path, monkeypatch, desk
         assert not any(item and ("Desktop" in item.title or "ChatGPT app" in item.title) for item in live_app.menu)
     live_app._panel = Mock()
     live_app.rebuild_menu()
-    assert not any(item and item.title == "Switch ChatGPT app (experimental)" for item in live_app.menu)
+    assert not any(item and item.title == "Switch ChatGPT app" for item in live_app.menu)
     callbacks = [call.args[0].__name__ for call in fake_rumps.Timer.call_args_list]
     assert "on_sync_tick" in callbacks
 
