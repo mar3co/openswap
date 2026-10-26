@@ -1132,7 +1132,6 @@ class MenuBarPanel:
 
     def close(self) -> None:
         self._page = MAIN_PAGE
-        self._card_scroll = None
         self._release_token_field()
         self._clear_dismiss_watchers()
         if self._popover is not None and self._popover.isShown():
@@ -1546,7 +1545,7 @@ class MenuBarPanel:
         snap = self._snapshot()
         all_cards = panel_accounts(snap)
         provider = self._selected_provider
-        offset = self._take_card_list_offset(provider)
+        list_offset = self._take_card_list_offset(provider)
         settings = self._settings() if callable(self._settings) else None
         if settings is None:
             settings = MenuBarSettings()
@@ -1844,7 +1843,7 @@ class MenuBarPanel:
             list_view, card_x = root, PAD
             if scrolls:
                 # The list reaches into the right margin so the overlay
-                # scroller sits beside the cards, not over their ··· buttons.
+                # scroller clears the cards' ··· buttons.
                 scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(PAD, y, inner_w + PAD, body_h))
                 scroll.setDrawsBackground_(False)
                 scroll.setHasVerticalScroller_(True)
@@ -1992,7 +1991,7 @@ class MenuBarPanel:
                 list_view.addSubview_(card_view)
                 y += card_h + CARD_GAP
             if scrolls:
-                list_view.scrollPoint_((0, offset))
+                list_view.scrollPoint_((0, list_offset))
 
         # Footer
         fy = height - footer_h
