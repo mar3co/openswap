@@ -47,6 +47,10 @@ def default_root() -> Path:
     return Path.home() / "Library" / "Application Support" / "OpenSwap Claude Desktop"
 
 
+def default_desktop_path() -> Path:
+    return Path.home() / "Library" / "Application Support" / "Claude"
+
+
 def _name(value: str) -> str:
     if not isinstance(value, str):
         raise ClaudeDesktopError("A profile needs a name.")
@@ -123,12 +127,15 @@ class Profile:
     email: str = ""
     organization: str = ""
     detected_at: str = ""
+    kind: str = "managed"
+    auto_detect: bool = True
 
 
 class DesktopProfiles:
-    def __init__(self, root: Path | None = None):
+    def __init__(self, root: Path | None = None, *, default_desktop: Path | None = None):
         self.root = (root if root is not None else default_root()).absolute()
         self.registry = self.root / "profiles.json"
+        self.default_desktop = (default_desktop if default_desktop is not None else default_desktop_path()).absolute()
 
     def _root(self, *, create: bool = False) -> bool:
         if _plain(self.root, directory=True):
@@ -156,7 +163,7 @@ class DesktopProfiles:
             if self.registry.stat().st_size > 256_000:
                 raise ValueError
             data = json.loads(self.registry.read_text(encoding="utf-8"))
-            if not isinstance(data, dict) or set(data) != {"version", "profiles"} or type(data["version"]) is not int or data["version"] not in (1, 2, 3, 4):
+            if not isinstance(data, dict) or set(data) != {"version", "profiles"} or type(data["version"]) is not int or data["version"] not in (1, 2, 3, 4, 5):
                 raise ValueError
             rows = data["profiles"]
             if not isinstance(rows, list) or len(rows) > 100:
@@ -165,7 +172,8 @@ class DesktopProfiles:
             ids, names = set(), set()
             for index, row in enumerate(rows):
                 extra = {1: set(), 2: {"code_account"}, 3: {"badge", "color"},
-                         4: {"badge", "color", "email", "organization", "detected_at"}}[data["version"]]
+                         4: {"badge", "color", "email", "organization", "detected_at"},
+                         5: {"badge", "color", "email", "organization", "detected_at", "kind", "auto_detect"}}[data["version"]]
                 keys = {"id", "name", "archived"} | extra
                 if not isinstance(row, dict) or set(row) != keys:
                     raise ValueError
@@ -182,14 +190,20 @@ class DesktopProfiles:
                 badge, color = (row["badge"], row["color"]) if data["version"] >= 3 else (str(index + 1), "orange")
                 validate_badge(badge, color)
                 email, organization, detected_at = "", "", ""
-                if data["version"] == 4:
+                if data["version"] >= 4:
                     email = account_label(row["email"], email=True)
                     organization = account_label(row["organization"])
                     detected_at = row["detected_at"]
                     if email != row["email"] or organization != row["organization"]:
                         raise ValueError
                     self._validate_detection_time(detected_at, email, organization)
-                profiles.append(Profile(pid, name, row["archived"], badge, color, email, organization, detected_at))
+                kind = row["kind"] if data["version"] == 5 else "managed"
+                automatic = row["auto_detect"] if data["version"] == 5 else not ((email or organization) and not detected_at)
+                if kind not in ("managed", "default") or type(automatic) is not bool:
+                    raise ValueError
+                if kind == "default" and any(p.kind == "default" for p in profiles):
+                    raise ValueError
+                profiles.append(Profile(pid, name, row["archived"], badge, color, email, organization, detected_at, kind, automatic))
             return [p for p in profiles if include_archived or not p.archived]
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
             raise ClaudeDesktopError("Claude Desktop profile metadata is invalid. Restore profiles.json from a backup; it has not been replaced.") from exc
@@ -204,14 +218,53 @@ class DesktopProfiles:
             raise ClaudeDesktopError("Claude Desktop profile not found. List profiles, or restore an archived profile first.")
         return found
 
-    def paths(self, profile: Profile) -> tuple[Path, Path]:
+    def paths(self, profile: Profile) -> tuple[Path, Path | None]:
         if not re.fullmatch(r"[0-9a-f]{32}", profile.id):
             raise ClaudeDesktopError("Invalid Claude Desktop profile ID.")
+        if profile.kind == "default":
+            return self.default_desktop, None
         parent = self.root / profile.id
         return parent / "desktop", parent / "code"
 
-    def _directories(self, profile: Profile, *, create: bool = False) -> tuple[Path, Path]:
+    def _default_exists(self) -> bool:
+        """Claude owns this directory and its permissions. Never create/chmod it."""
+        try:
+            info = self.default_desktop.lstat()
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(info.st_mode) or (hasattr(os, "getuid") and info.st_uid != os.getuid()):
+            raise ClaudeDesktopError("The existing Claude profile folder could not be read safely.")
+        return True
+
+    def default_available(self) -> bool:
+        return self._default_exists() and not any(p.kind == "default" for p in self.list())
+
+    def add_default(self) -> Profile:
+        """Register/restore the one ordinary Claude profile; never copy its data."""
+        if not self._default_exists():
+            raise ClaudeDesktopError("Open Claude Desktop and sign in first, then add its existing profile.")
+        with self._lock():
+            rows = self.list(include_archived=True)
+            existing = next((p for p in rows if p.kind == "default"), None)
+            if existing is not None:
+                profile = replace(existing, archived=False)
+                if profile != existing:
+                    self._save([profile if p.id == profile.id else p for p in rows])
+                return profile
+            if len(rows) >= 100:
+                raise ClaudeDesktopError("This store already has 100 Claude Desktop profiles.")
+            names = {p.name.casefold() for p in rows}
+            name = next(n for n in ["Default", *(f"Default ({i})" for i in range(2, 102))] if n.casefold() not in names)
+            profile = Profile(uuid.uuid4().hex, name, badge="", kind="default")
+            self._save([*rows, profile])
+            return profile
+
+    def _directories(self, profile: Profile, *, create: bool = False) -> tuple[Path, Path | None]:
         desktop, code = self.paths(profile)
+        if profile.kind == "default":
+            if not self._default_exists():
+                raise ClaudeDesktopError("The existing Claude profile folder is missing. Open Claude Desktop to restore it.")
+            return desktop, None
         for path in (desktop.parent, desktop, code):
             if not _plain(path, directory=True):
                 if not create:
@@ -224,7 +277,7 @@ class DesktopProfiles:
         fd, raw = tempfile.mkstemp(prefix=".profiles-", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 4, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
+                json.dump({"version": 5, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -256,14 +309,19 @@ class DesktopProfiles:
 
     def update(self, identifier: str, *, name: str | None = None, archived: bool | None = None,
                badge: str | None = None, color: str | None = None, email: str | None = None,
-               organization: str | None = None, detected_at: str | None = None) -> Profile:
+               organization: str | None = None, detected_at: str | None = None,
+               auto_detect: bool | None = None, expected: Profile | None = None) -> Profile:
         if name is not None:
             name = _name(name)
         if archived is not None and type(archived) is not bool:
             raise ClaudeDesktopError("Invalid archive state.")
+        if auto_detect is not None and type(auto_detect) is not bool:
+            raise ClaudeDesktopError("Invalid automatic detection setting.")
         with self._lock():
             rows = self.list(include_archived=True)
             current = self.get(identifier, include_archived=True)
+            if expected is not None and (current != expected or current.archived or not current.auto_detect):
+                raise ClaudeDesktopError("Profile changed during account detection.")
             if name is not None and any(p.id != current.id and p.name.casefold() == name.casefold() for p in rows):
                 raise ClaudeDesktopError("That profile name already exists.")
             new_badge = current.badge if badge is None else badge
@@ -283,7 +341,8 @@ class DesktopProfiles:
             updated = replace(current, name=current.name if name is None else name,
                               archived=current.archived if archived is None else archived,
                               badge=new_badge, color=new_color, email=new_email,
-                              organization=new_org, detected_at=new_time)
+                              organization=new_org, detected_at=new_time,
+                              auto_detect=current.auto_detect if auto_detect is None else auto_detect)
             self._save([updated if p.id == current.id else p for p in rows])
             return updated
 
@@ -298,7 +357,7 @@ class DesktopProfiles:
                     "identity_verified": False, "experimental": True}
 
 
-def launch_environment(code: Path, source: dict[str, str] | None = None) -> dict[str, str]:
+def launch_environment(code: Path | None, source: dict[str, str] | None = None) -> dict[str, str]:
     """Keep OS/proxy/trust settings, never inherit an API login or developer flags.
 
     Organization policy is still read by Claude from its normal managed locations.
@@ -310,8 +369,9 @@ def launch_environment(code: Path, source: dict[str, str] | None = None) -> dict
                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
                "CLAUDE_CODE_MANAGED_SETTINGS_PATH", "CLAUDE_CODE_REMOTE_SETTINGS_PATH"}
     env = {k: v for k, v in source.items() if k in allowed or k.startswith("LC_")}
-    env["CLAUDE_CONFIG_DIR"] = str(code)
-    env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(code)
+    if code is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(code)
+        env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(code)
     return env
 
 
@@ -387,7 +447,8 @@ class ClaudeDesktopApp:
         for profile in profiles:
             desktop, _code = store.paths(profile)
             try:
-                pid = self._running([str(self.binary), f"--user-data-dir={desktop}"], desktop,
+                argv = [str(self.binary)] if profile.kind == "default" else [str(self.binary), f"--user-data-dir={desktop}"]
+                pid = self._running(argv, desktop,
                                     processes=processes)
                 states[profile.id] = "Running" if pid is not None else "Not running"
             except ClaudeDesktopError:
@@ -406,14 +467,17 @@ class ClaudeDesktopApp:
             pid, command = parts
             if command == expected:
                 matches.append(int(pid))
-            elif f"--user-data-dir={desktop}" in command and "--type=" not in command:
+            elif len(argv) == 1 and command.startswith(expected + " ") and "--user-data-dir" not in command and "--type=" not in command:
+                # The ordinary app can receive a launch-services document/URL.
+                matches.append(int(pid))
+            elif (f"--user-data-dir={desktop}" in command or f"--user-data-dir {desktop}" in command) and "--type=" not in command:
                 raise ClaudeDesktopError("Another launch is using this profile folder. Quit that profile in Claude before reopening it here.")
         if len(matches) > 1:
             raise ClaudeDesktopError("Multiple processes are using this profile. Quit them in Claude before reopening it.")
         return matches[0] if matches else None
 
-    def open(self, desktop: Path, code: Path) -> dict:
-        argv = [str(self.binary), f"--user-data-dir={desktop}"]
+    def open(self, desktop: Path, code: Path | None) -> dict:
+        argv = [str(self.binary)] if code is None else [str(self.binary), f"--user-data-dir={desktop}"]
         pid = self._running(argv, desktop)
         try:
             if self._validation_stamp is None or self._validation_stamp != self._stamp():

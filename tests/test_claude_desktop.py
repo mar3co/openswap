@@ -85,7 +85,7 @@ def test_public_storage_refused(store):
         store.add("Work")
 
 
-@pytest.mark.parametrize("contents", ["{", "[]", '{"version":5,"profiles":[]}',
+@pytest.mark.parametrize("contents", ["{", "[]", '{"version":6,"profiles":[]}',
     '{"version":true,"profiles":[]}', '{"version":1,"profiles":[{}]}'])
 def test_damaged_or_newer_registry_is_not_replaced(store, contents):
     store.add("Personal")
@@ -248,6 +248,31 @@ def test_already_running_profile_is_reused_not_restarted(store, app):
     app.run.return_value.stdout = f"42 {app.binary} --user-data-dir={desktop}\n"
     assert store.open(p.id, app=app)["state"] == "already_running"
     app.popen.assert_not_called()
+
+
+@pytest.mark.parametrize("suffix", ["", " -psn_0_123"])
+def test_default_profile_focuses_ordinary_claude_and_never_an_isolated_instance(store, app, tmp_path, suffix):
+    store.default_desktop = tmp_path / "existing"
+    store.default_desktop.mkdir()
+    p = store.add_default()
+    app.run.return_value.stdout = f"42 {app.binary}{suffix}\n43 {app.binary} --user-data-dir=/isolated\n"
+    assert store.open(p.id, app=app)["pid"] == 42
+    assert app.profile_states(store)[p.id] == "Running"
+    app.popen.assert_not_called()
+
+
+def test_default_profile_launch_does_not_override_code_or_desktop_storage(store, app, tmp_path):
+    store.default_desktop = tmp_path / "existing"
+    store.default_desktop.mkdir()
+    p = store.add_default()
+    proc = Mock(pid=42)
+    proc.wait.side_effect = [subprocess.TimeoutExpired("Claude", .75), 0]
+    app.popen.return_value = proc
+    store.open(p.id, app=app)
+    args, kwargs = app.popen.call_args
+    assert args[0] == [str(app.binary)]
+    assert "CLAUDE_CONFIG_DIR" not in kwargs["env"] and "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in kwargs["env"]
+    assert list(store.default_desktop.iterdir()) == []
 
 
 @pytest.mark.parametrize("failure", ["process-check", "process-timeout", "ambiguous", "exit-zero", "exit-error", "spawn"])

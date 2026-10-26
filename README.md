@@ -10,8 +10,10 @@ OpenSwap is a standalone MIT descendant of [claude-swap](https://github.com/real
 **Developers:** [docs/](docs/README.md) (architecture, hacking, tests)
 
 **Desktop apps (experimental, opt-in):** turn on **Settings → General → Enable
-desktop app features**, then open the main **Claude Desktop** tab to add
-Personal, Work or other profiles. Each can stay open with its own sign-in.
+desktop app features**, then open the main **Claude Desktop** tab and choose
+**Add profile**. Use your existing Claude profile as Default, or create separate
+Personal, Work or other profiles. Email and organization update automatically
+after sign-in or account changes. Each profile can stay open with its own sign-in.
 **Create shortcut…** makes a launcher for Finder and the Dock, with an optional
 number and colored badge on Claude's icon. Claude Code switching and rotation
 stay independent. The Desktop app picker also contains ChatGPT's controls.

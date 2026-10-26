@@ -9,6 +9,7 @@ from datetime import datetime
 
 from openswap.claude_desktop import BADGE_COLORS, BUNDLE_ID, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, account_label, validate_badge
 from openswap.exceptions import ClaudeSwitchError
+from openswap.claude_desktop_monitor import ProfileIdentityMonitor
 
 
 def focus_profile(pid: int) -> None:
@@ -34,7 +35,7 @@ def has_saved_profiles() -> bool:
 
 class ClaudeDesktopMenu:
     def __init__(self, *, prompt, show_error, changed, notify, store=None, app_factory=None, show_status=None, enabled=None,
-                 blocked=None, shortcut_factory=None, reveal=None, confirm=None, detector=None):
+                 blocked=None, shortcut_factory=None, reveal=None, confirm=None, detector=None, monitor=None):
         self.store = store or DesktopProfiles()
         self.prompt = prompt
         self.show_error = show_error
@@ -47,6 +48,8 @@ class ClaudeDesktopMenu:
         self.reveal = reveal or reveal_shortcut
         self.confirm = confirm
         self.detector = detector
+        self.monitor = monitor or ProfileIdentityMonitor(self.store)
+        self._editing_details = False
         self.operation = "Opening Claude…"
         self.busy = False
         self._results = queue.SimpleQueue()
@@ -62,6 +65,7 @@ class ClaudeDesktopMenu:
     def suspend_checks(self):
         self._check_generation += 1
         self.checking = False
+        self.monitor.suspend()
 
     def settings_state(self):
         state = {"checking": self.checking, "busy": self.busy or self.blocked(),
@@ -72,7 +76,9 @@ class ClaudeDesktopMenu:
             state.update(profiles=sum(not p.archived for p in profiles),
                          archived=sum(p.archived for p in profiles),
                          items=[{**asdict(p), "status": self._profile_states.get(p.id, ""),
-                                 "checked_at": self._profile_checked_at.get(p.id)} for p in profiles])
+                                 "checked_at": self._profile_checked_at.get(p.id),
+                                 **({"account_status": self.monitor.statuses[p.id]} if self.monitor.statuses.get(p.id) else {})}
+                                for p in profiles])
         except (ClaudeSwitchError, OSError):
             state["storage_error"] = "Could not read profiles. Check folder permissions or view details."
         return state
@@ -202,9 +208,33 @@ class ClaudeDesktopMenu:
     def add(self, _=None):
         if self.busy or self.blocked() or not self.enabled():
             return
+        try:
+            available = self.store.default_available()
+        except (ClaudeSwitchError, OSError):
+            available = False  # an unreadable existing profile cannot block creating a separate one
+        if available:
+            response = self.prompt(
+                title="Add Claude Desktop profile",
+                message="Use the Claude profile already on this Mac, or create a separate one. Account details update automatically.",
+                choices=["Use existing Claude profile (Default)", "Create a separate profile"], selected=0,
+                ok="Continue", cancel="Cancel",
+            )
+            if response.clicked != 1 or response.choice not in (0, 1):
+                return
+            if self.busy or self.blocked() or not self.enabled():
+                return
+            if response.choice == 0:
+                try:
+                    profile = self.store.add_default()
+                except (ClaudeSwitchError, OSError) as exc:
+                    self._error(exc)
+                    return
+                self.monitor.refresh(profile.id)
+                self.open(profile.id)
+                return
         response = self.prompt(
             title="Create Claude Desktop profile",
-            message="Create a separate Claude window with its own sign-in.",
+            message="Create a separate Claude window with its own sign-in. Account details update after you sign in.",
             input_label="Profile name", placeholder="e.g. Work",
             default_text="", ok="Create and open", cancel="Cancel",
         )
@@ -231,21 +261,26 @@ class ClaudeDesktopMenu:
         values = draft or {"email": profile.email, "organization": profile.organization,
                            "detected_at": profile.detected_at}
         while True:
-            message = note or "Optional labels. Detect uses this profile's saved sign-in; macOS may ask for Keychain access."
+            message = note or "Account details update after sign-in or account changes. macOS may ask for Keychain access."
             if values.get("detected_at"):
                 when = datetime.fromisoformat(values["detected_at"]).astimezone().strftime("%b %d, %H:%M")
                 message += f"\nLast detected {when}. The account may have changed."
-            response = self.prompt(title=f"Account details · {profile.name}", message=message,
-                                   fields=[("Email (optional)", values["email"]),
-                                           ("Organization (optional)", values["organization"])],
-                                   ok="Save", cancel="Cancel", other="Detect")
+            self._editing_details = True
+            try:
+                response = self.prompt(title=f"Account details · {profile.name}", message=message,
+                                       fields=[("Email (optional)", values["email"]),
+                                               ("Organization (optional)", values["organization"])],
+                                       checkbox="Update account details automatically", checkbox_checked=values.get("auto_detect", profile.auto_detect),
+                                       ok="Save", cancel="Cancel", other="Detect")
+            finally:
+                self._editing_details = False
             if response.clicked not in (1, -1):
                 return
             if self.busy or self.blocked() or not self.enabled():
                 return
             email, organization = response.values
             detected_at = values.get("detected_at", "") if (email, organization) == (values["email"], values["organization"]) else ""
-            values = {"email": email, "organization": organization, "detected_at": detected_at}
+            values = {"email": email, "organization": organization, "detected_at": detected_at, "auto_detect": response.checked}
             if response.clicked == -1:
                 self._detect(profile.id, values)
                 return
@@ -264,12 +299,14 @@ class ClaudeDesktopMenu:
                 self._error(exc)
                 return
             self.changed()
+            self.monitor.refresh(profile.id)
             return
 
     def _detect(self, identifier, draft):
         if self.busy or self.blocked() or not self.enabled():
             return
-        from openswap.claude_desktop_identity import DetectionError, detect_account
+        from openswap.claude_desktop_identity import DetectionError
+        self.monitor.detector.retry()
         self.busy = True
         self.operation = "Detecting account…"
         self.changed()
@@ -277,7 +314,8 @@ class ClaudeDesktopMenu:
         def work():
             result = {"state": "account_details", "identifier": identifier, "draft": draft}
             try:
-                result["draft"] = (self.detector or detect_account)(self.store, identifier)
+                result["draft"] = {**(self.detector or self.monitor.detector)(self.store, identifier),
+                                   "auto_detect": draft.get("auto_detect", True)}
             except DetectionError as exc:
                 result["note"] = str(exc)
             except Exception:
@@ -362,6 +400,8 @@ class ClaudeDesktopMenu:
             self._results.put((None, exc))
 
     def poll(self):
+        if self.monitor.poll(enabled=self.enabled(), idle=not (self.busy or self.blocked() or self._editing_details)):
+            self.changed()
         try:
             generation, message, states, checked_at = self._checks.get_nowait()
         except queue.Empty:

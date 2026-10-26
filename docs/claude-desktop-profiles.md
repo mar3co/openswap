@@ -1,7 +1,8 @@
 # Claude Desktop profiles and shortcuts (experimental)
 
-OpenSwap can open named Claude Desktop profiles side by side on macOS. Each
-profile keeps its own sign-in, desktop data and Code configuration. Desktop
+OpenSwap can open named Claude Desktop profiles side by side on macOS. Separate
+profiles keep their own sign-in, desktop data and Code configuration. The Default
+profile uses the existing Claude Desktop data in place. Desktop
 profiles are optional and independent of Claude Code account switching and
 rotation. A profile name is your label, not a verified account identity.
 
@@ -10,9 +11,12 @@ rotation. A profile name is your label, not a verified account identity.
 1. Install the official Claude app in `/Applications/Claude.app`.
 2. Turn on **Settings → General → Enable desktop app features**.
 3. Open the **Claude Desktop** tab on the main screen and choose **Add profile**.
-   Name it Personal, Work, or another recognizable name, then create and open it.
-4. Sign into the intended account in the new window. Check its email and
-   selected organization before starting work.
+   If Claude already has a profile on this Mac, choose **Use existing Claude
+   profile (Default)** or **Create a separate profile**. A separate profile needs
+   a name, such as Personal or Work, before **Create and open**.
+4. Default reuses your existing Claude window and sign-in. For a separate
+   profile, sign in inside its new window. Email and organization appear
+   automatically after detection succeeds.
 5. Open that profile's **•••** menu and choose **Create shortcut…**. Choose a number from
    1 to 999 and an orange, blue, purple or green badge. Leave the number blank
    for Claude's standard icon.
@@ -34,31 +38,50 @@ shortcut changes the default Code login in your terminal or editor. Desktop
 profiles have no automatic rotation, and do not require saved Code accounts.
 
 Claude handles sign-in inside each profile. OpenSwap does not transfer credentials
-between profiles or import the default Claude profile. The personal/Team/Enterprise selection
+between profiles. Default references the existing profile without copying it. The personal/Team/Enterprise selection
 within one email still happens inside Claude. Creating a profile does not
 create an Anthropic account or subscription.
 
-## Optional account details
+## Default profile and automatic account details
 
-Choose **••• → Account details…** on a profile. Email and Organization are
-optional labels shown beneath its name. Enter them yourself, or click **Detect**
-after signing in inside that profile. Review the detected values and choose
-**Save**. Cancel leaves the saved details unchanged; blank fields clear them.
+Default is added only through **Add profile → Use existing Claude profile
+(Default)**. OpenSwap never adds it just because it exists. The existing data
+stays in `~/Library/Application Support/Claude`; its permissions and sign-in are
+unchanged. Default uses the normal Claude launch without a separate data folder
+or Code environment overrides. It is saved only once, even if renamed. Adding
+it again after archiving restores the same profile and shortcuts.
 
-Detection runs only when requested. macOS may ask for access to **Claude Safe
-Storage** in Keychain. OpenSwap reads that profile's saved sign-in and requests
-its account details from Claude. It does not sign in, switch accounts, refresh
-tokens, or change Claude's files. Failed detection keeps the form available for
-manual entry. Opening a profile and checking running status do not read sign-ins.
+While Desktop features are enabled, OpenSwap watches registered profiles for
+new sign-ins, sign-outs and account/organization changes. Changed profile files
+are checked about every ten seconds. Account requests run only when the login
+changes or a periodic refresh is due; they never block opening a profile.
+Detected details are saved automatically beneath the existing profile name.
+The profile name and ID never change based on email, and several profiles can
+use the same email or account.
 
-Detected labels are a **last detected** snapshot, not a live sign-in indicator.
-The dialog and label tooltip show their source; editing either field removes
-the detection timestamp. Detect again after switching accounts inside Claude.
-Code and Cowork identity must still be checked inside those features.
+macOS may ask for access to **Claude Safe Storage** in Keychain. If access is
+denied or times out, automatic requests pause for the current app session;
+choose **••• → Account details… → Detect** to retry. No repeated background
+permission dialogs are shown. A successful read caches the decryption key only
+in memory. Disabling Desktop features clears that key and discards in-flight
+results. No tokens are refreshed or transferred between profiles.
 
-Several profiles can use the **same email**, including different organizations.
-Neither email nor organization is a unique key. Renaming, archiving and restoring
-keep the profile's ID, data, shortcuts and account labels.
+**Account details…** also offers manual editing and an **Update account details
+automatically** checkbox. Turn it off to keep your own labels. Older manual
+labels stay manual when upgrading. Detect still works when automatic updates
+are off; review its result and choose Save. Cancel preserves saved details.
+
+Automatic results are discarded if a profile is archived, edited or disabled
+while a check runs. A confirmed sign-out clears previously detected labels.
+When a new login cannot be resolved, the previous detected account is cleared
+and **Account details unavailable** is shown. **Waiting for sign-in** and
+**Account detection paused** explain the other common states. Manual labels
+remain user-owned. Detection failures never prevent opening profiles.
+
+Detected labels are a last-detected snapshot; hover for the timestamp. Switching
+inside Claude can take a short time to appear. Check Code and Cowork identity
+inside those features. Archived profiles and profiles with automatic updates
+off are not inspected in the background.
 
 ## What the shortcut and icon do
 
@@ -98,7 +121,7 @@ for the check's time.
 Running means an app process exists, not that its sign-in is verified.
 
 **Archive…** explains what is kept before hiding a profile from the available list and preventing
-its shortcuts from opening it. Sign-ins, settings, local conversations, icons
+its OpenSwap shortcuts from opening it. Default's ordinary Claude app/Dock entry keeps working. Sign-ins, settings, local conversations, icons
 and shortcut files are kept; running windows stay open. **Archived profiles →
 Restore** makes the same profile and shortcuts usable again without
 launching it. Use Claude's own Quit action to close a running profile.
@@ -144,17 +167,20 @@ path and respect archived profiles. Launch and shortcut creation require macOS.
 
 ## Storage, recovery, and removal
 
-Profile data lives in `~/Library/Application Support/OpenSwap Claude Desktop/`:
+Separate profile data lives in `~/Library/Application Support/OpenSwap Claude Desktop/`:
 
 - `profiles.json`: versioned labels, stable IDs, archive flags and badge settings;
-  optional email/organization labels and a last-detected timestamp; no tokens or Code account associations.
+  optional email/organization labels, a last-detected timestamp, profile kind and automatic-update preference; no tokens or Code account associations.
 - `<id>/desktop/`: Claude-owned desktop data, including local sessions.
 - `<id>/code/`: a separate `CLAUDE_CONFIG_DIR` and Keychain namespace.
 
+Default has only a registry entry here. Its original Claude-owned folder is
+never moved, recreated, chmodded or deleted by OpenSwap.
+
 These private folders can contain conversations and credentials created by
-Claude. Do not share them as a diagnostic attachment. Profile versions 1–3, including the
+Claude. Do not share them as a diagnostic attachment. Profile versions 1–4, including the
 unreleased linked-selection version 2, are readable. Their next save upgrades
-metadata to version 4, preserving IDs, data and archives while discarding old
+metadata to version 5, preserving IDs, data and archives while discarding old
 account-link metadata. No account credentials are changed during migration.
 
 A failed launch keeps the profile. Corrupt/newer metadata and missing data
@@ -178,23 +204,25 @@ The inspected Claude Desktop version is **3.6556.2**, bundle
 
 - The original signed executable accepts `--user-data-dir`, which selects
   Electron's desktop data directory.
-- Both `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` point at the
+- For separate profiles, both `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` point at the
   profile's Code folder. The inspected app uses a path-derived Keychain suffix.
 - API credentials and runtime-injection variables are removed from the launch
   environment. OS proxy/trust settings and managed policy paths are preserved.
 - Profile locks serialize management and launch checks. Matching processes are
   reused. Conflicting or uncertain process state is refused; user processes
   are never killed. Launch always reports `identity_verified: false`.
-- On-demand detection supports the inspected Chromium v24 cookie schema and
-  macOS v10 encryption. It checks the signed Claude app, reads only the selected
-  managed profile, and uses a private temporary copy of the original DB/WAL so
+- Automatic and on-demand detection support the inspected Chromium v24 cookie schema and
+  macOS v10 encryption. They check the signed Claude app, read only the selected
+  registered profile (including Default), and use a private temporary copy of the original DB/WAL so
   SQLite cannot create sidecars in Claude's folder. The copy is removed after
   reading. Decrypted cookies and the Keychain key stay in memory. Only the
   selected Claude session cookies go to the fixed HTTPS `/api/bootstrap`
   endpoint, with redirects refused and bounded response size/timeouts. The
   selected organization must match an account membership; account or cookie
-  changes during the request reject the result. There is no default-profile or
-  CLI identity fallback. Unknown formats, blocked requests and denied Keychain
+  changes during the request reject the result. Default is read only when
+  explicitly registered; a separate profile never falls back to Default or CLI
+  identity. Background results use conditional writes and a final file-change
+  check so manual edits and newer logins win. Unknown formats, blocked requests and denied Keychain
   access leave manual labels usable.
 - Shortcuts use Apple's `osacompile` applets. Shell arguments and AppleScript
   strings are escaped independently. Icons are rendered locally from the
@@ -226,6 +254,15 @@ metadata migration. Light/dark native renders cover the new fields and profile
 rows, long labels, archived profiles and scrolling. Only the Keychain item's
 name/account label was checked live; no real sign-in was read or sent during
 these tests.
+
+The Default-profile and automatic-update follow-up passed **776 focused tests**
+and **15 native dialog tests**. Additional coverage includes explicit adoption,
+no credential copying, ordinary-process reuse, default/isolated launch arguments,
+version 4 migration, login/org changes, sign-out, backoff, Keychain denial,
+feature disabling, and late-result rejection. Native light/dark checks cover
+both create-flow choices, automatic-update controls and paused/waiting states.
+A live read-only check against the existing Default profile reached macOS
+Keychain access, which timed out. No live account response was retrieved.
 
 Observed on October 26, 2026: a disposable native launcher was compiled and
 signed, rendered its numbered Claude icon, launched through Finder, preserved
@@ -260,7 +297,9 @@ Before claiming authenticated account support:
   different selected organizations. Check Keychain allow/deny, expired sign-in,
   organization switching, same-profile sign-out/sign-in, and application updates.
   Automated fixtures and a real CommonCrypto/OpenSSL vector verify the reader;
-  authenticated detection still needs a live profile test.
+  authenticated detection still needs a live profile test. A read-only check
+  of the existing Default profile reached Keychain access, which timed out;
+  account details were not retrieved or saved.
 - Sign into two different accounts and verify email, organization and restart
   persistence in each profile. Exercise Google, magic-link and organization SSO
   callbacks with another profile/default Claude already running.

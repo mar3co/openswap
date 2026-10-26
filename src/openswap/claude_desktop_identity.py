@@ -1,7 +1,7 @@
-"""On-demand account labels from one managed Claude Desktop cookie store.
+"""Account labels from one explicitly registered Claude Desktop cookie store.
 
-No default-profile fallback, Code credentials, writes to Claude's files, token
-refresh, or background polling. The caller must explicitly request detection.
+No default-profile fallback, Code credentials, writes to Claude's files or token
+refresh. The default profile is read only after the user explicitly adds it.
 Decrypted cookies and the macOS key exist only in memory; only display labels
 and a detection timestamp leave this module. Claude's private bootstrap API and
 Chromium v24 cookie format may change: an unknown shape fails without guessing.
@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from contextlib import closing
@@ -37,6 +38,14 @@ CHANGED = "The account changed during detection. Try again after choosing the ac
 
 class DetectionError(ClaudeDesktopError):
     """Safe, user-facing errors only; never include cookies or response bodies."""
+
+
+class NoSavedLogin(DetectionError):
+    """No usable sign-in cookies; distinct from an unreadable/unknown format."""
+
+
+class KeyAccessError(DetectionError):
+    """Automatic detection must stop prompting until the user retries."""
 
 
 def _uuid(value):
@@ -81,6 +90,8 @@ def _snapshot(desktop: Path):
     network = desktop / "Network"
     if _file(network, optional=True, directory=True) and _file(network / "Cookies", optional=True):
         candidates.append(network / "Cookies")
+    if not candidates:
+        raise NoSavedLogin("Waiting for sign-in in Claude.")
     if len(candidates) != 1:
         raise DetectionError(UNAVAILABLE)
     database = candidates[0]
@@ -140,8 +151,9 @@ def _cookie_rows(database):
             (now, *COOKIE_NAMES),
         ).fetchall()
     names = [row[0] for row in rows]
-    if (len(names) != len(set(names)) or "lastActiveOrg" not in names
-            or not {"sessionKey", "sessionKeyV3"}.intersection(names)):
+    if not {"sessionKey", "sessionKeyV3"}.intersection(names):
+        raise NoSavedLogin("Waiting for sign-in in Claude.")
+    if len(names) != len(set(names)) or "lastActiveOrg" not in names:
         raise DetectionError(UNAVAILABLE)
     for _, _, plain, encrypted in rows:
         if not isinstance(plain, str) or not isinstance(encrypted, bytes) or len(plain) + len(encrypted) > 16384:
@@ -160,11 +172,11 @@ def _key():
             capture_output=True, timeout=30,
         )
         if result.returncode or not result.stdout or len(result.stdout) > 4096:
-            raise DetectionError("Could not access Claude's saved sign-in. Allow Keychain access when prompted, or enter the details yourself.")
+            raise KeyAccessError("Could not access Claude's saved sign-in. Choose Detect to retry Keychain access, or enter the details yourself.")
         password = result.stdout.removesuffix(b"\n")
         return hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1003, 16)
     except (OSError, subprocess.TimeoutExpired):
-        raise DetectionError("Claude's Keychain access timed out or was unavailable. You can try again or enter the details yourself.") from None
+        raise KeyAccessError("Claude's Keychain access timed out or was unavailable. Choose Detect to retry, or enter the details yourself.") from None
 
 
 def _decrypt(encrypted: bytes, host: str, key: bytes):
@@ -232,16 +244,86 @@ def _labels(data, org_id, expected_account):
             "detected_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
-def detect_account(store: DesktopProfiles, identifier: str, *, app=None):
+def login_fingerprint(snapshot):
+    account, rows = snapshot
+    payload = [account, [[name, host, plain, encrypted.hex()] for name, host, plain, encrypted in rows]]
+    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+
+
+def observe_login(store, profile):
+    """Inspect only this profile's cookie state; no Keychain or network access."""
+    desktop, _ = store._directories(profile)
+    try:
+        return login_fingerprint(_snapshot(desktop))
+    except NoSavedLogin:
+        return ""
+
+
+def disk_stamp(store, profile):
+    """Cheap hint for scheduling reads. Never used as authenticated identity."""
+    desktop, _ = store._directories(profile)
+    result = []
+    for relative in ("config.json", "Cookies", "Cookies-wal", "Network", "Network/Cookies", "Network/Cookies-wal"):
+        path = desktop / relative
+        if not _file(path, optional=True, directory=relative == "Network"):
+            result.append(None)
+        else:
+            info = path.stat()
+            result.append((info.st_ino, info.st_size, info.st_mtime_ns))
+    return tuple(result)
+
+
+class AccountDetector:
+    """Keep the decryption key in memory and avoid repeated permission prompts."""
+
+    def __init__(self):
+        self._cached_key = None
+        self.denied = False
+        self._lock = threading.Lock()
+        self._generation = 0
+
+    def retry(self):
+        self.denied = False
+
+    def clear(self):
+        # Called from the UI thread: never wait for a macOS permission dialog.
+        self._generation += 1
+        self._cached_key = None
+        self.denied = False
+
+    def _get_key(self):
+        with self._lock:
+            if self.denied:
+                raise KeyAccessError("Choose Detect in Account details to allow Keychain access.")
+            if self._cached_key is None:
+                generation = self._generation
+                try:
+                    key = _key()
+                    if generation != self._generation:
+                        raise DetectionError("Account detection stopped.")
+                    self._cached_key = key
+                except KeyAccessError:
+                    if generation == self._generation:
+                        self.denied = True
+                    raise
+            return self._cached_key
+
+    def __call__(self, store, identifier, *, expected_fingerprint=None):
+        return detect_account(store, identifier, key_provider=self._get_key, expected_fingerprint=expected_fingerprint)
+
+
+def detect_account(store: DesktopProfiles, identifier: str, *, app=None, key_provider=None, expected_fingerprint=None):
     """Return a last-detected label pair, never a verified live session state."""
     try:
         if sys.platform != "darwin":
             raise DetectionError("Account detection is available on macOS. You can enter the details yourself.")
-        (app or ClaudeDesktopApp()).validate()
         profile = store.get(identifier)  # archived profiles are not inspected
         desktop, _ = store._directories(profile)
         before = _snapshot(desktop)
-        key = _key() if any(row[3] for row in before[1]) else None
+        if expected_fingerprint is not None and login_fingerprint(before) != expected_fingerprint:
+            raise DetectionError(CHANGED)
+        (app or ClaudeDesktopApp()).validate()
+        key = (key_provider or _key)() if any(row[3] for row in before[1]) else None
         cookies = {}
         for name, host, plain, encrypted in before[1]:
             value = _decrypt(encrypted, host, key) if encrypted else plain
@@ -251,6 +333,9 @@ def detect_account(store: DesktopProfiles, identifier: str, *, app=None):
         org_id = cookies["lastActiveOrg"]
         if not _uuid(org_id):
             raise DetectionError(UNAVAILABLE)
+        current = store.get(identifier)
+        if expected_fingerprint is not None and not current.auto_detect:
+            raise DetectionError("Automatic account detection was turned off.")
         result = _labels(_bootstrap(cookies), org_id, before[0])
         store.get(identifier)
         store._directories(profile)

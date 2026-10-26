@@ -272,7 +272,7 @@ class BrandDialog:
     def __init__(
         self, *, title=None, message="", ok=None, cancel=None, other=None,
         default_text=None, secure=False, destructive=False, checkbox=None, close=None,
-        choices=None, selected=0, fields=None, input_label=None, placeholder=None,
+        choices=None, selected=0, fields=None, input_label=None, placeholder=None, checkbox_checked=False,
     ):
         shown_title = str(title or "OpenSwap")
         if shown_title.casefold() == "openswap":
@@ -406,7 +406,7 @@ class BrandDialog:
             y += 16
             box = NSButton.checkboxWithTitle_target_action_(str(checkbox), None, None)
             box.setFont_(NSFont.systemFontOfSize_(13))
-            box.setState_(NSControlStateValueOff)
+            box.setState_(NSControlStateValueOn if checkbox_checked else NSControlStateValueOff)
             box.sizeToFit()
             box.setFrameOrigin_((DIALOG_PADDING, y))
             surface.addSubview_(box)

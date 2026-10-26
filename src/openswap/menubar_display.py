@@ -1051,7 +1051,7 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
         ("open", "Opening profiles", "Open profile brings it forward. Other profiles keep running."),
         ("shortcut", "Shortcuts and icons", "Choose Create shortcut in a profile's menu, then drag it from Finder to the Dock. Claude's running icon stays unchanged."),
         ("signin", "Sign-in", "Sign in inside each profile. Check its account and workspace; Running only means the app is open."),
-        ("details", "Account details", "Use a profile's menu to detect or edit its email and organization. Saved details may be out of date. The same email can have several profiles."),
+        ("details", "Account details", "Add your existing Claude profile as Default, or create a separate one. Email and organization update after sign-in or account changes. Manage automatic updates in Account details."),
         ("archive", "Archiving", "Keeps sign-ins, data and open windows. Shortcuts are disabled until restored. Restore does not open the profile."),
         ("limits", "Limitations", "Check the account inside Code and Cowork. Chrome pairing is unavailable. OpenSwap does not verify the account or usage."),
     ):

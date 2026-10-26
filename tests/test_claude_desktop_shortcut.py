@@ -63,7 +63,7 @@ def test_legacy_profiles_migrate_without_account_links_or_data_changes(store,ver
     assert store.get(p.id).badge=='1'
     store.update(p.id,color='green')
     raw=json.loads(store.registry.read_text())
-    assert raw['version']==4 and 'code_account' not in raw['profiles'][0]
+    assert raw['version']==5 and 'code_account' not in raw['profiles'][0]
     assert data.read_text()=='kept'
 
 

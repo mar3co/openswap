@@ -2287,7 +2287,7 @@ class MenuBarPanel:
             action_x = width - 12 - action_w - (0 if archived else 32)
             name = _label(profile["name"], font_body, pal["fg"], NSMakeRect(54, y + 10, action_x - 62, 19))
             name.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
-            name.setToolTip_(profile["name"])
+            name.setToolTip_(profile["name"] + (" · Existing Claude profile on this Mac" if profile.get("kind") == "default" else ""))
             group.addSubview_(name)
             if detail:
                 label = _label(detail, font_small, pal["muted"], NSMakeRect(54, y + 30, action_x - 62, 16))
@@ -2296,6 +2296,8 @@ class MenuBarPanel:
                 label.setToolTip_(f"{detail}\n{source}. Check the current account inside Claude.")
                 group.addSubview_(label)
             status = "Archived" if archived else profile.get("status") or "Status not checked"
+            if not archived and profile.get("account_status"):
+                status = profile["account_status"]
             label = _label(status, font_small, pal["muted"], NSMakeRect(54, y + (48 if detail else 30), action_x - 62, 16))
             label.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
             checked = profile.get("checked_at")

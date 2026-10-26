@@ -105,6 +105,18 @@ def test_same_email_profiles_resolve_their_own_organization(setup):
     assert store.paths(profile) != store.paths(personal)
 
 
+def test_default_detection_uses_existing_store_without_falling_back_from_managed(setup, tmp_path):
+    store, managed, _, app = setup
+    store.default_desktop = tmp_path / "existing-Claude"
+    store.default_desktop.mkdir()
+    default = store.add_default()
+    desktop = cookie_store(store, default, org=ORG_A)
+    before = {p: p.read_bytes() for p in desktop.iterdir()}
+    assert identity.detect_account(store, default.id, app=app)["organization"] == "Personal"
+    assert identity.detect_account(store, managed.id, app=app)["organization"] == "Acme"
+    assert before == {p: p.read_bytes() for p in desktop.iterdir()}
+
+
 def test_manual_edit_clears_detection_but_lifecycle_preserves_details(setup):
     store, p, desktop, _ = setup
     store.update(p.id, email="same@example.test", organization="Acme", detected_at=STAMP)
@@ -128,7 +140,7 @@ def test_metadata_upgrade_keeps_ids_and_data_without_inventing_identity(setup, v
     before = (desktop / "Cookies").read_bytes()
     assert store.get(p.id).email == ""
     store.update(p.id, email="new@example.test")
-    assert json.loads(store.registry.read_text())["version"] == 4
+    assert json.loads(store.registry.read_text())["version"] == 5
     assert (desktop / "Cookies").read_bytes() == before
     if version == 3:
         assert store.get(p.id).badge == "8"
@@ -297,8 +309,8 @@ def controller(tmp_path, monkeypatch):
                                  "email": "same@example.test", "organization": "Acme", "detected_at": STAMP}))
 
 
-def answer(clicked, email="", organization=""):
-    return SimpleNamespace(clicked=clicked, values=(email, organization))
+def answer(clicked, email="", organization="", checked=True):
+    return SimpleNamespace(clicked=clicked, values=(email, organization), checked=checked)
 
 
 def test_detect_then_save_is_explicit_and_keeps_profile_identity(controller):
