@@ -11,6 +11,12 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
+## Unreleased
+
+### Fixed
+
+- With more accounts than fit on the screen, the menu bar panel's account list scrolls instead of running off the bottom of the screen.
+
 ## 0.2.2 (2026-10-18)
 
 ### Fixed

@@ -1693,6 +1693,36 @@ def test_settings_header_frames_share_the_main_header_center_line():
     assert title[1] + menubar.HEADER_LABEL_CAP_MID == back[1] + back[3] / 2.0
 
 
+def test_card_list_shows_every_card_when_the_panel_fits():
+    assert menubar.card_list_height(600.0, 200.0, 877.0) == (600.0, False)
+    assert menubar.card_list_height(677.0, 200.0, 877.0) == (677.0, False)
+
+
+def test_card_list_scrolls_when_the_panel_would_leave_the_screen():
+    # Six accounts with three usage rows each on a 877pt-tall visible frame.
+    assert menubar.card_list_height(796.0, 142.0, 877.0) == (735.0, True)
+
+
+def test_card_list_keeps_a_usable_height_on_a_short_screen():
+    floor = menubar.MIN_CARD_LIST_H
+    assert menubar.card_list_height(796.0, 142.0, 200.0) == (floor, True)
+    assert menubar.card_list_height(floor, 142.0, 200.0) == (floor, False)
+
+
+def test_card_list_is_uncapped_without_a_screen():
+    assert menubar.card_list_height(796.0, 142.0, None) == (796.0, False)
+
+
+def test_rebuilding_the_open_card_list_keeps_its_scroll_position():
+    assert menubar.kept_card_list_offset(240.0, same_provider=True, shown=True) == 240.0
+
+
+def test_card_list_starts_at_the_top_when_opened_or_on_another_tab():
+    assert menubar.kept_card_list_offset(240.0, same_provider=True, shown=False) == 0.0
+    assert menubar.kept_card_list_offset(240.0, same_provider=False, shown=True) == 0.0
+    assert menubar.kept_card_list_offset(None, same_provider=True, shown=True) == 0.0
+
+
 def test_popover_is_a_quarter_wider():
     assert menubar.PANEL_WIDTH == 390.0
 

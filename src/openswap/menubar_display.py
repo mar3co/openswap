@@ -1208,6 +1208,9 @@ SETTINGS_HEADER_GAP = 8.0
 SETTINGS_POPUP_W = 118.0
 # Was 312. The extra's popover is the "dropdown"; 390 is +25%.
 PANEL_WIDTH = 390.0
+# Room the popover's arrow and a gap above the Dock take from the screen.
+PANEL_SCREEN_MARGIN = 24.0
+MIN_CARD_LIST_H = 120.0
 
 
 @dataclass(frozen=True)
@@ -3155,6 +3158,39 @@ def trailing_row_frames(
         x -= gap
     frames.reverse()
     return frames
+
+
+def card_list_height(
+    content_h: float, chrome_h: float, available_h: float | None
+) -> tuple[float, bool]:
+    """Height of the main page's account list, and whether it scrolls.
+
+    ``chrome_h`` is everything else on the page (header, tabs, footer) and
+    ``available_h`` the most the popover's content can take on its screen
+    (None when the status item has no screen yet). The list shows in full
+    while the page fits; past that it scrolls, keeping at least
+    ``MIN_CARD_LIST_H`` so a short screen still shows a card.
+    """
+    if available_h is None or chrome_h + content_h <= available_h:
+        return content_h, False
+    height = max(MIN_CARD_LIST_H, available_h - chrome_h)
+    if height >= content_h:
+        return content_h, False
+    return height, True
+
+
+def kept_card_list_offset(
+    offset: float | None, *, same_provider: bool, shown: bool
+) -> float:
+    """Where a rebuilt card list starts scrolled to.
+
+    A rebuild of the open popover (a refresh, a switch, back from Settings)
+    keeps the reader's place in the same tab's list; opening the popover or
+    changing tabs starts at the top.
+    """
+    if offset is None or not same_provider or not shown:
+        return 0.0
+    return offset
 
 
 CARD_MENU_RENAME = "rename"
