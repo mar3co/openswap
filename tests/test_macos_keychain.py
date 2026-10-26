@@ -10,7 +10,9 @@ function bodies run against a fake process.)
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import MagicMock, patch
+import ctypes
+import sys
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -40,6 +42,55 @@ def test_get_password_returns_value_on_rc0():
         args = run.call_args.args[0]
         assert args[:2] == ["/usr/bin/security", "find-generic-password"]
         assert "-a" in args and "acct" in args and "svc" in args
+
+
+@pytest.mark.parametrize("status,size,kind,expected", [
+    (0, 7, 9, "fixture"), (-25300, 7, 9, None),
+    (-128, 7, 9, "error"), (-25293, 7, 9, "error"), (-25308, 7, 9, "error"),
+    (0, 4097, 9, "error"), (0, 0, 9, "error"), (0, 7, 8, "error"),
+])
+def test_native_read_is_exact_read_only_and_releases_objects(monkeypatch, status, size, kind, expected):
+    # Substitute frameworks, not the reader: inspect the real query and ensure
+    # every object is released on successful reads, denied access and bad data.
+    monkeypatch.setattr(sys, "platform", "darwin")
+    payload = ctypes.create_string_buffer(b"fixture")
+    cf = Mock()
+    cf.CFStringCreateWithCString.side_effect = [101, 102]
+    cf.CFDictionaryCreate.return_value = 103
+    cf.CFGetTypeID.return_value = kind
+    cf.CFDataGetTypeID.return_value = 9
+    cf.CFDataGetLength.return_value = size
+    cf.CFDataGetBytePtr.return_value = ctypes.addressof(payload)
+    security = Mock()
+    def copy(query, result):
+        ctypes.cast(result, ctypes.POINTER(ctypes.c_void_p))[0] = 104
+        return status
+    security.SecItemCopyMatching.side_effect = copy
+    keys = ("kSecClass", "kSecClassGenericPassword", "kSecAttrService", "kSecAttrAccount",
+            "kSecMatchLimit", "kSecMatchLimitOne", "kSecReturnData", "kCFBooleanTrue",
+            "kCFTypeDictionaryKeyCallBacks", "kCFTypeDictionaryValueCallBacks")
+    constants = {key: n for n, key in enumerate(keys, 10)}
+    monkeypatch.setattr(macos_keychain, "_native_api", lambda: (cf, security, constants))
+    with patch.object(macos_keychain.subprocess, "run", side_effect=AssertionError("No CLI")):
+        if expected == "error":
+            with pytest.raises(macos_keychain.KeychainError):
+                macos_keychain.get_password("Claude Safe Storage", "Claude Key", native=True)
+        else:
+            assert macos_keychain.get_password("Claude Safe Storage", "Claude Key", native=True) == expected
+    assert [call.args[1] for call in cf.CFStringCreateWithCString.call_args_list] == [b"Claude Safe Storage", b"Claude Key"]
+    args = cf.CFDictionaryCreate.call_args.args
+    assert list(zip(args[1], args[2])) == [(10, 11), (12, 101), (13, 102), (14, 15), (16, 17)]
+    assert args[3] == 5
+    security.SecItemCopyMatching.assert_called_once()
+    assert [call.args[0] for call in cf.CFRelease.call_args_list] == [104, 103, 102, 101]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS framework binding")
+def test_native_framework_abi_loads_without_accessing_keychain():
+    cf, security, constants = macos_keychain._native_api()
+    assert security.SecItemCopyMatching.restype is ctypes.c_int32
+    assert cf.CFDataGetBytePtr.restype is ctypes.c_void_p
+    assert all(constants.values())
 
 
 def test_get_password_returns_none_only_on_rc44():

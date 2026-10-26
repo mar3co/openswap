@@ -1,4 +1,4 @@
-"""macOS Keychain access via the ``security`` CLI.
+"""Shared macOS Keychain access.
 
 A small wrapper around the system ``security`` tool for storing generic
 passwords, used instead of the third-party ``keyring`` library. Two reasons:
@@ -29,8 +29,14 @@ back *hex-encoded*, so a write/read round-trip would not be identity. Fine for
 this codebase (credentials are ASCII JSON), but don't reuse this wrapper for
 arbitrary binary data. Claude Code's ``-w`` reads share the same constraint.
 
-This module is import-safe on every platform (it only shells out at call time);
+This module is import-safe on every platform (platform access is lazy);
 its functions are only meaningful on macOS.
+
+``get_password(..., native=True)`` reads another app's item through
+Security.framework so macOS identifies the running OpenSwap app in permission
+dialogs. The default CLI path stays stable for OpenSwap/Claude Code storage.
+Source installs identify their Python interpreter; the packaged app identifies
+OpenSwap. Neither path changes an existing item's access rules.
 """
 
 from __future__ import annotations
@@ -104,13 +110,15 @@ def _quote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def get_password(service: str, account: str) -> str | None:
+def get_password(service: str, account: str, *, native: bool = False) -> str | None:
     """Return the stored password, or ``None`` if no such item exists (rc 44).
 
     Raises :class:`KeychainError` on any other non-zero exit (locked / denied /
     unavailable) or a timeout, so a genuine miss is not confused with a transient
     failure.
     """
+    if native:
+        return _native_get_password(service, account)
     try:
         result = subprocess.run(
             [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
@@ -132,6 +140,95 @@ def get_password(service: str, account: str) -> str | None:
         f"security find-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"
     )
+
+
+def _native_get_password(service: str, account: str) -> str | None:
+    """Read one generic password in this process; never spawn a credential tool.
+
+    Keep imports lazy for CLI-only/non-macOS installs. CoreFoundation owns all
+    query/result objects; release them even on denial or an unexpected result.
+    No writes, access-list edits, credential copying or authentication fallback.
+    """
+    import ctypes as c
+    import sys
+
+    if sys.platform != "darwin":
+        raise KeychainError("Native Keychain access is available on macOS.")
+    owned = []
+    cf = None
+    try:
+        cf, security, constants = _native_api()
+        def string(value):
+            ref = cf.CFStringCreateWithCString(None, value.encode("utf-8"), 0x08000100)
+            if not ref:
+                raise KeychainError("Could not prepare Keychain access.")
+            owned.append(ref)
+            return ref
+
+        pairs = [(constants["kSecClass"], constants["kSecClassGenericPassword"]),
+                 (constants["kSecAttrService"], string(service)),
+                 (constants["kSecAttrAccount"], string(account)),
+                 (constants["kSecMatchLimit"], constants["kSecMatchLimitOne"]),
+                 (constants["kSecReturnData"], constants["kCFBooleanTrue"])]
+        query = cf.CFDictionaryCreate(None, (c.c_void_p * len(pairs))(*(k for k, _ in pairs)),
+                                      (c.c_void_p * len(pairs))(*(v for _, v in pairs)), len(pairs),
+                                      constants["kCFTypeDictionaryKeyCallBacks"],
+                                      constants["kCFTypeDictionaryValueCallBacks"])
+        if not query:
+            raise KeychainError("Could not prepare Keychain access.")
+        owned.append(query)
+        result = c.c_void_p()
+        status = security.SecItemCopyMatching(query, c.byref(result))
+        if result.value:
+            owned.append(result.value)
+        if status == -25300:  # errSecItemNotFound
+            return None
+        if status != 0:
+            raise KeychainError("Keychain access was canceled, denied or unavailable.")
+        if not result.value or cf.CFGetTypeID(result) != cf.CFDataGetTypeID():
+            raise KeychainError("Keychain returned an unsupported value.")
+        size = cf.CFDataGetLength(result)
+        if not 0 < size <= 4096:
+            raise KeychainError("Keychain returned an unsupported value.")
+        pointer = cf.CFDataGetBytePtr(result)
+        if not pointer:
+            raise KeychainError("Keychain returned an unsupported value.")
+        return c.string_at(pointer, size).decode("utf-8")
+    except (OSError, AttributeError, ValueError):
+        raise KeychainError("Could not read the saved Keychain item.") from None
+    finally:
+        if cf is not None:
+            for ref in reversed(owned):
+                cf.CFRelease(ref)
+
+
+def _native_api():
+    """Bind the system frameworks using pointer-sized types on both Mac CPUs."""
+    import ctypes as c
+
+    cf = c.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    security = c.CDLL("/System/Library/Frameworks/Security.framework/Security")
+    signatures = {
+        "CFStringCreateWithCString": ([c.c_void_p, c.c_char_p, c.c_uint32], c.c_void_p),
+        "CFDictionaryCreate": ([c.c_void_p, c.POINTER(c.c_void_p), c.POINTER(c.c_void_p), c.c_long, c.c_void_p, c.c_void_p], c.c_void_p),
+        "CFGetTypeID": ([c.c_void_p], c.c_ulong),
+        "CFDataGetTypeID": ([], c.c_ulong),
+        "CFDataGetLength": ([c.c_void_p], c.c_long),
+        "CFDataGetBytePtr": ([c.c_void_p], c.c_void_p),
+        "CFRelease": ([c.c_void_p], None),
+    }
+    for name, (args, result) in signatures.items():
+        function = getattr(cf, name)
+        function.argtypes, function.restype = args, result
+    security.SecItemCopyMatching.argtypes = [c.c_void_p, c.POINTER(c.c_void_p)]
+    security.SecItemCopyMatching.restype = c.c_int32
+    constants = {name: c.c_void_p.in_dll(security, name).value for name in (
+        "kSecClass", "kSecClassGenericPassword", "kSecAttrService", "kSecAttrAccount", "kSecMatchLimit",
+        "kSecMatchLimitOne", "kSecReturnData")}
+    constants["kCFBooleanTrue"] = c.c_void_p.in_dll(cf, "kCFBooleanTrue").value
+    for name in ("kCFTypeDictionaryKeyCallBacks", "kCFTypeDictionaryValueCallBacks"):
+        constants[name] = c.addressof(c.c_byte.in_dll(cf, name))
+    return cf, security, constants
 
 
 def item_exists(service: str, account: str) -> bool:

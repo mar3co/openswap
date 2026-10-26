@@ -112,6 +112,7 @@ def test_create_flow_offers_existing_then_reuses_it(store):
     assert p.kind == "default"
     controller.open.assert_called_once_with(p.id)
     assert "Use existing Claude profile (Default)" in controller.prompt.call_args.kwargs["choices"]
+    assert "OpenSwap may request Keychain access" in controller.prompt.call_args.kwargs["message"]
     controller.monitor.refresh.assert_called_once_with(p.id)
 
 
@@ -124,6 +125,7 @@ def test_create_flow_new_choice_creates_separate_empty_storage(store):
     assert list(store.paths(p)[0].iterdir()) == []
     controller.open.assert_called_once_with(p.id)
     assert controller.prompt.call_args.kwargs["title"] == "Create Claude Desktop profile"
+    assert "After sign-in, OpenSwap may request Keychain access" in controller.prompt.call_args.kwargs["message"]
 
 
 @pytest.mark.parametrize("second", [False, True])
@@ -284,6 +286,56 @@ def test_detector_caches_key_and_denial_without_repeated_prompts(monkeypatch):
     detector.retry()
     key.side_effect = None
     assert detector._get_key() == b"k" * 16 and key.call_count == 3
+
+
+def test_denial_survives_restart_feature_toggle_and_adding_profiles(store, monkeypatch):
+    from openswap import claude_desktop_identity as module
+    key = Mock(side_effect=KeyAccessError("Denied"))
+    monkeypatch.setattr(module, "_key", key)
+    first = AccountDetector(store)
+    with pytest.raises(KeyAccessError): first._get_key()
+    assert store.keychain_paused()
+    assert (store.root / "keychain-paused").stat().st_mode & 0o777 == 0o600
+    store.add("Another profile")
+    first.clear()
+    restarted = AccountDetector(store)
+    for detector in (first, restarted):
+        with pytest.raises(KeyAccessError): detector._get_key()
+    assert key.call_count == 1
+    restarted.retry()
+    key.side_effect = None
+    key.return_value = b"k" * 16
+    assert restarted._get_key() == b"k" * 16
+    assert not store.keychain_paused() and not AccountDetector(store).denied
+    assert key.call_count == 2
+
+
+def test_quitting_during_request_preserves_pause_until_explicit_retry(store, monkeypatch):
+    from openswap import claude_desktop_identity as module
+    detector = AccountDetector(store)
+    def key():
+        assert store.keychain_paused()  # durable before the system dialog
+        detector.clear()
+        return b"k" * 16
+    monkeypatch.setattr(module, "_key", key)
+    with pytest.raises(KeyAccessError): detector._get_key()
+    assert detector.denied and AccountDetector(store).denied
+    assert detector._cached_key is None
+
+
+def test_unreadable_pause_marker_cannot_trigger_prompt(store, tmp_path, monkeypatch):
+    from openswap import claude_desktop_identity as module
+    store.add("Work")
+    target = tmp_path / "elsewhere"
+    target.touch()
+    (store.root / "keychain-paused").symlink_to(target)
+    key = Mock()
+    monkeypatch.setattr(module, "_key", key)
+    detector = AccountDetector(store)
+    assert detector.denied
+    with pytest.raises(KeyAccessError): detector._get_key()
+    with pytest.raises(ClaudeDesktopError): detector.retry()
+    key.assert_not_called()
 
 
 def test_suspending_during_permission_prompt_discards_late_key(monkeypatch):

@@ -215,7 +215,7 @@ class ClaudeDesktopMenu:
         if available:
             response = self.prompt(
                 title="Add Claude Desktop profile",
-                message="Use the Claude profile already on this Mac, or create a separate one. Account details update automatically.",
+                message="Use your existing Claude login or create a separate profile.\n\nOpenSwap may request Keychain access to show your email and organization. If denied, choose Account details → Detect to retry.",
                 choices=["Use existing Claude profile (Default)", "Create a separate profile"], selected=0,
                 ok="Continue", cancel="Cancel",
             )
@@ -234,7 +234,7 @@ class ClaudeDesktopMenu:
                 return
         response = self.prompt(
             title="Create Claude Desktop profile",
-            message="Create a separate Claude window with its own sign-in. Account details update after you sign in.",
+            message="Create a separate Claude window with its own sign-in.\n\nAfter sign-in, OpenSwap may request Keychain access to show your email and organization. If denied, choose Account details → Detect to retry.",
             input_label="Profile name", placeholder="e.g. Work",
             default_text="", ok="Create and open", cancel="Cancel",
         )
@@ -261,7 +261,9 @@ class ClaudeDesktopMenu:
         values = draft or {"email": profile.email, "organization": profile.organization,
                            "detected_at": profile.detected_at}
         while True:
-            message = note or "Account details update after sign-in or account changes. macOS may ask for Keychain access."
+            message = note or ("Account detection is paused. Choose Detect to retry Keychain access, or enter the details yourself."
+                               if self.monitor.detector.denied else
+                               "Account details update after sign-in or account changes. OpenSwap may request Keychain access.")
             if values.get("detected_at"):
                 when = datetime.fromisoformat(values["detected_at"]).astimezone().strftime("%b %d, %H:%M")
                 message += f"\nLast detected {when}. The account may have changed."
@@ -306,7 +308,11 @@ class ClaudeDesktopMenu:
         if self.busy or self.blocked() or not self.enabled():
             return
         from openswap.claude_desktop_identity import DetectionError
-        self.monitor.detector.retry()
+        try:
+            self.monitor.detector.retry()
+        except (ClaudeSwitchError, OSError) as exc:
+            self._error(exc)
+            return
         self.busy = True
         self.operation = "Detecting account…"
         self.changed()

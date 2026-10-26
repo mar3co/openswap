@@ -27,7 +27,7 @@ def _labels(profile):
 class ProfileIdentityMonitor:
     def __init__(self, store, *, detector=None, clock=None, observe=None, stamp=None):
         self.store = store
-        self.detector = detector or AccountDetector()
+        self.detector = detector or AccountDetector(store)
         self.clock = clock or time.monotonic
         self.observe = observe or observe_login
         self.stamp = stamp or disk_stamp

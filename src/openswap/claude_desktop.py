@@ -156,6 +156,25 @@ class DesktopProfiles:
                 _plain(path)
         return FileLock(path, timeout=0.5)
 
+    def keychain_paused(self) -> bool:
+        """A durable stop flag, shared by all Desktop profiles in this store."""
+        path = self.root / "keychain-paused"
+        return self._root() and _plain(path)
+
+    def pause_keychain(self, paused: bool) -> None:
+        # Record before a permission request so quitting during the dialog also
+        # requires an explicit retry. This contains no credentials or identity.
+        if type(paused) is not bool:
+            raise ClaudeDesktopError("Invalid Keychain access state.")
+        with self._lock():
+            path = self.root / "keychain-paused"
+            present = _plain(path)
+            if not paused:
+                path.unlink(missing_ok=True)
+            elif not present:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                os.close(fd)
+
     def list(self, *, include_archived: bool = False) -> list[Profile]:
         if not self._root() or not _plain(self.registry):
             return []

@@ -3,7 +3,6 @@
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -258,14 +257,13 @@ def test_keychain_failure_does_not_make_request(setup, monkeypatch):
     identity._bootstrap.assert_not_called()
 
 
-def test_keychain_read_is_exact_and_bounded(monkeypatch):
-    run = Mock(return_value=SimpleNamespace(returncode=0, stdout=b"fixture-key\n"))
-    monkeypatch.setattr(identity.subprocess, "run", run)
+def test_keychain_read_uses_shared_app_identified_helper(monkeypatch):
+    read = Mock(return_value="fixture-key")
+    monkeypatch.setattr(identity.macos_keychain, "get_password", read)
     assert len(identity._key()) == 16
-    assert run.call_args.args[0] == ["/usr/bin/security", "find-generic-password", "-s", "Claude Safe Storage", "-a", "Claude Key", "-w"]
-    assert run.call_args.kwargs["timeout"] == 30
-    run.side_effect = subprocess.TimeoutExpired("security", 30)
-    with pytest.raises(identity.DetectionError, match="timed out"): identity._key()
+    read.assert_called_once_with("Claude Safe Storage", "Claude Key", native=True)
+    read.side_effect = identity.macos_keychain.KeychainError("private error")
+    with pytest.raises(identity.KeyAccessError, match="paused"): identity._key()
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="CommonCrypto is macOS-only")

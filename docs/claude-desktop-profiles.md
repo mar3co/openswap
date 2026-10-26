@@ -59,12 +59,21 @@ Detected details are saved automatically beneath the existing profile name.
 The profile name and ID never change based on email, and several profiles can
 use the same email or account.
 
-macOS may ask for access to **Claude Safe Storage** in Keychain. If access is
-denied or times out, automatic requests pause for the current app session;
-choose **••• → Account details… → Detect** to retry. No repeated background
-permission dialogs are shown. A successful read caches the decryption key only
-in memory. Disabling Desktop features clears that key and discards in-flight
-results. No tokens are refreshed or transferred between profiles.
+Add profile explains that macOS may ask OpenSwap for access to **Claude Safe
+Storage** in Keychain to show the email and organization. The shared Keychain
+helper uses native Security.framework access for this Claude-owned item, so the
+packaged app is the requester. Source installs may identify their Python
+interpreter instead. The existing Code credential path keeps its stable Apple
+helper and existing access behavior.
+
+If access is denied or unavailable, automatic requests stay paused across
+restarts, feature toggles and new profiles. Choose **••• → Account details… →
+Detect** to retry. A private, credential-free `keychain-paused` marker is written
+before the system request and removed after successful access or explicit
+retry; quitting during a request also leaves detection paused. No repeated
+background permission dialogs are shown. A successful read caches the decryption
+key only in memory. Disabling Desktop features clears that key and discards
+in-flight results. No tokens are refreshed or transferred between profiles.
 
 **Account details…** also offers manual editing and an **Update account details
 automatically** checkbox. Turn it off to keep your own labels. Older manual
@@ -263,6 +272,18 @@ feature disabling, and late-result rejection. Native light/dark checks cover
 both create-flow choices, automatic-update controls and paused/waiting states.
 A live read-only check against the existing Default profile reached macOS
 Keychain access, which timed out. No live account response was retrieved.
+
+The Keychain UX follow-up passed **834 focused tests** (three real-Keychain CI
+tests skipped locally) and **15 native dialog tests**. It covers the shared
+helper's native query, denial/cancellation, resource cleanup, persisted pauses,
+explicit retry, feature toggles, restart and interrupted requests. Light/dark
+renders verify the explanation in both Add profile choices. A temporary
+PyInstaller DEV app named OpenSwap passed strict signature verification and a
+native lookup for a unique nonexistent item without reading a credential.
+It is running locally with settings and the Homebrew login item preserved.
+The password dialog's displayed requester and real signed-in detection still
+need user verification; this local build is ad hoc signed, not a notarized
+release or proof that Keychain trust persists across release updates.
 
 Observed on October 26, 2026: a disposable native launcher was compiled and
 signed, rendered its numbered Claude icon, launched through Finder, preserved
