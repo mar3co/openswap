@@ -26,6 +26,7 @@ def snapshot():
 
 
 def title(snapshot, provider, **options):
+    options = {"desktop_features_enabled": True, "chatgpt_switching_enabled": True, **options}
     return menubar.format_menu_bar_title(
         snapshot, menubar.MenuBarSettings(menu_bar_provider=provider, **options), now=200
     )
@@ -122,3 +123,17 @@ def test_provider_setting_persists_and_rebuilds_without_switching_accounts(tmp_p
     assert menubar.MenuBarSettings.load(scope["settings_path"]).menu_bar_provider == "both"
     methods._on_setting(app, "menu_bar_provider", "bad-value")
     assert app.settings.menu_bar_provider == "both"
+
+
+@pytest.mark.parametrize('use_kind', [True, False])
+def test_cli_only_title_shows_active_codex_key_without_desktop_or_oauth_quota(snapshot, use_kind):
+    from openswap.json_output import USAGE_API_KEY
+    if use_kind:
+        snapshot['kinds'] = {'codex:2': 'api_key'}
+    else:
+        row = list(snapshot['accounts'][2])
+        row[3] = USAGE_API_KEY
+        snapshot['accounts'][2] = tuple(row)
+    result = title(snapshot, 'chatgpt', desktop_features_enabled=False)
+    assert result == 'Codex · Work'
+    assert '%' not in result and 'ChatGPT' not in result

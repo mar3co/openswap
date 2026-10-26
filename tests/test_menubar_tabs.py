@@ -21,6 +21,10 @@ def _panel():
         "SETTINGS_SECTION_GENERAL": "general",
         "SETTINGS_SECTION_AUTOMATION": "automation",
         "SETTINGS_SECTION_REMOTE": "remote",
+        "SETTINGS_SECTION_DESKTOP": "desktop",
+        "MenuBarSettings": menubar.MenuBarSettings,
+        "chatgpt_tab_desktop": menubar.chatgpt_tab_desktop,
+        "settings_sections": menubar.settings_sections,
         "SETTINGS_SECTIONS": (
             ("general", "General"), ("automation", "Automation"), ("remote", "Remote")
         ),
@@ -138,7 +142,7 @@ def test_activate_card_noops_when_activation_is_disabled():
     view.on_switch.reset_mock()
     view.card = menubar.apply_chatgpt_activation(
         [{"num": "codex:1", "disabled": False}],
-        menubar.MenuBarSettings(chatgpt_switching_enabled=False),
+        menubar.MenuBarSettings(desktop_features_enabled=True, chatgpt_switching_enabled=False),
         menubar.DesktopCapability("stopped", "stopped", observed_at=1.0),
         now=1.0,
     )[0]
@@ -173,7 +177,7 @@ def test_empty_state_gives_provider_specific_add_guidance(provider, name):
         assert state["secondary_button"] == "Save current login"
     else:
         assert state["action"] == "start"
-        assert state["button"] == "Sign in with Claude"
+        assert state["button"] == "Sign in to Claude Code"
         assert state["secondary_action"] == "add"
         assert state["secondary_button"] == "Save current login"
         assert state["hint"] == ""

@@ -11,5 +11,6 @@ How this checkout is put together. **Users** (install, switch, extra, widget, ki
 | pytest rules and what not to import | [Testing](testing.md) |
 | Experimental ChatGPT restart-and-switch | [Desktop testing](chatgpt-desktop-testing.md) |
 | ChatGPT desktop evidence and gates | [Desktop feasibility](chatgpt-desktop-feasibility.md) |
+| Experimental Claude Desktop profiles, recovery and validation | [Claude Desktop profiles](claude-desktop-profiles.md) |
 
 Standalone MIT descendant of [realiti4/claude-swap](https://github.com/realiti4/claude-swap). Remote is `origin` (`mar3co/openswap`).

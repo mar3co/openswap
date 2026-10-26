@@ -109,7 +109,7 @@ def test_settings_defaults_when_file_missing(tmp_path: Path):
 
 def test_settings_round_trip(tmp_path: Path):
     path = tmp_path / "menubar_settings.json"
-    original = menubar.MenuBarSettings(
+    original = menubar.MenuBarSettings(desktop_features_enabled=True,
         show_account_name=False,
         title_pct="5h",
         refresh_interval=300,
@@ -171,7 +171,8 @@ def test_menu_bar_provider_settings_validation(tmp_path: Path, provider):
 
 @pytest.mark.parametrize("provider", ["claude", "chatgpt", "both", "logo"])
 def test_menu_bar_display_controls_follow_provider(provider):
-    settings = menubar.MenuBarSettings(menu_bar_provider=provider, title_scoped=True)
+    settings = menubar.MenuBarSettings(menu_bar_provider=provider, title_scoped=True,
+                                      desktop_features_enabled=True, chatgpt_switching_enabled=True)
     rows = menubar.settings_page_rows(
         settings, strategy="best", threshold=90, section="general"
     )
@@ -181,7 +182,7 @@ def test_menu_bar_display_controls_follow_provider(provider):
     assert picker["kind"] == "popup"
     assert picker["value"] == provider
     assert picker["options"] == [
-        ("claude", "Claude"), ("chatgpt", "ChatGPT"),
+        ("claude", "Claude Code"), ("chatgpt", "ChatGPT"),
         ("both", "Both"), ("logo", "Logo only"),
     ]
     assert ("title_scoped" in by_id) == (provider in ("claude", "both"))
@@ -256,12 +257,13 @@ def test_settings_page_constants():
     assert menubar.SETTINGS_SECTIONS == (
         ("general", "General"),
         ("automation", "Automation"),
+        ("desktop", "Desktop"),
         ("remote", "Remote"),
     )
 
 
 def test_settings_page_sections_separate_display_from_provider_automation():
-    settings = menubar.MenuBarSettings(
+    settings = menubar.MenuBarSettings(desktop_features_enabled=True,
         auto_switch_enabled=True,
         chatgpt_auto_enabled=False,
     )
@@ -287,6 +289,11 @@ def test_settings_page_sections_separate_display_from_provider_automation():
         worker_paired=True,
         section=menubar.SETTINGS_SECTION_REMOTE,
     )
+    desktop = menubar.settings_page_rows(
+        settings, strategy="best", threshold=90, has_codex=True,
+        section=menubar.SETTINGS_SECTION_DESKTOP, desktop_app="chatgpt",
+    )
+    desktop_by_id = {row["id"]: row for row in desktop}
 
     general_ids = {row["id"] for row in general}
     automation_by_id = {row["id"]: row for row in automation}
@@ -301,16 +308,17 @@ def test_settings_page_sections_separate_display_from_provider_automation():
         "remote_tasks_status", "remote_tasks_paused", "remote_tasks_stop",
     }
     assert automation_by_id["auto_switch_enabled"]["label"] == (
-        "Auto-switch Claude accounts"
+        "Auto-switch linked Claude accounts"
     )
-    assert automation_by_id["chatgpt_switching_enabled"]["label"] == (
+    assert "chatgpt_switching_enabled" not in automation_by_id
+    assert desktop_by_id["chatgpt_switching_enabled"]["label"] == (
         "Enable ChatGPT switching"
     )
-    assert automation_by_id["chatgpt_auto_enabled"]["label"] == (
+    assert desktop_by_id["chatgpt_auto_enabled"]["label"] == (
         "Suggest ChatGPT account switches"
     )
-    assert automation_by_id["chatgpt_auto_enabled"]["disabled"] is True
-    ids = [row["id"] for row in automation]
+    assert desktop_by_id["chatgpt_auto_enabled"]["disabled"] is True
+    ids = [row["id"] for row in desktop]
     assert ids.index("chatgpt_switching_enabled") < ids.index("chatgpt_auto_enabled")
     assert automation_by_id["codex_enabled"]["label"] == (
         "Auto-switch Codex CLI accounts"
@@ -544,7 +552,7 @@ def test_chatgpt_capability_freshness_and_activation_helpers():
     assert capability_is_fresh(stopped, now=now) is True
     assert capability_is_fresh(expired, now=now) is False
     settings_off = menubar.MenuBarSettings()
-    settings_on = menubar.MenuBarSettings(chatgpt_switching_enabled=True)
+    settings_on = menubar.MenuBarSettings(desktop_features_enabled=True, chatgpt_switching_enabled=True)
     assert menubar.chatgpt_manual_activation_allowed(settings_off, stopped, now=now) is False
     assert menubar.chatgpt_manual_activation_allowed(settings_on, expired, now=now) is False
     assert menubar.chatgpt_manual_activation_allowed(settings_on, stopped, now=now) is True
@@ -600,7 +608,7 @@ def test_chatgpt_desktop_config_check_reuses_transaction_policy(tmp_path, monkey
 
 
 def test_chatgpt_auto_is_persisted_independently_and_exposes_policy():
-    settings = menubar.MenuBarSettings(
+    settings = menubar.MenuBarSettings(desktop_features_enabled=True,
         auto_switch_enabled=False,
         chatgpt_switching_enabled=True,
         chatgpt_auto_enabled=True,
@@ -621,7 +629,7 @@ def test_chatgpt_auto_is_persisted_independently_and_exposes_policy():
 
 
 def test_chatgpt_switching_parent_defaults_off_and_disables_suggestions_toggle():
-    settings = menubar.MenuBarSettings()
+    settings = menubar.MenuBarSettings(desktop_features_enabled=True)
     rows = menubar.settings_page_rows(
         settings, strategy="best", threshold=90, has_codex=True,
     )
@@ -662,7 +670,7 @@ def test_present_chatgpt_switching_false_wins_over_legacy_auto(tmp_path: Path):
 
 
 def test_parent_off_does_not_block_codex_rotation_on_stored_child():
-    settings = menubar.MenuBarSettings(
+    settings = menubar.MenuBarSettings(desktop_features_enabled=True,
         auto_switch_enabled=True,
         chatgpt_switching_enabled=False,
         chatgpt_auto_enabled=True,
@@ -674,7 +682,7 @@ def test_parent_off_does_not_block_codex_rotation_on_stored_child():
     by_id = {row["id"]: row for row in rows}
     assert by_id["chatgpt_auto_enabled"]["disabled"] is True
     assert by_id["codex_enabled"]["disabled"] is False
-    on = menubar.MenuBarSettings(
+    on = menubar.MenuBarSettings(desktop_features_enabled=True,
         auto_switch_enabled=True,
         chatgpt_switching_enabled=True,
         chatgpt_auto_enabled=True,
@@ -1755,7 +1763,7 @@ def test_card_view_accepts_the_first_click():
 
 def test_rebuild_menu_does_not_reload_an_open_popover():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
-    rebuild = text[text.index("def rebuild_menu") : text.index("def _add_menu")]
+    rebuild = text[text.index("def rebuild_menu") : text.index("def _claude_desktop_changed")]
     assert "self._panel.reload()" not in rebuild
     assert "_reload_main_panel_if_shown" not in rebuild
     sync = text[text.index("def on_sync_tick") : text.index("def _detect_active_change")]
@@ -2652,7 +2660,7 @@ def test_panel_accounts_saved_login_is_current_and_actionable():
     assert card["note"] == (
         "Usage verified just now · Click to restore the saved Claude login."
     )
-    assert menubar.provider_tab_title([card], "claude") == "Claude · Fix login"
+    assert menubar.provider_tab_title([card], "claude") == "Claude Code · Fix login"
 
 
 def test_store_only_missing_live_login_marks_cached_usage_stale_and_restorable():
@@ -2691,7 +2699,7 @@ def test_missing_saved_login_is_an_actionable_sign_in_state():
     assert card["action_required"] is True
     assert card["needs_restore"] is False
     assert card["note"] == menubar.MISSING_LOGIN_CARD_NOTE
-    assert menubar.provider_tab_title([card], "claude") == "Claude · Sign in"
+    assert menubar.provider_tab_title([card], "claude") == "Claude Code · Sign in"
 
 
 def test_saved_login_usage_becomes_visibly_stale_after_serve_ttl():
@@ -3019,7 +3027,7 @@ def test_kickoff_oauth_failure_marks_card_and_provider_tab_for_action():
     assert cards[0]["action_required"] is True
     assert "OAuth expired" in cards[0]["note"]
     assert menubar.provider_tab_title(cards, "chatgpt") == "ChatGPT · Sign in"
-    assert menubar.provider_tab_title(cards, "claude") == "Claude"
+    assert menubar.provider_tab_title(cards, "claude") == "Claude Code"
 
 
 def test_provider_cards_filters_and_transforms_shared_codex_without_mutating():
@@ -3497,6 +3505,13 @@ def test_every_settings_row_is_dispatched():
     for row in rows:
         if row["kind"] in {"group", "status"}:
             continue
+        if row["id"] == "desktop_app":
+            continue  # local settings navigation, covered by panel tests
+        if row["id"] == "claude_desktop_profiles":
+            # Native menus need the clicked button as their popover anchor.
+            panel = Path(menubar.__file__).with_name("menubar_panel.py").read_text()
+            assert 'self._claude_desktop_profiles if row["id"] == "claude_desktop_profiles"' in panel
+            continue
         assert f'"{row["id"]}"' in body, row["id"]
 
 
@@ -3898,7 +3913,7 @@ def test_claude_empty_state_signs_in_and_saves_through_separate_actions():
 def test_claude_add_is_offered_on_the_claude_page_and_in_the_add_menu():
     text = Path(menubar.__file__).read_text(encoding="utf-8")
     add_menu = text[text.index("def _add_menu") : text.index("def _rename_menu")]
-    assert add_menu.index('"Sign in with Claude…"') < add_menu.index('"From current login"')
+    assert add_menu.index('"Sign in to Claude Code…"') < add_menu.index('"Save current Claude Code login"')
     assert "on_add_claude=" in text
     panel = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
         encoding="utf-8"
@@ -4015,8 +4030,9 @@ def test_more_menu_is_management_only_once_the_popover_is_attached():
                  "_disable_menu(rumps)", "_remove_menu(rumps)", "_desktop_menu(rumps)"):
         assert name in gated
     always = gated.replace("if fallback else []", "")
-    assert '"Claude: next available"' in always
-    assert gated.count("if fallback else []") == 2
+    assert '"Claude Code: next available"' in always
+    assert gated.count("if fallback else []") == 1
+    assert "if fallback and not self.settings.desktop_features_enabled else []" in gated
 
 
 # -- Second tab: Codex CLI or the ChatGPT desktop app, by one setting ---------
@@ -4025,7 +4041,7 @@ def test_more_menu_is_management_only_once_the_popover_is_attached():
 def test_chatgpt_tab_desktop_follows_the_switching_setting():
     assert menubar.chatgpt_tab_desktop(menubar.MenuBarSettings()) is False
     assert menubar.chatgpt_tab_desktop(
-        menubar.MenuBarSettings(chatgpt_switching_enabled=True)
+        menubar.MenuBarSettings(desktop_features_enabled=True, chatgpt_switching_enabled=True)
     ) is True
     assert menubar.chatgpt_tab_desktop(None) is False
 
@@ -4033,7 +4049,7 @@ def test_chatgpt_tab_desktop_follows_the_switching_setting():
 def test_second_tab_copy_is_codex_when_desktop_switching_is_off():
     assert menubar.provider_tab_title([], "chatgpt", desktop=False) == "Codex"
     assert menubar.provider_tab_title([], "chatgpt") == "ChatGPT"
-    assert menubar.provider_tab_title([], "claude", desktop=False) == "Claude"
+    assert menubar.provider_tab_title([], "claude", desktop=False) == "Claude Code"
     assert menubar.provider_shared_copy("chatgpt", desktop=False) == ""
     assert menubar.provider_shared_copy("chatgpt") == "Shared with Codex · Codex usage"
     empty = menubar.provider_empty_state("chatgpt", desktop=False)
@@ -4096,7 +4112,7 @@ def test_card_badge_and_suffix_follow_the_tab_mode():
 
 def test_switching_setting_explains_what_the_second_tab_does():
     rows = menubar.settings_page_rows(
-        menubar.MenuBarSettings(), strategy="best", threshold=90.0, has_codex=True,
+        menubar.MenuBarSettings(desktop_features_enabled=True), strategy="best", threshold=90.0, has_codex=True,
     )
     ids = [row["id"] for row in rows]
     assert ids.index("chatgpt_switching_enabled") < ids.index("chatgpt_switching_hint") < ids.index("chatgpt_auto_enabled")
@@ -4142,7 +4158,7 @@ def test_codex_tab_click_switches_codex_cli_instead_of_asking_to_enable():
     assert "self._on_account_click(num, close_panel=True)" in off
     # The tab's mode comes from the in-memory setting the panel also reads; a
     # persisted mismatch falls back to the Settings offer, never a CLI switch.
-    assert "desktop_tab = self.settings.chatgpt_switching_enabled" in click
+    assert "desktop_tab = chatgpt_tab_desktop(self.settings)" in click
     assert "_offer_enable_chatgpt_switching" in click
     toggle = text[text.index("def _toggle_codex_auto") : text.index("def _popup_overflow")]
     assert "autoswitch.codexEnabled" in toggle and "_reload_main_panel_if_shown" in toggle

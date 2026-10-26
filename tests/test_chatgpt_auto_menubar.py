@@ -30,6 +30,8 @@ def _app(monkeypatch, tmp_path):
     set_setting = Mock()
     thread_type = Mock()
     scope = {
+        "chatgpt_suggestions_effective": menubar.chatgpt_suggestions_effective,
+        "chatgpt_tab_desktop": menubar.chatgpt_tab_desktop,
         "AutoSwitchEngine": engine_type,
         "desktop_switch_choices": menubar.desktop_switch_choices,
         "load_settings": load,
@@ -39,7 +41,7 @@ def _app(monkeypatch, tmp_path):
         "time": time,
     }
     app = extract_class(menubar.__file__, "MenuBarApp", METHODS, scope)()
-    app.settings = menubar.MenuBarSettings(
+    app.settings = menubar.MenuBarSettings(desktop_features_enabled=True,
         chatgpt_switching_enabled=True, chatgpt_auto_enabled=True,
     )
     app.switcher = Mock(backup_dir=tmp_path, _logger=Mock())
@@ -403,3 +405,18 @@ def test_reconcile_resumes_after_onboarding_or_transaction_finishes(monkeypatch,
     app._desktop_switching = False
     app._reconcile_chatgpt_auto_mode()
     app._start_chatgpt_auto_monitor.assert_called_once()
+
+
+def test_global_desktop_off_stops_monitor_and_clears_pending_suggestion(monkeypatch, tmp_path):
+    app = _app(monkeypatch, tmp_path)
+    app._start_chatgpt_auto_monitor()
+    engine = app._chatgpt_auto_engine
+    assert engine is not None
+    app._pending_chatgpt_switch = ('1', ('a', 'b'), '2', ('c', 'd'))
+    app.settings.desktop_features_enabled = False
+    app._reconcile_chatgpt_auto_mode()
+    assert app._chatgpt_auto_engine is None and app._pending_chatgpt_switch is None
+    engine.stop.assert_called_once()
+    app._start_chatgpt_auto_monitor()
+    assert app._chatgpt_auto_engine is None
+    assert app.settings.chatgpt_switching_enabled and app.settings.chatgpt_auto_enabled

@@ -661,6 +661,10 @@ def run(zap: bool, say: Say, *, from_app: bool = False) -> int:
     Homebrew moves itself to the Trash as the last step, and a failed
     ``brew uninstall`` opens the log.
     """
+    from openswap.claude_desktop import default_root as desktop_profiles_root
+
+    if desktop_profiles_root().exists():
+        say(f"Claude Desktop profiles, including sign-ins and local work, are kept at {desktop_profiles_root()}.")
     still_installed = "OpenSwap is still installed. " + (
         "Fix the error above, then open OpenSwap and choose Uninstall OpenSwap… again."
         if from_app else f"Fix that, then run: openswap uninstall{' --zap' if zap else ''}"
@@ -795,6 +799,10 @@ def app_dialog() -> dict[str, str]:
         lines.append(f"• {app.name}, {'through Homebrew' if bundle.installed_by_homebrew() else 'moved to the Trash'}")
         after = ""
     names = [server_name(url) for url in paired_servers()]
+    from openswap.claude_desktop import default_root as desktop_profiles_root
+
+    if desktop_profiles_root().exists():
+        after += "\n\nClaude Desktop profiles, including their sign-ins and local work, stay on this Mac even when deleting saved accounts."
     if names:
         # Nobody reads the uninstall's log, so say it here, before the zap.
         if len(names) == 1:

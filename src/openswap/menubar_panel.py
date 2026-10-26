@@ -102,9 +102,11 @@ from openswap.menubar import (
     SETTINGS_PAGE,
     SETTINGS_POPUP_W,
     SETTINGS_SECTION_AUTOMATION,
+    SETTINGS_SECTION_DESKTOP,
     SETTINGS_SECTION_GENERAL,
     SETTINGS_SECTION_REMOTE,
     SETTINGS_SECTIONS,
+    settings_sections,
     TOKEN_PAGE,
     apply_chatgpt_activation,
     DesktopCapability,
@@ -243,7 +245,7 @@ def _card_height(card) -> float:
     if card.get("note"):
         n += 1
     n = max(n, 1)
-    sub = SUBTITLE_H if card.get("subtitle") else 0.0
+    sub = (SUBTITLE_H if card.get("subtitle") else 0.0) + (SUBTITLE_H if card.get("desktop_profile") else 0.0)
     return CARD_PAD * 2 + TITLE_H + sub + 6 + n * ROW_H
 
 
@@ -1002,6 +1004,9 @@ class MenuBarPanel:
         worker_paired=None,
         login_item=None,
         on_add_claude=None,
+        on_claude_desktop=None,
+        claude_desktop_state=None,
+        on_claude_desktop_check=None,
         on_card_menu=None,
         on_toggle_codex_auto=None,
         status_line=None,
@@ -1013,6 +1018,9 @@ class MenuBarPanel:
         self._on_rotate = on_rotate
         self._on_best = on_best
         self._on_add_claude = on_add_claude
+        self._on_claude_desktop = on_claude_desktop
+        self._claude_desktop_state = claude_desktop_state or (lambda: {})
+        self._on_claude_desktop_check = on_claude_desktop_check
         self._on_toggle_auto = on_toggle_auto
         self._on_toggle_chatgpt_auto = on_toggle_chatgpt_auto
         self._on_review_chatgpt_switch = on_review_chatgpt_switch
@@ -1052,6 +1060,7 @@ class MenuBarPanel:
         # second provider without losing their place when the popover closes.
         self._selected_provider = "claude"
         self._settings_section = SETTINGS_SECTION_GENERAL
+        self._desktop_settings_app = "claude"
         self._page = MAIN_PAGE
         self._item = None
         self._popover = None
@@ -1350,6 +1359,24 @@ class MenuBarPanel:
         self._page = TOKEN_PAGE
         self.reload()
 
+    def _claude_desktop_profiles(self, sender):
+        if self._on_claude_desktop is None or not self._settings().desktop_features_enabled:
+            return
+        self._hold_overflow(True)
+        try:
+            self._on_claude_desktop(sender)
+        finally:
+            self._hold_overflow(False)
+            if self._page == SETTINGS_PAGE and self.is_shown():
+                self.reload()
+
+    def _show_claude_desktop_settings(self, _sender=None):
+        if not self._settings().desktop_features_enabled:
+            return
+        self._desktop_settings_app = "claude"
+        self._page = SETTINGS_PAGE
+        self._select_settings_section(SETTINGS_SECTION_DESKTOP)
+
     def _login_action(self, action: str, alias: str | None = None) -> None:
         if self._on_login_action is not None:
             self._on_login_action(action, alias=alias)
@@ -1386,12 +1413,15 @@ class MenuBarPanel:
         return t
 
     def _show_settings(self, _sender=None):
+        settings = self._settings() if callable(self._settings) else MenuBarSettings()
         self._settings_section = (
-            SETTINGS_SECTION_AUTOMATION
+            (SETTINGS_SECTION_DESKTOP if chatgpt_tab_desktop(settings) else SETTINGS_SECTION_AUTOMATION)
             if self._selected_provider == "chatgpt"
             else SETTINGS_SECTION_GENERAL
         )
         self._page = SETTINGS_PAGE
+        if self._settings_section == SETTINGS_SECTION_DESKTOP:
+            self._desktop_settings_app = "chatgpt"
         self.reload()
 
     def _show_main(self, _sender=None):
@@ -1402,18 +1432,34 @@ class MenuBarPanel:
         self.reload()
 
     def _select_settings_section(self, section: str) -> None:
-        if section not in {value for value, _label in SETTINGS_SECTIONS}:
+        settings = self._settings() if callable(self._settings) else MenuBarSettings()
+        if section not in {value for value, _label in settings_sections(settings)}:
             return
         self._settings_section = section
         if section == SETTINGS_SECTION_REMOTE and self._on_worker_view_active is not None:
             self._on_worker_view_active()
+        if section == SETTINGS_SECTION_DESKTOP:
+            self._check_desktop_settings_app()
         if self.is_shown():
             self.reload()
 
     def _emit_setting(self, row_id, value):
+        if row_id == "desktop_app":
+            if value not in {"claude", "chatgpt"} or not self._settings().desktop_features_enabled:
+                return
+            self._desktop_settings_app = value
+            self._check_desktop_settings_app()
+            self.reload()
+            return
         cb = self._on_setting
         if cb is not None:
             cb(row_id, value)
+
+    def _check_desktop_settings_app(self):
+        if self._desktop_settings_app == "claude" and self._on_claude_desktop_check is not None:
+            self._on_claude_desktop_check()
+        elif self._desktop_settings_app == "chatgpt" and self._on_chatgpt_view_active is not None:
+            self._on_chatgpt_view_active()
 
     def _add_popup(self, root, options, current, frame, row_id, font):
         btn = _PopupButton.alloc().initWithPanel_frame_(self, frame)
@@ -1574,9 +1620,15 @@ class MenuBarPanel:
             self._login_alias = ""
         self._login_alias_field = None
         empty = provider_empty_state(provider, self._account_state(provider), desktop=desktop_tab) if not cards else None
+        if empty and provider == "claude" and settings.desktop_features_enabled and empty.get("action") == "start":
+            empty = {**empty, "title": "Add a Claude account", "body": "Add a Claude Code login, then select the account to link its Desktop profile."}
         if login_view:
             empty = None
         shared_copy = provider_shared_copy(provider, desktop=desktop_tab)
+        if provider == "claude" and settings.desktop_features_enabled:
+            shared_copy = "Select an account for Desktop + Code."
+            cards = [{**card, "desktop_profile": (snap.get("claude_desktop_labels") or {}).get(str(card["num"]), "Desktop: Click to link a profile")}
+                     for card in cards]
         hold_line = snap.get("hold_line") or ""
         if provider != "claude" or not self._auto_enabled():
             hold_line = ""
@@ -1604,11 +1656,13 @@ class MenuBarPanel:
         n_running = (1 if running_line else 0) + (1 if codex_running_line else 0)
         running_h = RUNNING_LINE_H * n_running
         status_h = RUNNING_LINE_H if desktop_status else 0.0
+        claude_desktop_h = 32.0 if (provider == "claude" and settings.desktop_features_enabled
+                                   and self._on_claude_desktop is not None) else 0.0
         # Settings / More live in the header, so an empty roster needs no
         # footer row at all.
         show_footer = bool(cards)
         footer_h = FOOTER_H if show_footer else 0.0
-        chrome_h = PAD + HEADER_H + TAB_H + hold_h + info_h + 4 + PAD + running_h + status_h + footer_h
+        chrome_h = PAD + HEADER_H + TAB_H + hold_h + info_h + 4 + PAD + running_h + status_h + claude_desktop_h + footer_h
         content_h = body_h
         scrolls = False
         if cards and not login_view:
@@ -1690,6 +1744,8 @@ class MenuBarPanel:
         tab_w = (inner_w - TAB_GAP) / 2.0
         for index, tab_provider in enumerate(("claude", "chatgpt")):
             title = provider_tab_title(all_cards, tab_provider, desktop=desktop_tab)
+            if tab_provider == "claude" and settings.desktop_features_enabled:
+                title = title.replace("Claude Code", "Claude", 1)
             tab = self._add_button(
                 root,
                 title,
@@ -1870,8 +1926,11 @@ class MenuBarPanel:
                     title = f"{title}  ({suffix})"
                 action_required = bool(card.get("action_required"))
                 badge_text = card_badge_text(card, provider, desktop=desktop_tab)
+                linked_mode = provider == "claude" and settings.desktop_features_enabled
+                if badge_text and not action_required and linked_mode:
+                    badge_text = "Code active"
                 badge_w = (
-                    86 if action_required else (58 if provider == "chatgpt" else 48)
+                    86 if action_required else (68 if linked_mode else 58 if provider == "chatgpt" else 48)
                 )
                 title_w = inner_w - CARD_PAD * 2 - 8
                 trailing_x = inner_w - CARD_PAD
@@ -1911,6 +1970,8 @@ class MenuBarPanel:
                         )
                     elif provider == "chatgpt":
                         badge.setToolTip_("Selected in the shared Codex credential file.")
+                    elif settings.desktop_features_enabled:
+                        badge.setToolTip_("Selected in Claude Code. Check the account inside the linked Desktop profile.")
                     card_view.addSubview_(badge)
 
                 subtitle = card.get("subtitle") or ""
@@ -1926,6 +1987,12 @@ class MenuBarPanel:
                             ),
                         )
                     )
+                    row_y += SUBTITLE_H
+                if card.get("desktop_profile"):
+                    label = _label(card["desktop_profile"], font_small, pal["muted"],
+                                   NSMakeRect(CARD_PAD + 6, row_y, inner_w - CARD_PAD * 2 - 8, SUBTITLE_H))
+                    label.setToolTip_(card["desktop_profile"] + ". Link supplied by you; Desktop sign-in is unverified.")
+                    card_view.addSubview_(label)
                     row_y += SUBTITLE_H
                 row_y += 6
                 if card["windows"]:
@@ -1995,6 +2062,11 @@ class MenuBarPanel:
 
         # Footer
         fy = height - footer_h
+        if claude_desktop_h:
+            root.addSubview_(_label("Claude Desktop · Experimental", font_small, pal["muted"],
+                                    NSMakeRect(PAD, fy - claude_desktop_h + 6, inner_w - 100, 20)))
+            self._add_button(root, "Profiles…", NSMakeRect(PANEL_WIDTH - PAD - 90, fy - claude_desktop_h + 3, 90, FOOTER_BTN_H),
+                             self._show_claude_desktop_settings, font_small)
         extra = RUNNING_LINE_H if (running_line and codex_running_line) else 0.0
         if running_line:
             root.addSubview_(
@@ -2002,7 +2074,7 @@ class MenuBarPanel:
                     running_line,
                     font_small,
                     pal["muted"],
-                    NSMakeRect(PAD, fy - RUNNING_LINE_H - extra, inner_w, RUNNING_LINE_H),
+                    NSMakeRect(PAD, fy - claude_desktop_h - RUNNING_LINE_H - extra, inner_w, RUNNING_LINE_H),
                 )
             )
         if codex_running_line:
@@ -2027,12 +2099,13 @@ class MenuBarPanel:
         row_y = fy + (FOOTER_H - FOOTER_BTN_H) / 2.0
         trailing: list = []
         if provider == "claude" and cards:
-            self._add_button(
-                root, "Rotate", NSMakeRect(PAD, row_y, 62, FOOTER_BTN_H), self._on_rotate, font_small
-            )
-            self._add_button(
-                root, "Best", NSMakeRect(PAD + 70, row_y, 54, FOOTER_BTN_H), self._on_best, font_small
-            )
+            if not settings.desktop_features_enabled:
+                self._add_button(
+                    root, "Rotate", NSMakeRect(PAD, row_y, 62, FOOTER_BTN_H), self._on_rotate, font_small
+                )
+                self._add_button(
+                    root, "Best", NSMakeRect(PAD + 70, row_y, 54, FOOTER_BTN_H), self._on_best, font_small
+                )
             add = self._add_button(
                 root, "Add account", NSMakeRect(0, row_y, 90, FOOTER_BTN_H),
                 lambda _s: self._on_add_claude(), font_small,
@@ -2072,6 +2145,9 @@ class MenuBarPanel:
         font_group = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold)
         inner_w = PANEL_WIDTH - PAD * 2
         settings = self._settings() if callable(self._settings) else MenuBarSettings()
+        sections = settings_sections(settings)
+        if self._settings_section not in {key for key, _label in sections}:
+            self._settings_section = SETTINGS_SECTION_GENERAL
         strategy = self._strategy() if callable(self._strategy) else "best"
         try:
             threshold = float(self._threshold())
@@ -2125,6 +2201,8 @@ class MenuBarPanel:
             status_line=status_line == "on",
             status_line_other=status_line == "other",
             bundled_widget=bundled_widget,
+            claude_desktop=self._claude_desktop_state() if self._settings_section == SETTINGS_SECTION_DESKTOP else None,
+            desktop_app=self._desktop_settings_app,
             section=self._settings_section,
         )
 
@@ -2187,8 +2265,8 @@ class MenuBarPanel:
         root.addSubview_(hairline)
 
         y = PAD + HEADER_H
-        tab_w = (inner_w - TAB_GAP) / len(SETTINGS_SECTIONS)
-        for index, (section, label) in enumerate(SETTINGS_SECTIONS):
+        tab_w = (inner_w - TAB_GAP * (len(sections) - 1)) / len(sections)
+        for index, (section, label) in enumerate(sections):
             tab = self._add_button(
                 root,
                 label,
@@ -2302,6 +2380,7 @@ class MenuBarPanel:
                     root,
                     title,
                     NSMakeRect(PANEL_WIDTH - PAD - button_w, y + 2, button_w, 26),
+                    self._claude_desktop_profiles if row["id"] == "claude_desktop_profiles" else
                     lambda _s, rid=row["id"], v=row.get("value"): self._emit_setting(rid, v),
                     font_small,
                 )

@@ -9,6 +9,15 @@ OpenSwap is a standalone MIT descendant of [claude-swap](https://github.com/real
 **Users:** [Wiki](https://github.com/mar3co/openswap/wiki) (features, install, extra, widget, kickoff)
 **Developers:** [docs/](docs/README.md) (architecture, hacking, tests)
 
+**Desktop apps (experimental, opt-in):** turn on **Settings → General → Enable
+desktop app features**. Selecting a Claude account then switches Code and opens
+its linked Desktop profile; first use guides you through linking and sign-in.
+Auto-switch uses linked accounts only. Turn Desktop features off for the existing
+Code-only behavior. The **Settings → Desktop** app picker separates Claude and
+ChatGPT controls. Claude profiles keep their own sign-ins and local data;
+opening one leaves other Desktop work running.
+See [setup, limitations, and recovery](docs/claude-desktop-profiles.md).
+
 ## Install
 
 Needs a Mac (macOS 14 or later). With [Homebrew](https://brew.sh):
@@ -92,6 +101,7 @@ The command-line executable is `openswap`.
 | Command | What it does |
 | --- | --- |
 | `openswap setup` | Save the current login and start the menu bar extra |
+| `openswap claude-desktop add/list/open` | Experimental Claude Desktop profiles; sign in once per profile (`rename`, `archive`, `restore`, `check`, `path` also available) |
 | `openswap list` | Accounts with 5h / 7d usage |
 | `openswap switch` / `openswap switch 2` | Rotate, or jump to a slot |
 | `openswap add` | Save the current OAuth login |
@@ -135,10 +145,12 @@ Pairing does not start the worker: the portal shows the Mac Offline until you ru
 
 `openswap help` lists the main commands. Full list: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
 
-The menu-bar popover has **Claude | ChatGPT** tabs. The ChatGPT tab lists the
+With Desktop features enabled, the menu-bar popover has **Claude | ChatGPT** tabs.
+Otherwise it shows **Claude Code | Codex**. The ChatGPT tab lists the
 shared ChatGPT/Codex accounts. Usage bars are **Codex usage**, not ChatGPT
 message limits. Desktop switching is experimental and **off by default**: turn on
-Settings → Automation → **Enable ChatGPT switching**, wait until the extra shows
+Settings → General → **Enable desktop app features**, then Settings → Desktop →
+ChatGPT → **Enable ChatGPT switching**. Wait until the extra shows
 **Switch and open ChatGPT** or **Restart ChatGPT**, then click an OAuth account
 and confirm. While switching is off, a click offers **Enable in Settings**.
 Incompatible builds show **This ChatGPT build isn’t compatible with switching.**
