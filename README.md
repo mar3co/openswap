@@ -10,13 +10,12 @@ OpenSwap is a standalone MIT descendant of [claude-swap](https://github.com/real
 **Developers:** [docs/](docs/README.md) (architecture, hacking, tests)
 
 **Desktop apps (experimental, opt-in):** turn on **Settings → General → Enable
-desktop app features**. Selecting a Claude account then switches Code and opens
-its linked Desktop profile; first use guides you through linking and sign-in.
-Auto-switch uses linked accounts only. Turn Desktop features off for the existing
-Code-only behavior. The **Settings → Desktop** app picker separates Claude and
-ChatGPT controls. Claude profiles keep their own sign-ins and local data;
-opening one leaves other Desktop work running.
-See [setup, limitations, and recovery](docs/claude-desktop-profiles.md).
+desktop app features**, then open **Settings → Desktop → Claude Desktop** to add
+Personal, Work or other profiles. Each can stay open with its own sign-in.
+**Create shortcut…** makes a launcher for Finder and the Dock, with an optional
+number and colored badge on Claude's icon. Claude Code switching and rotation
+stay independent. The Desktop app picker also contains ChatGPT's controls.
+See [setup, shortcuts, limitations and recovery](docs/claude-desktop-profiles.md).
 
 ## Install
 
@@ -101,7 +100,7 @@ The command-line executable is `openswap`.
 | Command | What it does |
 | --- | --- |
 | `openswap setup` | Save the current login and start the menu bar extra |
-| `openswap claude-desktop add/list/open` | Experimental Claude Desktop profiles; sign in once per profile (`rename`, `archive`, `restore`, `check`, `path` also available) |
+| `openswap claude-desktop add/list/open` | Experimental Claude Desktop profiles; sign in once per profile (`shortcut`, `rename`, `archive`, `restore`, `check`, `path` also available) |
 | `openswap list` | Accounts with 5h / 7d usage |
 | `openswap switch` / `openswap switch 2` | Rotate, or jump to a slot |
 | `openswap add` | Save the current OAuth login |
@@ -145,8 +144,8 @@ Pairing does not start the worker: the portal shows the Mac Offline until you ru
 
 `openswap help` lists the main commands. Full list: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
 
-With Desktop features enabled, the menu-bar popover has **Claude | ChatGPT** tabs.
-Otherwise it shows **Claude Code | Codex**. The ChatGPT tab lists the
+The main Claude tab is always **Claude Code**. The second tab shows **ChatGPT**
+when its Desktop switching is enabled, and **Codex** otherwise. The ChatGPT tab lists the
 shared ChatGPT/Codex accounts. Usage bars are **Codex usage**, not ChatGPT
 message limits. Desktop switching is experimental and **off by default**: turn on
 Settings → General → **Enable desktop app features**, then Settings → Desktop →

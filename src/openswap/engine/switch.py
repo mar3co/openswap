@@ -1568,7 +1568,6 @@ class SwitchMixin:
         json_output: bool = False,
         force: bool = False,
         force_if_live_missing: bool = False,
-        expected_identity: tuple[str, str] | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
@@ -1629,10 +1628,6 @@ class SwitchMixin:
         data = self._get_sequence_data()
         if target_account not in data.get("accounts", {}):
             raise AccountNotFoundError(f"Account-{target_account} does not exist")
-        if expected_identity is not None and self.slot_identity(target_account) != expected_identity:
-            raise SwitchError("The saved account changed. Review its Desktop link and try again.")
-        if expected_identity is not None and (self.account_kind_for(target_account) == "api_key" or self._disabled_from_data(data, target_account)):
-            raise SwitchError("This account is no longer available for a linked Desktop selection.")
 
         # Short-circuit a no-op before mutating (issue #79). A self-switch
         # would first back up the live credentials into the target slot —
@@ -1684,8 +1679,6 @@ class SwitchMixin:
         }
         if force_if_live_missing:
             perform_kwargs["force_if_live_missing"] = True
-        if expected_identity is not None:
-            perform_kwargs["expected_identity"] = expected_identity
         op = self._perform_switch(target_account, **perform_kwargs)
         if json_output and op.get("restoreSkipped"):
             result = self._switch_noop(
@@ -2032,7 +2025,6 @@ class SwitchMixin:
         force_activate: bool = False,
         provenance: dict | None = None,
         force_if_live_missing: bool = False,
-        expected_identity: tuple[str, str] | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -2065,8 +2057,6 @@ class SwitchMixin:
         # first, and the switch activates the live generation.
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
-        if expected_identity is not None and (pre_account.get("email"), pre_account.get("organizationUuid") or "") != expected_identity:
-            raise SwitchError("The saved account changed. Review its Desktop link and try again.")
         pre_email = pre_account.get("email", "")
         if pre_email:
             pre_org = pre_account.get("organizationUuid", "") or ""
@@ -2134,12 +2124,6 @@ class SwitchMixin:
         ):
             lease_guard.assert_unleased()
             data = self._get_sequence_data()
-            if expected_identity is not None:
-                target = (data.get("accounts") or {}).get(target_account) or {}
-                if (target.get("email"), target.get("organizationUuid") or "") != expected_identity:
-                    raise SwitchError("The saved account changed. Review its Desktop link and try again.")
-                if target.get("kind") == "api_key" or self._disabled_from_data(data, target_account):
-                    raise SwitchError("This account is no longer available for a linked Desktop selection.")
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]

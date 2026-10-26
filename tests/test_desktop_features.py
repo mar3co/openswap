@@ -90,7 +90,6 @@ def app(tmp_path):
     app.settings.save(scope['settings_path'])
     app._settings_path = scope['settings_path']
     app._desktop_switching = False
-    app._claude_selection_busy = Mock(return_value=False)
     app._restart_engine = Mock()
     app._claude_desktop_profiles = Mock(busy=False)
     app._chatgpt_capability_generation = 7

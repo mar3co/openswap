@@ -245,7 +245,7 @@ def _card_height(card) -> float:
     if card.get("note"):
         n += 1
     n = max(n, 1)
-    sub = (SUBTITLE_H if card.get("subtitle") else 0.0) + (SUBTITLE_H if card.get("desktop_profile") else 0.0)
+    sub = SUBTITLE_H if card.get("subtitle") else 0.0
     return CARD_PAD * 2 + TITLE_H + sub + 6 + n * ROW_H
 
 
@@ -1620,15 +1620,9 @@ class MenuBarPanel:
             self._login_alias = ""
         self._login_alias_field = None
         empty = provider_empty_state(provider, self._account_state(provider), desktop=desktop_tab) if not cards else None
-        if empty and provider == "claude" and settings.desktop_features_enabled and empty.get("action") == "start":
-            empty = {**empty, "title": "Add a Claude account", "body": "Add a Claude Code login, then select the account to link its Desktop profile."}
         if login_view:
             empty = None
         shared_copy = provider_shared_copy(provider, desktop=desktop_tab)
-        if provider == "claude" and settings.desktop_features_enabled:
-            shared_copy = "Select an account for Desktop + Code."
-            cards = [{**card, "desktop_profile": (snap.get("claude_desktop_labels") or {}).get(str(card["num"]), "Desktop: Click to link a profile")}
-                     for card in cards]
         hold_line = snap.get("hold_line") or ""
         if provider != "claude" or not self._auto_enabled():
             hold_line = ""
@@ -1744,8 +1738,6 @@ class MenuBarPanel:
         tab_w = (inner_w - TAB_GAP) / 2.0
         for index, tab_provider in enumerate(("claude", "chatgpt")):
             title = provider_tab_title(all_cards, tab_provider, desktop=desktop_tab)
-            if tab_provider == "claude" and settings.desktop_features_enabled:
-                title = title.replace("Claude Code", "Claude", 1)
             tab = self._add_button(
                 root,
                 title,
@@ -1926,11 +1918,8 @@ class MenuBarPanel:
                     title = f"{title}  ({suffix})"
                 action_required = bool(card.get("action_required"))
                 badge_text = card_badge_text(card, provider, desktop=desktop_tab)
-                linked_mode = provider == "claude" and settings.desktop_features_enabled
-                if badge_text and not action_required and linked_mode:
-                    badge_text = "Code active"
                 badge_w = (
-                    86 if action_required else (68 if linked_mode else 58 if provider == "chatgpt" else 48)
+                    86 if action_required else (58 if provider == "chatgpt" else 48)
                 )
                 title_w = inner_w - CARD_PAD * 2 - 8
                 trailing_x = inner_w - CARD_PAD
@@ -1970,8 +1959,6 @@ class MenuBarPanel:
                         )
                     elif provider == "chatgpt":
                         badge.setToolTip_("Selected in the shared Codex credential file.")
-                    elif settings.desktop_features_enabled:
-                        badge.setToolTip_("Selected in Claude Code. Check the account inside the linked Desktop profile.")
                     card_view.addSubview_(badge)
 
                 subtitle = card.get("subtitle") or ""
@@ -1987,12 +1974,6 @@ class MenuBarPanel:
                             ),
                         )
                     )
-                    row_y += SUBTITLE_H
-                if card.get("desktop_profile"):
-                    label = _label(card["desktop_profile"], font_small, pal["muted"],
-                                   NSMakeRect(CARD_PAD + 6, row_y, inner_w - CARD_PAD * 2 - 8, SUBTITLE_H))
-                    label.setToolTip_(card["desktop_profile"] + ". Link supplied by you; Desktop sign-in is unverified.")
-                    card_view.addSubview_(label)
                     row_y += SUBTITLE_H
                 row_y += 6
                 if card["windows"]:
@@ -2099,13 +2080,12 @@ class MenuBarPanel:
         row_y = fy + (FOOTER_H - FOOTER_BTN_H) / 2.0
         trailing: list = []
         if provider == "claude" and cards:
-            if not settings.desktop_features_enabled:
-                self._add_button(
-                    root, "Rotate", NSMakeRect(PAD, row_y, 62, FOOTER_BTN_H), self._on_rotate, font_small
-                )
-                self._add_button(
-                    root, "Best", NSMakeRect(PAD + 70, row_y, 54, FOOTER_BTN_H), self._on_best, font_small
-                )
+            self._add_button(
+                root, "Rotate", NSMakeRect(PAD, row_y, 62, FOOTER_BTN_H), self._on_rotate, font_small
+            )
+            self._add_button(
+                root, "Best", NSMakeRect(PAD + 70, row_y, 54, FOOTER_BTN_H), self._on_best, font_small
+            )
             add = self._add_button(
                 root, "Add account", NSMakeRect(0, row_y, 90, FOOTER_BTN_H),
                 lambda _s: self._on_add_claude(), font_small,

@@ -3,13 +3,11 @@
 Only metadata and new directories are written here. Claude owns sign-in,
 cookies, secrets and conversation data. Opening a profile never stops another
 process, copies credentials, changes the default login, or rotates accounts.
-The separate selection coordinator owns linked Code + Desktop actions.
 """
 
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 import plistlib
 import re
@@ -32,7 +30,8 @@ BUNDLE_ID = "com.anthropic.claudefordesktop"
 TEAM_ID = "Q6L2SF6YDW"
 PROFILE_NOTICE = (
     "Experimental Claude Desktop profiles keep their own sign-ins. "
-    "Link a saved Code account to select Desktop and Code together. "
+    "Open profiles side by side, or create numbered shortcuts for your Dock. "
+    "Opening a profile does not change your terminal or editor Code login. "
     "Sign in inside Claude on first use; that profile keeps its own sign-in. "
     "Check the account in Claude before starting work. Opening a profile leaves other windows running. "
     "Chrome-extension pairing is currently unavailable in these profiles. "
@@ -75,36 +74,32 @@ def _plain(path: Path, *, directory: bool = False) -> bool:
     return True
 
 
-@dataclass(frozen=True)
-class CodeAccount:
-    store: str
-    email: str
-    organization: str
+BADGE_COLORS = {"orange": (0.73, 0.29, 0.17), "blue": (0.12, 0.34, 0.72),
+                "purple": (0.48, 0.24, 0.68), "green": (0.12, 0.48, 0.34)}
 
-    @classmethod
-    def for_identity(cls, root: Path, identity: tuple[str, str]):
-        if not isinstance(identity, tuple) or len(identity) != 2:
-            raise ClaudeDesktopError("Choose a saved Claude Code account first.")
-        return cls.parse({"store": hashlib.sha256(str(root.resolve()).encode()).hexdigest(),
-                          "email": identity[0], "organization": identity[1]})
 
-    @classmethod
-    def parse(cls, value):
-        if not isinstance(value, dict) or set(value) != {"store", "email", "organization"}:
-            raise ValueError("Invalid Code account link")
-        if not isinstance(value["store"], str) or not re.fullmatch(r"[a-f0-9]{64}", value["store"]):
-            raise ValueError("Invalid Code account store")
-        for key in ("email", "organization"):
-            text = value[key]
-            if not isinstance(text, str) or len(text) > 512 or any(unicodedata.category(c).startswith("C") for c in text):
-                raise ValueError("Invalid Code account identity")
-        if not value["email"]:
-            raise ValueError("Missing Code account identity")
-        return cls(**value)
+def validate_badge(badge: str, color: str) -> None:
+    if not isinstance(badge, str) or (badge and not re.fullmatch(r"[1-9][0-9]{0,2}", badge)):
+        raise ClaudeDesktopError("Use a number from 1 to 999, or leave it blank for the standard icon.")
+    if not isinstance(color, str) or color not in BADGE_COLORS:
+        raise ClaudeDesktopError("Choose one of the available badge colors.")
 
-    @property
-    def identity(self):
-        return self.email, self.organization
+
+def _validate_legacy_link(value) -> None:
+    # Read previews of the old linked-selection format without carrying any
+    # account association into the independent launcher. Never use its identity.
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {"store", "email", "organization"}:
+        raise ValueError("Invalid legacy link")
+    if not isinstance(value["store"], str) or not re.fullmatch(r"[a-f0-9]{64}", value["store"]):
+        raise ValueError("Invalid legacy store")
+    for key in ("email", "organization"):
+        text = value[key]
+        if not isinstance(text, str) or len(text) > 512 or any(unicodedata.category(c).startswith("C") for c in text):
+            raise ValueError("Invalid legacy identity")
+    if not value["email"]:
+        raise ValueError("Missing legacy identity")
 
 
 @dataclass(frozen=True)
@@ -112,7 +107,8 @@ class Profile:
     id: str
     name: str
     archived: bool = False
-    code_account: CodeAccount | None = None
+    badge: str = "1"
+    color: str = "orange"
 
 
 class DesktopProfiles:
@@ -146,15 +142,16 @@ class DesktopProfiles:
             if self.registry.stat().st_size > 256_000:
                 raise ValueError
             data = json.loads(self.registry.read_text(encoding="utf-8"))
-            if not isinstance(data, dict) or set(data) != {"version", "profiles"} or type(data["version"]) is not int or data["version"] not in (1, 2):
+            if not isinstance(data, dict) or set(data) != {"version", "profiles"} or type(data["version"]) is not int or data["version"] not in (1, 2, 3):
                 raise ValueError
             rows = data["profiles"]
             if not isinstance(rows, list) or len(rows) > 100:
                 raise ValueError
             profiles = []
-            ids, names, links = set(), set(), set()
-            for row in rows:
-                keys = {"id", "name", "archived"} | ({"code_account"} if data["version"] == 2 else set())
+            ids, names = set(), set()
+            for index, row in enumerate(rows):
+                extra = {1: set(), 2: {"code_account"}, 3: {"badge", "color"}}[data["version"]]
+                keys = {"id", "name", "archived"} | extra
                 if not isinstance(row, dict) or set(row) != keys:
                     raise ValueError
                 pid = row["id"]
@@ -165,12 +162,11 @@ class DesktopProfiles:
                     raise ValueError
                 ids.add(pid)
                 names.add(name.casefold())
-                link = CodeAccount.parse(row["code_account"]) if row.get("code_account") is not None else None
-                if link is not None:
-                    if link in links:
-                        raise ValueError("Duplicate Code account link")
-                    links.add(link)
-                profiles.append(Profile(pid, name, row["archived"], link))
+                if data["version"] == 2:
+                    _validate_legacy_link(row["code_account"])
+                badge, color = (row["badge"], row["color"]) if data["version"] == 3 else (str(index + 1), "orange")
+                validate_badge(badge, color)
+                profiles.append(Profile(pid, name, row["archived"], badge, color))
             return [p for p in profiles if include_archived or not p.archived]
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
             raise ClaudeDesktopError("Claude Desktop profile metadata is invalid. Restore profiles.json from a backup; it has not been replaced.") from exc
@@ -205,7 +201,7 @@ class DesktopProfiles:
         fd, raw = tempfile.mkstemp(prefix=".profiles-", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 2, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
+                json.dump({"version": 3, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -221,12 +217,15 @@ class DesktopProfiles:
                 raise ClaudeDesktopError("That profile name already exists, possibly in Archived profiles.")
             if len(rows) >= 100:
                 raise ClaudeDesktopError("This store already has 100 Claude Desktop profiles.")
-            profile = Profile(uuid.uuid4().hex, name)
+            used = {p.badge for p in rows}
+            badge = next(str(n) for n in range(1, 1000) if str(n) not in used)
+            profile = Profile(uuid.uuid4().hex, name, badge=badge)
             self._directories(profile, create=True)
             self._save([*rows, profile])
             return profile
 
-    def update(self, identifier: str, *, name: str | None = None, archived: bool | None = None) -> Profile:
+    def update(self, identifier: str, *, name: str | None = None, archived: bool | None = None,
+               badge: str | None = None, color: str | None = None) -> Profile:
         if name is not None:
             name = _name(name)
         if archived is not None and type(archived) is not bool:
@@ -236,41 +235,13 @@ class DesktopProfiles:
             current = self.get(identifier, include_archived=True)
             if name is not None and any(p.id != current.id and p.name.casefold() == name.casefold() for p in rows):
                 raise ClaudeDesktopError("That profile name already exists.")
+            new_badge = current.badge if badge is None else badge
+            new_color = current.color if color is None else color
+            validate_badge(new_badge, new_color)
             updated = replace(current, name=current.name if name is None else name,
-                              archived=current.archived if archived is None else archived)
+                              archived=current.archived if archived is None else archived,
+                              badge=new_badge, color=new_color)
             self._save([updated if p.id == current.id else p for p in rows])
-            return updated
-
-    def linked(self, account: CodeAccount, *, include_archived: bool = False) -> Profile | None:
-        return next((p for p in self.list(include_archived=include_archived) if p.code_account == account), None)
-
-    def link(self, identifier: str, account: CodeAccount | None, *, expected: CodeAccount | None = None) -> Profile:
-        if account is not None:
-            account = CodeAccount.parse(asdict(account))
-        with self._lock():
-            rows = self.list(include_archived=True)
-            current = self.get(identifier, include_archived=True)
-            if expected is not None and current.code_account != expected:
-                raise ClaudeDesktopError("This profile's account link changed. Open its menu again.")
-            if current.archived and account is not None:
-                raise ClaudeDesktopError("Restore this profile before linking it to an account.")
-            if account is not None and any(p.id != current.id and p.code_account == account for p in rows):
-                raise ClaudeDesktopError("This Code account already has a Desktop profile. Unlink that profile first, including if it is archived.")
-            updated = replace(current, code_account=account)
-            self._save([updated if p.id == current.id else p for p in rows])
-            return updated
-
-    def assign(self, identifier: str, account: CodeAccount) -> Profile:
-        """Move this account's link atomically; never take another account's profile."""
-        account = CodeAccount.parse(asdict(account))
-        with self._lock():
-            rows = self.list(include_archived=True)
-            current = self.get(identifier)
-            if current.code_account not in (None, account):
-                raise ClaudeDesktopError("This profile is linked to another Code account. Unlink it before assigning it here.")
-            updated = replace(current, code_account=account)
-            self._save([updated if p.id == current.id else replace(p, code_account=None)
-                        if p.code_account == account else p for p in rows])
             return updated
 
     def open(self, identifier: str, *, app: ClaudeDesktopApp | None = None) -> dict:
@@ -431,19 +402,26 @@ def main(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(prog="openswap claude-desktop", description=PROFILE_NOTICE)
     sub = parser.add_subparsers(dest="action", required=True)
-    for action in ("list", "check", "path", "add", "open", "rename", "archive", "restore"):
+    for action in ("list", "check", "path", "add", "open", "rename", "archive", "restore", "shortcut"):
         command = sub.add_parser(action)
         command.add_argument("--json", action="store_true")
         if action == "list":
             command.add_argument("--all", action="store_true", help="include archived profiles")
         elif action == "add":
             command.add_argument("name")
-        elif action in {"open", "rename", "archive", "restore"}:
+        elif action in {"open", "rename", "archive", "restore", "shortcut"}:
             command.add_argument("profile", help="profile name or stable ID")
             if action == "rename":
                 command.add_argument("name")
+            if action == "open":
+                command.add_argument("--profile-root", type=Path, help=argparse.SUPPRESS)
+                command.add_argument("--focus", action="store_true", help="bring the profile window forward")
+            if action == "shortcut":
+                command.add_argument("--badge", help="number 1–999; empty string for the standard icon")
+                command.add_argument("--color", choices=tuple(BADGE_COLORS))
+                command.add_argument("--directory", type=Path, help="destination folder (default: ~/Applications/OpenSwap Profiles)")
     args = parser.parse_args(argv)
-    store = DesktopProfiles()
+    store = DesktopProfiles(getattr(args, "profile_root", None))
     try:
         if args.action == "check":
             data = ClaudeDesktopApp().validate()
@@ -453,8 +431,17 @@ def main(argv: list[str]) -> int:
             data = {"profiles": [asdict(p) for p in store.list(include_archived=args.all)]}
         elif args.action == "add":
             data = {"profile": asdict(store.add(args.name)), "state": "created"}
+        elif args.action == "shortcut":
+            from openswap.claude_desktop_shortcut import create_shortcut
+            data = create_shortcut(store, args.profile, badge=args.badge, color=args.color, directory=args.directory)
         elif args.action == "open":
             data = store.open(args.profile)
+            if args.focus:
+                try:
+                    from openswap.claude_desktop_menu import focus_profile
+                    focus_profile(data["pid"])
+                except Exception:
+                    pass
         else:
             values = {"name": args.name} if args.action == "rename" else {"archived": args.action == "archive"}
             data = {"profile": asdict(store.update(args.profile, **values)), "state": args.action}
@@ -469,6 +456,8 @@ def main(argv: list[str]) -> int:
             print(data["path"])
         elif args.action == "check":
             print(f"Claude {data['version']}: publisher verified. {PROFILE_NOTICE}")
+        elif args.action == "shortcut":
+            print(f"Shortcut created: {data['path']}. Drag it from Finder to your Dock.")
         elif args.action == "open":
             verb = "is already running" if data["state"] == "already_running" else "was launched"
             print(f"{data['profile']['name']} {verb} (PID {data['pid']}). Check the account in Claude; sign in there on first use.")

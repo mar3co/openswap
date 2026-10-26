@@ -308,7 +308,7 @@ def test_settings_page_sections_separate_display_from_provider_automation():
         "remote_tasks_status", "remote_tasks_paused", "remote_tasks_stop",
     }
     assert automation_by_id["auto_switch_enabled"]["label"] == (
-        "Auto-switch linked Claude accounts"
+        "Auto-switch Claude Code accounts"
     )
     assert "chatgpt_switching_enabled" not in automation_by_id
     assert desktop_by_id["chatgpt_switching_enabled"]["label"] == (
@@ -4031,8 +4031,7 @@ def test_more_menu_is_management_only_once_the_popover_is_attached():
         assert name in gated
     always = gated.replace("if fallback else []", "")
     assert '"Claude Code: next available"' in always
-    assert gated.count("if fallback else []") == 1
-    assert "if fallback and not self.settings.desktop_features_enabled else []" in gated
+    assert gated.count("if fallback else []") == 2
 
 
 # -- Second tab: Codex CLI or the ChatGPT desktop app, by one setting ---------

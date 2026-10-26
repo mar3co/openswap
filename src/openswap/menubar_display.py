@@ -686,7 +686,7 @@ def settings_page_rows(
         {"kind": "toggle", "section": SETTINGS_SECTION_GENERAL,
          "id": "desktop_features_enabled", "label": "Enable desktop app features", "value": settings.desktop_features_enabled},
         {"kind": "group", "style": "hint", "section": SETTINGS_SECTION_GENERAL,
-         "id": "desktop_features_hint", "label": "Experimental: Claude selections switch Code and open linked Desktop profiles. ChatGPT controls also appear. Turning this off keeps profiles, sign-ins and windows.", "lines": 4},
+         "id": "desktop_features_hint", "label": "Experimental: separate Claude Desktop profiles and shortcuts, plus ChatGPT controls. Claude Code switching stays independent. Turning this off keeps profiles, sign-ins and shortcuts.", "lines": 4},
     ])
     general.extend(this_mac_rows(login_item))
     general.extend(_this_mac_setup_rows(
@@ -782,22 +782,21 @@ def settings_page_rows(
             "style": "section",
             "section": SETTINGS_SECTION_AUTOMATION,
             "id": "group_claude",
-            "label": "Claude · Desktop + Code" if settings.desktop_features_enabled else "Claude Code accounts",
+            "label": "Claude Code accounts",
         },
         {
             "kind": "group",
             "style": "hint",
             "section": SETTINGS_SECTION_AUTOMATION,
             "id": "claude_code_accounts_hint",
-            "label": ("Desktop mode: auto-switch selects Code and opens linked profiles only. Check sign-in inside Desktop."
-                      if settings.desktop_features_enabled else "Switching changes the login used by Claude Code."),
+            "label": "Switching changes the login used by Claude Code. Desktop profiles open separately and do not rotate.",
             "lines": 2,
         },
         {
             "kind": "toggle",
             "section": SETTINGS_SECTION_AUTOMATION,
             "id": "auto_switch_enabled",
-            "label": "Auto-switch linked Claude accounts" if settings.desktop_features_enabled else "Auto-switch Claude Code accounts",
+            "label": "Auto-switch Claude Code accounts",
             "value": bool(settings.auto_switch_enabled),
         },
     ]
@@ -1001,7 +1000,7 @@ def claude_desktop_settings_rows(state: dict | None = None) -> list[dict]:
         rows.append({"kind": "group", "style": "hint", "id": id,
                      "label": text, "lines": _hint_lines(text)})
 
-    hint("claude_desktop_separation", "Experimental: select an account in the Claude tab to switch Code and open its linked Desktop profile. Links do not verify sign-in.")
+    hint("claude_desktop_separation", "Experimental Desktop profiles open side by side and keep separate sign-ins. Claude Code switching stays independent.")
     rows.append({"kind": "button", "id": "claude_desktop_check", "label": "Claude Desktop app",
                  "title": "Checking…" if state.get("checking") else "Check app", "disabled": bool(state.get("checking"))})
     hint("claude_desktop_app", state.get("app_message") or "Not checked yet. Install Claude.app in Applications.")
@@ -1010,15 +1009,16 @@ def claude_desktop_settings_rows(state: dict | None = None) -> list[dict]:
     rows.append({"kind": "button", "id": "claude_desktop_profiles", "label": "Manage profiles", "title": "Manage…",
                  "disabled": bool(state.get("busy"))})
     hint("claude_desktop_count", state.get("storage_error") or (
-        "Opening Claude…" if state.get("busy") else
+        "Working on profile…" if state.get("busy") else
         f"{count} available · {archived} archived. Add, open, rename or archive a profile from Manage."
         if count or archived else "No profiles yet. Choose Manage → Add profile to create your first one."
     ))
     for key, title, body in (
-        ("open", "Selecting an account", "Click a Claude account to link its profile on first use. Later selections switch Code and open that profile. Auto-switch uses linked accounts only. Other Desktop windows stay open."),
-        ("signin", "Sign-in", "Sign in inside Claude on first use. The profile keeps its own login; sign in again if Claude asks. Check the account and workspace in Claude. Running only means the app is open, not signed in."),
-        ("archive", "Archiving", "Archive hides a profile and keeps its sign-in, settings and local conversations. Running windows stay open. Archived profiles → Restore profile makes it available again without opening Claude."),
-        ("limits", "Experimental limits", "Chrome-extension pairing is unavailable in these profiles. Code and Cowork support is experimental. OpenSwap does not verify the signed-in account or Desktop usage."),
+        ("open", "Opening profiles", "Choose Manage → Add profile, then Open profile. Opening again brings it forward. Other windows and your Code login stay unchanged."),
+        ("shortcut", "Shortcuts and icons", "Create shortcut in a profile's menu. Choose a number and color, then drag the launcher from Finder to your Dock. Claude's running-app icon stays unchanged."),
+        ("signin", "Sign-in", "Sign in inside each profile on first use. Check the email and workspace in Claude; Running means open, not signed in."),
+        ("archive", "Archiving", "Archive keeps sign-ins and local work, leaves windows open, and disables shortcuts until you restore the profile. Restore does not open Claude."),
+        ("limits", "Experimental limits", "Chrome-extension pairing is unavailable. Code and Cowork remain experimental. Desktop identity and usage are not verified."),
     ):
         if key != "limits":
             rows.append({"kind": "group", "id": f"claude_desktop_{key}_heading", "label": title})

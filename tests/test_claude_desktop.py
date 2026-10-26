@@ -85,7 +85,7 @@ def test_public_storage_refused(store):
         store.add("Work")
 
 
-@pytest.mark.parametrize("contents", ["{", "[]", '{"version":3,"profiles":[]}',
+@pytest.mark.parametrize("contents", ["{", "[]", '{"version":4,"profiles":[]}',
     '{"version":true,"profiles":[]}', '{"version":1,"profiles":[{}]}'])
 def test_damaged_or_newer_registry_is_not_replaced(store, contents):
     store.add("Personal")
@@ -456,8 +456,8 @@ def test_app_check_is_read_only_and_only_updates_ui_when_polled(menu, store, app
     assert "Publisher verified" in menu.settings_state()["app_message"]
     assert menu._profile_states[profile.id] == "Not running"
     row = next(i for i in menu.menu(SimpleNamespace(MenuItem=Item)).children if i.title == "Profile: Personal")
-    assert "Not running at" in row.children[3].title
-    assert row.children[4].title == "Sign-in: Check inside Claude"
+    assert any("Not running at" in child.title for child in row.children)
+    assert any(child.title == "Sign-in: Check inside Claude" for child in row.children)
     app.popen.assert_not_called()
     menu.show_error.assert_not_called()
 

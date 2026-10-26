@@ -6,7 +6,7 @@ import queue
 import threading
 from datetime import datetime
 
-from openswap.claude_desktop import BUNDLE_ID, ClaudeDesktopApp, DesktopProfiles, PROFILE_NOTICE
+from openswap.claude_desktop import BADGE_COLORS, BUNDLE_ID, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, PROFILE_NOTICE, validate_badge
 from openswap.exceptions import ClaudeSwitchError
 
 
@@ -20,6 +20,12 @@ def focus_profile(pid: int) -> None:
         app.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
 
 
+def reveal_shortcut(path: str) -> None:
+    import AppKit
+    from Foundation import NSURL
+    AppKit.NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_([NSURL.fileURLWithPath_(path)])
+
+
 def has_saved_profiles() -> bool:
     """Upgrade hint only; do not inspect Claude's data or authenticate a profile."""
     return bool(DesktopProfiles().list(include_archived=True))
@@ -27,7 +33,7 @@ def has_saved_profiles() -> bool:
 
 class ClaudeDesktopMenu:
     def __init__(self, *, prompt, show_error, changed, notify, store=None, app_factory=None, show_status=None, enabled=None,
-                 blocked=None, select_linked=None, link_account=None):
+                 blocked=None, shortcut_factory=None, reveal=None):
         self.store = store or DesktopProfiles()
         self.prompt = prompt
         self.show_error = show_error
@@ -36,8 +42,9 @@ class ClaudeDesktopMenu:
         self.show_status = show_status or show_error
         self.enabled = enabled or (lambda: True)
         self.blocked = blocked or (lambda: False)
-        self.select_linked = select_linked
-        self.link_account = link_account
+        self.shortcut_factory = shortcut_factory
+        self.reveal = reveal or reveal_shortcut
+        self.operation = "Opening Claude…"
         self.busy = False
         self._results = queue.SimpleQueue()
         self._checks = queue.SimpleQueue()
@@ -103,7 +110,7 @@ class ClaudeDesktopMenu:
         if self._checked_at:
             menu.add(rumps.MenuItem("App check details…", callback=lambda _: self.show_status(self._app_message)))
         if self.busy or self.blocked():
-            menu.add(rumps.MenuItem("Opening Claude…", callback=None))
+            menu.add(rumps.MenuItem(self.operation, callback=None))
             return menu
         menu.add(rumps.MenuItem("Add profile…", callback=self.add))
         try:
@@ -123,15 +130,11 @@ class ClaudeDesktopMenu:
             # rumps keys siblings by title; a name such as 'Add profile…'
             # must not overwrite a management action in its menu dictionary.
             item = rumps.MenuItem(f"Profile: {profile.name}")
-            item.add(rumps.MenuItem("Select Desktop + Code" if profile.code_account and self.select_linked else "Open to sign in…",
+            item.add(rumps.MenuItem("Open profile",
                                    callback=lambda _, p=profile: self.open(p.id)))
             item.add(rumps.MenuItem("Rename…", callback=lambda _, p=profile: self.rename(p)))
             item.add(rumps.MenuItem("Archive (keep data)", callback=lambda _, p=profile: self.edit(p, archived=True)))
-            if self.link_account is not None:
-                item.add(rumps.MenuItem("Link Code account…", callback=lambda _, p=profile: self.link_account(p)))
-                if profile.code_account is not None:
-                    item.add(rumps.MenuItem("Unlink Code account", callback=lambda _, p=profile: self.unlink(p)))
-                    item.add(rumps.MenuItem(f"Linked: {profile.code_account.email}", callback=None))
+            item.add(rumps.MenuItem("Create shortcut…", callback=lambda _, p=profile: self.shortcut(p)))
             self._add_status(item, profile, rumps)
             menu.add(item)
         if any(p.archived for p in profiles):
@@ -196,15 +199,7 @@ class ClaudeDesktopMenu:
     def open(self, identifier):
         if self.busy or self.blocked() or not self.enabled():
             return
-        if self.select_linked is not None:
-            try:
-                profile = self.store.get(identifier)
-            except (ClaudeSwitchError, OSError) as exc:
-                self._error(exc)
-                return
-            if profile.code_account is not None:
-                self.select_linked(profile)
-                return
+        self.operation = "Opening Claude…"
         self.busy = True
         self.changed()
 
@@ -219,16 +214,42 @@ class ClaudeDesktopMenu:
         except Exception as exc:
             self._results.put((None, exc))
 
-    def unlink(self, profile):
+    def shortcut(self, profile):
         if self.busy or self.blocked() or not self.enabled():
             return
+        from openswap.claude_desktop_shortcut import ICON_NOTICE, create_shortcut
+        response = self.prompt(title="Shortcut icon", message="Add a number from 1 to 999 to Claude's icon, or leave it blank for the standard icon.\n\n" + ICON_NOTICE,
+                               default_text=profile.badge, ok="Continue", cancel="Cancel")
+        if response.clicked != 1:
+            return
+        badge, color = response.text.strip(), profile.color
         try:
-            self.store.link(profile.id, None, expected=profile.code_account)
-        except (ClaudeSwitchError, OSError) as exc:
+            validate_badge(badge, color)
+        except ClaudeDesktopError as exc:
             self._error(exc)
             return
+        if badge:
+            colors = list(BADGE_COLORS)
+            response = self.prompt(title="Badge color", message="The shortcut will be saved in Applications → OpenSwap Profiles in your home folder. Drag it from Finder to your Dock. Creating it again updates this profile's shortcut.",
+                choices=[c.title() for c in colors], selected=colors.index(color), ok="Create shortcut", cancel="Cancel")
+            if response.clicked != 1 or not 0 <= response.choice < len(colors):
+                return
+            color = colors[response.choice]
+        if self.busy or self.blocked() or not self.enabled():
+            return
+        self.busy = True
+        self.operation = "Creating shortcut…"
         self.changed()
-        self._notify("Desktop link removed", "The profile and its sign-in are kept. Link it again to select Desktop and Code together.")
+        def work():
+            try:
+                result = (self.shortcut_factory or create_shortcut)(self.store, profile.id, badge=badge, color=color)
+                self._results.put((result, None))
+            except Exception as exc:
+                self._results.put((None, exc))
+        try:
+            threading.Thread(target=work, daemon=True, name="claude-desktop-shortcut").start()
+        except Exception as exc:
+            self._results.put((None, exc))
 
     def poll(self):
         try:
@@ -248,6 +269,13 @@ class ClaudeDesktopMenu:
         self.changed()
         if error is not None:
             self._error(error)
+            return
+        if result.get("state") == "shortcut_created":
+            try:
+                self.reveal(result["path"])
+            except Exception:
+                pass
+            self.show_status(f"Shortcut created: {result['path']}\n\nDrag it from Finder to your Dock.\n\n{result['notice']}")
             return
         try:
             focus_profile(result["pid"])

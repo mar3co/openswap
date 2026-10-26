@@ -1,92 +1,96 @@
-# Claude Desktop profiles (experimental)
+# Claude Desktop profiles and shortcuts (experimental)
 
-OpenSwap can open named Claude Desktop profiles on macOS. Turn on **Settings →
-General → Enable desktop app features**. The **Claude** tab then selects Code
-and a linked Desktop profile together. **Profiles…** opens the **Settings →
-Desktop** page; its app picker separates Claude Desktop from ChatGPT controls.
-Each profile has its own desktop data folder and Claude Code config
-folder. A profile name is your label; it is not a verified account identity.
+OpenSwap can open named Claude Desktop profiles side by side on macOS. Each
+profile keeps its own sign-in, desktop data and Code configuration. Desktop
+profiles are optional and independent of Claude Code account switching and
+rotation. A profile name is your label, not a verified account identity.
 
-This supports separate email logins, including separate personal accounts. The
-personal/Team/Enterprise choice within one email still happens inside Claude.
-Creating a profile does not create another Anthropic account or subscription.
-
-## Use it
+## Add a profile and make a shortcut
 
 1. Install the official Claude app in `/Applications/Claude.app`.
-2. Enable desktop app features in **Settings → General**. Add your Claude Code
-   logins if they are not already saved.
-3. Select an account in the **Claude** tab. On first use, choose an existing
-   Desktop profile or create one. Confirm the email, workspace and profile link.
-4. Select both. OpenSwap switches the default Code login, then opens the linked
-   Desktop profile. Sign into the intended account in that window on first use.
-   Check its email and selected organization, including the Code tab, before work.
-5. Repeat for another account. Later selections reuse its link. An already
-   running profile is brought forward when macOS permits it.
+2. Turn on **Settings → General → Enable desktop app features**.
+3. Open **Settings → Desktop → Claude Desktop → Manage… → Add profile…**.
+   Name it Personal, Work, or another recognizable name, then create and open it.
+4. Sign into the intended account in the new window. Check its email and
+   selected organization before starting work.
+5. In that profile's menu, choose **Create shortcut…**. Choose a number from
+   1 to 999 and an orange, blue, purple or green badge. Leave the number blank
+   for Claude's standard icon.
+6. OpenSwap creates `Claude Work.app` (or your chosen profile name) under
+   `~/Applications/OpenSwap Profiles/` and reveals it in Finder. Drag that
+   launcher to the Dock for one-click access.
 
-The link is your choice, not a verified Desktop identity. OpenSwap never copies
-Code credentials into Desktop. The account card shows the profile name; its
-**Link Desktop profile…** menu changes the link. **Manage…** also offers **Link
-Code account…** and **Unlink Code account**. An unlinked profile can **Open to
-sign in…** during setup without changing Code. A linked profile offers **Select
-Desktop + Code**. Unlinking keeps the profile and its sign-in.
+**Profiles…** under the **Claude Code** tab opens the same Desktop settings.
+**More → Claude Desktop profiles** also provides **Open profile**, **Rename…**,
+**Archive (keep data)**, and **Create shortcut…** for each profile.
 
-Opening a profile leaves other windows and tasks running. Use Claude's own Quit
-action to close a profile. Launching the original Claude app from Applications
-or its ordinary Dock icon uses its default profile, not an OpenSwap profile.
-Open managed profiles through OpenSwap, including after a Claude update or Mac
-restart. macOS may display the same Claude icon/name for different instances.
+Opening a profile again brings its existing process forward when macOS permits
+it. Other profile windows stay open. Neither opening a profile nor using its
+shortcut changes the default Code login in your terminal or editor. Desktop
+profiles have no automatic rotation, and do not require saved Code accounts.
 
-With Desktop enabled, **Automation → Claude · Desktop + Code → Auto-switch
-linked Claude accounts** uses the existing Code quota policy and selects both.
-Only available, linked OAuth accounts participate. Unlinked, archived and
-API-key accounts are excluded. Desktop's own chat limits are not measured.
-Code's selected badge does not prove Desktop sign-in. Other Desktop windows and
-conversations remain in place; running terminal/editor Code clients may need to
-reload their login. Separate Code session profiles retain their own namespace.
+Claude handles sign-in inside each profile. OpenSwap does not copy credentials
+or import the default Claude profile. The personal/Team/Enterprise selection
+within one email still happens inside Claude. Creating a profile does not
+create an Anthropic account or subscription.
 
-Desktop features are off by default. With them off, the main tabs are **Claude
-Code** and **Codex**. The Desktop tab, profile shortcut, Desktop menus and ChatGPT
-switching/suggestion controls are hidden. No new Desktop probes or suggestions
-start. Turning the preference off clears pending suggestions and discards stale
-check results; it keeps profiles, credentials, windows, and per-app preferences.
-An app opening or switch already underway must finish before changing the option.
-The terminal's explicit `claude-desktop` commands remain available.
+## What the shortcut and icon do
 
-On upgrade, an existing ChatGPT Desktop preference or a saved Claude Desktop
-profile keeps the feature visible. An explicitly saved off preference always
-wins, including after restarting OpenSwap.
+The shortcut is a small, locally generated macOS application. It calls OpenSwap
+with the profile's stable ID, then exits. OpenSwap checks the installed Claude
+publisher and opens that profile. Claude's app is never copied or modified.
 
-The **Desktop** app picker separates Claude profiles from ChatGPT switching.
-ChatGPT uses the shared Codex login and still asks before restarting the app.
-Its suggestion policy lives in **Automation**. Enabling Desktop features does
-not immediately open an app. If Claude auto-switch is already on, future rotation
-uses the linked profiles. With Desktop features off, Claude selection and
-automatic rotation return to their existing Code-only behavior.
+The numbered icon identifies the **shortcut in Finder and when pinned to the
+Dock**. Claude's own running-app icon and window titles remain unchanged; macOS
+can show the usual Claude icon for each running instance. The badge is not
+an unread count or proof of which account is signed in. Pin the generated
+launcher, rather than Claude's ordinary running-app icon, to reopen that profile.
 
-Opening the Claude Desktop settings page checks the installed app in the background.
-**Check app** repeats the publisher/version check and refreshes running-profile
-status; it does not open Claude or read credentials. The profile menu also has
-**Check app and running profiles**. Each profile's submenu shows **Running**,
-**Not running**, or **Could not confirm**, with the time of the check. A profile
-that has not been checked says so. **Running** is process status, not proof of
-sign-in. Check the email and workspace in Claude; sign in again if Claude asks.
+Badge numbers are assigned initially in profile order and can be changed when
+creating a shortcut. Numbers need not be unique. Creating a shortcut again with
+the same name and destination updates that profile's launcher and icon.
+OpenSwap refuses to replace unrelated apps or a shortcut for another profile.
+If macOS retains an old pinned icon, remove that Dock item and drag the updated
+launcher in again.
 
-The page shows available and archived profile counts. **Archive (keep data)**
-hides a profile from the available list and automatic rotation, and preserves its sign-in, settings and
-local conversations; it leaves running windows open. **Archived profiles →
-Profile: name → Restore profile** makes it available again without launching it.
-The link is kept while archived. Selecting that account asks you to restore the
-profile or choose another link. Rename only changes the label. These actions do
-not delete an Anthropic account.
+Renaming a profile preserves its stable ID, data and existing working shortcuts.
+It does not rename shortcuts already created. Creating a shortcut after renaming
+uses the new name; remove an old launcher yourself if no longer needed. Deleting
+a launcher does not delete its profile or sign out of Claude.
 
-**Experimental limitations:** check the account in each window. OpenSwap does
-not read or verify the Desktop identity or quota, or move conversations between
-accounts. Chrome-extension local pairing is
-disabled for relocated desktop data in the inspected Claude build. Real OAuth
-callback routing, Code sessions, Cowork tasks, and app-update relaunches still
-need acceptance testing with two accounts. App launch success is not that proof.
-Use your default Claude window for features that are unavailable in a profile.
+Shortcuts need OpenSwap to remain installed. If OpenSwap or a source/uv
+installation moves, recreate the shortcut from the new location. Claude updates
+continue to use `/Applications/Claude.app`; its publisher is checked on each
+open. App updates may still change profile compatibility.
+
+## Sign-in, status, and archiving
+
+Use **Check app** to verify the installed publisher/version and refresh running
+status without opening Claude or reading credentials. Profile submenus show
+**Running**, **Not running**, or **Could not confirm**, with the check's time.
+Running means an app process exists, not that its sign-in is verified.
+
+**Archive (keep data)** hides a profile from the available list and prevents
+its shortcuts from opening it. Sign-ins, settings, local conversations, icons
+and shortcut files are kept; running windows stay open. **Archived profiles →
+Restore profile** makes the same profile and shortcuts usable again without
+launching it. Use Claude's own Quit action to close a running profile.
+
+The ordinary Claude app/Dock icon does not select an OpenSwap profile and can
+focus an already-running Claude instance. Open managed profiles through OpenSwap
+or their generated shortcuts, including after a restart.
+
+Desktop features are off by default. Turning them off hides the Desktop tab,
+profile shortcut and Desktop menus, and stops new Desktop checks/suggestions.
+It keeps profiles, credentials, windows, shortcuts and per-app preferences.
+Explicit terminal commands and already-created shortcuts remain available.
+Finish an in-progress profile action before changing the option.
+
+An existing ChatGPT Desktop preference or saved Claude profile keeps Desktop
+features visible on upgrade. An explicitly saved off preference always wins.
+The Desktop app picker separates Claude profiles from ChatGPT restart-and-switch
+controls. Claude Code's account cards and Automation settings remain Code-only
+whether Desktop features are on or off.
 
 ## Terminal commands
 
@@ -95,7 +99,9 @@ openswap claude-desktop check
 openswap claude-desktop add "Personal"
 openswap claude-desktop add "Work"
 openswap claude-desktop list
-openswap claude-desktop open "Personal"
+openswap claude-desktop open "Work" --focus
+openswap claude-desktop shortcut "Work" --badge 2 --color blue
+openswap claude-desktop shortcut "Personal" --badge ""
 openswap claude-desktop rename "Work" "Client work"
 openswap claude-desktop archive "Client work"
 openswap claude-desktop list --all
@@ -103,177 +109,111 @@ openswap claude-desktop restore "Client work"
 openswap claude-desktop path
 ```
 
-Every action accepts `--json`. Names or full stable IDs identify profiles. The
-terminal's `add` saves a profile; `open` launches it. CLI dispatch does not create
-the Claude Code account engine, migrate logins, or change auto-switch settings.
-These explicit CLI commands retain their individual scope: `openswap switch`
-changes Code only, and `claude-desktop open` opens only that profile. The combined
-selection applies to the menu bar's Claude account picker and auto-switch engine.
-`check` verifies the installed publisher and reports its version. It does not
-certify compatibility or authenticate a profile. Non-macOS launch is refused.
+Every action accepts `--json`. Names or full stable IDs identify profiles.
+`shortcut --directory PATH` chooses another output folder. `add` saves a profile;
+`open` launches it. This dispatch does not construct the Code account engine,
+migrate credentials, or change automatic rotation. Shortcuts use the same open
+path and respect archived profiles. Launch and shortcut creation require macOS.
 
 ## Storage, recovery, and removal
 
-Data is kept in `~/Library/Application Support/OpenSwap Claude Desktop/`:
+Profile data lives in `~/Library/Application Support/OpenSwap Claude Desktop/`:
 
-- `profiles.json`: versioned labels, stable IDs, archive flags and optional Code
-  links (email, organization UUID and a hash of the Code store path); no tokens.
+- `profiles.json`: versioned labels, stable IDs, archive flags and badge settings;
+  no tokens or Code account associations.
 - `<id>/desktop/`: Claude-owned desktop data, including local sessions.
 - `<id>/code/`: a separate `CLAUDE_CONFIG_DIR` and Keychain namespace.
 
-These folders can contain private conversations and credentials created by
-Claude. OpenSwap creates private folders/files and never exports their contents.
-Do not share this directory as a diagnostic attachment.
+These private folders can contain conversations and credentials created by
+Claude. Do not share them as a diagnostic attachment. Profile version 1 and the
+unreleased linked-selection version 2 are readable. Their next save upgrades
+metadata to version 3, preserving IDs, data and archives while discarding old
+account-link metadata. No account credentials are changed during migration.
 
-Renaming only changes a label. Archiving hides a profile while keeping all data
-and any running process. Restore it from **Archived profiles**. A failed launch
-keeps the profile for retry. Corrupt or newer metadata is rejected without
-replacement. Missing data folders are not silently recreated during open.
-Restore a backup to its original location; Code Keychain names depend on the
-absolute path. Never restore or copy a profile over a running Claude process.
+A failed launch keeps the profile. Corrupt/newer metadata and missing data
+folders are refused without replacing the login. Restore backups to their
+original paths; Code Keychain names depend on the absolute path. Never restore
+or copy profile data over a running Claude process.
 
-Normal uninstall and `--zap` preserve this separate data directory. To permanently
-remove a profile, first sign out and quit that profile in Claude, then remove its
-folder yourself. Claude owns its Keychain entries; OpenSwap does not delete them.
-No profile deletion or account logout is performed by archive.
+Shortcut creation builds and signs the new launcher in a temporary folder,
+then replaces only a matching OpenSwap launcher. Failure restores the old
+launcher. Badge settings are saved only after the launcher is installed.
 
-## Implementation and evidence
+Normal uninstall and `--zap` preserve profile data and shortcut applications.
+Remove unused launchers yourself. To permanently remove a profile, first sign
+out and quit that profile in Claude, then remove its data folder yourself.
+Claude owns its Keychain entries; OpenSwap does not delete them.
 
-Research date: October 25, 2026. Inspected installed Claude Desktop **3.6556.2**,
-bundle `com.anthropic.claudefordesktop`, publisher team `Q6L2SF6YDW`.
+## Implementation and verification
 
-- The packaged app recognizes `--user-data-dir`. Desktop persistence resolves
-  Electron's `userData` directory.
-- The main bundle resolves `CLAUDE_CONFIG_DIR`; `.claude.json` and Code settings
-  use it. Code's secure storage uses a path-derived Keychain suffix. Both
-  `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` are set to the same
-  dedicated profile path so an inherited override cannot select a shared login.
-- Packaged production Claude strips `CLAUDE_USER_DATA_DIR`. OpenSwap does not
-  use that variable or developer/debugging authorization flags.
-- Relocated `userData` sets `localPairingDisabledReason` to `userData relocated`;
-  the Chrome-extension pairing paths honor it. OpenSwap does not bypass it.
+The inspected Claude Desktop version is **3.6556.2**, bundle
+`com.anthropic.claudefordesktop`, publisher team `Q6L2SF6YDW`.
 
-Launch calls the original, publisher-verified executable directly with a
-profile directory argument. There is no shell interpolation, app copying,
-re-signing, browser-cookie import, credential injection, debugging endpoint,
-or change to the default Claude data. API credentials and runtime-injection
-variables are not inherited; OS proxy/trust settings and explicit managed
-policy paths are preserved. Claude still applies its own system policies.
-Settings, connectors, permissions, skills, and history from the default profile
-are not seeded into a new profile.
+- The original signed executable accepts `--user-data-dir`, which selects
+  Electron's desktop data directory.
+- Both `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` point at the
+  profile's Code folder. The inspected app uses a path-derived Keychain suffix.
+- API credentials and runtime-injection variables are removed from the launch
+  environment. OS proxy/trust settings and managed policy paths are preserved.
+- Profile locks serialize management and launch checks. Matching processes are
+  reused. Conflicting or uncertain process state is refused; user processes
+  are never killed. Launch always reports `identity_verified: false`.
+- Shortcuts use Apple's `osacompile` applets. Shell arguments and AppleScript
+  strings are escaped independently. Icons are rendered locally from the
+  installed app's icon at all ICNS sizes. Only the generated launcher receives
+  an ad-hoc signature; Claude's signature is untouched.
 
-A cross-process lock serializes metadata changes and launch checks. A matching
-running main process is reused; uncertain process state or conflicting launches
-are refused. OpenSwap never kills a user process. An immediate app exit is an
-error, even if its exit code is zero. A surviving process is reported as
-`launched`, always with `identity_verified: false`.
+References: [Apple's script applications](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/SaveaScript.html),
+[app icon keys](https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html),
+[Electron data paths](https://www.electronjs.org/docs/latest/api/app), and
+read-only inspection of the installed Claude app. These mechanisms do not
+constitute Anthropic endorsement or authenticated compatibility proof.
 
-Links use the exact email and organization, not the slot number. Two teams under
-one email stay distinct, and moving slots preserves the link. Version-1 profile
-metadata is read without changes and upgraded to version 2 on the next save.
-Only one profile can be linked to a Code account within its store. Moving a
-link updates both profiles atomically. Moving the Code store requires relinking.
+Local tests cover private profile storage, concurrency, corrupt metadata,
+symlinks/hardlinks, publisher refusal, launch reuse and failure, independent
+Code behavior, metadata migration, badge validation, canceled dialogs, shortcut
+collisions, failed-update recovery, shell escaping, and CLI/UI dispatch.
+The relevant local regression selection passed **1,937 tests** on October 26,
+2026, covering profile/shortcut commands, settings, menu bar behavior, Code
+switching/rotation, and uninstall preservation.
 
-Combined selection verifies the installed app and profile directories before
-changing Code. It rechecks the link under the profile lock and the account under
-the credential transaction locks. Archived, stale or changed links fail closed.
-The normal Code engine owns credential writes and quota decisions; a small
-adapter limits automatic destinations to linked profiles.
+Observed on October 26, 2026: a disposable native launcher was compiled and
+signed, rendered its numbered Claude icon, launched through Finder, preserved
+quoted/Unicode arguments, and launched again after an icon update. Creation
+also worked on a background thread. Its target was a harmless argument recorder,
+not an authenticated Claude account. Native settings and account panels were
+checked in light/dark appearance, including scrolling lists.
 
-If Code succeeds but Desktop fails, OpenSwap reports the partial result and
-refreshes Code's displayed state. It does not roll back and risk overwriting a
-newer login. Select the same account again to retry opening Desktop. A concurrent
-outside Code change is also reported. A Desktop window may already have opened
-when that check fails; verify both apps. These operations are not an atomic
-login across applications.
-
-The app signature is checked on every open, including after updates. Passing
-that check means the app is signed by the expected publisher; it is not a
-compatibility test for a future build. Changed app behavior may break profiles.
-
-Background launches and publisher checks keep the menu responsive. Results are
-applied on the main thread. Opening a running profile targets its process ID,
-not the shared bundle ID. Profile names never enter shell commands or paths.
-
-Sources: [Anthropic account switching](https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account),
-[organization membership](https://support.claude.com/en/articles/13566435-find-and-join-a-team-or-enterprise-organization),
-[Electron app data paths](https://www.electronjs.org/docs/latest/api/app),
-and read-only inspection of the installed app's packaged JavaScript. Community
-[profile launchers](https://github.com/istisiki/multi-profile-claude) provide prior
-art, not Anthropic endorsement or proof of this implementation.
-
-## Verification and release checks
-
-Automated tests cover profile lifecycle, concurrency, failed atomic writes,
-invalid metadata, Unicode name collisions, symlinks/hardlinks, private storage,
-publisher/platform refusal, process reuse, launch failures, environment
-separation, CLI dispatch, menu actions, and worker-to-main-thread handoff.
-Linked-selection coverage includes same-email/different-workspace accounts,
-slot moves, stale menus, v1 metadata upgrades, exact identity rechecks under the
-credential locks, concurrent selections, mode changes, cancellation, archived
-links, partial failures and retrying the already-selected Code account. Tests
-also run the real rotation and credential engine against temporary accounts,
-with a fake Desktop app, to verify filtering and partial-failure reporting.
-
-Observed locally on October 25, 2026: publisher verification passed for
-Claude 3.6556.2. Two signed-out temporary instances survived the observation,
-created separate desktop data (including separate cookie stores), and repeated
-opens reused their original PIDs. Neither instance created its Code identity
-file during the signed-out observation, so this did not exercise Code login.
-Native empty/populated panels and the Desktop settings page (including checking
-and missing-app states) rendered in light/dark appearance. The Profiles/Manage
-button callbacks and submenu construction were exercised. These were
-constructed native views, not a test of the installed OpenSwap build.
-The settings controller also completed a read-only check against the installed
-Claude 3.6556.2: publisher verified, one available and one archived disposable
-profile, both correctly reported as not running. That check launched no profiles
-and accessed no sign-ins.
-
-The October 26 expanded run, after rebasing onto `025bb68`, passed **1,942 tests**
-across profiles, linked selection, CLI, core switching/rotation, menu/panel,
-Desktop opt-in and upgrade behavior, monitoring, onboarding and uninstall.
-This includes the **39-test** linked-selection suite and main's scrolling tests.
-Native views covered Desktop on/off, linked/unlinked/archived account cards,
-hidden-section recovery, Automation, and the Claude Desktop/ChatGPT settings
-picker in light/dark appearance, without clipped text. A 12-account native
-panel stayed within a 620-point height limit with Desktop controls below the
-scrolling list; scroll position retention was also checked.
-A clean full-suite result was unavailable on this
-Mac: seven `test_bundle_move.py` failures also reproduced in an untouched
-archive of baseline `d221f50` (48 passed / 7 failed for that file), and worker
-folder tests stalled inside `pathid._on_disk_darwin` while opening a system
-path. A representative stall reproduced in that same untouched archive with
-a 12-second bound. Full-suite attempts were interrupted after recording the
-diagnostics; these failures are not reported as passing or attributed to the
-new feature. No changes were made to those unrelated modules/tests.
-
-The opt-in local smoke probe opens two empty disposable profiles, checks that
-both survive and repeated opens reuse the correct process, then stops only its
-own children. Do not sign in or start work in those temporary windows:
+Earlier signed-out smoke testing on Claude 3.6556.2 opened two temporary profiles
+with separate data/cookie stores and reused their original PIDs. It did not
+exercise sign-in or create Code identity files. The optional disposable probe is:
 
 ```sh
 PYTHONPATH=src python tools/probe_claude_desktop_profiles.py --launch
 ```
 
-Before calling this verified desktop account support, complete these checks:
+A clean full local suite was unavailable on this Mac: seven bundle-move failures
+and a worker-folder stall also reproduced on untouched baseline `d221f50`.
+The worker stall occurred inside `pathid._on_disk_darwin` while opening a system
+path. These unrelated failures are not counted as passing checks.
 
-- Sign into two different emails (including two personal accounts); confirm
-  each email and organization. Verify A → B → A and restart persistence.
-- Exercise Google, magic-link, and organization SSO callbacks with another
-  profile/default Claude already running. Verify the intended window received
-  the login. Cancel/retry login and sign out of one; the other must remain usable.
-- Start a chat, a Code session and a Cowork task in each account; confirm
-  billing identity, history and permissions. Opening the other profile must
-  leave ongoing Desktop work intact. Combined selection must change the default
-  Code login to the linked account; explicit profile-only CLI open must not.
-- Test organization changes inside a profile, expired credentials, managed
-  policy, app update/relaunch, missing app and damaged profile recovery.
-- Link two Code accounts to their Desktop profiles, switch A → B → A manually
-  and through automatic rotation, and check both Code and Desktop identities.
-  Verify same-email/different-team links, disabling Desktop mode, archived links,
-  and retry after Code succeeds but Desktop cannot open.
-- Exercise the menu and popover with empty/populated rosters in light/dark
-  appearance, including archive/restore and a failed launch.
+## Remaining live acceptance checks
 
-Record authenticated results separately from synthetic tests and unsigned or
-signed-out smoke tests. No tokens or conversation contents belong in evidence.
+The feature remains experimental. Chrome-extension local pairing is disabled
+for relocated data in the inspected Claude build. OpenSwap does not verify
+Desktop identity or quota, move conversations, or promise embedded Code/Cowork
+compatibility from a successful launch.
+
+Before claiming authenticated account support:
+
+- Sign into two different accounts and verify email, organization and restart
+  persistence in each profile. Exercise Google, magic-link and organization SSO
+  callbacks with another profile/default Claude already running.
+- Start a chat, a Code session and a Cowork task in each profile. Confirm billing
+  identity, permissions and history. Opening another profile must preserve
+  ongoing work and the default terminal/editor Code login.
+- Check app updates, expired sign-ins, managed policy, missing-app recovery,
+  archive/restore with existing shortcuts, and pinned Dock icons across restart.
+
+Record authenticated results separately from synthetic tests and signed-out
+smoke tests. Do not include tokens or conversation contents in evidence.
