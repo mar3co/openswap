@@ -134,6 +134,7 @@ jobs:
           EXE="$CHECK/OpenSwap.app/Contents/MacOS/OpenSwap"
           lipo -archs "$EXE"
           lipo -archs "$EXE" | grep -qw "$OPENSWAP_ARCH"
+          uv run --with pyinstaller python packaging/macos/appkit_compat.py "$EXE"
           "$EXE" --version
 
       # The DMG a person installs from without Homebrew: it mounts, and holds

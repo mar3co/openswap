@@ -151,6 +151,8 @@ xcodebuild -project OpenSwapWidget.xcodeproj -scheme OpenSwapWidgetReload \
   CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=NO build
 
 cd "$HERE"
+# A local preview runner must never leak into a distributable build.
+unset OPENSWAP_DEV_ENTRY
 # Local extra from the repo root (.[menubar]). The plan's '../..[menubar]'
 # string is missing the slash after the path.
 uv run --directory "$ROOT" --with pyinstaller --with '.[menubar]' \
