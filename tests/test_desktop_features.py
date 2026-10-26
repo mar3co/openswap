@@ -70,8 +70,8 @@ def test_hidden_desktop_section_falls_back_to_general_and_codex_labels():
     assert menubar.format_menu_bar_title({}, settings) == 'Codex · No account'
 
 
-@pytest.mark.parametrize('app,expected,absent', [('claude', 'claude_desktop_profiles', 'chatgpt_switching_enabled'),
-                                                ('chatgpt', 'chatgpt_switching_enabled', 'claude_desktop_profiles')])
+@pytest.mark.parametrize('app,expected,absent', [('claude', 'claude_desktop_check', 'chatgpt_switching_enabled'),
+                                                ('chatgpt', 'chatgpt_switching_enabled', 'claude_desktop_check')])
 def test_desktop_app_picker_keeps_controls_in_their_own_section(app, expected, absent):
     settings = menubar.MenuBarSettings(desktop_features_enabled=True)
     rows = menubar.settings_page_rows(settings, strategy='best', threshold=90, section='desktop',

@@ -1,4 +1,4 @@
-"""Inline profile settings use the existing store, with local-only navigation."""
+"""The main profile tab uses the existing store, separate from Desktop settings."""
 
 from dataclasses import asdict
 from pathlib import Path
@@ -10,7 +10,7 @@ import pytest
 from openswap import menubar
 from openswap.claude_desktop import DesktopProfiles
 from openswap.claude_desktop_menu import ClaudeDesktopMenu
-from openswap.menubar_display import claude_desktop_settings_rows, settings_page_rows
+from openswap.menubar_display import claude_desktop_profile_rows, claude_desktop_settings_rows, settings_page_rows
 from tests.menubar_harness import extract_class
 
 
@@ -20,12 +20,15 @@ def controller(tmp_path):
                              show_error=Mock(), changed=Mock(), notify=Mock(), confirm=Mock(return_value=1))
 
 
-def test_empty_settings_offer_add_and_keep_guidance_collapsed():
-    rows = claude_desktop_settings_rows()
+def test_empty_main_tab_offers_add_and_settings_keep_guidance_collapsed():
+    rows = claude_desktop_profile_rows()
     by_id = {row["id"]: row for row in rows}
     assert by_id["claude_desktop_profiles"]["items"] == []
     assert not by_id["claude_desktop_profiles"]["disabled"]
-    assert by_id["claude_desktop_help"]["value"] is False
+    settings = {row["id"]: row for row in claude_desktop_settings_rows()}
+    assert settings["claude_desktop_help"]["value"] is False
+    assert "claude_desktop_check" in settings and "claude_desktop_check" not in by_id
+    assert "claude_desktop_profiles" not in settings and "claude_desktop_add" not in settings
     assert "Claude Code switching stays separate" in by_id["claude_desktop_separation"]["label"]
     assert not any(row["id"].endswith(("open_hint", "signin_hint", "archive_hint")) for row in rows)
     assert not any(row.get("title") == "Manage…" for row in rows)
@@ -36,10 +39,10 @@ def test_archived_profiles_and_help_expand_independently(controller):
     archived = controller.store.add("Work")
     controller.store.update(archived.id, archived=True)
     state = controller.settings_state()
-    rows = claude_desktop_settings_rows(state)
+    rows = claude_desktop_profile_rows(state)
     assert next(row for row in rows if row["kind"] == "profiles")["items"][0]["id"] == active.id
     assert not any(row["id"] == "claude_desktop_archived_profiles" for row in rows)
-    expanded = claude_desktop_settings_rows(state, expanded={"claude_desktop_archived"})
+    expanded = claude_desktop_profile_rows(state, expanded={"claude_desktop_archived"})
     restored_row = next(row for row in expanded if row["id"] == "claude_desktop_archived_profiles")
     assert restored_row["items"][0]["id"] == archived.id
     assert not any(row["id"] == "claude_desktop_archive_hint" for row in expanded)
@@ -51,7 +54,7 @@ def test_archived_profiles_and_help_expand_independently(controller):
 def test_storage_error_is_not_an_empty_profile_list(controller):
     controller.store.add("Work")
     controller.store.registry.write_text("invalid")
-    rows = claude_desktop_settings_rows(controller.settings_state())
+    rows = claude_desktop_profile_rows(controller.settings_state())
     assert not any(row["kind"] == "profiles" for row in rows)
     assert next(row for row in rows if row["id"] == "claude_desktop_add")["disabled"]
     assert any(row.get("title") == "View details" for row in rows)

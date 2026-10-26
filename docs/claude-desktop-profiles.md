@@ -9,7 +9,7 @@ rotation. A profile name is your label, not a verified account identity.
 
 1. Install the official Claude app in `/Applications/Claude.app`.
 2. Turn on **Settings → General → Enable desktop app features**.
-3. Open **Settings → Desktop → Claude Desktop → Add profile**.
+3. Open the **Claude Desktop** tab on the main screen and choose **Add profile**.
    Name it Personal, Work, or another recognizable name, then create and open it.
 4. Sign into the intended account in the new window. Check its email and
    selected organization before starting work.
@@ -20,10 +20,13 @@ rotation. A profile name is your label, not a verified account identity.
    `~/Applications/OpenSwap Profiles/` and reveals it in Finder. Drag that
    launcher to the Dock for one-click access.
 
-**Profiles…** under the **Claude Code** tab opens the same Desktop settings.
+With Desktop features enabled, the main tabs are **Claude Code**, **Claude Desktop**,
+and **Codex**. Turning Desktop features off hides the Claude Desktop tab.
 Each profile has an **Open** button and a **•••** menu for **Create shortcut…**,
 **Rename…**, and **Archive…**. The same actions are available under
-**More → Claude Desktop profiles**. Expand **About profiles** for usage details.
+**More → Claude Desktop profiles**. App checks and **About profiles** help remain
+under **Settings → Desktop → Claude Desktop**. The gear button on the Claude
+Desktop tab opens those settings; Back returns to the profile list.
 
 Opening a profile again brings its existing process forward when macOS permits
 it. Other profile windows stay open. Neither opening a profile nor using its
@@ -66,7 +69,7 @@ open. App updates may still change profile compatibility.
 
 ## Sign-in, status, and archiving
 
-Use **Check** to verify the installed publisher/version and refresh running
+Use **Settings → Desktop → Claude Desktop → Check** to verify the installed publisher/version and refresh running
 status without opening Claude or reading credentials. Profile rows show
 **Running**, **Not running**, or **Could not confirm**; hover over the status
 for the check's time.

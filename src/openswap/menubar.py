@@ -2563,9 +2563,11 @@ def run(switcher, codex=None) -> int:
                 return  # preserve the menu's anchor and callbacks until it closes
             self._claude_desktop_update_pending = False
             self.rebuild_menu()
-            if (panel is not None and panel.is_shown()
-                    and getattr(panel, "_page", None) == SETTINGS_PAGE
-                    and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_DESKTOP):
+            if (panel is not None and panel.is_shown() and (
+                    (getattr(panel, "_page", None) == SETTINGS_PAGE
+                     and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_DESKTOP)
+                    or (getattr(panel, "_page", None) == MAIN_PAGE
+                        and getattr(panel, "_selected_provider", None) == "claude_desktop"))):
                 panel.reload()
 
         def _show_claude_desktop_profiles(self, sender):

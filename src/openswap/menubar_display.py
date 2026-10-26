@@ -996,8 +996,8 @@ def _hint_lines(text: str) -> int:
     return max(2, -(-len(text) // _HINT_LINE_CHARS))
 
 
-def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str] | None = None) -> list[dict]:
-    """Actions first; guidance expands locally without changing saved settings."""
+def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str] | None = None) -> list[dict]:
+    """Everyday profile actions for the main Claude Desktop tab."""
     state = state or {}
     expanded = expanded or set()
     rows = []
@@ -1026,6 +1026,19 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
                      "value": "claude_desktop_archived" in expanded})
         if "claude_desktop_archived" in expanded:
             rows.append({"kind": "profiles", "id": "claude_desktop_archived_profiles", "items": archived, "disabled": disabled})
+    return rows
+
+
+def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str] | None = None) -> list[dict]:
+    """App checks and optional guidance, separate from the main profile list."""
+    state = state or {}
+    expanded = expanded or set()
+    rows = [{"kind": "group", "id": "claude_desktop_app_heading", "label": "Claude Desktop app"}]
+
+    def hint(id, text):
+        rows.append({"kind": "group", "style": "hint", "id": id,
+                     "label": text, "lines": _hint_lines(text)})
+
     message = state.get("app_message") or "Not checked yet. Install Claude.app in Applications."
     rows.append({"kind": "app_check", "id": "claude_desktop_check", "label": message,
                  "title": "Checking…" if state.get("checking") else "Check", "disabled": bool(state.get("checking")),
@@ -2605,15 +2618,23 @@ def provider_cards(cards: list[dict], provider: str, *, desktop: bool = True) ->
 
 
 def provider_tab_name(provider: str, *, desktop: bool = True) -> str:
-    """Name the account consumer explicitly, separate from Desktop profiles."""
+    """Navigation names stay stable when ChatGPT switching is enabled."""
     if provider == "chatgpt":
-        return "ChatGPT" if desktop else "Codex"
+        return "Codex"
+    if provider == "claude_desktop":
+        return "Claude Desktop"
     return "Claude Code"
+
+
+def provider_tabs(settings: MenuBarSettings) -> tuple[str, ...]:
+    return ("claude", "claude_desktop", "chatgpt") if settings.desktop_features_enabled else ("claude", "chatgpt")
 
 
 def provider_tab_title(cards: list[dict], provider: str, *, desktop: bool = True) -> str:
     """Provider tab copy that keeps hidden action-required accounts visible."""
     name = provider_tab_name(provider, desktop=desktop)
+    if provider == "claude_desktop":
+        return name
     shown = provider_cards(cards, provider, desktop=desktop)
     if any(
         card.get("needs_restore") or card.get("needs_reconcile")
@@ -2699,9 +2720,9 @@ def welcome_on_start(
 
 
 def provider_shared_copy(provider: str, *, desktop: bool = True) -> str:
-    """Under-tab line: only the desktop-app tab needs to say its roster is Codex's."""
+    """Explain the optional app restart beside the Codex account controls."""
     if provider == "chatgpt" and desktop:
-        return "Shared with Codex · Codex usage"
+        return "Also restarts ChatGPT"
     return ""
 
 

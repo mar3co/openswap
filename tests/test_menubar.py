@@ -3026,7 +3026,7 @@ def test_kickoff_oauth_failure_marks_card_and_provider_tab_for_action():
     assert cards[0]["needs_relogin"] is True
     assert cards[0]["action_required"] is True
     assert "OAuth expired" in cards[0]["note"]
-    assert menubar.provider_tab_title(cards, "chatgpt") == "ChatGPT · Sign in"
+    assert menubar.provider_tab_title(cards, "chatgpt") == "Codex · Sign in"
     assert menubar.provider_tab_title(cards, "claude") == "Claude Code"
 
 
@@ -3977,8 +3977,8 @@ def test_panel_header_holds_settings_and_more_icons_and_footer_holds_autoswitch(
     text = (Path(menubar.__file__).resolve().parent / "menubar_panel.py").read_text(
         encoding="utf-8"
     )
-    build = text[text.index("    def _build(self):") : text.index("    def _build_settings(self):")]
-    header = build[: build.index("inner_w = PANEL_WIDTH - PAD * 2")]
+    build = text[text.index("    def _build(self):") : text.index("    def _add_main_header")]
+    header = text[text.index("    def _add_main_header") : text.index("    def _add_provider_tabs")]
     assert '"gearshape"' in header and "self._show_settings" in header
     assert '"ellipsis.circle"' in header and "self._more" in header
     assert "trailing_header_frames" in header
@@ -4048,14 +4048,14 @@ def test_chatgpt_tab_desktop_follows_the_switching_setting():
 
 def test_second_tab_copy_is_codex_when_desktop_switching_is_off():
     assert menubar.provider_tab_title([], "chatgpt", desktop=False) == "Codex"
-    assert menubar.provider_tab_title([], "chatgpt") == "ChatGPT"
+    assert menubar.provider_tab_title([], "chatgpt") == "Codex"
     assert menubar.provider_tab_title([], "claude", desktop=False) == "Claude Code"
     assert menubar.provider_shared_copy("chatgpt", desktop=False) == ""
-    assert menubar.provider_shared_copy("chatgpt") == "Shared with Codex · Codex usage"
+    assert menubar.provider_shared_copy("chatgpt") == "Also restarts ChatGPT"
     empty = menubar.provider_empty_state("chatgpt", desktop=False)
     assert empty["title"] == "Add a Codex account"
     assert empty["button"] == "Sign in with ChatGPT"
-    assert menubar.provider_empty_state("chatgpt")["title"] == "Add a ChatGPT account"
+    assert menubar.provider_empty_state("chatgpt")["title"] == "Add a Codex account"
     assert menubar.provider_empty_state("chatgpt", "loading", desktop=False)["title"] == (
         "Loading Codex accounts…"
     )
@@ -4131,7 +4131,7 @@ def test_panel_second_tab_toggle_and_copy_follow_the_mode():
     assert "desktop_tab = chatgpt_tab_desktop(settings)" in build
     for call in (
         "provider_cards(all_cards, provider, desktop=desktop_tab)",
-        "provider_tab_title(all_cards, tab_provider, desktop=desktop_tab)",
+        "provider_tab_title(all_cards, provider, desktop=desktop_tab)",
         "provider_shared_copy(provider, desktop=desktop_tab)",
         "card_title_suffix(card, provider, desktop=desktop_tab)",
         "card_badge_text(card, provider, desktop=desktop_tab)",

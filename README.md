@@ -10,7 +10,7 @@ OpenSwap is a standalone MIT descendant of [claude-swap](https://github.com/real
 **Developers:** [docs/](docs/README.md) (architecture, hacking, tests)
 
 **Desktop apps (experimental, opt-in):** turn on **Settings → General → Enable
-desktop app features**, then open **Settings → Desktop → Claude Desktop** to add
+desktop app features**, then open the main **Claude Desktop** tab to add
 Personal, Work or other profiles. Each can stay open with its own sign-in.
 **Create shortcut…** makes a launcher for Finder and the Dock, with an optional
 number and colored badge on Claude's icon. Claude Code switching and rotation
@@ -144,19 +144,21 @@ Pairing does not start the worker: the portal shows the Mac Offline until you ru
 
 `openswap help` lists the main commands. Full list: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
 
-The main Claude tab is always **Claude Code**. The second tab shows **ChatGPT**
-when its Desktop switching is enabled, and **Codex** otherwise. The ChatGPT tab lists the
-shared ChatGPT/Codex accounts. Usage bars are **Codex usage**, not ChatGPT
+The main tabs are **Claude Code** and **Codex**. Enabling Desktop features adds
+**Claude Desktop** between them for profiles. App checks, preferences and help
+stay in **Settings → Desktop**. The Codex tab keeps its name when ChatGPT
+switching is enabled and shows **Also restarts ChatGPT** above its accounts.
+Usage bars are **Codex usage**, not ChatGPT
 message limits. Desktop switching is experimental and **off by default**: turn on
 Settings → General → **Enable desktop app features**, then Settings → Desktop →
 ChatGPT Desktop → **Enable ChatGPT switching**. Wait until the extra shows
 **Switch and open ChatGPT** or **Restart ChatGPT**, then click an OAuth account
-and confirm. While switching is off, a click offers **Enable in Settings**.
+and confirm. With ChatGPT switching off, account clicks switch Codex only.
 Incompatible builds show **This ChatGPT build isn’t compatible with switching.**
 Relaunch does not prove which profile ChatGPT loaded. Read the
 [test and recovery guide](docs/chatgpt-desktop-testing.md) first.
 
-**Suggest ChatGPT account switches** (**Suggest switches** on the ChatGPT tab) only runs
+**Suggest account switches** (**Suggest switches** on the Codex tab) only runs
 when switching is on. It picks a replacement from Codex quota, then **Review
 switch**; you still confirm before ChatGPT restarts. That mode cannot run with
 live Codex CLI rotation. Unattended desktop rotation is not implemented.

@@ -549,6 +549,9 @@ def test_desktop_updates_preserve_open_menu_anchor_and_do_not_reload_account_car
     panel._page = "main"
     app._claude_desktop_changed()
     panel.reload.assert_not_called()
+    panel._selected_provider = "claude_desktop"
+    app._claude_desktop_changed()
+    panel.reload.assert_called_once()
 
 
 def test_hidden_desktop_blocks_stale_actions_and_checks(menu, store, monkeypatch):
