@@ -333,7 +333,7 @@ class Item:
 
 @pytest.fixture
 def menu(store):
-    return ui.ClaudeDesktopMenu(store=store, prompt=Mock(), show_error=Mock(), changed=Mock(), notify=Mock())
+    return ui.ClaudeDesktopMenu(store=store, prompt=Mock(), show_error=Mock(), changed=Mock(), notify=Mock(), confirm=Mock(return_value=1))
 
 
 def test_menu_profile_actions_resolve_stable_ids(menu, store, monkeypatch):
@@ -539,8 +539,10 @@ def test_desktop_updates_preserve_open_menu_anchor_and_do_not_reload_account_car
     app._claude_desktop_changed()
     app.rebuild_menu.assert_not_called()
     panel.reload.assert_not_called()
+    assert app._claude_desktop_update_pending
     panel._menu_open = False
     app._claude_desktop_changed()
+    assert not app._claude_desktop_update_pending
     app.rebuild_menu.assert_called_once()
     panel.reload.assert_called_once()
     panel.reload.reset_mock()

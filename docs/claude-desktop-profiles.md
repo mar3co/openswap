@@ -9,11 +9,11 @@ rotation. A profile name is your label, not a verified account identity.
 
 1. Install the official Claude app in `/Applications/Claude.app`.
 2. Turn on **Settings → General → Enable desktop app features**.
-3. Open **Settings → Desktop → Claude Desktop → Manage… → Add profile…**.
+3. Open **Settings → Desktop → Claude Desktop → Add profile**.
    Name it Personal, Work, or another recognizable name, then create and open it.
 4. Sign into the intended account in the new window. Check its email and
    selected organization before starting work.
-5. In that profile's menu, choose **Create shortcut…**. Choose a number from
+5. Open that profile's **•••** menu and choose **Create shortcut…**. Choose a number from
    1 to 999 and an orange, blue, purple or green badge. Leave the number blank
    for Claude's standard icon.
 6. OpenSwap creates `Claude Work.app` (or your chosen profile name) under
@@ -21,8 +21,9 @@ rotation. A profile name is your label, not a verified account identity.
    launcher to the Dock for one-click access.
 
 **Profiles…** under the **Claude Code** tab opens the same Desktop settings.
-**More → Claude Desktop profiles** also provides **Open profile**, **Rename…**,
-**Archive (keep data)**, and **Create shortcut…** for each profile.
+Each profile has an **Open** button and a **•••** menu for **Create shortcut…**,
+**Rename…**, and **Archive…**. The same actions are available under
+**More → Claude Desktop profiles**. Expand **About profiles** for usage details.
 
 Opening a profile again brings its existing process forward when macOS permits
 it. Other profile windows stay open. Neither opening a profile nor using its
@@ -65,15 +66,16 @@ open. App updates may still change profile compatibility.
 
 ## Sign-in, status, and archiving
 
-Use **Check app** to verify the installed publisher/version and refresh running
-status without opening Claude or reading credentials. Profile submenus show
-**Running**, **Not running**, or **Could not confirm**, with the check's time.
+Use **Check** to verify the installed publisher/version and refresh running
+status without opening Claude or reading credentials. Profile rows show
+**Running**, **Not running**, or **Could not confirm**; hover over the status
+for the check's time.
 Running means an app process exists, not that its sign-in is verified.
 
-**Archive (keep data)** hides a profile from the available list and prevents
+**Archive…** explains what is kept before hiding a profile from the available list and preventing
 its shortcuts from opening it. Sign-ins, settings, local conversations, icons
 and shortcut files are kept; running windows stay open. **Archived profiles →
-Restore profile** makes the same profile and shortcuts usable again without
+Restore** makes the same profile and shortcuts usable again without
 launching it. Use Claude's own Quit action to close a running profile.
 
 The ordinary Claude app/Dock icon does not select an OpenSwap profile and can

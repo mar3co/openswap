@@ -315,7 +315,7 @@ def test_settings_page_sections_separate_display_from_provider_automation():
         "Enable ChatGPT switching"
     )
     assert desktop_by_id["chatgpt_auto_enabled"]["label"] == (
-        "Suggest ChatGPT account switches"
+        "Suggest account switches"
     )
     assert desktop_by_id["chatgpt_auto_enabled"]["disabled"] is True
     ids = [row["id"] for row in desktop]

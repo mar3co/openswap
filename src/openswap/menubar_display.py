@@ -567,6 +567,7 @@ def settings_page_rows(
     bundled_widget: bool = False,
     claude_desktop: dict | None = None,
     desktop_app: str = "claude",
+    expanded_sections: set[str] | None = None,
     section: str | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
@@ -809,7 +810,7 @@ def settings_page_rows(
                     "style": "section",
                     "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "group_chatgpt",
-                    "label": "ChatGPT Desktop",
+                    "label": "ChatGPT switching",
                 },
                 {
                     "kind": "toggle",
@@ -829,7 +830,7 @@ def settings_page_rows(
                     "kind": "toggle",
                     "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "chatgpt_auto_enabled",
-                    "label": "Suggest ChatGPT account switches",
+                    "label": "Suggest account switches",
                     "value": bool(settings.chatgpt_auto_enabled),
                     "disabled": not bool(settings.chatgpt_switching_enabled),
                 },
@@ -962,10 +963,14 @@ def settings_page_rows(
             if not desktop_chatgpt:
                 desktop.append({"kind": "group", "style": "hint", "section": SETTINGS_SECTION_DESKTOP,
                                 "id": "chatgpt_unavailable", "label": "Sign in with ChatGPT from the Codex tab to get started.", "lines": 2})
-            desktop.append({"kind": "group", "style": "hint", "section": SETTINGS_SECTION_DESKTOP,
-                            "id": "chatgpt_policy_location", "label": "Save work before restarting. Rotation settings are in Automation.", "lines": 2})
+            desktop.append({"kind": "disclosure", "section": SETTINGS_SECTION_DESKTOP,
+                            "id": "chatgpt_help", "label": "About switching",
+                            "value": "chatgpt_help" in (expanded_sections or ())})
+            if "chatgpt_help" in (expanded_sections or ()):
+                desktop.append({"kind": "group", "style": "hint", "section": SETTINGS_SECTION_DESKTOP,
+                                "id": "chatgpt_policy_location", "label": "Save work before restarting. Turn switching off to switch Codex only. Rotation settings are in Automation.", "lines": 3})
         if desktop_app != "chatgpt" or section is None:
-            desktop.extend(claude_desktop_settings_rows(claude_desktop))
+            desktop.extend(claude_desktop_settings_rows(claude_desktop, expanded=expanded_sections))
     rows = general + automation + desktop + remote
     if section is not None:
         valid_sections = {value for value, _label in settings_sections(settings)}
@@ -991,28 +996,44 @@ def _hint_lines(text: str) -> int:
     return max(2, -(-len(text) // _HINT_LINE_CHARS))
 
 
-def claude_desktop_settings_rows(state: dict | None = None) -> list[dict]:
-    """Desktop guidance and management; no login or usage claims from process state."""
+def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str] | None = None) -> list[dict]:
+    """Actions first; guidance expands locally without changing saved settings."""
     state = state or {}
+    expanded = expanded or set()
     rows = []
 
     def hint(id, text):
         rows.append({"kind": "group", "style": "hint", "id": id,
                      "label": text, "lines": _hint_lines(text)})
 
-    hint("claude_desktop_separation", "Open profiles side by side. Each keeps its own sign-in. Claude Code switching stays separate.")
-    rows.append({"kind": "button", "id": "claude_desktop_check", "label": "Claude Desktop app",
-                 "title": "Checking…" if state.get("checking") else "Check app", "disabled": bool(state.get("checking"))})
-    hint("claude_desktop_app", state.get("app_message") or "Not checked yet. Install Claude.app in Applications.")
-    count = state.get("profiles", 0)
-    archived = state.get("archived", 0)
-    rows.append({"kind": "button", "id": "claude_desktop_profiles", "label": "Manage profiles", "title": "Manage…",
-                 "disabled": bool(state.get("busy"))})
-    hint("claude_desktop_count", state.get("storage_error") or (
-        "Working on profile…" if state.get("busy") else
-        f"{count} available · {archived} archived."
-        if count or archived else "No profiles yet. Choose Manage → Add profile."
-    ))
+    items = [] if state.get("storage_error") else state.get("items") or []
+    active = [p for p in items if not p.get("archived")]
+    archived = [p for p in items if p.get("archived")]
+    disabled = bool(state.get("busy"))
+    rows.append({"kind": "profiles_header", "id": "claude_desktop_add", "label": "Profiles",
+                 "title": "Add profile" if active else "", "disabled": disabled or bool(state.get("storage_error"))})
+    hint("claude_desktop_separation", "Separate sign-ins, side by side.\nClaude Code switching stays separate.")
+    if state.get("storage_error"):
+        hint("claude_desktop_storage_error_hint", state["storage_error"])
+        rows.append({"kind": "button", "id": "claude_desktop_storage_error", "label": "Profile storage",
+                     "title": "View details", "disabled": disabled})
+    else:
+        rows.append({"kind": "profiles", "id": "claude_desktop_profiles", "items": active, "disabled": disabled})
+    if disabled:
+        hint("claude_desktop_operation", state.get("operation") or "Working on profile…")
+    if archived:
+        rows.append({"kind": "disclosure", "id": "claude_desktop_archived", "label": f"Archived profiles ({len(archived)})",
+                     "value": "claude_desktop_archived" in expanded})
+        if "claude_desktop_archived" in expanded:
+            rows.append({"kind": "profiles", "id": "claude_desktop_archived_profiles", "items": archived, "disabled": disabled})
+    message = state.get("app_message") or "Not checked yet. Install Claude.app in Applications."
+    rows.append({"kind": "app_check", "id": "claude_desktop_check", "label": message,
+                 "title": "Checking…" if state.get("checking") else "Check", "disabled": bool(state.get("checking")),
+                 "lines": _hint_lines(message)})
+    rows.append({"kind": "disclosure", "id": "claude_desktop_help", "label": "About profiles",
+                 "value": "claude_desktop_help" in expanded})
+    if "claude_desktop_help" not in expanded:
+        return [{"section": SETTINGS_SECTION_DESKTOP, **row} for row in rows]
     for key, title, body in (
         ("open", "Opening profiles", "Open profile brings it forward. Other profiles keep running."),
         ("shortcut", "Shortcuts and icons", "Choose Create shortcut in a profile's menu, then drag it from Finder to the Dock. Claude's running icon stays unchanged."),
@@ -1020,9 +1041,7 @@ def claude_desktop_settings_rows(state: dict | None = None) -> list[dict]:
         ("archive", "Archiving", "Keeps sign-ins, data and open windows. Shortcuts are disabled until restored. Restore does not open the profile."),
         ("limits", "Experimental limits", "Code and Cowork in these profiles are experimental. No Chrome pairing. OpenSwap does not verify the account or usage."),
     ):
-        if key != "limits":
-            rows.append({"kind": "group", "id": f"claude_desktop_{key}_heading", "label": title})
-        hint(f"claude_desktop_{key}_hint", body)
+        hint(f"claude_desktop_{key}_hint", f"{title}: {body}" if key != "limits" else body)
     return [{"section": SETTINGS_SECTION_DESKTOP, **row} for row in rows]
 
 

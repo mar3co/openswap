@@ -249,6 +249,7 @@ def run(switcher, codex=None) -> int:
             self._desktop_app = DesktopApp()
             self._claude_desktop_profiles = ClaudeDesktopMenu(
                 prompt=self._prompt, show_error=self._show_error, changed=self._claude_desktop_changed,
+                confirm=self._alert,
                 show_status=lambda message: self._alert(title="Claude Desktop", message=message),
                 notify=lambda title, body: self._notify(NotificationCopy(title=title, body=body)),
                 enabled=lambda: self.settings.desktop_features_enabled,
@@ -611,6 +612,9 @@ def run(switcher, codex=None) -> int:
             self._drain_desktop_result()
             if getattr(self, "_claude_desktop_profiles", None) is not None:
                 self._claude_desktop_profiles.poll()
+            if (getattr(self, "_claude_desktop_update_pending", False)
+                    and not getattr(self._panel, "_menu_open", False)):
+                self._claude_desktop_changed()
             self._drain_worker_result()
             self._drain_guided_setup()
             self._drain_login_item_result()
@@ -1611,6 +1615,7 @@ def run(switcher, codex=None) -> int:
                 on_claude_desktop=lambda sender: self._show_claude_desktop_profiles(sender),
                 claude_desktop_state=self._claude_desktop_profiles.settings_state,
                 on_claude_desktop_check=self._claude_desktop_profiles.refresh_status,
+                on_claude_desktop_action=self._claude_desktop_profiles.perform,
                 on_toggle_auto=lambda *_a: self.on_toggle_autoswitch(None),
                 on_toggle_chatgpt_auto=lambda *_a: self.on_toggle_chatgpt_auto(None),
                 on_review_chatgpt_switch=self._review_chatgpt_switch,
@@ -2554,7 +2559,9 @@ def run(switcher, codex=None) -> int:
         def _claude_desktop_changed(self):
             panel = self._panel
             if panel is not None and getattr(panel, "_menu_open", False):
+                self._claude_desktop_update_pending = True
                 return  # preserve the menu's anchor and callbacks until it closes
+            self._claude_desktop_update_pending = False
             self.rebuild_menu()
             if (panel is not None and panel.is_shown()
                     and getattr(panel, "_page", None) == SETTINGS_PAGE

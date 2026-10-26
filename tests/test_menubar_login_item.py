@@ -541,7 +541,7 @@ def _attach(app, monkeypatch):
             return lambda *a, **k: None
 
     attached = App()
-    attached._claude_desktop_profiles = types.SimpleNamespace(settings_state=lambda: {}, refresh_status=lambda: None)
+    attached._claude_desktop_profiles = types.SimpleNamespace(settings_state=lambda: {}, refresh_status=lambda: None, perform=lambda *args: None)
     attached.switcher = app.switcher
     attached._nsapp = types.SimpleNamespace(nsstatusitem=object())
     attached._panel = None

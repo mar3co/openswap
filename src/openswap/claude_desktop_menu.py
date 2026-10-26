@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from dataclasses import asdict
 from datetime import datetime
 
 from openswap.claude_desktop import BADGE_COLORS, BUNDLE_ID, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, validate_badge
@@ -33,7 +34,7 @@ def has_saved_profiles() -> bool:
 
 class ClaudeDesktopMenu:
     def __init__(self, *, prompt, show_error, changed, notify, store=None, app_factory=None, show_status=None, enabled=None,
-                 blocked=None, shortcut_factory=None, reveal=None):
+                 blocked=None, shortcut_factory=None, reveal=None, confirm=None):
         self.store = store or DesktopProfiles()
         self.prompt = prompt
         self.show_error = show_error
@@ -44,6 +45,7 @@ class ClaudeDesktopMenu:
         self.blocked = blocked or (lambda: False)
         self.shortcut_factory = shortcut_factory
         self.reveal = reveal or reveal_shortcut
+        self.confirm = confirm
         self.operation = "Opening Claude…"
         self.busy = False
         self._results = queue.SimpleQueue()
@@ -52,6 +54,7 @@ class ClaudeDesktopMenu:
         self.checking = False
         self._app_message = "Not checked yet. Install Claude.app in Applications."
         self._profile_states = {}
+        self._profile_checked_at = {}
         self._checked_at = None
         self._check_generation = 0
 
@@ -61,13 +64,16 @@ class ClaudeDesktopMenu:
 
     def settings_state(self):
         state = {"checking": self.checking, "busy": self.busy or self.blocked(),
+                 "operation": self.operation if self.busy else "Waiting for app switch…",
                  "app_message": "Checking Claude Desktop…" if self.checking else self._app_message}
         try:
             profiles = self.store.list(include_archived=True)
             state.update(profiles=sum(not p.archived for p in profiles),
-                         archived=sum(p.archived for p in profiles))
+                         archived=sum(p.archived for p in profiles),
+                         items=[{**asdict(p), "status": self._profile_states.get(p.id, ""),
+                                 "checked_at": self._profile_checked_at.get(p.id)} for p in profiles])
         except (ClaudeSwitchError, OSError):
-            state["storage_error"] = "Profile storage needs attention. Open Manage profiles for details."
+            state["storage_error"] = "Could not read profiles. Check folder permissions or view details."
         return state
 
     def refresh_status(self, _=None):
@@ -133,7 +139,7 @@ class ClaudeDesktopMenu:
             item.add(rumps.MenuItem("Open profile",
                                    callback=lambda _, p=profile: self.open(p.id)))
             item.add(rumps.MenuItem("Rename…", callback=lambda _, p=profile: self.rename(p)))
-            item.add(rumps.MenuItem("Archive (keep data)", callback=lambda _, p=profile: self.edit(p, archived=True)))
+            item.add(rumps.MenuItem("Archive…", callback=lambda _, p=profile: self.archive(p)))
             item.add(rumps.MenuItem("Create shortcut…", callback=lambda _, p=profile: self.shortcut(p)))
             self._add_status(item, profile, rumps)
             menu.add(item)
@@ -143,7 +149,8 @@ class ClaudeDesktopMenu:
 
     def _add_status(self, item, profile, rumps):
         state = self._profile_states.get(profile.id)
-        label = f"{state} at {self._checked_at}" if state and self._checked_at else "Running status not checked"
+        checked_at = self._profile_checked_at.get(profile.id)
+        label = f"{state} at {checked_at}" if state and checked_at else "Running status not checked"
         item.add(rumps.MenuItem(label, callback=None))
         item.add(rumps.MenuItem("Sign-in: Check inside Claude", callback=None))
 
@@ -157,12 +164,42 @@ class ClaudeDesktopMenu:
         self.show_error(str(exc) if isinstance(exc, ClaudeSwitchError)
                         else "Could not access Claude Desktop profiles. Check folder permissions and retry.")
 
+    def perform(self, action, identifier=None):
+        """Resolve the current profile by stable ID for inline settings actions."""
+        if self.busy or self.blocked() or not self.enabled():
+            return
+        if action == "add":
+            return self.add()
+        if action == "storage_error":
+            return self.storage_error()
+        if action not in {"open", "rename", "archive", "restore", "shortcut"}:
+            return
+        try:
+            profile = self.store.get(identifier, include_archived=action == "restore")
+        except (ClaudeSwitchError, OSError) as exc:
+            self._error(exc)
+            return
+        if action == "open":
+            self.open(profile.id)
+        elif action == "restore":
+            self.edit(profile, archived=False)
+        else:
+            getattr(self, action)(profile)
+
+    def archive(self, profile):
+        if self.busy or self.blocked() or not self.enabled() or self.confirm is None:
+            return
+        if self.confirm(title=f"Archive {profile.name}?",
+                        message="Keeps sign-ins, data and open windows. Shortcuts are disabled until you restore this profile.",
+                        ok="Archive", cancel="Cancel") == 1:
+            self.edit(profile, archived=True)
+
     def add(self, _=None):
         if self.busy or self.blocked() or not self.enabled():
             return
         response = self.prompt(
             title="Add Claude Desktop profile",
-            message="Name this profile, such as Personal or Work.\n\nSign in inside Claude Desktop when it opens. Each profile keeps its own sign-in. Your terminal and editor Claude Code login stays unchanged.",
+            message="Name this profile, such as Personal or Work.\n\nSign in and check your account inside the new Claude window. Claude Code switching stays separate.",
             default_text="", ok="Create and open", cancel="Cancel",
         )
         if response.clicked != 1:
@@ -260,6 +297,7 @@ class ClaudeDesktopMenu:
         else:
             if generation == self._check_generation and self.enabled():
                 self._app_message, self._profile_states, self._checked_at = message, states, checked_at
+                self._profile_checked_at = dict.fromkeys(states, checked_at)
                 self.checking = False
                 self.changed()
         try:
@@ -267,6 +305,9 @@ class ClaudeDesktopMenu:
         except queue.Empty:
             return
         self.busy = False
+        if error is None and result.get("pid") and result.get("profile", {}).get("id"):
+            self._profile_states[result["profile"]["id"]] = "Running"
+            self._profile_checked_at[result["profile"]["id"]] = datetime.now().strftime("%b %d, %H:%M:%S")
         self.changed()
         if error is not None:
             self._error(error)
