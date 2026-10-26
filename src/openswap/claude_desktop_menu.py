@@ -203,8 +203,9 @@ class ClaudeDesktopMenu:
         if self.busy or self.blocked() or not self.enabled():
             return
         response = self.prompt(
-            title="Add Claude Desktop profile",
-            message="Name this profile, such as Personal or Work.\n\nSign in and check your account inside the new Claude window. Claude Code switching stays separate.",
+            title="Create Claude Desktop profile",
+            message="Create a separate Claude window with its own sign-in.",
+            input_label="Profile name", placeholder="e.g. Work",
             default_text="", ok="Create and open", cancel="Cancel",
         )
         if response.clicked != 1:

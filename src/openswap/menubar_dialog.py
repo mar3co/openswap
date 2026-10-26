@@ -272,7 +272,7 @@ class BrandDialog:
     def __init__(
         self, *, title=None, message="", ok=None, cancel=None, other=None,
         default_text=None, secure=False, destructive=False, checkbox=None, close=None,
-        choices=None, selected=0, fields=None,
+        choices=None, selected=0, fields=None, input_label=None, placeholder=None,
     ):
         shown_title = str(title or "OpenSwap")
         if shown_title.casefold() == "openswap":
@@ -381,7 +381,7 @@ class BrandDialog:
             self.body = body
             screen = window.screen()
             max_height = min(640, screen.visibleFrame().size.height - 80) if screen else 640
-            input_space = (DIALOG_INPUT_HEIGHT + 20 if default_text is not None else 0) + (
+            input_space = (DIALOG_INPUT_HEIGHT + 20 + (24 if input_label else 0) if default_text is not None else 0) + (
                 POPUP_HEIGHT + 20 if choices is not None else 0) + len(fields or ()) * (DIALOG_INPUT_HEIGHT + 42)
             body_limit = max(80, max_height - y - input_space - FOOTER_GAP - footer_height)
             body_height = body.frame().size.height
@@ -415,6 +415,11 @@ class BrandDialog:
 
         if default_text is not None:
             y += 20
+            if input_label:
+                label = _label(str(input_label), NSFont.systemFontOfSize_(12), NSColor.secondaryLabelColor(), DIALOG_CONTENT_WIDTH)
+                label.setFrameOrigin_((DIALOG_PADDING, y))
+                surface.addSubview_(label)
+                y += label.frame().size.height + 6
             field_class = NSSecureTextField if secure else NSTextField
             field = field_class.alloc().initWithFrame_(
                 NSMakeRect(DIALOG_PADDING, y, DIALOG_CONTENT_WIDTH, DIALOG_INPUT_HEIGHT)
@@ -428,7 +433,9 @@ class BrandDialog:
             field.setControlSize_(NSControlSizeLarge)
             field.setBezelStyle_(1)  # NSTextFieldRoundedBezel
             field.setStringValue_(str(default_text))
-            field.setAccessibilityLabel_(shown_title)
+            field.setAccessibilityLabel_(str(input_label or shown_title))
+            if placeholder is not None:
+                field.setPlaceholderString_(str(placeholder))
             field.cell().setUsesSingleLineMode_(True)
             field.cell().setScrollable_(True)
             surface.addSubview_(field)
