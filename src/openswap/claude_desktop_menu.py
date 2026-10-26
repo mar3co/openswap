@@ -6,7 +6,7 @@ import queue
 import threading
 from datetime import datetime
 
-from openswap.claude_desktop import BADGE_COLORS, BUNDLE_ID, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, PROFILE_NOTICE, validate_badge
+from openswap.claude_desktop import BADGE_COLORS, BUNDLE_ID, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, validate_badge
 from openswap.exceptions import ClaudeSwitchError
 
 
@@ -105,7 +105,7 @@ class ClaudeDesktopMenu:
     def menu(self, rumps):
         menu = rumps.MenuItem("Claude Desktop profiles")
         menu.add(rumps.MenuItem("Experimental · Separate sign-ins", callback=None))
-        menu.add(rumps.MenuItem("Checking app and profiles…" if self.checking else "Check app and running profiles",
+        menu.add(rumps.MenuItem("Checking status…" if self.checking else "Refresh status",
                                 callback=None if self.checking else self.refresh_status))
         if self._checked_at:
             menu.add(rumps.MenuItem("App check details…", callback=lambda _: self.show_status(self._app_message)))
@@ -161,7 +161,8 @@ class ClaudeDesktopMenu:
         if self.busy or self.blocked() or not self.enabled():
             return
         response = self.prompt(
-            title="Add Claude Desktop profile", message=PROFILE_NOTICE + "\n\nName this profile (for example, Personal or Work).",
+            title="Add Claude Desktop profile",
+            message="Name this profile, such as Personal or Work.\n\nSign in inside Claude Desktop when it opens. Each profile keeps its own sign-in. Your terminal and editor Claude Code login stays unchanged.",
             default_text="", ok="Create and open", cancel="Cancel",
         )
         if response.clicked != 1:
@@ -192,9 +193,9 @@ class ClaudeDesktopMenu:
         self.changed()
         if "archived" in changes:
             self._notify("Profile archived" if updated.archived else "Profile restored",
-                        f"{updated.name}. Sign-in and local work are kept. "
-                        + ("Running windows stay open; restore it from Archived profiles."
-                           if updated.archived else "Open it when you're ready; restoring does not launch Claude."))
+                        f"{updated.name}. "
+                        + ("Sign-in, work and open windows kept. Restore to use its shortcuts again."
+                           if updated.archived else "Ready to open. Restoring does not launch Claude Desktop."))
 
     def open(self, identifier):
         if self.busy or self.blocked() or not self.enabled():
@@ -218,7 +219,7 @@ class ClaudeDesktopMenu:
         if self.busy or self.blocked() or not self.enabled():
             return
         from openswap.claude_desktop_shortcut import ICON_NOTICE, create_shortcut
-        response = self.prompt(title="Shortcut icon", message="Add a number from 1 to 999 to Claude's icon, or leave it blank for the standard icon.\n\n" + ICON_NOTICE,
+        response = self.prompt(title="Shortcut icon", message="Choose a number from 1–999, or leave blank for the standard icon.\n\n" + ICON_NOTICE,
                                default_text=profile.badge, ok="Continue", cancel="Cancel")
         if response.clicked != 1:
             return
@@ -230,7 +231,7 @@ class ClaudeDesktopMenu:
             return
         if badge:
             colors = list(BADGE_COLORS)
-            response = self.prompt(title="Badge color", message="The shortcut will be saved in Applications → OpenSwap Profiles in your home folder. Drag it from Finder to your Dock. Creating it again updates this profile's shortcut.",
+            response = self.prompt(title="Badge color", message="Choose a badge color. The shortcut will appear in Finder; drag it to your Dock.",
                 choices=[c.title() for c in colors], selected=colors.index(color), ok="Create shortcut", cancel="Cancel")
             if response.clicked != 1 or not 0 <= response.choice < len(colors):
                 return

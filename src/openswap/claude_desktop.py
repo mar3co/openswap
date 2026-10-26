@@ -29,13 +29,10 @@ APP_PATH = Path("/Applications/Claude.app")
 BUNDLE_ID = "com.anthropic.claudefordesktop"
 TEAM_ID = "Q6L2SF6YDW"
 PROFILE_NOTICE = (
-    "Experimental Claude Desktop profiles keep their own sign-ins. "
-    "Open profiles side by side, or create numbered shortcuts for your Dock. "
-    "Opening a profile does not change your terminal or editor Code login. "
-    "Sign in inside Claude on first use; that profile keeps its own sign-in. "
-    "Check the account in Claude before starting work. Opening a profile leaves other windows running. "
-    "Chrome-extension pairing is currently unavailable in these profiles. "
-    "Code and Cowork support is experimental."
+    "Claude Desktop profiles open side by side and keep separate sign-ins. "
+    "Sign in and check the account inside each profile. "
+    "Your terminal and editor Claude Code login stays unchanged. "
+    "Profiles are experimental, including Code and Cowork. Chrome pairing is unavailable."
 )
 
 

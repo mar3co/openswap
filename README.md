@@ -149,14 +149,14 @@ when its Desktop switching is enabled, and **Codex** otherwise. The ChatGPT tab 
 shared ChatGPT/Codex accounts. Usage bars are **Codex usage**, not ChatGPT
 message limits. Desktop switching is experimental and **off by default**: turn on
 Settings → General → **Enable desktop app features**, then Settings → Desktop →
-ChatGPT → **Enable ChatGPT switching**. Wait until the extra shows
+ChatGPT Desktop → **Enable ChatGPT switching**. Wait until the extra shows
 **Switch and open ChatGPT** or **Restart ChatGPT**, then click an OAuth account
 and confirm. While switching is off, a click offers **Enable in Settings**.
 Incompatible builds show **This ChatGPT build isn’t compatible with switching.**
 Relaunch does not prove which profile ChatGPT loaded. Read the
 [test and recovery guide](docs/chatgpt-desktop-testing.md) first.
 
-**Suggest ChatGPT account switches** (the ChatGPT tab Auto-switch) only runs
+**Suggest ChatGPT account switches** (**Suggest switches** on the ChatGPT tab) only runs
 when switching is on. It picks a replacement from Codex quota, then **Review
 switch**; you still confirm before ChatGPT restarts. That mode cannot run with
 live Codex CLI rotation. Unattended desktop rotation is not implemented.

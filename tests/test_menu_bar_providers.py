@@ -36,7 +36,7 @@ def test_provider_titles_identify_account_and_quota_source(snapshot):
     claude = title(snapshot, "claude")
     chatgpt = title(snapshot, "chatgpt")
     both = title(snapshot, "both")
-    assert claude.startswith("Claude · Personal")
+    assert claude.startswith("Claude Code · Personal")
     assert "42%" in claude and "18%" in claude and "ChatGPT" not in claude
     assert chatgpt.startswith("ChatGPT (unverified) · Work")
     assert "Codex" in chatgpt and "13%" in chatgpt and "27%" in chatgpt
@@ -69,7 +69,7 @@ def test_missing_shared_login_never_guesses_saved_account(snapshot, active_num):
 
 def test_empty_provider_states_remain_distinguishable():
     result = title({}, "both")
-    assert "Claude · No account" in result
+    assert "Claude Code · No account" in result
     assert "ChatGPT · No shared account" in result
     assert title({}, "logo") == ""
 

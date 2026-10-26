@@ -321,7 +321,7 @@ def test_settings_page_sections_separate_display_from_provider_automation():
     ids = [row["id"] for row in desktop]
     assert ids.index("chatgpt_switching_enabled") < ids.index("chatgpt_auto_enabled")
     assert automation_by_id["codex_enabled"]["label"] == (
-        "Auto-switch Codex CLI accounts"
+        "Auto-switch Codex accounts"
     )
     assert automation_by_id["group_policy"]["label"] == "Shared rotation policy"
     assert all(row["section"] == menubar.SETTINGS_SECTION_GENERAL for row in general)
@@ -704,7 +704,7 @@ def test_settings_page_shows_codex_enabled_when_auto_on_and_has_codex():
     )
     by_id = {row["id"]: row for row in rows}
     assert by_id["codex_enabled"]["kind"] == "toggle"
-    assert by_id["codex_enabled"]["label"] == "Auto-switch Codex CLI accounts"
+    assert by_id["codex_enabled"]["label"] == "Auto-switch Codex accounts"
     assert by_id["codex_enabled"]["value"] is True
     ids = [row["id"] for row in rows]
     assert ids.index("auto_switch_enabled") < ids.index("codex_enabled")
@@ -2461,8 +2461,8 @@ def test_kickoff_notification_names_accounts_not_slots():
     text = _combined(copy)
     assert "personal" in text
     assert "adsonline" in text
-    assert "Claude" in text
-    assert "ChatGPT" in text
+    assert "Claude Code" in text
+    assert "Codex" in text and "ChatGPT" not in text
     assert "Account-" not in text
     assert "openswap --add-account" not in text
 
@@ -2481,7 +2481,7 @@ def test_kickoff_notification_drops_noisy_stdin_preamble():
         ]
     )
     assert copy is not None
-    assert copy.title == "Couldn't start ChatGPT 5-hour window"
+    assert copy.title == "Couldn't start Codex 5-hour window"
     assert "stdin" not in copy.body
     assert "trusted directory" in copy.body
 
@@ -2499,7 +2499,7 @@ def test_kickoff_expired_oauth_notification_is_actionable():
         ]
     )
     assert copy is not None
-    assert copy.title == "Couldn't start ChatGPT 5-hour window"
+    assert copy.title == "Couldn't start Codex 5-hour window"
     assert copy.body.startswith("personal:")
     assert "Sign in again" in copy.body
     assert "Codex" in copy.body
@@ -2864,11 +2864,11 @@ def test_slot_identity_from_sequence_uses_org_uuid():
 
 def test_notification_copy_for_relogin_has_no_cli():
     copy = menubar.notification_copy_for_relogin("personal")
-    assert copy.title == "Claude · personal signed out"
+    assert copy.title == "Claude Code · personal signed out"
     assert "openswap" not in copy.body.lower()
-    assert "click" in copy.body.lower()
+    assert "select" in copy.body.lower()
     codex = menubar.notification_copy_for_relogin("work", provider="codex")
-    assert codex.title == "ChatGPT · work signed out"
+    assert codex.title == "Codex · work signed out"
     assert "Codex" in codex.body
     assert "Claude Code" not in codex.body
     captured = menubar.notification_copy_for_relogin_captured("personal")
@@ -3186,7 +3186,7 @@ def test_codex_quarantine_toast_says_sign_in_with_codex():
     copy = menubar.notification_copy_for_event(ev)
     assert copy is not None
     assert (
-        "Sign in with this account in Codex, then click it in the extra."
+        "Sign in with this account in Codex, then select it in OpenSwap."
         in copy.body
     )
     assert "Claude Code" not in copy.body
@@ -3359,7 +3359,8 @@ def test_reconcile_dialog_names_the_real_owner_and_both_choices():
     assert "click virtualshield's card" in body
     # Switching uses the saved login, which may need a fresh sign-in.
     assert "sign in again" in body
-    assert "Claude app" in body
+    assert "Another session using this Claude Code login" in body
+    assert "Claude app" not in body
 
 
 def test_reconcile_dialog_for_unsaved_owner_says_to_add_it():
@@ -4118,7 +4119,8 @@ def test_switching_setting_explains_what_the_second_tab_does():
     hint = next(row for row in rows if row["id"] == "chatgpt_switching_hint")
     assert hint["style"] == "hint"
     assert hint["label"] == menubar.CHATGPT_SWITCHING_HINT
-    assert "Codex CLI" in hint["label"] and "ChatGPT app" in hint["label"]
+    assert "shared Codex account" in hint["label"] and "restart ChatGPT" in hint["label"]
+    assert "Turn off to switch Codex only" in hint["label"]
 
 
 def test_panel_second_tab_toggle_and_copy_follow_the_mode():

@@ -20,8 +20,8 @@ from openswap.claude_desktop import (
 from openswap.locking import FileLock
 
 ICON_NOTICE = (
-    "The number identifies your shortcut in Finder and when pinned to the Dock. "
-    "Claude's own running-app icon stays unchanged."
+    "The badge appears on the shortcut in Finder and the Dock. "
+    "Claude's running icon stays unchanged."
 )
 
 

@@ -264,7 +264,7 @@ TOKEN_PAGE = "token"
 SETUP_TOKEN_PREFIX = "sk-ant-oat"
 MAIN_PAGE = "main"
 CHATGPT_SWITCHING_HINT = (
-    "Off: the Codex tab switches Codex CLI. On: the ChatGPT tab reopens the ChatGPT app."
+    "Switch the shared Codex account and restart ChatGPT. Turn off to switch Codex only."
 )
 SETTINGS_SECTION_GENERAL = "general"
 SETTINGS_SECTION_AUTOMATION = "automation"
@@ -686,7 +686,7 @@ def settings_page_rows(
         {"kind": "toggle", "section": SETTINGS_SECTION_GENERAL,
          "id": "desktop_features_enabled", "label": "Enable desktop app features", "value": settings.desktop_features_enabled},
         {"kind": "group", "style": "hint", "section": SETTINGS_SECTION_GENERAL,
-         "id": "desktop_features_hint", "label": "Experimental: separate Claude Desktop profiles and shortcuts, plus ChatGPT controls. Claude Code switching stays independent. Turning this off keeps profiles, sign-ins and shortcuts.", "lines": 4},
+         "id": "desktop_features_hint", "label": "Experimental Claude Desktop profiles and ChatGPT switching. Turning this off keeps profiles, sign-ins and shortcuts.", "lines": 3},
     ])
     general.extend(this_mac_rows(login_item))
     general.extend(_this_mac_setup_rows(
@@ -789,7 +789,7 @@ def settings_page_rows(
             "style": "hint",
             "section": SETTINGS_SECTION_AUTOMATION,
             "id": "claude_code_accounts_hint",
-            "label": "Switching changes the login used by Claude Code. Desktop profiles open separately and do not rotate.",
+            "label": "Switch and rotate Claude Code accounts. Desktop profiles stay separate.",
             "lines": 2,
         },
         {
@@ -809,7 +809,7 @@ def settings_page_rows(
                     "style": "section",
                     "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "group_chatgpt",
-                    "label": "ChatGPT",
+                    "label": "ChatGPT Desktop",
                 },
                 {
                     "kind": "toggle",
@@ -838,7 +838,7 @@ def settings_page_rows(
                     "style": "hint",
                     "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "chatgpt_auto_hint",
-                    "label": "Uses Codex quota. You approve every ChatGPT restart.",
+                    "label": "Based on Codex usage. You approve each restart.",
                 },
             ]
         )
@@ -887,13 +887,13 @@ def settings_page_rows(
                         "style": "section",
                         "section": SETTINGS_SECTION_AUTOMATION,
                         "id": "group_codex",
-                        "label": "Codex CLI",
+                        "label": "Codex accounts",
                     },
                     {
                         "kind": "toggle",
                         "section": SETTINGS_SECTION_AUTOMATION,
                         "id": "codex_enabled",
-                        "label": "Auto-switch Codex CLI accounts",
+                        "label": "Auto-switch Codex accounts",
                         "value": bool(codex_enabled),
                         "disabled": chatgpt_suggestions_effective(settings),
                     },
@@ -903,9 +903,9 @@ def settings_page_rows(
                         "section": SETTINGS_SECTION_AUTOMATION,
                         "id": "codex_auto_hint",
                         "label": (
-                            "Turn off ChatGPT suggestions to use live Codex rotation."
+                            "Turn off ChatGPT suggestions to auto-switch Codex."
                             if chatgpt_suggestions_effective(settings)
-                            else "Runs alongside Claude auto-switch using the shared policy."
+                            else "Uses the same rotation settings as Claude Code."
                         ),
                     },
                 ]
@@ -955,15 +955,15 @@ def settings_page_rows(
     if settings.desktop_features_enabled:
         desktop.append({"kind": "popup", "section": SETTINGS_SECTION_DESKTOP,
                         "id": "desktop_app", "label": "App", "wide": True,
-                        "options": [("claude", "Claude Desktop"), ("chatgpt", "ChatGPT")],
+                        "options": [("claude", "Claude Desktop"), ("chatgpt", "ChatGPT Desktop")],
                         "value": desktop_app})
         if desktop_app == "chatgpt" or section is None:
             desktop.extend({**row, "section": SETTINGS_SECTION_DESKTOP} for row in desktop_chatgpt)
             if not desktop_chatgpt:
                 desktop.append({"kind": "group", "style": "hint", "section": SETTINGS_SECTION_DESKTOP,
-                                "id": "chatgpt_unavailable", "label": "Add a ChatGPT login from the Codex tab to set up Desktop switching.", "lines": 2})
+                                "id": "chatgpt_unavailable", "label": "Sign in with ChatGPT from the Codex tab to get started.", "lines": 2})
             desktop.append({"kind": "group", "style": "hint", "section": SETTINGS_SECTION_DESKTOP,
-                            "id": "chatgpt_policy_location", "label": "Uses the shared Codex login. Switching requires confirmation before restarting ChatGPT. Rotation policy is in Automation.", "lines": 3})
+                            "id": "chatgpt_policy_location", "label": "Save work before restarting. Rotation settings are in Automation.", "lines": 2})
         if desktop_app != "chatgpt" or section is None:
             desktop.extend(claude_desktop_settings_rows(claude_desktop))
     rows = general + automation + desktop + remote
@@ -1000,7 +1000,7 @@ def claude_desktop_settings_rows(state: dict | None = None) -> list[dict]:
         rows.append({"kind": "group", "style": "hint", "id": id,
                      "label": text, "lines": _hint_lines(text)})
 
-    hint("claude_desktop_separation", "Experimental Desktop profiles open side by side and keep separate sign-ins. Claude Code switching stays independent.")
+    hint("claude_desktop_separation", "Open profiles side by side. Each keeps its own sign-in. Claude Code switching stays separate.")
     rows.append({"kind": "button", "id": "claude_desktop_check", "label": "Claude Desktop app",
                  "title": "Checking…" if state.get("checking") else "Check app", "disabled": bool(state.get("checking"))})
     hint("claude_desktop_app", state.get("app_message") or "Not checked yet. Install Claude.app in Applications.")
@@ -1010,15 +1010,15 @@ def claude_desktop_settings_rows(state: dict | None = None) -> list[dict]:
                  "disabled": bool(state.get("busy"))})
     hint("claude_desktop_count", state.get("storage_error") or (
         "Working on profile…" if state.get("busy") else
-        f"{count} available · {archived} archived. Add, open, rename or archive a profile from Manage."
-        if count or archived else "No profiles yet. Choose Manage → Add profile to create your first one."
+        f"{count} available · {archived} archived."
+        if count or archived else "No profiles yet. Choose Manage → Add profile."
     ))
     for key, title, body in (
-        ("open", "Opening profiles", "Choose Manage → Add profile, then Open profile. Opening again brings it forward. Other windows and your Code login stay unchanged."),
-        ("shortcut", "Shortcuts and icons", "Create shortcut in a profile's menu. Choose a number and color, then drag the launcher from Finder to your Dock. Claude's running-app icon stays unchanged."),
-        ("signin", "Sign-in", "Sign in inside each profile on first use. Check the email and workspace in Claude; Running means open, not signed in."),
-        ("archive", "Archiving", "Archive keeps sign-ins and local work, leaves windows open, and disables shortcuts until you restore the profile. Restore does not open Claude."),
-        ("limits", "Experimental limits", "Chrome-extension pairing is unavailable. Code and Cowork remain experimental. Desktop identity and usage are not verified."),
+        ("open", "Opening profiles", "Open profile brings it forward. Other profiles keep running."),
+        ("shortcut", "Shortcuts and icons", "Choose Create shortcut in a profile's menu, then drag it from Finder to the Dock. Claude's running icon stays unchanged."),
+        ("signin", "Sign-in", "Sign in inside each profile. Check its account and workspace; Running only means the app is open."),
+        ("archive", "Archiving", "Keeps sign-ins, data and open windows. Shortcuts are disabled until restored. Restore does not open the profile."),
+        ("limits", "Experimental limits", "Code and Cowork in these profiles are experimental. No Chrome pairing. OpenSwap does not verify the account or usage."),
     ):
         if key != "limits":
             rows.append({"kind": "group", "id": f"claude_desktop_{key}_heading", "label": title})
@@ -1205,7 +1205,7 @@ def _remote_tasks_account_row(picker) -> dict:
         number = _bounded_text(entry.get("number"), 8)
         name = _bounded_text(entry.get("email")) or "(no email)"
         alias = _bounded_text(entry.get("alias"), 40)
-        label = f"Claude {number} · {name}" + (f" ({alias})" if alias else "")
+        label = f"Claude Code {number} · {name}" + (f" ({alias})" if alias else "")
         ref = entry.get("account_ref")
         if entry.get("eligible") is True and isinstance(ref, str) and ref.startswith("claude:"):
             options.append((ref, label))
@@ -1251,7 +1251,7 @@ def _remote_tasks_web_choice_row(picker) -> dict:
     options: list[tuple] = [("", summary)]
     listed = set()
     entries = [("Codex", "codex:", e) for e in picker.get("codex") or []] + [
-        ("Claude", "claude:", e) for e in picker.get("claude") or []]
+        ("Claude Code", "claude:", e) for e in picker.get("claude") or []]
     for provider_name, prefix, entry in entries:
         if not isinstance(entry, dict) or entry.get("eligible") is not True:
             continue
@@ -1709,9 +1709,9 @@ def notification_copy_for_event(
             getattr(event, "number", None),
         )
         if provider == "codex":
-            body = "Sign in with this account in Codex, then click it in the extra."
+            body = "Sign in with this account in Codex, then select it in OpenSwap."
         else:
-            body = "Sign in with this account in Claude Code, then click it in the extra."
+            body = "Sign in with this account in Claude Code, then select it in OpenSwap."
         return NotificationCopy(
             title=f"{name} was paused",
             body=body,
@@ -1765,8 +1765,8 @@ def notification_copy_for_kickoff(
 
     def provider_name(result: KickoffResult) -> str:
         return {
-            "claude": "Claude",
-            "codex": "ChatGPT",
+            "claude": "Claude Code",
+            "codex": "Codex",
             "openswap": "OpenSwap",
         }.get(result.provider, str(result.provider).title())
 
@@ -1858,11 +1858,11 @@ def reconcile_kickoff_action_required(
 def notification_copy_for_relogin(
     name: str, *, provider: str = "claude"
 ) -> NotificationCopy:
-    provider_name = "ChatGPT" if provider == "codex" else "Claude"
+    provider_name = "Codex" if provider == "codex" else "Claude Code"
     if provider == "codex":
-        body = "OAuth expired. Sign in again with Codex; OpenSwap will detect it."
+        body = "Your sign-in expired. Sign in again with Codex; OpenSwap will detect it."
     else:
-        body = "OAuth expired. Sign in with Claude Code, then click that account."
+        body = "Your sign-in expired. Sign in with Claude Code, then select that account."
     return NotificationCopy(
         title=f"{provider_name} · {name} signed out",
         body=body,
@@ -2074,9 +2074,8 @@ def reconcile_dialog_copy(
             f"To use {slot_name}: click Restore. OpenSwap puts {slot_name}'s "
             f"saved login back and keeps {owner}'s login.\n\n"
             f"{other}\n\n"
-            f"If you signed in as {owner} in the Claude app or another Claude "
-            f"Code window, sign in there as {slot_name} too, or it will switch "
-            "back."
+            "Another session using this Claude Code login can change it back. "
+            f"Sign in there as {slot_name} too."
         ),
         f"Restore {slot_name}",
     )
@@ -3054,9 +3053,9 @@ def format_menu_bar_title(
                 now=title_clock(snapshot, now), alias=snapshot.get("active_alias"),
                 org_name=snapshot.get("active_org"), label_windows=True,
             )
-            titles.append("Claude" + (f" · {detail}" if detail else ""))
+            titles.append("Claude Code" + (f" · {detail}" if detail else ""))
         else:
-            titles.append("Claude · No account")
+            titles.append("Claude Code · No account")
     if provider in ("chatgpt", "both"):
         desktop = chatgpt_tab_desktop(settings)
         number = snapshot.get("codex_active_num")

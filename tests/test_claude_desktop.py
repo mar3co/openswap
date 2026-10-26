@@ -495,11 +495,11 @@ def test_archived_count_and_restore_do_not_launch_claude(menu, store, monkeypatc
     menu.edit(p, archived=True)
     state = menu.settings_state()
     assert state["profiles"] == 0 and state["archived"] == 1
-    assert "Running windows stay open" in menu.notify.call_args.args[1]
+    assert "open windows kept" in menu.notify.call_args.args[1]
     menu.edit(p, archived=False)
     state = menu.settings_state()
     assert state["profiles"] == 1 and state["archived"] == 0
-    assert "restoring does not launch" in menu.notify.call_args.args[1]
+    assert "restoring does not launch" in menu.notify.call_args.args[1].lower()
     opened.assert_not_called()
 
 

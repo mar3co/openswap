@@ -59,7 +59,7 @@ def test_desktop_consent_explicitly_covers_restart_idle_and_verification():
 def test_desktop_consent_explains_persistent_pause_only_when_needed():
     _, body = menubar.desktop_switch_confirm_copy("Work", pause_auto=True)
     assert "all OpenSwap instances" in body
-    assert "Claude is unchanged" in body
+    assert "Claude Code stays unchanged" in body
     assert "until re-enabled" in body
     assert "turns off" not in menubar.desktop_switch_confirm_copy("Work")[1]
     assert len(body.split()) < 80

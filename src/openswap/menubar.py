@@ -83,7 +83,7 @@ def desktop_switch_confirm_ok(process_state="running"):
 def desktop_switch_confirm_copy(name, *, pause_auto=False, process_state="running"):
     pause_copy = (
         "Codex auto-switching turns off for all OpenSwap instances using this "
-        "store until re-enabled. Claude is unchanged."
+        "store until re-enabled. Claude Code stays unchanged."
         if pause_auto else "Keep Codex auto-switching off during desktop switching."
     )
     if process_state == "stopped":
@@ -1142,7 +1142,7 @@ def run(switcher, codex=None) -> int:
             if time.monotonic() < self._chatgpt_auto_retry_at:
                 return
             if self._codex_enabled():
-                self._chatgpt_monitor_notice = "Auto-switch paused · Live Codex rotation is on"
+                self._chatgpt_monitor_notice = "Suggestions paused · Codex auto-switching is on"
                 self._hold_reload_pending = True
                 return
             try:
@@ -1162,7 +1162,7 @@ def run(switcher, codex=None) -> int:
                 threading.Thread(target=self._run_chatgpt_auto_engine, args=(engine, generation), daemon=True).start()
             except Exception:
                 self._chatgpt_auto_engine = None
-                self._chatgpt_monitor_notice = "Auto-switch paused · Monitor unavailable"
+                self._chatgpt_monitor_notice = "Suggestions paused · Couldn’t check accounts"
                 self._chatgpt_auto_retry_at = time.monotonic() + 60
                 self._hold_reload_pending = True
                 self.switcher._logger.debug("ChatGPT candidate monitor failed to start")
@@ -1190,7 +1190,7 @@ def run(switcher, codex=None) -> int:
                             generation == self._chatgpt_auto_generation):
                         self._chatgpt_auto_engine = None
                         self._pending_chatgpt_switch = None
-                        self._chatgpt_monitor_notice = "Auto-switch paused · Monitor unavailable"
+                        self._chatgpt_monitor_notice = "Suggestions paused · Couldn’t check accounts"
                         self._chatgpt_auto_retry_at = time.monotonic() + 60
                         self._dirty = True
                         self._hold_reload_pending = True
@@ -1209,7 +1209,7 @@ def run(switcher, codex=None) -> int:
             if self._codex_enabled():
                 if self._chatgpt_auto_engine is not None or self._pending_chatgpt_switch is not None:
                     self._stop_chatgpt_auto_monitor(clear_pending=True)
-                notice = "Auto-switch paused · Live Codex rotation is on"
+                notice = "Suggestions paused · Codex auto-switching is on"
                 if self._chatgpt_monitor_notice != notice:
                     self._chatgpt_monitor_notice = notice
                     self._hold_reload_pending = True
@@ -1339,7 +1339,7 @@ def run(switcher, codex=None) -> int:
                 elif event.kind in ("no-switch", "all-exhausted", "error"):
                     self._pending_chatgpt_switch = None
                     self._chatgpt_monitor_notice = (
-                        "Auto-switch paused · Couldn’t check accounts" if event.kind == "error" else ""
+                        "Suggestions paused · Couldn’t check accounts" if event.kind == "error" else ""
                     )
             self._dirty = True
             self._hold_reload_pending = True
@@ -1405,8 +1405,8 @@ def run(switcher, codex=None) -> int:
             enabling = not self.settings.chatgpt_auto_enabled
             if enabling:
                 if self._alert(
-                    title="Turn on ChatGPT Auto-switch?",
-                    message="Finds the next account automatically. You confirm before ChatGPT restarts.\n\nThis disables live Codex rotation to prevent conflicting account changes.",
+                    title="Suggest ChatGPT switches?",
+                    message="Suggests accounts based on Codex usage. You approve each ChatGPT restart.\n\nThis turns off Codex auto-switching.",
                     ok="Turn On", cancel="Cancel",
                 ) != 1:
                     return
@@ -2385,7 +2385,7 @@ def run(switcher, codex=None) -> int:
         def _toggle_codex_auto(self) -> bool:
             """Flip live Codex CLI rotation (Settings row and the Codex tab's footer toggle)."""
             if (not self._codex_enabled()) and chatgpt_suggestions_effective(self.settings):
-                self._show_error("Turn off ChatGPT Auto-switch before enabling live Codex rotation.")
+                self._show_error("Turn off ChatGPT suggestions before enabling Codex auto-switching.")
                 return False
             try:
                 current = load_settings(self.switcher.backup_dir).codex_enabled
@@ -2577,7 +2577,7 @@ def run(switcher, codex=None) -> int:
             if self.codex is not None:
                 menu.add(rumps.MenuItem("Sign in with ChatGPT…", callback=lambda _sender: self._on_login_action("start")))
                 menu.add(rumps.MenuItem(
-                    "Save current ChatGPT login", callback=self.on_add_codex_login
+                    "Save current Codex login", callback=self.on_add_codex_login
                 ))
             if hasattr(self.switcher, "add_account_from_token"):
                 menu.add(rumps.MenuItem("From API key or setup token…", callback=self.on_add_token))
@@ -2615,7 +2615,7 @@ def run(switcher, codex=None) -> int:
                 title="Pause Codex auto-switching?",
                 message=(
                     "This turns off automatic Codex account rotation for all OpenSwap "
-                    "instances using this account store. Claude rotation is unchanged. "
+                    "instances using this account store. Claude Code rotation is unchanged. "
                     "It stays off until you re-enable it in Settings or with the CLI."
                 ),
                 ok="Pause Codex", cancel="Cancel",
@@ -3302,7 +3302,7 @@ def run(switcher, codex=None) -> int:
             self._start_claude_login(claude_bin, None, num=None)
             self._notify(
                 NotificationCopy(
-                    title="Sign in with Claude", body=claude_add_opened_message()
+                    title="Sign in to Claude Code", body=claude_add_opened_message()
                 )
             )
 

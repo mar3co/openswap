@@ -161,7 +161,7 @@ def test_error_event_clears_pending_without_exposing_raw_error(monkeypatch, tmp_
     )
 
     assert app._pending_chatgpt_switch is None
-    assert app._chatgpt_monitor_notice == "Auto-switch paused · Couldn’t check accounts"
+    assert app._chatgpt_monitor_notice == "Suggestions paused · Couldn’t check accounts"
     assert "secret-token" not in app._chatgpt_monitor_notice
 
 
@@ -177,7 +177,7 @@ def test_monitor_error_clears_pending_and_surfaces_safe_status(monkeypatch, tmp_
 
     assert app._chatgpt_auto_engine is None
     assert app._pending_chatgpt_switch is None
-    assert app._chatgpt_monitor_notice == "Auto-switch paused · Monitor unavailable"
+    assert app._chatgpt_monitor_notice == "Suggestions paused · Couldn’t check accounts"
     assert "secret" not in app._chatgpt_monitor_notice
 
 
@@ -383,7 +383,7 @@ def test_external_live_rotation_conflict_holds_monitor(monkeypatch, tmp_path):
     engine.stop.assert_called_once()
     assert app._chatgpt_auto_engine is None
     assert app._pending_chatgpt_switch is None
-    assert app._chatgpt_monitor_notice == "Auto-switch paused · Live Codex rotation is on"
+    assert app._chatgpt_monitor_notice == "Suggestions paused · Codex auto-switching is on"
 
 
 def test_monitor_does_not_start_during_login_or_desktop_transaction(monkeypatch, tmp_path):

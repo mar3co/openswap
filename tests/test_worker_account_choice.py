@@ -329,7 +329,7 @@ def test_menu_web_choice_row_marks_allowed_and_default(root):
     assert options[f"allow:{BOB}"][1] == "   Codex 2 · bob@example.com"
     # Claude slots are offered too (owner decision 2026-10-07); API-key slots are not.
     claude = [option for value, option in options.items() if "claude:" in str(value)]
-    assert [option[1] for option in claude] == ["   Claude 1 · alice@example.com", "   Claude 4 · carol@example.com (claudey)"]
+    assert [option[1] for option in claude] == ["   Claude Code 1 · alice@example.com", "   Claude Code 4 · carol@example.com (claudey)"]
     assert len(row["options"]) == 7  # the summary, Codex slots 1, 2, 5 and 6, Claude slots 1 and 4
     assert not any("3 · " in option[1] for option in options.values())
     assert SECRET not in json.dumps(row)
