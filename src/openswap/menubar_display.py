@@ -1076,9 +1076,9 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
         return [{"section": SETTINGS_SECTION_DESKTOP, **row} for row in rows]
     for key, title, body in (
         ("open", "Opening profiles", "Open profile brings it forward. Other profiles keep running."),
-        ("shortcut", "Shortcuts and icons", "Choose Create shortcut in a profile's menu, then drag it from Finder to the Dock. Claude's running icon stays unchanged."),
+        ("shortcut", "Shortcuts and icons", "Pin profile shortcuts, including Default, to open a specific session. Badges identify the shortcuts; Claude's own Dock icon can focus any running profile."),
         ("signin", "Sign-in", "Sign in inside each profile. OpenSwap adds its account to Claude Code automatically. Complete browser authorization if asked; Continue setup resumes a canceled sign-in. Your current CLI account stays selected."),
-        ("signin_window", "Wrong sign-in window", "If Open Claude returns to another window, copy that button's link. In the intended profile's menu, choose Finish sign-in and paste it."),
+        ("signin_window", "Sign-in windows", "Keep OpenSwap running and allow it to open Claude links. Some returns ask you to choose a profile. If the wrong window opens, choose Reconnect sign-in in the profile menu, then start a fresh sign-in."),
         ("details", "Account details", "Your existing Claude profile appears as Default automatically. Add profile creates an additional sign-in. Email and organization update automatically; macOS may request Keychain access. Manage updates in Account details."),
         ("archive", "Archiving", "Keeps sign-ins, data and open windows. Shortcuts are disabled until restored. Saved Claude Code accounts stay available. Restore does not open the profile."),
         ("limits", "Limitations", "Usage comes from the matching Claude Code account. Check the account inside Code and Cowork. Chrome pairing is unavailable."),

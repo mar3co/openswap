@@ -27,6 +27,13 @@ A profile name is your label, not an account identity.
    `~/Applications/OpenSwap Profiles/` and reveals it in Finder. Drag that
    launcher to the Dock for one-click access.
 
+Create a shortcut for **Default** too if you want a Dock button that always opens
+the original session. Claude's standard Dock icon identifies the shared app and
+can focus a secondary profile that is already running. Profile shortcuts select
+the exact data folder and running process. Their badges identify the launchers;
+they do not change Claude's running Dock icon. No supported external API for a
+different running icon per Claude instance was found in the inspected version.
+
 With Desktop features enabled, the main tabs are **Claude Code**, **Claude Desktop**,
 and **Codex**. Turning Desktop features off hides the Claude Desktop tab.
 Each profile has an **Open** button and a **•••** menu for **Create shortcut…**,
@@ -48,7 +55,13 @@ create an Anthropic account or subscription.
 
 ## Browser sign-in returns to the right profile
 
-Keep OpenSwap running while signing in. When an additional profile opens,
+Install OpenSwap in Applications and keep it running while signing in. Temporary
+build folders cannot receive Claude links on macOS. OpenSwap registers its bundle
+and checks that macOS offers it as a handler before requesting the change; an
+ineligible copy asks you to move it to Applications instead of presenting a
+misleading permission error.
+
+When an additional profile opens,
 OpenSwap prepares Claude link handling. If macOS asks, allow OpenSwap to open
 Claude links. Google sign-in in the inspected Claude version then uses Apple's
 browser authentication session, which returns to the exact Claude instance

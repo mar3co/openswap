@@ -299,3 +299,66 @@ def test_nested_native_event_loop_cannot_open_two_choosers(env):
     assert seen == [GOOGLE]
     e.router.poll()
     assert seen == [GOOGLE, MAGIC]
+
+
+@pytest.mark.parametrize('eligible', [True, False])
+def test_native_registers_bundle_and_verifies_eligibility_before_request(monkeypatch, eligible):
+    import sys
+    from openswap import claude_desktop_links as links
+    from openswap.claude_desktop import ClaudeDesktopError
+    calls = []
+    path = Path('/Applications/OpenSwap.app')
+    url = SimpleNamespace(path=lambda: str(path))
+    def candidates(_url):
+        calls.append('candidates')
+        return [url] if eligible else []
+    workspace = SimpleNamespace(URLsForApplicationsToOpenURL_=candidates,
+        setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler_=lambda *args: calls.append('request'))
+    native = object.__new__(links.MacOSLinks)
+    native.workspace = workspace
+    monkeypatch.setattr(links, 'register_application', lambda value: calls.append(('register', value)))
+    monkeypatch.setitem(sys.modules, 'Foundation', SimpleNamespace(NSURL=SimpleNamespace(
+        URLWithString_=lambda value: value, fileURLWithPath_=lambda value: value)))
+    if eligible:
+        native.set_handler(path, Mock())
+        assert calls == [('register', path), 'candidates', 'request']
+    else:
+        with pytest.raises(ClaudeDesktopError, match='Move OpenSwap to Applications'):
+            native.set_handler(path, Mock())
+        assert calls == [('register', path), 'candidates']
+
+
+@pytest.mark.parametrize('reason', ['success', 'native_failure', 'no_url'])
+def test_native_registration_releases_cf_url_and_never_changes_default(monkeypatch, reason):
+    import ctypes
+    from openswap import claude_desktop_links as links
+    from openswap.claude_desktop import ClaudeDesktopError
+    cf, ls = Mock(), Mock()
+    cf.CFURLCreateFromFileSystemRepresentation.return_value = None if reason == 'no_url' else 123
+    ls.LSRegisterURL.return_value = -50 if reason == 'native_failure' else 0
+    monkeypatch.setattr(ctypes, 'CDLL', lambda name: cf if 'CoreFoundation' in name else ls)
+    if reason == 'success':
+        links.register_application(Path('/Applications/OpenSwap.app'))
+    else:
+        with pytest.raises(ClaudeDesktopError): links.register_application(Path('/Applications/OpenSwap.app'))
+    if reason == 'no_url':
+        cf.CFRelease.assert_not_called()
+        ls.LSRegisterURL.assert_not_called()
+    else:
+        cf.CFRelease.assert_called_once_with(123)
+        ls.LSRegisterURL.assert_called_once_with(123, True)
+    ls.LSSetDefaultHandlerForURLScheme.assert_not_called()
+
+
+def test_registration_failure_is_explained_without_mislabeling_permission(env):
+    from openswap.claude_desktop import ClaudeDesktopError
+    e = env
+    e.native.set_handler = Mock(side_effect=ClaudeDesktopError('Move OpenSwap to Applications'))
+    e.router.prepare()
+    e.now[0] += 3
+    e.router.poll()
+    e.error.assert_called_once_with('Move OpenSwap to Applications')
+    assert not e.router.changing
+    assert e.native.paused()
+    e.router.poll()
+    assert e.native.set_handler.call_count == 1

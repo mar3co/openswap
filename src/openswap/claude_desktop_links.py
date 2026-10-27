@@ -8,6 +8,7 @@ cannot establish an originating profile: ask once, never guess or broadcast.
 from __future__ import annotations
 
 import hashlib
+import os
 import queue
 import time
 from pathlib import Path
@@ -20,6 +21,36 @@ OWNER_IDS = {"com.opensoft.openswap", "com.opensoft.openswap.dev"}
 PREVIOUS_KEY = "ClaudeLinksPreviousApplication"
 PAUSED_KEY = "ClaudeLinksPermissionPaused"
 MAX_AGE = 120
+
+
+def register_application(path):
+    """Publish this bundle's URL claims before asking macOS to select it.
+
+    Executing Contents/MacOS/OpenSwap directly (DEV, CLI and some login items)
+    does not register the bundle with Launch Services. NSWorkspace's default
+    handler request can otherwise fail without ever presenting consent.
+    Registration makes the app a candidate; it does not change user defaults.
+    """
+    import ctypes as c
+
+    cf = c.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    ls = c.CDLL("/System/Library/Frameworks/CoreServices.framework/CoreServices")
+    create = cf.CFURLCreateFromFileSystemRepresentation
+    create.argtypes = [c.c_void_p, c.c_char_p, c.c_long, c.c_bool]
+    create.restype = c.c_void_p
+    release = cf.CFRelease
+    release.argtypes, release.restype = [c.c_void_p], None
+    register = ls.LSRegisterURL
+    register.argtypes, register.restype = [c.c_void_p, c.c_bool], c.c_int32
+    raw = os.fsencode(path)
+    url = create(None, raw, len(raw), True)
+    if not url:
+        raise ClaudeDesktopError("macOS could not register OpenSwap for sign-in. Reopen OpenSwap and try again.")
+    try:
+        if register(url, True) != 0:
+            raise ClaudeDesktopError("macOS could not register OpenSwap for sign-in. Reopen OpenSwap and try again.")
+    finally:
+        release(url)
 
 
 def owns_system_handler():
@@ -130,6 +161,12 @@ class MacOSLinks:
 
     def set_handler(self, path, completed):
         from Foundation import NSURL
+        register_application(path)
+        candidates = self.workspace.URLsForApplicationsToOpenURL_(NSURL.URLWithString_("claude://")) or []
+        if Path(path).resolve() not in {Path(url.path()).resolve() for url in candidates}:
+            # Launch Services records temporary bundles but excludes them from
+            # URL binding. LSRegisterURL can return success in that case.
+            raise ClaudeDesktopError("Move OpenSwap to Applications, reopen it, then choose Reconnect sign-in in the profile menu.")
         self.workspace.setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler_(
             NSURL.fileURLWithPath_(str(path)), "claude", lambda error: completed(error is None))
 
@@ -192,6 +229,9 @@ class DesktopSignInLinks:
         self.changing = True
         try:
             self.native.set_handler(self.native.application, lambda ok: self.completions.put(("claim", ok)))
+        except ClaudeDesktopError as exc:
+            self.changing = False
+            self.show_error(str(exc))
         except Exception:
             self.completions.put(("claim", False))
 
