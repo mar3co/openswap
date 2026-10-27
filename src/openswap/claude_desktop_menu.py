@@ -36,7 +36,8 @@ def has_saved_profiles() -> bool:
 class ClaudeDesktopMenu:
     def __init__(self, *, prompt, show_error, changed, notify, store=None, app_factory=None, show_status=None, enabled=None,
                  blocked=None, shortcut_factory=None, reveal=None, confirm=None, detector=None, monitor=None,
-                 code_engine=None, code_connector=None, code_login_allowed=None, signin_sender=None, shortcut_setup=None):
+                 code_engine=None, code_connector=None, code_login_allowed=None, signin_sender=None, shortcut_setup=None,
+                 guide_seen=None, mark_guide_seen=None):
         self.store = store or DesktopProfiles()
         self.prompt = prompt
         self.show_error = show_error
@@ -47,6 +48,8 @@ class ClaudeDesktopMenu:
         self.blocked = blocked or (lambda: False)
         self.shortcut_factory = shortcut_factory
         self.shortcut_setup = shortcut_setup
+        self.guide_seen = guide_seen or (lambda: False)
+        self.mark_guide_seen = mark_guide_seen or (lambda: None)
         self.reveal = reveal or reveal_shortcut
         self.confirm = confirm
         self.detector = detector
@@ -256,16 +259,49 @@ class ClaudeDesktopMenu:
                         ok="Archive", cancel="Cancel") == 1:
             self.edit(profile, archived=True)
 
+    def show_guide(self, *, for_creation=False):
+        if self.busy or self.blocked() or not self.enabled() or self._editing_details:
+            return False
+        from openswap.claude_desktop_guide import illustrations
+
+        self._editing_details = True
+        try:
+            response = self.prompt(
+                title="Your Claude profiles",
+                message="Your current sign-in appears as Default. Add a profile for another sign-in. Your Claude icon stays in place.",
+                illustrations=illustrations(),
+                default_text=None,
+                ok="Continue" if for_creation else "Done",
+                cancel="Cancel" if for_creation else None,
+            )
+            if response.clicked != 1:
+                return False
+            self.mark_guide_seen()
+            # Also remember within this run if saving is unavailable.
+            self._guide_shown = True
+            return True
+        finally:
+            self._editing_details = False
+
     def add(self, _=None):
+        if self.busy or self.blocked() or not self.enabled() or self._editing_details:
+            return
+        if not (self.guide_seen() or getattr(self, "_guide_shown", False)):
+            if not self.show_guide(for_creation=True):
+                return
         if self.busy or self.blocked() or not self.enabled():
             return
-        response = self.prompt(
-            title="Create Claude Desktop profile",
-            message="Sign in to the new Claude window. Allow OpenSwap to open Claude links if asked.\n\nOpenSwap detects the account with Keychain access and adds it to Claude Code. Finish browser authorization if asked.\n\nCreates a numbered shortcut. Add to Dock places it beside Claude's original icon.",
-            input_label="Profile name", placeholder="e.g. Work",
-            checkbox="Add to Dock", checkbox_checked=True,
-            default_text="", ok="Create and open", cancel="Cancel",
-        )
+        self._editing_details = True
+        try:
+            response = self.prompt(
+                title="Create Claude Desktop profile",
+                message="Sign in to the new Claude window. Allow OpenSwap to open Claude links if asked.\n\nKeychain access lets OpenSwap read the account and add it to Claude Code. Finish browser sign-in if asked.",
+                input_label="Profile name", placeholder="e.g. Work",
+                checkbox="Add profile icon to Dock", checkbox_checked=True,
+                default_text="", ok="Create and open", cancel="Cancel",
+            )
+        finally:
+            self._editing_details = False
         if response.clicked != 1:
             return
         if self.busy or self.blocked() or not self.enabled():

@@ -273,6 +273,7 @@ class BrandDialog:
         self, *, title=None, message="", ok=None, cancel=None, other=None,
         default_text=None, secure=False, destructive=False, checkbox=None, close=None,
         choices=None, selected=0, fields=None, input_label=None, placeholder=None, checkbox_checked=False,
+        illustrations=None,
     ):
         shown_title = str(title or "OpenSwap")
         if shown_title.casefold() == "openswap":
@@ -401,6 +402,30 @@ class BrandDialog:
                 body.setFrameOrigin_((DIALOG_PADDING, y))
                 surface.addSubview_(body)
                 y += body_height
+
+        self.illustration_views = []
+        for item in illustrations or ():
+            y += 20
+            icon = NSImageView.alloc().initWithFrame_(NSMakeRect(DIALOG_PADDING, y, 64, 64))
+            icon.setImage_(item.get("image"))
+            icon.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            icon.setAccessibilityLabel_(item["title"])
+            surface.addSubview_(icon)
+            if item.get("running"):
+                dot = _label("●", NSFont.systemFontOfSize_(9), NSColor.secondaryLabelColor(), 12)
+                dot.setFrameOrigin_((DIALOG_PADDING + 29, y + 64))
+                dot.setAccessibilityLabel_("Running indicator example")
+                surface.addSubview_(dot)
+            text_x, text_width = DIALOG_PADDING + 80, DIALOG_CONTENT_WIDTH - 80
+            caption = _label(item["title"], NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold),
+                             NSColor.labelColor(), text_width)
+            caption.setFrameOrigin_((text_x, y))
+            surface.addSubview_(caption)
+            detail = _label(item["body"], NSFont.systemFontOfSize_(13), NSColor.secondaryLabelColor(), text_width)
+            detail.setFrameOrigin_((text_x, y + caption.frame().size.height + 5))
+            surface.addSubview_(detail)
+            self.illustration_views.append((icon, caption, detail))
+            y += max(80, caption.frame().size.height + 5 + detail.frame().size.height)
 
         if checkbox:
             y += 16

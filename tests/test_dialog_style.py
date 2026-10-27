@@ -232,3 +232,36 @@ def test_checkbox_starts_unchecked_and_is_reported():
     dialog.checkbox.performClick_(None)
     assert dialog.run().checked is True
     assert make_dialog_alert(message="No option.").checkbox is None
+
+
+@pytest.mark.parametrize("appearance", ["NSAppearanceNameAqua", "NSAppearanceNameDarkAqua"])
+def test_desktop_guide_has_real_icons_and_no_input_or_clipped_text(appearance):
+    from unittest.mock import Mock
+    from openswap.claude_desktop_guide import illustrations
+    from openswap.claude_desktop_menu import ClaudeDesktopMenu
+
+    AppKit.NSApplication.sharedApplication().setAppearance_(
+        AppKit.NSAppearance.appearanceNamed_(getattr(AppKit, appearance)))
+    captured = []
+    def prompt(**kwargs):
+        dialog = make_dialog_prompt(**kwargs)
+        captured.append(dialog)
+        return type("Response", (), {"clicked": 0})()
+    controller = ClaudeDesktopMenu(prompt=prompt, show_error=Mock(), notify=Mock(), changed=Mock())
+    try:
+        controller.show_guide(for_creation=True)
+        dialog = captured[0]
+        assert dialog.textfield is None
+        assert dialog.surface.frame().size.height <= 540
+        assert len(dialog.illustration_views) == 2
+        for icon, title, body in dialog.illustration_views:
+            for view in (icon, title, body):
+                frame = view.frame()
+                assert frame.origin.y + frame.size.height < dialog.surface.footer_y
+                assert frame.origin.x + frame.size.width <= DIALOG_WIDTH
+        # On machines with Claude installed, both previews must be real artwork.
+        from openswap.claude_desktop import APP_PATH
+        if APP_PATH.exists():
+            assert all(item["image"] is not None and item["image"].isValid() for item in illustrations())
+    finally:
+        AppKit.NSApplication.sharedApplication().setAppearance_(None)

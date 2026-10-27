@@ -445,6 +445,7 @@ class MenuBarSettings:
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
     desktop_features_enabled: bool = False
+    claude_desktop_guide_seen: bool = False
     chatgpt_switching_enabled: bool = False
     # Separate from Claude's live rotation: this only proposes desktop targets.
     chatgpt_auto_enabled: bool = False
@@ -1070,13 +1071,15 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
     rows.append({"kind": "app_check", "id": "claude_desktop_check", "label": message,
                  "title": "Checking…" if state.get("checking") else "Check", "disabled": bool(state.get("checking")),
                  "lines": _hint_lines(message)})
+    rows.append({"kind": "button", "id": "claude_desktop_guide", "label": "Profiles and Dock icons",
+                 "title": "Show guide", "disabled": bool(state.get("busy"))})
     rows.append({"kind": "disclosure", "id": "claude_desktop_help", "label": "About profiles",
                  "value": "claude_desktop_help" in expanded})
     if "claude_desktop_help" not in expanded:
         return [{"section": SETTINGS_SECTION_DESKTOP, **row} for row in rows]
     for key, title, body in (
         ("open", "Opening profiles", "Open profile brings it forward. Other profiles keep running."),
-        ("shortcut", "Shortcuts and icons", "Each numbered icon shows a dot while its profile runs. Click to return to that session; Quit closes only that profile. Add to Dock keeps the icon pinned. Claude's original icon stays available."),
+        ("shortcut", "Dock icons", "A numbered icon opens its own profile. Its dot means it’s running. Quit closes only that profile. Claude’s original icon may open any running profile. Use Default → Open in OpenSwap for your original session."),
         ("signin", "Sign-in", "Sign in inside each profile. OpenSwap adds its account to Claude Code automatically. Complete browser authorization if asked; Continue setup resumes a canceled sign-in. Your current CLI account stays selected."),
         ("signin_window", "Sign-in windows", "Keep OpenSwap running and allow it to open Claude links. Some returns ask you to choose a profile. If the wrong window opens, choose Reconnect sign-in in the profile menu, then start a fresh sign-in."),
         ("details", "Account details", "Your existing Claude profile appears as Default automatically. Add profile creates an additional sign-in. Email and organization update automatically; macOS may request Keychain access. Manage updates in Account details."),

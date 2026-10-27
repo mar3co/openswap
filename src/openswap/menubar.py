@@ -259,6 +259,8 @@ def run(switcher, codex=None) -> int:
                 blocked=lambda: self._desktop_switching,
                 code_engine=self.switcher,
                 code_login_allowed=lambda: getattr(self, "_claude_login", None) is None,
+                guide_seen=lambda: self.settings.claude_desktop_guide_seen,
+                mark_guide_seen=self._mark_claude_desktop_guide_seen,
             )
             try:
                 from openswap.claude_desktop_links import DesktopSignInLinks
@@ -2194,7 +2196,19 @@ def run(switcher, codex=None) -> int:
                 else:
                     self._reload_main_panel_if_shown()
 
+        def _mark_claude_desktop_guide_seen(self):
+            previous = self.settings.claude_desktop_guide_seen
+            self.settings.claude_desktop_guide_seen = True
+            try:
+                self.settings.save(settings_path)
+            except OSError:
+                self.settings.claude_desktop_guide_seen = previous
+                self._show_error("Could not save this preference. The guide may appear again next time.")
+
         def _on_setting(self, row_id, value):
+            if row_id == "claude_desktop_guide":
+                self._claude_desktop_profiles.show_guide()
+                return
             if row_id == "claude_desktop_check":
                 self._claude_desktop_profiles.refresh_status()
                 return

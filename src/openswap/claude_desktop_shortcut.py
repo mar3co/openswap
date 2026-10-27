@@ -86,6 +86,47 @@ def original_icon(app_path: Path) -> Path:
         raise ClaudeDesktopError("Could not read Claude's original app icon. Reinstall Claude and try again.") from exc
 
 
+def _icon_bitmap(base, mark, badge: str, color: str, px: int):
+    """One renderer for shortcut files and the onboarding preview."""
+    import AppKit as A
+    import Foundation as F
+
+    rep = A.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+        None, px, px, 8, 4, True, False, A.NSDeviceRGBColorSpace, 0, 0)
+    ctx = A.NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
+    A.NSGraphicsContext.saveGraphicsState()
+    try:
+        A.NSGraphicsContext.setCurrentContext_(ctx)
+        base.drawInRect_fromRect_operation_fraction_(A.NSMakeRect(0, 0, px, px), A.NSZeroRect, A.NSCompositingOperationCopy, 1.0)
+        # Keep overlays inside Claude's rounded outline. Tahoe
+        # encloses icons with protruding badges in a gray plate,
+        # even when the generated ICNS itself has no frame.
+        brand = A.NSMakeRect(px * .13, px * .13, px * .24, px * .24)
+        A.NSColor.colorWithSRGBRed_green_blue_alpha_(.98, .97, .94, 1).setFill()
+        A.NSBezierPath.bezierPathWithOvalInRect_(brand).fill()
+        mark.drawInRect_fromRect_operation_fraction_(
+            A.NSMakeRect(brand.origin.x + px * .024, brand.origin.y + px * .024,
+                         brand.size.width - px * .048, brand.size.height - px * .048),
+            A.NSZeroRect, A.NSCompositingOperationSourceOver, 1.0)
+        if badge:
+            diameter = px * (0.34 if len(badge) == 3 else 0.30)
+            box = A.NSMakeRect(px - diameter - px * .12, px - diameter - px * .12, diameter, diameter)
+            A.NSColor.whiteColor().setFill()
+            A.NSBezierPath.bezierPathWithOvalInRect_(box).fill()
+            inset = px * .018
+            inner = A.NSMakeRect(box.origin.x + inset, box.origin.y + inset, diameter - 2 * inset, diameter - 2 * inset)
+            A.NSColor.colorWithSRGBRed_green_blue_alpha_(*BADGE_COLORS[color], 1.0).setFill()
+            A.NSBezierPath.bezierPathWithOvalInRect_(inner).fill()
+            font = A.NSFont.boldSystemFontOfSize_(diameter * (0.44 if len(badge) == 3 else .59))
+            attrs = {A.NSFontAttributeName: font, A.NSForegroundColorAttributeName: A.NSColor.whiteColor()}
+            text = F.NSString.stringWithString_(badge)
+            bounds = text.sizeWithAttributes_(attrs)
+            text.drawAtPoint_withAttributes_((box.origin.x + (diameter-bounds.width)/2, box.origin.y + (diameter-bounds.height)/2), attrs)
+    finally:
+        A.NSGraphicsContext.restoreGraphicsState()
+    return rep
+
+
 def render_icon(app_path: Path, target: Path, badge: str, color: str, *, run=subprocess.run) -> None:
     """Original Claude artwork, a small OpenSwap mark and an optional number."""
     validate_badge(badge, color)
@@ -108,39 +149,7 @@ def render_icon(app_path: Path, target: Path, badge: str, color: str, *, run=sub
             for size in (16, 32, 128, 256, 512):
                 for scale in (1, 2):
                     px = size * scale
-                    rep = A.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
-                        None, px, px, 8, 4, True, False, A.NSDeviceRGBColorSpace, 0, 0)
-                    ctx = A.NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
-                    A.NSGraphicsContext.saveGraphicsState()
-                    try:
-                        A.NSGraphicsContext.setCurrentContext_(ctx)
-                        base.drawInRect_fromRect_operation_fraction_(A.NSMakeRect(0, 0, px, px), A.NSZeroRect, A.NSCompositingOperationCopy, 1.0)
-                        # Keep overlays inside Claude's rounded outline. Tahoe
-                        # encloses icons with protruding badges in a gray plate,
-                        # even when the generated ICNS itself has no frame.
-                        brand = A.NSMakeRect(px * .13, px * .13, px * .24, px * .24)
-                        A.NSColor.colorWithSRGBRed_green_blue_alpha_(.98, .97, .94, 1).setFill()
-                        A.NSBezierPath.bezierPathWithOvalInRect_(brand).fill()
-                        mark.drawInRect_fromRect_operation_fraction_(
-                            A.NSMakeRect(brand.origin.x + px * .024, brand.origin.y + px * .024,
-                                         brand.size.width - px * .048, brand.size.height - px * .048),
-                            A.NSZeroRect, A.NSCompositingOperationSourceOver, 1.0)
-                        if badge:
-                            diameter = px * (0.34 if len(badge) == 3 else 0.30)
-                            box = A.NSMakeRect(px - diameter - px * .12, px - diameter - px * .12, diameter, diameter)
-                            A.NSColor.whiteColor().setFill()
-                            A.NSBezierPath.bezierPathWithOvalInRect_(box).fill()
-                            inset = px * .018
-                            inner = A.NSMakeRect(box.origin.x + inset, box.origin.y + inset, diameter - 2 * inset, diameter - 2 * inset)
-                            A.NSColor.colorWithSRGBRed_green_blue_alpha_(*BADGE_COLORS[color], 1.0).setFill()
-                            A.NSBezierPath.bezierPathWithOvalInRect_(inner).fill()
-                            font = A.NSFont.boldSystemFontOfSize_(diameter * (0.44 if len(badge) == 3 else .59))
-                            attrs = {A.NSFontAttributeName: font, A.NSForegroundColorAttributeName: A.NSColor.whiteColor()}
-                            text = F.NSString.stringWithString_(badge)
-                            bounds = text.sizeWithAttributes_(attrs)
-                            text.drawAtPoint_withAttributes_((box.origin.x + (diameter-bounds.width)/2, box.origin.y + (diameter-bounds.height)/2), attrs)
-                    finally:
-                        A.NSGraphicsContext.restoreGraphicsState()
+                    rep = _icon_bitmap(base, mark, badge, color, px)
                     data = rep.representationUsingType_properties_(A.NSBitmapImageFileTypePNG, {})
                     suffix = "@2x" if scale == 2 else ""
                     if not data.writeToFile_atomically_(str(iconset / f"icon_{size}x{size}{suffix}.png"), True):

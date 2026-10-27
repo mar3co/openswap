@@ -274,6 +274,7 @@ def test_missing_or_unsafe_original_icon_does_not_use_decorated_fallback(tmp_pat
 
 @pytest.mark.parametrize('pin', [True, False])
 def test_add_prepares_shortcuts_then_opens_once_without_another_dialog(menu, store, monkeypatch, pin):
+    menu.guide_seen = lambda: True
     menu.prompt.return_value = SimpleNamespace(clicked=1, text='Work', checked=pin)
     events = []
     menu.shortcut_setup = Mock(side_effect=lambda *a, **kw: events.append(('setup', kw['pin'])))

@@ -1,4 +1,4 @@
-# Claude Desktop profiles and shortcuts (experimental)
+# Claude Desktop profiles and shortcuts
 
 OpenSwap can open named Claude Desktop profiles side by side on macOS. Separate
 profiles keep their own sign-in, desktop data and Code configuration. The Default
@@ -13,8 +13,9 @@ A profile name is your label, not an account identity.
 2. Turn on **Settings → General → Enable desktop app features**.
 3. Open the **Claude Desktop** tab on the main screen. Your existing Claude
    profile appears first as **Default**, ready to open. Use **Add profile** only
-   for an additional session: enter a name such as Personal or Work, then choose
-   **Create and open**.
+   for an additional session. The first time, a short guide shows how the Dock
+   icons work. Choose **Continue**, enter a name such as Personal or Work, then
+   choose **Create and open**. Later additions go straight to the name form.
 4. Default reuses your existing Claude window and sign-in. For an additional
    profile, sign in inside its new window. Email and organization appear
    automatically after detection succeeds. OpenSwap adds that account and
@@ -23,7 +24,7 @@ A profile name is your label, not an account identity.
 5. **Create and open** automatically creates a numbered shortcut for the new
    profile and a **Default** shortcut for the existing session, when available.
    Both are saved under `~/Applications/OpenSwap Profiles/`.
-6. **Add to Dock** is checked by default. It adds the new numbered shortcut beside
+6. **Add profile icon to Dock** is checked by default. It adds the new numbered shortcut beside
    the original Claude pin. Claude’s original launcher and running indicator stay
    intact. Other pins keep their relative order. Uncheck it to create the shortcut
    files without changing the Dock. Default’s separate shortcut stays in Finder
@@ -36,6 +37,9 @@ so macOS does not add a gray frame. Default has the OpenSwap mark
 without a number. Each profile app stays in the Dock with a running dot while
 its session is open. Clicking it returns to that session; Quit requests a normal
 quit of that session only. Claude’s original app icon remains available.
+That original icon may open any running profile. Use **Default → Open** in
+OpenSwap for your original session. Reopen the visual guide from
+**Settings → Desktop → Claude Desktop → Show guide**.
 
 If setup needs attention, the new profile is kept and still opens for sign-in.
 Choose **••• → Set up Dock shortcuts** to retry without creating another profile.
