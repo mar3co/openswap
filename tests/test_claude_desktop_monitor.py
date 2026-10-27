@@ -140,13 +140,13 @@ def test_default_appears_when_claude_is_first_used_later(store):
 
 def test_add_profile_always_creates_additional_empty_storage_in_one_step(store):
     existing(store)
-    controller = menu(store, [SimpleNamespace(clicked=1, text="Client")])
+    controller = menu(store, [SimpleNamespace(clicked=1, text="Client", checked=True)])
     default = controller.settings_state()["items"][0]
     controller.add()
     p = store.get("Client")
     assert p.kind == "managed" and p.auto_detect and p.id != default["id"]
     assert list(store.paths(p)[0].iterdir()) == []
-    controller.open.assert_called_once_with(p.id)
+    controller.open.assert_called_once_with(p.id, setup_shortcuts=True)
     assert controller.prompt.call_count == 1
     assert "choices" not in controller.prompt.call_args.kwargs
     assert "adds it to Claude Code" in controller.prompt.call_args.kwargs["message"]
@@ -170,7 +170,7 @@ def test_unreadable_default_does_not_block_additional_profiles(store, tmp_path):
     actual = tmp_path / "elsewhere"
     actual.mkdir()
     store.default_desktop.symlink_to(actual)
-    controller = menu(store, [SimpleNamespace(clicked=1, text="Work")])
+    controller = menu(store, [SimpleNamespace(clicked=1, text="Work", checked=True)])
     state = controller.settings_state()
     assert state["default_error"] and "storage_error" not in state
     controller.add()

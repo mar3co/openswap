@@ -71,8 +71,25 @@ end run
 '''
 
 
+def original_icon(app_path: Path) -> Path:
+    """Use Claude's original artwork, before macOS adds its surrounding plate."""
+    try:
+        info = plistlib.loads((app_path / "Contents/Info.plist").read_bytes())
+        name = info["CFBundleIconFile"]
+        if not isinstance(name, str) or not name or Path(name).name != name:
+            raise ValueError
+        name = name if name.endswith(".icns") else name + ".icns"
+        resources = (app_path / "Contents/Resources").resolve()
+        path = resources / name
+        if path.is_symlink() or path.resolve().parent != resources or not path.is_file():
+            raise ValueError
+        return path
+    except (OSError, KeyError, ValueError, TypeError, ExpatError) as exc:
+        raise ClaudeDesktopError("Could not read Claude's original app icon. Reinstall Claude and try again.") from exc
+
+
 def render_icon(app_path: Path, target: Path, badge: str, color: str, *, run=subprocess.run) -> None:
-    """Render the installed app icon with an optional badge, at every ICNS size."""
+    """Original Claude artwork, a small OpenSwap mark and an optional number."""
     validate_badge(badge, color)
     try:
         import AppKit as A
@@ -81,9 +98,12 @@ def render_icon(app_path: Path, target: Path, badge: str, color: str, *, run=sub
         raise ClaudeDesktopError("Install OpenSwap with menu bar support to create shortcut icons.") from exc
     pool = F.NSAutoreleasePool.alloc().init()
     try:
-        base = A.NSWorkspace.sharedWorkspace().iconForFile_(str(app_path))
+        base = A.NSImage.alloc().initWithContentsOfFile_(str(original_icon(app_path)))
         if base is None or not base.isValid():
             raise ClaudeDesktopError("Could not read Claude's app icon. Reinstall Claude and try again.")
+        mark = A.NSImage.alloc().initWithContentsOfFile_(str(Path(__file__).parent / "assets/opensoft-symbol.svg"))
+        if mark is None or not mark.isValid():
+            raise ClaudeDesktopError("OpenSwap's icon is missing. Reinstall OpenSwap and try again.")
         with tempfile.TemporaryDirectory(prefix="openswap-icon-") as raw:
             iconset = Path(raw) / "Profile.iconset"
             iconset.mkdir()
@@ -97,9 +117,19 @@ def render_icon(app_path: Path, target: Path, badge: str, color: str, *, run=sub
                     try:
                         A.NSGraphicsContext.setCurrentContext_(ctx)
                         base.drawInRect_fromRect_operation_fraction_(A.NSMakeRect(0, 0, px, px), A.NSZeroRect, A.NSCompositingOperationCopy, 1.0)
+                        # Keep overlays inside Claude's rounded outline. Tahoe
+                        # encloses icons with protruding badges in a gray plate,
+                        # even when the generated ICNS itself has no frame.
+                        brand = A.NSMakeRect(px * .13, px * .13, px * .24, px * .24)
+                        A.NSColor.colorWithSRGBRed_green_blue_alpha_(.98, .97, .94, 1).setFill()
+                        A.NSBezierPath.bezierPathWithOvalInRect_(brand).fill()
+                        mark.drawInRect_fromRect_operation_fraction_(
+                            A.NSMakeRect(brand.origin.x + px * .024, brand.origin.y + px * .024,
+                                         brand.size.width - px * .048, brand.size.height - px * .048),
+                            A.NSZeroRect, A.NSCompositingOperationSourceOver, 1.0)
                         if badge:
-                            diameter = px * (0.45 if len(badge) == 3 else 0.39)
-                            box = A.NSMakeRect(px - diameter - px * .025, px - diameter - px * .025, diameter, diameter)
+                            diameter = px * (0.34 if len(badge) == 3 else 0.30)
+                            box = A.NSMakeRect(px - diameter - px * .12, px - diameter - px * .12, diameter, diameter)
                             A.NSColor.whiteColor().setFill()
                             A.NSBezierPath.bezierPathWithOvalInRect_(box).fill()
                             inset = px * .018
@@ -217,3 +247,27 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
                 raise
     return {"path": str(path), "profile": asdict(updated), "state": "shortcut_created",
             "app_version": info["version"], "notice": ICON_NOTICE}
+
+
+def prepare_shortcuts(store: DesktopProfiles, identifier: str, *, pin: bool, creator=None, installer=None) -> dict:
+    """Complete Add's shortcut setup, or retry it without adding another profile.
+
+    Partial failures keep the profile and any completed shortcuts. Dock changes
+    happen only after all required launchers exist; the caller can still open
+    Claude when setup needs attention.
+    """
+    from openswap.claude_desktop_dock import DockShortcut, install_shortcuts
+
+    creator, installer = creator or create_shortcut, installer or install_shortcuts
+    profile = store.get(identifier)
+    default = store.ensure_default()
+    profiles = ([default] if default and not default.archived and default.id != profile.id else []) + [profile]
+    shortcuts = []
+    for item in profiles:
+        result = creator(store, item.id)
+        shortcuts.append(DockShortcut(Path(result["path"]), item.id, store.root, item.kind == "default"))
+    if pin:
+        # Add only the requested profile to the Dock. Default's shortcut is
+        # available in Finder, but never replaces Claude's ordinary launcher.
+        installer(store, [s for s in shortcuts if s.profile_id == profile.id], refresh_icons=True)
+    return {"state": "dock_ready" if pin else "shortcuts_ready", "paths": [str(s.path) for s in shortcuts]}

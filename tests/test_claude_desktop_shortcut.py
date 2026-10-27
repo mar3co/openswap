@@ -252,3 +252,67 @@ def test_shortcut_open_resolves_renamed_profile_and_focuses_correct_process(stor
     assert cd.main(['open',p.id,'--profile-root',str(store.root),'--focus','--json'])==0
     assert json.loads(capsys.readouterr().out)['profile']['name']=='New name'
     app.open.assert_called_once_with(*store.paths(p));focus.assert_called_once_with(42)
+
+
+@pytest.mark.parametrize('name', ['electron', 'electron.icns'])
+def test_uses_original_artwork_not_macos_decorated_icon(tmp_path, name):
+    app = tmp_path/'Claude.app'; resources = app/'Contents/Resources'; resources.mkdir(parents=True)
+    icon = resources/'electron.icns'; icon.write_bytes(b'fixture')
+    (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIconFile': name, 'CFBundleIconName': 'Claude'}))
+    assert sc.original_icon(app) == icon
+
+
+@pytest.mark.parametrize('name', ['../other', '/tmp/other', '', 5, 'missing'])
+def test_missing_or_unsafe_original_icon_does_not_use_decorated_fallback(tmp_path, name):
+    app = tmp_path/'Claude.app'; (app/'Contents/Resources').mkdir(parents=True)
+    (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIconFile': name}))
+    with pytest.raises(cd.ClaudeDesktopError, match='original app icon'):
+        sc.original_icon(app)
+
+
+@pytest.mark.parametrize('pin', [True, False])
+def test_add_prepares_shortcuts_then_opens_once_without_another_dialog(menu, store, monkeypatch, pin):
+    menu.prompt.return_value = SimpleNamespace(clicked=1, text='Work', checked=pin)
+    events = []
+    menu.shortcut_setup = Mock(side_effect=lambda *a, **kw: events.append(('setup', kw['pin'])))
+    def opened(identifier):
+        events.append(('open', identifier))
+        return {'state': 'opened', 'pid': 4321, 'profile': asdict(store.get(identifier))}
+    monkeypatch.setattr(store, 'open', opened)
+    monkeypatch.setattr('openswap.claude_desktop_menu.threading.Thread', lambda **kw: SimpleNamespace(start=kw['target']))
+    monkeypatch.setattr('openswap.claude_desktop_menu.focus_profile', Mock())
+    menu.add(); profile = store.get('Work')
+    assert events == [('setup', pin), ('open', profile.id)]
+    assert menu.prompt.call_count == 1
+    assert menu.prompt.call_args.kwargs['checkbox_checked'] is True
+    assert menu.busy
+    menu.poll()
+    assert not menu.busy
+    menu.show_error.assert_not_called()
+
+
+def test_shortcut_failure_does_not_block_signin_and_retry_does_not_add_profile(menu, store, monkeypatch):
+    p = store.add('Work')
+    menu.shortcut_setup = Mock(side_effect=cd.ClaudeDesktopError('Dock unavailable'))
+    opened = Mock(return_value={'state': 'opened', 'pid': 4321, 'profile': asdict(p)})
+    monkeypatch.setattr(store, 'open', opened)
+    monkeypatch.setattr('openswap.claude_desktop_menu.threading.Thread', lambda **kw: SimpleNamespace(start=kw['target']))
+    monkeypatch.setattr('openswap.claude_desktop_menu.focus_profile', Mock())
+    menu.show_status = Mock()
+    menu.open(p.id, setup_shortcuts=True); menu.poll()
+    opened.assert_called_once_with(p.id)
+    assert store.list() == [p]
+    assert 'Set up Dock shortcuts' in menu.show_status.call_args.args[0]
+    menu.shortcut_setup = Mock(return_value={'state': 'dock_ready'})
+    menu.perform('setup_dock', p.id); menu.poll()
+    menu.shortcut_setup.assert_called_once_with(store, p.id, pin=True)
+    assert store.list() == [p]
+    opened.assert_called_once()
+
+
+def test_ordinary_open_does_not_repin_or_recreate_shortcuts(menu, store, monkeypatch):
+    p = store.add('Work'); menu.shortcut_setup = Mock()
+    monkeypatch.setattr(store, 'open', Mock(return_value={'state': 'opened', 'profile': asdict(p)}))
+    monkeypatch.setattr('openswap.claude_desktop_menu.threading.Thread', lambda **kw: SimpleNamespace(start=kw['target']))
+    menu.open(p.id); menu.poll()
+    menu.shortcut_setup.assert_not_called()

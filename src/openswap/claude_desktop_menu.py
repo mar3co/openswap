@@ -36,7 +36,7 @@ def has_saved_profiles() -> bool:
 class ClaudeDesktopMenu:
     def __init__(self, *, prompt, show_error, changed, notify, store=None, app_factory=None, show_status=None, enabled=None,
                  blocked=None, shortcut_factory=None, reveal=None, confirm=None, detector=None, monitor=None,
-                 code_engine=None, code_connector=None, code_login_allowed=None, signin_sender=None):
+                 code_engine=None, code_connector=None, code_login_allowed=None, signin_sender=None, shortcut_setup=None):
         self.store = store or DesktopProfiles()
         self.prompt = prompt
         self.show_error = show_error
@@ -46,6 +46,7 @@ class ClaudeDesktopMenu:
         self.enabled = enabled or (lambda: True)
         self.blocked = blocked or (lambda: False)
         self.shortcut_factory = shortcut_factory
+        self.shortcut_setup = shortcut_setup
         self.reveal = reveal or reveal_shortcut
         self.confirm = confirm
         self.detector = detector
@@ -182,6 +183,7 @@ class ClaudeDesktopMenu:
                                             callback=lambda _, p=profile, a=action: self.perform(a, p.id)))
             item.add(rumps.MenuItem("Archive…", callback=lambda _, p=profile: self.archive(p)))
             item.add(rumps.MenuItem("Create shortcut…", callback=lambda _, p=profile: self.shortcut(p)))
+            item.add(rumps.MenuItem("Set up Dock shortcuts", callback=lambda _, p=profile: self.setup_dock(p)))
             self._add_status(item, profile, rumps)
             menu.add(item)
         if any(p.archived for p in profiles):
@@ -216,7 +218,7 @@ class ClaudeDesktopMenu:
             return self.add()
         if action == "storage_error":
             return self.storage_error()
-        if action not in {"open", "rename", "archive", "restore", "shortcut", "details", "reconnect_signin", "connect_code", "cancel_code"}:
+        if action not in {"open", "rename", "archive", "restore", "shortcut", "setup_dock", "details", "reconnect_signin", "connect_code", "cancel_code"}:
             return
         try:
             profile = self.store.get(identifier, include_archived=action == "restore")
@@ -250,8 +252,9 @@ class ClaudeDesktopMenu:
             return
         response = self.prompt(
             title="Create Claude Desktop profile",
-            message="Sign in to the new Claude window. Allow OpenSwap to open Claude links if macOS asks, so sign-in can return to the right window.\n\nOpenSwap detects the account with Keychain access and adds it to Claude Code. Finish browser authorization if asked.",
+            message="Sign in to the new Claude window. Allow OpenSwap to open Claude links if asked.\n\nOpenSwap detects the account with Keychain access and adds it to Claude Code. Finish browser authorization if asked.\n\nCreates a numbered shortcut. Add to Dock places it beside Claude's original icon.",
             input_label="Profile name", placeholder="e.g. Work",
+            checkbox="Add to Dock", checkbox_checked=True,
             default_text="", ok="Create and open", cancel="Cancel",
         )
         if response.clicked != 1:
@@ -263,7 +266,7 @@ class ClaudeDesktopMenu:
         except (ClaudeSwitchError, OSError) as exc:
             self._error(exc)
             return
-        self.open(profile.id)
+        self.open(profile.id, setup_shortcuts=response.checked)
 
     def rename(self, profile):
         if self.busy or self.blocked() or not self.enabled():
@@ -448,7 +451,28 @@ class ClaudeDesktopMenu:
                         + ("Sign-in, work and open windows kept. Restore to use its shortcuts again."
                            if updated.archived else "Ready to open. Restoring does not launch Claude Desktop."))
 
-    def open(self, identifier):
+    def _prepare_shortcuts(self, identifier, *, pin):
+        from openswap.claude_desktop_shortcut import prepare_shortcuts
+        return (self.shortcut_setup or prepare_shortcuts)(self.store, identifier, pin=pin)
+
+    def setup_dock(self, profile):
+        if self.busy or self.blocked() or not self.enabled():
+            return
+        self.operation = "Setting up Dock shortcuts…"
+        self.busy = True
+        self.changed()
+
+        def work():
+            try:
+                self._results.put((self._prepare_shortcuts(profile.id, pin=True), None))
+            except Exception as exc:
+                self._results.put((None, exc))
+        try:
+            threading.Thread(target=work, daemon=True, name="claude-desktop-dock").start()
+        except Exception as exc:
+            self._results.put((None, exc))
+
+    def open(self, identifier, *, setup_shortcuts=None):
         if self.busy or self.blocked() or not self.enabled():
             return
         self.operation = "Opening Claude…"
@@ -456,8 +480,18 @@ class ClaudeDesktopMenu:
         self.changed()
 
         def work():
+            warning = ""
+            if setup_shortcuts is not None:
+                try:
+                    self._prepare_shortcuts(identifier, pin=setup_shortcuts)
+                except Exception as exc:
+                    warning = ((str(exc) + "\n\n") if isinstance(exc, ClaudeSwitchError) else "") + (
+                        "Your profile was kept. Choose Set up Dock shortcuts in its menu to retry.")
             try:
-                self._results.put((self.store.open(identifier), None))
+                result = self.store.open(identifier)
+                if warning:
+                    result["setup_warning"] = warning
+                self._results.put((result, None))
             except Exception as exc:
                 self._results.put((None, exc))
 
@@ -546,7 +580,11 @@ class ClaudeDesktopMenu:
                 self.reveal(result["path"])
             except Exception:
                 pass
-            self.show_status(f"Shortcut created: {result['path']}\n\nDrag it from Finder to your Dock.\n\n{result['notice']}")
+            self.show_status(f"Shortcut created: {result['path']}\n\nChoose Set up Dock shortcuts in the profile menu to pin it or refresh its Dock icon.\n\n{result['notice']}")
+            return
+        if result.get("state") in {"dock_ready", "shortcuts_ready"}:
+            self._notify("Dock shortcuts ready" if result["state"] == "dock_ready" else "Shortcuts ready",
+                         "Use each profile's shortcut to open its Claude window.")
             return
         try:
             focus_profile(result["pid"])
@@ -559,3 +597,5 @@ class ClaudeDesktopMenu:
         if self.signin_links and self.enabled():
             self.signin_links.prepare()
         self._notify("Claude profile opened", f"{result['profile']['name']} · Check the account in Claude.")
+        if result.get("setup_warning"):
+            self.show_status(result["setup_warning"])

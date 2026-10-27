@@ -21,8 +21,9 @@ With OpenSwap running, browser sign-in uses macOS sessions to return to the
 profile that started it. Allow OpenSwap to open Claude links if macOS asks.
 Email links and fallback redirects may ask you to choose a profile; no copying
 or pasting is needed.
-**Create shortcut…** makes a launcher for Finder and the Dock, with an optional
-number and colored badge on Claude's icon. Claude Code switching and rotation
+Adding a profile creates numbered shortcuts with an OpenSwap mark. **Add to Dock**
+is checked by default and adds the new shortcut beside Claude’s original launcher.
+Use **Create shortcut…** to customize the badge. Claude Code switching and rotation
 stay independent. The Desktop app picker also contains ChatGPT's controls.
 See [setup, shortcuts, limitations and recovery](docs/claude-desktop-profiles.md).
 

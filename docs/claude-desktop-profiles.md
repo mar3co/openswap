@@ -20,23 +20,35 @@ A profile name is your label, not an account identity.
    automatically after detection succeeds. OpenSwap adds that account and
    organization to Claude Code automatically. Complete Claude's browser
    authorization if asked; there is no separate add step or checkbox.
-5. Open that profile's **•••** menu and choose **Create shortcut…**. Choose a number from
-   1 to 999 and an orange, blue, purple or green badge. Leave the number blank
-   for Claude's standard icon.
-6. OpenSwap creates `Claude Work.app` (or your chosen profile name) under
-   `~/Applications/OpenSwap Profiles/` and reveals it in Finder. Drag that
-   launcher to the Dock for one-click access.
+5. **Create and open** automatically creates a numbered shortcut for the new
+   profile and a **Default** shortcut for the existing session, when available.
+   Both are saved under `~/Applications/OpenSwap Profiles/`.
+6. **Add to Dock** is checked by default. It adds the new numbered shortcut beside
+   the original Claude pin. Claude’s original launcher and running indicator stay
+   intact. Other pins keep their relative order. Uncheck it to create the shortcut
+   files without changing the Dock. Default’s separate shortcut stays in Finder
+   unless you explicitly choose **Set up Dock shortcuts** for Default.
 
-Create a shortcut for **Default** too if you want a Dock button that always opens
-the original session. Claude's standard Dock icon identifies the shared app and
-can focus a secondary profile that is already running. Profile shortcuts select
-the exact data folder and running process. Their badges identify the launchers;
-they do not change Claude's running Dock icon. No supported external API for a
-different running icon per Claude instance was found in the inspected version.
+The shortcuts select the exact profile, even when other Claude windows are open.
+Their icons use Claude's original artwork without macOS's surrounding plate,
+with a small OpenSwap mark and the profile number kept inside the rounded outline
+so macOS does not add a gray frame. Default has the OpenSwap mark
+without a number. The running Claude app icon remains unchanged.
+
+If setup needs attention, the new profile is kept and still opens for sign-in.
+Choose **••• → Set up Dock shortcuts** to retry without creating another profile.
+This also sets up shortcuts for existing profiles and refreshes their icons.
+Retries do not duplicate pins. Ordinary opens and startup never re-add pins the
+user removed. If an organization manages the Dock, the shortcut files are still
+available in Applications → OpenSwap Profiles.
+
+Choose **Create shortcut…** to customize the number (1–999 or blank) and badge
+color (orange, blue, purple or green). Then use **Set up Dock shortcuts** to
+refresh a pinned icon.
 
 With Desktop features enabled, the main tabs are **Claude Code**, **Claude Desktop**,
 and **Codex**. Turning Desktop features off hides the Claude Desktop tab.
-Each profile has an **Open** button and a **•••** menu for **Create shortcut…**,
+Each profile has an **Open** button and a **•••** menu for **Set up Dock shortcuts**, **Create shortcut…**,
 **Reconnect sign-in…**, **Account details…**, **Rename…**, and **Archive…**. The same actions are available under
 **More → Claude Desktop profiles**. App checks and **About profiles** help remain
 under **Settings → Desktop → Claude Desktop**. The gear button on the Claude
@@ -205,12 +217,16 @@ Badge numbers are assigned initially in profile order and can be changed when
 creating a shortcut. Numbers need not be unique. Creating a shortcut again with
 the same name and destination updates that profile's launcher and icon.
 OpenSwap refuses to replace unrelated apps or a shortcut for another profile.
-If macOS retains an old pinned icon, remove that Dock item and drag the updated
-launcher in again.
+**Set up Dock shortcuts** rebuilds the launchers and refreshes the Dock. A private
+backup of the previous pinned-app list is saved under the profile store before
+changing pins. OpenSwap changes only that list; it does not stop Claude sessions.
+Dock pinning uses macOS preferences rather than a supported profile-specific
+Claude API, and may need updates for future macOS versions.
 
 Renaming a profile preserves its stable ID, data and existing working shortcuts.
 It does not rename shortcuts already created. Creating a shortcut after renaming
-uses the new name; remove an old launcher yourself if no longer needed. Deleting
+uses the new name; Dock setup updates a recognized old pin in place. Remove an
+old launcher yourself if no longer needed. Deleting
 a launcher does not delete its profile or sign out of Claude.
 
 Shortcuts need OpenSwap to remain installed. If OpenSwap or a source/uv
@@ -227,7 +243,7 @@ for the check's time.
 Running means an app process exists, not that its sign-in is verified.
 
 **Archive…** explains what is kept before hiding a profile from the available list and preventing
-its OpenSwap shortcuts from opening it. Default's ordinary Claude app/Dock entry keeps working. Sign-ins, settings, local conversations, icons
+its OpenSwap shortcuts from opening it. The ordinary Claude app still opens from Applications; an OpenSwap Default shortcut is disabled while Default is archived. Sign-ins, settings, local conversations, icons
 and shortcut files are kept; running windows stay open. **Archived profiles →
 Restore** makes the same profile and shortcuts usable again without
 launching it. Use Claude's own Quit action to close a running profile.
@@ -435,6 +451,23 @@ A clean full local suite was unavailable on this Mac: seven bundle-move failures
 and a worker-folder stall also reproduced on untouched baseline `d221f50`.
 The worker stall occurred inside `pathid._on_disk_darwin` while opening a system
 path. These unrelated failures are not counted as passing checks.
+
+Latest automatic Dock setup follow-up (October 26, 2026): **1,038 focused tests
+passed**. Coverage includes preserving the original Claude pin, additive pinning,
+idempotent retries, renamed shortcuts, archived defaults, managed Dock settings,
+concurrent Dock edits, private backups, and opening a profile after shortcut
+setup fails. The native preferences writer round-tripped a disposable test domain
+and preserved an unrelated setting. Live setup refreshed the existing shortcuts
+without changing their positions or Claude session PIDs. The user's original
+Claude Dock pin was restored from its backup; future adds leave it intact.
+
+Native `NSWorkspace.iconForFile` rendering verified Default, 1 and 999 icons
+without the gray frame. Badge overhang caused Tahoe to add the frame even when
+the source image had none; keeping both marks inside the rounded outline fixed
+it. Generated shortcuts pass strict signature verification. The updated DEV
+app uses the shared SDK policy, with the Homebrew app, settings and login item
+preserved. These checks cover creation, rendering and setup, not new provider
+sign-ins or Dock persistence across a reboot.
 
 ## Remaining live acceptance checks
 
