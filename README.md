@@ -23,6 +23,7 @@ Email links and fallback redirects may ask you to choose a profile; no copying
 or pasting is needed.
 Adding a profile creates numbered shortcuts with an OpenSwap mark. **Add to Dock**
 is checked by default and adds the new shortcut beside Claude’s original launcher.
+Each numbered icon shows its own running dot and brings its session forward.
 Use **Create shortcut…** to customize the badge. Claude Code switching and rotation
 stay independent. The Desktop app picker also contains ChatGPT's controls.
 See [setup, shortcuts, limitations and recovery](docs/claude-desktop-profiles.md).

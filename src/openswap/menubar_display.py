@@ -1076,7 +1076,7 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
         return [{"section": SETTINGS_SECTION_DESKTOP, **row} for row in rows]
     for key, title, body in (
         ("open", "Opening profiles", "Open profile brings it forward. Other profiles keep running."),
-        ("shortcut", "Shortcuts and icons", "New profiles get numbered OpenSwap shortcuts. Add to Dock pins them beside Claude's original icon. Choose Set up Dock shortcuts in a profile's menu to retry. Running status stays on Claude's own icon."),
+        ("shortcut", "Shortcuts and icons", "Each numbered icon shows a dot while its profile runs. Click to return to that session; Quit closes only that profile. Add to Dock keeps the icon pinned. Claude's original icon stays available."),
         ("signin", "Sign-in", "Sign in inside each profile. OpenSwap adds its account to Claude Code automatically. Complete browser authorization if asked; Continue setup resumes a canceled sign-in. Your current CLI account stays selected."),
         ("signin_window", "Sign-in windows", "Keep OpenSwap running and allow it to open Claude links. Some returns ask you to choose a profile. If the wrong window opens, choose Reconnect sign-in in the profile menu, then start a fresh sign-in."),
         ("details", "Account details", "Your existing Claude profile appears as Default automatically. Add profile creates an additional sign-in. Email and organization update automatically; macOS may request Keychain access. Manage updates in Account details."),

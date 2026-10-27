@@ -406,13 +406,13 @@ class DesktopProfiles:
             self._save([updated if p.id == current.id else p for p in rows])
             return updated
 
-    def open(self, identifier: str, *, app: ClaudeDesktopApp | None = None) -> dict:
+    def open(self, identifier: str, *, app: ClaudeDesktopApp | None = None, existing_only=False) -> dict:
         app = app or ClaudeDesktopApp()
         info = app.validate()  # no profile changes or launch before publisher validation
         with self._lock():
             profile = self.get(identifier)
             desktop, code = self._directories(profile)
-            result = app.open(desktop, code)
+            result = app.open(desktop, code, existing_only=True) if existing_only else app.open(desktop, code)
             return {**result, "profile": asdict(profile), "app_version": info["version"],
                     "identity_verified": False, "experimental": True}
 
@@ -536,7 +536,7 @@ class ClaudeDesktopApp:
             raise ClaudeDesktopError("Multiple processes are using this profile. Quit them in Claude before reopening it.")
         return matches[0] if matches else None
 
-    def open(self, desktop: Path, code: Path | None) -> dict:
+    def open(self, desktop: Path, code: Path | None, *, existing_only=False) -> dict:
         argv = [str(self.binary)] if code is None else [str(self.binary), f"--user-data-dir={desktop}"]
         pid = self._running(argv, desktop)
         try:
@@ -546,6 +546,10 @@ class ClaudeDesktopApp:
             raise ClaudeDesktopError("Claude changed since validation. Wait for its update to finish and try again.") from exc
         if pid is not None:
             return {"state": "already_running", "pid": pid}
+        if existing_only:
+            # Attaching a Dock indicator must never reopen a session that quit
+            # between the UI's launch result and the helper's startup.
+            return {"state": "not_running", "pid": None}
         try:
             proc = self.popen(argv, env=launch_environment(code), cwd=str(desktop.parent),
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -583,6 +587,8 @@ def main(argv: list[str]) -> int:
             if action == "open":
                 command.add_argument("--profile-root", type=Path, help=argparse.SUPPRESS)
                 command.add_argument("--focus", action="store_true", help="bring the profile window forward")
+                command.add_argument("--existing", action="store_true", help=argparse.SUPPRESS)
+                command.add_argument("--from-launcher", action="store_true", help=argparse.SUPPRESS)
             if action == "shortcut":
                 command.add_argument("--badge", help="number 1–999; empty string for the standard icon")
                 command.add_argument("--color", choices=tuple(BADGE_COLORS))
@@ -602,8 +608,14 @@ def main(argv: list[str]) -> int:
             from openswap.claude_desktop_shortcut import create_shortcut
             data = create_shortcut(store, args.profile, badge=args.badge, color=args.color, directory=args.directory)
         elif args.action == "open":
-            data = store.open(args.profile)
-            if args.focus:
+            data = store.open(args.profile, existing_only=True) if args.existing else store.open(args.profile)
+            if data.get("pid") and not args.from_launcher:
+                from openswap.claude_desktop_presence import attach_presence
+                try:
+                    attach_presence(store, data["profile"]["id"])
+                except (ClaudeSwitchError, OSError):
+                    data["dock_warning"] = "Could not show the profile's running indicator. Choose Set up Dock shortcuts to retry."
+            if args.focus and data.get("pid"):
                 try:
                     from openswap.claude_desktop_menu import focus_profile
                     focus_profile(data["pid"])
@@ -626,9 +638,14 @@ def main(argv: list[str]) -> int:
         elif args.action == "shortcut":
             print(f"Shortcut created: {data['path']}. Drag it from Finder to your Dock.")
         elif args.action == "open":
-            verb = "is already running" if data["state"] == "already_running" else "was launched"
-            print(f"{data['profile']['name']} {verb} (PID {data['pid']}). Check the account in Claude; sign in there on first use.")
-            print(PROFILE_NOTICE)
+            if data["state"] == "not_running":
+                print(f"{data['profile']['name']} is not running.")
+            else:
+                verb = "is already running" if data["state"] == "already_running" else "was launched"
+                print(f"{data['profile']['name']} {verb} (PID {data['pid']}). Check the account in Claude; sign in there on first use.")
+                print(PROFILE_NOTICE)
+            if data.get("dock_warning"):
+                print(data["dock_warning"])
         else:
             print(f"{data['profile']['name']}: {data['state']}. Profile data is kept.")
             if args.action == "add":

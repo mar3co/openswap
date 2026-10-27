@@ -120,14 +120,23 @@ class ClaudeDesktopMenu:
         self.changed()
 
         def check():
+            validated = False
             try:
                 app = self._app_factory()
                 info = app.validate()
+                validated = True
                 message = f"Claude {info['version']} · Publisher verified."
             except Exception as exc:
                 message = str(exc) if isinstance(exc, ClaudeSwitchError) else "Could not check Claude Desktop. Try again."
             try:
                 states = app.profile_states(self.store)
+                from openswap.claude_desktop_presence import attach_presence
+                for profile in self.store.list():
+                    if validated and generation == self._check_generation and self.enabled() and states.get(profile.id) == "Running":
+                        try:
+                            attach_presence(self.store, profile.id)
+                        except (ClaudeSwitchError, OSError):
+                            pass  # passive refresh must not interrupt work with dialogs
             except Exception:
                 states = {}
             self._checks.put((generation, message, states, datetime.now().strftime("%b %d, %H:%M:%S")))
@@ -489,6 +498,11 @@ class ClaudeDesktopMenu:
                         "Your profile was kept. Choose Set up Dock shortcuts in its menu to retry.")
             try:
                 result = self.store.open(identifier)
+                from openswap.claude_desktop_presence import attach_presence
+                try:
+                    attach_presence(self.store, identifier)
+                except (ClaudeSwitchError, OSError):
+                    warning = warning or "Claude opened, but its running indicator could not start. Choose Set up Dock shortcuts to retry."
                 if warning:
                     result["setup_warning"] = warning
                 self._results.put((result, None))
@@ -585,6 +599,7 @@ class ClaudeDesktopMenu:
         if result.get("state") in {"dock_ready", "shortcuts_ready"}:
             self._notify("Dock shortcuts ready" if result["state"] == "dock_ready" else "Shortcuts ready",
                          "Use each profile's shortcut to open its Claude window.")
+            self.refresh_status()
             return
         try:
             focus_profile(result["pid"])

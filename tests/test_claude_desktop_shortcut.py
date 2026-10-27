@@ -74,6 +74,8 @@ def test_shortcut_uses_stable_profile_and_does_not_launch_or_change_code(store,b
     assert path.name=='Claude Work.app'
     assert info['CFBundleIconFile']=='Profile.icns'
     assert info['CFBundleIdentifier'].endswith(p.id)
+    assert info['LSUIElement'] is False and info['OpenSwapProfileLauncherVersion'] == 2
+    assert '-s' in builder.run.call_args_list[0].args[0]
     script=(path/'Contents/Resources/source.txt').read_text()
     assert f'claude-desktop open {p.id}' in script and '--focus' in script
     assert 'switch ' not in script
@@ -161,7 +163,7 @@ def test_script_quotes_shell_and_applescript_independently(tmp_path):
     value=f'path with spaces "quotes" \\ $(touch {marker}) `touch {marker}`'
     command=['printf','%s',value]
     source=sc.launcher_script(command)
-    literal=source.split('do shell script ',1)[1].split('\n',1)[0]
+    literal=source.split('set launchCommand to ',1)[1].split('\n',1)[0]
     # AppleScript's emitted string uses the same two escapes as JSON here.
     shell=json.loads(literal)
     assert shlex.split(shell)==command

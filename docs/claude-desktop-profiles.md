@@ -33,7 +33,9 @@ The shortcuts select the exact profile, even when other Claude windows are open.
 Their icons use Claude's original artwork without macOS's surrounding plate,
 with a small OpenSwap mark and the profile number kept inside the rounded outline
 so macOS does not add a gray frame. Default has the OpenSwap mark
-without a number. The running Claude app icon remains unchanged.
+without a number. Each profile app stays in the Dock with a running dot while
+its session is open. Clicking it returns to that session; Quit requests a normal
+quit of that session only. Claude’s original app icon remains available.
 
 If setup needs attention, the new profile is kept and still opens for sign-in.
 Choose **••• → Set up Dock shortcuts** to retry without creating another profile.
@@ -203,15 +205,30 @@ off are not inspected in the background.
 
 ## What the shortcut and icon do
 
-The shortcut is a small, locally generated macOS application. It calls OpenSwap
-with the profile's stable ID, then exits. OpenSwap checks the installed Claude
-publisher and opens that profile. Claude's app is never copied or modified.
+The shortcut is a small, locally generated, stay-open macOS application. It calls
+OpenSwap with the profile's stable ID, then retains the exact Claude process
+object. OpenSwap checks the installed Claude publisher and opens that profile.
+Claude's app is never copied or modified.
 
-The numbered icon identifies the **shortcut in Finder and when pinned to the
-Dock**. Claude's own running-app icon and window titles remain unchanged; macOS
-can show the usual Claude icon for each running instance. The badge is not
-an unread count or proof of which account is signed in. Pin the generated
-launcher, rather than Claude's ordinary running-app icon, to reopen that profile.
+The profile app has its own Dock icon and running dot. Clicking it focuses that
+profile. Quitting it requests a normal quit of that Claude process, allowing
+Claude to handle unsaved work. If Claude cancels quitting, the icon stays running.
+When the profile quits or crashes, its helper exits and the dot disappears. A
+pinned icon remains ready to reopen the profile. Force-quitting the helper itself
+does not force-quit Claude; use Open or Refresh status to reattach the indicator.
+
+Opening a managed profile from OpenSwap or the CLI attaches its existing profile
+app in the background. Status refresh also reattaches missing indicators and
+upgrades older generated launchers in place. Passive attachment never reopens a
+closed profile or steals focus. Default continues to use the original Claude
+icon unless its separate launcher is explicitly opened. Unticking Add to Dock
+leaves the profile app unpinned, so its icon disappears after the session quits.
+
+The numbered icon identifies the **profile app in Finder and the Dock**. Its dot
+means the process is running, not that sign-in or account identity is verified.
+Claude's own icon and window titles remain unchanged; macOS may also display its
+ordinary icon. The badge is not an unread count or proof of which account is
+signed in. Each numbered icon selects its own session.
 
 Badge numbers are assigned initially in profile order and can be changed when
 creating a shortcut. Numbers need not be unique. Creating a shortcut again with
@@ -468,6 +485,23 @@ it. Generated shortcuts pass strict signature verification. The updated DEV
 app uses the shared SDK policy, with the Homebrew app, settings and login item
 preserved. These checks cover creation, rendering and setup, not new provider
 sign-ins or Dock persistence across a reboot.
+
+Resident Dock follow-up: **1,054 focused tests passed**, followed by targeted
+coverage for renamed running helpers and conflicting stores. Native disposable-app
+tests cover each helper's regular
+Dock presence, repeated clicks, exact-process focus, normal Quit, canceled Quit,
+crash cleanup, background attachment, closed-session attachment, preservation of
+another running app, and signatures after exit. Live verification attached the
+numbered icon to the user's existing secondary Claude process without stealing
+focus. Two successive opens focused that exact process, with one resident helper,
+both Claude PIDs unchanged, and the original Dock pin intact. The Homebrew app,
+settings, login item and shared DEV/release appearance policy were preserved.
+Real Claude's Quit/unsaved-work dialogs and reboot restoration still need user
+acceptance; destructive lifecycle tests used disposable apps. Run the probe with:
+
+```sh
+PYTHONPATH=src python tools/probe_claude_desktop_presence.py --launch
+```
 
 ## Remaining live acceptance checks
 

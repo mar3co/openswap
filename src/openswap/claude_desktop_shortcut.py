@@ -15,13 +15,13 @@ from pathlib import Path
 from xml.parsers.expat import ExpatError
 
 from openswap.claude_desktop import (
-    BADGE_COLORS, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, _plain, validate_badge,
+    APP_PATH, BUNDLE_ID, BADGE_COLORS, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, _plain, validate_badge,
 )
 from openswap.locking import FileLock
 
 ICON_NOTICE = (
-    "The badge appears on the shortcut in Finder and the Dock. "
-    "Claude's running icon stays unchanged."
+    "The numbered icon shows a running dot while this profile is open. "
+    "Click it to return to that session. Claude’s original icon stays available."
 )
 
 
@@ -55,20 +55,18 @@ def _apple_string(value: str) -> str:
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r') + '"'
 
 
-def launcher_script(command: list[str]) -> str:
-    # Shell escaping and AppleScript escaping are different layers. The command
-    # is a fixed argv vector; no name or path is interpolated as executable text.
-    shell = shlex.join(command)
-    return f'''on run
-    try
-        with timeout of 120 seconds
-            do shell script {_apple_string(shell)}
-        end timeout
-    on error messageText number errorNumber
-        display alert "Could not open Claude profile" message (messageText & return & return & "If OpenSwap was moved or removed, open OpenSwap and create this shortcut again.") as warning
-    end try
-end run
-'''
+def launcher_script(command: list[str], *, attach_command=None, app_path=APP_PATH, bundle_id=BUNDLE_ID) -> str:
+    # Compile a regular, stay-open applet. AppKit retains the exact process
+    # object (including after exit), so PID reuse cannot select another app.
+    source = (Path(__file__).parent / "assets/profile-launcher.applescript").read_text()
+    for token, value in {
+        '"OPEN_COMMAND"': shlex.join(command),
+        '"ATTACH_COMMAND"': shlex.join(attach_command or command),
+        '"TARGET_BUNDLE"': bundle_id,
+        '"TARGET_PATH"': str(Path(app_path).resolve()),
+    }.items():
+        source = source.replace(token, _apple_string(value))
+    return source
 
 
 def original_icon(app_path: Path) -> Path:
@@ -209,7 +207,10 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
         command = launcher_command(store, profile.id)
         with tempfile.TemporaryDirectory(prefix=".openswap-shortcut-", dir=directory) as raw:
             stage = Path(raw) / path.name
-            _run(run, ["/usr/bin/osacompile", "-o", str(stage), "-"], input=launcher_script(command))
+            _run(run, ["/usr/bin/osacompile", "-o", str(stage), "-s", "-"], input=launcher_script(
+                [*command, "--json", "--from-launcher"],
+                attach_command=[*(arg for arg in command if arg != "--focus"), "--json", "--from-launcher", "--existing"],
+                app_path=app.path))
             contents = stage / "Contents"
             plist_path = contents / "Info.plist"
             try:
@@ -220,7 +221,8 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
                 raise ClaudeDesktopError("macOS produced an incomplete shortcut. Try creating it again.") from exc
             plist.update(CFBundleIdentifier=f"com.opensoft.openswap.claude-profile.{profile.id}",
                          CFBundleName=f"Claude {profile.name}", CFBundleDisplayName=f"Claude {profile.name}",
-                         CFBundleIconFile="Profile.icns", LSUIElement=True, OpenSwapProfile=marker)
+                         CFBundleIconFile="Profile.icns", LSUIElement=False, OpenSwapProfile=marker,
+                         OpenSwapProfileLauncherVersion=2)
             plist.pop("CFBundleIconName", None)
             plist_path.write_bytes(plistlib.dumps(plist))
             (icon_renderer or render_icon)(app.path, contents / "Resources" / "Profile.icns", badge, color)
