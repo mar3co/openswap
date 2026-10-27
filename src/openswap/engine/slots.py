@@ -1117,6 +1117,7 @@ class SlotsMixin:
         uuid: str,
         expected_email: str | None = None,
         expected_org: str | None = None,
+        expected_credentials: str | None = None,
     ) -> None:
         """Record a resolved account uuid on a slot that lacks one.
 
@@ -1126,7 +1127,9 @@ class SlotsMixin:
         to still hold that identity under the lock (a remove/re-add landing
         in the gap — even one keeping the email but changing the org — must
         not get the predecessor's uuid stamped on it). Caller must NOT hold
-        ``self.lock_file``.
+        ``self.lock_file``. ``expected_credentials`` also pins the exact
+        credential verified by a caller, so a concurrent login cannot inherit
+        the preceding credential's account UUID.
         """
         if not uuid:
             return
@@ -1144,6 +1147,8 @@ class SlotsMixin:
                     expected_org is None
                     or (acct.get("organizationUuid", "") or "") == expected_org
                 )
+                and (expected_credentials is None or
+                     self._read_account_credentials_ex(str(account_num), acct.get("email", "")) == (expected_credentials, False))
             ):
                 acct["uuid"] = uuid
                 data["lastUpdated"] = get_timestamp()

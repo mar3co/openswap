@@ -85,7 +85,7 @@ def test_public_storage_refused(store):
         store.add("Work")
 
 
-@pytest.mark.parametrize("contents", ["{", "[]", '{"version":6,"profiles":[]}',
+@pytest.mark.parametrize("contents", ["{", "[]", '{"version":7,"profiles":[]}',
     '{"version":true,"profiles":[]}', '{"version":1,"profiles":[{}]}'])
 def test_damaged_or_newer_registry_is_not_replaced(store, contents):
     store.add("Personal")

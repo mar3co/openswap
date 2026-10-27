@@ -21,7 +21,7 @@ CLEAR_DETAILS = {"email": "", "organization": "", "detected_at": ""}
 
 
 def _labels(profile):
-    return profile.email, profile.organization, profile.detected_at
+    return profile.email, profile.organization, profile.detected_at, profile.account_uuid, profile.organization_uuid, profile.detected_login
 
 
 class ProfileIdentityMonitor:
@@ -82,7 +82,7 @@ class ProfileIdentityMonitor:
                             or (record["stamp"] is not None and self.stamp(self.store, current) != record["stamp"])):
                         self.refresh(profile.id)
                         continue
-                    if details is not None and _labels(current) != (details["email"], details["organization"], details["detected_at"]):
+                    if details is not None and _labels(current) != tuple(details.get(k, "") for k in ("email", "organization", "detected_at", "account_uuid", "organization_uuid", "detected_login")):
                         current = self.store.update(profile.id, expected=profile, **details)
                         changed = True
                     record["labels"] = _labels(current)

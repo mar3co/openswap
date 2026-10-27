@@ -35,7 +35,8 @@ def has_saved_profiles() -> bool:
 
 class ClaudeDesktopMenu:
     def __init__(self, *, prompt, show_error, changed, notify, store=None, app_factory=None, show_status=None, enabled=None,
-                 blocked=None, shortcut_factory=None, reveal=None, confirm=None, detector=None, monitor=None):
+                 blocked=None, shortcut_factory=None, reveal=None, confirm=None, detector=None, monitor=None,
+                 code_engine=None, code_connector=None, code_login_allowed=None):
         self.store = store or DesktopProfiles()
         self.prompt = prompt
         self.show_error = show_error
@@ -49,6 +50,12 @@ class ClaudeDesktopMenu:
         self.confirm = confirm
         self.detector = detector
         self.monitor = monitor or ProfileIdentityMonitor(self.store)
+        self.code = code_connector
+        if self.code is None and code_engine is not None:
+            from openswap.claude_desktop_code import DesktopCodeConnector
+            from openswap.menubar_display import resolve_claude_bin
+            self.code = DesktopCodeConnector(self.store, code_engine, resolve_binary=resolve_claude_bin, notify=self._notify)
+        self.code_login_allowed = code_login_allowed or (lambda: True)
         self._editing_details = False
         self.operation = "Opening Claude…"
         self.busy = False
@@ -66,6 +73,8 @@ class ClaudeDesktopMenu:
         self._check_generation += 1
         self.checking = False
         self.monitor.suspend()
+        if self.code:
+            self.code.suspend()
 
     def _profiles(self):
         self._default_error = ""
@@ -90,7 +99,8 @@ class ClaudeDesktopMenu:
                          archived=sum(p.archived for p in profiles),
                          items=[{**asdict(p), "status": self._profile_states.get(p.id, ""),
                                  "checked_at": self._profile_checked_at.get(p.id),
-                                 **({"account_status": self.monitor.statuses[p.id]} if self.monitor.statuses.get(p.id) else {})}
+                                 **({"account_status": self.monitor.statuses[p.id]} if self.monitor.statuses.get(p.id) else {}),
+                                 **(self.code.state(p) if self.code else {})}
                                 for p in profiles])
         except (ClaudeSwitchError, OSError):
             state["storage_error"] = "Could not read profiles. Check folder permissions or view details."
@@ -160,6 +170,11 @@ class ClaudeDesktopMenu:
                                    callback=lambda _, p=profile: self.open(p.id)))
             item.add(rumps.MenuItem("Rename…", callback=lambda _, p=profile: self.rename(p)))
             item.add(rumps.MenuItem("Account details…", callback=lambda _, p=profile: self.details(p)))
+            if self.code:
+                action = self.code.state(profile).get("code_action")
+                if action:
+                    item.add(rumps.MenuItem("Cancel Code sign-in" if action == "cancel_code" else "Continue Code setup…",
+                                            callback=lambda _, p=profile, a=action: self.perform(a, p.id)))
             item.add(rumps.MenuItem("Archive…", callback=lambda _, p=profile: self.archive(p)))
             item.add(rumps.MenuItem("Create shortcut…", callback=lambda _, p=profile: self.shortcut(p)))
             self._add_status(item, profile, rumps)
@@ -196,14 +211,21 @@ class ClaudeDesktopMenu:
             return self.add()
         if action == "storage_error":
             return self.storage_error()
-        if action not in {"open", "rename", "archive", "restore", "shortcut", "details"}:
+        if action not in {"open", "rename", "archive", "restore", "shortcut", "details", "connect_code", "cancel_code"}:
             return
         try:
             profile = self.store.get(identifier, include_archived=action == "restore")
         except (ClaudeSwitchError, OSError) as exc:
             self._error(exc)
             return
-        if action == "open":
+        if action in {"connect_code", "cancel_code"}:
+            if self.code:
+                try:
+                    (self.code.retry if action == "connect_code" else self.code.cancel)(profile.id)
+                except (ClaudeSwitchError, OSError) as exc:
+                    self._error(exc)
+                self.changed()
+        elif action == "open":
             self.open(profile.id)
         elif action == "restore":
             self.edit(profile, archived=False)
@@ -223,7 +245,7 @@ class ClaudeDesktopMenu:
             return
         response = self.prompt(
             title="Create Claude Desktop profile",
-            message="Create an additional Claude window with its own sign-in.\n\nAfter sign-in, OpenSwap may request Keychain access to show your email and organization. If denied, choose Account details → Detect to retry.",
+            message="Sign in to the new Claude window. OpenSwap adds the same account to Claude Code; finish authorization in your browser if asked.\n\nAllow Keychain access to detect the account. If denied, retry in Account details → Detect.",
             input_label="Profile name", placeholder="e.g. Work",
             default_text="", ok="Create and open", cancel="Cancel",
         )
@@ -250,7 +272,8 @@ class ClaudeDesktopMenu:
         if self.busy or self.blocked() or not self.enabled():
             return
         values = draft or {"email": profile.email, "organization": profile.organization,
-                           "detected_at": profile.detected_at}
+                           "detected_at": profile.detected_at, "account_uuid": profile.account_uuid,
+                           "organization_uuid": profile.organization_uuid, "detected_login": profile.detected_login}
         while True:
             message = note or ("Account detection is paused. Choose Detect to retry Keychain access, or enter the details yourself."
                                if self.monitor.detector.denied else
@@ -273,7 +296,10 @@ class ClaudeDesktopMenu:
                 return
             email, organization = response.values
             detected_at = values.get("detected_at", "") if (email, organization) == (values["email"], values["organization"]) else ""
-            values = {"email": email, "organization": organization, "detected_at": detected_at, "auto_detect": response.checked}
+            values = {"email": email, "organization": organization, "detected_at": detected_at, "auto_detect": response.checked,
+                      "account_uuid": values.get("account_uuid", "") if detected_at else "",
+                      "organization_uuid": values.get("organization_uuid", "") if detected_at else "",
+                      "detected_login": values.get("detected_login", "") if detected_at else ""}
             if response.clicked == -1:
                 self._detect(profile.id, values)
                 return
@@ -398,6 +424,8 @@ class ClaudeDesktopMenu:
 
     def poll(self):
         if self.monitor.poll(enabled=self.enabled(), idle=not (self.busy or self.blocked() or self._editing_details)):
+            self.changed()
+        if self.code and self.code.poll(enabled=self.enabled(), idle=not (self.busy or self.blocked() or self._editing_details) and self.code_login_allowed()):
             self.changed()
         try:
             generation, message, states, checked_at = self._checks.get_nowait()

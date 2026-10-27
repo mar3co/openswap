@@ -3,8 +3,9 @@
 OpenSwap can open named Claude Desktop profiles side by side on macOS. Separate
 profiles keep their own sign-in, desktop data and Code configuration. The Default
 profile uses the existing Claude Desktop data in place. Desktop
-profiles are optional and independent of Claude Code account switching and
-rotation. A profile name is your label, not a verified account identity.
+profiles automatically link or add their detected account to Claude Code.
+Opening a profile leaves the currently selected CLI account unchanged.
+A profile name is your label, not an account identity.
 
 ## Add a profile and make a shortcut
 
@@ -16,7 +17,9 @@ rotation. A profile name is your label, not a verified account identity.
    **Create and open**.
 4. Default reuses your existing Claude window and sign-in. For an additional
    profile, sign in inside its new window. Email and organization appear
-   automatically after detection succeeds.
+   automatically after detection succeeds. OpenSwap adds that account and
+   organization to Claude Code automatically. Complete Claude's browser
+   authorization if asked; there is no separate add step or checkbox.
 5. Open that profile's **•••** menu and choose **Create shortcut…**. Choose a number from
    1 to 999 and an orange, blue, purple or green badge. Leave the number blank
    for Claude's standard icon.
@@ -35,12 +38,44 @@ Desktop tab opens those settings; Back returns to the profile list.
 Opening a profile again brings its existing process forward when macOS permits
 it. Other profile windows stay open. Neither opening a profile nor using its
 shortcut changes the default Code login in your terminal or editor. Desktop
-profiles have no automatic rotation, and do not require saved Code accounts.
+profiles have no automatic rotation. Code accounts are linked or added after
+authenticated account detection succeeds.
 
 Claude handles sign-in inside each profile. OpenSwap does not transfer credentials
 between profiles. Default references the existing profile without copying it. The personal/Team/Enterprise selection
 within one email still happens inside Claude. Creating a profile does not
 create an Anthropic account or subscription.
+
+## One setup flow for Desktop and Code
+
+With the menu bar app running and Desktop features enabled, authenticated
+account detection starts Code setup for both Default and additional profiles.
+An existing Code account is linked by account ID and organization ID. Multiple
+Desktop profiles can share one Code account; the same email in different
+organizations produces distinct Code accounts. Manual email/organization labels
+cannot create or link an account.
+
+When authorization is needed, the shared Code login helper opens the browser
+with the detected email prefilled. Choose the same organization as in Desktop.
+It signs in using a disposable configuration folder, verifies the resulting
+account, and saves it through OpenSwap's existing credential store. The active
+terminal/editor login and account selection are preserved. Desktop cookies are
+never used as Code credentials. A response that omits personal-account org
+metadata must agree with the completed CLI authorization's identity; a server
+identity disagreement always stops the add.
+
+Profiles show **In Claude Code** when linked, plus usage from the same Code
+snapshot shown in the first tab. Stale usage is labeled **Last known**. Running
+still means a Desktop process exists; it does not verify an embedded Code or
+Cowork session's identity.
+
+Canceling, denying, timing out, or interrupting authorization pauses setup
+across restarts. **Continue setup** resumes it; no browser repeatedly opens in
+the background. Install Claude Code first if the profile asks for it. Sign-out,
+an organization change, archiving, and disabling Desktop features invalidate
+an in-flight authorization. New detected identities start their own setup.
+Removing a saved Code account does not silently recreate it. Archiving a
+Desktop profile preserves its saved Code account and the other open profiles.
 
 ## Default profile and automatic account details
 
@@ -152,8 +187,8 @@ Finish an in-progress profile action before changing the option.
 An existing ChatGPT Desktop preference or saved Claude profile keeps Desktop
 features visible on upgrade. An explicitly saved off preference always wins.
 The Desktop app picker separates Claude profiles from ChatGPT restart-and-switch
-controls. Claude Code's account cards and Automation settings remain Code-only
-whether Desktop features are on or off.
+controls. Desktop sign-in adds to the Claude Code account list, while account
+switching and Automation settings continue to control the CLI.
 
 ## Terminal commands
 
@@ -183,18 +218,26 @@ path and respect archived profiles. Launch and shortcut creation require macOS.
 Separate profile data lives in `~/Library/Application Support/OpenSwap Claude Desktop/`:
 
 - `profiles.json`: versioned labels, stable IDs, archive flags and badge settings;
-  optional email/organization labels, a last-detected timestamp, profile kind and automatic-update preference; no tokens or Code account associations.
+  optional email/organization labels, authenticated account/organization IDs,
+  a hash of the detected login, a last-detected timestamp, profile kind,
+  automatic-update preference and durable Code setup status. Version 6 upgrades
+  older profiles without treating their labels as authenticated identities.
+  No cookies, passwords or tokens are stored in this registry.
 - `<id>/desktop/`: Claude-owned desktop data, including local sessions.
 - `<id>/code/`: a separate `CLAUDE_CONFIG_DIR` and Keychain namespace.
+- `.code-login-*/`: private scratch directories used only during Code
+  authorization, removed with their temporary Keychain entries when the login
+  worker finishes. Saved Code credentials use OpenSwap's existing account store.
 
 Default has only a registry entry here. Its original Claude-owned folder is
 never moved, recreated, chmodded or deleted by OpenSwap.
 
 These private folders can contain conversations and credentials created by
-Claude. Do not share them as a diagnostic attachment. Profile versions 1–4, including the
+Claude. Do not share them as a diagnostic attachment. Profile versions 1–5, including the
 unreleased linked-selection version 2, are readable. Their next save upgrades
-metadata to version 5, preserving IDs, data and archives while discarding old
-account-link metadata. No account credentials are changed during migration.
+metadata to version 6, preserving IDs, data and archives while discarding old
+selection-link metadata. Previous labels need fresh authenticated detection
+before automatic Code setup. No account credentials change during migration.
 
 A failed launch keeps the profile. Corrupt/newer metadata and missing data
 folders are refused without replacing the login. Restore backups to their
@@ -211,6 +254,15 @@ out and quit that profile in Claude, then remove its data folder yourself.
 Claude owns its Keychain entries; OpenSwap does not delete them.
 
 ## Implementation and verification
+
+Automatic Code setup passed **1,616 focused tests**, with three real-Keychain
+CI tests skipped locally. These include isolated login, exact account and
+organization matching, deduplication, paused retries, account changes during
+authorization, credential-write failure, worker leases, usage sharing, and the
+existing account-switching and credential tests. **15 native dialog tests**
+also passed. Native light/dark previews cover linked usage, browser sign-in,
+cancel/retry actions and long labels. These previews use fixture accounts;
+authenticated provider authorization remains a live acceptance check below.
 
 The inspected Claude Desktop version is **3.6556.2**, bundle
 `com.anthropic.claudefordesktop`, publisher team `Q6L2SF6YDW`.
@@ -320,10 +372,11 @@ path. These unrelated failures are not counted as passing checks.
 
 ## Remaining live acceptance checks
 
-The feature remains experimental. Chrome-extension local pairing is disabled
-for relocated data in the inspected Claude build. OpenSwap does not verify
-Desktop identity or quota, move conversations, or promise embedded Code/Cowork
-compatibility from a successful launch.
+Chrome-extension local pairing is disabled for relocated data in the inspected
+Claude build. Account detection verifies the selected Desktop identity; usage
+comes from the matching saved Code account. Launch success alone does not
+verify identity or quota, move conversations, or establish embedded Code/Cowork
+compatibility.
 
 Before claiming authenticated account support:
 
@@ -337,6 +390,11 @@ Before claiming authenticated account support:
 - Sign into two different accounts and verify email, organization and restart
   persistence in each profile. Exercise Google, magic-link and organization SSO
   callbacks with another profile/default Claude already running.
+- Complete automatic Code authorization for Default and an additional profile.
+  Verify the same account and organization appear in both tabs, usage agrees,
+  and the previously selected CLI account stays active. Cancel and restart to
+  check that setup resumes only after **Continue setup**. Automated connector
+  tests use provider and CLI fixtures; live authorization is still unverified.
 - Start a chat, a Code session and a Cowork task in each profile. Confirm billing
   identity, permissions and history. Opening another profile must preserve
   ongoing work and the default terminal/editor Code login.

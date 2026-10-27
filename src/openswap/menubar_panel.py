@@ -121,6 +121,8 @@ from openswap.menubar import (
     provider_tab_title,
     provider_tabs,
     claude_desktop_profile_rows,
+    desktop_profile_usage,
+    desktop_profile_height,
     resolve_popover_theme,
     card_badge_text,
     card_list_height,
@@ -2176,11 +2178,13 @@ class MenuBarPanel:
         font_body = NSFont.systemFontOfSize_weight_(12, NSFontWeightRegular)
         font_small = NSFont.systemFontOfSize_weight_(11, NSFontWeightRegular)
         inner_w = PANEL_WIDTH - PAD * 2
-        rows = claude_desktop_profile_rows(self._claude_desktop_state(), expanded=self._settings_disclosures)
+        state = self._claude_desktop_state()
+        state = {**state, "items": [{**p, "code_usage": desktop_profile_usage(p, all_cards)} for p in state.get("items", [])]}
+        rows = claude_desktop_profile_rows(state, expanded=self._settings_disclosures)
 
         def row_height(row):
             if row["kind"] == "profiles":
-                return sum(76.0 if p.get("email") or p.get("organization") else 58.0 for p in row["items"]) if row["items"] else 88.0
+                return sum(desktop_profile_height(p) for p in row["items"]) if row["items"] else 88.0
             if row["kind"] == "group":
                 return 34.0 + 14.0 * max(0, row.get("lines", 2) - 2)
             return 30.0
@@ -2262,7 +2266,8 @@ class MenuBarPanel:
         y = 0.0
         for index, profile in enumerate(items):
             detail = " · ".join(x for x in (profile.get("email"), profile.get("organization")) if x)
-            row_h = 76.0 if detail else 58.0
+            base_h = 76.0 if detail else 58.0
+            row_h = desktop_profile_height(profile)
             if index:
                 line = _FillView.alloc().initWithColor_(pal["hairline"])
                 line.setFrame_(NSMakeRect(12, y, width - 24, 1))
@@ -2303,15 +2308,34 @@ class MenuBarPanel:
             checked = profile.get("checked_at")
             label.setToolTip_(f"{status}" + (f" · Checked {checked}" if checked else "") + ". Sign-in must be checked inside Claude.")
             group.addSubview_(label)
-            button = self._add_button(group, "Restore" if archived else "Open", NSMakeRect(action_x, y + (row_h - 26) / 2, action_w, 26),
+            button = self._add_button(group, "Restore" if archived else "Open", NSMakeRect(action_x, y + (base_h - 26) / 2, action_w, 26),
                                       lambda _, p=profile: self._desktop_profile_action("restore" if p.get("archived") else "open", p["id"]), font_small)
             button.setAccessibilityLabel_(f"{'Restore' if archived else 'Open'} {profile['name']}")
             button.setEnabled_(enabled)
             if not archived:
-                more = self._add_icon_button(group, "ellipsis", "•••", NSMakeRect(width - 39, y + (row_h - 26) / 2, 27, 26),
+                more = self._add_icon_button(group, "ellipsis", "•••", NSMakeRect(width - 39, y + (base_h - 26) / 2, 27, 26),
                                              lambda sender, pid=profile["id"]: self._desktop_profile_menu(pid, sender),
                                              f"Actions for {profile['name']}", bordered=True)
                 more.setEnabled_(enabled)
+                extra_y = y + base_h - 4
+                if profile.get("code_status"):
+                    action = profile.get("code_action")
+                    label = _label(profile["code_status"], font_small, pal["muted"],
+                                   NSMakeRect(54, extra_y, width - 66 - (102 if action else 0), 18))
+                    label.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+                    label.setToolTip_(profile["code_status"])
+                    group.addSubview_(label)
+                    if action:
+                        button = self._add_button(group, "Cancel" if action == "cancel_code" else "Continue setup",
+                                                  NSMakeRect(width - 110, extra_y - 3, 98, 22),
+                                                  lambda _, p=profile, a=action: self._desktop_profile_action(a, p["id"]), font_small)
+                        button.setEnabled_(enabled)
+                    extra_y += 22
+                if profile.get("code_usage"):
+                    label = _label(profile["code_usage"], font_small, pal["muted"], NSMakeRect(54, extra_y, width - 66, 18))
+                    label.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+                    label.setToolTip_(profile["code_usage"])
+                    group.addSubview_(label)
             y += row_h
 
     def _build_settings(self):

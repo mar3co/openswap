@@ -89,12 +89,14 @@ class ClaudeLoginRun:
         timeout: float = DEFAULT_TIMEOUT_S,
         popen=subprocess.Popen,
         clock=time.monotonic,
+        env: dict[str, str] | None = None,
     ) -> None:
         self._argv = login_argv(claude_bin, email)
         self._on_done = on_done
         self._timeout = timeout
         self._popen = popen
         self._clock = clock
+        self._env = dict(env) if env is not None else None
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
         self._canceled = False
@@ -126,6 +128,7 @@ class ClaudeLoginRun:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            **({"env": self._env} if self._env is not None else {}),
         )
         with self._lock:
             self._proc = proc

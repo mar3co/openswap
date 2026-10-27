@@ -254,6 +254,8 @@ def run(switcher, codex=None) -> int:
                 notify=lambda title, body: self._notify(NotificationCopy(title=title, body=body)),
                 enabled=lambda: self.settings.desktop_features_enabled,
                 blocked=lambda: self._desktop_switching,
+                code_engine=self.switcher,
+                code_login_allowed=lambda: getattr(self, "_claude_login", None) is None,
             )
             self._desktop_app_lock = threading.Lock()
             self._chatgpt_capability = DesktopCapability("checking", "checking")
@@ -3695,6 +3697,8 @@ def run(switcher, codex=None) -> int:
             self.refresh_async(full=True)  # explicit user refresh → full pass
 
         def on_quit(self, _sender):
+            if getattr(self, "_claude_desktop_profiles", None) is not None:
+                self._claude_desktop_profiles.suspend_checks()
             if self._status_icon_animator is not None:
                 self._status_icon_animator.stop()
             if self._login_session is not None:

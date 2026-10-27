@@ -14,6 +14,9 @@ desktop app features**, then open the main **Claude Desktop** tab. Your existing
 Claude profile appears as **Default** automatically. **Add profile** creates
 additional Personal, Work or other profiles. Email and organization update automatically
 after sign-in or account changes. Each profile can stay open with its own sign-in.
+OpenSwap automatically links or adds the same account and organization to
+Claude Code. Complete browser authorization if Claude asks; no separate add
+step or checkbox is needed. Linked profiles show the Code account's usage.
 **Create shortcut…** makes a launcher for Finder and the Dock, with an optional
 number and colored badge on Claude's icon. Claude Code switching and rotation
 stay independent. The Desktop app picker also contains ChatGPT's controls.

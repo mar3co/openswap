@@ -61,7 +61,8 @@ def test_detects_selected_org_not_first_membership_and_never_saves(setup):
     files = {p: p.read_bytes() for p in (store.registry, desktop / "Cookies", desktop / "config.json")}
     result = detect(setup)
     assert result["email"] == "same@example.test" and result["organization"] == "Acme"
-    assert set(result) == {"email", "organization", "detected_at"}
+    assert set(result) == {"email", "organization", "detected_at", "account_uuid", "organization_uuid", "detected_login"}
+    assert result["account_uuid"] == ACCOUNT and result["organization_uuid"] == ORG_B
     assert files == {p: p.read_bytes() for p in files}
     app.validate.assert_called_once()
 
@@ -139,7 +140,7 @@ def test_metadata_upgrade_keeps_ids_and_data_without_inventing_identity(setup, v
     before = (desktop / "Cookies").read_bytes()
     assert store.get(p.id).email == ""
     store.update(p.id, email="new@example.test")
-    assert json.loads(store.registry.read_text())["version"] == 5
+    assert json.loads(store.registry.read_text())["version"] == 6
     assert (desktop / "Cookies").read_bytes() == before
     if version == 3:
         assert store.get(p.id).badge == "8"

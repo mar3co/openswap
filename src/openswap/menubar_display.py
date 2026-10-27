@@ -1012,7 +1012,7 @@ def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str]
     disabled = bool(state.get("busy"))
     rows.append({"kind": "profiles_header", "id": "claude_desktop_add", "label": "Profiles",
                  "title": "Add profile" if active else "", "disabled": disabled or bool(state.get("storage_error"))})
-    hint("claude_desktop_separation", "Default is your existing Claude profile. Add profiles for additional sign-ins. Claude Code switching stays separate.")
+    hint("claude_desktop_separation", "Default is your existing Claude profile. Signed-in profiles are added to Claude Code automatically.")
     if state.get("storage_error"):
         hint("claude_desktop_storage_error_hint", state["storage_error"])
         rows.append({"kind": "button", "id": "claude_desktop_storage_error", "label": "Profile storage",
@@ -1029,6 +1029,31 @@ def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str]
         if "claude_desktop_archived" in expanded:
             rows.append({"kind": "profiles", "id": "claude_desktop_archived_profiles", "items": archived, "disabled": disabled})
     return rows
+
+
+def desktop_profile_usage(profile: dict, cards: list[dict]) -> str:
+    """Reuse the Code snapshot only when both its slot and org still match."""
+    if profile.get("archived") or not profile.get("account_uuid") or not profile.get("organization_uuid"):
+        return ""
+    for card in cards:
+        known = card.get("identity")
+        if (str(card["num"]) != str(profile.get("code_slot")) or card.get("provider") != "claude"
+                or not known or (known[0].casefold(), known[1].lower()) !=
+                (profile.get("email", "").casefold(), profile["organization_uuid"])):
+            continue
+        if card.get("windows"):
+            usage = " · ".join(f"{w['label']} {w['pct']:.0f}%" for w in card["windows"])
+            return ("Last known: " if card.get("stale") else "Usage: ") + usage
+        return "Usage unavailable"
+    return ""
+
+
+def desktop_profile_height(profile: dict) -> float:
+    height = 76.0 if profile.get("email") or profile.get("organization") else 58.0
+    if not profile.get("archived"):
+        height += 22 if profile.get("code_status") else 0
+        height += 18 if profile.get("code_usage") else 0
+    return height
 
 
 def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str] | None = None) -> list[dict]:
@@ -1052,10 +1077,10 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
     for key, title, body in (
         ("open", "Opening profiles", "Open profile brings it forward. Other profiles keep running."),
         ("shortcut", "Shortcuts and icons", "Choose Create shortcut in a profile's menu, then drag it from Finder to the Dock. Claude's running icon stays unchanged."),
-        ("signin", "Sign-in", "Sign in inside each profile. Check its account and workspace; Running only means the app is open."),
+        ("signin", "Sign-in", "Sign in inside each profile. OpenSwap adds its account to Claude Code automatically. Complete browser authorization if asked; Continue setup resumes a canceled sign-in. Your current CLI account stays selected."),
         ("details", "Account details", "Your existing Claude profile appears as Default automatically. Add profile creates an additional sign-in. Email and organization update automatically; macOS may request Keychain access. Manage updates in Account details."),
-        ("archive", "Archiving", "Keeps sign-ins, data and open windows. Shortcuts are disabled until restored. Restore does not open the profile."),
-        ("limits", "Limitations", "Check the account inside Code and Cowork. Chrome pairing is unavailable. OpenSwap does not verify the account or usage."),
+        ("archive", "Archiving", "Keeps sign-ins, data and open windows. Shortcuts are disabled until restored. Saved Claude Code accounts stay available. Restore does not open the profile."),
+        ("limits", "Limitations", "Usage comes from the matching Claude Code account. Check the account inside Code and Cowork. Chrome pairing is unavailable."),
     ):
         hint(f"claude_desktop_{key}_hint", f"{title}: {body}" if key != "limits" else body)
     return [{"section": SETTINGS_SECTION_DESKTOP, **row} for row in rows]
@@ -2584,6 +2609,7 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 "provider": provider,
                 "email": email,
                 "alias": alias or "",
+                "identity": (snapshot.get("identities") or {}).get(str(num)),
             }
         )
     return cards

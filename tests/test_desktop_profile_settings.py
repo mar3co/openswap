@@ -29,7 +29,7 @@ def test_empty_main_tab_offers_add_and_settings_keep_guidance_collapsed():
     assert settings["claude_desktop_help"]["value"] is False
     assert "claude_desktop_check" in settings and "claude_desktop_check" not in by_id
     assert "claude_desktop_profiles" not in settings and "claude_desktop_add" not in settings
-    assert "Claude Code switching stays separate" in by_id["claude_desktop_separation"]["label"]
+    assert "added to Claude Code automatically" in by_id["claude_desktop_separation"]["label"]
     assert not any(row["id"].endswith(("open_hint", "signin_hint", "archive_hint")) for row in rows)
     assert not any(row.get("title") == "Manage…" for row in rows)
 

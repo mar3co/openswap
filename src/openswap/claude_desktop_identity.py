@@ -2,8 +2,9 @@
 
 No default-profile fallback, Code credentials, writes to Claude's files or token
 refresh. Default is discovered only while Desktop features are enabled.
-Decrypted cookies and the macOS key exist only in memory; only display labels
-and a detection timestamp leave this module. Claude's private bootstrap API and
+Decrypted cookies and the macOS key exist only in memory; only display labels,
+account/organization IDs, a login hash and detection timestamp leave this module.
+Claude's private bootstrap API and
 Chromium v24 cookie format may change: an unknown shape fails without guessing.
 """
 
@@ -237,6 +238,7 @@ def _labels(data, org_id, expected_account):
     if not email or not organization:
         raise DetectionError(UNAVAILABLE)
     return {"email": email, "organization": organization,
+            "account_uuid": account["uuid"].lower(), "organization_uuid": org_id.lower(),
             "detected_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
@@ -349,6 +351,7 @@ def detect_account(store: DesktopProfiles, identifier: str, *, app=None, key_pro
         if expected_fingerprint is not None and not current.auto_detect:
             raise DetectionError("Automatic account detection was turned off.")
         result = _labels(_bootstrap(cookies), org_id, before[0])
+        result["detected_login"] = login_fingerprint(before)
         store.get(identifier)
         store._directories(profile)
         if _snapshot(desktop) != before:

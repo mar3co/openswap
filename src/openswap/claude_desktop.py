@@ -129,6 +129,11 @@ class Profile:
     detected_at: str = ""
     kind: str = "managed"
     auto_detect: bool = True
+    account_uuid: str = ""
+    organization_uuid: str = ""
+    code_setup_key: str = ""
+    code_setup_state: str = ""
+    detected_login: str = ""
 
 
 class DesktopProfiles:
@@ -182,7 +187,7 @@ class DesktopProfiles:
             if self.registry.stat().st_size > 256_000:
                 raise ValueError
             data = json.loads(self.registry.read_text(encoding="utf-8"))
-            if not isinstance(data, dict) or set(data) != {"version", "profiles"} or type(data["version"]) is not int or data["version"] not in (1, 2, 3, 4, 5):
+            if not isinstance(data, dict) or set(data) != {"version", "profiles"} or type(data["version"]) is not int or data["version"] not in (1, 2, 3, 4, 5, 6):
                 raise ValueError
             rows = data["profiles"]
             if not isinstance(rows, list) or len(rows) > 100:
@@ -192,7 +197,9 @@ class DesktopProfiles:
             for index, row in enumerate(rows):
                 extra = {1: set(), 2: {"code_account"}, 3: {"badge", "color"},
                          4: {"badge", "color", "email", "organization", "detected_at"},
-                         5: {"badge", "color", "email", "organization", "detected_at", "kind", "auto_detect"}}[data["version"]]
+                         5: {"badge", "color", "email", "organization", "detected_at", "kind", "auto_detect"},
+                         6: {"badge", "color", "email", "organization", "detected_at", "kind", "auto_detect",
+                             "account_uuid", "organization_uuid", "code_setup_key", "code_setup_state", "detected_login"}}[data["version"]]
                 keys = {"id", "name", "archived"} | extra
                 if not isinstance(row, dict) or set(row) != keys:
                     raise ValueError
@@ -216,13 +223,15 @@ class DesktopProfiles:
                     if email != row["email"] or organization != row["organization"]:
                         raise ValueError
                     self._validate_detection_time(detected_at, email, organization)
-                kind = row["kind"] if data["version"] == 5 else "managed"
-                automatic = row["auto_detect"] if data["version"] == 5 else not ((email or organization) and not detected_at)
+                kind = row["kind"] if data["version"] >= 5 else "managed"
+                automatic = row["auto_detect"] if data["version"] >= 5 else not ((email or organization) and not detected_at)
                 if kind not in ("managed", "default") or type(automatic) is not bool:
                     raise ValueError
                 if kind == "default" and any(p.kind == "default" for p in profiles):
                     raise ValueError
-                profiles.append(Profile(pid, name, row["archived"], badge, color, email, organization, detected_at, kind, automatic))
+                code_identity = {k: row[k] for k in ("account_uuid", "organization_uuid", "code_setup_key", "code_setup_state", "detected_login")} if data["version"] >= 6 else {}
+                self._validate_code_identity(detected_at=detected_at, **code_identity)
+                profiles.append(Profile(pid, name, row["archived"], badge, color, email, organization, detected_at, kind, automatic, **code_identity))
             return [p for p in profiles if include_archived or not p.archived]
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
             raise ClaudeDesktopError("Claude Desktop profile metadata is invalid. Restore profiles.json from a backup; it has not been replaced.") from exc
@@ -295,7 +304,7 @@ class DesktopProfiles:
         fd, raw = tempfile.mkstemp(prefix=".profiles-", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 5, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
+                json.dump({"version": 6, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -319,6 +328,24 @@ class DesktopProfiles:
             return profile
 
     @staticmethod
+    def _validate_code_identity(*, detected_at="", account_uuid="", organization_uuid="", code_setup_key="", code_setup_state="", detected_login=""):
+        for value in (account_uuid, organization_uuid):
+            if not isinstance(value, str) or (value and not re.fullmatch(r"[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}", value)):
+                raise ValueError("Invalid detected identity")
+        if bool(account_uuid) != bool(organization_uuid) or (account_uuid and not detected_at):
+            raise ValueError("Incomplete detected identity")
+        if not isinstance(detected_login, str) or (detected_login and not re.fullmatch(r"[a-f0-9]{64}", detected_login)):
+            raise ValueError("Invalid detected login")
+        if bool(account_uuid) != bool(detected_login):
+            raise ValueError("Missing detected login")
+        if not isinstance(code_setup_key, str) or (code_setup_key and not re.fullmatch(r"[a-f0-9]{64}", code_setup_key)):
+            raise ValueError("Invalid Code setup key")
+        if code_setup_state not in ("", "authorizing", "connected", "sign_in", "install", "mismatch", "failed"):
+            raise ValueError("Invalid Code setup state")
+        if bool(code_setup_key) != bool(code_setup_state):
+            raise ValueError("Incomplete Code setup state")
+
+    @staticmethod
     def _validate_detection_time(value, email, organization):
         if not isinstance(value, str) or len(value) > 40:
             raise ValueError("Invalid detection time")
@@ -328,7 +355,10 @@ class DesktopProfiles:
     def update(self, identifier: str, *, name: str | None = None, archived: bool | None = None,
                badge: str | None = None, color: str | None = None, email: str | None = None,
                organization: str | None = None, detected_at: str | None = None,
-               auto_detect: bool | None = None, expected: Profile | None = None) -> Profile:
+               auto_detect: bool | None = None, expected: Profile | None = None,
+               account_uuid: str | None = None, organization_uuid: str | None = None,
+               code_setup_key: str | None = None, code_setup_state: str | None = None,
+               detected_login: str | None = None) -> Profile:
         if name is not None:
             name = _name(name)
         if archived is not None and type(archived) is not bool:
@@ -352,15 +382,25 @@ class DesktopProfiles:
             new_time = current.detected_at if email is None and organization is None else ""
             if detected_at is not None:
                 new_time = detected_at
+            # Display labels alone can never authorize or link a Code account.
+            preserve_identity = bool(new_time and new_email == current.email and new_org == current.organization)
+            ids = {
+                "account_uuid": account_uuid if account_uuid is not None else (current.account_uuid if preserve_identity else ""),
+                "organization_uuid": organization_uuid if organization_uuid is not None else (current.organization_uuid if preserve_identity else ""),
+                "detected_login": detected_login if detected_login is not None else (current.detected_login if preserve_identity else ""),
+                "code_setup_key": current.code_setup_key if code_setup_key is None else code_setup_key,
+                "code_setup_state": current.code_setup_state if code_setup_state is None else code_setup_state,
+            }
             try:
                 self._validate_detection_time(new_time, new_email, new_org)
+                self._validate_code_identity(detected_at=new_time, **ids)
             except ValueError as exc:
                 raise ClaudeDesktopError("Invalid account detection details.") from exc
             updated = replace(current, name=current.name if name is None else name,
                               archived=current.archived if archived is None else archived,
                               badge=new_badge, color=new_color, email=new_email,
                               organization=new_org, detected_at=new_time,
-                              auto_detect=current.auto_detect if auto_detect is None else auto_detect)
+                              auto_detect=current.auto_detect if auto_detect is None else auto_detect, **ids)
             self._save([updated if p.id == current.id else p for p in rows])
             return updated
 
