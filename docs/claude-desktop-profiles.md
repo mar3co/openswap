@@ -30,7 +30,7 @@ A profile name is your label, not an account identity.
 With Desktop features enabled, the main tabs are **Claude Code**, **Claude Desktop**,
 and **Codex**. Turning Desktop features off hides the Claude Desktop tab.
 Each profile has an **Open** button and a **•••** menu for **Create shortcut…**,
-**Account details…**, **Rename…**, and **Archive…**. The same actions are available under
+**Finish sign-in…**, **Account details…**, **Rename…**, and **Archive…**. The same actions are available under
 **More → Claude Desktop profiles**. App checks and **About profiles** help remain
 under **Settings → Desktop → Claude Desktop**. The gear button on the Claude
 Desktop tab opens those settings; Back returns to the profile list.
@@ -45,6 +45,28 @@ Claude handles sign-in inside each profile. OpenSwap does not transfer credentia
 between profiles. Default references the existing profile without copying it. The personal/Team/Enterprise selection
 within one email still happens inside Claude. Creating a profile does not
 create an Anthropic account or subscription.
+
+## When sign-in opens the wrong window
+
+Claude's browser return link uses the shared `claude://` handler. Separate data
+folders do not tell macOS which running profile should receive it, so **Open
+Claude** can activate the original instance. Automatic callback routing is not
+provided by the profile launcher.
+
+Keep the intended profile open on its sign-in screen. On the browser's finish
+page, right-click **Open Claude** and copy its link. In OpenSwap, open that
+profile's **••• → Finish sign-in…**, paste the link and choose **Send to profile**.
+If it expired or was already consumed, start sign-in again in that profile and
+copy the fresh link. Check the resulting account inside Claude.
+
+This action targets the exact running process after checking the signed Claude
+app and profile folder. It refuses missing, ambiguous or changed processes and
+never falls back to Default, launches another instance or changes the system
+URL handler. Only the inspected Google, email magic-link and SSO login routes
+are accepted. The input is masked; links are not stored, logged or included in
+process arguments. A delivery acknowledgement does not establish successful
+authentication. Google callbacks still require Claude's matching in-memory
+login nonce. Other callback formats require separate support.
 
 ## One setup flow for Desktop and Code
 
@@ -255,7 +277,7 @@ Claude owns its Keychain entries; OpenSwap does not delete them.
 
 ## Implementation and verification
 
-Automatic Code setup passed **1,616 focused tests**, with three real-Keychain
+Desktop profiles, Code setup and callback recovery passed **1,737 focused tests**, with three real-Keychain
 CI tests skipped locally. These include isolated login, exact account and
 organization matching, deduplication, paused retries, account changes during
 authorization, credential-write failure, worker leases, usage sharing, and the
@@ -263,6 +285,14 @@ existing account-switching and credential tests. **15 native dialog tests**
 also passed. Native light/dark previews cover linked usage, browser sign-in,
 cancel/retry actions and long labels. These previews use fixture accounts;
 authenticated provider authorization remains a live acceptance check below.
+
+Callback recovery was checked with two real, disposable signed-out Claude
+instances: macOS acknowledged an event addressed to the selected profile's PID.
+The callback used invalid fixture credentials; no authenticated login was
+attempted. Automated cases cover route validation, profile selection, missing
+or ambiguous processes, app updates, native delivery errors and secret-free
+errors/results. The browser still uses its shared handler until the user copies
+the link into the profile-specific recovery action.
 
 The inspected Claude Desktop version is **3.6556.2**, bundle
 `com.anthropic.claudefordesktop`, publisher team `Q6L2SF6YDW`.

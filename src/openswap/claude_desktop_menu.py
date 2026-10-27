@@ -36,7 +36,7 @@ def has_saved_profiles() -> bool:
 class ClaudeDesktopMenu:
     def __init__(self, *, prompt, show_error, changed, notify, store=None, app_factory=None, show_status=None, enabled=None,
                  blocked=None, shortcut_factory=None, reveal=None, confirm=None, detector=None, monitor=None,
-                 code_engine=None, code_connector=None, code_login_allowed=None):
+                 code_engine=None, code_connector=None, code_login_allowed=None, signin_sender=None):
         self.store = store or DesktopProfiles()
         self.prompt = prompt
         self.show_error = show_error
@@ -56,6 +56,7 @@ class ClaudeDesktopMenu:
             from openswap.menubar_display import resolve_claude_bin
             self.code = DesktopCodeConnector(self.store, code_engine, resolve_binary=resolve_claude_bin, notify=self._notify)
         self.code_login_allowed = code_login_allowed or (lambda: True)
+        self.signin_sender = signin_sender
         self._editing_details = False
         self.operation = "Opening Claude…"
         self.busy = False
@@ -170,6 +171,7 @@ class ClaudeDesktopMenu:
                                    callback=lambda _, p=profile: self.open(p.id)))
             item.add(rumps.MenuItem("Rename…", callback=lambda _, p=profile: self.rename(p)))
             item.add(rumps.MenuItem("Account details…", callback=lambda _, p=profile: self.details(p)))
+            item.add(rumps.MenuItem("Finish sign-in…", callback=lambda _, p=profile: self.finish_signin(p)))
             if self.code:
                 action = self.code.state(profile).get("code_action")
                 if action:
@@ -211,7 +213,7 @@ class ClaudeDesktopMenu:
             return self.add()
         if action == "storage_error":
             return self.storage_error()
-        if action not in {"open", "rename", "archive", "restore", "shortcut", "details", "connect_code", "cancel_code"}:
+        if action not in {"open", "rename", "archive", "restore", "shortcut", "details", "finish_signin", "connect_code", "cancel_code"}:
             return
         try:
             profile = self.store.get(identifier, include_archived=action == "restore")
@@ -267,6 +269,42 @@ class ClaudeDesktopMenu:
                                default_text=profile.name, ok="Save", cancel="Cancel")
         if response.clicked == 1:
             self.edit(profile, name=response.text)
+
+    def finish_signin(self, profile):
+        if self.busy or self.blocked() or not self.enabled():
+            return
+        from openswap.claude_desktop_signin import finish_signin, signin_link
+        response = self.prompt(
+            title=f"Finish sign-in to {profile.name}",
+            message='If the browser opened the wrong Claude window, right-click “Open Claude” and copy its link. Paste it below to send it to this profile.\n\nKeep this profile open. If the link expired or was already used, restart sign-in in that window.',
+            input_label="Sign-in link", placeholder="Paste the Open Claude link",
+            default_text="", secure=True, ok="Send to profile", cancel="Cancel")
+        if response.clicked != 1 or self.busy or self.blocked() or not self.enabled():
+            return
+        try:
+            value = signin_link(response.text)
+        except ClaudeDesktopError as exc:
+            self._error(exc)
+            return
+        self.busy = True
+        self.operation = "Finishing sign-in…"
+        self.changed()
+
+        def work():
+            try:
+                result = finish_signin(self.store, profile.id, value, app=self._app_factory(), sender=self.signin_sender)
+                self._results.put((result, None))
+            except Exception:
+                # A callback is a credential. Keep native error details and the
+                # pasted value out of UI errors, result queues and logs.
+                self._results.put((None, ClaudeDesktopError("Could not finish sign-in. Keep this profile open, restart sign-in there and copy a fresh Open Claude link.")))
+
+        try:
+            threading.Thread(target=work, daemon=True, name="claude-profile-signin").start()
+        except Exception:
+            self.busy = False
+            self.changed()
+            self.show_error("Could not finish sign-in. Try again.")
 
     def details(self, profile, *, draft=None, note=""):
         if self.busy or self.blocked() or not self.enabled():
@@ -469,4 +507,8 @@ class ClaudeDesktopMenu:
             focus_profile(result["pid"])
         except Exception:
             pass  # opening succeeded; focus failure is not a login failure
+        if result.get("state") == "signin_sent":
+            self.monitor.refresh(result["profile"]["id"])
+            self._notify("Sign-in link sent", f"Check sign-in in {result['profile']['name']}.")
+            return
         self._notify("Claude profile opened", f"{result['profile']['name']} · Check the account in Claude.")
