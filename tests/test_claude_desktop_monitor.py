@@ -1,6 +1,7 @@
 """Default discovery and automatic identity must preserve logins and user edits."""
 
 import json
+import os
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -334,7 +335,8 @@ def test_denial_survives_restart_feature_toggle_and_adding_profiles(store, monke
     first = AccountDetector(store)
     with pytest.raises(KeyAccessError): first._get_key()
     assert store.keychain_paused()
-    assert (store.root / "keychain-paused").stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert (store.root / "keychain-paused").stat().st_mode & 0o777 == 0o600
     store.add("Another profile")
     first.clear()
     restarted = AccountDetector(store)
@@ -360,6 +362,14 @@ def test_quitting_during_request_preserves_pause_until_explicit_retry(store, mon
     with pytest.raises(KeyAccessError): detector._get_key()
     assert detector.denied and AccountDetector(store).denied
     assert detector._cached_key is None
+
+
+def test_pause_marker_uses_exclusive_create_when_nofollow_is_unavailable(store, monkeypatch):
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    store.pause_keychain(True)
+    assert store.keychain_paused()
+    store.pause_keychain(False)
+    assert not store.keychain_paused()
 
 
 def test_unreadable_pause_marker_cannot_trigger_prompt(store, tmp_path, monkeypatch):

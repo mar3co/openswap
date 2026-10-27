@@ -177,7 +177,9 @@ class DesktopProfiles:
             if not paused:
                 path.unlink(missing_ok=True)
             elif not present:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                # O_EXCL | O_CREAT already refuses an existing link; retain
+                # O_NOFOLLOW where available without requiring it for metadata.
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
                 os.close(fd)
 
     def list(self, *, include_archived: bool = False) -> list[Profile]:

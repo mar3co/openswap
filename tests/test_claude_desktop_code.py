@@ -1,6 +1,7 @@
 """Automatic Desktop -> Code onboarding with isolated auth and exact identity."""
 
 import json
+import os
 import threading
 import time
 from dataclasses import asdict
@@ -363,6 +364,7 @@ def test_stale_detected_identity_cannot_start_code_authorization(setup):
     assert not s.calls and s.engine.sequence_data()["accounts"] == {}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Completed Desktop auth reads use the macOS/POSIX no-follow reader")
 def test_personal_account_can_use_completed_oauth_org_when_profile_omits_it(setup):
     s = setup
     s.oracle.return_value["organizationUuid"] = None

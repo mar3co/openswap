@@ -41,11 +41,15 @@ def cookie_store(store, profile, *, org=ORG_B):
 
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
+    if os.name == "nt":
+        pytest.skip("The macOS cookie reader requires POSIX no-follow opens and file ownership checks")
     store = DesktopProfiles(tmp_path / "profiles")
     profile = store.add("Work")
     desktop = cookie_store(store, profile)
     app = Mock()
-    monkeypatch.setattr(identity.sys, "platform", "darwin")
+    # Never replace process-wide sys.platform: the real file-lock backend must
+    # continue to match the host where it was imported.
+    monkeypatch.setattr(identity, "sys", SimpleNamespace(platform="darwin"))
     monkeypatch.setattr(identity, "_bootstrap", Mock(return_value=bootstrap()))
     monkeypatch.setattr(identity, "_key", Mock(side_effect=AssertionError("No Keychain for plaintext fixtures")))
     return store, profile, desktop, app
