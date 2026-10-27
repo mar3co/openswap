@@ -1,8 +1,8 @@
-"""Deliver an explicitly pasted sign-in link to one verified Claude process.
+"""Deliver a sign-in callback to one verified Claude process.
 
 macOS's shared claude:// handler cannot select a user-data-dir. This recovery
-path addresses a running process directly; it never registers a URL handler,
-launches another instance, stores the link, or puts it in subprocess arguments.
+path addresses a running process directly; it never launches another instance,
+stores the link, or puts it in subprocess arguments.
 Claude remains responsible for validating and consuming the login callback.
 """
 
@@ -13,7 +13,7 @@ from urllib.parse import parse_qsl, urlsplit
 from openswap.claude_desktop import BUNDLE_ID, ClaudeDesktopApp, ClaudeDesktopError
 
 
-INVALID_LINK = 'Copy the link from the browser’s “Open Claude” button, then paste it here.'
+INVALID_LINK = 'This sign-in link is incomplete or unsupported. Restart sign-in in the intended Claude profile.'
 
 
 def signin_link(value: str) -> str:
@@ -74,7 +74,7 @@ def send_to_process(pid: int, value: str, binary: Path) -> None:
         raise ClaudeDesktopError("Claude could not accept the sign-in link. Restart sign-in in this profile.")
 
 
-def finish_signin(store, identifier, value, *, app=None, sender=None):
+def finish_signin(store, identifier, value, *, app=None, sender=None, expected_pid=None):
     value = signin_link(value)
     app = app or ClaudeDesktopApp()
     app.validate()
@@ -83,8 +83,8 @@ def finish_signin(store, identifier, value, *, app=None, sender=None):
         desktop, code = store._directories(profile)
         argv = [str(app.binary)] if code is None else [str(app.binary), f"--user-data-dir={desktop}"]
         pid = app._running(argv, desktop)
-        if pid is None:
-            raise ClaudeDesktopError("Open this Claude profile and start sign-in there before pasting the link.")
+        if pid is None or (expected_pid is not None and pid != expected_pid):
+            raise ClaudeDesktopError("This Claude profile closed or restarted. Open it and restart sign-in.")
         try:
             if app._validation_stamp is None or app._stamp() != app._validation_stamp:
                 raise ClaudeDesktopError("Claude updated during sign-in. Open this profile and restart sign-in.")

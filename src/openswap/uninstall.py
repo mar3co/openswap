@@ -129,6 +129,7 @@ def remove_integrations(
     home = home if home is not None else Path.home()
     removal = Removal()
     steps = (
+        ("Claude Desktop link handling", lambda: _restore_claude_links(home)),
         ("menu bar login item", lambda: _remove_menubar_agent(home, uid)),
         ("menu bar's runtime files", _remove_menubar_state),
         ("setup wizard state", _reset_welcome),
@@ -143,6 +144,13 @@ def remove_integrations(
         except Exception as e:
             removal.failed.append(f"{name}: {e}")
     return removal
+
+
+def _restore_claude_links(home: Path) -> bool:
+    if sys.platform != "darwin" or home != Path.home():
+        return False
+    from openswap.claude_desktop_links import restore_for_uninstall
+    return restore_for_uninstall()
 
 
 def _ours(plist: Path) -> bool:

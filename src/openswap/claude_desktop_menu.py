@@ -57,6 +57,7 @@ class ClaudeDesktopMenu:
             self.code = DesktopCodeConnector(self.store, code_engine, resolve_binary=resolve_claude_bin, notify=self._notify)
         self.code_login_allowed = code_login_allowed or (lambda: True)
         self.signin_sender = signin_sender
+        self.signin_links = None
         self._editing_details = False
         self.operation = "Opening Claude…"
         self.busy = False
@@ -76,6 +77,8 @@ class ClaudeDesktopMenu:
         self.monitor.suspend()
         if self.code:
             self.code.suspend()
+        if self.signin_links:
+            self.signin_links.restore()
 
     def _profiles(self):
         self._default_error = ""
@@ -171,7 +174,7 @@ class ClaudeDesktopMenu:
                                    callback=lambda _, p=profile: self.open(p.id)))
             item.add(rumps.MenuItem("Rename…", callback=lambda _, p=profile: self.rename(p)))
             item.add(rumps.MenuItem("Account details…", callback=lambda _, p=profile: self.details(p)))
-            item.add(rumps.MenuItem("Finish sign-in…", callback=lambda _, p=profile: self.finish_signin(p)))
+            item.add(rumps.MenuItem("Reconnect sign-in…", callback=lambda _, p=profile: self.reconnect_signin(p)))
             if self.code:
                 action = self.code.state(profile).get("code_action")
                 if action:
@@ -213,7 +216,7 @@ class ClaudeDesktopMenu:
             return self.add()
         if action == "storage_error":
             return self.storage_error()
-        if action not in {"open", "rename", "archive", "restore", "shortcut", "details", "finish_signin", "connect_code", "cancel_code"}:
+        if action not in {"open", "rename", "archive", "restore", "shortcut", "details", "reconnect_signin", "connect_code", "cancel_code"}:
             return
         try:
             profile = self.store.get(identifier, include_archived=action == "restore")
@@ -247,7 +250,7 @@ class ClaudeDesktopMenu:
             return
         response = self.prompt(
             title="Create Claude Desktop profile",
-            message="Sign in to the new Claude window. OpenSwap adds the same account to Claude Code; finish authorization in your browser if asked.\n\nAllow Keychain access to detect the account. If denied, retry in Account details → Detect.",
+            message="Sign in to the new Claude window. Allow OpenSwap to open Claude links if macOS asks, so sign-in can return to the right window.\n\nOpenSwap detects the account with Keychain access and adds it to Claude Code. Finish browser authorization if asked.",
             input_label="Profile name", placeholder="e.g. Work",
             default_text="", ok="Create and open", cancel="Cancel",
         )
@@ -270,34 +273,74 @@ class ClaudeDesktopMenu:
         if response.clicked == 1:
             self.edit(profile, name=response.text)
 
-    def finish_signin(self, profile):
+    def reconnect_signin(self, profile):
         if self.busy or self.blocked() or not self.enabled():
             return
-        from openswap.claude_desktop_signin import finish_signin, signin_link
-        response = self.prompt(
-            title=f"Finish sign-in to {profile.name}",
-            message='If the browser opened the wrong Claude window, right-click “Open Claude” and copy its link. Paste it below to send it to this profile.\n\nKeep this profile open. If the link expired or was already used, restart sign-in in that window.',
-            input_label="Sign-in link", placeholder="Paste the Open Claude link",
-            default_text="", secure=True, ok="Send to profile", cancel="Cancel")
-        if response.clicked != 1 or self.busy or self.blocked() or not self.enabled():
+        if self.signin_links is None:
+            self.show_error("Automatic sign-in needs the OpenSwap app. Open the installed app and try again.")
             return
+        self.signin_links.prepare(retry=True)
+        self.open(profile.id)
+
+    def receive_signin(self, value, fresh):
+        """External email/fallback links have no trustworthy profile binding.
+
+        Native web-auth returns bypass OpenSwap and reach the origin process.
+        Only unbound links need this one-click choice; never select by recency,
+        inferred email, or the number of running profiles.
+        """
+        if self.busy or self.blocked() or not self.enabled() or not fresh():
+            return
+        from openswap.claude_desktop_signin import finish_signin, signin_link
         try:
-            value = signin_link(response.text)
-        except ClaudeDesktopError as exc:
+            value = signin_link(value)
+            app = self._app_factory()
+            app.validate()
+            candidates = []
+            for profile in self._profiles():
+                if profile.archived:
+                    continue
+                desktop, code = self.store.paths(profile)
+                argv = [str(app.binary)] if code is None else [str(app.binary), f"--user-data-dir={desktop}"]
+                pid = app._running(argv, desktop)
+                if pid is not None:
+                    candidates.append((profile, pid))
+        except (ClaudeSwitchError, OSError) as exc:
             self._error(exc)
             return
+        if not candidates:
+            self.show_error("Open the intended Claude profile and restart sign-in there.")
+            return
+        self._editing_details = True
+        try:
+            response = self.prompt(title="Finish Claude sign-in", message="Which profile did you start signing in to?",
+                                   choices=[p.name for p, _ in candidates], selected=0,
+                                   ok="Continue", cancel="Cancel")
+        finally:
+            self._editing_details = False
+        if response.clicked != 1 or not 0 <= response.choice < len(candidates):
+            return
+        if not fresh():
+            self.show_error("This sign-in link expired. Restart sign-in in the intended profile.")
+            return
+        if self.busy or self.blocked() or not self.enabled():
+            return
+        profile, pid = candidates[response.choice]
         self.busy = True
         self.operation = "Finishing sign-in…"
         self.changed()
 
         def work():
             try:
-                result = finish_signin(self.store, profile.id, value, app=self._app_factory(), sender=self.signin_sender)
+                if not fresh() or not self.enabled():
+                    raise ClaudeDesktopError("Sign-in interrupted")
+                result = finish_signin(self.store, profile.id, value, app=self._app_factory(),
+                                       sender=self.signin_sender, expected_pid=pid)
                 self._results.put((result, None))
             except Exception:
                 # A callback is a credential. Keep native error details and the
-                # pasted value out of UI errors, result queues and logs.
-                self._results.put((None, ClaudeDesktopError("Could not finish sign-in. Keep this profile open, restart sign-in there and copy a fresh Open Claude link.")))
+                # callback out of UI errors, result queues and logs.
+                self._results.put((None, ClaudeDesktopError("Could not finish sign-in. Restart sign-in in the intended Claude profile.")))
 
         try:
             threading.Thread(target=work, daemon=True, name="claude-profile-signin").start()
@@ -461,6 +504,8 @@ class ClaudeDesktopMenu:
             self._results.put((None, exc))
 
     def poll(self):
+        if self.signin_links:
+            self.signin_links.poll(idle=not (self.busy or self.blocked() or self._editing_details))
         if self.monitor.poll(enabled=self.enabled(), idle=not (self.busy or self.blocked() or self._editing_details)):
             self.changed()
         if self.code and self.code.poll(enabled=self.enabled(), idle=not (self.busy or self.blocked() or self._editing_details) and self.code_login_allowed()):
@@ -511,4 +556,6 @@ class ClaudeDesktopMenu:
             self.monitor.refresh(result["profile"]["id"])
             self._notify("Sign-in link sent", f"Check sign-in in {result['profile']['name']}.")
             return
+        if self.signin_links and self.enabled():
+            self.signin_links.prepare()
         self._notify("Claude profile opened", f"{result['profile']['name']} · Check the account in Claude.")

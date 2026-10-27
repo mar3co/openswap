@@ -17,8 +17,10 @@ after sign-in or account changes. Each profile can stay open with its own sign-i
 OpenSwap automatically links or adds the same account and organization to
 Claude Code. Complete browser authorization if Claude asks; no separate add
 step or checkbox is needed. Linked profiles show the Code account's usage.
-If the browser's **Open Claude** button returns to the wrong window, copy its
-link and use the intended profile's **Finish sign-in…** action.
+With OpenSwap running, browser sign-in uses macOS sessions to return to the
+profile that started it. Allow OpenSwap to open Claude links if macOS asks.
+Email links and fallback redirects may ask you to choose a profile; no copying
+or pasting is needed.
 **Create shortcut…** makes a launcher for Finder and the Dock, with an optional
 number and colored badge on Claude's icon. Claude Code switching and rotation
 stay independent. The Desktop app picker also contains ChatGPT's controls.

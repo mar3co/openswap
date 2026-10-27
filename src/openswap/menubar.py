@@ -146,7 +146,10 @@ def run(switcher, codex=None) -> int:
         # launchd started this copy, so the last failed start is history.
         launch_agent.clear_start_failure(switcher.backup_dir)
     # The login item is the copy that should run: start it and step aside.
-    if not as_login_item and hand_over_to_login_item(
+    # A registered URL handler must first receive its pending Apple event;
+    # exiting here would lose a browser callback after a crash/relaunch.
+    from openswap.claude_desktop_links import owns_system_handler
+    if not as_login_item and not owns_system_handler() and hand_over_to_login_item(
         switcher.backup_dir, logger=switcher._logger
     ):
         if instance_lock is not None:
@@ -257,6 +260,19 @@ def run(switcher, codex=None) -> int:
                 code_engine=self.switcher,
                 code_login_allowed=lambda: getattr(self, "_claude_login", None) is None,
             )
+            try:
+                from openswap.claude_desktop_links import DesktopSignInLinks
+                self._claude_desktop_profiles.signin_links = DesktopSignInLinks(
+                    enabled=lambda: self.settings.desktop_features_enabled,
+                    needed=lambda: any(p.kind == "managed" for p in self._claude_desktop_profiles.store.list()),
+                    receive_signin=self._claude_desktop_profiles.receive_signin,
+                    show_error=self._show_error,
+                )
+                self._claude_desktop_profiles.signin_links.prepare()
+            except Exception:
+                # Source/CLI runs do not have a registered application bundle.
+                # Never log native exception details, which may contain URLs.
+                pass
             self._desktop_app_lock = threading.Lock()
             self._chatgpt_capability = DesktopCapability("checking", "checking")
             self._chatgpt_capability_generation = 0
@@ -2168,6 +2184,8 @@ def run(switcher, codex=None) -> int:
             else:
                 self._chatgpt_auto_retry_at = 0.0
                 self._start_chatgpt_auto_monitor()
+                if self._claude_desktop_profiles.signin_links:
+                    self._claude_desktop_profiles.signin_links.prepare()
             self.rebuild_menu()
             panel = self._panel
             if panel is not None and panel.is_shown():
@@ -3697,6 +3715,14 @@ def run(switcher, codex=None) -> int:
             self.refresh_async(full=True)  # explicit user refresh → full pass
 
         def on_quit(self, _sender):
+            profiles = getattr(self, "_claude_desktop_profiles", None)
+            links = getattr(profiles, "signin_links", None)
+            if links is not None:
+                links.restore(lambda: self._finish_quit(_sender))
+                return
+            self._finish_quit(_sender)
+
+        def _finish_quit(self, _sender):
             if getattr(self, "_claude_desktop_profiles", None) is not None:
                 self._claude_desktop_profiles.suspend_checks()
             if self._status_icon_animator is not None:

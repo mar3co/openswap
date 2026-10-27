@@ -144,6 +144,9 @@ def test_dev_and_release_use_the_same_native_appearance(monkeypatch, tmp_path, p
     assert dev["bundle_identifier"] == "com.opensoft.openswap.dev"
     assert release["entries"] == [str(PACKAGING / "entry.py")]
     assert dev["entries"] == [str(tmp_path / "preview runner.py")]
+    assert release["info_plist"]["CFBundleURLTypes"] == [{
+        "CFBundleURLName": "Claude profile sign-in", "CFBundleURLSchemes": ["claude"],
+        "CFBundleTypeRole": "Viewer", "LSHandlerRank": "Alternate"}]
 
 
 @pytest.mark.parametrize("dev", [False, True])

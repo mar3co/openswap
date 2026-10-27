@@ -30,7 +30,7 @@ A profile name is your label, not an account identity.
 With Desktop features enabled, the main tabs are **Claude Code**, **Claude Desktop**,
 and **Codex**. Turning Desktop features off hides the Claude Desktop tab.
 Each profile has an **Open** button and a **•••** menu for **Create shortcut…**,
-**Finish sign-in…**, **Account details…**, **Rename…**, and **Archive…**. The same actions are available under
+**Reconnect sign-in…**, **Account details…**, **Rename…**, and **Archive…**. The same actions are available under
 **More → Claude Desktop profiles**. App checks and **About profiles** help remain
 under **Settings → Desktop → Claude Desktop**. The gear button on the Claude
 Desktop tab opens those settings; Back returns to the profile list.
@@ -46,27 +46,50 @@ between profiles. Default references the existing profile without copying it. Th
 within one email still happens inside Claude. Creating a profile does not
 create an Anthropic account or subscription.
 
-## When sign-in opens the wrong window
+## Browser sign-in returns to the right profile
 
-Claude's browser return link uses the shared `claude://` handler. Separate data
-folders do not tell macOS which running profile should receive it, so **Open
-Claude** can activate the original instance. Automatic callback routing is not
-provided by the profile launcher.
+Keep OpenSwap running while signing in. When an additional profile opens,
+OpenSwap prepares Claude link handling. If macOS asks, allow OpenSwap to open
+Claude links. Google sign-in in the inspected Claude version then uses Apple's
+browser authentication session, which returns to the exact Claude instance
+that started it. Each instance keeps its own sign-in state; concurrent native
+sessions are not routed by whichever window opened last.
 
-Keep the intended profile open on its sign-in screen. On the browser's finish
-page, right-click **Open Claude** and copy its link. In OpenSwap, open that
-profile's **••• → Finish sign-in…**, paste the link and choose **Send to profile**.
-If it expired or was already consumed, start sign-in again in that profile and
-copy the fresh link. Check the resulting account inside Claude.
+Email magic links and fallback redirects do not reliably identify a profile.
+For these, OpenSwap asks **Which profile did you start signing in to?** Choose
+that open profile and **Continue**. There is no link to copy or paste. The choice
+is still required when only one known profile is open, because another instance
+could have started the sign-in. OpenSwap never broadcasts a login callback or
+guesses from the last opened window, email or organization.
 
-This action targets the exact running process after checking the signed Claude
-app and profile folder. It refuses missing, ambiguous or changed processes and
-never falls back to Default, launches another instance or changes the system
-URL handler. Only the inspected Google, email magic-link and SSO login routes
-are accepted. The input is masked; links are not stored, logged or included in
-process arguments. A delivery acknowledgement does not establish successful
-authentication. Google callbacks still require Claude's matching in-memory
-login nonce. Other callback formats require separate support.
+Denying macOS's link permission pauses further requests, including after restart.
+**••• → Reconnect sign-in…** retries permission and opens the profile. Start a
+fresh sign-in there; a callback already consumed by another window cannot be
+recovered. Keychain detection permission is separate and still retries through
+**Account details → Detect**.
+
+OpenSwap rechecks the signed Claude app, profile folder and chosen running PID
+before delivering an external login link. Closed, restarted, archived or
+ambiguous profiles are refused. Only inspected Google, email and SSO login
+routes are accepted; unsupported authentication routes are refused rather than
+forwarded to Default. External links expire after two minutes and stay only in memory until handled
+or discarded. They are never written to disk, logged, copied to the clipboard
+or put in process arguments. Duplicate deliveries are suppressed.
+A delivery acknowledgement does not establish successful authentication.
+
+Ordinary Claude links are passed to the previous handler explicitly. Quitting
+OpenSwap, disabling Desktop features or uninstalling restores that handler if
+OpenSwap still owns it; a later choice by the user or another app is preserved.
+Claude registers its own handler when it starts, so OpenSwap prepares routing
+after startup, including launches from Dock shortcuts. CLI-only users and users
+with just Default do not get a permission request. Installing the app alone does
+not request ownership. DEV and release use the same registration policy.
+
+This behavior relies on Claude's native browser-auth path, inspected in version
+3.6556.2, and can change with Claude updates. It does not modify Claude's signed
+bundle or bypass its nonce checks. The full real Google/email/SSO login flow,
+concurrent sessions, denied permission and cold-start delivery remain manual
+acceptance checks; fixture callbacks do not prove a successful provider login.
 
 ## One setup flow for Desktop and Code
 

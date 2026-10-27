@@ -149,8 +149,9 @@ def test_add_profile_always_creates_additional_empty_storage_in_one_step(store):
     controller.open.assert_called_once_with(p.id)
     assert controller.prompt.call_count == 1
     assert "choices" not in controller.prompt.call_args.kwargs
-    assert "adds the same account to Claude Code" in controller.prompt.call_args.kwargs["message"]
-    assert "Allow Keychain access" in controller.prompt.call_args.kwargs["message"]
+    assert "adds it to Claude Code" in controller.prompt.call_args.kwargs["message"]
+    assert "Keychain access" in controller.prompt.call_args.kwargs["message"]
+    assert "Allow OpenSwap to open Claude links" in controller.prompt.call_args.kwargs["message"]
 
 
 def test_cancel_add_keeps_default_and_does_not_create_another_profile(store):

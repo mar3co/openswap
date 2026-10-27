@@ -60,6 +60,8 @@ app = BUNDLE(
         "LSMinimumSystemVersion": "14.0",
         "NSHumanReadableCopyright": "",
         "LSApplicationCategoryType": "public.app-category.developer-tools",
+        "CFBundleURLTypes": [{"CFBundleURLName": "Claude profile sign-in", "CFBundleURLSchemes": ["claude"],
+                              "CFBundleTypeRole": "Viewer", "LSHandlerRank": "Alternate"}],
     },
 )
 check_appkit_sdk(str(Path(app.name) / "Contents" / "MacOS" / "OpenSwap"), osx)

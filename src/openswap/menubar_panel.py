@@ -1425,7 +1425,7 @@ class MenuBarPanel:
         # Dispatch after the native menu closes so dialogs and reloads cannot
         # replace its anchor or deallocate callbacks during menu tracking.
         tramps = []
-        for title, action in (("Finish sign-in…", "finish_signin"), ("Account details…", "details"), ("Create shortcut…", "shortcut"), ("Rename…", "rename"), ("Archive…", "archive")):
+        for title, action in (("Reconnect sign-in…", "reconnect_signin"), ("Account details…", "details"), ("Create shortcut…", "shortcut"), ("Rename…", "rename"), ("Archive…", "archive")):
             item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, "act:", "")
             tramp = _Trampoline.alloc().initWithCallback_(lambda _, a=action: selected.append(a))
             tramps.append(tramp)
