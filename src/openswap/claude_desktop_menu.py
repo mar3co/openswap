@@ -374,7 +374,7 @@ class ClaudeDesktopMenu:
 
         def work():
             result = {"state": "signin_candidates", "connector": kind == "connector",
-                      "candidates": [], "unchecked": 0, "default_unchecked": False}
+                      "candidates": [], "default_unchecked": False, "managed_unchecked": False}
             try:
                 app = self._app_factory()
                 app.validate()
@@ -382,21 +382,20 @@ class ClaudeDesktopMenu:
                     self.store.ensure_default()
                 except (ClaudeSwitchError, OSError):
                     result["default_unchecked"] = True
-                    result["unchecked"] += 1
                 profiles = sorted(self.store.list(), key=lambda p: p.kind != "default")
                 processes = app.processes()
-            except (ClaudeSwitchError, OSError) as exc:
+                for profile in profiles:
+                    desktop, code = self.store.paths(profile)
+                    try:
+                        pid = app.running(app.launch_argv(desktop, code), desktop, processes=processes)
+                    except ClaudeDesktopError:
+                        result["default_unchecked" if profile.kind == "default" else "managed_unchecked"] = True
+                        continue
+                    if pid is not None:
+                        result["candidates"].append((profile, pid))
+            except Exception as exc:
                 self._results.put((None, exc))
                 return
-            for profile in profiles:
-                desktop, code = self.store.paths(profile)
-                try:
-                    pid = app.running(app.launch_argv(desktop, code), desktop, processes=processes)
-                except ClaudeDesktopError:
-                    result["unchecked"] += 1
-                    continue
-                if pid is not None:
-                    result["candidates"].append((profile, pid))
             self._results.put((result, None))
 
         try:
@@ -410,25 +409,29 @@ class ClaudeDesktopMenu:
     def _choose_signin_profile(self, result, held):
         """One click picks the target; nothing is preselected unless a single candidate is certain."""
         from openswap.claude_desktop_signin import finish_signin
+        stopped = self.blocked() or not self.enabled() or (self.signin_links is not None and self.signin_links.stopping)
         if held is None:
-            return  # discovery was suspended meanwhile
+            if not stopped:
+                self.show_error("Start again from the intended Claude profile.")
+            return
         value, fresh = held
         connector, candidates = result["connector"], result["candidates"]
         if not fresh():
             self.show_error("This link expired. Start again from the intended Claude profile.")
             return
-        if self.blocked() or not self.enabled() or (self.signin_links is not None and self.signin_links.stopping):
+        if stopped:
             return
+        unchecked = result["default_unchecked"] or result["managed_unchecked"]
         if not candidates:
             self.show_error("Could not check the open Claude profiles. Start again from the intended Claude profile."
-                            if result["unchecked"] else "Open the intended Claude profile and start again there.")
+                            if unchecked else "Open the intended Claude profile and start again there.")
             return
         # An unchecked profile may be the origin, so a lone candidate is not preselected then either.
-        placeholder = ["Choose a profile…"] if len(candidates) > 1 or result["unchecked"] else []
+        placeholder = ["Choose a profile…"] if len(candidates) > 1 or unchecked else []
         message = "Which Claude profile did you connect this app from?" if connector else "Which profile did you start signing in to?"
         if result["default_unchecked"]:
             message += "\n\nThe existing Claude profile could not be checked."
-        elif result["unchecked"]:
+        if result["managed_unchecked"]:
             message += "\n\nSome open Claude profiles could not be checked."
         while True:
             with self._modal():
