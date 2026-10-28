@@ -549,6 +549,8 @@ def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_l
         (folder / ".claude.json").write_text("{}")
         (folder / "nested").mkdir()
         (folder / "nested" / ".credentials.json").write_text("{}")
+    # A new folder's mtime can trail time.time() by a filesystem tick.
+    s.connector._started -= 1
     os.utime(stale, (s.connector._started - 100,) * 2)
     os.utime(live, (s.connector._started + 100,) * 2)
     s.connector.poll(enabled=False)
@@ -564,6 +566,7 @@ def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_l
     assert live.is_dir() and (live / "nested" / ".credentials.json").exists()
     if outcome == "deleted":
         assert not stale.exists()
+        assert not [r for r in caplog.records if "discard" in r.getMessage()]
     else:
         # The item may survive: the empty folder keeps its name for the next sweep.
         assert stale.is_dir() and list(stale.iterdir()) == []
