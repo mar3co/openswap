@@ -932,7 +932,11 @@ def app_dialog() -> dict[str, str]:
         "• the widget",
     ]
     folder = _shortcut_folder()
-    if folder is not None and _owned_launchers(folder):
+    try:
+        shortcuts = folder is not None and _owned_launchers(folder)
+    except OSError:
+        shortcuts = False
+    if shortcuts:
         lines.append("• the Claude profile shortcuts and their Dock tiles")
     app = bundle.app_path()
     if app is None:

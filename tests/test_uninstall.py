@@ -1468,6 +1468,16 @@ class TestAppDialog:
         launcher(folder, "Work", "a" * 32, tmp_path / "another store")
         assert "• the Claude profile shortcuts and their Dock tiles" in uninstall.app_dialog()["message"]
 
+    @pytest.mark.parametrize("error", [PermissionError(13, "Permission denied"), OSError(5, "Input/output error")])
+    def test_an_unreadable_shortcuts_folder_lists_no_profile_shortcuts(self, monkeypatch, tmp_path, error):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(uninstall, "paired_servers", lambda: [])
+        folder = tmp_path / "Applications" / "OpenSwap Profiles"
+        folder.mkdir(parents=True)
+        launcher(folder, "Work", "a" * 32, tmp_path / "another store")
+        monkeypatch.setattr("pathlib.Path.iterdir", Mock(side_effect=error))
+        assert "profile shortcuts" not in uninstall.app_dialog()["message"]
+
     def test_two_pairings_are_both_named(self, monkeypatch):
         monkeypatch.setattr(uninstall, "paired_servers", lambda: ["https://opentag.me", "https://worker.example"])
         assert ("forgets this Mac's pairing with OpenTag and https://worker.example. Each still lists the Mac "
