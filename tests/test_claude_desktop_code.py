@@ -754,6 +754,8 @@ NOTHING = dict.fromkeys(("uuid", "organizationUuid", "email"))
 ANSWERS = {
     "match": ("verified", {"uuid": ACCOUNT, "organizationUuid": ORG, "email": EMAIL}),
     "mismatch": ("verified", {"uuid": OTHER, "organizationUuid": ORG, "email": EMAIL}),
+    "other account": ("verified", {"uuid": OTHER, "organizationUuid": ORG, "email": "other@example.test"}),
+    "other organization": ("verified", {"uuid": ACCOUNT, "organizationUuid": OTHER, "email": EMAIL}),
     "partial mismatch": ("incomplete", {"uuid": ACCOUNT, "organizationUuid": OTHER, "email": None}),
     "incomplete": ("incomplete", {"uuid": ACCOUNT, "organizationUuid": None, "email": None}),
     "rejected": ("rejected", NOTHING),
@@ -810,6 +812,22 @@ def test_legacy_slot_token_is_refreshed_only_through_the_gate(setup, monkeypatch
         assert s.engine.account_identity("7")["uuid"] == (ACCOUNT if state == "connected" else "")
     status = s.connector.state(s.store.get(s.profile.id))["code_status"]
     assert ("Claude Code session" in status) is (gate == "live session")
+    assert ("answers as a different account" in status) is (state == "mismatch")
+
+
+@pytest.mark.parametrize("token, named", [("other account", " (other@example.test)"), ("mismatch", "")])
+def test_a_saved_login_for_another_account_names_it_and_the_remedy_that_replaces_it(setup, token, named):
+    s = setup
+    seed(s, uuid="")
+    s.classifier.side_effect = lambda _token: ANSWERS[token]
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == "mismatch"
+    assert s.calls == []
+    assert s.engine.read_account_credentials("7", EMAIL) == CREDS
+    assert s.connector.state(s.store.get(s.profile.id))["code_status"] == (
+        f"The saved Claude Code login for {EMAIL} answers as a different account{named}. "
+        f"To use this profile's account, choose Add account > Sign in to Claude Code… and sign in as {EMAIL}. "
+        "This replaces that saved login.")
 
 
 def test_session_note_belongs_to_its_own_setup_attempt(setup, monkeypatch):
@@ -827,17 +845,26 @@ def test_session_note_belongs_to_its_own_setup_attempt(setup, monkeypatch):
     assert s.connector.state(s.store.get(s.profile.id))["code_status"] == "Code setup needs attention"
 
 
-@pytest.mark.parametrize("live, answer, state, browser", [
-    (LIVE, "match", "connected", False), (LIVE, "rejected", "connected", True),
-    (LIVE, "incomplete", "connected", True), (LIVE, "transient", "failed", False),
-    (LIVE, "mismatch", "mismatch", False), (LIVE, "degraded", "failed", False),
-    ("", None, "connected", True), (None, None, "failed", False),
+STALE = json.dumps({"claudeAiOauth": {"accessToken": "live-access", "refreshToken": "live-refresh", "expiresAt": 1}})
+UNDATED = json.dumps({"claudeAiOauth": {"accessToken": "live-access", "refreshToken": "live-refresh"}})
+
+
+@pytest.mark.parametrize("live, answer, state, browser, config_uuid", [
+    (LIVE, "match", "connected", False, ""), (LIVE, "rejected", "connected", True, ""),
+    (UNDATED, "rejected", "connected", True, ""), (STALE, "rejected", "failed", False, ""),
+    (LIVE, "incomplete", "connected", True, ""), (LIVE, "transient", "failed", False, ""),
+    (LIVE, "mismatch", "mismatch", False, ""), (LIVE, "mismatch", "mismatch", False, OTHER),
+    (LIVE, "mismatch", "failed", False, ACCOUNT), (LIVE, "other account", "failed", False, ""),
+    (LIVE, "other organization", "failed", False, ""), (LIVE, "degraded", "failed", False, ""),
+    ("", None, "connected", True, ""), (None, None, "failed", False, ""),
 ])
-def test_active_legacy_slot_is_verified_read_only_with_the_live_credential(setup, monkeypatch, live, answer, state, browser):
+def test_active_legacy_slot_is_verified_read_only_with_the_live_credential(setup, monkeypatch, live, answer, state, browser,
+                                                                           config_uuid):
     from openswap.credentials import ActiveCredentials
     s = setup
     seed(s, uuid="")
-    monkeypatch.setattr(s.engine, "_get_current_identity_triple", lambda strict=False: (EMAIL.upper(), ORG, ""))
+    monkeypatch.setattr(s.engine, "_get_current_identity_triple",
+                        lambda strict=False: (EMAIL.upper(), ORG, config_uuid.upper()))
     monkeypatch.setattr(s.engine, "_read_active_credentials",
                         Mock(return_value=ActiveCredentials(live, False, answer == "degraded")))
     s.classifier.side_effect = lambda token: {"live-access": ANSWERS.get(answer)}[token]
@@ -848,6 +875,9 @@ def test_active_legacy_slot_is_verified_read_only_with_the_live_credential(setup
     s.engine.consume_backup_grant.assert_not_called()
     assert s.engine.read_account_credentials("7", EMAIL) == CREDS
     assert s.engine.account_identity("7")["uuid"] == (ACCOUNT if state == "connected" else "")
+    status = s.connector.state(s.store.get(s.profile.id))["code_status"]
+    assert (status == code.OPEN_CLAUDE_CODE) is (live == STALE)
+    assert ("answers as a different account" in status) is (state == "mismatch")
 
 
 def test_sweeper_that_fails_to_start_is_started_by_a_later_poll(setup, monkeypatch):
