@@ -1,7 +1,7 @@
 """Native sessions own their return; unbound URLs must never pick a profile."""
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -694,7 +694,7 @@ def gone():
 @pytest.mark.parametrize('held, ended, changing, needed, current, lost', [
     (True, False, False, True, lambda: CLAUDE, True),
     (True, False, False, True, lambda: OPENSWAP, False),
-    (True, False, False, True, lambda: None, False),
+    (True, False, False, True, lambda: None, None),
     (True, False, False, True, gone, None),
     (None, False, False, True, lambda: CLAUDE, False),
     (False, False, False, True, lambda: CLAUDE, False),
@@ -717,7 +717,8 @@ def test_ownership_is_lost_only_when_a_held_handler_is_taken_while_needed(held, 
     (CLAUDE, True, True, False, False, 'claim'),
     (None, True, True, False, False, 'claim'),
     (CLAUDE, True, False, False, False, 'lost'),
-    (None, True, False, False, False, 'claim'),
+    (None, True, False, False, False, 'wait'),
+    (None, None, False, False, False, 'claim'),
     (CLAUDE, None, False, True, False, 'notice'),
     (None, None, False, True, False, 'notice'),
     (CLAUDE, True, True, True, False, 'notice'),
@@ -842,15 +843,24 @@ def test_a_loss_check_that_cannot_run_yet_waits_and_then_reports(env, obstacle):
     assert len(e.native.requests) == 1
 
 
-def test_a_handler_missing_at_the_launch_check_is_claimed_without_a_notice(env):
+@pytest.mark.parametrize('owner, notice', [('claude', True), ('openswap', False)])
+def test_an_unknown_owner_after_holding_waits_instead_of_claiming(env, owner, notice):
     e = env
     claim(e)
     e.native.owner = None
     e.native.launched()
     e.now[0] += 3
     e.router.poll()
-    assert len(e.native.requests) == 2
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+    assert len(e.native.requests) == 1
     e.error.assert_not_called()
+    assert e.router.verify_at is not None
+    e.native.owner = e.native.saved if owner == 'claude' else e.native.application
+    e.router.poll()
+    assert len(e.native.requests) == 1
+    assert e.error.call_args_list == ([call(OWNERSHIP_LOST)] if notice else [])
+    assert e.router.verify_at is None
 
 
 def take_over_unnoticed(e):

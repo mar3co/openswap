@@ -151,13 +151,17 @@ def ownership_lost(*, held, ended, changing, needed, current, application):
         owner = current()
     except Exception:
         return None
-    return owner is not None and owner != application
+    if owner is None:
+        return None
+    return owner != application
 
 
 def claim_step(*, current, application, held, reconnecting, paused, noticed):
-    """What the post-launch check does: "held", "claim", "lost", "notice" or "paused".
+    """What the post-launch check does: "held", "claim", "lost", "wait",
+    "notice" or "paused".
 
-    Once held in this process, only Reconnect sign-in may claim again. A
+    Once held in this process, only Reconnect sign-in may claim again; an
+    unknown owner then waits for the ownership check rather than claiming. A
     pause never claims; it is explained once per run unless this run already
     told the user about it.
     """
@@ -165,8 +169,8 @@ def claim_step(*, current, application, held, reconnecting, paused, noticed):
         return "held"
     if paused:
         return "paused" if noticed else "notice"
-    if held and not reconnecting and current is not None:
-        return "lost"
+    if held and not reconnecting:
+        return "wait" if current is None else "lost"
     return "claim"
 
 
