@@ -163,7 +163,7 @@ class NativeDock:
 def _prune_backups(directory):
     """Keep the oldest backup (the Dock before OpenSwap first changed it) and the newest few."""
     backups = sorted(directory.glob("*.plist"), key=lambda p: p.lstat().st_mtime_ns)
-    for stale in backups[1:1 - BACKUPS_KEPT]:
+    for stale in backups[1:-(BACKUPS_KEPT - 1)]:
         stale.unlink()
 
 
