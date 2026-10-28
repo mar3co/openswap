@@ -541,6 +541,8 @@ def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_l
     caplog.set_level("WARNING", logger="openswap")
     s.connector.cleanup = code.delete_login_keychain_item
     deletes = real_keychain(monkeypatch, outcome)
+    scratch, mkdtemp = [], code.tempfile.mkdtemp
+    monkeypatch.setattr(code.tempfile, "mkdtemp", lambda **kw: scratch.append(mkdtemp(**kw)) or scratch[-1])
     stale, live = (s.store.root / f".code-login-{name}" for name in ("stale", "live"))
     for folder in (stale, live):
         folder.mkdir()
@@ -554,19 +556,20 @@ def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_l
     assert s.connector.poll(enabled=True)
     s.connector._sweeper.join(4)
     assert s.connector._sweeper.name == "claude-desktop-code-sweep" and not s.connector._sweeper.is_alive()
+    # The setup's own scratch login is discarded too; let it finish before counting.
+    assert finish(s).code_setup_state == "connected"
     from openswap.session import keychain_service_name
-    # The setup's own scratch login may also be discarded by now; only the
-    # orphan and the live folder are this test's business.
-    assert keychain_service_name(stale) in deletes and keychain_service_name(live) not in deletes
+    assert len(scratch) == 1
+    assert sorted(deletes) == sorted(keychain_service_name(Path(p)) for p in [stale, *scratch])
     assert live.is_dir() and (live / "nested" / ".credentials.json").exists()
     if outcome == "deleted":
         assert not stale.exists()
     else:
         # The item may survive: the empty folder keeps its name for the next sweep.
         assert stale.is_dir() and list(stale.iterdir()) == []
-        [record] = [r for r in caplog.records if "discard" in r.getMessage()]
-        assert "KeychainError" in record.getMessage() and "security" not in record.getMessage()
-    assert finish(s).code_setup_state == "connected"
+        records = [r.getMessage() for r in caplog.records if "discard" in r.getMessage()]
+        assert len(records) == 1 + len(scratch)
+        assert all("KeychainError" in m and "security" not in m for m in records)
 
 
 @pytest.mark.parametrize("outcome", ["deleted", "locked"])
