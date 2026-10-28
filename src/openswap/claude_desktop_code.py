@@ -368,7 +368,10 @@ class DesktopCodeConnector:
             return changed
         self._next_scan = self.clock() + 10
         try:
-            for profile in self.store.list():
+            profiles = self.store.list()
+            listed = {profile.id for profile in profiles}
+            self._notes = {pid: note for pid, note in self._notes.items() if pid in listed}
+            for profile in profiles:
                 if identity(profile) is None:
                     continue
                 key = setup_key(profile, self.engine)

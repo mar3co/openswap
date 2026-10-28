@@ -849,6 +849,20 @@ STALE = json.dumps({"claudeAiOauth": {"accessToken": "live-access", "refreshToke
 UNDATED = json.dumps({"claudeAiOauth": {"accessToken": "live-access", "refreshToken": "live-refresh"}})
 
 
+def test_a_setup_note_is_forgotten_once_its_profile_is_archived(setup, monkeypatch):
+    s = setup
+    seed(s, uuid="")
+    s.classifier.side_effect = lambda token: ANSWERS["rejected"]
+    monkeypatch.setattr(s.engine, "live_session_pids_for", Mock(return_value=[42]))
+    s.connector.poll(enabled=True)
+    finish(s)
+    assert s.profile.id in s.connector._notes
+    s.store.update(s.profile.id, archived=True)
+    s.connector._next_scan = 0
+    s.connector.poll(enabled=True)
+    assert s.profile.id not in s.connector._notes
+
+
 @pytest.mark.parametrize("live, answer, state, browser, config_uuid", [
     (LIVE, "match", "connected", False, ""), (LIVE, "rejected", "connected", True, ""),
     (UNDATED, "rejected", "connected", True, ""), (STALE, "rejected", "failed", False, ""),
