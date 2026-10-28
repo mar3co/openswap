@@ -214,3 +214,12 @@ Required outcomes:
 - L1-m2 (Minor): the `consume_backup_grant` docstring should say a `skip-active` refusal can follow a session-profile resync write ("nothing consumed", not "nothing written").
 - L1-m3 (Minor): the "is this slot's account active" comparison is written twice (consume.py and claude_desktop_code.py). Use one strict engine helper.
 - L1-m4 (Minor): dead `rejected` assignment for 403 in `oauth.py`.
+
+### Whole-branch final review (5 seats: cold and silent on Code setup, cold and silent on links, cold on menu/uninstall/tests)
+- No Critical findings.
+- Code setup cold seat, Important: abandoning a legacy repair after its write restored a spent backup after the write had invalidated the session-profile credential, which can log the account out. Ruling (controller, 2026-10-28): keep the new verified credential on a post-write abandon. This supersedes the #148 "restore the original" ruling. Cleanup W7.
+- Code setup cold seat, Important: the "mismatch" message names a remedy the user can't take, and a live-token contradiction on the active branch should be "failed". Cleanup W8.
+- Code setup silent seat, Important: a stale live token on the active account went to browser login. Ruling (user, 2026-10-28): "Open Claude Code once, then continue setup", with no browser login. Cleanup W9.
+- Links silent seat, Important: a dropped Reconnect (same as L2-b; cleanup W2). Also, a persisted pause is silent after a restart. This is #150, folded in because it is cheap and this branch makes it more likely. Cleanup W3.
+- Menu seat, Minor: the F-3 branch is unreachable. Removed (W5). F-3 resolves as "no change needed", because suspension only happens on Quit or disable, where silence is right.
+- Cleanup wave: W1–W14 in one fix dispatch, with the pre-dispatch ruling check first. After it come one cold seat, the gates, and the PR. Every non-Critical finding after that becomes an issue.
