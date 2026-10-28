@@ -10,6 +10,8 @@ Follow-up to #144 (merged as 0b4fd90). This covers issues #145, #146, #148 and #
 - 2026-10-28, controller: for #146, the refresh goes only through `engine.consume_backup_grant`, never `freshen_backup` or a direct refresh. A transient failure ends in the existing needs-attention state, with no automatic retry. A token that proves to be another account ends in "mismatch", and the slot is never overwritten.
 - 2026-10-28, controller: for #145, detection and notice only. After a loss, no automatic claim happens until the user chooses Reconnect sign-in.
 
+- 2026-10-28, user: #145 early takeover. If Claude takes the handler back before the 2 s check, after OpenSwap held it in this run, OpenSwap behaves as for a late takeover: one notice, then a pause, and no automatic claim or consent prompt until Reconnect sign-in. A first claim in a run still happens. This supersedes the behavior pinned by `test_new_claude_instance_registering_again_reconnects_after_startup`.
+
 ## Pre-dispatch ruling check
 
 Two Opus passes (the second because credential rulings changed) amended the briefs. In all, they made 15 + 9 corrections, including:
@@ -163,4 +165,16 @@ Required outcomes:
 
 ## Review dispositions
 
-_Pending._
+### Lane 3 (#149 menu, uninstall, Dock, dialog)
+- Cold seat: one Important. An unexpected discovery exception showed the "check folder permissions" message. Fixed in 793fdd5, and the test now pins the exact text. `OSError` keeps the folder-permissions message, as F-4 requires.
+- Cold seat on 793fdd5: clean.
+- Note: the `suspend` route of the release test covers a state barely reachable in production. Coverage note only, no change.
+- Pre-existing, noted by the fix seat: `poll` shows a discovery error before checking stopped, blocked or suspended. Ledgered as a Minor for the final review.
+- F-12 left unchanged: dropping `info=` adds a second plist read and can read the version from a different file.
+
+### Lane 2 (#145, F-6, F-8)
+- Cold seat and silent seat: the same Important. In `_claim`'s `ClaudeDesktopError` branch, a stale `held=True` gives two alerts. Goes to fix round 1.
+- Silent seat: the one-shot 30 s check is used up while busy or uncertain. Rated Important, because it is a behavior change on a reachable path. Goes to fix round 1.
+- Silent seat: the paused state is silent after a restart. It predates this change and touches the menu, so it is filed as #150.
+- Cold seat policy note: an early takeover re-claims on every launch. User ruling above; goes to fix round 1.
+
