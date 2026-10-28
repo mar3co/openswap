@@ -117,6 +117,10 @@ A delivery acknowledgement does not establish successful authentication.
 Ordinary Claude links are passed to the previous handler explicitly. Quitting
 OpenSwap, disabling Desktop features or uninstalling restores that handler if
 OpenSwap still owns it; a later choice by the user or another app is preserved.
+Quit waits at most 10 seconds for macOS to confirm the handback, then quits
+anyway. If OpenSwap still owns links on its next start while no profile needs
+them, it hands them back quietly; it skips this when Claude.app is gone.
+Uninstall treats a failed handback as a warning, not a reason to stop.
 Claude registers its own handler when it starts, so OpenSwap prepares routing
 after startup, including launches from Dock shortcuts. CLI-only users and users
 with just Default do not get a permission request. Installing the app alone does
@@ -222,7 +226,9 @@ Claude's app is never copied or modified.
 
 The profile app has its own Dock icon and running dot. Clicking it focuses that
 profile. Quitting it requests a normal quit of that Claude process, allowing
-Claude to handle unsaved work. If Claude cancels quitting, the icon stays running.
+Claude to handle unsaved work. Once the quit request is sent, the profile app
+quits too, so logout and restart are never canceled. If Claude then cancels
+quitting, the running dot returns on the next status refresh.
 When the profile quits or crashes, its helper exits and the dot disappears. A
 pinned icon remains ready to reopen the profile. Force-quitting the helper itself
 does not force-quit Claude; use Open or Refresh status to reattach the indicator.
@@ -246,7 +252,8 @@ the same name and destination updates that profile's launcher and icon.
 OpenSwap refuses to replace unrelated apps or a shortcut for another profile.
 **Set up Dock shortcuts** rebuilds the launchers and refreshes the Dock. A private
 backup of the previous pinned-app list is saved under the profile store before
-changing pins. OpenSwap changes only that list; it does not stop Claude sessions.
+changing pins. The first backup (the layout before OpenSwap changed it) and the
+newest four are kept. OpenSwap changes only that list; it does not stop Claude sessions.
 Dock pinning uses macOS preferences rather than a supported profile-specific
 Claude API, and may need updates for future macOS versions.
 
@@ -321,24 +328,24 @@ Separate profile data lives in `~/Library/Application Support/OpenSwap Claude De
 - `profiles.json`: versioned labels, stable IDs, archive flags and badge settings;
   optional email/organization labels, authenticated account/organization IDs,
   a hash of the detected login, a last-detected timestamp, profile kind,
-  automatic-update preference and durable Code setup status. Version 6 upgrades
-  older profiles without treating their labels as authenticated identities.
+  automatic-update preference and durable Code setup status. Only version 6
+  is read.
   No cookies, passwords or tokens are stored in this registry.
 - `<id>/desktop/`: Claude-owned desktop data, including local sessions.
 - `<id>/code/`: a separate `CLAUDE_CONFIG_DIR` and Keychain namespace.
 - `.code-login-*/`: private scratch directories used only during Code
   authorization, removed with their temporary Keychain entries when the login
-  worker finishes. Saved Code credentials use OpenSwap's existing account store.
+  worker finishes. If the Keychain entry can't be confirmed deleted, the folder
+  is emptied and kept so a later start can finish the cleanup. Saved Code credentials use OpenSwap's existing account store.
 
 Default has only a registry entry here. Its original Claude-owned folder is
 never moved, recreated, chmodded or deleted by OpenSwap.
 
 These private folders can contain conversations and credentials created by
-Claude. Do not share them as a diagnostic attachment. Profile versions 1–5, including the
-unreleased linked-selection version 2, are readable. Their next save upgrades
-metadata to version 6, preserving IDs, data and archives while discarding old
-selection-link metadata. Previous labels need fresh authenticated detection
-before automatic Code setup. No account credentials change during migration.
+Claude. Do not share them as a diagnostic attachment. Registries written by
+unreleased development builds (versions 1–5) are refused as invalid metadata;
+the version 5 to 6 change only adds empty identity fields, so such a file can be
+edited by hand.
 
 A failed launch keeps the profile. Corrupt/newer metadata and missing data
 folders are refused without replacing the login. Restore backups to their
@@ -349,8 +356,10 @@ Shortcut creation builds and signs the new launcher in a temporary folder,
 then replaces only a matching OpenSwap launcher. Failure restores the old
 launcher. Badge settings are saved only after the launcher is installed.
 
-Normal uninstall and `--zap` preserve profile data and shortcut applications.
-Remove unused launchers yourself. To permanently remove a profile, first sign
+Normal uninstall and `--zap` preserve profile data. They remove OpenSwap's
+generated profile launchers from Applications → OpenSwap Profiles and their Dock
+tiles, because the launchers can't work without OpenSwap; recreate them from the
+profile menu after reinstalling. To permanently remove a profile, first sign
 out and quit that profile in Claude, then remove its data folder yourself.
 Claude owns its Keychain entries; OpenSwap does not delete them.
 

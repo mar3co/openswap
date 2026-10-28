@@ -162,9 +162,29 @@ The user was away and delegated these decisions to a Fable advisor, whose recomm
   - `create_shortcut`: builds outside the registry lock and persists the badge through the validating `store.update`.
   - Code worker: lock ordering is engine guard → registry lock, never the reverse. Cookies are re-observed with no lock held.
 
-## Fix rounds
+## Fix round 1
 
-_Pending._
+Four Fable implementers, one per lane, each in its own worktree with disjoint file ownership. Their commits were cherry-picked one at a time onto the PR branch. Every pick was clean, with no hand-resolved hunks.
+
+| Commit | Lane | Summary |
+| --- | --- | --- |
+| `8a36457` | C | Launcher `continue quit`, reopen focus without the CLI, cold-start wait, stderr alert; `plan_pins` exact-match and creation order; shortcut build outside the registry lock with a locked re-read; Default bundle reuse; Dock refresh only on change; backups pruned to 5; Dock tests skipped off macOS |
+| `8b32d63` | B | Identity cleared only against the persisted fingerprint; orphaned `.code-login-*` sweep; lock order engine → registry with a fresh row check inside the engine guard; duplicate-slot isolation; non-fatal `clear_dead_token`; Keychain pause fix; legacy backup kept; post-launch `ProfileChanged` → `sign_in` |
+| `7b83639` | controller | `LAUNCHER_VERSION` 2 → 3, so existing branch-built launchers pick up the fixed script (lane C suggestion, adopted: the user has v2 launchers with the logout-canceling quit handler) |
+| `3ae4893` | D | Off-main-thread sign-in discovery with the link gate held; per-profile skip; chooser placeholder; waiting label; deferred popover reload while the mouse is down; Codex row stays switchable; `needed` raise handling; scroll reset; dead chain removed; copy fixes; scroll/disclosure helpers; single reload |
+| `8599b71` | A | Restore unsticks `changing`; Quit bounded at 10 s, single pending; startup/A8 recheck; dedupe only callbacks; codesign `-R` requirement (passes on the real Claude.app); launch lock + `already_opening`; Apple-event send outside the registry lock with Automation-consent messages; entitlement + usage string; best-effort uninstall link step with a warnings channel; uninstall removes owned launchers and Dock tiles; registry v6 only; `--from-launcher` stderr; focus warning; directory fsync |
+
+Gates on the merged tree: full suite 6,088 passed, 9 skipped, and the 7 known `test_bundle_move` environment failures. `git diff --check` is clean.
+
+Implementer deviations and suggestions, ruled:
+
+- **C4 deviation (accepted):** a locked re-read plus `_save` replaces `store.update`. `FileLock` isn't reentrant, so `update` can't run inside the final check; the outcome (an archive or rename mid-build leaves no launcher and no badge) holds.
+- **C suggestion (adopted):** bump the launcher version (above).
+- **B suggestion (rejected):** merge the scratch `oauthAccount` into kept backups. It would change what a backup holds, and keeping the existing backup already fixes the data loss.
+- **B note:** a microsecond UI-thread race in B7 can leave an in-memory pause (never persisted) until retry. Ledgered as no change, since it fails safe.
+- **D:** kept the Settings "Show → ChatGPT" label, because the desktop-mode menu bar title reads "ChatGPT · …". Accepted.
+- **A suggestion (cleanup wave):** `_owned_bundle` should accept the marker it reads, so the uninstall `_launcher` shim goes away. `_quit_pending`/`_quit_finished` should be initialized in `__init__`.
+- **A note:** with features on and the handler held, `needed()` (a `profiles.json` read) runs every 5 s. Accepted as a cheap read.
 
 ## Pre-dispatch ruling check (Opus adversarial reader, one pass)
 
@@ -190,3 +210,85 @@ The pass amended the required outcomes before any implementer saw them:
 - **D1-1:** no second dispatch while discovery or the chooser is pending.
 - **D1-2:** shows a "could not check" message when every check raised.
 - **D2-m4:** keeps `ensure_default` for sign-in discovery.
+
+## Round-1 fix review (whole-branch final review)
+
+Six Opus seats reviewed the fix commits: a cold seat on each of A, B, C and D, and a silent-failure seat on each of A and B. A usage limit interrupted five of them mid-run; each was resumed under the 40% context line (110–135k tokens measured). No Critical findings.
+
+| ID | Sev | Finding | Disposition |
+| --- | --- | --- | --- |
+| R2-1 | Important | A background release empties the event queue, dropping the ordinary link that cold-started OpenSwap. | Fix |
+| R2-2 | Important | After the Quit deadline, `_finish_quit` → `suspend_checks` → `restore()` sends a second handler request. | Fix |
+| R2-3 | Important | A failed background release alerts unprompted, on every launch when Claude.app is gone. | Fix: quiet, and skipped when the target is absent |
+| R2-4 | Important | `register_application` failing for the restore target says "Reopen OpenSwap". | Fix |
+| R2-5 | Important | One launch lock for all profiles: opening B while A launches answers `already_opening` and launches nothing. | Fix: per-profile lock |
+| R2-6 | Important | `already_opening` is shown as "opened" in the menu, and the applet hits a null-pid coercion error. | Fix |
+| R2-7 | Important | `_unpin` catches only two exception types; an escape fails the step after launchers were deleted, and a retry leaves dead tiles silently. | Fix |
+| R2-8 | Important | The orphan sweep relies on a cleanup that swallows Keychain errors, so it deletes the folder and orphans a live token. Same blind spot in `_connect`'s `finally` (pre-existing). The test mocked a raise production never does. | Fix |
+| R2-9 | Important | Legacy-slot credential and config writes happen before the commit guard and aren't rolled back. | Fix |
+| R2-10 | Minor | The sweep runs a blocking `security` call on the main thread. | Fix |
+| R2-11 | Important | `ensure_default` failing in sign-in discovery cancels it for every profile (diverged from `_profiles()`). | Fix |
+| R2-12 | Important | Retrying "Set up Dock shortcuts" no longer refreshes the Dock. | Fix |
+| R2-13 | Important | Backup pruning deletes the original, pre-OpenSwap Dock layout. | Fix: keep the oldest plus the newest 4 |
+| — | Important (refuted) | "Launcher alerts never show the CLI message." Refuted on the merged tree: lane A writes stderr under `--from-launcher`. The seat reviewed lane C's commit alone. | No change |
+| — | Minor | Late registry-lock timeout rolls back a finished shortcut build; Code worker lock timeout behind `install_shortcuts`. | No change: visible failure with a retry |
+| — | Minor | 2-minute launcher wait blocks quit events during a cold start; `continue quit` before Claude confirms its quit; pinned Default refresh. | No change: accepted trade-offs of rulings C1/C7 |
+| — | Minor | Whole Dock test module skipped off macOS. | No change: the `plan_pins` tests use POSIX file URLs too, which failed on Windows CI |
+| — | Minor | Microsecond race between archive and launch; half-deleted launcher; focus ImportError silent; version `6.0` accepted. | No change: nothing lost, fails safe |
+| R2-m1…m8 | Minor | Uninstall dialog wording; logging the `clear_dead_token` failure; `MISMATCH` order; `_require_present` inlined; padding test removed; callback kept out of `_results`; guide dot; `_default_registered`; reuse record name, single plist read, quoted pid; quit flags initialized. | Fix in the final dispatch |
+
+The final dispatch combines R2 with the cleanup wave (Q8 renames, P-m5 dedup, docstrings) in two commits. Notes are in the session scratchpad, mirrored here by ID.
+
+### Pre-dispatch ruling check on the final dispatch (Opus, one pass)
+
+Amendments made before the implementer saw the notes:
+
+- **R2-1:** ordinary links are forwarded without waiting on a pending handler change; at Quit or disable, only callbacks are discarded.
+- **R2-2:** covers every Quit route (decline, raise, deadline): no second request or alert.
+- **R2-3:** quiet only when no explicit restore is waiting.
+- **R2-4:** an explicit restore to a missing Claude is quiet.
+- **R2-6:** no focus and no "running" for `already_opening`.
+- **R2-8 (security):** a kept folder holds no credential or identity files.
+- **R2-10:** scoped to the Code connector.
+- **R2-11 (wrong-profile risk):** an unchecked Default never allows preselection, even with one candidate.
+- **R2-m2:** the log line carries only the exception type.
+- **R2-m4:** the held callback is cleared on every exit.
+- **CW-1:** uninstall ownership is not tied to `default_root()`.
+- **CW-2:** whitespace handling is preserved per caller.
+
+## Final dispatch
+
+Commits:
+- `ffd5914`: R2 behavior fixes, Fable.
+- `a4a33ec`: cleanup wave (Q8 renames, P-m5 dedupe, docstrings).
+- `27fcca1`: controller change. With any open profile unchecked, a lone candidate is never preselected. This extends R2-11 to managed profiles under the same reasoning: the unchecked profile may be the origin.
+
+Docs (`docs/claude-desktop-profiles.md`) were updated for behavior the fixes changed: bounded Quit and quiet startup handback, launcher quit, backup retention, v6-only registry, kept scratch folders, and uninstall removing launchers.
+
+Gates: full suite 6,116 passed, 9 skipped, and the 7 known `test_bundle_move` environment failures. `git diff --check` is clean. The launcher script compiles.
+
+### Final review (one cold seat, one silent-failure seat, Opus)
+
+No Critical findings. Under the hard budget, every non-Critical finding became a tracked issue:
+
+| ID | Sev | Finding | Disposition |
+| --- | --- | --- | --- |
+| F-1 | Important | `save_verified_account` holds the registry lock across the Keychain credential write (R2-9 widened the guard). A concurrent open, monitor write or `ensure_default` can time out. Both seats raised it. | #148 |
+| F-2…F-12 | Minor | Chooser note when both kinds go unchecked; silent drop on suspend; discovery `try/finally`; cleanup log; `previous()` order; uninstall dialog `iterdir`; percent-encoded auth route (pre-existing); dialog dot coupling; prune readability; sweeper start failure; `owned_bundle(info=)`. | #149 |
+
+The seats verified the rename/dedupe commit as behavior-preserving. The only differences are stricter symlink and bundle-id checks in `open_presence` and the uninstall scan.
+
+## Tracked issues
+
+- #145: detect lost `claude://` ownership (A10).
+- #146: refresh an expired legacy-slot token (B5).
+- #147: verify Apple-event delivery on a Developer-ID build (A4).
+- #148: registry lock during the Keychain write (F-1).
+- #149: final-review Minors (F-2…F-12).
+
+## Left for the user
+
+- Live acceptance from the PR body still applies: real Google, email and SSO sign-in with multiple profiles; Keychain detection; Code authorization; Dock pins across reboot.
+- New since the review: on a Developer-ID build, the first Apple-event sign-in delivery may show a macOS Automation prompt (#147).
+- Launchers built by this branch (v2) rebuild as v3 on the next status refresh or open.
+- Merging is the user's call.
