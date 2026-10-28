@@ -25,8 +25,11 @@ MAX_AGE = 120
 # consent sheet to the user, and how often idle ownership is reconsidered.
 RESTORE_TIMEOUT = 10
 RECHECK = 5
+# Long enough after a Claude launch for a slow cold start to register its scheme.
+OWNERSHIP_CHECK = 30
 RESTORE_FAILED = "Could not restore Claude links. Open Claude once before signing in again."
 RESTORE_REINSTALL = "Could not restore Claude links. Open Claude once to restore its link handling, or reinstall Claude."
+OWNERSHIP_LOST = "Claude links no longer open in OpenSwap, so a sign-in may open the wrong profile. Choose Reconnect sign-in in the profile menu to fix it."
 
 
 def register_application(path):
@@ -126,6 +129,20 @@ def ordinary_link(value):
         route = unquote(parsed.netloc + parsed.path).lower()
         return not any(part in route for part in ("auth", "login", "callback", "magic-link"))
     return False
+
+
+def ownership_lost(*, held, busy, needed, current, application):
+    """Whether a held handler was taken over while profiles still need it.
+
+    Only reports: claiming again could show the consent sheet on every launch.
+    """
+    if not held or busy or not needed:
+        return False
+    try:
+        owner = current()
+    except Exception:
+        return False
+    return owner is not None and owner != application
 
 
 class MacOSLinks:
@@ -245,6 +262,7 @@ class DesktopSignInLinks:
         # Handed back because no profile needed links; claims again once one does.
         self.released = False
         self.recheck_at = 0.0
+        self.verify_at = None
         self.native = native_factory(self.receive, self.launched)
 
     def receive(self, value):
@@ -268,6 +286,7 @@ class DesktopSignInLinks:
         if self.enabled() and self._needed() and not self.stopping:
             self.released = False
             self.prepare_at = self.clock() + 2
+            self.verify_at = self.clock() + OWNERSHIP_CHECK
 
     def prepare(self, *, retry=False):
         self.stopping = self.closed = False
@@ -280,6 +299,7 @@ class DesktopSignInLinks:
             return
         current = self.native.current()
         if current == self.native.application:
+            self.held = True
             return
         self.native.remember(current)
         # Denial, a crash during the OS prompt, or an uncertain result pauses
@@ -362,6 +382,15 @@ class DesktopSignInLinks:
             self.released = True
             self._hand_back()
 
+    def _verify(self):
+        """Tell the user once that the handler was taken over; Reconnect sign-in claims it again."""
+        if ownership_lost(held=self.held, busy=self.changing or self.stopping or self.released,
+                          needed=self.enabled() and self._needed(),
+                          current=self.native.current, application=self.native.application):
+            self.held = False
+            self.native.pause(True)
+            self.show_error(OWNERSHIP_LOST)
+
     def _sift(self, *, keep_callbacks):
         """Forward ordinary links now; callbacks expire, or all go when not kept.
 
@@ -426,6 +455,9 @@ class DesktopSignInLinks:
                 self._claim()
             except Exception:
                 self.show_error("Could not set up automatic sign-in. Choose Reconnect sign-in in the profile menu to retry.")
+        if self.verify_at is not None and self.clock() >= self.verify_at:
+            self.verify_at = None
+            self._verify()
         # Discard old queued credentials even while another operation is busy.
         self._sift(keep_callbacks=True)
         if not idle or self.changing or self.dispatching:
