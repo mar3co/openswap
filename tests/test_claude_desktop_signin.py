@@ -333,7 +333,7 @@ def test_unexpected_discovery_failure_still_releases_the_callback(menu, store, a
         "Could not check the open Claude profiles. Start again from the intended Claude profile.")
 
 
-@pytest.mark.parametrize("route", ["error", "cancel", "suspend", "quit"])
+@pytest.mark.parametrize("route", ["error", "cancel", "quit"])
 def test_held_callback_is_released_however_discovery_ends(menu, store, app, monkeypatch, route):
     p = store.add("Work")
     process_list(app, store, [(33, p)])
@@ -347,8 +347,8 @@ def test_held_callback_is_released_however_discovery_ends(menu, store, app, monk
     monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: started.append(kw["target"])))
     menu.receive_signin(GOOGLE, lambda: True)
     assert menu._signin == (GOOGLE, menu._signin[1])
-    if route in {"suspend", "quit"}:
-        menu.signin_links = Mock(stopping=route == "quit")
+    if route == "quit":
+        menu.signin_links = Mock(stopping=True)
         menu.suspend_checks()
         assert menu._signin is None
     started.pop()()
@@ -356,9 +356,30 @@ def test_held_callback_is_released_however_discovery_ends(menu, store, app, monk
     assert menu._signin is None and not menu.busy
     menu.signin_sender.assert_not_called()
     assert menu.prompt.call_count == (1 if route == "cancel" else 0)
-    assert menu.show_error.call_count == (1 if route in {"error", "suspend"} else 0)
-    if route == "suspend":
-        menu.show_error.assert_called_once_with("Start again from the intended Claude profile.")
+    assert menu.show_error.call_count == (1 if route == "error" else 0)
+
+
+@pytest.mark.parametrize("state, shown", [
+    ("quit", None), ("disabled", None), ("suspended", None),
+    ("blocked", "Start again from the intended Claude profile."), ("open", "Reinstall the official app.")])
+def test_a_failed_discovery_is_shown_only_while_sign_in_is_still_wanted(menu, store, app, monkeypatch, state, shown):
+    store.add("Work")
+    app.validate = Mock(side_effect=ClaudeDesktopError("Reinstall the official app."))
+    menu._app_factory = lambda: app
+    menu.monitor = Mock(poll=Mock(return_value=False))
+    started = []
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: started.append(kw["target"])))
+    menu.receive_signin(GOOGLE, lambda: True)
+    menu.signin_links = Mock(stopping=state in {"quit", "suspended"})
+    if state == "suspended":
+        menu.suspend_checks()
+    if state == "disabled":
+        menu.enabled = lambda: False
+    if state == "blocked":
+        menu.blocked = lambda: True
+    started.pop()()
+    menu.poll()
+    assert menu.show_error.call_args_list == ([((shown,),)] if shown else [])
 
 
 @pytest.mark.parametrize("answers", [[(1, 0), (1, 2)], [(1, 0), (0, 0)]])

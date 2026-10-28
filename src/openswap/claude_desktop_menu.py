@@ -394,10 +394,10 @@ class ClaudeDesktopMenu:
                     if pid is not None:
                         result["candidates"].append((profile, pid))
             except (ClaudeSwitchError, OSError) as exc:
-                self._results.put((None, exc))
+                self._results.put((result, exc))
                 return
             except Exception:
-                self._results.put((None, ClaudeDesktopError(
+                self._results.put((result, ClaudeDesktopError(
                     "Could not check the open Claude profiles. Start again from the intended Claude profile.")))
                 return
             self._results.put((result, None))
@@ -410,20 +410,29 @@ class ClaudeDesktopMenu:
             self.changed()
             self.show_error("Could not check the open Claude profiles. Try again.")
 
+    def _signin_stopped(self):
+        """Quit, disable or suspend ended sign-in, so its results are not shown."""
+        return not self.enabled() or (self.signin_links is not None and self.signin_links.stopping)
+
+    def _discovery_failed(self, error):
+        if self._signin_stopped():
+            return
+        if self.blocked():
+            self.show_error("Start again from the intended Claude profile.")
+            return
+        self._error(error)
+
     def _choose_signin_profile(self, result, held):
         """One click picks the target; nothing is preselected unless a single candidate is certain."""
         from openswap.claude_desktop_signin import finish_signin
-        stopped = self.blocked() or not self.enabled() or (self.signin_links is not None and self.signin_links.stopping)
         if held is None:
-            if not stopped:
-                self.show_error("Start again from the intended Claude profile.")
-            return
+            return  # discovery was suspended meanwhile
         value, fresh = held
         connector, candidates = result["connector"], result["candidates"]
         if not fresh():
             self.show_error("This link expired. Start again from the intended Claude profile.")
             return
-        if stopped:
+        if self.blocked() or self._signin_stopped():
             return
         unchecked = result["default_unchecked"] or result["managed_unchecked"]
         if not candidates:
@@ -699,7 +708,10 @@ class ClaudeDesktopMenu:
             self._profile_checked_at[result["profile"]["id"]] = datetime.now().strftime("%b %d, %H:%M:%S")
         self.changed()
         if error is not None:
-            self._error(error)
+            if result is not None and result.get("state") == "signin_candidates":
+                self._discovery_failed(error)
+            else:
+                self._error(error)
             return
         if result.get("state") == "signin_candidates":
             self._choose_signin_profile(result, held)
