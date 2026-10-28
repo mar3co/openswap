@@ -177,4 +177,25 @@ Required outcomes:
 - Silent seat: the one-shot 30 s check is used up while busy or uncertain. Rated Important, because it is a behavior change on a reachable path. Goes to fix round 1.
 - Silent seat: the paused state is silent after a restart. It predates this change and touches the menu, so it is filed as #150.
 - Cold seat policy note: an early takeover re-claims on every launch. User ruling above; goes to fix round 1.
+- Pre-dispatch reader on fix round 1: a Reconnect must always claim (never answer with "Choose Reconnect"), and the `claim_pending` test is reworked. Notes amended.
+- Fix round 1 (e2a6b9f), cold seat: two Important findings with low reach, both in code the round added:
+  - "wait" when `current()` is None never retries.
+  - The `reconnecting` flag is consumed before `_needed()`'s early return.
+  Under the convergence rule, there is no further per-task round. Both go to the final review's single fix dispatch. One Minor: unbounded polling of `current()` while it raises. Ledgered.
+- Trade-off accepted by the ruling: if Claude re-registers its scheme on every launch, launching a second profile in the same OpenSwap run asks for Reconnect again.
+
+### Lane 1 (#146, #148, F-5, F-11)
+- Cold seat and silent seat: no Critical. Important findings, all in fix round 1:
+  - A: the gate could spend the live token after a switch (both seats).
+  - C: 408 counted as rejected.
+  - D: the active branch with an empty backup.
+  - E: `skip-live-session` stuck with the wrong remedy.
+  - F: an active account with no live credential.
+  Minor G: the `_commit_guard` docstring.
+- Pre-dispatch reader on fix round 1:
+  - F's premise was backwards (`""` means absent, `None` a read error), so it became test-only.
+  - A: "active" now means the live config's identity, and an unreadable read means "failed".
+  - B (stale restore): refuted. Every slot writer holds the provider mutation guard. Dropped.
+  - C: extended to a non-JSON 403.
+  - D: extended to a backup with no access token.
 
