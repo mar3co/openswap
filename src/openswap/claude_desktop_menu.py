@@ -339,9 +339,10 @@ class ClaudeDesktopMenu:
         """
         if self.busy or self.blocked() or not self.enabled() or not fresh():
             return
-        from openswap.claude_desktop_signin import finish_signin, signin_link
+        from openswap.claude_desktop_signin import finish_signin, callback_link
         try:
-            value = signin_link(value)
+            value, kind = callback_link(value)
+            connector = kind == "connector"
             app = self._app_factory()
             app.validate()
             candidates = []
@@ -357,11 +358,12 @@ class ClaudeDesktopMenu:
             self._error(exc)
             return
         if not candidates:
-            self.show_error("Open the intended Claude profile and restart sign-in there.")
+            self.show_error("Open the intended Claude profile and start again there.")
             return
         self._editing_details = True
         try:
-            response = self.prompt(title="Finish Claude sign-in", message="Which profile did you start signing in to?",
+            response = self.prompt(title="Finish connecting app" if connector else "Finish Claude sign-in",
+                                   message="Which Claude profile did you connect this app from?" if connector else "Which profile did you start signing in to?",
                                    choices=[p.name for p, _ in candidates], selected=0,
                                    ok="Continue", cancel="Cancel")
         finally:
@@ -369,13 +371,13 @@ class ClaudeDesktopMenu:
         if response.clicked != 1 or not 0 <= response.choice < len(candidates):
             return
         if not fresh():
-            self.show_error("This sign-in link expired. Restart sign-in in the intended profile.")
+            self.show_error("This link expired. Start again from the intended Claude profile.")
             return
         if self.busy or self.blocked() or not self.enabled():
             return
         profile, pid = candidates[response.choice]
         self.busy = True
-        self.operation = "Finishing sign-in…"
+        self.operation = "Connecting app…" if connector else "Finishing sign-in…"
         self.changed()
 
         def work():
@@ -388,14 +390,16 @@ class ClaudeDesktopMenu:
             except Exception:
                 # A callback is a credential. Keep native error details and the
                 # callback out of UI errors, result queues and logs.
-                self._results.put((None, ClaudeDesktopError("Could not finish sign-in. Restart sign-in in the intended Claude profile.")))
+                self._results.put((None, ClaudeDesktopError(
+                    "Could not connect the app. Start again from the intended Claude profile." if connector else
+                    "Could not finish sign-in. Restart sign-in in the intended Claude profile.")))
 
         try:
             threading.Thread(target=work, daemon=True, name="claude-profile-signin").start()
         except Exception:
             self.busy = False
             self.changed()
-            self.show_error("Could not finish sign-in. Try again.")
+            self.show_error("Could not connect the app. Try again." if connector else "Could not finish sign-in. Try again.")
 
     def details(self, profile, *, draft=None, note=""):
         if self.busy or self.blocked() or not self.enabled():
@@ -641,6 +645,9 @@ class ClaudeDesktopMenu:
             focus_profile(result["pid"])
         except Exception:
             pass  # opening succeeded; focus failure is not a login failure
+        if result.get("state") == "connector_sent":
+            self._notify("Connection link sent", f"Check the connection in {result['profile']['name']}.")
+            return
         if result.get("state") == "signin_sent":
             self.monitor.refresh(result["profile"]["id"])
             self._notify("Sign-in link sent", f"Check sign-in in {result['profile']['name']}.")

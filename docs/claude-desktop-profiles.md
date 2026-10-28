@@ -93,6 +93,12 @@ is still required when only one known profile is open, because another instance
 could have started the sign-in. OpenSwap never broadcasts a login callback or
 guesses from the last opened window, email or organization.
 
+App connections (MCP), including Code and Cowork authorization, also return
+through OpenSwap. The browser may say **Open OpenSwap** (or **OpenSwap DEV** in
+a local build). Click it, choose the Claude profile where you started the
+connection, then **Continue**. OpenSwap sends the link to that running profile;
+Claude checks the authorization and finishes connecting the app.
+
 Denying macOS's link permission pauses further requests, including after restart.
 **••• → Reconnect sign-in…** retries permission and opens the profile. Start a
 fresh sign-in there; a callback already consumed by another window cannot be
@@ -101,8 +107,8 @@ recovered. Keychain detection permission is separate and still retries through
 
 OpenSwap rechecks the signed Claude app, profile folder and chosen running PID
 before delivering an external login link. Closed, restarted, archived or
-ambiguous profiles are refused. Only inspected Google, email and SSO login
-routes are accepted; unsupported authentication routes are refused rather than
+ambiguous profiles are refused. Inspected Google, email and SSO login routes,
+and `/mcp-auth-callback/<target>` connector routes, are accepted; unsupported authentication routes are refused rather than
 forwarded to Default. External links expire after two minutes and stay only in memory until handled
 or discarded. They are never written to disk, logged, copied to the clipboard
 or put in process arguments. Duplicate deliveries are suppressed.

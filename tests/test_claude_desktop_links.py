@@ -194,7 +194,7 @@ def test_invalid_inputs_are_dropped_without_logging_or_forwarding(env, link):
 
 
 @pytest.mark.parametrize('link', [GOOGLE.replace('&hop_nonce=fixture-nonce', ''),
-    'claude://claude.ai/mcp-auth-callback/sdk?code=fixture-secret',
+    'claude://claude.ai/mcp-auth-callback/../login?code=fixture-secret',
     'claude://login/new-auth?code=fixture-secret'])
 def test_unknown_auth_routes_never_fall_through_to_default(env, link):
     e = env

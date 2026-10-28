@@ -1,4 +1,4 @@
-"""Deliver a sign-in callback to one verified Claude process.
+"""Deliver a sign-in or connector callback to one verified Claude process.
 
 macOS's shared claude:// handler cannot select a user-data-dir. This recovery
 path addresses a running process directly; it never launches another instance,
@@ -8,12 +8,14 @@ Claude remains responsible for validating and consuming the login callback.
 
 from dataclasses import asdict
 from pathlib import Path
+import re
 from urllib.parse import parse_qsl, urlsplit
 
 from openswap.claude_desktop import BUNDLE_ID, ClaudeDesktopApp, ClaudeDesktopError
 
 
 INVALID_LINK = 'This sign-in link is incomplete or unsupported. Restart sign-in in the intended Claude profile.'
+INVALID_CALLBACK = 'This Claude link is incomplete or unsupported. Start again from the intended Claude profile.'
 
 
 def signin_link(value: str) -> str:
@@ -51,6 +53,38 @@ def _fourcc(value):
     return int.from_bytes(value.encode("ascii"), "big")
 
 
+def callback_link(value: str) -> tuple[str, str]:
+    """Classify inspected Claude routes without rewriting credential payloads.
+
+    Desktop 3.6556.2 sends Code/Cowork MCP authorization to
+    /mcp-auth-callback/sdk and connector returns to /mcp-auth-callback/<id>.
+    These are not account sign-ins. Claude owns OAuth state/PKCE validation;
+    OpenSwap only delivers the original link to the explicitly chosen process.
+    """
+    try:
+        return signin_link(value), "signin"
+    except ClaudeDesktopError:
+        pass
+    try:
+        if not isinstance(value, str) or not 0 < len(value) <= 16384:
+            raise ValueError
+        value = value.strip()
+        if not value or any(ord(c) <= 32 or ord(c) >= 127 or c == "\\" for c in value):
+            raise ValueError
+        url = urlsplit(value)
+        if (url.scheme != "claude" or url.netloc != "claude.ai" or url.fragment
+                or not re.fullmatch(r"/mcp-auth-callback/[A-Za-z0-9_-]+", url.path)):
+            raise ValueError
+        pairs = parse_qsl(url.query, keep_blank_values=True, strict_parsing=True, max_num_fields=32)
+        if len(dict(pairs)) != len(pairs):
+            raise ValueError
+        # Connector returns can carry step=finish rather than code/state, and
+        # OAuth denial returns carry error. Do not require a success credential.
+        return value, "connector"
+    except (ValueError, TypeError):
+        raise ClaudeDesktopError(INVALID_CALLBACK) from None
+
+
 def send_to_process(pid: int, value: str, binary: Path) -> None:
     from AppKit import NSRunningApplication
     from Foundation import NSAppleEventDescriptor
@@ -75,7 +109,7 @@ def send_to_process(pid: int, value: str, binary: Path) -> None:
 
 
 def finish_signin(store, identifier, value, *, app=None, sender=None, expected_pid=None):
-    value = signin_link(value)
+    value, kind = callback_link(value)
     app = app or ClaudeDesktopApp()
     app.validate()
     with store._lock():
@@ -94,4 +128,4 @@ def finish_signin(store, identifier, value, *, app=None, sender=None, expected_p
         except Exception:
             # Native errors may contain the callback. Do not surface or log it.
             raise ClaudeDesktopError("Could not send the link to this Claude profile. Restart sign-in and try again.") from None
-    return {"state": "signin_sent", "pid": pid, "profile": asdict(profile)}
+    return {"state": "connector_sent" if kind == "connector" else "signin_sent", "pid": pid, "profile": asdict(profile)}

@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from openswap.claude_desktop import APP_PATH, BUNDLE_ID, ClaudeDesktopError
-from openswap.claude_desktop_signin import _fourcc, signin_link
+from openswap.claude_desktop_signin import _fourcc, callback_link
 
 OWNER_IDS = {"com.opensoft.openswap", "com.opensoft.openswap.dev"}
 PREVIOUS_KEY = "ClaudeLinksPreviousApplication"
@@ -318,15 +318,15 @@ class DesktopSignInLinks:
             # An unrecognized auth route is never sent to an arbitrary profile.
             parsed = urlsplit(value)
             try:
-                signin_link(value)
+                callback_link(value)
             except ClaudeDesktopError:
                 if any(part in (parsed.netloc + parsed.path).lower() for part in ("auth", "login", "callback", "magic-link")):
-                    self.show_error("This Claude sign-in link is not supported. Restart sign-in from the intended Claude profile.")
+                    self.show_error("This Claude link is not supported. Start again from the intended Claude profile.")
                 else:
                     self.native.forward(value)
                 return
             if not self.enabled() or self.stopping:
-                self.show_error("Open the Claude Desktop tab and restart sign-in in the intended profile.")
+                self.show_error("Open the Claude Desktop tab and start again from the intended profile.")
                 return
             self.dispatching = True
             try:
@@ -334,4 +334,4 @@ class DesktopSignInLinks:
             finally:
                 self.dispatching = False
         except Exception:
-            self.show_error("Could not finish Claude sign-in. Restart sign-in in the intended profile.")
+            self.show_error("Could not open the Claude link. Start again from the intended profile.")
