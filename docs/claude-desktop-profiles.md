@@ -105,6 +105,13 @@ fresh sign-in there; a callback already consumed by another window cannot be
 recovered. Keychain detection permission is separate and still retries through
 **Account details → Detect**.
 
+If Claude takes its links back after OpenSwap held them, OpenSwap says so once
+and pauses instead of asking macOS again on every Claude launch. Choose
+**Reconnect sign-in…** to claim them again. A pause carried over from an earlier
+run is explained once per run, while a profile needs links and another app
+handles them. Reconnect sign-in waits for an unreadable profile list and claims
+once it can be read, or says that automatic sign-in could not be set up.
+
 OpenSwap rechecks the signed Claude app, profile folder and chosen running PID
 before delivering an external login link. Closed, restarted, archived or
 ambiguous profiles are refused. Inspected Google, email and SSO login routes,
@@ -149,6 +156,17 @@ terminal/editor login and account selection are preserved. Desktop cookies are
 never used as Code credentials. A response that omits personal-account org
 metadata must agree with the completed CLI authorization's identity; a server
 identity disagreement always stops the add.
+
+A saved Code account from before account IDs were recorded is linked silently
+once its saved login verifies as this profile's account. An expired saved login
+is refreshed first, through the same single-use path the usage collector uses.
+When that account is the one Claude Code is signed in to, OpenSwap only reads
+Claude Code's own login and never refreshes or copies it. If that login has
+expired, setup asks you to **Open Claude Code once (sign in if it asks), then
+continue setup.** If the account has a running Claude Code session, setup asks
+you to close it first. A saved login that answers as a different account is
+never overwritten: setup names it and suggests **Add account → Sign in to
+Claude Code…**, which replaces that saved login.
 
 Profiles show **In Claude Code** when linked, plus usage from the same Code
 snapshot shown in the first tab. Stale usage is labeled **Last known**. Running
