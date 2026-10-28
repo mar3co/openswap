@@ -95,6 +95,37 @@ def verify_credentials(credentials, profile, *, authorized_identity=None):
         raise IdentityMismatch(MISMATCH)
 
 
+REFRESH_NEEDS_LOGIN = frozenset({"invalid_grant", "invalid_client", "no_refresh_token", "store-unmirrored"})
+
+
+def verdict(credentials, profile):
+    """A saved token's answer: match, mismatch, incomplete, rejected or transient.
+
+    No request is sent for a credential without an access token; it is
+    incomplete, so only a browser login can repair its slot.
+    """
+    token = oauth.extract_access_token(credentials or "")
+    if not token:
+        return "incomplete"
+    status, found = oauth.classify_oauth_profile(token)
+    if status not in ("verified", "incomplete"):
+        return status
+    actual = ((found["uuid"] or "").lower(), (found["organizationUuid"] or "").lower(),
+              (found["email"] or "").casefold())
+    if any(value and value != expected for value, expected in zip(actual, identity(profile))):
+        return "mismatch"
+    return "match" if status == "verified" else "incomplete"
+
+
+def refresh_step(outcome):
+    """After the consume gate: verify the new token, log in by browser, or fail for a retry."""
+    if outcome.error in REFRESH_NEEDS_LOGIN:
+        return "login"
+    if outcome.error or not outcome.credentials:
+        return "failed"
+    return "verify"
+
+
 def delete_login_keychain_item(directory):
     """A scratch login's item must be confirmed gone, or absent, before its folder goes."""
     delete_macos_keychain_entry(directory, strict=True)
@@ -113,9 +144,12 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
 
     Runs under the engine's mutation guard and writes only backups and the
     roster: the active login is never touched and no account is switched.
-    ``guard`` is entered inside the engine lock before the slot's files and
-    the roster are written, so a caller can take the registry lock there and
-    abandon a changed row while the slot is still untouched.
+    ``guard`` is entered inside the engine lock twice, never around a slot
+    write: once before the slot's files are written, so a caller can abandon
+    a changed row while the slot is still untouched, and once around the
+    roster commit. Abandoning at the commit restores a legacy slot's
+    original files, or removes a new slot's, before the engine lock is
+    released.
     """
     if identity(profile) is None or not engine._validate_email(profile.email):
         raise ClaudeDesktopError("The detected account is not valid for Claude Code.")
@@ -136,15 +170,24 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
                 legacy = str(num)
         number = legacy or str(engine._get_next_account_number())
         email = data["accounts"][number]["email"] if legacy else profile.email
+        original = original_config = ""
+        if legacy:
+            original, unreadable = engine.read_backup_credentials(number, email)
+            if unreadable:
+                raise ClaudeDesktopError("Code credentials are unavailable.")
+            original_config = engine.read_account_config(number, email)
+        with guard():
+            pass
+        committed = False
         try:
+            engine.write_account_credentials(number, email, credentials)
+            # A legacy slot keeps the full config captured when it was added.
+            if not original_config:
+                engine._write_account_config(number, email, json.dumps({"oauthAccount": {
+                    "emailAddress": email, "accountUuid": profile.account_uuid,
+                    "organizationUuid": profile.organization_uuid, "organizationName": profile.organization,
+                }}))
             with guard():
-                engine.write_account_credentials(number, email, credentials)
-                # A legacy slot keeps the full config captured when it was added.
-                if not legacy or not engine.read_account_config(number, email):
-                    engine._write_account_config(number, email, json.dumps({"oauthAccount": {
-                        "emailAddress": email, "accountUuid": profile.account_uuid,
-                        "organizationUuid": profile.organization_uuid, "organizationName": profile.organization,
-                    }}))
                 data["accounts"][number] = {
                     **data["accounts"].get(number, {}),
                     "email": email, "uuid": profile.account_uuid,
@@ -156,11 +199,16 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
                 data["sequence"].sort()
                 data["lastUpdated"] = get_timestamp()
                 engine._write_json(engine.sequence_file, data)
+                committed = True
         except Exception:
-            # Only clean files when the roster did not commit this new slot.
-            with suppress(Exception):
-                if not legacy and number not in ((engine.sequence_data() or {}).get("accounts") or {}):
-                    engine._delete_account_files(number, profile.email)
+            if legacy:
+                if not committed:
+                    _restore_slot(engine, number, email, original, original_config)
+            else:
+                # Only clean files when the roster did not commit this new slot.
+                with suppress(Exception):
+                    if number not in ((engine.sequence_data() or {}).get("accounts") or {}):
+                        engine._delete_account_files(number, profile.email)
             raise
         try:
             engine._usage_store.clear_dead_token([number], {number: (email, profile.organization_uuid)})
@@ -168,6 +216,24 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
             # The roster has committed; a stale usage quarantine is not a failed add.
             _logger.warning("could not clear the usage quarantine after adding a Code account: %s", type(exc).__name__)
         return number
+
+
+def _restore_slot(engine, number, email, credentials, config):
+    """Put back a legacy slot's credential and config, including absent ones.
+
+    The save writes a config only where none existed, so a present one is
+    still the original. On failure the slot keeps the verified credential,
+    which is for its own email and organization.
+    """
+    try:
+        if credentials:
+            engine.write_account_credentials(number, email, credentials)
+        else:
+            engine._delete_account_credentials(number, email)
+        if not config:
+            (engine.configs_dir / f".claude-config-{number}-{email}.json").unlink(missing_ok=True)
+    except Exception as exc:
+        _logger.warning("could not restore a Code account backup after abandoned setup: %s", type(exc).__name__)
 
 
 class DesktopCodeConnector:
@@ -243,8 +309,10 @@ class DesktopCodeConnector:
         elif self._sweeper is None:
             # Keychain deletes block; the UI thread never waits on them.
             self._sweeper = threading.Thread(target=self._sweep_orphaned_logins, daemon=True, name="claude-desktop-code-sweep")
-            with suppress(Exception):
+            try:
                 self._sweeper.start()
+            except Exception:
+                self._sweeper = None
         if self._active:
             try:
                 current = self.store.get(self._active[0])
@@ -336,8 +404,8 @@ class DesktopCodeConnector:
                     child.unlink()
             self.cleanup(directory)
             directory.rmdir()
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.warning("could not discard a Code setup login: %s", type(exc).__name__)
 
     def _connect(self, profile, key, binary, cancel):
         state, launched = "failed", False
@@ -353,14 +421,13 @@ class DesktopCodeConnector:
                     credentials, unreadable = self.engine.read_backup_credentials(str(number), row["email"])
                     if unreadable:
                         raise ClaudeDesktopError("Code credentials are unavailable.")
-                    try:
-                        verify_credentials(credentials, profile)
-                    except ClaudeDesktopError:
+                    verified = self._verify_legacy(str(number), row, credentials, profile)
+                    if verified is None:
                         break  # complete fresh authorization and repair the legacy slot
                     self._check_current(profile, fingerprint, cancel)
                     self.engine.backfill_account_uuid(str(number), profile.account_uuid,
                                                      expected_email=row["email"], expected_org=row["organizationUuid"],
-                                                     expected_credentials=credentials, guard=guard)
+                                                     expected_credentials=verified, guard=guard)
                     if not matching_slot(self.engine, profile):
                         raise ClaudeDesktopError("The saved account changed during setup.")
                     state = "connected"
@@ -406,6 +473,38 @@ class DesktopCodeConnector:
             state = "sign_in" if cancel.is_set() else "failed"
         finally:
             self._results.put((profile, key, state))
+
+    def _verify_legacy(self, number, row, credentials, profile):
+        """The slot credential to pin a silent link to, or None to repair the slot by browser login.
+
+        Claude Code owns the active account's credentials, so the live one
+        is only read and verified. Any other slot's rejected token is
+        refreshed only through the engine's consume gate, which serializes
+        single-use refresh tokens and writes the successor itself.
+        """
+        email = row["email"]
+        live = self.engine._get_current_identity_triple(strict=True)
+        if live and (live[0].casefold(), live[1].lower()) == (email.casefold(), row["organizationUuid"].lower()):
+            active = self.engine._read_active_credentials()
+            result = "transient" if active.degraded or active.value is None else verdict(active.value, profile)
+        else:
+            result = verdict(credentials, profile)
+            if result == "rejected":
+                outcome = (oauth.RefreshOutcome(None, "skip-live-session")
+                           if self.engine.live_session_pids_for(number, email)
+                           else self.engine.consume_backup_grant(number, email, credentials))
+                step = refresh_step(outcome)
+                if step == "login":
+                    return None
+                if step == "failed":
+                    raise ClaudeDesktopError("Could not refresh the saved Code login. Continue setup to try again.")
+                credentials = outcome.credentials
+                result = verdict(credentials, profile)
+        if result == "mismatch":
+            raise IdentityMismatch(MISMATCH)
+        if result == "transient":
+            raise ClaudeDesktopError("Could not verify the Code login. Continue setup to try again.")
+        return credentials if result == "match" else None
 
     def _check_row(self, profile, fingerprint, cancel):
         current = self.store.get(profile.id)

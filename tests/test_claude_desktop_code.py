@@ -64,10 +64,18 @@ def setup(temp_home, tmp_path, monkeypatch):
 
     oracle = Mock(return_value={"uuid": ACCOUNT, "organizationUuid": ORG, "email": DETAILS["email"]})
     monkeypatch.setattr(code.oauth, "fetch_oauth_profile", oracle)
+
+    def classify(token):
+        found = oracle(token) or dict.fromkeys(("uuid", "organizationUuid", "email"))
+        return ("verified" if all(found.values()) else "incomplete"), found
+
+    classifier = Mock(side_effect=classify)
+    monkeypatch.setattr(code.oauth, "classify_oauth_profile", classifier)
     connector = code.DesktopCodeConnector(store, engine, resolve_binary=Mock(return_value="/fake/claude"),
         login_factory=login, observe=Mock(return_value="f" * 64),
         read_credentials=Mock(return_value=CREDS), cleanup=Mock(), notify=Mock(), clock=lambda: 100)
-    return SimpleNamespace(engine=engine, store=store, profile=p, connector=connector, calls=calls, oracle=oracle)
+    return SimpleNamespace(engine=engine, store=store, profile=p, connector=connector, calls=calls, oracle=oracle,
+                           classifier=classifier)
 
 
 def finish(s):
@@ -527,8 +535,9 @@ def real_keychain(monkeypatch, outcome):
 
 
 @pytest.mark.parametrize("outcome", ["deleted", "locked", "timeout"])
-def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_live_ones(setup, monkeypatch, outcome):
+def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_live_ones(setup, monkeypatch, caplog, outcome):
     s = setup
+    caplog.set_level("WARNING", logger="openswap")
     s.connector.cleanup = code.delete_login_keychain_item
     deletes = real_keychain(monkeypatch, outcome)
     stale, live = (s.store.root / f".code-login-{name}" for name in ("stale", "live"))
@@ -552,6 +561,8 @@ def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_l
     else:
         # The item may survive: the empty folder keeps its name for the next sweep.
         assert stale.is_dir() and list(stale.iterdir()) == []
+        [record] = [r for r in caplog.records if "discard" in r.getMessage()]
+        assert "KeychainError" in record.getMessage() and "security" not in record.getMessage()
     assert finish(s).code_setup_state == "connected"
 
 
@@ -637,3 +648,218 @@ def test_archiving_retains_the_saved_code_account(setup):
     s.connector._next_scan = 0
     s.connector.poll(enabled=True)
     assert s.engine.sequence_data() == before
+
+
+LEGACY_CONFIG = json.dumps({"oauthAccount": {"emailAddress": EMAIL}, "projects": {"/work": {}}})
+
+
+def legacy_slot(s, *, config=True):
+    """A legacy slot whose credential cannot be verified, so setup repairs it by browser login."""
+    seed(s, uuid="")
+    s.engine._write_account_credentials("7", EMAIL, "legacy credential")
+    if config:
+        s.engine._write_account_config("7", EMAIL, LEGACY_CONFIG)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_registry_lock_is_free_during_the_credential_write(setup, monkeypatch, legacy):
+    s = setup
+    if legacy:
+        legacy_slot(s)
+    write = s.engine.write_account_credentials
+
+    def write_while_a_profile_opens(*args):
+        with s.store.lock():
+            pass
+        write(*args)
+
+    monkeypatch.setattr(s.engine, "write_account_credentials", write_while_a_profile_opens)
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == "connected"
+    assert s.engine.account_identity("7" if legacy else "1")["uuid"] == ACCOUNT
+
+
+@pytest.mark.parametrize("slot", ["legacy", "legacy without config", "new"])
+def test_profile_change_during_the_credential_write_restores_or_removes_the_slot(setup, monkeypatch, slot):
+    s = setup
+    if slot != "new":
+        legacy_slot(s, config=slot == "legacy")
+    write = s.engine.write_account_credentials
+
+    def archive_during_write(number, email, credentials):
+        if credentials == CREDS:
+            s.store.update(s.profile.id, archived=True)
+        write(number, email, credentials)
+
+    monkeypatch.setattr(s.engine, "write_account_credentials", archive_during_write)
+    s.connector.poll(enabled=True)
+    finish(s)
+    if slot == "new":
+        assert s.engine.sequence_data()["accounts"] == {}
+        assert s.engine.read_backup_credentials("1", EMAIL) == ("", False)
+        assert not list(s.engine.configs_dir.glob("*-1-*"))
+        return
+    assert s.engine.read_backup_credentials("7", EMAIL) == ("legacy credential", False)
+    assert s.engine.read_account_config("7", EMAIL) == (LEGACY_CONFIG if slot == "legacy" else "")
+    assert s.engine.account_identity("7")["uuid"] == ""
+
+
+def test_failed_restore_logs_only_the_error_type_and_keeps_the_verified_credential(setup, monkeypatch, caplog):
+    s = setup
+    legacy_slot(s)
+    write = s.engine.write_account_credentials
+
+    def archive_then_fail_restore(number, email, credentials):
+        if credentials != CREDS:
+            raise OSError("restore failed for " + EMAIL)
+        s.store.update(s.profile.id, archived=True)
+        write(number, email, credentials)
+
+    monkeypatch.setattr(s.engine, "write_account_credentials", archive_then_fail_restore)
+    with caplog.at_level("WARNING", logger="openswap"):
+        s.connector.poll(enabled=True)
+        finish(s)
+    [record] = [r for r in caplog.records if "restore" in r.getMessage()]
+    assert "OSError" in record.getMessage() and EMAIL not in record.getMessage()
+    assert s.engine.read_backup_credentials("7", EMAIL) == (CREDS, False)
+    assert s.engine.account_identity("7")["uuid"] == ""
+
+
+def test_failed_credential_write_commits_nothing_and_restores_the_legacy_slot(setup, monkeypatch):
+    s = setup
+    legacy_slot(s)
+    write = s.engine.write_account_credentials
+
+    def write_then_fail(number, email, credentials):
+        write(number, email, credentials)
+        if credentials == CREDS:
+            raise OSError("keychain")
+
+    monkeypatch.setattr(s.engine, "write_account_credentials", write_then_fail)
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == "failed"
+    assert s.engine.read_backup_credentials("7", EMAIL) == ("legacy credential", False)
+    assert s.engine.read_account_config("7", EMAIL) == LEGACY_CONFIG
+    assert s.engine.account_identity("7")["uuid"] == ""
+
+
+def test_unreadable_legacy_slot_at_commit_writes_nothing(setup, monkeypatch):
+    s = setup
+    legacy_slot(s)
+    read = s.engine.read_backup_credentials
+    answers = iter([None, ("", True)])
+
+    def locked_at_commit(number, email):
+        return next(answers) or read(number, email)
+
+    monkeypatch.setattr(s.engine, "read_backup_credentials", locked_at_commit)
+    monkeypatch.setattr(s.engine, "write_account_credentials", Mock())
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == "failed"
+    assert len(s.calls) == 1
+    s.engine.write_account_credentials.assert_not_called()
+    assert s.engine.account_identity("7")["uuid"] == ""
+
+
+REFRESHED = json.dumps({"claudeAiOauth": {"accessToken": "refreshed-access", "refreshToken": "refreshed-refresh",
+                                          "expiresAt": 99999999999999}})
+LIVE = json.dumps({"claudeAiOauth": {"accessToken": "live-access", "refreshToken": "live-refresh",
+                                     "expiresAt": 99999999999999}})
+NOTHING = dict.fromkeys(("uuid", "organizationUuid", "email"))
+ANSWERS = {
+    "match": ("verified", {"uuid": ACCOUNT, "organizationUuid": ORG, "email": EMAIL}),
+    "mismatch": ("verified", {"uuid": OTHER, "organizationUuid": ORG, "email": EMAIL}),
+    "partial mismatch": ("incomplete", {"uuid": ACCOUNT, "organizationUuid": OTHER, "email": None}),
+    "incomplete": ("incomplete", {"uuid": ACCOUNT, "organizationUuid": None, "email": None}),
+    "rejected": ("rejected", NOTHING),
+    "transient": ("transient", NOTHING),
+}
+
+
+def refreshed(error=None, credentials=REFRESHED, **kwargs):
+    return code.oauth.RefreshOutcome(credentials, error, **kwargs)
+
+
+@pytest.mark.parametrize("backup, gate, after, state, browser", [
+    ("match", None, None, "connected", False),
+    ("transient", None, None, "failed", False),
+    ("incomplete", None, None, "connected", True),
+    ("mismatch", None, None, "mismatch", False),
+    ("rejected", refreshed(), "match", "connected", False),
+    ("rejected", refreshed(), "mismatch", "mismatch", False),
+    ("rejected", refreshed(), "partial mismatch", "mismatch", False),
+    ("rejected", refreshed(), "incomplete", "connected", True),
+    ("rejected", refreshed(), "rejected", "connected", True),
+    ("rejected", refreshed(), "transient", "failed", False),
+    *[("rejected", refreshed(error, None), None, "connected", True)
+      for error in ("invalid_grant", "invalid_client", "no_refresh_token", "store-unmirrored")],
+    ("rejected", refreshed("transient", stashed=True), None, "failed", False),
+    *[("rejected", refreshed(error, None), None, "failed", False)
+      for error in ("transient", "consume-busy", "stash-unreadable")],
+    ("rejected", "live session", None, "failed", False),
+])
+def test_legacy_slot_token_is_refreshed_only_through_the_gate(setup, monkeypatch, backup, gate, after, state, browser):
+    s = setup
+    seed(s, uuid="")
+    answers = {"fixture-access": ANSWERS[backup], "refreshed-access": ANSWERS.get(after)}
+    s.classifier.side_effect = lambda token: answers[token]
+    persisted = isinstance(gate, code.oauth.RefreshOutcome) and gate.error is None
+
+    def consume(number, email, snapshot):
+        assert (number, email, snapshot) == ("7", EMAIL, CREDS)
+        if persisted:
+            s.engine._write_account_credentials(number, email, gate.credentials)
+        return gate
+
+    monkeypatch.setattr(s.engine, "consume_backup_grant", Mock(side_effect=consume))
+    monkeypatch.setattr(s.engine, "live_session_pids_for", Mock(return_value=[42] if gate == "live session" else []))
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == state
+    assert len(s.calls) == int(browser)
+    assert s.engine.consume_backup_grant.called is isinstance(gate, code.oauth.RefreshOutcome)
+    slot = s.engine.read_account_credentials("7", EMAIL)
+    if browser:
+        assert slot == CREDS and s.engine.account_identity("7")["uuid"] == ACCOUNT
+    else:
+        assert slot == (REFRESHED if persisted else CREDS)
+        assert s.engine.account_identity("7")["uuid"] == (ACCOUNT if state == "connected" else "")
+
+
+@pytest.mark.parametrize("answer, state, browser", [
+    ("match", "connected", False), ("rejected", "connected", True), ("incomplete", "connected", True),
+    ("transient", "failed", False), ("mismatch", "mismatch", False), ("degraded", "failed", False),
+])
+def test_active_legacy_slot_is_verified_read_only_with_the_live_credential(setup, monkeypatch, answer, state, browser):
+    from openswap.credentials import ActiveCredentials
+    s = setup
+    seed(s, uuid="")
+    monkeypatch.setattr(s.engine, "_get_current_identity_triple", lambda strict=False: (EMAIL.upper(), ORG, ""))
+    monkeypatch.setattr(s.engine, "_read_active_credentials",
+                        Mock(return_value=ActiveCredentials(LIVE, False, answer == "degraded")))
+    s.classifier.side_effect = lambda token: {"live-access": ANSWERS.get(answer)}[token]
+    monkeypatch.setattr(s.engine, "consume_backup_grant", Mock())
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == state
+    assert len(s.calls) == int(browser)
+    s.engine.consume_backup_grant.assert_not_called()
+    assert s.engine.read_account_credentials("7", EMAIL) == CREDS
+    assert s.engine.account_identity("7")["uuid"] == (ACCOUNT if state == "connected" else "")
+
+
+def test_sweeper_that_fails_to_start_is_started_by_a_later_poll(setup, monkeypatch):
+    s = setup
+    real, failed = threading.Thread, []
+
+    def thread(*args, **kwargs):
+        made = real(*args, **kwargs)
+        if made.name == "claude-desktop-code-sweep" and not failed:
+            failed.append(made)
+            made.start = Mock(side_effect=RuntimeError("can't start new thread"))
+        return made
+
+    monkeypatch.setattr(code.threading, "Thread", thread)
+    s.connector.poll(enabled=True)
+    assert failed and s.connector._sweeper is None
+    finish(s)
+    s.connector._sweeper.join(4)
+    assert s.connector._sweeper is not failed[0] and not s.connector._sweeper.is_alive()
