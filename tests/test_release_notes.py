@@ -28,7 +28,7 @@ The intro.
 
 ### Fixed
 
-- A fix.
+- A fix in Settings → General.
 
 ## 1.1.0 (2026-09-07)
 
@@ -53,7 +53,7 @@ def test_prints_only_that_versions_section(tmp_path: Path):
     path.write_text(CHANGELOG, encoding="utf-8")
     result = _notes("1.2.0", path)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "The intro.\n\n### Fixed\n\n- A fix.\n"
+    assert result.stdout == "The intro.\n\n### Fixed\n\n- A fix in Settings → General.\n"
 
 
 def test_a_heading_without_a_date_still_matches(tmp_path: Path):

@@ -48,7 +48,7 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
-    # The notes are UTF-8 Markdown; a Windows console's code page can't print them.
+    # Redirected stdout on Windows uses the ANSI code page, which can't encode the UTF-8 notes.
     sys.stdout.reconfigure(encoding="utf-8")
     print(notes)
     return 0

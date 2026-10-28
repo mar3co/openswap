@@ -555,7 +555,9 @@ def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_l
     s.connector._sweeper.join(4)
     assert s.connector._sweeper.name == "claude-desktop-code-sweep" and not s.connector._sweeper.is_alive()
     from openswap.session import keychain_service_name
-    assert deletes == [keychain_service_name(stale)]
+    # The setup's own scratch login may also be discarded by now; only the
+    # orphan and the live folder are this test's business.
+    assert keychain_service_name(stale) in deletes and keychain_service_name(live) not in deletes
     assert live.is_dir() and (live / "nested" / ".credentials.json").exists()
     if outcome == "deleted":
         assert not stale.exists()
