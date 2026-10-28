@@ -13,6 +13,11 @@ opensoft.me/swap/changelog shows this file.
 
 ## Unreleased
 
+### New
+
+- Claude Desktop profiles: open several Claude desktop app sessions side by side, each with its own sign-in. Turn on Enable desktop app features in Settings → General, then add profiles in the Claude Desktop tab. Each profile you add gets a numbered Dock icon, and its account is added to Claude Code for you: an account Claude Code already has is linked without signing in again, and a new one needs one browser sign-in.
+- Sign-in links from email, SSO and connected apps reach the right Claude profile: Google sign-in returns on its own, and for other links OpenSwap asks which profile you started from. If Claude takes those links back, OpenSwap tells you once and waits for you to choose Reconnect sign-in…, rather than showing the macOS permission prompt again.
+
 ### Fixed
 
 - With more accounts than fit on the screen, the menu bar panel's account list scrolls instead of running off the bottom of the screen.

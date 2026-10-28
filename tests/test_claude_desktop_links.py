@@ -1,11 +1,12 @@
 """Native sessions own their return; unbound URLs must never pick a profile."""
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
-from openswap.claude_desktop_links import DesktopSignInLinks, MAX_AGE, RECHECK, RESTORE_TIMEOUT
+from openswap.claude_desktop_links import (
+    DesktopSignInLinks, MAX_AGE, OWNERSHIP_CHECK, OWNERSHIP_LOST, PAUSED, RECHECK, SETUP_FAILED, RESTORE_TIMEOUT, claim_step, ordinary_link, ownership_lost)
 from tests.test_claude_desktop_signin import GOOGLE, MAGIC, SSO
 
 
@@ -103,14 +104,24 @@ def test_denied_permission_stays_paused_until_explicit_retry(env):
     assert e.error.call_count == 1
 
 
-def test_new_claude_instance_registering_again_reconnects_after_startup(env):
+def test_new_claude_instance_registering_again_is_reported_not_reclaimed_to_avoid_repeated_prompts(env):
     e = env
     claim(e)
     e.native.owner = e.native.saved
     e.native.launched()
     e.now[0] += 3
     e.router.poll()
+    assert len(e.native.requests) == 1
+    e.error.assert_called_once_with(OWNERSHIP_LOST)
+    assert e.native.paused()
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+    e.error.assert_called_once()
+    e.router.prepare(retry=True)
+    e.now[0] += 3
+    e.router.poll()
     assert len(e.native.requests) == 2
+    e.error.assert_called_once()
 
 
 def test_quitting_restores_previous_before_completion(env):
@@ -215,6 +226,17 @@ def test_ordinary_links_go_to_previous_handler_without_scheme_recursion(env):
     env.router.poll()
     env.native.forward.assert_called_once_with('claude://claude.ai/chat/fixture')
     env.received.assert_not_called()
+
+
+@pytest.mark.parametrize('link, ordinary', [
+    ('claude://claude.ai/chat/fixture', True),
+    ('claude://claude.ai/chat/%zz%ff%', True),
+    ('claude://login/new-auth?code=fixture-secret', False),
+    ('claude://claude.ai/m%61gic-link#fixture:fixture-secret', False),
+    ('claude://%6Cogin/new-auth?code=fixture-secret', False),
+    ('claude://claude.ai/%4C%4F%47%49%4E/%zz', False)])
+def test_auth_routes_are_recognized_after_percent_decoding(link, ordinary):
+    assert ordinary_link(link) is ordinary
 
 
 def test_repeated_ordinary_link_is_forwarded_each_time_but_a_repeated_callback_is_not(env):
@@ -660,3 +682,256 @@ def test_registration_failure_is_explained_without_mislabeling_permission(env):
     assert e.native.paused()
     e.router.poll()
     assert e.native.set_handler.call_count == 1
+
+
+OPENSWAP, CLAUDE = Path('/Applications/OpenSwap.app'), Path('/Applications/Claude.app')
+
+
+def gone():
+    raise OSError('Launch Services unavailable')
+
+
+@pytest.mark.parametrize('held, ended, changing, needed, current, lost', [
+    (True, False, False, True, lambda: CLAUDE, True),
+    (True, False, False, True, lambda: OPENSWAP, False),
+    (True, False, False, True, lambda: None, None),
+    (True, False, False, True, gone, None),
+    (None, False, False, True, lambda: CLAUDE, False),
+    (False, False, False, True, lambda: CLAUDE, False),
+    (True, True, False, True, lambda: CLAUDE, False),
+    (True, True, True, True, lambda: CLAUDE, False),
+    (True, False, True, True, lambda: CLAUDE, None),
+    (True, False, False, False, lambda: CLAUDE, False),
+    (True, False, False, None, lambda: CLAUDE, None)])
+def test_ownership_is_lost_only_when_a_held_handler_is_taken_while_needed(held, ended, changing, needed, current, lost):
+    assert ownership_lost(held=held, ended=ended, changing=changing, needed=needed,
+                          current=current, application=OPENSWAP) is lost
+
+
+@pytest.mark.parametrize('current, held, reconnecting, paused, noticed, step', [
+    (OPENSWAP, None, False, False, False, 'held'),
+    (OPENSWAP, True, True, False, False, 'held'),
+    (OPENSWAP, None, False, True, False, 'held'),
+    (CLAUDE, None, False, False, False, 'claim'),
+    (CLAUDE, False, False, False, False, 'claim'),
+    (CLAUDE, True, True, False, False, 'claim'),
+    (None, True, True, False, False, 'claim'),
+    (CLAUDE, True, False, False, False, 'lost'),
+    (None, True, False, False, False, 'wait'),
+    (None, None, False, False, False, 'claim'),
+    (CLAUDE, None, False, True, False, 'notice'),
+    (None, None, False, True, False, 'notice'),
+    (CLAUDE, True, True, True, False, 'notice'),
+    (CLAUDE, None, False, True, True, 'paused'),
+    (CLAUDE, True, True, True, True, 'paused')])
+def test_only_reconnect_claims_a_handler_taken_after_it_was_held(current, held, reconnecting, paused, noticed, step):
+    assert claim_step(current=current, application=OPENSWAP, held=held, reconnecting=reconnecting,
+                      paused=paused, noticed=noticed) == step
+
+
+def take_over(e):
+    e.native.owner = e.native.saved
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+
+
+def relaunch(e):
+    e.native.launched()
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+
+
+@pytest.mark.parametrize('start', ['claimed', 'already_owned'])
+def test_lost_handler_is_reported_once_and_only_reconnect_claims_it_again(env, start):
+    e = env
+    if start == 'claimed':
+        claim(e)
+    else:
+        e.native.owner = e.native.application
+        e.router.prepare()
+        e.now[0] += 3
+        e.router.poll()
+    requests = len(e.native.requests)
+    take_over(e)
+    e.error.assert_called_once_with(OWNERSHIP_LOST)
+    for _ in range(3):
+        relaunch(e)
+    assert len(e.native.requests) == requests
+    e.error.assert_called_once()
+    e.router.prepare(retry=True)
+    e.now[0] += 3
+    e.router.poll()
+    e.native.respond(True)
+    e.router.poll()
+    take_over(e)
+    assert e.error.call_count == 2
+
+
+def test_a_kept_handler_is_not_reported(env):
+    e = env
+    claim(e)
+    relaunch(e)
+    e.error.assert_not_called()
+
+
+def test_a_declined_claim_reports_only_the_claim_failure(env):
+    e = env
+    e.router.prepare()
+    e.now[0] += 3
+    e.router.poll()
+    e.native.respond(False)
+    take_over(e)
+    e.error.assert_called_once()
+    assert e.error.call_args.args[0] != OWNERSHIP_LOST
+
+
+@pytest.mark.parametrize('state', ['claim_pending', 'disabled', 'not_needed', 'quitting'])
+def test_no_loss_check_while_the_handler_is_in_flux_or_unneeded(env, state):
+    e = env
+    claim(e)
+    e.native.launched()
+    if state == 'claim_pending':
+        e.native.owner = e.native.saved
+        e.router.prepare(retry=True)
+        e.now[0] += 3
+        e.router.poll()
+        assert e.router.changing
+    if state == 'disabled': e.enabled[0] = False
+    if state == 'not_needed': e.needed[0] = False
+    if state == 'quitting': e.router.restore(Mock())
+    e.native.owner = e.native.saved
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+    assert OWNERSHIP_LOST not in [call.args[0] for call in e.error.call_args_list]
+
+
+def test_a_failed_reconnect_claim_shows_only_its_own_error(env):
+    from openswap.claude_desktop import ClaudeDesktopError
+    e = env
+    claim(e)
+    e.native.owner = e.native.saved
+    e.native.set_handler = Mock(side_effect=ClaudeDesktopError('Move OpenSwap to Applications'))
+    e.router.prepare(retry=True)
+    e.now[0] += 3
+    e.router.poll()
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+    e.error.assert_called_once_with('Move OpenSwap to Applications')
+
+
+@pytest.mark.parametrize('obstacle', ['needed_unknown', 'handler_unreadable'])
+def test_a_loss_check_that_cannot_run_yet_waits_and_then_reports(env, obstacle):
+    e = env
+    claim(e)
+    e.native.owner = e.native.saved
+    if obstacle == 'needed_unknown':
+        e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    else:
+        e.native.current = Mock(side_effect=OSError('Launch Services unavailable'))
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+    e.router.poll()
+    e.error.assert_not_called()
+    assert len(e.native.requests) == 1
+    assert e.router.verify_at is not None
+    if obstacle == 'needed_unknown':
+        e.router.needed = lambda: e.needed[0]
+    else:
+        del e.native.current
+    e.router.poll()
+    e.error.assert_called_once_with(OWNERSHIP_LOST)
+    assert len(e.native.requests) == 1
+
+
+@pytest.mark.parametrize('owner, notice', [('claude', True), ('openswap', False)])
+def test_an_unknown_owner_after_holding_waits_instead_of_claiming(env, owner, notice):
+    e = env
+    claim(e)
+    e.native.owner = None
+    e.native.launched()
+    e.now[0] += 3
+    e.router.poll()
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+    assert len(e.native.requests) == 1
+    e.error.assert_not_called()
+    assert e.router.verify_at is not None
+    e.native.owner = e.native.saved if owner == 'claude' else e.native.application
+    e.router.poll()
+    assert len(e.native.requests) == 1
+    assert e.error.call_args_list == ([call(OWNERSHIP_LOST)] if notice else [])
+    assert e.router.verify_at is None
+
+
+def take_over_unnoticed(e):
+    claim(e)
+    e.native.owner = e.native.saved
+    e.router.verify_at = None
+
+
+@pytest.mark.parametrize('blocked', ['at_the_claim', 'when_chosen'])
+def test_a_reconnect_the_profile_store_holds_up_claims_once_the_store_answers(env, blocked):
+    e = env
+    take_over_unnoticed(e)
+    store = e.router.needed
+    if blocked == 'when_chosen':
+        e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    e.router.prepare(retry=True)
+    e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    e.now[0] += 3
+    e.router.poll()
+    assert len(e.native.requests) == 1
+    e.router.needed = store
+    e.now[0] += RECHECK
+    e.router.poll()
+    e.now[0] += 3
+    e.router.poll()
+    assert len(e.native.requests) == 2
+    e.native.respond(True)
+    e.router.poll()
+    e.error.assert_not_called()
+
+
+def test_a_reconnect_the_profile_store_never_answers_reports_the_setup_failure(env):
+    e = env
+    take_over_unnoticed(e)
+    e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    e.router.prepare(retry=True)
+    for _ in range(3):
+        e.now[0] += RECHECK
+        e.router.poll()
+    e.error.assert_called_once_with(SETUP_FAILED)
+    assert len(e.native.requests) == 1
+
+
+def test_a_pause_after_a_reconnect_cancels_it_with_only_its_own_notice(env):
+    e = env
+    take_over_unnoticed(e)
+    store = e.router.needed
+    e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    e.router.prepare(retry=True)
+    e.router._lost()
+    e.router.needed = store
+    e.now[0] += RECHECK
+    e.router.poll()
+    relaunch(e)
+    assert len(e.native.requests) == 1
+    e.error.assert_called_once_with(OWNERSHIP_LOST)
+
+
+@pytest.mark.parametrize('state, notice', [
+    ('taken', True), ('missing', True), ('owned', False), ('disabled', False), ('not_needed', False)])
+def test_a_pause_from_an_earlier_run_is_explained_once_and_never_claims(env, state, notice):
+    e = env
+    e.native.pause(True)
+    if state == 'missing': e.native.owner = None
+    if state == 'owned': e.native.owner = e.native.application
+    if state == 'disabled': e.enabled[0] = False
+    if state == 'not_needed': e.needed[0] = False
+    e.router.prepare()
+    e.now[0] += 3
+    e.router.poll()
+    for _ in range(3):
+        relaunch(e)
+    assert e.native.requests == []
+    assert e.error.call_args_list == ([((PAUSED,),)] if notice else [])

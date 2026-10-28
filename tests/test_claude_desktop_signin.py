@@ -291,7 +291,49 @@ def test_unregistered_default_still_offers_managed_profiles_but_never_preselects
     menu.show_error.assert_not_called()
 
 
-@pytest.mark.parametrize("route", ["error", "cancel", "suspend"])
+@pytest.mark.parametrize("unchecked", ["default", "default_twice", "managed", "both"])
+def test_chooser_notes_name_each_kind_of_profile_that_went_unchecked(menu, store, app, monkeypatch, unchecked):
+    store.default_desktop = store.root.parent / "Claude"
+    store.default_desktop.mkdir()
+    store.ensure_default()
+    a, b = store.add("A"), store.add("B")
+    lines = [f"22 {app.binary} --user-data-dir={store.paths(a)[0]}"]
+    if unchecked != "managed":
+        lines += [f"11 {app.binary}", f"12 {app.binary}"]
+    if unchecked in {"managed", "both"}:
+        lines += [f"33 {app.binary} --user-data-dir={store.paths(b)[0]}", f"34 {app.binary} --user-data-dir={store.paths(b)[0]}"]
+    app.run.return_value.stdout = "\n".join(lines)
+    if unchecked == "default_twice":
+        monkeypatch.setattr(store, "ensure_default", Mock(side_effect=OSError("unreadable")))
+    menu._app_factory = lambda: app
+    menu.monitor = Mock(poll=Mock(return_value=False))
+    menu.prompt.return_value = SimpleNamespace(clicked=0, choice=0)
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=kw["target"]))
+    menu.receive_signin(GOOGLE, lambda: True)
+    menu.poll()
+    message = menu.prompt.call_args.kwargs["message"]
+    assert menu.prompt.call_args.kwargs["choices"] == ["Choose a profile…", "A"]
+    assert ("The existing Claude profile could not be checked." in message) is (unchecked != "managed")
+    assert ("Some open Claude profiles could not be checked." in message) is (unchecked in {"managed", "both"})
+
+
+def test_unexpected_discovery_failure_still_releases_the_callback(menu, store, app, monkeypatch):
+    store.add("Work")
+    app.processes = Mock(side_effect=RuntimeError("fixture-secret"))
+    menu._app_factory = lambda: app
+    menu.monitor = Mock(poll=Mock(return_value=False))
+    started = []
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: started.append(kw["target"])))
+    menu.receive_signin(GOOGLE, lambda: True)
+    started.pop()()
+    menu.poll()
+    assert menu._signin is None and not menu.busy
+    menu.prompt.assert_not_called()
+    menu.show_error.assert_called_once_with(
+        "Could not check the open Claude profiles. Start again from the intended Claude profile.")
+
+
+@pytest.mark.parametrize("route", ["error", "cancel", "quit"])
 def test_held_callback_is_released_however_discovery_ends(menu, store, app, monkeypatch, route):
     p = store.add("Work")
     process_list(app, store, [(33, p)])
@@ -305,7 +347,8 @@ def test_held_callback_is_released_however_discovery_ends(menu, store, app, monk
     monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: started.append(kw["target"])))
     menu.receive_signin(GOOGLE, lambda: True)
     assert menu._signin == (GOOGLE, menu._signin[1])
-    if route == "suspend":
+    if route == "quit":
+        menu.signin_links = Mock(stopping=True)
         menu.suspend_checks()
         assert menu._signin is None
     started.pop()()
@@ -314,6 +357,29 @@ def test_held_callback_is_released_however_discovery_ends(menu, store, app, monk
     menu.signin_sender.assert_not_called()
     assert menu.prompt.call_count == (1 if route == "cancel" else 0)
     assert menu.show_error.call_count == (1 if route == "error" else 0)
+
+
+@pytest.mark.parametrize("state, shown", [
+    ("quit", None), ("disabled", None), ("suspended", None),
+    ("blocked", "Start again from the intended Claude profile."), ("open", "Reinstall the official app.")])
+def test_a_failed_discovery_is_shown_only_while_sign_in_is_still_wanted(menu, store, app, monkeypatch, state, shown):
+    store.add("Work")
+    app.validate = Mock(side_effect=ClaudeDesktopError("Reinstall the official app."))
+    menu._app_factory = lambda: app
+    menu.monitor = Mock(poll=Mock(return_value=False))
+    started = []
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: started.append(kw["target"])))
+    menu.receive_signin(GOOGLE, lambda: True)
+    menu.signin_links = Mock(stopping=state in {"quit", "suspended"})
+    if state == "suspended":
+        menu.suspend_checks()
+    if state == "disabled":
+        menu.enabled = lambda: False
+    if state == "blocked":
+        menu.blocked = lambda: True
+    started.pop()()
+    menu.poll()
+    assert menu.show_error.call_args_list == ([((shown,),)] if shown else [])
 
 
 @pytest.mark.parametrize("answers", [[(1, 0), (1, 2)], [(1, 0), (0, 0)]])

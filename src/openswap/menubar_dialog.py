@@ -267,6 +267,8 @@ class BrandDialog:
     action on the footer's left, as the setup wizard places Back; it returns
     ``DIALOG_CLOSE``. ``choices`` shows a popup of those rows (``selected``
     first) where a prompt has its text field; :meth:`run` reports the row.
+    ``illustrations`` rows show an image beside a title and body; a row with
+    ``running_dot`` also shows a running dot under its image, when it has one.
     """
 
     def __init__(
@@ -421,8 +423,7 @@ class BrandDialog:
             icon.setImageScaling_(NSImageScaleProportionallyUpOrDown)
             icon.setAccessibilityLabel_(item["title"])
             surface.addSubview_(icon)
-            if item.get("image") is not None:
-                # The running dot illustrates the icon above it; no icon, no dot.
+            if item.get("running_dot") and item.get("image") is not None:
                 dot = _label("●", NSFont.systemFontOfSize_(9), NSColor.secondaryLabelColor(), 12)
                 dot.setFrameOrigin_((DIALOG_PADDING + 29, y + 64))
                 dot.setAccessibilityLabel_("Running indicator example")

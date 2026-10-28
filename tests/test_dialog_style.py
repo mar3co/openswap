@@ -57,7 +57,7 @@ def test_long_messages_scroll_without_pushing_actions_off_screen():
 
 
 def test_illustrations_fit_below_a_long_scrolling_message():
-    rows = [{"image": None, "title": f"Icon {i}", "running": True, "body": "What this icon opens. " * 6} for i in range(2)]
+    rows = [{"image": None, "title": f"Icon {i}", "running_dot": True, "body": "What this icon opens. " * 6} for i in range(2)]
     dialog = make_dialog_prompt(title="Your Claude profiles", message="Read this first.\n" * 100,
                                 illustrations=rows, default_text=None, ok="Done")
     assert dialog.surface.frame().size.height <= 640
@@ -67,6 +67,16 @@ def test_illustrations_fit_below_a_long_scrolling_message():
             frame = view.frame()
             assert frame.origin.y >= scroll.origin.y + scroll.size.height
             assert frame.origin.y + frame.size.height < dialog.surface.footer_y
+
+
+@pytest.mark.parametrize("running_dot, image, drawn", [(True, True, True), (True, False, False), (False, True, False)])
+def test_running_dot_is_drawn_only_for_a_row_that_opts_in_and_has_an_image(running_dot, image, drawn):
+    row = {"image": AppKit.NSImage.alloc().initWithSize_((64, 64)) if image else None, "title": "Icon", "body": "Opens it."}
+    if running_dot:
+        row["running_dot"] = True
+    dialog = make_dialog_prompt(title="Icons", message="Read this.", illustrations=[row], default_text=None, ok="Done")
+    labels = [view.accessibilityLabel() for view in dialog.surface.subviews()]
+    assert ("Running indicator example" in labels) is drawn
 
 
 def test_buttons_preserve_confirmation_and_cancellation_results():

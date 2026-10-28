@@ -11,7 +11,7 @@ class ConsumeMixin:
     """One-time refresh-token consume: CAS on fingerprint, unclaimed stash on persist failure."""
 
     def consume_backup_grant(
-        self, account_num: str, email: str, snapshot: str
+        self, account_num: str, email: str, snapshot: str, *, refuse_active: bool = False
     ) -> "oauth.RefreshOutcome":
         """The gate through which a backup refresh token is consumed.
 
@@ -37,6 +37,14 @@ class ConsumeMixin:
         never discarded — a stash is adopted by the next pass — and the gate
         never raises after the grant is consumed, since callers run in the
         never-raises collect pass.
+
+        ``refuse_active`` re-reads the live config under the provider
+        mutation guard right before the POST: when it names this slot's
+        account the outcome is ``skip-active`` and nothing is consumed, since
+        Claude Code may hold the same refresh token live; an unreadable
+        config is ``transient``. Nothing consumed is not nothing written: the
+        session-profile resync before that check may already have written
+        the slot.
 
         Returns a ``RefreshOutcome``: ``credentials`` is the slot's
         now-current credential on success (ours, or a racing writer's adopted
@@ -96,7 +104,7 @@ class ConsumeMixin:
                 ).mutation_guard() as guard:
                     guard.assert_available()
                     return self._consume_backup_grant_locked(
-                        account_num, email, snapshot
+                        account_num, email, snapshot, refuse_active
                     )
             except AccountLeaseError:
                 # A durable active, uncertain, or unreadable lease prevents
@@ -117,7 +125,7 @@ class ConsumeMixin:
             consume_lock.release()
 
     def _consume_backup_grant_locked(
-        self, account_num: str, email: str, snapshot: str
+        self, account_num: str, email: str, snapshot: str, refuse_active: bool = False
     ) -> "oauth.RefreshOutcome":
         """Body of ``consume_backup_grant``; caller holds both guards."""
         from openswap.session import (
@@ -295,6 +303,18 @@ class ConsumeMixin:
             # shape: the server just rejected these exact bytes), this
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
+
+        if refuse_active:
+            try:
+                active = self._live_identity_for(email, org_uuid)
+            except Exception:
+                self._logger.info(
+                    "Live config unreadable; not consuming account %s's grant.",
+                    account_num, exc_info=True,
+                )
+                return oauth.RefreshOutcome(None, "transient", None, consumed_fp)
+            if active:
+                return oauth.RefreshOutcome(None, "skip-active", None, consumed_fp)
 
         result = oauth.try_refresh_oauth_credentials(refresh_input)
         if result.error is not None or not result.credentials:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import urllib.error
 from datetime import datetime, timezone
@@ -1385,6 +1386,48 @@ class TestFetchOauthProfile:
             "401" in r.message and "pre-fix" in r.message
             for r in caplog.records
         )
+
+
+class TestClassifyOauthProfile:
+    """A rejected token goes to re-authorization; a failed request only to a retry."""
+
+    COMPLETE = {"account": {"uuid": "acc-uuid", "email": "a@b.c"}, "organization": {"uuid": "org-uuid"}}
+
+    API_ERROR = b'{"type": "error", "error": {"type": "permission_error"}}'
+
+    @pytest.mark.parametrize("code, body, status", [
+        (400, b"", "rejected"), (401, b"", "rejected"), (403, API_ERROR, "rejected"), (404, b"", "rejected"),
+        (410, b"", "rejected"),
+        (403, b"<html>Access denied</html>", "transient"), (403, b"", "transient"), (403, b"[]", "transient"),
+        (408, b"", "transient"), (429, b"", "transient"), (500, b"", "transient"), (503, b"", "transient"),
+    ])
+    def test_http_errors(self, code, body, status):
+        err = urllib.error.HTTPError("https://api.anthropic.com/api/oauth/profile", code, "x", {}, io.BytesIO(body))
+        with patch("openswap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.classify_oauth_profile("sk-live")[0] == status
+
+    @pytest.mark.parametrize("error", [urllib.error.URLError("down"), TimeoutError()])
+    def test_network_failures_are_transient(self, error):
+        with patch("openswap.oauth.urllib.request.urlopen", side_effect=error):
+            assert oauth.classify_oauth_profile("sk-live")[0] == "transient"
+
+    @pytest.mark.parametrize("payload, status, found", [
+        (COMPLETE, "verified", {"uuid": "acc-uuid", "email": "a@b.c", "organizationUuid": "org-uuid"}),
+        ({"account": {"uuid": "acc-uuid", "email": "a@b.c"}}, "incomplete",
+         {"uuid": "acc-uuid", "email": "a@b.c", "organizationUuid": None}),
+        ({"account": {"uuid": "acc-uuid", "email": ""}, "organization": {"uuid": "org-uuid"}}, "incomplete",
+         {"uuid": "acc-uuid", "email": "", "organizationUuid": "org-uuid"}),
+        ({"account": {"uuid": "  ", "email": "a@b.c"}, "organization": {"uuid": "org-uuid"}}, "incomplete",
+         {"uuid": None, "email": "a@b.c", "organizationUuid": "org-uuid"}),
+        ({"unexpected": True}, "incomplete", {"uuid": None, "email": None, "organizationUuid": None}),
+    ])
+    def test_successful_answers(self, payload, status, found):
+        response = MagicMock()
+        response.read.return_value = json.dumps(payload).encode()
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
+        with patch("openswap.oauth.urllib.request.urlopen", return_value=response):
+            assert oauth.classify_oauth_profile("sk-live") == (status, found)
 
 
 class TestInvalidGrantTaxonomy:

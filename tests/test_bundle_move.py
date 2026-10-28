@@ -23,6 +23,12 @@ def _app(folder: Path, version: str | None = "0.2.0", name: str = "OpenSwap.app"
     return app
 
 
+def _no_other_applications(monkeypatch, tmp_path):
+    """Keep move_plan from finding this Mac's own installed OpenSwap copies."""
+    monkeypatch.setattr(bundle, "_SYSTEM_APPLICATIONS", tmp_path / "System Applications")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+
+
 @pytest.fixture
 def fs(tmp_path, monkeypatch):
     """A disk image copy, an Applications folder, no Homebrew, fake tools."""
@@ -45,6 +51,7 @@ def fs(tmp_path, monkeypatch):
     monkeypatch.setattr("openswap.widget_install._move_to_trash", move_to_trash)
     monkeypatch.setattr(bundle, "CASKROOMS", (tmp_path / "no-caskroom",))
     monkeypatch.setattr(bundle, "_disk_image_mounts", lambda: set())
+    _no_other_applications(monkeypatch, tmp_path)
     from openswap import launch_agent
 
     calls["repoint"] = []
@@ -315,6 +322,7 @@ def test_quarantine_that_will_not_clear_fails_the_move(fs, monkeypatch):
     monkeypatch.undo()  # the fixture's fake; use the real _drop_quarantine
     monkeypatch.setattr(bundle, "_ditto", lambda s, d: shutil.copytree(s, d, symlinks=True))
     monkeypatch.setattr(bundle, "CASKROOMS", (fs["tmp"] / "no-caskroom",))
+    _no_other_applications(monkeypatch, fs["tmp"])
 
     def xattr(argv, **kwargs):  # -d "fails", -p still finds it
         return subprocess.CompletedProcess(argv, 0 if argv[1] == "-p" else 1, b"", b"Operation not permitted")
@@ -334,6 +342,7 @@ def test_quarantine_already_absent_is_fine(fs, monkeypatch):
     monkeypatch.undo()  # the fixture's fake; use the real _drop_quarantine
     monkeypatch.setattr(bundle, "_ditto", lambda s, d: shutil.copytree(s, d, symlinks=True))
     monkeypatch.setattr(bundle, "CASKROOMS", (fs["tmp"] / "no-caskroom",))
+    _no_other_applications(monkeypatch, fs["tmp"])
     calls = []
 
     def xattr(argv, **kwargs):  # -d exits 1 for "no such xattr"; -p agrees

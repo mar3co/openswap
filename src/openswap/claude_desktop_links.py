@@ -12,7 +12,7 @@ import os
 import queue
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from openswap.claude_desktop import APP_PATH, BUNDLE_ID, ClaudeDesktopError
 from openswap.claude_desktop_signin import callback_link, fourcc, link_text
@@ -25,8 +25,13 @@ MAX_AGE = 120
 # consent sheet to the user, and how often idle ownership is reconsidered.
 RESTORE_TIMEOUT = 10
 RECHECK = 5
+# Long enough after a Claude launch for a slow cold start to register its scheme.
+OWNERSHIP_CHECK = 30
 RESTORE_FAILED = "Could not restore Claude links. Open Claude once before signing in again."
 RESTORE_REINSTALL = "Could not restore Claude links. Open Claude once to restore its link handling, or reinstall Claude."
+OWNERSHIP_LOST = "Claude links no longer open in OpenSwap, so a sign-in may open the wrong profile. Choose Reconnect sign-in in the profile menu to fix it."
+PAUSED = "Automatic sign-in is paused. Choose Reconnect sign-in in the profile menu to allow OpenSwap to open Claude links."
+SETUP_FAILED = "Could not set up automatic sign-in. Choose Reconnect sign-in in the profile menu to retry."
 
 
 def register_application(path):
@@ -123,8 +128,50 @@ def ordinary_link(value):
         callback_link(value)
     except ClaudeDesktopError:
         parsed = urlsplit(value)
-        return not any(part in (parsed.netloc + parsed.path).lower() for part in ("auth", "login", "callback", "magic-link"))
+        route = unquote(parsed.netloc + parsed.path).lower()
+        return not any(part in route for part in ("auth", "login", "callback", "magic-link"))
     return False
+
+
+def ownership_lost(*, held, ended, changing, needed, current, application):
+    """True when a held handler was taken over while profiles still need it,
+    False when there is nothing to report, None when the check cannot run yet.
+
+    Only reports: claiming again could show the consent sheet on every launch.
+    """
+    if ended:
+        return False
+    if changing:
+        return None
+    if not held or needed is False:
+        return False
+    if needed is None:
+        return None
+    try:
+        owner = current()
+    except Exception:
+        return None
+    if owner is None:
+        return None
+    return owner != application
+
+
+def claim_step(*, current, application, held, reconnecting, paused, noticed):
+    """What the post-launch check does: "held", "claim", "lost", "wait",
+    "notice" or "paused".
+
+    Once held in this process, only Reconnect sign-in may claim again; an
+    unknown owner then waits for the ownership check rather than claiming. A
+    pause never claims; it is explained once per run unless this run already
+    told the user about it.
+    """
+    if current == application:
+        return "held"
+    if paused:
+        return "paused" if noticed else "notice"
+    if held and not reconnecting:
+        return "wait" if current is None else "lost"
+    return "claim"
 
 
 class MacOSLinks:
@@ -244,6 +291,12 @@ class DesktopSignInLinks:
         # Handed back because no profile needed links; claims again once one does.
         self.released = False
         self.recheck_at = 0.0
+        self.verify_at = None
+        # Reconnect sign-in asked for the next claim; kept until a claim runs,
+        # a pause cancels it, or a quit or disable clears it.
+        self.reconnecting = False
+        # This run told the user why automatic sign-in is paused.
+        self.noticed = False
         self.native = native_factory(self.receive, self.launched)
 
     def receive(self, value):
@@ -267,19 +320,32 @@ class DesktopSignInLinks:
         if self.enabled() and self._needed() and not self.stopping:
             self.released = False
             self.prepare_at = self.clock() + 2
+            self.verify_at = self.clock() + OWNERSHIP_CHECK
 
     def prepare(self, *, retry=False):
         self.stopping = self.closed = False
         if retry:
             self.native.pause(False)
+            self.reconnecting = True
         self.launched()
 
     def _claim(self):
-        if not self.enabled() or not self._needed() or self.stopping or self.native.paused():
+        if not self.enabled() or not self._needed() or self.stopping:
             return
+        reconnecting, self.reconnecting = self.reconnecting, False
+        paused = self.native.paused()
         current = self.native.current()
-        if current == self.native.application:
+        step = claim_step(current=current, application=self.native.application, held=self.held,
+                          reconnecting=reconnecting, paused=paused, noticed=self.noticed)
+        if step == "held":
+            self.held = True
+        elif step == "lost":
+            self._lost()
+        elif step == "notice":
+            self._notice(PAUSED)
+        if step != "claim":
             return
+        self.held = False
         self.native.remember(current)
         # Denial, a crash during the OS prompt, or an uncertain result pauses
         # subsequent requests. Only an explicit Reconnect action retries it.
@@ -289,7 +355,7 @@ class DesktopSignInLinks:
             self.native.set_handler(self.native.application, lambda ok: self.completions.put(("claim", ok)))
         except ClaudeDesktopError as exc:
             self.changing = False
-            self.show_error(str(exc))
+            self._notice(str(exc))
         except Exception:
             self.completions.put(("claim", False))
 
@@ -301,6 +367,7 @@ class DesktopSignInLinks:
             return
         self.stopping = self.explicit = True
         self.prepare_at = None
+        self.reconnecting = False
         self._sift(keep_callbacks=False)
         if completed:
             self.restore_callbacks.append(completed)
@@ -311,10 +378,9 @@ class DesktopSignInLinks:
         if self.changing:
             return  # a pending grant must be undone before quitting/disabling
         try:
-            previous = self.native.previous()
             if self.native.current() != self.native.application:
                 self.held = False
-            elif previous.is_dir():
+            elif (previous := self.native.previous()).is_dir():
                 self.changing = True
                 self.native.set_handler(previous, lambda ok: self.completions.put(("restore", ok)))
                 return
@@ -341,8 +407,23 @@ class DesktopSignInLinks:
             callback()
 
     def _recheck(self):
-        """Hand the handler back while no profile needs links; take it again when one does."""
-        if self.changing or self.stopping or (self.held is False and not self.released):
+        """Hand the handler back while no profile needs links; take it again when one does.
+
+        A Reconnect that could not claim yet claims once the profile store
+        answers, or says it could not.
+        """
+        if self.changing or self.stopping:
+            return
+        if self.reconnecting and self.prepare_at is None:
+            needed = self._needed() if self.enabled() else False
+            if needed is None:
+                self.reconnecting = False
+                self.show_error(SETUP_FAILED)
+                return
+            if needed:
+                self.launched()
+                return
+        if self.held is False and not self.released:
             return
         needed = self._needed() if self.enabled() else False
         if needed is None:
@@ -361,6 +442,29 @@ class DesktopSignInLinks:
         if self.held:
             self.released = True
             self._hand_back()
+
+    def _verify(self):
+        """Tell the user once that the handler was taken over; Reconnect sign-in claims it again."""
+        enabled = self.enabled()
+        lost = ownership_lost(held=self.held, ended=self.stopping or self.released or not enabled,
+                              changing=self.changing or self.reconnecting,
+                              needed=self._needed() if enabled else False,
+                              current=self.native.current, application=self.native.application)
+        if lost is None:
+            return
+        self.verify_at = None
+        if lost:
+            self._lost()
+
+    def _lost(self):
+        self.held = False
+        self.reconnecting = False
+        self.native.pause(True)
+        self._notice(OWNERSHIP_LOST)
+
+    def _notice(self, message):
+        self.noticed = True
+        self.show_error(message)
 
     def _sift(self, *, keep_callbacks):
         """Forward ordinary links now; callbacks expire, or all go when not kept.
@@ -406,7 +510,7 @@ class DesktopSignInLinks:
                 if self.stopping or not self.enabled():
                     self.restore()
                 elif not ok:
-                    self.show_error("Automatic sign-in is paused. Choose Reconnect sign-in in the profile menu to allow OpenSwap to open Claude links.")
+                    self._notice(PAUSED)
             else:
                 if ok:
                     self.held = False
@@ -425,7 +529,9 @@ class DesktopSignInLinks:
             try:
                 self._claim()
             except Exception:
-                self.show_error("Could not set up automatic sign-in. Choose Reconnect sign-in in the profile menu to retry.")
+                self.show_error(SETUP_FAILED)
+        if self.verify_at is not None and self.clock() >= self.verify_at:
+            self._verify()
         # Discard old queued credentials even while another operation is busy.
         self._sift(keep_callbacks=True)
         if not idle or self.changing or self.dispatching:
