@@ -541,12 +541,16 @@ def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_l
     caplog.set_level("WARNING", logger="openswap")
     s.connector.cleanup = code.delete_login_keychain_item
     deletes = real_keychain(monkeypatch, outcome)
+    scratch, mkdtemp = [], code.tempfile.mkdtemp
+    monkeypatch.setattr(code.tempfile, "mkdtemp", lambda **kw: scratch.append(mkdtemp(**kw)) or scratch[-1])
     stale, live = (s.store.root / f".code-login-{name}" for name in ("stale", "live"))
     for folder in (stale, live):
         folder.mkdir()
         (folder / ".claude.json").write_text("{}")
         (folder / "nested").mkdir()
         (folder / "nested" / ".credentials.json").write_text("{}")
+    # A new folder's mtime can trail time.time() by a filesystem tick.
+    s.connector._started -= 1
     os.utime(stale, (s.connector._started - 100,) * 2)
     os.utime(live, (s.connector._started + 100,) * 2)
     s.connector.poll(enabled=False)
@@ -554,17 +558,21 @@ def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_l
     assert s.connector.poll(enabled=True)
     s.connector._sweeper.join(4)
     assert s.connector._sweeper.name == "claude-desktop-code-sweep" and not s.connector._sweeper.is_alive()
+    # The setup's own scratch login is discarded too; let it finish before counting.
+    assert finish(s).code_setup_state == "connected"
     from openswap.session import keychain_service_name
-    assert deletes == [keychain_service_name(stale)]
+    assert len(scratch) == 1
+    assert sorted(deletes) == sorted(keychain_service_name(Path(p)) for p in [stale, *scratch])
     assert live.is_dir() and (live / "nested" / ".credentials.json").exists()
     if outcome == "deleted":
         assert not stale.exists()
+        assert not [r for r in caplog.records if "discard" in r.getMessage()]
     else:
         # The item may survive: the empty folder keeps its name for the next sweep.
         assert stale.is_dir() and list(stale.iterdir()) == []
-        [record] = [r for r in caplog.records if "discard" in r.getMessage()]
-        assert "KeychainError" in record.getMessage() and "security" not in record.getMessage()
-    assert finish(s).code_setup_state == "connected"
+        records = [r.getMessage() for r in caplog.records if "discard" in r.getMessage()]
+        assert len(records) == 1 + len(scratch)
+        assert all("KeychainError" in m and "security" not in m for m in records)
 
 
 @pytest.mark.parametrize("outcome", ["deleted", "locked"])

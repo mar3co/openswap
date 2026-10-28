@@ -11,12 +11,13 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
-## Unreleased
+## 0.3.0 (2026-10-28)
 
 ### New
 
 - Claude Desktop profiles: open several Claude desktop app sessions side by side, each with its own sign-in. Turn on Enable desktop app features in Settings → General, then add profiles in the Claude Desktop tab. Each profile you add gets a numbered Dock icon, and its account is added to Claude Code for you: an account Claude Code already has is linked without signing in again, and a new one needs one browser sign-in.
 - Sign-in links from email, SSO and connected apps reach the right Claude profile: Google sign-in returns on its own, and for other links OpenSwap asks which profile you started from. If Claude takes those links back, OpenSwap tells you once and waits for you to choose Reconnect sign-in…, rather than showing the macOS permission prompt again.
+- OpenSwap tells you when a newer release is out: an Update available item in the menu bar's More menu, one notification per release, and a one-line notice in the terminal, each saying how to upgrade.
 
 ### Fixed
 

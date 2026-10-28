@@ -48,6 +48,8 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+    # Redirected stdout on Windows uses the ANSI code page, which can't encode the UTF-8 notes.
+    sys.stdout.reconfigure(encoding="utf-8")
     print(notes)
     return 0
 
