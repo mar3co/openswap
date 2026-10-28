@@ -11,7 +11,7 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
-## Unreleased
+## 0.3.0 (2026-10-28)
 
 ### New
 
