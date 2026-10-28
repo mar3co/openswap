@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from openswap.claude_desktop_links import DesktopSignInLinks, MAX_AGE, RECHECK, RESTORE_TIMEOUT
+from openswap.claude_desktop_links import DesktopSignInLinks, MAX_AGE, RECHECK, RESTORE_TIMEOUT, ordinary_link
 from tests.test_claude_desktop_signin import GOOGLE, MAGIC, SSO
 
 
@@ -215,6 +215,17 @@ def test_ordinary_links_go_to_previous_handler_without_scheme_recursion(env):
     env.router.poll()
     env.native.forward.assert_called_once_with('claude://claude.ai/chat/fixture')
     env.received.assert_not_called()
+
+
+@pytest.mark.parametrize('link, ordinary', [
+    ('claude://claude.ai/chat/fixture', True),
+    ('claude://claude.ai/chat/%zz%ff%', True),
+    ('claude://login/new-auth?code=fixture-secret', False),
+    ('claude://claude.ai/m%61gic-link#fixture:fixture-secret', False),
+    ('claude://%6Cogin/new-auth?code=fixture-secret', False),
+    ('claude://claude.ai/%4C%4F%47%49%4E/%zz', False)])
+def test_auth_routes_are_recognized_after_percent_decoding(link, ordinary):
+    assert ordinary_link(link) is ordinary
 
 
 def test_repeated_ordinary_link_is_forwarded_each_time_but_a_repeated_callback_is_not(env):
@@ -660,3 +671,4 @@ def test_registration_failure_is_explained_without_mislabeling_permission(env):
     assert e.native.paused()
     e.router.poll()
     assert e.native.set_handler.call_count == 1
+

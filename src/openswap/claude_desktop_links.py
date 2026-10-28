@@ -12,7 +12,7 @@ import os
 import queue
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from openswap.claude_desktop import APP_PATH, BUNDLE_ID, ClaudeDesktopError
 from openswap.claude_desktop_signin import callback_link, fourcc, link_text
@@ -123,7 +123,8 @@ def ordinary_link(value):
         callback_link(value)
     except ClaudeDesktopError:
         parsed = urlsplit(value)
-        return not any(part in (parsed.netloc + parsed.path).lower() for part in ("auth", "login", "callback", "magic-link"))
+        route = unquote(parsed.netloc + parsed.path).lower()
+        return not any(part in route for part in ("auth", "login", "callback", "magic-link"))
     return False
 
 
