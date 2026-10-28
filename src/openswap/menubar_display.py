@@ -82,14 +82,22 @@ def chatgpt_suggestions_effective(settings: "MenuBarSettings") -> bool:
     )
 
 
+def codex_auto_hint(settings: "MenuBarSettings", *, codex_enabled: bool) -> str:
+    """The Codex auto-switch row's hint; a running Codex pauses suggestions, never the reverse."""
+    if not chatgpt_suggestions_effective(settings):
+        return "Uses the same rotation settings as Claude Code."
+    if codex_enabled:
+        return "ChatGPT suggestions are paused while this is on."
+    return "Turn off ChatGPT suggestions to auto-switch Codex."
+
+
 def chatgpt_tab_desktop(settings: "MenuBarSettings | None") -> bool:
     """Whether the ChatGPT tab is about the desktop app (True) or Codex CLI.
 
-    Desktop features and **Enable ChatGPT switching** decide the tab's whole
-    identity: either off, the tab is titled Codex, a card click selects that login
-    for Codex CLI and the footer toggle is live Codex rotation; on, the tab is
-    titled ChatGPT, a click reopens the ChatGPT app and the toggle is ChatGPT
-    suggestions.
+    Desktop features and **Enable ChatGPT switching** decide what the tab,
+    still titled Codex, does: either off, a card click selects that login for
+    Codex CLI and the footer toggle is Codex auto-switching; on, a click
+    reopens the ChatGPT app and the toggle is ChatGPT suggestions.
     """
     return bool(getattr(settings, "desktop_features_enabled", False)) and bool(
         getattr(settings, "chatgpt_switching_enabled", False)
@@ -583,9 +591,9 @@ def settings_page_rows(
     tagged with a settings section so AppKit can keep the page compact; callers
     that omit ``section`` receive the complete model for compatibility.
 
-    Claude, ChatGPT desktop selection, and Codex CLI rotation are named
-    independently. ChatGPT suggestions and live Codex rotation are mutually
-    exclusive in the controller; the model makes that relationship visible.
+    Claude, ChatGPT desktop selection, and Codex auto-switching are named
+    independently. The controller pauses ChatGPT suggestions while Codex
+    auto-switching is on; the model makes that relationship visible.
 
     General ends with **This Mac**: what ``openswap setup`` and its
     neighbours set up from a terminal. After Open at login,
@@ -897,18 +905,14 @@ def settings_page_rows(
                         "id": "codex_enabled",
                         "label": "Auto-switch Codex accounts",
                         "value": bool(codex_enabled),
-                        "disabled": chatgpt_suggestions_effective(settings),
+                        "disabled": chatgpt_suggestions_effective(settings) and not codex_enabled,
                     },
                     {
                         "kind": "group",
                         "style": "hint",
                         "section": SETTINGS_SECTION_AUTOMATION,
                         "id": "codex_auto_hint",
-                        "label": (
-                            "Turn off ChatGPT suggestions to auto-switch Codex."
-                            if chatgpt_suggestions_effective(settings)
-                            else "Uses the same rotation settings as Claude Code."
-                        ),
+                        "label": codex_auto_hint(settings, codex_enabled=bool(codex_enabled)),
                     },
                 ]
             )
@@ -1040,7 +1044,7 @@ def desktop_profile_usage(profile: dict, cards: list[dict]) -> str:
         known = card.get("identity")
         if (str(card["num"]) != str(profile.get("code_slot")) or card.get("provider") != "claude"
                 or not known or (known[0].casefold(), known[1].lower()) !=
-                (profile.get("email", "").casefold(), profile["organization_uuid"])):
+                (profile.get("email", "").casefold(), profile["organization_uuid"].lower())):
             continue
         if card.get("windows"):
             usage = " · ".join(f"{w['label']} {w['pct']:.0f}%" for w in card["windows"])
@@ -2650,7 +2654,7 @@ def provider_cards(cards: list[dict], provider: str, *, desktop: bool = True) ->
     return result
 
 
-def provider_tab_name(provider: str, *, desktop: bool = True) -> str:
+def provider_tab_name(provider: str) -> str:
     """Navigation names stay stable when ChatGPT switching is enabled."""
     if provider == "chatgpt":
         return "Codex"
@@ -2665,7 +2669,7 @@ def provider_tabs(settings: MenuBarSettings) -> tuple[str, ...]:
 
 def provider_tab_title(cards: list[dict], provider: str, *, desktop: bool = True) -> str:
     """Provider tab copy that keeps hidden action-required accounts visible."""
-    name = provider_tab_name(provider, desktop=desktop)
+    name = provider_tab_name(provider)
     if provider == "claude_desktop":
         return name
     shown = provider_cards(cards, provider, desktop=desktop)
@@ -2681,7 +2685,7 @@ def provider_tab_title(cards: list[dict], provider: str, *, desktop: bool = True
 
 def provider_empty_state(provider: str, state: str = "ready", *, desktop: bool = True) -> dict:
     """Actionable empty copy; never mistake a failed read for an empty roster."""
-    name = provider_tab_name(provider, desktop=desktop)
+    name = provider_tab_name(provider)
     if state == "loading":
         return {"title": f"Loading {name} accounts…",
                 "body": "Checking your saved logins. This may take a moment.",

@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -147,10 +148,12 @@ def test_visibility_cannot_change_halfway_through_an_app_operation(app, opening)
 @pytest.mark.parametrize('enabled', [False, True])
 def test_desktop_app_navigation_is_gated_and_does_not_change_accounts(enabled):
     cls = extract_class(Path(menubar.__file__).with_name('menubar_panel.py'), 'MenuBarPanel',
-                        {'_emit_setting', '_check_desktop_settings_app'}, dict(vars(menubar)))
+                        {'_emit_setting', '_check_desktop_settings_app', '_reload_after'}, dict(vars(menubar)))
     panel = cls()
     panel._settings = lambda: menubar.MenuBarSettings(desktop_features_enabled=enabled)
     panel._desktop_settings_app = 'claude'
+    panel._reloads = 0
+    panel.is_shown = lambda: True
     panel._on_claude_desktop_check = Mock()
     panel._on_chatgpt_view_active = Mock()
     panel._on_setting = Mock()
@@ -161,3 +164,62 @@ def test_desktop_app_navigation_is_gated_and_does_not_change_accounts(enabled):
     assert panel.reload.call_count == int(enabled)
     panel._on_claude_desktop_check.assert_not_called()
     panel._on_setting.assert_not_called()
+
+
+def test_enabling_completes_when_the_profile_store_cannot_be_read(app):
+    app.settings.desktop_features_enabled = False
+    app._claude_desktop_profiles.signin_links.prepare.side_effect = menubar.ClaudeSwitchError('unreadable registry')
+    app._toggle_desktop_features()
+    assert menubar.MenuBarSettings.load(app._settings_path).desktop_features_enabled
+    app.rebuild_menu.assert_called_once()
+    app._panel.reload.assert_called_once()
+
+
+def test_signin_links_are_needed_only_for_live_managed_profiles(tmp_path):
+    from openswap.claude_desktop import ClaudeDesktopError, DesktopProfiles
+    app = extract_class(menubar.__file__, 'MenuBarApp', {'_desktop_signin_needed'}, {})()
+    store = DesktopProfiles(tmp_path / 'profiles')
+    app._claude_desktop_profiles = SimpleNamespace(store=store)
+    assert app._desktop_signin_needed() is False
+    profile = store.add('Work')
+    assert app._desktop_signin_needed() is True
+    store.update(profile.id, archived=True)
+    assert app._desktop_signin_needed() is False
+    store.registry.write_text('invalid')
+    with pytest.raises(ClaudeDesktopError):
+        app._desktop_signin_needed()
+
+
+def test_background_desktop_updates_wait_for_the_mouse_button():
+    down = [True]
+    scope = {**vars(menubar), 'mouse_button_down': lambda: down[0]}
+    app = extract_class(menubar.__file__, 'MenuBarApp', {'_claude_desktop_changed'}, scope)()
+    app._panel = SimpleNamespace(_menu_open=False, _page='main', _selected_provider='claude_desktop',
+                                 is_shown=lambda: True, reload=Mock())
+    app.rebuild_menu = Mock()
+    app._claude_desktop_update_pending = False
+    app._claude_desktop_changed()
+    assert app._claude_desktop_update_pending
+    app.rebuild_menu.assert_not_called()
+    app._panel.reload.assert_not_called()
+    down[0] = False
+    app._claude_desktop_changed()
+    assert not app._claude_desktop_update_pending
+    app.rebuild_menu.assert_called_once()
+    app._panel.reload.assert_called_once()
+
+
+@pytest.mark.parametrize('codex_on', [True, False])
+def test_codex_row_stays_switchable_while_codex_runs_under_suggestions(codex_on):
+    settings = menubar.MenuBarSettings(desktop_features_enabled=True, chatgpt_switching_enabled=True,
+                                       chatgpt_auto_enabled=True, auto_switch_enabled=True)
+    rows = {row['id']: row for row in menubar.settings_page_rows(
+        settings, strategy='best', threshold=90, has_codex=True, codex_enabled=codex_on, section='automation')}
+    assert rows['codex_enabled']['disabled'] is (not codex_on)
+    assert rows['codex_auto_hint']['label'] == (
+        'ChatGPT suggestions are paused while this is on.' if codex_on else 'Turn off ChatGPT suggestions to auto-switch Codex.')
+    settings.chatgpt_auto_enabled = False
+    rows = {row['id']: row for row in menubar.settings_page_rows(
+        settings, strategy='best', threshold=90, has_codex=True, codex_enabled=codex_on, section='automation')}
+    assert not rows['codex_enabled']['disabled']
+    assert rows['codex_auto_hint']['label'] == 'Uses the same rotation settings as Claude Code.'

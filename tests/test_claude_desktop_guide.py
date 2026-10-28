@@ -117,6 +117,6 @@ def test_missing_claude_artwork_keeps_instructions_readable(monkeypatch, tmp_pat
     from openswap import claude_desktop_guide
     monkeypatch.setattr(claude_desktop_guide, "APP_PATH", tmp_path / "missing.app")
     rows = claude_desktop_guide.illustrations()
-    assert len(rows) == 2 and all(r["image"] is None for r in rows)
+    assert len(rows) == 2 and all(r["image"] is None and r["running"] for r in rows)
     assert "Default → Open" in rows[0]["body"]
     assert "dot" in rows[1]["body"]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
 
@@ -63,6 +64,9 @@ class ClaudeDesktopMenu:
         self.signin_sender = signin_sender
         self.signin_links = None
         self._editing_details = False
+        self._guide_shown = False
+        self._default_error = ""
+        self._default_registered = False
         self.operation = "Opening Claude…"
         self.busy = False
         self._results = queue.SimpleQueue()
@@ -78,17 +82,31 @@ class ClaudeDesktopMenu:
     def suspend_checks(self):
         self._check_generation += 1
         self.checking = False
+        self._default_registered = False
         self.monitor.suspend()
         if self.code:
             self.code.suspend()
         if self.signin_links:
             self.signin_links.restore()
 
+    @contextmanager
+    def _modal(self):
+        self._editing_details = True
+        try:
+            yield
+        finally:
+            self._editing_details = False
+
+    def _operation_label(self):
+        return self.operation if self.busy else "Waiting for app switch…"
+
     def _profiles(self):
-        self._default_error = ""
-        if self.enabled():
+        if self.enabled() and not self._default_registered:
+            # Registering the ordinary profile is the one write a view can
+            # cause; once it exists, views only read.
+            self._default_error = ""
             try:
-                self.store.ensure_default()
+                self._default_registered = self.store.ensure_default() is not None
             except (ClaudeSwitchError, OSError):
                 # Discovery cannot prevent managing separate profiles. Invalid
                 # registry metadata is still surfaced by list() below.
@@ -97,7 +115,7 @@ class ClaudeDesktopMenu:
 
     def settings_state(self):
         state = {"checking": self.checking, "busy": self.busy or self.blocked(),
-                 "operation": self.operation if self.busy else "Waiting for app switch…",
+                 "operation": self._operation_label(),
                  "app_message": "Checking Claude Desktop…" if self.checking else self._app_message}
         try:
             profiles = self._profiles()
@@ -123,7 +141,7 @@ class ClaudeDesktopMenu:
         self.changed()
 
         def check():
-            validated = False
+            app, validated, states = None, False, {}
             try:
                 app = self._app_factory()
                 info = app.validate()
@@ -131,17 +149,18 @@ class ClaudeDesktopMenu:
                 message = f"Claude {info['version']} · Publisher verified."
             except Exception as exc:
                 message = str(exc) if isinstance(exc, ClaudeSwitchError) else "Could not check Claude Desktop. Try again."
-            try:
-                states = app.profile_states(self.store)
-                from openswap.claude_desktop_presence import attach_presence
-                for profile in self.store.list():
-                    if validated and generation == self._check_generation and self.enabled() and states.get(profile.id) == "Running":
-                        try:
-                            attach_presence(self.store, profile.id)
-                        except (ClaudeSwitchError, OSError):
-                            pass  # passive refresh must not interrupt work with dialogs
-            except Exception:
-                states = {}
+            if app is not None:
+                try:
+                    states = app.profile_states(self.store)
+                    from openswap.claude_desktop_presence import attach_presence
+                    for profile in self.store.list():
+                        if validated and generation == self._check_generation and self.enabled() and states.get(profile.id) == "Running":
+                            try:
+                                attach_presence(self.store, profile.id)
+                            except (ClaudeSwitchError, OSError):
+                                pass  # passive refresh must not interrupt work with dialogs
+                except Exception:
+                    states = {}
             self._checks.put((generation, message, states, datetime.now().strftime("%b %d, %H:%M:%S")))
 
         try:
@@ -163,7 +182,7 @@ class ClaudeDesktopMenu:
         if self._checked_at:
             menu.add(rumps.MenuItem("App check details…", callback=lambda _: self.show_status(self._app_message)))
         if self.busy or self.blocked():
-            menu.add(rumps.MenuItem(self.operation, callback=None))
+            menu.add(rumps.MenuItem(self._operation_label(), callback=None))
             return menu
         menu.add(rumps.MenuItem("Add profile…", callback=self.add))
         try:
@@ -254,9 +273,11 @@ class ClaudeDesktopMenu:
     def archive(self, profile):
         if self.busy or self.blocked() or not self.enabled() or self.confirm is None:
             return
-        if self.confirm(title=f"Archive {profile.name}?",
-                        message="Keeps sign-ins, data and open windows. Shortcuts are disabled until you restore this profile.",
-                        ok="Archive", cancel="Cancel") == 1:
+        with self._modal():
+            confirmed = self.confirm(title=f"Archive {profile.name}?",
+                                     message="Keeps sign-ins, data and open windows. Shortcuts are disabled until you restore this profile.",
+                                     ok="Archive", cancel="Cancel") == 1
+        if confirmed:
             self.edit(profile, archived=True)
 
     def show_guide(self, *, for_creation=False):
@@ -264,8 +285,7 @@ class ClaudeDesktopMenu:
             return False
         from openswap.claude_desktop_guide import illustrations
 
-        self._editing_details = True
-        try:
+        with self._modal():
             response = self.prompt(
                 title="Your Claude profiles",
                 message="Your current sign-in appears as Default. Add a profile for another sign-in. Your Claude icon stays in place.",
@@ -280,19 +300,16 @@ class ClaudeDesktopMenu:
             # Also remember within this run if saving is unavailable.
             self._guide_shown = True
             return True
-        finally:
-            self._editing_details = False
 
     def add(self, _=None):
         if self.busy or self.blocked() or not self.enabled() or self._editing_details:
             return
-        if not (self.guide_seen() or getattr(self, "_guide_shown", False)):
+        if not (self.guide_seen() or self._guide_shown):
             if not self.show_guide(for_creation=True):
                 return
         if self.busy or self.blocked() or not self.enabled():
             return
-        self._editing_details = True
-        try:
+        with self._modal():
             response = self.prompt(
                 title="Create Claude Desktop profile",
                 message="Sign in to the new Claude window. Allow OpenSwap to open Claude links if asked.\n\nKeychain access lets OpenSwap read the account and add it to Claude Code. Finish browser sign-in if asked.",
@@ -300,8 +317,6 @@ class ClaudeDesktopMenu:
                 checkbox="Add profile icon to Dock", checkbox_checked=True,
                 default_text="", ok="Create and open", cancel="Cancel",
             )
-        finally:
-            self._editing_details = False
         if response.clicked != 1:
             return
         if self.busy or self.blocked() or not self.enabled():
@@ -316,8 +331,9 @@ class ClaudeDesktopMenu:
     def rename(self, profile):
         if self.busy or self.blocked() or not self.enabled():
             return
-        response = self.prompt(title="Rename Claude Desktop profile", message="Choose a name for this profile.",
-                               default_text=profile.name, ok="Save", cancel="Cancel")
+        with self._modal():
+            response = self.prompt(title="Rename Claude Desktop profile", message="Choose a name for this profile.",
+                                   default_text=profile.name, ok="Save", cancel="Cancel")
         if response.clicked == 1:
             self.edit(profile, name=response.text)
 
@@ -327,7 +343,11 @@ class ClaudeDesktopMenu:
         if self.signin_links is None:
             self.show_error("Automatic sign-in needs the OpenSwap app. Open the installed app and try again.")
             return
-        self.signin_links.prepare(retry=True)
+        try:
+            self.signin_links.prepare(retry=True)
+        except (ClaudeSwitchError, OSError) as exc:
+            self._error(exc)
+            return
         self.open(profile.id)
 
     def receive_signin(self, value, fresh):
@@ -339,43 +359,80 @@ class ClaudeDesktopMenu:
         """
         if self.busy or self.blocked() or not self.enabled() or not fresh():
             return
-        from openswap.claude_desktop_signin import finish_signin, callback_link
+        from openswap.claude_desktop_signin import callback_link
         try:
             value, kind = callback_link(value)
-            connector = kind == "connector"
-            app = self._app_factory()
-            app.validate()
-            candidates = []
-            for profile in self._profiles():
-                if profile.archived:
-                    continue
-                desktop, code = self.store.paths(profile)
-                argv = [str(app.binary)] if code is None else [str(app.binary), f"--user-data-dir={desktop}"]
-                pid = app._running(argv, desktop)
-                if pid is not None:
-                    candidates.append((profile, pid))
-        except (ClaudeSwitchError, OSError) as exc:
+        except ClaudeDesktopError as exc:
             self._error(exc)
             return
-        if not candidates:
-            self.show_error("Open the intended Claude profile and start again there.")
-            return
-        self._editing_details = True
+        self.busy = True
+        self.operation = "Checking open Claude profiles…"
+        self.changed()
+
+        def work():
+            result = {"state": "signin_candidates", "value": value, "connector": kind == "connector", "fresh": fresh,
+                      "candidates": [], "unchecked": 0}
+            try:
+                app = self._app_factory()
+                app.validate()
+                self.store.ensure_default()
+                profiles = sorted(self.store.list(), key=lambda p: p.kind != "default")
+                processes = app._processes()
+            except (ClaudeSwitchError, OSError) as exc:
+                self._results.put((None, exc))
+                return
+            for profile in profiles:
+                desktop, code = self.store.paths(profile)
+                argv = [str(app.binary)] if code is None else [str(app.binary), f"--user-data-dir={desktop}"]
+                try:
+                    pid = app._running(argv, desktop, processes=processes)
+                except ClaudeDesktopError:
+                    result["unchecked"] += 1
+                    continue
+                if pid is not None:
+                    result["candidates"].append((profile, pid))
+            self._results.put((result, None))
+
         try:
-            response = self.prompt(title="Finish connecting app" if connector else "Finish Claude sign-in",
-                                   message="Which Claude profile did you connect this app from?" if connector else "Which profile did you start signing in to?",
-                                   choices=[p.name for p, _ in candidates], selected=0,
-                                   ok="Continue", cancel="Cancel")
-        finally:
-            self._editing_details = False
-        if response.clicked != 1 or not 0 <= response.choice < len(candidates):
+            threading.Thread(target=work, daemon=True, name="claude-profile-discovery").start()
+        except Exception:
+            self.busy = False
+            self.changed()
+            self.show_error("Could not check the open Claude profiles. Try again.")
+
+    def _choose_signin_profile(self, result):
+        """One click picks the target; with several candidates nothing is preselected."""
+        from openswap.claude_desktop_signin import finish_signin
+        value, fresh, connector, candidates = result["value"], result["fresh"], result["connector"], result["candidates"]
+        if not fresh():
+            self.show_error("This link expired. Start again from the intended Claude profile.")
             return
+        if self.blocked() or not self.enabled() or (self.signin_links is not None and self.signin_links.stopping):
+            return
+        if not candidates:
+            self.show_error("Could not check the open Claude profiles. Start again from the intended Claude profile."
+                            if result["unchecked"] else "Open the intended Claude profile and start again there.")
+            return
+        placeholder = ["Choose a profile…"] if len(candidates) > 1 else []
+        while True:
+            with self._modal():
+                response = self.prompt(title="Finish connecting app" if connector else "Finish Claude sign-in",
+                                       message="Which Claude profile did you connect this app from?" if connector else "Which profile did you start signing in to?",
+                                       choices=placeholder + [p.name for p, _ in candidates], selected=0,
+                                       ok="Continue", cancel="Cancel")
+            if response.clicked != 1:
+                return
+            choice = response.choice - len(placeholder)
+            if 0 <= choice < len(candidates):
+                break
+            if not (placeholder and response.choice == 0):
+                return
         if not fresh():
             self.show_error("This link expired. Start again from the intended Claude profile.")
             return
         if self.busy or self.blocked() or not self.enabled():
             return
-        profile, pid = candidates[response.choice]
+        profile, pid = candidates[choice]
         self.busy = True
         self.operation = "Connecting app…" if connector else "Finishing sign-in…"
         self.changed()
@@ -414,15 +471,12 @@ class ClaudeDesktopMenu:
             if values.get("detected_at"):
                 when = datetime.fromisoformat(values["detected_at"]).astimezone().strftime("%b %d, %H:%M")
                 message += f"\nLast detected {when}. The account may have changed."
-            self._editing_details = True
-            try:
+            with self._modal():
                 response = self.prompt(title=f"Account details · {profile.name}", message=message,
                                        fields=[("Email (optional)", values["email"]),
                                                ("Organization (optional)", values["organization"])],
                                        checkbox="Update account details automatically", checkbox_checked=values.get("auto_detect", profile.auto_detect),
                                        ok="Save", cancel="Cancel", other="Detect")
-            finally:
-                self._editing_details = False
             if response.clicked not in (1, -1):
                 return
             if self.busy or self.blocked() or not self.enabled():
@@ -558,8 +612,9 @@ class ClaudeDesktopMenu:
         if self.busy or self.blocked() or not self.enabled():
             return
         from openswap.claude_desktop_shortcut import ICON_NOTICE, create_shortcut
-        response = self.prompt(title="Shortcut icon", message="Choose a number from 1–999, or leave blank for the standard icon.\n\n" + ICON_NOTICE,
-                               default_text=profile.badge, ok="Continue", cancel="Cancel")
+        with self._modal():
+            response = self.prompt(title="Shortcut icon", message="Choose a number from 1–999, or leave blank for the standard icon.\n\n" + ICON_NOTICE,
+                                   default_text=profile.badge, ok="Continue", cancel="Cancel")
         if response.clicked != 1:
             return
         badge, color = response.text.strip(), profile.color
@@ -570,8 +625,9 @@ class ClaudeDesktopMenu:
             return
         if badge:
             colors = list(BADGE_COLORS)
-            response = self.prompt(title="Badge color", message="Choose a badge color. The shortcut will appear in Finder; drag it to your Dock.",
-                choices=[c.title() for c in colors], selected=colors.index(color), ok="Create shortcut", cancel="Cancel")
+            with self._modal():
+                response = self.prompt(title="Badge color", message="Choose a badge color. The shortcut will appear in Finder; drag it to your Dock.",
+                                       choices=[c.title() for c in colors], selected=colors.index(color), ok="Create shortcut", cancel="Cancel")
             if response.clicked != 1 or not 0 <= response.choice < len(colors):
                 return
             color = colors[response.choice]
@@ -620,6 +676,9 @@ class ClaudeDesktopMenu:
         if error is not None:
             self._error(error)
             return
+        if result.get("state") == "signin_candidates":
+            self._choose_signin_profile(result)
+            return
         if result.get("state") == "account_details":
             if not self.enabled() or self.blocked():
                 return
@@ -653,7 +712,10 @@ class ClaudeDesktopMenu:
             self._notify("Sign-in link sent", f"Check sign-in in {result['profile']['name']}.")
             return
         if self.signin_links and self.enabled():
-            self.signin_links.prepare()
+            try:
+                self.signin_links.prepare()
+            except (ClaudeSwitchError, OSError):
+                pass  # the profile opened; the Desktop section reports an unreadable store
         self._notify("Claude profile opened", f"{result['profile']['name']} · Check the account in Claude.")
         if result.get("setup_warning"):
             self.show_status(result["setup_warning"])

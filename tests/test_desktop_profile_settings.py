@@ -154,3 +154,49 @@ def test_disclosures_are_local_and_action_failure_releases_panel():
         panel._desktop_profile_action("open", "profile-id")
     assert [call.args for call in panel._hold_overflow.call_args_list] == [(True,), (False,)]
     panel._on_claude_desktop_action.assert_called_once_with("open", "profile-id")
+
+
+def test_pending_app_switch_shows_waiting_not_the_last_operation(controller):
+    from tests.test_claude_desktop import Item
+    controller.operation = "Opening Claude…"
+    controller.blocked = lambda: True
+    titles = [item.title for item in controller.menu(SimpleNamespace(MenuItem=Item)).children]
+    assert "Waiting for app switch…" in titles and "Opening Claude…" not in titles
+    assert controller.settings_state()["operation"] == "Waiting for app switch…"
+    controller.busy = True
+    assert "Opening Claude…" in [item.title for item in controller.menu(SimpleNamespace(MenuItem=Item)).children]
+
+
+@pytest.mark.parametrize("action", ["rename", "archive", "shortcut"])
+def test_every_modal_pauses_background_work_while_open(controller, action):
+    profile = controller.store.add("Work")
+    seen = []
+    def answer(**_kwargs):
+        seen.append(controller._editing_details)
+        return SimpleNamespace(clicked=0)
+    controller.prompt.side_effect = answer
+    controller.confirm = Mock(side_effect=lambda **kwargs: answer(**kwargs).clicked)
+    getattr(controller, action)(profile)
+    assert seen == [True] and not controller._editing_details
+
+
+def test_default_profile_is_registered_once_and_then_only_read(controller, tmp_path, monkeypatch):
+    controller.store.default_desktop = tmp_path / "Claude"
+    assert controller.settings_state()["items"] == []
+    controller.store.default_desktop.mkdir()
+    assert controller.settings_state()["items"][0]["kind"] == "default"
+    monkeypatch.setattr(controller.store, "ensure_default", Mock(return_value=None))
+    assert controller.settings_state()["items"][0]["kind"] == "default"
+    controller.store.ensure_default.assert_not_called()
+    controller.suspend_checks()
+    controller.settings_state()
+    controller.store.ensure_default.assert_called_once()
+
+
+def test_profile_usage_matches_the_org_uuid_case_insensitively():
+    from openswap.menubar_display import desktop_profile_usage
+    profile = {"archived": False, "account_uuid": "acct", "organization_uuid": "ORG-UUID", "code_slot": "1",
+               "email": "me@example.test"}
+    card = {"num": "1", "provider": "claude", "identity": ("me@example.test", "org-uuid"),
+            "windows": [{"label": "5h", "pct": 23}]}
+    assert desktop_profile_usage(profile, [card]) == "Usage: 5h 23%"

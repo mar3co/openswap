@@ -428,25 +428,6 @@ def test_notification_failure_does_not_break_completed_operation(menu, monkeypat
     menu.show_error.assert_not_called()
 
 
-def test_profile_menu_holds_popover_until_closed(monkeypatch):
-    from openswap import menubar
-    from tests.menubar_harness import extract_class
-
-    panel_path = Path(menubar.__file__).with_name("menubar_panel.py")
-    panel = extract_class(panel_path, "MenuBarPanel", {"_claude_desktop_profiles"}, {"SETTINGS_PAGE": "settings"})()
-    panel._settings = lambda: SimpleNamespace(desktop_features_enabled=True)
-    panel._page = "settings"
-    panel.is_shown = lambda: True
-    panel.reload = Mock()
-    panel._hold_overflow = Mock()
-    panel._on_claude_desktop = Mock(side_effect=RuntimeError("menu failed"))
-    with pytest.raises(RuntimeError):
-        panel._claude_desktop_profiles("button")
-    assert [c.args for c in panel._hold_overflow.call_args_list] == [(True,), (False,)]
-    panel._on_claude_desktop.assert_called_once_with("button")
-    panel.reload.assert_called_once()
-
-
 def test_running_status_checks_all_profiles_once_without_launching(store, app):
     running, stopped, archived, conflict = [store.add(n) for n in ("Running", "Stopped", "Archived", "Conflict")]
     store.update(archived.id, archived=True)
@@ -549,10 +530,12 @@ def test_profiles_shortcut_opens_desktop_settings_and_checks_app():
     from openswap import menubar
     from tests.menubar_harness import extract_class
     cls = extract_class(Path(menubar.__file__).with_name("menubar_panel.py"), "MenuBarPanel",
-                        {"_show_claude_desktop_settings", "_select_settings_section", "_check_desktop_settings_app"}, dict(vars(menubar)))
+                        {"_show_claude_desktop_settings", "_select_settings_section", "_check_desktop_settings_app", "_reload_after"},
+                        dict(vars(menubar)))
     panel = cls()
     panel._settings = lambda: menubar.MenuBarSettings(desktop_features_enabled=True)
     panel._page = "main"
+    panel._reloads = 0
     panel._on_claude_desktop_check = Mock()
     panel.is_shown = lambda: True
     panel.reload = Mock()
@@ -565,7 +548,8 @@ def test_profiles_shortcut_opens_desktop_settings_and_checks_app():
 def test_desktop_updates_preserve_open_menu_anchor_and_do_not_reload_account_cards():
     from openswap import menubar
     from tests.menubar_harness import extract_class
-    cls = extract_class(menubar.__file__, "MenuBarApp", {"_claude_desktop_changed"}, dict(vars(menubar)))
+    cls = extract_class(menubar.__file__, "MenuBarApp", {"_claude_desktop_changed"},
+                        {**vars(menubar), "mouse_button_down": lambda: False})
     app = cls()
     panel = SimpleNamespace(_menu_open=True, _page="settings", _settings_section="desktop", is_shown=lambda: True, reload=Mock())
     app._panel = panel

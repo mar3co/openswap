@@ -162,7 +162,10 @@ def test_unbound_callback_asks_for_profile_without_exposing_link_or_claiming_aut
     focus = Mock()
     monkeypatch.setattr(ui, "focus_profile", focus)
     menu.receive_signin(GOOGLE, lambda: True)
-    assert menu.prompt.call_args.kwargs["choices"] == ["Work"]
+    menu.prompt.assert_not_called()
+    menu.poll()
+    # One candidate is preselected; the chooser never offers a placeholder then.
+    assert menu.prompt.call_args.kwargs["choices"] == ["Work"] and menu.prompt.call_args.kwargs["selected"] == 0
     assert GOOGLE not in repr(menu.prompt.call_args)
     assert menu.busy
     menu.poll()
@@ -174,19 +177,98 @@ def test_unbound_callback_asks_for_profile_without_exposing_link_or_claiming_aut
 
 
 @pytest.mark.parametrize("reason", ["cancel", "invalid", "busy", "disabled", "blocked", "archived", "expired", "closed"])
-def test_menu_guards_do_not_send_or_launch(menu, store, app, reason):
+def test_menu_guards_do_not_send_or_launch(menu, store, app, reason, monkeypatch):
     p = store.add("Work")
     process_list(app, store, [] if reason == "closed" else [(33, p)])
     menu._app_factory = lambda: app
     menu.signin_sender = Mock()
     menu.prompt.return_value = SimpleNamespace(clicked=0 if reason == "cancel" else 1, choice=0)
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=kw["target"]))
     if reason == "busy": menu.busy = True
     if reason == "disabled": menu.enabled = lambda: False
     if reason == "blocked": menu.blocked = lambda: True
     if reason == "archived": store.update(p.id, archived=True)
     menu.receive_signin("invalid" if reason == "invalid" else GOOGLE, lambda: reason != "expired")
+    menu.poll()
+    menu.poll()
     menu.signin_sender.assert_not_called()
     app.popen.assert_not_called()
+    if reason == "closed":
+        assert menu.show_error.call_args.args[0] == "Open the intended Claude profile and start again there."
+
+
+def test_discovery_runs_off_the_main_thread_and_holds_further_links(menu, store, app, monkeypatch):
+    p = store.add("Work")
+    process_list(app, store, [(33, p)])
+    menu._app_factory = lambda: app
+    menu.signin_links = Mock(stopping=False)
+    menu.monitor = Mock(poll=Mock(return_value=False))
+    started = []
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: started.append(kw["target"])))
+    menu.receive_signin(GOOGLE, lambda: True)
+    assert menu.busy and menu.operation == "Checking open Claude profiles…"
+    app.run.assert_not_called()
+    menu.prompt.assert_not_called()
+    menu.poll()
+    assert menu.signin_links.poll.call_args.kwargs == {"idle": False}
+    started.pop()()
+    ps_calls = [c for c in app.run.call_args_list if c.args[0][0] == "/bin/ps"]
+    assert len(ps_calls) == 1 and GOOGLE not in repr(app.run.call_args_list)
+    menu.prompt.return_value = SimpleNamespace(clicked=0, choice=0)
+    menu.poll()
+    assert menu.prompt.call_args.kwargs["choices"] == ["Work"]
+    assert not menu.busy and not menu._editing_details
+    menu.poll()
+    assert menu.signin_links.poll.call_args.kwargs == {"idle": True}
+
+
+@pytest.mark.parametrize("failing", ["one", "all"])
+def test_profile_whose_process_check_fails_is_skipped_not_fatal(menu, store, app, monkeypatch, failing):
+    a, b = store.add("A"), store.add("B")
+    lines = [f"11 {app.binary}", f"33 {app.binary} --user-data-dir={store.paths(b)[0]}",
+             f"34 {app.binary} --user-data-dir={store.paths(b)[0]}"]
+    if failing == "all":
+        lines += [f"22 {app.binary} --user-data-dir={store.paths(a)[0]}", f"23 {app.binary} --user-data-dir={store.paths(a)[0]}"]
+    else:
+        lines.append(f"22 {app.binary} --user-data-dir={store.paths(a)[0]}")
+    app.run.return_value.stdout = "\n".join(lines)
+    menu._app_factory = lambda: app
+    menu.signin_sender = Mock()
+    menu.monitor = Mock(poll=Mock(return_value=False))
+    menu.prompt.return_value = SimpleNamespace(clicked=0, choice=0)
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=kw["target"]))
+    menu.receive_signin(GOOGLE, lambda: True)
+    menu.poll()
+    if failing == "all":
+        menu.prompt.assert_not_called()
+        assert menu.show_error.call_args.args[0].startswith("Could not check the open Claude profiles.")
+    else:
+        assert menu.prompt.call_args.kwargs["choices"] == ["A"]
+        menu.show_error.assert_not_called()
+    assert not menu.busy
+
+
+@pytest.mark.parametrize("answers", [[(1, 0), (1, 2)], [(1, 0), (0, 0)]])
+def test_several_candidates_start_unselected_and_the_placeholder_reprompts(menu, store, app, monkeypatch, answers):
+    a, b = store.add("A"), store.add("B")
+    process_list(app, store, [(22, a), (33, b)])
+    menu._app_factory = lambda: app
+    menu.signin_sender = Mock()
+    menu.monitor = Mock(poll=Mock(return_value=False))
+    menu.prompt.side_effect = [SimpleNamespace(clicked=clicked, choice=choice) for clicked, choice in answers]
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=kw["target"]))
+    monkeypatch.setattr(ui, "focus_profile", Mock())
+    menu.receive_signin(GOOGLE, lambda: True)
+    menu.poll()
+    assert menu.prompt.call_count == 2
+    for call in menu.prompt.call_args_list:
+        assert call.kwargs["choices"] == ["Choose a profile…", "A", "B"] and call.kwargs["selected"] == 0
+    menu.poll()
+    if answers[-1][0] == 1:
+        menu.signin_sender.assert_called_once_with(33, GOOGLE, app.binary)
+    else:
+        menu.signin_sender.assert_not_called()
+    assert not menu.busy
 
 
 def test_fallback_profile_menu_exposes_reconnect_without_paste(menu, store):
@@ -224,16 +306,17 @@ def test_changes_while_chooser_open_do_not_misroute(menu, store, app, monkeypatc
     menu.monitor = Mock(poll=Mock(return_value=False))
     fresh = [True]
     def choose(**kw):
-        assert kw["choices"] == ["A", "B"]
+        assert kw["choices"] == ["Choose a profile…", "A", "B"]
         if change == "expired": fresh[0] = False
         if change == "archived": store.update(b.id, archived=True)
         if change == "closed": process_list(app, store, [(22, a)])
         if change == "disabled": menu.enabled = lambda: False
         if change == "switched_pid": process_list(app, store, [(22, a), (44, b)])
-        return SimpleNamespace(clicked=1, choice=1)
+        return SimpleNamespace(clicked=1, choice=2)
     menu.prompt.side_effect = choose
     monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=kw["target"]))
     menu.receive_signin(GOOGLE, lambda: fresh[0])
+    menu.poll()
     menu.poll()
     menu.signin_sender.assert_not_called()
     app.popen.assert_not_called()

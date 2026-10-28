@@ -54,13 +54,14 @@ def test_connection_return_selects_secondary_while_default_is_running(menu, stor
     menu._app_factory = lambda: app
     menu.signin_sender = Mock()
     menu.monitor = Mock(poll=Mock(return_value=False))
-    menu.prompt.return_value = SimpleNamespace(clicked=1, choice=1)
+    menu.prompt.return_value = SimpleNamespace(clicked=1, choice=2)
     monkeypatch.setattr(ui.threading, 'Thread', lambda **kw: SimpleNamespace(start=kw['target']))
     focus = Mock()
     monkeypatch.setattr(ui, 'focus_profile', focus)
     saved = store.registry.read_bytes()
     menu.receive_signin(MCP, lambda: True)
-    assert menu.prompt.call_args.kwargs['choices'] == [default.name, 'Work']
+    menu.poll()
+    assert menu.prompt.call_args.kwargs['choices'] == ['Choose a profile…', default.name, 'Work']
     assert menu.prompt.call_args.kwargs['title'] == 'Finish connecting app'
     assert MCP not in repr(menu.prompt.call_args)
     menu.poll()
@@ -90,6 +91,7 @@ def test_connector_selection_rechecks_target_and_expiry(menu, store, app, monkey
     menu.prompt.side_effect = choose
     monkeypatch.setattr(ui.threading, 'Thread', lambda **kw: SimpleNamespace(start=kw['target']))
     menu.receive_signin(MCP, lambda: fresh[0])
+    menu.poll()
     menu.poll()
     menu.signin_sender.assert_not_called()
     app.popen.assert_not_called()

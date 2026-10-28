@@ -374,6 +374,16 @@ class BrandDialog:
         rows = (len(widths) + (1 if close else 0)) if stacked else 1
         footer_height = 40 + rows * (ACTION_HEIGHT + ACTION_GAP) - ACTION_GAP
 
+        # Measured before the message so its scroll limit leaves them room.
+        text_x, text_width = DIALOG_PADDING + 80, DIALOG_CONTENT_WIDTH - 80
+        figures = []
+        for item in illustrations or ():
+            caption = _label(item["title"], NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold),
+                             NSColor.labelColor(), text_width)
+            detail = _label(item["body"], NSFont.systemFontOfSize_(13), NSColor.secondaryLabelColor(), text_width)
+            figures.append((item, caption, detail, max(80, caption.frame().size.height + 5 + detail.frame().size.height)))
+        illustration_space = sum(20 + height for _item, _caption, _detail, height in figures)
+
         if message:
             y += 8
             body = _label(str(message), NSFont.systemFontOfSize_(13),
@@ -384,7 +394,7 @@ class BrandDialog:
             max_height = min(640, screen.visibleFrame().size.height - 80) if screen else 640
             input_space = (DIALOG_INPUT_HEIGHT + 20 + (24 if input_label else 0) if default_text is not None else 0) + (
                 POPUP_HEIGHT + 20 if choices is not None else 0) + len(fields or ()) * (DIALOG_INPUT_HEIGHT + 42)
-            body_limit = max(80, max_height - y - input_space - FOOTER_GAP - footer_height)
+            body_limit = max(80, max_height - y - input_space - illustration_space - FOOTER_GAP - footer_height)
             body_height = body.frame().size.height
             if body_height > body_limit:
                 scroll = NSScrollView.alloc().initWithFrame_(
@@ -404,7 +414,7 @@ class BrandDialog:
                 y += body_height
 
         self.illustration_views = []
-        for item in illustrations or ():
+        for item, caption, detail, height in figures:
             y += 20
             icon = NSImageView.alloc().initWithFrame_(NSMakeRect(DIALOG_PADDING, y, 64, 64))
             icon.setImage_(item.get("image"))
@@ -416,16 +426,12 @@ class BrandDialog:
                 dot.setFrameOrigin_((DIALOG_PADDING + 29, y + 64))
                 dot.setAccessibilityLabel_("Running indicator example")
                 surface.addSubview_(dot)
-            text_x, text_width = DIALOG_PADDING + 80, DIALOG_CONTENT_WIDTH - 80
-            caption = _label(item["title"], NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold),
-                             NSColor.labelColor(), text_width)
             caption.setFrameOrigin_((text_x, y))
             surface.addSubview_(caption)
-            detail = _label(item["body"], NSFont.systemFontOfSize_(13), NSColor.secondaryLabelColor(), text_width)
             detail.setFrameOrigin_((text_x, y + caption.frame().size.height + 5))
             surface.addSubview_(detail)
             self.illustration_views.append((icon, caption, detail))
-            y += max(80, caption.frame().size.height + 5 + detail.frame().size.height)
+            y += height
 
         if checkbox:
             y += 16

@@ -927,6 +927,19 @@ class _FlippedView(NSView):
         return True
 
 
+def _overlay_scroll(root, frame, width, height):
+    """A transparent overlay-scroller list inside ``root``: ``(scroll, document view)``."""
+    scroll = NSScrollView.alloc().initWithFrame_(frame)
+    scroll.setDrawsBackground_(False)
+    scroll.setHasVerticalScroller_(True)
+    scroll.setAutohidesScrollers_(True)
+    scroll.setScrollerStyle_(NSScrollerStyleOverlay)
+    content = _FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, width, height))
+    scroll.setDocumentView_(content)
+    root.addSubview_(scroll)
+    return scroll, content
+
+
 class _ProfileGroupView(_FlippedView):
     def drawRect_(self, _rect):
         pal = _colors()
@@ -1019,7 +1032,6 @@ class MenuBarPanel:
         worker_paired=None,
         login_item=None,
         on_add_claude=None,
-        on_claude_desktop=None,
         claude_desktop_state=None,
         on_claude_desktop_check=None,
         on_claude_desktop_action=None,
@@ -1034,7 +1046,6 @@ class MenuBarPanel:
         self._on_rotate = on_rotate
         self._on_best = on_best
         self._on_add_claude = on_add_claude
-        self._on_claude_desktop = on_claude_desktop
         self._claude_desktop_state = claude_desktop_state or (lambda: {})
         self._on_claude_desktop_check = on_claude_desktop_check
         self._on_claude_desktop_action = on_claude_desktop_action
@@ -1088,6 +1099,7 @@ class MenuBarPanel:
         self._controller = None
         self._card_scroll = None
         self._card_scroll_provider = None
+        self._reloads = 0
         self._tramps: list = []
         self._toggle_tramp = None
         self._appearance_obs = None
@@ -1187,6 +1199,7 @@ class MenuBarPanel:
     def reload(self) -> None:
         if self._popover is None:
             return
+        self._reloads += 1
         view = self._build()
         controller = _PanelController.alloc().init()
         controller.setView_(view)
@@ -1361,9 +1374,18 @@ class MenuBarPanel:
         settings = self._settings() if callable(self._settings) else MenuBarSettings()
         if provider not in provider_tabs(settings):
             return
+        if provider != self._selected_provider:
+            # A new tab starts at the top, also when the previous page did not
+            # rebuild the list whose scroll position is kept.
+            self._card_scroll = self._profiles_scroll = None
         self._selected_provider = provider
-        self._refresh_active_provider()
-        if self.is_shown():
+        self._reload_after(self._refresh_active_provider)
+
+    def _reload_after(self, action) -> None:
+        """Reload the shown popover once; ``action`` may already have reloaded it through the controller."""
+        reloads = self._reloads
+        action()
+        if self.is_shown() and self._reloads == reloads:
             self.reload()
 
     def _refresh_active_provider(self):
@@ -1386,17 +1408,6 @@ class MenuBarPanel:
         self._token_error = ""
         self._page = TOKEN_PAGE
         self.reload()
-
-    def _claude_desktop_profiles(self, sender):
-        if self._on_claude_desktop is None or not self._settings().desktop_features_enabled:
-            return
-        self._hold_overflow(True)
-        try:
-            self._on_claude_desktop(sender)
-        finally:
-            self._hold_overflow(False)
-            if self._page == SETTINGS_PAGE and self.is_shown():
-                self.reload()
 
     def _show_claude_desktop_settings(self, _sender=None):
         if not self._settings().desktop_features_enabled:
@@ -1501,10 +1512,7 @@ class MenuBarPanel:
         self._settings_section = section
         if section == SETTINGS_SECTION_REMOTE and self._on_worker_view_active is not None:
             self._on_worker_view_active()
-        if section == SETTINGS_SECTION_DESKTOP:
-            self._check_desktop_settings_app()
-        if self.is_shown():
-            self.reload()
+        self._reload_after(self._check_desktop_settings_app if section == SETTINGS_SECTION_DESKTOP else lambda: None)
 
     def _emit_setting(self, row_id, value):
         if row_id in {"claude_desktop_help", "claude_desktop_archived", "chatgpt_help"}:
@@ -1521,8 +1529,7 @@ class MenuBarPanel:
             if value not in {"claude", "chatgpt"} or not self._settings().desktop_features_enabled:
                 return
             self._desktop_settings_app = value
-            self._check_desktop_settings_app()
-            self.reload()
+            self._reload_after(self._check_desktop_settings_app)
             return
         cb = self._on_setting
         if cb is not None:
@@ -1583,6 +1590,16 @@ class MenuBarPanel:
         btn.setAction_("act:")
         root.addSubview_(btn)
         return btn
+
+    def _add_disclosure(self, root, row, y, width, font):
+        expanded = bool(row.get("value"))
+        button = self._add_button(root, ("▾ " if expanded else "▸ ") + row["label"], NSMakeRect(PAD, y + 2, width, 26),
+                                  lambda _, rid=row["id"]: self._emit_setting(rid, None), font)
+        button.setBordered_(False)
+        button.setAlignment_(0)
+        button.setAccessibilityLabel_(row["label"])
+        button.setAccessibilityValue_("Expanded" if expanded else "Collapsed")
+        return button
 
     def _add_icon_button(
         self, root, symbol, fallback, frame, cb, tooltip, *, bordered=False, point_size=None,
@@ -1913,14 +1930,7 @@ class MenuBarPanel:
             if scrolls:
                 # The list reaches into the right margin so the overlay
                 # scroller clears the cards' ··· buttons.
-                scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(PAD, y, inner_w + PAD, body_h))
-                scroll.setDrawsBackground_(False)
-                scroll.setHasVerticalScroller_(True)
-                scroll.setAutohidesScrollers_(True)
-                scroll.setScrollerStyle_(NSScrollerStyleOverlay)
-                list_view = _FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, inner_w + PAD, content_h))
-                scroll.setDocumentView_(list_view)
-                root.addSubview_(scroll)
+                scroll, list_view = _overlay_scroll(root, NSMakeRect(PAD, y, inner_w + PAD, body_h), inner_w + PAD, content_h)
                 self._card_scroll = scroll
                 self._card_scroll_provider = provider
                 card_x, y = 0.0, 0.0
@@ -2203,15 +2213,7 @@ class MenuBarPanel:
         self._profiles_scroll = None
         content, y = root, PAD + HEADER_H + TAB_H
         if visible_h < body_h:
-            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, y, PANEL_WIDTH, visible_h))
-            scroll.setDrawsBackground_(False)
-            scroll.setHasVerticalScroller_(True)
-            scroll.setAutohidesScrollers_(True)
-            scroll.setScrollerStyle_(NSScrollerStyleOverlay)
-            content = _FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, PANEL_WIDTH, body_h))
-            scroll.setDocumentView_(content)
-            root.addSubview_(scroll)
-            self._profiles_scroll = scroll
+            self._profiles_scroll, content = _overlay_scroll(root, NSMakeRect(0, y, PANEL_WIDTH, visible_h), PANEL_WIDTH, body_h)
             y = 0
         for row in rows:
             kind, h = row["kind"], row_height(row)
@@ -2228,13 +2230,7 @@ class MenuBarPanel:
                 _wrap(label)
                 content.addSubview_(label)
             elif kind == "disclosure":
-                button = self._add_button(content, ("▾ " if row["value"] else "▸ ") + row["label"],
-                                          NSMakeRect(PAD, y + 2, inner_w, 26),
-                                          lambda _, rid=row["id"]: self._emit_setting(rid, None), font_small)
-                button.setBordered_(False)
-                button.setAlignment_(0)
-                button.setAccessibilityLabel_(row["label"])
-                button.setAccessibilityValue_("Expanded" if row["value"] else "Collapsed")
+                self._add_disclosure(content, row, y, inner_w, font_small)
             elif kind == "button":
                 width = max(70.0, _button_width(row["title"], font_small))
                 content.addSubview_(_label(row["label"], font_body, pal["fg"], NSMakeRect(PAD, y + 5, inner_w - width - 8, 20)))
@@ -2501,28 +2497,14 @@ class MenuBarPanel:
         self._settings_scroll = None
         self._settings_scroll_key = scroll_key
         if visible_body_h < body_h:
-            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, y, PANEL_WIDTH, visible_body_h))
-            scroll.setDrawsBackground_(False)
-            scroll.setHasVerticalScroller_(True)
-            scroll.setAutohidesScrollers_(True)
-            scroll.setScrollerStyle_(NSScrollerStyleOverlay)
-            content = _FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, PANEL_WIDTH, body_h))
-            scroll.setDocumentView_(content)
-            root.addSubview_(scroll)
-            self._settings_scroll = scroll
+            self._settings_scroll, content = _overlay_scroll(root, NSMakeRect(0, y, PANEL_WIDTH, visible_body_h), PANEL_WIDTH, body_h)
             y = 0
 
         for row in rows:
             kind = row.get("kind")
             h = _row_height(row)
             if kind == "disclosure":
-                button = self._add_button(content, ("▾ " if row.get("value") else "▸ ") + row["label"],
-                                          NSMakeRect(PAD, y + 2, inner_w, 26),
-                                          lambda _, rid=row["id"]: self._emit_setting(rid, None), font_small)
-                button.setBordered_(False)
-                button.setAlignment_(0)
-                button.setAccessibilityLabel_(row["label"])
-                button.setAccessibilityValue_("Expanded" if row.get("value") else "Collapsed")
+                self._add_disclosure(content, row, y, inner_w, font_small)
             elif kind == "app_check":
                 button_w = max(70.0, _button_width(row["title"], font_small))
                 label = _label(row["label"], font_small, pal["muted"], NSMakeRect(PAD, y + 6, inner_w - button_w - 8, h - 12))
@@ -2625,7 +2607,6 @@ class MenuBarPanel:
                     content,
                     title,
                     NSMakeRect(PANEL_WIDTH - PAD - button_w, y + 2, button_w, 26),
-                    self._claude_desktop_profiles if row["id"] == "claude_desktop_profiles" else
                     lambda _s, rid=row["id"], v=row.get("value"): self._emit_setting(rid, v),
                     font_small,
                 )

@@ -44,8 +44,13 @@ from openswap.menubar_display import (  # noqa: F401  tests poke these
 )
 
 
+def mouse_button_down() -> bool:
+    import AppKit
+    return bool(AppKit.NSEvent.pressedMouseButtons())
+
+
 def desktop_switch_choices(snapshot):
-    """Only offer managed Codex OAuth rows in the experimental submenu."""
+    """Only offer managed Codex OAuth rows in the Switch ChatGPT app menu."""
     from openswap.codex import split_provider_num
     from openswap.json_output import USAGE_API_KEY
 
@@ -250,6 +255,7 @@ def run(switcher, codex=None) -> int:
             self._worker_generation = 0
             self._worker_result_lock = threading.Lock()
             self._desktop_app = DesktopApp()
+            self._claude_desktop_update_pending = False
             self._claude_desktop_profiles = ClaudeDesktopMenu(
                 prompt=self._prompt, show_error=self._show_error, changed=self._claude_desktop_changed,
                 confirm=self._alert,
@@ -266,7 +272,7 @@ def run(switcher, codex=None) -> int:
                 from openswap.claude_desktop_links import DesktopSignInLinks
                 self._claude_desktop_profiles.signin_links = DesktopSignInLinks(
                     enabled=lambda: self.settings.desktop_features_enabled,
-                    needed=lambda: any(p.kind == "managed" for p in self._claude_desktop_profiles.store.list()),
+                    needed=self._desktop_signin_needed,
                     receive_signin=self._claude_desktop_profiles.receive_signin,
                     show_error=self._show_error,
                 )
@@ -632,8 +638,7 @@ def run(switcher, codex=None) -> int:
             self._drain_desktop_result()
             if getattr(self, "_claude_desktop_profiles", None) is not None:
                 self._claude_desktop_profiles.poll()
-            if (getattr(self, "_claude_desktop_update_pending", False)
-                    and not getattr(self._panel, "_menu_open", False)):
+            if self._claude_desktop_update_pending:
                 self._claude_desktop_changed()
             self._drain_worker_result()
             self._drain_guided_setup()
@@ -1439,7 +1444,7 @@ def run(switcher, codex=None) -> int:
                 self.settings.save(settings_path)
             except Exception:
                 self.settings.chatgpt_auto_enabled = not enabling
-                self._show_error("Couldn’t save Auto-switch settings. Try again.")
+                self._show_error("Couldn’t save the ChatGPT suggestions setting. Try again.")
                 return
             self._chatgpt_auto_retry_at = 0.0
             if enabling:
@@ -1455,7 +1460,7 @@ def run(switcher, codex=None) -> int:
                     except Exception:
                         self.settings.chatgpt_auto_enabled = True
                         self._show_error(
-                            "Couldn’t restore Auto-switch settings. "
+                            "Couldn’t restore the ChatGPT suggestions setting. "
                             "Turn off ChatGPT suggestions and try again."
                         )
                     else:
@@ -1632,7 +1637,6 @@ def run(switcher, codex=None) -> int:
                 on_rotate=lambda *_a: self._switch(None)(None),
                 on_best=lambda *_a: self._switch("best")(None),
                 on_add_claude=lambda: self.on_add_claude_login(None),
-                on_claude_desktop=lambda sender: self._show_claude_desktop_profiles(sender),
                 claude_desktop_state=self._claude_desktop_profiles.settings_state,
                 on_claude_desktop_check=self._claude_desktop_profiles.refresh_status,
                 on_claude_desktop_action=self._claude_desktop_profiles.perform,
@@ -2187,7 +2191,10 @@ def run(switcher, codex=None) -> int:
                 self._chatgpt_auto_retry_at = 0.0
                 self._start_chatgpt_auto_monitor()
                 if self._claude_desktop_profiles.signin_links:
-                    self._claude_desktop_profiles.signin_links.prepare()
+                    try:
+                        self._claude_desktop_profiles.signin_links.prepare()
+                    except (ClaudeSwitchError, OSError):
+                        pass  # the Desktop section reports the unreadable store
             self.rebuild_menu()
             panel = self._panel
             if panel is not None and panel.is_shown():
@@ -2195,6 +2202,10 @@ def run(switcher, codex=None) -> int:
                     panel.reload()
                 else:
                     self._reload_main_panel_if_shown()
+
+        def _desktop_signin_needed(self):
+            """Whether OpenSwap must own claude:// links; raises on an unreadable store."""
+            return any(p.kind == "managed" for p in self._claude_desktop_profiles.store.list())
 
         def _mark_claude_desktop_guide_seen(self):
             previous = self.settings.claude_desktop_guide_seen
@@ -2422,7 +2433,7 @@ def run(switcher, codex=None) -> int:
                 self._show_error(f"Couldn't change the Claude Code status line: {e}")
 
         def _toggle_codex_auto(self) -> bool:
-            """Flip live Codex CLI rotation (Settings row and the Codex tab's footer toggle)."""
+            """Flip Codex auto-switching (Settings row and the Codex tab's footer toggle)."""
             if (not self._codex_enabled()) and chatgpt_suggestions_effective(self.settings):
                 self._show_error("Turn off ChatGPT suggestions before enabling Codex auto-switching.")
                 return False
@@ -2592,9 +2603,11 @@ def run(switcher, codex=None) -> int:
 
         def _claude_desktop_changed(self):
             panel = self._panel
-            if panel is not None and getattr(panel, "_menu_open", False):
+            # Preserve an open menu's anchor and callbacks, and never replace
+            # the view tree under a pressed button: mouseUp would be lost.
+            if (panel is not None and getattr(panel, "_menu_open", False)) or mouse_button_down():
                 self._claude_desktop_update_pending = True
-                return  # preserve the menu's anchor and callbacks until it closes
+                return
             self._claude_desktop_update_pending = False
             self.rebuild_menu()
             if (panel is not None and panel.is_shown() and (
@@ -2603,15 +2616,6 @@ def run(switcher, codex=None) -> int:
                     or (getattr(panel, "_page", None) == MAIN_PAGE
                         and getattr(panel, "_selected_provider", None) == "claude_desktop"))):
                 panel.reload()
-
-        def _show_claude_desktop_profiles(self, sender):
-            # Rebuild from disk so CLI edits are visible immediately. Reusing
-            # the regular menu also uses its rumps callback-registry cleanup.
-            if self._desktop_switching or not self.settings.desktop_features_enabled:
-                return
-            self.rebuild_menu()
-            menu = self.menu["Claude Desktop profiles"]
-            menu._menu.popUpMenuPositioningItem_atLocation_inView_(None, (0, sender.bounds().size.height), sender)
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
@@ -2640,7 +2644,7 @@ def run(switcher, codex=None) -> int:
             menu = rumps.MenuItem("Switch ChatGPT app")
             if self.codex is not None and self._codex_enabled():
                 menu.add(rumps.MenuItem(
-                    "Pause Codex auto-switching for testing…",
+                    "Pause Codex auto-switching…",
                     callback=self._pause_codex_for_desktop,
                 ))
                 menu.add(None)

@@ -13,7 +13,7 @@ from tests.menubar_harness import extract_class
 def _panel():
     methods = {
         "__init__", "_select_provider", "_show_settings", "_show_main",
-        "_select_settings_section", "close", "_release_token_field",
+        "_select_settings_section", "close", "_release_token_field", "_reload_after",
         "_refresh_active_provider", "_show_claude_desktop_settings", "_check_desktop_settings_app", "_build",
     }
     namespace = {
@@ -202,6 +202,30 @@ def test_disabling_desktop_rejects_stale_tab_click_and_resets_hidden_selection()
     panel._build()
     assert panel._selected_provider == "claude"
     panel._build_settings.assert_called_once()
+
+
+def test_changing_tabs_forgets_kept_scroll_positions():
+    panel, _ = _panel()
+    panel._settings = lambda: menubar.MenuBarSettings(desktop_features_enabled=True)
+    panel._on_claude_desktop_check = Mock()
+    panel._card_scroll, panel._card_scroll_provider, panel._profiles_scroll = object(), "claude", object()
+    panel._select_provider("claude")
+    assert panel._card_scroll is not None and panel._profiles_scroll is not None
+    panel._select_provider("claude_desktop")
+    assert panel._card_scroll is None and panel._profiles_scroll is None
+
+
+@pytest.mark.parametrize("controller_reloads", [False, True])
+def test_opening_desktop_views_reloads_once(controller_reloads):
+    panel, _ = _panel()
+    panel._settings = lambda: menubar.MenuBarSettings(desktop_features_enabled=True)
+    panel.reload = Mock(side_effect=lambda: setattr(panel, "_reloads", panel._reloads + 1))
+    panel._on_claude_desktop_check = Mock(side_effect=panel.reload if controller_reloads else None)
+    panel._select_provider("claude_desktop")
+    assert panel.reload.call_count == 1
+    panel._show_claude_desktop_settings()
+    assert panel.reload.call_count == 2
+    assert panel._on_claude_desktop_check.call_count == 2
 
 
 def test_hidden_panel_selection_does_not_rebuild_native_views():
