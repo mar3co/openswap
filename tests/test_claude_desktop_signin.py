@@ -329,7 +329,8 @@ def test_unexpected_discovery_failure_still_releases_the_callback(menu, store, a
     menu.poll()
     assert menu._signin is None and not menu.busy
     menu.prompt.assert_not_called()
-    assert "fixture-secret" not in menu.show_error.call_args.args[0]
+    menu.show_error.assert_called_once_with(
+        "Could not check the open Claude profiles. Start again from the intended Claude profile.")
 
 
 @pytest.mark.parametrize("route", ["error", "cancel", "suspend", "quit"])

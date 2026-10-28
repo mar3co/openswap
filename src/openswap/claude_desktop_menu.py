@@ -393,8 +393,12 @@ class ClaudeDesktopMenu:
                         continue
                     if pid is not None:
                         result["candidates"].append((profile, pid))
-            except Exception as exc:
+            except (ClaudeSwitchError, OSError) as exc:
                 self._results.put((None, exc))
+                return
+            except Exception:
+                self._results.put((None, ClaudeDesktopError(
+                    "Could not check the open Claude profiles. Start again from the intended Claude profile.")))
                 return
             self._results.put((result, None))
 
