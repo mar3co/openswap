@@ -350,6 +350,7 @@ def profile_mac(mac, monkeypatch, tmp_path):
     return SimpleNamespace(home=home, folder=home / "Applications" / "OpenSwap Profiles", root=root, dock=dock, state=state)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the Dock fixtures use drive-less POSIX paths")
 class TestClaudeDesktopCleanup:
     def test_owned_launchers_their_tiles_and_the_empty_folder_go(self, profile_mac):
         m = profile_mac

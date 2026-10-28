@@ -331,7 +331,7 @@ def test_native_registers_bundle_and_verifies_eligibility_before_request(monkeyp
     from openswap.claude_desktop import ClaudeDesktopError
     calls = []
     native = object.__new__(links.MacOSLinks)
-    native.application = Path('/Applications/OpenSwap.app')
+    native.application = Path('/Applications/OpenSwap.app').resolve()
     path = Path('/Applications/Claude.app') if target.startswith('claude') else native.application
     url = SimpleNamespace(path=lambda: str(path))
     def candidates(_url):
