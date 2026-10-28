@@ -200,3 +200,17 @@ Required outcomes:
   - D: extended to a backup with no access token.
 
 - Controller fix: `tests/test_bundle_move.py` read the real /Applications and ~/Applications, so 7 tests failed on any Mac with OpenSwap installed (main too). Isolated in the fixture. Covered by the final review's cold seat.
+- Lane 1 fix round 1 (C: ed31ab0; A, D, E, F, G: 9c270f1). Cold and silent seats: no Critical, no Important. The gate's `refuse_active` is opt-in, and only Desktop Code setup passes it, so `setup_session` and the other callers are unchanged.
+
+### Merge
+- Lanes 3, 2 and 1 cherry-picked onto `claude-desktop-profiles-followups` with no conflicts. Full suite: 6232 passed, 9 skipped, 0 failed.
+
+### Ledgered for the final review's single fix dispatch
+- L2-a (Important, low reach): `claim_step` returns "wait" when `current()` is None, and nothing retries it.
+- L2-b (Important, low reach): `reconnecting` is consumed before `_claim`'s `_needed()` early return.
+- L2-m1 (Minor): unbounded polling of `current()` while it raises. Note only.
+- L3-m1 (Minor, pre-existing): `poll` shows a discovery error before checking stopped, blocked or suspended.
+- L1-m1 (Minor): `_notes` is never pruned for deleted profiles.
+- L1-m2 (Minor): the `consume_backup_grant` docstring should say a `skip-active` refusal can follow a session-profile resync write ("nothing consumed", not "nothing written").
+- L1-m3 (Minor): the "is this slot's account active" comparison is written twice (consume.py and claude_desktop_code.py). Use one strict engine helper.
+- L1-m4 (Minor): dead `rejected` assignment for 403 in `oauth.py`.
