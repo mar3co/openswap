@@ -48,6 +48,36 @@ codesigning identity) and `OPENSWAP_NOTARY_PROFILE=openswap-notary` after
 `xcrun notarytool store-credentials openswap-notary`. CI does this from
 secrets instead.
 
+## Native appearance in DEV and release
+
+Use `openswap.spec` for all frozen builds, including lightweight UI previews.
+`appkit_compat.py` pins the main executable's linked SDK to 26.2 after
+PyInstaller creates it and checks the finished bundle. This keeps AppKit's
+native tab/button styling consistent on the same macOS version, even when
+local and CI Python distributions were built with different SDKs. It preserves
+the executable's minimum macOS version and repairs its ad-hoc signature before
+bundling; release signing still runs last. CI also checks the shipped zip.
+The SDK baseline is a deliberate UI choice, not an environment override.
+
+A local preview runner can use the same spec without building the widget:
+
+```bash
+OPENSWAP_DEV_ENTRY=/absolute/path/to/local-preview.py \
+  uv run --with pyinstaller --with '.[menubar]' pyinstaller \
+  --noconfirm --clean --distpath /tmp/openswap-dev-dist \
+  --workpath /tmp/openswap-dev-build packaging/macos/openswap.spec
+```
+
+The optional runner uses the DEV bundle identifier; the appearance policy and
+Info.plist settings remain shared. The runner controls any DEV label or startup
+behavior. `build.sh` always uses the release entry point, even if
+`OPENSWAP_DEV_ENTRY` is set. Building does not launch or install either app.
+Running the source directly under Python cannot guarantee the same appearance:
+macOS uses that Python executable's linked SDK. Test visual changes in the
+frozen preview instead of maintaining a separate spec or copying SDK values
+from an installed app. macOS versions and system appearance settings can still
+change how native controls look.
+
 ## GitHub Actions
 
 Workflow `macOS app` freezes on `workflow_dispatch`, version tags (`v*`),

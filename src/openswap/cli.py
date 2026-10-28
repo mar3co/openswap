@@ -125,7 +125,7 @@ _SUBCOMMAND_FLAGS = {
 # on a mistype (`openswap acount`) or a worker verb typed without `worker`
 # (`openswap account`, `openswap pair`).
 _KNOWN_VERBS = frozenset({
-    *_SUBCOMMAND_FLAGS, "switch", "auto", "codex", "widget", "statusline", "setup", "uninstall", "config",
+    *_SUBCOMMAND_FLAGS, "switch", "auto", "codex", "claude-desktop", "widget", "statusline", "setup", "uninstall", "config",
     "unclaimed", "alias", "swap", "move", "worker", "tui", "watch", "run", "map", "unmap",
 })
 # The worker verbs an owner is likely to type at the top level.
@@ -1669,6 +1669,10 @@ def main() -> None:
         from openswap.worker.cli import main as worker_main
 
         sys.exit(worker_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "claude-desktop":
+        from openswap.claude_desktop import main as desktop_main
+
+        sys.exit(desktop_main(sys.argv[2:]))
     # Also before migration: the cask's uninstall hook runs this on every
     # brew upgrade and must not touch state on the way through.
     if len(sys.argv) > 1 and sys.argv[1] == "uninstall":
@@ -1750,6 +1754,7 @@ def main() -> None:
         description="""OpenSwap: OpenSoft macOS CLI for rotating Claude Code accounts
 
 Claude accounts:
+  %(prog)s claude-desktop <action>    experimental Desktop profiles (add/list/open)
   %(prog)s list                       list managed accounts (alias: ls)
   %(prog)s status                     show the current account
   %(prog)s switch                     rotate to the next account

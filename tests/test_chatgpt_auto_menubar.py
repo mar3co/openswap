@@ -30,6 +30,8 @@ def _app(monkeypatch, tmp_path):
     set_setting = Mock()
     thread_type = Mock()
     scope = {
+        "chatgpt_suggestions_effective": menubar.chatgpt_suggestions_effective,
+        "chatgpt_tab_desktop": menubar.chatgpt_tab_desktop,
         "AutoSwitchEngine": engine_type,
         "desktop_switch_choices": menubar.desktop_switch_choices,
         "load_settings": load,
@@ -39,7 +41,7 @@ def _app(monkeypatch, tmp_path):
         "time": time,
     }
     app = extract_class(menubar.__file__, "MenuBarApp", METHODS, scope)()
-    app.settings = menubar.MenuBarSettings(
+    app.settings = menubar.MenuBarSettings(desktop_features_enabled=True,
         chatgpt_switching_enabled=True, chatgpt_auto_enabled=True,
     )
     app.switcher = Mock(backup_dir=tmp_path, _logger=Mock())
@@ -56,7 +58,7 @@ def _app(monkeypatch, tmp_path):
     app._pending_chatgpt_switch = None
     app._desktop_switching = False
     app._login_session = None
-    app._desktop_status = "Experimental · Switching reopens ChatGPT"
+    app._desktop_status = "Switching reopens ChatGPT"
     app._chatgpt_monitor_notice = ""
     app._chatgpt_auto_retry_at = 0.0
     app._event_lock = threading.Lock()
@@ -159,7 +161,7 @@ def test_error_event_clears_pending_without_exposing_raw_error(monkeypatch, tmp_
     )
 
     assert app._pending_chatgpt_switch is None
-    assert app._chatgpt_monitor_notice == "Auto-switch paused · Couldn’t check accounts"
+    assert app._chatgpt_monitor_notice == "Suggestions paused · Couldn’t check accounts"
     assert "secret-token" not in app._chatgpt_monitor_notice
 
 
@@ -175,7 +177,7 @@ def test_monitor_error_clears_pending_and_surfaces_safe_status(monkeypatch, tmp_
 
     assert app._chatgpt_auto_engine is None
     assert app._pending_chatgpt_switch is None
-    assert app._chatgpt_monitor_notice == "Auto-switch paused · Monitor unavailable"
+    assert app._chatgpt_monitor_notice == "Suggestions paused · Couldn’t check accounts"
     assert "secret" not in app._chatgpt_monitor_notice
 
 
@@ -381,7 +383,7 @@ def test_external_live_rotation_conflict_holds_monitor(monkeypatch, tmp_path):
     engine.stop.assert_called_once()
     assert app._chatgpt_auto_engine is None
     assert app._pending_chatgpt_switch is None
-    assert app._chatgpt_monitor_notice == "Auto-switch paused · Live Codex rotation is on"
+    assert app._chatgpt_monitor_notice == "Suggestions paused · Codex auto-switching is on"
 
 
 def test_monitor_does_not_start_during_login_or_desktop_transaction(monkeypatch, tmp_path):
@@ -403,3 +405,18 @@ def test_reconcile_resumes_after_onboarding_or_transaction_finishes(monkeypatch,
     app._desktop_switching = False
     app._reconcile_chatgpt_auto_mode()
     app._start_chatgpt_auto_monitor.assert_called_once()
+
+
+def test_global_desktop_off_stops_monitor_and_clears_pending_suggestion(monkeypatch, tmp_path):
+    app = _app(monkeypatch, tmp_path)
+    app._start_chatgpt_auto_monitor()
+    engine = app._chatgpt_auto_engine
+    assert engine is not None
+    app._pending_chatgpt_switch = ('1', ('a', 'b'), '2', ('c', 'd'))
+    app.settings.desktop_features_enabled = False
+    app._reconcile_chatgpt_auto_mode()
+    assert app._chatgpt_auto_engine is None and app._pending_chatgpt_switch is None
+    engine.stop.assert_called_once()
+    app._start_chatgpt_auto_monitor()
+    assert app._chatgpt_auto_engine is None
+    assert app.settings.chatgpt_switching_enabled and app.settings.chatgpt_auto_enabled

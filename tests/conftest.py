@@ -469,7 +469,7 @@ class _KeychainStore:
         self.data: dict[tuple[str, str], str] = {}
 
     # Mirrors the ``macos_keychain`` (security CLI) contract.
-    def get_password(self, service: str, account: str) -> str | None:
+    def get_password(self, service: str, account: str, *, native: bool = False) -> str | None:
         return self.data.get((service, account))
 
     def item_exists(self, service: str, account: str) -> bool:

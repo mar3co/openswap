@@ -56,6 +56,19 @@ def test_long_messages_scroll_without_pushing_actions_off_screen():
     assert dialog.body_scroll.frame().origin.y + dialog.body_scroll.frame().size.height < dialog.surface.footer_y
 
 
+def test_illustrations_fit_below_a_long_scrolling_message():
+    rows = [{"image": None, "title": f"Icon {i}", "running": True, "body": "What this icon opens. " * 6} for i in range(2)]
+    dialog = make_dialog_prompt(title="Your Claude profiles", message="Read this first.\n" * 100,
+                                illustrations=rows, default_text=None, ok="Done")
+    assert dialog.surface.frame().size.height <= 640
+    scroll = dialog.body_scroll.frame()
+    for views in dialog.illustration_views:
+        for view in views:
+            frame = view.frame()
+            assert frame.origin.y >= scroll.origin.y + scroll.size.height
+            assert frame.origin.y + frame.size.height < dialog.surface.footer_y
+
+
 def test_buttons_preserve_confirmation_and_cancellation_results():
     dialog = make_dialog_alert(ok="Continue", cancel=True, other="Review")
     for button in dialog.buttons:
@@ -122,6 +135,23 @@ def test_prompt_preserves_text_and_literal_percent_signs():
     assert dialog.textfield.stringValue() == "Work 50%"
     assert dialog.textfield.nextKeyView() == dialog.buttons[0]
     assert dialog.buttons[-1].nextKeyView() == dialog.textfield
+
+
+def test_account_details_fields_share_a_dialog_and_preserve_drafts():
+    dialog = make_dialog_prompt(title="Account details · Work", message="Optional labels.",
+                               fields=[("Email (optional)", "same@example.test"), ("Organization (optional)", "Acme")],
+                               checkbox="Update account details automatically", checkbox_checked=True,
+                               ok="Save", cancel="Cancel", other="Detect")
+    assert dialog.textfield is None and len(dialog.fields) == 2
+    assert dialog.fields[0].nextKeyView() == dialog.fields[1]
+    assert dialog.fields[1].nextKeyView() == dialog.buttons[0]
+    assert dialog.buttons[-1].nextKeyView() == dialog.checkbox
+    assert dialog.checkbox.nextKeyView() == dialog.fields[0]
+    for field in dialog.fields:
+        assert field.frame().origin.y + field.frame().size.height < dialog.surface.footer_y
+    response = _run_with_action(dialog, lambda: dialog.buttons[0].performClick_(None))
+    assert response.clicked == -1 and response.values == ("same@example.test", "Acme")
+    assert response.checked
 
 
 class DialogTestDriver(NSObject):
@@ -215,3 +245,36 @@ def test_checkbox_starts_unchecked_and_is_reported():
     dialog.checkbox.performClick_(None)
     assert dialog.run().checked is True
     assert make_dialog_alert(message="No option.").checkbox is None
+
+
+@pytest.mark.parametrize("appearance", ["NSAppearanceNameAqua", "NSAppearanceNameDarkAqua"])
+def test_desktop_guide_has_real_icons_and_no_input_or_clipped_text(appearance):
+    from unittest.mock import Mock
+    from openswap.claude_desktop_guide import illustrations
+    from openswap.claude_desktop_menu import ClaudeDesktopMenu
+
+    AppKit.NSApplication.sharedApplication().setAppearance_(
+        AppKit.NSAppearance.appearanceNamed_(getattr(AppKit, appearance)))
+    captured = []
+    def prompt(**kwargs):
+        dialog = make_dialog_prompt(**kwargs)
+        captured.append(dialog)
+        return type("Response", (), {"clicked": 0})()
+    controller = ClaudeDesktopMenu(prompt=prompt, show_error=Mock(), notify=Mock(), changed=Mock())
+    try:
+        controller.show_guide(for_creation=True)
+        dialog = captured[0]
+        assert dialog.textfield is None
+        assert dialog.surface.frame().size.height <= 540
+        assert len(dialog.illustration_views) == 2
+        for icon, title, body in dialog.illustration_views:
+            for view in (icon, title, body):
+                frame = view.frame()
+                assert frame.origin.y + frame.size.height < dialog.surface.footer_y
+                assert frame.origin.x + frame.size.width <= DIALOG_WIDTH
+        # On machines with Claude installed, both previews must be real artwork.
+        from openswap.claude_desktop import APP_PATH
+        if APP_PATH.exists():
+            assert all(item["image"] is not None and item["image"].isValid() for item in illustrations())
+    finally:
+        AppKit.NSApplication.sharedApplication().setAppearance_(None)

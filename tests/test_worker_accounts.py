@@ -658,8 +658,8 @@ def test_menu_account_row_marks_pin_and_offers_claude(root):
     assert options["ineligible:3"][2] == {"disabled": True}
     claude = [option for option in row["options"] if str(option[0]).startswith("claude:")]
     assert [option[1] for option in claude] == [
-        "Claude 1 · alice@example.com",
-        "Claude 4 · carol@example.com (claudey)",
+        "Claude Code 1 · alice@example.com",
+        "Claude Code 4 · carol@example.com (claudey)",
     ]
     assert all(len(option) == 2 for option in claude)  # enabled
     assert SECRET not in json.dumps(row)

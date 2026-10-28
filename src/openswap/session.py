@@ -246,12 +246,14 @@ def _keychain_account_name() -> str:
     return macos_keychain.keychain_account_name()
 
 
-def delete_macos_keychain_entry(session_dir: Path) -> None:
-    """Best-effort delete of a session profile's hashed keychain entry.
+def delete_macos_keychain_entry(session_dir: Path, *, strict: bool = False) -> None:
+    """Delete a session profile's hashed keychain entry, best-effort by default.
 
     No-op off macOS. Needed before seeding (Claude reads the keychain before
     the plaintext file, so a stale entry would shadow a fresh seed) and on
     profile removal (once the dir is gone the hashed name is unrecoverable).
+    ``strict`` raises when the item may still exist (locked, denied, timed
+    out), for a caller that must not lose the directory name before then.
     """
     if Platform.detect() != Platform.MACOS:
         return
@@ -260,7 +262,8 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
             keychain_service_name(session_dir), _keychain_account_name()
         )
     except macos_keychain.KEYCHAIN_ERRORS:
-        pass  # best-effort; absent entry is already success (rc 44)
+        if strict:
+            raise  # absent entry is already success (rc 44) and never reaches here
 
 
 def read_session_credentials(session_dir: Path) -> str | None:

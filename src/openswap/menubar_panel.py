@@ -38,6 +38,8 @@ from AppKit import (
     NSImageView,
     NSLineBreakByTruncatingTail,
     NSLineBreakByWordWrapping,
+    NSMenu,
+    NSMenuItem,
     NSNoImage,
     NSPopUpButton,
     NSPopover,
@@ -102,9 +104,11 @@ from openswap.menubar import (
     SETTINGS_PAGE,
     SETTINGS_POPUP_W,
     SETTINGS_SECTION_AUTOMATION,
+    SETTINGS_SECTION_DESKTOP,
     SETTINGS_SECTION_GENERAL,
     SETTINGS_SECTION_REMOTE,
     SETTINGS_SECTIONS,
+    settings_sections,
     TOKEN_PAGE,
     apply_chatgpt_activation,
     DesktopCapability,
@@ -113,7 +117,12 @@ from openswap.menubar import (
     provider_empty_state,
     login_panel_state,
     provider_shared_copy,
+    provider_tab_name,
     provider_tab_title,
+    provider_tabs,
+    claude_desktop_profile_rows,
+    desktop_profile_usage,
+    desktop_profile_height,
     resolve_popover_theme,
     card_badge_text,
     card_list_height,
@@ -918,6 +927,27 @@ class _FlippedView(NSView):
         return True
 
 
+def _overlay_scroll(root, frame, width, height):
+    """A transparent overlay-scroller list inside ``root``: ``(scroll, document view)``."""
+    scroll = NSScrollView.alloc().initWithFrame_(frame)
+    scroll.setDrawsBackground_(False)
+    scroll.setHasVerticalScroller_(True)
+    scroll.setAutohidesScrollers_(True)
+    scroll.setScrollerStyle_(NSScrollerStyleOverlay)
+    content = _FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, width, height))
+    scroll.setDocumentView_(content)
+    root.addSubview_(scroll)
+    return scroll, content
+
+
+class _ProfileGroupView(_FlippedView):
+    def drawRect_(self, _rect):
+        pal = _colors()
+        path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(self.bounds(), 8, 8)
+        pal["card"].setFill()
+        path.fill()
+
+
 class _RootView(NSVisualEffectView):
     """Flipped popover chrome; reports pointer enter/leave for auto-close."""
 
@@ -1002,6 +1032,9 @@ class MenuBarPanel:
         worker_paired=None,
         login_item=None,
         on_add_claude=None,
+        claude_desktop_state=None,
+        on_claude_desktop_check=None,
+        on_claude_desktop_action=None,
         on_card_menu=None,
         on_toggle_codex_auto=None,
         status_line=None,
@@ -1013,6 +1046,9 @@ class MenuBarPanel:
         self._on_rotate = on_rotate
         self._on_best = on_best
         self._on_add_claude = on_add_claude
+        self._claude_desktop_state = claude_desktop_state or (lambda: {})
+        self._on_claude_desktop_check = on_claude_desktop_check
+        self._on_claude_desktop_action = on_claude_desktop_action
         self._on_toggle_auto = on_toggle_auto
         self._on_toggle_chatgpt_auto = on_toggle_chatgpt_auto
         self._on_review_chatgpt_switch = on_review_chatgpt_switch
@@ -1026,7 +1062,7 @@ class MenuBarPanel:
         self._strategy = strategy
         self._has_codex = has_codex
         self._codex_enabled = codex_enabled
-        self._desktop_status = desktop_status or (lambda: "Experimental · Switching reopens ChatGPT")
+        self._desktop_status = desktop_status or (lambda: "Switching reopens ChatGPT")
         self._chatgpt_capability = chatgpt_capability
         self._on_chatgpt_view_active = on_chatgpt_view_active
         self._account_state = account_state or (lambda _provider: "ready")
@@ -1052,12 +1088,18 @@ class MenuBarPanel:
         # second provider without losing their place when the popover closes.
         self._selected_provider = "claude"
         self._settings_section = SETTINGS_SECTION_GENERAL
+        self._desktop_settings_app = "claude"
+        self._settings_disclosures = set()
+        self._settings_scroll = None
+        self._settings_scroll_key = None
+        self._profiles_scroll = None
         self._page = MAIN_PAGE
         self._item = None
         self._popover = None
         self._controller = None
         self._card_scroll = None
         self._card_scroll_provider = None
+        self._reloads = 0
         self._tramps: list = []
         self._toggle_tramp = None
         self._appearance_obs = None
@@ -1145,8 +1187,7 @@ class MenuBarPanel:
             return
         self._sync_popover_appearance()
         self.reload()
-        if self._selected_provider == "chatgpt" and self._on_chatgpt_view_active is not None:
-            self._on_chatgpt_view_active()
+        self._refresh_active_provider()
         button = self._item.button()
         if button is None:
             return
@@ -1158,6 +1199,7 @@ class MenuBarPanel:
     def reload(self) -> None:
         if self._popover is None:
             return
+        self._reloads += 1
         view = self._build()
         controller = _PanelController.alloc().init()
         controller.setView_(view)
@@ -1329,13 +1371,30 @@ class MenuBarPanel:
             self._hold_overflow(False)
 
     def _select_provider(self, provider: str) -> None:
-        if provider not in ("claude", "chatgpt"):
+        settings = self._settings() if callable(self._settings) else MenuBarSettings()
+        if provider not in provider_tabs(settings):
             return
+        if provider != self._selected_provider:
+            # A new tab starts at the top, also when the previous page did not
+            # rebuild the list whose scroll position is kept.
+            self._card_scroll = self._profiles_scroll = None
         self._selected_provider = provider
-        if provider == "chatgpt" and self._on_chatgpt_view_active is not None:
-            self._on_chatgpt_view_active()
-        if self.is_shown():
+        self._reload_after(self._refresh_active_provider)
+
+    def _reload_after(self, action) -> None:
+        """Reload the shown popover once; ``action`` may already have reloaded it through the controller."""
+        reloads = self._reloads
+        action()
+        if self.is_shown() and self._reloads == reloads:
             self.reload()
+
+    def _refresh_active_provider(self):
+        if self._selected_provider == "chatgpt" and self._on_chatgpt_view_active is not None:
+            self._on_chatgpt_view_active()
+        elif self._selected_provider == "claude_desktop":
+            settings = self._settings() if callable(self._settings) else MenuBarSettings()
+            if settings.desktop_features_enabled and self._on_claude_desktop_check is not None:
+                self._on_claude_desktop_check()
 
     def show_login(self) -> None:
         """Open the ChatGPT onboarding surface in the current popover."""
@@ -1349,6 +1408,49 @@ class MenuBarPanel:
         self._token_error = ""
         self._page = TOKEN_PAGE
         self.reload()
+
+    def _show_claude_desktop_settings(self, _sender=None):
+        if not self._settings().desktop_features_enabled:
+            return
+        self._desktop_settings_app = "claude"
+        self._page = SETTINGS_PAGE
+        self._select_settings_section(SETTINGS_SECTION_DESKTOP)
+
+    def _desktop_profile_action(self, action, identifier=None):
+        if self._on_claude_desktop_action is None or not self._settings().desktop_features_enabled:
+            return
+        self._hold_overflow(True)
+        try:
+            self._on_claude_desktop_action(action, identifier)
+        finally:
+            self._hold_overflow(False)
+            if self.is_shown():
+                self.reload()
+
+    def _desktop_profile_menu(self, identifier, sender):
+        if not self._settings().desktop_features_enabled:
+            return
+        menu = NSMenu.alloc().initWithTitle_("Profile actions")
+        menu.setAutoenablesItems_(False)
+        selected = []
+        # Dispatch after the native menu closes so dialogs and reloads cannot
+        # replace its anchor or deallocate callbacks during menu tracking.
+        tramps = []
+        for title, action in (("Reconnect sign-in…", "reconnect_signin"), ("Account details…", "details"), ("Set up Dock shortcuts", "setup_dock"), ("Create shortcut…", "shortcut"), ("Rename…", "rename"), ("Archive…", "archive")):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, "act:", "")
+            tramp = _Trampoline.alloc().initWithCallback_(lambda _, a=action: selected.append(a))
+            tramps.append(tramp)
+            item.setTarget_(tramp)
+            menu.addItem_(item)
+        self._hold_overflow(True)
+        try:
+            menu.popUpMenuPositioningItem_atLocation_inView_(None, (0, sender.bounds().size.height), sender)
+        finally:
+            self._hold_overflow(False)
+        if selected:
+            self._desktop_profile_action(selected[0], identifier)
+        elif self.is_shown():
+            self.reload()
 
     def _login_action(self, action: str, alias: str | None = None) -> None:
         if self._on_login_action is not None:
@@ -1386,34 +1488,58 @@ class MenuBarPanel:
         return t
 
     def _show_settings(self, _sender=None):
-        self._settings_section = (
-            SETTINGS_SECTION_AUTOMATION
-            if self._selected_provider == "chatgpt"
-            else SETTINGS_SECTION_GENERAL
-        )
+        settings = self._settings() if callable(self._settings) else MenuBarSettings()
+        if self._selected_provider == "claude_desktop" and settings.desktop_features_enabled:
+            self._show_claude_desktop_settings()
+            return
+        self._settings_section = ((SETTINGS_SECTION_DESKTOP if chatgpt_tab_desktop(settings) else SETTINGS_SECTION_AUTOMATION)
+                                  if self._selected_provider == "chatgpt" else SETTINGS_SECTION_GENERAL)
         self._page = SETTINGS_PAGE
+        if self._settings_section == SETTINGS_SECTION_DESKTOP:
+            self._desktop_settings_app = "chatgpt"
         self.reload()
 
     def _show_main(self, _sender=None):
         self._page = MAIN_PAGE
         self._token_error = ""
-        if self._selected_provider == "chatgpt" and self._on_chatgpt_view_active is not None:
-            self._on_chatgpt_view_active()
+        self._refresh_active_provider()
         self.reload()
 
     def _select_settings_section(self, section: str) -> None:
-        if section not in {value for value, _label in SETTINGS_SECTIONS}:
+        settings = self._settings() if callable(self._settings) else MenuBarSettings()
+        if section not in {value for value, _label in settings_sections(settings)}:
             return
         self._settings_section = section
         if section == SETTINGS_SECTION_REMOTE and self._on_worker_view_active is not None:
             self._on_worker_view_active()
-        if self.is_shown():
-            self.reload()
+        self._reload_after(self._check_desktop_settings_app if section == SETTINGS_SECTION_DESKTOP else lambda: None)
 
     def _emit_setting(self, row_id, value):
+        if row_id in {"claude_desktop_help", "claude_desktop_archived", "chatgpt_help"}:
+            if row_id in self._settings_disclosures:
+                self._settings_disclosures.remove(row_id)
+            else:
+                self._settings_disclosures.add(row_id)
+            self.reload()
+            return
+        if row_id in {"claude_desktop_add", "claude_desktop_storage_error"}:
+            self._desktop_profile_action("add" if row_id == "claude_desktop_add" else "storage_error")
+            return
+        if row_id == "desktop_app":
+            if value not in {"claude", "chatgpt"} or not self._settings().desktop_features_enabled:
+                return
+            self._desktop_settings_app = value
+            self._reload_after(self._check_desktop_settings_app)
+            return
         cb = self._on_setting
         if cb is not None:
             cb(row_id, value)
+
+    def _check_desktop_settings_app(self):
+        if self._desktop_settings_app == "claude" and self._on_claude_desktop_check is not None:
+            self._on_claude_desktop_check()
+        elif self._desktop_settings_app == "chatgpt" and self._on_chatgpt_view_active is not None:
+            self._on_chatgpt_view_active()
 
     def _add_popup(self, root, options, current, frame, row_id, font):
         btn = _PopupButton.alloc().initWithPanel_frame_(self, frame)
@@ -1464,6 +1590,16 @@ class MenuBarPanel:
         btn.setAction_("act:")
         root.addSubview_(btn)
         return btn
+
+    def _add_disclosure(self, root, row, y, width, font):
+        expanded = bool(row.get("value"))
+        button = self._add_button(root, ("▾ " if expanded else "▸ ") + row["label"], NSMakeRect(PAD, y + 2, width, 26),
+                                  lambda _, rid=row["id"]: self._emit_setting(rid, None), font)
+        button.setBordered_(False)
+        button.setAlignment_(0)
+        button.setAccessibilityLabel_(row["label"])
+        button.setAccessibilityValue_("Expanded" if expanded else "Collapsed")
+        return button
 
     def _add_icon_button(
         self, root, symbol, fallback, frame, cb, tooltip, *, bordered=False, point_size=None,
@@ -1538,6 +1674,9 @@ class MenuBarPanel:
     def _build(self):
         self._tramps = []
         self._release_token_field()
+        settings = self._settings() if callable(self._settings) else MenuBarSettings()
+        if self._selected_provider not in provider_tabs(settings):
+            self._selected_provider = "claude"
         if self._page == SETTINGS_PAGE:
             return self._build_settings()
         if self._page == TOKEN_PAGE:
@@ -1545,12 +1684,11 @@ class MenuBarPanel:
         snap = self._snapshot()
         all_cards = panel_accounts(snap)
         provider = self._selected_provider
+        if provider == "claude_desktop":
+            return self._build_desktop_profiles(settings, all_cards)
         list_offset = self._take_card_list_offset(provider)
-        settings = self._settings() if callable(self._settings) else None
-        if settings is None:
-            settings = MenuBarSettings()
-        # One setting decides whether the second tab is Codex CLI or the
-        # ChatGPT desktop app: title, click, toggle, badge and menu follow it.
+        # Codex keeps a stable tab name; this setting adds ChatGPT restarting
+        # to its existing activation and suggestion behavior.
         desktop_tab = chatgpt_tab_desktop(settings)
         cards = provider_cards(all_cards, provider, desktop=desktop_tab)
         if provider == "chatgpt":
@@ -1626,39 +1764,7 @@ class MenuBarPanel:
         font_digits = NSFont.monospacedDigitSystemFontOfSize_weight_(11, NSFontWeightMedium)
         font_label = NSFont.monospacedDigitSystemFontOfSize_weight_(11, NSFontWeightRegular)
 
-        # Header: OpenSoft mark + product name on the left, provider-specific
-        # automation switch hugging the top-right.
-        mark = _brand_mark(NSMakeRect(PAD, PAD + 1, 18, 18), pal["fg"])
-        if mark is not None:
-            root.addSubview_(mark)
-        root.addSubview_(
-            _label(
-                "OpenSwap",
-                font_title,
-                pal["fg"],
-                NSMakeRect(
-                    PAD + (24 if mark is not None else 0),
-                    PAD + HEADER_TITLE_H / 2.0 - HEADER_LABEL_CAP_MID,
-                    86,
-                    20,
-                ),
-            )
-        )
-        # Settings (gear) and More (ellipsis) are quiet icon buttons hugging
-        # the top-right, so the footer keeps only account actions.
-        gear_f, more_f = trailing_header_frames(
-            PANEL_WIDTH, PAD,
-            (HEADER_ICON_SIZE, HEADER_ICON_SIZE), (HEADER_ICON_SIZE, HEADER_ICON_SIZE),
-            gap=HEADER_ICON_GAP, outset=HEADER_ICON_OUTSET,
-        )
-        self._add_icon_button(
-            root, "gearshape", "⚙", NSMakeRect(*gear_f), self._show_settings, "Settings",
-            point_size=HEADER_ICON_POINT,
-        )
-        self._add_icon_button(
-            root, "ellipsis.circle", "…", NSMakeRect(*more_f), self._more, "More",
-            point_size=HEADER_ICON_POINT,
-        )
+        self._add_main_header(root, pal)
 
         # Auto-switch lives in the footer next to Rotate / Best, the actions it
         # governs. Built here so the footer only has to place it.
@@ -1686,28 +1792,8 @@ class MenuBarPanel:
         show_auto = bool(cards) and auto_cb is not None
 
         inner_w = PANEL_WIDTH - PAD * 2
-        y = PAD + HEADER_H
-        tab_w = (inner_w - TAB_GAP) / 2.0
-        for index, tab_provider in enumerate(("claude", "chatgpt")):
-            title = provider_tab_title(all_cards, tab_provider, desktop=desktop_tab)
-            tab = self._add_button(
-                root,
-                title,
-                NSMakeRect(PAD + index * (tab_w + TAB_GAP), y, tab_w, TAB_H),
-                lambda _sender, p=tab_provider: self._select_provider(p),
-                font_small,
-            )
-            if tab_provider == provider:
-                tab.setButtonType_(NSButtonTypePushOnPushOff)
-                tab.setState_(1)
-                tab.setFont_(font_title)
-            else:
-                tab.setButtonType_(NSButtonTypePushOnPushOff)
-                tab.setState_(0)
-                tab.setAlphaValue_(0.68)
-            if title.endswith(" · Sign in"):
-                tab.setToolTip_("OAuth sign-in required for this provider.")
-        y += TAB_H
+        self._add_provider_tabs(root, settings, all_cards)
+        y = PAD + HEADER_H + TAB_H
         if hold_line:
             root.addSubview_(
                 _label(
@@ -1844,14 +1930,7 @@ class MenuBarPanel:
             if scrolls:
                 # The list reaches into the right margin so the overlay
                 # scroller clears the cards' ··· buttons.
-                scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(PAD, y, inner_w + PAD, body_h))
-                scroll.setDrawsBackground_(False)
-                scroll.setHasVerticalScroller_(True)
-                scroll.setAutohidesScrollers_(True)
-                scroll.setScrollerStyle_(NSScrollerStyleOverlay)
-                list_view = _FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, inner_w + PAD, content_h))
-                scroll.setDocumentView_(list_view)
-                root.addSubview_(scroll)
+                scroll, list_view = _overlay_scroll(root, NSMakeRect(PAD, y, inner_w + PAD, body_h), inner_w + PAD, content_h)
                 self._card_scroll = scroll
                 self._card_scroll_provider = provider
                 card_x, y = 0.0, 0.0
@@ -2064,6 +2143,197 @@ class MenuBarPanel:
 
         return root
 
+    def _add_main_header(self, root, pal):
+        font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+        mark = _brand_mark(NSMakeRect(PAD, PAD + 1, 18, 18), pal["fg"])
+        if mark is not None:
+            root.addSubview_(mark)
+        root.addSubview_(_label("OpenSwap", font, pal["fg"],
+                               NSMakeRect(PAD + (24 if mark is not None else 0),
+                                          PAD + HEADER_TITLE_H / 2.0 - HEADER_LABEL_CAP_MID, 86, 20)))
+        gear_f, more_f = trailing_header_frames(
+            PANEL_WIDTH, PAD, (HEADER_ICON_SIZE, HEADER_ICON_SIZE), (HEADER_ICON_SIZE, HEADER_ICON_SIZE),
+            gap=HEADER_ICON_GAP, outset=HEADER_ICON_OUTSET,
+        )
+        self._add_icon_button(root, "gearshape", "⚙", NSMakeRect(*gear_f), self._show_settings, "Settings", point_size=HEADER_ICON_POINT)
+        self._add_icon_button(root, "ellipsis.circle", "…", NSMakeRect(*more_f), self._more, "More", point_size=HEADER_ICON_POINT)
+
+    def _add_provider_tabs(self, root, settings, all_cards):
+        providers = provider_tabs(settings)
+        width = (PANEL_WIDTH - PAD * 2 - TAB_GAP * (len(providers) - 1)) / len(providers)
+        font = NSFont.systemFontOfSize_weight_(11, NSFontWeightRegular)
+        desktop_tab = chatgpt_tab_desktop(settings)
+        for index, provider in enumerate(providers):
+            name = provider_tab_name(provider)
+            detail = provider_tab_title(all_cards, provider, desktop=desktop_tab)
+            # Keep action-required accounts discoverable without squeezing a
+            # long status sentence into the three-tab navigation.
+            title = name + (" •" if detail != name else "")
+            tab = self._add_button(root, title, NSMakeRect(PAD + index * (width + TAB_GAP), PAD + HEADER_H, width, TAB_H),
+                                   lambda _, p=provider: self._select_provider(p), font)
+            selected = provider == self._selected_provider
+            tab.setButtonType_(NSButtonTypePushOnPushOff)
+            tab.setState_(1 if selected else 0)
+            if selected:
+                tab.setFont_(NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold))
+            else:
+                tab.setAlphaValue_(0.68)
+            tab.setAccessibilityLabel_(detail)
+            if detail != name:
+                tab.setToolTip_(detail)
+
+    def _build_desktop_profiles(self, settings, all_cards):
+        pal = _colors()
+        font_title = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+        font_body = NSFont.systemFontOfSize_weight_(12, NSFontWeightRegular)
+        font_small = NSFont.systemFontOfSize_weight_(11, NSFontWeightRegular)
+        inner_w = PANEL_WIDTH - PAD * 2
+        state = self._claude_desktop_state()
+        state = {**state, "items": [{**p, "code_usage": desktop_profile_usage(p, all_cards)} for p in state.get("items", [])]}
+        rows = claude_desktop_profile_rows(state, expanded=self._settings_disclosures)
+
+        def row_height(row):
+            if row["kind"] == "profiles":
+                return sum(desktop_profile_height(p) for p in row["items"]) if row["items"] else 88.0
+            if row["kind"] == "group":
+                return 34.0 + 14.0 * max(0, row.get("lines", 2) - 2)
+            return 30.0
+
+        body_h = sum(row_height(row) + SETTINGS_ROW_GAP for row in rows)
+        chrome_h = PAD + HEADER_H + TAB_H + PAD
+        visible_h = min(body_h, max(120, (self._available_panel_height() or 640) - chrome_h))
+        root = _RootView.alloc().initWithHover_(self._on_hover)
+        root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, chrome_h + visible_h))
+        root.setMaterial_(NSVisualEffectMaterialMenu)
+        root.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        root.setState_(NSVisualEffectStateActive)
+        self._add_main_header(root, pal)
+        self._add_provider_tabs(root, settings, all_cards)
+        offset = self._profiles_scroll.contentView().bounds().origin.y if self._profiles_scroll is not None and self.is_shown() else 0
+        self._profiles_scroll = None
+        content, y = root, PAD + HEADER_H + TAB_H
+        if visible_h < body_h:
+            self._profiles_scroll, content = _overlay_scroll(root, NSMakeRect(0, y, PANEL_WIDTH, visible_h), PANEL_WIDTH, body_h)
+            y = 0
+        for row in rows:
+            kind, h = row["kind"], row_height(row)
+            if kind == "profiles":
+                self._add_desktop_profiles(content, row, NSMakeRect(PAD, y, inner_w, h), pal, font_body, font_small)
+            elif kind == "profiles_header":
+                content.addSubview_(_label("Profiles", font_title, pal["fg"], NSMakeRect(PAD, y + 5, 100, 20)))
+                if row["title"]:
+                    button = self._add_button(content, row["title"], NSMakeRect(PANEL_WIDTH - PAD - 100, y + 2, 100, 26),
+                                              lambda _: self._desktop_profile_action("add"), font_small)
+                    button.setEnabled_(not row.get("disabled") and self._on_claude_desktop_action is not None)
+            elif kind == "group":
+                label = _label(row["label"], font_small, pal["muted"], NSMakeRect(PAD, y + 2, inner_w, h - 4))
+                _wrap(label)
+                content.addSubview_(label)
+            elif kind == "disclosure":
+                self._add_disclosure(content, row, y, inner_w, font_small)
+            elif kind == "button":
+                width = max(70.0, _button_width(row["title"], font_small))
+                content.addSubview_(_label(row["label"], font_body, pal["fg"], NSMakeRect(PAD, y + 5, inner_w - width - 8, 20)))
+                button = self._add_button(content, row["title"], NSMakeRect(PANEL_WIDTH - PAD - width, y + 2, width, 26),
+                                          lambda _, rid=row["id"]: self._emit_setting(rid, None), font_small)
+                button.setEnabled_(not row.get("disabled"))
+            y += h + SETTINGS_ROW_GAP
+        if self._profiles_scroll is not None:
+            content.scrollPoint_((0, min(offset, body_h - visible_h)))
+        return root
+
+    def _add_desktop_profiles(self, root, row, frame, pal, font_body, font_small):
+        from openswap.claude_desktop import BADGE_COLORS
+
+        group = _ProfileGroupView.alloc().initWithFrame_(frame)
+        root.addSubview_(group)
+        width = frame.size.width
+        enabled = not row.get("disabled") and self._on_claude_desktop_action is not None
+        items = row.get("items") or []
+        if not items:
+            label = _label("No profiles yet", font_small, pal["muted"], NSMakeRect(12, 15, width - 24, 20))
+            label.setAlignment_(1)
+            group.addSubview_(label)
+            button = self._add_button(group, "Add profile", NSMakeRect((width - 110) / 2, 43, 110, 28),
+                                      lambda _: self._desktop_profile_action("add"), font_body)
+            button.setEnabled_(enabled)
+            return
+        icon = NSWorkspace.sharedWorkspace().iconForFile_("/Applications/Claude.app")
+        y = 0.0
+        for index, profile in enumerate(items):
+            detail = " · ".join(x for x in (profile.get("email"), profile.get("organization")) if x)
+            base_h = 76.0 if detail else 58.0
+            row_h = desktop_profile_height(profile)
+            if index:
+                line = _FillView.alloc().initWithColor_(pal["hairline"])
+                line.setFrame_(NSMakeRect(12, y, width - 24, 1))
+                group.addSubview_(line)
+            image = NSImageView.alloc().initWithFrame_(NSMakeRect(10, y + 12, 34, 34))
+            image.setImage_(icon)
+            image.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            group.addSubview_(image)
+            badge = profile.get("badge") or ""
+            if badge:
+                badge_w = max(20, len(badge) * 8 + 8)
+                label = _label(badge, font_small, NSColor.whiteColor(), NSMakeRect(45 - badge_w, y + 7, badge_w, 16))
+                label.setDrawsBackground_(True)
+                label.setBackgroundColor_(NSColor.colorWithSRGBRed_green_blue_alpha_(*BADGE_COLORS.get(profile.get("color"), BADGE_COLORS["orange"]), 1))
+                label.setAlignment_(1)
+                label.setWantsLayer_(True)
+                label.layer().setCornerRadius_(8)
+                label.layer().setMasksToBounds_(True)
+                group.addSubview_(label)
+            archived = profile.get("archived", False)
+            action_w = 72.0 if archived else 54.0
+            action_x = width - 12 - action_w - (0 if archived else 32)
+            name = _label(profile["name"], font_body, pal["fg"], NSMakeRect(54, y + 10, action_x - 62, 19))
+            name.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+            name.setToolTip_(profile["name"] + (" · Existing Claude profile on this Mac" if profile.get("kind") == "default" else ""))
+            group.addSubview_(name)
+            if detail:
+                label = _label(detail, font_small, pal["muted"], NSMakeRect(54, y + 30, action_x - 62, 16))
+                label.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+                source = ("Last detected " + profile["detected_at"]) if profile.get("detected_at") else "Entered by you"
+                label.setToolTip_(f"{detail}\n{source}. Check the current account inside Claude.")
+                group.addSubview_(label)
+            status = "Archived" if archived else profile.get("status") or "Status not checked"
+            if not archived and profile.get("account_status"):
+                status = profile["account_status"]
+            label = _label(status, font_small, pal["muted"], NSMakeRect(54, y + (48 if detail else 30), action_x - 62, 16))
+            label.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+            checked = profile.get("checked_at")
+            label.setToolTip_(f"{status}" + (f" · Checked {checked}" if checked else "") + ". Sign-in must be checked inside Claude.")
+            group.addSubview_(label)
+            button = self._add_button(group, "Restore" if archived else "Open", NSMakeRect(action_x, y + (base_h - 26) / 2, action_w, 26),
+                                      lambda _, p=profile: self._desktop_profile_action("restore" if p.get("archived") else "open", p["id"]), font_small)
+            button.setAccessibilityLabel_(f"{'Restore' if archived else 'Open'} {profile['name']}")
+            button.setEnabled_(enabled)
+            if not archived:
+                more = self._add_icon_button(group, "ellipsis", "•••", NSMakeRect(width - 39, y + (base_h - 26) / 2, 27, 26),
+                                             lambda sender, pid=profile["id"]: self._desktop_profile_menu(pid, sender),
+                                             f"Actions for {profile['name']}", bordered=True)
+                more.setEnabled_(enabled)
+                extra_y = y + base_h - 4
+                if profile.get("code_status"):
+                    action = profile.get("code_action")
+                    label = _label(profile["code_status"], font_small, pal["muted"],
+                                   NSMakeRect(54, extra_y, width - 66 - (102 if action else 0), 18))
+                    label.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+                    label.setToolTip_(profile["code_status"])
+                    group.addSubview_(label)
+                    if action:
+                        button = self._add_button(group, "Cancel" if action == "cancel_code" else "Continue setup",
+                                                  NSMakeRect(width - 110, extra_y - 3, 98, 22),
+                                                  lambda _, p=profile, a=action: self._desktop_profile_action(a, p["id"]), font_small)
+                        button.setEnabled_(enabled)
+                    extra_y += 22
+                if profile.get("code_usage"):
+                    label = _label(profile["code_usage"], font_small, pal["muted"], NSMakeRect(54, extra_y, width - 66, 18))
+                    label.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+                    label.setToolTip_(profile["code_usage"])
+                    group.addSubview_(label)
+            y += row_h
+
     def _build_settings(self):
         pal = _colors()
         font_title = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
@@ -2072,6 +2342,9 @@ class MenuBarPanel:
         font_group = NSFont.systemFontOfSize_weight_(11, NSFontWeightSemibold)
         inner_w = PANEL_WIDTH - PAD * 2
         settings = self._settings() if callable(self._settings) else MenuBarSettings()
+        sections = settings_sections(settings)
+        if self._settings_section not in {key for key, _label in sections}:
+            self._settings_section = SETTINGS_SECTION_GENERAL
         strategy = self._strategy() if callable(self._strategy) else "best"
         try:
             threshold = float(self._threshold())
@@ -2125,6 +2398,9 @@ class MenuBarPanel:
             status_line=status_line == "on",
             status_line_other=status_line == "other",
             bundled_widget=bundled_widget,
+            claude_desktop=self._claude_desktop_state() if self._settings_section == SETTINGS_SECTION_DESKTOP else None,
+            desktop_app=self._desktop_settings_app,
+            expanded_sections=self._settings_disclosures,
             section=self._settings_section,
         )
 
@@ -2148,6 +2424,11 @@ class MenuBarPanel:
 
         def _row_height(row) -> float:
             kind = row.get("kind")
+            if kind == "app_check":
+                width = inner_w - max(70, _button_width(row["title"], font_small)) - 8
+                label = _label(row["label"], font_small, pal["muted"], NSMakeRect(0, 0, width, 1000))
+                _wrap(label)
+                return max(38.0, label.cell().cellSizeForBounds_(label.frame()).height + 12)
             if kind == "group":
                 if row.get("style") == "hint":
                     return 34.0 + 14.0 * max(0, int(row.get("lines") or 2) - 2)
@@ -2166,7 +2447,11 @@ class MenuBarPanel:
         body_h = 0.0
         for row in rows:
             body_h += _row_height(row) + SETTINGS_ROW_GAP
-        height = PAD + HEADER_H + SETTINGS_TABS_H + body_h + PAD
+        chrome_h = PAD + HEADER_H + SETTINGS_TABS_H + PAD
+        visible_body_h = body_h
+        if self._settings_section == SETTINGS_SECTION_DESKTOP:
+            visible_body_h = min(body_h, max(120, (self._available_panel_height() or 640) - chrome_h))
+        height = chrome_h + visible_body_h
         root = _RootView.alloc().initWithHover_(self._on_hover)
         root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, height))
         root.setMaterial_(NSVisualEffectMaterialMenu)
@@ -2187,8 +2472,8 @@ class MenuBarPanel:
         root.addSubview_(hairline)
 
         y = PAD + HEADER_H
-        tab_w = (inner_w - TAB_GAP) / len(SETTINGS_SECTIONS)
-        for index, (section, label) in enumerate(SETTINGS_SECTIONS):
+        tab_w = (inner_w - TAB_GAP * (len(sections) - 1)) / len(sections)
+        for index, (section, label) in enumerate(sections):
             tab = self._add_button(
                 root,
                 label,
@@ -2205,10 +2490,30 @@ class MenuBarPanel:
                 tab.setAlphaValue_(0.68)
         y += SETTINGS_TABS_H
 
+        content = root
+        scroll_key = (self._settings_section, self._desktop_settings_app)
+        offset = (self._settings_scroll.contentView().bounds().origin.y
+                  if self._settings_scroll is not None and self._settings_scroll_key == scroll_key and self.is_shown() else 0)
+        self._settings_scroll = None
+        self._settings_scroll_key = scroll_key
+        if visible_body_h < body_h:
+            self._settings_scroll, content = _overlay_scroll(root, NSMakeRect(0, y, PANEL_WIDTH, visible_body_h), PANEL_WIDTH, body_h)
+            y = 0
+
         for row in rows:
             kind = row.get("kind")
             h = _row_height(row)
-            if kind == "group":
+            if kind == "disclosure":
+                self._add_disclosure(content, row, y, inner_w, font_small)
+            elif kind == "app_check":
+                button_w = max(70.0, _button_width(row["title"], font_small))
+                label = _label(row["label"], font_small, pal["muted"], NSMakeRect(PAD, y + 6, inner_w - button_w - 8, h - 12))
+                _wrap(label)
+                content.addSubview_(label)
+                button = self._add_button(content, row["title"], NSMakeRect(PANEL_WIDTH - PAD - button_w, y + 4, button_w, 26),
+                                          lambda _: self._emit_setting("claude_desktop_check", None), font_small)
+                button.setEnabled_(not row.get("disabled"))
+            elif kind == "group":
                 is_hint = row.get("style") == "hint"
                 label = _label(
                     row.get("label") or "",
@@ -2218,9 +2523,9 @@ class MenuBarPanel:
                 )
                 if is_hint:
                     _wrap(label)
-                root.addSubview_(label)
+                content.addSubview_(label)
             elif kind == "toggle":
-                root.addSubview_(
+                content.addSubview_(
                     _label(
                         row.get("label") or "",
                         font_body,
@@ -2242,13 +2547,13 @@ class MenuBarPanel:
                         cs.height,
                     )
                 )
-                root.addSubview_(sw)
+                content.addSubview_(sw)
             elif kind == "popup":
                 popup_w = (
                     max(SETTINGS_POPUP_W, inner_w - SETTINGS_WIDE_POPUP_LABEL_W)
                     if row.get("wide") else SETTINGS_POPUP_W
                 )
-                root.addSubview_(
+                content.addSubview_(
                     _label(
                         row.get("label") or "",
                         font_body,
@@ -2257,7 +2562,7 @@ class MenuBarPanel:
                     )
                 )
                 popup = self._add_popup(
-                    root,
+                    content,
                     row.get("options") or [],
                     row.get("value"),
                     NSMakeRect(
@@ -2271,7 +2576,7 @@ class MenuBarPanel:
                 )
                 popup.setEnabled_(not bool(row.get("disabled")))
             elif kind == "status":
-                root.addSubview_(
+                content.addSubview_(
                     _label(
                         row.get("label") or "",
                         font_small,
@@ -2286,11 +2591,11 @@ class MenuBarPanel:
                     NSMakeRect(PAD, y + 14, inner_w, h - 14),
                 )
                 _wrap(value_label)
-                root.addSubview_(value_label)
+                content.addSubview_(value_label)
             elif kind == "button":
                 title = row.get("title") or "Action"
                 button_w = max(70.0, _button_width(title, font_small))
-                root.addSubview_(
+                content.addSubview_(
                     _label(
                         row.get("label") or "",
                         font_body,
@@ -2299,7 +2604,7 @@ class MenuBarPanel:
                     )
                 )
                 button = self._add_button(
-                    root,
+                    content,
                     title,
                     NSMakeRect(PANEL_WIDTH - PAD - button_w, y + 2, button_w, 26),
                     lambda _s, rid=row["id"], v=row.get("value"): self._emit_setting(rid, v),
@@ -2307,7 +2612,7 @@ class MenuBarPanel:
                 )
                 button.setEnabled_(not bool(row.get("disabled")))
             elif kind == "choice":
-                root.addSubview_(
+                content.addSubview_(
                     _label(
                         row.get("label") or "",
                         font_small,
@@ -2321,7 +2626,7 @@ class MenuBarPanel:
                     x = PAD
                     for title, value, w in line:
                         self._add_button(
-                            root,
+                            content,
                             title,
                             NSMakeRect(x, by, w, SETTINGS_BTN_H),
                             lambda _s, i=rid, v=value: self._emit_setting(i, v),
@@ -2331,6 +2636,8 @@ class MenuBarPanel:
                     by += SETTINGS_BTN_H + SETTINGS_BTN_GAP_Y
             y += h + SETTINGS_ROW_GAP
 
+        if self._settings_scroll is not None:
+            content.scrollPoint_((0, min(offset, body_h - visible_body_h)))
         return root
 
     def _build_token_page(self):

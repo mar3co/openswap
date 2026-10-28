@@ -76,22 +76,32 @@ MENUBAR_SETTINGS_FILENAME = "menubar_settings.json"
 
 
 def chatgpt_suggestions_effective(settings: "MenuBarSettings") -> bool:
-    """True only when both stored ChatGPT toggles are on."""
-    return bool(getattr(settings, "chatgpt_switching_enabled", False)) and bool(
+    """Suggestions require desktop features and both ChatGPT switches."""
+    return chatgpt_tab_desktop(settings) and bool(
         getattr(settings, "chatgpt_auto_enabled", False)
     )
+
+
+def codex_auto_hint(settings: "MenuBarSettings", *, codex_enabled: bool) -> str:
+    """The Codex auto-switch row's hint; a running Codex pauses suggestions, never the reverse."""
+    if not chatgpt_suggestions_effective(settings):
+        return "Uses the same rotation settings as Claude Code."
+    if codex_enabled:
+        return "ChatGPT suggestions are paused while this is on."
+    return "Turn off ChatGPT suggestions to auto-switch Codex."
 
 
 def chatgpt_tab_desktop(settings: "MenuBarSettings | None") -> bool:
     """Whether the ChatGPT tab is about the desktop app (True) or Codex CLI.
 
-    One stored switch, **Enable ChatGPT switching**, decides the tab's whole
-    identity: off, the tab is titled Codex, a card click selects that login
-    for Codex CLI and the footer toggle is live Codex rotation; on, the tab is
-    titled ChatGPT, a click reopens the ChatGPT app and the toggle is ChatGPT
-    suggestions.
+    Desktop features and **Enable ChatGPT switching** decide what the tab,
+    still titled Codex, does: either off, a card click selects that login for
+    Codex CLI and the footer toggle is Codex auto-switching; on, a click
+    reopens the ChatGPT app and the toggle is ChatGPT suggestions.
     """
-    return bool(getattr(settings, "chatgpt_switching_enabled", False))
+    return bool(getattr(settings, "desktop_features_enabled", False)) and bool(
+        getattr(settings, "chatgpt_switching_enabled", False)
+    )
 
 
 def chatgpt_manual_activation_allowed(
@@ -101,7 +111,7 @@ def chatgpt_manual_activation_allowed(
     now: float,
 ) -> bool:
     """True only when the persisted parent is on and a fresh process observation exists."""
-    if not bool(getattr(settings, "chatgpt_switching_enabled", False)):
+    if not chatgpt_tab_desktop(settings):
         return False
     if not capability_is_fresh(capability, now=now):
         return False
@@ -116,7 +126,7 @@ def apply_chatgpt_activation(
     now: float,
 ) -> list[dict]:
     """Mark capability-blocked rows while preserving the parent-off Settings route."""
-    if not bool(getattr(settings, "chatgpt_switching_enabled", False)):
+    if not chatgpt_tab_desktop(settings):
         return cards
     if chatgpt_manual_activation_allowed(settings, capability, now=now):
         return cards
@@ -262,16 +272,24 @@ TOKEN_PAGE = "token"
 SETUP_TOKEN_PREFIX = "sk-ant-oat"
 MAIN_PAGE = "main"
 CHATGPT_SWITCHING_HINT = (
-    "Off: the Codex tab switches Codex CLI. On: the ChatGPT tab reopens the ChatGPT app."
+    "Switch the shared Codex account and restart ChatGPT. Turn off to switch Codex only."
 )
 SETTINGS_SECTION_GENERAL = "general"
 SETTINGS_SECTION_AUTOMATION = "automation"
+SETTINGS_SECTION_DESKTOP = "desktop"
 SETTINGS_SECTION_REMOTE = "remote"
 SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = (
     (SETTINGS_SECTION_GENERAL, "General"),
     (SETTINGS_SECTION_AUTOMATION, "Automation"),
+    (SETTINGS_SECTION_DESKTOP, "Desktop"),
     (SETTINGS_SECTION_REMOTE, "Remote"),
 )
+
+
+def settings_sections(settings: "MenuBarSettings") -> tuple[tuple[str, str], ...]:
+    return tuple((key, label) for key, label in SETTINGS_SECTIONS
+                 if key != SETTINGS_SECTION_DESKTOP or settings.desktop_features_enabled)
+
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.opensoft.openswap.menubar"
 RELOGIN_CARD_NOTE = (
@@ -434,6 +452,8 @@ class MenuBarSettings:
     title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
+    desktop_features_enabled: bool = False
+    claude_desktop_guide_seen: bool = False
     chatgpt_switching_enabled: bool = False
     # Separate from Claude's live rotation: this only proposes desktop targets.
     chatgpt_auto_enabled: bool = False
@@ -447,7 +467,7 @@ class MenuBarSettings:
     welcome_done: bool = False
 
     @classmethod
-    def load(cls, path: Path) -> "MenuBarSettings":
+    def load(cls, path: Path, *, has_desktop_profiles=None) -> "MenuBarSettings":
         """Load settings, falling back to defaults on any problem.
 
         Unknown keys are ignored; a value whose type doesn't match the field
@@ -458,6 +478,8 @@ class MenuBarSettings:
         defaults = cls()
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raw = {}
         except (OSError, ValueError):
             return defaults
         if not isinstance(raw, dict):
@@ -479,6 +501,17 @@ class MenuBarSettings:
         # parent was on. A present false always wins over that inference.
         if "chatgpt_switching_enabled" not in raw and kwargs.get("chatgpt_auto_enabled") is True:
             settings.chatgpt_switching_enabled = True
+        # Preserve existing Desktop users on upgrade. Once stored, an explicit
+        # false wins even if profiles or per-app preferences remain saved.
+        if "desktop_features_enabled" not in raw:
+            settings.desktop_features_enabled = bool(
+                settings.chatgpt_switching_enabled or settings.chatgpt_auto_enabled
+            )
+            if not settings.desktop_features_enabled and has_desktop_profiles is not None:
+                try:
+                    settings.desktop_features_enabled = bool(has_desktop_profiles())
+                except Exception:
+                    pass
         return settings
 
     def save(self, path: Path) -> None:
@@ -541,6 +574,9 @@ def settings_page_rows(
     status_line: bool = False,
     status_line_other: bool = False,
     bundled_widget: bool = False,
+    claude_desktop: dict | None = None,
+    desktop_app: str = "claude",
+    expanded_sections: set[str] | None = None,
     section: str | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
@@ -555,9 +591,9 @@ def settings_page_rows(
     tagged with a settings section so AppKit can keep the page compact; callers
     that omit ``section`` receive the complete model for compatibility.
 
-    Claude, ChatGPT desktop selection, and Codex CLI rotation are named
-    independently. ChatGPT suggestions and live Codex rotation are mutually
-    exclusive in the controller; the model makes that relationship visible.
+    Claude, ChatGPT desktop selection, and Codex auto-switching are named
+    independently. The controller pauses ChatGPT suggestions while Codex
+    auto-switching is on; the model makes that relationship visible.
 
     General ends with **This Mac**: what ``openswap setup`` and its
     neighbours set up from a terminal. After Open at login,
@@ -581,7 +617,7 @@ def settings_page_rows(
             "id": "menu_bar_provider",
             "label": "Show",
             "options": [
-                ("claude", "Claude"), ("chatgpt", "ChatGPT"),
+                ("claude", "Claude Code"), ("chatgpt", "ChatGPT" if chatgpt_tab_desktop(settings) else "Codex"),
                 ("both", "Both"), ("logo", "Logo only"),
             ],
             "value": settings.menu_bar_provider,
@@ -611,7 +647,7 @@ def settings_page_rows(
             "kind": "toggle",
             "section": SETTINGS_SECTION_GENERAL,
             "id": "title_scoped",
-            "label": "Claude model limits",
+            "label": "Claude Code model limits",
             "value": bool(settings.title_scoped),
         },
         {
@@ -642,7 +678,7 @@ def settings_page_rows(
         general = [row for row in general if row["id"] not in title_controls]
     elif settings.menu_bar_provider == "chatgpt":
         general = [row for row in general if row["id"] != "title_scoped"]
-    if settings.menu_bar_provider in ("chatgpt", "both"):
+    if settings.menu_bar_provider in ("chatgpt", "both") and chatgpt_tab_desktop(settings):
         hint_at = next(i for i, row in enumerate(general) if row["id"] == "group_behavior")
         general.insert(hint_at, {
             "kind": "group",
@@ -654,6 +690,14 @@ def settings_page_rows(
                 "these aren’t ChatGPT message limits."
             ),
         })
+    general.extend([
+        {"kind": "group", "section": SETTINGS_SECTION_GENERAL,
+         "id": "group_optional_features", "label": "Optional features"},
+        {"kind": "toggle", "section": SETTINGS_SECTION_GENERAL,
+         "id": "desktop_features_enabled", "label": "Enable desktop app features", "value": settings.desktop_features_enabled},
+        {"kind": "group", "style": "hint", "section": SETTINGS_SECTION_GENERAL,
+         "id": "desktop_features_hint", "label": "Claude Desktop profiles and ChatGPT switching. Turning this off keeps profiles, sign-ins and shortcuts.", "lines": 2},
+    ])
     general.extend(this_mac_rows(login_item))
     general.extend(_this_mac_setup_rows(
         status_line=status_line,
@@ -748,25 +792,34 @@ def settings_page_rows(
             "style": "section",
             "section": SETTINGS_SECTION_AUTOMATION,
             "id": "group_claude",
-            "label": "Claude Code",
+            "label": "Claude Code accounts",
+        },
+        {
+            "kind": "group",
+            "style": "hint",
+            "section": SETTINGS_SECTION_AUTOMATION,
+            "id": "claude_code_accounts_hint",
+            "label": "Switch and rotate Claude Code accounts. Desktop profiles stay separate.",
+            "lines": 2,
         },
         {
             "kind": "toggle",
             "section": SETTINGS_SECTION_AUTOMATION,
             "id": "auto_switch_enabled",
-            "label": "Auto-switch Claude accounts",
+            "label": "Auto-switch Claude Code accounts",
             "value": bool(settings.auto_switch_enabled),
         },
     ]
+    desktop_chatgpt = []
     if has_codex or settings.chatgpt_auto_enabled or settings.chatgpt_switching_enabled:
-        automation.extend(
+        desktop_chatgpt.extend(
             [
                 {
                     "kind": "group",
                     "style": "section",
                     "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "group_chatgpt",
-                    "label": "ChatGPT",
+                    "label": "ChatGPT switching",
                 },
                 {
                     "kind": "toggle",
@@ -786,7 +839,7 @@ def settings_page_rows(
                     "kind": "toggle",
                     "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "chatgpt_auto_enabled",
-                    "label": "Suggest ChatGPT account switches",
+                    "label": "Suggest account switches",
                     "value": bool(settings.chatgpt_auto_enabled),
                     "disabled": not bool(settings.chatgpt_switching_enabled),
                 },
@@ -795,11 +848,11 @@ def settings_page_rows(
                     "style": "hint",
                     "section": SETTINGS_SECTION_AUTOMATION,
                     "id": "chatgpt_auto_hint",
-                    "label": "Uses Codex quota. You approve every ChatGPT restart.",
+                    "label": "Based on Codex usage. You approve each restart.",
                 },
             ]
         )
-    if settings.auto_switch_enabled or settings.chatgpt_auto_enabled:
+    if settings.auto_switch_enabled or chatgpt_suggestions_effective(settings):
         automation.extend(
             [
                 {
@@ -844,26 +897,22 @@ def settings_page_rows(
                         "style": "section",
                         "section": SETTINGS_SECTION_AUTOMATION,
                         "id": "group_codex",
-                        "label": "Codex CLI",
+                        "label": "Codex accounts",
                     },
                     {
                         "kind": "toggle",
                         "section": SETTINGS_SECTION_AUTOMATION,
                         "id": "codex_enabled",
-                        "label": "Auto-switch Codex CLI accounts",
+                        "label": "Auto-switch Codex accounts",
                         "value": bool(codex_enabled),
-                        "disabled": chatgpt_suggestions_effective(settings),
+                        "disabled": chatgpt_suggestions_effective(settings) and not codex_enabled,
                     },
                     {
                         "kind": "group",
                         "style": "hint",
                         "section": SETTINGS_SECTION_AUTOMATION,
                         "id": "codex_auto_hint",
-                        "label": (
-                            "Turn off ChatGPT suggestions to use live Codex rotation."
-                            if chatgpt_suggestions_effective(settings)
-                            else "Runs alongside Claude auto-switch using the shared policy."
-                        ),
+                        "label": codex_auto_hint(settings, codex_enabled=bool(codex_enabled)),
                     },
                 ]
             )
@@ -908,9 +957,28 @@ def settings_page_rows(
                 ),
             }
         )
-    rows = general + automation + remote
+    desktop = []
+    if settings.desktop_features_enabled:
+        desktop.append({"kind": "popup", "section": SETTINGS_SECTION_DESKTOP,
+                        "id": "desktop_app", "label": "App", "wide": True,
+                        "options": [("claude", "Claude Desktop"), ("chatgpt", "ChatGPT Desktop")],
+                        "value": desktop_app})
+        if desktop_app == "chatgpt" or section is None:
+            desktop.extend({**row, "section": SETTINGS_SECTION_DESKTOP} for row in desktop_chatgpt)
+            if not desktop_chatgpt:
+                desktop.append({"kind": "group", "style": "hint", "section": SETTINGS_SECTION_DESKTOP,
+                                "id": "chatgpt_unavailable", "label": "Sign in with ChatGPT from the Codex tab to get started.", "lines": 2})
+            desktop.append({"kind": "disclosure", "section": SETTINGS_SECTION_DESKTOP,
+                            "id": "chatgpt_help", "label": "About switching",
+                            "value": "chatgpt_help" in (expanded_sections or ())})
+            if "chatgpt_help" in (expanded_sections or ()):
+                desktop.append({"kind": "group", "style": "hint", "section": SETTINGS_SECTION_DESKTOP,
+                                "id": "chatgpt_policy_location", "label": "Save work before restarting. Turn switching off to switch Codex only. Rotation settings are in Automation.", "lines": 3})
+        if desktop_app != "chatgpt" or section is None:
+            desktop.extend(claude_desktop_settings_rows(claude_desktop, expanded=expanded_sections))
+    rows = general + automation + desktop + remote
     if section is not None:
-        valid_sections = {value for value, _label in SETTINGS_SECTIONS}
+        valid_sections = {value for value, _label in settings_sections(settings)}
         if section not in valid_sections:
             section = SETTINGS_SECTION_GENERAL
         rows = [row for row in rows if row["section"] == section]
@@ -931,6 +999,99 @@ _HINT_LINE_CHARS = 60
 
 def _hint_lines(text: str) -> int:
     return max(2, -(-len(text) // _HINT_LINE_CHARS))
+
+
+def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str] | None = None) -> list[dict]:
+    """Everyday profile actions for the main Claude Desktop tab."""
+    state = state or {}
+    expanded = expanded or set()
+    rows = []
+
+    def hint(id, text):
+        rows.append({"kind": "group", "style": "hint", "id": id,
+                     "label": text, "lines": _hint_lines(text)})
+
+    items = [] if state.get("storage_error") else state.get("items") or []
+    active = [p for p in items if not p.get("archived")]
+    archived = [p for p in items if p.get("archived")]
+    disabled = bool(state.get("busy"))
+    rows.append({"kind": "profiles_header", "id": "claude_desktop_add", "label": "Profiles",
+                 "title": "Add profile" if active else "", "disabled": disabled or bool(state.get("storage_error"))})
+    hint("claude_desktop_separation", "Default is your existing Claude profile. Signed-in profiles are added to Claude Code automatically.")
+    if state.get("storage_error"):
+        hint("claude_desktop_storage_error_hint", state["storage_error"])
+        rows.append({"kind": "button", "id": "claude_desktop_storage_error", "label": "Profile storage",
+                     "title": "View details", "disabled": disabled})
+    else:
+        if state.get("default_error"):
+            hint("claude_desktop_default_error", state["default_error"])
+        rows.append({"kind": "profiles", "id": "claude_desktop_profiles", "items": active, "disabled": disabled})
+    if disabled:
+        hint("claude_desktop_operation", state.get("operation") or "Working on profile…")
+    if archived:
+        rows.append({"kind": "disclosure", "id": "claude_desktop_archived", "label": f"Archived profiles ({len(archived)})",
+                     "value": "claude_desktop_archived" in expanded})
+        if "claude_desktop_archived" in expanded:
+            rows.append({"kind": "profiles", "id": "claude_desktop_archived_profiles", "items": archived, "disabled": disabled})
+    return rows
+
+
+def desktop_profile_usage(profile: dict, cards: list[dict]) -> str:
+    """Reuse the Code snapshot only when both its slot and org still match."""
+    if profile.get("archived") or not profile.get("account_uuid") or not profile.get("organization_uuid"):
+        return ""
+    for card in cards:
+        known = card.get("identity")
+        if (str(card["num"]) != str(profile.get("code_slot")) or card.get("provider") != "claude"
+                or not known or (known[0].casefold(), known[1].lower()) !=
+                (profile.get("email", "").casefold(), profile["organization_uuid"].lower())):
+            continue
+        if card.get("windows"):
+            usage = " · ".join(f"{w['label']} {w['pct']:.0f}%" for w in card["windows"])
+            return ("Last known: " if card.get("stale") else "Usage: ") + usage
+        return "Usage unavailable"
+    return ""
+
+
+def desktop_profile_height(profile: dict) -> float:
+    height = 76.0 if profile.get("email") or profile.get("organization") else 58.0
+    if not profile.get("archived"):
+        height += 22 if profile.get("code_status") else 0
+        height += 18 if profile.get("code_usage") else 0
+    return height
+
+
+def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str] | None = None) -> list[dict]:
+    """App checks and optional guidance, separate from the main profile list."""
+    state = state or {}
+    expanded = expanded or set()
+    rows = [{"kind": "group", "id": "claude_desktop_app_heading", "label": "Claude Desktop app"}]
+
+    def hint(id, text):
+        rows.append({"kind": "group", "style": "hint", "id": id,
+                     "label": text, "lines": _hint_lines(text)})
+
+    message = state.get("app_message") or "Not checked yet. Install Claude.app in Applications."
+    rows.append({"kind": "app_check", "id": "claude_desktop_check", "label": message,
+                 "title": "Checking…" if state.get("checking") else "Check", "disabled": bool(state.get("checking")),
+                 "lines": _hint_lines(message)})
+    rows.append({"kind": "button", "id": "claude_desktop_guide", "label": "Profiles and Dock icons",
+                 "title": "Show guide", "disabled": bool(state.get("busy"))})
+    rows.append({"kind": "disclosure", "id": "claude_desktop_help", "label": "About profiles",
+                 "value": "claude_desktop_help" in expanded})
+    if "claude_desktop_help" not in expanded:
+        return [{"section": SETTINGS_SECTION_DESKTOP, **row} for row in rows]
+    for key, title, body in (
+        ("open", "Opening profiles", "Open profile brings it forward. Other profiles keep running."),
+        ("shortcut", "Dock icons", "A numbered icon opens its own profile. Its dot means it’s running. Quit closes only that profile. Claude’s original icon may open any running profile. Use Default → Open in OpenSwap for your original session."),
+        ("signin", "Sign-in", "Sign in inside each profile. OpenSwap adds its account to Claude Code automatically. Complete browser authorization if asked; Continue setup resumes a canceled sign-in. Your current CLI account stays selected."),
+        ("signin_window", "Browser returns", "The browser may say Open OpenSwap. Choose your Claude profile to finish sign-in or connect an app. Keep OpenSwap running. If the wrong window opens, choose Reconnect sign-in and start again."),
+        ("details", "Account details", "Your existing Claude profile appears as Default automatically. Add profile creates an additional sign-in. Email and organization update automatically; macOS may request Keychain access. Manage updates in Account details."),
+        ("archive", "Archiving", "Keeps sign-ins, data and open windows. Shortcuts are disabled until restored. Saved Claude Code accounts stay available. Restore does not open the profile."),
+        ("limits", "Limitations", "Usage comes from the matching Claude Code account. Check the account inside Code and Cowork. Chrome pairing is unavailable."),
+    ):
+        hint(f"claude_desktop_{key}_hint", f"{title}: {body}" if key != "limits" else body)
+    return [{"section": SETTINGS_SECTION_DESKTOP, **row} for row in rows]
 
 
 def this_mac_rows(login_item: dict | None) -> list[dict]:
@@ -1112,7 +1273,7 @@ def _remote_tasks_account_row(picker) -> dict:
         number = _bounded_text(entry.get("number"), 8)
         name = _bounded_text(entry.get("email")) or "(no email)"
         alias = _bounded_text(entry.get("alias"), 40)
-        label = f"Claude {number} · {name}" + (f" ({alias})" if alias else "")
+        label = f"Claude Code {number} · {name}" + (f" ({alias})" if alias else "")
         ref = entry.get("account_ref")
         if entry.get("eligible") is True and isinstance(ref, str) and ref.startswith("claude:"):
             options.append((ref, label))
@@ -1158,7 +1319,7 @@ def _remote_tasks_web_choice_row(picker) -> dict:
     options: list[tuple] = [("", summary)]
     listed = set()
     entries = [("Codex", "codex:", e) for e in picker.get("codex") or []] + [
-        ("Claude", "claude:", e) for e in picker.get("claude") or []]
+        ("Claude Code", "claude:", e) for e in picker.get("claude") or []]
     for provider_name, prefix, entry in entries:
         if not isinstance(entry, dict) or entry.get("eligible") is not True:
             continue
@@ -1616,9 +1777,9 @@ def notification_copy_for_event(
             getattr(event, "number", None),
         )
         if provider == "codex":
-            body = "Sign in with this account in Codex, then click it in the extra."
+            body = "Sign in with this account in Codex, then select it in OpenSwap."
         else:
-            body = "Sign in with this account in Claude Code, then click it in the extra."
+            body = "Sign in with this account in Claude Code, then select it in OpenSwap."
         return NotificationCopy(
             title=f"{name} was paused",
             body=body,
@@ -1672,8 +1833,8 @@ def notification_copy_for_kickoff(
 
     def provider_name(result: KickoffResult) -> str:
         return {
-            "claude": "Claude",
-            "codex": "ChatGPT",
+            "claude": "Claude Code",
+            "codex": "Codex",
             "openswap": "OpenSwap",
         }.get(result.provider, str(result.provider).title())
 
@@ -1765,11 +1926,11 @@ def reconcile_kickoff_action_required(
 def notification_copy_for_relogin(
     name: str, *, provider: str = "claude"
 ) -> NotificationCopy:
-    provider_name = "ChatGPT" if provider == "codex" else "Claude"
+    provider_name = "Codex" if provider == "codex" else "Claude Code"
     if provider == "codex":
-        body = "OAuth expired. Sign in again with Codex; OpenSwap will detect it."
+        body = "Your sign-in expired. Sign in again with Codex; OpenSwap will detect it."
     else:
-        body = "OAuth expired. Sign in with Claude Code, then click that account."
+        body = "Your sign-in expired. Sign in with Claude Code, then select that account."
     return NotificationCopy(
         title=f"{provider_name} · {name} signed out",
         body=body,
@@ -1981,9 +2142,8 @@ def reconcile_dialog_copy(
             f"To use {slot_name}: click Restore. OpenSwap puts {slot_name}'s "
             f"saved login back and keeps {owner}'s login.\n\n"
             f"{other}\n\n"
-            f"If you signed in as {owner} in the Claude app or another Claude "
-            f"Code window, sign in there as {slot_name} too, or it will switch "
-            "back."
+            "Another session using this Claude Code login can change it back. "
+            f"Sign in there as {slot_name} too."
         ),
         f"Restore {slot_name}",
     )
@@ -2457,6 +2617,7 @@ def panel_accounts(snapshot: dict, now: float | None = None) -> list[dict]:
                 "provider": provider,
                 "email": email,
                 "alias": alias or "",
+                "identity": (snapshot.get("identities") or {}).get(str(num)),
             }
         )
     return cards
@@ -2493,16 +2654,24 @@ def provider_cards(cards: list[dict], provider: str, *, desktop: bool = True) ->
     return result
 
 
-def provider_tab_name(provider: str, *, desktop: bool = True) -> str:
-    """Tab / empty-state noun: Claude, ChatGPT, or Codex when the tab is CLI-only."""
+def provider_tab_name(provider: str) -> str:
+    """Navigation names stay stable when ChatGPT switching is enabled."""
     if provider == "chatgpt":
-        return "ChatGPT" if desktop else "Codex"
-    return "Claude"
+        return "Codex"
+    if provider == "claude_desktop":
+        return "Claude Desktop"
+    return "Claude Code"
+
+
+def provider_tabs(settings: MenuBarSettings) -> tuple[str, ...]:
+    return ("claude", "claude_desktop", "chatgpt") if settings.desktop_features_enabled else ("claude", "chatgpt")
 
 
 def provider_tab_title(cards: list[dict], provider: str, *, desktop: bool = True) -> str:
     """Provider tab copy that keeps hidden action-required accounts visible."""
-    name = provider_tab_name(provider, desktop=desktop)
+    name = provider_tab_name(provider)
+    if provider == "claude_desktop":
+        return name
     shown = provider_cards(cards, provider, desktop=desktop)
     if any(
         card.get("needs_restore") or card.get("needs_reconcile")
@@ -2516,7 +2685,7 @@ def provider_tab_title(cards: list[dict], provider: str, *, desktop: bool = True
 
 def provider_empty_state(provider: str, state: str = "ready", *, desktop: bool = True) -> dict:
     """Actionable empty copy; never mistake a failed read for an empty roster."""
-    name = provider_tab_name(provider, desktop=desktop)
+    name = provider_tab_name(provider)
     if state == "loading":
         return {"title": f"Loading {name} accounts…",
                 "body": "Checking your saved logins. This may take a moment.",
@@ -2543,7 +2712,7 @@ def provider_empty_state(provider: str, state: str = "ready", *, desktop: bool =
         "title": f"Add your first {name} account",
         "body": "Sign in through your browser, or save the login Claude Code already has.",
         "action": "start",
-        "button": "Sign in with Claude",
+        "button": "Sign in to Claude Code",
         "secondary_action": "add",
         "secondary_button": "Save current login",
         "hint": "",
@@ -2588,9 +2757,9 @@ def welcome_on_start(
 
 
 def provider_shared_copy(provider: str, *, desktop: bool = True) -> str:
-    """Under-tab line: only the desktop-app tab needs to say its roster is Codex's."""
+    """Explain the optional app restart beside the Codex account controls."""
     if provider == "chatgpt" and desktop:
-        return "Shared with Codex · Codex usage"
+        return "Also restarts ChatGPT"
     return ""
 
 
@@ -2961,22 +3130,24 @@ def format_menu_bar_title(
                 now=title_clock(snapshot, now), alias=snapshot.get("active_alias"),
                 org_name=snapshot.get("active_org"), label_windows=True,
             )
-            titles.append("Claude" + (f" · {detail}" if detail else ""))
+            titles.append("Claude Code" + (f" · {detail}" if detail else ""))
         else:
-            titles.append("Claude · No account")
+            titles.append("Claude Code · No account")
     if provider in ("chatgpt", "both"):
+        desktop = chatgpt_tab_desktop(settings)
         number = snapshot.get("codex_active_num")
         active = next(
             (row for row in snapshot.get("accounts") or []
              if number is not None and str(row[0]) == f"codex:{number}"
-             and (snapshot.get("kinds") or {}).get(str(row[0])) != "api_key"
-             and row[3] != USAGE_API_KEY),
+             and (not desktop or ((snapshot.get("kinds") or {}).get(str(row[0])) != "api_key"
+                                  and row[3] != USAGE_API_KEY))),
             None,
         )
         if active is None:
-            titles.append("ChatGPT · No shared account")
+            titles.append("ChatGPT · No shared account" if chatgpt_tab_desktop(settings) else "Codex · No account")
         else:
             _num, email, _active, usage, last_good, alias, org, _disabled, fetched_at = active
+            api_key = (snapshot.get("kinds") or {}).get(str(_num)) == "api_key" or usage == USAGE_API_KEY
             shared = {
                 "active_usage": usage, "active_last_good": last_good,
                 "active_fetched_at": fetched_at,
@@ -2985,16 +3156,16 @@ def format_menu_bar_title(
                 email, None, replace(settings, title_pct="off", title_scoped=False),
                 alias=alias, org_name=org,
             )
-            quota = format_title(
+            quota = "" if api_key else format_title(
                 email, title_usage(shared),
                 replace(settings, show_account_name=False, title_scoped=False),
                 now=title_clock(shared, now), label_windows=True,
             )
-            parts = ["ChatGPT (unverified)"]
+            parts = ["ChatGPT (unverified)" if desktop else "Codex"]
             if name:
                 parts.append(name)
             if quota:
-                parts.append(f"Codex {quota}")
+                parts.append(f"Codex {quota}" if desktop else quota)
             titles.append(" · ".join(parts))
     return "  |  ".join(titles)
 

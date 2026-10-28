@@ -9,6 +9,25 @@ OpenSwap is a standalone MIT descendant of [claude-swap](https://github.com/real
 **Users:** [Wiki](https://github.com/mar3co/openswap/wiki) (features, install, extra, widget, kickoff)
 **Developers:** [docs/](docs/README.md) (architecture, hacking, tests)
 
+**Desktop apps (experimental, opt-in):** turn on **Settings → General → Enable
+desktop app features**, then open the main **Claude Desktop** tab. Your existing
+Claude profile appears as **Default** automatically. **Add profile** creates
+additional Personal, Work or other profiles. Email and organization update automatically
+after sign-in or account changes. Each profile can stay open with its own sign-in.
+OpenSwap automatically links or adds the same account and organization to
+Claude Code. Complete browser authorization if Claude asks; no separate add
+step or checkbox is needed. Linked profiles show the Code account's usage.
+With OpenSwap running, browser sign-in uses macOS sessions to return to the
+profile that started it. Allow OpenSwap to open Claude links if macOS asks.
+Email links and fallback redirects may ask you to choose a profile; no copying
+or pasting is needed.
+Adding a profile creates numbered shortcuts with an OpenSwap mark. **Add to Dock**
+is checked by default and adds the new shortcut beside Claude’s original launcher.
+Each numbered icon shows its own running dot and brings its session forward.
+Use **Create shortcut…** to customize the badge. Claude Code switching and rotation
+stay independent. The Desktop app picker also contains ChatGPT's controls.
+See [setup, shortcuts, limitations and recovery](docs/claude-desktop-profiles.md).
+
 ## Install
 
 Needs a Mac (macOS 14 or later). With [Homebrew](https://brew.sh):
@@ -92,6 +111,7 @@ The command-line executable is `openswap`.
 | Command | What it does |
 | --- | --- |
 | `openswap setup` | Save the current login and start the menu bar extra |
+| `openswap claude-desktop add/list/open` | Experimental Claude Desktop profiles; sign in once per profile (`shortcut`, `rename`, `archive`, `restore`, `check`, `path` also available) |
 | `openswap list` | Accounts with 5h / 7d usage |
 | `openswap switch` / `openswap switch 2` | Rotate, or jump to a slot |
 | `openswap add` | Save the current OAuth login |
@@ -135,17 +155,21 @@ Pairing does not start the worker: the portal shows the Mac Offline until you ru
 
 `openswap help` lists the main commands. Full list: [CLI reference](https://github.com/mar3co/openswap/wiki/CLI-Reference).
 
-The menu-bar popover has **Claude | ChatGPT** tabs. The ChatGPT tab lists the
-shared ChatGPT/Codex accounts. Usage bars are **Codex usage**, not ChatGPT
+The main tabs are **Claude Code** and **Codex**. Enabling Desktop features adds
+**Claude Desktop** between them for profiles. App checks, preferences and help
+stay in **Settings → Desktop**. The Codex tab keeps its name when ChatGPT
+switching is enabled and shows **Also restarts ChatGPT** above its accounts.
+Usage bars are **Codex usage**, not ChatGPT
 message limits. Desktop switching is experimental and **off by default**: turn on
-Settings → Automation → **Enable ChatGPT switching**, wait until the extra shows
+Settings → General → **Enable desktop app features**, then Settings → Desktop →
+ChatGPT Desktop → **Enable ChatGPT switching**. Wait until the extra shows
 **Switch and open ChatGPT** or **Restart ChatGPT**, then click an OAuth account
-and confirm. While switching is off, a click offers **Enable in Settings**.
+and confirm. With ChatGPT switching off, account clicks switch Codex only.
 Incompatible builds show **This ChatGPT build isn’t compatible with switching.**
 Relaunch does not prove which profile ChatGPT loaded. Read the
 [test and recovery guide](docs/chatgpt-desktop-testing.md) first.
 
-**Suggest ChatGPT account switches** (the ChatGPT tab Auto-switch) only runs
+**Suggest account switches** (**Suggest switches** on the Codex tab) only runs
 when switching is on. It picks a replacement from Codex quota, then **Review
 switch**; you still confirm before ChatGPT restarts. That mode cannot run with
 live Codex CLI rotation. Unattended desktop rotation is not implemented.

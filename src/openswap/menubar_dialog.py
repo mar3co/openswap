@@ -82,6 +82,7 @@ class DialogResponse:
     text: str
     checked: bool = False
     choice: int = -1  # the popup's selected row; -1 without ``choices``
+    values: tuple[str, ...] = ()  # labeled fields, in their displayed order
 
 
 class _DialogSurface(NSView):
@@ -271,7 +272,8 @@ class BrandDialog:
     def __init__(
         self, *, title=None, message="", ok=None, cancel=None, other=None,
         default_text=None, secure=False, destructive=False, checkbox=None, close=None,
-        choices=None, selected=0,
+        choices=None, selected=0, fields=None, input_label=None, placeholder=None, checkbox_checked=False,
+        illustrations=None,
     ):
         shown_title = str(title or "OpenSwap")
         if shown_title.casefold() == "openswap":
@@ -279,6 +281,7 @@ class BrandDialog:
         self._result = 0
         self._running = False
         self.textfield = None
+        self.fields = []
         self.checkbox = None
         self.popup = None
         self._window = _DialogPanel.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -371,6 +374,16 @@ class BrandDialog:
         rows = (len(widths) + (1 if close else 0)) if stacked else 1
         footer_height = 40 + rows * (ACTION_HEIGHT + ACTION_GAP) - ACTION_GAP
 
+        # Measured before the message so its scroll limit leaves them room.
+        text_x, text_width = DIALOG_PADDING + 80, DIALOG_CONTENT_WIDTH - 80
+        figures = []
+        for item in illustrations or ():
+            caption = _label(item["title"], NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold),
+                             NSColor.labelColor(), text_width)
+            detail = _label(item["body"], NSFont.systemFontOfSize_(13), NSColor.secondaryLabelColor(), text_width)
+            figures.append((item, caption, detail, max(80, caption.frame().size.height + 5 + detail.frame().size.height)))
+        illustration_space = sum(20 + height for _item, _caption, _detail, height in figures)
+
         if message:
             y += 8
             body = _label(str(message), NSFont.systemFontOfSize_(13),
@@ -379,9 +392,9 @@ class BrandDialog:
             self.body = body
             screen = window.screen()
             max_height = min(640, screen.visibleFrame().size.height - 80) if screen else 640
-            input_space = (DIALOG_INPUT_HEIGHT + 20 if default_text is not None else 0) + (
-                POPUP_HEIGHT + 20 if choices is not None else 0)
-            body_limit = max(80, max_height - y - input_space - FOOTER_GAP - footer_height)
+            input_space = (DIALOG_INPUT_HEIGHT + 20 + (24 if input_label else 0) if default_text is not None else 0) + (
+                POPUP_HEIGHT + 20 if choices is not None else 0) + len(fields or ()) * (DIALOG_INPUT_HEIGHT + 42)
+            body_limit = max(80, max_height - y - input_space - illustration_space - FOOTER_GAP - footer_height)
             body_height = body.frame().size.height
             if body_height > body_limit:
                 scroll = NSScrollView.alloc().initWithFrame_(
@@ -400,11 +413,32 @@ class BrandDialog:
                 surface.addSubview_(body)
                 y += body_height
 
+        self.illustration_views = []
+        for item, caption, detail, height in figures:
+            y += 20
+            icon = NSImageView.alloc().initWithFrame_(NSMakeRect(DIALOG_PADDING, y, 64, 64))
+            icon.setImage_(item.get("image"))
+            icon.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            icon.setAccessibilityLabel_(item["title"])
+            surface.addSubview_(icon)
+            if item.get("image") is not None:
+                # The running dot illustrates the icon above it; no icon, no dot.
+                dot = _label("●", NSFont.systemFontOfSize_(9), NSColor.secondaryLabelColor(), 12)
+                dot.setFrameOrigin_((DIALOG_PADDING + 29, y + 64))
+                dot.setAccessibilityLabel_("Running indicator example")
+                surface.addSubview_(dot)
+            caption.setFrameOrigin_((text_x, y))
+            surface.addSubview_(caption)
+            detail.setFrameOrigin_((text_x, y + caption.frame().size.height + 5))
+            surface.addSubview_(detail)
+            self.illustration_views.append((icon, caption, detail))
+            y += height
+
         if checkbox:
             y += 16
             box = NSButton.checkboxWithTitle_target_action_(str(checkbox), None, None)
             box.setFont_(NSFont.systemFontOfSize_(13))
-            box.setState_(NSControlStateValueOff)
+            box.setState_(NSControlStateValueOn if checkbox_checked else NSControlStateValueOff)
             box.sizeToFit()
             box.setFrameOrigin_((DIALOG_PADDING, y))
             surface.addSubview_(box)
@@ -413,6 +447,11 @@ class BrandDialog:
 
         if default_text is not None:
             y += 20
+            if input_label:
+                label = _label(str(input_label), NSFont.systemFontOfSize_(12), NSColor.secondaryLabelColor(), DIALOG_CONTENT_WIDTH)
+                label.setFrameOrigin_((DIALOG_PADDING, y))
+                surface.addSubview_(label)
+                y += label.frame().size.height + 6
             field_class = NSSecureTextField if secure else NSTextField
             field = field_class.alloc().initWithFrame_(
                 NSMakeRect(DIALOG_PADDING, y, DIALOG_CONTENT_WIDTH, DIALOG_INPUT_HEIGHT)
@@ -426,13 +465,39 @@ class BrandDialog:
             field.setControlSize_(NSControlSizeLarge)
             field.setBezelStyle_(1)  # NSTextFieldRoundedBezel
             field.setStringValue_(str(default_text))
-            field.setAccessibilityLabel_(shown_title)
+            field.setAccessibilityLabel_(str(input_label or shown_title))
+            if placeholder is not None:
+                field.setPlaceholderString_(str(placeholder))
             field.cell().setUsesSingleLineMode_(True)
             field.cell().setScrollable_(True)
             surface.addSubview_(field)
             self.textfield = field
             window.setInitialFirstResponder_(field)
             y += DIALOG_INPUT_HEIGHT
+
+        for caption, value in fields or ():
+            y += 16
+            label = _label(caption, NSFont.systemFontOfSize_(12), NSColor.secondaryLabelColor(), DIALOG_CONTENT_WIDTH)
+            label.setFrameOrigin_((DIALOG_PADDING, y))
+            surface.addSubview_(label)
+            y += label.frame().size.height + 6
+            field = NSTextField.alloc().initWithFrame_(NSMakeRect(DIALOG_PADDING, y, DIALOG_CONTENT_WIDTH, DIALOG_INPUT_HEIGHT))
+            field.setCell_(_DialogInputCell.alloc().initTextCell_(""))
+            field.setBezeled_(True)
+            field.setEditable_(True)
+            field.setSelectable_(True)
+            field.setFont_(NSFont.systemFontOfSize_(14))
+            field.setControlSize_(NSControlSizeLarge)
+            field.setBezelStyle_(1)
+            field.setStringValue_(str(value))
+            field.setAccessibilityLabel_(caption)
+            field.cell().setUsesSingleLineMode_(True)
+            field.cell().setScrollable_(True)
+            surface.addSubview_(field)
+            self.fields.append(field)
+            y += DIALOG_INPUT_HEIGHT
+        if self.fields:
+            window.setInitialFirstResponder_(self.fields[0])
 
         if choices is not None:
             y += 20
@@ -475,7 +540,7 @@ class BrandDialog:
             ))
         window.setContentSize_((DIALOG_WIDTH, y + footer_height))
         surface.setFrameSize_((DIALOG_WIDTH, y + footer_height))
-        chain = [view for view in (self.checkbox, self.textfield, self.popup, self.close_button)
+        chain = [view for view in (self.checkbox, self.textfield, *self.fields, self.popup, self.close_button)
                  if view is not None]
         chain += self.buttons
         for current, following in zip(chain, chain[1:]):
@@ -500,6 +565,8 @@ class BrandDialog:
         if self.textfield is not None:
             self._window.makeFirstResponder_(self.textfield)
             self.textfield.selectText_(None)
+        elif self.fields:
+            self._window.makeFirstResponder_(self.fields[0])
         try:
             app.runModalForWindow_(self._window)
             return self._result
@@ -516,6 +583,7 @@ class BrandDialog:
             str(self.textfield.stringValue()) if self.textfield else "",
             self.checkbox is not None and self.checkbox.state() == NSControlStateValueOn,
             int(self.popup.indexOfSelectedItem()) if self.popup is not None else -1,
+            tuple(str(field.stringValue()) for field in self.fields),
         )
 
 
@@ -523,9 +591,10 @@ def make_dialog_alert(**kwargs):
     return BrandDialog(**kwargs)
 
 
-def make_dialog_prompt(*, default_text="", choices=None, **kwargs):
+def make_dialog_prompt(*, default_text="", choices=None, fields=None, **kwargs):
     """A text prompt, or a popup of ``choices`` in place of the text field."""
-    return BrandDialog(default_text=None if choices is not None else default_text, choices=choices, **kwargs)
+    return BrandDialog(default_text=None if choices is not None or fields is not None else default_text,
+                       choices=choices, fields=fields, **kwargs)
 
 
 class _ChooserClose(NSObject):

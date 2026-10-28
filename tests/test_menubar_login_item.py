@@ -410,7 +410,8 @@ def test_show_popover_before_the_panel_attaches_waits_for_it(app):
 def _quitting_app(quits, logged):
     scope = dict(vars(menubar))
     scope["rumps"] = types.SimpleNamespace(quit_application=lambda: quits.append(1))
-    app = extract_class(menubar.__file__, "MenuBarApp", {"on_quit"}, scope)()
+    app = extract_class(menubar.__file__, "MenuBarApp", {"on_quit", "_finish_quit"}, scope)()
+    app._quit_pending = app._quit_finished = False
     app._status_icon_animator = None
     app._login_session = None
     app._claude_login = None
@@ -480,7 +481,7 @@ def test_quit_unloads_the_job_only_through_unload_own_job(monkeypatch):
         raise OSError("launchctl missing")
 
     monkeypatch.setattr(launch_agent, "unload_own_job", boom)
-    app.on_quit(None)
+    _quitting_app(quits, logged).on_quit(None)  # a process quits once; a second Quit needs a fresh one
     assert quits == [1, 1]
     assert logged == ["could not unload the login item"]
 
@@ -541,6 +542,7 @@ def _attach(app, monkeypatch):
             return lambda *a, **k: None
 
     attached = App()
+    attached._claude_desktop_profiles = types.SimpleNamespace(settings_state=lambda: {}, refresh_status=lambda: None, perform=lambda *args: None)
     attached.switcher = app.switcher
     attached._nsapp = types.SimpleNamespace(nsstatusitem=object())
     attached._panel = None

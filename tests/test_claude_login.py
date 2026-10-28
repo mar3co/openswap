@@ -42,6 +42,21 @@ def test_login_argv():
     ]
 
 
+@posix_only
+def test_login_runner_uses_supplied_environment_without_modifying_parent(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/original")
+    done = threading.Event()
+    result = []
+    def completed(value):
+        result.append(value)
+        done.set()
+    run = ClaudeLoginRun("/bin/sh", None, env={"CLAUDE_CONFIG_DIR": "/isolated"}, on_done=completed,
+        popen=lambda argv, **kwargs: subprocess.Popen(["/bin/sh", "-c", 'test "$CLAUDE_CONFIG_DIR" = /isolated'], **kwargs))
+    run.start()
+    assert done.wait(3) and result[0].returncode == 0
+    assert os.environ["CLAUDE_CONFIG_DIR"] == "/original"
+
+
 def test_remove_legacy_login_command_tolerates_absence(tmp_path):
     stale = tmp_path / "login.command"
     stale.write_text("#!/bin/bash\n")

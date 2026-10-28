@@ -49,7 +49,7 @@ def test_changed_suggestion_during_confirmation_never_launches_switch(app):
 def test_desktop_consent_explicitly_covers_restart_idle_and_verification():
     title, body = menubar.desktop_switch_confirm_copy("Work")
     assert "Restart ChatGPT" in title
-    for text in ("Experimental", "Work", "entire app", "shared Codex login",
+    for text in ("Work", "entire app", "shared Codex login",
                  "Save and stop all local/remote work", "close other Codex clients before continuing",
                  "check the account in Chat, Work, and Codex", "auto-switching off"):
         assert text in body
@@ -59,7 +59,7 @@ def test_desktop_consent_explicitly_covers_restart_idle_and_verification():
 def test_desktop_consent_explains_persistent_pause_only_when_needed():
     _, body = menubar.desktop_switch_confirm_copy("Work", pause_auto=True)
     assert "all OpenSwap instances" in body
-    assert "Claude is unchanged" in body
+    assert "Claude Code stays unchanged" in body
     assert "until re-enabled" in body
     assert "turns off" not in menubar.desktop_switch_confirm_copy("Work")[1]
     assert len(body.split()) < 80
@@ -88,6 +88,7 @@ def app(monkeypatch, tmp_path):
         "desktop_switch_choices": menubar.desktop_switch_choices,
         "desktop_capability_status_copy": menubar.desktop_capability_status_copy,
         "chatgpt_manual_activation_allowed": menubar.chatgpt_manual_activation_allowed,
+        "chatgpt_tab_desktop": menubar.chatgpt_tab_desktop,
         "chatgpt_desktop_config_check": config_check,
         "notification_copy_for_desktop_switch": menubar.notification_copy_for_desktop_switch,
         "NotificationCopy": menubar.NotificationCopy,
@@ -102,6 +103,8 @@ def app(monkeypatch, tmp_path):
         "set_setting": setting,
         "settings_path": settings_path,
         "SETTINGS_SECTION_AUTOMATION": "automation",
+        "SETTINGS_SECTION_DESKTOP": "desktop",
+        "SETTINGS_SECTION_GENERAL": "general",
         "MAIN_PAGE": "main",
         "WELCOME_PAGE": "welcome",
         "chatgpt_suggestions_effective": menubar.chatgpt_suggestions_effective,
@@ -115,7 +118,7 @@ def app(monkeypatch, tmp_path):
     instance._desktop_switching = False
     instance._login_session = None
     instance._desktop_result = None
-    instance._desktop_status = "Experimental"
+    instance._desktop_status = "Switching reopens ChatGPT"
     instance.snapshot = {"accounts": [_row(f"{CODEX_NUM_PREFIX}2")]}
     instance._on_account_click = Mock()
     instance._slot_needs_relogin = Mock(return_value=False)
@@ -123,7 +126,7 @@ def app(monkeypatch, tmp_path):
     instance._kickoff_running = False
     instance._event_lock = threading.Lock()
     instance._panel = Mock()
-    instance.settings = menubar.MenuBarSettings(chatgpt_switching_enabled=True)
+    instance.settings = menubar.MenuBarSettings(desktop_features_enabled=True, chatgpt_switching_enabled=True)
     instance.settings.save(settings_path)
     instance._chatgpt_capability = DesktopCapability(
         "running", "running", observed_at=time.monotonic(),
@@ -310,7 +313,8 @@ def test_worker_unexpected_error_does_not_leak_protocol_or_credentials(app, monk
     app._test_record.assert_not_called()
 
 
-def test_real_run_wires_submenu_and_completion_timer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("desktop_enabled", [False, True])
+def test_real_run_wires_submenu_and_completion_timer(tmp_path, monkeypatch, desktop_enabled):
     """Construct the actual nested app; stub only native/event-loop boundaries."""
     instances = []
 
@@ -354,17 +358,22 @@ def test_real_run_wires_submenu_and_completion_timer(tmp_path, monkeypatch):
     codex = Mock(home=tmp_path / "codex", sequence_file=tmp_path / "codex-sequence.json")
     from openswap.settings import set_setting
     set_setting(tmp_path, "autoswitch.codexEnabled", "false")
+    menubar.MenuBarSettings(desktop_features_enabled=desktop_enabled).save(menubar.menubar_settings_path(tmp_path))
 
     assert menubar.run(switcher, codex) == 0
     live_app = instances[0]
     live_app.snapshot["accounts"] = [_row(f"{CODEX_NUM_PREFIX}2")]
     live_app.rebuild_menu()
-    submenu = next(item for item in live_app.menu if item and item.title == "Switch ChatGPT app (experimental)")
-    assert len(submenu.items) == 1
-    assert callable(submenu.items[0].callback)
+    if desktop_enabled:
+        submenu = next(item for item in live_app.menu if item and item.title == "Switch ChatGPT app")
+        assert len(submenu.items) == 1
+        assert callable(submenu.items[0].callback)
+        assert any(item and item.title == "Claude Desktop profiles" for item in live_app.menu)
+    else:
+        assert not any(item and ("Desktop" in item.title or "ChatGPT app" in item.title) for item in live_app.menu)
     live_app._panel = Mock()
     live_app.rebuild_menu()
-    assert not any(item and item.title == "Switch ChatGPT app (experimental)" for item in live_app.menu)
+    assert not any(item and item.title == "Switch ChatGPT app" for item in live_app.menu)
     callbacks = [call.args[0].__name__ for call in fake_rumps.Timer.call_args_list]
     assert "on_sync_tick" in callbacks
 
@@ -395,7 +404,7 @@ def test_codex_tab_refuses_an_expired_login_before_switching(app):
 def test_chatgpt_mode_with_stored_off_offers_settings_not_a_cli_switch(app):
     # In-memory on (the tab renders ChatGPT mode), but the stored file says
     # off: never rewrite the shared login under a running ChatGPT.
-    menubar.MenuBarSettings(chatgpt_switching_enabled=False).save(app._test_settings_path)
+    menubar.MenuBarSettings(desktop_features_enabled=True, chatgpt_switching_enabled=False).save(app._test_settings_path)
     app._on_panel_account_click(f"{CODEX_NUM_PREFIX}2")
     app._on_account_click.assert_not_called()
     app._test_thread.assert_not_called()
@@ -670,3 +679,25 @@ def test_transaction_invalidates_capability_probes(app):
     )
     app._chatgpt_capability_worker(3)
     assert app._chatgpt_capability.state != "running" or app._desktop_switching
+
+
+def test_global_desktop_off_blocks_probes_and_routes_account_click_to_cli(app):
+    app.settings.desktop_features_enabled = False
+    app.settings.save(app._test_settings_path)
+    app._on_chatgpt_view_active()
+    app._request_chatgpt_capability()
+    app._on_panel_account_click(f'{CODEX_NUM_PREFIX}2')
+    app._test_thread.assert_not_called()
+    app._on_account_click.assert_called_once_with(f'{CODEX_NUM_PREFIX}2', close_panel=True)
+    app._desktop_app.observe_capability.assert_not_called()
+
+
+def test_global_desktop_disabled_during_confirmation_never_starts_switch(app):
+    def disable(**kwargs):
+        app.settings.desktop_features_enabled = False
+        app.settings.save(app._test_settings_path)
+        return 1
+    app._alert.side_effect = disable
+    app._make_desktop_switch('2', 'Work')(None)
+    app._test_thread.assert_not_called()
+    app.codex.switch_to.assert_not_called()

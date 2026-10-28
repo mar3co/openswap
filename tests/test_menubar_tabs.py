@@ -13,7 +13,8 @@ from tests.menubar_harness import extract_class
 def _panel():
     methods = {
         "__init__", "_select_provider", "_show_settings", "_show_main",
-        "_select_settings_section", "close", "_release_token_field",
+        "_select_settings_section", "close", "_release_token_field", "_reload_after",
+        "_refresh_active_provider", "_show_claude_desktop_settings", "_check_desktop_settings_app", "_build",
     }
     namespace = {
         "MAIN_PAGE": "main",
@@ -21,6 +22,11 @@ def _panel():
         "SETTINGS_SECTION_GENERAL": "general",
         "SETTINGS_SECTION_AUTOMATION": "automation",
         "SETTINGS_SECTION_REMOTE": "remote",
+        "SETTINGS_SECTION_DESKTOP": "desktop",
+        "MenuBarSettings": menubar.MenuBarSettings,
+        "chatgpt_tab_desktop": menubar.chatgpt_tab_desktop,
+        "settings_sections": menubar.settings_sections,
+        "provider_tabs": menubar.provider_tabs,
         "SETTINGS_SECTIONS": (
             ("general", "General"), ("automation", "Automation"), ("remote", "Remote")
         ),
@@ -138,7 +144,7 @@ def test_activate_card_noops_when_activation_is_disabled():
     view.on_switch.reset_mock()
     view.card = menubar.apply_chatgpt_activation(
         [{"num": "codex:1", "disabled": False}],
-        menubar.MenuBarSettings(chatgpt_switching_enabled=False),
+        menubar.MenuBarSettings(desktop_features_enabled=True, chatgpt_switching_enabled=False),
         menubar.DesktopCapability("stopped", "stopped", observed_at=1.0),
         now=1.0,
     )[0]
@@ -153,6 +159,75 @@ def test_unknown_provider_does_not_change_view_or_reload():
     panel.reload.assert_not_called()
 
 
+def test_desktop_tab_is_optional_and_never_renames_codex():
+    for switching in (False, True):
+        settings = menubar.MenuBarSettings(desktop_features_enabled=True, chatgpt_switching_enabled=switching)
+        assert [menubar.provider_tab_name(provider) for provider in menubar.provider_tabs(settings)] == [
+            "Claude Code", "Claude Desktop", "Codex"
+        ]
+        settings.desktop_features_enabled = False
+        assert menubar.provider_tabs(settings) == ("claude", "chatgpt")
+
+
+def test_desktop_navigation_checks_status_and_returns_to_profiles_without_account_actions():
+    panel, actions = _panel()
+    settings = menubar.MenuBarSettings(desktop_features_enabled=True)
+    panel._settings = lambda: settings
+    panel._on_claude_desktop_check = Mock()
+    panel._on_claude_desktop_action = Mock()
+    panel._select_provider("claude_desktop")
+    assert panel._selected_provider == "claude_desktop"
+    panel._on_claude_desktop_check.assert_called_once()
+    panel._show_settings()
+    assert (panel._page, panel._settings_section, panel._desktop_settings_app) == ("settings", "desktop", "claude")
+    panel._show_main()
+    assert panel._page == "main" and panel._selected_provider == "claude_desktop"
+    panel.close()
+    assert panel._selected_provider == "claude_desktop"
+    panel._on_claude_desktop_action.assert_not_called()
+    for action in actions.values():
+        action.assert_not_called()
+
+
+def test_disabling_desktop_rejects_stale_tab_click_and_resets_hidden_selection():
+    panel, _ = _panel()
+    panel._settings = lambda: menubar.MenuBarSettings()
+    panel._on_claude_desktop_check = Mock()
+    panel._select_provider("claude_desktop")
+    assert panel._selected_provider == "claude"
+    panel._on_claude_desktop_check.assert_not_called()
+    panel._selected_provider = "claude_desktop"
+    panel._page = "settings"
+    panel._build_settings = Mock()
+    panel._build()
+    assert panel._selected_provider == "claude"
+    panel._build_settings.assert_called_once()
+
+
+def test_changing_tabs_forgets_kept_scroll_positions():
+    panel, _ = _panel()
+    panel._settings = lambda: menubar.MenuBarSettings(desktop_features_enabled=True)
+    panel._on_claude_desktop_check = Mock()
+    panel._card_scroll, panel._card_scroll_provider, panel._profiles_scroll = object(), "claude", object()
+    panel._select_provider("claude")
+    assert panel._card_scroll is not None and panel._profiles_scroll is not None
+    panel._select_provider("claude_desktop")
+    assert panel._card_scroll is None and panel._profiles_scroll is None
+
+
+@pytest.mark.parametrize("controller_reloads", [False, True])
+def test_opening_desktop_views_reloads_once(controller_reloads):
+    panel, _ = _panel()
+    panel._settings = lambda: menubar.MenuBarSettings(desktop_features_enabled=True)
+    panel.reload = Mock(side_effect=lambda: setattr(panel, "_reloads", panel._reloads + 1))
+    panel._on_claude_desktop_check = Mock(side_effect=panel.reload if controller_reloads else None)
+    panel._select_provider("claude_desktop")
+    assert panel.reload.call_count == 1
+    panel._show_claude_desktop_settings()
+    assert panel.reload.call_count == 2
+    assert panel._on_claude_desktop_check.call_count == 2
+
+
 def test_hidden_panel_selection_does_not_rebuild_native_views():
     panel, _ = _panel()
     panel.is_shown.return_value = False
@@ -161,7 +236,7 @@ def test_hidden_panel_selection_does_not_rebuild_native_views():
     panel.reload.assert_not_called()
 
 
-@pytest.mark.parametrize("provider,name", [("claude", "Claude"), ("chatgpt", "ChatGPT")])
+@pytest.mark.parametrize("provider,name", [("claude", "Claude"), ("chatgpt", "Codex")])
 def test_empty_state_gives_provider_specific_add_guidance(provider, name):
     state = menubar.provider_empty_state(provider)
     assert name in state["title"]
@@ -173,7 +248,7 @@ def test_empty_state_gives_provider_specific_add_guidance(provider, name):
         assert state["secondary_button"] == "Save current login"
     else:
         assert state["action"] == "start"
-        assert state["button"] == "Sign in with Claude"
+        assert state["button"] == "Sign in to Claude Code"
         assert state["secondary_action"] == "add"
         assert state["secondary_button"] == "Save current login"
         assert state["hint"] == ""

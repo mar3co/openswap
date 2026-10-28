@@ -617,6 +617,7 @@ def _attach_at_start(tmp_path, monkeypatch, *, runs_this):
             return lambda *a, **k: None
 
     attached = App()
+    attached._claude_desktop_profiles = SimpleNamespace(settings_state=lambda: {}, refresh_status=lambda: None, perform=lambda *args: None)
     attached.switcher = SimpleNamespace(
         backup_dir=tmp_path,
         _logger=SimpleNamespace(debug=lambda *a, **k: None, info=lambda *a, **k: None,
