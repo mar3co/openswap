@@ -169,7 +169,8 @@ class ProfileIdentityMonitor:
         except Exception:
             details = None
         if (details is None and profile.detected_at and record["fingerprint"] is not None
-                and record["fingerprint"] != previous.get("fingerprint")):
-            # A known new login must not keep the previous detected identity.
+                and record["fingerprint"] != profile.detected_login):
+            # A known new login must not keep the previous detected identity;
+            # the persisted login, not this process's memory, says what is known.
             details = CLEAR_DETAILS
         return profile, record, details

@@ -15,6 +15,10 @@ from openswap.claude_desktop_monitor import ProfileIdentityMonitor, REFRESH_INTE
 
 STAMP = "2026-10-26T20:00:00+00:00"
 DETAILS = {"email": "same@example.test", "organization": "Acme", "detected_at": STAMP}
+ACCOUNT = "11111111-1111-4111-8111-111111111111"
+ORG = "22222222-2222-4222-8222-222222222222"
+LOGIN, NEW_LOGIN = "a" * 64, "b" * 64
+IDENTITY = {**DETAILS, "account_uuid": ACCOUNT, "organization_uuid": ORG, "detected_login": LOGIN}
 
 
 @pytest.fixture
@@ -315,6 +319,56 @@ def test_unreadable_profile_surfaces_status_without_overwriting_details(watcher)
     detector.assert_not_called()
 
 
+def persisted_watcher(store, monkeypatch, details):
+    """A monitor with no memory of a profile whose identity is already on disk."""
+    from openswap import claude_desktop_monitor as module
+    monkeypatch.setattr(module.threading, "Thread", lambda *, target, **_: SimpleNamespace(start=target))
+    p = store.update(store.add("Work").id, **details)
+    clock, login = [0.0], {"value": LOGIN}
+    detector = Mock(denied=False, side_effect=lambda store, _, expected_fingerprint: {**IDENTITY, "detected_login": expected_fingerprint})
+    monitor = ProfileIdentityMonitor(store, detector=detector, clock=lambda: clock[0],
+                                     observe=lambda *_: login["value"], stamp=lambda *_: 1)
+    return monitor, store, p, clock, login, detector
+
+
+def fail_detection(detector, failure):
+    if failure == "denied":
+        detector.denied = True
+    else:
+        detector.side_effect = {"error": RuntimeError("offline"), "keychain": KeyAccessError("Denied")}[failure]
+
+
+@pytest.mark.parametrize("failure", ["error", "keychain", "denied"])
+@pytest.mark.parametrize("memory", ["restart", "refresh"])
+def test_failed_check_keeps_identity_until_the_persisted_login_changes(store, monkeypatch, failure, memory):
+    watcher = persisted_watcher(store, monkeypatch, IDENTITY)
+    monitor, store, p, _, login, detector = watcher
+    if memory == "refresh":
+        cycle(watcher)
+        monitor.refresh()
+    success = detector.side_effect
+    fail_detection(detector, failure)
+    cycle(watcher, 100)
+    saved = store.get(p.id)
+    assert (saved.email, saved.account_uuid, saved.detected_login) == (DETAILS["email"], ACCOUNT, LOGIN)
+    assert monitor.statuses[p.id] == ("Account details unavailable" if failure == "error" else "Account detection paused")
+    login["value"] = NEW_LOGIN
+    cycle(watcher, 100)
+    saved = store.get(p.id)
+    assert saved.email == saved.account_uuid == saved.detected_login == ""
+    detector.denied, detector.side_effect = False, success
+    cycle(watcher, 100)
+    assert store.get(p.id).detected_login == NEW_LOGIN
+
+
+def test_labels_without_a_persisted_login_do_not_survive_a_failed_check(store, monkeypatch):
+    watcher = persisted_watcher(store, monkeypatch, DETAILS)
+    _, store, p, _, _, detector = watcher
+    fail_detection(detector, "error")
+    cycle(watcher)
+    assert store.get(p.id).email == ""
+
+
 def test_detector_caches_key_and_denial_without_repeated_prompts(monkeypatch):
     from openswap import claude_desktop_identity as module
     key = Mock(return_value=b"k" * 16)
@@ -355,17 +409,25 @@ def test_denial_survives_restart_feature_toggle_and_adding_profiles(store, monke
     assert key.call_count == 2
 
 
-def test_quitting_during_request_preserves_pause_until_explicit_retry(store, monkeypatch):
+@pytest.mark.parametrize("granted", [True, False])
+def test_feature_toggle_during_prompt_persists_a_pause_only_for_a_real_denial(store, monkeypatch, granted):
     from openswap import claude_desktop_identity as module
     detector = AccountDetector(store)
+    prompts = []
     def key():
-        assert store.keychain_paused()  # durable before the system dialog
-        detector.clear()
+        assert store.keychain_paused()  # durable before the system dialog, so a quit mid-dialog stays paused
+        prompts.append(None)
+        if len(prompts) == 1:
+            detector.clear()
+        if not granted:
+            raise KeyAccessError("Denied")
         return b"k" * 16
     monkeypatch.setattr(module, "_key", key)
     with pytest.raises(KeyAccessError): detector._get_key()
-    assert detector.denied and AccountDetector(store).denied
     assert detector._cached_key is None
+    assert store.keychain_paused() is detector.denied is AccountDetector(store).denied is (not granted)
+    if granted:
+        assert detector._get_key() == b"k" * 16 and len(prompts) == 2
 
 
 def test_pause_marker_uses_exclusive_create_when_nofollow_is_unavailable(store, monkeypatch):

@@ -257,6 +257,12 @@ def observe_login(store, profile):
         return ""
 
 
+def _require_present(store, identifier, profile):
+    """Raise if the profile was archived or its folders vanished mid-detection."""
+    store.get(identifier)
+    store._directories(profile)
+
+
 def disk_stamp(store, profile):
     """Cheap hint for scheduling reads. Never used as authenticated identity."""
     desktop, _ = store._directories(profile)
@@ -311,10 +317,13 @@ class AccountDetector:
                     if self.store:
                         self.store.pause_keychain(True)
                     key = _key()
-                    if generation != self._generation:
-                        raise DetectionError("Account detection stopped.")
+                    # Granted access lifts the pause even when a toggle during
+                    # the prompt copied the marker; only a real denial persists.
                     if self.store:
                         self.store.pause_keychain(False)
+                    self.denied = False
+                    if generation != self._generation:
+                        raise DetectionError("Account detection stopped.")
                     self._cached_key = key
                 except (KeyAccessError, ClaudeDesktopError, OSError):
                     if generation == self._generation:
@@ -352,8 +361,7 @@ def detect_account(store: DesktopProfiles, identifier: str, *, app=None, key_pro
             raise DetectionError("Automatic account detection was turned off.")
         result = _labels(_bootstrap(cookies), org_id, before[0])
         result["detected_login"] = login_fingerprint(before)
-        store.get(identifier)
-        store._directories(profile)
+        _require_present(store, identifier, profile)
         if _snapshot(desktop) != before:
             raise DetectionError(CHANGED)
         return result

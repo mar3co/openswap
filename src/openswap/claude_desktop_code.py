@@ -10,9 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import queue
+import shutil
+import stat
 import tempfile
 import threading
 import time
+from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 
 from openswap import oauth
@@ -52,7 +55,10 @@ def matching_slot(engine, profile):
 
 
 def completed_login_identity(directory):
-    """Identity recorded by the successful CLI OAuth exchange in our scratch dir."""
+    """Identity recorded by the successful CLI OAuth exchange in our scratch dir.
+
+    None means the config could not be read, which is never a mismatch.
+    """
     try:
         account = json.loads(_read(directory / ".claude.json", 2_000_000))["oauthAccount"]
         return ((account.get("accountUuid") or "").lower(), (account.get("organizationUuid") or "").lower(),
@@ -73,13 +79,19 @@ def verify_credentials(credentials, profile, *, authorized_identity=None):
         raise ClaudeDesktopError("Could not verify the Code login. Continue setup to try again.")
     actual = ((found.get("uuid") or "").lower(), (found.get("organizationUuid") or "").lower(),
               (found.get("email") or "").casefold())
+    # A nonempty server field always wins; config can never overrule a disagreement.
+    if not actual[0] or any(value and value != expected for value, expected in zip(actual, wanted)):
+        raise IdentityMismatch(MISMATCH)
     # Some personal-account responses omit organization/email. Only a fresh,
-    # successful CLI OAuth exchange can supply those missing fields. A nonempty
-    # server field always wins; config can never overrule a disagreement.
-    if (actual[0] != wanted[0] or any(value and value != expected for value, expected in zip(actual, wanted))
-            or (not all(actual) and authorized_identity != wanted)
-            or (authorized_identity is not None and authorized_identity != wanted)):
-        raise IdentityMismatch("Choose the same account and organization as this Desktop profile.")
+    # successful CLI OAuth exchange can supply those missing fields.
+    if authorized_identity is None:
+        if not all(actual):
+            raise ClaudeDesktopError("Could not verify the Code login's organization. Continue setup to try again.")
+    elif authorized_identity != wanted:
+        raise IdentityMismatch(MISMATCH)
+
+
+MISMATCH = "Choose the same account and organization as this Desktop profile."
 
 
 class IdentityMismatch(ClaudeDesktopError):
@@ -90,16 +102,18 @@ class ProfileChanged(ClaudeDesktopError):
     pass
 
 
-def save_verified_account(engine, profile, credentials):
-    """Commit previously verified authorization through the shared store/lease guard.
+def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
+    """Add a verified credential to the Code roster, or repair its legacy slot.
 
-    Caller holds the Desktop metadata lock and rechecks its login fingerprint here.
-    No network calls, active credential writes, or account switching happen here.
+    Runs under the engine's mutation guard and writes only backups and the
+    roster: the active login is never touched and no account is switched.
+    ``guard`` is entered inside the engine lock right before the roster write,
+    so a caller can take the registry lock there and abandon a changed row.
     """
     if identity(profile) is None or not engine._validate_email(profile.email):
         raise ClaudeDesktopError("The detected account is not valid for Claude Code.")
-    with AccountLeaseStore(engine.backup_dir, "claude").mutation_guard() as guard:
-        guard.assert_available()
+    with AccountLeaseStore(engine.backup_dir, "claude").mutation_guard() as lease:
+        lease.assert_available()
         engine._setup_directories()
         engine._init_sequence_file()
         data = engine.sequence_data()
@@ -115,30 +129,35 @@ def save_verified_account(engine, profile, credentials):
                 legacy = str(num)
         number = legacy or str(engine._get_next_account_number())
         email = data["accounts"][number]["email"] if legacy else profile.email
-        config = json.dumps({"oauthAccount": {
-            "emailAddress": email, "accountUuid": profile.account_uuid,
-            "organizationUuid": profile.organization_uuid, "organizationName": profile.organization,
-        }})
         try:
-            engine._write_account_credentials(number, email, credentials)
-            engine._write_account_config(number, email, config)
-            data["accounts"][number] = {
-                **data["accounts"].get(number, {}),
-                "email": email, "uuid": profile.account_uuid,
-                "organizationUuid": profile.organization_uuid, "organizationName": profile.organization,
-                "added": data["accounts"].get(number, {}).get("added") or get_timestamp(),
-            }
-            if int(number) not in data["sequence"]:
-                data["sequence"].append(int(number))
-            data["sequence"].sort()
-            data["lastUpdated"] = get_timestamp()
-            engine._write_json(engine.sequence_file, data)
-            engine._usage_store.clear_dead_token([number], {number: (email, profile.organization_uuid)})
+            engine.write_account_credentials(number, email, credentials)
+            # A legacy slot keeps the full config captured when it was added.
+            if not legacy or not engine.read_account_config(number, email):
+                engine._write_account_config(number, email, json.dumps({"oauthAccount": {
+                    "emailAddress": email, "accountUuid": profile.account_uuid,
+                    "organizationUuid": profile.organization_uuid, "organizationName": profile.organization,
+                }}))
+            with guard():
+                data["accounts"][number] = {
+                    **data["accounts"].get(number, {}),
+                    "email": email, "uuid": profile.account_uuid,
+                    "organizationUuid": profile.organization_uuid, "organizationName": profile.organization,
+                    "added": data["accounts"].get(number, {}).get("added") or get_timestamp(),
+                }
+                if int(number) not in data["sequence"]:
+                    data["sequence"].append(int(number))
+                data["sequence"].sort()
+                data["lastUpdated"] = get_timestamp()
+                engine._write_json(engine.sequence_file, data)
         except Exception:
             # Only clean files when the roster did not commit this new slot.
-            if not legacy and number not in ((engine.sequence_data() or {}).get("accounts") or {}):
-                engine._delete_account_files(number, profile.email)
+            with suppress(Exception):
+                if not legacy and number not in ((engine.sequence_data() or {}).get("accounts") or {}):
+                    engine._delete_account_files(number, profile.email)
             raise
+        with suppress(Exception):
+            # The roster has committed; a stale usage quarantine is not a failed add.
+            engine._usage_store.clear_dead_token([number], {number: (email, profile.organization_uuid)})
         return number
 
 
@@ -155,6 +174,8 @@ class DesktopCodeConnector:
         self._login = None
         self._results = queue.SimpleQueue()
         self._next_scan = 0.0
+        self._started = time.time()
+        self._swept = False
 
     def suspend(self):
         if self._active:
@@ -181,6 +202,8 @@ class DesktopCodeConnector:
             }
             return {"code_status": messages[state],
                     **({"code_action": "cancel_code" if running else "connect_code"} if state else {})}
+        except ClaudeDesktopError as exc:
+            return {"code_status": str(exc)}  # duplicate roster rows; resolved in Claude Code, not by retrying
         except Exception:
             return {"code_status": "Code accounts unavailable", "code_action": "connect_code"}
 
@@ -208,6 +231,9 @@ class DesktopCodeConnector:
         changed = False
         if not enabled:
             self.suspend()
+        elif not self._swept:
+            self._swept = True
+            self._sweep_orphaned_logins()
         if self._active:
             try:
                 current = self.store.get(self._active[0])
@@ -237,7 +263,11 @@ class DesktopCodeConnector:
                 if identity(profile) is None:
                     continue
                 key = setup_key(profile, self.engine)
-                if matching_slot(self.engine, profile):
+                try:
+                    slot = matching_slot(self.engine, profile)
+                except ClaudeDesktopError:
+                    continue  # duplicate roster rows for this profile only; state() shows the message
+                if slot:
                     if profile.code_setup_key != key or profile.code_setup_state != "connected":
                         changed |= self._record(profile, key, "connected")
                     continue
@@ -261,11 +291,32 @@ class DesktopCodeConnector:
             pass
         return changed
 
+    def _sweep_orphaned_logins(self):
+        """Remove scratch logins a quit or crash left behind, Keychain item first.
+
+        Best-effort. A folder written since this process started may belong to
+        a live login, so it is left alone.
+        """
+        try:
+            folders = list(self.store.root.glob(".code-login-*"))
+        except OSError:
+            return
+        for folder in folders:
+            try:
+                info = folder.lstat()
+                if not stat.S_ISDIR(info.st_mode) or info.st_mtime >= self._started:
+                    continue
+                self.cleanup(folder)
+                shutil.rmtree(folder)
+            except Exception:
+                continue  # the folder name is the only way back to the item, so keep both
+
     def _connect(self, profile, key, binary, cancel):
-        state = "failed"
+        state, launched = "failed", False
         try:
             fingerprint = self.observe(self.store, profile)
             self._check_current(profile, fingerprint, cancel)
+            guard = lambda: self._commit_guard(profile, fingerprint, cancel)
             # An existing legacy slot can be linked after verifying its token.
             for number, row in ((self.engine.sequence_data() or {}).get("accounts") or {}).items():
                 if ((row.get("email") or "").casefold() == profile.email.casefold()
@@ -281,7 +332,7 @@ class DesktopCodeConnector:
                     self._check_current(profile, fingerprint, cancel)
                     self.engine.backfill_account_uuid(str(number), profile.account_uuid,
                                                      expected_email=row["email"], expected_org=row["organizationUuid"],
-                                                     expected_credentials=credentials)
+                                                     expected_credentials=credentials, guard=guard)
                     if not matching_slot(self.engine, profile):
                         raise ClaudeDesktopError("The saved account changed during setup.")
                     state = "connected"
@@ -299,6 +350,7 @@ class DesktopCodeConnector:
                     self._login = run
                     self._check_current(profile, fingerprint, cancel)
                     run.start()
+                    launched = True
                     while not done.wait(0.25):
                         if cancel.is_set():
                             run.cancel()
@@ -312,24 +364,36 @@ class DesktopCodeConnector:
                     verify_credentials(credentials, profile, authorized_identity=completed_login_identity(directory))
                     # A rename is harmless; sign-out, org change, manual labels,
                     # archiving or disabling the feature invalidate this handoff.
-                    with self.store._lock():
-                        self._check_current(profile, fingerprint, cancel)
-                        save_verified_account(self.engine, profile, credentials)
+                    self._check_current(profile, fingerprint, cancel)
+                    save_verified_account(self.engine, profile, credentials, guard=guard)
                     state = "connected"
                 finally:
                     self.cleanup(directory)  # only this disposable login's Keychain entry
         except IdentityMismatch:
             state = "mismatch"
         except ProfileChanged:
-            state = "sign_in" if cancel.is_set() else ""
+            # Once the browser opened, only an explicit click may open it again.
+            state = "sign_in" if cancel.is_set() or launched else ""
         except Exception:
             state = "sign_in" if cancel.is_set() else "failed"
         finally:
             self._results.put((profile, key, state))
 
-    def _check_current(self, profile, fingerprint, cancel):
+    def _check_row(self, profile, fingerprint, cancel):
         current = self.store.get(profile.id)
         if (cancel.is_set() or identity(current) != identity(profile) or not fingerprint
-                or current.detected_login != fingerprint or profile.detected_login != fingerprint
-                or self.observe(self.store, profile) != fingerprint):
+                or current.detected_login != fingerprint or profile.detected_login != fingerprint):
             raise ProfileChanged("The Desktop account changed during Code setup.")
+
+    def _check_current(self, profile, fingerprint, cancel):
+        """Row check plus a cookie re-read; runs with no lock held."""
+        self._check_row(profile, fingerprint, cancel)
+        if self.observe(self.store, profile) != fingerprint:
+            raise ProfileChanged("The Desktop account changed during Code setup.")
+
+    @contextmanager
+    def _commit_guard(self, profile, fingerprint, cancel):
+        """Registry lock around a roster write; entered only inside the engine lock."""
+        with self.store._lock():
+            self._check_row(profile, fingerprint, cancel)
+            yield

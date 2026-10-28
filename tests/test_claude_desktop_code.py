@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,15 +124,43 @@ def test_existing_account_links_without_login_or_changing_alias_disabled_or_acti
     assert s.connector.state(p)["code_slot"] == "7"
 
 
-@pytest.mark.parametrize("change", [{"uuid": OTHER}, {"organizationUuid": OTHER}, {"email": "different@example.test"},
-                                    {"organizationUuid": None}, {"uuid": None}])
-def test_wrong_or_incomplete_provider_identity_never_adds_an_account(setup, change):
+@pytest.mark.parametrize("change, state", [({"uuid": OTHER}, "mismatch"), ({"organizationUuid": OTHER}, "mismatch"),
+                                           ({"email": "different@example.test"}, "mismatch"), ({"uuid": None}, "mismatch"),
+                                           ({"organizationUuid": None}, "failed")])
+def test_wrong_or_incomplete_provider_identity_never_adds_an_account(setup, change, state):
     s = setup
     s.oracle.return_value.update(change)
     s.connector.poll(enabled=True)
-    assert finish(s).code_setup_state == "mismatch"
+    # An omitted field with no readable completed login is unverifiable, not a different account.
+    assert finish(s).code_setup_state == state
     assert s.engine.sequence_data()["accounts"] == {}
     assert s.connector.cleanup.call_count == 1
+
+
+WANTED = (ACCOUNT, ORG, DETAILS["email"])
+EMAIL = DETAILS["email"]
+
+
+@pytest.mark.parametrize("found, authorized, outcome", [
+    ((ACCOUNT, ORG, EMAIL), None, None),
+    ((ACCOUNT, ORG, EMAIL), WANTED, None),
+    ((ACCOUNT, ORG, EMAIL), (ACCOUNT, OTHER, EMAIL), code.IdentityMismatch),
+    ((ACCOUNT, None, None), WANTED, None),
+    ((ACCOUNT, None, None), None, ClaudeDesktopError),
+    ((ACCOUNT, None, None), (ACCOUNT, OTHER, EMAIL), code.IdentityMismatch),
+    ((None, ORG, EMAIL), WANTED, code.IdentityMismatch),
+    ((ACCOUNT, OTHER, EMAIL), WANTED, code.IdentityMismatch),
+    ((OTHER, ORG, EMAIL), None, code.IdentityMismatch),
+])
+def test_verification_truth_table(setup, found, authorized, outcome):
+    s = setup
+    s.oracle.return_value = dict(zip(("uuid", "organizationUuid", "email"), found))
+    if outcome is None:
+        code.verify_credentials(CREDS, s.profile, authorized_identity=authorized)
+        return
+    with pytest.raises(outcome) as info:
+        code.verify_credentials(CREDS, s.profile, authorized_identity=authorized)
+    assert isinstance(info.value, code.IdentityMismatch) is (outcome is code.IdentityMismatch)
 
 
 def test_unavailable_verification_is_not_treated_as_a_match(setup):
@@ -232,8 +261,57 @@ def test_login_cookie_change_between_verification_and_save_rejects_stale_result(
 
     s.oracle.side_effect = verify
     s.connector.poll(enabled=True)
-    assert finish(s).code_setup_state == ""
-    assert not s.engine.sequence_data()["accounts"]
+    p = finish(s)
+    # The browser already opened once: resume only on an explicit click.
+    assert p.code_setup_state == "sign_in" and not s.engine.sequence_data()["accounts"]
+    s.connector._next_scan = 0
+    s.connector.poll(enabled=True)
+    assert len(s.calls) == 1 and s.connector.state(p)["code_action"] == "connect_code"
+
+
+def guard_factory(s, on_enter):
+    class Store(code.AccountLeaseStore):
+        @contextmanager
+        def mutation_guard(self, **kwargs):
+            with super().mutation_guard(**kwargs) as guard:
+                on_enter()
+                yield guard
+    return Store
+
+
+def test_registry_lock_held_during_the_engine_wait_does_not_lose_a_finished_login(setup, monkeypatch):
+    s = setup
+
+    def ui_edit_holds_registry_lock():
+        with s.store._lock():
+            pass
+
+    monkeypatch.setattr(code, "AccountLeaseStore", guard_factory(s, ui_edit_holds_registry_lock))
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == "connected"
+
+
+def test_profile_archived_between_verification_and_commit_is_not_committed(setup, monkeypatch):
+    s = setup
+    monkeypatch.setattr(code, "AccountLeaseStore", guard_factory(s, lambda: s.store.update(s.profile.id, archived=True)))
+    s.connector.poll(enabled=True)
+    finish(s)
+    assert s.engine.sequence_data()["accounts"] == {}
+
+
+def test_legacy_link_rechecks_the_profile_inside_the_engine_lock(setup, monkeypatch):
+    s = setup
+    seed(s, uuid="")
+    backfill = s.engine.backfill_account_uuid
+
+    def archive_then_backfill(*args, **kwargs):
+        s.store.update(s.profile.id, archived=True)
+        return backfill(*args, **kwargs)
+
+    monkeypatch.setattr(s.engine, "backfill_account_uuid", archive_then_backfill)
+    s.connector.poll(enabled=True)
+    finish(s)
+    assert s.engine.account_identity("7")["uuid"] == ""
 
 
 def test_same_email_in_two_organizations_creates_two_distinct_accounts(setup):
@@ -400,6 +478,69 @@ def test_old_unknown_slot_gets_fresh_credentials_without_duplicate_or_selection_
     assert data["accounts"]["7"]["uuid"] == ACCOUNT
     assert data["accounts"]["7"]["alias"] == "Keep me" and data["accounts"]["7"]["disabled"]
     assert len(s.calls) == 1
+    assert json.loads(s.engine.read_account_config("7", DETAILS["email"]))["oauthAccount"]["accountUuid"] == ACCOUNT
+
+
+def test_relinking_a_legacy_slot_keeps_its_full_config_backup(setup):
+    s = setup
+    seed(s, uuid="")
+    backup = json.dumps({"oauthAccount": {"emailAddress": DETAILS["email"], "organizationUuid": ORG}, "projects": {"/work": {}}})
+    s.engine._write_account_config("7", DETAILS["email"], backup)
+    s.oracle.side_effect = [None, {"uuid": ACCOUNT, "organizationUuid": ORG, "email": DETAILS["email"]}]
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == "connected"
+    assert s.engine.account_identity("7")["uuid"] == ACCOUNT
+    assert s.engine.read_account_config("7", DETAILS["email"]) == backup
+
+
+def test_usage_quarantine_failure_after_commit_still_reports_the_added_account(setup, monkeypatch):
+    s = setup
+    monkeypatch.setattr(s.engine._usage_store, "clear_dead_token", Mock(side_effect=OSError("locked")))
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == "connected"
+    assert s.engine.account_identity("1")["uuid"] == ACCOUNT
+    s.connector.notify.assert_called_once()
+
+
+def test_duplicate_roster_match_reports_itself_without_blocking_other_profiles(setup):
+    s = setup
+    seed(s)
+    seed(s, number="8")
+    other = s.store.add("Client")
+    s.store.update(other.id, **{**DETAILS, "organization_uuid": OTHER})
+    s.oracle.return_value["organizationUuid"] = OTHER
+    s.connector.poll(enabled=True)
+    finish(s)
+    assert len(s.calls) == 1 and s.store.get(other.id).code_setup_state == "connected"
+    assert s.connector.state(s.store.get(s.profile.id)) == {
+        "code_status": "More than one saved Code account matches. Resolve the duplicate in Claude Code."}
+
+
+def test_code_setup_is_not_offered_while_automatic_detection_is_off(setup):
+    s = setup
+    s.store.update(s.profile.id, code_setup_key=code.setup_key(s.profile, s.engine), code_setup_state="sign_in")
+    p = s.store.update(s.profile.id, auto_detect=False)
+    assert s.connector.state(p) == {}
+    with pytest.raises(ClaudeDesktopError, match="Detect this profile's account"):
+        s.connector.retry(p.id)
+
+
+def test_first_enabled_poll_sweeps_orphaned_logins_but_never_live_ones(setup):
+    s = setup
+    stale, live, stuck = (s.store.root / f".code-login-{name}" for name in ("stale", "live", "stuck"))
+    for folder in (stale, live, stuck):
+        folder.mkdir()
+        (folder / ".claude.json").write_text("{}")
+    for folder, age in ((stale, -100), (stuck, -100), (live, 100)):
+        os.utime(folder, (s.connector._started + age,) * 2)
+    s.connector.cleanup.side_effect = lambda path: (_ for _ in ()).throw(OSError("busy")) if path == stuck else None
+    s.connector.poll(enabled=False)
+    assert stale.exists() and not s.connector.cleanup.called
+    assert s.connector.poll(enabled=True)
+    swept = {call.args[0] for call in s.connector.cleanup.call_args_list}
+    assert {stale, stuck} <= swept and live not in swept
+    assert not stale.exists() and live.exists() and stuck.exists()
+    assert finish(s).code_setup_state == "connected"
 
 
 def test_roster_write_failure_cleans_only_new_backup_and_preserves_active(setup, monkeypatch):
