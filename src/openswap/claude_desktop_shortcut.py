@@ -20,7 +20,7 @@ from openswap.claude_desktop import (
 from openswap.claude_desktop_dock import DockShortcut, _owned_bundle, install_shortcuts
 from openswap.locking import FileLock
 
-LAUNCHER_VERSION = 2
+LAUNCHER_VERSION = 3
 ICON_NOTICE = (
     "The numbered icon shows a running dot while this profile is open. "
     "Click it to return to that session. Claude’s original icon stays available."

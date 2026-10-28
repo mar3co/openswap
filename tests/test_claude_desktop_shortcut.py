@@ -74,7 +74,7 @@ def test_shortcut_uses_stable_profile_and_does_not_launch_or_change_code(store,b
     assert path.name=='Claude Work.app'
     assert info['CFBundleIconFile']=='Profile.icns'
     assert info['CFBundleIdentifier'].endswith(p.id)
-    assert info['LSUIElement'] is False and info['OpenSwapProfileLauncherVersion'] == 2
+    assert info['LSUIElement'] is False and info['OpenSwapProfileLauncherVersion'] == sc.LAUNCHER_VERSION
     assert '-s' in builder.run.call_args_list[0].args[0]
     script=(path/'Contents/Resources/source.txt').read_text()
     assert f'claude-desktop open {p.id}' in script and '--focus' in script

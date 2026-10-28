@@ -51,7 +51,7 @@ def test_legacy_shortcut_upgrades_in_place_preserving_badge(store, builder):
     assert presence.attach_presence(store,p.id,directory=builder.directory,creator=creator,opener=opener)
     creator.assert_called_once_with(store,p.id,directory=builder.directory)
     assert (store.get(p.id).badge,store.get(p.id).color)==('7','blue')
-    assert plistlib.loads(info.read_bytes())['OpenSwapProfileLauncherVersion']==2
+    assert plistlib.loads(info.read_bytes())['OpenSwapProfileLauncherVersion']==sc.LAUNCHER_VERSION
     assert opener.call_args.args[0]==path
 
 
