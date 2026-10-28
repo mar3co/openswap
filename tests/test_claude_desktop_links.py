@@ -6,7 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from openswap.claude_desktop_links import (
-    DesktopSignInLinks, MAX_AGE, OWNERSHIP_CHECK, OWNERSHIP_LOST, RECHECK, RESTORE_TIMEOUT, claim_step, ordinary_link, ownership_lost)
+    DesktopSignInLinks, MAX_AGE, OWNERSHIP_CHECK, OWNERSHIP_LOST, PAUSED, RECHECK, SETUP_FAILED, RESTORE_TIMEOUT, claim_step, ordinary_link, ownership_lost)
 from tests.test_claude_desktop_signin import GOOGLE, MAGIC, SSO
 
 
@@ -708,17 +708,24 @@ def test_ownership_is_lost_only_when_a_held_handler_is_taken_while_needed(held, 
                           current=current, application=OPENSWAP) is lost
 
 
-@pytest.mark.parametrize('current, held, reconnecting, step', [
-    (OPENSWAP, None, False, 'held'),
-    (OPENSWAP, True, True, 'held'),
-    (CLAUDE, None, False, 'claim'),
-    (CLAUDE, False, False, 'claim'),
-    (CLAUDE, True, True, 'claim'),
-    (None, True, True, 'claim'),
-    (CLAUDE, True, False, 'lost'),
-    (None, True, False, 'wait')])
-def test_only_reconnect_claims_a_handler_taken_after_it_was_held(current, held, reconnecting, step):
-    assert claim_step(current=current, application=OPENSWAP, held=held, reconnecting=reconnecting) == step
+@pytest.mark.parametrize('current, held, reconnecting, paused, noticed, step', [
+    (OPENSWAP, None, False, False, False, 'held'),
+    (OPENSWAP, True, True, False, False, 'held'),
+    (OPENSWAP, None, False, True, False, 'held'),
+    (CLAUDE, None, False, False, False, 'claim'),
+    (CLAUDE, False, False, False, False, 'claim'),
+    (CLAUDE, True, True, False, False, 'claim'),
+    (None, True, True, False, False, 'claim'),
+    (CLAUDE, True, False, False, False, 'lost'),
+    (None, True, False, False, False, 'claim'),
+    (CLAUDE, None, False, True, False, 'notice'),
+    (None, None, False, True, False, 'notice'),
+    (CLAUDE, True, True, True, False, 'notice'),
+    (CLAUDE, None, False, True, True, 'paused'),
+    (CLAUDE, True, True, True, True, 'paused')])
+def test_only_reconnect_claims_a_handler_taken_after_it_was_held(current, held, reconnecting, paused, noticed, step):
+    assert claim_step(current=current, application=OPENSWAP, held=held, reconnecting=reconnecting,
+                      paused=paused, noticed=noticed) == step
 
 
 def take_over(e):
@@ -833,3 +840,88 @@ def test_a_loss_check_that_cannot_run_yet_waits_and_then_reports(env, obstacle):
     e.router.poll()
     e.error.assert_called_once_with(OWNERSHIP_LOST)
     assert len(e.native.requests) == 1
+
+
+def test_a_handler_missing_at_the_launch_check_is_claimed_without_a_notice(env):
+    e = env
+    claim(e)
+    e.native.owner = None
+    e.native.launched()
+    e.now[0] += 3
+    e.router.poll()
+    assert len(e.native.requests) == 2
+    e.error.assert_not_called()
+
+
+def take_over_unnoticed(e):
+    claim(e)
+    e.native.owner = e.native.saved
+    e.router.verify_at = None
+
+
+@pytest.mark.parametrize('blocked', ['at_the_claim', 'when_chosen'])
+def test_a_reconnect_the_profile_store_holds_up_claims_once_the_store_answers(env, blocked):
+    e = env
+    take_over_unnoticed(e)
+    store = e.router.needed
+    if blocked == 'when_chosen':
+        e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    e.router.prepare(retry=True)
+    e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    e.now[0] += 3
+    e.router.poll()
+    assert len(e.native.requests) == 1
+    e.router.needed = store
+    e.now[0] += RECHECK
+    e.router.poll()
+    e.now[0] += 3
+    e.router.poll()
+    assert len(e.native.requests) == 2
+    e.native.respond(True)
+    e.router.poll()
+    e.error.assert_not_called()
+
+
+def test_a_reconnect_the_profile_store_never_answers_reports_the_setup_failure(env):
+    e = env
+    take_over_unnoticed(e)
+    e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    e.router.prepare(retry=True)
+    for _ in range(3):
+        e.now[0] += RECHECK
+        e.router.poll()
+    e.error.assert_called_once_with(SETUP_FAILED)
+    assert len(e.native.requests) == 1
+
+
+def test_a_pause_after_a_reconnect_cancels_it_with_only_its_own_notice(env):
+    e = env
+    take_over_unnoticed(e)
+    store = e.router.needed
+    e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    e.router.prepare(retry=True)
+    e.router._lost()
+    e.router.needed = store
+    e.now[0] += RECHECK
+    e.router.poll()
+    relaunch(e)
+    assert len(e.native.requests) == 1
+    e.error.assert_called_once_with(OWNERSHIP_LOST)
+
+
+@pytest.mark.parametrize('state, notice', [
+    ('taken', True), ('missing', True), ('owned', False), ('disabled', False), ('not_needed', False)])
+def test_a_pause_from_an_earlier_run_is_explained_once_and_never_claims(env, state, notice):
+    e = env
+    e.native.pause(True)
+    if state == 'missing': e.native.owner = None
+    if state == 'owned': e.native.owner = e.native.application
+    if state == 'disabled': e.enabled[0] = False
+    if state == 'not_needed': e.needed[0] = False
+    e.router.prepare()
+    e.now[0] += 3
+    e.router.poll()
+    for _ in range(3):
+        relaunch(e)
+    assert e.native.requests == []
+    assert e.error.call_args_list == ([((PAUSED,),)] if notice else [])
