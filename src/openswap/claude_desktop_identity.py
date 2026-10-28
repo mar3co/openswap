@@ -27,7 +27,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openswap.claude_desktop import ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, account_label
+from openswap.claude_desktop import UUID_PATTERN, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, account_label
 from openswap import macos_keychain
 
 BOOTSTRAP_URL = "https://claude.ai/api/bootstrap"
@@ -50,7 +50,7 @@ class KeyAccessError(DetectionError):
 
 
 def _uuid(value):
-    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}", value)
+    return isinstance(value, str) and UUID_PATTERN.fullmatch(value.lower())
 
 
 def _file(path: Path, *, optional=False, directory=False):
@@ -66,7 +66,7 @@ def _file(path: Path, *, optional=False, directory=False):
     return True
 
 
-def _read(path, limit):
+def read_limited(path, limit):
     # Do not follow a file replaced with a link between inspection and open.
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as stream:
@@ -101,7 +101,7 @@ def _snapshot(desktop: Path):
     config = desktop / "config.json"
     account = None
     if _file(config, optional=True):
-        account = json.loads(_read(config, MAX_RESPONSE)).get("lastKnownAccountUuid")
+        account = json.loads(read_limited(config, MAX_RESPONSE)).get("lastKnownAccountUuid")
         if account is not None and not _uuid(account):
             raise DetectionError(UNAVAILABLE)
     # SQLite can create or update a WAL shared-memory file even with mode=ro.
@@ -123,7 +123,7 @@ def _snapshot(desktop: Path):
         copy = Path(temporary) / "Cookies"
         for path, stamp in zip(paths, before):
             if stamp is not None:
-                data = _read(path, 64_000_000)
+                data = read_limited(path, 64_000_000)
                 target = Path(temporary) / ("Cookies" if path == database else "Cookies-wal")
                 target.touch(mode=0o600)
                 target.write_bytes(data)
@@ -218,7 +218,7 @@ def _bootstrap(cookies):
         return json.loads(data)
 
 
-def _labels(data, org_id, expected_account):
+def _bootstrap_labels(data, org_id, expected_account):
     account = data.get("account") if isinstance(data, dict) else None
     if not isinstance(account, dict) or not _uuid(account.get("uuid")):
         raise DetectionError(UNAVAILABLE)
@@ -250,7 +250,7 @@ def login_fingerprint(snapshot):
 
 def observe_login(store, profile):
     """Inspect only this profile's cookie state; no Keychain or network access."""
-    desktop, _ = store._directories(profile)
+    desktop, _ = store.directories(profile)
     try:
         return login_fingerprint(_snapshot(desktop))
     except NoSavedLogin:
@@ -259,7 +259,7 @@ def observe_login(store, profile):
 
 def disk_stamp(store, profile):
     """Cheap hint for scheduling reads. Never used as authenticated identity."""
-    desktop, _ = store._directories(profile)
+    desktop, _ = store.directories(profile)
     result = []
     for relative in ("config.json", "Cookies", "Cookies-wal", "Network", "Network/Cookies", "Network/Cookies-wal"):
         path = desktop / relative
@@ -335,7 +335,7 @@ def detect_account(store: DesktopProfiles, identifier: str, *, app=None, key_pro
         if sys.platform != "darwin":
             raise DetectionError("Account detection is available on macOS. You can enter the details yourself.")
         profile = store.get(identifier)  # archived profiles are not inspected
-        desktop, _ = store._directories(profile)
+        desktop, _ = store.directories(profile)
         before = _snapshot(desktop)
         if expected_fingerprint is not None and login_fingerprint(before) != expected_fingerprint:
             raise DetectionError(CHANGED)
@@ -353,11 +353,11 @@ def detect_account(store: DesktopProfiles, identifier: str, *, app=None, key_pro
         current = store.get(identifier)
         if expected_fingerprint is not None and not current.auto_detect:
             raise DetectionError("Automatic account detection was turned off.")
-        result = _labels(_bootstrap(cookies), org_id, before[0])
+        result = _bootstrap_labels(_bootstrap(cookies), org_id, before[0])
         result["detected_login"] = login_fingerprint(before)
         # Archived mid-detection or folders gone: both raise here.
         store.get(identifier)
-        store._directories(profile)
+        store.directories(profile)
         if _snapshot(desktop) != before:
             raise DetectionError(CHANGED)
         return result

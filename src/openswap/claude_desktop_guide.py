@@ -9,7 +9,7 @@ def illustrations():
     original, profile = None, None
     try:
         import AppKit as A
-        from openswap.claude_desktop_shortcut import _icon_bitmap, original_icon
+        from openswap.claude_desktop_shortcut import icon_bitmap, original_icon
 
         original = A.NSImage.alloc().initWithContentsOfFile_(str(original_icon(APP_PATH)))
         if original is not None and not original.isValid():
@@ -17,7 +17,7 @@ def illustrations():
         mark = A.NSImage.alloc().initWithContentsOfFile_(str(Path(__file__).parent / "assets/opensoft-symbol.svg"))
         if original is not None and mark is not None and mark.isValid():
             profile = A.NSImage.alloc().initWithSize_((64, 64))
-            profile.addRepresentation_(_icon_bitmap(original, mark, "1", "orange", 128))
+            profile.addRepresentation_(icon_bitmap(original, mark, "1", "orange", 128))
     except (ImportError, ClaudeDesktopError, OSError):
         # The guide remains readable before Claude is installed.
         pass

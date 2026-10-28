@@ -316,7 +316,7 @@ def test_an_open_that_outwaits_another_launch_is_not_an_error(store, app, monkey
     p = store.add("Personal")
     desktop, _ = store.paths(p)
     monkeypatch.setattr(cd, "LAUNCH_LOCK_TIMEOUT", 0.1)
-    other = store._lock(f"launch-{p.id}.lock")
+    other = store.lock(f"launch-{p.id}.lock")
     assert other.acquire()
     try:
         result = store.open(p.id, app=app)
@@ -335,7 +335,7 @@ def test_one_profile_launching_does_not_hold_up_another(store, app, monkeypatch)
     proc = Mock(pid=42)
     proc.wait.side_effect = [subprocess.TimeoutExpired("Claude", 0.75), 0]
     app.popen.return_value = proc
-    launching_a = store._lock(f"launch-{a.id}.lock")
+    launching_a = store.lock(f"launch-{a.id}.lock")
     assert launching_a.acquire()
     try:
         assert store.open(b.id, app=app)["state"] == "launched"
@@ -414,7 +414,7 @@ def test_launch_failures_keep_profile_and_never_claim_success(store, app, failur
     p = store.add("Personal")
     desktop, code = store.paths(p)
     app.validate = Mock(return_value={"version": "test"})
-    app._validation_stamp = app._stamp()
+    app.validation_stamp = app.stamp()
     if failure == "process-check":
         app.run.return_value.returncode = 1
     elif failure == "process-timeout":

@@ -283,7 +283,7 @@ def test_registry_lock_held_during_the_engine_wait_does_not_lose_a_finished_logi
     s = setup
 
     def ui_edit_holds_registry_lock():
-        with s.store._lock():
+        with s.store.lock():
             pass
 
     monkeypatch.setattr(code, "AccountLeaseStore", guard_factory(s, ui_edit_holds_registry_lock))

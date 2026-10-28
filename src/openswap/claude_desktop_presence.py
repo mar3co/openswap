@@ -1,13 +1,11 @@
 """Attach a resident Dock launcher to an existing profile without reopening it."""
 from __future__ import annotations
 
-import plistlib
 import subprocess
 from pathlib import Path
-from xml.parsers.expat import ExpatError
 
 from openswap.claude_desktop import ClaudeDesktopError
-from openswap.claude_desktop_dock import DockShortcut, _owned_bundle, launcher_info
+from openswap.claude_desktop_dock import DockShortcut, owned_bundle, launcher_info
 from openswap.claude_desktop_shortcut import LAUNCHER_VERSION, create_shortcut, shortcut_directory, shortcut_name
 
 
@@ -27,13 +25,9 @@ def open_presence(path: Path, bundle_id: str) -> None:
             return
         # Rename keeps old launchers usable. Recognize the same profile there
         # instead of creating another app or sending it a focus-stealing reopen.
-        try:
-            marker = plistlib.loads((path / "Contents/Info.plist").read_bytes())["OpenSwapProfile"]
-            expected = DockShortcut(path, marker["profile"], Path(marker["root"]))
-            if actual is not None and _owned_bundle(actual, expected):
-                return
-        except (OSError, ValueError, TypeError, KeyError, ExpatError):
-            pass
+        expected = owned_bundle(path)
+        if actual is not None and expected is not None and owned_bundle(actual, expected):
+            return
         raise ClaudeDesktopError("Could not match the running profile icon. Close the other profile launcher and try again.")
     try:
         result = subprocess.run(["/usr/bin/open", "-g", str(path), "--args", "--openswap-attach"],
@@ -53,12 +47,12 @@ def attach_presence(store, identifier: str, *, directory=None, creator=None, ope
     path = (directory or shortcut_directory()) / shortcut_name(profile.name)
     shortcut = DockShortcut(path, profile.id, store.root)
     info = launcher_info(path)
-    if info is None or not _owned_bundle(path, shortcut, info=info):
+    if info is None or not owned_bundle(path, shortcut, info=info):
         return False  # never create an unexpected Dock app or open an unrelated file
     if info.get("OpenSwapProfileLauncherVersion") != LAUNCHER_VERSION:
         result = (creator or create_shortcut)(store, profile.id, directory=path.parent)
         path = Path(result["path"])
-        if path != shortcut.path or not _owned_bundle(path, shortcut):
+        if path != shortcut.path or not owned_bundle(path, shortcut):
             raise ClaudeDesktopError("The profile shortcut changed during setup. Choose Set up Dock shortcuts to retry.")
     (opener or open_presence)(path, shortcut.bundle_id)
     return True

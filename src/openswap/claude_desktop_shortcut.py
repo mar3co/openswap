@@ -15,10 +15,9 @@ from pathlib import Path
 from xml.parsers.expat import ExpatError
 
 from openswap.claude_desktop import (
-    APP_PATH, BUNDLE_ID, BADGE_COLORS, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, _plain, validate_badge,
+    APP_PATH, BUNDLE_ID, BADGE_COLORS, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, private_lock, validate_badge,
 )
-from openswap.claude_desktop_dock import DockShortcut, _owned_bundle, install_shortcuts, launcher_info
-from openswap.locking import FileLock
+from openswap.claude_desktop_dock import DockShortcut, owned_bundle, install_shortcuts, launcher_info
 
 LAUNCHER_VERSION = 3
 ICON_NOTICE = (
@@ -88,7 +87,7 @@ def original_icon(app_path: Path) -> Path:
         raise ClaudeDesktopError("Could not read Claude's original app icon. Reinstall Claude and try again.") from exc
 
 
-def _icon_bitmap(base, mark, badge: str, color: str, px: int):
+def icon_bitmap(base, mark, badge: str, color: str, px: int):
     """One renderer for shortcut files and the onboarding preview."""
     import AppKit as A
     import Foundation as F
@@ -151,7 +150,7 @@ def render_icon(app_path: Path, target: Path, badge: str, color: str, *, run=sub
             for size in (16, 32, 128, 256, 512):
                 for scale in (1, 2):
                     px = size * scale
-                    rep = _icon_bitmap(base, mark, badge, color, px)
+                    rep = icon_bitmap(base, mark, badge, color, px)
                     data = rep.representationUsingType_properties_(A.NSBitmapImageFileTypePNG, {})
                     suffix = "@2x" if scale == 2 else ""
                     if not data.writeToFile_atomically_(str(iconset / f"icon_{size}x{size}{suffix}.png"), True):
@@ -172,28 +171,22 @@ def _run(run, argv, **kwargs):
 
 
 def _destination_lock(directory: Path):
-    path = directory / ".openswap-shortcuts.lock"
-    if not _plain(path):
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.close(fd)
-        except FileExistsError:
-            _plain(path)
-    return FileLock(path, timeout=1)
+    return private_lock(directory / ".openswap-shortcuts.lock", timeout=1)
 
 
 def _check_destination(path: Path, shortcut: DockShortcut) -> None:
     if path.is_symlink():
         raise ClaudeDesktopError("The shortcut destination is a symbolic link. Choose another folder.")
-    if path.exists() and not _owned_bundle(path, shortcut):
+    if path.exists() and not owned_bundle(path, shortcut):
         raise ClaudeDesktopError("Another app or file already uses this shortcut name. Rename the profile or choose another folder; nothing was replaced.")
 
 
 def _current_launcher(path: Path, shortcut: DockShortcut, record: dict) -> bool:
     """An owned bundle built from the same name, command, Claude app and badge needs no rebuild."""
     info = launcher_info(path)
-    return (info is not None and _owned_bundle(path, shortcut, info=info)
-            and info.get("OpenSwapProfileLauncherVersion") == LAUNCHER_VERSION and info.get("OpenSwapProfileLauncher") == record)
+    if info is None or owned_bundle(path, shortcut, info=info) is None:
+        return False
+    return info.get("OpenSwapProfileLauncherVersion") == LAUNCHER_VERSION and info.get("OpenSwapProfileLauncher") == record
 
 
 def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, color=None,
@@ -207,9 +200,9 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
     directory.mkdir(parents=True, mode=0o700, exist_ok=True)
     # The registry lock guards metadata reads and the final write only, never
     # the build: osacompile, iconutil and codesign take seconds.
-    with store._lock():
+    with store.lock():
         profile = store.get(identifier)  # archived shortcuts cannot be recreated
-        store._directories(profile)
+        store.directories(profile)
     badge = profile.badge if badge is None else badge
     color = profile.color if color is None else color
     validate_badge(badge, color)
@@ -254,7 +247,7 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
             try:
                 os.replace(stage, path)
                 installed = True
-                with store._lock():
+                with store.lock():
                     # Re-read under the lock: an archive or rename during the
                     # build must leave neither a launcher nor a saved badge.
                     current = store.get(profile.id, include_archived=True)
@@ -262,7 +255,7 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
                         raise ClaudeDesktopError("The profile changed while its shortcut was being created. Nothing was saved; try again.")
                     updated = replace(current, badge=badge, color=color)
                     rows = store.list(include_archived=True)
-                    store._save([updated if p.id == profile.id else p for p in rows])
+                    store.save([updated if p.id == profile.id else p for p in rows])
             except Exception:
                 # Roll back only the launcher we just built, never profile data.
                 if installed:

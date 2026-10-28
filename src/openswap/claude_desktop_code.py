@@ -21,7 +21,7 @@ from pathlib import Path
 
 from openswap import oauth
 from openswap.claude_desktop import ClaudeDesktopError, launch_environment
-from openswap.claude_desktop_identity import observe_login, _read
+from openswap.claude_desktop_identity import observe_login, read_limited
 from openswap.claude_login import ClaudeLoginRun
 from openswap.exceptions import ClaudeSwitchError
 from openswap.models import get_timestamp
@@ -64,7 +64,7 @@ def completed_login_identity(directory):
     None means the config could not be read, which is never a mismatch.
     """
     try:
-        account = json.loads(_read(directory / ".claude.json", 2_000_000))["oauthAccount"]
+        account = json.loads(read_limited(directory / ".claude.json", 2_000_000))["oauthAccount"]
         return ((account.get("accountUuid") or "").lower(), (account.get("organizationUuid") or "").lower(),
                 (account.get("emailAddress") or "").casefold())
     except Exception:
@@ -422,6 +422,6 @@ class DesktopCodeConnector:
     @contextmanager
     def _commit_guard(self, profile, fingerprint, cancel):
         """Registry lock around the slot and roster writes; entered only inside the engine lock."""
-        with self.store._lock():
+        with self.store.lock():
             self._check_row(profile, fingerprint, cancel)
             yield

@@ -20,8 +20,11 @@ RETRY_INTERVAL = 60.0
 CLEAR_DETAILS = {"email": "", "organization": "", "detected_at": ""}
 
 
+LABEL_FIELDS = ("email", "organization", "detected_at", "account_uuid", "organization_uuid", "detected_login")
+
+
 def _labels(profile):
-    return profile.email, profile.organization, profile.detected_at, profile.account_uuid, profile.organization_uuid, profile.detected_login
+    return tuple(getattr(profile, field) for field in LABEL_FIELDS)
 
 
 class ProfileIdentityMonitor:
@@ -82,7 +85,7 @@ class ProfileIdentityMonitor:
                             or (record["stamp"] is not None and self.stamp(self.store, current) != record["stamp"])):
                         self.refresh(profile.id)
                         continue
-                    if details is not None and _labels(current) != tuple(details.get(k, "") for k in ("email", "organization", "detected_at", "account_uuid", "organization_uuid", "detected_login")):
+                    if details is not None and _labels(current) != tuple(details.get(k, "") for k in LABEL_FIELDS):
                         current = self.store.update(profile.id, expected=profile, **details)
                         changed = True
                     record["labels"] = _labels(current)

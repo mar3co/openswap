@@ -95,7 +95,7 @@ def test_send_runs_outside_the_registry_lock(store, app):
     process_list(app, store, [(33, p)])
 
     def sender(pid, value, binary):
-        with store._lock():
+        with store.lock():
             pass
 
     assert signin.finish_signin(store, p.id, GOOGLE, app=app, sender=sender)["state"] == "signin_sent"
@@ -134,7 +134,7 @@ def test_native_event_targets_pid_and_does_not_use_shared_handler(native):
     n.descriptors.descriptorWithProcessIdentifier_.assert_called_once_with(33)
     n.descriptors.descriptorWithString_.assert_called_once_with(GOOGLE)
     n.descriptors.appleEventWithEventClass_eventID_targetDescriptor_returnID_transactionID_.assert_called_once_with(
-        signin._fourcc("GURL"), signin._fourcc("GURL"), n.descriptors.descriptorWithProcessIdentifier_.return_value, -1, 0)
+        signin.fourcc("GURL"), signin.fourcc("GURL"), n.descriptors.descriptorWithProcessIdentifier_.return_value, -1, 0)
     n.event.sendEventWithOptions_timeout_error_.assert_called_once_with(0x13, 5.0, None)
 
 

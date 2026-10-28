@@ -18,13 +18,26 @@ INVALID_LINK = 'This sign-in link is incomplete or unsupported. Restart sign-in 
 INVALID_CALLBACK = 'This Claude link is incomplete or unsupported. Start again from the intended Claude profile.'
 
 
+def link_text(value, *, strip: bool) -> str | None:
+    """The link when it is bounded, printable ASCII without backslashes; None otherwise.
+
+    Sign-in and callback links tolerate surrounding whitespace; a pass-through
+    link does not.
+    """
+    if not isinstance(value, str) or len(value) > 16384:
+        return None
+    if strip:
+        value = value.strip()
+    if not value or any(ord(c) <= 32 or ord(c) >= 127 or c == "\\" for c in value):
+        return None
+    return value
+
+
 def signin_link(value: str) -> str:
     """Accept only the login routes inspected in Claude 3.6556.2."""
     try:
-        if not isinstance(value, str) or len(value) > 16384:
-            raise ValueError
-        value = value.strip()
-        if not value or any(ord(c) <= 32 or ord(c) >= 127 or c == "\\" for c in value):
+        value = link_text(value, strip=True)
+        if value is None:
             raise ValueError
         url = urlsplit(value)
         if url.scheme != "claude" or url.netloc not in ("login", "claude.ai"):
@@ -49,7 +62,7 @@ def signin_link(value: str) -> str:
         raise ClaudeDesktopError(INVALID_LINK) from None
 
 
-def _fourcc(value):
+def fourcc(value):
     return int.from_bytes(value.encode("ascii"), "big")
 
 
@@ -66,10 +79,8 @@ def callback_link(value: str) -> tuple[str, str]:
     except ClaudeDesktopError:
         pass
     try:
-        if not isinstance(value, str) or not 0 < len(value) <= 16384:
-            raise ValueError
-        value = value.strip()
-        if not value or any(ord(c) <= 32 or ord(c) >= 127 or c == "\\" for c in value):
+        value = link_text(value, strip=True)
+        if value is None:
             raise ValueError
         url = urlsplit(value)
         if (url.scheme != "claude" or url.netloc != "claude.ai" or url.fragment
@@ -113,14 +124,14 @@ def send_to_process(pid: int, value: str, binary: Path) -> None:
     # Address by PID, never by bundle identifier (which all profiles share).
     address = NSAppleEventDescriptor.descriptorWithProcessIdentifier_(pid)
     event = NSAppleEventDescriptor.appleEventWithEventClass_eventID_targetDescriptor_returnID_transactionID_(
-        _fourcc("GURL"), _fourcc("GURL"), address, -1, 0)
-    event.setParamDescriptor_forKeyword_(NSAppleEventDescriptor.descriptorWithString_(value), _fourcc("----"))
+        fourcc("GURL"), fourcc("GURL"), address, -1, 0)
+    event.setParamDescriptor_forKeyword_(NSAppleEventDescriptor.descriptorWithString_(value), fourcc("----"))
     # Wait only for event delivery, not completion of the web sign-in. Never
     # retry automatically: a timeout could still mean Claude received the link.
     reply, error = event.sendEventWithOptions_timeout_error_(0x03 | 0x10, 5.0, None)
     if error is not None or reply is None:
         raise ClaudeDesktopError(delivery_error(error.code() if error is not None else None))
-    event_error = reply.paramDescriptorForKeyword_(_fourcc("errn"))
+    event_error = reply.paramDescriptorForKeyword_(fourcc("errn"))
     if event_error is not None and event_error.int32Value() != 0:
         raise ClaudeDesktopError("Claude could not accept the sign-in link. Restart sign-in in this profile.")
 
@@ -130,14 +141,14 @@ def finish_signin(store, identifier, value, *, app=None, sender=None, expected_p
     app = app or ClaudeDesktopApp()
     app.validate()
     # The registry lock covers the metadata reads only; the send can take seconds.
-    with store._lock():
+    with store.lock():
         profile = store.get(identifier)
-        desktop, code = store._directories(profile)
-        pid = app._running(app.launch_argv(desktop, code), desktop)
+        desktop, code = store.directories(profile)
+        pid = app.running(app.launch_argv(desktop, code), desktop)
         if pid is None or (expected_pid is not None and pid != expected_pid):
             raise ClaudeDesktopError("This Claude profile closed or restarted. Open it and restart sign-in.")
         try:
-            unchanged = app._validation_stamp is not None and app._stamp() == app._validation_stamp
+            unchanged = app.validation_stamp is not None and app.stamp() == app.validation_stamp
         except OSError:
             unchanged = False
         if not unchanged:

@@ -191,7 +191,7 @@ def test_default_profile_is_registered_once_and_then_only_read(controller, tmp_p
     controller.settings_state()
     controller.store.ensure_default.assert_not_called()
     # A Default that disappeared from profiles.json is registered again on the next view.
-    controller.store._save([p for p in controller.store.list(include_archived=True) if p.kind != "default"])
+    controller.store.save([p for p in controller.store.list(include_archived=True) if p.kind != "default"])
     controller.settings_state()
     controller.store.ensure_default.assert_called_once()
 

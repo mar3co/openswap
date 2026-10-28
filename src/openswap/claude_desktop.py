@@ -66,7 +66,7 @@ def _name(value: str) -> str:
     return value
 
 
-def _plain(path: Path, *, directory: bool = False) -> bool:
+def plain(path: Path, *, directory: bool = False) -> bool:
     """Never follow links in the managed namespace, including metadata/locks."""
     try:
         info = path.lstat()
@@ -81,6 +81,20 @@ def _plain(path: Path, *, directory: bool = False) -> bool:
         raise ClaudeDesktopError("Claude Desktop profile storage must be private to your user (0700 folders / 0600 files).")
     return True
 
+
+def private_lock(path: Path, *, timeout: float) -> FileLock:
+    """A lock on a 0600 file that is never a link, created when missing."""
+    if not plain(path):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            plain(path)
+    return FileLock(path, timeout=timeout)
+
+
+# Registry identity fields are stored lowercase; detection lowercases before matching.
+UUID_PATTERN = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")
 
 BADGE_COLORS = {"orange": (0.73, 0.29, 0.17), "blue": (0.12, 0.34, 0.72),
                 "purple": (0.48, 0.24, 0.68), "green": (0.12, 0.48, 0.34)}
@@ -132,38 +146,31 @@ class DesktopProfiles:
         self.default_desktop = (default_desktop if default_desktop is not None else default_desktop_path()).absolute()
 
     def _root(self, *, create: bool = False) -> bool:
-        if _plain(self.root, directory=True):
+        if plain(self.root, directory=True):
             return True
         if not create:
             return False
         self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        return _plain(self.root, directory=True)
+        return plain(self.root, directory=True)
 
-    def _lock(self, name: str = "profiles.lock", *, timeout: float = 0.5) -> FileLock:
-        """The registry lock guards metadata only; launches take ``launch.lock``."""
+    def lock(self, name: str = "profiles.lock", *, timeout: float = 0.5) -> FileLock:
+        """The registry lock guards metadata only; each launch takes its profile's ``launch-<id>.lock``."""
         self._root(create=True)
-        path = self.root / name
-        if not _plain(path):
-            try:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                os.close(fd)
-            except FileExistsError:
-                _plain(path)
-        return FileLock(path, timeout=timeout)
+        return private_lock(self.root / name, timeout=timeout)
 
     def keychain_paused(self) -> bool:
         """A durable stop flag, shared by all Desktop profiles in this store."""
         path = self.root / "keychain-paused"
-        return self._root() and _plain(path)
+        return self._root() and plain(path)
 
     def pause_keychain(self, paused: bool) -> None:
         # Record before a permission request so quitting during the dialog also
         # requires an explicit retry. This contains no credentials or identity.
         if type(paused) is not bool:
             raise ClaudeDesktopError("Invalid Keychain access state.")
-        with self._lock():
+        with self.lock():
             path = self.root / "keychain-paused"
-            present = _plain(path)
+            present = plain(path)
             if not paused:
                 path.unlink(missing_ok=True)
             elif not present:
@@ -173,7 +180,7 @@ class DesktopProfiles:
                 os.close(fd)
 
     def list(self, *, include_archived: bool = False) -> list[Profile]:
-        if not self._root() or not _plain(self.registry):
+        if not self._root() or not plain(self.registry):
             return []
         try:
             if self.registry.stat().st_size > 256_000:
@@ -251,7 +258,7 @@ class DesktopProfiles:
             return existing
         if not self._default_exists():
             return None
-        with self._lock():
+        with self.lock():
             rows = self.list(include_archived=True)
             existing = next((p for p in rows if p.kind == "default"), None)
             if existing is not None:
@@ -263,24 +270,24 @@ class DesktopProfiles:
             names = {p.name.casefold() for p in rows}
             name = next(n for n in ["Default", *(f"Default ({i})" for i in range(2, 102))] if n.casefold() not in names)
             profile = Profile(uuid.uuid4().hex, name, badge="", kind="default")
-            self._save([profile, *rows])
+            self.save([profile, *rows])
             return profile
 
-    def _directories(self, profile: Profile, *, create: bool = False) -> tuple[Path, Path | None]:
+    def directories(self, profile: Profile, *, create: bool = False) -> tuple[Path, Path | None]:
         desktop, code = self.paths(profile)
         if profile.kind == "default":
             if not self._default_exists():
                 raise ClaudeDesktopError("The existing Claude profile folder is missing. Open Claude Desktop to restore it.")
             return desktop, None
         for path in (desktop.parent, desktop, code):
-            if not _plain(path, directory=True):
+            if not plain(path, directory=True):
                 if not create:
                     raise ClaudeDesktopError("Profile data is missing. Restore its original folder before opening it; OpenSwap will not create a replacement login.")
                 path.mkdir(mode=0o700)
         return desktop, code
 
-    def _save(self, profiles: list[Profile]) -> None:
-        _plain(self.registry)
+    def save(self, profiles: list[Profile]) -> None:
+        plain(self.registry)
         fd, raw = tempfile.mkstemp(prefix=".profiles-", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -305,7 +312,7 @@ class DesktopProfiles:
 
     def add(self, name: str) -> Profile:
         name = _name(name)
-        with self._lock():
+        with self.lock():
             rows = self.list(include_archived=True)
             if any(p.name.casefold() == name.casefold() for p in rows):
                 raise ClaudeDesktopError("That profile name already exists, possibly in Archived profiles.")
@@ -314,14 +321,14 @@ class DesktopProfiles:
             used = {p.badge for p in rows}
             badge = next(str(n) for n in range(1, 1000) if str(n) not in used)
             profile = Profile(uuid.uuid4().hex, name, badge=badge)
-            self._directories(profile, create=True)
-            self._save([*rows, profile])
+            self.directories(profile, create=True)
+            self.save([*rows, profile])
             return profile
 
     @staticmethod
     def _validate_code_identity(*, detected_at="", account_uuid="", organization_uuid="", code_setup_key="", code_setup_state="", detected_login=""):
         for value in (account_uuid, organization_uuid):
-            if not isinstance(value, str) or (value and not re.fullmatch(r"[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}", value)):
+            if not isinstance(value, str) or (value and not UUID_PATTERN.fullmatch(value)):
                 raise ValueError("Invalid detected identity")
         if bool(account_uuid) != bool(organization_uuid) or (account_uuid and not detected_at):
             raise ValueError("Incomplete detected identity")
@@ -356,7 +363,7 @@ class DesktopProfiles:
             raise ClaudeDesktopError("Invalid archive state.")
         if auto_detect is not None and type(auto_detect) is not bool:
             raise ClaudeDesktopError("Invalid automatic detection setting.")
-        with self._lock():
+        with self.lock():
             rows = self.list(include_archived=True)
             current = self.get(identifier, include_archived=True)
             if expected is not None and (current != expected or current.archived or not current.auto_detect):
@@ -392,16 +399,16 @@ class DesktopProfiles:
                               badge=new_badge, color=new_color, email=new_email,
                               organization=new_org, detected_at=new_time,
                               auto_detect=current.auto_detect if auto_detect is None else auto_detect, **ids)
-            self._save([updated if p.id == current.id else p for p in rows])
+            self.save([updated if p.id == current.id else p for p in rows])
             return updated
 
     def open(self, identifier: str, *, app: ClaudeDesktopApp | None = None, existing_only=False) -> dict:
         app = app or ClaudeDesktopApp()
         info = app.validate()  # no profile changes or launch before publisher validation
-        with self._lock():
+        with self.lock():
             profile = self.get(identifier)
-            desktop, code = self._directories(profile)
-        launch = self._lock(f"launch-{profile.id}.lock", timeout=LAUNCH_LOCK_TIMEOUT)
+            desktop, code = self.directories(profile)
+        launch = self.lock(f"launch-{profile.id}.lock", timeout=LAUNCH_LOCK_TIMEOUT)
         if launch.acquire():
             try:
                 result = app.open(desktop, code, existing_only=True) if existing_only else app.open(desktop, code)
@@ -410,7 +417,7 @@ class DesktopProfiles:
         else:
             # Another open of this profile is still launching: not an error.
             # It shows up as running once that launch is through.
-            pid = app._running(app.launch_argv(desktop, code), desktop)
+            pid = app.running(app.launch_argv(desktop, code), desktop)
             result = {"state": "already_running", "pid": pid} if pid is not None else {"state": "already_opening", "pid": None}
         return {**result, "profile": asdict(profile), "app_version": info["version"],
                 "identity_verified": False, "experimental": True}
@@ -441,12 +448,12 @@ class ClaudeDesktopApp:
         self.run = run or subprocess.run
         self.popen = popen or subprocess.Popen
         self.platform = sys.platform if platform is None else platform
-        self._validation_stamp = None
+        self.validation_stamp = None
 
     def launch_argv(self, desktop: Path, code: Path | None) -> list[str]:
         return [str(self.binary)] if code is None else [str(self.binary), f"--user-data-dir={desktop}"]
 
-    def _stamp(self) -> tuple:
+    def stamp(self) -> tuple:
         paths = (self.path / "Contents" / "Info.plist", self.binary,
                  self.path / "Contents" / "Resources" / "app.asar",
                  self.path / "Contents" / "_CodeSignature" / "CodeResources")
@@ -459,13 +466,13 @@ class ClaudeDesktopApp:
         return tuple(values)
 
     def validate(self) -> dict:
-        self._validation_stamp = None
+        self.validation_stamp = None
         if self.platform != "darwin":
             raise ClaudeDesktopError("Claude Desktop profiles are available on macOS only.")
         try:
             if self.path.is_symlink() or not self.path.is_dir() or self.binary.is_symlink() or not self.binary.is_file():
                 raise ClaudeDesktopError("Install the official Claude.app in Applications before opening a profile.")
-            before = self._stamp()
+            before = self.stamp()
             info = plistlib.loads((self.path / "Contents" / "Info.plist").read_bytes())
             if not isinstance(info, dict) or info.get("CFBundleIdentifier") != BUNDLE_ID or info.get("CFBundleExecutable") != "Claude":
                 raise ClaudeDesktopError("The installed app is not the expected Claude Desktop application.")
@@ -476,15 +483,15 @@ class ClaudeDesktopApp:
             version = info.get("CFBundleShortVersionString")
             if not isinstance(version, str) or not version:
                 raise ClaudeDesktopError("Claude Desktop did not report an application version.")
-            if before != self._stamp():
+            if before != self.stamp():
                 raise ClaudeDesktopError("Claude changed during validation, possibly due to an update. Try again after the update finishes.")
-            self._validation_stamp = before
+            self.validation_stamp = before
             return {"version": version, "publisher_verified": True, "experimental": True,
                     "identity_verified": False, "notice": PROFILE_NOTICE}
         except (OSError, ValueError, ExpatError, plistlib.InvalidFileException, subprocess.SubprocessError) as exc:
             raise ClaudeDesktopError("Could not inspect Claude Desktop. Check that it is installed and try again.") from exc
 
-    def _processes(self) -> str:
+    def processes(self) -> str:
         try:
             result = self.run(["/bin/ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -499,24 +506,22 @@ class ClaudeDesktopApp:
         if not profiles:
             return {}
         try:
-            processes = self._processes()
+            processes = self.processes()
         except ClaudeDesktopError:
             return {profile.id: "Could not confirm" for profile in profiles}
         states = {}
         for profile in profiles:
-            desktop, _code = store.paths(profile)
+            desktop, code = store.paths(profile)
             try:
-                argv = [str(self.binary)] if profile.kind == "default" else [str(self.binary), f"--user-data-dir={desktop}"]
-                pid = self._running(argv, desktop,
-                                    processes=processes)
+                pid = self.running(self.launch_argv(desktop, code), desktop, processes=processes)
                 states[profile.id] = "Running" if pid is not None else "Not running"
             except ClaudeDesktopError:
                 states[profile.id] = "Could not confirm"
         return states
 
-    def _running(self, argv: list[str], desktop: Path, *, processes: str | None = None) -> int | None:
+    def running(self, argv: list[str], desktop: Path, *, processes: str | None = None) -> int | None:
         if processes is None:
-            processes = self._processes()
+            processes = self.processes()
         expected = " ".join(argv)
         matches = []
         for line in processes.splitlines():
@@ -537,9 +542,9 @@ class ClaudeDesktopApp:
 
     def open(self, desktop: Path, code: Path | None, *, existing_only=False) -> dict:
         argv = self.launch_argv(desktop, code)
-        pid = self._running(argv, desktop)
+        pid = self.running(argv, desktop)
         try:
-            if self._validation_stamp is None or self._validation_stamp != self._stamp():
+            if self.validation_stamp is None or self.validation_stamp != self.stamp():
                 raise ClaudeDesktopError("Claude changed since validation. Try opening the profile again after the update finishes.")
         except OSError as exc:
             raise ClaudeDesktopError("Claude changed since validation. Wait for its update to finish and try again.") from exc

@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from openswap.claude_desktop import APP_PATH, BUNDLE_ID, ClaudeDesktopError
-from openswap.claude_desktop_signin import _fourcc, callback_link
+from openswap.claude_desktop_signin import callback_link, fourcc, link_text
 
 OWNER_IDS = {"com.opensoft.openswap", "com.opensoft.openswap.dev"}
 PREVIOUS_KEY = "ClaudeLinksPreviousApplication"
@@ -109,9 +109,7 @@ def restore_for_uninstall():
 
 def claude_link(value):
     """Bound all external input, including ordinary links passed through."""
-    if not isinstance(value, str) or not 0 < len(value) <= 16384:
-        return False
-    if any(ord(c) <= 32 or ord(c) >= 127 or c == "\\" for c in value):
+    if link_text(value, strip=False) is None:
         return False
     try:
         return urlsplit(value).scheme == "claude"
@@ -148,7 +146,7 @@ class MacOSLinks:
             class _Receiver(NSObject):
                 def handleEvent_withReplyEvent_(self, event, reply):
                     try:
-                        self.receive(event.paramDescriptorForKeyword_(_fourcc("----")).stringValue())
+                        self.receive(event.paramDescriptorForKeyword_(fourcc("----")).stringValue())
                     except Exception:
                         pass  # never allow native exceptions to print a credential
 
@@ -160,7 +158,7 @@ class MacOSLinks:
         self.receiver = _Receiver.alloc().init()
         self.receiver.receive, self.receiver.launched = receive, launched
         NSAppleEventManager.sharedAppleEventManager().setEventHandler_andSelector_forEventClass_andEventID_(
-            self.receiver, "handleEvent:withReplyEvent:", _fourcc("GURL"), _fourcc("GURL"))
+            self.receiver, "handleEvent:withReplyEvent:", fourcc("GURL"), fourcc("GURL"))
         self.workspace.notificationCenter().addObserver_selector_name_object_(
             self.receiver, "applicationLaunched:", NSWorkspaceDidLaunchApplicationNotification, None)
 

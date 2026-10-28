@@ -385,14 +385,14 @@ class ClaudeDesktopMenu:
                     result["default_unchecked"] = True
                     result["unchecked"] += 1
                 profiles = sorted(self.store.list(), key=lambda p: p.kind != "default")
-                processes = app._processes()
+                processes = app.processes()
             except (ClaudeSwitchError, OSError) as exc:
                 self._results.put((None, exc))
                 return
             for profile in profiles:
                 desktop, code = self.store.paths(profile)
                 try:
-                    pid = app._running(app.launch_argv(desktop, code), desktop, processes=processes)
+                    pid = app.running(app.launch_argv(desktop, code), desktop, processes=processes)
                 except ClaudeDesktopError:
                     result["unchecked"] += 1
                     continue

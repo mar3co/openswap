@@ -33,7 +33,6 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from xml.parsers.expat import ExpatError
 
 from openswap import bundle, paths
 from openswap.exceptions import ClaudeSwitchError
@@ -118,7 +117,9 @@ def remove_integrations(
     uid: int | None = None,
     force: bool = False,
 ) -> Removal:
-    """Remove the login item, the worker, the status line, and the widget.
+    """Remove the login item, the worker, the status line, and the widget,
+    hand claude:// links back to Claude, and delete the Claude profile
+    launchers with their Dock tiles.
 
     Also, quietly: the menu bar's lock, show and hand-over requests, and the
     login item's last start failure, and in the app the finished welcome
@@ -224,27 +225,9 @@ def _shortcut_folder() -> Path | None:
 def _owned_launchers(directory: Path) -> list[Path]:
     """The bundles in ``directory`` carrying OpenSwap's own marker, whichever
     store they name: the one predicate for both the dialog and the removal."""
-    from openswap.claude_desktop_dock import _owned_bundle
+    from openswap.claude_desktop_dock import owned_bundle
 
-    return [path for path in sorted(directory.iterdir())
-            if (shortcut := _launcher(path)) is not None and _owned_bundle(path, shortcut)]
-
-
-def _launcher(path: Path):
-    """The shortcut a launcher bundle claims to be, from its own marker, for
-    the ownership check; None for anything that is not one."""
-    from openswap.claude_desktop_dock import DockShortcut
-
-    info = path / "Contents" / "Info.plist"
-    try:
-        if path.is_symlink() or info.is_symlink() or info.stat().st_size > 65536:
-            return None
-        marker = plistlib.loads(info.read_bytes()).get("OpenSwapProfile")
-        if not isinstance(marker, dict) or not isinstance(marker.get("profile"), str) or not isinstance(marker.get("root"), str):
-            return None
-        return DockShortcut(path, marker["profile"], Path(marker["root"]))
-    except (OSError, ValueError, TypeError, AttributeError, ExpatError, plistlib.InvalidFileException):
-        return None
+    return [path for path in sorted(directory.iterdir()) if owned_bundle(path) is not None]
 
 
 def _dock():

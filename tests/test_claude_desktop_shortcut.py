@@ -98,7 +98,7 @@ def test_failed_update_keeps_old_shortcut_and_profile(store,builder,monkeypatch,
     if failure=='sign':
         original=builder.run.side_effect
         builder.run.side_effect=lambda argv,**kw: SimpleNamespace(returncode=1) if argv[0].endswith('codesign') else original(argv,**kw)
-    if failure=='metadata': monkeypatch.setattr(store,'_save',Mock(side_effect=OSError('disk full')))
+    if failure=='metadata': monkeypatch.setattr(store,'save',Mock(side_effect=OSError('disk full')))
     if failure=='publish':
         original=sc.os.replace
         def replace(source,target):

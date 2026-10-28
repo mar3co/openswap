@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from xml.parsers.expat import ExpatError
 
-from openswap.claude_desktop import APP_PATH, ClaudeDesktopError, _plain
+from openswap.claude_desktop import APP_PATH, ClaudeDesktopError, plain
 
 BUNDLE_PREFIX = "com.opensoft.openswap.claude-profile."
 BACKUPS_KEPT = 5
@@ -105,11 +105,24 @@ def launcher_info(path):
         return None
 
 
-def _owned_bundle(path, shortcut, *, info=None):
-    """``info`` is the bundle's already-read plist, for a caller that reads more of it."""
+def owned_bundle(path, shortcut=None, *, info=None):
+    """The shortcut a launcher bundle at ``path`` is, by its own marker and bundle id; None otherwise.
+
+    With ``shortcut``, only that exact shortcut (profile and store root) counts.
+    ``info`` is the bundle's already-read plist, for a caller that reads more of it.
+    """
     if info is None:
         info = launcher_info(path)
-    return info is not None and info.get("OpenSwapProfile") == shortcut.marker and info.get("CFBundleIdentifier") == shortcut.bundle_id
+    if info is None:
+        return None
+    if shortcut is None:
+        marker = info.get("OpenSwapProfile")
+        if not isinstance(marker, dict) or not isinstance(marker.get("profile"), str) or not isinstance(marker.get("root"), str):
+            return None
+        shortcut = DockShortcut(path, marker["profile"], Path(marker["root"]))
+    if info.get("OpenSwapProfile") == shortcut.marker and info.get("CFBundleIdentifier") == shortcut.bundle_id:
+        return shortcut
+    return None
 
 
 class NativeDock:
@@ -161,11 +174,11 @@ def install_shortcuts(store, shortcuts, *, backend=None, refresh_icons=False):
     """
     backend = backend or NativeDock()
     shortcuts = [DockShortcut(s.path, s.profile_id, store.root, s.default) for s in shortcuts]
-    with store._lock():
+    with store.lock():
         # Store-level lock also serializes setup from this app's CLI/UI.
         for shortcut in shortcuts:
             store.get(shortcut.profile_id)  # no archived/stale profile pins
-            if not _owned_bundle(shortcut.path, shortcut):
+            if not owned_bundle(shortcut.path, shortcut):
                 raise ClaudeDesktopError("A profile shortcut changed. Try Dock setup again.")
         if backend.managed():
             raise ClaudeDesktopError("Your organization manages the Dock. Profile shortcuts are ready in Applications → OpenSwap Profiles.")
@@ -175,13 +188,13 @@ def install_shortcuts(store, shortcuts, *, backend=None, refresh_icons=False):
         resolved = []
         for shortcut in shortcuts:
             aliases = tuple(p for row in before if (p := tile_path(row)) is not None
-                            and p != shortcut.path.resolve() and _owned_bundle(p, shortcut))
+                            and p != shortcut.path.resolve() and owned_bundle(p, shortcut))
             resolved.append(replace(shortcut, aliases=aliases))
         after = plan_pins(before, resolved)
         changed = after != before
         if changed:
             backup_dir = store.root / "dock-backups"
-            if not _plain(backup_dir, directory=True):
+            if not plain(backup_dir, directory=True):
                 backup_dir.mkdir(mode=0o700)
             backup = backup_dir / (uuid.uuid4().hex + ".plist")
             fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
