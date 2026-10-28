@@ -228,3 +228,8 @@ Required outcomes:
 - Pre-dispatch reader corrected W2, W3, W6, W8 and W9 before dispatch.
 - Implemented in f3a24d6..5c7a2ad. Full suite: 6261 passed, 0 failed.
 - Final cold seat and silent seat on the wave: no Critical. The remaining non-Critical findings (live-token contradiction loop, live-path mismatch wording, silent drop on a fast disable and re-enable, a pause not cleared once held, doc wording) are filed as #151 under the hard budget. The review loop is closed.
+
+### After the PR opened
+- Codex review on #152, P1 (Important): W1 made a held handler that reads as missing claim again, which can show the consent prompt with no user action. Fixed in a52f5b0: it now waits, and the ownership check keeps checking until the owner resolves. Cold seat: no Critical. The remaining "wait has no bound" finding is added to #151.
+- The changelog entry was added at the user's request (aa97ef4, c11ee12). A cold seat corrected two overclaims: browser sign-in for new accounts, and asking for the profile on non-Google links.
+- 2026-10-28, user: the leftover helper branches (lane-a..d, worktree-agent-*) and their worktrees were deleted, after confirming their commits are on main or this branch.
