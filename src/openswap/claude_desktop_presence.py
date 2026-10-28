@@ -8,7 +8,7 @@ from xml.parsers.expat import ExpatError
 
 from openswap.claude_desktop import ClaudeDesktopError
 from openswap.claude_desktop_dock import DockShortcut, _owned_bundle
-from openswap.claude_desktop_shortcut import create_shortcut, shortcut_directory, shortcut_name
+from openswap.claude_desktop_shortcut import LAUNCHER_VERSION, create_shortcut, shortcut_directory, shortcut_name
 
 
 def open_presence(path: Path, bundle_id: str) -> None:
@@ -58,7 +58,7 @@ def attach_presence(store, identifier: str, *, directory=None, creator=None, ope
         info = plistlib.loads((path / "Contents/Info.plist").read_bytes())
     except (OSError, ValueError, ExpatError) as exc:
         raise ClaudeDesktopError("The profile shortcut changed. Choose Set up Dock shortcuts to retry.") from exc
-    if info.get("OpenSwapProfileLauncherVersion", 0) != 2:
+    if info.get("OpenSwapProfileLauncherVersion") != LAUNCHER_VERSION:
         result = (creator or create_shortcut)(store, profile.id, directory=path.parent)
         path = Path(result["path"])
         if path != shortcut.path or not _owned_bundle(path, shortcut):

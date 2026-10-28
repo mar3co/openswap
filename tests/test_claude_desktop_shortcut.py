@@ -124,6 +124,20 @@ def test_failed_update_keeps_old_shortcut_and_profile(store,builder,monkeypatch,
     assert not list(builder.directory.glob('.openswap-shortcut-*'))
 
 
+@pytest.mark.parametrize('change',['archived','renamed'])
+def test_profile_changed_during_build_leaves_no_launcher_or_badge(store,builder,change):
+    p=store.add('Work')
+    def icon(app,target,badge,color):
+        # Lands only because the registry lock is not held during the build.
+        store.update(p.id,**({'archived':True} if change=='archived' else {'name':'Renamed'}))
+        target.write_bytes(b'icon')
+    builder.icon.side_effect=icon
+    with pytest.raises(cd.ClaudeDesktopError,match='changed'): builder.build(p,badge='5',color='green')
+    assert not list(builder.directory.glob('*.app'))
+    current=store.get(p.id,include_archived=True)
+    assert (current.badge,current.color)==('1','orange')
+
+
 def test_unrelated_app_collision_is_preserved(store,builder):
     p=store.add('Work');target=builder.directory/'Claude Work.app';target.mkdir(parents=True)
     keep=target/'user-file';keep.write_text('keep')

@@ -81,6 +81,8 @@ def test_resident_script_targets_process_object_and_normal_quit():
     assert 'forceTerminate' not in source and 'killall' not in source
     assert 'bundleIdentifier()' in source and 'bundleURL()' in source
     assert '--openswap-attach' in source
+    assert 'continue quit' in source and 'with timeout' not in source
+    assert '/bin/kill -0' in source
 
 
 def test_existing_only_reuses_exact_profile_without_launch(store,app):

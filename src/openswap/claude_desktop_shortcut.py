@@ -17,8 +17,10 @@ from xml.parsers.expat import ExpatError
 from openswap.claude_desktop import (
     APP_PATH, BUNDLE_ID, BADGE_COLORS, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, _plain, validate_badge,
 )
+from openswap.claude_desktop_dock import DockShortcut, _owned_bundle, install_shortcuts
 from openswap.locking import FileLock
 
+LAUNCHER_VERSION = 2
 ICON_NOTICE = (
     "The numbered icon shows a running dot while this profile is open. "
     "Click it to return to that session. Claude’s original icon stays available."
@@ -180,40 +182,50 @@ def _destination_lock(directory: Path):
     return FileLock(path, timeout=1)
 
 
-def _check_destination(path: Path, marker: dict) -> None:
+def _check_destination(path: Path, shortcut: DockShortcut) -> None:
     if path.is_symlink():
         raise ClaudeDesktopError("The shortcut destination is a symbolic link. Choose another folder.")
-    if not path.exists():
-        return
+    if path.exists() and not _owned_bundle(path, shortcut):
+        raise ClaudeDesktopError("Another app or file already uses this shortcut name. Rename the profile or choose another folder; nothing was replaced.")
+
+
+def _current_launcher(path: Path, shortcut: DockShortcut, record: dict) -> bool:
+    """An owned bundle built from the same command, Claude app and badge needs no rebuild."""
+    if not _owned_bundle(path, shortcut):
+        return False
     try:
-        info = path / "Contents" / "Info.plist"
-        if (not path.is_dir() or (path / "Contents").is_symlink() or info.is_symlink()
-                or info.stat().st_size > 65536):
-            raise ValueError
-        if plistlib.loads(info.read_bytes()).get("OpenSwapProfile") != marker:
-            raise ValueError
-    except (OSError, ValueError, TypeError, AttributeError, plistlib.InvalidFileException) as exc:
-        raise ClaudeDesktopError("Another app or file already uses this shortcut name. Rename the profile or choose another folder; nothing was replaced.") from exc
+        info = plistlib.loads((path / "Contents/Info.plist").read_bytes())
+    except (OSError, ValueError, ExpatError):
+        return False
+    return info.get("OpenSwapProfileLauncherVersion") == LAUNCHER_VERSION and info.get("OpenSwapProfileLauncher") == record
 
 
 def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, color=None,
-                    directory: Path | None = None, app=None, run=None, icon_renderer=None) -> dict:
+                    directory: Path | None = None, app=None, run=None, icon_renderer=None,
+                    reuse_current=False) -> dict:
     app, run = app or ClaudeDesktopApp(), run or subprocess.run
     info = app.validate()
     directory = (directory if directory is not None else shortcut_directory()).absolute()
     if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
         raise ClaudeDesktopError("Choose a regular folder for your shortcuts.")
     directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-    with store._lock(), _destination_lock(directory):
+    # The registry lock guards metadata reads and the final write only, never
+    # the build: osacompile, iconutil and codesign take seconds.
+    with store._lock():
         profile = store.get(identifier)  # archived shortcuts cannot be recreated
         store._directories(profile)
-        badge = profile.badge if badge is None else badge
-        color = profile.color if color is None else color
-        validate_badge(badge, color)
-        path = directory / shortcut_name(profile.name)
-        marker = {"version": 1, "profile": profile.id, "root": str(store.root)}
-        _check_destination(path, marker)
-        command = launcher_command(store, profile.id)
+    badge = profile.badge if badge is None else badge
+    color = profile.color if color is None else color
+    validate_badge(badge, color)
+    path = directory / shortcut_name(profile.name)
+    shortcut = DockShortcut(path, profile.id, store.root, profile.kind == "default")
+    command = launcher_command(store, profile.id)
+    record = {"command": command, "target": str(Path(app.path).resolve()), "badge": badge, "color": color}
+    result = {"path": str(path), "app_version": info["version"], "notice": ICON_NOTICE}
+    with _destination_lock(directory):
+        if reuse_current and (badge, color) == (profile.badge, profile.color) and _current_launcher(path, shortcut, record):
+            return {**result, "profile": asdict(profile), "state": "shortcut_kept"}
+        _check_destination(path, shortcut)
         with tempfile.TemporaryDirectory(prefix=".openswap-shortcut-", dir=directory) as raw:
             stage = Path(raw) / path.name
             _run(run, ["/usr/bin/osacompile", "-o", str(stage), "-s", "-"], input=launcher_script(
@@ -228,17 +240,17 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
                     raise ValueError
             except (OSError, ValueError, ExpatError, plistlib.InvalidFileException) as exc:
                 raise ClaudeDesktopError("macOS produced an incomplete shortcut. Try creating it again.") from exc
-            plist.update(CFBundleIdentifier=f"com.opensoft.openswap.claude-profile.{profile.id}",
+            plist.update(CFBundleIdentifier=shortcut.bundle_id,
                          CFBundleName=f"Claude {profile.name}", CFBundleDisplayName=f"Claude {profile.name}",
-                         CFBundleIconFile="Profile.icns", LSUIElement=False, OpenSwapProfile=marker,
-                         OpenSwapProfileLauncherVersion=2)
+                         CFBundleIconFile="Profile.icns", LSUIElement=False, OpenSwapProfile=shortcut.marker,
+                         OpenSwapProfileLauncherVersion=LAUNCHER_VERSION, OpenSwapProfileLauncher=record)
             plist.pop("CFBundleIconName", None)
             plist_path.write_bytes(plistlib.dumps(plist))
             (icon_renderer or render_icon)(app.path, contents / "Resources" / "Profile.icns", badge, color)
             # Sign only our generated launcher after writing its icon and plist.
             _run(run, ["/usr/bin/codesign", "--force", "--sign", "-", str(stage)])
             _run(run, ["/usr/bin/codesign", "--verify", "--strict", str(stage)])
-            _check_destination(path, marker)
+            _check_destination(path, shortcut)
             previous = Path(raw) / "previous.app"
             if path.exists():
                 os.replace(path, previous)
@@ -246,9 +258,15 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
             try:
                 os.replace(stage, path)
                 installed = True
-                updated = replace(profile, badge=badge, color=color)
-                rows = store.list(include_archived=True)
-                store._save([updated if p.id == profile.id else p for p in rows])
+                with store._lock():
+                    # Re-read under the lock: an archive or rename during the
+                    # build must leave neither a launcher nor a saved badge.
+                    current = store.get(profile.id, include_archived=True)
+                    if current.archived or current.name != profile.name:
+                        raise ClaudeDesktopError("The profile changed while its shortcut was being created. Nothing was saved; try again.")
+                    updated = replace(current, badge=badge, color=color)
+                    rows = store.list(include_archived=True)
+                    store._save([updated if p.id == profile.id else p for p in rows])
             except Exception:
                 # Roll back only the launcher we just built, never profile data.
                 if installed:
@@ -256,8 +274,7 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
                 if previous.exists():
                     os.replace(previous, path)
                 raise
-    return {"path": str(path), "profile": asdict(updated), "state": "shortcut_created",
-            "app_version": info["version"], "notice": ICON_NOTICE}
+    return {**result, "profile": asdict(updated), "state": "shortcut_created"}
 
 
 def prepare_shortcuts(store: DesktopProfiles, identifier: str, *, pin: bool, creator=None, installer=None) -> dict:
@@ -265,20 +282,22 @@ def prepare_shortcuts(store: DesktopProfiles, identifier: str, *, pin: bool, cre
 
     Partial failures keep the profile and any completed shortcuts. Dock changes
     happen only after all required launchers exist; the caller can still open
-    Claude when setup needs attention.
+    Claude when setup needs attention. Launchers already built from the current
+    command, Claude app and badge are kept, so the Dock restarts only when the
+    pinned launcher was rebuilt or its pin is new.
     """
-    from openswap.claude_desktop_dock import DockShortcut, install_shortcuts
-
     creator, installer = creator or create_shortcut, installer or install_shortcuts
     profile = store.get(identifier)
     default = store.ensure_default()
     profiles = ([default] if default and not default.archived and default.id != profile.id else []) + [profile]
-    shortcuts = []
+    shortcuts, rebuilt = [], False
     for item in profiles:
-        result = creator(store, item.id)
+        result = creator(store, item.id, reuse_current=True)
         shortcuts.append(DockShortcut(Path(result["path"]), item.id, store.root, item.kind == "default"))
+        if item.id == profile.id:
+            rebuilt = result["state"] == "shortcut_created"
     if pin:
         # Add only the requested profile to the Dock. Default's shortcut is
         # available in Finder, but never replaces Claude's ordinary launcher.
-        installer(store, [s for s in shortcuts if s.profile_id == profile.id], refresh_icons=True)
+        installer(store, [s for s in shortcuts if s.profile_id == profile.id], refresh_icons=rebuilt)
     return {"state": "dock_ready" if pin else "shortcuts_ready", "paths": [str(s.path) for s in shortcuts]}

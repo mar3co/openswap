@@ -1,8 +1,8 @@
 """Dock setup preserves the user's layout and never touches running Claude."""
 import copy
 import plistlib
+import sys
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -12,6 +12,8 @@ from openswap import claude_desktop_shortcut as sc
 from openswap.claude_desktop import ClaudeDesktopError
 from tests.test_claude_desktop_monitor import store, existing
 from tests.test_claude_desktop_shortcut import builder
+
+pytestmark = pytest.mark.skipif(sys.platform != 'darwin', reason='Dock shortcuts are macOS-only')
 
 
 def tile(path, guid=1):
@@ -58,6 +60,23 @@ def test_renamed_shortcut_updates_owned_alias_at_same_position(tmp_path):
     after = dock.plan_pins(before, [s])
     assert after[0] == before[0] and after[1]['GUID'] == 2
     assert dock.tile_path(after[1]) == s.path
+
+
+def test_current_pin_wins_over_alias_without_duplicate(tmp_path):
+    s = shortcuts(tmp_path)[1]
+    alias = tmp_path/'Claude Old Name.app'
+    s = dock.DockShortcut(s.path, s.profile_id, s.root, aliases=(alias,))
+    before = [tile(dock.APP_PATH, 1), tile(alias, 2), tile(s.path, 3)]
+    assert dock.plan_pins(before, [s]) == before
+
+
+def test_new_pins_follow_existing_profile_pins_in_creation_order(tmp_path):
+    work = shortcuts(tmp_path)[1]
+    personal = dock.DockShortcut(tmp_path/'Claude Personal.app', 'c'*32, tmp_path)
+    before = [tile(dock.APP_PATH, 1), tile('/Applications/Other.app', 2)]
+    after = dock.plan_pins(before, [work], guid_factory=iter([3]).__next__)
+    after = dock.plan_pins(after, [personal], guid_factory=iter([4]).__next__)
+    assert [dock.tile_path(row) for row in after] == [dock.APP_PATH.resolve(), work.path, personal.path, Path('/Applications/Other.app')]
 
 
 @pytest.mark.parametrize('before', [None, {}, [None]])
@@ -122,6 +141,28 @@ def test_unsafe_or_managed_setup_keeps_dock_untouched(store, builder, reason):
     backend.write.assert_not_called(); backend.refresh.assert_not_called()
 
 
+def test_installer_checks_ownership_against_store_root_not_caller_root(store, builder):
+    s = built(store, builder)
+    other = dock.DockShortcut(s.path, s.profile_id, Path('/other/store'))
+    assert dock.install_shortcuts(store, [other], backend=Backend([]))['state'] == 'updated'
+    info = s.path/'Contents/Info.plist'
+    data = plistlib.loads(info.read_bytes()); data['OpenSwapProfile']['root'] = '/other/store'
+    info.write_bytes(plistlib.dumps(data))
+    backend = Backend([])
+    with pytest.raises(ClaudeDesktopError): dock.install_shortcuts(store, [other], backend=backend)
+    backend.write.assert_not_called()
+
+
+def test_backups_keep_only_the_newest_five(store, builder):
+    s = built(store, builder)
+    backend = Backend([])
+    for i in range(7):
+        backend.apps = [tile(f'/Applications/App{i}.app', 100 + i)]
+        dock.install_shortcuts(store, [s], backend=backend)
+    backups = list((store.root/'dock-backups').glob('*.plist'))
+    assert sorted(plistlib.loads(b.read_bytes())['persistent-apps'][0]['GUID'] for b in backups) == [102, 103, 104, 105, 106]
+
+
 def test_installer_finds_renamed_owned_shortcut_but_not_other_store(store, builder):
     s = built(store, builder)
     old = s.path
@@ -145,7 +186,7 @@ def test_installer_finds_renamed_owned_shortcut_but_not_other_store(store, build
 def test_add_setup_creates_default_and_numbered_shortcuts_without_launching(store, builder, pin):
     existing(store)
     p = store.add('Work')
-    creator = Mock(side_effect=lambda s, i: builder.build(s.get(i)))
+    creator = Mock(side_effect=lambda s, i, **kw: builder.build(s.get(i), **kw))
     installer = Mock()
     sc.prepare_shortcuts(store, p.id, pin=pin, creator=creator, installer=installer)
     assert [c.args[1] for c in creator.call_args_list] == [store.ensure_default().id, p.id]
@@ -157,24 +198,59 @@ def test_add_setup_creates_default_and_numbered_shortcuts_without_launching(stor
         installer.assert_called_once()
         items = installer.call_args.args[1]
         assert len(items) == 1 and items[0].profile_id == p.id and not items[0].default
+        assert installer.call_args.kwargs['refresh_icons'] is True
     else:
         installer.assert_not_called()
+
+
+def test_add_keeps_current_launchers_and_restarts_dock_only_after_rebuild(store, builder):
+    existing(store)
+    creator = lambda s, i, **kw: builder.build(s.get(i), **kw)
+    installer = Mock()
+    work = store.add('Work')
+    sc.prepare_shortcuts(store, work.id, pin=True, creator=creator, installer=installer)
+    runs = builder.run.call_count
+    personal = store.add('Personal')
+    sc.prepare_shortcuts(store, personal.id, pin=True, creator=creator, installer=installer)
+    assert builder.run.call_count == runs + 3  # Personal compiled and signed; Default kept
+    assert installer.call_args.kwargs['refresh_icons'] is True
+    sc.prepare_shortcuts(store, personal.id, pin=True, creator=creator, installer=installer)
+    assert builder.run.call_count == runs + 3
+    assert installer.call_args.kwargs['refresh_icons'] is False
+
+
+@pytest.mark.parametrize('stale', ['version', 'command', 'target', 'badge'])
+def test_add_rebuilds_default_launcher_that_no_longer_matches(store, builder, stale):
+    existing(store)
+    creator = lambda s, i, **kw: builder.build(s.get(i), **kw)
+    default = store.ensure_default(); builder.build(default)
+    info = builder.directory/'Claude Default.app'/'Contents/Info.plist'
+    data = plistlib.loads(info.read_bytes())
+    if stale == 'version': data['OpenSwapProfileLauncherVersion'] = 1
+    if stale == 'command': data['OpenSwapProfileLauncher']['command'][-1] = '--other-flag'
+    if stale == 'target': data['OpenSwapProfileLauncher']['target'] = '/Applications/Old Claude.app'
+    if stale == 'badge': data['OpenSwapProfileLauncher']['badge'] = '3'
+    info.write_bytes(plistlib.dumps(data))
+    runs = builder.run.call_count
+    sc.prepare_shortcuts(store, store.add('Work').id, pin=False, creator=creator, installer=Mock())
+    assert builder.run.call_count == runs + 6
+    assert plistlib.loads(info.read_bytes())['OpenSwapProfileLauncherVersion'] == sc.LAUNCHER_VERSION
 
 
 def test_archived_default_is_not_restored_or_pinned_by_add(store, builder):
     existing(store); default = store.ensure_default(); store.update(default.id, archived=True)
     p = store.add('Work'); installer = Mock()
     sc.prepare_shortcuts(store, p.id, pin=True,
-                         creator=lambda s, i: builder.build(s.get(i)), installer=installer)
+                         creator=lambda s, i, **kw: builder.build(s.get(i), **kw), installer=installer)
     assert len(installer.call_args.args[1]) == 1
     assert store.get(default.id, include_archived=True).archived
 
 
 def test_creation_failure_keeps_profile_and_completed_default_without_changing_dock(store, builder):
     existing(store); p = store.add('Work'); installer = Mock()
-    def create(s, identifier):
+    def create(s, identifier, **kw):
         if identifier == p.id: raise OSError('disk full')
-        return builder.build(s.get(identifier))
+        return builder.build(s.get(identifier), **kw)
     with pytest.raises(OSError): sc.prepare_shortcuts(store, p.id, pin=True, creator=create, installer=installer)
     installer.assert_not_called()
     assert store.get(p.id) == p and (builder.directory/'Claude Default.app').is_dir()
