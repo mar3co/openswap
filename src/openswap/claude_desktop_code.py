@@ -139,6 +139,10 @@ class ProfileChanged(ClaudeDesktopError):
     pass
 
 
+class SessionRunning(ClaudeDesktopError):
+    pass
+
+
 def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
     """Add a verified credential to the Code roster, or repair its legacy slot.
 
@@ -251,6 +255,7 @@ class DesktopCodeConnector:
         self._next_scan = 0.0
         self._started = time.time()
         self._sweeper = None
+        self._notes = {}
 
     def suspend(self):
         if self._active:
@@ -275,6 +280,9 @@ class DesktopCodeConnector:
                 "install": "Claude Code isn’t installed", "failed": "Code setup needs attention",
                 "mismatch": "Choose the same Code account",
             }
+            note = self._notes.get(profile.id, ("", ""))
+            if state == "failed" and note[0] == profile.code_setup_key and note[1]:
+                messages["failed"] = note[1]  # held in memory; a restart shows the general message
             return {"code_status": messages[state],
                     **({"code_action": "cancel_code" if running else "connect_code"} if state else {})}
         except ClaudeDesktopError as exc:
@@ -322,10 +330,11 @@ class DesktopCodeConnector:
                 self.suspend()
         while True:
             try:
-                profile, key, state = self._results.get_nowait()
+                profile, key, state, note = self._results.get_nowait()
             except queue.Empty:
                 break
             self._active, self._login = None, None
+            self._notes[profile.id] = (key, note)
             recorded = False
             try:
                 recorded = self._record(profile, key, state)
@@ -364,7 +373,7 @@ class DesktopCodeConnector:
                     threading.Thread(target=self._connect, args=(profile, key, binary, cancel),
                                      daemon=True, name="claude-desktop-code").start()
                 except Exception:
-                    self._results.put((profile, key, "failed"))
+                    self._results.put((profile, key, "failed", ""))
                 return True
         except (ClaudeSwitchError, OSError):
             pass
@@ -408,7 +417,7 @@ class DesktopCodeConnector:
             _logger.warning("could not discard a Code setup login: %s", type(exc).__name__)
 
     def _connect(self, profile, key, binary, cancel):
-        state, launched = "failed", False
+        state, launched, note = "failed", False, ""
         try:
             fingerprint = self.observe(self.store, profile)
             self._check_current(profile, fingerprint, cancel)
@@ -469,10 +478,12 @@ class DesktopCodeConnector:
         except ProfileChanged:
             # Once the browser opened, only an explicit click may open it again.
             state = "sign_in" if cancel.is_set() or launched else ""
-        except Exception:
+        except Exception as exc:
             state = "sign_in" if cancel.is_set() else "failed"
+            if isinstance(exc, SessionRunning):
+                note = str(exc)
         finally:
-            self._results.put((profile, key, state))
+            self._results.put((profile, key, state, note))
 
     def _verify_legacy(self, number, row, credentials, profile):
         """The slot credential to pin a silent link to, or None to repair the slot by browser login.
@@ -485,14 +496,16 @@ class DesktopCodeConnector:
         email = row["email"]
         live = self.engine._get_current_identity_triple(strict=True)
         if live and (live[0].casefold(), live[1].lower()) == (email.casefold(), row["organizationUuid"].lower()):
+            if not oauth.extract_access_token(credentials or ""):
+                return None  # the link would leave the slot without a Code credential
             active = self.engine._read_active_credentials()
             result = "transient" if active.degraded or active.value is None else verdict(active.value, profile)
         else:
             result = verdict(credentials, profile)
             if result == "rejected":
-                outcome = (oauth.RefreshOutcome(None, "skip-live-session")
-                           if self.engine.live_session_pids_for(number, email)
-                           else self.engine.consume_backup_grant(number, email, credentials))
+                if self.engine.live_session_pids_for(number, email):
+                    raise SessionRunning("Close this account’s running Claude Code session, then continue setup.")
+                outcome = self.engine.consume_backup_grant(number, email, credentials, refuse_active=True)
                 step = refresh_step(outcome)
                 if step == "login":
                     return None
@@ -520,7 +533,10 @@ class DesktopCodeConnector:
 
     @contextmanager
     def _commit_guard(self, profile, fingerprint, cancel):
-        """Registry lock around the slot and roster writes; entered only inside the engine lock."""
+        """Registry lock and row check for the fresh-row check and the roster commit, never a slot write.
+
+        Entered only inside the engine lock.
+        """
         with self.store.lock():
             self._check_row(profile, fingerprint, cancel)
             yield

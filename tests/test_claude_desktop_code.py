@@ -15,6 +15,7 @@ import pytest
 from openswap import claude_desktop_code as code
 from openswap.claude_desktop import DesktopProfiles, ClaudeDesktopError
 from openswap.claude_login import LoginResult
+from openswap.exceptions import ConfigError
 from openswap.menubar_display import desktop_profile_usage, desktop_profile_height
 from openswap.switcher import ClaudeAccountSwitcher
 
@@ -189,7 +190,7 @@ def test_verification_requires_a_current_detected_identity(setup):
 
 def test_late_completion_does_not_notify_for_a_changed_profile(setup):
     s = setup
-    s.connector._results.put((s.profile, code.setup_key(s.profile, s.engine), "connected"))
+    s.connector._results.put((s.profile, code.setup_key(s.profile, s.engine), "connected", ""))
     s.store.update(s.profile.id, email="new@example.test")
     s.connector.poll(enabled=True)
     s.connector.notify.assert_not_called()
@@ -795,7 +796,7 @@ def refreshed(error=None, credentials=REFRESHED, **kwargs):
       for error in ("invalid_grant", "invalid_client", "no_refresh_token", "store-unmirrored")],
     ("rejected", refreshed("transient", stashed=True), None, "failed", False),
     *[("rejected", refreshed(error, None), None, "failed", False)
-      for error in ("transient", "consume-busy", "stash-unreadable")],
+      for error in ("transient", "consume-busy", "stash-unreadable", "skip-active")],
     ("rejected", "live session", None, "failed", False),
 ])
 def test_legacy_slot_token_is_refreshed_only_through_the_gate(setup, monkeypatch, backup, gate, after, state, browser):
@@ -805,8 +806,8 @@ def test_legacy_slot_token_is_refreshed_only_through_the_gate(setup, monkeypatch
     s.classifier.side_effect = lambda token: answers[token]
     persisted = isinstance(gate, code.oauth.RefreshOutcome) and gate.error is None
 
-    def consume(number, email, snapshot):
-        assert (number, email, snapshot) == ("7", EMAIL, CREDS)
+    def consume(number, email, snapshot, *, refuse_active):
+        assert (number, email, snapshot, refuse_active) == ("7", EMAIL, CREDS, True)
         if persisted:
             s.engine._write_account_credentials(number, email, gate.credentials)
         return gate
@@ -823,19 +824,38 @@ def test_legacy_slot_token_is_refreshed_only_through_the_gate(setup, monkeypatch
     else:
         assert slot == (REFRESHED if persisted else CREDS)
         assert s.engine.account_identity("7")["uuid"] == (ACCOUNT if state == "connected" else "")
+    status = s.connector.state(s.store.get(s.profile.id))["code_status"]
+    assert ("Claude Code session" in status) is (gate == "live session")
 
 
-@pytest.mark.parametrize("answer, state, browser", [
-    ("match", "connected", False), ("rejected", "connected", True), ("incomplete", "connected", True),
-    ("transient", "failed", False), ("mismatch", "mismatch", False), ("degraded", "failed", False),
+def test_session_note_belongs_to_its_own_setup_attempt(setup, monkeypatch):
+    s = setup
+    seed(s, uuid="")
+    s.classifier.side_effect = lambda token: ANSWERS["rejected"]
+    monkeypatch.setattr(s.engine, "live_session_pids_for", Mock(return_value=[42]))
+    s.connector.poll(enabled=True)
+    finish(s)
+    s.connector.retry(s.profile.id)
+    s.engine.live_session_pids_for.return_value = []
+    monkeypatch.setattr(s.engine, "consume_backup_grant", Mock(return_value=refreshed("consume-busy", None)))
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == "failed"
+    assert s.connector.state(s.store.get(s.profile.id))["code_status"] == "Code setup needs attention"
+
+
+@pytest.mark.parametrize("live, answer, state, browser", [
+    (LIVE, "match", "connected", False), (LIVE, "rejected", "connected", True),
+    (LIVE, "incomplete", "connected", True), (LIVE, "transient", "failed", False),
+    (LIVE, "mismatch", "mismatch", False), (LIVE, "degraded", "failed", False),
+    ("", None, "connected", True), (None, None, "failed", False),
 ])
-def test_active_legacy_slot_is_verified_read_only_with_the_live_credential(setup, monkeypatch, answer, state, browser):
+def test_active_legacy_slot_is_verified_read_only_with_the_live_credential(setup, monkeypatch, live, answer, state, browser):
     from openswap.credentials import ActiveCredentials
     s = setup
     seed(s, uuid="")
     monkeypatch.setattr(s.engine, "_get_current_identity_triple", lambda strict=False: (EMAIL.upper(), ORG, ""))
     monkeypatch.setattr(s.engine, "_read_active_credentials",
-                        Mock(return_value=ActiveCredentials(LIVE, False, answer == "degraded")))
+                        Mock(return_value=ActiveCredentials(live, False, answer == "degraded")))
     s.classifier.side_effect = lambda token: {"live-access": ANSWERS.get(answer)}[token]
     monkeypatch.setattr(s.engine, "consume_backup_grant", Mock())
     s.connector.poll(enabled=True)
@@ -863,3 +883,46 @@ def test_sweeper_that_fails_to_start_is_started_by_a_later_poll(setup, monkeypat
     finish(s)
     s.connector._sweeper.join(4)
     assert s.connector._sweeper is not failed[0] and not s.connector._sweeper.is_alive()
+
+
+@pytest.mark.parametrize("backup", ["absent", "", "legacy credential"])
+def test_active_legacy_slot_without_a_usable_backup_is_repaired_by_browser_login(setup, monkeypatch, backup):
+    s = setup
+    seed(s, uuid="")
+    if backup == "absent":
+        s.engine._delete_account_credentials("7", EMAIL)
+    else:
+        s.engine._write_account_credentials("7", EMAIL, backup)
+    monkeypatch.setattr(s.engine, "_get_current_identity_triple", lambda strict=False: (EMAIL, ORG, ""))
+    monkeypatch.setattr(s.engine, "_read_active_credentials", Mock(side_effect=AssertionError("live read")))
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == "connected"
+    assert len(s.calls) == 1
+    assert s.engine.read_account_credentials("7", EMAIL) == CREDS
+
+
+@pytest.mark.parametrize("live, refuse_active, error, posted", [
+    ((EMAIL.upper(), ORG.upper(), ""), True, "skip-active", False),
+    (ConfigError("torn config"), True, "transient", False),
+    ((EMAIL, OTHER, ""), True, None, True),
+    (None, True, None, True),
+    ((EMAIL, ORG, ""), False, None, True),
+])
+def test_gate_refuses_to_spend_the_active_accounts_refresh_token_when_asked(setup, monkeypatch, live, refuse_active,
+                                                                            error, posted):
+    s = setup
+    seed(s)
+    monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+    def current(strict=False):
+        assert strict
+        if isinstance(live, Exception):
+            raise live
+        return live
+
+    monkeypatch.setattr(s.engine, "_get_current_identity_triple", current)
+    post = Mock(return_value=code.oauth.RefreshOutcome(REFRESHED, None))
+    monkeypatch.setattr(code.oauth, "try_refresh_oauth_credentials", post)
+    outcome = s.engine.consume_backup_grant("7", EMAIL, CREDS, refuse_active=refuse_active)
+    assert outcome.error == error and post.called is posted
+    assert s.engine.read_account_credentials("7", EMAIL) == (REFRESHED if posted else CREDS)
