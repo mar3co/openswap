@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from openswap.claude_desktop_links import DesktopSignInLinks, MAX_AGE
+from openswap.claude_desktop_links import DesktopSignInLinks, MAX_AGE, RECHECK, RESTORE_TIMEOUT
 from tests.test_claude_desktop_signin import GOOGLE, MAGIC, SSO
 
 
@@ -213,6 +213,18 @@ def test_ordinary_links_go_to_previous_handler_without_scheme_recursion(env):
     env.received.assert_not_called()
 
 
+def test_repeated_ordinary_link_is_forwarded_each_time_but_a_repeated_callback_is_not(env):
+    e = env
+    for _ in range(2):
+        e.router.receive('claude://claude.ai/chat/fixture')
+        e.router.poll()
+    assert e.native.forward.call_count == 2
+    for _ in range(2):
+        e.router.receive(SSO)
+        e.router.poll()
+    assert e.received.call_count == 1
+
+
 def test_disabled_callback_cannot_modify_default_account(env):
     env.enabled[0] = False
     env.router.receive(MAGIC)
@@ -246,41 +258,48 @@ def test_uninstall_preserves_another_handler(monkeypatch):
     native.assert_not_called()
 
 
-@pytest.mark.parametrize('success', [True, False])
-def test_uninstall_restores_only_owned_registration_and_reports_denial(monkeypatch, success):
+@pytest.mark.parametrize('outcome', ['restored', 'denied', 'refused', 'claude_gone'])
+def test_uninstall_restores_only_owned_registration_and_reports_denial(monkeypatch, tmp_path, outcome):
     import sys
     from openswap import claude_desktop_links as links
     from openswap.claude_desktop import ClaudeDesktopError
     n = Native(None, None)
     n.owner = n.application
+    n.saved = tmp_path / 'Claude.app'
+    if outcome != 'claude_gone':
+        n.saved.mkdir()
     def set_handler(path, callback):
-        n.owner = path if success else n.application
-        callback(success)
-    n.set_handler = set_handler
+        if outcome == 'refused':
+            raise ClaudeDesktopError('Could not restore Claude links. Open Claude once to restore its link handling, or reinstall Claude.')
+        n.owner = path if outcome == 'restored' else n.application
+        callback(outcome == 'restored')
+    n.set_handler = Mock(side_effect=set_handler)
     monkeypatch.setattr(links, 'owns_system_handler', lambda: True)
     monkeypatch.setattr(links, 'MacOSLinks', lambda *args: n)
     monkeypatch.setitem(sys.modules, 'Foundation', SimpleNamespace(NSDate=Mock(), NSRunLoop=Mock()))
-    if success:
+    if outcome == 'restored':
         assert links.restore_for_uninstall()
         assert n.owner == n.saved
+    elif outcome == 'claude_gone':
+        assert links.restore_for_uninstall() is False
+        n.set_handler.assert_not_called()
     else:
-        with pytest.raises(ClaudeDesktopError, match='restore Claude links'):
+        with pytest.raises(ClaudeDesktopError, match='restore Claude links') as error:
             links.restore_for_uninstall()
+        assert ('reinstall Claude' in str(error.value)) is (outcome == 'refused')
 
 
-@pytest.mark.parametrize('owner', ['self', 'other_copy', 'claude', 'none'])
-def test_cold_start_handover_guard_uses_exact_registered_bundle(monkeypatch, owner):
+@pytest.mark.parametrize('owner', ['self', 'other_copy', 'claude', 'none', 'not_frozen'])
+def test_cold_start_handover_guard_uses_exact_registered_bundle(monkeypatch, tmp_path, owner):
     import sys
-    from openswap import claude_desktop_links as links
-    bundle = SimpleNamespace(bundleIdentifier=lambda: 'com.opensoft.openswap.dev',
-                             bundlePath=lambda: '/Applications/OpenSwap.app')
-    paths = {'self': '/Applications/OpenSwap.app', 'other_copy': '/other/OpenSwap.app',
-             'claude': '/Applications/Claude.app'}
-    target = None if owner == 'none' else SimpleNamespace(path=lambda: paths[owner])
+    from openswap import bundle, claude_desktop_links as links
+    app = tmp_path / 'OpenSwap.app'
+    monkeypatch.setattr(bundle, 'app_path', lambda: None if owner == 'not_frozen' else app)
+    paths = {'self': str(app), 'other_copy': '/other/OpenSwap.app', 'claude': '/Applications/Claude.app'}
+    target = None if owner in ('none', 'not_frozen') else SimpleNamespace(path=lambda: paths[owner])
     workspace = SimpleNamespace(URLForApplicationToOpenURL_=lambda url: target)
     monkeypatch.setitem(sys.modules, 'AppKit', SimpleNamespace(NSWorkspace=SimpleNamespace(sharedWorkspace=lambda: workspace)))
-    monkeypatch.setitem(sys.modules, 'Foundation', SimpleNamespace(NSBundle=SimpleNamespace(mainBundle=lambda: bundle),
-        NSURL=SimpleNamespace(URLWithString_=lambda value: value)))
+    monkeypatch.setitem(sys.modules, 'Foundation', SimpleNamespace(NSURL=SimpleNamespace(URLWithString_=lambda value: value)))
     assert links.owns_system_handler() is (owner == 'self')
 
 
@@ -301,31 +320,180 @@ def test_nested_native_event_loop_cannot_open_two_choosers(env):
     assert seen == [GOOGLE, MAGIC]
 
 
-@pytest.mark.parametrize('eligible', [True, False])
-def test_native_registers_bundle_and_verifies_eligibility_before_request(monkeypatch, eligible):
+@pytest.mark.parametrize('target', ['eligible', 'openswap', 'claude'])
+def test_native_registers_bundle_and_verifies_eligibility_before_request(monkeypatch, target):
     import sys
     from openswap import claude_desktop_links as links
     from openswap.claude_desktop import ClaudeDesktopError
     calls = []
-    path = Path('/Applications/OpenSwap.app')
+    native = object.__new__(links.MacOSLinks)
+    native.application = Path('/Applications/OpenSwap.app')
+    path = Path('/Applications/Claude.app') if target == 'claude' else native.application
     url = SimpleNamespace(path=lambda: str(path))
     def candidates(_url):
         calls.append('candidates')
-        return [url] if eligible else []
-    workspace = SimpleNamespace(URLsForApplicationsToOpenURL_=candidates,
+        return [url] if target == 'eligible' else []
+    native.workspace = SimpleNamespace(URLsForApplicationsToOpenURL_=candidates,
         setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler_=lambda *args: calls.append('request'))
-    native = object.__new__(links.MacOSLinks)
-    native.workspace = workspace
     monkeypatch.setattr(links, 'register_application', lambda value: calls.append(('register', value)))
     monkeypatch.setitem(sys.modules, 'Foundation', SimpleNamespace(NSURL=SimpleNamespace(
         URLWithString_=lambda value: value, fileURLWithPath_=lambda value: value)))
-    if eligible:
+    if target == 'eligible':
         native.set_handler(path, Mock())
         assert calls == [('register', path), 'candidates', 'request']
     else:
-        with pytest.raises(ClaudeDesktopError, match='Move OpenSwap to Applications'):
+        remedy = 'Move OpenSwap to Applications' if target == 'openswap' else 'Open Claude once.*or reinstall Claude'
+        with pytest.raises(ClaudeDesktopError, match=remedy):
             native.set_handler(path, Mock())
         assert calls == [('register', path), 'candidates']
+
+
+@pytest.mark.parametrize('outcome', ['restored', 'denied', 'refused', 'no_answer'])
+def test_quit_always_finishes_whatever_the_restore_does(env, outcome):
+    from openswap.claude_desktop import ClaudeDesktopError
+    e = env
+    claim(e)
+    if outcome == 'refused':
+        e.native.set_handler = Mock(side_effect=ClaudeDesktopError('Could not restore Claude links. Reinstall Claude.'))
+    done = Mock()
+    e.router.restore(done)
+    if outcome == 'refused':
+        done.assert_called_once()
+        e.error.assert_called_once_with('Could not restore Claude links. Reinstall Claude.')
+        assert not e.router.changing
+        return
+    done.assert_not_called()
+    if outcome == 'no_answer':
+        e.now[0] += RESTORE_TIMEOUT - 1
+        e.router.poll()
+        done.assert_not_called()
+        e.now[0] += 1
+    else:
+        e.native.respond(outcome == 'restored')
+    e.router.poll()
+    done.assert_called_once()
+    assert e.error.call_count == (1 if outcome == 'denied' else 0)
+
+
+def test_quit_during_a_pending_claim_is_bounded_from_the_quit_itself(env):
+    e = env
+    e.router.prepare()
+    e.now[0] = 3
+    e.router.poll()
+    done = Mock()
+    e.router.restore(done)
+    e.now[0] = 3 + RESTORE_TIMEOUT - 2
+    e.native.respond(True)
+    e.router.poll()
+    assert e.native.requests[-1][0] == e.native.saved
+    done.assert_not_called()
+    e.now[0] += 2
+    e.router.poll()
+    done.assert_called_once()
+    e.error.assert_not_called()
+
+
+def test_failed_restore_leaves_the_coordinator_usable(env):
+    e = env
+    claim(e)
+    e.native.set_handler = Mock(side_effect=RuntimeError('native failure'))
+    done = Mock()
+    e.router.restore(done)
+    done.assert_called_once()
+    assert not e.router.changing
+    again = Mock()
+    e.router.restore(again)
+    again.assert_called_once()
+    # Stopped by the quit: a Claude launch alone must not claim again.
+    e.native.set_handler = Mock()
+    e.router.launched()
+    e.now[0] += 3
+    e.router.poll()
+    e.native.set_handler.assert_not_called()
+    e.router.prepare()
+    e.router.receive(GOOGLE)
+    e.now[0] += 3
+    e.router.poll()
+    e.received.assert_called_once()
+
+
+def test_handler_returns_when_no_profile_needs_links_and_comes_back_when_one_does(env):
+    e = env
+    claim(e)
+    e.needed[0] = False
+    e.router.poll()
+    e.now[0] += RECHECK
+    e.router.poll()
+    assert e.native.requests[-1][0] == e.native.saved
+    e.native.respond(True)
+    e.router.poll()
+    assert e.native.current() == e.native.saved
+    e.error.assert_not_called()
+    e.needed[0] = True
+    e.now[0] += RECHECK
+    e.router.poll()
+    e.now[0] += 2
+    e.router.poll()
+    assert e.native.requests[-1][0] == e.native.application
+    assert len(e.native.requests) == 3
+
+
+def test_handler_returns_after_a_claude_launch_reclaims_it_too(env):
+    e = env
+    claim(e)
+    e.needed[0] = False
+    e.now[0] += RECHECK
+    e.router.poll()
+    e.native.respond(True)
+    e.router.poll()
+    e.needed[0] = True
+    e.router.launched()
+    e.now[0] += 2
+    e.router.poll()
+    assert [path for path, _ in e.native.requests] == [e.native.application, e.native.saved, e.native.application]
+
+
+def test_unknown_profile_state_changes_nothing(env):
+    e = env
+    claim(e)
+    e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    e.now[0] += RECHECK
+    e.router.poll()
+    e.router.launched()
+    e.now[0] += 3
+    e.router.poll()
+    assert len(e.native.requests) == 1
+    assert e.native.current() == e.native.application
+    e.error.assert_not_called()
+
+
+def test_a_refused_handback_is_not_retried(env):
+    e = env
+    claim(e)
+    e.needed[0] = False
+    e.now[0] += RECHECK
+    e.router.poll()
+    e.native.respond(False)
+    e.router.poll()
+    e.error.assert_called_once()
+    e.now[0] += RECHECK
+    e.router.poll()
+    assert len(e.native.requests) == 2
+
+
+@pytest.mark.parametrize('reason', ['disabled', 'not_needed'])
+def test_startup_returns_a_handler_kept_from_an_earlier_session(env, reason):
+    e = env
+    e.native.owner = e.native.application
+    (e.enabled if reason == 'disabled' else e.needed)[0] = False
+    e.router.prepare()
+    e.router.poll()
+    assert e.native.requests == [(e.native.saved, e.native.requests[0][1])]
+    e.native.respond(True)
+    e.router.poll()
+    e.now[0] += RECHECK
+    e.router.poll()
+    assert len(e.native.requests) == 1
 
 
 @pytest.mark.parametrize('reason', ['success', 'native_failure', 'no_url'])

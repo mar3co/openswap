@@ -132,24 +132,6 @@ def test_manual_edit_clears_detection_but_lifecycle_preserves_details(setup):
     assert not cleared.email and not cleared.organization
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
-def test_metadata_upgrade_keeps_ids_and_data_without_inventing_identity(setup, version):
-    store, p, desktop, _ = setup
-    row = {"id": p.id, "name": p.name, "archived": False}
-    if version == 2:
-        row["code_account"] = {"store": "a" * 64, "email": "wrong@example.test", "organization": "CLI org"}
-    if version == 3:
-        row.update(badge="8", color="purple")
-    store.registry.write_text(json.dumps({"version": version, "profiles": [row]}))
-    before = (desktop / "Cookies").read_bytes()
-    assert store.get(p.id).email == ""
-    store.update(p.id, email="new@example.test")
-    assert json.loads(store.registry.read_text())["version"] == 6
-    assert (desktop / "Cookies").read_bytes() == before
-    if version == 3:
-        assert store.get(p.id).badge == "8"
-
-
 @pytest.mark.parametrize("changes", [
     {"email": "bad"}, {"email": "bad\n@example.test"}, {"email": []},
     {"organization": "x\u202ey"}, {"organization": "x" * 129},

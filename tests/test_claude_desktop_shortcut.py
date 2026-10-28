@@ -54,19 +54,6 @@ def test_invalid_badges_cannot_change_profiles(store,badge,color):
     assert store.registry.read_bytes()==before
 
 
-@pytest.mark.parametrize('version',[1,2])
-def test_legacy_profiles_migrate_without_account_links_or_data_changes(store,version):
-    p=store.add('Work');data=store.paths(p)[0]/'work';data.write_text('kept')
-    row={'id':p.id,'name':p.name,'archived':False}
-    if version==2: row['code_account']={'store':'a'*64,'email':'same@example.test','organization':'team'}
-    store.registry.write_text(json.dumps({'version':version,'profiles':[row]}))
-    assert store.get(p.id).badge=='1'
-    store.update(p.id,color='green')
-    raw=json.loads(store.registry.read_text())
-    assert raw['version']==6 and 'code_account' not in raw['profiles'][0]
-    assert data.read_text()=='kept'
-
-
 def test_shortcut_uses_stable_profile_and_does_not_launch_or_change_code(store,builder):
     p=store.add('Work')
     result=builder.build(p,badge='2',color='blue')

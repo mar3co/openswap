@@ -90,6 +90,17 @@ def test_invalid_link_does_not_inspect_apps_or_profiles(store, app):
     assert not store.root.exists()
 
 
+def test_send_runs_outside_the_registry_lock(store, app):
+    p = store.add("Work")
+    process_list(app, store, [(33, p)])
+
+    def sender(pid, value, binary):
+        with store._lock():
+            pass
+
+    assert signin.finish_signin(store, p.id, GOOGLE, app=app, sender=sender)["state"] == "signin_sent"
+
+
 def test_native_exception_cannot_expose_callback(store, app):
     profile = store.add("Work")
     process_list(app, store, [(33, profile)])
@@ -139,15 +150,26 @@ def test_native_process_reuse_and_substitution_are_refused(native, reason):
     n.descriptors.descriptorWithString_.assert_not_called()
 
 
-@pytest.mark.parametrize("reason", ["timeout", "no_reply", "handler_error"])
+@pytest.mark.parametrize("reason", ["timeout", "consent", "no_reply", "handler_error"])
 def test_native_delivery_failure_never_retries_or_claims_signin(native, reason):
     n = native
-    if reason == "timeout": n.event.sendEventWithOptions_timeout_error_.return_value = None, GOOGLE
+    if reason == "timeout": n.event.sendEventWithOptions_timeout_error_.return_value = None, Mock(code=Mock(return_value=-1712))
+    if reason == "consent": n.event.sendEventWithOptions_timeout_error_.return_value = None, Mock(code=Mock(return_value=-1743))
     if reason == "no_reply": n.event.sendEventWithOptions_timeout_error_.return_value = None, None
     if reason == "handler_error": n.reply.paramDescriptorForKeyword_.return_value = Mock(int32Value=Mock(return_value=-1708))
     with pytest.raises(ClaudeDesktopError) as error: signin.send_to_process(33, GOOGLE, n.binary)
     assert "fixture-secret" not in str(error.value)
+    assert ("Automation" in str(error.value)) is (reason in ("timeout", "consent"))
     n.event.sendEventWithOptions_timeout_error_.assert_called_once()
+
+
+@pytest.mark.parametrize("code", [-1743, -1744, -1712, -600, None])
+def test_consent_problems_name_the_automation_setting_and_a_restart(code):
+    message = signin.delivery_error(code)
+    consent = code in (-1743, -1744, -1712)
+    assert ("System Settings → Privacy & Security → Automation" in message) is consent
+    assert ("restart sign-in" in message) is consent
+    assert ("try again" in message) is not consent
 
 
 def test_unbound_callback_asks_for_profile_without_exposing_link_or_claiming_auth(menu, store, app, monkeypatch):

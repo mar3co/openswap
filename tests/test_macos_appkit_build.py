@@ -1,6 +1,7 @@
 """Build-policy regressions: Python's SDK must not choose OpenSwap's tabs."""
 
 from pathlib import Path
+import plistlib
 import runpy
 import sys
 from types import ModuleType, SimpleNamespace
@@ -147,6 +148,16 @@ def test_dev_and_release_use_the_same_native_appearance(monkeypatch, tmp_path, p
     assert release["info_plist"]["CFBundleURLTypes"] == [{
         "CFBundleURLName": "Claude profile sign-in", "CFBundleURLSchemes": ["claude"],
         "CFBundleTypeRole": "Viewer", "LSHandlerRank": "Alternate"}]
+
+
+def test_the_app_may_send_apple_events_and_says_why(monkeypatch, tmp_path):
+    """Sign-in delivery is an Apple event to Claude: the hardened runtime needs
+    the entitlement, and the consent prompt shows the usage description."""
+    release = execute_spec(monkeypatch, tmp_path, dev=False, python_sdk=SDK)
+    assert release["info_plist"]["NSAppleEventsUsageDescription"] == (
+        "OpenSwap delivers Claude sign-in links to the Claude profile you choose.")
+    entitlements = plistlib.loads((PACKAGING / "entitlements.plist").read_bytes())
+    assert entitlements["com.apple.security.automation.apple-events"] is True
 
 
 @pytest.mark.parametrize("dev", [False, True])

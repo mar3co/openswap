@@ -21,6 +21,11 @@ OWNER_IDS = {"com.opensoft.openswap", "com.opensoft.openswap.dev"}
 PREVIOUS_KEY = "ClaudeLinksPreviousApplication"
 PAUSED_KEY = "ClaudeLinksPermissionPaused"
 MAX_AGE = 120
+# How long Quit waits for macOS to answer a handler change before leaving the
+# consent sheet to the user, and how often idle ownership is reconsidered.
+RESTORE_TIMEOUT = 10
+RECHECK = 5
+RESTORE_FAILED = "Could not restore Claude links. Open Claude once before signing in again."
 
 
 def register_application(path):
@@ -54,32 +59,48 @@ def register_application(path):
 
 
 def owns_system_handler():
-    """Keep the registered copy alive to receive a cold-start URL event."""
+    """Whether the system claude:// handler is this install's OpenSwap.app.
+
+    Decided by the bundle this process runs from, not the process's main
+    bundle, so the CLI and the app agree. The registered copy must stay alive
+    to receive a cold-start URL event.
+    """
+    from openswap import bundle
+    app = bundle.app_path()
+    if app is None:
+        return False
     try:
         from AppKit import NSWorkspace
-        from Foundation import NSBundle, NSURL
-        bundle = NSBundle.mainBundle()
+        from Foundation import NSURL
         target = NSWorkspace.sharedWorkspace().URLForApplicationToOpenURL_(NSURL.URLWithString_("claude://"))
-        return (bundle.bundleIdentifier() in OWNER_IDS and target is not None
-                and Path(target.path()).resolve() == Path(bundle.bundlePath()).resolve())
+        return target is not None and Path(target.path()).resolve() == app.resolve()
     except Exception:
         return False
 
 
 def restore_for_uninstall():
-    """Undo only this packaged copy's registration before it is removed."""
+    """Undo only this install's registration before it is removed.
+
+    False when there is nothing to undo, including when the handler to return
+    links to is gone. Raises with the remedy when macOS refuses or never answers.
+    """
     if not owns_system_handler():
         return False
     from Foundation import NSDate, NSRunLoop
     native = MacOSLinks(lambda _value: None, lambda: None)
+    previous = native.previous()
+    if not previous.is_dir():
+        return False
     result = []
     try:
-        native.set_handler(native.previous(), result.append)
-        deadline = time.monotonic() + 10
+        native.set_handler(previous, result.append)
+        deadline = time.monotonic() + RESTORE_TIMEOUT
         while not result and time.monotonic() < deadline:
             NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.05))
         if not result or not result[0] or native.current() == native.application:
             raise ValueError
+    except ClaudeDesktopError:
+        raise
     except Exception:
         raise ClaudeDesktopError("Could not restore Claude links. Open Claude once to restore its link handling.") from None
     return True
@@ -166,7 +187,9 @@ class MacOSLinks:
         if Path(path).resolve() not in {Path(url.path()).resolve() for url in candidates}:
             # Launch Services records temporary bundles but excludes them from
             # URL binding. LSRegisterURL can return success in that case.
-            raise ClaudeDesktopError("Move OpenSwap to Applications, reopen it, then choose Reconnect sign-in in the profile menu.")
+            if Path(path).resolve() == self.application:
+                raise ClaudeDesktopError("Move OpenSwap to Applications, reopen it, then choose Reconnect sign-in in the profile menu.")
+            raise ClaudeDesktopError("Could not restore Claude links. Open Claude once to restore its link handling, or reinstall Claude.")
         self.workspace.setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler_(
             NSURL.fileURLWithPath_(str(path)), "claude", lambda error: completed(error is None))
 
@@ -194,6 +217,13 @@ class DesktopSignInLinks:
         self.stopping = False
         self.dispatching = False
         self.restore_callbacks = []
+        self.restore_deadline = None
+        # Whether this app is the handler: unknown until checked, then tracked
+        # through its own claims and restores.
+        self.held = None
+        # Handed back because no profile needed links; claims again once one does.
+        self.released = False
+        self.recheck_at = 0.0
         self.native = native_factory(self.receive, self.launched)
 
     def receive(self, value):
@@ -204,10 +234,18 @@ class DesktopSignInLinks:
         except queue.Full:
             pass
 
+    def _needed(self):
+        """True, False, or None when the store cannot say; only False releases."""
+        try:
+            return bool(self.needed())
+        except Exception:
+            return None
+
     def launched(self):
         # Claude registers its scheme during startup. Wait for that registration
         # before requesting ownership, including when a Dock shortcut starts it.
-        if self.enabled() and self.needed() and not self.stopping:
+        if self.enabled() and self._needed() and not self.stopping:
+            self.released = False
             self.prepare_at = self.clock() + 2
 
     def prepare(self, *, retry=False):
@@ -217,7 +255,7 @@ class DesktopSignInLinks:
         self.launched()
 
     def _claim(self):
-        if not self.enabled() or not self.needed() or self.stopping or self.native.paused():
+        if not self.enabled() or not self._needed() or self.stopping or self.native.paused():
             return
         current = self.native.current()
         if current == self.native.application:
@@ -245,6 +283,7 @@ class DesktopSignInLinks:
                 break
         if completed:
             self.restore_callbacks.append(completed)
+            self.restore_deadline = self.clock() + RESTORE_TIMEOUT
         if self.changing:
             return  # a pending grant must be undone before quitting/disabling
         try:
@@ -252,14 +291,44 @@ class DesktopSignInLinks:
                 self.changing = True
                 self.native.set_handler(self.native.previous(), lambda ok: self.completions.put(("restore", ok)))
                 return
+            self.held = False
+        except ClaudeDesktopError as exc:
+            self.changing = False
+            self.show_error(str(exc))
         except Exception:
-            self.show_error("Could not restore Claude links. Open Claude once before signing in again.")
+            self.changing = False
+            self.show_error(RESTORE_FAILED)
         self._restored()
 
     def _restored(self):
+        self.restore_deadline = None
+        if self.released:
+            self.stopping = False
         callbacks, self.restore_callbacks = self.restore_callbacks, []
         for callback in callbacks:
             callback()
+
+    def _recheck(self):
+        """Hand the handler back while no profile needs links; take it again when one does."""
+        if self.changing or self.stopping or (self.held is False and not self.released):
+            return
+        needed = self._needed() if self.enabled() else False
+        if needed is None:
+            return
+        if needed:
+            if self.released:
+                self.launched()
+            return
+        if self.released:
+            return  # one attempt per release: never re-prompt on a refusal
+        if self.held is None:
+            try:
+                self.held = self.native.current() == self.native.application
+            except Exception:
+                return
+        if self.held:
+            self.released = True
+            self.restore()
 
     def poll(self, *, idle=True):
         try:
@@ -273,15 +342,25 @@ class DesktopSignInLinks:
                     ok = ok and self.native.current() == self.native.application
                 except Exception:
                     ok = False
+                self.held = ok
                 self.native.pause(not ok)
                 if self.stopping or not self.enabled():
                     self.restore()
                 elif not ok:
                     self.show_error("Automatic sign-in is paused. Choose Reconnect sign-in in the profile menu to allow OpenSwap to open Claude links.")
             else:
-                if not ok:
-                    self.show_error("Could not restore Claude links. Open Claude once before signing in again.")
+                if ok:
+                    self.held = False
+                else:
+                    self.show_error(RESTORE_FAILED)
                 self._restored()
+        if self.restore_callbacks and self.restore_deadline is not None and self.clock() >= self.restore_deadline:
+            # The consent sheet stays with the user; Quit cannot wait on it.
+            self.changing = False
+            self._restored()
+        if self.clock() >= self.recheck_at:
+            self.recheck_at = self.clock() + RECHECK
+            self._recheck()
         if self.prepare_at is not None and self.clock() >= self.prepare_at and not self.changing:
             self.prepare_at = None
             try:
@@ -309,11 +388,8 @@ class DesktopSignInLinks:
         except queue.Empty:
             return
         now = self.clock()
-        self.seen = {key: at for key, at in self.seen.items() if now - at < MAX_AGE}
-        digest = hashlib.sha256(value.encode("ascii")).digest()
-        if now - received > MAX_AGE or digest in self.seen:
+        if now - received > MAX_AGE:
             return
-        self.seen[digest] = now
         try:
             # An unrecognized auth route is never sent to an arbitrary profile.
             parsed = urlsplit(value)
@@ -325,6 +401,12 @@ class DesktopSignInLinks:
                 else:
                     self.native.forward(value)
                 return
+            # Only one-time callbacks are deduplicated; an ordinary link may repeat.
+            self.seen = {key: at for key, at in self.seen.items() if now - at < MAX_AGE}
+            digest = hashlib.sha256(value.encode("ascii")).digest()
+            if digest in self.seen:
+                return
+            self.seen[digest] = now
             if not self.enabled() or self.stopping:
                 self.show_error("Open the Claude Desktop tab and start again from the intended profile.")
                 return

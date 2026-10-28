@@ -4187,3 +4187,42 @@ def test_card_menu_edits_reload_the_open_popover_once_the_refresh_lands():
     assert "edit_landed = self._reload_after_refresh and not self._refresh_pending" in tail
     assert "or edit_landed" in tail
     assert "self._reload_after_refresh = False" in tail and "self._hold_reload_pending = True" in tail
+
+
+def _quitting_app_with_links(quits):
+    from tests.menubar_harness import extract_class
+
+    scope = dict(vars(menubar))
+    scope["rumps"] = SimpleNamespace(quit_application=lambda: quits.append(1))
+    app = extract_class(menubar.__file__, "MenuBarApp", {"on_quit", "_finish_quit"}, scope)()
+    pending = []
+    links = SimpleNamespace(restore=lambda done: pending.append(done))
+    app._claude_desktop_profiles = SimpleNamespace(signin_links=links, suspend_checks=lambda: None)
+    app._status_icon_animator = None
+    app._login_session = None
+    app._claude_login = None
+    app._stop_chatgpt_auto_monitor = lambda clear_pending: None
+    app._stop_engine = lambda: None
+    app.switcher = SimpleNamespace(_logger=SimpleNamespace(warning=lambda *a, **k: None))
+    return app, pending
+
+
+def test_quit_waits_for_the_link_handback_once_and_a_second_quit_goes_right_away(monkeypatch):
+    monkeypatch.setattr("openswap.launch_agent.unload_own_job", lambda **k: True)
+    quits = []
+    app, pending = _quitting_app_with_links(quits)
+    app.on_quit(None)
+    assert len(pending) == 1 and quits == []
+    app.on_quit(None)
+    assert len(pending) == 1 and quits == [1]
+    pending[0]()
+    assert quits == [1]
+
+
+def test_quit_finishes_when_the_link_handback_completes(monkeypatch):
+    monkeypatch.setattr("openswap.launch_agent.unload_own_job", lambda **k: True)
+    quits = []
+    app, pending = _quitting_app_with_links(quits)
+    app.on_quit(None)
+    pending[0]()
+    assert quits == [1]

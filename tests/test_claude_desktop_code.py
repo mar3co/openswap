@@ -422,18 +422,6 @@ def test_usage_is_shared_only_for_the_exact_code_slot_and_org(setup):
     assert desktop_profile_height({**p, "code_usage": "Usage: 5h 23%"}) == 116
 
 
-def test_v5_labels_do_not_become_authoritative_code_identities(setup):
-    s = setup
-    raw = json.loads(s.store.registry.read_text())
-    raw["version"] = 5
-    for row in raw["profiles"]:
-        for key in ("account_uuid", "organization_uuid", "code_setup_key", "code_setup_state", "detected_login"):
-            row.pop(key)
-    s.store.registry.write_text(json.dumps(raw))
-    s.connector.poll(enabled=True)
-    assert not s.calls and not s.store.get(s.profile.id).account_uuid
-
-
 def test_stale_detected_identity_cannot_start_code_authorization(setup):
     s = setup
     s.connector.observe.return_value = "new Desktop login, not yet detected"

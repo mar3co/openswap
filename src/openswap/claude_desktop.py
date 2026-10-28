@@ -18,7 +18,7 @@ import tempfile
 import threading
 import unicodedata
 import uuid
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 from xml.parsers.expat import ExpatError
@@ -29,6 +29,12 @@ from openswap.locking import FileLock
 APP_PATH = Path("/Applications/Claude.app")
 BUNDLE_ID = "com.anthropic.claudefordesktop"
 TEAM_ID = "Q6L2SF6YDW"
+# codesign evaluates this against the signature itself, so a lookalike that
+# copies the identifier text cannot pass without Anthropic's certificate.
+REQUIREMENT = f'anchor apple generic and identifier "{BUNDLE_ID}" and certificate leaf[subject.OU] = "{TEAM_ID}"'
+REGISTRY_VERSION = 6
+# A second open of the same profile waits this long for the first to finish.
+LAUNCH_LOCK_TIMEOUT = 3
 PROFILE_NOTICE = (
     "Claude Desktop profiles open side by side and keep separate sign-ins. "
     "Sign in and check the account inside each profile. "
@@ -100,23 +106,6 @@ def account_label(value: str, *, email: bool = False) -> str:
     return value
 
 
-def _validate_legacy_link(value) -> None:
-    # Read previews of the old linked-selection format without carrying any
-    # account association into the independent launcher. Never use its identity.
-    if value is None:
-        return
-    if not isinstance(value, dict) or set(value) != {"store", "email", "organization"}:
-        raise ValueError("Invalid legacy link")
-    if not isinstance(value["store"], str) or not re.fullmatch(r"[a-f0-9]{64}", value["store"]):
-        raise ValueError("Invalid legacy store")
-    for key in ("email", "organization"):
-        text = value[key]
-        if not isinstance(text, str) or len(text) > 512 or any(unicodedata.category(c).startswith("C") for c in text):
-            raise ValueError("Invalid legacy identity")
-    if not value["email"]:
-        raise ValueError("Missing legacy identity")
-
-
 @dataclass(frozen=True)
 class Profile:
     id: str
@@ -150,16 +139,17 @@ class DesktopProfiles:
         self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
         return _plain(self.root, directory=True)
 
-    def _lock(self) -> FileLock:
+    def _lock(self, name: str = "profiles.lock", *, timeout: float = 0.5) -> FileLock:
+        """The registry lock guards metadata only; launches take ``launch.lock``."""
         self._root(create=True)
-        path = self.root / "profiles.lock"
+        path = self.root / name
         if not _plain(path):
             try:
                 fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(fd)
             except FileExistsError:
                 _plain(path)
-        return FileLock(path, timeout=0.5)
+        return FileLock(path, timeout=timeout)
 
     def keychain_paused(self) -> bool:
         """A durable stop flag, shared by all Desktop profiles in this store."""
@@ -189,21 +179,15 @@ class DesktopProfiles:
             if self.registry.stat().st_size > 256_000:
                 raise ValueError
             data = json.loads(self.registry.read_text(encoding="utf-8"))
-            if not isinstance(data, dict) or set(data) != {"version", "profiles"} or type(data["version"]) is not int or data["version"] not in (1, 2, 3, 4, 5, 6):
+            if not isinstance(data, dict) or set(data) != {"version", "profiles"} or data["version"] != REGISTRY_VERSION:
                 raise ValueError
             rows = data["profiles"]
             if not isinstance(rows, list) or len(rows) > 100:
                 raise ValueError
             profiles = []
             ids, names = set(), set()
-            for index, row in enumerate(rows):
-                extra = {1: set(), 2: {"code_account"}, 3: {"badge", "color"},
-                         4: {"badge", "color", "email", "organization", "detected_at"},
-                         5: {"badge", "color", "email", "organization", "detected_at", "kind", "auto_detect"},
-                         6: {"badge", "color", "email", "organization", "detected_at", "kind", "auto_detect",
-                             "account_uuid", "organization_uuid", "code_setup_key", "code_setup_state", "detected_login"}}[data["version"]]
-                keys = {"id", "name", "archived"} | extra
-                if not isinstance(row, dict) or set(row) != keys:
+            for row in rows:
+                if not isinstance(row, dict) or set(row) != {f.name for f in fields(Profile)}:
                     raise ValueError
                 pid = row["id"]
                 name = _name(row["name"])
@@ -213,27 +197,21 @@ class DesktopProfiles:
                     raise ValueError
                 ids.add(pid)
                 names.add(name.casefold())
-                if data["version"] == 2:
-                    _validate_legacy_link(row["code_account"])
-                badge, color = (row["badge"], row["color"]) if data["version"] >= 3 else (str(index + 1), "orange")
-                validate_badge(badge, color)
-                email, organization, detected_at = "", "", ""
-                if data["version"] >= 4:
-                    email = account_label(row["email"], email=True)
-                    organization = account_label(row["organization"])
-                    detected_at = row["detected_at"]
-                    if email != row["email"] or organization != row["organization"]:
-                        raise ValueError
-                    self._validate_detection_time(detected_at, email, organization)
-                kind = row["kind"] if data["version"] >= 5 else "managed"
-                automatic = row["auto_detect"] if data["version"] >= 5 else not ((email or organization) and not detected_at)
-                if kind not in ("managed", "default") or type(automatic) is not bool:
+                validate_badge(row["badge"], row["color"])
+                email = account_label(row["email"], email=True)
+                organization = account_label(row["organization"])
+                detected_at = row["detected_at"]
+                if email != row["email"] or organization != row["organization"]:
                     raise ValueError
-                if kind == "default" and any(p.kind == "default" for p in profiles):
+                self._validate_detection_time(detected_at, email, organization)
+                if row["kind"] not in ("managed", "default") or type(row["auto_detect"]) is not bool:
                     raise ValueError
-                code_identity = {k: row[k] for k in ("account_uuid", "organization_uuid", "code_setup_key", "code_setup_state", "detected_login")} if data["version"] >= 6 else {}
+                if row["kind"] == "default" and any(p.kind == "default" for p in profiles):
+                    raise ValueError
+                code_identity = {k: row[k] for k in ("account_uuid", "organization_uuid", "code_setup_key", "code_setup_state", "detected_login")}
                 self._validate_code_identity(detected_at=detected_at, **code_identity)
-                profiles.append(Profile(pid, name, row["archived"], badge, color, email, organization, detected_at, kind, automatic, **code_identity))
+                profiles.append(Profile(pid, name, row["archived"], row["badge"], row["color"], email, organization,
+                                        detected_at, row["kind"], row["auto_detect"], **code_identity))
             return [p for p in profiles if include_archived or not p.archived]
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
             raise ClaudeDesktopError("Claude Desktop profile metadata is invalid. Restore profiles.json from a backup; it has not been replaced.") from exc
@@ -306,13 +284,24 @@ class DesktopProfiles:
         fd, raw = tempfile.mkstemp(prefix=".profiles-", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 6, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
+                json.dump({"version": REGISTRY_VERSION, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(raw, self.registry)
         finally:
             Path(raw).unlink(missing_ok=True)
+        # The rename is in place either way; the directory sync only hastens durability.
+        try:
+            dir_fd = os.open(self.root, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(dir_fd)
 
     def add(self, name: str) -> Profile:
         name = _name(name)
@@ -412,9 +401,19 @@ class DesktopProfiles:
         with self._lock():
             profile = self.get(identifier)
             desktop, code = self._directories(profile)
-            result = app.open(desktop, code, existing_only=True) if existing_only else app.open(desktop, code)
-            return {**result, "profile": asdict(profile), "app_version": info["version"],
-                    "identity_verified": False, "experimental": True}
+        launch = self._lock("launch.lock", timeout=LAUNCH_LOCK_TIMEOUT)
+        if launch.acquire():
+            try:
+                result = app.open(desktop, code, existing_only=True) if existing_only else app.open(desktop, code)
+            finally:
+                launch.release()
+        else:
+            # Another open of some profile is still launching: not an error.
+            # The same profile shows up as running once its launch is through.
+            pid = app._running(app.launch_argv(desktop, code), desktop)
+            result = {"state": "already_running", "pid": pid} if pid is not None else {"state": "already_opening", "pid": None}
+        return {**result, "profile": asdict(profile), "app_version": info["version"],
+                "identity_verified": False, "experimental": True}
 
 
 def launch_environment(code: Path | None, source: dict[str, str] | None = None) -> dict[str, str]:
@@ -444,6 +443,9 @@ class ClaudeDesktopApp:
         self.platform = sys.platform if platform is None else platform
         self._validation_stamp = None
 
+    def launch_argv(self, desktop: Path, code: Path | None) -> list[str]:
+        return [str(self.binary)] if code is None else [str(self.binary), f"--user-data-dir={desktop}"]
+
     def _stamp(self) -> tuple:
         paths = (self.path / "Contents" / "Info.plist", self.binary,
                  self.path / "Contents" / "Resources" / "app.asar",
@@ -467,12 +469,9 @@ class ClaudeDesktopApp:
             info = plistlib.loads((self.path / "Contents" / "Info.plist").read_bytes())
             if not isinstance(info, dict) or info.get("CFBundleIdentifier") != BUNDLE_ID or info.get("CFBundleExecutable") != "Claude":
                 raise ClaudeDesktopError("The installed app is not the expected Claude Desktop application.")
-            verified = self.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(self.path)],
+            verified = self.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", f"-R={REQUIREMENT}", str(self.path)],
                                 capture_output=True, text=True, timeout=30)
-            details = self.run(["/usr/bin/codesign", "-d", "--verbose=4", str(self.path)],
-                               capture_output=True, text=True, timeout=10)
-            values = dict(line.split("=", 1) for line in details.stderr.splitlines() if "=" in line)
-            if verified.returncode or details.returncode or values.get("Identifier") != BUNDLE_ID or values.get("TeamIdentifier") != TEAM_ID:
+            if verified.returncode:
                 raise ClaudeDesktopError("Claude's publisher signature could not be verified. Reinstall Claude from Anthropic and try again.")
             version = info.get("CFBundleShortVersionString")
             if not isinstance(version, str) or not version:
@@ -537,7 +536,7 @@ class ClaudeDesktopApp:
         return matches[0] if matches else None
 
     def open(self, desktop: Path, code: Path | None, *, existing_only=False) -> dict:
-        argv = [str(self.binary)] if code is None else [str(self.binary), f"--user-data-dir={desktop}"]
+        argv = self.launch_argv(desktop, code)
         pid = self._running(argv, desktop)
         try:
             if self._validation_stamp is None or self._validation_stamp != self._stamp():
@@ -619,8 +618,10 @@ def main(argv: list[str]) -> int:
                 try:
                     from openswap.claude_desktop_menu import focus_profile
                     focus_profile(data["pid"])
+                except ImportError:
+                    pass  # the CLI without AppKit: the window stays where it is
                 except Exception:
-                    pass
+                    data["focus_warning"] = "Could not bring the profile window forward. Click it in the Dock."
         else:
             values = {"name": args.name} if args.action == "rename" else {"archived": args.action == "archive"}
             data = {"profile": asdict(store.update(args.profile, **values)), "state": args.action}
@@ -640,12 +641,15 @@ def main(argv: list[str]) -> int:
         elif args.action == "open":
             if data["state"] == "not_running":
                 print(f"{data['profile']['name']} is not running.")
+            elif data["state"] == "already_opening":
+                print(f"{data['profile']['name']} is already opening.")
             else:
                 verb = "is already running" if data["state"] == "already_running" else "was launched"
                 print(f"{data['profile']['name']} {verb} (PID {data['pid']}). Check the account in Claude; sign in there on first use.")
                 print(PROFILE_NOTICE)
-            if data.get("dock_warning"):
-                print(data["dock_warning"])
+            for key in ("dock_warning", "focus_warning"):
+                if data.get(key):
+                    print(data[key])
         else:
             print(f"{data['profile']['name']}: {data['state']}. Profile data is kept.")
             if args.action == "add":
@@ -653,8 +657,13 @@ def main(argv: list[str]) -> int:
         return 0
     except (ClaudeSwitchError, OSError) as exc:
         message = str(exc) if isinstance(exc, ClaudeSwitchError) else "Could not access Claude Desktop profile storage. Check permissions and retry."
-        if args.json:
-            print(json.dumps({"ok": False, "error": message}))
-        else:
-            print(message, file=sys.stderr)
-        return 1
+    except Exception:
+        if not getattr(args, "from_launcher", False):
+            raise
+        message = "Could not open this Claude profile. Open it from the OpenSwap menu to see details."
+    if args.json:
+        print(json.dumps({"ok": False, "error": message}))
+    # The launcher shows stderr when the command fails, never stdout.
+    if not args.json or getattr(args, "from_launcher", False):
+        print(message, file=sys.stderr)
+    return 1

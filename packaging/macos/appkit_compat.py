@@ -9,21 +9,23 @@
 APPKIT_SDK = (26, 2, 0)
 
 
-def check_appkit_sdk(executable, osx):
-    """Fail the build if a later packaging step undid the shared SDK policy."""
+def _require_single_arch(executable, osx):
+    # PyInstaller's SDK getter/setter handles only the first slice.
     _fat, architectures = osx.get_binary_architectures(executable)
     if len(architectures) != 1 or architectures[0] not in {"arm64", "x86_64"}:
-        # PyInstaller's SDK getter/setter handles only the first slice.
         raise RuntimeError("OpenSwap's AppKit policy requires one arm64 or x86_64 executable")
+
+
+def check_appkit_sdk(executable, osx):
+    """Fail the build if a later packaging step undid the shared SDK policy."""
+    _require_single_arch(executable, osx)
     if osx.get_macos_sdk_version(executable) != APPKIT_SDK:
         raise RuntimeError(f"OpenSwap's AppKit SDK must be {APPKIT_SDK}: {executable}")
 
 
 def normalize_appkit_sdk(executable, osx):
     """Apply after EXE, before COLLECT/BUNDLE and final distribution signing."""
-    _fat, architectures = osx.get_binary_architectures(executable)
-    if len(architectures) != 1 or architectures[0] not in {"arm64", "x86_64"}:
-        raise RuntimeError("OpenSwap's AppKit policy requires one arm64 or x86_64 executable")
+    _require_single_arch(executable, osx)
     minimum = osx.macosx_version_min(executable)
     if osx.get_macos_sdk_version(executable) != APPKIT_SDK:
         osx.set_macos_sdk_version(executable, *APPKIT_SDK)

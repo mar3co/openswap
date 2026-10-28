@@ -3735,12 +3735,18 @@ def run(switcher, codex=None) -> int:
         def on_quit(self, _sender):
             profiles = getattr(self, "_claude_desktop_profiles", None)
             links = getattr(profiles, "signin_links", None)
-            if links is not None:
+            # The first Quit hands Claude links back first (bounded by the
+            # coordinator); a second Quit while that waits quits right away.
+            if links is not None and not getattr(self, "_quit_pending", False):
+                self._quit_pending = True
                 links.restore(lambda: self._finish_quit(_sender))
                 return
             self._finish_quit(_sender)
 
         def _finish_quit(self, _sender):
+            if getattr(self, "_quit_finished", False):
+                return
+            self._quit_finished = True
             if getattr(self, "_claude_desktop_profiles", None) is not None:
                 self._claude_desktop_profiles.suspend_checks()
             if self._status_icon_animator is not None:

@@ -9,6 +9,7 @@ here; nothing touches a real LaunchAgent or file outside ``tmp_path``.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import plistlib
 import shlex
@@ -17,10 +18,12 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from openswap import cli, launch_agent, macos_keychain, menubar_instance, uninstall
+from openswap.claude_desktop_dock import tile_path
 from openswap.exceptions import ClaudeSwitchError
 from openswap.menubar_display import MenuBarSettings, menubar_settings_path
 
@@ -300,6 +303,162 @@ class TestRemoveIntegrations:
         monkeypatch.setattr("openswap.widget_install.uninstall_widget", failing)
         removal = uninstall.remove_integrations(home=home, uid=501)
         assert removal.failed == [] and "widget" not in removal.removed
+
+
+class FakeDock:
+    def __init__(self, apps):
+        self.apps = apps
+        self.managed = Mock(return_value=False)
+        self.refresh = Mock()
+        self.writes: list = []
+
+    def snapshot(self):
+        return copy.deepcopy(self.apps)
+
+    def write(self, apps):
+        self.writes.append(copy.deepcopy(apps))
+        self.apps = copy.deepcopy(apps)
+
+
+def tile(path, guid=1):
+    return {"GUID": guid, "tile-type": "file-tile", "tile-data": {
+        "file-data": {"_CFURLString": Path(path).as_uri() + "/", "_CFURLStringType": 15}}}
+
+
+def launcher(folder, name, profile_id, root, *, bundle_id=None, marker=None):
+    """A bundle shaped like create_shortcut's output: only its plist matters here."""
+    path = folder / f"Claude {name}.app"
+    (path / "Contents").mkdir(parents=True)
+    info = {"CFBundleIdentifier": bundle_id or f"com.opensoft.openswap.claude-profile.{profile_id}",
+            "OpenSwapProfile": marker if marker is not None else {"version": 1, "profile": profile_id, "root": str(root)}}
+    (path / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info))
+    return path
+
+
+@pytest.fixture
+def profile_mac(mac, monkeypatch, tmp_path):
+    """The mac fixture's home as this Mac's own, with the Dock faked and the
+    profile store elsewhere under tmp_path (absent until a test makes it)."""
+    home, _agents, _seen, state = mac
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr("openswap.claude_desktop_links.restore_for_uninstall", lambda: False)
+    root = tmp_path / "store"
+    monkeypatch.setattr("openswap.claude_desktop.default_root", lambda: root)
+    dock = FakeDock([tile("/Applications/Claude.app", 1), tile("/Applications/Other.app", 2)])
+    monkeypatch.setattr(uninstall, "_dock", lambda: dock)
+    return SimpleNamespace(home=home, folder=home / "Applications" / "OpenSwap Profiles", root=root, dock=dock, state=state)
+
+
+class TestClaudeDesktopCleanup:
+    def test_owned_launchers_their_tiles_and_the_empty_folder_go(self, profile_mac):
+        m = profile_mac
+        m.root.mkdir()
+        work = launcher(m.folder, "Work", "a" * 32, m.root)
+        launcher(m.folder, "Personal", "b" * 32, m.root)
+        (m.folder / ".openswap-shortcuts.lock").touch()
+        m.dock.apps.insert(1, tile(work, 3))
+        removal = uninstall.remove_integrations(home=m.home, uid=501)
+        assert removal.removed == ["Claude profile shortcuts"]
+        assert removal.failed == [] and removal.warnings == []
+        assert not m.folder.exists()
+        assert [tile_path(row) for row in m.dock.apps] == [Path("/Applications/Claude.app").resolve(),
+                                                           Path("/Applications/Other.app").resolve()]
+        m.dock.refresh.assert_called_once()
+        [backup] = list((m.root / "dock-backups").iterdir())
+        assert plistlib.loads(backup.read_bytes())["persistent-apps"][1] == tile(work, 3)
+        assert not (m.root / "profiles.json").exists() and not (m.root / "profiles.lock").exists()
+
+    def test_only_bundles_with_openswap_marker_go_and_the_folder_then_stays(self, profile_mac, monkeypatch):
+        m = profile_mac
+        foreign = m.folder / "Other.app"
+        (foreign / "Contents").mkdir(parents=True)
+        (foreign / "Contents" / "Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": "com.example.other"}))
+        lookalike = launcher(m.folder, "Fake", "c" * 32, m.root, bundle_id="com.example.fake")
+        broken = launcher(m.folder, "Broken", "d" * 32, m.root, marker="not a marker")
+        stray = m.folder / "notes.txt"
+        stray.write_text("mine")
+        monkeypatch.setattr(uninstall, "_dock", Mock(side_effect=AssertionError("the Dock was read")))
+        removal = uninstall.remove_integrations(home=m.home, uid=501)
+        assert removal.removed == [] and removal.failed == [] and removal.warnings == []
+        assert foreign.is_dir() and lookalike.is_dir() and broken.is_dir() and stray.exists()
+
+    def test_a_launcher_that_will_not_delete_fails_the_step_and_keeps_its_tile(self, profile_mac, monkeypatch):
+        m = profile_mac
+        work = launcher(m.folder, "Work", "a" * 32, m.root)
+        stuck = launcher(m.folder, "Stuck", "b" * 32, m.root)
+        m.dock.apps += [tile(work, 3), tile(stuck, 4)]
+        real = shutil.rmtree
+
+        def rmtree(path, *args, **kwargs):
+            if Path(path) == stuck:
+                raise OSError("Operation not permitted")
+            real(path, *args, **kwargs)
+
+        monkeypatch.setattr(uninstall.shutil, "rmtree", rmtree)
+        removal = uninstall.remove_integrations(home=m.home, uid=501)
+        assert removal.removed == [] and removal.warnings == []
+        [failure] = removal.failed
+        assert failure.startswith("Claude profile shortcuts: could not delete Claude Stuck.app")
+        assert not work.exists() and stuck.is_dir() and m.folder.is_dir()
+        assert [tile_path(row) for row in m.dock.apps][-1] == stuck.resolve() and len(m.dock.apps) == 3
+
+    @pytest.mark.parametrize("trouble", ["managed", "changed", "refresh"])
+    def test_dock_trouble_is_a_warning_not_a_failure(self, profile_mac, trouble):
+        m = profile_mac
+        work = launcher(m.folder, "Work", "a" * 32, m.root)
+        m.dock.apps.append(tile(work, 3))
+        if trouble == "managed":
+            m.dock.managed.return_value = True
+        if trouble == "changed":
+            snapshots = iter([copy.deepcopy(m.dock.apps), [tile("/Applications/Claude.app", 1)]])
+            m.dock.snapshot = lambda: next(snapshots)
+        if trouble == "refresh":
+            m.dock.refresh.side_effect = ClaudeSwitchError("Shortcuts were saved. Reopen the Dock to refresh their icons.")
+        removal = uninstall.remove_integrations(home=m.home, uid=501)
+        assert removal.removed == ["Claude profile shortcuts"] and removal.failed == []
+        [warning] = removal.warnings
+        assert "Dock" in warning
+        assert not m.folder.exists()
+        assert (m.dock.writes == []) is (trouble != "refresh")
+
+    def test_the_dock_backup_never_creates_the_profile_store(self, profile_mac):
+        m = profile_mac
+        work = launcher(m.folder, "Work", "a" * 32, m.root)
+        m.dock.apps.append(tile(work, 3))
+        removal = uninstall.remove_integrations(home=m.home, uid=501)
+        assert removal.warnings == [] and not m.root.exists()
+        [backup] = (m.home / "Library" / "Logs").glob("com.opensoft.openswap.dock-backup.*.plist")
+        assert len(plistlib.loads(backup.read_bytes())["persistent-apps"]) == 3 and len(m.dock.apps) == 2
+
+    def test_another_home_is_left_alone(self, mac, monkeypatch, tmp_path):
+        home, _agents, _seen, _state = mac
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(uninstall, "_dock", Mock(side_effect=AssertionError("the Dock was read")))
+        work = launcher(home / "Applications" / "OpenSwap Profiles", "Work", "a" * 32, tmp_path)
+        assert uninstall.remove_integrations(home=home, uid=501).removed == []
+        assert work.is_dir()
+
+    @pytest.mark.parametrize("outcome", ["restored", "nothing", "refused", "native"])
+    def test_link_handback_never_fails_the_uninstall(self, profile_mac, monkeypatch, outcome):
+        from openswap.claude_desktop import ClaudeDesktopError
+        m = profile_mac
+        remedy = "Could not restore Claude links. Open Claude once to restore its link handling."
+
+        def restore():
+            if outcome == "refused":
+                raise ClaudeDesktopError(remedy)
+            if outcome == "native":
+                raise RuntimeError("objc: no run loop")
+            return outcome == "restored"
+
+        monkeypatch.setattr("openswap.claude_desktop_links.restore_for_uninstall", restore)
+        removal = uninstall.remove_integrations(home=m.home, uid=501)
+        assert removal.failed == []
+        assert removal.removed == (["Claude Desktop link handling"] if outcome == "restored" else [])
+        expected = {"refused": [remedy], "native": [f"Could not restore Claude links (objc: no run loop). "
+                                                     "Open Claude once to restore its link handling."]}
+        assert removal.warnings == expected.get(outcome, [])
 
 
 class TestUndoPhaseOneAndTwo:
@@ -720,7 +879,8 @@ class TestUninstallCommand:
 
         def fake_remove(home=None, uid=None, force=False):
             seen["remove"].append(force)
-            return uninstall.Removal(removed=["menu bar login item"], failed=list(state["failed"]))
+            return uninstall.Removal(removed=["menu bar login item"], failed=list(state["failed"]),
+                                     warnings=list(state.get("warnings", [])))
 
         def fake_logins():
             seen["logins"] += 1
@@ -1057,6 +1217,24 @@ class TestUninstallCommand:
         assert seen["exec"] is None and seen["data"] == ([False] if zap else [])
         assert lines[-1] == (f"To finish, move {frozen_app} to the Trash.", False)
 
+
+    def test_warnings_are_said_but_never_stop_the_uninstall(self, harness):
+        seen, state = harness
+        remedy = "Could not restore Claude links. Open Claude once to restore its link handling."
+        state["warnings"] = [remedy]
+        lines, say = self._say()
+        assert uninstall.run(False, say) == 0
+        assert (f"Warning: {remedy}", True) in lines
+        assert not any(line.startswith("OpenSwap is still installed") for line, _ in lines)
+
+    def test_kept_profiles_are_named_with_how_to_get_their_shortcuts_back(self, harness, monkeypatch, tmp_path):
+        root = tmp_path / "OpenSwap Claude Desktop"
+        root.mkdir()
+        monkeypatch.setattr("openswap.claude_desktop.default_root", lambda: root)
+        lines, say = self._say()
+        assert uninstall.run(False, say) == 0
+        assert (f"Claude Desktop profiles, including sign-ins and local work, are kept at {root}. "
+                "Their shortcuts are removed; recreate them from the profile menu after reinstalling.", False) in lines
     @pytest.mark.parametrize("zap", [False, True])
     def test_run_stops_on_a_failed_removal(self, harness, zap):
         seen, state = harness
@@ -1271,6 +1449,13 @@ class TestAppDialog:
         assert ".app" not in message
         assert message.endswith("run “uv tool uninstall openswap” afterwards.")
         assert "pairing" not in message
+
+    def test_profile_shortcuts_are_listed_only_when_present(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(uninstall, "paired_servers", lambda: [])
+        assert "profile shortcuts" not in uninstall.app_dialog()["message"]
+        (tmp_path / "Applications" / "OpenSwap Profiles").mkdir(parents=True)
+        assert "• the Claude profile shortcuts and their Dock tiles" in uninstall.app_dialog()["message"]
 
     def test_two_pairings_are_both_named(self, monkeypatch):
         monkeypatch.setattr(uninstall, "paired_servers", lambda: ["https://opentag.me", "https://worker.example"])

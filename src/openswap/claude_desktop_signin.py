@@ -85,6 +85,23 @@ def callback_link(value: str) -> tuple[str, str]:
         raise ClaudeDesktopError(INVALID_CALLBACK) from None
 
 
+AUTOMATION_REMEDY = ("Allow OpenSwap to control Claude in System Settings → Privacy & Security → Automation, "
+                     "then restart sign-in in this profile.")
+# Apple event manager results: not permitted, needs user consent, timed out.
+CONSENT_ERRORS = (-1743, -1744)
+TIMEOUT_ERROR = -1712
+
+
+def delivery_error(code) -> str:
+    """The message for a failed Apple event send, by its error code."""
+    if code in CONSENT_ERRORS:
+        return "macOS blocked the sign-in link because OpenSwap may not control Claude yet. " + AUTOMATION_REMEDY
+    if code == TIMEOUT_ERROR:
+        return ("macOS did not deliver the sign-in link in time. If a permission request appeared, allow it. "
+                + AUTOMATION_REMEDY)
+    return "macOS could not deliver the sign-in link. Keep this profile open and try again."
+
+
 def send_to_process(pid: int, value: str, binary: Path) -> None:
     from AppKit import NSRunningApplication
     from Foundation import NSAppleEventDescriptor
@@ -102,7 +119,7 @@ def send_to_process(pid: int, value: str, binary: Path) -> None:
     # retry automatically: a timeout could still mean Claude received the link.
     reply, error = event.sendEventWithOptions_timeout_error_(0x03 | 0x10, 5.0, None)
     if error is not None or reply is None:
-        raise ClaudeDesktopError("macOS could not deliver the sign-in link. Keep this profile open and try again.")
+        raise ClaudeDesktopError(delivery_error(error.code() if error is not None else None))
     event_error = reply.paramDescriptorForKeyword_(_fourcc("errn"))
     if event_error is not None and event_error.int32Value() != 0:
         raise ClaudeDesktopError("Claude could not accept the sign-in link. Restart sign-in in this profile.")
@@ -112,20 +129,24 @@ def finish_signin(store, identifier, value, *, app=None, sender=None, expected_p
     value, kind = callback_link(value)
     app = app or ClaudeDesktopApp()
     app.validate()
+    # The registry lock covers the metadata reads only; the send can take seconds.
     with store._lock():
         profile = store.get(identifier)
         desktop, code = store._directories(profile)
-        argv = [str(app.binary)] if code is None else [str(app.binary), f"--user-data-dir={desktop}"]
-        pid = app._running(argv, desktop)
+        pid = app._running(app.launch_argv(desktop, code), desktop)
         if pid is None or (expected_pid is not None and pid != expected_pid):
             raise ClaudeDesktopError("This Claude profile closed or restarted. Open it and restart sign-in.")
         try:
-            if app._validation_stamp is None or app._stamp() != app._validation_stamp:
-                raise ClaudeDesktopError("Claude updated during sign-in. Open this profile and restart sign-in.")
-            (sender or send_to_process)(pid, value, app.binary)
-        except ClaudeDesktopError:
-            raise
-        except Exception:
-            # Native errors may contain the callback. Do not surface or log it.
-            raise ClaudeDesktopError("Could not send the link to this Claude profile. Restart sign-in and try again.") from None
+            unchanged = app._validation_stamp is not None and app._stamp() == app._validation_stamp
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            raise ClaudeDesktopError("Claude updated during sign-in. Open this profile and restart sign-in.")
+    try:
+        (sender or send_to_process)(pid, value, app.binary)
+    except ClaudeDesktopError:
+        raise
+    except Exception:
+        # Native errors may contain the callback. Do not surface or log it.
+        raise ClaudeDesktopError("Could not send the link to this Claude profile. Restart sign-in and try again.") from None
     return {"state": "connector_sent" if kind == "connector" else "signin_sent", "pid": pid, "profile": asdict(profile)}

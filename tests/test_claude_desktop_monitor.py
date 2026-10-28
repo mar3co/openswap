@@ -2,7 +2,6 @@
 
 import json
 import os
-from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -83,24 +82,6 @@ def test_multiple_default_references_fail_closed(store):
     raw["profiles"].append({**raw["profiles"][0], "id": "f" * 32, "name": "Second"})
     store.registry.write_text(json.dumps(raw))
     with pytest.raises(ClaudeDesktopError): store.list()
-
-
-@pytest.mark.parametrize("manual", [True, False])
-def test_v4_migration_preserves_manual_details_and_existing_ids(store, manual):
-    p = store.add("Work")
-    row = asdict(p)
-    row.pop("kind")
-    row.pop("auto_detect")
-    for key in ("account_uuid", "organization_uuid", "code_setup_key", "code_setup_state", "detected_login"):
-        row.pop(key)
-    row.update(DETAILS)
-    if manual: row["detected_at"] = ""
-    store.registry.write_text(json.dumps({"version": 4, "profiles": [row]}))
-    loaded = store.get(p.id)
-    assert loaded.kind == "managed" and loaded.auto_detect == (not manual)
-    store.update(p.id, name="Client")
-    assert store.get(p.id).email == DETAILS["email"]
-    assert json.loads(store.registry.read_text())["version"] == 6
 
 
 def menu(store, answers):

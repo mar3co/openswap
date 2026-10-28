@@ -480,7 +480,7 @@ def test_quit_unloads_the_job_only_through_unload_own_job(monkeypatch):
         raise OSError("launchctl missing")
 
     monkeypatch.setattr(launch_agent, "unload_own_job", boom)
-    app.on_quit(None)
+    _quitting_app(quits, logged).on_quit(None)  # a process quits once; a second Quit needs a fresh one
     assert quits == [1, 1]
     assert logged == ["could not unload the login item"]
 

@@ -62,6 +62,8 @@ app = BUNDLE(
         "LSApplicationCategoryType": "public.app-category.developer-tools",
         "CFBundleURLTypes": [{"CFBundleURLName": "Claude profile sign-in", "CFBundleURLSchemes": ["claude"],
                               "CFBundleTypeRole": "Viewer", "LSHandlerRank": "Alternate"}],
+        # Shown by the Automation consent prompt the first sign-in delivery raises.
+        "NSAppleEventsUsageDescription": "OpenSwap delivers Claude sign-in links to the Claude profile you choose.",
     },
 )
 check_appkit_sdk(str(Path(app.name) / "Contents" / "MacOS" / "OpenSwap"), osx)

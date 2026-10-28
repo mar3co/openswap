@@ -5,6 +5,7 @@ import os
 import plistlib
 import stat
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,6 +96,20 @@ def test_damaged_or_newer_registry_is_not_replaced(store, contents):
     assert store.registry.read_text() == contents
 
 
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+def test_registries_from_unreleased_versions_are_refused_not_migrated(store, version):
+    p = store.add("Personal")
+    data = json.loads(store.registry.read_text())
+    data["version"] = version
+    if version < 3:
+        data["profiles"] = [{"id": p.id, "name": p.name, "archived": False}]
+    store.registry.write_text(json.dumps(data))
+    before = store.registry.read_bytes()
+    with pytest.raises(cd.ClaudeDesktopError, match="Restore profiles.json from a backup"):
+        store.list()
+    assert store.registry.read_bytes() == before
+
+
 @pytest.mark.parametrize("change", ["id", "duplicate", "archived", "name"])
 def test_invalid_rows_fail_closed(store, change):
     store.add("Personal")
@@ -155,6 +170,23 @@ def test_atomic_write_failure_keeps_registry_and_data(store, monkeypatch):
     assert not list(store.root.glob(".profiles-*"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="directory fsync")
+def test_registry_save_syncs_its_directory_but_survives_that_sync_failing(store, monkeypatch):
+    p = store.add("Personal")
+    real, synced = os.fsync, []
+
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            synced.append(fd)
+            raise OSError("not supported here")
+        real(fd)
+
+    monkeypatch.setattr(cd.os, "fsync", fsync)
+    assert store.update(p.id, archived=True).archived
+    assert store.get(p.id, include_archived=True).archived
+    assert len(synced) == 1
+
+
 def test_concurrent_adds_do_not_lose_profiles(store):
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(store.add, ["Personal", "Work"]))
@@ -190,21 +222,28 @@ def app(tmp_path):
     (path / "Contents" / "Info.plist").write_bytes(plistlib.dumps({
         "CFBundleIdentifier": cd.BUNDLE_ID, "CFBundleExecutable": "Claude", "CFBundleShortVersionString": "3.6556.2",
     }))
-    run = Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=f"Identifier={cd.BUNDLE_ID}\nTeamIdentifier={cd.TEAM_ID}\n"))
+    run = Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
     return cd.ClaudeDesktopApp(path, platform="darwin", run=run, popen=Mock())
 
 
 def test_check_signature_without_launching(app):
     result = app.validate()
     assert result["publisher_verified"] and not result["identity_verified"]
-    assert "--deep" in app.run.call_args_list[0].args[0]
+    [(argv,), *_] = [call.args for call in app.run.call_args_list]
+    assert argv[:4] == ["/usr/bin/codesign", "--verify", "--deep", "--strict"]
+    # codesign checks the designated requirement itself; no text output is parsed.
+    assert f"-R={cd.REQUIREMENT}" in argv and "-d" not in argv
+    assert cd.REQUIREMENT == ('anchor apple generic and identifier "com.anthropic.claudefordesktop" '
+                              'and certificate leaf[subject.OU] = "Q6L2SF6YDW"')
     app.popen.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", ["wrong-team", "bad-signature", "bad-plist", "truncated-plist", "missing", "platform", "timeout"])
 def test_invalid_app_never_launches_or_creates_profile(store, app, failure):
     if failure == "wrong-team":
-        app.run.return_value.stderr = f"Identifier={cd.BUNDLE_ID}\nTeamIdentifier=other"
+        # Signed, but not to the requirement: only the -R verification fails.
+        app.run.side_effect = lambda argv, **kw: SimpleNamespace(
+            returncode=int(any(arg.startswith("-R=") for arg in argv)), stdout="", stderr="")
     elif failure == "bad-signature":
         app.run.return_value.returncode = 1
     elif failure == "bad-plist":
@@ -248,6 +287,45 @@ def test_already_running_profile_is_reused_not_restarted(store, app):
     app.run.return_value.stdout = f"42 {app.binary} --user-data-dir={desktop}\n"
     assert store.open(p.id, app=app)["state"] == "already_running"
     app.popen.assert_not_called()
+
+
+def test_concurrent_opens_of_one_profile_launch_it_once(store, app):
+    p = store.add("Personal")
+    processes, launching = [], threading.Event()
+    app.run.side_effect = lambda argv, **kw: SimpleNamespace(returncode=0, stdout="\n".join(processes), stderr="")
+
+    def popen(argv, **kwargs):
+        processes.append(f"42 {' '.join(argv)}")
+        launching.set()
+        proc = Mock(pid=42)
+        proc.wait.side_effect = [subprocess.TimeoutExpired("Claude", 0.75), 0]
+        return proc
+
+    app.popen.side_effect = popen
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(store.open, p.id, app=app)
+        assert launching.wait(5)
+        second = pool.submit(store.open, p.id, app=app)
+        states = sorted(result["state"] for result in (first.result(), second.result()))
+    assert states == ["already_running", "launched"]
+    assert app.popen.call_count == 1
+
+
+def test_an_open_that_outwaits_another_launch_is_not_an_error(store, app, monkeypatch):
+    p = store.add("Personal")
+    desktop, _ = store.paths(p)
+    monkeypatch.setattr(cd, "LAUNCH_LOCK_TIMEOUT", 0.1)
+    other = store._lock("launch.lock")
+    assert other.acquire()
+    try:
+        result = store.open(p.id, app=app)
+        assert (result["state"], result["pid"]) == ("already_opening", None)
+        app.popen.assert_not_called()
+        app.run.return_value.stdout = f"42 {app.binary} --user-data-dir={desktop}\n"
+        assert store.open(p.id, app=app)["state"] == "already_running"
+    finally:
+        other.release()
+    assert store.open(p.id, app=app)["state"] == "already_running"
 
 
 @pytest.mark.parametrize("suffix", ["", " -psn_0_123"])
@@ -345,6 +423,40 @@ def test_cli_roundtrip_does_not_construct_account_engine(store, monkeypatch, cap
     assert store.get("Work").id == p["id"]
     assert run_cli(["claude-desktop", "archive", "absent", "--json"]) == 1
     assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+@pytest.mark.parametrize("launcher", [True, False])
+def test_launcher_failures_reach_stderr_as_a_plain_message(store, app, monkeypatch, capsys, launcher):
+    monkeypatch.setattr(cd, "ClaudeDesktopApp", lambda: app)
+    extra = ["--from-launcher"] if launcher else []
+    assert cd.main(["open", "absent", "--profile-root", str(store.root), "--json", *extra]) == 1
+    out, err = capsys.readouterr()
+    assert json.loads(out)["ok"] is False
+    assert ("profile not found" in err) is launcher
+    monkeypatch.setattr(cd.DesktopProfiles, "open", Mock(side_effect=RuntimeError("unexpected")))
+    if not launcher:
+        with pytest.raises(RuntimeError):
+            cd.main(["open", "absent", "--profile-root", str(store.root), "--json"])
+        return
+    assert cd.main(["open", "absent", "--profile-root", str(store.root), "--json", *extra]) == 1
+    out, err = capsys.readouterr()
+    assert json.loads(out)["ok"] is False
+    assert err.strip() == "Could not open this Claude profile. Open it from the OpenSwap menu to see details."
+
+
+@pytest.mark.parametrize("failure", ["import", "runtime", None])
+def test_focus_trouble_never_fails_a_successful_open(store, app, monkeypatch, capsys, failure):
+    p = store.add("Work")
+    desktop, _ = store.paths(p)
+    app.run.return_value.stdout = f"42 {app.binary} --user-data-dir={desktop}\n"
+    monkeypatch.setattr(cd, "ClaudeDesktopApp", lambda: app)
+    errors = {"import": ImportError("No module named AppKit"), "runtime": RuntimeError("activation refused")}
+    monkeypatch.setattr(ui, "focus_profile", Mock(side_effect=errors.get(failure)))
+    assert cd.main(["open", p.id, "--profile-root", str(store.root), "--json", "--from-launcher", "--focus"]) == 0
+    out, err = capsys.readouterr()
+    data = json.loads(out)
+    assert data["ok"] and data["pid"] == 42 and err == ""
+    assert ("focus_warning" in data) is (failure == "runtime")
 
 
 def test_zap_does_not_include_desktop_documents(temp_home, monkeypatch):
