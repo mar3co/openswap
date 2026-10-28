@@ -381,7 +381,6 @@ class ClaudeDesktopMenu:
                 try:
                     self.store.ensure_default()
                 except (ClaudeSwitchError, OSError):
-                    # The ordinary profile may be the origin; without it listed, no candidate is preselected.
                     result["default_unchecked"] = True
                     result["unchecked"] += 1
                 profiles = sorted(self.store.list(), key=lambda p: p.kind != "default")
@@ -409,7 +408,7 @@ class ClaudeDesktopMenu:
             self.show_error("Could not check the open Claude profiles. Try again.")
 
     def _choose_signin_profile(self, result, held):
-        """One click picks the target; with several candidates nothing is preselected."""
+        """One click picks the target; nothing is preselected unless a single candidate is certain."""
         from openswap.claude_desktop_signin import finish_signin
         if held is None:
             return  # discovery was suspended meanwhile
@@ -424,10 +423,13 @@ class ClaudeDesktopMenu:
             self.show_error("Could not check the open Claude profiles. Start again from the intended Claude profile."
                             if result["unchecked"] else "Open the intended Claude profile and start again there.")
             return
-        placeholder = ["Choose a profile…"] if len(candidates) > 1 or result["default_unchecked"] else []
+        # An unchecked profile may be the origin, so a lone candidate is not preselected then either.
+        placeholder = ["Choose a profile…"] if len(candidates) > 1 or result["unchecked"] else []
         message = "Which Claude profile did you connect this app from?" if connector else "Which profile did you start signing in to?"
         if result["default_unchecked"]:
             message += "\n\nThe existing Claude profile could not be checked."
+        elif result["unchecked"]:
+            message += "\n\nSome open Claude profiles could not be checked."
         while True:
             with self._modal():
                 response = self.prompt(title="Finish connecting app" if connector else "Finish Claude sign-in",

@@ -265,7 +265,8 @@ def test_profile_whose_process_check_fails_is_skipped_not_fatal(menu, store, app
         menu.prompt.assert_not_called()
         assert menu.show_error.call_args.args[0].startswith("Could not check the open Claude profiles.")
     else:
-        assert menu.prompt.call_args.kwargs["choices"] == ["A"]
+        assert menu.prompt.call_args.kwargs["choices"] == ["Choose a profile…", "A"]
+        assert "Some open Claude profiles could not be checked" in menu.prompt.call_args.kwargs["message"]
         menu.show_error.assert_not_called()
     assert not menu.busy
 
