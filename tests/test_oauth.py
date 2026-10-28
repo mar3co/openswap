@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import urllib.error
 from datetime import datetime, timezone
@@ -1392,12 +1393,16 @@ class TestClassifyOauthProfile:
 
     COMPLETE = {"account": {"uuid": "acc-uuid", "email": "a@b.c"}, "organization": {"uuid": "org-uuid"}}
 
-    @pytest.mark.parametrize("code, status", [
-        (400, "rejected"), (401, "rejected"), (403, "rejected"), (404, "rejected"), (410, "rejected"),
-        (429, "transient"), (500, "transient"), (503, "transient"),
+    API_ERROR = b'{"type": "error", "error": {"type": "permission_error"}}'
+
+    @pytest.mark.parametrize("code, body, status", [
+        (400, b"", "rejected"), (401, b"", "rejected"), (403, API_ERROR, "rejected"), (404, b"", "rejected"),
+        (410, b"", "rejected"),
+        (403, b"<html>Access denied</html>", "transient"), (403, b"", "transient"), (403, b"[]", "transient"),
+        (408, b"", "transient"), (429, b"", "transient"), (500, b"", "transient"), (503, b"", "transient"),
     ])
-    def test_http_errors(self, code, status):
-        err = urllib.error.HTTPError("https://api.anthropic.com/api/oauth/profile", code, "x", {}, None)
+    def test_http_errors(self, code, body, status):
+        err = urllib.error.HTTPError("https://api.anthropic.com/api/oauth/profile", code, "x", {}, io.BytesIO(body))
         with patch("openswap.oauth.urllib.request.urlopen", side_effect=err):
             assert oauth.classify_oauth_profile("sk-live")[0] == status
 

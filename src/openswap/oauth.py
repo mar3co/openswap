@@ -277,15 +277,21 @@ def classify_oauth_profile(access_token: str) -> tuple[str, dict]:
 
     Returns ``(status, identity)``. ``status`` is ``"verified"`` (200 with
     account uuid, email and organization), ``"incomplete"`` (200 missing any
-    of them), ``"rejected"`` (a 4xx other than 429) or ``"transient"``
-    (network error, timeout, 429, 5xx, or an unreadable body). ``identity``
-    has the ``fetch_oauth_profile`` keys, each str-or-None.
+    of them), ``"rejected"`` (a 4xx other than 408 and 429; a 403 only with
+    a JSON body) or ``"transient"`` (network error, timeout, 408, 429, 5xx,
+    a 403 page from an edge or firewall, or an unreadable body).
+    ``identity`` has the ``fetch_oauth_profile`` keys, each str-or-None.
     """
     try:
         data = _get_oauth_profile(access_token)
     except urllib.error.HTTPError as e:
         _logger.debug("OAuth profile fetch failed: %r", e)
-        rejected = 400 <= e.code < 500 and e.code != 429
+        rejected = 400 <= e.code < 500 and e.code not in (408, 429)
+        if e.code == 403:
+            try:
+                rejected = isinstance(json.loads(e.read().decode(errors="replace")), dict)
+            except Exception:
+                rejected = False
         return ("rejected" if rejected else "transient"), _profile_identity(None)
     except Exception as e:
         _logger.debug("OAuth profile fetch failed: %r", e)
