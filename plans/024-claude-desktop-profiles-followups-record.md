@@ -223,3 +223,8 @@ Required outcomes:
 - Links silent seat, Important: a dropped Reconnect (same as L2-b; cleanup W2). Also, a persisted pause is silent after a restart. This is #150, folded in because it is cheap and this branch makes it more likely. Cleanup W3.
 - Menu seat, Minor: the F-3 branch is unreachable. Removed (W5). F-3 resolves as "no change needed", because suspension only happens on Quit or disable, where silence is right.
 - Cleanup wave: W1–W14 in one fix dispatch, with the pre-dispatch ruling check first. After it come one cold seat, the gates, and the PR. Every non-Critical finding after that becomes an issue.
+
+### Cleanup wave
+- Pre-dispatch reader corrected W2, W3, W6, W8 and W9 before dispatch.
+- Implemented in f3a24d6..5c7a2ad. Full suite: 6261 passed, 0 failed.
+- Final cold seat and silent seat on the wave: no Critical. The remaining non-Critical findings (live-token contradiction loop, live-path mismatch wording, silent drop on a fast disable and re-enable, a pause not cleared once held, doc wording) are filed as #151 under the hard budget. The review loop is closed.
