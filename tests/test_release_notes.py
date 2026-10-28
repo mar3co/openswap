@@ -43,6 +43,7 @@ def _notes(version: str, path: Path) -> subprocess.CompletedProcess[str]:
         [sys.executable, str(SCRIPT), version, str(path)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
 
