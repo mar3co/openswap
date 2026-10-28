@@ -6,7 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from openswap.claude_desktop_links import (
-    DesktopSignInLinks, MAX_AGE, OWNERSHIP_CHECK, OWNERSHIP_LOST, RECHECK, RESTORE_TIMEOUT, ordinary_link, ownership_lost)
+    DesktopSignInLinks, MAX_AGE, OWNERSHIP_CHECK, OWNERSHIP_LOST, RECHECK, RESTORE_TIMEOUT, claim_step, ordinary_link, ownership_lost)
 from tests.test_claude_desktop_signin import GOOGLE, MAGIC, SSO
 
 
@@ -104,14 +104,24 @@ def test_denied_permission_stays_paused_until_explicit_retry(env):
     assert e.error.call_count == 1
 
 
-def test_new_claude_instance_registering_again_reconnects_after_startup(env):
+def test_new_claude_instance_registering_again_is_reported_not_reclaimed_to_avoid_repeated_prompts(env):
     e = env
     claim(e)
     e.native.owner = e.native.saved
     e.native.launched()
     e.now[0] += 3
     e.router.poll()
+    assert len(e.native.requests) == 1
+    e.error.assert_called_once_with(OWNERSHIP_LOST)
+    assert e.native.paused()
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+    e.error.assert_called_once()
+    e.router.prepare(retry=True)
+    e.now[0] += 3
+    e.router.poll()
     assert len(e.native.requests) == 2
+    e.error.assert_called_once()
 
 
 def test_quitting_restores_previous_before_completion(env):
@@ -681,18 +691,34 @@ def gone():
     raise OSError('Launch Services unavailable')
 
 
-@pytest.mark.parametrize('held, busy, needed, current, lost', [
-    (True, False, True, lambda: CLAUDE, True),
-    (True, False, True, lambda: OPENSWAP, False),
-    (True, False, True, lambda: None, False),
-    (True, False, True, gone, False),
-    (None, False, True, lambda: CLAUDE, False),
-    (False, False, True, lambda: CLAUDE, False),
-    (True, True, True, lambda: CLAUDE, False),
-    (True, False, False, lambda: CLAUDE, False),
-    (True, False, None, lambda: CLAUDE, False)])
-def test_ownership_is_lost_only_when_a_held_handler_is_taken_while_needed(held, busy, needed, current, lost):
-    assert ownership_lost(held=held, busy=busy, needed=needed, current=current, application=OPENSWAP) is lost
+@pytest.mark.parametrize('held, ended, changing, needed, current, lost', [
+    (True, False, False, True, lambda: CLAUDE, True),
+    (True, False, False, True, lambda: OPENSWAP, False),
+    (True, False, False, True, lambda: None, False),
+    (True, False, False, True, gone, None),
+    (None, False, False, True, lambda: CLAUDE, False),
+    (False, False, False, True, lambda: CLAUDE, False),
+    (True, True, False, True, lambda: CLAUDE, False),
+    (True, True, True, True, lambda: CLAUDE, False),
+    (True, False, True, True, lambda: CLAUDE, None),
+    (True, False, False, False, lambda: CLAUDE, False),
+    (True, False, False, None, lambda: CLAUDE, None)])
+def test_ownership_is_lost_only_when_a_held_handler_is_taken_while_needed(held, ended, changing, needed, current, lost):
+    assert ownership_lost(held=held, ended=ended, changing=changing, needed=needed,
+                          current=current, application=OPENSWAP) is lost
+
+
+@pytest.mark.parametrize('current, held, reconnecting, step', [
+    (OPENSWAP, None, False, 'held'),
+    (OPENSWAP, True, True, 'held'),
+    (CLAUDE, None, False, 'claim'),
+    (CLAUDE, False, False, 'claim'),
+    (CLAUDE, True, True, 'claim'),
+    (None, True, True, 'claim'),
+    (CLAUDE, True, False, 'lost'),
+    (None, True, False, 'wait')])
+def test_only_reconnect_claims_a_handler_taken_after_it_was_held(current, held, reconnecting, step):
+    assert claim_step(current=current, application=OPENSWAP, held=held, reconnecting=reconnecting) == step
 
 
 def take_over(e):
@@ -758,8 +784,10 @@ def test_no_loss_check_while_the_handler_is_in_flux_or_unneeded(env, state):
     e.native.launched()
     if state == 'claim_pending':
         e.native.owner = e.native.saved
+        e.router.prepare(retry=True)
         e.now[0] += 3
         e.router.poll()
+        assert e.router.changing
     if state == 'disabled': e.enabled[0] = False
     if state == 'not_needed': e.needed[0] = False
     if state == 'quitting': e.router.restore(Mock())
@@ -767,3 +795,41 @@ def test_no_loss_check_while_the_handler_is_in_flux_or_unneeded(env, state):
     e.now[0] += OWNERSHIP_CHECK
     e.router.poll()
     assert OWNERSHIP_LOST not in [call.args[0] for call in e.error.call_args_list]
+
+
+def test_a_failed_reconnect_claim_shows_only_its_own_error(env):
+    from openswap.claude_desktop import ClaudeDesktopError
+    e = env
+    claim(e)
+    e.native.owner = e.native.saved
+    e.native.set_handler = Mock(side_effect=ClaudeDesktopError('Move OpenSwap to Applications'))
+    e.router.prepare(retry=True)
+    e.now[0] += 3
+    e.router.poll()
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+    e.error.assert_called_once_with('Move OpenSwap to Applications')
+
+
+@pytest.mark.parametrize('obstacle', ['needed_unknown', 'handler_unreadable'])
+def test_a_loss_check_that_cannot_run_yet_waits_and_then_reports(env, obstacle):
+    e = env
+    claim(e)
+    e.native.owner = e.native.saved
+    if obstacle == 'needed_unknown':
+        e.router.needed = Mock(side_effect=OSError('registry unreadable'))
+    else:
+        e.native.current = Mock(side_effect=OSError('Launch Services unavailable'))
+    e.now[0] += OWNERSHIP_CHECK
+    e.router.poll()
+    e.router.poll()
+    e.error.assert_not_called()
+    assert len(e.native.requests) == 1
+    assert e.router.verify_at is not None
+    if obstacle == 'needed_unknown':
+        e.router.needed = lambda: e.needed[0]
+    else:
+        del e.native.current
+    e.router.poll()
+    e.error.assert_called_once_with(OWNERSHIP_LOST)
+    assert len(e.native.requests) == 1
