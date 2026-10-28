@@ -826,7 +826,7 @@ def test_a_saved_login_for_another_account_names_it_and_the_remedy_that_replaces
     assert s.engine.read_account_credentials("7", EMAIL) == CREDS
     assert s.connector.state(s.store.get(s.profile.id))["code_status"] == (
         f"The saved Claude Code login for {EMAIL} answers as a different account{named}. "
-        f"To use this profile's account, choose Add account > Sign in to Claude Code… and sign in as {EMAIL}. "
+        f"To use this profile's account, choose Add account → Sign in to Claude Code… and sign in as {EMAIL}. "
         "This replaces that saved login.")
 
 

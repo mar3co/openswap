@@ -138,7 +138,7 @@ def saved_login_mismatch(email, found):
     other = found.get("email") or ""
     named = f" ({other})" if other and other.casefold() != email.casefold() else ""
     return (f"The saved Claude Code login for {email} answers as a different account{named}. "
-            f"To use this profile's account, choose Add account > Sign in to Claude Code… and sign in as {email}. "
+            f"To use this profile's account, choose Add account → Sign in to Claude Code… and sign in as {email}. "
             "This replaces that saved login.")
 
 
