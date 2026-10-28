@@ -32,6 +32,7 @@ Commit style: `feat(menubar): …` / `fix(…): …` / `docs: …`. Origin is
 | 020  | Set up OpenSwap fully from the app or the terminal | P1 | L | 008, PR #107 | DONE; manual checks on a notarized build still open before release |
 | 021  | Setup wizard and Move to Applications | P1 | L | 020, PR #114 | DONE; manual checks on a notarized build still open before release |
 | 022  | Pair a Mac by signing in to OpenTag, and rotate device keys in place | P1 | L | 017, 018 | IN PROGRESS; all four phases merged and live, O1 conformance pin open |
+| 023  | Claude Desktop profiles (PR #144): deep review record and fix rounds | P1 | L | — | IN PROGRESS |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED. Feature proposals use PROPOSED until accepted; 017 is accepted and tracked in its progress log.
 
