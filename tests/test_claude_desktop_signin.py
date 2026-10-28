@@ -270,6 +270,51 @@ def test_profile_whose_process_check_fails_is_skipped_not_fatal(menu, store, app
     assert not menu.busy
 
 
+def test_unregistered_default_still_offers_managed_profiles_but_never_preselects(menu, store, app, monkeypatch):
+    p = store.add("Work")
+    process_list(app, store, [(33, p)])
+    store.default_desktop = store.root.parent / "not-a-folder"
+    store.default_desktop.write_text("")  # ensure_default raises: the ordinary profile cannot be read safely
+    menu._app_factory = lambda: app
+    menu.signin_sender = Mock()
+    menu.monitor = Mock(poll=Mock(return_value=False))
+    menu.prompt.return_value = SimpleNamespace(clicked=1, choice=1)
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=kw["target"]))
+    monkeypatch.setattr(ui, "focus_profile", Mock())
+    menu.receive_signin(GOOGLE, lambda: True)
+    menu.poll()
+    assert menu.prompt.call_args.kwargs["choices"] == ["Choose a profile…", "Work"]
+    assert "existing Claude profile could not be checked" in menu.prompt.call_args.kwargs["message"]
+    menu.poll()
+    menu.signin_sender.assert_called_once_with(33, GOOGLE, app.binary)
+    menu.show_error.assert_not_called()
+
+
+@pytest.mark.parametrize("route", ["error", "cancel", "suspend"])
+def test_held_callback_is_released_however_discovery_ends(menu, store, app, monkeypatch, route):
+    p = store.add("Work")
+    process_list(app, store, [(33, p)])
+    if route == "error":
+        app.validate = Mock(side_effect=ClaudeDesktopError("Reinstall the official app."))
+    menu._app_factory = lambda: app
+    menu.signin_sender = Mock()
+    menu.monitor = Mock(poll=Mock(return_value=False))
+    menu.prompt.return_value = SimpleNamespace(clicked=0, choice=0)
+    started = []
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=lambda: started.append(kw["target"])))
+    menu.receive_signin(GOOGLE, lambda: True)
+    assert menu._signin == (GOOGLE, menu._signin[1])
+    if route == "suspend":
+        menu.suspend_checks()
+        assert menu._signin is None
+    started.pop()()
+    menu.poll()
+    assert menu._signin is None and not menu.busy
+    menu.signin_sender.assert_not_called()
+    assert menu.prompt.call_count == (1 if route == "cancel" else 0)
+    assert menu.show_error.call_count == (1 if route == "error" else 0)
+
+
 @pytest.mark.parametrize("answers", [[(1, 0), (1, 2)], [(1, 0), (0, 0)]])
 def test_several_candidates_start_unselected_and_the_placeholder_reprompts(menu, store, app, monkeypatch, answers):
     a, b = store.add("A"), store.add("B")

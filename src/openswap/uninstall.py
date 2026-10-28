@@ -186,17 +186,11 @@ def _remove_profile_launchers(home: Path, removal: Removal) -> bool:
     """
     if sys.platform != "darwin" or home != Path.home():
         return False
-    from openswap.claude_desktop_dock import _owned_bundle
-    from openswap.claude_desktop_shortcut import shortcut_directory
-
-    directory = shortcut_directory()
-    if directory.is_symlink() or not directory.is_dir():
+    directory = _shortcut_folder()
+    if directory is None:
         return False
     deleted, failed = [], []
-    for path in sorted(directory.iterdir()):
-        shortcut = _launcher(path)
-        if shortcut is None or not _owned_bundle(path, shortcut):
-            continue
+    for path in _owned_launchers(directory):
         resolved = path.resolve()
         try:
             shutil.rmtree(path)
@@ -217,6 +211,23 @@ def _remove_profile_launchers(home: Path, removal: Removal) -> bool:
         except OSError:
             pass
     return bool(deleted)
+
+
+def _shortcut_folder() -> Path | None:
+    """The profile shortcuts folder, when it is a real folder."""
+    from openswap.claude_desktop_shortcut import shortcut_directory
+
+    directory = shortcut_directory()
+    return None if directory.is_symlink() or not directory.is_dir() else directory
+
+
+def _owned_launchers(directory: Path) -> list[Path]:
+    """The bundles in ``directory`` carrying OpenSwap's own marker, whichever
+    store they name: the one predicate for both the dialog and the removal."""
+    from openswap.claude_desktop_dock import _owned_bundle
+
+    return [path for path in sorted(directory.iterdir())
+            if (shortcut := _launcher(path)) is not None and _owned_bundle(path, shortcut)]
 
 
 def _launcher(path: Path):
@@ -246,8 +257,8 @@ def _unpin(deleted: list[Path], home: Path, removal: Removal) -> None:
     """Take the deleted launchers' tiles off the Dock, after backing its app
     list up as Dock setup does. The backup goes beside setup's when the
     profile store exists (never created here), else next to the uninstall
-    log. Any trouble is a warning: a stale tile is dragged off, not a reason
-    to keep OpenSwap installed.
+    log. Any trouble, native included, is a warning: a stale tile is dragged
+    off, not a reason to keep OpenSwap installed.
     """
     from openswap.claude_desktop import default_root
     from openswap.claude_desktop_dock import tile_path
@@ -278,12 +289,12 @@ def _unpin(deleted: list[Path], home: Path, removal: Removal) -> None:
         dock.write(after)
         if dock.snapshot() != after:
             raise ClaudeSwitchError("the Dock did not keep the change")
-    except (ClaudeSwitchError, OSError) as e:
+    except Exception as e:
         removal.warnings.append(f"Could not remove the profile shortcuts' Dock tiles ({e}). Drag them off the Dock.")
         return
     try:
         dock.refresh()
-    except ClaudeSwitchError:
+    except Exception:
         removal.warnings.append("The Dock still shows the removed profile shortcuts; log out and back in to refresh it.")
 
 
@@ -937,9 +948,8 @@ def app_dialog() -> dict[str, str]:
         "• the Claude Code status line (your own comes back)",
         "• the widget",
     ]
-    from openswap.claude_desktop_shortcut import shortcut_directory
-
-    if shortcut_directory().is_dir():
+    folder = _shortcut_folder()
+    if folder is not None and _owned_launchers(folder):
         lines.append("• the Claude profile shortcuts and their Dock tiles")
     app = bundle.app_path()
     if app is None:

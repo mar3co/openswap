@@ -32,11 +32,15 @@ class Native:
 
 
 @pytest.fixture
-def env():
+def env(tmp_path):
     now, enabled, needed = [0.0], [True], [True]
     error, received = Mock(), Mock()
     router = DesktopSignInLinks(enabled=lambda: enabled[0], needed=lambda: needed[0],
         receive_signin=received, show_error=error, native_factory=Native, clock=lambda: now[0])
+    # The previous handler must exist on disk for a handback to be attempted.
+    claude = tmp_path / 'Claude.app'
+    claude.mkdir()
+    router.native.owner = router.native.saved = claude
     return SimpleNamespace(router=router, native=router.native, now=now, enabled=enabled,
                            needed=needed, error=error, received=received)
 
@@ -320,7 +324,7 @@ def test_nested_native_event_loop_cannot_open_two_choosers(env):
     assert seen == [GOOGLE, MAGIC]
 
 
-@pytest.mark.parametrize('target', ['eligible', 'openswap', 'claude'])
+@pytest.mark.parametrize('target', ['eligible', 'openswap', 'claude', 'openswap_unregistered', 'claude_unregistered'])
 def test_native_registers_bundle_and_verifies_eligibility_before_request(monkeypatch, target):
     import sys
     from openswap import claude_desktop_links as links
@@ -328,24 +332,30 @@ def test_native_registers_bundle_and_verifies_eligibility_before_request(monkeyp
     calls = []
     native = object.__new__(links.MacOSLinks)
     native.application = Path('/Applications/OpenSwap.app')
-    path = Path('/Applications/Claude.app') if target == 'claude' else native.application
+    path = Path('/Applications/Claude.app') if target.startswith('claude') else native.application
     url = SimpleNamespace(path=lambda: str(path))
     def candidates(_url):
         calls.append('candidates')
         return [url] if target == 'eligible' else []
+    def register(value):
+        calls.append(('register', value))
+        if target.endswith('unregistered'):
+            raise ClaudeDesktopError('macOS could not register OpenSwap for sign-in. Reopen OpenSwap and try again.')
     native.workspace = SimpleNamespace(URLsForApplicationsToOpenURL_=candidates,
         setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler_=lambda *args: calls.append('request'))
-    monkeypatch.setattr(links, 'register_application', lambda value: calls.append(('register', value)))
+    monkeypatch.setattr(links, 'register_application', register)
     monkeypatch.setitem(sys.modules, 'Foundation', SimpleNamespace(NSURL=SimpleNamespace(
         URLWithString_=lambda value: value, fileURLWithPath_=lambda value: value)))
     if target == 'eligible':
         native.set_handler(path, Mock())
         assert calls == [('register', path), 'candidates', 'request']
-    else:
-        remedy = 'Move OpenSwap to Applications' if target == 'openswap' else 'Open Claude once.*or reinstall Claude'
-        with pytest.raises(ClaudeDesktopError, match=remedy):
-            native.set_handler(path, Mock())
-        assert calls == [('register', path), 'candidates']
+        return
+    remedy = {'openswap': 'Move OpenSwap to Applications', 'openswap_unregistered': 'Reopen OpenSwap'}.get(
+        target, 'Open Claude once.*or reinstall Claude')
+    with pytest.raises(ClaudeDesktopError, match=remedy) as error:
+        native.set_handler(path, Mock())
+    assert ('OpenSwap' in str(error.value)) is target.startswith('openswap')
+    assert calls == [('register', path)] + ([] if target.endswith('unregistered') else ['candidates'])
 
 
 @pytest.mark.parametrize('outcome', ['restored', 'denied', 'refused', 'no_answer'])
@@ -467,7 +477,7 @@ def test_unknown_profile_state_changes_nothing(env):
     e.error.assert_not_called()
 
 
-def test_a_refused_handback_is_not_retried(env):
+def test_a_refused_handback_is_quiet_and_not_retried(env):
     e = env
     claim(e)
     e.needed[0] = False
@@ -475,10 +485,130 @@ def test_a_refused_handback_is_not_retried(env):
     e.router.poll()
     e.native.respond(False)
     e.router.poll()
-    e.error.assert_called_once()
+    e.error.assert_not_called()
     e.now[0] += RECHECK
     e.router.poll()
     assert len(e.native.requests) == 2
+
+
+def test_a_background_handback_that_cannot_register_claude_is_quiet(env):
+    from openswap.claude_desktop import ClaudeDesktopError
+    e = env
+    claim(e)
+    e.native.set_handler = Mock(side_effect=ClaudeDesktopError('Could not restore Claude links. Reinstall Claude.'))
+    e.needed[0] = False
+    e.now[0] += RECHECK
+    e.router.poll()
+    e.error.assert_not_called()
+    assert not e.router.changing
+    e.now[0] += RECHECK
+    e.router.poll()
+    assert e.native.set_handler.call_count == 1
+
+
+def test_an_explicit_restore_waiting_on_a_background_handback_still_alerts(env):
+    e = env
+    claim(e)
+    e.needed[0] = False
+    e.now[0] += RECHECK
+    e.router.poll()
+    done = Mock()
+    e.router.restore(done)
+    assert len(e.native.requests) == 2
+    e.native.respond(False)
+    e.router.poll()
+    e.error.assert_called_once_with('Could not restore Claude links. Open Claude once before signing in again.')
+    done.assert_called_once()
+
+
+@pytest.mark.parametrize('route', ['background', 'quit', 'disable'])
+def test_no_handback_is_attempted_when_the_previous_handler_is_gone(env, tmp_path, route):
+    e = env
+    claim(e)
+    e.native.saved = tmp_path / 'Gone.app'
+    done = Mock()
+    if route == 'background':
+        e.needed[0] = False
+        e.now[0] += RECHECK
+        e.router.poll()
+    elif route == 'quit':
+        e.router.restore(done)
+        done.assert_called_once()
+    else:
+        e.router.restore()
+    assert len(e.native.requests) == 1
+    assert e.native.current() == e.native.application
+    e.error.assert_not_called()
+    assert not e.router.changing
+
+
+def test_startup_handback_still_forwards_a_queued_ordinary_link_and_holds_callbacks(env):
+    e = env
+    e.native.owner = e.native.application
+    e.needed[0] = False
+    e.router.prepare()
+    e.router.receive('claude://claude.ai/chat/fixture')
+    e.router.poll()
+    assert e.native.requests[-1][0] == e.native.saved
+    e.native.forward.assert_called_once_with('claude://claude.ai/chat/fixture')
+    e.router.receive(GOOGLE)
+    e.now[0] += MAX_AGE + 1
+    e.router.receive('claude://claude.ai/chat/later')
+    e.router.poll()
+    e.received.assert_not_called()
+    assert e.native.forward.call_count == 2
+    e.native.respond(True)
+    e.router.poll()
+    e.received.assert_not_called()  # the callback aged out while the sheet waited; nothing stale is sent
+    e.router.receive(MAGIC)
+    e.router.poll()
+    e.received.assert_called_once()
+    e.error.assert_not_called()
+
+
+def test_quit_forwards_queued_ordinary_links_but_drops_callbacks(env):
+    e = env
+    claim(e)
+    e.router.receive('claude://claude.ai/chat/fixture')
+    e.router.receive(GOOGLE)
+    done = Mock()
+    e.router.restore(done)
+    e.native.forward.assert_called_once_with('claude://claude.ai/chat/fixture')
+    e.native.respond(True)
+    e.router.poll()
+    done.assert_called_once()
+    e.received.assert_not_called()
+    assert e.router.events.empty()
+
+
+@pytest.mark.parametrize('route', ['restored', 'declined', 'raised', 'deadline'])
+def test_a_finished_quit_sends_no_second_request_and_no_further_alert(env, route):
+    from openswap.claude_desktop import ClaudeDesktopError
+    e = env
+    claim(e)
+    if route == 'raised':
+        e.native.set_handler = Mock(side_effect=ClaudeDesktopError('Could not restore Claude links. Reinstall Claude.'))
+    # Quitting suspends the Desktop section, which asks for a restore again.
+    done = Mock(side_effect=lambda: e.router.restore())
+    e.router.restore(done)
+    if route == 'deadline':
+        e.now[0] += RESTORE_TIMEOUT
+        e.router.poll()
+    elif route != 'raised':
+        e.native.respond(route == 'restored')
+        e.router.poll()
+    done.assert_called_once()
+    requests = len(e.native.requests) if route != 'raised' else e.native.set_handler.call_count
+    assert requests == (1 if route == 'raised' else 2)
+    alerts = e.error.call_count
+    assert alerts == (1 if route in ('declined', 'raised') else 0)
+    if route == 'deadline':
+        e.native.respond(False)  # the sheet answered after the quit went ahead
+    e.now[0] += RECHECK
+    e.router.poll()
+    e.router.restore()
+    assert e.error.call_count == alerts
+    assert (len(e.native.requests) if route != 'raised' else e.native.set_handler.call_count) == requests
 
 
 @pytest.mark.parametrize('reason', ['disabled', 'not_needed'])

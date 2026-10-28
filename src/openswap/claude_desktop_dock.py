@@ -92,16 +92,24 @@ def plan_pins(existing, shortcuts, *, claude_app=APP_PATH, guid_factory=lambda: 
     return result
 
 
-def _owned_bundle(path, shortcut):
+def launcher_info(path):
+    """A launcher bundle's Info.plist, read without following links; None when it is not one."""
     try:
         info = path / "Contents/Info.plist"
         if (path.is_symlink() or (path / "Contents").is_symlink() or info.is_symlink()
                 or info.stat().st_size > 65536):
-            return False
+            return None
         data = plistlib.loads(info.read_bytes())
-        return data.get("OpenSwapProfile") == shortcut.marker and data.get("CFBundleIdentifier") == shortcut.bundle_id
-    except (OSError, ValueError, TypeError, AttributeError, ExpatError):
-        return False
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, TypeError, AttributeError, ExpatError, plistlib.InvalidFileException):
+        return None
+
+
+def _owned_bundle(path, shortcut, *, info=None):
+    """``info`` is the bundle's already-read plist, for a caller that reads more of it."""
+    if info is None:
+        info = launcher_info(path)
+    return info is not None and info.get("OpenSwapProfile") == shortcut.marker and info.get("CFBundleIdentifier") == shortcut.bundle_id
 
 
 class NativeDock:
@@ -140,8 +148,9 @@ class NativeDock:
 
 
 def _prune_backups(directory):
+    """Keep the oldest backup (the Dock before OpenSwap first changed it) and the newest few."""
     backups = sorted(directory.glob("*.plist"), key=lambda p: p.lstat().st_mtime_ns)
-    for stale in backups[:-BACKUPS_KEPT]:
+    for stale in backups[1:1 - BACKUPS_KEPT]:
         stale.unlink()
 
 

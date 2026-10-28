@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import queue
 import shutil
 import stat
@@ -26,6 +27,9 @@ from openswap.exceptions import ClaudeSwitchError
 from openswap.models import get_timestamp
 from openswap.session import delete_macos_keychain_entry, read_config_dir_credentials
 from openswap.worker.leases import AccountLeaseStore
+
+_logger = logging.getLogger("openswap")
+MISMATCH = "Choose the same account and organization as this Desktop profile."
 
 
 def identity(profile):
@@ -91,7 +95,9 @@ def verify_credentials(credentials, profile, *, authorized_identity=None):
         raise IdentityMismatch(MISMATCH)
 
 
-MISMATCH = "Choose the same account and organization as this Desktop profile."
+def delete_login_keychain_item(directory):
+    """A scratch login's item must be confirmed gone, or absent, before its folder goes."""
+    delete_macos_keychain_entry(directory, strict=True)
 
 
 class IdentityMismatch(ClaudeDesktopError):
@@ -107,8 +113,9 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
 
     Runs under the engine's mutation guard and writes only backups and the
     roster: the active login is never touched and no account is switched.
-    ``guard`` is entered inside the engine lock right before the roster write,
-    so a caller can take the registry lock there and abandon a changed row.
+    ``guard`` is entered inside the engine lock before the slot's files and
+    the roster are written, so a caller can take the registry lock there and
+    abandon a changed row while the slot is still untouched.
     """
     if identity(profile) is None or not engine._validate_email(profile.email):
         raise ClaudeDesktopError("The detected account is not valid for Claude Code.")
@@ -130,14 +137,14 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
         number = legacy or str(engine._get_next_account_number())
         email = data["accounts"][number]["email"] if legacy else profile.email
         try:
-            engine.write_account_credentials(number, email, credentials)
-            # A legacy slot keeps the full config captured when it was added.
-            if not legacy or not engine.read_account_config(number, email):
-                engine._write_account_config(number, email, json.dumps({"oauthAccount": {
-                    "emailAddress": email, "accountUuid": profile.account_uuid,
-                    "organizationUuid": profile.organization_uuid, "organizationName": profile.organization,
-                }}))
             with guard():
+                engine.write_account_credentials(number, email, credentials)
+                # A legacy slot keeps the full config captured when it was added.
+                if not legacy or not engine.read_account_config(number, email):
+                    engine._write_account_config(number, email, json.dumps({"oauthAccount": {
+                        "emailAddress": email, "accountUuid": profile.account_uuid,
+                        "organizationUuid": profile.organization_uuid, "organizationName": profile.organization,
+                    }}))
                 data["accounts"][number] = {
                     **data["accounts"].get(number, {}),
                     "email": email, "uuid": profile.account_uuid,
@@ -155,16 +162,18 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
                 if not legacy and number not in ((engine.sequence_data() or {}).get("accounts") or {}):
                     engine._delete_account_files(number, profile.email)
             raise
-        with suppress(Exception):
-            # The roster has committed; a stale usage quarantine is not a failed add.
+        try:
             engine._usage_store.clear_dead_token([number], {number: (email, profile.organization_uuid)})
+        except Exception as exc:
+            # The roster has committed; a stale usage quarantine is not a failed add.
+            _logger.warning("could not clear the usage quarantine after adding a Code account: %s", type(exc).__name__)
         return number
 
 
 class DesktopCodeConnector:
     def __init__(self, store, engine, *, resolve_binary, notify=lambda *_: None,
                  login_factory=ClaudeLoginRun, observe=observe_login,
-                 read_credentials=read_config_dir_credentials, cleanup=delete_macos_keychain_entry,
+                 read_credentials=read_config_dir_credentials, cleanup=delete_login_keychain_item,
                  clock=time.monotonic):
         self.store, self.engine = store, engine
         self.resolve_binary, self.notify = resolve_binary, notify
@@ -175,7 +184,7 @@ class DesktopCodeConnector:
         self._results = queue.SimpleQueue()
         self._next_scan = 0.0
         self._started = time.time()
-        self._swept = False
+        self._sweeper = None
 
     def suspend(self):
         if self._active:
@@ -231,9 +240,11 @@ class DesktopCodeConnector:
         changed = False
         if not enabled:
             self.suspend()
-        elif not self._swept:
-            self._swept = True
-            self._sweep_orphaned_logins()
+        elif self._sweeper is None:
+            # Keychain deletes block; the UI thread never waits on them.
+            self._sweeper = threading.Thread(target=self._sweep_orphaned_logins, daemon=True, name="claude-desktop-code-sweep")
+            with suppress(Exception):
+                self._sweeper.start()
         if self._active:
             try:
                 current = self.store.get(self._active[0])
@@ -292,7 +303,7 @@ class DesktopCodeConnector:
         return changed
 
     def _sweep_orphaned_logins(self):
-        """Remove scratch logins a quit or crash left behind, Keychain item first.
+        """Discard scratch logins a quit or crash left behind.
 
         Best-effort. A folder written since this process started may belong to
         a live login, so it is left alone.
@@ -306,10 +317,27 @@ class DesktopCodeConnector:
                 info = folder.lstat()
                 if not stat.S_ISDIR(info.st_mode) or info.st_mtime >= self._started:
                     continue
-                self.cleanup(folder)
-                shutil.rmtree(folder)
-            except Exception:
-                continue  # the folder name is the only way back to the item, so keep both
+            except OSError:
+                continue
+            self._discard_login(folder)
+
+    def _discard_login(self, directory):
+        """Empty a scratch login, then remove it once its Keychain item is confirmed gone.
+
+        A Keychain that cannot confirm (locked, denied, timed out) keeps the
+        emptied folder: its path is the item's only pointer, and the next
+        sweep tries again.
+        """
+        try:
+            for child in directory.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            self.cleanup(directory)
+            directory.rmdir()
+        except Exception:
+            pass
 
     def _connect(self, profile, key, binary, cancel):
         state, launched = "failed", False
@@ -337,38 +365,38 @@ class DesktopCodeConnector:
                         raise ClaudeDesktopError("The saved account changed during setup.")
                     state = "connected"
                     return
-            with tempfile.TemporaryDirectory(prefix=".code-login-", dir=self.store.root) as raw:
-                directory = Path(raw)
-                try:
-                    done, results = threading.Event(), []
+            raw = tempfile.mkdtemp(prefix=".code-login-", dir=self.store.root)
+            directory = Path(raw)
+            try:
+                done, results = threading.Event(), []
 
-                    def finished(result):
-                        results.append(result)
-                        done.set()
+                def finished(result):
+                    results.append(result)
+                    done.set()
 
-                    run = self.login_factory(binary, profile.email, env=launch_environment(directory), on_done=finished)
-                    self._login = run
-                    self._check_current(profile, fingerprint, cancel)
-                    run.start()
-                    launched = True
-                    while not done.wait(0.25):
-                        if cancel.is_set():
-                            run.cancel()
-                    result = results[-1]
-                    if result.canceled or result.timed_out or cancel.is_set():
-                        state = "sign_in"
-                        return
-                    if result.returncode != 0:
-                        return
-                    credentials = self.read_credentials(raw, strict_keychain=True)
-                    verify_credentials(credentials, profile, authorized_identity=completed_login_identity(directory))
-                    # A rename is harmless; sign-out, org change, manual labels,
-                    # archiving or disabling the feature invalidate this handoff.
-                    self._check_current(profile, fingerprint, cancel)
-                    save_verified_account(self.engine, profile, credentials, guard=guard)
-                    state = "connected"
-                finally:
-                    self.cleanup(directory)  # only this disposable login's Keychain entry
+                run = self.login_factory(binary, profile.email, env=launch_environment(directory), on_done=finished)
+                self._login = run
+                self._check_current(profile, fingerprint, cancel)
+                run.start()
+                launched = True
+                while not done.wait(0.25):
+                    if cancel.is_set():
+                        run.cancel()
+                result = results[-1]
+                if result.canceled or result.timed_out or cancel.is_set():
+                    state = "sign_in"
+                    return
+                if result.returncode != 0:
+                    return
+                credentials = self.read_credentials(raw, strict_keychain=True)
+                verify_credentials(credentials, profile, authorized_identity=completed_login_identity(directory))
+                # A rename is harmless; sign-out, org change, manual labels,
+                # archiving or disabling the feature invalidate this handoff.
+                self._check_current(profile, fingerprint, cancel)
+                save_verified_account(self.engine, profile, credentials, guard=guard)
+                state = "connected"
+            finally:
+                self._discard_login(directory)  # only this disposable login's files and Keychain entry
         except IdentityMismatch:
             state = "mismatch"
         except ProfileChanged:
@@ -393,7 +421,7 @@ class DesktopCodeConnector:
 
     @contextmanager
     def _commit_guard(self, profile, fingerprint, cancel):
-        """Registry lock around a roster write; entered only inside the engine lock."""
+        """Registry lock around the slot and roster writes; entered only inside the engine lock."""
         with self.store._lock():
             self._check_row(profile, fingerprint, cancel)
             yield

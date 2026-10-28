@@ -187,8 +187,11 @@ def test_default_profile_is_registered_once_and_then_only_read(controller, tmp_p
     assert controller.settings_state()["items"][0]["kind"] == "default"
     monkeypatch.setattr(controller.store, "ensure_default", Mock(return_value=None))
     assert controller.settings_state()["items"][0]["kind"] == "default"
-    controller.store.ensure_default.assert_not_called()
     controller.suspend_checks()
+    controller.settings_state()
+    controller.store.ensure_default.assert_not_called()
+    # A Default that disappeared from profiles.json is registered again on the next view.
+    controller.store._save([p for p in controller.store.list(include_archived=True) if p.kind != "default"])
     controller.settings_state()
     controller.store.ensure_default.assert_called_once()
 

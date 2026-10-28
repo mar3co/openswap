@@ -17,7 +17,7 @@ from xml.parsers.expat import ExpatError
 from openswap.claude_desktop import (
     APP_PATH, BUNDLE_ID, BADGE_COLORS, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, _plain, validate_badge,
 )
-from openswap.claude_desktop_dock import DockShortcut, _owned_bundle, install_shortcuts
+from openswap.claude_desktop_dock import DockShortcut, _owned_bundle, install_shortcuts, launcher_info
 from openswap.locking import FileLock
 
 LAUNCHER_VERSION = 3
@@ -190,14 +190,10 @@ def _check_destination(path: Path, shortcut: DockShortcut) -> None:
 
 
 def _current_launcher(path: Path, shortcut: DockShortcut, record: dict) -> bool:
-    """An owned bundle built from the same command, Claude app and badge needs no rebuild."""
-    if not _owned_bundle(path, shortcut):
-        return False
-    try:
-        info = plistlib.loads((path / "Contents/Info.plist").read_bytes())
-    except (OSError, ValueError, ExpatError):
-        return False
-    return info.get("OpenSwapProfileLauncherVersion") == LAUNCHER_VERSION and info.get("OpenSwapProfileLauncher") == record
+    """An owned bundle built from the same name, command, Claude app and badge needs no rebuild."""
+    info = launcher_info(path)
+    return (info is not None and _owned_bundle(path, shortcut, info=info)
+            and info.get("OpenSwapProfileLauncherVersion") == LAUNCHER_VERSION and info.get("OpenSwapProfileLauncher") == record)
 
 
 def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, color=None,
@@ -220,7 +216,7 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
     path = directory / shortcut_name(profile.name)
     shortcut = DockShortcut(path, profile.id, store.root, profile.kind == "default")
     command = launcher_command(store, profile.id)
-    record = {"command": command, "target": str(Path(app.path).resolve()), "badge": badge, "color": color}
+    record = {"name": profile.name, "command": command, "target": str(Path(app.path).resolve()), "badge": badge, "color": color}
     result = {"path": str(path), "app_version": info["version"], "notice": ICON_NOTICE}
     with _destination_lock(directory):
         if reuse_current and (badge, color) == (profile.badge, profile.color) and _current_launcher(path, shortcut, record):
@@ -277,14 +273,16 @@ def create_shortcut(store: DesktopProfiles, identifier: str, *, badge=None, colo
     return {**result, "profile": asdict(updated), "state": "shortcut_created"}
 
 
-def prepare_shortcuts(store: DesktopProfiles, identifier: str, *, pin: bool, creator=None, installer=None) -> dict:
+def prepare_shortcuts(store: DesktopProfiles, identifier: str, *, pin: bool, refresh: bool = False,
+                      creator=None, installer=None) -> dict:
     """Complete Add's shortcut setup, or retry it without adding another profile.
 
     Partial failures keep the profile and any completed shortcuts. Dock changes
     happen only after all required launchers exist; the caller can still open
     Claude when setup needs attention. Launchers already built from the current
     command, Claude app and badge are kept, so the Dock restarts only when the
-    pinned launcher was rebuilt or its pin is new.
+    pinned launcher was rebuilt or its pin is new, or when ``refresh`` asks for
+    it: the explicit setup action repairs a Dock that shows stale icons.
     """
     creator, installer = creator or create_shortcut, installer or install_shortcuts
     profile = store.get(identifier)
@@ -299,5 +297,5 @@ def prepare_shortcuts(store: DesktopProfiles, identifier: str, *, pin: bool, cre
     if pin:
         # Add only the requested profile to the Dock. Default's shortcut is
         # available in Finder, but never replaces Claude's ordinary launcher.
-        installer(store, [s for s in shortcuts if s.profile_id == profile.id], refresh_icons=rebuilt)
+        installer(store, [s for s in shortcuts if s.profile_id == profile.id], refresh_icons=rebuilt or refresh)
     return {"state": "dock_ready" if pin else "shortcuts_ready", "paths": [str(s.path) for s in shortcuts]}

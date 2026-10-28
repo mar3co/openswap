@@ -26,6 +26,7 @@ MAX_AGE = 120
 RESTORE_TIMEOUT = 10
 RECHECK = 5
 RESTORE_FAILED = "Could not restore Claude links. Open Claude once before signing in again."
+RESTORE_REINSTALL = "Could not restore Claude links. Open Claude once to restore its link handling, or reinstall Claude."
 
 
 def register_application(path):
@@ -118,6 +119,16 @@ def claude_link(value):
         return False
 
 
+def ordinary_link(value):
+    """Neither a recognized callback nor an unknown auth route, which is never forwarded."""
+    try:
+        callback_link(value)
+    except ClaudeDesktopError:
+        parsed = urlsplit(value)
+        return not any(part in (parsed.netloc + parsed.path).lower() for part in ("auth", "login", "callback", "magic-link"))
+    return False
+
+
 class MacOSLinks:
     """Native plumbing; completion handlers only enqueue results, never show UI."""
     def __init__(self, receive, launched):
@@ -182,14 +193,20 @@ class MacOSLinks:
 
     def set_handler(self, path, completed):
         from Foundation import NSURL
-        register_application(path)
+        restoring = Path(path).resolve() != self.application
+        try:
+            register_application(path)
+        except ClaudeDesktopError:
+            if not restoring:
+                raise
+            raise ClaudeDesktopError(RESTORE_REINSTALL) from None
         candidates = self.workspace.URLsForApplicationsToOpenURL_(NSURL.URLWithString_("claude://")) or []
         if Path(path).resolve() not in {Path(url.path()).resolve() for url in candidates}:
             # Launch Services records temporary bundles but excludes them from
             # URL binding. LSRegisterURL can return success in that case.
-            if Path(path).resolve() == self.application:
+            if not restoring:
                 raise ClaudeDesktopError("Move OpenSwap to Applications, reopen it, then choose Reconnect sign-in in the profile menu.")
-            raise ClaudeDesktopError("Could not restore Claude links. Open Claude once to restore its link handling, or reinstall Claude.")
+            raise ClaudeDesktopError(RESTORE_REINSTALL)
         self.workspace.setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler_(
             NSURL.fileURLWithPath_(str(path)), "claude", lambda error: completed(error is None))
 
@@ -218,6 +235,11 @@ class DesktopSignInLinks:
         self.dispatching = False
         self.restore_callbacks = []
         self.restore_deadline = None
+        # An explicit restore (Quit or disable) is waiting on the handler
+        # change; a background handback fails quietly.
+        self.explicit = False
+        # Quit's restore has finished: no further request or alert this run.
+        self.closed = False
         # Whether this app is the handler: unknown until checked, then tracked
         # through its own claims and restores.
         self.held = None
@@ -249,7 +271,7 @@ class DesktopSignInLinks:
             self.prepare_at = self.clock() + 2
 
     def prepare(self, *, retry=False):
-        self.stopping = False
+        self.stopping = self.closed = False
         if retry:
             self.native.pause(False)
         self.launched()
@@ -274,37 +296,49 @@ class DesktopSignInLinks:
             self.completions.put(("claim", False))
 
     def restore(self, completed=None):
-        self.stopping = True
+        """Quit or disable: hand the handler back; queued callbacks are dropped."""
+        if self.closed:
+            if completed:
+                completed()
+            return
+        self.stopping = self.explicit = True
         self.prepare_at = None
-        while not self.events.empty():
-            try:
-                self.events.get_nowait()
-            except queue.Empty:
-                break
+        self._sift(keep_callbacks=False)
         if completed:
             self.restore_callbacks.append(completed)
             self.restore_deadline = self.clock() + RESTORE_TIMEOUT
+        self._hand_back()
+
+    def _hand_back(self):
         if self.changing:
             return  # a pending grant must be undone before quitting/disabling
         try:
-            if self.native.current() == self.native.application:
+            previous = self.native.previous()
+            if self.native.current() != self.native.application:
+                self.held = False
+            elif previous.is_dir():
                 self.changing = True
-                self.native.set_handler(self.native.previous(), lambda ok: self.completions.put(("restore", ok)))
+                self.native.set_handler(previous, lambda ok: self.completions.put(("restore", ok)))
                 return
-            self.held = False
+            # A previous handler that is gone leaves nothing to restore to.
         except ClaudeDesktopError as exc:
             self.changing = False
-            self.show_error(str(exc))
+            self._restore_failed(str(exc))
         except Exception:
             self.changing = False
-            self.show_error(RESTORE_FAILED)
+            self._restore_failed(RESTORE_FAILED)
         self._restored()
+
+    def _restore_failed(self, message):
+        if self.explicit:
+            self.show_error(message)
 
     def _restored(self):
         self.restore_deadline = None
-        if self.released:
-            self.stopping = False
+        self.explicit = False
         callbacks, self.restore_callbacks = self.restore_callbacks, []
+        if callbacks:
+            self.closed = True
         for callback in callbacks:
             callback()
 
@@ -328,7 +362,34 @@ class DesktopSignInLinks:
                 return
         if self.held:
             self.released = True
-            self.restore()
+            self._hand_back()
+
+    def _sift(self, *, keep_callbacks):
+        """Forward ordinary links now; callbacks expire, or all go when not kept.
+
+        Ordinary links are not credentials and never wait on a pending handler
+        change, so a handback stalled on its consent sheet cannot age them out.
+        """
+        live = []
+        for _ in range(8):
+            try:
+                item = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if self.clock() - item[0] > MAX_AGE:
+                continue
+            if ordinary_link(item[1]):
+                try:
+                    self.native.forward(item[1])
+                except Exception:
+                    self.show_error("Could not open the Claude link. Start again from the intended profile.")
+            elif keep_callbacks:
+                live.append(item)
+        for item in live:
+            try:
+                self.events.put_nowait(item)
+            except queue.Full:
+                break
 
     def poll(self, *, idle=True):
         try:
@@ -352,7 +413,7 @@ class DesktopSignInLinks:
                 if ok:
                     self.held = False
                 else:
-                    self.show_error(RESTORE_FAILED)
+                    self._restore_failed(RESTORE_FAILED)
                 self._restored()
         if self.restore_callbacks and self.restore_deadline is not None and self.clock() >= self.restore_deadline:
             # The consent sheet stays with the user; Quit cannot wait on it.
@@ -368,19 +429,7 @@ class DesktopSignInLinks:
             except Exception:
                 self.show_error("Could not set up automatic sign-in. Choose Reconnect sign-in in the profile menu to retry.")
         # Discard old queued credentials even while another operation is busy.
-        live = []
-        for _ in range(8):
-            try:
-                item = self.events.get_nowait()
-            except queue.Empty:
-                break
-            if self.clock() - item[0] <= MAX_AGE:
-                live.append(item)
-        for item in live:
-            try:
-                self.events.put_nowait(item)
-            except queue.Full:
-                break
+        self._sift(keep_callbacks=True)
         if not idle or self.changing or self.dispatching:
             return
         try:
@@ -388,20 +437,14 @@ class DesktopSignInLinks:
         except queue.Empty:
             return
         now = self.clock()
-        if now - received > MAX_AGE:
-            return
         try:
             # An unrecognized auth route is never sent to an arbitrary profile.
-            parsed = urlsplit(value)
             try:
                 callback_link(value)
             except ClaudeDesktopError:
-                if any(part in (parsed.netloc + parsed.path).lower() for part in ("auth", "login", "callback", "magic-link")):
-                    self.show_error("This Claude link is not supported. Start again from the intended Claude profile.")
-                else:
-                    self.native.forward(value)
+                self.show_error("This Claude link is not supported. Start again from the intended Claude profile.")
                 return
-            # Only one-time callbacks are deduplicated; an ordinary link may repeat.
+            # One-time callbacks are deduplicated; ordinary links were forwarded by the sift.
             self.seen = {key: at for key, at in self.seen.items() if now - at < MAX_AGE}
             digest = hashlib.sha256(value.encode("ascii")).digest()
             if digest in self.seen:

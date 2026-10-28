@@ -403,8 +403,8 @@ class TestClaudeDesktopCleanup:
         assert not work.exists() and stuck.is_dir() and m.folder.is_dir()
         assert [tile_path(row) for row in m.dock.apps][-1] == stuck.resolve() and len(m.dock.apps) == 3
 
-    @pytest.mark.parametrize("trouble", ["managed", "changed", "refresh"])
-    def test_dock_trouble_is_a_warning_not_a_failure(self, profile_mac, trouble):
+    @pytest.mark.parametrize("trouble", ["managed", "changed", "refresh", "no_appkit", "objc", "refresh_native"])
+    def test_dock_trouble_is_a_warning_not_a_failure(self, profile_mac, monkeypatch, trouble):
         m = profile_mac
         work = launcher(m.folder, "Work", "a" * 32, m.root)
         m.dock.apps.append(tile(work, 3))
@@ -415,12 +415,18 @@ class TestClaudeDesktopCleanup:
             m.dock.snapshot = lambda: next(snapshots)
         if trouble == "refresh":
             m.dock.refresh.side_effect = ClaudeSwitchError("Shortcuts were saved. Reopen the Dock to refresh their icons.")
+        if trouble == "no_appkit":
+            monkeypatch.setattr(uninstall, "_dock", Mock(side_effect=ImportError("No module named Foundation")))
+        if trouble == "objc":
+            m.dock.managed.side_effect = AttributeError("NSUserDefaults does not recognize the selector")
+        if trouble == "refresh_native":
+            m.dock.refresh.side_effect = RuntimeError("NSRunningApplication unavailable")
         removal = uninstall.remove_integrations(home=m.home, uid=501)
         assert removal.removed == ["Claude profile shortcuts"] and removal.failed == []
         [warning] = removal.warnings
         assert "Dock" in warning
         assert not m.folder.exists()
-        assert (m.dock.writes == []) is (trouble != "refresh")
+        assert (m.dock.writes == []) is (trouble not in ("refresh", "refresh_native"))
 
     def test_the_dock_backup_never_creates_the_profile_store(self, profile_mac):
         m = profile_mac
@@ -1450,11 +1456,15 @@ class TestAppDialog:
         assert message.endswith("run “uv tool uninstall openswap” afterwards.")
         assert "pairing" not in message
 
-    def test_profile_shortcuts_are_listed_only_when_present(self, monkeypatch, tmp_path):
+    def test_profile_shortcuts_are_listed_only_when_an_owned_launcher_is_present(self, monkeypatch, tmp_path):
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
         monkeypatch.setattr(uninstall, "paired_servers", lambda: [])
         assert "profile shortcuts" not in uninstall.app_dialog()["message"]
-        (tmp_path / "Applications" / "OpenSwap Profiles").mkdir(parents=True)
+        folder = tmp_path / "Applications" / "OpenSwap Profiles"
+        folder.mkdir(parents=True)
+        launcher(folder, "Fake", "c" * 32, tmp_path, bundle_id="com.example.fake")
+        assert "profile shortcuts" not in uninstall.app_dialog()["message"]
+        launcher(folder, "Work", "a" * 32, tmp_path / "another store")
         assert "• the Claude profile shortcuts and their Dock tiles" in uninstall.app_dialog()["message"]
 
     def test_two_pairings_are_both_named(self, monkeypatch):

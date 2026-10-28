@@ -80,7 +80,7 @@ end openProfile
 
 on processAlive(pid)
     try
-        do shell script "/bin/kill -0 " & pid
+        do shell script "/bin/kill -0 " & quoted form of (pid as text)
         return true
     on error
         return false

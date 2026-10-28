@@ -481,13 +481,16 @@ def test_relinking_a_legacy_slot_keeps_its_full_config_backup(setup):
     assert s.engine.read_account_config("7", DETAILS["email"]) == backup
 
 
-def test_usage_quarantine_failure_after_commit_still_reports_the_added_account(setup, monkeypatch):
+def test_usage_quarantine_failure_after_commit_still_reports_the_added_account(setup, monkeypatch, caplog):
     s = setup
-    monkeypatch.setattr(s.engine._usage_store, "clear_dead_token", Mock(side_effect=OSError("locked")))
-    s.connector.poll(enabled=True)
-    assert finish(s).code_setup_state == "connected"
+    monkeypatch.setattr(s.engine._usage_store, "clear_dead_token", Mock(side_effect=OSError("locked " + DETAILS["email"])))
+    with caplog.at_level("WARNING", logger="openswap"):
+        s.connector.poll(enabled=True)
+        assert finish(s).code_setup_state == "connected"
     assert s.engine.account_identity("1")["uuid"] == ACCOUNT
     s.connector.notify.assert_called_once()
+    [record] = [r for r in caplog.records if "usage quarantine" in r.getMessage()]
+    assert "OSError" in record.getMessage() and DETAILS["email"] not in record.getMessage()
 
 
 def test_duplicate_roster_match_reports_itself_without_blocking_other_profiles(setup):
@@ -504,31 +507,83 @@ def test_duplicate_roster_match_reports_itself_without_blocking_other_profiles(s
         "code_status": "More than one saved Code account matches. Resolve the duplicate in Claude Code."}
 
 
-def test_code_setup_is_not_offered_while_automatic_detection_is_off(setup):
-    s = setup
-    s.store.update(s.profile.id, code_setup_key=code.setup_key(s.profile, s.engine), code_setup_state="sign_in")
-    p = s.store.update(s.profile.id, auto_detect=False)
-    assert s.connector.state(p) == {}
-    with pytest.raises(ClaudeDesktopError, match="Detect this profile's account"):
-        s.connector.retry(p.id)
+def real_keychain(monkeypatch, outcome):
+    """The production Keychain delete, with ``security`` answering as ``outcome`` says."""
+    from openswap import macos_keychain
+    from openswap.models import Platform
+    monkeypatch.setattr(Platform, "detect", classmethod(lambda cls: Platform.MACOS))
+    calls = []
+
+    def delete_password(service, account):
+        calls.append(service)
+        if outcome == "locked":
+            raise macos_keychain.KeychainError("security delete-generic-password failed (rc=36): User interaction is not allowed.")
+        if outcome == "timeout":
+            raise macos_keychain.KeychainError("security delete-generic-password timed out after 10s")
+        # rc 0 and rc 44 (absent) both return without raising
+
+    monkeypatch.setattr(macos_keychain, "delete_password", delete_password)
+    return calls
 
 
-def test_first_enabled_poll_sweeps_orphaned_logins_but_never_live_ones(setup):
+@pytest.mark.parametrize("outcome", ["deleted", "locked", "timeout"])
+def test_first_enabled_poll_sweeps_orphaned_logins_off_the_ui_thread_but_never_live_ones(setup, monkeypatch, outcome):
     s = setup
-    stale, live, stuck = (s.store.root / f".code-login-{name}" for name in ("stale", "live", "stuck"))
-    for folder in (stale, live, stuck):
+    s.connector.cleanup = code.delete_login_keychain_item
+    deletes = real_keychain(monkeypatch, outcome)
+    stale, live = (s.store.root / f".code-login-{name}" for name in ("stale", "live"))
+    for folder in (stale, live):
         folder.mkdir()
         (folder / ".claude.json").write_text("{}")
-    for folder, age in ((stale, -100), (stuck, -100), (live, 100)):
-        os.utime(folder, (s.connector._started + age,) * 2)
-    s.connector.cleanup.side_effect = lambda path: (_ for _ in ()).throw(OSError("busy")) if path == stuck else None
+        (folder / "nested").mkdir()
+        (folder / "nested" / ".credentials.json").write_text("{}")
+    os.utime(stale, (s.connector._started - 100,) * 2)
+    os.utime(live, (s.connector._started + 100,) * 2)
     s.connector.poll(enabled=False)
-    assert stale.exists() and not s.connector.cleanup.called
+    assert stale.exists() and deletes == []
     assert s.connector.poll(enabled=True)
-    swept = {call.args[0] for call in s.connector.cleanup.call_args_list}
-    assert {stale, stuck} <= swept and live not in swept
-    assert not stale.exists() and live.exists() and stuck.exists()
+    s.connector._sweeper.join(4)
+    assert s.connector._sweeper.name == "claude-desktop-code-sweep" and not s.connector._sweeper.is_alive()
+    from openswap.session import keychain_service_name
+    assert deletes == [keychain_service_name(stale)]
+    assert live.is_dir() and (live / "nested" / ".credentials.json").exists()
+    if outcome == "deleted":
+        assert not stale.exists()
+    else:
+        # The item may survive: the empty folder keeps its name for the next sweep.
+        assert stale.is_dir() and list(stale.iterdir()) == []
     assert finish(s).code_setup_state == "connected"
+
+
+@pytest.mark.parametrize("outcome", ["deleted", "locked"])
+def test_finished_login_keeps_its_empty_scratch_folder_until_the_keychain_item_is_confirmed_gone(setup, monkeypatch, outcome):
+    s = setup
+    s.connector.cleanup = code.delete_login_keychain_item
+    deletes = real_keychain(monkeypatch, outcome)
+    s.connector.poll(enabled=True)
+    assert finish(s).code_setup_state == "connected"
+    scratch = Path(s.calls[0].env["CLAUDE_CONFIG_DIR"])
+    assert len(deletes) == 1
+    if outcome == "deleted":
+        assert not scratch.exists()
+    else:
+        assert scratch.is_dir() and list(scratch.iterdir()) == []
+
+
+def test_profile_change_before_commit_leaves_a_legacy_slot_byte_for_byte_unchanged(setup, monkeypatch):
+    s = setup
+    seed(s, uuid="")
+    # An unusable legacy credential sends setup through fresh authorization.
+    s.engine._write_account_credentials("7", DETAILS["email"], "legacy credential")
+    backup = json.dumps({"oauthAccount": {"emailAddress": DETAILS["email"]}, "projects": {"/work": {}}})
+    s.engine._write_account_config("7", DETAILS["email"], backup)
+    monkeypatch.setattr(code, "AccountLeaseStore", guard_factory(s, lambda: s.store.update(s.profile.id, archived=True)))
+    s.connector.poll(enabled=True)
+    finish(s)
+    assert len(s.calls) == 1
+    assert s.engine.read_backup_credentials("7", DETAILS["email"]) == ("legacy credential", False)
+    assert s.engine.read_account_config("7", DETAILS["email"]) == backup
+    assert s.engine.account_identity("7")["uuid"] == ""
 
 
 def test_roster_write_failure_cleans_only_new_backup_and_preserves_active(setup, monkeypatch):

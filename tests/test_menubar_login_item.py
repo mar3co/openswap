@@ -411,6 +411,7 @@ def _quitting_app(quits, logged):
     scope = dict(vars(menubar))
     scope["rumps"] = types.SimpleNamespace(quit_application=lambda: quits.append(1))
     app = extract_class(menubar.__file__, "MenuBarApp", {"on_quit", "_finish_quit"}, scope)()
+    app._quit_pending = app._quit_finished = False
     app._status_icon_animator = None
     app._login_session = None
     app._claude_login = None

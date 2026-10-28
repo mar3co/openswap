@@ -257,12 +257,6 @@ def observe_login(store, profile):
         return ""
 
 
-def _require_present(store, identifier, profile):
-    """Raise if the profile was archived or its folders vanished mid-detection."""
-    store.get(identifier)
-    store._directories(profile)
-
-
 def disk_stamp(store, profile):
     """Cheap hint for scheduling reads. Never used as authenticated identity."""
     desktop, _ = store._directories(profile)
@@ -361,7 +355,9 @@ def detect_account(store: DesktopProfiles, identifier: str, *, app=None, key_pro
             raise DetectionError("Automatic account detection was turned off.")
         result = _labels(_bootstrap(cookies), org_id, before[0])
         result["detected_login"] = login_fingerprint(before)
-        _require_present(store, identifier, profile)
+        # Archived mid-detection or folders gone: both raise here.
+        store.get(identifier)
+        store._directories(profile)
         if _snapshot(desktop) != before:
             raise DetectionError(CHANGED)
         return result

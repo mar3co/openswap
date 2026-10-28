@@ -309,7 +309,7 @@ def test_shortcut_failure_does_not_block_signin_and_retry_does_not_add_profile(m
     assert 'Set up Dock shortcuts' in menu.show_status.call_args.args[0]
     menu.shortcut_setup = Mock(return_value={'state': 'dock_ready'})
     menu.perform('setup_dock', p.id); menu.poll()
-    menu.shortcut_setup.assert_called_once_with(store, p.id, pin=True)
+    menu.shortcut_setup.assert_called_once_with(store, p.id, pin=True, refresh=True)
     assert store.list() == [p]
     opened.assert_called_once()
 

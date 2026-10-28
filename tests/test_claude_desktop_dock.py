@@ -153,14 +153,14 @@ def test_installer_checks_ownership_against_store_root_not_caller_root(store, bu
     backend.write.assert_not_called()
 
 
-def test_backups_keep_only_the_newest_five(store, builder):
+def test_backups_keep_the_first_layout_and_the_newest_four(store, builder):
     s = built(store, builder)
     backend = Backend([])
     for i in range(7):
         backend.apps = [tile(f'/Applications/App{i}.app', 100 + i)]
         dock.install_shortcuts(store, [s], backend=backend)
     backups = list((store.root/'dock-backups').glob('*.plist'))
-    assert sorted(plistlib.loads(b.read_bytes())['persistent-apps'][0]['GUID'] for b in backups) == [102, 103, 104, 105, 106]
+    assert sorted(plistlib.loads(b.read_bytes())['persistent-apps'][0]['GUID'] for b in backups) == [100, 103, 104, 105, 106]
 
 
 def test_installer_finds_renamed_owned_shortcut_but_not_other_store(store, builder):
@@ -217,9 +217,13 @@ def test_add_keeps_current_launchers_and_restarts_dock_only_after_rebuild(store,
     sc.prepare_shortcuts(store, personal.id, pin=True, creator=creator, installer=installer)
     assert builder.run.call_count == runs + 3
     assert installer.call_args.kwargs['refresh_icons'] is False
+    # The explicit setup action repairs the Dock even when nothing was rebuilt or re-pinned.
+    sc.prepare_shortcuts(store, personal.id, pin=True, refresh=True, creator=creator, installer=installer)
+    assert builder.run.call_count == runs + 3
+    assert installer.call_args.kwargs['refresh_icons'] is True
 
 
-@pytest.mark.parametrize('stale', ['version', 'command', 'target', 'badge'])
+@pytest.mark.parametrize('stale', ['version', 'command', 'target', 'badge', 'name'])
 def test_add_rebuilds_default_launcher_that_no_longer_matches(store, builder, stale):
     existing(store)
     creator = lambda s, i, **kw: builder.build(s.get(i), **kw)
@@ -230,6 +234,7 @@ def test_add_rebuilds_default_launcher_that_no_longer_matches(store, builder, st
     if stale == 'command': data['OpenSwapProfileLauncher']['command'][-1] = '--other-flag'
     if stale == 'target': data['OpenSwapProfileLauncher']['target'] = '/Applications/Old Claude.app'
     if stale == 'badge': data['OpenSwapProfileLauncher']['badge'] = '3'
+    if stale == 'name': data['OpenSwapProfileLauncher']['name'] = 'Default (old)'
     info.write_bytes(plistlib.dumps(data))
     runs = builder.run.call_count
     sc.prepare_shortcuts(store, store.add('Work').id, pin=False, creator=creator, installer=Mock())

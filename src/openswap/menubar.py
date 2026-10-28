@@ -256,6 +256,8 @@ def run(switcher, codex=None) -> int:
             self._worker_result_lock = threading.Lock()
             self._desktop_app = DesktopApp()
             self._claude_desktop_update_pending = False
+            self._quit_pending = False
+            self._quit_finished = False
             self._claude_desktop_profiles = ClaudeDesktopMenu(
                 prompt=self._prompt, show_error=self._show_error, changed=self._claude_desktop_changed,
                 confirm=self._alert,
@@ -3737,14 +3739,14 @@ def run(switcher, codex=None) -> int:
             links = getattr(profiles, "signin_links", None)
             # The first Quit hands Claude links back first (bounded by the
             # coordinator); a second Quit while that waits quits right away.
-            if links is not None and not getattr(self, "_quit_pending", False):
+            if links is not None and not self._quit_pending:
                 self._quit_pending = True
                 links.restore(lambda: self._finish_quit(_sender))
                 return
             self._finish_quit(_sender)
 
         def _finish_quit(self, _sender):
-            if getattr(self, "_quit_finished", False):
+            if self._quit_finished:
                 return
             self._quit_finished = True
             if getattr(self, "_claude_desktop_profiles", None) is not None:

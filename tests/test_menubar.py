@@ -4195,6 +4195,7 @@ def _quitting_app_with_links(quits):
     scope = dict(vars(menubar))
     scope["rumps"] = SimpleNamespace(quit_application=lambda: quits.append(1))
     app = extract_class(menubar.__file__, "MenuBarApp", {"on_quit", "_finish_quit"}, scope)()
+    app._quit_pending = app._quit_finished = False
     pending = []
     links = SimpleNamespace(restore=lambda done: pending.append(done))
     app._claude_desktop_profiles = SimpleNamespace(signin_links=links, suspend_checks=lambda: None)

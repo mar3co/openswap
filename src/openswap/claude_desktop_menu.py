@@ -63,10 +63,11 @@ class ClaudeDesktopMenu:
         self.code_login_allowed = code_login_allowed or (lambda: True)
         self.signin_sender = signin_sender
         self.signin_links = None
+        # The callback under discovery and its freshness check; never queued.
+        self._signin = None
         self._editing_details = False
         self._guide_shown = False
         self._default_error = ""
-        self._default_registered = False
         self.operation = "Opening Claude…"
         self.busy = False
         self._results = queue.SimpleQueue()
@@ -82,7 +83,7 @@ class ClaudeDesktopMenu:
     def suspend_checks(self):
         self._check_generation += 1
         self.checking = False
-        self._default_registered = False
+        self._signin = None
         self.monitor.suspend()
         if self.code:
             self.code.suspend()
@@ -101,17 +102,18 @@ class ClaudeDesktopMenu:
         return self.operation if self.busy else "Waiting for app switch…"
 
     def _profiles(self):
-        if self.enabled() and not self._default_registered:
+        rows = self.store.list(include_archived=True)
+        self._default_error = ""
+        if self.enabled() and not any(p.kind == "default" for p in rows):
             # Registering the ordinary profile is the one write a view can
-            # cause; once it exists, views only read.
-            self._default_error = ""
+            # cause; while the registry lists it, views only read.
             try:
-                self._default_registered = self.store.ensure_default() is not None
+                if self.store.ensure_default() is not None:
+                    rows = self.store.list(include_archived=True)
             except (ClaudeSwitchError, OSError):
-                # Discovery cannot prevent managing separate profiles. Invalid
-                # registry metadata is still surfaced by list() below.
+                # Discovery cannot prevent managing separate profiles.
                 self._default_error = "Could not show the existing Claude profile. Check its folder permissions."
-        return sorted(self.store.list(include_archived=True), key=lambda p: p.kind != "default")
+        return sorted(rows, key=lambda p: p.kind != "default")
 
     def settings_state(self):
         state = {"checking": self.checking, "busy": self.busy or self.blocked(),
@@ -368,14 +370,20 @@ class ClaudeDesktopMenu:
         self.busy = True
         self.operation = "Checking open Claude profiles…"
         self.changed()
+        self._signin = (value, fresh)
 
         def work():
-            result = {"state": "signin_candidates", "value": value, "connector": kind == "connector", "fresh": fresh,
-                      "candidates": [], "unchecked": 0}
+            result = {"state": "signin_candidates", "connector": kind == "connector",
+                      "candidates": [], "unchecked": 0, "default_unchecked": False}
             try:
                 app = self._app_factory()
                 app.validate()
-                self.store.ensure_default()
+                try:
+                    self.store.ensure_default()
+                except (ClaudeSwitchError, OSError):
+                    # The ordinary profile may be the origin; without it listed, no candidate is preselected.
+                    result["default_unchecked"] = True
+                    result["unchecked"] += 1
                 profiles = sorted(self.store.list(), key=lambda p: p.kind != "default")
                 processes = app._processes()
             except (ClaudeSwitchError, OSError) as exc:
@@ -383,9 +391,8 @@ class ClaudeDesktopMenu:
                 return
             for profile in profiles:
                 desktop, code = self.store.paths(profile)
-                argv = [str(app.binary)] if code is None else [str(app.binary), f"--user-data-dir={desktop}"]
                 try:
-                    pid = app._running(argv, desktop, processes=processes)
+                    pid = app._running(app.launch_argv(desktop, code), desktop, processes=processes)
                 except ClaudeDesktopError:
                     result["unchecked"] += 1
                     continue
@@ -397,13 +404,17 @@ class ClaudeDesktopMenu:
             threading.Thread(target=work, daemon=True, name="claude-profile-discovery").start()
         except Exception:
             self.busy = False
+            self._signin = None
             self.changed()
             self.show_error("Could not check the open Claude profiles. Try again.")
 
-    def _choose_signin_profile(self, result):
+    def _choose_signin_profile(self, result, held):
         """One click picks the target; with several candidates nothing is preselected."""
         from openswap.claude_desktop_signin import finish_signin
-        value, fresh, connector, candidates = result["value"], result["fresh"], result["connector"], result["candidates"]
+        if held is None:
+            return  # discovery was suspended meanwhile
+        value, fresh = held
+        connector, candidates = result["connector"], result["candidates"]
         if not fresh():
             self.show_error("This link expired. Start again from the intended Claude profile.")
             return
@@ -413,11 +424,14 @@ class ClaudeDesktopMenu:
             self.show_error("Could not check the open Claude profiles. Start again from the intended Claude profile."
                             if result["unchecked"] else "Open the intended Claude profile and start again there.")
             return
-        placeholder = ["Choose a profile…"] if len(candidates) > 1 else []
+        placeholder = ["Choose a profile…"] if len(candidates) > 1 or result["default_unchecked"] else []
+        message = "Which Claude profile did you connect this app from?" if connector else "Which profile did you start signing in to?"
+        if result["default_unchecked"]:
+            message += "\n\nThe existing Claude profile could not be checked."
         while True:
             with self._modal():
                 response = self.prompt(title="Finish connecting app" if connector else "Finish Claude sign-in",
-                                       message="Which Claude profile did you connect this app from?" if connector else "Which profile did you start signing in to?",
+                                       message=message,
                                        choices=placeholder + [p.name for p, _ in candidates], selected=0,
                                        ok="Continue", cancel="Cancel")
             if response.clicked != 1:
@@ -554,9 +568,9 @@ class ClaudeDesktopMenu:
                         + ("Sign-in, work and open windows kept. Restore to use its shortcuts again."
                            if updated.archived else "Ready to open. Restoring does not launch Claude Desktop."))
 
-    def _prepare_shortcuts(self, identifier, *, pin):
+    def _prepare_shortcuts(self, identifier, *, pin, refresh=False):
         from openswap.claude_desktop_shortcut import prepare_shortcuts
-        return (self.shortcut_setup or prepare_shortcuts)(self.store, identifier, pin=pin)
+        return (self.shortcut_setup or prepare_shortcuts)(self.store, identifier, pin=pin, refresh=refresh)
 
     def setup_dock(self, profile):
         if self.busy or self.blocked() or not self.enabled():
@@ -567,7 +581,8 @@ class ClaudeDesktopMenu:
 
         def work():
             try:
-                self._results.put((self._prepare_shortcuts(profile.id, pin=True), None))
+                # The explicit action is the repair path: the Dock is refreshed even when nothing changed.
+                self._results.put((self._prepare_shortcuts(profile.id, pin=True, refresh=True), None))
             except Exception as exc:
                 self._results.put((None, exc))
         try:
@@ -669,6 +684,7 @@ class ClaudeDesktopMenu:
         except queue.Empty:
             return
         self.busy = False
+        held, self._signin = self._signin, None
         if error is None and result.get("pid") and result.get("profile", {}).get("id"):
             self._profile_states[result["profile"]["id"]] = "Running"
             self._profile_checked_at[result["profile"]["id"]] = datetime.now().strftime("%b %d, %H:%M:%S")
@@ -677,7 +693,7 @@ class ClaudeDesktopMenu:
             self._error(error)
             return
         if result.get("state") == "signin_candidates":
-            self._choose_signin_profile(result)
+            self._choose_signin_profile(result, held)
             return
         if result.get("state") == "account_details":
             if not self.enabled() or self.blocked():
@@ -699,6 +715,9 @@ class ClaudeDesktopMenu:
             self._notify("Dock shortcuts ready" if result["state"] == "dock_ready" else "Shortcuts ready",
                          "Use each profile's shortcut to open its Claude window.")
             self.refresh_status()
+            return
+        if result.get("state") == "already_opening":
+            self._notify("Claude is still starting", f"{result['profile']['name']} · Open it again in a moment.")
             return
         try:
             focus_profile(result["pid"])

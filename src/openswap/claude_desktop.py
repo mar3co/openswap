@@ -401,15 +401,15 @@ class DesktopProfiles:
         with self._lock():
             profile = self.get(identifier)
             desktop, code = self._directories(profile)
-        launch = self._lock("launch.lock", timeout=LAUNCH_LOCK_TIMEOUT)
+        launch = self._lock(f"launch-{profile.id}.lock", timeout=LAUNCH_LOCK_TIMEOUT)
         if launch.acquire():
             try:
                 result = app.open(desktop, code, existing_only=True) if existing_only else app.open(desktop, code)
             finally:
                 launch.release()
         else:
-            # Another open of some profile is still launching: not an error.
-            # The same profile shows up as running once its launch is through.
+            # Another open of this profile is still launching: not an error.
+            # It shows up as running once that launch is through.
             pid = app._running(app.launch_argv(desktop, code), desktop)
             result = {"state": "already_running", "pid": pid} if pid is not None else {"state": "already_opening", "pid": None}
         return {**result, "profile": asdict(profile), "app_version": info["version"],
@@ -608,6 +608,9 @@ def main(argv: list[str]) -> int:
             data = create_shortcut(store, args.profile, badge=args.badge, color=args.color, directory=args.directory)
         elif args.action == "open":
             data = store.open(args.profile, existing_only=True) if args.existing else store.open(args.profile)
+            if data["state"] == "already_opening" and args.from_launcher:
+                # The applet waits on a PID; without one it can only ask for another click.
+                raise ClaudeDesktopError("Claude is still starting. Click this profile again in a moment.")
             if data.get("pid") and not args.from_launcher:
                 from openswap.claude_desktop_presence import attach_presence
                 try:

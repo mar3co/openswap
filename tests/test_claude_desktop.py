@@ -7,6 +7,7 @@ import stat
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -315,7 +316,7 @@ def test_an_open_that_outwaits_another_launch_is_not_an_error(store, app, monkey
     p = store.add("Personal")
     desktop, _ = store.paths(p)
     monkeypatch.setattr(cd, "LAUNCH_LOCK_TIMEOUT", 0.1)
-    other = store._lock("launch.lock")
+    other = store._lock(f"launch-{p.id}.lock")
     assert other.acquire()
     try:
         result = store.open(p.id, app=app)
@@ -326,6 +327,52 @@ def test_an_open_that_outwaits_another_launch_is_not_an_error(store, app, monkey
     finally:
         other.release()
     assert store.open(p.id, app=app)["state"] == "already_running"
+
+
+def test_one_profile_launching_does_not_hold_up_another(store, app, monkeypatch):
+    a, b = store.add("A"), store.add("B")
+    monkeypatch.setattr(cd, "LAUNCH_LOCK_TIMEOUT", 0.1)
+    proc = Mock(pid=42)
+    proc.wait.side_effect = [subprocess.TimeoutExpired("Claude", 0.75), 0]
+    app.popen.return_value = proc
+    launching_a = store._lock(f"launch-{a.id}.lock")
+    assert launching_a.acquire()
+    try:
+        assert store.open(b.id, app=app)["state"] == "launched"
+        assert app.popen.call_args.args[0][-1] == f"--user-data-dir={store.paths(b)[0]}"
+        assert store.open(a.id, app=app)["state"] == "already_opening"
+    finally:
+        launching_a.release()
+    assert app.popen.call_count == 1
+
+
+def test_launcher_is_told_to_click_again_while_its_profile_is_still_opening(store, app, monkeypatch, capsys):
+    p = store.add("Work")
+    monkeypatch.setattr(cd, "ClaudeDesktopApp", lambda: app)
+    monkeypatch.setattr(cd.DesktopProfiles, "open", lambda self, identifier, **kw: {
+        "state": "already_opening", "pid": None, "profile": asdict(self.get(identifier)), "app_version": "test"})
+    assert cd.main(["open", p.id, "--profile-root", str(store.root), "--json", "--from-launcher", "--focus"]) == 1
+    out, err = capsys.readouterr()
+    assert json.loads(out) == {"ok": False, "error": "Claude is still starting. Click this profile again in a moment."}
+    assert err.strip() == "Claude is still starting. Click this profile again in a moment."
+    assert cd.main(["open", p.id, "--profile-root", str(store.root)]) == 0
+    out, err = capsys.readouterr()
+    assert out.strip() == "Work is already opening." and err == ""
+
+
+def test_menu_reports_a_profile_still_opening_without_claiming_success(menu, store, monkeypatch):
+    p = store.add("Work")
+    monkeypatch.setattr(store, "open", Mock(return_value={"state": "already_opening", "pid": None, "profile": asdict(p)}))
+    monkeypatch.setattr(ui.threading, "Thread", lambda **kw: SimpleNamespace(start=kw["target"]))
+    focus = Mock()
+    monkeypatch.setattr(ui, "focus_profile", focus)
+    menu.open(p.id)
+    menu.poll()
+    focus.assert_not_called()
+    assert menu.notify.call_args.args[0] == "Claude is still starting"
+    assert "Work" in menu.notify.call_args.args[1]
+    assert menu._profile_states.get(p.id) != "Running"
+    assert not menu.busy and menu.show_error.call_count == 0
 
 
 @pytest.mark.parametrize("suffix", ["", " -psn_0_123"])

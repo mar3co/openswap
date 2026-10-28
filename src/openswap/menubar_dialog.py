@@ -421,7 +421,8 @@ class BrandDialog:
             icon.setImageScaling_(NSImageScaleProportionallyUpOrDown)
             icon.setAccessibilityLabel_(item["title"])
             surface.addSubview_(icon)
-            if item.get("running"):
+            if item.get("image") is not None:
+                # The running dot illustrates the icon above it; no icon, no dot.
                 dot = _label("●", NSFont.systemFontOfSize_(9), NSColor.secondaryLabelColor(), 12)
                 dot.setFrameOrigin_((DIALOG_PADDING + 29, y + 64))
                 dot.setAccessibilityLabel_("Running indicator example")
