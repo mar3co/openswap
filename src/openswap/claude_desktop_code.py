@@ -151,9 +151,11 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
     ``guard`` is entered inside the engine lock twice, never around a slot
     write: once before the slot's files are written, so a caller can abandon
     a changed row while the slot is still untouched, and once around the
-    roster commit. Abandoning at the commit restores a legacy slot's
-    original files, or removes a new slot's, before the engine lock is
-    released.
+    roster commit. Abandoning at the commit removes a new slot's files
+    before the engine lock is released. A legacy slot keeps the new
+    credential, which is for its own email and organization: the write also
+    invalidated the slot's session profile, so the spent original could
+    leave the account signed out. Only a config this save created is removed.
     """
     if identity(profile) is None or not engine._validate_email(profile.email):
         raise ClaudeDesktopError("The detected account is not valid for Claude Code.")
@@ -174,23 +176,25 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
                 legacy = str(num)
         number = legacy or str(engine._get_next_account_number())
         email = data["accounts"][number]["email"] if legacy else profile.email
-        original = original_config = ""
+        original_config = ""
         if legacy:
-            original, unreadable = engine.read_backup_credentials(number, email)
+            _, unreadable = engine.read_backup_credentials(number, email)
             if unreadable:
                 raise ClaudeDesktopError("Code credentials are unavailable.")
             original_config = engine.read_account_config(number, email)
         with guard():
             pass
-        committed = False
+        written = created_config = committed = False
         try:
             engine.write_account_credentials(number, email, credentials)
+            written = True
             # A legacy slot keeps the full config captured when it was added.
             if not original_config:
                 engine._write_account_config(number, email, json.dumps({"oauthAccount": {
                     "emailAddress": email, "accountUuid": profile.account_uuid,
                     "organizationUuid": profile.organization_uuid, "organizationName": profile.organization,
                 }}))
+                created_config = True
             with guard():
                 data["accounts"][number] = {
                     **data["accounts"].get(number, {}),
@@ -204,10 +208,18 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
                 data["lastUpdated"] = get_timestamp()
                 engine._write_json(engine.sequence_file, data)
                 committed = True
-        except Exception:
+        except Exception as exc:
             if legacy:
-                if not committed:
-                    _restore_slot(engine, number, email, original, original_config)
+                if not written:
+                    # A failed or timed-out store write may or may not have
+                    # replaced the original; either credential is kept.
+                    _logger.warning("could not write a Code account backup during setup: %s", type(exc).__name__)
+                elif created_config and not committed:
+                    try:
+                        (engine.configs_dir / f".claude-config-{number}-{email}.json").unlink(missing_ok=True)
+                    except OSError as cleanup:
+                        _logger.warning("could not remove a Code account config after abandoned setup: %s",
+                                        type(cleanup).__name__)
             else:
                 # Only clean files when the roster did not commit this new slot.
                 with suppress(Exception):
@@ -220,24 +232,6 @@ def save_verified_account(engine, profile, credentials, *, guard=nullcontext):
             # The roster has committed; a stale usage quarantine is not a failed add.
             _logger.warning("could not clear the usage quarantine after adding a Code account: %s", type(exc).__name__)
         return number
-
-
-def _restore_slot(engine, number, email, credentials, config):
-    """Put back a legacy slot's credential and config, including absent ones.
-
-    The save writes a config only where none existed, so a present one is
-    still the original. On failure the slot keeps the verified credential,
-    which is for its own email and organization.
-    """
-    try:
-        if credentials:
-            engine.write_account_credentials(number, email, credentials)
-        else:
-            engine._delete_account_credentials(number, email)
-        if not config:
-            (engine.configs_dir / f".claude-config-{number}-{email}.json").unlink(missing_ok=True)
-    except Exception as exc:
-        _logger.warning("could not restore a Code account backup after abandoned setup: %s", type(exc).__name__)
 
 
 class DesktopCodeConnector:

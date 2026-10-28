@@ -681,7 +681,7 @@ def test_registry_lock_is_free_during_the_credential_write(setup, monkeypatch, l
 
 
 @pytest.mark.parametrize("slot", ["legacy", "legacy without config", "new"])
-def test_profile_change_during_the_credential_write_restores_or_removes_the_slot(setup, monkeypatch, slot):
+def test_profile_change_during_the_credential_write_keeps_the_new_credential_or_removes_the_slot(setup, monkeypatch, slot):
     s = setup
     if slot != "new":
         legacy_slot(s, config=slot == "legacy")
@@ -700,48 +700,32 @@ def test_profile_change_during_the_credential_write_restores_or_removes_the_slot
         assert s.engine.read_backup_credentials("1", EMAIL) == ("", False)
         assert not list(s.engine.configs_dir.glob("*-1-*"))
         return
-    assert s.engine.read_backup_credentials("7", EMAIL) == ("legacy credential", False)
+    assert s.engine.read_backup_credentials("7", EMAIL) == (CREDS, False)
     assert s.engine.read_account_config("7", EMAIL) == (LEGACY_CONFIG if slot == "legacy" else "")
     assert s.engine.account_identity("7")["uuid"] == ""
 
 
-def test_failed_restore_logs_only_the_error_type_and_keeps_the_verified_credential(setup, monkeypatch, caplog):
+@pytest.mark.parametrize("replaced", [False, True])
+def test_failed_credential_write_commits_nothing_and_keeps_whichever_credential_the_slot_holds(
+        setup, monkeypatch, caplog, replaced):
     s = setup
     legacy_slot(s)
     write = s.engine.write_account_credentials
 
-    def archive_then_fail_restore(number, email, credentials):
-        if credentials != CREDS:
-            raise OSError("restore failed for " + EMAIL)
-        s.store.update(s.profile.id, archived=True)
-        write(number, email, credentials)
+    def fail(number, email, credentials):
+        if replaced:
+            write(number, email, credentials)
+        raise OSError("keychain timed out for " + EMAIL)
 
-    monkeypatch.setattr(s.engine, "write_account_credentials", archive_then_fail_restore)
+    monkeypatch.setattr(s.engine, "write_account_credentials", fail)
     with caplog.at_level("WARNING", logger="openswap"):
         s.connector.poll(enabled=True)
-        finish(s)
-    [record] = [r for r in caplog.records if "restore" in r.getMessage()]
-    assert "OSError" in record.getMessage() and EMAIL not in record.getMessage()
-    assert s.engine.read_backup_credentials("7", EMAIL) == (CREDS, False)
-    assert s.engine.account_identity("7")["uuid"] == ""
-
-
-def test_failed_credential_write_commits_nothing_and_restores_the_legacy_slot(setup, monkeypatch):
-    s = setup
-    legacy_slot(s)
-    write = s.engine.write_account_credentials
-
-    def write_then_fail(number, email, credentials):
-        write(number, email, credentials)
-        if credentials == CREDS:
-            raise OSError("keychain")
-
-    monkeypatch.setattr(s.engine, "write_account_credentials", write_then_fail)
-    s.connector.poll(enabled=True)
-    assert finish(s).code_setup_state == "failed"
-    assert s.engine.read_backup_credentials("7", EMAIL) == ("legacy credential", False)
+        assert finish(s).code_setup_state == "failed"
+    assert s.engine.read_backup_credentials("7", EMAIL) == (CREDS if replaced else "legacy credential", False)
     assert s.engine.read_account_config("7", EMAIL) == LEGACY_CONFIG
     assert s.engine.account_identity("7")["uuid"] == ""
+    [record] = [r for r in caplog.records if "backup" in r.getMessage()]
+    assert "OSError" in record.getMessage() and EMAIL not in record.getMessage()
 
 
 def test_unreadable_legacy_slot_at_commit_writes_nothing(setup, monkeypatch):
