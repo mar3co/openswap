@@ -246,16 +246,8 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     evidence is sufficient for each decision. Must not be called while any
     credential/config lock is held (network under locks is forbidden).
     """
-    url = "https://api.anthropic.com/api/oauth/profile"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "User-Agent": "openswap/1.0",
-    }
-    req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
+        data = _get_oauth_profile(access_token)
     except urllib.error.HTTPError as e:
         if e.code == 401:
             # Evidence, not proof: the live access token can't authenticate.
@@ -273,19 +265,56 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     except Exception as e:
         _logger.debug("OAuth profile fetch failed: %r", e)
         return None
-    account = data.get("account") if isinstance(data, dict) else None
-    if not isinstance(account, dict):
-        _logger.debug("OAuth profile response missing account object")
-        return None
-    uuid = account.get("uuid")
-    if not isinstance(uuid, str) or not uuid.strip():
+    found = _profile_identity(data)
+    if not found["uuid"]:
         _logger.debug("OAuth profile response missing account.uuid")
         return None
-    email = account.get("email")
-    organization = data.get("organization")
+    return found
+
+
+def classify_oauth_profile(access_token: str) -> tuple[str, dict]:
+    """``fetch_oauth_profile`` that tells a rejected token from a failed request.
+
+    Returns ``(status, identity)``. ``status`` is ``"verified"`` (200 with
+    account uuid, email and organization), ``"incomplete"`` (200 missing any
+    of them), ``"rejected"`` (a 4xx other than 429) or ``"transient"``
+    (network error, timeout, 429, 5xx, or an unreadable body). ``identity``
+    has the ``fetch_oauth_profile`` keys, each str-or-None.
+    """
+    try:
+        data = _get_oauth_profile(access_token)
+    except urllib.error.HTTPError as e:
+        _logger.debug("OAuth profile fetch failed: %r", e)
+        rejected = 400 <= e.code < 500 and e.code != 429
+        return ("rejected" if rejected else "transient"), _profile_identity(None)
+    except Exception as e:
+        _logger.debug("OAuth profile fetch failed: %r", e)
+        return "transient", _profile_identity(None)
+    found = _profile_identity(data)
+    return ("verified" if all(found.values()) else "incomplete"), found
+
+
+def _get_oauth_profile(access_token: str) -> object:
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/profile",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "openswap/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _profile_identity(data: object) -> dict:
+    account = data.get("account") if isinstance(data, dict) else None
+    organization = data.get("organization") if isinstance(data, dict) else None
+    uuid = account.get("uuid") if isinstance(account, dict) else None
+    email = account.get("email") if isinstance(account, dict) else None
     org_uuid = organization.get("uuid") if isinstance(organization, dict) else None
     return {
-        "uuid": uuid.strip(),
+        "uuid": (uuid.strip() or None) if isinstance(uuid, str) else None,
         "email": email if isinstance(email, str) else None,
         "organizationUuid": org_uuid if isinstance(org_uuid, str) else None,
     }

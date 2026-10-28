@@ -1387,6 +1387,44 @@ class TestFetchOauthProfile:
         )
 
 
+class TestClassifyOauthProfile:
+    """A rejected token goes to re-authorization; a failed request only to a retry."""
+
+    COMPLETE = {"account": {"uuid": "acc-uuid", "email": "a@b.c"}, "organization": {"uuid": "org-uuid"}}
+
+    @pytest.mark.parametrize("code, status", [
+        (400, "rejected"), (401, "rejected"), (403, "rejected"), (404, "rejected"), (410, "rejected"),
+        (429, "transient"), (500, "transient"), (503, "transient"),
+    ])
+    def test_http_errors(self, code, status):
+        err = urllib.error.HTTPError("https://api.anthropic.com/api/oauth/profile", code, "x", {}, None)
+        with patch("openswap.oauth.urllib.request.urlopen", side_effect=err):
+            assert oauth.classify_oauth_profile("sk-live")[0] == status
+
+    @pytest.mark.parametrize("error", [urllib.error.URLError("down"), TimeoutError()])
+    def test_network_failures_are_transient(self, error):
+        with patch("openswap.oauth.urllib.request.urlopen", side_effect=error):
+            assert oauth.classify_oauth_profile("sk-live")[0] == "transient"
+
+    @pytest.mark.parametrize("payload, status, found", [
+        (COMPLETE, "verified", {"uuid": "acc-uuid", "email": "a@b.c", "organizationUuid": "org-uuid"}),
+        ({"account": {"uuid": "acc-uuid", "email": "a@b.c"}}, "incomplete",
+         {"uuid": "acc-uuid", "email": "a@b.c", "organizationUuid": None}),
+        ({"account": {"uuid": "acc-uuid", "email": ""}, "organization": {"uuid": "org-uuid"}}, "incomplete",
+         {"uuid": "acc-uuid", "email": "", "organizationUuid": "org-uuid"}),
+        ({"account": {"uuid": "  ", "email": "a@b.c"}, "organization": {"uuid": "org-uuid"}}, "incomplete",
+         {"uuid": None, "email": "a@b.c", "organizationUuid": "org-uuid"}),
+        ({"unexpected": True}, "incomplete", {"uuid": None, "email": None, "organizationUuid": None}),
+    ])
+    def test_successful_answers(self, payload, status, found):
+        response = MagicMock()
+        response.read.return_value = json.dumps(payload).encode()
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
+        with patch("openswap.oauth.urllib.request.urlopen", return_value=response):
+            assert oauth.classify_oauth_profile("sk-live") == (status, found)
+
+
 class TestInvalidGrantTaxonomy:
     """M3: the permanent invalid_grant verdict requires an RFC 6749 §5.2
     parse — top-level error == "invalid_grant" in the JSON body. Substring
