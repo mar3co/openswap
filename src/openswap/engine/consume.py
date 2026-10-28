@@ -42,7 +42,9 @@ class ConsumeMixin:
         mutation guard right before the POST: when it names this slot's
         account the outcome is ``skip-active`` and nothing is consumed, since
         Claude Code may hold the same refresh token live; an unreadable
-        config is ``transient``.
+        config is ``transient``. Nothing consumed is not nothing written: the
+        session-profile resync before that check may already have written
+        the slot.
 
         Returns a ``RefreshOutcome``: ``credentials`` is the slot's
         now-current credential on success (ours, or a racing writer's adopted
@@ -304,16 +306,14 @@ class ConsumeMixin:
 
         if refuse_active:
             try:
-                live = self._get_current_identity_triple(strict=True)
+                active = self._live_identity_for(email, org_uuid)
             except Exception:
                 self._logger.info(
                     "Live config unreadable; not consuming account %s's grant.",
                     account_num, exc_info=True,
                 )
                 return oauth.RefreshOutcome(None, "transient", None, consumed_fp)
-            if live and (live[0].casefold(), live[1].lower()) == (
-                email.casefold(), org_uuid.lower()
-            ):
+            if active:
                 return oauth.RefreshOutcome(None, "skip-active", None, consumed_fp)
 
         result = oauth.try_refresh_oauth_credentials(refresh_input)

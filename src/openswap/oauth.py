@@ -286,12 +286,13 @@ def classify_oauth_profile(access_token: str) -> tuple[str, dict]:
         data = _get_oauth_profile(access_token)
     except urllib.error.HTTPError as e:
         _logger.debug("OAuth profile fetch failed: %r", e)
-        rejected = 400 <= e.code < 500 and e.code not in (408, 429)
         if e.code == 403:
             try:
                 rejected = isinstance(json.loads(e.read().decode(errors="replace")), dict)
             except Exception:
                 rejected = False
+        else:
+            rejected = 400 <= e.code < 500 and e.code not in (408, 429)
         return ("rejected" if rejected else "transient"), _profile_identity(None)
     except Exception as e:
         _logger.debug("OAuth profile fetch failed: %r", e)

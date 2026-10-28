@@ -243,6 +243,21 @@ class IdentityMixin:
         identity = self._get_current_account()
         return identity is not None and identity == (email, org_uuid or "")
 
+    def _live_identity_for(
+        self, email: str, org_uuid: str
+    ) -> tuple[str, str, str] | None:
+        """The live config's identity triple when it is this slot's account, else None.
+
+        Strict, unlike ``_live_identity_matches``: an unreadable or malformed
+        config raises ``ConfigError`` rather than looking like another
+        account. The email compares casefolded and the organization
+        lowercased, since a slot's row and ``.claude.json`` may differ in case.
+        """
+        live = self._get_current_identity_triple(strict=True)
+        if live and (live[0].casefold(), live[1].lower()) == (email.casefold(), (org_uuid or "").lower()):
+            return live
+        return None
+
     def _resolved_matches_slot_identity(
         self, account_num: str, resolved: dict
     ) -> bool | None:
