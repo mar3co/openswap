@@ -22,8 +22,8 @@ def illustrations():
         # The guide remains readable before Claude is installed.
         pass
     return [
-        {"image": original, "title": "Your Claude icon",
+        {"image": original, "title": "Your Claude icon", "running_dot": True,
          "body": "May open any running profile. For your original session, use Default → Open in OpenSwap."},
-        {"image": profile, "title": "Your profile icon",
+        {"image": profile, "title": "Your profile icon", "running_dot": True,
          "body": "Claude + OpenSwap + a number. Opens only that profile. The dot means it’s running."},
     ]
