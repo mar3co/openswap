@@ -311,10 +311,9 @@ class DesktopSignInLinks:
         if self.changing:
             return  # a pending grant must be undone before quitting/disabling
         try:
-            previous = self.native.previous()
             if self.native.current() != self.native.application:
                 self.held = False
-            elif previous.is_dir():
+            elif (previous := self.native.previous()).is_dir():
                 self.changing = True
                 self.native.set_handler(previous, lambda ok: self.completions.put(("restore", ok)))
                 return
