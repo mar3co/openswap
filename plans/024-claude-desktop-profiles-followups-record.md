@@ -199,3 +199,4 @@ Required outcomes:
   - C: extended to a non-JSON 403.
   - D: extended to a backup with no access token.
 
+- Controller fix: `tests/test_bundle_move.py` read the real /Applications and ~/Applications, so 7 tests failed on any Mac with OpenSwap installed (main too). Isolated in the fixture. Covered by the final review's cold seat.
