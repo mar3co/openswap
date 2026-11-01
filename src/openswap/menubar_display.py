@@ -2784,10 +2784,9 @@ STALE_PARENT = "stale-parent"
 # OpenSwap cannot see or stop a key's spend, so the cap belongs in the
 # Console: a workspace spend limit, which the key probe then recognizes.
 TOKEN_CREDIT_HINT = (
-    "Claude Code on this key spends credit you bought in the Claude Console. "
-    "The monthly API credit included with Max and Team doesn't cover it. "
-    "To cap what it can spend, put the key in its own Console workspace with "
-    "a monthly spend limit."
+    "Uses purchased Claude Console credit. The monthly API credit included "
+    "with Max and Team doesn't cover Claude Code. Set a Console workspace "
+    "spend limit to cap costs."
 )
 
 
@@ -2813,23 +2812,26 @@ def token_entry_state(text: str, accounts: list, kinds: dict | None = None) -> d
     ``accounts`` are the snapshot rows; ``kinds`` the snapshot kinds map. The
     page is stricter than the engine: only ``sk-ant-api`` and ``sk-ant-oat``
     prefixes are accepted, so a stray paste cannot be stored as a login.
+    This detects the format only; it does not verify the credential remotely.
     """
     value = (text or "").strip()
     if not value:
         kind, line = None, ""
+    elif not re.fullmatch(r"sk-ant-(?:api|oat)[A-Za-z0-9_-]+", value):
+        kind, line = None, "Paste a complete Claude API key or setup token."
     elif looks_like_api_key(value):
         kind, line = "api_key", "API key"
     elif value.startswith(SETUP_TOKEN_PREFIX):
         kind, line = "setup_token", "Setup token"
     else:
-        kind, line = None, "Not a Claude token"
-    choices: list[tuple[str, str]] = [("", "None (standalone)")]
+        kind, line = None, "Paste a complete Claude API key or setup token."
+    choices: list[tuple[str, str]] = [("", "Standalone API key")]
     for row in accounts or []:
         num, email, _active, _display, _last_good, alias, org_name, _disabled, _fetched = row
         if str(num).startswith("codex:") or (kinds or {}).get(str(num)) == "api_key":
             continue
         title, _subtitle = account_card_names(email, alias, org_name)
-        choices.append((str(num), f"{title} · {email}"))
+        choices.append((str(num), f"{title} · {email}" if title != email else email))
     return {
         "kind": kind,
         "line": line,
@@ -2837,6 +2839,11 @@ def token_entry_state(text: str, accounts: list, kinds: dict | None = None) -> d
         "credit_hint": TOKEN_CREDIT_HINT if kind == "api_key" else "",
         "choices": choices,
         "can_add": kind is not None,
+        "button": {"api_key": "Save API key", "setup_token": "Save setup token"}.get(kind, "Save token"),
+        "hint": {
+            "api_key": "API key detected · Uses Claude Console billing.",
+            "setup_token": "Setup token detected · Adds a Claude subscription login.",
+        }.get(kind, line or "Starts with sk-ant-api… or sk-ant-oat…"),
     }
 
 
