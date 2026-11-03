@@ -23,7 +23,7 @@ The suite describes the product we ship: engine, extra, widget, kickoff, and adv
 
 Live AppKit probes (status item padding, appearance) are one-off scripts, not CI.
 
-`tests/test_dialog_style.py` is the one exception: it opens real AppKit dialogs, so it is skipped unless `OPENSWAP_NATIVE_UI_TESTS=1` is set. Run it that way after touching `menubar_dialog.py`.
+`tests/test_dialog_style.py` and `tests/test_token_entry_native.py` are the exceptions: they require native AppKit, so they are skipped unless `OPENSWAP_NATIVE_UI_TESTS=1` is set. Run the dialog checks that way after touching `menubar_dialog.py`. Token form checks use synthetic credentials and a fake save callback; run `OPENSWAP_NATIVE_UI_TESTS=1 uv run --extra menubar pytest tests/test_token_entry_native.py -n 0` after changing that form. The native checks cover conditional layout, draft preservation, retry, changed-account selection, explicit paste, and cleanup. Use the shared frozen preview build described in [macOS packaging](../packaging/macos/README.md) to check light/dark appearance against the release SDK policy.
 
 ## Conventions already in the suite
 

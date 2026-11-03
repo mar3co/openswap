@@ -41,6 +41,8 @@ from AppKit import (
     NSMenu,
     NSMenuItem,
     NSNoImage,
+    NSPasteboard,
+    NSPasteboardTypeString,
     NSPopUpButton,
     NSPopover,
     NSPopoverBehaviorApplicationDefined,
@@ -82,6 +84,7 @@ from Foundation import (
     NSRunLoopCommonModes,
     NSTimer,
     NSUserDefaults,
+    NSURL,
 )
 
 from openswap.menubar_dialog import forward_edit_shortcut
@@ -1073,6 +1076,8 @@ class MenuBarPanel:
         self._token_error = ""
         self._token_watcher = None
         self._token_fields = ()
+        self._token_refresh = None
+        self._token_notice = ""
         self._worker_enabled = worker_enabled or (lambda: False)
         self._worker_paused = worker_paused or (lambda: False)
         self._worker_status = worker_status or (lambda: {})
@@ -1174,6 +1179,7 @@ class MenuBarPanel:
 
     def close(self) -> None:
         self._page = MAIN_PAGE
+        self._token_notice = ""
         self._release_token_field()
         self._clear_dismiss_watchers()
         if self._popover is not None and self._popover.isShown():
@@ -1194,6 +1200,7 @@ class MenuBarPanel:
         self._popover.showRelativeToRect_ofView_preferredEdge_(
             button.bounds(), button, NSRectEdgeMinY
         )
+        self._focus_token_field()
         self._arm_auto_close()
 
     def reload(self) -> None:
@@ -1207,7 +1214,14 @@ class MenuBarPanel:
         self._popover.setContentSize_(view.frame().size)
         self._popover.setContentViewController_(controller)
         if self._popover.isShown():
+            self._focus_token_field()
             self._arm_auto_close()
+
+    def _focus_token_field(self) -> None:
+        if self._page == TOKEN_PAGE and self._token_fields:
+            field = self._token_fields[0]
+            if field.window() is not None:
+                field.window().makeFirstResponder_(field)
 
     def _cancel_close_timer(self) -> None:
         timer = self._close_timer
@@ -1295,7 +1309,9 @@ class MenuBarPanel:
             self._reset_close_timer()
 
     def _on_global_click(self, event) -> None:
-        if not self.is_shown() or self._menu_open:
+        # Getting a credential requires another app. Keep this form and its
+        # draft open until Back, Escape, or the status item explicitly closes it.
+        if not self.is_shown() or self._menu_open or self._page == TOKEN_PAGE:
             return
         try:
             pt = event.locationInWindow()
@@ -1406,6 +1422,7 @@ class MenuBarPanel:
         """Open the Add-from-token page in the current popover."""
         self._selected_provider = "claude"
         self._token_error = ""
+        self._token_notice = ""
         self._page = TOKEN_PAGE
         self.reload()
 
@@ -1665,11 +1682,14 @@ class MenuBarPanel:
         fields = self._token_fields
         self._token_fields = ()
         self._token_watcher = None
+        self._token_refresh = None
         for field in fields:
             field.setDelegate_(None)
         window = fields[0].window() if fields else None
         if window is not None:
             window.makeFirstResponder_(None)
+        for field in fields:
+            field.setStringValue_("")
 
     def _build(self):
         self._tramps = []
@@ -1742,11 +1762,13 @@ class MenuBarPanel:
         n_running = (1 if running_line else 0) + (1 if codex_running_line else 0)
         running_h = RUNNING_LINE_H * n_running
         status_h = RUNNING_LINE_H if desktop_status else 0.0
+        token_notice = self._token_notice if provider == "claude" else ""
+        notice_h = 26.0 if token_notice else 0.0
         # Settings / More live in the header, so an empty roster needs no
         # footer row at all.
         show_footer = bool(cards)
         footer_h = FOOTER_H if show_footer else 0.0
-        chrome_h = PAD + HEADER_H + TAB_H + hold_h + info_h + 4 + PAD + running_h + status_h + footer_h
+        chrome_h = PAD + HEADER_H + TAB_H + hold_h + info_h + notice_h + 4 + PAD + running_h + status_h + footer_h
         content_h = body_h
         scrolls = False
         if cards and not login_view:
@@ -1794,6 +1816,9 @@ class MenuBarPanel:
         inner_w = PANEL_WIDTH - PAD * 2
         self._add_provider_tabs(root, settings, all_cards)
         y = PAD + HEADER_H + TAB_H
+        if token_notice:
+            root.addSubview_(_label(token_notice, font_small, pal["ok"], NSMakeRect(PAD, y + 4, inner_w, 18)))
+            y += notice_h
         if hold_line:
             root.addSubview_(
                 _label(
@@ -2646,11 +2671,12 @@ class MenuBarPanel:
         font_body = NSFont.systemFontOfSize_weight_(12, NSFontWeightRegular)
         font_small = NSFont.systemFontOfSize_weight_(11, NSFontWeightRegular)
         inner_w = PANEL_WIDTH - PAD * 2
-        field_w = inner_w - 24
+        x, field_w = PAD + 12, inner_w - 24
         snap = self._snapshot()
-        rows = snap.get("accounts") or []
-        kinds = snap.get("kinds") or {}
+        rows, kinds = snap.get("accounts") or [], snap.get("kinds") or {}
         state = token_entry_state("", rows, kinds)
+        expanded = {"help": False, "email": False}
+        last_kind = None
 
         root = _RootView.alloc().initWithHover_(self._on_hover)
         root._cancel = self._show_main
@@ -2671,61 +2697,188 @@ class MenuBarPanel:
         hairline.setFrame_(NSMakeRect(PAD, PAD + HEADER_H - 4, inner_w, 1))
         root.addSubview_(hairline)
 
-        y = PAD + HEADER_H + 8
-        token_field = _SecureTokenField.alloc().initWithFrame_(NSMakeRect(PAD + 12, y, field_w, 28))
-        token_field.setPlaceholderString_("API key (sk-ant-api…) or setup token (sk-ant-oat…)")
+        # Reflow existing controls in place. Rebuilding on each keystroke loses
+        # the field editor, selection, and draft. Only the body scrolls on small screens.
+        scroll, body = _overlay_scroll(root, NSMakeRect(0, PAD + HEADER_H, PANEL_WIDTH, 1), PANEL_WIDTH, 1)
+
+        def label(text, font=font_small, color=None):
+            view = _label(text, font, color or pal["muted"], NSMakeRect(x, 0, field_w, 1))
+            _wrap(view)
+            body.addSubview_(view)
+            return view
+
+        intro = label("Connect Claude Code", NSFont.systemFontOfSize_weight_(17, NSFontWeightSemibold), pal["fg"])
+        scope_hint = label("For Claude Code only")
+        subtitle = label("Use purchased Claude Console credits with Claude Code, or connect with a setup token.", font_body)
+        token_label = label("API key or setup token", font_title, pal["fg"])
+        token_field = _SecureTokenField.alloc().initWithFrame_(NSMakeRect(x, 0, field_w - 64, 30))
+        token_field.setPlaceholderString_("Paste your key or token")
+        token_field.setAccessibilityLabel_("API key or setup token")
         token_field.setFont_(font_body)
-        root.addSubview_(token_field)
-        y += 28 + 6
-        detect = _label("", font_small, pal["muted"], NSMakeRect(PAD + 12, y, field_w, 18))
-        root.addSubview_(detect)
-        y += 18 + 10
+        token_field.cell().setUsesSingleLineMode_(True)
+        body.addSubview_(token_field)
+        detect = label("")
 
-        parent_label = _label("Use as API credit for", font_small, pal["muted"], NSMakeRect(PAD + 12, y, field_w, 18))
-        root.addSubview_(parent_label)
-        y += 18 + 4
-        popup = _PopupButton.alloc().initWithPanel_frame_(self, NSMakeRect(PAD + 12, y, field_w, 28))
-        popup.setControlSize_(NSControlSizeSmall)
-        popup.setFont_(font_body)
-        self._fill_parent_popup(popup, state["choices"], snap.get("identities") or {})
-        root.addSubview_(popup)
-        y += 28 + 6
-        hint_h = float(int(font_small.boundingRectForFont().size.height + 1)) * 5
-        hint = _label(TOKEN_CREDIT_HINT, font_small, pal["muted"], NSMakeRect(PAD + 12, y, field_w, hint_h))
-        _wrap(hint)
-        root.addSubview_(hint)
-        y += hint_h + 10
+        def paste(_sender):
+            value = NSPasteboard.generalPasteboard().stringForType_(NSPasteboardTypeString)
+            if value is None or not str(value).strip():
+                self._show_token_error(error, add, "No text to paste. Copy your key or token first.")
+                return
+            token_field.setStringValue_(str(value).strip())
+            refresh()
+            if token_field.window() is not None:
+                token_field.window().makeFirstResponder_(token_field)
 
-        label_field = _TokenField.alloc().initWithFrame_(NSMakeRect(PAD + 12, y, field_w, 28))
-        label_field.setPlaceholderString_("Email label (optional)")
-        label_field.setFont_(font_body)
-        label_field.cell().setUsesSingleLineMode_(True)
-        root.addSubview_(label_field)
-        y += 28 + 10
+        paste_button = self._add_button(body, "Paste", NSMakeRect(0, 0, 56, 30), paste, font_body)
+        paste_button.setControlSize_(0)
+        paste_button.setToolTip_("Paste a key or token from the clipboard (⌘V).")
 
-        error_h = float(int(font_small.boundingRectForFont().size.height + 1)) * 3
-        error = _label(self._token_error, font_small, pal["crit"], NSMakeRect(PAD + 12, y, field_w, error_h))
-        _wrap(error)
-        root.addSubview_(error)
-        y += error_h + 10
+        def disclose(section):
+            expanded[section] = not expanded[section]
+            refresh(clear_error=False)
+            if section == "email" and expanded[section] and label_field.window() is not None:
+                label_field.window().makeFirstResponder_(label_field)
 
-        add = self._add_button(
-            root, "Add", NSMakeRect(PAD + 12, y, field_w, 40),
-            lambda _s: self._submit_token(token_field, label_field, popup, error, add),
+        help_button = self._add_button(body, "", NSMakeRect(x, 0, field_w, 24), lambda _s: disclose("help"), font_small)
+        help_button.setBordered_(False)
+        help_button.setAlignment_(0)
+        help_api = label("API key · Create a key in the Claude Console.")
+        console = self._add_button(
+            body, "Open Claude Console ↗", NSMakeRect(x, 0, field_w, 28),
+            lambda _s: NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_("https://platform.claude.com/settings/keys")),
             font_body,
         )
-        add.setEnabled_(False)
+        help_setup = label("Setup token · With Claude Code installed, run this in Terminal, sign in, then paste the token here.")
+        command = label("claude setup-token", NSFont.monospacedSystemFontOfSize_weight_(12, NSFontWeightRegular), pal["fg"])
+        command.setSelectable_(True)
+
+        def copy_command(sender):
+            clipboard = NSPasteboard.generalPasteboard()
+            clipboard.clearContents()
+            clipboard.setString_forType_("claude setup-token", NSPasteboardTypeString)
+            sender.setTitle_("Copied")
+
+        copy = self._add_button(body, "Copy command", NSMakeRect(0, 0, 112, 28), copy_command, font_small)
+        parent_label = label("Link to a subscription (optional)", font_title, pal["fg"])
+        popup = _PopupButton.alloc().initWithPanel_frame_(self, NSMakeRect(x, 0, field_w, 28))
+        popup.setControlSize_(0)
+        popup.setFont_(font_body)
+        popup.setAccessibilityLabel_("Use as API credit for")
+        self._fill_parent_popup(popup, state["choices"], snap.get("identities") or {})
+        popup.setTarget_(self._tramp(lambda _s: refresh()))
+        popup.setAction_("act:")
+        body.addSubview_(popup)
+        parent_hint = label("")
+        credit_hint = label(TOKEN_CREDIT_HINT)
+        email_button = self._add_button(body, "", NSMakeRect(x, 0, field_w, 24), lambda _s: disclose("email"), font_small)
+        email_button.setBordered_(False)
+        email_button.setAlignment_(0)
+        label_field = _TokenField.alloc().initWithFrame_(NSMakeRect(x, 0, field_w, 30))
+        label_field.setPlaceholderString_("you@example.com")
+        label_field.setAccessibilityLabel_("Email label (optional)")
+        label_field.setFont_(font_body)
+        label_field.cell().setUsesSingleLineMode_(True)
+        body.addSubview_(label_field)
+        email_hint = label("Leave blank to auto-name. Using an existing email updates that account’s token.")
+        error = label("", color=pal["crit"])
+
+        footer = _FillView.alloc().initWithColor_(pal["hairline"])
+        root.addSubview_(footer)
+        save_hint = _label("Saves to OpenSwap without switching accounts.", font_small, pal["muted"], NSMakeRect(x, 0, field_w, 18), align="center")
+        root.addSubview_(save_hint)
+        add = self._add_button(
+            root, "Save token", NSMakeRect(x, 0, field_w, 32),
+            lambda _s: self._submit_token(token_field, label_field, popup, error, add), font_title,
+        )
+        add.setControlSize_(0)
+        add.setBezelColor_(pal["accent"])
         add.setKeyEquivalent_("\r")
-        root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, y + 40 + PAD))
 
-        def refresh():
+        def refresh(clear_error=True):
+            nonlocal last_kind
+            if clear_error:
+                self._token_error = ""
             current = token_entry_state(token_field.stringValue(), rows, kinds)
-            detect.setStringValue_(current["line"])
-            parent_label.setHidden_(not current["show_parent"])
-            popup.setHidden_(not current["show_parent"])
-            hint.setHidden_(not current["credit_hint"])
-            add.setEnabled_(current["can_add"] and self._on_add_token is not None)
+            if current["kind"] != last_kind:
+                popup.selectItemAtIndex_(0)
+            last_kind = current["kind"]
+            item = popup.selectedItem()
+            picked = item.representedObject() if item is not None else None
+            linked = bool(current["show_parent"] and picked and picked[0])
+            detect.setStringValue_(current["hint"])
+            detect.setTextColor_(pal["crit"] if token_field.stringValue().strip() and not current["can_add"] else pal["muted"])
+            parent_hint.setStringValue_(
+                "Saved as API credit for the selected account. Auto-switch uses it only when no subscription has room."
+                if linked else "Saved as a separate account you can switch to."
+            )
+            add.setTitle_("Save API credit" if linked else current["button"])
+            add.setEnabled_(current["can_add"] and self._on_add_token is not None
+                            and (not current["show_parent"] or item is not None))
+            error.setStringValue_(self._token_error)
+            help_button.setTitle_(("▾" if expanded["help"] else "▸") + " Where do I find a key or token?")
+            email_button.setTitle_(("▾" if expanded["email"] else "▸") +
+                                  (" Email label (set)" if label_field.stringValue().strip() else " Email label (optional)"))
+            help_button.setAccessibilityExpanded_(expanded["help"])
+            email_button.setAccessibilityExpanded_(expanded["email"])
+            y = 14.0
 
+            def place(view, *, height=None, width=field_w, left=x, gap=6, visible=True):
+                nonlocal y
+                view.setHidden_(not visible)
+                if not visible:
+                    return
+                h = height
+                if h is None:
+                    h = float(int(view.cell().cellSizeForBounds_(NSMakeRect(0, 0, width, 10000)).height + 1))
+                view.setFrame_(NSMakeRect(left, y, width, h))
+                y += h + gap
+
+            place(intro, gap=2)
+            place(scope_hint, gap=6)
+            place(subtitle, gap=10)
+            place(token_label, gap=6)
+            paste_button.setFrame_(NSMakeRect(x + field_w - 56, y, 56, 30))
+            place(token_field, height=30, width=field_w - 64, gap=6)
+            place(detect, gap=6)
+            place(help_button, height=24, gap=12)
+            place(help_api, visible=expanded["help"])
+            place(console, height=28, gap=12, visible=expanded["help"])
+            place(help_setup, visible=expanded["help"])
+            copy.setHidden_(not expanded["help"])
+            copy.setFrame_(NSMakeRect(x + field_w - 112, y, 112, 28))
+            place(command, height=28, width=field_w - 120, gap=16, visible=expanded["help"])
+            place(parent_label, visible=current["show_parent"])
+            place(popup, height=28, visible=current["show_parent"])
+            place(parent_hint, gap=10, visible=current["show_parent"])
+            place(credit_hint, gap=12, visible=current["show_parent"])
+            place(email_button, height=24, gap=6)
+            place(label_field, height=30, visible=expanded["email"])
+            place(email_hint, gap=10, visible=expanded["email"])
+            place(error, gap=10, visible=bool(self._token_error))
+            body_h = y + 6
+            footer_h = 80
+            available = self._available_panel_height() or 720
+            visible_h = min(body_h, max(100, available - PAD - HEADER_H - footer_h))
+            body.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, body_h))
+            scroll.setFrame_(NSMakeRect(0, PAD + HEADER_H, PANEL_WIDTH, visible_h))
+            footer_y = PAD + HEADER_H + visible_h
+            footer.setFrame_(NSMakeRect(PAD, footer_y, inner_w, 1))
+            add.setFrame_(NSMakeRect(x, footer_y + 12, field_w, 32))
+            save_hint.setFrame_(NSMakeRect(x, footer_y + 50, field_w, 18))
+            root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, footer_y + footer_h))
+            if self._popover is not None and self._controller is not None and self._controller.view() == root:
+                self._popover.setContentSize_(root.frame().size)
+            token_field.setNextKeyView_(paste_button)
+            paste_button.setNextKeyView_(help_button)
+            help_button.setNextKeyView_(console if expanded["help"] else popup if current["show_parent"] else email_button)
+            console.setNextKeyView_(copy)
+            copy.setNextKeyView_(popup if current["show_parent"] else email_button)
+            popup.setNextKeyView_(email_button)
+            email_button.setNextKeyView_(label_field if expanded["email"] else add)
+            label_field.setNextKeyView_(add)
+            add.setNextKeyView_(token_field)
+
+        self._token_refresh = refresh
         self._token_watcher = _TextWatcher.alloc().initWithCallback_(refresh)
         self._token_watcher._cancel = self._show_main
         self._token_fields = (token_field, label_field)
@@ -2754,14 +2907,19 @@ class MenuBarPanel:
         credit_for = None
         if state["show_parent"]:
             item = popup.selectedItem()
+            if item is None:
+                self._show_token_error(error_label, add, "Choose an account or Standalone API key.")
+                return
             identities = snap.get("identities") or {}
             credit_for = parent_link_choice(
                 item.representedObject() if item is not None else None, identities
             )
             if credit_for is STALE_PARENT:
                 self._fill_parent_popup(popup, state["choices"], identities)
+                popup.selectItemAtIndex_(-1)
                 self._show_token_error(error_label, add, "The account list changed; pick the account again.")
                 return
+        add.setTitle_("Saving…")
         error = self._on_add_token(
             token_field.stringValue().strip(),
             label_field.stringValue().strip(),
@@ -2771,9 +2929,15 @@ class MenuBarPanel:
             self._show_token_error(error_label, add, error)
             return
         token_field.setStringValue_("")
+        self._token_notice = (
+            "API credit saved. Your account is linked." if credit_for else
+            f"{state['line']} saved. Select it below to switch."
+        )
         self._show_main()
 
     def _show_token_error(self, error_label, add, message):
         self._token_error = message
         error_label.setStringValue_(message)
-        add.setEnabled_(True)
+        if self._token_refresh is not None:
+            self._token_refresh(clear_error=False)
+            error_label.scrollRectToVisible_(error_label.bounds())

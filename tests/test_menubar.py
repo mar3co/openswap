@@ -1103,7 +1103,7 @@ def test_token_entry_state_api_key_offers_subscription_parents_only():
     assert state["show_parent"] is True
     assert state["can_add"] is True
     assert state["choices"] == [
-        ("", "None (standalone)"),
+        ("", "Standalone API key"),
         ("1", "work · a@x.com"),
         ("2", "Ads Online · b@x.com"),
     ]
@@ -1120,7 +1120,7 @@ def test_token_entry_state_setup_token_hides_parent():
 def test_token_entry_state_rejects_garbage():
     state = menubar.token_entry_state("hunter2", _TOKEN_ROWS, _TOKEN_KINDS)
     assert state["kind"] is None
-    assert state["line"] == "Not a Claude token"
+    assert state["line"] == "Paste a complete Claude API key or setup token."
     assert state["can_add"] is False
 
 

@@ -1098,10 +1098,10 @@ def test_status_says_the_key_renews_or_when_it_expires():
             "remote_connectivity": "online"}
     assert "Key" not in cli._format_status(base)  # not known yet
     assert remote_key_copy(base) == ""
-    renews = {**base, "remote_key_renews": True, "remote_key_expires_at": "2026-11-01T00:00:00Z"}
+    expires = (datetime.now(timezone.utc) + timedelta(days=12, hours=1)).isoformat()
+    renews = {**base, "remote_key_renews": True, "remote_key_expires_at": expires}
     assert "✓ Key           renews automatically" in cli._format_status(renews)
     assert remote_key_copy(renews) == "Key renews automatically."
-    expires = (datetime.now(timezone.utc) + timedelta(days=12, hours=1)).isoformat()
     lacking = {**base, "remote_key_renews": False, "remote_key_expires_at": expires}
     text = cli._format_status(lacking)
     assert "expires in 12 days" in text and "openswap worker connect" in text
