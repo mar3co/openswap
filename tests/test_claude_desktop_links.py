@@ -763,7 +763,7 @@ def test_native_error_logs_only_known_domain_and_numeric_code(monkeypatch, caplo
     import sys
     from openswap import claude_desktop_links as links
     native = object.__new__(links.MacOSLinks)
-    native.application = OPENSWAP
+    native.application = OPENSWAP.resolve()
     error = Mock(domain=Mock(return_value=domain), code=Mock(return_value=-10814))
     error.localizedDescription.return_value = GOOGLE
     error.userInfo.return_value = {'callback': GOOGLE}
