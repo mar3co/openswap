@@ -42,6 +42,28 @@ def test_attach_uses_existing_app_without_rebuilding_or_launching_claude(store, 
     builder.app.open.assert_not_called()
 
 
+def test_restore_finds_owned_shortcut_after_profile_rename(store, builder):
+    profile = store.add('Work')
+    original = Path(builder.build(profile)['path'])
+    store.update(profile.id, name='Renamed')
+    opener = Mock()
+    assert presence.attach_presence(store, profile.id, directory=builder.directory, opener=opener)
+    opener.assert_called_once_with(original, f'com.opensoft.openswap.claude-profile.{profile.id}')
+
+
+def test_renamed_shortcut_search_rejects_foreign_ownership(store, builder):
+    profile = store.add('Work')
+    original = Path(builder.build(profile)['path'])
+    store.update(profile.id, name='Renamed')
+    info = original / 'Contents/Info.plist'
+    data = plistlib.loads(info.read_bytes())
+    data['OpenSwapProfile']['root'] = '/another/store'
+    info.write_bytes(plistlib.dumps(data))
+    opener = Mock()
+    assert not presence.attach_presence(store, profile.id, directory=builder.directory, opener=opener)
+    opener.assert_not_called()
+
+
 def test_legacy_shortcut_upgrades_in_place_preserving_badge(store, builder):
     p=store.add('Work'); store.update(p.id,badge='7',color='blue')
     path=Path(builder.build(store.get(p.id))['path'])

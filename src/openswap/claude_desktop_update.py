@@ -240,9 +240,14 @@ class DesktopUpdate:
         target = record["target"] if record else self.backend.staged()
         installed = bool(record and version(before) >= version(target))
         if not installed:
+            staged = self.backend.staged()
+            if record and version(staged) >= version(target):
+                # Claude can replace a pending download while the user finishes
+                # work. Confirm the newer version rather than strand recovery.
+                target = staged
             if version(target) <= version(before):
                 raise cd.ClaudeDesktopError("Claude is already on this update. Check for a newer update in Claude.")
-            if self.backend.staged() != target or not self.backend.installer_running():
+            if staged != target or not self.backend.installer_running():
                 raise cd.ClaudeDesktopError("Claude's downloaded update is not ready to install. Open Claude's update check, then retry here. The saved profiles are kept.")
         targets = {} if installed else self.backend.snapshot(self.store)
         identifiers = record["profiles"] if installed else list(targets)
@@ -275,6 +280,7 @@ class DesktopUpdate:
                               "profiles": list(plan.targets), "phase": "waiting"}
                 elif not plan.installed:
                     record["profiles"] = list(dict.fromkeys([*record["profiles"], *plan.targets]))
+                    record["target"] = plan.target
                 # Durable before the first quit request, even if it is refused.
                 self.journal.write(record)
 
@@ -326,7 +332,10 @@ class DesktopUpdate:
                     if identifier in rows:
                         if version(self.backend.installed()[0]) < version(plan.target):
                             raise cd.ClaudeDesktopError("Claude changed during recovery. Choose Resume update.")
-                        self.backend.restore(self.store, identifier)
+                        result = self.backend.restore(self.store, identifier)
+                        if (result.get("state") not in {"launched", "already_running"}
+                                or not result.get("pid")):
+                            raise cd.ClaudeDesktopError("A Claude profile is still opening. Wait a moment, then choose Resume update to restore its Dock indicator.")
                 if identifier in rows:
                     self.backend.attach(self.store, identifier)
                 with self.journal.lock():

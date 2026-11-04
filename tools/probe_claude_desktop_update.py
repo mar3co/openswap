@@ -111,6 +111,7 @@ def main():
                     native = launch(app, bundle)
                     targets[identifier] = native
                     replies[identifier].write_text(json.dumps({"pid": native.processIdentifier()}))
+                    return {"state": "launched", "pid": native.processIdentifier()}
 
                 def attach(self, store, identifier):
                     app, bundle = helpers[identifier]

@@ -300,8 +300,9 @@ its menu/CLI/Dock launchers from reopening the old app, and waits up to two minu
 for the downloaded version to install. Once the installed app passes publisher
 verification and stops changing, it waits for old numbered Dock helpers to exit,
 reopens the saved profiles, and attaches their existing Dock shortcuts. Closed
-profiles stay closed; profiles archived during the update are not reopened. Dock
-pins, sign-ins and profile data are preserved. Claude's own updater may also open
+profiles stay closed; profiles archived during the update are not reopened.
+Shortcuts retained under an older profile name are found by their stable profile ID.
+Dock pins, sign-ins and profile data are preserved. Claude's own updater may also open
 the ordinary Default window; OpenSwap leaves that window alone.
 
 If quitting is canceled, installation stalls, a Dock attachment fails, Desktop
@@ -312,6 +313,8 @@ launches remain blocked while an installation may still be pending. If Claude's
 download is no longer available, use the ordinary Claude app to download it again,
 then resume in OpenSwap. Instances from other profile stores or archived profiles
 must be closed manually before starting the coordinated update.
+If Claude replaces the pending download with a newer version, Resume update
+confirms that newer version while preserving the saved profile list.
 
 This action coordinates an update already staged by Claude; it does not download
 updates, edit ShipIt's files, or intercept Claude's own **Restart to update**

@@ -70,6 +70,7 @@ class Backend:
         assert update.version(self.current) >= update.version(self.target)
         self.restored.append(identifier)
         self.targets[identifier] = Native(100 + len(self.restored))
+        return {"state": "launched", "pid": self.targets[identifier].pid}
 
     def attach(self, store, identifier):
         if self.attach_error:
@@ -255,6 +256,8 @@ def test_corrupt_journal_blocks_launch_without_replacing_data(setup):
 
 @pytest.fixture
 def stage(tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("Squirrel.Mac uses macOS file URLs and bundle paths")
     cache = tmp_path / update.SHIPIT_ID
     staged = cache / "update.fixture" / "Claude.app"
     staged.mkdir(parents=True)
@@ -422,3 +425,37 @@ def test_panel_update_button_dispatches_coordinated_action():
     panel._desktop_profile_action = Mock()
     panel._emit_setting("claude_desktop_update", None)
     panel._desktop_profile_action.assert_called_once_with("update")
+
+
+def test_resume_accepts_a_newer_staged_update_after_original_is_replaced(setup):
+    s = setup
+    s.backend.refuse_quit = True
+    with pytest.raises(cd.ClaudeDesktopError):
+        s.updater.execute(s.updater.plan())
+    s.backend.refuse_quit = False
+    s.backend.target = "4.20000.0"
+    plan = s.updater.plan()
+    assert plan.target == "4.20000.0"
+    s.updater.execute(plan)
+    assert s.backend.restored == [p.id for p in s.profiles]
+    assert not s.updater.pending()
+
+
+def test_incomplete_launch_is_kept_for_recovery_instead_of_reported_restored(setup):
+    s = setup
+    s.backend.restore = Mock(return_value={"state": "already_opening", "pid": None})
+    with pytest.raises(cd.ClaudeDesktopError, match="still opening"):
+        s.updater.execute(s.updater.plan())
+    assert s.updater.journal.read()["profiles"] == [p.id for p in s.profiles]
+    assert not s.backend.attached
+
+
+def test_resume_never_accepts_an_older_replacement_download(setup):
+    s = setup
+    s.backend.refuse_quit = True
+    with pytest.raises(cd.ClaudeDesktopError):
+        s.updater.execute(s.updater.plan())
+    s.backend.target = "4.9999.0"
+    with pytest.raises(cd.ClaudeDesktopError, match="not ready"):
+        s.updater.plan()
+    assert s.updater.journal.read()["target"] == "4.16336.0"
