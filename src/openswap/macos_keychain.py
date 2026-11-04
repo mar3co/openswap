@@ -69,6 +69,11 @@ _SECURITY = "/usr/bin/security"
 class KeychainError(Exception):
     """A ``security`` invocation failed for a reason other than "not found"."""
 
+    def __init__(self, message, *, status=None, reason="unavailable"):
+        super().__init__(message)
+        self.status = status
+        self.reason = reason
+
 
 # The exceptions a Keychain operation may raise that callers should treat as
 # "Keychain unusable" (→ fall back to file storage) rather than a programming
@@ -184,15 +189,17 @@ def _native_get_password(service: str, account: str) -> str | None:
         if status == -25300:  # errSecItemNotFound
             return None
         if status != 0:
-            raise KeychainError("Keychain access was canceled, denied or unavailable.")
+            reason = {-128: "cancelled", -25293: "authentication_failed",
+                      -25308: "interaction_not_allowed", -25291: "not_available"}.get(status, "system_error")
+            raise KeychainError("Keychain access was canceled, denied or unavailable.", status=status, reason=reason)
         if not result.value or cf.CFGetTypeID(result) != cf.CFDataGetTypeID():
-            raise KeychainError("Keychain returned an unsupported value.")
+            raise KeychainError("Keychain returned an unsupported value.", reason="unsupported_value")
         size = cf.CFDataGetLength(result)
         if not 0 < size <= 4096:
-            raise KeychainError("Keychain returned an unsupported value.")
+            raise KeychainError("Keychain returned an unsupported value.", reason="unsupported_value")
         pointer = cf.CFDataGetBytePtr(result)
         if not pointer:
-            raise KeychainError("Keychain returned an unsupported value.")
+            raise KeychainError("Keychain returned an unsupported value.", reason="unsupported_value")
         return c.string_at(pointer, size).decode("utf-8")
     except (OSError, AttributeError, ValueError):
         raise KeychainError("Could not read the saved Keychain item.") from None

@@ -112,6 +112,14 @@ run is explained once per run, while a profile needs links and another app
 handles them. Reconnect sign-in waits for an unreadable profile list and claims
 once it can be read, or says that automatic sign-in could not be set up.
 
+Sign-in link setup and Reconnect outcomes are recorded in `openswap.log` in
+OpenSwap's data folder (`~/Library/Application Support/OpenSwap` on macOS).
+Failures include the operation, exception type and code locations, and numeric
+macOS error codes when available. Repeated profile-store read failures are
+logged once until the store recovers or the error changes. These diagnostics
+exclude callback URLs, credentials, exception messages and native error details
+that could contain a sign-in link.
+
 OpenSwap rechecks the signed Claude app, profile folder and chosen running PID
 before delivering an external login link. Closed, restarted, archived or
 ambiguous profiles are refused. Inspected Google, email and SSO login routes,
@@ -210,13 +218,24 @@ interpreter instead. The existing Code credential path keeps its stable Apple
 helper and existing access behavior.
 
 If access is denied or unavailable, automatic requests stay paused across
-restarts, feature toggles and new profiles. Choose **••• → Account details… →
-Detect** to retry. A private, credential-free `keychain-paused` marker is written
+restarts, feature toggles and new profiles. The affected profiles say **Keychain
+access needed**, with a **Retry detection** button directly beneath the status.
+The explanation above them distinguishes reading account details from being
+signed in to Claude. Retry starts detection immediately, shows progress and
+opens Account details to review and save the result or see why it failed.
+**••• → Account details… → Detect** also retries. A private, credential-free `keychain-paused` marker is written
 before the system request and removed after successful access or explicit
 retry; quitting during a request also leaves detection paused. No repeated
 background permission dialogs are shown. A successful read caches the decryption
 key only in memory. Disabling Desktop features clears that key and discards
 in-flight results. No tokens are refreshed or transferred between profiles.
+
+`openswap.log` records the pause reason (cancelled, authentication failed,
+interaction not allowed, Keychain unavailable, missing item or unsupported
+value), the numeric macOS status when available, retry requests and successful
+access. An existing pause marker is reported as having an unknown original
+reason; it cannot reconstruct an earlier failure. No keys, cookies, account
+labels, raw error messages or response bodies are logged.
 
 **Account details…** also offers manual editing and an **Update account details
 automatically** checkbox. Turn it off to keep your own labels. Older manual
@@ -227,7 +246,7 @@ Automatic results are discarded if a profile is archived, edited or disabled
 while a check runs. A confirmed sign-out clears previously detected labels.
 When a new login cannot be resolved, the previous detected account is cleared
 and **Account details unavailable** is shown. **Waiting for sign-in** and
-**Account detection paused** explain the other common states. Manual labels
+**Keychain access needed** explain the other common states. Manual labels
 remain user-owned. Detection failures never prevent opening profiles.
 
 Detected labels are a last-detected snapshot; hover for the timestamp. Switching

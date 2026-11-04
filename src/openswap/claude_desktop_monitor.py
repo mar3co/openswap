@@ -17,6 +17,7 @@ from openswap.claude_desktop_identity import AccountDetector, KeyAccessError, di
 SCAN_INTERVAL = 10.0
 REFRESH_INTERVAL = 600.0
 RETRY_INTERVAL = 60.0
+PAUSED_STATUS = "Keychain access needed"
 CLEAR_DETAILS = {"email": "", "organization": "", "detected_at": ""}
 
 
@@ -53,6 +54,10 @@ class ProfileIdentityMonitor:
 
     def refresh(self, identifier=None):
         if identifier is None:
+            # A permission retry must also invalidate queued/in-flight pauses,
+            # or they can reinstate the old status and its retry delay.
+            self._generation += 1
+            self._cancel.set()
             self._records.clear()
         else:
             self._records.pop(identifier, None)
@@ -155,7 +160,7 @@ class ProfileIdentityMonitor:
                   and now < previous.get("next_check", 0)):
                 record = {**previous, "stamp": stamp}
             elif self.detector.denied:
-                record["status"] = "Account detection paused"
+                record["status"] = PAUSED_STATUS
             else:
                 details = self.detector(self.store, profile.id, expected_fingerprint=fingerprint)
                 if cancel.is_set():
@@ -168,7 +173,7 @@ class ProfileIdentityMonitor:
                 record.update(stamp=stamp, status="", next_check=self.clock() + REFRESH_INTERVAL)
         except KeyAccessError:
             details = None
-            record["status"] = "Account detection paused"
+            record["status"] = PAUSED_STATUS
         except Exception:
             details = None
         if (details is None and profile.detected_at and record["fingerprint"] is not None

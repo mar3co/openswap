@@ -250,7 +250,7 @@ def test_keychain_read_uses_shared_app_identified_helper(monkeypatch):
     assert len(identity._key()) == 16
     read.assert_called_once_with("Claude Safe Storage", "Claude Key", native=True)
     read.side_effect = identity.macos_keychain.KeychainError("private error")
-    with pytest.raises(identity.KeyAccessError, match="paused"): identity._key()
+    with pytest.raises(identity.KeyAccessError, match="Keychain access"): identity._key()
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="CommonCrypto is macOS-only")
@@ -308,6 +308,49 @@ def test_detect_then_save_is_explicit_and_keeps_profile_identity(controller):
     saved = controller.store.get(p.id)
     assert saved.name == "Work" and saved.email == "same@example.test" and saved.detected_at == STAMP
     assert not controller.busy
+
+
+def test_inline_retry_starts_detection_then_reviews_result(controller):
+    p = controller.store.add("Work")
+    controller.store.pause_keychain(True)
+    controller.monitor.detector.denied = True
+    controller.monitor.refresh = Mock()
+    controller.monitor.poll = Mock(return_value=False)
+    controller.prompt.return_value = answer(1, "same@example.test", "Acme")
+    controller.perform("retry_detection", p.id)
+    controller.prompt.assert_not_called()  # no trip through Account details first
+    controller.detector.assert_called_once_with(controller.store, p.id)
+    assert controller.busy and "Allow Keychain access" in controller.operation
+    assert not controller.store.keychain_paused()
+    controller.monitor.refresh.assert_called_once_with()  # retry unblocks every profile
+    controller.poll()
+    assert not controller.busy
+    assert controller.store.get(p.id).email == "same@example.test"
+
+
+def test_inline_retry_failure_preserves_labels_and_shows_the_recovery_action(controller):
+    p = controller.store.add("Work")
+    controller.store.update(p.id, email="kept@example.test")
+    controller.monitor.poll = Mock(return_value=False)
+    controller.detector.side_effect = identity.KeyAccessError(identity.KEYCHAIN_RETRY, reason="cancelled", status=-128)
+    controller.prompt.return_value = answer(0)
+    controller.perform("retry_detection", p.id)
+    controller.poll()
+    assert controller.store.get(p.id).email == "kept@example.test"
+    assert "allow access" in controller.prompt.call_args.kwargs["message"]
+
+
+@pytest.mark.parametrize("gate", ["disabled", "busy", "blocked", "archived"])
+def test_inline_retry_obeys_gates_without_clearing_saved_pause(controller, gate):
+    p = controller.store.add("Work")
+    controller.store.pause_keychain(True)
+    if gate == "archived": controller.store.update(p.id, archived=True)
+    controller.enabled = lambda: gate != "disabled"
+    controller.blocked = lambda: gate == "blocked"
+    controller.busy = gate == "busy"
+    controller.perform("retry_detection", p.id)
+    assert controller.store.keychain_paused()
+    controller.detector.assert_not_called()
 
 
 def test_detect_then_cancel_does_not_save(controller):

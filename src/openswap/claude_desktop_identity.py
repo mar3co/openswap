@@ -14,10 +14,12 @@ import ctypes
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -35,6 +37,10 @@ COOKIE_NAMES = ("lastActiveOrg", "sessionKey", "sessionKeyV3", "sessionKeyLC", "
 MAX_RESPONSE = 2_000_000
 UNAVAILABLE = "Could not detect this profile's account. Sign in inside its Claude window, then try again or enter the details yourself."
 CHANGED = "The account changed during detection. Try again after choosing the account in Claude."
+KEYCHAIN_RETRY = "Account details need Keychain access. Choose Retry detection on the profile, or Detect in Account details, and allow access if macOS asks."
+_logger = logging.getLogger("openswap")
+_KEYCHAIN_REASONS = {"cancelled", "authentication_failed", "interaction_not_allowed", "not_available",
+                     "system_error", "unsupported_value", "item_missing", "timed_out", "unavailable"}
 
 
 class DetectionError(ClaudeDesktopError):
@@ -47,6 +53,20 @@ class NoSavedLogin(DetectionError):
 
 class KeyAccessError(DetectionError):
     """Automatic detection must stop prompting until the user retries."""
+
+    def __init__(self, message, *, reason="unavailable", status=None):
+        super().__init__(message)
+        self.reason = reason if reason in _KEYCHAIN_REASONS else "unavailable"
+        self.status = status if isinstance(status, int) else None
+
+
+def _log_pause(reason, error=None):
+    # Raw Keychain errors, cookies, account labels and response bodies stay out
+    # of logs. Only our fixed reason, exception class and numeric codes leave.
+    _logger.warning("Claude account detection: paused reason=%s exception=%s osstatus=%s errno=%s",
+                    reason, type(error).__name__ if error else "none",
+                    error.status if isinstance(error, KeyAccessError) else None,
+                    error.errno if isinstance(error, OSError) and isinstance(error.errno, int) else None)
 
 
 def _uuid(value):
@@ -169,11 +189,17 @@ def _key():
     # The ordinary Code credential path keeps its existing stable CLI reader.
     try:
         password = macos_keychain.get_password("Claude Safe Storage", "Claude Key", native=True)
-        if not password or len(password.encode("utf-8")) > 4096:
-            raise macos_keychain.KeychainError("Unavailable")
+        if not password:
+            raise KeyAccessError(KEYCHAIN_RETRY, reason="item_missing")
+        if len(password.encode("utf-8")) > 4096:
+            raise KeyAccessError(KEYCHAIN_RETRY, reason="unsupported_value")
         return hashlib.pbkdf2_hmac("sha1", password.encode("utf-8"), b"saltysalt", 1003, 16)
-    except macos_keychain.KEYCHAIN_ERRORS:
-        raise KeyAccessError("Account detection is paused. Choose Detect in Account details to retry Keychain access, or enter the details yourself.") from None
+    except macos_keychain.KeychainError as exc:
+        raise KeyAccessError(KEYCHAIN_RETRY, reason=exc.reason, status=exc.status) from None
+    except subprocess.TimeoutExpired:
+        raise KeyAccessError(KEYCHAIN_RETRY, reason="timed_out") from None
+    except OSError:
+        raise KeyAccessError(KEYCHAIN_RETRY, reason="system_error") from None
 
 
 def _decrypt(encrypted: bytes, host: str, key: bytes):
@@ -279,14 +305,22 @@ class AccountDetector:
         self._cached_key = None
         try:
             self.denied = bool(store and store.keychain_paused())
-        except (ClaudeDesktopError, OSError):
+            if self.denied:
+                _log_pause("saved_pause_original_reason_unknown")
+        except (ClaudeDesktopError, OSError) as exc:
             self.denied = True  # unreadable permission state must not prompt
+            _log_pause("pause_state_unreadable", exc)
         self._lock = threading.Lock()
         self._generation = 0
 
     def retry(self):
-        if self.store:
-            self.store.pause_keychain(False)
+        _logger.info("Claude account detection: retry_requested")
+        try:
+            if self.store:
+                self.store.pause_keychain(False)
+        except (ClaudeDesktopError, OSError) as exc:
+            _log_pause("retry_could_not_clear_pause", exc)
+            raise
         self._generation += 1
         self.denied = False
 
@@ -298,31 +332,44 @@ class AccountDetector:
         if self.store:
             try:
                 self.denied |= self.store.keychain_paused()
-            except (ClaudeDesktopError, OSError):
+            except (ClaudeDesktopError, OSError) as exc:
                 self.denied = True
+                _log_pause("pause_state_unreadable", exc)
 
     def _get_key(self):
         with self._lock:
             if self.denied:
-                raise KeyAccessError("Choose Detect in Account details to allow Keychain access.")
+                raise KeyAccessError(KEYCHAIN_RETRY)
             if self._cached_key is None:
                 generation = self._generation
+                stage = "record_pause_failed"
                 try:
                     if self.store:
                         self.store.pause_keychain(True)
+                    stage = "keychain_read_failed"
+                    _logger.info("Claude account detection: keychain_access_started")
                     key = _key()
                     # Granted access lifts the pause even when a toggle during
                     # the prompt copied the marker; only a real denial persists.
+                    stage = "clear_pause_failed"
                     if self.store:
                         self.store.pause_keychain(False)
                     self.denied = False
+                    _logger.info("Claude account detection: keychain_access_succeeded pause_cleared=True")
                     if generation != self._generation:
+                        stage = "detection_stopped"
+                        _logger.info("Claude account detection: stopped_after_access")
                         raise DetectionError("Account detection stopped.")
                     self._cached_key = key
-                except (KeyAccessError, ClaudeDesktopError, OSError):
+                except (KeyAccessError, ClaudeDesktopError, OSError) as exc:
+                    if stage == "detection_stopped":
+                        raise
                     if generation == self._generation:
                         self.denied = True
-                    raise KeyAccessError("Account detection is paused. Choose Detect in Account details to retry Keychain access.") from None
+                    _log_pause(exc.reason if isinstance(exc, KeyAccessError) else stage, exc)
+                    raise KeyAccessError(KEYCHAIN_RETRY,
+                                         reason=exc.reason if isinstance(exc, KeyAccessError) else "unavailable",
+                                         status=exc.status if isinstance(exc, KeyAccessError) else None) from None
             return self._cached_key
 
     def __call__(self, store, identifier, *, expected_fingerprint=None):

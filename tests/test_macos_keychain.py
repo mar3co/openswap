@@ -73,8 +73,14 @@ def test_native_read_is_exact_read_only_and_releases_objects(monkeypatch, status
     monkeypatch.setattr(macos_keychain, "_native_api", lambda: (cf, security, constants))
     with patch.object(macos_keychain.subprocess, "run", side_effect=AssertionError("No CLI")):
         if expected == "error":
-            with pytest.raises(macos_keychain.KeychainError):
+            with pytest.raises(macos_keychain.KeychainError) as error:
                 macos_keychain.get_password("Claude Safe Storage", "Claude Key", native=True)
+            if status:
+                assert error.value.status == status
+                assert error.value.reason == {-128: "cancelled", -25293: "authentication_failed",
+                                              -25308: "interaction_not_allowed"}[status]
+            else:
+                assert error.value.reason == "unsupported_value"
         else:
             assert macos_keychain.get_password("Claude Safe Storage", "Claude Key", native=True) == expected
     assert [call.args[1] for call in cf.CFStringCreateWithCString.call_args_list] == [b"Claude Safe Storage", b"Claude Key"]

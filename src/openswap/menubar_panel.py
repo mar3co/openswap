@@ -2339,6 +2339,13 @@ class MenuBarPanel:
                                              f"Actions for {profile['name']}", bordered=True)
                 more.setEnabled_(enabled)
                 extra_y = y + base_h - 4
+                if profile.get("account_action") == "retry_detection":
+                    button = self._add_button(group, "Retry detection", NSMakeRect(54, extra_y, 116, 24),
+                                              lambda _, p=profile: self._desktop_profile_action("retry_detection", p["id"]), font_small)
+                    button.setEnabled_(enabled)
+                    button.setAccessibilityLabel_(f"Retry account detection for {profile['name']}")
+                    button.setToolTip_("Allow Keychain access to read this account's email and organization. Your Claude sign-in stays unchanged.")
+                    extra_y += 28
                 if profile.get("code_status"):
                     action = profile.get("code_action")
                     label = _label(profile["code_status"], font_small, pal["muted"],

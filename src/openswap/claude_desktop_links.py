@@ -8,6 +8,7 @@ cannot establish an originating profile: ask once, never guess or broadcast.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import queue
 import time
@@ -16,6 +17,32 @@ from urllib.parse import unquote, urlsplit
 
 from openswap.claude_desktop import APP_PATH, BUNDLE_ID, ClaudeDesktopError
 from openswap.claude_desktop_signin import callback_link, fourcc, link_text
+
+_logger = logging.getLogger("openswap")
+# Never render native descriptions/userInfo: either can contain a callback URL.
+_ERROR_DOMAINS = {"NSCocoaErrorDomain", "NSOSStatusErrorDomain", "NSPOSIXErrorDomain", "NSURLErrorDomain"}
+
+
+def log_failure(stage, error=None):
+    """Log a fixed stage plus exception type, errno and code locations only.
+
+    No exception text, source lines, locals, paths supplied by an exception,
+    or chained exceptions: those can contain sign-in links and credentials.
+    """
+    detail = ""
+    if error is not None:
+        detail = f" exception={type(error).__name__}"
+        if isinstance(error, OSError) and isinstance(error.errno, int):
+            detail += f" errno={error.errno}"
+        frames, tb = [], error.__traceback__
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            frames.append(f"{Path(code.co_filename).name}:{tb.tb_lineno}:{code.co_name}")
+            tb = tb.tb_next
+        if frames:
+            detail += " locations=" + ",".join(frames[-8:])
+    _logger.warning("Claude sign-in links: %s%s", stage, detail)
+
 
 OWNER_IDS = {"com.opensoft.openswap", "com.opensoft.openswap.dev"}
 PREVIOUS_KEY = "ClaudeLinksPreviousApplication"
@@ -56,9 +83,12 @@ def register_application(path):
     raw = os.fsencode(path)
     url = create(None, raw, len(raw), True)
     if not url:
+        log_failure("registration_url_failed")
         raise ClaudeDesktopError("macOS could not register OpenSwap for sign-in. Reopen OpenSwap and try again.")
     try:
-        if register(url, True) != 0:
+        status = register(url, True)
+        if status != 0:
+            _logger.warning("Claude sign-in links: registration_failed osstatus=%d", status)
             raise ClaudeDesktopError("macOS could not register OpenSwap for sign-in. Reopen OpenSwap and try again.")
     finally:
         release(url)
@@ -249,11 +279,24 @@ class MacOSLinks:
         if Path(path).resolve() not in {Path(url.path()).resolve() for url in candidates}:
             # Launch Services records temporary bundles but excludes them from
             # URL binding. LSRegisterURL can return success in that case.
+            _logger.warning("Claude sign-in links: handler_ineligible restoring=%s", restoring)
             if not restoring:
                 raise ClaudeDesktopError("Move OpenSwap to Applications, reopen it, then choose Reconnect sign-in in the profile menu.")
             raise ClaudeDesktopError(RESTORE_REINSTALL)
+        def answered(error):
+            if error is not None:
+                try:
+                    domain, code = error.domain(), error.code()
+                    domain = domain if domain in _ERROR_DOMAINS else "other"
+                    code = code if isinstance(code, int) else "unknown"
+                    _logger.warning("Claude sign-in links: macos_handler_failed restoring=%s domain=%s code=%s",
+                                    restoring, domain, code)
+                except Exception as exc:
+                    log_failure("macos_error_metadata_unavailable", exc)
+            completed(error is None)
+
         self.workspace.setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler_(
-            NSURL.fileURLWithPath_(str(path)), "claude", lambda error: completed(error is None))
+            NSURL.fileURLWithPath_(str(path)), "claude", answered)
 
     def forward(self, value):
         from AppKit import NSWorkspaceOpenConfiguration
@@ -297,6 +340,7 @@ class DesktopSignInLinks:
         self.reconnecting = False
         # This run told the user why automatic sign-in is paused.
         self.noticed = False
+        self._needed_error = None
         self.native = native_factory(self.receive, self.launched)
 
     def receive(self, value):
@@ -310,9 +354,15 @@ class DesktopSignInLinks:
     def _needed(self):
         """True, False, or None when the store cannot say; only False releases."""
         try:
-            return bool(self.needed())
-        except Exception:
+            needed = bool(self.needed())
+        except Exception as exc:
+            signature = (type(exc), exc.errno if isinstance(exc, OSError) else None)
+            if signature != self._needed_error:
+                log_failure("profile_store_unavailable", exc)
+                self._needed_error = signature
             return None
+        self._needed_error = None
+        return needed
 
     def launched(self):
         # Claude registers its scheme during startup. Wait for that registration
@@ -325,6 +375,7 @@ class DesktopSignInLinks:
     def prepare(self, *, retry=False):
         self.stopping = self.closed = False
         if retry:
+            _logger.info("Claude sign-in links: reconnect_requested")
             self.native.pause(False)
             self.reconnecting = True
         self.launched()
@@ -337,6 +388,7 @@ class DesktopSignInLinks:
         current = self.native.current()
         step = claim_step(current=current, application=self.native.application, held=self.held,
                           reconnecting=reconnecting, paused=paused, noticed=self.noticed)
+        _logger.info("Claude sign-in links: claim_decision=%s reconnect=%s paused=%s", step, reconnecting, paused)
         if step == "held":
             self.held = True
         elif step == "lost":
@@ -354,9 +406,11 @@ class DesktopSignInLinks:
         try:
             self.native.set_handler(self.native.application, lambda ok: self.completions.put(("claim", ok)))
         except ClaudeDesktopError as exc:
+            log_failure("claim_request_failed", exc)
             self.changing = False
             self._notice(str(exc))
-        except Exception:
+        except Exception as exc:
+            log_failure("claim_request_failed", exc)
             self.completions.put(("claim", False))
 
     def restore(self, completed=None):
@@ -386,9 +440,11 @@ class DesktopSignInLinks:
                 return
             # A previous handler that is gone leaves nothing to restore to.
         except ClaudeDesktopError as exc:
+            log_failure("restore_request_failed", exc)
             self.changing = False
             self._restore_failed(str(exc))
-        except Exception:
+        except Exception as exc:
+            log_failure("restore_request_failed", exc)
             self.changing = False
             self._restore_failed(RESTORE_FAILED)
         self._restored()
@@ -418,6 +474,7 @@ class DesktopSignInLinks:
             needed = self._needed() if self.enabled() else False
             if needed is None:
                 self.reconnecting = False
+                log_failure("reconnect_profile_store_unavailable")
                 self.show_error(SETUP_FAILED)
                 return
             if needed:
@@ -464,6 +521,8 @@ class DesktopSignInLinks:
 
     def _notice(self, message):
         self.noticed = True
+        reason = {PAUSED: "permission_paused", OWNERSHIP_LOST: "handler_ownership_lost"}.get(message, "setup_failed")
+        log_failure(reason)
         self.show_error(message)
 
     def _sift(self, *, keep_callbacks):
@@ -483,7 +542,8 @@ class DesktopSignInLinks:
             if ordinary_link(item[1]):
                 try:
                     self.native.forward(item[1])
-                except Exception:
+                except Exception as exc:
+                    log_failure("forward_failed", exc)
                     self.show_error("Could not open the Claude link. Start again from the intended profile.")
             elif keep_callbacks:
                 live.append(item)
@@ -502,9 +562,13 @@ class DesktopSignInLinks:
             self.changing = False
             if operation == "claim":
                 try:
-                    ok = ok and self.native.current() == self.native.application
-                except Exception:
+                    if ok and self.native.current() != self.native.application:
+                        log_failure("claim_handler_mismatch")
+                        ok = False
+                except Exception as exc:
+                    log_failure("claim_verification_failed", exc)
                     ok = False
+                _logger.info("Claude sign-in links: claim_completed success=%s", ok)
                 self.held = ok
                 self.native.pause(not ok)
                 if self.stopping or not self.enabled():
@@ -512,6 +576,7 @@ class DesktopSignInLinks:
                 elif not ok:
                     self._notice(PAUSED)
             else:
+                _logger.info("Claude sign-in links: restore_completed success=%s", ok)
                 if ok:
                     self.held = False
                 else:
@@ -519,6 +584,7 @@ class DesktopSignInLinks:
                 self._restored()
         if self.restore_callbacks and self.restore_deadline is not None and self.clock() >= self.restore_deadline:
             # The consent sheet stays with the user; Quit cannot wait on it.
+            log_failure("restore_timed_out")
             self.changing = False
             self._restored()
         if self.clock() >= self.recheck_at:
@@ -528,7 +594,8 @@ class DesktopSignInLinks:
             self.prepare_at = None
             try:
                 self._claim()
-            except Exception:
+            except Exception as exc:
+                log_failure("setup_failed", exc)
                 self.show_error(SETUP_FAILED)
         if self.verify_at is not None and self.clock() >= self.verify_at:
             self._verify()
@@ -546,6 +613,7 @@ class DesktopSignInLinks:
             try:
                 callback_link(value)
             except ClaudeDesktopError:
+                log_failure("callback_unsupported")
                 self.show_error("This Claude link is not supported. Start again from the intended Claude profile.")
                 return
             # One-time callbacks are deduplicated; ordinary links were forwarded by the sift.
@@ -555,6 +623,7 @@ class DesktopSignInLinks:
                 return
             self.seen[digest] = now
             if not self.enabled() or self.stopping:
+                log_failure("callback_while_disabled")
                 self.show_error("Open the Claude Desktop tab and start again from the intended profile.")
                 return
             self.dispatching = True
@@ -562,5 +631,6 @@ class DesktopSignInLinks:
                 self.receive_signin(value, lambda: self.clock() - received <= MAX_AGE)
             finally:
                 self.dispatching = False
-        except Exception:
+        except Exception as exc:
+            log_failure("callback_dispatch_failed", exc)
             self.show_error("Could not open the Claude link. Start again from the intended profile.")

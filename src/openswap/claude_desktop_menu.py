@@ -10,7 +10,7 @@ from datetime import datetime
 
 from openswap.claude_desktop import BADGE_COLORS, BUNDLE_ID, ClaudeDesktopApp, ClaudeDesktopError, DesktopProfiles, account_label, validate_badge
 from openswap.exceptions import ClaudeSwitchError
-from openswap.claude_desktop_monitor import ProfileIdentityMonitor
+from openswap.claude_desktop_monitor import PAUSED_STATUS, ProfileIdentityMonitor
 
 
 def focus_profile(pid: int) -> None:
@@ -128,6 +128,8 @@ class ClaudeDesktopMenu:
                          items=[{**asdict(p), "status": self._profile_states.get(p.id, ""),
                                  "checked_at": self._profile_checked_at.get(p.id),
                                  **({"account_status": self.monitor.statuses[p.id]} if self.monitor.statuses.get(p.id) else {}),
+                                 **({"account_action": "retry_detection"}
+                                    if not p.archived and self.monitor.statuses.get(p.id) == PAUSED_STATUS else {}),
                                  **(self.code.state(p) if self.code else {})}
                                 for p in profiles])
         except (ClaudeSwitchError, OSError):
@@ -208,6 +210,8 @@ class ClaudeDesktopMenu:
                                    callback=lambda _, p=profile: self.open(p.id)))
             item.add(rumps.MenuItem("Rename…", callback=lambda _, p=profile: self.rename(p)))
             item.add(rumps.MenuItem("Account details…", callback=lambda _, p=profile: self.details(p)))
+            if self.monitor.statuses.get(profile.id) == PAUSED_STATUS:
+                item.add(rumps.MenuItem("Retry account detection…", callback=lambda _, p=profile: self.retry_detection(p)))
             item.add(rumps.MenuItem("Reconnect sign-in…", callback=lambda _, p=profile: self.reconnect_signin(p)))
             if self.code:
                 action = self.code.state(profile).get("code_action")
@@ -251,7 +255,7 @@ class ClaudeDesktopMenu:
             return self.add()
         if action == "storage_error":
             return self.storage_error()
-        if action not in {"open", "rename", "archive", "restore", "shortcut", "setup_dock", "details", "reconnect_signin", "connect_code", "cancel_code"}:
+        if action not in {"open", "rename", "archive", "restore", "shortcut", "setup_dock", "details", "reconnect_signin", "connect_code", "cancel_code", "retry_detection"}:
             return
         try:
             profile = self.store.get(identifier, include_archived=action == "restore")
@@ -348,6 +352,8 @@ class ClaudeDesktopMenu:
         try:
             self.signin_links.prepare(retry=True)
         except (ClaudeSwitchError, OSError) as exc:
+            from openswap.claude_desktop_links import log_failure
+            log_failure("reconnect_prepare_failed", exc)
             self._error(exc)
             return
         self.open(profile.id)
@@ -497,7 +503,7 @@ class ClaudeDesktopMenu:
                            "detected_at": profile.detected_at, "account_uuid": profile.account_uuid,
                            "organization_uuid": profile.organization_uuid, "detected_login": profile.detected_login}
         while True:
-            message = note or ("Account detection is paused. Choose Detect to retry Keychain access, or enter the details yourself."
+            message = note or ("OpenSwap needs Keychain access to read your email and organization. Choose Detect and allow access if macOS asks. Your Claude sign-in stays unchanged."
                                if self.monitor.detector.denied else
                                "Account details update after sign-in or account changes. OpenSwap may request Keychain access.")
             if values.get("detected_at"):
@@ -540,17 +546,23 @@ class ClaudeDesktopMenu:
             self.monitor.refresh(profile.id)
             return
 
+    def retry_detection(self, profile):
+        """Start detection directly from a profile row; review the result as usual."""
+        self._detect(profile.id, {key: getattr(profile, key) for key in (
+            "email", "organization", "detected_at", "account_uuid", "organization_uuid", "detected_login", "auto_detect")})
+
     def _detect(self, identifier, draft):
         if self.busy or self.blocked() or not self.enabled():
             return
         from openswap.claude_desktop_identity import DetectionError
         try:
             self.monitor.detector.retry()
+            self.monitor.refresh()  # Keychain permission is shared by all profiles.
         except (ClaudeSwitchError, OSError) as exc:
             self._error(exc)
             return
         self.busy = True
-        self.operation = "Detecting account…"
+        self.operation = "Detecting account… Allow Keychain access if macOS asks."
         self.changed()
 
         def work():
