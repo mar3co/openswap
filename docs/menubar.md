@@ -93,6 +93,8 @@ macOS Reduce Motion and coalesces switches that finish together.
 
 `fit_status_item(..., title=...)` writes the optional title on the status-item **button** (rumps still uses the deprecated `NSStatusItem.setTitle_`) and always displays the packaged OpenSoft template image at 16pt. AppKit sizes the image and text together; **Logo only** leaves the logo visible by itself. There is no asterisk preference; legacy `show_icon` values are ignored. Call it after every title rebuild and on popover attach. A sentinel on either provider's active slot still titles from `last_good` (`title_usage`), frozen at that provider's `fetched_at` so a passed weekly reset does not paint as a fresh 0%.
 
+When adding another Claude Code account, an unrecognized config identity does not by itself mean the login is unsaved. `current_login_is_saved` checks the live credential against saved credential lineages and requires a matching saved config, without recapturing under the unrecognized identity. A verified saved copy skips the warning; unreadable credentials and worker leases still stop the flow. A genuinely unmatched login shows **Add another Claude Code account?** with **Continue to sign in**, explains that existing saved accounts remain, and distinguishes an email saved for another organization. Known identities still refresh their backup before sign-in.
+
 ## Appearance
 
 An `NSPopover` shown from a status item inherits the **menu bar** appearance (wallpaper tint), which can stay Aqua while System Settings is Dark. `resolve_popover_theme` prefers `AppleInterfaceStyle` (`Dark` or unset), then `NSApp.effectiveAppearance`.

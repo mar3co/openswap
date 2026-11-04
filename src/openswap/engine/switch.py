@@ -8,6 +8,52 @@ from openswap.worker.leases import AccountLeaseStore
 class SwitchMixin:
     """Capture, activate, classify outgoing live bytes, shared MCP merge."""
 
+    def current_login_is_saved(self) -> bool:
+        """Whether the live credential already has a restorable saved copy.
+
+        The config's email/organization can drift independently of the
+        credential. Before adding a login, compare the credential itself;
+        never recapture it under that potentially unrelated config identity.
+        A shared refresh token is enough even after access-token rotation.
+        This checks preservation, not which account is currently active.
+        """
+        self._refuse_session_shell()
+        with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as guard:
+            guard.assert_available()
+            live = self._read_capture_credentials()
+            if live is None:
+                raise CredentialReadError("Couldn't read Claude Code's current login.")
+            if not live:
+                return False
+            login = oauth.extract_oauth_data(live)
+            if not login or not (login.get("accessToken") or login.get("refreshToken")):
+                return False
+            fingerprint = oauth.credential_fingerprint(live)
+            roster = self._get_sequence_data() or {}
+            unreadable = False
+            for num, account in (roster.get("accounts") or {}).items():
+                email = account.get("email") or ""
+                backup, failed = self._read_account_credentials_ex(num, email)
+                unreadable |= failed
+                if not backup or failed or oauth.credential_fingerprint(backup) != fingerprint:
+                    continue
+                # A token without its saved config is not a restorable login.
+                try:
+                    config = json.loads(self._read_account_config(num, email) or "null")
+                except (OSError, ValueError):
+                    unreadable = True
+                    continue
+                identity = config.get("oauthAccount") if isinstance(config, dict) else None
+                if isinstance(identity, dict) and (
+                    identity.get("emailAddress") == email
+                    and (identity.get("organizationUuid") or "")
+                    == (account.get("organizationUuid") or "")
+                ):
+                    return True
+            if unreadable:
+                raise CredentialReadError("Couldn't check OpenSwap's saved logins.")
+            return False
+
     def _prepare_credentials_for_activation(
         self, target_credentials: str, live_credentials: str | None
     ) -> str:
