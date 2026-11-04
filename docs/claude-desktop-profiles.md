@@ -286,6 +286,55 @@ installation moves, recreate the shortcut from the new location. Claude updates
 continue to use `/Applications/Claude.app`; its publisher is checked on each
 open. App updates may still change profile compatibility.
 
+### Updating Claude with several profiles open
+
+After Claude has downloaded an update, choose **Update Claude…** in OpenSwap's
+Claude Desktop tab, profile menu, or Desktop settings. Review the profiles that
+will close, finish active work, then choose **Update and reopen**. OpenSwap asks
+each verified Claude process to quit normally; answer any unfinished-work prompt
+inside Claude. It never force-quits a session.
+
+All profiles share one Claude.app. Claude's updater waits for every instance to
+exit. OpenSwap remembers the open profiles before requesting any quit, prevents
+its menu/CLI/Dock launchers from reopening the old app, and waits up to two minutes
+for the downloaded version to install. Once the installed app passes publisher
+verification and stops changing, it waits for old numbered Dock helpers to exit,
+reopens the saved profiles, and attaches their existing Dock shortcuts. Closed
+profiles stay closed; profiles archived during the update are not reopened. Dock
+pins, sign-ins and profile data are preserved. Claude's own updater may also open
+the ordinary Default window; OpenSwap leaves that window alone.
+
+If quitting is canceled, installation stalls, a Dock attachment fails, Desktop
+features are disabled, or OpenSwap exits, the recovery record remains. Choose
+**Resume update…** to continue after resolving the issue. Recovery requires a
+fresh confirmation and retries only unfinished profile restorations. Profile
+launches remain blocked while an installation may still be pending. If Claude's
+download is no longer available, use the ordinary Claude app to download it again,
+then resume in OpenSwap. Instances from other profile stores or archived profiles
+must be closed manually before starting the coordinated update.
+
+This action coordinates an update already staged by Claude; it does not download
+updates, edit ShipIt's files, or intercept Claude's own **Restart to update**
+button. Use OpenSwap's action for coordinated closing and restoration. The gate
+applies to launchers invoking this OpenSwap version; macOS's ordinary Claude icon
+and older OpenSwap installations cannot be prevented from launching Claude.
+
+Recovery uses a private, atomically written `desktop-update.json` under the
+default OpenSwap Claude Desktop store, shared even by CLI callers using a custom
+profile root. It contains versions, the originating store path and unfinished
+profile IDs, never cookies or credentials. A separate process lock prevents DEV
+and release builds from coordinating the same installation simultaneously.
+
+`tests/test_claude_desktop_update.py` covers update/quit failures, launch blocking,
+confirmation races, interrupted recovery, signature failures and Dock retries.
+The opt-in native probe uses disposable app sessions and numbered Dock helpers:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/probe_claude_desktop_update.py --launch
+```
+
+The native probe simulates installation; it does not update or quit real Claude.
+
 ## Sign-in, status, and archiving
 
 Use **Settings → Desktop → Claude Desktop → Check** to verify the installed publisher/version and refresh running

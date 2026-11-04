@@ -1014,7 +1014,7 @@ def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str]
     items = [] if state.get("storage_error") else state.get("items") or []
     active = [p for p in items if not p.get("archived")]
     archived = [p for p in items if p.get("archived")]
-    disabled = bool(state.get("busy"))
+    disabled = bool(state.get("busy") or state.get("update_pending"))
     rows.append({"kind": "profiles_header", "id": "claude_desktop_add", "label": "Profiles",
                  "title": "Add profile" if active else "", "disabled": disabled or bool(state.get("storage_error"))})
     hint("claude_desktop_separation", "Default is your existing Claude profile. Signed-in profiles are added to Claude Code automatically.")
@@ -1026,7 +1026,12 @@ def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str]
         if state.get("default_error"):
             hint("claude_desktop_default_error", state["default_error"])
         rows.append({"kind": "profiles", "id": "claude_desktop_profiles", "items": active, "disabled": disabled})
-    if disabled:
+    rows.append({"kind": "button", "id": "claude_desktop_update", "label": "Claude Desktop update",
+                 "title": "Resume update…" if state.get("update_pending") else "Update Claude…",
+                 "disabled": bool(state.get("busy")) or bool(state.get("storage_error"))})
+    if state.get("update_pending") and not state.get("busy"):
+        hint("claude_desktop_update_pending", "An update is unfinished. Resume it to restore your profiles and Dock indicators.")
+    elif disabled:
         hint("claude_desktop_operation", state.get("operation") or "Working on profile…")
     if archived:
         rows.append({"kind": "disclosure", "id": "claude_desktop_archived", "label": f"Archived profiles ({len(archived)})",
@@ -1073,8 +1078,13 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
 
     message = state.get("app_message") or "Not checked yet. Install Claude.app in Applications."
     rows.append({"kind": "app_check", "id": "claude_desktop_check", "label": message,
-                 "title": "Checking…" if state.get("checking") else "Check", "disabled": bool(state.get("checking")),
+                 "title": "Checking…" if state.get("checking") else "Check", "disabled": bool(state.get("checking") or state.get("update_pending")),
                  "lines": _hint_lines(message)})
+    rows.append({"kind": "button", "id": "claude_desktop_update", "label": "Update and restore profiles",
+                 "title": "Resume update…" if state.get("update_pending") else "Update Claude…",
+                 "disabled": bool(state.get("busy"))})
+    if state.get("update_pending") or state.get("busy"):
+        hint("claude_desktop_update_status", state.get("operation") if state.get("busy") else "Resume the unfinished update to restore profiles and Dock indicators.")
     rows.append({"kind": "button", "id": "claude_desktop_guide", "label": "Profiles and Dock icons",
                  "title": "Show guide", "disabled": bool(state.get("busy"))})
     rows.append({"kind": "disclosure", "id": "claude_desktop_help", "label": "About profiles",

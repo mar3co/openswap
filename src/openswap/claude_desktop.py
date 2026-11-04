@@ -403,6 +403,12 @@ class DesktopProfiles:
             return updated
 
     def open(self, identifier: str, *, app: ClaudeDesktopApp | None = None, existing_only=False) -> dict:
+        from openswap.claude_desktop_update import launch_guard
+        with launch_guard(existing_only=existing_only):
+            return self._open(identifier, app=app, existing_only=existing_only)
+
+    def _open(self, identifier: str, *, app: ClaudeDesktopApp | None = None, existing_only=False) -> dict:
+        """Launch under the shared update gate; recovery also calls this while holding it."""
         app = app or ClaudeDesktopApp()
         info = app.validate()  # no profile changes or launch before publisher validation
         with self.lock():

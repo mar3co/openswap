@@ -1532,6 +1532,9 @@ class MenuBarPanel:
         self._reload_after(self._check_desktop_settings_app if section == SETTINGS_SECTION_DESKTOP else lambda: None)
 
     def _emit_setting(self, row_id, value):
+        if row_id == "claude_desktop_update":
+            self._desktop_profile_action("update")
+            return
         if row_id in {"claude_desktop_help", "claude_desktop_archived", "chatgpt_help"}:
             if row_id in self._settings_disclosures:
                 self._settings_disclosures.remove(row_id)
