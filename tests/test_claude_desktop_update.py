@@ -289,8 +289,10 @@ def test_corrupt_journal_blocks_launch_without_replacing_data(setup):
     with s.updater.journal.lock():
         s.updater.journal.path.write_text("{broken")
         s.updater.journal.path.chmod(0o600)
+    app = launcher()
     with pytest.raises(cd.ClaudeDesktopError, match="unreadable"):
-        s.store.open(s.profiles[1].id)
+        s.store.open(s.profiles[1].id, app=app)
+    app.open.assert_not_called()
     assert s.updater.journal.path.read_text() == "{broken"
 
 
