@@ -110,6 +110,12 @@ def execute_spec(monkeypatch, tmp_path, *, dev, python_sdk, bundled_sdk=None):
         monkeypatch.setenv("OPENSWAP_DEV_ENTRY", str(runner))
     captured = {}
 
+    def make_dev_icon(source, work):
+        captured["icon_source"] = source
+        return work / "AppIcon.icns"
+
+    monkeypatch.setitem(sys.modules, "dev_icon", SimpleNamespace(make_dev_icon=make_dev_icon))
+
     def analysis(entries, **kwargs):
         captured["entries"] = entries
         return SimpleNamespace(pure=[], scripts=[], binaries=[], datas=[])
@@ -126,6 +132,7 @@ def execute_spec(monkeypatch, tmp_path, *, dev, python_sdk, bundled_sdk=None):
 
     runpy.run_path(str(PACKAGING / "openswap.spec"), init_globals={
         "SPECPATH": str(PACKAGING),
+        "workpath": str(tmp_path / "work"),
         "Analysis": analysis,
         "PYZ": lambda *_: None,
         "EXE": lambda *_, **kw: SimpleNamespace(name="OpenSwap"),
@@ -139,7 +146,13 @@ def execute_spec(monkeypatch, tmp_path, *, dev, python_sdk, bundled_sdk=None):
 def test_dev_and_release_use_the_same_native_appearance(monkeypatch, tmp_path, python_sdk):
     release = execute_spec(monkeypatch, tmp_path, dev=False, python_sdk=python_sdk)
     dev = execute_spec(monkeypatch, tmp_path, dev=True, python_sdk=python_sdk)
-    assert release["info_plist"] == dev["info_plist"]
+    shared = {**release["info_plist"], "CFBundleDisplayName": None}
+    assert shared == {**dev["info_plist"], "CFBundleDisplayName": None}
+    assert (release["info_plist"]["CFBundleDisplayName"], dev["info_plist"]["CFBundleDisplayName"]) == (
+        "OpenSwap", "OpenSwap DEV")
+    assert release["icon"] is None and "icon_source" not in release
+    assert dev["icon"] == str(tmp_path / "work" / "AppIcon.icns") and dev["icon_source"].name == "icon_1024.png"
+    assert dev["icon_source"].is_file()
     assert release["info_plist"]["LSMinimumSystemVersion"] == "14.0"
     assert release["bundle_identifier"] == "com.opensoft.openswap"
     assert dev["bundle_identifier"] == "com.opensoft.openswap.dev"
