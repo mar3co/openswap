@@ -377,7 +377,9 @@ def wizard_page(step: str, facts: WizardFacts, choices: WizardChoices) -> dict:
     button; an ``actions`` row item marked ``primary`` takes that role
     instead), ``secondary`` (a filled gray button, or None), ``skip`` (a
     plain text button, or None), ``back`` (a plain text button) and
-    ``progress`` (``(n, total)`` or None).
+    ``progress`` (``(n, total)`` or None). The Remote tasks setup's pages
+    (``openswap.worker.setup_window``) also use ``leading`` (a plain text
+    button in Back's place) and ``busy`` (every button but ``leading`` disabled).
     """
     if step not in wizard_steps(facts):
         step = wizard_steps(facts)[0]

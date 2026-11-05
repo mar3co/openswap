@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
 
-from openswap import printer
+from openswap import pathid, printer
 from openswap.exceptions import ClaudeSwitchError
 from openswap.settings import load_worker_settings
 
@@ -43,10 +43,17 @@ class Prompts(Protocol):
     def choose_folder(self, question: str) -> str | None:
         """A folder path; "" or ``None`` when the owner is done choosing."""
 
-    # Optional: ``pick(question, options, *, default=0) -> int | None`` shows
-    # ``options`` as a list to choose from (the menu bar's popup) and returns
-    # the chosen index, ``None`` when skipped. Without it, steps number the
-    # options and ``ask`` for the number.
+    # Optional: ``pick(question, options, *, default=None) -> int | None`` shows
+    # ``options`` as a list to choose one from (``default`` selected, nothing
+    # when None) and returns the chosen index, ``None`` when skipped. Without
+    # it, steps number the options and ``ask`` for the number.
+    #
+    # The setup window adds ``gui = True`` (lines name the Settings → Remote
+    # control that does a thing, never a command), ``check_folders(options,
+    # checked)`` (see ``choose_folders``), ``changing_folders()`` (a context
+    # manager around the folder step, from reading the saved folders until
+    # its changes are written) and ``done(state)`` (the final checklist, from
+    # a ``Readiness``).
 
 
 def _section(ui, title: str) -> None:
@@ -142,6 +149,20 @@ CLAUDE_EXECUTION_OFF_NOTE = (
     "`openswap worker live-check --provider claude` to turn on live tasks."
 )
 READY_NOTE = f"{printer.MARK_OK} Ready: Slack can send tasks to this Mac."
+# The setup window's line for each `Next:` above: the Settings → Remote control instead.
+SETTINGS_NEXT = {
+    START_WORKER_NEXT: "Turn on Enable local worker in Settings → Remote to start it.",
+    ACCOUNT_NEXT: "Pick one under Account in Settings → Remote.",
+    FOLDER_NEXT: "Add one under Folders in Settings → Remote.",
+}
+
+
+def _gui(ui) -> bool:
+    return getattr(ui, "gui", False) is True
+
+
+def _next(ui, text: str) -> str:
+    return SETTINGS_NEXT[text] if _gui(ui) else text
 
 
 # The live check refuses while the worker takes tasks: a running, unpaused worker pauses first.
@@ -166,6 +187,15 @@ def _provider_name(choice) -> str:
 
 WORKER_OFFER = "Start the worker now?"
 WORKER_ONLINE = f"{printer.MARK_OK} Worker started. This Mac shows online in about 15 seconds."
+WORKER_STOPPED = f"{printer.MARK_BAD} The worker is on but not running."
+WORKER_PAUSED = ("The worker is running but paused, so it takes no new tasks. "
+                 "Turn off Pause admission in Settings → Remote to resume.")
+WORKER_UNREADABLE = f"{printer.MARK_BAD} Couldn't read the worker's status."
+WORKER_RESTART = "turn Enable local worker off and on in Settings → Remote to restart it"
+# The setup window's words for `enable` refusals whose message names a command.
+_SETTINGS_ENABLE_MESSAGES = {
+    "worker_running_unmanaged": "Could not start the worker: another one started from Terminal is running.",
+}
 _RUNNING_STATES = frozenset({"starting", "running"})
 _MAX_ATTEMPTS = 3
 _MAX_PICKS = 16
@@ -184,32 +214,43 @@ def offer_worker(root: Path, ui: Prompts) -> None:
     when the owner says yes. An already enabled worker is never toggled.
     """
     cli = _cli()
-    if load_worker_settings(root).enabled is True:
+    policy = load_worker_settings(root)
+    later = _next(ui, START_WORKER_NEXT)
+    restart = False
+    if policy.enabled is True:
+        unreadable = False
         try:
             process = cli.read_status(root).get("process_state")
         except Exception:
-            process = None
+            process, unreadable = None, True
         if process in _RUNNING_STATES:
-            ui.say(f"{printer.MARK_OK} Worker running.")
-        else:
+            ui.say(WORKER_PAUSED if _gui(ui) and policy.paused is True else f"{printer.MARK_OK} Worker running.")
+            return
+        if not _gui(ui):
             ui.say("The worker is on but not running. Next: `openswap worker enable`.")
-        return
+            return
+        # The window offers to start it again (`enable` is idempotent); Settings' switch is already on.
+        ui.say(WORKER_UNREADABLE if unreadable else WORKER_STOPPED)
+        restart, later = True, f"{WORKER_RESTART[0].upper()}{WORKER_RESTART[1:]}."
     if not ui.interactive:
         ui.say(START_WORKER_NEXT)
         return
     if ui.confirm(WORKER_OFFER) is not True:
-        ui.say(f"Not started. {START_WORKER_NEXT}")
+        ui.say(f"Not started. {later}")
         return
     try:
         cli.enable_worker(root)
     except ClaudeSwitchError as exc:
         code = str(exc)
         message = cli._enable_failure_message(exc)
+        if _gui(ui):
+            message = _SETTINGS_ENABLE_MESSAGES.get(code, message)
         if code in cli._ENABLE_DIAGNOSTICS:
             message = f"{message.rstrip('.')} ({code})."
-        ui.say(f"{message} {START_WORKER_NEXT}")
+        # Restarting can't help while a worker from Terminal runs.
+        ui.say(message if restart and code == "worker_running_unmanaged" else f"{message} {later}")
     except Exception:
-        ui.say(f"Could not start the worker. {START_WORKER_NEXT}")
+        ui.say(f"Could not start the worker. {later}")
     else:
         ui.say(WORKER_ONLINE)
 
@@ -250,6 +291,25 @@ def account_options(menu) -> list[str]:
             for row, choice in zip(rows, menu)]
 
 
+# The setup window's words for pin refusals whose message names a command.
+_SETTINGS_ACCOUNT_MESSAGES = {
+    "claude_not_supported": "That Claude account can't be picked here. Pick another.",
+    "account_not_found": "That account is gone. Pick another.",
+    "account_ambiguous": "That matches several accounts. Pick another.",
+    "account_not_allowlisted": "Tasks can't pick that account yet. Pick another.",
+    "account_is_default": "That is the pinned account already.",
+}
+NO_ACCOUNT = "No account to pick. Next: `openswap codex add` or `openswap add`."
+NO_ACCOUNT_SETTINGS = "No account to pick. Add a Claude or Codex account in OpenSwap first."
+
+
+def account_message(code: str, *, gui: bool = False) -> str:
+    """Why a pin was refused: the CLI's line, or the setup window's when ``gui``."""
+    cli = _cli()
+    text = cli._ACCOUNT_MESSAGES.get(code, f"Could not pin that account ({code}).")
+    return _SETTINGS_ACCOUNT_MESSAGES.get(code, text) if gui else text
+
+
 def confirm_account(root: Path, ui: Prompts) -> None:
     """Show the eligible accounts as a numbered menu; Enter keeps the pinned one."""
     cli = _cli()
@@ -262,18 +322,18 @@ def confirm_account(root: Path, ui: Prompts) -> None:
         ui.say(f"{printer.MARK_OK} Account: {_provider_name(pinned)} {pinned.label()}")
         return
     if not ui.interactive or choices is None:
-        ui.say(ACCOUNT_NEXT)
+        ui.say(_next(ui, ACCOUNT_NEXT))
         return
     if choices.pinned_missing:
         ui.say("Your pinned account is gone; pick another.")
     menu, lines = account_menu(choices, pinned)
     if not menu:
-        ui.say("No account to pick. Next: `openswap codex add` or `openswap add`.")
+        ui.say(NO_ACCOUNT_SETTINGS if _gui(ui) else NO_ACCOUNT)
         return
     # Skipping after declining the current pin cancels the change: say the
     # previous account stays selected rather than implying none is pinned.
     later = (f"Kept {_provider_name(pinned)} {pinned.label()}." if pinned is not None
-             else f"Skipped. {ACCOUNT_NEXT}")
+             else f"Skipped. {_next(ui, ACCOUNT_NEXT)}")
     current = next((str(n) for n, c in enumerate(menu, start=1)
                     if pinned is not None and c.account_ref == pinned.account_ref), "")
     pick = getattr(ui, "pick", None)
@@ -283,7 +343,7 @@ def confirm_account(root: Path, ui: Prompts) -> None:
 
         def answer_once():
             index = pick("Tasks run on the account you pick.", options,
-                         default=int(current) - 1 if current else 0)
+                         default=int(current) - 1 if current else None)
             return None if index is None else str(index + 1)
     else:
         ui.say("Tasks run on the account you pick.")
@@ -312,10 +372,10 @@ def confirm_account(root: Path, ui: Prompts) -> None:
         try:
             chosen = cli.set_worker_account(root, selector)
         except cli.AccountPinError as exc:
-            ui.say(cli._ACCOUNT_MESSAGES.get(exc.code, f"Could not pin that account ({exc.code})."))
+            ui.say(account_message(exc.code, gui=_gui(ui)))
             continue
         except Exception:
-            ui.say(f"Could not pick that account. {ACCOUNT_NEXT}")
+            ui.say(f"Could not pick that account. {_next(ui, ACCOUNT_NEXT)}")
             return
         ui.say(f"{printer.MARK_OK} {_provider_name(chosen)} {chosen.label()}")
         return
@@ -371,9 +431,36 @@ def suggested_folder_id(folder: Path, taken: set[str]) -> str:
     return _cli().suggested_folder_id(folder, taken)
 
 
-def _workspace_message(code: str) -> str:
-    cli = _cli()
-    return cli._WORKSPACE_MESSAGES.get(code, f"Could not approve that folder ({code}).")
+# The setup window's and Settings' words for workspace refusals whose message names a command.
+_SETTINGS_WORKSPACE_MESSAGES = {
+    "workspace_not_found": "That folder was already removed.",
+    "folder_permissions": ("Only you may open a results folder. Remove other people's access in "
+                           "Finder (Get Info), then try again."),
+    "readonly_source_permissions": ("Other users can change that read-only folder. Remove their write "
+                                    "access in Finder (Get Info)."),
+    "readable_permissions": ("Other users can change that folder. Remove their write access in Finder "
+                             "(Get Info), then try again."),
+    "work_not_a_repo": "That's not a git repo and holds none. Pick a repo or a folder of repos.",
+    "work_overlaps_readable": "That folder overlaps one tasks only read. Remove that one under Folders first.",
+    "mode_invalid": "A folder either gives each task its own copy or works in the folder itself.",
+    "mode_not_work": "Only a folder tasks work in has a mode.",
+}
+
+
+def workspace_message(code: str, *, gui: bool = False) -> str:
+    """Why a folder change was refused: the CLI's line, or the setup window's when ``gui``."""
+    text = _cli()._WORKSPACE_MESSAGES.get(code, f"Could not approve that folder ({code}).")
+    return _SETTINGS_WORKSPACE_MESSAGES.get(code, text) if gui else text
+
+
+def folder_label(workspace) -> str:
+    """A saved folder as the window and Settings list it: its paths, then how tasks use it."""
+    paths = ", ".join(_display_path(source) for source in _folder_of(workspace))
+    if not paths:
+        return f"{_display_path(workspace.output_root)} (results only)"
+    if getattr(workspace, "work_root", None) is None:
+        return f"{paths} (read only)"
+    return f"{paths} (works in the folder itself)" if workspace.mode == "direct" else paths
 
 
 @dataclass(frozen=True)
@@ -484,13 +571,18 @@ def parse_folder_choice(answer: str, count: int) -> list[int] | str | None:
 
 
 def choose_folders(root: Path, ui: Prompts) -> None:
-    """Ask which folders remote tasks may read; each becomes a read-only workspace.
+    """Ask which folders remote sessions may work in; each becomes a workspace.
 
     Results go to ``~/OpenSwap Research/<id>``, created owner-only without
     asking. Enter takes the recommended GitHub folder (else the first one
-    found), or keeps the current folders when some are readable already.
+    found), or keeps the current folders when some are readable already. The
+    setup window (``check_folders``) shows saved and found folders as
+    checkboxes instead (see ``apply_folders``).
     """
-    cli = _cli()
+    if getattr(ui, "check_folders", None) is not None:
+        with ui.changing_folders():
+            _check_folders(root, ui, load_worker_settings(root).workspaces)
+        return
     policy = load_worker_settings(root)
     current = _readable(policy.workspaces)
     if not ui.interactive:
@@ -536,6 +628,140 @@ def choose_folders(root: Path, ui: Prompts) -> None:
     ui.say(later)
 
 
+@dataclass(frozen=True)
+class FolderRow:
+    """One checkbox on the setup window's folder step."""
+
+    label: str
+    note: str
+    checked: bool
+    workspace: object = None  # a saved folder: unchecking removes it
+    folder: Path | None = None  # a found folder: checking adds it
+
+
+def folder_rows(root: Path, workspaces) -> list[FolderRow]:
+    """Every saved folder (checked), then the found ones not saved yet (unchecked).
+
+    With nothing saved, the recommended folder (else the first found) starts checked.
+    """
+    saved = _readable(workspaces)
+    rows = [FolderRow(folder_label(w), "", True, workspace=w) for w in saved]
+    menu = folder_menu(root, workspaces)
+    first = menu.recommended or 0
+    for index, (folder, note) in enumerate(zip(menu.folders, menu.notes)):
+        if folder not in menu.readable:
+            rows.append(FolderRow(_display_path(folder), note.strip("()"), not saved and index == first,
+                                  folder=folder))
+    return rows
+
+
+def _check_folders(root: Path, ui, workspaces) -> None:
+    """The setup window's folder step: the checked set is what tasks may work in."""
+    rows = folder_rows(root, workspaces)
+    saved = any(row.workspace is not None for row in rows)
+    for _attempt in range(_MAX_ATTEMPTS):
+        answer = ui.check_folders([(row.label, row.note) for row in rows], [row.checked for row in rows])
+        if answer is None:
+            ui.say("Kept the current folders." if saved else f"No folder added. {_next(ui, FOLDER_NEXT)}")
+            return
+        if answer:
+            apply_folders(root, ui, rows, answer)
+            return
+        ui.say("Keep at least one folder." if saved else "Check a folder, or Skip.")
+    ui.say("Kept the current folders." if saved else f"No folder added. {_next(ui, FOLDER_NEXT)}")
+
+
+def apply_folders(root: Path, ui, rows: list[FolderRow], answer) -> None:
+    """Make the checked set the allowed folders and say each folder's result.
+
+    ``answer`` holds the checked row indexes and the paths added with Add
+    folder…. Adds run before removes, so the last folder is never removed
+    first; a checked repo inside an unchecked folder (of repos, or one tasks
+    only read) is added after that folder is removed, since until then the
+    folder allows it already or blocks it.
+    """
+    picked = {item for item in answer if isinstance(item, int)}
+    adds = [rows[i].folder for i in sorted(picked) if rows[i].workspace is None]
+    adds += [item for item in answer if isinstance(item, str)]
+    removes = [row.workspace for i, row in enumerate(rows) if row.workspace is not None and i not in picked]
+
+    def within(folder, workspace) -> bool:
+        return any(pathid.inside(folder, source) for source in _folder_of(workspace))
+
+    after = [folder for folder in adds if any(within(folder, w) for w in removes)]
+    _add_folders(root, ui, [folder for folder in adds if folder not in after])
+    last = None  # the only saved folder, kept: its line waits on the adds inside it
+    for workspace in removes:
+        refused = _remove(root, workspace.workspace_id)
+        shown = folder_label(workspace)
+        if refused is None:
+            ui.say(f"{printer.MARK_OK} Removed {shown} (its files are kept).")
+        elif refused[0] == "last_workspace":
+            last = (workspace, f"{printer.MARK_BAD} {shown}: {refused[1]}")
+        else:
+            ui.say(f"{printer.MARK_BAD} {shown}: {refused[1]}")
+    switched = []
+
+    def switch(folder, code) -> bool:
+        # Neither refusal alone says what to do: the kept folder blocks the repo, and is the last one.
+        if last is None or code != "work_overlaps_readable" or not within(folder, last[0]):
+            return False
+        ui.say(f"To switch to {_display_path(Path(folder))}, add another folder first, "
+               f"then remove {folder_label(last[0])}.")
+        switched.append(folder)
+        return True
+
+    _add_folders(root, ui, after, refused=switch)
+    if last is not None and not switched:
+        ui.say(last[1])
+
+
+def _write_failure(exc: Exception) -> str:
+    """The window's and Settings' line for a folder change that failed without a refusal code."""
+    if isinstance(exc, ClaudeSwitchError) and str(exc) == "worker_lifecycle_busy":
+        return _cli().BUSY_MESSAGE
+    return workspace_message("settings_unavailable", gui=True)
+
+
+def _remove(root: Path, workspace_id: str) -> tuple[str | None, str] | None:
+    """Remove a saved folder with `worker workspace remove`'s function: None, or (code, the window's reason)."""
+    cli = _cli()
+    try:
+        cli.remove_worker_workspace(root, workspace_id)
+    except cli.WorkspaceError as exc:
+        return exc.code, workspace_message(exc.code, gui=True)
+    except Exception as exc:
+        return None, _write_failure(exc)
+    return None
+
+
+def remove_folder(root: Path, workspace_id: str) -> str | None:
+    """Remove a saved folder (Settings → Remote); the window's reason if refused."""
+    refused = _remove(root, workspace_id)
+    return None if refused is None else refused[1]
+
+
+def add_folder(root: Path, folder) -> str | None:
+    """Add a folder with `worker workspace add --work`'s function (Settings → Remote).
+
+    Returns what to tell the owner, or None when it was simply added.
+    """
+    cli = _cli()
+    try:
+        result = cli.add_work_folder(root, folder)
+    except cli.WorkspaceError as exc:
+        return workspace_message(exc.code, gui=True)
+    except Exception as exc:
+        return _write_failure(exc)
+    if result.added:
+        return f'"{cli.DEFAULT_RESEARCH_ID}" stays until its running task ends.' if result.kept_builtin else None
+    added = result.workspace.work_root
+    parent = next((w for w in load_worker_settings(root).workspaces
+                   if getattr(w, "repos", False) and w.work_root is not None
+                   and not pathid.same(w.work_root, added) and pathid.inside(added, w.work_root)), None)
+    return f"Already allowed through {_display_path(parent.work_root)}." if parent else "Already allowed."
+
+
 def _bad_choice(count: int) -> str:
     return f"Type numbers from 1 to {count}, or a folder path." if count else "Type a folder path."
 
@@ -575,8 +801,11 @@ def _search_folders(root: Path, ui, has_current: bool) -> None:
             question = "Add another (Enter to finish)"
 
 
-def _add_folders(root: Path, ui, folders) -> bool:
-    """Add each folder as one where sessions work and say what happened; whether any was."""
+def _add_folders(root: Path, ui, folders, *, refused=None) -> bool:
+    """Add each folder as one where sessions work and say what happened; whether any was.
+
+    ``refused(folder, code)`` may say a refusal's line itself (True) instead.
+    """
     cli = _cli()
     any_ok = False
     for folder in folders:
@@ -584,10 +813,11 @@ def _add_folders(root: Path, ui, folders) -> bool:
         try:
             result = cli.add_work_folder(root, folder)
         except cli.WorkspaceError as exc:
-            ui.say(f"{shown}: {_workspace_message(exc.code)}")
+            if refused is None or not refused(folder, exc.code):
+                ui.say(f"{shown}: {workspace_message(exc.code, gui=_gui(ui))}")
             continue
-        except Exception:
-            ui.say(f"{shown}: {_workspace_message('settings_unavailable')}")
+        except Exception as exc:
+            ui.say(f"{shown}: {_write_failure(exc) if _gui(ui) else workspace_message('settings_unavailable')}")
             continue
         any_ok = True
         workspace = result.workspace
@@ -643,30 +873,56 @@ class Readiness:
 
     @property
     def missing(self) -> tuple[str, ...]:
+        """What is still missing, each as the command that fixes it."""
+        return self._missing(gui=False)
+
+    @property
+    def settings_missing(self) -> tuple[str, ...]:
+        """The same, each naming the Settings → Remote control that fixes it (the setup window)."""
+        return self._missing(gui=True)
+
+    def _missing(self, *, gui: bool) -> tuple[str, ...]:
         out = []
+        wait = ("wait a moment, then check Status in Settings → Remote" if gui
+                else "wait a moment, then `openswap worker status`")
         if self.paired_url is None:
-            out.append("`openswap worker pair <url> <code>` to pair this Mac")
+            out.append("Connect to OpenTag… in Settings → Remote to pair this Mac" if gui
+                       else "`openswap worker pair <url> <code>` to pair this Mac")
         if self.worker == "starting":
-            out.append("wait a moment, then `openswap worker status`")
+            out.append(wait)
+        elif self.worker == "stopped" and gui:
+            out.append(WORKER_RESTART)
         elif self.worker != "running":
-            out.append("`openswap worker enable` to start the worker")
+            out.append("turn on Enable local worker in Settings → Remote" if gui
+                       else "`openswap worker enable` to start the worker")
         elif self.paired_url is not None and self.connection != "online":
             # Only an online worker can receive tasks from the service.
-            out.append({
-                "revoked": "`openswap worker pair <url> <code>` to pair again (this Mac was removed)",
-                "expired": "`openswap worker pair <url> <code>` to pair again (the pairing expired)",
-            }.get(self.connection, "wait a moment, then `openswap worker status`"))
+            if gui:
+                out.append({
+                    "revoked": "this Mac was removed in OpenTag, so it must be paired again",
+                    "expired": "Reconnect this Mac in Settings → Remote (the pairing expired)",
+                }.get(self.connection, wait))
+            else:
+                out.append({
+                    "revoked": "`openswap worker pair <url> <code>` to pair again (this Mac was removed)",
+                    "expired": "`openswap worker pair <url> <code>` to pair again (the pairing expired)",
+                }.get(self.connection, wait))
         # A paused worker is what the live check needs: resuming is a step only once live
         # tasks are on (until then the summary names the check, without a pause first).
-        if self.paused and self.execution == "live":
-            out.append("`openswap worker pause --off` to resume")
+        # The window has no live check, so there a pause is always a step.
+        if self.paused and (self.execution == "live" or gui):
+            out.append("turn off Pause admission in Settings → Remote to resume" if gui
+                       else "`openswap worker pause --off` to resume")
         if self.account is None:
-            out.append("`openswap worker account <slot>` to pick an account")
+            out.append("pick an account under Account in Settings → Remote" if gui
+                       else "`openswap worker account <slot>` to pick an account")
         if not self.folders:
-            out.append("`openswap worker workspace add --work <folder>` to add a folder")
+            out.append("add a folder under Folders in Settings → Remote" if gui
+                       else "`openswap worker workspace add --work <folder>` to add a folder")
         if self.refused:
             names = ", ".join(f'"{workspace_id}"' for workspace_id, _code in self.refused)
-            out.append(f"`openswap worker workspace list` to fix {names}")
+            out.append(f"remove {names} under Folders in Settings → Remote" if gui
+                       else f"`openswap worker workspace list` to fix {names}")
         return tuple(out)
 
 
@@ -730,7 +986,7 @@ def readiness(root: Path) -> Readiness:
     )
 
 
-def _settling(state: Readiness) -> bool:
+def settling(state: Readiness) -> bool:
     """A just-enabled worker that has not yet started or reached the service."""
     return state.worker == "starting" or (
         state.worker == "running" and state.paired_url is not None
@@ -774,9 +1030,13 @@ def summary(root: Path, ui: Prompts, *, start_wait_s: float | None = None) -> No
     if start_wait_s is None:
         start_wait_s = getattr(ui, "settle_wait_s", 5.0)
     deadline = time.monotonic() + start_wait_s
-    while _settling(state) and time.monotonic() < deadline:
+    while settling(state) and time.monotonic() < deadline:
         time.sleep(0.25)
         state = readiness(root)
+    done = getattr(ui, "done", None)
+    if done is not None:
+        done(state)
+        return
     for line in checklist(state):
         ui.say(line)
     for workspace_id, code in state.refused:
@@ -827,13 +1087,14 @@ def checklist(state: Readiness) -> list[str]:
 
 
 # Steps run in order (looked up by name), each with its header and the line
-# shown if it fails unexpectedly.
+# shown if it fails unexpectedly (the setup window's for the summary: ``SUMMARY_FAILED``).
 STEPS = (
     ("offer_worker", "Step 1 of 4 · Worker", START_WORKER_NEXT),
     ("confirm_account", "Step 2 of 4 · Account", ACCOUNT_NEXT),
     ("choose_folders", "Step 3 of 4 · Folders", FOLDER_NEXT),
     ("summary", "Step 4 of 4 · Summary", None),
 )
+SUMMARY_FAILED = f"{printer.MARK_BAD} Couldn't check what is set up. See Status in Settings → Remote."
 
 
 def run(root: Path, ui: Prompts) -> None:
@@ -844,7 +1105,9 @@ def run(root: Path, ui: Prompts) -> None:
             globals()[name](Path(root), ui)
         except Exception:
             if fallback is not None:
-                ui.say(fallback)
+                ui.say(_next(ui, fallback))
+            elif _gui(ui):
+                ui.say(SUMMARY_FAILED)
 
 
 class SetupClosed(BaseException):
@@ -862,22 +1125,20 @@ DIALOG_CLOSED = -3
 
 
 class DialogPrompts:
-    """Prompts for the menu bar: ``alert``/``prompt`` are its modal dialog helpers.
+    """The menu bar's pairing dialogs: ``alert``/``prompt`` are its modal dialog helpers.
 
     Lines said between questions are collected and shown above the next
-    question, so the owner sees one dialog per decision; ``flush`` shows what
-    is left (the summary) in a final dialog. Every question also offers
-    Close Setup, which raises :class:`SetupClosed`; nothing is shown after it.
+    question; ``flush`` shows what is left in a final dialog. Every question
+    also offers Close Setup, which raises :class:`SetupClosed`; nothing is
+    shown after it. The steps after pairing show in the setup window
+    (``openswap.worker.setup_window``).
     """
 
     interactive = True
     closed = False
 
-    def __init__(self, alert, prompt, title: str = "Set up Remote tasks", *, choose_folder=None, wait=None):
+    def __init__(self, alert, prompt, title: str = "Set up Remote tasks", *, wait=None):
         self._alert, self._prompt, self.title = alert, prompt, title
-        # ``choose_folder(title=, message=, close=)`` opens the native folder chooser and
-        # returns a path or None; without one, folders are typed into a prompt.
-        self._choose_folder = choose_folder
         # ``wait(title=, message=, done=)`` shows one dialog with Cancel until the
         # ``done`` event is set; it returns True when the owner cancelled.
         self._wait = wait
@@ -900,12 +1161,6 @@ class DialogPrompts:
             self._lines = []
             raise SetupClosed()
 
-    def confirm(self, question: str, *, default: bool = True) -> bool | None:
-        clicked = self._alert(title=self.title, message=self._message(question), ok="Yes", cancel="No",
-                              close=CLOSE_SETUP)
-        self._closing(clicked)
-        return clicked == 1
-
     def ask(self, question: str, *, default: str = "") -> str | None:
         response = self._prompt(title=self.title, message=self._message(question),
                                 default_text=default, ok="Continue", cancel="Skip", close=CLOSE_SETUP)
@@ -913,21 +1168,6 @@ class DialogPrompts:
         if getattr(response, "clicked", 0) != 1:
             return None
         return str(getattr(response, "text", "")).strip() or default
-
-    def pick(self, question: str, options, *, default: int = 0) -> int | None:
-        response = self._prompt(title=self.title, message=self._message(question), choices=list(options),
-                                selected=default, ok="Continue", cancel="Skip", close=CLOSE_SETUP)
-        clicked = getattr(response, "clicked", 0)
-        self._closing(clicked)
-        choice = getattr(response, "choice", -1)
-        return choice if clicked == 1 and 0 <= choice < len(options) else None
-
-    def choose_folder(self, question: str) -> str | None:
-        if self._choose_folder is None:
-            return self.ask(question)
-        answer = self._choose_folder(title=self.title, message=self._message(question), close=CLOSE_SETUP)
-        self._closing(answer)
-        return answer
 
     def flush(self) -> None:
         if self._lines and not self.closed:
@@ -953,7 +1193,7 @@ PAIRING_QUESTION = (
 class ThreadedPrompts:
     """Run the setup on a worker thread while dialogs stay on the UI thread.
 
-    The worker thread calls ``confirm``/``ask``/``flush`` as usual; each call
+    The worker thread calls ``ask``/``flush`` as usual; each call
     is handed to the UI thread, which shows it from ``serve()`` (the menu
     bar's timer) and wakes the worker with the answer. Lines said in between
     are only collected, so pairing, ``enable``, pins and folder changes (which
@@ -985,17 +1225,8 @@ class ThreadedPrompts:
             raise SetupClosed()
         return request["result"]
 
-    def confirm(self, question: str, *, default: bool = True) -> bool | None:
-        return self._call("confirm", question, default=default)
-
     def ask(self, question: str, *, default: str = "") -> str | None:
         return self._call("ask", question, default=default)
-
-    def pick(self, question: str, options, *, default: int = 0) -> int | None:
-        return self._call("pick", question, options, default=default)
-
-    def choose_folder(self, question: str) -> str | None:
-        return self._call("choose_folder", question)
 
     def flush(self) -> None:
         self._call("flush")

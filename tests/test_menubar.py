@@ -409,7 +409,8 @@ def test_worker_status_poll_refreshes_policy_and_discards_stale_policy(
     app_type = extract_class(
         menubar.__file__,
         "MenuBarApp",
-        {"_worker_status_worker", "_with_account_picker", "_drain_worker_result"},
+        {"_worker_status_worker", "_with_account_picker", "_with_folders", "_drain_worker_result",
+         "_reload_remote_settings"},
         {},
     )
     app = app_type()

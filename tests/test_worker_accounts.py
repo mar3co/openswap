@@ -691,7 +691,8 @@ def _menu_app(root):
     app_type = extract_class(
         menubar.__file__, "MenuBarApp",
         {"_worker_action", "_worker_action_worker", "_pin_worker_account",
-         "_with_account_picker", "_drain_worker_result", "_on_setting"},
+         "_with_account_picker", "_with_folders", "_drain_worker_result", "_on_setting",
+         "_reload_remote_settings", "_setup_changing_folders"},
         {"threading": threading},
     )
     app = app_type()

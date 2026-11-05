@@ -224,7 +224,7 @@ def _remote_tasks_status_copy(
     operation = snapshot.get("operation")
     if not isinstance(operation, str) or operation not in {
         "worker_enable_or_disable", "worker_admission_update", "worker_stop_requested",
-        "worker_account_update", "worker_control_busy", "worker_status_checking",
+        "worker_account_update", "worker_folder_update", "worker_control_busy", "worker_status_checking",
     }:
         operation = None
     notice = snapshot.get("diagnostic_notice")
@@ -559,6 +559,75 @@ def remote_connect_rows(paired: bool, worker_status: dict) -> list[dict]:
     return []
 
 
+REMOTE_NO_FOLDERS = "No folders yet. Tasks need at least one."
+REMOTE_FOLDERS_UNREADABLE = "The folder list can't be read right now."
+REMOTE_SETUP_CHANGING_FOLDERS = "Setup is changing folders; finish or close that step first."
+# What fits beside Remove on one line of the Settings panel.
+REMOTE_FOLDER_LABEL_CHARS = 40
+
+
+def _folder_row_label(label: str) -> str:
+    """``label`` fit to one row: its paths shortened in the middle, its "(…)" suffix kept whole."""
+    if len(label) <= REMOTE_FOLDER_LABEL_CHARS:
+        return label
+    paths, sep, suffix = label.rpartition(" (")
+    if not (sep and label.endswith(")")):
+        paths, suffix = label, ""
+    else:
+        suffix = sep + suffix
+    room = max(REMOTE_FOLDER_LABEL_CHARS - len(suffix) - 1, 8)
+    return f"{paths[:room - room // 2]}…{paths[-(room // 2):]}{suffix}"
+
+
+def remote_folder_rows(worker_status: dict) -> list[dict]:
+    """Settings › Remote › Folders on a paired Mac: each saved folder with Remove, then Add folder….
+
+    ``worker_status["folders"]`` is ``(workspace ID, label)`` pairs read off
+    the UI thread (no rows until the first read; None when a folder change's
+    reread failed); ``folder_notice`` is the last folder change's message and
+    ``setup_changing_folders`` holds the buttons while the setup window's
+    folder step may write.
+    """
+    if "folders" not in worker_status:
+        return []
+    folders = worker_status["folders"]
+    unreadable = not isinstance(folders, list)
+    locked = worker_status.get("setup_changing_folders") is True
+    busy = worker_status.get("operation") is not None or locked
+    rows = [{"kind": "group", "section": SETTINGS_SECTION_REMOTE, "id": "remote_tasks_folders", "label": "Folders"}]
+    for workspace_id, label in [] if unreadable else folders:
+        full = _bounded_text(label, 400)
+        rows.append({
+            "kind": "button",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_folder_remove",
+            "label": _folder_row_label(full),
+            "full_label": full,
+            "title": "Remove",
+            "value": _bounded_text(workspace_id, 64),
+            "disabled": busy,
+        })
+    hints = [REMOTE_FOLDERS_UNREADABLE] if unreadable else [] if folders else [REMOTE_NO_FOLDERS]
+    if locked:
+        hints.append(REMOTE_SETUP_CHANGING_FOLDERS)
+    notice = _bounded_text(worker_status.get("folder_notice"), 200)
+    if notice:
+        hints.append(notice)
+    for hint in hints:
+        rows.append({"kind": "group", "style": "hint", "section": SETTINGS_SECTION_REMOTE,
+                     "id": "remote_tasks_folders_note", "label": hint, "lines": _hint_lines(hint)})
+    rows.append({
+        "kind": "button",
+        "section": SETTINGS_SECTION_REMOTE,
+        "id": "remote_tasks_folder_add",
+        "label": "A git repo or a folder of repos",
+        "title": "Add folder…",
+        "value": None,
+        "disabled": busy,
+    })
+    return rows
+
+
 def settings_page_rows(
     settings: MenuBarSettings,
     *,
@@ -760,7 +829,15 @@ def settings_page_rows(
             "disabled": _worker_active_job_id(worker_status or {}) is None,
         },
     ]
+    if worker_paired:
+        folders_at = next(i for i, row in enumerate(remote) if row["id"] == "remote_tasks_status")
+        remote[folders_at:folders_at] = remote_folder_rows(worker_status or {})
     remote[1:1] = remote_connect_rows(worker_paired, worker_status or {})
+    setup_note = _bounded_text((worker_status or {}).get("setup_note"), 120)
+    if setup_note:
+        # Why Set up or Connect did nothing just now.
+        remote.insert(1, {"kind": "group", "style": "hint", "section": SETTINGS_SECTION_REMOTE,
+                          "id": "remote_tasks_setup_note", "label": setup_note, "lines": _hint_lines(setup_note)})
     if worker_paired and not worker_enabled and (
         (worker_status or {}).get("operation") != "worker_enable_or_disable"
     ):

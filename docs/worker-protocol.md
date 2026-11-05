@@ -733,8 +733,9 @@ Pairing does not start the worker or choose an account or folder, so right
 after pairing `openswap worker pair` walks the owner through the remaining
 steps, in this order; `openswap worker setup` runs the same steps again on a
 paired Mac, and the menu bar's Settings → Remote → **Set up
-Remote tasks…** button runs them in dialogs (pairing first, from the pasted
-`openswap worker pair <url> <code>` command, when the Mac is not paired yet).
+Remote tasks…** button runs them in its setup window (pairing first, in a
+dialog, from the pasted `openswap worker pair <url> <code>` command, when the
+Mac is not paired yet; see [Menu bar](menubar.md)).
 A new pairing through [Connect](#connect-to-opentag-optional)
 (`openswap worker connect`, or **Connect to OpenTag…**) runs the same steps.
 Every step calls the same function as its own command, and nothing in them can
@@ -782,8 +783,9 @@ and ends with at most one `Next:` command.
    [Permissions](#permissions-the-accounts-own-settings)).
 
 Each step is headed `Step N of 4 · <name>`; on a terminal the headers are
-bold unless `NO_COLOR` is set or stdout is not a terminal, and the menu bar
-shows the same lines in its dialogs. Without a terminal, `pair` asks nothing
+bold unless `NO_COLOR` is set or stdout is not a terminal. The menu bar's
+window shows the same steps as pages, naming the Settings → Remote control
+that fixes a gap instead of a command. Without a terminal, `pair` asks nothing
 and prints each step's command. While a URL is configured and the worker is
 disabled or not running, human `worker status` adds "Next: paired with
 <origin> but the worker is off; run `openswap worker enable`" (`--json` is
@@ -931,13 +933,14 @@ ticked `✓`; Enter on nothing (or Esc) finishes. When folders are already set
 up, nothing is highlighted and Enter on nothing keeps them. A refused folder
 prints one line (what is wrong, what to do) and the same picker opens again.
 
-The menu bar, and a terminal run that is piped, scripted or on Windows, keep
-the numbered list and one question instead, "Folders (numbers or a path)
+A terminal run that is piped, scripted or on Windows keeps the numbered list
+and one question instead, "Folders (numbers or a path)
 [1]" (or "Folders (Enter keeps current)"); with nothing detected they ask
-"Type the path to your code folder, for example ~/GitHub" through the native
-folder chooser (menu bar) or a typed line. The answer is one or more numbers
+"Type the path to your code folder, for example ~/GitHub" as a typed line.
+The menu bar's window lists the saved and found folders as checkboxes
+instead, where unchecking a saved folder removes it. The answer is one or more numbers
 (`1 3` or `1,3`), or one folder path (a path dragged into Terminal may be
-shell-escaped). Choosing adds folders; it never removes one (`openswap
+shell-escaped). In the terminal, choosing adds folders; it never removes one (`openswap
 worker workspace remove <id>` does). Only each folder's ID and name reach
 the control service; paths never leave this Mac. `openswap worker workspace
 add --work <folder> [--direct] [--label TEXT]` does the same from the command

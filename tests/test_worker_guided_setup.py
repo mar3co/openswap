@@ -16,7 +16,6 @@ import json
 import os
 import stat
 import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1410,7 +1409,7 @@ def test_menu_has_a_set_up_button_first_in_remote_tasks():
 
 
 class _Dialogs:
-    """Scripted modal dialogs: answers are clicked button numbers or (clicked, text)."""
+    """Scripted pairing dialogs: answers are clicked button numbers or (clicked, text)."""
 
     def __init__(self, answers):
         self.answers = list(answers)
@@ -1423,56 +1422,45 @@ class _Dialogs:
     def prompt(self, **kwargs):
         self.shown.append(("prompt", kwargs))
         clicked, text = self.answers.pop(0) if self.answers else (0, "")
-        # A popup (the account step): the text is the 1-based row picked, "" keeps the selection.
-        choice = (int(text) - 1 if text else kwargs.get("selected", 0)) if "choices" in kwargs else -1
-        return SimpleNamespace(clicked=clicked, text=text, choice=choice)
+        return SimpleNamespace(clicked=clicked, text=text)
 
     def choose_folder(self, **kwargs):
         self.shown.append(("choose_folder", kwargs))
         clicked, text = self.answers.pop(0) if self.answers else (0, "")
-        if clicked == guided_setup.DIALOG_CLOSED:
-            return clicked
         return text if clicked == 1 else None
 
 
-def _menu(root, dialogs):
-    from tests.menubar_harness import extract_class
+def _menu(root, dialogs, window=()):
+    from tests.menubar_harness import SetupWindow, setup_app
 
-    app_type = extract_class(menubar.__file__, "MenuBarApp",
-                             {"_run_guided_setup", "_on_setting", "_drain_guided_setup"},
-                             {"threading": threading})
-    app = app_type()
-    app.switcher = SimpleNamespace(backup_dir=root)
-    app._worker_operation = None
-    app._panel = None
-    app._alert, app._prompt = dialogs.alert, dialogs.prompt
-    app._choose_folder = dialogs.choose_folder
-    app.refreshed = 0
-    app._worker_view_active = lambda: setattr(app, "refreshed", app.refreshed + 1)
-    return app
+    return setup_app(root, SetupWindow(window), _alert=dialogs.alert, _prompt=dialogs.prompt,
+                     _choose_folder=dialogs.choose_folder, _wait_dialog=lambda **_kwargs: False)
 
 
 def _settle(app):
-    """What on_sync_tick does: serve each dialog the setup thread asks for until it ends."""
-    deadline = time.monotonic() + 20
-    while getattr(app, "_guided_setup", None) is not None:
-        assert time.monotonic() < deadline, "guided setup did not finish"
-        app._drain_guided_setup()
-        time.sleep(0.005)
+    from tests.menubar_harness import settle_setup
+
+    settle_setup(app)
 
 
-def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root, keychain, monkeypatch,
-                                                                          enable_calls, research_home, github):
+def _titles(app):
+    return [page["title"] for page in app._remote_setup_window.shown]
+
+
+def _page_text(page) -> str:
+    return " ".join(str(value) for value in [page["title"], page.get("body")] + [
+        row.get("text") or row.get("items") for row in page["rows"]])
+
+
+def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_steps_in_the_window(
+        root, keychain, monkeypatch, enable_calls, research_home, github):
     monkeypatch.setattr(pairing, "Transport", lambda *_: PairTransport())
     dialogs = _Dialogs([
         (1, "not a command"),
         (1, "openswap worker pair http://localhost one-use"),
-        1,              # start the worker
-        (1, "1"),       # account
-        (1, "1"),       # folders tasks may read: ~/GitHub
-        1,              # Done
     ])
-    app = _menu(root, dialogs)
+    window = ["yes", ["select:0", "continue"], "continue", "continue", "done"]
+    app = _menu(root, dialogs, window)
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
     assert enable_calls == [root]
@@ -1480,26 +1468,29 @@ def test_menu_setup_pairs_from_the_pasted_command_then_runs_the_same_steps(root,
     assert policy.control_service_url == "http://localhost" and policy.pinned_account_ref == ALICE
     (workspace,) = policy.workspaces
     assert workspace.workspace_id == "github" and workspace.work_root == github.resolve()
-    assert workspace.output_root == (research_home / "github").resolve()
-    messages = [kwargs["message"] for _kind, kwargs in dialogs.shown]
-    # The numbered list and the question share one dialog; Enter's default is prefilled.
-    folders = dialogs.shown[4][1]
-    assert "Step 3 of 4 · Folders" in folders["message"]
-    assert f"{guided_setup.FOLDER_USE}. {guided_setup.FOLDER_COPY}" in folders["message"]
-    assert "  • 1  ~/GitHub  (recommended)" in folders["message"]
-    assert folders["message"].endswith("Folders (numbers or a path)")
-    assert folders["default_text"] == "1" and folders["ok"] == "Continue"
-    assert "That is not a pairing command" in messages[1]
-    assert "✓ Paired this Mac (worker)." in messages[2] and "Start the worker now?" in messages[2]
-    assert dialogs.shown[-1][1]["ok"] == "Done" and SUMMARY in messages[-1]
-    # The dialogs carry the same step headers, and no ANSI codes.
-    assert "Step 1 of 4 · Worker" in messages[2] and "Step 2 of 4 · Account" in messages[3]
-    assert "\x1b[" not in "".join(messages)
-    # The account step is a popup of nicknames, not a numbered list to type from.
-    account = dialogs.shown[3][1]
-    assert account["choices"][0] == "work · alice@example.com · Codex" and account["selected"] == 0
-    assert "  • 1  Codex" not in account["message"] and "default_text" not in account
-    assert app.refreshed == 1
+    # Pairing stays in dialogs; nothing after it is a dialog.
+    assert [kind for kind, _kwargs in dialogs.shown] == ["prompt", "prompt"]
+    assert "That is not a pairing command" in dialogs.shown[1][1]["message"]
+    shown = app._remote_setup_window.shown
+    assert _titles(app) == ["Start the worker", "Choose the account for tasks", "Choose folders for tasks",
+                            "Choose folders for tasks", "Almost done"]
+    worker, account, folders, results, done = shown
+    assert worker["progress"] == (1, 4) and done["progress"] == (4, 4)
+    assert worker["primary"]["title"] == "Start worker" and worker["skip"]["title"] == "Skip"
+    assert worker["leading"]["title"] == guided_setup.CLOSE_SETUP
+    assert worker["rows"][0]["text"] == "✓ Paired this Mac (worker)."
+    # No pin: nothing is selected and Continue waits for a pick.
+    (choices,) = [row for row in account["rows"] if row["kind"] == "choices"]
+    assert choices["multiple"] is False and choices["items"][0]["title"] == "work · alice@example.com · Codex"
+    assert not any(item["selected"] for item in choices["items"]) and account["primary"]["enabled"] is False
+    (boxes,) = [row for row in folders["rows"] if row["kind"] == "choices"]
+    assert boxes["multiple"] is True
+    assert boxes["items"][0] == {"title": "~/GitHub", "detail": "recommended", "selected": True,
+                                 "action": "toggle:0"}
+    assert results["rows"][0]["text"].startswith("✓ ~/GitHub") and results["skip"] is None
+    assert done["rows"][0]["kind"] == "summary"
+    assert all("`" not in _page_text(page) and "\x1b[" not in _page_text(page) for page in shown)
+    assert app._remote_setup_window.closed >= 1 and app.refreshed == 1
 
 
 def test_menu_setup_cancelled_at_pairing_does_nothing(root, keychain):
@@ -1508,30 +1499,32 @@ def test_menu_setup_cancelled_at_pairing_does_nothing(root, keychain):
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
     assert len(dialogs.shown) == 1 and load_worker_settings(root).control_service_url is None
+    assert app._remote_setup_window.shown == []
 
 
 def test_menu_setup_on_a_paired_mac_skips_pairing(root, enable_calls):
     configure_worker_service(root, URL, "worker-1")
-    dialogs = _Dialogs([0, (0, ""), (0, ""), 1])
-    app = _menu(root, dialogs)
+    app = _menu(root, _Dialogs([]), ["skip", "skip", "skip", "done"])
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
-    assert "Start the worker now?" in dialogs.shown[0][1]["message"]
-    assert "Type the path to your code folder, for example ~/GitHub" in dialogs.shown[2][1]["message"]
-    assert "No folder added." in dialogs.shown[3][1]["message"]
+    worker, _account, folders, done = app._remote_setup_window.shown
+    assert worker["title"] == "Start the worker"
+    # Nothing found: only Add folder….
+    assert [row["kind"] for row in folders["rows"]] == ["choices", "actions"]
+    assert folders["rows"][0]["items"] == [] and folders["rows"][1]["items"][0]["title"] == "Add folder…"
+    assert done["title"] == "Almost done"
+    assert "Turn on Enable local worker in Settings → Remote." in [row.get("text") for row in done["rows"]]
     assert enable_calls == [] and _builtin(root)
 
 
 def test_menu_setup_offers_skip_for_a_step_and_close_for_the_whole_setup(root, enable_calls):
     configure_worker_service(root, URL, "worker-1")
-    dialogs = _Dialogs([0, (guided_setup.DIALOG_CLOSED, "")])  # No to the worker, then Close Setup
-    app = _menu(root, dialogs)
+    app = _menu(root, _Dialogs([]), ["skip", "close"])  # Skip the worker, then Close Setup
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
-    (_, worker), (_, account) = dialogs.shown  # no folder step, no summary
-    assert worker["cancel"] == "No" and account["cancel"] == "Skip"
-    assert worker["close"] == account["close"] == guided_setup.CLOSE_SETUP
-    assert enable_calls == [] and app.refreshed == 1
+    assert _titles(app) == ["Start the worker", "Choose the account for tasks"]  # no folders, no summary
+    assert all(page["leading"]["action"] == "close" for page in app._remote_setup_window.shown)
+    assert enable_calls == [] and app.refreshed == 1 and not app._remote_setup_window.visible
 
 
 def test_account_options_lead_with_the_nickname_and_tell_twins_apart():
@@ -1551,17 +1544,18 @@ def test_menu_setup_closed_at_pairing_shows_nothing_more(root, keychain):
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
     assert len(dialogs.shown) == 1 and load_worker_settings(root).control_service_url is None
+    assert app._remote_setup_window.shown == []
 
 
-def test_menu_setup_reads_several_folders_by_number(root, enable_calls, research_home):
+def test_menu_setup_checks_several_found_folders(root, enable_calls, research_home):
     configure_worker_service(root, URL, "worker-1")
     _repo(*[_code(research_home.parent, name) for name in ("GitHub", "Projects")])
-    dialogs = _Dialogs([0, (0, ""), (1, "1, 2"), 1])
-    app = _menu(root, dialogs)
+    app = _menu(root, _Dialogs([]), ["skip", "skip", ["toggle:1", "continue"], "continue", "done"])
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
     assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github", "projects"]
-    assert "Folders     github (GitHub), projects (Projects)" in dialogs.shown[-1][1]["message"]
+    (folders,) = [item for item in app._remote_setup_window.shown[-1]["rows"][0]["items"] if item[0] == "Folders"]
+    assert folders == ("Folders", "github (GitHub), projects (Projects)", True)
 
 
 def test_menu_setup_reports_a_refused_code(root, keychain, monkeypatch):
@@ -1589,8 +1583,8 @@ def test_menu_setup_runs_every_step_off_the_ui_thread(root, keychain, monkeypatc
     monkeypatch.setattr(pairing, "Transport", lambda *_: Recording())
     monkeypatch.setattr(cli, "enable_worker",
                         lambda backup_root: threads.append(("enable", threading.current_thread())) or {"enabled": True})
-    dialogs = _Dialogs([(1, "openswap worker pair http://localhost one-use"), 1, (0, ""), 0, (0, ""), 1])
-    app = _menu(root, dialogs)
+    dialogs = _Dialogs([(1, "openswap worker pair http://localhost one-use")])
+    app = _menu(root, dialogs, ["yes", "skip", "skip", "done"])
     app._on_setting("remote_tasks_setup", None)
     assert app._guided_setup is not None and app.refreshed == 0  # the UI thread returned at once
     _settle(app)
@@ -1659,51 +1653,30 @@ def test_a_claude_pin_with_a_passing_claude_check_reports_live(root, monkeypatch
     assert state.execution == "live" and state.provider == "claude" and picked == ["claude"]
 
 
-def test_menu_setup_approves_a_folder_from_the_native_chooser(root, enable_calls, tmp_path):
-    """With no code folder found, the native chooser picks the folder tasks may read."""
+def test_menu_setup_adds_a_folder_from_the_native_chooser(root, enable_calls, tmp_path):
+    """Add folder… opens the native chooser and adds the folder as a checked row."""
     configure_worker_service(root, URL, "worker-1")
     notes = _repo(_code(tmp_path, "Notes"))
-    dialogs = _Dialogs([0, (0, ""), (1, str(notes)), 1])
-    app = _menu(root, dialogs)
+    dialogs = _Dialogs([(1, str(notes))])
+    app = _menu(root, dialogs, ["skip", "skip", ["add_folder", "continue"], "continue", "done"])
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
-    kinds = [kind for kind, _kwargs in dialogs.shown]
-    assert kinds.count("choose_folder") == 1
-    chooser = dialogs.shown[kinds.index("choose_folder")][1]
-    assert chooser["title"] == "Set up Remote tasks"
-    assert "Type the path to your code folder, for example ~/GitHub" in chooser["message"]
+    (chooser,) = [kwargs for kind, kwargs in dialogs.shown if kind == "choose_folder"]
+    assert chooser["title"] == "Add folder"
+    redrawn = app._remote_setup_window.pages[app._remote_setup_window.pages.index(
+        app._remote_setup_window.shown[2]) + 1]
+    assert redrawn["rows"][0]["items"][-1]["selected"] is True
     (workspace,) = load_worker_settings(root).workspaces
     assert workspace.workspace_id == "notes" and workspace.work_root == notes.resolve()
 
 
-def test_close_setup_in_the_native_chooser_ends_the_setup(root, enable_calls, tmp_path):
-    """On a Mac with no code folder found, the chooser also offers Close Setup."""
+def test_closing_the_window_mid_setup_ends_it(root, enable_calls, tmp_path):
     configure_worker_service(root, URL, "worker-1")
-    dialogs = _Dialogs([0, (0, ""), (guided_setup.DIALOG_CLOSED, "")])
-    app = _menu(root, dialogs)
+    app = _menu(root, _Dialogs([]), ["skip", "skip", "close"])
     app._on_setting("remote_tasks_setup", None)
     _settle(app)
-    kind, chooser = dialogs.shown[-1]  # no summary after it
-    assert kind == "choose_folder" and chooser["close"] == guided_setup.CLOSE_SETUP
-    assert _builtin(root) and app.refreshed == 1
-
-
-def test_with_folders_found_the_menu_bar_asks_for_numbers_not_the_chooser(root, enable_calls, research_home):
-    configure_worker_service(root, URL, "worker-1")
-    _repo(_code(research_home.parent, "GitHub"))
-    dialogs = _Dialogs([0, (0, ""), (1, "1"), 1])
-    app = _menu(root, dialogs)
-    app._on_setting("remote_tasks_setup", None)
-    _settle(app)
-    assert "choose_folder" not in [kind for kind, _kwargs in dialogs.shown]
-    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github"]
-
-
-def test_dialog_prompts_type_the_folder_without_a_chooser():
-    dialogs = _Dialogs([(1, "/tmp/x")])
-    ui = guided_setup.DialogPrompts(dialogs.alert, dialogs.prompt)
-    assert ui.choose_folder("Folder?") == "/tmp/x"
-    assert dialogs.shown[0][0] == "prompt"
+    assert _titles(app)[-1] == "Choose folders for tasks"  # no summary after it
+    assert _builtin(root) and app.refreshed == 1 and not app._remote_setup_window.visible
 
 
 # --- the terminal folder search ------------------------------------------------------------------
