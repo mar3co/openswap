@@ -92,7 +92,7 @@ class ClaudeDesktopMenu:
         self._profile_checked_at = {}
         self._checked_at = None
         self._update_label = None
-        self._verified = False
+        self._check_failed = False
         self._labels = queue.SimpleQueue()
         self._label_checked_at = None
         self.clock = time.monotonic
@@ -110,7 +110,7 @@ class ClaudeDesktopMenu:
     def suspend_checks(self):
         self._check_generation += 1
         self.checking = False
-        self._update_label, self._verified = None, False
+        self._update_label, self._check_failed = None, False
         self._signin = None
         self.monitor.suspend()
         if self.code:
@@ -206,7 +206,7 @@ class ClaudeDesktopMenu:
             self._checks.put((generation, "Could not check Claude Desktop. Try again.", {}, None, None, False))
 
     def _refresh_update_label(self, max_age, pending=None):
-        if (not self._verified or self.busy or self.checking or self.blocked() or not self.enabled()
+        if (self._check_failed or self.busy or self.checking or self.blocked() or not self.enabled()
                 or (self._update_pending() if pending is None else pending)
                 or self._label_checked_at is not None and self.clock() - self._label_checked_at < max_age):
             return
@@ -851,7 +851,7 @@ class ClaudeDesktopMenu:
         else:
             if generation == self._check_generation and self.enabled():
                 self._app_message, self._profile_states, self._checked_at = message, states, checked_at
-                self._update_label, self._verified = update, verified
+                self._update_label, self._check_failed = update, not verified
                 self._profile_checked_at = dict.fromkeys(states, checked_at)
                 self.checking = False
                 self.changed()

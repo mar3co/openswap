@@ -446,7 +446,7 @@ def test_failed_app_check_has_no_update_label(menu, monkeypatch):
     assert menu.settings_state()["update_label"] is None
 
 
-def test_unverified_app_gets_no_label_between_checks(passive):
+def test_failed_check_stops_the_label_until_a_check_passes(passive):
     p = passive
     p.app.validate.side_effect = cd.ClaudeDesktopError("Reinstall the official app.")
     p.app.profile_states.return_value = {}
@@ -457,6 +457,15 @@ def test_unverified_app_gets_no_label_between_checks(passive):
     p.menu.poll()
     p.downloaded.assert_not_called()
     assert p.menu.settings_state()["update_label"] is None
+    p.app.validate.side_effect = None
+    p.app.validate.return_value = {"version": "4.4212.0"}
+    p.menu.refresh_status()
+    p.menu.poll()
+    p.downloaded.reset_mock()
+    p.now[0] += 61
+    p.menu.poll()
+    p.menu.poll()
+    p.downloaded.assert_called_once()
 
 
 def test_stale_check_cannot_set_update_label(menu):
@@ -489,7 +498,6 @@ def passive(menu, monkeypatch):
     app = launcher()
     app.bundle_info.return_value = {"CFBundleShortVersionString": "4.4212.0"}
     menu._app_factory = lambda: app
-    menu._verified = True
     return SimpleNamespace(menu=menu, now=now, downloaded=downloaded, app=app)
 
 
