@@ -3743,9 +3743,10 @@ def test_refresh_requested_while_in_flight_runs_on_the_next_tick():
 def _claude_add_app():
     add_app = _claude_login_app()
     add_app._claude_login_num = None
-    add_app.switcher.current_account_number = lambda: (
-        "2" if add_app.live == ("a@x.com", "org-1") else None
+    add_app.switcher.account_number_for = lambda email, org: (
+        "2" if (email, org) == ("a@x.com", "org-1") else None
     )
+    add_app.switcher.current_account_number = lambda: add_app.switcher.account_number_for(*add_app.live)
     add_app.switcher.current_login_is_saved = lambda: False
     add_app.switcher.saved_organizations = lambda email: (
         {"org-1": "Org One"} if email == "a@x.com" else {}

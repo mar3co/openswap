@@ -3370,7 +3370,7 @@ def run(switcher, codex=None) -> int:
                 live = self.switcher._get_current_identity_triple(strict=True)
                 if live is None:
                     return True
-                if self.switcher.current_account_number() is None:
+                if self.switcher.account_number_for(live[0], live[1]) is None:
                     saved = self.switcher.current_login_is_saved()
                     if saved:
                         return True

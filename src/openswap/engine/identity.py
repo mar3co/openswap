@@ -101,11 +101,11 @@ class IdentityMixin:
         tell the two ``None`` cases apart.
         """
         identity = self.live_identity()
-        if identity is None:
-            return None
-        data = self._get_sequence_data() or {}
-        email, org_uuid = identity
-        return self._find_account_slot(data, email, org_uuid)
+        return None if identity is None else self.account_number_for(*identity)
+
+    def account_number_for(self, email: str, org_uuid: str) -> str | None:
+        """Slot saved for exactly ``(email, organizationUuid)``, else ``None``."""
+        return self._find_account_slot(self._get_sequence_data() or {}, email, org_uuid)
 
     def identity_drift(self) -> IdentityDrift | None:
         """Whether the config identity and the live credential disagree.

@@ -2216,7 +2216,12 @@ def claude_add_unsaved_live_message(
         for uuid, name in saved_orgs.items()
         if uuid != org_uuid
     )
-    if org_uuid in saved_orgs:
+    if incomplete:
+        current = (
+            f"OpenSwap couldn't confirm that the current Claude Code login for "
+            f"{email} is saved, because some saved logins couldn't be read."
+        )
+    elif org_uuid in saved_orgs:
         current = (
             f"OpenSwap has {email} saved, but its saved copy is older than "
             "Claude Code's current login."
@@ -2229,8 +2234,6 @@ def claude_add_unsaved_live_message(
         )
     else:
         current = f"The current Claude Code login for {email} isn't saved in OpenSwap."
-    if incomplete:
-        current += " OpenSwap couldn't check every saved login."
     return (
         f"Your existing saved accounts stay in OpenSwap.\n\n{current}\n\n"
         "Adding another account changes Claude Code's active login. To keep "

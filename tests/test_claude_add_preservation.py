@@ -180,7 +180,9 @@ def test_add_confirms_instead_of_blocking_when_some_saved_login_is_unreadable():
 
     app.on_add_claude_login(None)
 
-    assert "couldn't check every saved login" in app.dialogs[0]["message"]
+    message = app.dialogs[0]["message"]
+    assert "couldn't confirm that the current Claude Code login" in message
+    assert "isn't saved" not in message
     assert app.alerts == [] and app.starts == []
 
 
