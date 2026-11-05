@@ -32,8 +32,10 @@ from AppKit import (
     NSImageView,
     NSPasteboard,
     NSPasteboardTypeString,
+    NSScrollView,
     NSSwitch,
     NSView,
+    NSViewWidthSizable,
     NSWindow,
     NSWindowStyleMaskClosable,
     NSWindowStyleMaskFullSizeContentView,
@@ -55,6 +57,8 @@ SMALL_BUTTON_H = 30.0
 GAP = 10.0
 ACCOUNTS_SHOWN = 6  # account rows before "and N more", so the footer stays on screen
 CHOICE_GAP = 6.0
+# Taller choice lists scroll, so the footer stays on screen with 20 accounts or 16+ folders.
+CHOICES_MAX_HEIGHT = 260.0
 
 
 class _WizardButton(_DialogButton):
@@ -67,6 +71,19 @@ class _WizardSwitch(NSSwitch):
 
 class _WizardChoice(NSButton):
     """A checkbox or radio button that carries the action it reports."""
+
+
+class _Flipped(NSView):
+    def isFlipped(self):
+        return True
+
+
+def _buttons(view):
+    for child in view.subviews():
+        if isinstance(child, NSButton):
+            yield child
+        else:
+            yield from _buttons(child)
 
 
 class _Box(NSView):
@@ -160,11 +177,23 @@ class SetupWizard:
     def render(self, page: dict) -> None:
         """Redraw in place, keeping the window's top edge where it was."""
         self.page = page
-        surface, height = self._build(page)
         window = self._window
+        old_surface = window.contentView()
+        old = getattr(old_surface, "choices_scroll", None)
+        old_state = (getattr(old_surface, "choices_key", None), getattr(old_surface, "choices_height", 0.0),
+                     old.contentView().bounds().origin.y if old else 0.0)
+        surface, height = self._build(page)
         frame = window.frame()
         top = frame.origin.y + frame.size.height
         window.setContentView_(surface)
+        scroll = getattr(surface, "choices_scroll", None)
+        old_key, old_height, offset = old_state
+        if scroll is not None and old_key == (page.get("title"), page.get("progress")):
+            document = scroll.documentView().frame().size.height
+            # A taller list means Add folder… appended a row: show it; otherwise stay put.
+            limit = max(0.0, document - scroll.contentSize().height)
+            scroll.contentView().scrollToPoint_((0, limit if document > old_height else min(offset, limit)))
+            scroll.reflectScrolledClipView_(scroll.contentView())
         content = window.frameRectForContentRect_(NSMakeRect(0, 0, WIDTH, height))
         new = NSMakeRect(frame.origin.x, top - content.size.height, content.size.width, content.size.height)
         window.setFrame_display_animate_(new, True, self._placed and window.isVisible())
@@ -173,8 +202,8 @@ class SetupWizard:
             # Answered: the app is working until its next page, so nothing here acts twice;
             # the leading button (Close Setup) still closes the window.
             keep = (page.get("leading") or {}).get("action")
-            for view in surface.subviews():
-                if isinstance(view, NSButton) and (keep is None or getattr(view, "wizard_action", None) != keep):
+            for view in _buttons(surface):
+                if keep is None or getattr(view, "wizard_action", None) != keep:
                     view.setEnabled_(False)
             primary = None
         if primary is not None:
@@ -328,6 +357,31 @@ class SetupWizard:
         surface.setFrameSize_((WIDTH, height))
         return surface, height
 
+    def _choices(self, view, row) -> float:
+        # Inset so a scrolling clip view doesn't cut the first and last focus rings.
+        y = CHOICE_GAP
+        button_type = NSButtonTypeSwitch if row.get("multiple") else NSButtonTypeRadio
+        for item in row["items"]:
+            button = _WizardChoice.alloc().initWithFrame_(NSMakeRect(PAD, y, CONTENT, 20))
+            button.setButtonType_(button_type)
+            button.setTitle_(item["title"])
+            button.setFont_(_font(13))
+            button.setState_(NSControlStateValueOn if item.get("selected") else NSControlStateValueOff)
+            button.setTarget_(self._target)
+            button.setAction_("clicked:")
+            button.wizard_action = item["action"]
+            detail = item.get("detail") or ""
+            button.setAccessibilityLabel_(f"{item['title']}, {detail}" if detail else item["title"])
+            button.sizeToFit()
+            button.setFrameSize_((min(CONTENT, button.frame().size.width), button.frame().size.height))
+            view.addSubview_(button)
+            y += button.frame().size.height
+            if detail:
+                y += self._text(view, detail, y, size=11, color=NSColor.secondaryLabelColor(),
+                                x=PAD + 20, width=CONTENT - 20)
+            y += CHOICE_GAP
+        return y if row["items"] else 0.0
+
     def _row(self, surface, row, y) -> float:
         kind = row.get("kind")
         if kind == "note":
@@ -444,28 +498,25 @@ class SetupWizard:
                 ly += line
             return box_h
         if kind == "choices":
-            top = y
-            button_type = NSButtonTypeSwitch if row.get("multiple") else NSButtonTypeRadio
-            for item in row["items"]:
-                button = _WizardChoice.alloc().initWithFrame_(NSMakeRect(PAD, y, CONTENT, 20))
-                button.setButtonType_(button_type)
-                button.setTitle_(item["title"])
-                button.setFont_(_font(13))
-                button.setState_(NSControlStateValueOn if item.get("selected") else NSControlStateValueOff)
-                button.setTarget_(self._target)
-                button.setAction_("clicked:")
-                button.wizard_action = item["action"]
-                detail = item.get("detail") or ""
-                button.setAccessibilityLabel_(f"{item['title']}, {detail}" if detail else item["title"])
-                button.sizeToFit()
-                button.setFrameSize_((min(CONTENT, button.frame().size.width), button.frame().size.height))
-                surface.addSubview_(button)
-                y += button.frame().size.height
-                if detail:
-                    y += self._text(surface, detail, y, size=11, color=NSColor.secondaryLabelColor(),
-                                    x=PAD + 20, width=CONTENT - 20)
-                y += CHOICE_GAP
-            return y - top - CHOICE_GAP if row["items"] else 0.0
+            list_view = _Flipped.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, 0))
+            height = self._choices(list_view, row)
+            list_view.setFrameSize_((WIDTH, height))
+            surface.choices_key = (self.page.get("title"), self.page.get("progress"))
+            surface.choices_height = height
+            if height <= CHOICES_MAX_HEIGHT:
+                list_view.setFrameOrigin_((0, y))
+                surface.addSubview_(list_view)
+                return height
+            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, y, WIDTH, CHOICES_MAX_HEIGHT))
+            scroll.setDrawsBackground_(False)
+            scroll.setHasVerticalScroller_(True)
+            scroll.setAutohidesScrollers_(True)
+            list_view.setFrameSize_((scroll.contentSize().width, height))
+            list_view.setAutoresizingMask_(NSViewWidthSizable)
+            scroll.setDocumentView_(list_view)
+            surface.addSubview_(scroll)
+            surface.choices_scroll = scroll
+            return CHOICES_MAX_HEIGHT
         if kind == "command":
             top = y
             x, w = self._lead(surface, row, y)

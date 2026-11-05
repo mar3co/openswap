@@ -29,8 +29,11 @@ def _drawn(page):
     return wizard, wizard.window().contentView(), actions
 
 
-def _buttons(surface):
-    return [view for view in surface.subviews() if isinstance(view, AppKit.NSButton)]
+def _buttons(view):
+    found = []
+    for child in view.subviews():
+        found += [child] if isinstance(child, AppKit.NSButton) else _buttons(child)
+    return found
 
 
 def test_account_rows_are_radio_buttons_that_report_their_row():
@@ -78,3 +81,52 @@ def test_the_done_checklist_marks_each_row():
     _wizard, surface, _actions = _drawn(done_page(state))
     labels = {view.accessibilityLabel() for view in surface.subviews() if view.accessibilityLabel()}
     assert {"Worker: running, done", "Account: none, missing", "Live tasks: off"} <= labels
+
+
+def test_a_long_folder_list_scrolls_and_keeps_the_footer_on_screen():
+    folders = [(f"~/Code/repo{i}", "") for i in range(30)]
+    page = window_page(2, "check_folders", (folders, [False] * 30), {"checked": [False] * 30, "added": []}, [])
+    wizard, surface, actions = _drawn(page)
+    (scroll,) = [v for v in surface.subviews() if isinstance(v, AppKit.NSScrollView)]
+    assert scroll.frame().size.height < scroll.documentView().frame().size.height
+    assert wizard.window().frame().size.height < 700
+    boxes = [b for b in _buttons(surface) if getattr(b, "wizard_action", "").startswith("toggle:")]
+    assert len(boxes) == 30
+    boxes[-1].performClick_(None)
+    assert actions == ["toggle:29"]
+
+
+def test_a_scrolled_folder_list_keeps_its_place_and_shows_an_added_folder():
+    folders = [(f"~/Code/repo{i}", "") for i in range(30)]
+    page = window_page(2, "check_folders", (folders, [False] * 30), {"checked": [False] * 30, "added": []}, [])
+    wizard, surface, _actions = _drawn(page)
+    surface.choices_scroll.contentView().scrollToPoint_((0, 200))
+    checked = [False] * 30
+    checked[25] = True
+    wizard.render(window_page(2, "check_folders", (folders, [False] * 30), {"checked": checked, "added": []}, []))
+    scroll = wizard.window().contentView().choices_scroll
+    assert scroll.contentView().bounds().origin.y == 200
+    assert scroll.documentView().frame().size.width == scroll.contentSize().width
+    added = {"checked": checked + [True], "added": ["~/New"]}
+    wizard.render(window_page(2, "check_folders", (folders, [False] * 30), added, []))
+    scroll = wizard.window().contentView().choices_scroll
+    bottom = scroll.documentView().frame().size.height - scroll.contentSize().height
+    assert scroll.contentView().bounds().origin.y == bottom > 200
+
+
+def test_a_list_that_starts_scrolling_shows_the_added_folder_and_a_new_step_starts_at_the_top():
+    folders = [(f"~/Code/repo{i}", "") for i in range(9)]
+    wizard, _surface, _actions = _drawn(
+        window_page(2, "check_folders", (folders, [False] * 9), {"checked": [False] * 9, "added": []}, []))
+    assert getattr(wizard.window().contentView(), "choices_scroll", None) is None
+    many = [f"~/New{i}" for i in range(12)]
+    wizard.render(window_page(2, "check_folders", (folders, [False] * 9),
+                              {"checked": [False] * 9 + [True] * 12, "added": many}, []))
+    scroll = wizard.window().contentView().choices_scroll
+    assert scroll.contentView().bounds().origin.y > 0
+    accounts = [f"a{i}@x.com" for i in range(30)]
+    wizard.render(window_page(1, "pick", ("Pick.", accounts), {"selected": None}, []))
+    wizard.window().contentView().choices_scroll.contentView().scrollToPoint_((0, 300))
+    wizard.render(window_page(2, "check_folders", ([(f"~/r{i}", "") for i in range(40)], [False] * 40),
+                              {"checked": [False] * 40, "added": []}, []))
+    assert wizard.window().contentView().choices_scroll.contentView().bounds().origin.y == 0
