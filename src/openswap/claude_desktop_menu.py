@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
@@ -27,6 +28,18 @@ def reveal_shortcut(path: str) -> None:
     import AppKit
     from Foundation import NSURL
     AppKit.NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_([NSURL.fileURLWithPath_(path)])
+
+
+def update_label(app, installed):
+    """Passive: reads Info.plist files only, never signatures or processes."""
+    try:
+        from openswap.claude_desktop_update import downloaded_update
+        staged = downloaded_update(app, installed)
+    except Exception:
+        return None
+    if staged:
+        return f"Claude {staged} is ready to install"
+    return None if staged is None else f"Claude {installed} · No update downloaded"
 
 
 def has_saved_profiles() -> bool:
@@ -79,6 +92,9 @@ class ClaudeDesktopMenu:
         self._profile_checked_at = {}
         self._checked_at = None
         self._update_label = None
+        self._labels = queue.SimpleQueue()
+        self._label_checked_at = None
+        self.clock = time.monotonic
         self._check_generation = 0
         from openswap.claude_desktop_update import DesktopUpdate
         self.updater = updater or DesktopUpdate(self.store)
@@ -93,6 +109,7 @@ class ClaudeDesktopMenu:
     def suspend_checks(self):
         self._check_generation += 1
         self.checking = False
+        self._update_label = None
         self._signin = None
         self.monitor.suspend()
         if self.code:
@@ -126,6 +143,7 @@ class ClaudeDesktopMenu:
         return sorted(rows, key=lambda p: p.kind != "default")
 
     def settings_state(self):
+        self._refresh_update_label(30)
         state = {"checking": self.checking, "busy": self.busy or self.blocked(),
                  "operation": self._operation_label(),
                  "update_pending": self._update_pending(),
@@ -154,21 +172,17 @@ class ClaudeDesktopMenu:
         self._check_generation += 1
         generation = self._check_generation
         self.checking = True
+        self._label_checked_at = self.clock()
         self.changed()
 
         def check():
-            app, validated, states, update_label = None, False, {}, None
+            app, validated, states, update = None, False, {}, None
             try:
                 app = self._app_factory()
                 info = app.validate()
                 validated = True
                 message = f"Claude {info['version']} · Publisher verified."
-                from openswap.claude_desktop_update import downloaded_update
-                staged = downloaded_update(app, info["version"])
-                if staged:
-                    update_label = f"Claude {staged} is ready to install"
-                elif staged is not None:
-                    update_label = f"Claude {info['version']} · No update downloaded"
+                update = update_label(app, info["version"])
             except Exception as exc:
                 message = str(exc) if isinstance(exc, ClaudeSwitchError) else "Could not check Claude Desktop. Try again."
             if app is not None:
@@ -183,12 +197,32 @@ class ClaudeDesktopMenu:
                                 pass  # passive refresh must not interrupt work with dialogs
                 except Exception:
                     states = {}
-            self._checks.put((generation, message, states, update_label, datetime.now().strftime("%b %d, %H:%M:%S")))
+            self._checks.put((generation, message, states, update, datetime.now().strftime("%b %d, %H:%M:%S")))
 
         try:
             threading.Thread(target=check, daemon=True, name="claude-desktop-check").start()
         except Exception:
             self._checks.put((generation, "Could not check Claude Desktop. Try again.", {}, None, None))
+
+    def _refresh_update_label(self, max_age):
+        if (self.busy or self.checking or self.blocked() or not self.enabled() or self._update_pending()
+                or self._label_checked_at is not None and self.clock() - self._label_checked_at < max_age):
+            return
+        self._label_checked_at = self.clock()
+        generation = self._check_generation
+
+        def check():
+            try:
+                app = self._app_factory()
+                label = update_label(app, app.bundle_info()["CFBundleShortVersionString"])
+            except Exception:
+                label = None
+            self._labels.put((generation, label))
+
+        try:
+            threading.Thread(target=check, daemon=True, name="claude-desktop-update-label").start()
+        except Exception:
+            pass  # the next refresh retries
 
     def _notify(self, title, body):
         try:
@@ -789,6 +823,7 @@ class ClaudeDesktopMenu:
                 progress=lambda message: self._results.put(({"state": "update_progress", "message": message}, None))))
 
     def poll(self):
+        self._refresh_update_label(60)
         updating = self._update_pending()
         if updating != self._update_observed:
             self._update_observed = updating
@@ -800,13 +835,21 @@ class ClaudeDesktopMenu:
         if self.code and self.code.poll(enabled=self.enabled(), idle=not (self.busy or updating or self.blocked() or self._editing_details) and self.code_login_allowed()):
             self.changed()
         try:
-            generation, message, states, update_label, checked_at = self._checks.get_nowait()
+            generation, label = self._labels.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            if generation == self._check_generation and self.enabled() and label != self._update_label:
+                self._update_label = label
+                self.changed()
+        try:
+            generation, message, states, update, checked_at = self._checks.get_nowait()
         except queue.Empty:
             pass
         else:
             if generation == self._check_generation and self.enabled():
                 self._app_message, self._profile_states, self._checked_at = message, states, checked_at
-                self._update_label = update_label
+                self._update_label = update
                 self._profile_checked_at = dict.fromkeys(states, checked_at)
                 self.checking = False
                 self.changed()
