@@ -49,15 +49,17 @@ class UpdateJournal:
             if self.path.stat().st_size > 32_000:
                 raise ValueError
             data = json.loads(self.path.read_text())
+
+            def ids(key):
+                values = data.get(key)
+                return (isinstance(values, list) and len(values) <= 100
+                        and all(isinstance(p, str) and re.fullmatch(r"[a-f0-9]{32}", p) for p in values)
+                        and len(set(values)) == len(values))
             if (not isinstance(data, dict) or type(data.get("schema")) is not int or data["schema"] != 1
-                    or data.get("phase") not in {"waiting", "restoring"}
+                    or data.get("phase") not in {"waiting", "restoring", "canceled"}
                     or not isinstance(data.get("id"), str) or not re.fullmatch(r"[a-f0-9]{32}", data["id"])
                     or not isinstance(data.get("root"), str) or not Path(data["root"]).is_absolute()
-                    or not isinstance(data.get("profiles"), list) or len(data["profiles"]) > 100
-                    or any(not isinstance(p, str) or not re.fullmatch(r"[a-f0-9]{32}", p) for p in data["profiles"])
-                    or len(set(data["profiles"])) != len(data["profiles"])
-                    or not isinstance(data.get("docked"), list) or len(data["docked"]) > 100
-                    or any(not isinstance(p, str) or not re.fullmatch(r"[a-f0-9]{32}", p) for p in data["docked"])):
+                    or not ids("profiles") or not ids("docked") or not ids("restored")):
                 raise ValueError
             version(data["before"])
             version(data["target"])
@@ -83,7 +85,8 @@ def launch_guard(installed):
     journal = UpdateJournal()
     with journal.lock():
         record = journal.read()
-        if record and (record["phase"] == "waiting" or version(installed) < version(record["target"])):
+        if record and (record["phase"] == "waiting"
+                       or record["phase"] == "restoring" and version(installed) < version(record["target"])):
             raise cd.ClaudeDesktopError(BLOCKED)
         yield
 
@@ -236,6 +239,8 @@ class DesktopUpdate:
     def plan(self):
         self.store.ensure_default()
         record = self._owned(self.journal.read())
+        if record and record["phase"] == "canceled":
+            raise cd.ClaudeDesktopError("This update was canceled. Choose Cancel update to finish reopening your profiles.")
         before, stamp = self.backend.installed()
         installed = bool(record and version(before) >= version(record["target"]))
         target = record["target"] if installed else self.backend.staged()
@@ -280,7 +285,7 @@ class DesktopUpdate:
                 if record is None:
                     record = {"schema": 1, "id": uuid.uuid4().hex, "root": str(self.store.root),
                               "before": plan.before, "target": plan.target,
-                              "profiles": list(plan.targets), "docked": docked, "phase": "waiting"}
+                              "profiles": list(plan.targets), "docked": docked, "restored": [], "phase": "waiting"}
                 elif not plan.installed:
                     record["profiles"] = list(dict.fromkeys([*record["profiles"], *plan.targets]))
                     record["docked"] = list(dict.fromkeys([*record["docked"], *docked]))
@@ -322,23 +327,14 @@ class DesktopUpdate:
             with self.journal.lock():
                 record["phase"] = "restoring"
                 self.journal.write(record)
-            restored = []
             for identifier in list(record["profiles"]):
                 if not enabled():
                     raise cd.ClaudeDesktopError("Profile restoration paused. Choose Resume update when ready.")
                 # An archive during installation must not reopen a profile.
-                if identifier in {p.id for p in self.store.list()}:
-                    result = self.backend.restore(self.store, identifier)
-                    if result.get("state") not in {"launched", "already_running"} or not result.get("pid"):
-                        raise cd.ClaudeDesktopError("A Claude profile is still opening. Wait a moment, then choose Resume update to finish restoring it.")
-                    restored.append(identifier)
-                with self.journal.lock():
-                    record["profiles"].remove(identifier)
-                    self.journal.write(record)
-            with self.journal.lock():
-                self.journal.clear()
+                reopened = identifier in {p.id for p in self.store.list()} and self._reopen(identifier)
+                self._settle(record, identifier, reopened)
             return {"state": "update_done", "version": installed,
-                    "dock_warnings": self._reattach(restored, record["docked"], stale)}
+                    "dock_warnings": self._finish(record, stale)}
 
     def cancel(self):
         """Stop coordinating and reopen the closed profiles on whatever Claude is installed."""
@@ -347,25 +343,53 @@ class DesktopUpdate:
                 try:
                     record = self._owned(self.journal.read())
                 except UnreadableJournal:
-                    # The saved profile list is lost: unblock launches but reopen nothing.
-                    record = {"phase": "waiting", "profiles": [], "docked": [], "unreadable": True}
+                    record = {"phase": "waiting", "unreadable": True}
                 if record is None:
-                    return {"state": "update_canceled", "failed": [], "dock_warnings": []}
+                    return {"state": "update_canceled", "failed": [], "unreadable": False, "dock_warnings": []}
                 if record["phase"] == "waiting" and self.backend.installer_running() and not self.backend.claude_running():
                     raise cd.ClaudeDesktopError("Claude is installing its update. Wait a moment, then try again.")
-                self.journal.clear()
+                if record.get("unreadable"):
+                    # The saved profile list is lost: unblock launches but reopen nothing.
+                    self.journal.clear()
+                    return {"state": "update_canceled", "failed": [], "unreadable": True, "dock_warnings": []}
+                # Launches are allowed from here; the list remains until every profile is handled.
+                record["phase"] = "canceled"
+                self.journal.write(record)
             rows = {p.id: p for p in self.store.list()}
-            launched, failed = [], []
-            for identifier in record["profiles"]:
-                if identifier not in rows:
-                    continue
-                try:
-                    if self.backend.restore(self.store, identifier).get("state") == "launched":
-                        launched.append(identifier)
-                except (cd.ClaudeSwitchError, OSError):
-                    failed.append(rows[identifier].name)
-            return {"state": "update_canceled", "failed": failed, "unreadable": record.get("unreadable", False),
-                    "dock_warnings": self._reattach(launched, record["docked"], self._old_helpers(launched))}
+            failed = []
+            for identifier in list(record["profiles"]):
+                reopened = False
+                if identifier in rows:
+                    try:
+                        # A profile still open from before is left alone and keeps its indicator.
+                        reopened = self._reopen(identifier) != "already_running"
+                    except (cd.ClaudeSwitchError, OSError):
+                        failed.append(rows[identifier].name)
+                self._settle(record, identifier, reopened)
+            return {"state": "update_canceled", "failed": failed, "unreadable": False,
+                    "dock_warnings": self._finish(record, self._old_helpers(record["restored"]))}
+
+    def _reopen(self, identifier):
+        """Open a saved profile; a launch already in progress elsewhere counts as reopened."""
+        for _ in range(3):
+            state = self.backend.restore(self.store, identifier).get("state")
+            if state != "already_opening":
+                break
+            self.sleep(1)
+        return state
+
+    def _settle(self, record, identifier, reopened):
+        with self.journal.lock():
+            record["profiles"].remove(identifier)
+            if reopened:
+                record["restored"] = list(dict.fromkeys([*record["restored"], identifier]))
+            self.journal.write(record)
+
+    def _finish(self, record, stale):
+        warnings = self._reattach(record["restored"], record["docked"], stale)
+        with self.journal.lock():
+            self.journal.clear()
+        return warnings
 
     def _old_helpers(self, identifiers):
         """Profiles whose previous Dock helper is still running after a short wait."""

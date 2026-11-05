@@ -327,6 +327,8 @@ again in a moment. Cancel is unavailable while OpenSwap is already working on th
 and from a profile store other than the one that started the update. If the recovery
 record is damaged, launches stay blocked until you choose Cancel update; OpenSwap then
 removes the record but can't tell which profiles were open, so reopen them yourself.
+A damaged record can be canceled from any profile store. If OpenSwap stops while
+canceling, launches stay available and choosing Cancel update again reopens the rest.
 If Claude replaces the pending download with a newer version, Resume update
 confirms that newer version while preserving the saved profile list.
 

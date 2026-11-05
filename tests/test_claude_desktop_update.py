@@ -84,7 +84,7 @@ class Backend:
 
     def restore(self, store, identifier):
         record = update.UpdateJournal().read()
-        assert record is None or record["phase"] == "restoring"
+        assert record is None or record["phase"] in {"restoring", "canceled"}
         if not self.targets[identifier].closed:
             return {"state": "already_running", "pid": self.targets[identifier].pid}
         self.restored.append(identifier)
@@ -120,7 +120,7 @@ def write_journal(s, phase):
     journal = update.UpdateJournal()
     with journal.lock():
         journal.write({"schema": 1, "id": "a" * 32, "root": str(s.store.root), "before": "4.4212.0",
-                       "target": "4.16336.0", "profiles": [], "docked": [], "phase": phase})
+                       "target": "4.16336.0", "profiles": [], "docked": [], "restored": [], "phase": phase})
 
 
 @pytest.fixture
@@ -413,6 +413,7 @@ def test_native_quit_never_refetches_a_reused_pid():
     native.isTerminated.return_value = False
     native.terminate.return_value = False
     assert not update.MacUpdateBackend().quit(native)
+    native.forceTerminate.assert_not_called()
 
 
 def test_installer_detection_matches_exact_claude_helper(monkeypatch, tmp_path):
@@ -470,13 +471,76 @@ def test_resume_accepts_a_newer_staged_update_after_original_is_replaced(setup):
     assert not s.updater.pending()
 
 
-def test_incomplete_launch_is_kept_for_recovery_instead_of_reported_restored(setup):
+@pytest.mark.parametrize("action", ["update", "cancel"])
+@pytest.mark.parametrize("settles", [True, False])
+def test_launch_already_opening_elsewhere_counts_as_reopened(setup, action, settles):
     s = setup
-    s.backend.restore = Mock(return_value={"state": "already_opening", "pid": None})
-    with pytest.raises(cd.ClaudeDesktopError, match="still opening"):
+    work = s.profiles[1].id
+    calls = []
+    restore = s.backend.restore
+    def opening_elsewhere(store, identifier):
+        calls.append(identifier)
+        if identifier == work and (not settles or calls.count(work) < 3):
+            return {"state": "already_opening", "pid": None}
+        return restore(store, identifier)
+    if action == "cancel":
+        cancel_after_failed_update(s, allow_install=False)
+        s.backend.installer = False
+    s.backend.restore = opening_elsewhere
+    result = s.updater.execute(s.updater.plan()) if action == "update" else s.updater.cancel()
+    assert result["dock_warnings"] == [] and result.get("failed", []) == []
+    assert work in s.backend.attached
+    assert calls.count(work) == 3
+    assert not s.updater.pending()
+
+
+@pytest.mark.parametrize("finish", ["resume", "cancel"])
+def test_interrupted_restoration_keeps_reopened_profiles_for_dock_reattach(setup, finish):
+    s = setup
+    default, work = (p.id for p in s.profiles)
+    restore = s.backend.restore
+    def stop_on_work(store, identifier):
+        if identifier == work:
+            raise cd.ClaudeDesktopError("Claude exited during launch")
+        return restore(store, identifier)
+    s.backend.restore = stop_on_work
+    with pytest.raises(cd.ClaudeDesktopError, match="exited"):
         s.updater.execute(s.updater.plan())
-    assert s.updater.journal.read()["profiles"] == [p.id for p in s.profiles]
+    record = s.updater.journal.read()
+    assert (record["profiles"], record["restored"]) == ([work], [default])
     assert not s.backend.attached
+    s.backend.restore = restore
+    if finish == "resume":
+        s.updater.execute(s.updater.plan())
+    else:
+        s.updater.cancel()
+    assert s.backend.attached == [default, work]
+    assert not s.updater.pending()
+
+
+def test_interrupted_cancel_keeps_launches_open_and_resumes_reopening(setup):
+    s = setup
+    default, work = (p.id for p in s.profiles)
+    cancel_after_failed_update(s, allow_install=False)
+    s.backend.installer = False
+    restore = s.backend.restore
+    def crash_on_work(store, identifier):
+        if identifier == work:
+            raise RuntimeError("OpenSwap quit")
+        return restore(store, identifier)
+    s.backend.restore = crash_on_work
+    with pytest.raises(RuntimeError):
+        s.updater.cancel()
+    record = s.updater.journal.read()
+    assert (record["phase"], record["profiles"], record["restored"]) == ("canceled", [work], [default])
+    assert s.store.open(work, app=launcher(version="4.4212.0"))["state"] == "launched"
+    with pytest.raises(cd.ClaudeDesktopError, match="Cancel update"):
+        s.updater.plan()
+    s.backend.restore = restore
+    result = s.updater.cancel()
+    assert result["failed"] == [] and s.backend.restored == [default, work]
+    assert s.backend.attached == [default, work]
+    assert not s.updater.pending()
 
 
 def test_resume_never_accepts_an_older_replacement_download(setup):
@@ -600,9 +664,12 @@ def test_cancel_waits_while_the_installer_runs_with_every_profile_closed(setup):
 def test_cancel_during_restoration_reopens_remaining_profiles(setup):
     s = setup
     restore = s.backend.restore
-    s.backend.restore = lambda store, identifier: (
-        {"state": "already_opening", "pid": None} if identifier == s.profiles[1].id else restore(store, identifier))
-    with pytest.raises(cd.ClaudeDesktopError, match="still opening"):
+    def stop_on_work(store, identifier):
+        if identifier == s.profiles[1].id:
+            raise cd.ClaudeDesktopError("Claude exited during launch")
+        return restore(store, identifier)
+    s.backend.restore = stop_on_work
+    with pytest.raises(cd.ClaudeDesktopError, match="exited"):
         s.updater.execute(s.updater.plan())
     assert s.updater.journal.read()["phase"] == "restoring"
     s.backend.restore = restore
@@ -703,7 +770,19 @@ def test_cancel_removes_a_damaged_journal_and_reopens_nothing(menu, setup, monke
     damage_journal(s)
     assert {r["id"] for r in claude_desktop_profile_rows(menu.settings_state())} >= {"claude_desktop_cancel_update"}
     menu.perform("cancel_update")
+    assert "nothing is reopened" in menu.confirm.call_args.kwargs["message"]
     menu.poll()
     assert not s.updater.journal.path.exists() and not s.backend.restored
     assert "Reopen your profiles from OpenSwap." in menu.notify.call_args.args[1]
     assert s.store.open(s.profiles[1].id, app=launcher())["state"] == "launched"
+
+
+@pytest.mark.parametrize("row, action", [("claude_desktop_update", "update"), ("claude_desktop_cancel_update", "cancel_update")])
+def test_panel_update_rows_dispatch_their_actions(row, action):
+    from openswap import menubar
+    from tests.menubar_harness import extract_class
+    cls = extract_class(Path(menubar.__file__).with_name("menubar_panel.py"), "MenuBarPanel", {"_emit_setting"}, {})
+    panel = cls()
+    panel._desktop_profile_action = Mock()
+    panel._emit_setting(row, None)
+    panel._desktop_profile_action.assert_called_once_with(action)

@@ -711,13 +711,21 @@ class ClaudeDesktopMenu:
     def cancel_update(self, _=None):
         if self.busy or self.blocked() or not self.enabled() or self._editing_details or self.confirm is None:
             return
+        from openswap.claude_desktop_update import UnreadableJournal
+        try:
+            self.updater.pending()
+            message = ("OpenSwap stops waiting for the update and reopens the profiles it closed, "
+                       "on the Claude version installed now. Profiles that are still open are left alone. "
+                       "Nothing is force-quit.")
+        except UnreadableJournal:
+            message = ("OpenSwap's update record is damaged. Canceling removes it so profiles can open again. "
+                       "OpenSwap can't tell which profiles were open, so nothing is reopened.")
+        except (ClaudeSwitchError, OSError) as exc:
+            self._error(exc)
+            return
         with self._modal():
-            confirmed = self.confirm(
-                title="Cancel Claude's update?",
-                message=("OpenSwap stops waiting for the update and reopens the profiles it closed, "
-                         "on the Claude version installed now. Profiles that are still open are left alone. "
-                         "Nothing is force-quit."),
-                ok="Cancel update", cancel="Keep update") == 1
+            confirmed = self.confirm(title="Cancel Claude's update?", message=message,
+                                     ok="Cancel update", cancel="Keep update") == 1
         if confirmed and self.enabled() and not self.blocked():
             self._update_work("Canceling Claude's update…", self.updater.cancel)
 
