@@ -1001,6 +1001,10 @@ def _hint_lines(text: str) -> int:
     return max(2, -(-len(text) // _HINT_LINE_CHARS))
 
 
+def _update_label(state: dict, fallback: str) -> str:
+    return fallback if state.get("update_pending") else state.get("update_label") or fallback
+
+
 def _cancel_update_row(state: dict) -> dict:
     return {"kind": "button", "id": "claude_desktop_cancel_update", "label": "Unfinished update",
             "title": "Cancel update…", "disabled": bool(state.get("busy") or state.get("storage_error"))}
@@ -1033,7 +1037,7 @@ def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str]
         if any(p.get("account_action") == "retry_detection" for p in active):
             hint("claude_desktop_detection_hint", "Retry detection to allow Keychain access and show account details. You stay signed in to Claude.")
         rows.append({"kind": "profiles", "id": "claude_desktop_profiles", "items": active, "disabled": disabled})
-    rows.append({"kind": "button", "id": "claude_desktop_update", "label": "Claude Desktop update",
+    rows.append({"kind": "button", "id": "claude_desktop_update", "label": _update_label(state, "Claude Desktop update"),
                  "title": "Resume update…" if state.get("update_pending") else "Update Claude…",
                  "disabled": bool(state.get("busy")) or bool(state.get("storage_error"))})
     if state.get("update_pending"):
@@ -1090,7 +1094,7 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
     rows.append({"kind": "app_check", "id": "claude_desktop_check", "label": message,
                  "title": "Checking…" if state.get("checking") else "Check", "disabled": bool(state.get("checking") or state.get("update_pending")),
                  "lines": _hint_lines(message)})
-    rows.append({"kind": "button", "id": "claude_desktop_update", "label": "Update and restore profiles",
+    rows.append({"kind": "button", "id": "claude_desktop_update", "label": _update_label(state, "Update and restore profiles"),
                  "title": "Resume update…" if state.get("update_pending") else "Update Claude…",
                  "disabled": bool(state.get("busy") or state.get("storage_error"))})
     if state.get("update_pending"):

@@ -11,6 +11,12 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
+## Unreleased
+
+### Improved
+
+- The Claude Desktop update row now shows when Claude has downloaded an update that is ready to install, or that no update is downloaded yet.
+
 ## 0.3.1 (2026-11-05)
 
 ### New

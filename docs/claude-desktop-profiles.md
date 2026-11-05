@@ -312,7 +312,10 @@ open. App updates may still change profile compatibility.
 ### Updating Claude with several profiles open
 
 After Claude has downloaded an update, choose **Update Claude…** in OpenSwap's
-Claude Desktop tab, profile menu, or Desktop settings. Review the profiles that
+Claude Desktop tab, profile menu, or Desktop settings. After a status check, the
+update row in the Claude Desktop tab and Desktop settings shows whether a
+downloaded update is ready to install; this only reads Claude's update record,
+and the downloaded app's signature is verified when you choose Update Claude. Review the profiles that
 will close, finish active work, then choose **Update and reopen**. OpenSwap asks
 each verified Claude process to quit normally; answer any unfinished-work prompt
 inside Claude. It never force-quits a session.

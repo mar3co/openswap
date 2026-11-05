@@ -78,6 +78,7 @@ class ClaudeDesktopMenu:
         self._profile_states = {}
         self._profile_checked_at = {}
         self._checked_at = None
+        self._update_label = None
         self._check_generation = 0
         from openswap.claude_desktop_update import DesktopUpdate
         self.updater = updater or DesktopUpdate(self.store)
@@ -128,6 +129,7 @@ class ClaudeDesktopMenu:
         state = {"checking": self.checking, "busy": self.busy or self.blocked(),
                  "operation": self._operation_label(),
                  "update_pending": self._update_pending(),
+                 "update_label": self._update_label,
                  "app_message": "Checking Claude Desktop…" if self.checking else self._app_message}
         try:
             profiles = self._profiles()
@@ -155,12 +157,18 @@ class ClaudeDesktopMenu:
         self.changed()
 
         def check():
-            app, validated, states = None, False, {}
+            app, validated, states, update_label = None, False, {}, None
             try:
                 app = self._app_factory()
                 info = app.validate()
                 validated = True
                 message = f"Claude {info['version']} · Publisher verified."
+                from openswap.claude_desktop_update import downloaded_update
+                staged = downloaded_update(app, info["version"])
+                if staged:
+                    update_label = f"Claude {staged} is ready to install"
+                elif staged is not None:
+                    update_label = f"Claude {info['version']} · No update downloaded"
             except Exception as exc:
                 message = str(exc) if isinstance(exc, ClaudeSwitchError) else "Could not check Claude Desktop. Try again."
             if app is not None:
@@ -175,12 +183,12 @@ class ClaudeDesktopMenu:
                                 pass  # passive refresh must not interrupt work with dialogs
                 except Exception:
                     states = {}
-            self._checks.put((generation, message, states, datetime.now().strftime("%b %d, %H:%M:%S")))
+            self._checks.put((generation, message, states, update_label, datetime.now().strftime("%b %d, %H:%M:%S")))
 
         try:
             threading.Thread(target=check, daemon=True, name="claude-desktop-check").start()
         except Exception:
-            self._checks.put((generation, "Could not check Claude Desktop. Try again.", {}, None))
+            self._checks.put((generation, "Could not check Claude Desktop. Try again.", {}, None, None))
 
     def _notify(self, title, body):
         try:
@@ -792,12 +800,13 @@ class ClaudeDesktopMenu:
         if self.code and self.code.poll(enabled=self.enabled(), idle=not (self.busy or updating or self.blocked() or self._editing_details) and self.code_login_allowed()):
             self.changed()
         try:
-            generation, message, states, checked_at = self._checks.get_nowait()
+            generation, message, states, update_label, checked_at = self._checks.get_nowait()
         except queue.Empty:
             pass
         else:
             if generation == self._check_generation and self.enabled():
                 self._app_message, self._profile_states, self._checked_at = message, states, checked_at
+                self._update_label = update_label
                 self._profile_checked_at = dict.fromkeys(states, checked_at)
                 self.checking = False
                 self.changed()
