@@ -23,6 +23,10 @@ SHIPIT_ID = cd.BUNDLE_ID + ".ShipIt"
 BLOCKED = "Claude's update is unfinished. Choose Resume update or Cancel update in OpenSwap before opening profiles."
 
 
+class UnreadableJournal(cd.ClaudeDesktopError):
+    pass
+
+
 def version(value):
     if not isinstance(value, str) or not re.fullmatch(r"\d+\.\d+\.\d+", value):
         raise cd.ClaudeDesktopError("Claude reported an unsupported update version.")
@@ -59,7 +63,7 @@ class UpdateJournal:
             version(data["target"])
             return data
         except (ValueError, KeyError, TypeError) as exc:
-            raise cd.ClaudeDesktopError("Claude update recovery data is unreadable. Keep Claude closed and repair desktop-update.json before opening profiles.") from exc
+            raise UnreadableJournal("Claude update recovery data is unreadable. Choose Cancel update in OpenSwap to unblock profiles.") from exc
 
     def write(self, data):
         self.storage.write_json(self.path, data)
@@ -340,7 +344,11 @@ class DesktopUpdate:
         """Stop coordinating and reopen the closed profiles on whatever Claude is installed."""
         with self._worker():
             with self.journal.lock():
-                record = self._owned(self.journal.read())
+                try:
+                    record = self._owned(self.journal.read())
+                except UnreadableJournal:
+                    # The saved profile list is lost: unblock launches but reopen nothing.
+                    record = {"phase": "waiting", "profiles": [], "docked": [], "unreadable": True}
                 if record is None:
                     return {"state": "update_canceled", "failed": [], "dock_warnings": []}
                 if record["phase"] == "waiting" and self.backend.installer_running() and not self.backend.claude_running():
@@ -356,7 +364,7 @@ class DesktopUpdate:
                         launched.append(identifier)
                 except (cd.ClaudeSwitchError, OSError):
                     failed.append(rows[identifier].name)
-            return {"state": "update_canceled", "failed": failed,
+            return {"state": "update_canceled", "failed": failed, "unreadable": record.get("unreadable", False),
                     "dock_warnings": self._reattach(launched, record["docked"], self._old_helpers(launched))}
 
     def _old_helpers(self, identifiers):

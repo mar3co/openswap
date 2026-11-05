@@ -324,7 +324,9 @@ on whichever Claude version is installed; profiles still open are left alone and
 nothing is force-quit. The notification names any profile that didn't reopen.
 While Claude's installer is running with every profile closed, Cancel waits: try
 again in a moment. Cancel is unavailable while OpenSwap is already working on the update,
-and from a profile store other than the one that started the update.
+and from a profile store other than the one that started the update. If the recovery
+record is damaged, launches stay blocked until you choose Cancel update; OpenSwap then
+removes the record but can't tell which profiles were open, so reopen them yourself.
 If Claude replaces the pending download with a newer version, Resume update
 confirms that newer version while preserving the saved profile list.
 

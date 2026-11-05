@@ -811,7 +811,8 @@ class ClaudeDesktopMenu:
             else:
                 title = "Claude update canceled"
                 body = "Profiles can open again." + (
-                    f" These profiles didn't reopen: {', '.join(result['failed'])}." if result["failed"] else "")
+                    f" These profiles didn't reopen: {', '.join(result['failed'])}." if result["failed"] else "") + (
+                    " Reopen your profiles from OpenSwap." if result.get("unreadable") else "")
             if missing:
                 body += f" Dock indicators didn't return for {', '.join(missing)}. Choose Set up Dock shortcuts in their menus."
             self._notify(title, body)

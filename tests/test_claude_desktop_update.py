@@ -567,7 +567,7 @@ def test_cancel_while_profiles_still_run_reopens_only_closed_ones(setup):
     s.backend.targets[s.profiles[1].id].closed = True
     s.backend.helpers.clear()
     result = s.updater.cancel()
-    assert result == {"state": "update_canceled", "failed": [], "dock_warnings": []}
+    assert result == {"state": "update_canceled", "failed": [], "unreadable": False, "dock_warnings": []}
     assert s.backend.restored == [s.profiles[1].id]
     assert s.backend.attached == [s.profiles[1].id]
     assert s.backend.quits == [10]
@@ -669,3 +669,41 @@ def test_ui_cancel_update_requires_confirmation(menu, setup, monkeypatch, answer
         assert menu.notify.call_args.args[0] == "Claude update canceled"
     else:
         menu.notify.assert_not_called()
+
+
+def damage_journal(s):
+    with s.updater.journal.lock():
+        s.updater.journal.path.write_text("{broken")
+        s.updater.journal.path.chmod(0o600)
+
+
+@pytest.mark.parametrize("blocker", ["installer", "coordinator"])
+def test_cancel_keeps_a_damaged_journal_while_refused(setup, blocker):
+    s = setup
+    damage_journal(s)
+    s.backend.targets = {p: Native(1) for p in s.backend.targets}
+    for native in s.backend.targets.values():
+        native.closed = True
+    if blocker == "installer":
+        with pytest.raises(cd.ClaudeDesktopError, match="installing its update"):
+            s.updater.cancel()
+    else:
+        s.backend.installer = False
+        with s.updater.journal.storage.lock("desktop-update-worker.lock"):
+            with pytest.raises(cd.ClaudeDesktopError, match="already working"):
+                s.updater.cancel()
+    assert s.updater.journal.path.read_text() == "{broken"
+    with pytest.raises(cd.ClaudeDesktopError, match="Cancel update"):
+        s.store.open(s.profiles[1].id, app=launcher())
+
+
+def test_cancel_removes_a_damaged_journal_and_reopens_nothing(menu, setup, monkeypatch):
+    s = setup
+    monkeypatch.setattr(menu, "refresh_status", Mock())
+    damage_journal(s)
+    assert {r["id"] for r in claude_desktop_profile_rows(menu.settings_state())} >= {"claude_desktop_cancel_update"}
+    menu.perform("cancel_update")
+    menu.poll()
+    assert not s.updater.journal.path.exists() and not s.backend.restored
+    assert "Reopen your profiles from OpenSwap." in menu.notify.call_args.args[1]
+    assert s.store.open(s.profiles[1].id, app=launcher())["state"] == "launched"
