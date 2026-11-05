@@ -224,7 +224,7 @@ def _remote_tasks_status_copy(
     operation = snapshot.get("operation")
     if not isinstance(operation, str) or operation not in {
         "worker_enable_or_disable", "worker_admission_update", "worker_stop_requested",
-        "worker_account_update", "worker_control_busy", "worker_status_checking",
+        "worker_account_update", "worker_folder_update", "worker_control_busy", "worker_status_checking",
     }:
         operation = None
     notice = snapshot.get("diagnostic_notice")
@@ -559,6 +559,50 @@ def remote_connect_rows(paired: bool, worker_status: dict) -> list[dict]:
     return []
 
 
+REMOTE_NO_FOLDERS = "No folders yet. Tasks need at least one."
+
+
+def remote_folder_rows(worker_status: dict) -> list[dict]:
+    """Settings › Remote › Folders on a paired Mac: each saved folder with Remove, then Add folder….
+
+    ``worker_status["folders"]`` is ``(workspace ID, label)`` pairs read off
+    the UI thread (none until the first read: no rows); ``folder_notice`` is
+    the last folder change's message.
+    """
+    folders = worker_status.get("folders")
+    if not isinstance(folders, list):
+        return []
+    busy = worker_status.get("operation") is not None
+    rows = [{"kind": "group", "section": SETTINGS_SECTION_REMOTE, "id": "remote_tasks_folders", "label": "Folders"}]
+    for workspace_id, label in folders:
+        rows.append({
+            "kind": "button",
+            "section": SETTINGS_SECTION_REMOTE,
+            "id": "remote_tasks_folder_remove",
+            "label": _bounded_text(label),
+            "title": "Remove",
+            "value": _bounded_text(workspace_id, 64),
+            "disabled": busy,
+        })
+    hints = [] if folders else [REMOTE_NO_FOLDERS]
+    notice = _bounded_text(worker_status.get("folder_notice"), 200)
+    if notice:
+        hints.append(notice)
+    for hint in hints:
+        rows.append({"kind": "group", "style": "hint", "section": SETTINGS_SECTION_REMOTE,
+                     "id": "remote_tasks_folders_note", "label": hint, "lines": _hint_lines(hint)})
+    rows.append({
+        "kind": "button",
+        "section": SETTINGS_SECTION_REMOTE,
+        "id": "remote_tasks_folder_add",
+        "label": "A git repo or a folder of repos",
+        "title": "Add folder…",
+        "value": None,
+        "disabled": busy,
+    })
+    return rows
+
+
 def settings_page_rows(
     settings: MenuBarSettings,
     *,
@@ -760,6 +804,9 @@ def settings_page_rows(
             "disabled": _worker_active_job_id(worker_status or {}) is None,
         },
     ]
+    if worker_paired:
+        folders_at = next(i for i, row in enumerate(remote) if row["id"] == "remote_tasks_status")
+        remote[folders_at:folders_at] = remote_folder_rows(worker_status or {})
     remote[1:1] = remote_connect_rows(worker_paired, worker_status or {})
     if worker_paired and not worker_enabled and (
         (worker_status or {}).get("operation") != "worker_enable_or_disable"

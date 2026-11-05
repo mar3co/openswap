@@ -979,29 +979,25 @@ class _Dialogs:
 
 
 def _menu(root, dialogs, *, wait):
-    from tests.menubar_harness import extract_class
+    from tests.menubar_harness import SETUP_METHODS, SetupWindow, extract_class
 
-    app_type = extract_class(menubar.__file__, "MenuBarApp",
-                             {"_run_connect", "_connect_other_server", "_on_setting", "_drain_guided_setup",
-                              "_run_guided_setup"},
-                             {"threading": threading})
+    app_type = extract_class(menubar.__file__, "MenuBarApp", SETUP_METHODS, {"threading": threading})
     app = app_type()
     app.switcher = SimpleNamespace(backup_dir=root)
     app._worker_operation = None
     app._panel = None
     app._alert, app._prompt, app._choose_folder = dialogs.alert, dialogs.prompt, dialogs.choose_folder
     app._wait_dialog = wait
+    app._remote_setup_window = SetupWindow()
     app.refreshed = 0
     app._worker_view_active = lambda: setattr(app, "refreshed", app.refreshed + 1)
     return app
 
 
 def _settle(app):
-    deadline = time.monotonic() + 30
-    while getattr(app, "_guided_setup", None) is not None:
-        assert time.monotonic() < deadline, "connect did not finish"
-        app._drain_guided_setup()
-        time.sleep(0.005)
+    from tests.menubar_harness import settle_setup
+
+    settle_setup(app, timeout=30)
 
 
 @pytest.fixture

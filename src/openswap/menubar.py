@@ -254,6 +254,8 @@ def run(switcher, codex=None) -> int:
             self._worker_result = None
             self._worker_generation = 0
             self._worker_result_lock = threading.Lock()
+            # The Remote tasks setup's window, once opened (``_setup_prompts``).
+            self._remote_setup_window = None
             self._desktop_app = DesktopApp()
             self._claude_desktop_update_pending = False
             self._quit_pending = False
@@ -861,10 +863,18 @@ def run(switcher, codex=None) -> int:
                     policy = load_worker_settings(self.switcher.backup_dir)
                 except Exception:
                     pass
-            snapshot = self._with_account_picker(snapshot)
+            snapshot = self._with_folders(self._with_account_picker(snapshot), policy)
             with self._worker_result_lock:
                 if generation == self._worker_generation:
                     self._worker_result = (generation, snapshot, policy, None)
+
+        def _with_folders(self, snapshot, policy):
+            """Attach the saved folders for Settings › Remote: ``(workspace ID, label)``, never more."""
+            if policy is not None:
+                from openswap.worker.guided_setup import folder_label
+
+                snapshot["folders"] = [(w.workspace_id, folder_label(w)) for w in policy.workspaces]
+            return snapshot
 
         def _with_account_picker(self, snapshot):
             """Attach roster metadata for the Remote tasks account popup.
@@ -883,23 +893,53 @@ def run(switcher, codex=None) -> int:
                 snapshot.pop("account_picker", None)
             return snapshot
 
-        def _run_guided_setup(self):
-            """Set up Remote tasks…: the steps of `openswap worker pair`, in dialogs.
+        def _setup_running(self):
+            """Whether a Remote tasks setup runs already; choosing it again brings its window forward."""
+            ui = getattr(self, "_guided_setup", None)
+            if ui is not None:
+                ui.front()
+            return ui is not None
 
-            Pair from the pasted pairing command when this Mac is not paired,
-            then start the worker, confirm the account, approve a research
-            folder and show the summary, through the same functions as the
+        def _setup_prompts(self, title):
+            """The setup's front end: pairing in dialogs, every later step in the setup window."""
+            from openswap.worker import guided_setup
+            from openswap.worker.setup_window import WindowPrompts
+
+            if self._remote_setup_window is None:
+                from openswap.menubar_wizard import make_setup_wizard
+
+                self._remote_setup_window = make_setup_wizard(self._on_remote_setup_action,
+                                                              "Set Up Remote Tasks")
+            dialogs = guided_setup.DialogPrompts(self._alert, self._prompt, title, wait=self._wait_dialog)
+            return WindowPrompts(dialogs, self._remote_setup_window, self._choose_task_folder)
+
+        def _on_remote_setup_action(self, action):
+            ui = getattr(self, "_guided_setup", None)
+            if ui is not None:
+                ui.answer(action)
+            elif self._remote_setup_window is not None:
+                self._remote_setup_window.close()
+
+        def _choose_task_folder(self):
+            """The native folder chooser for a folder tasks may work in: a path, or None."""
+            return self._choose_folder(title="Add folder",
+                                       message="Choose a git repo, or a folder of repos, for tasks to work in.")
+
+        def _run_guided_setup(self):
+            """Set up Remote tasks…: the steps of `openswap worker pair`, in the setup window.
+
+            Pair from the pasted pairing command (a dialog) when this Mac is not
+            paired, then start the worker, confirm the account, choose the
+            folders and show the summary, through the same functions as the
             CLI. The steps run on a worker thread (pairing, launchctl, locks);
-            ``on_sync_tick`` shows each dialog on the UI thread as it is asked.
+            ``on_sync_tick`` shows each question on the UI thread as it is asked.
             """
-            if self._worker_operation is not None or getattr(self, "_guided_setup", None) is not None:
+            if self._setup_running() or self._worker_operation is not None:
                 return
             from openswap.worker import guided_setup
 
             root = self.switcher.backup_dir
-            ui = guided_setup.ThreadedPrompts(guided_setup.DialogPrompts(
-                self._alert, self._prompt, choose_folder=self._choose_folder,
-            ))
+            ui = self._setup_prompts("Set up Remote tasks")
             self._guided_setup = ui
 
             def steps():
@@ -912,7 +952,7 @@ def run(switcher, codex=None) -> int:
                 except guided_setup.SetupClosed:
                     pass
                 except Exception:
-                    ui.say("Setup stopped unexpectedly. Run `openswap worker setup` in Terminal to finish.")
+                    ui.say("Setup stopped unexpectedly. Choose Set up Remote tasks… again to finish.")
                 finally:
                     try:
                         ui.flush()
@@ -930,15 +970,12 @@ def run(switcher, codex=None) -> int:
             A new pairing then says "Paired with <workspace>" and runs the guided
             setup; a reconnect only says so.
             """
-            if self._worker_operation is not None or getattr(self, "_guided_setup", None) is not None:
+            if self._setup_running() or self._worker_operation is not None:
                 return
             from openswap.worker import connect, guided_setup
 
             root = self.switcher.backup_dir
-            ui = guided_setup.ThreadedPrompts(guided_setup.DialogPrompts(
-                self._alert, self._prompt, guided_setup.CONNECT_TITLE,
-                choose_folder=self._choose_folder, wait=self._wait_dialog,
-            ))
+            ui = self._setup_prompts(guided_setup.CONNECT_TITLE)
             flow = connect.ConnectFlow(root, url, open_browser=connect.open_in_browser)
             self._guided_setup = ui
 
@@ -952,7 +989,7 @@ def run(switcher, codex=None) -> int:
                     pass
                 except Exception:
                     flow.close()
-                    ui.say("Connect stopped unexpectedly. Run `openswap worker connect` in Terminal.")
+                    ui.say("Connect stopped unexpectedly. Choose Connect to OpenTag… again.")
                 finally:
                     try:
                         ui.flush()
@@ -963,7 +1000,7 @@ def run(switcher, codex=None) -> int:
 
         def _connect_other_server(self):
             """Use another server…: the only way to Connect to a backend other than OpenTag."""
-            if self._worker_operation is not None or getattr(self, "_guided_setup", None) is not None:
+            if self._setup_running() or self._worker_operation is not None:
                 return
             response = self._prompt(
                 title="Use another server",
@@ -989,6 +1026,7 @@ def run(switcher, codex=None) -> int:
             ui.serve()
             if ui.finished:
                 self._guided_setup = None
+                self._remote_setup_window.close()
                 self._worker_view_active()
 
         def _worker_action(self, row_id, value):
@@ -1000,11 +1038,14 @@ def run(switcher, codex=None) -> int:
                 "remote_tasks_stop": "worker_stop_requested",
                 "remote_tasks_account": "worker_account_update",
                 "remote_tasks_web_choice": "worker_account_update",
+                "remote_tasks_folder_add": "worker_folder_update",
+                "remote_tasks_folder_remove": "worker_folder_update",
             }.get(row_id)
             if self._worker_operation is None:
                 return
             self._worker_status_cache = dict(self._worker_status_cache)
             self._worker_status_cache["operation"] = self._worker_operation
+            self._worker_status_cache.pop("folder_notice", None)
             self._worker_generation += 1
             generation = self._worker_generation
             threading.Thread(
@@ -1016,6 +1057,7 @@ def run(switcher, codex=None) -> int:
         def _worker_action_worker(self, generation, row_id, value):
             diagnostic = None
             policy = None
+            notice = None
             try:
                 from openswap.settings import load_worker_settings
                 from openswap.worker.cli import (
@@ -1049,6 +1091,14 @@ def run(switcher, codex=None) -> int:
                     diagnostic = self._pin_worker_account(root, value)
                 elif row_id == "remote_tasks_web_choice":
                     diagnostic = self._toggle_web_choice(root, value)
+                elif row_id == "remote_tasks_folder_add":
+                    from openswap.worker.guided_setup import add_folder
+
+                    notice = add_folder(root, value)
+                elif row_id == "remote_tasks_folder_remove":
+                    from openswap.worker.guided_setup import remove_folder
+
+                    notice = remove_folder(root, value)
                 policy = load_worker_settings(root)
                 snapshot = read_status(root)
             except Exception:
@@ -1066,7 +1116,9 @@ def run(switcher, codex=None) -> int:
                     policy = load_worker_settings(self.switcher.backup_dir)
                 except Exception:
                     pass
-            snapshot = self._with_account_picker(snapshot)
+            snapshot = self._with_folders(self._with_account_picker(snapshot), policy)
+            if notice is not None:
+                snapshot["folder_notice"] = notice
             with self._worker_result_lock:
                 if generation == self._worker_generation:
                     self._worker_result = (generation, snapshot, policy, diagnostic)
@@ -1137,7 +1189,11 @@ def run(switcher, codex=None) -> int:
                 return
             self._worker_status_inflight = False
             self._worker_operation = None
+            # A folder change's message stays until the next one, across status refreshes.
+            notice = snapshot.get("folder_notice", self._worker_status_cache.get("folder_notice"))
             self._worker_status_cache = dict(snapshot)
+            if notice is not None:
+                self._worker_status_cache["folder_notice"] = notice
             if policy is not None:
                 self._worker_policy = policy
             self._worker_status_cache.pop("operation", None)
@@ -2236,6 +2292,10 @@ def run(switcher, codex=None) -> int:
                 self._run_connect()
             elif row_id == "remote_tasks_connect_other":
                 self._connect_other_server()
+            elif row_id == "remote_tasks_folder_add":
+                folder = self._choose_task_folder()
+                if folder:
+                    self._worker_action(row_id, str(folder))
             elif row_id == "open_at_login":
                 self._toggle_login_item()
             elif row_id == "open_at_login_failed":
@@ -2251,7 +2311,7 @@ def run(switcher, codex=None) -> int:
                 return
             elif row_id in {
                 "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_stop",
-                "remote_tasks_account", "remote_tasks_web_choice",
+                "remote_tasks_account", "remote_tasks_web_choice", "remote_tasks_folder_remove",
             }:
                 self._worker_action(row_id, value)
             elif row_id == "menu_bar_provider":
