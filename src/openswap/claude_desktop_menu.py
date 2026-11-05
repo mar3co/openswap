@@ -557,8 +557,8 @@ class ClaudeDesktopMenu:
         from openswap.claude_desktop_identity import DetectionError
         paused = self.monitor.detector.denied or PAUSED_STATUS in self.monitor.statuses.values()
         try:
-            self.monitor.detector.retry()
             if paused:
+                self.monitor.detector.retry()
                 self.monitor.refresh()  # Keychain permission is shared by all profiles.
         except (ClaudeSwitchError, OSError) as exc:
             self._error(exc)

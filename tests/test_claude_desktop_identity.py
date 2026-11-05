@@ -348,8 +348,11 @@ def test_detect_rescans_every_profile_only_when_permission_was_paused(controller
     if paused == "status":
         controller.monitor.statuses[other.id] = "Keychain access needed"
     controller.monitor.poll = Mock(return_value=False)
+    generation = controller.monitor.detector._generation
     controller.perform("retry_detection", p.id)
     assert (other.id in controller.monitor._records) == (paused == "no")
+    # An unpaused Detect must not invalidate a background read already in flight.
+    assert (controller.monitor.detector._generation == generation) == (paused == "no")
 
 
 def test_unreadable_key_is_reported_without_a_permission_prompt(controller):
