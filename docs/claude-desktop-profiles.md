@@ -315,12 +315,12 @@ After Claude has downloaded an update, choose **Update Claude…** in OpenSwap's
 Claude Desktop tab, profile menu, or Desktop settings. The update row in the
 Claude Desktop tab and Desktop settings shows whether a downloaded update is
 ready to install, rechecked about every minute and when you open the panel
-(paused after a failed status check until one passes). This only reads Claude's
-version and update records; the downloaded app's signature is verified when you
-choose Update Claude. Review the profiles that will close, finish active work,
-then choose **Update and reopen**. OpenSwap asks
-each verified Claude process to quit normally; answer any unfinished-work prompt
-inside Claude. It never force-quits a session.
+(paused after a failed status check until one passes, or until Desktop features
+are turned off and on). This only reads Claude's version and update records; the
+downloaded app's signature is verified when you choose Update Claude. Review the
+profiles that will close, finish active work, then choose **Update and reopen**.
+OpenSwap asks each verified Claude process to quit normally; answer any
+unfinished-work prompt inside Claude. It never force-quits a session.
 
 All profiles share one Claude.app. Claude's updater waits for every instance to
 exit. OpenSwap remembers the open profiles before requesting any quit, prevents
