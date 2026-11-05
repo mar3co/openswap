@@ -68,8 +68,10 @@ OPENSWAP_DEV_ENTRY=/absolute/path/to/local-preview.py \
   --workpath /tmp/openswap-dev-build packaging/macos/openswap.spec
 ```
 
-The optional runner uses the DEV bundle identifier; the appearance policy and
-Info.plist settings remain shared. The runner controls any DEV label or startup
+The optional runner uses the DEV bundle identifier, the name "OpenSwap DEV" and
+the app icon with an orange DEV banner (`dev_icon.py`), so it is easy to tell
+apart in Finder, the Dock and dialogs. The appearance policy and other Info.plist
+settings remain shared. The runner controls any other DEV label or startup
 behavior. `build.sh` always uses the release entry point, even if
 `OPENSWAP_DEV_ENTRY` is set. Building does not launch or install either app.
 Running the source directly under Python cannot guarantee the same appearance:
