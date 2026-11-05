@@ -28,7 +28,29 @@ def extract_class(source_path, class_name, names, scope):
 # What the Remote tasks setup needs lifted from ``MenuBarApp`` (pairing dialogs, then the setup window).
 SETUP_METHODS = {"_run_guided_setup", "_run_connect", "_connect_other_server", "_on_setting",
                  "_drain_guided_setup", "_setup_running", "_setup_prompts", "_on_remote_setup_action",
-                 "_choose_task_folder"}
+                 "_choose_task_folder", "_worker_busy", "_remote_settings_note", "_reload_remote_settings",
+                 "_setup_changing_folders"}
+
+
+def setup_app(root, window, **attrs):
+    """A ``MenuBarApp`` with ``SETUP_METHODS`` on ``root`` and the setup ``window``; ``refreshed`` counts refreshes."""
+    import threading
+    from types import SimpleNamespace
+
+    from openswap import menubar
+
+    app = extract_class(menubar.__file__, "MenuBarApp", SETUP_METHODS, {"threading": threading})()
+    app.switcher = SimpleNamespace(backup_dir=root)
+    app._worker_operation = None
+    app._worker_status_cache = {}
+    app._panel = None
+    app._remote_folders_locked = False
+    app._remote_setup_window = window
+    app.refreshed = 0
+    app._worker_view_active = lambda: setattr(app, "refreshed", app.refreshed + 1)
+    for name, value in attrs.items():
+        setattr(app, name, value)
+    return app
 
 
 class SetupWindow:
@@ -41,6 +63,7 @@ class SetupWindow:
         self.fresh = False
         self.visible = False
         self.closed = 0
+        self.alerts = []
 
     def show(self, page):
         self.pages.append(page)
@@ -53,6 +76,10 @@ class SetupWindow:
     def close(self):
         self.visible = False
         self.closed += 1
+
+    def alert(self, **kwargs):
+        """The dialogs' final alert, for lines left when no page can show them."""
+        self.alerts.append(kwargs["message"])
 
 
 def settle_setup(app, timeout=20):

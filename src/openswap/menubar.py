@@ -256,6 +256,8 @@ def run(switcher, codex=None) -> int:
             self._worker_result_lock = threading.Lock()
             # The Remote tasks setup's window, once opened (``_setup_prompts``).
             self._remote_setup_window = None
+            # Whether Settings › Remote last drew its folder buttons waiting on that setup.
+            self._remote_folders_locked = False
             self._desktop_app = DesktopApp()
             self._claude_desktop_update_pending = False
             self._quit_pending = False
@@ -894,11 +896,49 @@ def run(switcher, codex=None) -> int:
             return snapshot
 
         def _setup_running(self):
-            """Whether a Remote tasks setup runs already; choosing it again brings its window forward."""
+            """Whether a Remote tasks setup runs already; choosing it again brings its window forward.
+
+            Once its window is closed the run only finishes a change: Settings › Remote says so.
+            """
             ui = getattr(self, "_guided_setup", None)
-            if ui is not None:
-                ui.front()
+            if ui is not None and not ui.front():
+                self._remote_settings_note("Setup is finishing a change…")
             return ui is not None
+
+        def _worker_busy(self):
+            """Whether a Settings › Remote worker change is still running; if so, Settings says so."""
+            if self._worker_operation is None:
+                return False
+            from openswap.worker.cli import BUSY_MESSAGE
+
+            self._remote_settings_note(BUSY_MESSAGE)
+            return True
+
+        def _remote_settings_note(self, text):
+            """A line at the top of Settings › Remote until the next worker status read."""
+            self._worker_status_cache = {**self._worker_status_cache, "setup_note": text}
+            self._reload_remote_settings()
+
+        def _reload_remote_settings(self):
+            panel = self._panel
+            if (
+                panel is not None
+                and panel.is_shown()
+                and getattr(panel, "_page", None) == SETTINGS_PAGE
+                and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_REMOTE
+            ):
+                panel.reload()
+
+        def _setup_changing_folders(self):
+            """Whether the setup window's folder step may write the folders it read."""
+            ui = getattr(self, "_guided_setup", None)
+            return ui is not None and ui.folders_locked
+
+        def _remote_status(self):
+            """The worker snapshot Settings › Remote draws, with the setup window's folder lock."""
+            if self._setup_changing_folders():
+                return {**self._worker_status_cache, "setup_changing_folders": True}
+            return self._worker_status_cache
 
         def _setup_prompts(self, title):
             """The setup's front end: pairing in dialogs, every later step in the setup window."""
@@ -934,7 +974,7 @@ def run(switcher, codex=None) -> int:
             CLI. The steps run on a worker thread (pairing, launchctl, locks);
             ``on_sync_tick`` shows each question on the UI thread as it is asked.
             """
-            if self._setup_running() or self._worker_operation is not None:
+            if self._setup_running() or self._worker_busy():
                 return
             from openswap.worker import guided_setup
 
@@ -970,7 +1010,7 @@ def run(switcher, codex=None) -> int:
             A new pairing then says "Paired with <workspace>" and runs the guided
             setup; a reconnect only says so.
             """
-            if self._setup_running() or self._worker_operation is not None:
+            if self._setup_running() or self._worker_busy():
                 return
             from openswap.worker import connect, guided_setup
 
@@ -1000,7 +1040,7 @@ def run(switcher, codex=None) -> int:
 
         def _connect_other_server(self):
             """Use another server…: the only way to Connect to a backend other than OpenTag."""
-            if self._setup_running() or self._worker_operation is not None:
+            if self._setup_running() or self._worker_busy():
                 return
             response = self._prompt(
                 title="Use another server",
@@ -1024,6 +1064,9 @@ def run(switcher, codex=None) -> int:
             if ui is None:
                 return
             ui.serve()
+            if ui.folders_locked != self._remote_folders_locked:
+                self._remote_folders_locked = ui.folders_locked
+                self._reload_remote_settings()
             if ui.finished:
                 self._guided_setup = None
                 self._remote_setup_window.close()
@@ -1046,6 +1089,7 @@ def run(switcher, codex=None) -> int:
             self._worker_status_cache = dict(self._worker_status_cache)
             self._worker_status_cache["operation"] = self._worker_operation
             self._worker_status_cache.pop("folder_notice", None)
+            self._worker_status_cache.pop("folder_baseline", None)
             self._worker_generation += 1
             generation = self._worker_generation
             threading.Thread(
@@ -1117,6 +1161,9 @@ def run(switcher, codex=None) -> int:
                 except Exception:
                     pass
             snapshot = self._with_folders(self._with_account_picker(snapshot), policy)
+            if row_id in ("remote_tasks_folder_add", "remote_tasks_folder_remove"):
+                # Changed, but unreadable now: no list, not even the last one.
+                snapshot.setdefault("folders", None)
             if notice is not None:
                 snapshot["folder_notice"] = notice
             with self._worker_result_lock:
@@ -1189,23 +1236,24 @@ def run(switcher, codex=None) -> int:
                 return
             self._worker_status_inflight = False
             self._worker_operation = None
-            # A folder change's message stays until the next one, across status refreshes.
-            notice = snapshot.get("folder_notice", self._worker_status_cache.get("folder_notice"))
-            self._worker_status_cache = dict(snapshot)
-            if notice is not None:
-                self._worker_status_cache["folder_notice"] = notice
+            previous, cache = self._worker_status_cache, dict(snapshot)
+            self._worker_status_cache = cache
+            if "folders" not in cache and "folders" in previous:
+                # The settings couldn't be read: the last folders read stay.
+                cache["folders"] = previous["folders"]
+            if "folder_notice" in cache:
+                cache["folder_baseline"] = cache.get("folders")
+            elif "folder_notice" in previous:
+                # A folder change's message stays until a refresh reads a different folder list.
+                baseline, folders = previous.get("folder_baseline"), cache.get("folders")
+                if not isinstance(baseline, list) or not isinstance(folders, list) or folders == baseline:
+                    cache["folder_notice"] = previous["folder_notice"]
+                    cache["folder_baseline"] = baseline if isinstance(baseline, list) else folders
             if policy is not None:
                 self._worker_policy = policy
-            self._worker_status_cache.pop("operation", None)
-            self._worker_status_cache["diagnostic_notice"] = diagnostic
-            panel = self._panel
-            if (
-                panel is not None
-                and panel.is_shown()
-                and getattr(panel, "_page", None) == SETTINGS_PAGE
-                and getattr(panel, "_settings_section", None) == SETTINGS_SECTION_REMOTE
-            ):
-                panel.reload()
+            cache.pop("operation", None)
+            cache["diagnostic_notice"] = diagnostic
+            self._reload_remote_settings()
 
         def _stop_codex_engine(self):
             with self._event_lock:
@@ -1723,7 +1771,7 @@ def run(switcher, codex=None) -> int:
                 on_add_token=self._add_token,
                 worker_enabled=lambda: self._worker_policy.enabled,
                 worker_paused=lambda: self._worker_policy.paused,
-                worker_status=lambda: self._worker_status_cache,
+                worker_status=self._remote_status,
                 on_worker_view_active=self._worker_view_active,
                 worker_paired=lambda: self._worker_policy.control_service_url is not None,
                 login_item=self._login_item_state,
@@ -2286,6 +2334,9 @@ def run(switcher, codex=None) -> int:
                 return
             if row_id == "remote_tasks_web_choice" and not value:
                 return  # the summary item: nothing to toggle
+            if row_id in ("remote_tasks_folder_add", "remote_tasks_folder_remove") and self._setup_changing_folders():
+                self._reload_remote_settings()
+                return
             if row_id == "remote_tasks_setup":
                 self._run_guided_setup()
             elif row_id in ("remote_tasks_connect", "remote_tasks_reconnect"):

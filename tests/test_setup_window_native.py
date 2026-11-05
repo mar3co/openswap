@@ -57,10 +57,19 @@ def test_folder_rows_are_checkboxes_with_their_note_and_add_folder():
     assert add.title() == "Add folder…" and add.frame().origin.y < surface.footer_y
 
 
-def test_a_busy_page_disables_every_button():
+def test_a_busy_page_disables_every_button_but_close_setup():
     page = {**window_page(0, "confirm", (guided_setup.WORKER_OFFER,), {}, []), "busy": True}
+    _wizard, surface, actions = _drawn(page)
+    enabled = [b for b in _buttons(surface) if b.isEnabled()]
+    assert len(_buttons(surface)) > 1 and [b.title() for b in enabled] == ["Close Setup"]
+    enabled[0].performClick_(None)
+    assert actions == ["close"]
+
+
+def test_a_held_page_at_the_summary_step_draws():
+    page = window_page(3, "hold", (), {}, [guided_setup.SUMMARY_FAILED])
     _wizard, surface, _actions = _drawn(page)
-    assert _buttons(surface) and not any(b.isEnabled() for b in _buttons(surface))
+    assert any(getattr(b, "wizard_action", None) == "continue" for b in _buttons(surface))
 
 
 def test_the_done_checklist_marks_each_row():

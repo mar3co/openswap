@@ -170,9 +170,11 @@ class SetupWizard:
         window.setFrame_display_animate_(new, True, self._placed and window.isVisible())
         primary = getattr(surface, "primary", None)
         if page.get("busy"):
-            # Answered: the app is working until its next page, so nothing here acts twice.
+            # Answered: the app is working until its next page, so nothing here acts twice;
+            # the leading button (Close Setup) still closes the window.
+            keep = (page.get("leading") or {}).get("action")
             for view in surface.subviews():
-                if isinstance(view, NSButton):
+                if isinstance(view, NSButton) and (keep is None or getattr(view, "wizard_action", None) != keep):
                     view.setEnabled_(False)
             primary = None
         if primary is not None:

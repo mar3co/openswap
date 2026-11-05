@@ -10,6 +10,8 @@ so. No AppKit here.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from openswap import printer
 from openswap.setup_wizard import ACTION_CLOSE
 from openswap.worker import cli, guided_setup
@@ -22,7 +24,6 @@ ACTION_NO = "no"
 ACTION_DONE = "done"
 ACTION_ADD_FOLDER = "add_folder"
 
-STEP_TITLES = ("Start the worker", "Choose the account for tasks", "Choose folders for tasks")
 WORKER_BODY = "The worker runs in the background on this Mac and starts the tasks you send it from OpenTag."
 FOLDERS_BODY = ("Tasks can only work in these folders, each in its own copy (a git worktree) so your "
                 "files aren't touched, except folders that work in the folder itself.")
@@ -31,6 +32,10 @@ SIGN_IN_NOTE = ("A shell command in a Claude task can read or replace that accou
                 "(macOS can't run Claude Code's sandbox inside OpenSwap's).")
 SET_UP = "Remote tasks are set up"
 ALMOST = "Almost done"
+# One per ``guided_setup.STEPS``: the summary's only held page is its failure.
+STEP_TITLES = ("Start the worker", "Choose the account for tasks", "Choose folders for tasks", ALMOST)
+PAGE_FAILED = (f"{printer.MARK_BAD} Setup stopped: its window couldn't show the next step. "
+               "Try again from Settings → Remote.")
 
 # The questions that draw a window page; the rest (pairing) stay dialogs.
 _PAGES = frozenset({"confirm", "pick", "check_folders", "done", "hold"})
@@ -95,11 +100,10 @@ def window_page(step: int, call: str, args: tuple, view: dict, notes) -> dict:
 def _worker_row(state: Readiness) -> tuple[bool | None, str]:
     if guided_setup.settling(state):
         return None, "connecting…"
-    if state.worker == "running" and state.paused:
-        return False, "paused"
     if state.worker == "running":
         return {"revoked": (False, "removed in OpenTag"),
-                "expired": (False, "pairing expired")}.get(state.connection, (True, "running"))
+                "expired": (False, "pairing expired")}.get(
+            state.connection, (False, "paused") if state.paused else (True, "running"))
     return False, "on but not running" if state.worker == "stopped" else "off"
 
 
@@ -162,9 +166,11 @@ class WindowPrompts(ThreadedPrompts):
     thread), which redraws in place for a selection and wakes the worker
     thread for a finishing button. Lines said during a step are shown on its
     page; a step that ends with a line to read (a failure, or the folder
-    results) holds its page with Continue before the next step.
+    results) holds its page with Continue before the next step. A page that
+    can't be drawn ends the run, and what is left to say shows in a dialog.
     ``choose_folder()`` opens the native folder chooser (UI thread) and
-    returns a path or None.
+    returns a path or None. ``folders_locked`` is True while the folder step
+    may write the folders it read (Settings' folder buttons wait).
     """
 
     gui = True
@@ -178,6 +184,9 @@ class WindowPrompts(ThreadedPrompts):
         self._asked: str | None = None
         self._skipped = False
         self._closed = False
+        self._failed = False
+        self._paged = False
+        self.folders_locked = False
         self._showing: dict | None = None
         self._view: dict = {}
         self._last: dict | None = None
@@ -191,8 +200,8 @@ class WindowPrompts(ThreadedPrompts):
         self._hold()
         step = next(index for index, (_name, header, _next) in enumerate(guided_setup.STEPS) if header == title)
         with self._lock:
-            if self._step is not None:
-                self._notes = []  # the first page keeps what pairing said
+            if self._paged:
+                self._notes = []  # the first page drawn keeps what pairing said
             self._step, self._asked, self._skipped = step, None, False
 
     def confirm(self, question: str, *, default: bool = True) -> bool | None:
@@ -207,12 +216,21 @@ class WindowPrompts(ThreadedPrompts):
     def done(self, state: Readiness) -> None:
         self._call("done", state)
 
+    @contextmanager
+    def changing_folders(self):
+        self.folders_locked = True
+        try:
+            yield
+        finally:
+            self.folders_locked = False
+
     def flush(self) -> None:
-        if self._step is None:
+        """At the end: what is left to say, on a page to dismiss (in a dialog before any step or after a failed page)."""
+        if self._step is None or self._failed:
             super().flush()
             return
         try:
-            self._hold()
+            self._hold(always=True)
         except SetupClosed:
             pass
 
@@ -235,14 +253,18 @@ class WindowPrompts(ThreadedPrompts):
             return super()._call(name, *args, **kwargs)
         finally:
             with self._lock:
-                self._notes = []
+                if not self._failed:
+                    self._notes = []
 
-    def _hold(self) -> None:
-        """Before the next step: show what the last one said, unless the owner skipped it."""
+    def _hold(self, *, always: bool = False) -> None:
+        """Before the next step: show what the last one said, unless the owner skipped it.
+
+        ``always`` (the end of the run): show any line left, skipped or not.
+        """
         with self._lock:
-            read = self._step is not None and self._notes and not self._skipped and not self._closed and (
-                self._asked == "check_folders"
-                or any(not line.startswith(printer.MARK_OK) for line in self._notes))
+            read = self._step is not None and self._notes and not self._closed and (always or (
+                not self._skipped and (self._asked == "check_folders"
+                                       or any(not line.startswith(printer.MARK_OK) for line in self._notes))))
         if read:
             self._call("hold")
 
@@ -257,7 +279,7 @@ class WindowPrompts(ThreadedPrompts):
         if request is None:
             super().serve()
             return
-        if self._closed:
+        if self._closed or self._failed:
             request["closed"] = True
             request["done"].set()
             return
@@ -265,7 +287,9 @@ class WindowPrompts(ThreadedPrompts):
         self._showing = request
         self._view = {"selected": kwargs.get("default"), "added": [],
                       "checked": list(args[1]) if name == "check_folders" else []}
-        self._draw(self._window.show)
+        if self._draw(self._window.show):
+            with self._lock:
+                self._paged = True
 
     def _page(self) -> dict:
         name, args, _kwargs = self._showing["call"]
@@ -275,9 +299,25 @@ class WindowPrompts(ThreadedPrompts):
             notes, step = list(self._notes), self._step
         return window_page(step, name, args, self._view, notes)
 
-    def _draw(self, draw, **extra) -> None:
-        self._last = {**self._page(), **extra}
-        draw(self._last)
+    def _draw(self, draw, **extra) -> bool:
+        """Draw the page shown; a failure ends the run (``_fail``) instead of leaving its question waiting."""
+        try:
+            self._last = {**self._page(), **extra}
+            draw(self._last)
+        except Exception:
+            self._fail()
+            return False
+        return True
+
+    def _fail(self) -> None:
+        self._failed = True
+        request, self._showing = self._showing, None
+        with self._lock:
+            self._notes.append(PAGE_FAILED)
+        if request is not None:
+            request["closed"] = True
+            request["done"].set()
+        self._window.close()
 
     def answer(self, action: str) -> None:
         """A window button (``ACTION_*``, ``select:<row>``, ``toggle:<row>``)."""
@@ -305,9 +345,9 @@ class WindowPrompts(ThreadedPrompts):
                 return
             if name == "done":
                 self._window.close()
-            else:
-                # Until the next page: the step works (a write may take a moment).
-                self._draw(self._window.render, busy=True)
+            # Until the next page: the step works (a write may take a moment).
+            elif not self._draw(self._window.render, busy=True):
+                return
             self._showing = None
             self._skipped = action in (ACTION_SKIP, ACTION_NO)
             request["result"] = result
@@ -328,7 +368,13 @@ class WindowPrompts(ThreadedPrompts):
             request["closed"] = True
             request["done"].set()
 
-    def front(self) -> None:
-        """Set up chosen again while this run is open: bring its window forward."""
-        if not self._closed and self._last is not None:
+    def front(self) -> bool:
+        """Set up chosen again while this run is open: bring its window forward.
+
+        False once the window is closed and the run only finishes a change.
+        """
+        if self._closed or self._failed:
+            return False
+        if self._last is not None:
             self._window.show(self._last)
+        return True

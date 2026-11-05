@@ -2630,14 +2630,16 @@ class MenuBarPanel:
             elif kind == "button":
                 title = row.get("title") or "Action"
                 button_w = max(70.0, _button_width(title, font_small))
-                content.addSubview_(
-                    _label(
-                        row.get("label") or "",
-                        font_body,
-                        pal["fg"],
-                        NSMakeRect(PAD, y + 5, inner_w - button_w - 8, 20),
-                    )
+                label = _label(
+                    row.get("label") or "",
+                    font_body,
+                    pal["fg"],
+                    NSMakeRect(PAD, y + 5, inner_w - button_w - 8, 20),
                 )
+                if row.get("full_label"):
+                    label.setToolTip_(row["full_label"])
+                    label.setAccessibilityLabel_(row["full_label"])
+                content.addSubview_(label)
                 button = self._add_button(
                     content,
                     title,

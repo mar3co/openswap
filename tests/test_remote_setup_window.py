@@ -19,18 +19,19 @@ from openswap.settings import WorkerSettings, configure_worker_service, load_wor
 from openswap.worker import cli, guided_setup, setup_window
 from openswap.worker.guided_setup import Readiness, SetupClosed
 from openswap.worker.setup_window import WindowPrompts, done_page, window_page
-from tests.menubar_harness import SETUP_METHODS, SetupWindow, extract_class, settle_setup
+from tests.menubar_harness import SetupWindow, extract_class, settle_setup, setup_app
 from tests.test_worker_accounts import ALICE, root  # noqa: F401 (fixture)
 from tests.test_worker_guided_setup import URL, _code, _repo, enable_calls, research_home  # noqa: F401 (fixtures)
 
 
 def _drive(root, answers, *, chosen=(), steps=guided_setup.run):
     """Run ``steps`` on a worker thread through the window, clicking ``answers`` page by page."""
-    window = SetupWindow(answers)
+    window = answers if isinstance(answers, SetupWindow) else SetupWindow(answers)
     picks = list(chosen)
-    ui = WindowPrompts(guided_setup.DialogPrompts(lambda **_k: 0, lambda **_k: None), window,
+    ui = WindowPrompts(guided_setup.DialogPrompts(window.alert, lambda **_k: None), window,
                        lambda: picks.pop(0) if picks else None)
     ui.settle_wait_s = 0
+    window.ui = ui
 
     def run():
         try:
@@ -148,6 +149,17 @@ def test_the_done_page_names_refused_folders_and_the_claude_sign_in_note():
     assert "`" not in " ".join(lines)
 
 
+@pytest.mark.parametrize("connection, worker", [("revoked", "removed in OpenTag"), ("expired", "pairing expired")])
+def test_a_lost_pairing_shows_on_the_worker_row_ahead_of_paused(connection, worker):
+    page = done_page(_state(paused=True, connection=connection))
+    assert page["rows"][0]["items"][0] == ("Worker", worker, False)
+
+
+def test_a_held_page_at_the_summary_step_has_a_title():
+    page = window_page(3, "hold", (), {}, [guided_setup.SUMMARY_FAILED])
+    assert page["title"] == setup_window.ALMOST and page["progress"] == (4, 4)
+
+
 # --- copy: the CLI keeps its commands, the window names Settings controls ------------------------
 
 
@@ -220,6 +232,59 @@ def test_a_refused_start_stays_on_the_worker_page_without_a_command(root, monkey
     (line,) = _notes(held)
     assert line.startswith("Could not start the worker: another one started from Terminal is running")
     assert line.endswith(guided_setup.SETTINGS_NEXT[guided_setup.START_WORKER_NEXT])
+
+
+RESTART = "Turn Enable local worker off and on in Settings → Remote to restart it."
+
+
+def test_a_failed_restart_of_a_stopped_worker_points_to_the_switch(root, worker_on, monkeypatch):
+    worker_on("stopped")
+
+    def refuse(_root):
+        raise cli.ClaudeSwitchError("worker_stop_unconfirmed")
+
+    monkeypatch.setattr(cli, "enable_worker", refuse)
+    (line,) = _notes(_drive(root, ["yes", "continue", "skip", "skip", "done"]).shown[1])
+    assert line.endswith(f"(worker_stop_unconfirmed). {RESTART}") and guided_setup.SETTINGS_NEXT[guided_setup.START_WORKER_NEXT] not in line
+
+
+def test_a_worker_from_terminal_blocking_a_restart_says_only_that(root, worker_on, monkeypatch):
+    worker_on("stopped")
+
+    def refuse(_root):
+        raise cli.ClaudeSwitchError("worker_running_unmanaged")
+
+    monkeypatch.setattr(cli, "enable_worker", refuse)
+    assert _notes(_drive(root, ["yes", "continue", "skip", "skip", "done"]).shown[1]) == [
+        "Could not start the worker: another one started from Terminal is running (worker_running_unmanaged)."]
+
+
+def test_an_unreadable_worker_status_says_so_and_offers_start(root, monkeypatch, enable_calls):
+    update_worker_settings(root, enabled=True)
+
+    def unreadable(_root):
+        raise OSError("health")
+
+    monkeypatch.setattr(cli, "read_status", unreadable)
+    page = _drive(root, ["yes", "skip", "skip", "done"]).shown[0]
+    assert _notes(page) == [guided_setup.WORKER_UNREADABLE] and page["primary"]["title"] == "Start worker"
+    assert enable_calls == [root]
+
+
+@pytest.mark.parametrize("status", [{"process_state": "stopped"}, OSError("health")])
+def test_skipping_the_start_of_an_enabled_worker_points_to_the_switch(root, monkeypatch, status):
+    update_worker_settings(root, enabled=True)
+
+    def read(_root):
+        if isinstance(status, Exception):
+            raise status
+        return status
+
+    monkeypatch.setattr(cli, "read_status", read)
+    lines = []
+    guided_setup.offer_worker(root, SimpleNamespace(gui=True, interactive=True, say=lines.append,
+                                                    confirm=lambda *_a, **_k: None))
+    assert lines[-1] == f"Not started. {RESTART}"
 
 
 def test_the_page_is_disabled_while_its_answer_runs(root, enable_calls):
@@ -335,6 +400,91 @@ def test_a_checked_repo_inside_an_unchecked_folder_of_repos_stays_allowed(root, 
     assert [w.work_root.name for w in workspaces] == ["Notes", "app"]
 
 
+def test_a_checked_repo_inside_an_unchecked_read_only_folder_is_added_after_it(root, research_home, enable_calls):
+    home = research_home.parent
+    app = _repo(_code(home, "GitHub/app"))
+    cli.add_readable_folder(root, home / "GitHub")
+    cli.add_work_folder(root, _repo(_code(home, "Notes")))
+    # Rows: ~/GitHub (read only) ✓, ~/Notes ✓; uncheck ~/GitHub, add ~/GitHub/app.
+    window = _drive(root, ["skip", "skip", ["toggle:0", "add_folder", "continue"], "continue", "done"],
+                    chosen=[str(app)])
+    assert [w.work_root.name for w in load_worker_settings(root).workspaces] == ["Notes", "app"]
+    assert _notes(window.shown[3]) == ["✓ Removed ~/GitHub (read only) (its files are kept).", "✓ ~/GitHub/app (app)"]
+
+
+def test_switching_the_only_read_only_folder_to_a_repo_in_it_says_how(root, research_home, enable_calls):
+    home = research_home.parent
+    app = _repo(_code(home, "GitHub/app"))
+    cli.add_readable_folder(root, home / "GitHub")
+    window = _drive(root, ["skip", "skip", ["toggle:0", "add_folder", "continue"], "continue", "done"],
+                    chosen=[str(app)])
+    assert _notes(window.shown[3]) == [
+        "To switch to ~/GitHub/app, add another folder first, then remove ~/GitHub (read only)."]
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github"]
+
+
+def test_the_only_folder_of_repos_kept_still_says_why(root, research_home, enable_calls):
+    home = research_home.parent
+    _repo(_code(home, "Code/app"))
+    cli.add_work_folder(root, home / "Code")
+    window = _drive(root, ["skip", "skip", ["toggle:0", "add_folder", "continue"], "continue", "done"],
+                    chosen=[str(home / "Code" / "app")])
+    lines = _notes(window.shown[3])
+    assert lines[-1] == f"✗ ~/Code: {cli._WORKSPACE_MESSAGES['last_workspace']}" and len(lines) == 2
+
+
+class _LockWindow(SetupWindow):
+    """Records whether Settings' folder buttons wait, for each page shown and each folder write."""
+
+    def __init__(self, answers):
+        super().__init__(answers)
+        self.locks = []
+
+    def show(self, page):
+        self.locks.append((page["title"], self.ui.folders_locked))
+        super().show(page)
+
+
+def test_settings_folders_wait_only_while_the_folder_step_may_write(root, research_home, monkeypatch, enable_calls):
+    _folders(root, research_home, "GitHub", "Code", saved=("GitHub",))
+    window = _LockWindow(["skip", "skip", ["toggle:1", "continue"], "continue", "done"])
+    add = cli.add_work_folder
+    monkeypatch.setattr(cli, "add_work_folder",
+                        lambda r, f, **k: window.locks.append(("add", window.ui.folders_locked)) or add(r, f, **k))
+    _drive(root, window)
+    assert window.locks == [("Start the worker", False), ("Choose the account for tasks", False),
+                            ("Choose folders for tasks", True), ("add", True), ("Choose folders for tasks", False),
+                            (setup_window.ALMOST, False)]
+
+
+def test_a_skipped_folder_step_frees_the_settings_folders(root, research_home, enable_calls):
+    _folders(root, research_home, "GitHub", saved=("GitHub",))
+    window = _drive(root, _LockWindow(["skip", "skip", "skip", "done"]))
+    assert window.locks[2:] == [("Choose folders for tasks", True), (setup_window.ALMOST, False)]
+    assert window.ui.folders_locked is False
+
+
+def test_a_busy_worker_lock_on_a_folder_add_says_try_again(root, research_home, monkeypatch, enable_calls):
+    _folders(root, research_home, "GitHub", "Code", saved=("GitHub",))
+
+    def busy(*_args, **_kwargs):
+        raise cli.ClaudeSwitchError("worker_lifecycle_busy")
+
+    monkeypatch.setattr(cli, "add_work_folder", busy)
+    window = _drive(root, ["skip", "skip", ["toggle:1", "continue"], "continue", "done"])
+    assert _notes(window.shown[3]) == [f"~/Code: {cli.BUSY_MESSAGE}"]
+
+
+def test_the_terminal_keeps_its_line_when_a_folder_add_fails(root, monkeypatch):
+    def busy(*_args, **_kwargs):
+        raise cli.ClaudeSwitchError("worker_lifecycle_busy")
+
+    monkeypatch.setattr(cli, "add_work_folder", busy)
+    lines = []
+    guided_setup._add_folders(root, SimpleNamespace(say=lines.append), ["Code"])
+    assert lines == [f"Code: {cli._WORKSPACE_MESSAGES['settings_unavailable']}"]
+
+
 # --- the summary and closing ----------------------------------------------------------------------
 
 
@@ -377,16 +527,59 @@ def test_closing_answers_the_waiting_question_and_every_later_one_as_close_setup
     assert outcome == ["closed", "closed"] and len(window.shown) == 2
 
 
+def test_pairing_lines_show_on_the_first_page_drawn(root, worker_on, enable_calls):
+    worker_on("running")
+
+    def steps(backup_root, ui):
+        ui.say("✓ Paired this Mac (worker-1).")
+        guided_setup.run(backup_root, ui)
+
+    account = _drive(root, ["skip", "skip", "done"], steps=steps).shown[0]
+    assert account["title"] == "Choose the account for tasks"
+    assert _notes(account) == ["✓ Paired this Mac (worker-1).", "✓ Worker running."]
+
+
+def test_a_failed_summary_is_shown_before_the_window_closes(root, monkeypatch, enable_calls):
+    def unreadable(_root):
+        raise OSError("settings")
+
+    monkeypatch.setattr(guided_setup, "readiness", unreadable)
+    window = _drive(root, ["skip", "skip", "skip", "continue"])
+    last = window.shown[-1]
+    assert last["title"] == setup_window.ALMOST and _notes(last) == [guided_setup.SUMMARY_FAILED]
+
+
+class _BrokenOnce(SetupWindow):
+    """A window whose first page can't be shown."""
+
+    broken = True
+
+    def show(self, page):
+        if self.broken:
+            self.broken = False
+            raise RuntimeError("no window")
+        super().show(page)
+
+
+def test_a_page_that_cannot_show_ends_the_run_with_its_lines_in_a_dialog(root, enable_calls):
+    window = _drive(root, _BrokenOnce([]))
+    assert window.alerts == [setup_window.PAGE_FAILED] and window.shown == [] and window.closed >= 1
+
+
+def test_closing_while_a_folder_write_runs_lets_it_finish(root, research_home, monkeypatch, enable_calls):
+    _folders(root, research_home, "GitHub", "Code", saved=("GitHub",))
+    window = SetupWindow(["skip", "skip", ["toggle:1", "continue"]])
+    add = cli.add_work_folder
+    monkeypatch.setattr(cli, "add_work_folder", lambda r, f, **k: window.ui.answer("close") or add(r, f, **k))
+    _drive(root, window)
+    busy = [page for page in window.pages if page.get("busy")][-1]
+    assert busy["title"] == "Choose folders for tasks" and busy["leading"]["action"] == "close"
+    assert len(window.shown) == 3 and not window.visible and window.alerts == []
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github", "code"]
+
+
 def _menu(root, window):
-    app = extract_class(menubar.__file__, "MenuBarApp", SETUP_METHODS, {"threading": threading})()
-    app.switcher = SimpleNamespace(backup_dir=root)
-    app._worker_operation = None
-    app._panel = None
-    app._alert = app._prompt = app._choose_folder = app._wait_dialog = None
-    app._remote_setup_window = window
-    app.refreshed = 0
-    app._worker_view_active = lambda: setattr(app, "refreshed", app.refreshed + 1)
-    return app
+    return setup_app(root, window, _alert=window.alert, _prompt=None, _choose_folder=None, _wait_dialog=None)
 
 
 def test_choosing_setup_again_brings_the_running_one_forward(root, enable_calls):
@@ -404,6 +597,39 @@ def test_choosing_setup_again_brings_the_running_one_forward(root, enable_calls)
     window.shown[1:] = []
     settle_setup(app)
     assert app.refreshed == 1
+
+
+def test_setup_chosen_again_after_a_page_failed_runs(root, enable_calls):
+    configure_worker_service(root, URL, "worker-1")
+    window = _BrokenOnce(["skip", "skip", "skip", "done"])
+    app = _menu(root, window)
+    app._on_setting("remote_tasks_setup", None)
+    settle_setup(app)
+    assert window.alerts == [setup_window.PAGE_FAILED] and app.refreshed == 1
+    app._on_setting("remote_tasks_setup", None)
+    settle_setup(app)
+    assert [page["title"] for page in window.shown] == [
+        "Start the worker", "Choose the account for tasks", "Choose folders for tasks", setup_window.ALMOST]
+
+
+def test_setup_chosen_while_a_closed_run_finishes_a_change_says_so(root):
+    app = _menu(root, SetupWindow())
+    ui = WindowPrompts(guided_setup.DialogPrompts(None, None), app._remote_setup_window, lambda: None)
+    ui.close()
+    app._guided_setup = ui
+    app._on_setting("remote_tasks_setup", None)
+    assert app._guided_setup is ui and app._worker_status_cache["setup_note"] == "Setup is finishing a change…"
+
+
+@pytest.mark.parametrize("row_id", ["remote_tasks_setup", "remote_tasks_connect", "remote_tasks_connect_other"])
+def test_setup_chosen_while_a_settings_change_runs_says_so(root, row_id):
+    app = _menu(root, SetupWindow())
+    app._worker_operation = "worker_folder_update"
+    app._on_setting(row_id, None)
+    assert getattr(app, "_guided_setup", None) is None
+    assert app._worker_status_cache["setup_note"] == cli.BUSY_MESSAGE
+    rows = _remote(paired=False, **app._worker_status_cache)
+    assert rows[1]["id"] == "remote_tasks_setup_note" and rows[1]["label"] == cli.BUSY_MESSAGE
 
 
 # --- Settings › Remote › Folders ------------------------------------------------------------------
@@ -440,6 +666,30 @@ def test_settings_shows_no_folders_before_pairing_or_before_the_first_read():
         assert not any(row["id"].startswith("remote_tasks_folder") for row in rows)
 
 
+def test_settings_folders_wait_while_the_setup_window_changes_them():
+    rows = _remote(folders=[("github", "~/GitHub")], setup_changing_folders=True)
+    (hint,) = [row for row in rows if row["id"] == "remote_tasks_folders_note"]
+    assert hint["label"] == menubar.REMOTE_SETUP_CHANGING_FOLDERS
+    assert all(row["disabled"] for row in rows if row["id"] in ("remote_tasks_folder_remove",
+                                                                "remote_tasks_folder_add"))
+
+
+def test_settings_says_when_the_folder_list_cannot_be_read():
+    rows = _remote(folders=None, folder_notice="That folder was already removed.")
+    assert [row["label"] for row in rows if row["id"] == "remote_tasks_folders_note"] == [
+        menubar.REMOTE_FOLDERS_UNREADABLE, "That folder was already removed."]
+    assert "remote_tasks_folder_remove" not in [row["id"] for row in rows]
+    assert next(row for row in rows if row["id"] == "remote_tasks_folder_add")["disabled"] is False
+
+
+def test_a_long_folder_label_keeps_its_end_and_its_full_text():
+    full = "~/" + "/".join(["a-rather-long-folder-name"] * 4) + " (read only)"
+    (remove,) = [row for row in _remote(folders=[("site", full)]) if row["id"] == "remote_tasks_folder_remove"]
+    assert remove["full_label"] == full and len(remove["label"]) <= menubar.REMOTE_FOLDER_LABEL_CHARS
+    assert remove["label"].startswith("~/a-rather") and remove["label"].endswith("name (read only)")
+    assert "…" in remove["label"]
+
+
 def test_settings_shows_the_last_folder_message_and_disables_while_busy():
     rows = _remote(folders=[("github", "~/GitHub")], folder_notice="That folder was already removed.",
                    operation="worker_folder_update")
@@ -452,7 +702,8 @@ def test_settings_shows_the_last_folder_message_and_disables_while_busy():
 def _settings_app(root):
     app = extract_class(menubar.__file__, "MenuBarApp",
                         {"_worker_action", "_worker_action_worker", "_with_account_picker", "_with_folders",
-                         "_drain_worker_result", "_on_setting", "_choose_task_folder"},
+                         "_drain_worker_result", "_on_setting", "_choose_task_folder", "_reload_remote_settings",
+                         "_setup_changing_folders", "_remote_status"},
                         {"threading": threading})()
     app.switcher = SimpleNamespace(backup_dir=root)
     app._worker_generation = 0
@@ -534,3 +785,68 @@ def test_settings_remove_of_a_folder_already_gone_refreshes_the_list(root, resea
 def test_settings_cancelled_chooser_changes_nothing(root, settings_app):
     settings_app._on_setting("remote_tasks_folder_add", None)
     assert settings_app._worker_operation is None
+
+
+def test_settings_folder_buttons_write_nothing_while_the_setup_window_changes_folders(root, research_home,
+                                                                                      settings_app):
+    _folders(root, research_home, "GitHub", "Notes", saved=("GitHub", "Notes"))
+    settings_app._guided_setup = SimpleNamespace(folders_locked=True)
+    settings_app.picked = [str(research_home.parent / "Notes")]
+    settings_app._on_setting("remote_tasks_folder_remove", "github")
+    settings_app._on_setting("remote_tasks_folder_add", None)
+    assert settings_app._worker_operation is None and settings_app.picked
+    assert [w.workspace_id for w in load_worker_settings(root).workspaces] == ["github", "notes"]
+    assert settings_app._remote_status()["setup_changing_folders"] is True
+
+
+@pytest.mark.parametrize("row_id, value", [("remote_tasks_folder_add", None), ("remote_tasks_folder_remove", "github")])
+def test_settings_folder_change_during_another_worker_change_says_try_again(root, research_home, settings_app,
+                                                                            monkeypatch, row_id, value):
+    made = _folders(root, research_home, "GitHub", "Notes", saved=("GitHub",))
+
+    def busy(*_args, **_kwargs):
+        raise cli.ClaudeSwitchError("worker_lifecycle_busy")
+
+    monkeypatch.setattr(cli, "add_work_folder", busy)
+    monkeypatch.setattr(cli, "remove_worker_workspace", busy)
+    settings_app.picked = [str(made["Notes"])]
+    assert _settings(settings_app, row_id, value)["folder_notice"] == cli.BUSY_MESSAGE
+
+
+def _poll(app, **snapshot):
+    """A status read draining (``folders`` absent: the settings couldn't be read)."""
+    app._worker_result = (app._worker_generation, {"process_state": "stopped", **snapshot}, None, None)
+    app._drain_worker_result()
+    return app._worker_status_cache
+
+
+def test_a_folder_message_goes_once_a_refresh_reads_another_folder_list(root, research_home, settings_app):
+    _folders(root, research_home, "GitHub", "Notes", saved=("GitHub", "Notes"))
+    cli.remove_worker_workspace(root, "notes")
+    status = _settings(settings_app, "remote_tasks_folder_remove", "notes")
+    assert status["folder_notice"] == "That folder was already removed."
+    assert _poll(settings_app)["folder_notice"] == "That folder was already removed."
+    assert _poll(settings_app, folders=[("github", "~/GitHub")])["folder_notice"] == "That folder was already removed."
+    status = _poll(settings_app, folders=[("github", "~/GitHub"), ("code", "~/Code")])
+    assert "folder_notice" not in status
+
+
+def test_a_folder_message_stays_through_an_unreadable_reread(root, research_home, settings_app, monkeypatch):
+    _folders(root, research_home, "GitHub", saved=("GitHub",))
+    import openswap.settings
+
+    def unreadable(_root):
+        raise OSError("settings")
+
+    monkeypatch.setattr(openswap.settings, "load_worker_settings", unreadable)
+    status = _settings(settings_app, "remote_tasks_folder_remove", "gone")
+    assert status["folders"] is None and status["folder_notice"] == "That folder was already removed."
+    status = _poll(settings_app, folders=[("github", "~/GitHub")])
+    assert status["folder_notice"] == "That folder was already removed."
+    assert "folder_notice" not in _poll(settings_app, folders=[])
+
+
+def test_a_status_read_without_the_settings_keeps_the_last_folders(root, research_home, settings_app):
+    _folders(root, research_home, "GitHub", saved=("GitHub",))
+    _settings(settings_app, "remote_tasks_folder_remove", "gone")
+    assert _poll(settings_app)["folders"] == [("github", "~/GitHub")]

@@ -50,8 +50,10 @@ class Prompts(Protocol):
     #
     # The setup window adds ``gui = True`` (lines name the Settings → Remote
     # control that does a thing, never a command), ``check_folders(options,
-    # checked)`` (see ``choose_folders``) and ``done(state)`` (the final
-    # checklist, from a ``Readiness``).
+    # checked)`` (see ``choose_folders``), ``changing_folders()`` (a context
+    # manager around the folder step, from reading the saved folders until
+    # its changes are written) and ``done(state)`` (the final checklist, from
+    # a ``Readiness``).
 
 
 def _section(ui, title: str) -> None:
@@ -188,6 +190,8 @@ WORKER_ONLINE = f"{printer.MARK_OK} Worker started. This Mac shows online in abo
 WORKER_STOPPED = f"{printer.MARK_BAD} The worker is on but not running."
 WORKER_PAUSED = ("The worker is running but paused, so it takes no new tasks. "
                  "Turn off Pause admission in Settings → Remote to resume.")
+WORKER_UNREADABLE = f"{printer.MARK_BAD} Couldn't read the worker's status."
+WORKER_RESTART = "turn Enable local worker off and on in Settings → Remote to restart it"
 # The setup window's words for `enable` refusals whose message names a command.
 _SETTINGS_ENABLE_MESSAGES = {
     "worker_running_unmanaged": "Could not start the worker: another one started from Terminal is running.",
@@ -211,24 +215,28 @@ def offer_worker(root: Path, ui: Prompts) -> None:
     """
     cli = _cli()
     policy = load_worker_settings(root)
+    later = _next(ui, START_WORKER_NEXT)
+    restart = False
     if policy.enabled is True:
+        unreadable = False
         try:
             process = cli.read_status(root).get("process_state")
         except Exception:
-            process = None
+            process, unreadable = None, True
         if process in _RUNNING_STATES:
             ui.say(WORKER_PAUSED if _gui(ui) and policy.paused is True else f"{printer.MARK_OK} Worker running.")
             return
         if not _gui(ui):
             ui.say("The worker is on but not running. Next: `openswap worker enable`.")
             return
-        # The window offers to start it again (`enable` is idempotent).
-        ui.say(WORKER_STOPPED)
+        # The window offers to start it again (`enable` is idempotent); Settings' switch is already on.
+        ui.say(WORKER_UNREADABLE if unreadable else WORKER_STOPPED)
+        restart, later = True, f"{WORKER_RESTART[0].upper()}{WORKER_RESTART[1:]}."
     if not ui.interactive:
         ui.say(START_WORKER_NEXT)
         return
     if ui.confirm(WORKER_OFFER) is not True:
-        ui.say(f"Not started. {_next(ui, START_WORKER_NEXT)}")
+        ui.say(f"Not started. {later}")
         return
     try:
         cli.enable_worker(root)
@@ -239,9 +247,10 @@ def offer_worker(root: Path, ui: Prompts) -> None:
             message = _SETTINGS_ENABLE_MESSAGES.get(code, message)
         if code in cli._ENABLE_DIAGNOSTICS:
             message = f"{message.rstrip('.')} ({code})."
-        ui.say(f"{message} {_next(ui, START_WORKER_NEXT)}")
+        # Restarting can't help while a worker from Terminal runs.
+        ui.say(message if restart and code == "worker_running_unmanaged" else f"{message} {later}")
     except Exception:
-        ui.say(f"Could not start the worker. {_next(ui, START_WORKER_NEXT)}")
+        ui.say(f"Could not start the worker. {later}")
     else:
         ui.say(WORKER_ONLINE)
 
@@ -570,11 +579,12 @@ def choose_folders(root: Path, ui: Prompts) -> None:
     setup window (``check_folders``) shows saved and found folders as
     checkboxes instead (see ``apply_folders``).
     """
+    if getattr(ui, "check_folders", None) is not None:
+        with ui.changing_folders():
+            _check_folders(root, ui, load_worker_settings(root).workspaces)
+        return
     policy = load_worker_settings(root)
     current = _readable(policy.workspaces)
-    if getattr(ui, "check_folders", None) is not None:
-        _check_folders(root, ui, policy.workspaces)
-        return
     if not ui.interactive:
         if current:
             _say_folders(ui, _picked(root, policy.workspaces))
@@ -666,34 +676,69 @@ def apply_folders(root: Path, ui, rows: list[FolderRow], answer) -> None:
 
     ``answer`` holds the checked row indexes and the paths added with Add
     folder…. Adds run before removes, so the last folder is never removed
-    first; a checked repo inside an unchecked folder of repos is added after
-    that folder is removed (until then the folder already allows it).
+    first; a checked repo inside an unchecked folder (of repos, or one tasks
+    only read) is added after that folder is removed, since until then the
+    folder allows it already or blocks it.
     """
     picked = {item for item in answer if isinstance(item, int)}
     adds = [rows[i].folder for i in sorted(picked) if rows[i].workspace is None]
     adds += [item for item in answer if isinstance(item, str)]
     removes = [row.workspace for i, row in enumerate(rows) if row.workspace is not None and i not in picked]
-    parents = [w.work_root for w in removes if getattr(w, "repos", False) and w.work_root is not None]
-    after = [folder for folder in adds if any(pathid.inside(folder, parent) for parent in parents)]
+
+    def within(folder, workspace) -> bool:
+        return any(pathid.inside(folder, source) for source in _folder_of(workspace))
+
+    after = [folder for folder in adds if any(within(folder, w) for w in removes)]
     _add_folders(root, ui, [folder for folder in adds if folder not in after])
+    last = None  # the only saved folder, kept: its line waits on the adds inside it
     for workspace in removes:
-        reason = remove_folder(root, workspace.workspace_id)
+        refused = _remove(root, workspace.workspace_id)
         shown = folder_label(workspace)
-        ui.say(f"{printer.MARK_OK} Removed {shown} (its files are kept)." if reason is None
-               else f"{printer.MARK_BAD} {shown}: {reason}")
-    _add_folders(root, ui, after)
+        if refused is None:
+            ui.say(f"{printer.MARK_OK} Removed {shown} (its files are kept).")
+        elif refused[0] == "last_workspace":
+            last = (workspace, f"{printer.MARK_BAD} {shown}: {refused[1]}")
+        else:
+            ui.say(f"{printer.MARK_BAD} {shown}: {refused[1]}")
+    switched = []
+
+    def switch(folder, code) -> bool:
+        # Neither refusal alone says what to do: the kept folder blocks the repo, and is the last one.
+        if last is None or code != "work_overlaps_readable" or not within(folder, last[0]):
+            return False
+        ui.say(f"To switch to {_display_path(Path(folder))}, add another folder first, "
+               f"then remove {folder_label(last[0])}.")
+        switched.append(folder)
+        return True
+
+    _add_folders(root, ui, after, refused=switch)
+    if last is not None and not switched:
+        ui.say(last[1])
 
 
-def remove_folder(root: Path, workspace_id: str) -> str | None:
-    """Remove a saved folder with `worker workspace remove`'s function; the window's reason if refused."""
+def _write_failure(exc: Exception) -> str:
+    """The window's and Settings' line for a folder change that failed without a refusal code."""
+    if isinstance(exc, ClaudeSwitchError) and str(exc) == "worker_lifecycle_busy":
+        return _cli().BUSY_MESSAGE
+    return workspace_message("settings_unavailable", gui=True)
+
+
+def _remove(root: Path, workspace_id: str) -> tuple[str | None, str] | None:
+    """Remove a saved folder with `worker workspace remove`'s function: None, or (code, the window's reason)."""
     cli = _cli()
     try:
         cli.remove_worker_workspace(root, workspace_id)
     except cli.WorkspaceError as exc:
-        return workspace_message(exc.code, gui=True)
-    except Exception:
-        return workspace_message("settings_unavailable", gui=True)
+        return exc.code, workspace_message(exc.code, gui=True)
+    except Exception as exc:
+        return None, _write_failure(exc)
     return None
+
+
+def remove_folder(root: Path, workspace_id: str) -> str | None:
+    """Remove a saved folder (Settings → Remote); the window's reason if refused."""
+    refused = _remove(root, workspace_id)
+    return None if refused is None else refused[1]
 
 
 def add_folder(root: Path, folder) -> str | None:
@@ -706,8 +751,8 @@ def add_folder(root: Path, folder) -> str | None:
         result = cli.add_work_folder(root, folder)
     except cli.WorkspaceError as exc:
         return workspace_message(exc.code, gui=True)
-    except Exception:
-        return workspace_message("settings_unavailable", gui=True)
+    except Exception as exc:
+        return _write_failure(exc)
     if result.added:
         return f'"{cli.DEFAULT_RESEARCH_ID}" stays until its running task ends.' if result.kept_builtin else None
     added = result.workspace.work_root
@@ -756,8 +801,11 @@ def _search_folders(root: Path, ui, has_current: bool) -> None:
             question = "Add another (Enter to finish)"
 
 
-def _add_folders(root: Path, ui, folders) -> bool:
-    """Add each folder as one where sessions work and say what happened; whether any was."""
+def _add_folders(root: Path, ui, folders, *, refused=None) -> bool:
+    """Add each folder as one where sessions work and say what happened; whether any was.
+
+    ``refused(folder, code)`` may say a refusal's line itself (True) instead.
+    """
     cli = _cli()
     any_ok = False
     for folder in folders:
@@ -765,10 +813,11 @@ def _add_folders(root: Path, ui, folders) -> bool:
         try:
             result = cli.add_work_folder(root, folder)
         except cli.WorkspaceError as exc:
-            ui.say(f"{shown}: {workspace_message(exc.code, gui=_gui(ui))}")
+            if refused is None or not refused(folder, exc.code):
+                ui.say(f"{shown}: {workspace_message(exc.code, gui=_gui(ui))}")
             continue
-        except Exception:
-            ui.say(f"{shown}: {workspace_message('settings_unavailable', gui=_gui(ui))}")
+        except Exception as exc:
+            ui.say(f"{shown}: {_write_failure(exc) if _gui(ui) else workspace_message('settings_unavailable')}")
             continue
         any_ok = True
         workspace = result.workspace
@@ -842,7 +891,7 @@ class Readiness:
         if self.worker == "starting":
             out.append(wait)
         elif self.worker == "stopped" and gui:
-            out.append("turn Enable local worker off and on in Settings → Remote to restart it")
+            out.append(WORKER_RESTART)
         elif self.worker != "running":
             out.append("turn on Enable local worker in Settings → Remote" if gui
                        else "`openswap worker enable` to start the worker")
@@ -1038,13 +1087,14 @@ def checklist(state: Readiness) -> list[str]:
 
 
 # Steps run in order (looked up by name), each with its header and the line
-# shown if it fails unexpectedly.
+# shown if it fails unexpectedly (the setup window's for the summary: ``SUMMARY_FAILED``).
 STEPS = (
     ("offer_worker", "Step 1 of 4 · Worker", START_WORKER_NEXT),
     ("confirm_account", "Step 2 of 4 · Account", ACCOUNT_NEXT),
     ("choose_folders", "Step 3 of 4 · Folders", FOLDER_NEXT),
     ("summary", "Step 4 of 4 · Summary", None),
 )
+SUMMARY_FAILED = f"{printer.MARK_BAD} Couldn't check what is set up. See Status in Settings → Remote."
 
 
 def run(root: Path, ui: Prompts) -> None:
@@ -1056,6 +1106,8 @@ def run(root: Path, ui: Prompts) -> None:
         except Exception:
             if fallback is not None:
                 ui.say(_next(ui, fallback))
+            elif _gui(ui):
+                ui.say(SUMMARY_FAILED)
 
 
 class SetupClosed(BaseException):

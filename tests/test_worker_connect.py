@@ -979,19 +979,10 @@ class _Dialogs:
 
 
 def _menu(root, dialogs, *, wait):
-    from tests.menubar_harness import SETUP_METHODS, SetupWindow, extract_class
+    from tests.menubar_harness import SetupWindow, setup_app
 
-    app_type = extract_class(menubar.__file__, "MenuBarApp", SETUP_METHODS, {"threading": threading})
-    app = app_type()
-    app.switcher = SimpleNamespace(backup_dir=root)
-    app._worker_operation = None
-    app._panel = None
-    app._alert, app._prompt, app._choose_folder = dialogs.alert, dialogs.prompt, dialogs.choose_folder
-    app._wait_dialog = wait
-    app._remote_setup_window = SetupWindow()
-    app.refreshed = 0
-    app._worker_view_active = lambda: setattr(app, "refreshed", app.refreshed + 1)
-    return app
+    return setup_app(root, SetupWindow(), _alert=dialogs.alert, _prompt=dialogs.prompt,
+                     _choose_folder=dialogs.choose_folder, _wait_dialog=wait)
 
 
 def _settle(app):
