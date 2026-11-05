@@ -446,9 +446,22 @@ def test_failed_app_check_has_no_update_label(menu, monkeypatch):
     assert menu.settings_state()["update_label"] is None
 
 
+def test_unverified_app_gets_no_label_between_checks(passive):
+    p = passive
+    p.app.validate.side_effect = cd.ClaudeDesktopError("Reinstall the official app.")
+    p.app.profile_states.return_value = {}
+    p.menu.refresh_status()
+    p.menu.poll()
+    p.now[0] += 61
+    p.menu.poll()
+    p.menu.poll()
+    p.downloaded.assert_not_called()
+    assert p.menu.settings_state()["update_label"] is None
+
+
 def test_stale_check_cannot_set_update_label(menu):
     menu._label_checked_at = menu.clock()
-    menu._checks.put((menu._check_generation - 1, "Old result", {}, "Claude 4.1.0 is ready to install", "old"))
+    menu._checks.put((menu._check_generation - 1, "Old result", {}, "Claude 4.1.0 is ready to install", "old", True))
     menu._labels.put((menu._check_generation - 1, "Claude 4.1.0 is ready to install"))
     menu.poll()
     menu.poll()
@@ -476,6 +489,7 @@ def passive(menu, monkeypatch):
     app = launcher()
     app.bundle_info.return_value = {"CFBundleShortVersionString": "4.4212.0"}
     menu._app_factory = lambda: app
+    menu._verified = True
     return SimpleNamespace(menu=menu, now=now, downloaded=downloaded, app=app)
 
 

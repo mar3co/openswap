@@ -754,11 +754,11 @@ def test_disabling_discards_inflight_check_and_cannot_overwrite_new_check(menu, 
     old_generation = menu._check_generation
     menu.suspend_checks()
     menu.refresh_status()
-    menu._checks.put((old_generation, 'Old result', {}, None, 'old'))
+    menu._checks.put((old_generation, 'Old result', {}, None, 'old', True))
     menu.poll()
     assert menu.checking
     assert menu.settings_state()['app_message'] == 'Checking Claude Desktop…'
-    menu._checks.put((menu._check_generation, 'Current result', {}, None, 'now'))
+    menu._checks.put((menu._check_generation, 'Current result', {}, None, 'now', True))
     menu.poll()
     assert not menu.checking
     assert menu.settings_state()['app_message'] == 'Current result'

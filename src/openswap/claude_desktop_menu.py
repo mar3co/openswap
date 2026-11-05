@@ -92,6 +92,7 @@ class ClaudeDesktopMenu:
         self._profile_checked_at = {}
         self._checked_at = None
         self._update_label = None
+        self._verified = False
         self._labels = queue.SimpleQueue()
         self._label_checked_at = None
         self.clock = time.monotonic
@@ -109,7 +110,7 @@ class ClaudeDesktopMenu:
     def suspend_checks(self):
         self._check_generation += 1
         self.checking = False
-        self._update_label = None
+        self._update_label, self._verified = None, False
         self._signin = None
         self.monitor.suspend()
         if self.code:
@@ -197,15 +198,16 @@ class ClaudeDesktopMenu:
                                 pass  # passive refresh must not interrupt work with dialogs
                 except Exception:
                     states = {}
-            self._checks.put((generation, message, states, update, datetime.now().strftime("%b %d, %H:%M:%S")))
+            self._checks.put((generation, message, states, update, datetime.now().strftime("%b %d, %H:%M:%S"), validated))
 
         try:
             threading.Thread(target=check, daemon=True, name="claude-desktop-check").start()
         except Exception:
-            self._checks.put((generation, "Could not check Claude Desktop. Try again.", {}, None, None))
+            self._checks.put((generation, "Could not check Claude Desktop. Try again.", {}, None, None, False))
 
-    def _refresh_update_label(self, max_age):
-        if (self.busy or self.checking or self.blocked() or not self.enabled() or self._update_pending()
+    def _refresh_update_label(self, max_age, pending=None):
+        if (not self._verified or self.busy or self.checking or self.blocked() or not self.enabled()
+                or (self._update_pending() if pending is None else pending)
                 or self._label_checked_at is not None and self.clock() - self._label_checked_at < max_age):
             return
         self._label_checked_at = self.clock()
@@ -823,8 +825,8 @@ class ClaudeDesktopMenu:
                 progress=lambda message: self._results.put(({"state": "update_progress", "message": message}, None))))
 
     def poll(self):
-        self._refresh_update_label(60)
         updating = self._update_pending()
+        self._refresh_update_label(60, updating)
         if updating != self._update_observed:
             self._update_observed = updating
             self.changed()
@@ -843,13 +845,13 @@ class ClaudeDesktopMenu:
                 self._update_label = label
                 self.changed()
         try:
-            generation, message, states, update, checked_at = self._checks.get_nowait()
+            generation, message, states, update, checked_at, verified = self._checks.get_nowait()
         except queue.Empty:
             pass
         else:
             if generation == self._check_generation and self.enabled():
                 self._app_message, self._profile_states, self._checked_at = message, states, checked_at
-                self._update_label = update
+                self._update_label, self._verified = update, verified
                 self._profile_checked_at = dict.fromkeys(states, checked_at)
                 self.checking = False
                 self.changed()
