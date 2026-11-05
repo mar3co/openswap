@@ -2192,8 +2192,8 @@ def claude_login_timed_out_message(slot_name: str) -> str:
 
 def claude_add_opened_message() -> str:
     return (
-        "Sign in to Claude Code in the browser window that opened. "
-        "OpenSwap adds the account when you're done."
+        "Your saved accounts stay in OpenSwap. Use the browser window that "
+        "opened to sign in to another account and make it active in Claude Code."
     )
 
 
@@ -2206,20 +2206,48 @@ def notification_copy_for_claude_added(name: str, *, existed: bool) -> Notificat
     return NotificationCopy(title=f"{name} added", body="Claude Code is using it now.")
 
 
-def claude_add_unsaved_live_message(email: str) -> str:
+def claude_add_unsaved_live_message(
+    email: str, org_uuid: str, saved_orgs: dict[str, str], *, incomplete: bool = False
+) -> str:
+    """``saved_orgs`` is ``saved_organizations(email)``: lowercased UUID to name."""
+    org_uuid = (org_uuid or "").lower()
+    others = sorted(
+        name or ("an unnamed organization" if uuid else "a personal account")
+        for uuid, name in saved_orgs.items()
+        if uuid != org_uuid
+    )
+    if incomplete:
+        current = (
+            f"OpenSwap couldn't confirm that the current Claude Code login for "
+            f"{email} is saved, because some saved logins couldn't be read."
+        )
+    elif org_uuid in saved_orgs:
+        current = (
+            f"OpenSwap has {email} saved, but its saved copy is older than "
+            "Claude Code's current login."
+        )
+    elif others:
+        current = (
+            f"{email} is saved for {', '.join(others)}, but Claude Code "
+            "currently names a different organization. OpenSwap couldn't "
+            "match the current login to a saved copy."
+        )
+    else:
+        current = f"The current Claude Code login for {email} isn't saved in OpenSwap."
     return (
-        f"Claude Code is signed in as {email}, which OpenSwap hasn't saved. "
-        "Signing in to another account signs it out. To keep it, cancel and "
-        "save it first (Save current login, or More › Add account › From "
-        "current login)."
+        f"Your existing saved accounts stay in OpenSwap.\n\n{current}\n\n"
+        "Adding another account changes Claude Code's active login. To keep "
+        "the current login too, cancel and choose Save current login first. "
+        "Otherwise, you may need to sign in again to return to it."
     )
 
 
 def claude_add_backup_failed_message(error: str) -> str:
     return (
-        "OpenSwap couldn't save Claude Code's current login before signing in "
-        f"to another account ({error}). If you continue, that account may need "
-        "to sign in again later."
+        "Your existing saved accounts stay in OpenSwap. OpenSwap couldn't "
+        "save the latest version of Claude Code's current login. If you "
+        "continue, you may need to sign in again when switching back.\n\n"
+        f"Details: {error}"
     )
 
 

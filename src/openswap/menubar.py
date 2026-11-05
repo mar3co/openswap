@@ -3360,6 +3360,8 @@ def run(switcher, codex=None) -> int:
 
             Claude Code may have rotated its refresh token since the slot's
             backup was written, and the sign-in overwrites the only current copy.
+            An unrecognized config may still use an already-saved credential;
+            recognize that copy without capturing under the wrong identity.
             The read is strict: a torn config must not pass for "logged out".
             """
             from openswap.worker.leases import AccountLeaseError
@@ -3368,8 +3370,14 @@ def run(switcher, codex=None) -> int:
                 live = self.switcher._get_current_identity_triple(strict=True)
                 if live is None:
                     return True
-                if self.switcher.current_account_number() is None:
-                    message = claude_add_unsaved_live_message(live[0])
+                if self.switcher.account_number_for(live[0], live[1]) is None:
+                    saved = self.switcher.current_login_is_saved()
+                    if saved:
+                        return True
+                    message = claude_add_unsaved_live_message(
+                        live[0], live[1], self.switcher.saved_organizations(live[0]),
+                        incomplete=saved is None,
+                    )
                 else:
                     self.switcher.add_account(slot=None)
                     return True
@@ -3389,8 +3397,8 @@ def run(switcher, codex=None) -> int:
                 self.switcher._logger.warning("claude add: backup failed: %s", e)
                 message = claude_add_backup_failed_message(str(e))
             return self._alert(
-                title="Sign out of Claude Code's current login?", message=message,
-                ok="Continue", cancel="Cancel",
+                title="Add another Claude Code account?", message=message,
+                ok="Continue to sign in", cancel="Cancel",
             ) == 1
 
         def _claude_bin(self) -> str | None:
