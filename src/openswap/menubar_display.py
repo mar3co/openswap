@@ -1001,6 +1001,11 @@ def _hint_lines(text: str) -> int:
     return max(2, -(-len(text) // _HINT_LINE_CHARS))
 
 
+def _cancel_update_row(state: dict) -> dict:
+    return {"kind": "button", "id": "claude_desktop_cancel_update", "label": "Unfinished update",
+            "title": "Cancel update…", "disabled": bool(state.get("busy") or state.get("storage_error"))}
+
+
 def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str] | None = None) -> list[dict]:
     """Everyday profile actions for the main Claude Desktop tab."""
     state = state or {}
@@ -1029,8 +1034,10 @@ def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str]
     rows.append({"kind": "button", "id": "claude_desktop_update", "label": "Claude Desktop update",
                  "title": "Resume update…" if state.get("update_pending") else "Update Claude…",
                  "disabled": bool(state.get("busy")) or bool(state.get("storage_error"))})
+    if state.get("update_pending"):
+        rows.append(_cancel_update_row(state))
     if state.get("update_pending") and not state.get("busy"):
-        hint("claude_desktop_update_pending", "An update is unfinished. Resume it to restore your profiles and Dock indicators.")
+        hint("claude_desktop_update_pending", "An update is unfinished. Resume it to restore your profiles and Dock indicators, or cancel it.")
     elif disabled:
         hint("claude_desktop_operation", state.get("operation") or "Working on profile…")
     if archived:
@@ -1082,9 +1089,11 @@ def claude_desktop_settings_rows(state: dict | None = None, *, expanded: set[str
                  "lines": _hint_lines(message)})
     rows.append({"kind": "button", "id": "claude_desktop_update", "label": "Update and restore profiles",
                  "title": "Resume update…" if state.get("update_pending") else "Update Claude…",
-                 "disabled": bool(state.get("busy"))})
+                 "disabled": bool(state.get("busy") or state.get("storage_error"))})
+    if state.get("update_pending"):
+        rows.append(_cancel_update_row(state))
     if state.get("update_pending") or state.get("busy"):
-        hint("claude_desktop_update_status", state.get("operation") if state.get("busy") else "Resume the unfinished update to restore profiles and Dock indicators.")
+        hint("claude_desktop_update_status", state.get("operation") if state.get("busy") else "Resume the unfinished update to restore profiles and Dock indicators, or cancel it.")
     rows.append({"kind": "button", "id": "claude_desktop_guide", "label": "Profiles and Dock icons",
                  "title": "Show guide", "disabled": bool(state.get("busy"))})
     rows.append({"kind": "disclosure", "id": "claude_desktop_help", "label": "About profiles",

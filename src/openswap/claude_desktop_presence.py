@@ -51,9 +51,12 @@ def attach_presence(store, identifier: str, *, directory=None, creator=None, ope
         # Renaming a profile intentionally leaves its existing Dock app usable.
         # After an update that app is no longer running, so find it by the stable
         # ownership marker rather than relying only on the profile's new name.
+        # An outdated one is left for Set up Dock shortcuts, which rebuilds and
+        # re-pins it under the current name; rebuilding here could not re-pin.
         for alias in sorted(path.parent.glob("*.app")):
             alias_info = launcher_info(alias)
-            if alias_info is not None and owned_bundle(alias, shortcut, info=alias_info):
+            if (alias_info is not None and alias_info.get("OpenSwapProfileLauncherVersion") == LAUNCHER_VERSION
+                    and owned_bundle(alias, shortcut, info=alias_info)):
                 path, info = alias, alias_info
                 shortcut = DockShortcut(path, profile.id, store.root)
                 break

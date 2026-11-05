@@ -117,6 +117,7 @@ def main():
                     app, bundle = helpers[identifier]
                     open_presence(app, bundle)
                     wait(lambda: running(bundle))
+                    return True
 
             backend = FixtureBackend()
             coordinator = DesktopUpdate(store, backend=backend)

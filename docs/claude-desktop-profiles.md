@@ -301,18 +301,30 @@ for the downloaded version to install. Once the installed app passes publisher
 verification and stops changing, it waits for old numbered Dock helpers to exit,
 reopens the saved profiles, and attaches their existing Dock shortcuts. Closed
 profiles stay closed; profiles archived during the update are not reopened.
-Shortcuts retained under an older profile name are found by their stable profile ID.
+Current shortcuts retained under an older profile name are found by their stable
+profile ID. If a Dock indicator doesn't return, the update still finishes and the
+completion notification names those profiles; choose **Set up Dock shortcuts** in
+each one's menu.
 Dock pins, sign-ins and profile data are preserved. Claude's own updater may also open
 the ordinary Default window; OpenSwap leaves that window alone.
 
-If quitting is canceled, installation stalls, a Dock attachment fails, Desktop
+If quitting is canceled, installation stalls, a profile fails to reopen, Desktop
 features are disabled, or OpenSwap exits, the recovery record remains. Choose
 **Resume update…** to continue after resolving the issue. Recovery requires a
 fresh confirmation and retries only unfinished profile restorations. Profile
-launches remain blocked while an installation may still be pending. If Claude's
-download is no longer available, use the ordinary Claude app to download it again,
-then resume in OpenSwap. Instances from other profile stores or archived profiles
-must be closed manually before starting the coordinated update.
+launches remain blocked while an installation may still be pending; once the new
+version is installed, profiles can open while the rest are being restored. If
+Claude's download is no longer available, use the ordinary Claude app to download
+it again, then resume in OpenSwap. Instances from other profile stores or archived
+profiles must be closed manually before starting the coordinated update.
+
+To stop instead, choose **Cancel update…** from the same places. After you confirm,
+OpenSwap unblocks profile launches and reopens the saved profiles that are closed,
+on whichever Claude version is installed; profiles still open are left alone and
+nothing is force-quit. The notification names any profile that didn't reopen.
+While Claude's installer is running with every profile closed, Cancel waits: try
+again in a moment. Cancel is unavailable while OpenSwap is already working on the update,
+and from a profile store other than the one that started the update.
 If Claude replaces the pending download with a newer version, Resume update
 confirms that newer version while preserving the saved profile list.
 
@@ -324,12 +336,13 @@ and older OpenSwap installations cannot be prevented from launching Claude.
 
 Recovery uses a private, atomically written `desktop-update.json` under the
 default OpenSwap Claude Desktop store, shared even by CLI callers using a custom
-profile root. It contains versions, the originating store path and unfinished
-profile IDs, never cookies or credentials. A separate process lock prevents DEV
-and release builds from coordinating the same installation simultaneously.
+profile root. It contains versions, the originating store path, unfinished
+profile IDs and which of them had a Dock indicator, never cookies or credentials.
+A separate process lock prevents DEV and release builds from coordinating the
+same installation simultaneously.
 
 `tests/test_claude_desktop_update.py` covers update/quit failures, launch blocking,
-confirmation races, interrupted recovery, signature failures and Dock retries.
+confirmation races, interrupted recovery, cancellation, signature failures and Dock warnings.
 The opt-in native probe uses disposable app sessions and numbered Dock helpers:
 
 ```sh

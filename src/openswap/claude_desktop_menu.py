@@ -199,6 +199,7 @@ class ClaudeDesktopMenu:
         pending = self._update_pending()
         menu.add(rumps.MenuItem("Resume update…" if pending else "Update Claude…", callback=self.update_claude))
         if pending:
+            menu.add(rumps.MenuItem("Cancel update…", callback=self.cancel_update))
             menu.add(rumps.MenuItem("Profiles will reopen after the update finishes", callback=None))
             return menu
         menu.add(rumps.MenuItem("Add profile…", callback=self.add))
@@ -264,8 +265,10 @@ class ClaudeDesktopMenu:
             return
         if action == "update":
             return self.update_claude()
+        if action == "cancel_update":
+            return self.cancel_update()
         if self._update_pending():
-            self.show_error("Choose Resume update before managing Claude profiles.")
+            self.show_error("Choose Resume update or Cancel update before managing Claude profiles.")
             return
         if action == "add":
             return self.add()
@@ -705,6 +708,19 @@ class ClaudeDesktopMenu:
             return
         self._update_work("Checking Claude's update…", lambda: {"state": "update_plan", "plan": self.updater.plan()})
 
+    def cancel_update(self, _=None):
+        if self.busy or self.blocked() or not self.enabled() or self._editing_details or self.confirm is None:
+            return
+        with self._modal():
+            confirmed = self.confirm(
+                title="Cancel Claude's update?",
+                message=("OpenSwap stops waiting for the update and reopens the profiles it closed, "
+                         "on the Claude version installed now. Profiles that are still open are left alone. "
+                         "Nothing is force-quit."),
+                ok="Cancel update", cancel="Keep update") == 1
+        if confirmed and self.enabled() and not self.blocked():
+            self._update_work("Canceling Claude's update…", self.updater.cancel)
+
     def _update_work(self, operation, work):
         self.busy, self.operation = True, operation
         self._check_generation += 1
@@ -786,8 +802,19 @@ class ClaudeDesktopMenu:
         if result.get("state") == "update_plan":
             self._confirm_update(result["plan"])
             return
-        if result.get("state") == "update_done":
-            self._notify("Claude updated", f"Claude {result['version']} is installed. Your profiles and Dock indicators are restored.")
+        if result.get("state") in {"update_done", "update_canceled"}:
+            missing = result["dock_warnings"]
+            if result["state"] == "update_done":
+                title = "Claude updated"
+                body = f"Claude {result['version']} is installed. " + (
+                    "Your profiles reopened." if missing else "Your profiles and Dock indicators are restored.")
+            else:
+                title = "Claude update canceled"
+                body = "Profiles can open again." + (
+                    f" These profiles didn't reopen: {', '.join(result['failed'])}." if result["failed"] else "")
+            if missing:
+                body += f" Dock indicators didn't return for {', '.join(missing)}. Choose Set up Dock shortcuts in their menus."
+            self._notify(title, body)
             self.refresh_status()
             return
         if result.get("state") == "signin_candidates":

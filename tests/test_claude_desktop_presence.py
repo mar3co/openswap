@@ -64,6 +64,20 @@ def test_renamed_shortcut_search_rejects_foreign_ownership(store, builder):
     opener.assert_not_called()
 
 
+def test_outdated_shortcut_under_old_name_is_left_for_dock_setup(store, builder):
+    profile = store.add('Work')
+    original = Path(builder.build(profile)['path'])
+    store.update(profile.id, name='Renamed')
+    info = original / 'Contents/Info.plist'
+    data = plistlib.loads(info.read_bytes())
+    data.pop('OpenSwapProfileLauncherVersion')
+    info.write_bytes(plistlib.dumps(data))
+    creator, opener = Mock(), Mock()
+    assert not presence.attach_presence(store, profile.id, directory=builder.directory, creator=creator, opener=opener)
+    creator.assert_not_called()
+    opener.assert_not_called()
+
+
 def test_legacy_shortcut_upgrades_in_place_preserving_badge(store, builder):
     p=store.add('Work'); store.update(p.id,badge='7',color='blue')
     path=Path(builder.build(store.get(p.id))['path'])

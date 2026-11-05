@@ -1,15 +1,14 @@
 """Coordinate Squirrel's shared installation without modifying its state or app.
 
 The durable journal also gates CLI/Dock launches. A timeout never releases that
-gate: ShipIt may still be waiting to install. Recovery is explicit and only
-restores sessions after the requested version passes publisher validation.
+gate: ShipIt may still be waiting to install. Recovery is explicit: Resume
+restores sessions only after the requested version passes publisher validation,
+and Cancel reopens them on whichever version is installed.
 """
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -21,7 +20,7 @@ from openswap import claude_desktop as cd
 
 WAIT_SECONDS = 120
 SHIPIT_ID = cd.BUNDLE_ID + ".ShipIt"
-BLOCKED = "Claude's update is unfinished. Choose Resume update in OpenSwap before opening profiles."
+BLOCKED = "Claude's update is unfinished. Choose Resume update or Cancel update in OpenSwap before opening profiles."
 
 
 def version(value):
@@ -52,7 +51,9 @@ class UpdateJournal:
                     or not isinstance(data.get("root"), str) or not Path(data["root"]).is_absolute()
                     or not isinstance(data.get("profiles"), list) or len(data["profiles"]) > 100
                     or any(not isinstance(p, str) or not re.fullmatch(r"[a-f0-9]{32}", p) for p in data["profiles"])
-                    or len(set(data["profiles"])) != len(data["profiles"])):
+                    or len(set(data["profiles"])) != len(data["profiles"])
+                    or not isinstance(data.get("docked"), list) or len(data["docked"]) > 100
+                    or any(not isinstance(p, str) or not re.fullmatch(r"[a-f0-9]{32}", p) for p in data["docked"])):
                 raise ValueError
             version(data["before"])
             version(data["target"])
@@ -61,41 +62,24 @@ class UpdateJournal:
             raise cd.ClaudeDesktopError("Claude update recovery data is unreadable. Keep Claude closed and repair desktop-update.json before opening profiles.") from exc
 
     def write(self, data):
-        cd.plain(self.path)
-        fd, raw = tempfile.mkstemp(prefix=".desktop-update-", dir=self.storage.root)
-        try:
-            with os.fdopen(fd, "w") as stream:
-                json.dump(data, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(raw, self.path)
-            self._sync_directory()
-        finally:
-            Path(raw).unlink(missing_ok=True)
+        self.storage.write_json(self.path, data)
 
     def clear(self):
         cd.plain(self.path)
-        self.path.unlink()
-        self._sync_directory()
-
-    def _sync_directory(self):
-        try:
-            fd = os.open(self.storage.root, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        except OSError:
-            pass
+        self.path.unlink(missing_ok=True)
 
 
 @contextmanager
-def launch_guard(*, existing_only=False):
+def launch_guard(installed):
+    """Serialize spawning Claude with recording an update.
+
+    The installer cannot start between a successful gate check and the spawn.
+    Callers validate the app first; signature checks never hold this lock.
+    """
     journal = UpdateJournal()
-    # Serialize the complete launch with recording an update. The installer
-    # cannot start between a successful gate check and spawning Claude.
     with journal.lock():
-        if journal.read() and not existing_only:
+        record = journal.read()
+        if record and (record["phase"] == "waiting" or version(installed) < version(record["target"])):
             raise cd.ClaudeDesktopError(BLOCKED)
         yield
 
@@ -187,24 +171,25 @@ class MacUpdateBackend:
     def exited(self, targets):
         return all(native.isTerminated() for native in targets.values())
 
-    def helpers_exited(self, store, identifiers):
+    def claude_running(self):
+        from AppKit import NSRunningApplication
+        return any(not app.isTerminated() for app in NSRunningApplication.runningApplicationsWithBundleIdentifier_(cd.BUNDLE_ID))
+
+    def docked(self, store, identifiers):
+        """The profiles among ``identifiers`` whose Dock helper is running."""
         from AppKit import NSRunningApplication
         from openswap.claude_desktop_dock import DockShortcut
 
-        for identifier in identifiers:
-            bundle = DockShortcut(Path("unused.app"), identifier, store.root).bundle_id
-            if any(not app.isTerminated() for app in NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle)):
-                return False
-        return True
+        return [identifier for identifier in identifiers
+                if any(not app.isTerminated() for app in NSRunningApplication.runningApplicationsWithBundleIdentifier_(
+                    DockShortcut(Path("unused.app"), identifier, store.root).bundle_id))]
 
     def restore(self, store, identifier):
-        # Caller holds the journal lock and has validated the update. All
-        # ordinary callers still pass through DesktopProfiles.open's gate.
-        return store._open(identifier, app=self.app_factory())
+        return store.open(identifier, app=self.app_factory())
 
     def attach(self, store, identifier):
         from openswap.claude_desktop_presence import attach_presence
-        attach_presence(store, identifier)
+        return attach_presence(store, identifier)
 
 
 @dataclass
@@ -233,22 +218,32 @@ class DesktopUpdate:
             raise cd.ClaudeDesktopError("Resume Claude's update from the OpenSwap profile store that started it.")
         return record
 
+    @contextmanager
+    def _worker(self):
+        # Only one coordinator (release, DEV or a recovered process) may act.
+        lock = self.journal.storage.lock("desktop-update-worker.lock", timeout=0.1)
+        if not lock.acquire():
+            raise cd.ClaudeDesktopError("OpenSwap is already working on Claude's update. Wait for it to finish, then try again.")
+        try:
+            yield
+        finally:
+            lock.release()
+
     def plan(self):
         self.store.ensure_default()
         record = self._owned(self.journal.read())
         before, stamp = self.backend.installed()
-        target = record["target"] if record else self.backend.staged()
-        installed = bool(record and version(before) >= version(target))
+        installed = bool(record and version(before) >= version(record["target"]))
+        target = record["target"] if installed else self.backend.staged()
         if not installed:
-            staged = self.backend.staged()
-            if record and version(staged) >= version(target):
-                # Claude can replace a pending download while the user finishes
-                # work. Confirm the newer version rather than strand recovery.
-                target = staged
+            # Claude can replace a pending download while the user finishes
+            # work. Confirm the newer version rather than strand recovery.
+            if record and version(target) < version(record["target"]):
+                raise cd.ClaudeDesktopError("Claude's downloaded update is older than the one being installed. Open Claude's update check, then retry here. The saved profiles are kept.")
             if version(target) <= version(before):
                 raise cd.ClaudeDesktopError("Claude is already on this update. Check for a newer update in Claude.")
-            if staged != target or not self.backend.installer_running():
-                raise cd.ClaudeDesktopError("Claude's downloaded update is not ready to install. Open Claude's update check, then retry here. The saved profiles are kept.")
+            if not self.backend.installer_running():
+                raise cd.ClaudeDesktopError("OpenSwap could not find Claude's installer waiting for this update. In Claude, check for updates again, then retry here. The saved profiles are kept.")
         targets = {} if installed else self.backend.snapshot(self.store)
         identifiers = record["profiles"] if installed else list(targets)
         rows = {p.id: p for p in self.store.list()}
@@ -257,29 +252,34 @@ class DesktopUpdate:
                           record["id"] if record else None, installed)
 
     def execute(self, plan, *, progress=lambda _: None, enabled=lambda: True):
-        # Only one coordinator (release, DEV or a recovered process) may act.
-        with self.journal.storage.lock("desktop-update-worker.lock", timeout=0.1):
+        with self._worker():
+            # Signature checks run before taking the launch gate.
+            if self.backend.installed() != (plan.before, plan.stamp):
+                raise cd.ClaudeDesktopError("Claude changed while you reviewed the update. Try again.")
+            changed = cd.ClaudeDesktopError("The open profiles or downloaded update changed. Review the update again.")
+            if not plan.installed and self.backend.staged() != plan.target:
+                raise changed
             with self.journal.lock():
                 record = self._owned(self.journal.read())
                 if (record["id"] if record else None) != plan.recovery_id:
                     raise cd.ClaudeDesktopError("Claude's update changed. Review it again before continuing.")
                 if not enabled():
                     raise cd.ClaudeDesktopError("Claude update paused. Enable Desktop features and choose Resume update.")
-                if self.backend.installed() != (plan.before, plan.stamp):
-                    raise cd.ClaudeDesktopError("Claude changed while you reviewed the update. Try again.")
                 if not plan.installed:
                     current = self.backend.snapshot(self.store)
                     identity = lambda targets: {p: n.processIdentifier() for p, n in targets.items()}
                     if (identity(current) != identity(plan.targets)
                             or any(n.isTerminated() for n in plan.targets.values())
-                            or self.backend.staged() != plan.target or not self.backend.installer_running()):
-                        raise cd.ClaudeDesktopError("The open profiles or downloaded update changed. Review the update again.")
+                            or not self.backend.installer_running()):
+                        raise changed
+                docked = [] if plan.installed else self.backend.docked(self.store, list(plan.targets))
                 if record is None:
                     record = {"schema": 1, "id": uuid.uuid4().hex, "root": str(self.store.root),
                               "before": plan.before, "target": plan.target,
-                              "profiles": list(plan.targets), "phase": "waiting"}
+                              "profiles": list(plan.targets), "docked": docked, "phase": "waiting"}
                 elif not plan.installed:
                     record["profiles"] = list(dict.fromkeys([*record["profiles"], *plan.targets]))
+                    record["docked"] = list(dict.fromkeys([*record["docked"], *docked]))
                     record["target"] = plan.target
                 # Durable before the first quit request, even if it is refused.
                 self.journal.write(record)
@@ -305,42 +305,76 @@ class DesktopUpdate:
                         raise cd.ClaudeDesktopError("Claude has not finished updating. Check any open Claude windows or quit prompts, then choose Resume update. Profiles remain saved.")
                     self.sleep(1)
 
-            # Verify a stable signed bundle and let the old numbered helpers
-            # exit before attaching new ones. Never redirect an old helper.
             installed, stamp = self.backend.installed()
             if version(installed) < version(plan.target):
                 raise cd.ClaudeDesktopError("Claude's update is not installed yet. Choose Resume update.")
             self.sleep(2)
             if self.backend.installed() != (installed, stamp):
                 raise cd.ClaudeDesktopError("Claude is still changing. Choose Resume update in a moment.")
-            deadline = self.clock() + 10
-            while record["phase"] == "waiting" and not self.backend.helpers_exited(self.store, record["profiles"]):
-                if self.clock() >= deadline:
-                    raise cd.ClaudeDesktopError("A previous profile Dock icon is still closing. Wait for it to close, then choose Resume update.")
-                self.sleep(1)
+            # Never redirect an old numbered helper to a new session.
+            stale = self._old_helpers(record["profiles"]) if record["phase"] == "waiting" else set()
 
             progress("Restoring Claude profiles and Dock icons…")
             with self.journal.lock():
                 record["phase"] = "restoring"
                 self.journal.write(record)
+            restored = []
             for identifier in list(record["profiles"]):
                 if not enabled():
                     raise cd.ClaudeDesktopError("Profile restoration paused. Choose Resume update when ready.")
-                with self.journal.lock():
-                    # An archive during installation must not reopen a profile.
-                    rows = {p.id: p for p in self.store.list()}
-                    if identifier in rows:
-                        if version(self.backend.installed()[0]) < version(plan.target):
-                            raise cd.ClaudeDesktopError("Claude changed during recovery. Choose Resume update.")
-                        result = self.backend.restore(self.store, identifier)
-                        if (result.get("state") not in {"launched", "already_running"}
-                                or not result.get("pid")):
-                            raise cd.ClaudeDesktopError("A Claude profile is still opening. Wait a moment, then choose Resume update to restore its Dock indicator.")
-                if identifier in rows:
-                    self.backend.attach(self.store, identifier)
+                # An archive during installation must not reopen a profile.
+                if identifier in {p.id for p in self.store.list()}:
+                    result = self.backend.restore(self.store, identifier)
+                    if result.get("state") not in {"launched", "already_running"} or not result.get("pid"):
+                        raise cd.ClaudeDesktopError("A Claude profile is still opening. Wait a moment, then choose Resume update to finish restoring it.")
+                    restored.append(identifier)
                 with self.journal.lock():
                     record["profiles"].remove(identifier)
                     self.journal.write(record)
             with self.journal.lock():
                 self.journal.clear()
-            return {"state": "update_done", "version": installed}
+            return {"state": "update_done", "version": installed,
+                    "dock_warnings": self._reattach(restored, record["docked"], stale)}
+
+    def cancel(self):
+        """Stop coordinating and reopen the closed profiles on whatever Claude is installed."""
+        with self._worker():
+            with self.journal.lock():
+                record = self._owned(self.journal.read())
+                if record is None:
+                    return {"state": "update_canceled", "failed": [], "dock_warnings": []}
+                if record["phase"] == "waiting" and self.backend.installer_running() and not self.backend.claude_running():
+                    raise cd.ClaudeDesktopError("Claude is installing its update. Wait a moment, then try again.")
+                self.journal.clear()
+            rows = {p.id: p for p in self.store.list()}
+            launched, failed = [], []
+            for identifier in record["profiles"]:
+                if identifier not in rows:
+                    continue
+                try:
+                    if self.backend.restore(self.store, identifier).get("state") == "launched":
+                        launched.append(identifier)
+                except (cd.ClaudeSwitchError, OSError):
+                    failed.append(rows[identifier].name)
+            return {"state": "update_canceled", "failed": failed,
+                    "dock_warnings": self._reattach(launched, record["docked"], self._old_helpers(launched))}
+
+    def _old_helpers(self, identifiers):
+        """Profiles whose previous Dock helper is still running after a short wait."""
+        deadline = self.clock() + 10
+        while (running := set(self.backend.docked(self.store, identifiers))) and self.clock() < deadline:
+            self.sleep(1)
+        return running
+
+    def _reattach(self, identifiers, docked, stale):
+        """Names of profiles that had a Dock indicator before the update and lack one now."""
+        names = {p.id: p.name for p in self.store.list(include_archived=True)}
+        missing = []
+        for identifier in identifiers:
+            try:
+                attached = identifier not in stale and self.backend.attach(self.store, identifier)
+            except (cd.ClaudeSwitchError, OSError):
+                attached = False
+            if identifier in docked and not attached:
+                missing.append(names[identifier])
+        return missing
