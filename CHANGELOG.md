@@ -11,6 +11,22 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
+## 0.3.1 (2026-11-05)
+
+### New
+
+- Update Claude… in the Claude Desktop tab updates the Claude desktop app when several profiles are open. OpenSwap asks each profile to quit normally, waits for Claude to install the update it has already downloaded, then reopens your profiles and their Dock icons. If the update is interrupted, profiles stay closed until you choose Resume update… to finish it, or Cancel update… to stop and reopen the profiles OpenSwap closed.
+- A Claude Desktop profile that needs Keychain access now says Keychain access needed and offers Retry detection right on the profile, noting that you stay signed in to Claude.
+
+### Improved
+
+- Add from token reflows around what you enter, keeps Save in view on short screens, and adds a Paste button and instructions for finding a key or setup token. Save names what it will save, keeps what you typed if saving fails, and confirms when the token is saved.
+- Adding another Claude Code account no longer warns that your current login is unsaved when OpenSwap already has a copy of it. When it does warn, it says your saved accounts stay in OpenSwap and whether the email is saved under another organization.
+
+### Fixed
+
+- A Claude Desktop profile whose saved sign-in key is missing no longer pauses account detection. It shows Account details unavailable and tries again on its own.
+
 ## 0.3.0 (2026-10-28)
 
 ### New
