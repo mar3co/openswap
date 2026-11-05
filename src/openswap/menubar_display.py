@@ -1025,6 +1025,8 @@ def claude_desktop_profile_rows(state: dict | None = None, *, expanded: set[str]
     else:
         if state.get("default_error"):
             hint("claude_desktop_default_error", state["default_error"])
+        if any(p.get("account_action") == "retry_detection" for p in active):
+            hint("claude_desktop_detection_hint", "Retry detection to allow Keychain access and show account details. You stay signed in to Claude.")
         rows.append({"kind": "profiles", "id": "claude_desktop_profiles", "items": active, "disabled": disabled})
     if disabled:
         hint("claude_desktop_operation", state.get("operation") or "Working on profile…")
@@ -1056,6 +1058,7 @@ def desktop_profile_usage(profile: dict, cards: list[dict]) -> str:
 def desktop_profile_height(profile: dict) -> float:
     height = 76.0 if profile.get("email") or profile.get("organization") else 58.0
     if not profile.get("archived"):
+        height += 28 if profile.get("account_action") else 0
         height += 22 if profile.get("code_status") else 0
         height += 18 if profile.get("code_usage") else 0
     return height

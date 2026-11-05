@@ -71,6 +71,24 @@ def test_state_exposes_display_metadata_without_claiming_verified_identity(contr
     assert controller.store.registry.read_bytes() == before
 
 
+def test_paused_rows_explain_keychain_and_offer_inline_retry(controller):
+    from openswap.claude_desktop_monitor import PAUSED_STATUS
+    from openswap.menubar_display import desktop_profile_height
+    profile = controller.store.add("Work")
+    controller.monitor.statuses[profile.id] = PAUSED_STATUS
+    state = controller.settings_state()
+    item = state["items"][0]
+    assert item["account_status"] == "Keychain access needed"
+    assert item["account_action"] == "retry_detection"
+    assert desktop_profile_height(item) == 86
+    rows = {row["id"]: row for row in claude_desktop_profile_rows(state)}
+    assert "You stay signed in to Claude" in rows["claude_desktop_detection_hint"]["label"]
+    controller.store.update(profile.id, archived=True)
+    state = controller.settings_state()
+    assert "account_action" not in state["items"][0]
+    assert not any(row["id"] == "claude_desktop_detection_hint" for row in claude_desktop_profile_rows(state))
+
+
 def test_archive_cancel_then_confirm_and_restore_preserve_data(controller, monkeypatch):
     profile = controller.store.add("Work")
     opened = Mock()

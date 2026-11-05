@@ -196,6 +196,23 @@ def cycle(watcher, seconds=11):
     return monitor.poll(enabled=True)
 
 
+def test_retry_refresh_discards_queued_pause_results_for_every_profile(watcher):
+    monitor, store, profile, _, _, detector = watcher
+    second = store.add("Personal")
+    detector.denied = True
+    monitor.poll(enabled=True)  # paused results wait while the user starts a retry
+    detector.assert_not_called()
+
+    detector.denied = False
+    monitor.refresh()
+    cycle(watcher, seconds=0)
+
+    assert detector.call_count == 2  # no old retry delay after permission is granted
+    for identifier in (profile.id, second.id):
+        assert monitor.statuses[identifier] == ""
+        assert store.get(identifier).email == DETAILS["email"]
+
+
 def test_new_login_fills_details_automatically_without_renaming(watcher):
     monitor, store, p, _, state, detector = watcher
     state["value"] = ""
@@ -256,7 +273,7 @@ def test_keychain_denial_pauses_requests_until_explicit_retry(watcher):
         raise KeyAccessError("Denied")
     detector.side_effect = denied
     cycle(watcher)
-    assert monitor.statuses[p.id] == "Account detection paused"
+    assert monitor.statuses[p.id] == "Keychain access needed"
     state.update(value="other", stamp=2)
     cycle(watcher, 100)
     cycle(watcher, 100)
@@ -332,7 +349,7 @@ def test_failed_check_keeps_identity_until_the_persisted_login_changes(store, mo
     cycle(watcher, 100)
     saved = store.get(p.id)
     assert (saved.email, saved.account_uuid, saved.detected_login) == (DETAILS["email"], ACCOUNT, LOGIN)
-    assert monitor.statuses[p.id] == ("Account details unavailable" if failure == "error" else "Account detection paused")
+    assert monitor.statuses[p.id] == ("Account details unavailable" if failure == "error" else "Keychain access needed")
     login["value"] = NEW_LOGIN
     cycle(watcher, 100)
     saved = store.get(p.id)
@@ -390,8 +407,96 @@ def test_denial_survives_restart_feature_toggle_and_adding_profiles(store, monke
     assert key.call_count == 2
 
 
+@pytest.mark.parametrize("reason,status", [
+    ("cancelled", -128), ("authentication_failed", -25293),
+    ("interaction_not_allowed", -25308), ("not_available", -25291),
+    ("system_error", -999),
+])
+def test_keychain_pause_logs_reason_and_status_without_secrets(store, monkeypatch, caplog, reason, status):
+    from openswap import claude_desktop_identity as module
+    secret = "fixture-secret-cookie-key"
+    read = Mock(side_effect=module.macos_keychain.KeychainError(secret, reason=reason, status=status))
+    monkeypatch.setattr(module.macos_keychain, "get_password", read)
+    detector = AccountDetector(store)
+    for _ in range(3):
+        with pytest.raises(KeyAccessError): detector._get_key()
+    assert store.keychain_paused()
+    assert read.call_count == 1
+    assert f"paused reason={reason}" in caplog.text
+    assert f"osstatus={status}" in caplog.text
+    assert caplog.text.count("Claude account detection: paused") == 1
+    assert secret not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_paused_key_and_successful_retry_are_logged(store, monkeypatch, caplog):
+    from openswap import claude_desktop_identity as module
+    caplog.set_level("INFO", logger="openswap")
+    read = Mock(side_effect=module.macos_keychain.KeychainError("denied", reason="cancelled", status=-128))
+    monkeypatch.setattr(module.macos_keychain, "get_password", read)
+    detector = AccountDetector(store)
+    with pytest.raises(KeyAccessError): detector._get_key()
+    assert "paused reason=cancelled" in caplog.text
+    read.side_effect, read.return_value = None, "fixture-secret-key"
+    detector.retry()
+    detector._get_key()
+    assert "retry_requested" in caplog.text
+    assert "keychain_access_succeeded pause_cleared=True" in caplog.text
+    assert "fixture-secret-key" not in caplog.text
+    assert not store.keychain_paused()
+
+
+@pytest.mark.parametrize("reason,read", [
+    ("item_missing", lambda module: Mock(return_value=None)),
+    ("unsupported_value", lambda module: Mock(return_value="k" * 4097)),
+    ("unsupported_value", lambda module: Mock(side_effect=module.macos_keychain.KeychainError(
+        "fixture-secret", reason="unsupported_value"))),
+])
+def test_missing_or_unsupported_key_is_not_a_permission_pause(watcher, monkeypatch, caplog, reason, read):
+    from openswap import claude_desktop_identity as module
+    _, store, p, clock, fingerprint, _ = watcher
+    read = read(module)
+    monkeypatch.setattr(module.macos_keychain, "get_password", read)
+    monkeypatch.setattr(module, "detect_account",
+                        lambda *_, key_provider, **__: (key_provider(), dict(DETAILS))[1])
+    detector = AccountDetector(store)
+    monitor = ProfileIdentityMonitor(store, detector=detector, clock=lambda: clock[0],
+                                     observe=lambda *_: fingerprint["value"], stamp=lambda *_: fingerprint["stamp"])
+    watcher = (monitor, store, p, clock, fingerprint, detector)
+    cycle(watcher)
+    assert monitor.statuses[p.id] == "Account details unavailable"
+    assert not detector.denied and not store.keychain_paused()
+    assert not AccountDetector(store).denied  # nothing paused after a restart
+    assert f"key_unreadable reason={reason}" in caplog.text and "paused" not in caplog.text
+    assert "fixture-secret" not in caplog.text
+    cycle(watcher)
+    assert read.call_count == 1
+    read.side_effect, read.return_value = None, "fixture-key"
+    cycle(watcher, 61)
+    assert monitor.statuses[p.id] == "" and store.get(p.id).email == DETAILS["email"]
+
+
+def test_saved_pause_reports_unknown_history_without_prompting(store, caplog, monkeypatch):
+    from openswap import claude_desktop_identity as module
+    store.pause_keychain(True)
+    key = Mock()
+    monkeypatch.setattr(module, "_key", key)
+    detector = AccountDetector(store)
+    with pytest.raises(KeyAccessError): detector._get_key()
+    assert "saved_pause_original_reason_unknown" in caplog.text
+    key.assert_not_called()
+
+
+def test_pause_state_failure_is_logged_without_its_private_message(store, monkeypatch, caplog):
+    monkeypatch.setattr(store, "keychain_paused", Mock(side_effect=PermissionError(13, "private path")))
+    detector = AccountDetector(store)
+    assert detector.denied
+    assert "pause_state_unreadable" in caplog.text and "errno=13" in caplog.text
+    assert "private path" not in caplog.text
+
+
 @pytest.mark.parametrize("granted", [True, False])
-def test_feature_toggle_during_prompt_persists_a_pause_only_for_a_real_denial(store, monkeypatch, granted):
+def test_feature_toggle_during_prompt_persists_a_pause_only_for_a_real_denial(store, monkeypatch, granted, caplog):
     from openswap import claude_desktop_identity as module
     detector = AccountDetector(store)
     prompts = []
@@ -404,10 +509,11 @@ def test_feature_toggle_during_prompt_persists_a_pause_only_for_a_real_denial(st
             raise KeyAccessError("Denied")
         return b"k" * 16
     monkeypatch.setattr(module, "_key", key)
-    with pytest.raises(KeyAccessError): detector._get_key()
+    with pytest.raises(module.DetectionError if granted else KeyAccessError): detector._get_key()
     assert detector._cached_key is None
     assert store.keychain_paused() is detector.denied is AccountDetector(store).denied is (not granted)
     if granted:
+        assert 'Claude account detection: paused' not in caplog.text
         assert detector._get_key() == b"k" * 16 and len(prompts) == 2
 
 

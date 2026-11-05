@@ -260,11 +260,14 @@ def test_disabled_callback_cannot_modify_default_account(env):
     env.error.assert_called_once()
 
 
-def test_callback_exception_is_sanitized(env):
+def test_callback_exception_is_sanitized(env, caplog):
     env.received.side_effect = RuntimeError(GOOGLE)
     env.router.receive(GOOGLE)
     env.router.poll()
     assert GOOGLE not in repr(env.error.call_args)
+    assert 'callback_dispatch_failed exception=RuntimeError' in caplog.text
+    assert 'fixture-' not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 def test_busy_queue_still_discards_expired_credentials(env):
@@ -649,7 +652,7 @@ def test_startup_returns_a_handler_kept_from_an_earlier_session(env, reason):
 
 
 @pytest.mark.parametrize('reason', ['success', 'native_failure', 'no_url'])
-def test_native_registration_releases_cf_url_and_never_changes_default(monkeypatch, reason):
+def test_native_registration_releases_cf_url_and_never_changes_default(monkeypatch, reason, caplog):
     import ctypes
     from openswap import claude_desktop_links as links
     from openswap.claude_desktop import ClaudeDesktopError
@@ -662,11 +665,14 @@ def test_native_registration_releases_cf_url_and_never_changes_default(monkeypat
     else:
         with pytest.raises(ClaudeDesktopError): links.register_application(Path('/Applications/OpenSwap.app'))
     if reason == 'no_url':
+        assert 'registration_url_failed' in caplog.text
         cf.CFRelease.assert_not_called()
         ls.LSRegisterURL.assert_not_called()
     else:
         cf.CFRelease.assert_called_once_with(123)
         ls.LSRegisterURL.assert_called_once_with(123, True)
+    if reason == 'native_failure':
+        assert 'registration_failed osstatus=-50' in caplog.text
     ls.LSSetDefaultHandlerForURLScheme.assert_not_called()
 
 
@@ -685,6 +691,120 @@ def test_registration_failure_is_explained_without_mislabeling_permission(env):
 
 
 OPENSWAP, CLAUDE = Path('/Applications/OpenSwap.app'), Path('/Applications/Claude.app')
+
+
+@pytest.mark.parametrize('stage', ['setup', 'request', 'verification'])
+def test_claim_failures_log_the_cause_without_exception_payloads(env, caplog, stage):
+    e = env
+    e.router.prepare()
+    secret = 'fixture-private-token'
+    failure = PermissionError(13, GOOGLE + secret, '/private/' + secret)
+    if stage == 'setup':
+        e.native.current = Mock(side_effect=failure)
+    elif stage == 'request':
+        e.native.set_handler = Mock(side_effect=failure)
+    e.now[0] += 3
+    e.router.poll()
+    if stage == 'verification':
+        e.native.respond(True)
+        e.native.current = Mock(side_effect=failure)
+    e.router.poll()
+    expected = {'setup': 'setup_failed', 'request': 'claim_request_failed',
+                'verification': 'claim_verification_failed'}[stage]
+    assert f'{expected} exception=PermissionError errno=13' in caplog.text
+    assert 'claude_desktop_links.py:' in caplog.text
+    assert 'locations=' in caplog.text
+    assert secret not in caplog.text and GOOGLE not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    e.error.assert_called_once_with(SETUP_FAILED if stage == 'setup' else PAUSED)
+
+
+def test_profile_read_failure_is_logged_once_until_recovery(env, caplog):
+    e = env
+    available = e.router.needed
+    e.router.needed = Mock(side_effect=OSError(13, GOOGLE))
+    e.router.prepare(retry=True)
+    for _ in range(3):
+        e.now[0] += RECHECK
+        e.router.poll()
+    assert caplog.text.count('profile_store_unavailable exception=') == 1
+    assert 'reconnect_profile_store_unavailable' in caplog.text
+    e.error.assert_called_once_with(SETUP_FAILED)
+    e.router.needed = available
+    e.router.prepare(retry=True)
+    e.router.needed = Mock(side_effect=OSError(13, GOOGLE))
+    e.router.prepare(retry=True)
+    assert caplog.text.count('profile_store_unavailable exception=') == 2
+    assert GOOGLE not in caplog.text
+
+
+@pytest.mark.parametrize('already_owned', [True, False])
+def test_reconnect_outcomes_are_logged_even_when_no_permission_prompt_is_needed(env, caplog, already_owned):
+    e = env
+    caplog.set_level('INFO', logger='openswap')
+    if already_owned:
+        e.native.owner = e.native.application
+    e.router.prepare(retry=True)
+    e.now[0] += 3
+    e.router.poll()
+    assert 'reconnect_requested' in caplog.text
+    if already_owned:
+        assert e.native.requests == []
+        assert 'claim_decision=held reconnect=True' in caplog.text
+    else:
+        assert 'claim_decision=claim reconnect=True' in caplog.text
+        e.native.respond(True)
+        e.router.poll()
+        assert 'claim_completed success=True' in caplog.text
+
+
+@pytest.mark.parametrize('domain', ['NSOSStatusErrorDomain', GOOGLE])
+def test_native_error_logs_only_known_domain_and_numeric_code(monkeypatch, caplog, domain):
+    import sys
+    from openswap import claude_desktop_links as links
+    native = object.__new__(links.MacOSLinks)
+    native.application = OPENSWAP.resolve()
+    error = Mock(domain=Mock(return_value=domain), code=Mock(return_value=-10814))
+    error.localizedDescription.return_value = GOOGLE
+    error.userInfo.return_value = {'callback': GOOGLE}
+    native.workspace = Mock()
+    native.workspace.URLsForApplicationsToOpenURL_.return_value = [SimpleNamespace(path=lambda: str(OPENSWAP))]
+    native.workspace.setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler_.side_effect = (
+        lambda path, scheme, callback: callback(error))
+    monkeypatch.setattr(links, 'register_application', Mock())
+    monkeypatch.setitem(sys.modules, 'Foundation', SimpleNamespace(NSURL=SimpleNamespace(
+        URLWithString_=lambda value: value, fileURLWithPath_=lambda value: value)))
+    done = Mock()
+    native.set_handler(OPENSWAP, done)
+    done.assert_called_once_with(False)
+    safe_domain = domain if domain == 'NSOSStatusErrorDomain' else 'other'
+    assert f'macos_handler_failed restoring=False domain={safe_domain} code=-10814' in caplog.text
+    assert GOOGLE not in caplog.text
+    error.localizedDescription.assert_not_called()
+    error.userInfo.assert_not_called()
+
+
+def test_setup_failure_reaches_the_normal_log_file(env, tmp_path):
+    import logging
+    from openswap.logging_config import setup_logging
+    logger = logging.getLogger('openswap')
+    handlers, level = logger.handlers[:], logger.level
+    setup_logging(tmp_path)
+    try:
+        env.router.prepare()
+        env.native.current = Mock(side_effect=OSError(13, GOOGLE))
+        env.now[0] += 3
+        env.router.poll()
+        for handler in logger.handlers:
+            handler.flush()
+        text = (tmp_path / 'openswap.log').read_text()
+        assert 'WARNING - Claude sign-in links: setup_failed exception=PermissionError errno=13' in text
+        assert GOOGLE not in text
+    finally:
+        for handler in logger.handlers:
+            handler.close()
+        logger.handlers = handlers
+        logger.setLevel(level)
 
 
 def gone():
