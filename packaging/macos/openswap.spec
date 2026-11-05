@@ -16,6 +16,7 @@ HERE = Path(SPECPATH).resolve()
 ROOT = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 from appkit_compat import check_appkit_sdk, normalize_appkit_sdk
+from dev_icon import make_dev_icon
 
 with open(ROOT / "pyproject.toml", "rb") as f:
     VERSION = tomllib.load(f)["project"]["version"]
@@ -52,8 +53,11 @@ app = BUNDLE(
     coll,
     name="OpenSwap.app",
     bundle_identifier="com.opensoft.openswap.dev" if DEV_ENTRY else "com.opensoft.openswap",
+    # build.sh adds the release icon after the widget build; DEV gets a badged copy here.
+    icon=str(make_dev_icon(ROOT / "macos/OpenSwapWidget/Host/Assets.xcassets/AppIcon.appiconset/icon_1024.png",
+                           Path(workpath))) if DEV_ENTRY else None,
     info_plist={
-        "CFBundleDisplayName": "OpenSwap",
+        "CFBundleDisplayName": "OpenSwap DEV" if DEV_ENTRY else "OpenSwap",
         "CFBundleShortVersionString": VERSION,
         "CFBundleVersion": BUILD_NUMBER,
         "LSUIElement": True,
