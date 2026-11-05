@@ -410,7 +410,7 @@ def test_denial_survives_restart_feature_toggle_and_adding_profiles(store, monke
 @pytest.mark.parametrize("reason,status", [
     ("cancelled", -128), ("authentication_failed", -25293),
     ("interaction_not_allowed", -25308), ("not_available", -25291),
-    ("system_error", -999), ("unsupported_value", None),
+    ("system_error", -999),
 ])
 def test_keychain_pause_logs_reason_and_status_without_secrets(store, monkeypatch, caplog, reason, status):
     from openswap import claude_desktop_identity as module
@@ -429,21 +429,51 @@ def test_keychain_pause_logs_reason_and_status_without_secrets(store, monkeypatc
     assert all(record.exc_info is None for record in caplog.records)
 
 
-def test_missing_key_and_successful_retry_are_logged(store, monkeypatch, caplog):
+def test_paused_key_and_successful_retry_are_logged(store, monkeypatch, caplog):
     from openswap import claude_desktop_identity as module
     caplog.set_level("INFO", logger="openswap")
-    read = Mock(return_value=None)
+    read = Mock(side_effect=module.macos_keychain.KeychainError("denied", reason="cancelled", status=-128))
     monkeypatch.setattr(module.macos_keychain, "get_password", read)
     detector = AccountDetector(store)
     with pytest.raises(KeyAccessError): detector._get_key()
-    assert "paused reason=item_missing" in caplog.text
-    read.return_value = "fixture-secret-key"
+    assert "paused reason=cancelled" in caplog.text
+    read.side_effect, read.return_value = None, "fixture-secret-key"
     detector.retry()
     detector._get_key()
     assert "retry_requested" in caplog.text
     assert "keychain_access_succeeded pause_cleared=True" in caplog.text
     assert "fixture-secret-key" not in caplog.text
     assert not store.keychain_paused()
+
+
+@pytest.mark.parametrize("reason,read", [
+    ("item_missing", lambda module: Mock(return_value=None)),
+    ("unsupported_value", lambda module: Mock(return_value="k" * 4097)),
+    ("unsupported_value", lambda module: Mock(side_effect=module.macos_keychain.KeychainError(
+        "fixture-secret", reason="unsupported_value"))),
+])
+def test_missing_or_unsupported_key_is_not_a_permission_pause(watcher, monkeypatch, caplog, reason, read):
+    from openswap import claude_desktop_identity as module
+    _, store, p, clock, fingerprint, _ = watcher
+    read = read(module)
+    monkeypatch.setattr(module.macos_keychain, "get_password", read)
+    monkeypatch.setattr(module, "detect_account",
+                        lambda *_, key_provider, **__: (key_provider(), dict(DETAILS))[1])
+    detector = AccountDetector(store)
+    monitor = ProfileIdentityMonitor(store, detector=detector, clock=lambda: clock[0],
+                                     observe=lambda *_: fingerprint["value"], stamp=lambda *_: fingerprint["stamp"])
+    watcher = (monitor, store, p, clock, fingerprint, detector)
+    cycle(watcher)
+    assert monitor.statuses[p.id] == "Account details unavailable"
+    assert not detector.denied and not store.keychain_paused()
+    assert not AccountDetector(store).denied  # nothing paused after a restart
+    assert f"key_unreadable reason={reason}" in caplog.text and "paused" not in caplog.text
+    assert "fixture-secret" not in caplog.text
+    cycle(watcher)
+    assert read.call_count == 1
+    read.side_effect, read.return_value = None, "fixture-key"
+    cycle(watcher, 61)
+    assert monitor.statuses[p.id] == "" and store.get(p.id).email == DETAILS["email"]
 
 
 def test_saved_pause_reports_unknown_history_without_prompting(store, caplog, monkeypatch):

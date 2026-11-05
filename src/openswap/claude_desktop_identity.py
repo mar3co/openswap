@@ -37,10 +37,11 @@ COOKIE_NAMES = ("lastActiveOrg", "sessionKey", "sessionKeyV3", "sessionKeyLC", "
 MAX_RESPONSE = 2_000_000
 UNAVAILABLE = "Could not detect this profile's account. Sign in inside its Claude window, then try again or enter the details yourself."
 CHANGED = "The account changed during detection. Try again after choosing the account in Claude."
-KEYCHAIN_RETRY = "Account details need Keychain access. Choose Retry detection on the profile, or Detect in Account details, and allow access if macOS asks."
+KEYCHAIN_RETRY = "Account details need Keychain access. Choose Detect and allow access if macOS asks."
+KEY_UNREADABLE = "Couldn't read account details from Claude's saved sign-in key. Try again later or enter the details yourself."
 _logger = logging.getLogger("openswap")
 _KEYCHAIN_REASONS = {"cancelled", "authentication_failed", "interaction_not_allowed", "not_available",
-                     "system_error", "unsupported_value", "item_missing", "timed_out", "unavailable"}
+                     "system_error", "timed_out", "unavailable"}
 
 
 class DetectionError(ClaudeDesktopError):
@@ -49,6 +50,14 @@ class DetectionError(ClaudeDesktopError):
 
 class NoSavedLogin(DetectionError):
     """No usable sign-in cookies; distinct from an unreadable/unknown format."""
+
+
+class KeyUnreadable(DetectionError):
+    """Claude's key is missing or malformed: not a permission problem, so no pause."""
+
+    def __init__(self, reason):
+        super().__init__(KEY_UNREADABLE)
+        self.reason = reason
 
 
 class KeyAccessError(DetectionError):
@@ -190,11 +199,13 @@ def _key():
     try:
         password = macos_keychain.get_password("Claude Safe Storage", "Claude Key", native=True)
         if not password:
-            raise KeyAccessError(KEYCHAIN_RETRY, reason="item_missing")
+            raise KeyUnreadable("item_missing")
         if len(password.encode("utf-8")) > 4096:
-            raise KeyAccessError(KEYCHAIN_RETRY, reason="unsupported_value")
+            raise KeyUnreadable("unsupported_value")
         return hashlib.pbkdf2_hmac("sha1", password.encode("utf-8"), b"saltysalt", 1003, 16)
     except macos_keychain.KeychainError as exc:
+        if exc.reason == "unsupported_value":
+            raise KeyUnreadable(exc.reason) from None
         raise KeyAccessError(KEYCHAIN_RETRY, reason=exc.reason, status=exc.status) from None
     except subprocess.TimeoutExpired:
         raise KeyAccessError(KEYCHAIN_RETRY, reason="timed_out") from None
@@ -348,13 +359,20 @@ class AccountDetector:
                         self.store.pause_keychain(True)
                     stage = "keychain_read_failed"
                     _logger.info("Claude account detection: keychain_access_started")
-                    key = _key()
+                    try:
+                        key, unreadable = _key(), None
+                    except KeyUnreadable as exc:
+                        key, unreadable = None, exc
                     # Granted access lifts the pause even when a toggle during
                     # the prompt copied the marker; only a real denial persists.
                     stage = "clear_pause_failed"
                     if self.store:
                         self.store.pause_keychain(False)
                     self.denied = False
+                    if unreadable:
+                        stage = "key_unreadable"
+                        _logger.warning("Claude account detection: key_unreadable reason=%s", unreadable.reason)
+                        raise unreadable
                     _logger.info("Claude account detection: keychain_access_succeeded pause_cleared=True")
                     if generation != self._generation:
                         stage = "detection_stopped"
@@ -362,7 +380,7 @@ class AccountDetector:
                         raise DetectionError("Account detection stopped.")
                     self._cached_key = key
                 except (KeyAccessError, ClaudeDesktopError, OSError) as exc:
-                    if stage == "detection_stopped":
+                    if stage in ("detection_stopped", "key_unreadable"):
                         raise
                     if generation == self._generation:
                         self.denied = True

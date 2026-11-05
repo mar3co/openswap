@@ -223,16 +223,20 @@ access needed**, with a **Retry detection** button directly beneath the status.
 The explanation above them distinguishes reading account details from being
 signed in to Claude. Retry starts detection immediately, shows progress and
 opens Account details to review and save the result or see why it failed.
-**••• → Account details… → Detect** also retries. A private, credential-free `keychain-paused` marker is written
-before the system request and removed after successful access or explicit
-retry; quitting during a request also leaves detection paused. No repeated
+**••• → Account details… → Detect** also retries. A private, credential-free
+`keychain-paused` marker is written before the system request and removed after
+successful access or explicit retry; quitting during a request also leaves
+detection paused. A missing or unsupported **Claude Safe Storage** item is not a
+permission problem: it removes the marker, the profile says **Account details
+unavailable** without a Retry button, and detection tries again on its normal
+schedule until Claude creates the item. No repeated
 background permission dialogs are shown. A successful read caches the decryption
 key only in memory. Disabling Desktop features clears that key and discards
 in-flight results. No tokens are refreshed or transferred between profiles.
 
 `openswap.log` records the pause reason (cancelled, authentication failed,
-interaction not allowed, Keychain unavailable, missing item or unsupported
-value), the numeric macOS status when available, retry requests and successful
+interaction not allowed or Keychain unavailable), a missing item or unsupported
+value, the numeric macOS status when available, retry requests and successful
 access. An existing pause marker is reported as having an unknown original
 reason; it cannot reconstruct an earlier failure. No keys, cookies, account
 labels, raw error messages or response bodies are logged.

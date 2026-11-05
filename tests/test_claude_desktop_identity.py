@@ -340,6 +340,29 @@ def test_inline_retry_failure_preserves_labels_and_shows_the_recovery_action(con
     assert "allow access" in controller.prompt.call_args.kwargs["message"]
 
 
+@pytest.mark.parametrize("paused", ["no", "denied", "status"])
+def test_detect_rescans_every_profile_only_when_permission_was_paused(controller, paused):
+    p, other = controller.store.add("Work"), controller.store.add("Personal")
+    controller.monitor._records = {p.id: {}, other.id: {}}
+    controller.monitor.detector.denied = paused == "denied"
+    if paused == "status":
+        controller.monitor.statuses[other.id] = "Keychain access needed"
+    controller.monitor.poll = Mock(return_value=False)
+    controller.perform("retry_detection", p.id)
+    assert (other.id in controller.monitor._records) == (paused == "no")
+
+
+def test_unreadable_key_is_reported_without_a_permission_prompt(controller):
+    p = controller.store.add("Work")
+    controller.monitor.poll = Mock(return_value=False)
+    controller.detector.side_effect = identity.KeyUnreadable("item_missing")
+    controller.prompt.return_value = answer(0)
+    controller.perform("retry_detection", p.id)
+    controller.poll()
+    message = controller.prompt.call_args.kwargs["message"]
+    assert message.startswith(identity.KEY_UNREADABLE) and "Keychain access" not in message
+
+
 @pytest.mark.parametrize("gate", ["disabled", "busy", "blocked", "archived"])
 def test_inline_retry_obeys_gates_without_clearing_saved_pause(controller, gate):
     p = controller.store.add("Work")
