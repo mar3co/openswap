@@ -607,7 +607,7 @@ def test_native_quit_never_refetches_a_reused_pid():
 def test_installer_detection_matches_exact_claude_helper(monkeypatch, tmp_path):
     app = cd.ClaudeDesktopApp()
     command = (f"{app.path}/Contents/Frameworks/Squirrel.framework/Resources/ShipIt "
-               f"{update.SHIPIT_ID} {Path.home()}/Library/Caches/{update.SHIPIT_ID}/ShipItState.plist")
+               f"{update.SHIPIT_ID} {update._shipit_cache()}/ShipItState.plist")
     backend = update.MacUpdateBackend(app_factory=lambda: app)
     app.processes = Mock(return_value=f" 12 {command}\n")
     assert backend.installer_running()
