@@ -2206,15 +2206,31 @@ def notification_copy_for_claude_added(name: str, *, existed: bool) -> Notificat
     return NotificationCopy(title=f"{name} added", body="Claude Code is using it now.")
 
 
-def claude_add_unsaved_live_message(email: str, saved_orgs: list[str] | None = None) -> str:
-    if saved_orgs:
+def claude_add_unsaved_live_message(
+    email: str, org_uuid: str, saved_orgs: dict[str, str], *, incomplete: bool = False
+) -> str:
+    """``saved_orgs`` is ``saved_organizations(email)``: lowercased UUID to name."""
+    org_uuid = (org_uuid or "").lower()
+    others = sorted(
+        name or ("an unnamed organization" if uuid else "a personal account")
+        for uuid, name in saved_orgs.items()
+        if uuid != org_uuid
+    )
+    if org_uuid in saved_orgs:
         current = (
-            f"{email} is saved for {', '.join(saved_orgs)}, but Claude Code "
+            f"OpenSwap has {email} saved, but its saved copy is older than "
+            "Claude Code's current login."
+        )
+    elif others:
+        current = (
+            f"{email} is saved for {', '.join(others)}, but Claude Code "
             "currently names a different organization. OpenSwap couldn't "
             "match the current login to a saved copy."
         )
     else:
         current = f"The current Claude Code login for {email} isn't saved in OpenSwap."
+    if incomplete:
+        current += " OpenSwap couldn't check every saved login."
     return (
         f"Your existing saved accounts stay in OpenSwap.\n\n{current}\n\n"
         "Adding another account changes Claude Code's active login. To keep "

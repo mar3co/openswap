@@ -3370,16 +3370,14 @@ def run(switcher, codex=None) -> int:
                 live = self.switcher._get_current_identity_triple(strict=True)
                 if live is None:
                     return True
-                roster = self.switcher._get_sequence_data() or {}
-                if self.switcher._find_account_slot(roster, live[0], live[1]) is None:
-                    if self.switcher.current_login_is_saved():
+                if self.switcher.current_account_number() is None:
+                    saved = self.switcher.current_login_is_saved()
+                    if saved:
                         return True
-                    saved_orgs = sorted({
-                        account.get("organizationName") or "a personal organization"
-                        for account in (roster.get("accounts") or {}).values()
-                        if (account.get("email") or "").casefold() == live[0].casefold()
-                    })
-                    message = claude_add_unsaved_live_message(live[0], saved_orgs)
+                    message = claude_add_unsaved_live_message(
+                        live[0], live[1], self.switcher.saved_organizations(live[0]),
+                        incomplete=saved is None,
+                    )
                 else:
                     self.switcher.add_account(slot=None)
                     return True

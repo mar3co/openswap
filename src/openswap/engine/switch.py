@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from openswap.engine.identity import credential_owner_slots, normalized_identity
 from openswap.engine.notes import *  # noqa: F403
 from openswap.worker.leases import AccountLeaseStore
 
 class SwitchMixin:
     """Capture, activate, classify outgoing live bytes, shared MCP merge."""
 
-    def current_login_is_saved(self) -> bool:
+    def current_login_is_saved(self) -> bool | None:
         """Whether the live credential already has a restorable saved copy.
 
         The config's email/organization can drift independently of the
@@ -16,6 +17,9 @@ class SwitchMixin:
         never recapture it under that potentially unrelated config identity.
         A shared refresh token is enough even after access-token rotation.
         This checks preservation, not which account is currently active.
+
+        None when no readable slot holds it but some slot couldn't be read.
+        An unreadable live credential raises ``CredentialReadError``.
         """
         self._refuse_session_shell()
         with AccountLeaseStore(self.backup_dir, "claude").mutation_guard() as guard:
@@ -28,15 +32,15 @@ class SwitchMixin:
             login = oauth.extract_oauth_data(live)
             if not login or not (login.get("accessToken") or login.get("refreshToken")):
                 return False
-            fingerprint = oauth.credential_fingerprint(live)
-            roster = self._get_sequence_data() or {}
+            accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+            backup_fps: dict[str, str | None] = {}
             unreadable = False
-            for num, account in (roster.get("accounts") or {}).items():
-                email = account.get("email") or ""
-                backup, failed = self._read_account_credentials_ex(num, email)
+            for num, account in accounts.items():
+                backup, failed = self._read_account_credentials_ex(num, account.get("email") or "")
                 unreadable |= failed
-                if not backup or failed or oauth.credential_fingerprint(backup) != fingerprint:
-                    continue
+                backup_fps[num] = None if failed else oauth.credential_fingerprint(backup)
+            for num in credential_owner_slots(oauth.credential_fingerprint(live), backup_fps):
+                email = accounts[num].get("email") or ""
                 # A token without its saved config is not a restorable login.
                 try:
                     config = json.loads(self._read_account_config(num, email) or "null")
@@ -44,15 +48,11 @@ class SwitchMixin:
                     unreadable = True
                     continue
                 identity = config.get("oauthAccount") if isinstance(config, dict) else None
-                if isinstance(identity, dict) and (
-                    identity.get("emailAddress") == email
-                    and (identity.get("organizationUuid") or "")
-                    == (account.get("organizationUuid") or "")
-                ):
+                if isinstance(identity, dict) and normalized_identity(
+                    identity.get("emailAddress"), identity.get("organizationUuid")
+                ) == normalized_identity(email, accounts[num].get("organizationUuid")):
                     return True
-            if unreadable:
-                raise CredentialReadError("Couldn't check OpenSwap's saved logins.")
-            return False
+            return None if unreadable else False
 
     def _prepare_credentials_for_activation(
         self, target_credentials: str, live_credentials: str | None

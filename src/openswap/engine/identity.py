@@ -49,6 +49,12 @@ def credential_owner_slots(
     return [num for num, fp in backup_fps.items() if fp == live_fp]
 
 
+def normalized_identity(email: str | None, org_uuid: str | None) -> tuple[str, str]:
+    """``(email, organizationUuid)`` in comparable form: a slot's row and
+    ``.claude.json`` may differ in case."""
+    return (email or "").casefold(), (org_uuid or "").lower()
+
+
 class IdentityMixin:
     """(email, organizationUuid) matching and identifier resolution."""
 
@@ -161,6 +167,18 @@ class IdentityMixin:
             return None
         return IdentityDrift(config_slot, None, "unattributed", config_identity)
 
+    def saved_organizations(self, email: str) -> dict[str, str]:
+        """``{organizationUuid: organizationName}`` of the slots saved for
+        ``email``, keyed and matched as ``normalized_identity`` compares."""
+        accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+        wanted = normalized_identity(email, "")[0]
+        saved = {}
+        for account in accounts.values():
+            saved_email, org = normalized_identity(account.get("email"), account.get("organizationUuid"))
+            if saved_email == wanted:
+                saved[org] = account.get("organizationName") or ""
+        return saved
+
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
         return self.live_identity() is not None
@@ -250,11 +268,10 @@ class IdentityMixin:
 
         Strict, unlike ``_live_identity_matches``: an unreadable or malformed
         config raises ``ConfigError`` rather than looking like another
-        account. The email compares casefolded and the organization
-        lowercased, since a slot's row and ``.claude.json`` may differ in case.
+        account. Compares via ``normalized_identity``.
         """
         live = self._get_current_identity_triple(strict=True)
-        if live and (live[0].casefold(), live[1].lower()) == (email.casefold(), (org_uuid or "").lower()):
+        if live and normalized_identity(*live[:2]) == normalized_identity(email, org_uuid):
             return live
         return None
 
