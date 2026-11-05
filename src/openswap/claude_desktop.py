@@ -287,15 +287,19 @@ class DesktopProfiles:
         return desktop, code
 
     def save(self, profiles: list[Profile]) -> None:
-        plain(self.registry)
-        fd, raw = tempfile.mkstemp(prefix=".profiles-", dir=self.root)
+        self.write_json(self.registry, {"version": REGISTRY_VERSION, "profiles": [asdict(p) for p in profiles]})
+
+    def write_json(self, path: Path, data: dict) -> None:
+        """Replace a private file in the store atomically and durably."""
+        plain(path)
+        fd, raw = tempfile.mkstemp(prefix=f".{path.stem}-", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": REGISTRY_VERSION, "profiles": [asdict(p) for p in profiles]}, stream, ensure_ascii=False, indent=2)
+                json.dump(data, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(raw, self.registry)
+            os.replace(raw, path)
         finally:
             Path(raw).unlink(missing_ok=True)
         # The rename is in place either way; the directory sync only hastens durability.
@@ -403,6 +407,7 @@ class DesktopProfiles:
             return updated
 
     def open(self, identifier: str, *, app: ClaudeDesktopApp | None = None, existing_only=False) -> dict:
+        from openswap.claude_desktop_update import launch_guard
         app = app or ClaudeDesktopApp()
         info = app.validate()  # no profile changes or launch before publisher validation
         with self.lock():
@@ -411,7 +416,12 @@ class DesktopProfiles:
         launch = self.lock(f"launch-{profile.id}.lock", timeout=LAUNCH_LOCK_TIMEOUT)
         if launch.acquire():
             try:
-                result = app.open(desktop, code, existing_only=True) if existing_only else app.open(desktop, code)
+                if existing_only:
+                    result = app.open(desktop, code, existing_only=True)
+                else:
+                    # The update gate covers only the final check and spawn, never validation.
+                    with launch_guard(info["version"]):
+                        result = app.open(desktop, code)
             finally:
                 launch.release()
         else:

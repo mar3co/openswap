@@ -38,7 +38,7 @@ class ClaudeDesktopMenu:
     def __init__(self, *, prompt, show_error, changed, notify, store=None, app_factory=None, show_status=None, enabled=None,
                  blocked=None, shortcut_factory=None, reveal=None, confirm=None, detector=None, monitor=None,
                  code_engine=None, code_connector=None, code_login_allowed=None, signin_sender=None, shortcut_setup=None,
-                 guide_seen=None, mark_guide_seen=None):
+                 guide_seen=None, mark_guide_seen=None, updater=None):
         self.store = store or DesktopProfiles()
         self.prompt = prompt
         self.show_error = show_error
@@ -79,6 +79,15 @@ class ClaudeDesktopMenu:
         self._profile_checked_at = {}
         self._checked_at = None
         self._check_generation = 0
+        from openswap.claude_desktop_update import DesktopUpdate
+        self.updater = updater or DesktopUpdate(self.store)
+        self._update_observed = False
+
+    def _update_pending(self):
+        try:
+            return self.updater.pending()
+        except (ClaudeSwitchError, OSError):
+            return True  # damaged recovery data must not enable profile launches
 
     def suspend_checks(self):
         self._check_generation += 1
@@ -118,6 +127,7 @@ class ClaudeDesktopMenu:
     def settings_state(self):
         state = {"checking": self.checking, "busy": self.busy or self.blocked(),
                  "operation": self._operation_label(),
+                 "update_pending": self._update_pending(),
                  "app_message": "Checking Claude Desktop…" if self.checking else self._app_message}
         try:
             profiles = self._profiles()
@@ -137,7 +147,7 @@ class ClaudeDesktopMenu:
         return state
 
     def refresh_status(self, _=None):
-        if self.checking or not self.enabled():
+        if self.checking or not self.enabled() or self._update_pending():
             return
         self._check_generation += 1
         generation = self._check_generation
@@ -182,11 +192,17 @@ class ClaudeDesktopMenu:
         menu = rumps.MenuItem("Claude Desktop profiles")
         menu.add(rumps.MenuItem("Separate sign-ins", callback=None))
         menu.add(rumps.MenuItem("Checking status…" if self.checking else "Refresh status",
-                                callback=None if self.checking else self.refresh_status))
+                                callback=None if self.checking or self._update_pending() else self.refresh_status))
         if self._checked_at:
             menu.add(rumps.MenuItem("App check details…", callback=lambda _: self.show_status(self._app_message)))
         if self.busy or self.blocked():
             menu.add(rumps.MenuItem(self._operation_label(), callback=None))
+            return menu
+        pending = self._update_pending()
+        menu.add(rumps.MenuItem("Resume update…" if pending else "Update Claude…", callback=self.update_claude))
+        if pending:
+            menu.add(rumps.MenuItem("Cancel update…", callback=self.cancel_update))
+            menu.add(rumps.MenuItem("Profiles will reopen after the update finishes", callback=None))
             return menu
         menu.add(rumps.MenuItem("Add profile…", callback=self.add))
         try:
@@ -250,6 +266,13 @@ class ClaudeDesktopMenu:
     def perform(self, action, identifier=None):
         """Resolve the current profile by stable ID for inline settings actions."""
         if self.busy or self.blocked() or not self.enabled():
+            return
+        if action == "update":
+            return self.update_claude()
+        if action == "cancel_update":
+            return self.cancel_update()
+        if self._update_pending():
+            self.show_error("Choose Resume update or Cancel update before managing Claude profiles.")
             return
         if action == "add":
             return self.add()
@@ -694,12 +717,79 @@ class ClaudeDesktopMenu:
         except Exception as exc:
             self._results.put((None, exc))
 
+    def update_claude(self, _=None):
+        if self.busy or self.blocked() or not self.enabled() or self._editing_details or self.confirm is None:
+            return
+        self._update_work("Checking Claude's update…", lambda: {"state": "update_plan", "plan": self.updater.plan()})
+
+    def cancel_update(self, _=None):
+        if self.busy or self.blocked() or not self.enabled() or self._editing_details or self.confirm is None:
+            return
+        from openswap.claude_desktop_update import UnreadableJournal
+        try:
+            self.updater.pending()
+            message = ("OpenSwap stops waiting for the update and reopens the profiles it closed, "
+                       "on the Claude version installed now. Profiles that are still open are left alone. "
+                       "Nothing is force-quit.")
+        except UnreadableJournal:
+            message = ("OpenSwap's update record is damaged. Canceling removes it so profiles can open again. "
+                       "OpenSwap can't tell which profiles were open, so nothing is reopened.")
+        except (ClaudeSwitchError, OSError) as exc:
+            self._error(exc)
+            return
+        with self._modal():
+            confirmed = self.confirm(title="Cancel Claude's update?", message=message,
+                                     ok="Cancel update", cancel="Keep update") == 1
+        if confirmed and self.enabled() and not self.blocked():
+            self._update_work("Canceling Claude's update…", self.updater.cancel)
+
+    def _update_work(self, operation, work):
+        self.busy, self.operation = True, operation
+        self._check_generation += 1
+        self.checking = False
+        self._signin = None
+        self.changed()
+
+        def run():
+            try:
+                self._results.put((work(), None))
+            except Exception as exc:
+                self._results.put((None, exc))
+        try:
+            threading.Thread(target=run, daemon=True, name="claude-desktop-update").start()
+        except Exception as exc:
+            self._results.put((None, exc))
+
+    def _confirm_update(self, plan):
+        if not self.enabled() or self.blocked():
+            return
+        if plan.installed:
+            message = "Claude's update is installed. Restore the saved profiles and their Dock indicators?"
+        else:
+            names = ", ".join(plan.names) or "No profiles are currently open"
+            message = (f"Close these Claude profiles: {names}.\n\n"
+                       f"Finish any active work first. OpenSwap will let Claude install {plan.target}, "
+                       "then reopen your profiles and restore their Dock indicators. "
+                       "If Claude asks about unfinished work, answer in its window. Nothing is force-quit.")
+        with self._modal():
+            confirmed = self.confirm(title="Restore Claude profiles?" if plan.installed else "Update Claude Desktop?",
+                                     message=message, ok="Restore profiles" if plan.installed else "Update and reopen",
+                                     cancel="Cancel") == 1
+        if confirmed and self.enabled() and not self.blocked():
+            self._update_work("Updating Claude…", lambda: self.updater.execute(
+                plan, enabled=self.enabled,
+                progress=lambda message: self._results.put(({"state": "update_progress", "message": message}, None))))
+
     def poll(self):
-        if self.signin_links:
-            self.signin_links.poll(idle=not (self.busy or self.blocked() or self._editing_details))
-        if self.monitor.poll(enabled=self.enabled(), idle=not (self.busy or self.blocked() or self._editing_details)):
+        updating = self._update_pending()
+        if updating != self._update_observed:
+            self._update_observed = updating
             self.changed()
-        if self.code and self.code.poll(enabled=self.enabled(), idle=not (self.busy or self.blocked() or self._editing_details) and self.code_login_allowed()):
+        if self.signin_links:
+            self.signin_links.poll(idle=not (self.busy or updating or self.blocked() or self._editing_details))
+        if self.monitor.poll(enabled=self.enabled(), idle=not (self.busy or updating or self.blocked() or self._editing_details)):
+            self.changed()
+        if self.code and self.code.poll(enabled=self.enabled(), idle=not (self.busy or updating or self.blocked() or self._editing_details) and self.code_login_allowed()):
             self.changed()
         try:
             generation, message, states, checked_at = self._checks.get_nowait()
@@ -715,6 +805,10 @@ class ClaudeDesktopMenu:
             result, error = self._results.get_nowait()
         except queue.Empty:
             return
+        if error is None and result.get("state") == "update_progress":
+            self.operation = result["message"]
+            self.changed()
+            return
         self.busy = False
         held, self._signin = self._signin, None
         if error is None and result.get("pid") and result.get("profile", {}).get("id"):
@@ -726,6 +820,25 @@ class ClaudeDesktopMenu:
                 self._discovery_failed(error)
             else:
                 self._error(error)
+            return
+        if result.get("state") == "update_plan":
+            self._confirm_update(result["plan"])
+            return
+        if result.get("state") in {"update_done", "update_canceled"}:
+            missing = result["dock_warnings"]
+            if result["state"] == "update_done":
+                title = "Claude updated"
+                body = f"Claude {result['version']} is installed. " + (
+                    "Your profiles reopened." if missing else "Your profiles and Dock indicators are restored.")
+            else:
+                title = "Claude update canceled"
+                body = "Profiles can open again." + (
+                    f" These profiles didn't reopen: {', '.join(result['failed'])}." if result["failed"] else "") + (
+                    " Reopen your profiles from OpenSwap." if result.get("unreadable") else "")
+            if missing:
+                body += f" Dock indicators didn't return for {', '.join(missing)}. Choose Set up Dock shortcuts in their menus."
+            self._notify(title, body)
+            self.refresh_status()
             return
         if result.get("state") == "signin_candidates":
             self._choose_signin_profile(result, held)
