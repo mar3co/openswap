@@ -23,8 +23,6 @@ from tests.menubar_harness import SETUP_METHODS, SetupWindow, extract_class, set
 from tests.test_worker_accounts import ALICE, root  # noqa: F401 (fixture)
 from tests.test_worker_guided_setup import URL, _code, _repo, enable_calls, research_home  # noqa: F401 (fixtures)
 
-STEPS_BEFORE_DONE = 3
-
 
 def _drive(root, answers, *, chosen=(), steps=guided_setup.run):
     """Run ``steps`` on a worker thread through the window, clicking ``answers`` page by page."""

@@ -562,13 +562,14 @@ def parse_folder_choice(answer: str, count: int) -> list[int] | str | None:
 
 
 def choose_folders(root: Path, ui: Prompts) -> None:
-    """Ask which folders remote tasks may read; each becomes a read-only workspace.
+    """Ask which folders remote sessions may work in; each becomes a workspace.
 
     Results go to ``~/OpenSwap Research/<id>``, created owner-only without
     asking. Enter takes the recommended GitHub folder (else the first one
-    found), or keeps the current folders when some are readable already.
+    found), or keeps the current folders when some are readable already. The
+    setup window (``check_folders``) shows saved and found folders as
+    checkboxes instead (see ``apply_folders``).
     """
-    cli = _cli()
     policy = load_worker_settings(root)
     current = _readable(policy.workspaces)
     if getattr(ui, "check_folders", None) is not None:
