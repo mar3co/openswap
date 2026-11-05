@@ -475,6 +475,12 @@ class ClaudeDesktopApp:
             values.append((value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_mode))
         return tuple(values)
 
+    def bundle_info(self) -> dict:
+        info = plistlib.loads((self.path / "Contents" / "Info.plist").read_bytes())
+        if not isinstance(info, dict) or info.get("CFBundleIdentifier") != BUNDLE_ID or info.get("CFBundleExecutable") != "Claude":
+            raise ClaudeDesktopError("The installed app is not the expected Claude Desktop application.")
+        return info
+
     def validate(self) -> dict:
         self.validation_stamp = None
         if self.platform != "darwin":
@@ -483,9 +489,7 @@ class ClaudeDesktopApp:
             if self.path.is_symlink() or not self.path.is_dir() or self.binary.is_symlink() or not self.binary.is_file():
                 raise ClaudeDesktopError("Install the official Claude.app in Applications before opening a profile.")
             before = self.stamp()
-            info = plistlib.loads((self.path / "Contents" / "Info.plist").read_bytes())
-            if not isinstance(info, dict) or info.get("CFBundleIdentifier") != BUNDLE_ID or info.get("CFBundleExecutable") != "Claude":
-                raise ClaudeDesktopError("The installed app is not the expected Claude Desktop application.")
+            info = self.bundle_info()
             verified = self.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", f"-R={REQUIREMENT}", str(self.path)],
                                 capture_output=True, text=True, timeout=30)
             if verified.returncode:

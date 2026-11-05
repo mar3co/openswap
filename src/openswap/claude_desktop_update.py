@@ -8,6 +8,7 @@ and Cancel reopens them on whichever version is installed.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import uuid
@@ -15,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+from xml.parsers.expat import ExpatError
 
 from openswap import claude_desktop as cd
 
@@ -91,30 +93,38 @@ def launch_guard(installed):
         yield
 
 
-def staged_update(app, *, cache=None, app_factory=cd.ClaudeDesktopApp):
-    cache = cache or Path.home() / "Library" / "Caches" / SHIPIT_ID
+def _shipit_cache():
+    return Path.home() / "Library" / "Caches" / SHIPIT_ID
+
+
+def _staged_bundle(app, cache):
     state = cache / "ShipItState.plist"  # Squirrel writes JSON despite the suffix.
+    if cache.is_symlink() or state.is_symlink() or state.stat().st_size > 32_000:
+        raise ValueError
+    data = json.loads(state.read_text())
+    if not isinstance(data, dict) or data.get("bundleIdentifier") != cd.BUNDLE_ID:
+        raise ValueError
+
+    def local_url(raw):
+        if not isinstance(raw, str):
+            raise ValueError
+        url = urlsplit(raw)
+        if url.scheme != "file" or url.netloc or url.query or url.fragment:
+            raise ValueError
+        return Path(unquote(url.path))
+
+    target = local_url(data["targetBundleURL"])
+    staged = local_url(data["updateBundleURL"])
+    if (target != app.path or staged.name != "Claude.app"
+            or staged.parent.parent != cache or not staged.parent.name.startswith("update.")
+            or staged.parent.is_symlink() or staged.is_symlink()):
+        raise ValueError
+    return staged
+
+
+def staged_update(app, *, cache=None, app_factory=cd.ClaudeDesktopApp):
     try:
-        if cache.is_symlink() or state.is_symlink() or state.stat().st_size > 32_000:
-            raise ValueError
-        data = json.loads(state.read_text())
-        if not isinstance(data, dict) or data.get("bundleIdentifier") != cd.BUNDLE_ID:
-            raise ValueError
-
-        def local_url(raw):
-            if not isinstance(raw, str):
-                raise ValueError
-            url = urlsplit(raw)
-            if url.scheme != "file" or url.netloc or url.query or url.fragment:
-                raise ValueError
-            return Path(unquote(url.path))
-
-        target = local_url(data["targetBundleURL"])
-        staged = local_url(data["updateBundleURL"])
-        if (target != app.path or staged.name != "Claude.app"
-                or staged.parent.parent != cache or not staged.parent.name.startswith("update.")
-                or staged.parent.is_symlink() or staged.is_symlink()):
-            raise ValueError
+        staged = _staged_bundle(app, cache or _shipit_cache())
         # No executable from the state file is run. Verify the downloaded app
         # with the same Anthropic signing requirement as the installed one.
         info = app_factory(staged).validate()
@@ -122,6 +132,19 @@ def staged_update(app, *, cache=None, app_factory=cd.ClaudeDesktopApp):
         return info["version"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise cd.ClaudeDesktopError("No ready Claude update was found. In Claude, check for updates and wait for the download, then choose Update Claude here.") from exc
+
+
+def downloaded_update(app, installed, *, cache=None, app_factory=cd.ClaudeDesktopApp):
+    """A passive status hint, so no signature check: the downloaded version
+    when newer than ``installed``, "" when none is downloaded, None when unknown."""
+    cache = cache or _shipit_cache()
+    if not os.path.lexists(cache / "ShipItState.plist"):
+        return ""
+    try:
+        staged = app_factory(_staged_bundle(app, cache)).bundle_info().get("CFBundleShortVersionString")
+        return staged if version(staged) > version(installed) else ""
+    except (cd.ClaudeDesktopError, OSError, ValueError, KeyError, TypeError, ExpatError):
+        return None
 
 
 class MacUpdateBackend:
@@ -140,7 +163,7 @@ class MacUpdateBackend:
     def installer_running(self):
         app = self.app_factory()
         command = (f"{app.path}/Contents/Frameworks/Squirrel.framework/Resources/ShipIt "
-                   f"{SHIPIT_ID} {Path.home()}/Library/Caches/{SHIPIT_ID}/ShipItState.plist")
+                   f"{SHIPIT_ID} {_shipit_cache()}/ShipItState.plist")
         return any(len(parts) == 2 and parts[0].isdigit() and parts[1] == command
                    for line in app.processes().splitlines() if (parts := line.strip().split(None, 1)))
 

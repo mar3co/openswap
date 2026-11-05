@@ -1,5 +1,6 @@
 """Shared-install update coordination; never launch or quit the real Claude app."""
 import json
+import plistlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -333,11 +334,47 @@ def test_unusable_staging_state_is_not_trusted(stage, change):
     s.factory.assert_not_called()
 
 
+def staged_info(s, version="4.16336.0"):
+    (s.staged / "Contents").mkdir(exist_ok=True)
+    (s.staged / "Contents" / "Info.plist").write_bytes(plistlib.dumps(
+        {"CFBundleIdentifier": cd.BUNDLE_ID, "CFBundleExecutable": "Claude", "CFBundleShortVersionString": version}))
+    run = Mock()
+    return lambda path: cd.ClaudeDesktopApp(path, run=run), run
+
+
+@pytest.mark.parametrize("staged, expected", [("4.16336.0", "4.16336.0"), ("4.4212.0", ""), ("4.1.0", "")])
+def test_downloaded_update_reads_staged_version_without_signature_check(stage, staged, expected):
+    factory, run = staged_info(stage, staged)
+    assert update.downloaded_update(stage.app, "4.4212.0", cache=stage.cache, app_factory=factory) == expected
+    run.assert_not_called()
+
+
+def test_no_state_file_means_no_update_downloaded(stage):
+    stage.state.unlink()
+    assert update.downloaded_update(stage.app, "4.4212.0", cache=stage.cache, app_factory=stage.factory) == ""
+    stage.factory.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["invalid", "target", "plist", "missing", "bundle", "version", "installed"])
+def test_unreadable_download_state_is_unknown(stage, change):
+    factory, run = staged_info(stage, "4.x" if change == "version" else "4.16336.0")
+    installed = "unknown" if change == "installed" else "4.4212.0"
+    if change == "invalid": stage.state.write_text("{")
+    if change == "target":
+        stage.data["targetBundleURL"] = (stage.app.path.parent / "Other.app").as_uri()
+        stage.state.write_text(json.dumps(stage.data))
+    if change == "plist": (stage.staged / "Contents" / "Info.plist").write_text("<plist")
+    if change == "missing": (stage.staged / "Contents" / "Info.plist").unlink()
+    if change == "bundle": (stage.staged / "Contents" / "Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": "other"}))
+    assert update.downloaded_update(stage.app, installed, cache=stage.cache, app_factory=factory) is None
+    run.assert_not_called()
+
+
 @pytest.fixture
 def menu(setup, monkeypatch):
     monkeypatch.setattr("openswap.claude_desktop_menu.threading.Thread", lambda **kw: SimpleNamespace(start=kw["target"]))
     return ClaudeDesktopMenu(store=setup.store, updater=setup.updater, prompt=Mock(), confirm=Mock(return_value=1),
-                             show_error=Mock(), changed=Mock(), notify=Mock())
+                             show_error=Mock(), changed=Mock(), notify=Mock(), app_factory=launcher)
 
 
 def test_ui_cancel_never_quits_or_writes_recovery(menu, setup):
@@ -381,6 +418,155 @@ def test_pending_update_has_recovery_action_with_disabled_profile_controls(menu,
     menu.show_error.assert_called_once()
 
 
+@pytest.mark.parametrize("staged, label", [("4.16336.0", "Claude 4.16336.0 is ready to install"),
+                                           ("", "Claude 4.4212.0 · No update downloaded"), (None, None)])
+def test_status_check_reports_downloaded_update(menu, monkeypatch, staged, label):
+    downloaded = Mock(return_value=staged)
+    monkeypatch.setattr(update, "downloaded_update", downloaded)
+    app = launcher("4.4212.0")
+    app.profile_states.return_value = {}
+    menu._app_factory = lambda: app
+    menu.refresh_status()
+    menu.poll()
+    downloaded.assert_called_once_with(app, "4.4212.0")
+    assert menu.settings_state()["update_label"] == label
+
+
+def test_failed_app_check_has_no_update_label(menu, monkeypatch):
+    downloaded = Mock(return_value="4.16336.0")
+    monkeypatch.setattr(update, "downloaded_update", downloaded)
+    app = launcher()
+    app.validate.side_effect = cd.ClaudeDesktopError("Reinstall the official app.")
+    app.profile_states.return_value = {}
+    menu._app_factory = lambda: app
+    menu._update_label = "Claude 4.16336.0 is ready to install"
+    menu.refresh_status()
+    menu.poll()
+    downloaded.assert_not_called()
+    assert menu.settings_state()["update_label"] is None
+
+
+def test_failed_check_stops_the_label_until_a_check_passes(passive):
+    p = passive
+    p.app.validate.side_effect = cd.ClaudeDesktopError("Reinstall the official app.")
+    p.app.profile_states.return_value = {}
+    p.menu.refresh_status()
+    p.menu.poll()
+    p.now[0] += 61
+    p.menu.poll()
+    p.menu.poll()
+    p.downloaded.assert_not_called()
+    assert p.menu.settings_state()["update_label"] is None
+    p.app.validate.side_effect = None
+    p.app.validate.return_value = {"version": "4.4212.0"}
+    p.menu.refresh_status()
+    p.menu.poll()
+    p.downloaded.reset_mock()
+    p.now[0] += 61
+    p.menu.poll()
+    p.menu.poll()
+    p.downloaded.assert_called_once()
+
+
+def test_stale_check_cannot_set_update_label(menu):
+    menu._label_checked_at = menu.clock()
+    menu._checks.put((menu._check_generation - 1, "Old result", {}, "Claude 4.1.0 is ready to install", "old", True))
+    menu._labels.put((menu._check_generation - 1, "Claude 4.1.0 is ready to install"))
+    menu.poll()
+    menu.poll()
+    assert menu.settings_state()["update_label"] is None
+
+
+def test_label_error_keeps_verified_app_message(menu, monkeypatch):
+    monkeypatch.setattr(update, "downloaded_update", Mock(side_effect=RuntimeError("boom")))
+    app = launcher("4.4212.0")
+    app.profile_states.return_value = {}
+    menu._app_factory = lambda: app
+    menu.refresh_status()
+    menu.poll()
+    state = menu.settings_state()
+    assert state["app_message"] == "Claude 4.4212.0 · Publisher verified."
+    assert state["update_label"] is None
+
+
+@pytest.fixture
+def passive(menu, monkeypatch):
+    now = [1000.0]
+    menu.clock = lambda: now[0]
+    downloaded = Mock(return_value="4.16336.0")
+    monkeypatch.setattr(update, "downloaded_update", downloaded)
+    app = launcher()
+    app.bundle_info.return_value = {"CFBundleShortVersionString": "4.4212.0"}
+    menu._app_factory = lambda: app
+    return SimpleNamespace(menu=menu, now=now, downloaded=downloaded, app=app)
+
+
+def test_poll_notices_download_and_install_without_a_full_check(passive):
+    p = passive
+    p.menu.poll()
+    assert p.menu._update_label == "Claude 4.16336.0 is ready to install"
+    p.downloaded.return_value = ""
+    p.app.bundle_info.return_value = {"CFBundleShortVersionString": "4.16336.0"}
+    p.now[0] += 59
+    p.menu.poll()
+    assert p.menu._update_label == "Claude 4.16336.0 is ready to install"
+    p.now[0] += 2
+    p.menu.poll()
+    assert p.menu._update_label == "Claude 4.16336.0 · No update downloaded"
+    p.app.validate.assert_not_called()
+    p.app.profile_states.assert_not_called()
+
+
+def test_opening_the_panel_refreshes_a_label_older_than_30_seconds(passive):
+    p = passive
+    p.menu._label_checked_at = p.now[0]
+    p.now[0] += 29
+    p.menu.settings_state()
+    p.downloaded.assert_not_called()
+    p.now[0] += 2
+    p.menu.settings_state()
+    p.menu.poll()
+    assert p.menu.settings_state()["update_label"] == "Claude 4.16336.0 is ready to install"
+
+
+@pytest.mark.parametrize("reason", ["busy", "checking", "pending", "disabled"])
+def test_passive_label_refresh_waits(passive, setup, reason):
+    p = passive
+    if reason == "busy": p.menu.busy = True
+    if reason == "checking": p.menu.checking = True
+    if reason == "pending":
+        setup.backend.refuse_quit = True
+        with pytest.raises(cd.ClaudeDesktopError): setup.updater.execute(setup.updater.plan())
+    if reason == "disabled": p.menu.enabled = lambda: False
+    p.menu.poll()
+    p.menu.settings_state()
+    p.downloaded.assert_not_called()
+
+
+def test_turning_desktop_features_off_clears_the_label(passive):
+    p = passive
+    p.menu.poll()
+    assert p.menu._update_label
+    p.menu.suspend_checks()
+    assert p.menu.settings_state()["update_label"] is None
+
+
+@pytest.mark.parametrize("state, main, settings", [
+    ({"update_label": "Claude 4.16336.0 is ready to install"}, "Claude 4.16336.0 is ready to install", "Claude 4.16336.0 is ready to install"),
+    ({"update_label": "Claude 4.4212.0 · No update downloaded"}, "Claude 4.4212.0 · No update downloaded", "Claude 4.4212.0 · No update downloaded"),
+    ({}, "Claude Desktop update", "Update and restore profiles"),
+    ({"update_label": "Claude 4.16336.0 is ready to install", "update_pending": True}, "Claude Desktop update", "Update and restore profiles"),
+])
+def test_update_row_label_follows_last_check(state, main, settings):
+    rows = {r["id"]: r for r in claude_desktop_profile_rows(state)}
+    setting_rows = {r["id"]: r for r in claude_desktop_settings_rows(state)}
+    assert rows["claude_desktop_update"]["label"] == main
+    assert setting_rows["claude_desktop_update"]["label"] == settings
+    title = "Resume update…" if state.get("update_pending") else "Update Claude…"
+    for row in (rows["claude_desktop_update"], setting_rows["claude_desktop_update"]):
+        assert row["title"] == title and not row["disabled"]
+
+
 @pytest.mark.parametrize("problem", [None, "unknown", "archived", "executable", "bundle", "starting"])
 def test_native_snapshot_requires_exact_known_active_processes(setup, monkeypatch, problem):
     s = setup
@@ -421,7 +607,7 @@ def test_native_quit_never_refetches_a_reused_pid():
 def test_installer_detection_matches_exact_claude_helper(monkeypatch, tmp_path):
     app = cd.ClaudeDesktopApp()
     command = (f"{app.path}/Contents/Frameworks/Squirrel.framework/Resources/ShipIt "
-               f"{update.SHIPIT_ID} {Path.home()}/Library/Caches/{update.SHIPIT_ID}/ShipItState.plist")
+               f"{update.SHIPIT_ID} {update._shipit_cache()}/ShipItState.plist")
     backend = update.MacUpdateBackend(app_factory=lambda: app)
     app.processes = Mock(return_value=f" 12 {command}\n")
     assert backend.installer_running()
