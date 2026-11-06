@@ -1572,21 +1572,36 @@ Turning notices on installs Claude Code hooks (`openswap attention <event>`,
 `~/.claude`, each account session profile that has its own `settings.json`,
 and each Claude Desktop profile's Code folder. Only OpenSwap's own entries are
 added or removed; a settings file that cannot be read is left alone, as with
-the status line. Codex's `notify` is chained: it becomes `openswap attention
-codex-notify -- <the program that was there>`, which still runs that program
-with the same arguments. The worker repeats both at each start, so a config
-home added since gets the hooks and a `notify` another program rewrote is
-chained again, keeping the new program. Turning notices off, or uninstalling
-OpenSwap, removes the hooks and puts `notify` back only while it still names
-OpenSwap; with notices off, the worker also takes out at its start any hook a
-failed removal left.
+the status line. For Codex, it adds OpenSwap's hooks (`PermissionRequest`,
+`PostToolUse`, `Stop`, `UserPromptSubmit`, `Interrupt`, `SessionEnd`) to the
+Codex home's `hooks.json` and sets `[features] hooks = true` in its
+`config.toml`; Codex's `notify` is left alone. Each Codex entry runs
+`<backup root>/bin/codex-hook <event>`, a script that starts the current
+OpenSwap: the entries never change when the app is updated or moved or a DEV
+build runs, so Codex asks to trust them once. Codex records trust by an
+entry's position, so an existing entry keeps its place and other hooks are
+never moved; a new entry goes last. OpenSwap never writes `/etc/codex` or other
+managed Codex files. The worker repeats all of this at each start, so a
+config home added since gets the hooks and the script follows the app.
+Turning notices off, or uninstalling OpenSwap, removes the hooks and puts
+`features.hooks` back as it was (unset, `true` or `false`) unless `hooks.json`
+still holds other hooks, which keeps it on; with notices off, the worker also
+takes out at its start any hook a failed removal left.
+
+Codex shows "Hooks need review" at its next start after the hooks are added
+or changed; until the owner chooses "Trust all and continue" (or trusts them
+in `/hooks`), they do not run. Settings › Remote › Sessions shows Codex's
+actual state, read from Codex's own files: trusted, waiting for that review,
+turned off in Codex (`/hooks` or `features.hooks = false`), blocked by managed
+configuration (`allow_managed_hooks_only`, or hooks turned off in
+`/etc/codex` or a managed profile), or missing. Turning notices on says so
+when the review is still to come.
 
 A hook hands its event to the worker's socket and exits within a second,
 printing nothing; with no worker running the event is dropped. The worker
 publishes an item when Claude Code itself decides the owner seems away (its
 `permission_prompt` notification, about 6 seconds into a permission or
-question dialog, and `idle_prompt`, about 60 seconds after a turn ends) and
-for every finished Codex turn. A `permission_prompt` publishes only the prompt
+question dialog, and `idle_prompt`, about 60 seconds after a turn ends). A `permission_prompt` publishes only the prompt
 waiting now, once: Claude Code sends it 6 seconds after that dialog showed,
 which is when the dialog's `PermissionRequest` ran, so it is matched to that
 call (several subagent prompts can wait at once, each with its own notice). A
@@ -1611,6 +1626,23 @@ main thread's permission and question items, not a subagent's that still waits
 and not the idle item, which replies settle, and
 a turn that a background task's result starts (`<task-notification>`) closes
 nothing: a subagent's prompt may still be waiting.
+Codex sends no such notification, so its items wait as Claude Code's do: an
+approval (`PermissionRequest`) is published once it has been open 6 seconds,
+and a finished turn (`Stop`) once 60 seconds pass without the owner typing on
+that thread. Codex runs `Stop` only for a thread the owner works in (a
+subagent gets `SubagentStop`, and Codex's own helper threads, such as its
+title writer and approval reviewer, run no hooks). An approval no person is
+asked for opens nothing: with `approval_policy = "never"`, or when the
+thread's `approvals_reviewer` (read from its session record's `turn_context`)
+is not `user`. A Codex approval closes as `answered_on_mac` on that call's
+`PostToolUse`, on `Stop`, `UserPromptSubmit` or `Interrupt` (Esc or "No") on
+the same thread, or when Codex's own log database (`logs_*.sqlite` in the
+Codex home) records an answer on that thread since the approval was asked;
+a finished turn closes on the thread's next `UserPromptSubmit`. A subagent's
+approval belongs to its own thread. Codex items close as `session_ended` with
+`SessionEnd` or when the Codex process that ran their hooks exits (Codex's
+shared app-server, which keeps a thread open after the terminal closes, the
+desktop app, or `codex exec`), and expire after 24 hours.
 Hooks run asynchronously and can arrive out of order, so each one carries the
 time it ran, which orders it against the others and against the session
 files' `statusUpdatedAt`. An idle item shows the last message of the latest

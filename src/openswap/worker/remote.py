@@ -762,7 +762,7 @@ class RemoteClient:
             if changed:
                 store.changed.clear()
             try:
-                store.refresh()  # the session files: answers and exits that fire no hook
+                store.refresh()  # session files and Codex's log: answers and exits that fire no hook
                 store.tick()
                 now = time.monotonic()
                 if now >= next_pass:

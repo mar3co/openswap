@@ -941,10 +941,20 @@ def run(switcher, codex=None) -> int:
 
             status = dict(self._worker_status_cache)
             switches = load_attention_settings(self.switcher.backup_dir)
-            status["attention"] = {"notices": switches.notices, "details": switches.details}
+            status["attention"] = {"notices": switches.notices, "details": switches.details,
+                                   "codex": self._codex_hooks_status() if switches.notices else None}
             if self._setup_changing_folders():
                 status["setup_changing_folders"] = True
             return status
+
+        def _codex_hooks_status(self):
+            from openswap.attention import codex_hooks_status
+            from openswap.codex.auth import codex_home
+
+            try:
+                return codex_hooks_status(codex_home(), self.switcher.backup_dir)
+            except OSError:
+                return "unknown"
 
         def _setup_prompts(self, title):
             """The setup's front end: pairing in dialogs, every later step in the setup window."""
@@ -2617,6 +2627,10 @@ def run(switcher, codex=None) -> int:
             if problems:
                 more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
                 self._show_error(f"Session notices could not be set up everywhere: {problems[0]}{more}")
+            elif not current.notices and self._codex_hooks_status() == "review":
+                from openswap.menubar_display import CODEX_REVIEW
+
+                self._alert(title="openswap", message=CODEX_REVIEW)
 
         def _toggle_codex_auto(self) -> bool:
             """Flip Codex auto-switching (Settings row and the Codex tab's footer toggle)."""

@@ -1772,8 +1772,9 @@ def _mark_stopped_quietly(runtime) -> None:
 def _attention_store(backup_root: Path):
     """Session attention for this worker: the items, and the hooks brought up to date."""
     from openswap import attention as hooks
+    from openswap.codex.auth import codex_home
     from openswap.settings import load_attention_settings
-    from openswap.worker.attention import AttentionStore
+    from openswap.worker.attention import AttentionStore, read_codex_answers
 
     try:
         for problem in hooks.reconcile(backup_root):
@@ -1781,7 +1782,8 @@ def _attention_store(backup_root: Path):
     except Exception:
         logger.warning("Session notice hooks could not be checked", exc_info=True)
     return AttentionStore(backup_root, enabled=lambda: load_attention_settings(backup_root).notices,
-                          records=_session_records(backup_root))
+                          records=_session_records(backup_root),
+                          codex_answers=lambda threads: read_codex_answers([codex_home()], threads))
 
 
 def _session_records(backup_root: Path):

@@ -8,9 +8,9 @@ import os
 import socket
 import sys
 import threading
+import sqlite3
 import time
 import tomllib
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -625,20 +625,6 @@ def test_claude_pid_skips_the_shell_claude_code_ran_the_hook_through(monkeypatch
     assert int(out.stdout) == os.getpid()
 
 
-def test_codex_turns_supersede_and_expire(store):
-    items, clock = store
-    turn = {"provider": "codex", "event": "agent-turn-complete", "thread_id": "019a-thread", "cwd": "/r",
-            "last_message": "Done"}
-    items.notice(validate_notice(dict(turn)))
-    items.notice(validate_notice(dict(turn)))
-    [item] = published(items)
-    assert (item["kind"], item["provider"], item["session_label"]) == ("finished", "codex", "Codex · 019a")
-    assert [c["reason"] for c in closes(items)] == ["superseded"]
-    clock.now += 24 * 3600
-    items.tick()
-    assert published(items) == [] and closes(items)[-1] == {"id": item["id"], "reason": "expired"}
-
-
 def test_open_items_survive_a_restart_and_a_lost_file_reports_no_closes(tmp_path):
     clock = Clock()
     first = AttentionStore(tmp_path, clock=clock)
@@ -666,7 +652,9 @@ def test_notices_are_dropped_while_switched_off(tmp_path):
     {"provider": "claude", "event": "Stop", "session_id": "s", "cwd": "/x", "last_message": "x" * 1001},
     {"provider": "claude", "event": "Stop", "session_id": "s", "cwd": "/x", "last_message": "bad\x00"},
     {"provider": "claude", "event": "PostToolUse", "session_id": "s", "cwd": "/x", "tool_key": "NOTHEX"},
-    {"provider": "codex", "event": "agent-turn-complete", "cwd": "/x"},
+    {"provider": "codex", "event": "Stop", "cwd": "/x"},
+    {"provider": "codex", "event": "SubagentStop", "session_id": "t", "cwd": "/x"},
+    {"provider": "codex", "event": "Stop", "session_id": "t", "cwd": "/x", "prompt_kind": "task"},
 ])
 def test_malformed_notices_are_refused(notice):
     with pytest.raises(NoticeError):
@@ -1040,92 +1028,430 @@ def test_set_notices_saves_the_switch_and_reports_what_failed(tmp_path, monkeypa
     assert len(problems) == 1 and str(claude) in problems[0]
 
 
-# --- Codex notify ------------------------------------------------------------------
+# --- Codex (plan 025 D5: Codex hooks; required outcomes C1-C14) -----------------------
+
+# Shapes as Codex 0.166.0-alpha.6 sent them (live run, 2026-11-06).
+THREAD = "01a1b26a-eaa7-7221-8332-da938297142e"
+SUBAGENT = "01a1b26b-2ce2-7d81-bfc2-1b055006921a"
 
 
-COMPUTER_USE = ["/Users/o/.codex/computer-use/Sky.app/Contents/MacOS/SkyComputerUseClient", "turn-ended"]
+def codex(event, thread=THREAD, **fields):
+    data = {"session_id": thread, "transcript_path": None, "cwd": "/Users/o/code/app", "hook_event_name": event,
+            "model": "gpt-5.1", "permission_mode": "default", **fields}
+    notice = attention._codex_notice(event, json.dumps(data).encode())
+    return None if notice is None else validate_notice(notice)
 
 
-def _codex(tmp_path, text):
+def codex_permission(command="touch marker", thread=THREAD, **extra):
+    return codex("PermissionRequest", thread, turn_id="t1", tool_name="Bash",
+                 tool_input={"command": command, "description": "Create a marker file?"}, **extra)
+
+
+def codex_post(command="touch marker", thread=THREAD, **extra):
+    return codex("PostToolUse", thread, turn_id="t1", tool_name="Bash", tool_use_id="call_4",
+                 tool_input={"command": command}, tool_response="", **extra)
+
+
+def codex_stop(message="Codex mock reply 7", thread=THREAD):
+    return codex("Stop", thread, turn_id="t1", stop_hook_active=False, last_assistant_message=message)
+
+
+class Answers:
+    """Codex's log as ``read_codex_answers`` reads it: thread -> when a person answered."""
+
+    def __init__(self):
+        self.at, self.fail = {}, False
+
+    def __call__(self, threads):
+        if self.fail:
+            raise sqlite3.OperationalError("no such table: logs")
+        return {t: at for t, at in self.at.items() if t in threads}
+
+
+@pytest.fixture
+def codex_store(tmp_path):
+    clock, answers = Clock(), Answers()
+    return AttentionStore(tmp_path, clock=clock, codex_answers=answers), clock, answers
+
+
+def wait(items, clock, seconds):
+    clock.now += seconds
+    items.refresh()
+    items.tick()
+
+
+def test_c1_an_approval_still_open_after_six_seconds_is_published(codex_store):
+    items, clock, _ = codex_store
+    items.notice(codex_permission())
+    wait(items, clock, 5.9)
+    assert published(items) == []
+    wait(items, clock, 0.1)
+    [item] = published(items)
+    assert (item["kind"], item["provider"], item["session_label"]) == ("permission", "codex", "Codex · 01a1")
+    assert item["detail"] == {"tool_name": "Bash", "description": "Create a marker file?"}
+
+
+@pytest.mark.parametrize("signal", ["interrupt", "log"])
+def test_c2_a_decline_within_six_seconds_never_pushes(codex_store, signal):
+    items, clock, answers = codex_store
+    items.notice(codex_permission())
+    if signal == "interrupt":  # Esc, or "No", at Codex's prompt
+        items.notice(codex("Interrupt", turn_id="t1") | {"at": START + 2})
+    else:
+        answers.at[THREAD] = START + 2  # operation="exec_approval" (decision: Cancel) in Codex's log
+    wait(items, clock, 10)
+    assert published(items) == [] and closes(items) == []
+
+
+def test_c2_an_answer_after_the_push_closes_it_as_answered_on_the_mac(codex_store):
+    items, clock, answers = codex_store
+    items.notice(codex_permission())
+    wait(items, clock, 7)
+    [item] = published(items)
+    answers.at[THREAD] = START + 9
+    wait(items, clock, 3)
+    assert published(items) == [] and closes(items) == [{"id": item["id"], "reason": "answered_on_mac"}]
+
+
+def test_c2_an_answer_to_an_earlier_prompt_does_not_close_a_later_one(codex_store):
+    items, clock, answers = codex_store
+    answers.at[THREAD] = START - 1
+    items.notice(codex_permission())
+    wait(items, clock, 7)
+    assert len(published(items)) == 1
+
+
+def test_c2_without_codex_log_the_item_closes_at_the_threads_next_event(codex_store):
+    items, clock, answers = codex_store
+    answers.fail = True
+    items.notice(codex_permission())
+    wait(items, clock, 7)
+    [item] = published(items)
+    items.notice(codex_stop() | {"at": START + 20})
+    assert closes(items) == [{"id": item["id"], "reason": "answered_on_mac"}]
+
+
+def test_codex_log_answers_are_read_by_thread_from_codex_log_database(tmp_path):
+    from openswap.worker.attention import read_codex_answers
+
     home = tmp_path / "codex"
-    home.mkdir(exist_ok=True)
-    (home / "config.toml").write_text(text)
-    return home
+    home.mkdir()
+    db = sqlite3.connect(home / "logs_2.sqlite")
+    db.execute("create table logs (id integer primary key, ts integer, ts_nanos integer, level text, target text,"
+               " feedback_log_body text, thread_id text)")
+    body = ('session_loop{{thread_id={t}}}: Submission thread_id={t} submission_id=x operation="{op}" '
+            'op=ExecApproval {{ id: "call_4" }}')
+    db.executemany("insert into logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) values (?,?,?,?,?,?)", [
+        (int(START) + 3, 75_000_000, "DEBUG", "codex_core::session::handlers", body.format(t=THREAD, op="exec_approval"),
+         THREAD),
+        (int(START) + 4, 0, "DEBUG", "codex_core::session::handlers", body.format(t=OTHER, op="turn_input"), OTHER),
+        (int(START) - 600, 0, "DEBUG", "codex_core::session::handlers", body.format(t=OTHER, op="patch_approval"),
+         OTHER),
+    ])
+    db.commit()
+    db.close()
+    answers = read_codex_answers([home, tmp_path / "no-codex"], {THREAD: START, OTHER: START})
+    assert answers == {THREAD: pytest.approx(START + 3.075)}
 
 
-def _notify(home):
-    return tomllib.loads((home / "config.toml").read_text()).get("notify")
+def _transcript(tmp_path, reviewer, turn="t1"):
+    path = tmp_path / "rollout.jsonl"
+    lines = [{"type": "session_meta", "payload": {"thread_source": "user"}},
+             {"type": "turn_context", "payload": {"turn_id": "t0", "approvals_reviewer": "user"}},
+             {"type": "turn_context", "payload": {"turn_id": turn, "approvals_reviewer": reviewer}}]
+    path.write_text("".join(json.dumps(line, separators=(",", ":")) + "\n" for line in lines))
+    return str(path)
 
 
-def test_chaining_keeps_the_previous_program_and_the_rest_of_the_file(tmp_path):
-    original = ('# my settings\nmodel = "gpt-5"\nnotify = [\n  "%s",\n  "turn-ended",\n]\n\n'
-                '[profiles.fast]\nnotify = ["keep"]\nmodel = "mini"  # inline\n') % COMPUTER_USE[0]
-    home = _codex(tmp_path, original)
-    assert attention.chain_codex_notify(home, EXE) is True
-    text = (home / "config.toml").read_text()
-    assert _notify(home) == [EXE, "attention", "codex-notify", "--", *COMPUTER_USE]
-    assert "# my settings" in text and "# inline" in text
-    assert tomllib.loads(text)["profiles"] == {"fast": {"notify": ["keep"], "model": "mini"}}
-    assert attention.chain_codex_notify(home, EXE) is False
-    assert attention.unchain_codex_notify(home) is True
-    assert _notify(home) == COMPUTER_USE
-    assert tomllib.loads((home / "config.toml").read_text()) == tomllib.loads(original)
+def test_c3_approvals_no_person_is_asked_for_open_nothing(tmp_path, codex_store):
+    assert codex_permission(permission_mode="bypassPermissions") is None  # approval_policy = "never"
+    assert codex_permission(transcript_path=_transcript(tmp_path, "auto_review")) is None
+    assert codex_permission(transcript_path=_transcript(tmp_path, "user")) is not None
+    assert codex_permission(transcript_path=str(tmp_path / "gone.jsonl")) is not None  # cannot tell: a person
+    # The owner's own PermissionRequest hook allowing it: the call runs at once.
+    items, clock, _ = codex_store
+    items.notice(codex_permission())
+    items.notice(codex_post() | {"at": START + 0.2})
+    wait(items, clock, 10)
+    assert published(items) == [] and closes(items) == []
 
 
-def test_a_rewritten_notify_is_chained_again_keeping_the_new_program(tmp_path):
-    home = _codex(tmp_path, 'notify = ["first"]\n')
-    attention.chain_codex_notify(home, EXE)
-    (home / "config.toml").write_text('notify = ["second", "arg"]\n')  # Codex Computer Use updated
-    attention.chain_codex_notify(home, EXE)
-    assert _notify(home) == [EXE, "attention", "codex-notify", "--", "second", "arg"]
+@pytest.mark.parametrize("answer", ["post", "stop", "prompt"])
+def test_c4_the_threads_next_event_closes_its_approval(codex_store, answer):
+    items, clock, _ = codex_store
+    items.notice(codex_permission())
+    wait(items, clock, 7)
+    [item] = published(items)
+    event = {"post": codex_post(), "stop": codex_stop(),
+             "prompt": codex("UserPromptSubmit", turn_id="t2", prompt="next")}[answer]
+    items.notice(event | {"at": START + 8})
+    assert closes(items) == [{"id": item["id"], "reason": "answered_on_mac"}]
 
 
-def test_unchain_restores_only_while_notify_still_names_openswap(tmp_path):
-    home = _codex(tmp_path, f'notify = ["{EXE}", "attention", "codex-notify", "--"]\n')
-    assert attention.unchain_codex_notify(home) is True
-    assert _notify(home) is None
-    (home / "config.toml").write_text('notify = ["someone-else"]\n')
-    assert attention.unchain_codex_notify(home) is False
-    assert _notify(home) == ["someone-else"]
+def test_c4_events_from_another_thread_or_call_never_close_it(codex_store):
+    items, clock, _ = codex_store
+    items.notice(codex_permission())
+    wait(items, clock, 7)
+    for event in (codex_post(thread=OTHER), codex_stop(thread=OTHER), codex("Interrupt", OTHER, turn_id="x"),
+                  codex_post(command="touch other")):
+        items.notice(event | {"at": START + 8})
+    assert len(published(items)) == 1 and closes(items) == []
 
 
-def test_chaining_without_a_notify_or_without_codex(tmp_path):
-    home = _codex(tmp_path, '[tui]\ntheme = "dark"\n')
-    attention.chain_codex_notify(home, EXE)
-    assert tomllib.loads((home / "config.toml").read_text()) == {
-        "notify": [EXE, "attention", "codex-notify", "--"], "tui": {"theme": "dark"}}
-    assert attention.chain_codex_notify(tmp_path / "missing", EXE) is False
+def test_c5_a_finished_turn_is_pushed_only_after_sixty_quiet_seconds(codex_store):
+    items, clock, _ = codex_store
+    items.notice(codex_stop())
+    wait(items, clock, 59)
+    assert published(items) == []
+    wait(items, clock, 1)
+    [item] = published(items)
+    assert (item["kind"], item["detail"]) == ("finished", {"last_message": "Codex mock reply 7"})
 
 
-@pytest.mark.parametrize("text", ['notify = "a string"\n', "notify = [\n", 'notify = [1, 2]\n'])
-def test_a_notify_this_cannot_rewrite_is_left_alone(tmp_path, text):
-    home = _codex(tmp_path, text)
-    with pytest.raises(ConfigError):
-        attention.chain_codex_notify(home, EXE)
-    assert (home / "config.toml").read_text() == text
-    if text == "notify = [\n":
-        with pytest.raises(ConfigError):  # uninstall must say it could not check
-            attention.unchain_codex_notify(home)
+def test_c5_a_prompt_inside_the_window_closes_it_without_a_push(codex_store):
+    items, clock, _ = codex_store
+    items.notice(codex_stop())
+    items.notice(codex("UserPromptSubmit", turn_id="t2", prompt="more") | {"at": START + 30})
+    wait(items, clock, 120)
+    assert published(items) == [] and closes(items) == []
 
 
-def test_codex_notify_runs_the_previous_program_with_the_same_arguments(tmp_path, monkeypatch):
-    out = tmp_path / "argv.json"
-    script = tmp_path / "previous.py"
-    script.write_text(f"import json, sys\nopen({str(out)!r}, 'w').write(json.dumps(sys.argv[1:]))\n")
-    payload = json.dumps({"type": "agent-turn-complete", "thread-id": "019a", "cwd": "/r",
-                          "last-assistant-message": "Done", "input-messages": ["typed by the owner"]})
+def test_c6_typing_again_closes_the_finished_item(codex_store):
+    items, clock, _ = codex_store
+    items.notice(codex_stop())
+    wait(items, clock, 61)
+    [item] = published(items)
+    items.notice(codex("UserPromptSubmit", turn_id="t2", prompt="more") | {"at": START + 70})
+    assert closes(items) == [{"id": item["id"], "reason": "answered_on_mac"}]
+
+
+def test_c7_items_end_with_the_codex_process_never_as_answered(codex_store):
+    import subprocess
+
+    items, clock, _ = codex_store
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    items.notice(codex_permission() | {"pid": gone.pid})
+    items.notice(codex_stop(thread=OTHER) | {"pid": os.getpid()})
+    wait(items, clock, 61)
+    [alive] = published(items)
+    assert alive["kind"] == "finished"
+    assert closes(items) == []  # the ended process's approval was never pushed
+    items.notice(codex("SessionEnd", OTHER, reason="other"))
+    assert closes(items) == [{"id": alive["id"], "reason": "session_ended"}]
+
+
+def test_c7_every_codex_item_expires_after_a_day(codex_store):
+    items, clock, _ = codex_store
+    items.notice(codex_permission())
+    wait(items, clock, 7)
+    [item] = published(items)
+    wait(items, clock, 24 * 3600)
+    assert closes(items) == [{"id": item["id"], "reason": "expired"}]
+
+
+def test_c8_a_subagents_approval_is_its_own(codex_store):
+    items, clock, answers = codex_store
+    items.notice(codex_permission(agent_id=SUBAGENT, agent_type="default"))
+    items.notice(codex_stop() | {"at": START + 1})  # the owner's thread ends its turn
+    wait(items, clock, 61)
+    kinds = sorted(i["kind"] for i in published(items))
+    assert kinds == ["finished", "permission"]
+    answers.at[SUBAGENT] = START + 62  # answered on the subagent's own thread
+    wait(items, clock, 1)
+    assert [i["kind"] for i in published(items)] == ["finished"]
+
+
+def test_c9_a_finished_turn_needs_no_recorded_prompt(tmp_path):
+    clock = Clock()
+    first = AttentionStore(tmp_path, clock=clock)
+    first.notice(codex("UserPromptSubmit", turn_id="t1", prompt="go"))
+    restarted = AttentionStore(tmp_path, clock=clock)  # the worker restarted mid-turn, or `codex resume`
+    restarted.notice(codex_stop() | {"at": START + 5})
+    clock.now += 70
+    restarted.tick()
+    assert [i["kind"] for i in published(restarted)] == ["finished"]
+
+
+def test_codex_hook_entry_point_sends_the_notice(monkeypatch, capsys):
     sent = []
     monkeypatch.setattr(attention, "send_notice", sent.append)
-    code, _ = _run_main(monkeypatch, ["codex-notify", "--", sys.executable, str(script), "turn-ended", payload])
-    assert code == 0
-    for _ in range(50):
-        if out.exists():
-            break
-        time.sleep(0.1)
-    assert json.loads(out.read_text()) == ["turn-ended", payload]
-    assert [{k: v for k, v in n.items() if k != "at"} for n in sent] == [{"provider": "codex", "event": "agent-turn-complete", "thread_id": "019a", "cwd": "/r",
-                     "last_message": "Done"}]
-    validate_notice(sent[0])
+    stdin = json.dumps({"session_id": THREAD, "cwd": "/r", "hook_event_name": "Stop", "turn_id": "t",
+                        "last_assistant_message": "Done"}).encode()
+    code, took = _run_main(monkeypatch, ["codex", "Stop"], stdin)
+    assert (code, capsys.readouterr()) == (0, ("", "")) and took < 1
+    assert [{k: v for k, v in n.items() if k != "at"} for n in sent] == [
+        {"provider": "codex", "event": "Stop", "session_id": THREAD, "cwd": "/r", "last_message": "Done"}]
+
+
+def test_codex_hook_hash_is_the_one_codex_records():
+    command = ("SPIKE_DIR=/private/tmp/claude-501/-Users-yohan-GitHub-opensoft-openswap--claude-worktrees-p025-s1-"
+               "attention-notices-b693e7/cc37aaa0-a1a7-4a50-8b25-82920f08b375/scratchpad/cx/run /usr/bin/python3 "
+               "/private/tmp/claude-501/-Users-yohan-GitHub-opensoft-openswap--claude-worktrees-p025-s1-attention-"
+               "notices-b693e7/cc37aaa0-a1a7-4a50-8b25-82920f08b375/scratchpad/cx/hooklog.py")
+    entry = {"type": "command", "command": command, "timeout": 5, "async": False}
+    assert attention.codex_hook_hash("PermissionRequest", entry) == (
+        "sha256:c538785d39f38f0963b9ce062a82a0e3f6b1c6b1deb69a3fb526c14c495e1c7f")
+    assert attention.codex_hook_hash("SessionEnd", entry | {"timeout": 3}) == (
+        "sha256:01c58ee1bca1e201c5359aa65d532556cbbb0b55bcf71ca126e109fb507116d4")
+
+
+@pytest.fixture
+def codex_home(tmp_path, monkeypatch):
+    home = tmp_path / "codex"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setattr(attention, "CODEX_MANAGED_FILES", (tmp_path / "etc" / "requirements.toml",))
+    monkeypatch.setattr(attention, "CODEX_MANAGED_PLISTS", (tmp_path / "etc" / "codex.plist",))
+    monkeypatch.setattr(attention, "program", lambda: EXE)
+    return home, tmp_path / "backup"
+
+
+def _trust(home, root):
+    """What Codex writes once the owner chooses "Trust all and continue"."""
+    data = json.loads((home / "hooks.json").read_text())
+    lines = []
+    for event in attention.CODEX_HOOK_EVENTS:
+        entry = attention.codex_hook_entry(event, attention.codex_launcher(root))
+        for g, group in enumerate(data["hooks"][event]):
+            if group["hooks"] == [entry]:
+                label = {"PermissionRequest": "permission_request", "PostToolUse": "post_tool_use", "Stop": "stop",
+                         "UserPromptSubmit": "user_prompt_submit", "Interrupt": "interrupt",
+                         "SessionEnd": "session_end"}[event]
+                lines.append(f'[hooks.state."{home / "hooks.json"}:{label}:{g}:0"]\n'
+                             f'trusted_hash = "{attention.codex_hook_hash(event, entry)}"\n')
+    with open(home / "config.toml", "a") as handle:
+        handle.write("\n" + "\n".join(lines))
+
+
+def test_c10_settings_shows_codex_trust_state_from_codex_files(codex_home, tmp_path):
+    home, root = codex_home
+    assert attention.codex_hooks_status(home, root) == "missing"
+    attention.apply(root, True)
+    assert attention.codex_hooks_status(home, root) == "review"
+    _trust(home, root)
+    assert attention.codex_hooks_status(home, root) == "trusted"
+    text = (home / "config.toml").read_text()
+    (home / "config.toml").write_text(text.replace('"\n', '"\nenabled = false\n', 1))
+    assert attention.codex_hooks_status(home, root) == "disabled"
+    (home / "config.toml").write_text(text.replace("hooks = true", "hooks = false"))
+    assert attention.codex_hooks_status(home, root) == "off"
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "requirements.toml").write_text("allow_managed_hooks_only = true\n")
+    assert attention.codex_hooks_status(home, root) == "blocked"
+    (tmp_path / "etc" / "requirements.toml").write_text("[torn\n")
+    assert attention.codex_hooks_status(home, root) == "unknown"
+    assert attention.codex_hooks_status(tmp_path / "no-codex", root) is None
+
+
+def test_c10_settings_rows_say_what_codex_will_do():
+    from openswap.menubar_display import CODEX_HOOKS_STATUS, remote_attention_rows
+
+    rows = remote_attention_rows({"attention": {"notices": True, "details": True, "codex": "review"}}, enabled=True)
+    assert rows[-1]["id"] == "remote_attention_codex" and "Hooks need review" in rows[-1]["label"]
+    assert set(CODEX_HOOKS_STATUS) == {"trusted", "review", "disabled", "off", "blocked", "missing", "unknown"}
+    rows = remote_attention_rows({"attention": {"notices": False, "details": True, "codex": "review"}}, enabled=True)
+    assert all(r["id"] != "remote_attention_codex" for r in rows)
+
+
+def test_c11_entries_stay_byte_identical_across_updates_moves_and_builds(codex_home, monkeypatch):
+    home, root = codex_home
+    attention.apply(root, True)
+    before = (home / "hooks.json").read_bytes()
+    for moved in ("/Users/o/Downloads/OpenSwap.app/Contents/MacOS/OpenSwap", "/Users/o/dev/.venv/bin/openswap"):
+        monkeypatch.setattr(attention, "program", lambda moved=moved: moved)
+        attention.apply(root, True)
+        assert (home / "hooks.json").read_bytes() == before
+        assert moved in attention.codex_launcher(root).read_text()
+
+
+def test_the_launcher_runs_the_current_program_with_codex_input(codex_home, tmp_path, monkeypatch):
+    import subprocess
+
+    home, root = codex_home
+    record = tmp_path / "ran.json"
+    fake = tmp_path / "openswap"
+    fake.write_text(f"#!{sys.executable}\nimport json, sys\n"
+                    f"open({str(record)!r}, 'w').write(json.dumps([sys.argv[1:], sys.stdin.read()]))\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(attention, "program", lambda: str(fake))
+    attention.apply(root, True)
+    command = json.loads((home / "hooks.json").read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]
+    subprocess.run(["/bin/sh", "-c", command], input="{}", text=True, check=True)
+    assert json.loads(record.read_text()) == [["attention", "codex", "Stop"], "{}"]
+    fake.unlink()  # a moved app: the hook ends quietly
+    assert subprocess.run(["/bin/sh", "-c", command], input="{}", text=True, check=False).returncode == 0
+
+
+def test_c12_installing_keeps_every_trusted_user_hook_in_its_place(codex_home):
+    home, root = codex_home
+    theirs = {"hooks": [{"type": "command", "command": "python3 ~/.codex/hooks/audit.py", "timeout": 30}]}
+    original = {"description": "mine", "hooks": {"PermissionRequest": [{"matcher": "Bash", **theirs}],
+                                                 "Stop": [theirs, theirs]}}
+    (home / "hooks.json").write_text(json.dumps(original))
+    state = (f'[hooks.state."{home / "hooks.json"}:stop:1:0"]\n'
+             'trusted_hash = "sha256:theirs"\n')
+    (home / "config.toml").write_text(state)
+    attention.apply(root, True)
+    data = json.loads((home / "hooks.json").read_text())
+    assert data["description"] == "mine"
+    assert data["hooks"]["PermissionRequest"][0] == {"matcher": "Bash", **theirs}
+    assert data["hooks"]["Stop"][:2] == [theirs, theirs]
+    assert state in (home / "config.toml").read_text()
+
+
+@pytest.mark.parametrize("before", ["", "[features]\nhooks = true\n", "[features]\nhooks = false\nplugins = true\n",
+                                    "model = \"o3\"\n\n[features]\nmemories = true\n"])
+def test_c13_removal_puts_the_hooks_feature_back_exactly(codex_home, before):
+    home, root = codex_home
+    (home / "config.toml").write_text(before)
+    attention.apply(root, True)
+    assert tomllib.loads((home / "config.toml").read_text())["features"]["hooks"] is True
+    attention.remove(root)
+    assert (home / "config.toml").read_text() == before
+    assert not (home / "hooks.json").exists() and not attention.codex_launcher(root).exists()
+
+
+def test_c13_the_feature_stays_on_while_other_hooks_remain(codex_home):
+    home, root = codex_home
+    theirs = {"hooks": [{"type": "command", "command": "~/bin/log"}]}
+    (home / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [theirs]}}))
+    attention.apply(root, True)
+    attention.remove(root)
+    assert json.loads((home / "hooks.json").read_text()) == {"hooks": {"Stop": [theirs]}}
+    assert tomllib.loads((home / "config.toml").read_text())["features"]["hooks"] is True
+
+
+def test_c13_turning_notices_back_on_shows_whether_codex_asks_again(codex_home):
+    home, root = codex_home
+    attention.apply(root, True)
+    _trust(home, root)
+    attention.remove(root)
+    attention.apply(root, True)
+    assert attention.codex_hooks_status(home, root) == "trusted"  # Codex kept its record: no screen
+    text = (home / "config.toml").read_text()
+    (home / "config.toml").write_text(text[:text.index("[hooks.state")])
+    assert attention.codex_hooks_status(home, root) == "review"  # Settings says the screen comes back
+
+
+def test_c14_managed_codex_files_are_never_written(codex_home, tmp_path):
+    home, root = codex_home
+    with pytest.raises(ConfigError):
+        attention.set_codex_hooks(Path("/etc/codex"), root, True)
+    before = {p for p in tmp_path.rglob("*")}
+    attention.apply(root, True)
+    written = {p for p in tmp_path.rglob("*")} - before
+    assert {p for p in written if p.is_file()} <= {home / "hooks.json", home / "config.toml",
+                                                   attention.codex_launcher(root), root / attention.CODEX_STATE_FILE}
+
+
+@pytest.mark.parametrize("text", ['features = "x"\n', "[features\n", 'features.hooks = false\n'])
+def test_a_config_this_cannot_rewrite_is_left_alone(codex_home, text):
+    home, root = codex_home
+    (home / "config.toml").write_text(text)
+    _, problems = attention.apply(root, True)
+    assert len(problems) == 1 and problems[0].startswith("Codex:")
+    assert (home / "config.toml").read_text() == text
 
 
 # --- settings -------------------------------------------------------------------------

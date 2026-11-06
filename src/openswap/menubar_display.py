@@ -734,6 +734,19 @@ def remote_folder_rows(worker_status: dict) -> list[dict]:
 
 
 REMOTE_ATTENTION_NEEDS_WORKER = "Notices are sent while the local worker is on."
+CODEX_REVIEW = ("Codex shows “Hooks need review” the next time it starts. Choose “Trust all and "
+                "continue” so Codex sessions can tell you when they need you.")
+# Codex's state for OpenSwap's hooks (``attention.codex_hooks_status``), in words.
+CODEX_HOOKS_STATUS = {
+    "trusted": "Codex: OpenSwap's hooks are trusted.",
+    "review": "Codex: " + CODEX_REVIEW,
+    "disabled": "Codex: OpenSwap's hooks are turned off in Codex (/hooks), so Codex sessions can't tell you "
+                "when they need you.",
+    "off": "Codex: hooks are turned off in Codex's settings, so Codex sessions can't tell you when they need you.",
+    "blocked": "Codex: your organization's Codex settings don't allow OpenSwap's hooks.",
+    "missing": "Codex: OpenSwap's hooks are missing from Codex's hooks.json; the worker puts them back when it starts.",
+    "unknown": "Codex: OpenSwap can't read Codex's settings to tell whether its hooks are trusted.",
+}
 
 
 def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
@@ -741,7 +754,8 @@ def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
     paired Mac, and on an unpaired one while notices are on so they can be turned off).
 
     ``worker_status["attention"]`` is ``{"notices": bool, "details": bool}``
-    as read from settings; no rows until it is known.
+    as read from settings, plus ``codex``, Codex's state for OpenSwap's hooks
+    (None without Codex); no rows until it is known.
     """
     switches = worker_status.get("attention")
     if not isinstance(switches, dict):
@@ -756,6 +770,9 @@ def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
     ]
     if notices and not enabled:
         rows.append(_remote_hint("remote_attention_note", REMOTE_ATTENTION_NEEDS_WORKER))
+    codex = CODEX_HOOKS_STATUS.get(switches.get("codex"))
+    if notices and codex:
+        rows.append(_remote_hint("remote_attention_codex", codex))
     return rows
 
 

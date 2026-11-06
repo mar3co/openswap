@@ -1,14 +1,16 @@
 """Session attention: which of this Mac's sessions need the owner (plan 025).
 
-Claude Code hooks and Codex's ``notify`` program hand *notices* to the worker
-over its private socket (``openswap attention``). This module turns them into
+Claude Code's and Codex's hooks hand *notices* to the worker over its private
+socket (``openswap attention``). This module turns them into
 *items*, one per occurrence of a session needing the owner, and builds the
 optional ``attention`` report the worker sends to the control service.
 
 An item is recorded unpublished and published (reported) only once Claude
 Code itself decides the owner seems away (its ``permission_prompt`` and
-``idle_prompt`` notifications; ``permission_prompt`` fires for questions too),
-or for a finished Codex turn. Every item gets a
+``idle_prompt`` notifications; ``permission_prompt`` fires for questions too).
+Codex has no such notification: its approval is published after the same six
+seconds, and its finished turn after Claude Code's 60-second idle wait, each
+only if nothing on the thread has answered it by then. Every item gets a
 fresh random ID that is never reused. Open items are kept in a private file
 under the backup root so they survive a worker restart.
 
@@ -18,6 +20,12 @@ managed config home. Hooks are async and arrive out of order: each carries
 the time it ran, which orders it against the others and against the session
 files. A Claude item also ends with its Claude Code process, whose PID the
 hook reports, which covers a child session that writes no session file.
+
+Codex writes no session status. A Codex approval answered at the Mac shows in
+Codex's own log database (``logs_*.sqlite``: an ``exec_approval`` or other
+answer operation on the thread), and Esc fires its ``Interrupt`` hook. A
+Codex item ends with the Codex process that ran its hooks (the shared
+app-server, ``codex exec`` or the desktop app's), and after 24 hours at most.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ import logging
 import math
 import os
 import secrets
+import sqlite3
 import tempfile
 import threading
 import time
@@ -62,6 +71,12 @@ PROMPT_MATCH_SECONDS = 2.0
 # status is never read as an answer.
 NOT_WAITING = frozenset({"busy", "idle"})
 CODEX_ITEM_SECONDS = 24 * 3600
+# Claude Code's waits before its own notifications, applied to Codex's items.
+CODEX_PROMPT_SECONDS = PROMPT_NOTICE_SECONDS
+CODEX_FINISHED_SECONDS = 60.0
+# The operations Codex logs when a person answers a prompt (any decision).
+CODEX_ANSWER_OPERATIONS = ("exec_approval", "patch_approval", "resolve_elicitation", "user_input_answer",
+                           "request_permissions_response")
 # Closes kept for a report the service has not accepted yet (an offline Mac, or
 # a backend without the extension); past this the oldest go unreported.
 MAX_PENDING_CLOSES = 200
@@ -76,7 +91,8 @@ CLAUDE_EVENTS = frozenset({
     "PermissionRequest", "Notification", "Stop", "UserPromptSubmit", "PostToolUse",
     "PostToolUseFailure", "SessionEnd",
 })
-CODEX_EVENT = "agent-turn-complete"
+CODEX_EVENTS = frozenset({"PermissionRequest", "PostToolUse", "Stop", "UserPromptSubmit", "Interrupt",
+                          "SessionEnd"})
 MAX_ID = 200
 MAX_PATH = 4096
 MAX_PID = 2**31 - 1
@@ -132,6 +148,11 @@ def is_entrypoint(value: object) -> bool:
                                                                    for c in value)
 
 
+def is_agent_id(value: object) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= 64 and all(
+        c.isascii() and (c.isalnum() or c in "_-") for c in value)
+
+
 def _optional_text(data: dict, name: str, limit: int, *, multiline: bool = False) -> str:
     value = data.get(name, "")
     if not isinstance(value, str) or len(value) > limit or clean_text(value, limit, multiline=multiline) != value:
@@ -141,7 +162,8 @@ def _optional_text(data: dict, name: str, limit: int, *, multiline: bool = False
 
 _CLAUDE_FIELDS = {"provider", "event", "session_id", "cwd", "at", "pid", "entrypoint", "agent_id", "tool_name",
                   "tool_key", "description", "questions", "notification_type", "last_message", "prompt_kind"}
-_CODEX_FIELDS = {"provider", "event", "thread_id", "cwd", "at", "last_message"}
+_CODEX_FIELDS = {"provider", "event", "session_id", "cwd", "at", "pid", "agent_id", "tool_name", "tool_key",
+                 "description", "last_message"}
 PROMPT_KINDS = frozenset({"channel", "task", "end"})
 
 
@@ -157,15 +179,9 @@ def validate_notice(value: object) -> dict:
     allowed = _CLAUDE_FIELDS if provider == "claude" else _CODEX_FIELDS if provider == "codex" else None
     if allowed is None or not set(value) <= allowed or not {"event", "cwd"} <= set(value):
         raise NoticeError("invalid_notice")
-    event = value["event"]
-    if provider == "claude":
-        if event not in CLAUDE_EVENTS:
-            raise NoticeError("invalid_notice")
-        _bounded_id(value.get("session_id"))
-    elif event != CODEX_EVENT:
+    if value["event"] not in (CLAUDE_EVENTS if provider == "claude" else CODEX_EVENTS):
         raise NoticeError("invalid_notice")
-    else:
-        _bounded_id(value.get("thread_id"))
+    _bounded_id(value.get("session_id"))
     cwd = value["cwd"]
     if not isinstance(cwd, str) or len(cwd) > MAX_PATH or any(ord(c) < 32 for c in cwd):
         raise NoticeError("invalid_notice")
@@ -201,16 +217,16 @@ class Item:
     id: str
     kind: str  # permission | question | idle | finished
     provider: str  # claude | codex
-    session: str  # Claude session ID or Codex thread ID; never leaves the Mac
+    session: str  # Claude session ID or Codex thread ID (a subagent's: its parent's); never leaves the Mac
     cwd: str  # never leaves the Mac
     created_at: float  # epoch seconds
     published: bool = False
     tool_name: str = ""
     tool_key: str = ""
     detail: dict = field(default_factory=dict)
-    pid: int = 0  # the Claude Code process; 0 when the hook could not tell
+    pid: int = 0  # the Claude Code or Codex process; 0 when the hook could not tell
     entrypoint: str = ""  # Claude Code's own name for its surface (cli, claude-vscode, ...)
-    agent: str = ""  # the subagent whose call it is; "" for the main thread
+    agent: str = ""  # the subagent whose call it is (Codex: its own thread ID); "" for the main thread
 
     @classmethod
     def from_dict(cls, data: object) -> Item:
@@ -273,6 +289,45 @@ def read_records(config_homes) -> tuple[dict[str, SessionRecord], bool]:
     return records, complete
 
 
+def _newest_log_database(home: Path) -> Path | None:
+    def version(path: Path) -> int:
+        suffix = path.stem.rpartition("_")[2]
+        return int(suffix) if suffix.isdigit() else -1
+
+    found = [p for p in Path(home).glob("logs_*.sqlite") if version(p) >= 0]
+    return max(found, key=version) if found else None
+
+
+def read_codex_answers(codex_homes, threads: dict[str, float]) -> dict[str, float]:
+    """When a person last answered a prompt on each of ``threads`` (thread ID ->
+    the earliest time of interest), as Codex's own log database records it:
+    epoch seconds by thread ID, threads without an answer left out. Raises
+    OSError or sqlite3.Error when a home's log cannot be read."""
+    from urllib.parse import quote
+
+    answers: dict[str, float] = {}
+    ids = sorted(threads)
+    if not ids:
+        return answers
+    since = math.floor(min(threads.values())) - 1
+    matches = " or ".join("feedback_log_body like ?" for _ in CODEX_ANSWER_OPERATIONS)
+    query = (f"select thread_id, max(ts + ts_nanos / 1e9) from logs where thread_id in "
+             f"({','.join('?' for _ in ids)}) and ts >= ? and ({matches}) group by thread_id")
+    params = [*ids, since, *(f'%operation="{op}"%' for op in CODEX_ANSWER_OPERATIONS)]
+    for home in codex_homes:
+        database = _newest_log_database(home)
+        if database is None:
+            continue
+        connection = sqlite3.connect(f"file:{quote(str(database))}?mode=ro", uri=True, timeout=0.2)
+        try:
+            for thread, at in connection.execute(query, params):
+                if isinstance(thread, str) and isinstance(at, (int, float)):
+                    answers[thread] = max(at, answers.get(thread, 0.0))
+        finally:
+            connection.close()
+    return answers
+
+
 def _new_id() -> str:
     return secrets.token_urlsafe(16)
 
@@ -288,7 +343,7 @@ class AttentionStore:
     can send it at once instead of on its next pass.
     """
 
-    def __init__(self, backup_root: Path, *, clock=time.time, enabled=None, records=None):
+    def __init__(self, backup_root: Path, *, clock=time.time, enabled=None, records=None, codex_answers=None):
         self.backup_root = Path(backup_root)
         self.path = self.backup_root / STATE_FILE
         self.clock = clock
@@ -306,6 +361,8 @@ class AttentionStore:
         self._left_waiting: dict[str, float] = {}
         # The session files: ``records()`` reads them as (records, complete).
         self._read_records = records
+        # Codex's log: ``codex_answers(threads)`` as ``read_codex_answers``.
+        self._read_codex_answers = codex_answers
         self._records: dict[str, SessionRecord] = {}
         self._known: set[str] = set()  # sessions seen in a record, so a missing one has ended
         self._due: dict[str, float] = {}  # item ID -> when its answer at the Mac closes it
@@ -404,11 +461,7 @@ class AttentionStore:
 
     def _apply(self, notice: dict) -> bool:
         if notice["provider"] == "codex":
-            thread = notice["thread_id"]
-            self._close([i for i in self._items if i.provider == "codex" and i.session == thread], "superseded")
-            self._open("finished", "codex", thread, notice, published=True,
-                       detail={"last_message": notice.get("last_message", "")})
-            return True
+            return self._apply_codex(notice)
         event, session, at = notice["event"], notice["session_id"], self._at(notice)
         mine = [i for i in self._items if i.provider == "claude" and i.session == session]
         prompts = [i for i in mine if i.kind in ("permission", "question")]
@@ -514,18 +567,79 @@ class AttentionStore:
             match = [i for i in same_tool if i.tool_key == key][:1] if key else same_tool[:1]
         return self._close(match, "answered_on_mac")
 
+    def _apply_codex(self, notice: dict) -> bool:
+        """One Codex hook. ``Stop``, ``UserPromptSubmit`` and ``Interrupt`` run
+        only for a thread the owner works in (Codex runs ``SubagentStop`` for a
+        subagent and no hook for its own helper threads), so they open and
+        close that thread's items only; a subagent's approval is its own."""
+        event, thread, at = notice["event"], notice["session_id"], self._at(notice)
+        mine = [i for i in self._items if i.provider == "codex" and i.session == thread]
+        own = [i for i in mine if i.agent == notice.get("agent_id", "")]
+        prompts = [i for i in own if i.kind == "permission"]
+        tool_name = notice.get("tool_name", "")
+        if event == "PermissionRequest":
+            self._open("permission", "codex", thread, notice, published=False, tool_name=tool_name,
+                       tool_key=notice.get("tool_key", ""),
+                       detail={"tool_name": tool_name, "description": notice.get("description", "")})
+            return True
+        if event == "PostToolUse":
+            key = notice.get("tool_key", "")
+            return self._close([i for i in prompts if i.tool_name == tool_name and i.tool_key == key][:1],
+                               "answered_on_mac")
+        if event == "SessionEnd":
+            self._prompted.pop(thread, None)
+            return self._close(mine, "session_ended")
+        if event == "Stop":
+            changed = self._close([i for i in prompts if i.created_at <= at], "answered_on_mac")
+            if at < self._prompted.get(thread, 0.0) or any(i.kind == "finished" and i.created_at > at for i in own):
+                return changed  # a late Stop of an earlier turn
+            self._close([i for i in own if i.kind == "finished"], "superseded")
+            self._open("finished", "codex", thread, notice, published=False,
+                       detail={"last_message": notice.get("last_message", "")})
+            return True
+        if event == "UserPromptSubmit":
+            self._prompted[thread] = max(at, self._prompted.get(thread, 0.0))
+            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
+                del self._prompted[oldest]
+            return self._close([i for i in own if i.created_at <= at], "answered_on_mac")
+        # Interrupt: Esc or "No" at the prompt ends the turn.
+        return self._close([i for i in prompts if i.created_at <= at], "answered_on_mac")
+
     def refresh(self) -> None:
-        """Read the session files (outside the lock) and apply what they say."""
-        if self._read_records is None:
-            return
+        """Read the session files and Codex's log (outside the lock) and apply what they say."""
         # One read at a time, so an older read is never applied after a newer one.
         with self._refresh_lock:
-            try:
-                records, complete = self._read_records()
-            except Exception as exc:  # noqa: BLE001 - an unreadable folder must not stop notices
-                logger.debug("Session files unreadable: %s", exc)
-                return
-            self.observe(records, complete)
+            if self._read_records is not None:
+                try:
+                    records, complete = self._read_records()
+                except Exception as exc:  # noqa: BLE001 - an unreadable folder must not stop notices
+                    logger.debug("Session files unreadable: %s", exc)
+                else:
+                    self.observe(records, complete)
+            self._observe_codex_answers()
+
+    def _observe_codex_answers(self) -> None:
+        """Close the Codex approvals a person has answered since they were asked."""
+        if self._read_codex_answers is None:
+            return
+        with self._lock:
+            threads: dict[str, float] = {}
+            for item in self._items:
+                if item.provider == "codex" and item.kind == "permission":
+                    thread = item.agent or item.session
+                    threads[thread] = min(item.created_at, threads.get(thread, math.inf))
+        if not threads:
+            return
+        try:
+            answers = self._read_codex_answers(threads)
+        except Exception as exc:  # noqa: BLE001 - without Codex's log, the thread's next event closes it
+            logger.debug("Codex's log unreadable: %s", exc)
+            return
+        with self._lock:
+            answered = [i for i in self._items if i.provider == "codex" and i.kind == "permission"
+                        and answers.get(i.agent or i.session, -math.inf) >= i.created_at]
+            if self._close(answered, "answered_on_mac"):
+                self._commit()
 
     def observe(self, records: dict[str, SessionRecord], complete: bool) -> None:
         """Apply the running sessions' records (by session ID), as read from every
@@ -579,13 +693,24 @@ class AttentionStore:
                 self._commit()
 
     def tick(self) -> None:
-        """Close the answers whose grace has passed, and expire old Codex items."""
+        """Close the answers whose grace has passed; end the Codex items whose
+        process ended, expire old ones and publish those still open after
+        their wait."""
+        from openswap.process_detection import is_pid_alive
+
         with self._lock:
             now = self.clock()
             due = [i for i in self._items if self._due.get(i.id, now + 1) <= now]
             changed = self._close(due, "answered_on_mac")
-            expired = [i for i in self._items if i.provider == "codex" and now - i.created_at >= CODEX_ITEM_SECONDS]
+            codex = [i for i in self._items if i.provider == "codex"]
+            ended = [i for i in codex if i.pid and not is_pid_alive(i.pid)]
+            changed = self._close(ended, "session_ended") or changed
+            expired = [i for i in codex if i not in ended and now - i.created_at >= CODEX_ITEM_SECONDS]
             changed = self._close(expired, "expired") or changed
+            for item in self._items:
+                wait = CODEX_FINISHED_SECONDS if item.kind == "finished" else CODEX_PROMPT_SECONDS
+                if item.provider == "codex" and not item.published and now - item.created_at >= wait:
+                    item.published = changed = True
             if changed:
                 self._commit()
 
