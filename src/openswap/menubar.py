@@ -871,11 +871,11 @@ def run(switcher, codex=None) -> int:
                     self._worker_result = (generation, snapshot, policy, None)
 
         def _with_folders(self, snapshot, policy):
-            """Attach the saved folders for Settings › Remote: ``(workspace ID, label)``, never more."""
+            """Attach the saved folders for Settings › Remote: ``(ID, name, ~ paths, short use)``, never more."""
             if policy is not None:
-                from openswap.worker.guided_setup import folder_label
+                from openswap.worker.guided_setup import settings_folders
 
-                snapshot["folders"] = [(w.workspace_id, folder_label(w)) for w in policy.workspaces]
+                snapshot["folders"] = settings_folders(self.switcher.backup_dir, policy.workspaces)
             return snapshot
 
         def _with_account_picker(self, snapshot):
@@ -966,7 +966,7 @@ def run(switcher, codex=None) -> int:
                                        message="Choose a git repo, or a folder of repos, for tasks to work in.")
 
         def _run_guided_setup(self):
-            """Set up Remote tasks…: the steps of `openswap worker pair`, in the setup window.
+            """Settings › Remote › Set Up…: the steps of `openswap worker pair`, in the setup window.
 
             Pair from the pasted pairing command (a dialog) when this Mac is not
             paired, then start the worker, confirm the account, choose the
@@ -992,7 +992,7 @@ def run(switcher, codex=None) -> int:
                 except guided_setup.SetupClosed:
                     pass
                 except Exception:
-                    ui.say("Setup stopped unexpectedly. Choose Set up Remote tasks… again to finish.")
+                    ui.say("Setup stopped unexpectedly. Choose Set Up… in Settings → Remote again to finish.")
                 finally:
                     try:
                         ui.flush()
@@ -1090,6 +1090,8 @@ def run(switcher, codex=None) -> int:
             self._worker_status_cache["operation"] = self._worker_operation
             self._worker_status_cache.pop("folder_notice", None)
             self._worker_status_cache.pop("folder_baseline", None)
+            self._worker_status_cache.pop("diagnostic_notice", None)
+            self._worker_status_cache.pop("notice_state", None)
             self._worker_generation += 1
             generation = self._worker_generation
             threading.Thread(
@@ -1100,6 +1102,7 @@ def run(switcher, codex=None) -> int:
 
         def _worker_action_worker(self, generation, row_id, value):
             diagnostic = None
+            acted = False
             policy = None
             notice = None
             try:
@@ -1143,6 +1146,7 @@ def run(switcher, codex=None) -> int:
                     from openswap.worker.guided_setup import remove_folder
 
                     notice = remove_folder(root, value)
+                acted = True
                 policy = load_worker_settings(root)
                 snapshot = read_status(root)
             except Exception:
@@ -1153,7 +1157,7 @@ def run(switcher, codex=None) -> int:
                     "queue_depth": 0,
                     "lease_quarantined": True,
                 }
-                diagnostic = diagnostic or "worker_control_failed"
+                diagnostic = diagnostic or ("status_read_failed" if acted else "worker_control_failed")
                 try:
                     from openswap.settings import load_worker_settings
 
@@ -1235,6 +1239,7 @@ def run(switcher, codex=None) -> int:
                     self._worker_status_inflight = False
                 return
             self._worker_status_inflight = False
+            acting = self._worker_operation is not None
             self._worker_operation = None
             previous, cache = self._worker_status_cache, dict(snapshot)
             self._worker_status_cache = cache
@@ -1252,7 +1257,20 @@ def run(switcher, codex=None) -> int:
             if policy is not None:
                 self._worker_policy = policy
             cache.pop("operation", None)
-            cache["diagnostic_notice"] = diagnostic
+            from openswap.menubar_display import remote_control_state
+
+            # An action's result stays until the next action, or until a refresh shows the controls changed.
+            state = remote_control_state(cache, self._worker_policy)
+            if acting:
+                cache["diagnostic_notice"] = diagnostic
+            elif (previous.get("diagnostic_notice") and previous.get("notice_state") == state
+                  and not (previous["diagnostic_notice"] == "status_read_failed"
+                           and cache.get("process_state") != "unavailable")):
+                cache["diagnostic_notice"] = previous["diagnostic_notice"]
+            else:
+                cache["diagnostic_notice"] = None
+            if cache["diagnostic_notice"]:
+                cache["notice_state"] = state
             self._reload_remote_settings()
 
         def _stop_codex_engine(self):

@@ -168,12 +168,13 @@ def yellowed(text: str) -> str:
 # --- Status marks and layout (plain text; style whole lines afterwards) ---
 
 # Every mark is paired with a word by its caller, so the meaning never rests on
-# the glyph (or a colour) alone. The glyphs are the ones ``openswap list``
+# the glyph (or a color) alone. The glyphs are the ones ``openswap list``
 # already prints; ``force_utf8_output`` keeps them from crashing a legacy
 # console, where ``errors="replace"`` degrades them to ``?``.
 MARK_OK = "✓"   # ✓ done, pinned, passing
 MARK_BAD = "✗"  # ✗ missing, refused, failing
 MARK_DOT = "•"  # • neutral: listed, not chosen, nothing to do
+MARK_WARN = "⚠"  # ⚠ a change was refused in part or whole (Settings → Remote)
 
 
 def mark(state: bool | None) -> str:
@@ -184,7 +185,7 @@ def mark(state: bool | None) -> str:
 
 
 def heading(text: str) -> str:
-    """A section title: bold when colours are on, plain otherwise."""
+    """A section title: bold when colors are on, plain otherwise."""
     return bolded(text)
 
 

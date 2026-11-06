@@ -304,8 +304,9 @@ def test_settings_page_sections_separate_display_from_provider_automation():
     assert "group_remote_tasks" not in general_ids
     assert remote_ids == {
         "group_remote_tasks", "remote_tasks_setup", "remote_tasks_enabled",
-        "remote_tasks_paired_off", "remote_tasks_account", "remote_tasks_web_choice",
-        "remote_tasks_status", "remote_tasks_paused", "remote_tasks_stop",
+        "remote_tasks_paired_off", "group_remote_account", "remote_tasks_account", "remote_tasks_web_choice",
+        "group_remote_status", "remote_tasks_status", "remote_tasks_paused", "remote_tasks_stop",
+        "remote_tasks_details",
     }
     assert automation_by_id["auto_switch_enabled"]["label"] == (
         "Auto-switch Claude Code accounts"
@@ -357,7 +358,17 @@ def test_remote_tasks_settings_are_opt_in_redacted_and_stop_targets_job_id():
     assert by_id["remote_tasks_paused"]["value"] is True
     assert by_id["remote_tasks_stop"]["value"] == "job-local-7"
     assert by_id["remote_tasks_stop"]["disabled"] is False
-    status = by_id["remote_tasks_status"]["value"]
+    assert by_id["remote_tasks_stop"]["detail"] == "stopping the task"
+    assert by_id["remote_tasks_status"]["value"] == "Running · live tasks off · paused"
+    assert "remote_tasks_status_details" not in by_id
+    expanded = {row["id"]: row for row in menubar.settings_page_rows(
+        menubar.MenuBarSettings(), strategy="best", threshold=90, worker_enabled=True, worker_paused=True,
+        worker_status={"process_state": "running", "provider": {"available": False,
+                                                                "diagnostic_code": "live_adapter_disabled"},
+                       "active_job": {"job_id": "job-local-7", "state": "cancel_requested",
+                                      "task": "sensitive task text"}, "queue_depth": 1},
+        section=menubar.SETTINGS_SECTION_REMOTE, expanded_sections={"remote_tasks_details"})}
+    status = expanded["remote_tasks_status_details"]["label"]
     assert "provider live_adapter_disabled" in status
     assert "cancel_requested" in status
     assert "sensitive task text" not in status
@@ -384,10 +395,11 @@ def test_remote_tasks_settings_are_opt_in_redacted_and_stop_targets_job_id():
             "active_job": {"job_id": "job-local-8", "state": "succeeded"},
         },
         section=menubar.SETTINGS_SECTION_REMOTE,
+        expanded_sections={"remote_tasks_details"},
     )
     available = {row["id"]: row for row in available_rows}
-    assert "provider available" in available["remote_tasks_status"]["value"]
-    assert "job succeeded" in available["remote_tasks_status"]["value"]
+    assert "provider available" in available["remote_tasks_status_details"]["label"]
+    assert "job succeeded" in available["remote_tasks_status_details"]["label"]
 
 
 def test_worker_status_poll_refreshes_policy_and_discards_stale_policy(
@@ -2895,7 +2907,7 @@ def test_claude_login_copy_names_the_browser_and_the_retry():
 
 
 def test_claude_login_result_is_drained_before_auto_capture_and_canceled_on_quit():
-    text = Path(menubar.__file__).read_text()
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
     tick = text[text.index("def on_sync_tick") : text.index("def _consume_widget_command")]
     assert tick.index("_drain_claude_login_result()") < tick.index("_maybe_auto_capture_relogin()")
     quit_ = text[text.index("def on_quit") : text.index("def on_toggle_name")]
@@ -3505,13 +3517,13 @@ def test_every_settings_row_is_dispatched():
         threshold=90,
     )
     for row in rows:
-        if row["kind"] in {"group", "status"}:
+        if row["kind"] in {"group", "status", "disclosure"}:  # disclosures expand in the panel
             continue
         if row["id"] == "desktop_app":
             continue  # local settings navigation, covered by panel tests
         if row["id"] == "claude_desktop_profiles":
             # Native menus need the clicked button as their popover anchor.
-            panel = Path(menubar.__file__).with_name("menubar_panel.py").read_text()
+            panel = Path(menubar.__file__).with_name("menubar_panel.py").read_text(encoding="utf-8")
             assert 'self._claude_desktop_profiles if row["id"] == "claude_desktop_profiles"' in panel
             continue
         assert f'"{row["id"]}"' in body, row["id"]
@@ -3736,7 +3748,7 @@ def test_refresh_requested_while_in_flight_runs_on_the_next_tick():
     app._refresh_pending = False
     app.refresh_async()
     assert app._refresh_pending is True
-    text = Path(menubar.__file__).read_text()
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
     tick = text[text.index("def on_sync_tick") : text.index("def _consume_widget_command")]
     assert tick.index("_refresh_pending") < tick.index("_poll_login()")
 

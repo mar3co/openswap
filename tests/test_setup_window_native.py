@@ -57,7 +57,7 @@ def test_folder_rows_are_checkboxes_with_their_note_and_add_folder():
     (box,) = [b for b in _buttons(surface) if getattr(b, "wizard_action", "").startswith("toggle:")]
     assert box.accessibilityLabel() == "~/GitHub, recommended" and box.state() == AppKit.NSControlStateValueOn
     add = next(b for b in _buttons(surface) if getattr(b, "wizard_action", None) == "add_folder")
-    assert add.title() == "Add folder…" and add.frame().origin.y < surface.footer_y
+    assert add.title() == "Add Folder…" and add.frame().origin.y < surface.footer_y
 
 
 def test_a_busy_page_disables_every_button_but_close_setup():

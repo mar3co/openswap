@@ -55,7 +55,7 @@ def window_page(step: int, call: str, args: tuple, view: dict, notes) -> dict:
 
     ``view`` holds ``selected`` (the account row, or None), ``checked`` (one
     bool per folder row, then per added folder) and ``added`` (the folders
-    added with Add folder…).
+    added with Add Folder…).
     """
     rows = [_note(line) for line in notes]
     page = {
@@ -91,7 +91,7 @@ def window_page(step: int, call: str, args: tuple, view: dict, notes) -> dict:
             {"title": label, "detail": note, "selected": view["checked"][index], "action": f"toggle:{index}"}
             for index, (label, note) in enumerate(options)
         ]})
-        rows.append({"kind": "actions", "items": [_button("Add folder…", ACTION_ADD_FOLDER)]})
+        rows.append({"kind": "actions", "items": [_button("Add Folder…", ACTION_ADD_FOLDER)]})
     elif call == "hold":
         page["skip"] = None
     return page

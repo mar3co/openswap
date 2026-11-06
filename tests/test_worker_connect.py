@@ -894,7 +894,7 @@ def test_menu_offers_connect_on_an_unpaired_mac():
     assert rows["remote_tasks_connect"]["label"] == "Connect to OpenTag…"
     assert rows["remote_tasks_connect"]["kind"] == "button" and not rows["remote_tasks_connect"]["disabled"]
     assert rows["remote_tasks_connect_other"]["label"] == "Use another server…"
-    assert rows["remote_tasks_setup"]["label"] == "Set up Remote tasks…"  # the pasted command stays
+    assert rows["remote_tasks_setup"]["title"] == "Set Up…"  # the pasted command stays
     assert "remote_tasks_reconnect" not in rows
     busy = {row["id"]: row for row in _remote_rows(worker_status={"operation": "worker_account_update"})}
     assert busy["remote_tasks_connect"]["disabled"] and busy["remote_tasks_connect_other"]["disabled"]
