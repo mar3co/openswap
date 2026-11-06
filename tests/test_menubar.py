@@ -3521,11 +3521,6 @@ def test_every_settings_row_is_dispatched():
             continue
         if row["id"] == "desktop_app":
             continue  # local settings navigation, covered by panel tests
-        if row["id"] == "claude_desktop_profiles":
-            # Native menus need the clicked button as their popover anchor.
-            panel = Path(menubar.__file__).with_name("menubar_panel.py").read_text(encoding="utf-8")
-            assert 'self._claude_desktop_profiles if row["id"] == "claude_desktop_profiles"' in panel
-            continue
         assert f'"{row["id"]}"' in body, row["id"]
 
 

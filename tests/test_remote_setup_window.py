@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from openswap import menubar, menubar_display
+from openswap.exceptions import ClaudeSwitchError
 from openswap.settings import WorkerSettings, configure_worker_service, load_worker_settings, update_worker_settings
 from openswap.worker import cli, guided_setup, setup_window
 from openswap.worker.guided_setup import Readiness, SetupClosed
@@ -1018,8 +1019,8 @@ def test_a_refused_org_keeps_the_ones_added_and_is_named(root, research_home, se
     monkeypatch.setattr(cli, "add_work_folder", full)
     settings_app.picked = [str(github)]
     assert _settings(settings_app, "remote_tasks_folder_add")["folder_notice"] == (
-        "⚠ Added 1 folder from ~/GitHub; 2 not added: opensoft (at most 16 folders can be added), "
-        "veba (at most 16 folders can be added).")
+        "⚠ Added 1 folder from ~/GitHub. 2 not added. opensoft: at most 16 folders can be added. "
+        "veba: at most 16 folders can be added.")
     assert [entry[0] for entry in _saved(root)] == ["acme"]
 
 
@@ -1035,8 +1036,8 @@ def test_org_folders_all_refused_show_the_first_refusal(root, research_home, set
     monkeypatch.setattr(cli, "add_work_folder", full)
     settings_app.picked = [str(github)]
     assert _settings(settings_app, "remote_tasks_folder_add")["folder_notice"] == (
-        "⚠ No folders added from ~/GitHub; 2 not added: opensoft (at most 16 folders can be added), "
-        "veba (at most 16 folders can be added).")
+        "⚠ No folders added from ~/GitHub. 2 not added. opensoft: at most 16 folders can be added. "
+        "veba: at most 16 folders can be added.")
 
 
 def test_a_folder_whose_subfolders_hold_no_repos_is_refused_as_before(root, research_home, settings_app):
@@ -1071,14 +1072,17 @@ FULL = "At most 16 folders can be added."
     (0, 2, [], "Already allowed."),
     (0, 0, [("veba", "That folder isn't yours.")], "~/GitHub/veba: that folder isn't yours."),
     (0, 0, [("veba", "That folder isn't yours."), ("acme", "No git repos in it.")],
-     "No folders added from ~/GitHub; 2 not added: veba (that folder isn't yours), acme (no git repos in it)."),
-    (0, 1, [("veba", FULL)], "1 already allowed from ~/GitHub; 1 not added: veba (at most 16 folders can be added)."),
-    (2, 0, [("veba", FULL)], "Added 2 folders from ~/GitHub; 1 not added: veba (at most 16 folders can be added)."),
+     "No folders added from ~/GitHub. 2 not added. veba: that folder isn't yours. acme: no git repos in it."),
+    (0, 1, [("veba", FULL)], "1 already allowed from ~/GitHub. 1 not added. veba: at most 16 folders can be added."),
+    (2, 0, [("veba", FULL)], "Added 2 folders from ~/GitHub. 1 not added. veba: at most 16 folders can be added."),
     (2, 1, [("veba", FULL)],
-     "Added 2 folders from ~/GitHub; 1 already allowed; 1 not added: veba (at most 16 folders can be added)."),
+     "Added 2 folders from ~/GitHub; 1 already allowed. 1 not added. veba: at most 16 folders can be added."),
     (1, 0, [(name, "That folder isn't yours.") for name in ("a", "b", "c", "d", "e")],
-     "Added 1 folder from ~/GitHub; 5 not added: a (that folder isn't yours), b (that folder isn't yours), "
-     "c (that folder isn't yours) and 2 more."),
+     "Added 1 folder from ~/GitHub. 5 not added. a: that folder isn't yours. b: that folder isn't yours. "
+     "c: that folder isn't yours. And 2 more."),
+    (0, 0, [("veba", "Remove access in Finder (Get Info)."), ("acme", cli.BUSY_MESSAGE)],
+     "No folders added from ~/GitHub. 2 not added. veba: remove access in Finder (Get Info). "
+     "acme: another worker change is in progress; try again in a moment."),
 ])
 def test_the_org_folders_line(research_home, added, saved, refused, line):
     github = research_home.parent / "GitHub"
@@ -1093,12 +1097,18 @@ def test_a_long_org_folders_line_reaches_settings_whole(research_home):
                                                             for n in range(16)])
     (hint,) = [row for row in _remote(folders=[GITHUB], folder_notice=f"⚠ {line}")
                if row["id"] == "remote_tasks_folders_note"]
-    assert hint["label"] == f"⚠ {line}" and line.endswith("and 13 more.")
+    assert hint["label"] == f"⚠ {line}" and line.endswith("And 13 more.")
     shared = guided_setup.workspace_message("folder_permissions", gui=True)
     line = guided_setup.repo_groups_message(github, 0, 0, [(github / ("x" * 60 + str(n)), shared) for n in range(5)])
     (hint,) = [row for row in _remote(folders=[GITHUB], folder_notice=f"⚠ {line}")
                if row["id"] == "remote_tasks_folders_note"]
-    assert hint["label"] == f"⚠ {line}" and line.endswith("and 2 more.")
+    assert hint["label"] == f"⚠ {line}" and line.endswith("And 2 more.")
+    longest = guided_setup.repo_groups_message(github / ("y" * 250), 0, 0, [
+        (github / ("x" * 250 + str(n)), "z" * 1000) for n in range(5)])
+    (hint,) = [row for row in _remote(folders=[GITHUB], folder_notice=f"⚠ {longest}")
+               if row["id"] == "remote_tasks_folders_note"]
+    assert hint["label"] == f"⚠ {longest}" and longest.endswith("And 2 more.")
+    assert len(longest) < 1500 and longest.count("…") == 7
 
 
 def test_the_window_recommends_and_checks_a_folder_of_org_folders(root, research_home):
@@ -1172,26 +1182,43 @@ def test_a_direct_folder_is_named_by_its_label_and_says_in_place(root, research_
 # --- a control's result under the status line ------------------------------------------------------
 
 
-@pytest.mark.parametrize("code, words", [
-    ("pause_refused", "That change didn't go through."),
-    ("worker_control_failed", "That change didn't go through."),
-    ("status_read_failed", "Couldn't read the worker status after the change."),
-    ("job_identity_unknown", "The running task couldn't be identified."),
-    ("worker_lifecycle_busy", cli.BUSY_MESSAGE),
-    ("account_not_found", "That account is gone. Pick another."),
-    ("job_not_found", "Couldn't stop the task: no task has that ID."),
-    ("job_still_active", "Couldn't turn off the worker: a task is still running."),
+@pytest.mark.parametrize("code, action, words", [
+    ("pause_refused", "pause", "Couldn't pause new tasks."),
+    ("pause_refused", "resume", "Couldn't resume new tasks."),
+    ("settings_unavailable", "pause", "Couldn't pause new tasks: the worker couldn't apply it."),
+    ("worker_control_failed", "stop", "Couldn't stop the task."),
+    ("worker_control_failed", None, "That change didn't go through."),
+    ("status_read_failed", "disable", "Couldn't read the worker status after the change."),
+    ("worker_lifecycle_busy", "enable", cli.BUSY_MESSAGE),
+    ("job_identity_unknown", "stop", "Couldn't stop the task: the running task could not be identified."),
+    ("active_job_mismatch", "stop", "Couldn't stop the task: a different task is running now."),
+    ("job_identity_unknown", "disable", "Couldn't turn off the worker: the running task could not be identified."),
+    ("settings_unavailable", "disable", "Couldn't turn off the worker: the worker settings could not be saved."),
+    ("worker_stop_unconfirmed", "disable",
+     "Couldn't turn off the worker: the worker hasn't stopped yet; try again in a moment."),
+    ("worker_disable_blocked", "disable", "Couldn't turn off the worker."),
+    ("job_still_active", "disable", "Couldn't turn off the worker: a task is still running."),
+    ("job_not_found", "stop", "Couldn't stop the task: that task has already ended."),
+    ("stop_refused", "stop", "Couldn't stop the task."),
+    ("kickoff_in_progress", "enable",
+     "Could not start the worker: a scheduled kickoff is running; try again in a moment."),
+    ("worker_running_unmanaged", "enable",
+     "Could not start the worker: another one started from Terminal is running."),
+    ("worker_control_failed", "enable", "Couldn't turn on the worker."),
+    ("account_not_found", "account", "That account is gone. Pick another."),
+    ("account_not_eligible", "account", "That account can't be used for tasks. Pick another."),
+    ("settings_unavailable", "account", cli.SETTINGS_MESSAGE),
 ])
-def test_a_control_code_reads_as_words(code, words):
-    assert guided_setup.control_message(code) == words
+def test_a_control_code_reads_as_words(code, action, words):
+    assert guided_setup.control_message(code, action) == words
 
 
 def test_a_refused_control_shows_under_the_status_line_as_a_warning():
-    rows = _remote(enabled=True, **{**RUNNING, "diagnostic_notice": "pause_refused"})
+    rows = _remote(enabled=True, **{**RUNNING, "diagnostic_notice": "pause_refused", "notice_action": "pause"})
     ids = [row["id"] for row in rows]
     notice = rows[ids.index("remote_tasks_status") + 1]
     assert (notice["id"], notice["label"], notice["tone"]) == (
-        "remote_tasks_notice", f"⚠ {"That change didn't go through."}", "warning")
+        "remote_tasks_notice", "⚠ Couldn't pause new tasks.", "warning")
     assert rows[ids.index("remote_tasks_status")]["value"] == "Running · online · idle"
     assert "remote_tasks_notice" not in [row["id"] for row in _remote(enabled=True, **RUNNING)]
 
@@ -1208,6 +1235,45 @@ def test_a_control_notice_outlives_refreshes_until_the_state_or_the_next_action_
     _settings(settings_app, "remote_tasks_paused")
     monkeypatch.setattr(cli, "request_pause", lambda *_args: {"accepted": True})
     assert _settings(settings_app, "remote_tasks_paused")["diagnostic_notice"] is None
+
+
+def test_a_refused_start_reads_the_status_and_says_why(settings_app, monkeypatch):
+    monkeypatch.setattr(cli, "enable_worker",
+                        lambda _root: (_ for _ in ()).throw(ClaudeSwitchError("kickoff_in_progress")))
+    status = _settings(settings_app, "remote_tasks_enabled")
+    assert (status["diagnostic_notice"], status["notice_action"], status["process_state"]) == (
+        "kickoff_in_progress", "enable", "stopped")
+
+
+def test_a_refused_stop_outlives_a_refresh_that_cannot_read_the_status(settings_app, monkeypatch):
+    running = {**RUNNING, "active_job": {"job_id": "job-1", "state": "running"}}
+    monkeypatch.setattr(cli, "read_status", lambda _root: running)
+    monkeypatch.setattr(cli, "request_stop", lambda *_args: {"accepted": False})
+    settings_app._worker_policy = WorkerSettings(enabled=True)
+    assert _settings(settings_app, "remote_tasks_stop", "job-1")["diagnostic_notice"] == "stop_refused"
+    assert _poll(settings_app, process_state="unavailable", active_job=None)["diagnostic_notice"] == "stop_refused"
+    status = _poll(settings_app, **running)
+    assert (status["diagnostic_notice"], status["notice_action"]) == ("stop_refused", "stop")
+    assert _poll(settings_app, process_state="running", active_job=None)["diagnostic_notice"] is None
+
+
+_SEEN = menubar_display.remote_control_state({"active_job": {"job_id": "job-1"}}, WorkerSettings())
+_IDLE = menubar_display.remote_control_state({}, WorkerSettings())
+_UNSEEN = menubar_display.remote_control_state({"process_state": "unavailable"}, WorkerSettings())
+_PAUSED_UNSEEN = menubar_display.remote_control_state({"process_state": "unavailable"}, WorkerSettings(paused=True))
+
+
+@pytest.mark.parametrize("notice_state, state, kept", [
+    (_SEEN, _SEEN, _SEEN),
+    (_SEEN, _IDLE, None),
+    (_SEEN, _UNSEEN, _SEEN),
+    (_SEEN, _PAUSED_UNSEEN, None),
+    (_UNSEEN, _SEEN, _SEEN),
+    (_UNSEEN, _UNSEEN, _UNSEEN),
+    (None, _SEEN, None),
+])
+def test_a_control_notice_is_tied_to_the_task_last_seen(notice_state, state, kept):
+    assert menubar_display.kept_control_state(notice_state, state) == kept
 
 
 def test_a_status_read_failing_after_a_change_does_not_say_the_change_failed(root, settings_app, monkeypatch):

@@ -334,12 +334,33 @@ def remote_status_line(snapshot: dict, *, enabled: bool, paused: bool,
     return tone, "Running · online · idle" if connectivity == "online" else "Running · idle"
 
 
+_JOB_UNSEEN = object()
+
+
 def remote_control_state(snapshot: dict, policy) -> tuple:
     """What a worker control changes: a refresh that reads a different value clears its notice."""
     active = snapshot.get("active_job")
+    if snapshot.get("process_state") == "unavailable":
+        job = _JOB_UNSEEN
+    else:
+        job = active.get("job_id") if isinstance(active, dict) else None
     return (getattr(policy, "enabled", None), getattr(policy, "paused", None),
-            getattr(policy, "pinned_account_ref", None), getattr(policy, "account_allowlist", None),
-            active.get("job_id") if isinstance(active, dict) else None)
+            getattr(policy, "pinned_account_ref", None), getattr(policy, "account_allowlist", None), job)
+
+
+def kept_control_state(notice_state, state: tuple) -> tuple | None:
+    """The state a control's notice stays tied to after a refresh reads ``state``; None once the controls changed.
+
+    A refresh that couldn't read the status can't see the running task, so
+    only the settings are compared and the last task seen stays the baseline.
+    """
+    if not isinstance(notice_state, tuple) or notice_state[:-1] != state[:-1]:
+        return None
+    if state[-1] is _JOB_UNSEEN:
+        return notice_state
+    if notice_state[-1] is _JOB_UNSEEN or notice_state[-1] == state[-1]:
+        return state
+    return None
 
 
 SETTINGS_PAGE = "settings"
@@ -726,7 +747,8 @@ def remote_status_rows(worker_status: dict, *, enabled: bool, paused: bool, pair
     if isinstance(notice, str) and notice:
         from openswap.worker.guided_setup import control_message
 
-        rows.append(_remote_hint("remote_tasks_notice", f"{printer.MARK_WARN} {control_message(notice)}"))
+        words = control_message(notice, worker_status.get("notice_action"))
+        rows.append(_remote_hint("remote_tasks_notice", f"{printer.MARK_WARN} {words}"))
     key_note = remote_key_copy(worker_status) if paired else ""
     if key_note and key_note != REMOTE_KEY_RENEWS_NOTE:
         key = _remote_hint("remote_tasks_key", key_note)
