@@ -56,6 +56,8 @@ _DISABLE_WAIT_SECONDS = 3.0
 _DISABLE_POLL_SECONDS = 0.1
 _DISABLE_EXIT_WAIT_SECONDS = 3.0
 _LIFECYCLE_LOCK_TIMEOUT_SECONDS = 5.0
+# A settings write's failures, its file lock's timeout included.
+_SETTINGS_WRITE_ERRORS = (OSError, RuntimeError, ValueError, LockError)
 # Terminal states a lease release may follow. None of them proves on its own
 # that the provider's process tree stopped (see _journal_proves_provider_stop).
 # INTERRUPTED is terminal but records uncertainty, so it is not listed here.
@@ -91,16 +93,14 @@ def lifecycle_lock(backup_root: Path):
         Path(backup_root) / "worker" / "lifecycle.lock",
         timeout=_LIFECYCLE_LOCK_TIMEOUT_SECONDS,
     )
+    # Busy means only this lock is held elsewhere: a lock timeout inside the
+    # body (the settings file's, say) may follow a write and is not busy.
+    if not lock.acquire():
+        raise ClaudeSwitchError("worker_lifecycle_busy")
     try:
-        with lock:
-            yield
-    except Exception as exc:
-        # Expose only a stable local diagnostic, never lock path/system detail.
-        from openswap.exceptions import LockError
-
-        if isinstance(exc, LockError):
-            raise ClaudeSwitchError("worker_lifecycle_busy") from None
-        raise
+        yield
+    finally:
+        lock.release()
 
 
 def _snapshot(backup_root: Path) -> dict:
@@ -134,7 +134,7 @@ def request_pause(backup_root: Path, paused: bool) -> dict:
             try:
                 update_worker_settings(root, paused=previous.paused)
                 return True
-            except (OSError, RuntimeError, ValueError):
+            except _SETTINGS_WRITE_ERRORS:
                 return False
 
         try:
@@ -197,7 +197,7 @@ def enable_worker(backup_root: Path) -> dict:
             # result, even if the write itself succeeded.
             try:
                 update_worker_settings(root, enabled=previous.enabled)
-            except (OSError, RuntimeError, ValueError):
+            except _SETTINGS_WRITE_ERRORS:
                 pass
             raise ClaudeSwitchError("worker_configuration_invalid")
         try:
@@ -205,7 +205,7 @@ def enable_worker(backup_root: Path) -> dict:
         except ClaudeSwitchError:
             try:
                 update_worker_settings(root, enabled=previous.enabled)
-            except (OSError, RuntimeError, ValueError):
+            except _SETTINGS_WRITE_ERRORS:
                 pass
             raise
         return {"enabled": True, "service": service}
@@ -1012,7 +1012,7 @@ def _approve_locked(root: Path, kept, workspace_id: str, output: Path, sources, 
         if "disjoint" in str(exc):
             raise WorkspaceError("readonly_source_overlaps_folder") from None
         raise WorkspaceError("settings_unavailable") from None
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, LockError):
         raise WorkspaceError("settings_unavailable") from None
     return workspace
 
@@ -1215,7 +1215,7 @@ def set_workspace_mode(backup_root: Path, workspace_id: str, mode: str) -> Worke
         try:
             set_worker_workspaces(root, tuple(updated if w.workspace_id == workspace_id else w
                                               for w in current.workspaces))
-        except (OSError, RuntimeError, ValueError):
+        except _SETTINGS_WRITE_ERRORS:
             raise WorkspaceError("settings_unavailable") from None
         return updated
 
@@ -1274,7 +1274,7 @@ def remove_worker_workspace(backup_root: Path, workspace_id: str) -> None:
             raise WorkspaceError("workspace_in_use")
         try:
             set_worker_workspaces(root, remaining)
-        except (OSError, RuntimeError, ValueError):
+        except _SETTINGS_WRITE_ERRORS:
             raise WorkspaceError("settings_unavailable") from None
 
 
@@ -1331,7 +1331,7 @@ def label_worker_workspace(backup_root: Path, workspace_id: str, label: str | No
             set_worker_workspaces(root, tuple(
                 updated if item.workspace_id == workspace_id else item for item in current.workspaces
             ))
-        except (OSError, RuntimeError, ValueError):
+        except _SETTINGS_WRITE_ERRORS:
             raise WorkspaceError("settings_unavailable") from None
         return updated
 
@@ -1415,7 +1415,7 @@ def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
     # disabled worker must never re-enable it, even when a check blocks.
     try:
         was_enabled = update_worker_settings(backup_root, paused=True).enabled
-    except (OSError, RuntimeError, ValueError):
+    except _SETTINGS_WRITE_ERRORS:
         return False, {}, "settings_unavailable"
     client = WorkerClient(socket_path(backup_root))
     try:
@@ -1494,7 +1494,7 @@ def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
     # Policy is changed only after the active job and lease are confirmed safe.
     try:
         update_worker_settings(backup_root, enabled=False, paused=True)
-    except (OSError, RuntimeError, ValueError):
+    except _SETTINGS_WRITE_ERRORS:
         return _blocked(backup_root, was_enabled, snapshot, "settings_unavailable")
     try:
         service = uninstall(home=Path.home())
@@ -1504,7 +1504,7 @@ def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
         # helper cannot admit work.
         try:
             update_worker_settings(backup_root, enabled=was_enabled, paused=True)
-        except (OSError, RuntimeError, ValueError):
+        except _SETTINGS_WRITE_ERRORS:
             return False, _safe_snapshot(backup_root), "settings_unavailable"
         return False, _safe_snapshot(backup_root), "worker_unload_failed"
     if not _wait_for_worker_exit(backup_root):
@@ -1520,7 +1520,7 @@ def _blocked(
     """Keep the prior opt-in, paused, whenever safe disable is unproved."""
     try:
         update_worker_settings(backup_root, enabled=was_enabled, paused=True)
-    except (OSError, RuntimeError, ValueError):
+    except _SETTINGS_WRITE_ERRORS:
         diagnostic = "settings_unavailable"
     return False, snapshot, diagnostic
 
@@ -1642,8 +1642,9 @@ def _run(backup_root: Path, *, managed: bool = False) -> int:
             if not load_worker_settings(backup_root).enabled:
                 print(f"Remote tasks are off. {_ENABLE_NEXT}")
                 return 0
-    except ClaudeSwitchError:
-        print(BUSY_MESSAGE, file=sys.stderr)
+    except ClaudeSwitchError as exc:
+        print(BUSY_MESSAGE if str(exc) == "worker_lifecycle_busy" else "Could not start the worker.",
+              file=sys.stderr)
         return 1
     # Imported only in the dedicated worker command, after the default-off
     # policy check. The runtime owns its own SQLite journal and local socket.
@@ -2305,8 +2306,9 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
     if args.command == "disable":
         try:
             ok, result, diagnostic = disable_worker(root)
-        except ClaudeSwitchError:
-            print(BUSY_MESSAGE, file=sys.stderr)
+        except ClaudeSwitchError as exc:
+            print(BUSY_MESSAGE if str(exc) == "worker_lifecycle_busy" else "Could not stop the worker.",
+                  file=sys.stderr)
             return 1
         if not ok:
             if diagnostic == "worker_stop_unconfirmed":
@@ -2316,13 +2318,15 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                 # A blocked disable restores the prior opt-in, so report the
                 # persisted policy rather than assuming it is still enabled.
                 try:
-                    state = "on" if load_worker_settings(root).enabled else "off"
+                    saved = load_worker_settings(root)
+                    state = f"on{', paused' if saved.paused else ''}" if saved.enabled else (
+                        f"off{', paused' if saved.paused else ''}")
                 except Exception:
                     state = None
                 reason, step = _DISABLE_BLOCKED.get(diagnostic, ("the worker could not be proven idle", None))
                 if diagnostic == "lease_state_unknown":
                     step = _lease_release_step(root)
-                where = "no new task starts" if state is None else f"Remote tasks stay {state}, paused"
+                where = "no new task starts" if state is None else f"Remote tasks stay {state}"
                 line = f"Not stopped: {reason} ({diagnostic}). {where}."
                 print(line if step is None else f"{line} {printer.next_step(step)}", file=sys.stderr)
             return 1
@@ -2334,8 +2338,9 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
             ok, result, diagnostic = release_lease(
                 root, args.provider, confirm_stopped=args.confirm_stopped
             )
-        except ClaudeSwitchError:
-            print(BUSY_MESSAGE, file=sys.stderr)
+        except ClaudeSwitchError as exc:
+            print(BUSY_MESSAGE if str(exc) == "worker_lifecycle_busy" else "Could not release the account.",
+                  file=sys.stderr)
             return 1
         if not ok:
             print(f"Not released ({diagnostic}): {_LEASE_MESSAGES.get(diagnostic, 'the account may still be in use.')}",

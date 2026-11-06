@@ -282,7 +282,7 @@ def test_status_reports_a_stopped_worker_on_hosts_without_unix_sockets(
 def test_blocked_disable_reports_the_persisted_opt_in(
     tmp_path: Path, monkeypatch, capsys, enabled: bool
 ):
-    update_worker_settings(tmp_path, enabled=enabled)
+    update_worker_settings(tmp_path, enabled=enabled, paused=True)
     monkeypatch.setattr(cli, "disable_worker", lambda _root: (False, {}, "lease_state_unknown"))
 
     assert cli.main(["disable"], backup_root=tmp_path) == 1
@@ -773,3 +773,79 @@ def test_lease_release_cli_selects_the_claude_store(tmp_path: Path, capsys):
         ["lease", "release", "--provider", "claude", "--confirm-stopped"], backup_root=tmp_path
     ) == 0
     assert AccountLeaseStore(tmp_path, "claude").current().state == "released"
+
+
+def test_only_the_lifecycle_lock_itself_being_held_is_busy(tmp_path: Path, monkeypatch):
+    from openswap.locking import FileLock
+
+    monkeypatch.setattr(cli, "_LIFECYCLE_LOCK_TIMEOUT_SECONDS", 0.1)
+    with pytest.raises(cli.LockError) as inner:
+        with cli.lifecycle_lock(tmp_path):
+            raise cli.LockError("settings lock timed out")
+    assert str(inner.value) == "settings lock timed out"
+    with cli.lifecycle_lock(tmp_path):
+        pass
+    with FileLock(tmp_path / "worker" / "lifecycle.lock"):
+        with pytest.raises(cli.ClaudeSwitchError, match="^worker_lifecycle_busy$"):
+            with cli.lifecycle_lock(tmp_path):
+                pass
+
+
+def _settings_lock_timeout(*_args, **_kwargs):
+    raise cli.LockError("Failed to acquire lock - another instance may be running")
+
+
+def test_a_refused_pause_whose_rollback_times_out_reports_the_setting_kept(tmp_path: Path, monkeypatch):
+    class RefusingClient:
+        def __init__(self, _path):
+            pass
+
+        def set_paused(self, _paused):
+            monkeypatch.setattr(cli, "update_worker_settings", _settings_lock_timeout)
+            return {"accepted": False, "diagnostic_code": "pause_refused"}
+
+    update_worker_settings(tmp_path, enabled=True, paused=False)
+    monkeypatch.setattr(cli, "WorkerClient", RefusingClient)
+    assert cli.request_pause(tmp_path, True) == {
+        "accepted": False, "paused": True, "diagnostic_code": "settings_unavailable"}
+
+
+def test_a_failed_unload_whose_rollback_times_out_is_not_busy(tmp_path: Path, monkeypatch):
+    snapshot = {"process_state": "stopped", "enabled": True, "paused": True, "lease_quarantined": False,
+                "active_job": None}
+    monkeypatch.setattr(cli, "WorkerClient", lambda _path: _Client(None))
+    monkeypatch.setattr(cli, "_snapshot", lambda _root: snapshot)
+    monkeypatch.setattr(cli, "update_worker_settings", lambda _root, **_values: SimpleNamespace(enabled=True))
+
+    def unload_fails(**_kwargs):
+        monkeypatch.setattr(cli, "update_worker_settings", _settings_lock_timeout)
+        raise cli.ClaudeSwitchError("bootout failed")
+
+    monkeypatch.setattr(cli, "uninstall", unload_fails)
+    assert cli.disable_worker(tmp_path)[2] == "settings_unavailable"
+
+
+@pytest.mark.parametrize("code, line", [
+    ("worker_lifecycle_busy", cli.BUSY_MESSAGE), ("worker_state_unavailable", "Could not stop the worker.")])
+def test_disable_says_busy_only_when_the_lifecycle_lock_is_held(tmp_path: Path, monkeypatch, capsys, code, line):
+    monkeypatch.setattr(cli, "disable_worker", lambda _root: (_ for _ in ()).throw(cli.ClaudeSwitchError(code)))
+    assert cli.main(["disable"], backup_root=tmp_path) == 1
+    assert capsys.readouterr().err.strip() == line
+
+
+@pytest.mark.parametrize("paused, where", [(True, "Remote tasks stay on, paused."), (False, "Remote tasks stay on.")])
+def test_a_blocked_disable_says_paused_only_when_it_is(tmp_path: Path, monkeypatch, capsys, paused, where):
+    update_worker_settings(tmp_path, enabled=True, paused=paused)
+    monkeypatch.setattr(cli, "disable_worker", lambda _root: (False, {}, "settings_unavailable"))
+    assert cli.main(["disable"], backup_root=tmp_path) == 1
+    assert capsys.readouterr().err.strip().endswith(where)
+
+
+@pytest.mark.parametrize("code, line", [
+    ("worker_lifecycle_busy", cli.BUSY_MESSAGE), ("worker_state_unavailable", "Could not release the account.")])
+def test_lease_release_says_busy_only_when_the_lifecycle_lock_is_held(tmp_path: Path, monkeypatch, capsys,
+                                                                      code, line):
+    monkeypatch.setattr(cli, "release_lease", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        cli.ClaudeSwitchError(code)))
+    assert cli.main(["lease", "release"], backup_root=tmp_path) == 1
+    assert capsys.readouterr().err.strip() == line
