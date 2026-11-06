@@ -322,6 +322,9 @@ _CONTROL_FAILED = {
 # Reasons the CLI's tables don't have, or word for the terminal.
 _CONTROL_REASONS = {
     ("disable", "worker_stop_unconfirmed"): "the worker hasn't stopped yet; try again in a moment",
+    ("disable", "worker_state_unavailable"): "the worker's state could not be read",
+    ("pause", "worker_state_unavailable"): "the worker's state could not be read",
+    ("resume", "worker_state_unavailable"): "the worker's state could not be read",
     ("stop", "job_identity_unknown"): "the running task could not be identified",
     ("stop", "job_not_found"): "that task has already ended",
     ("stop", "active_job_mismatch"): "a different task is running now",

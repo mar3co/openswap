@@ -1120,10 +1120,15 @@ def run(switcher, codex=None) -> int:
                 )
 
                 root = self.switcher.backup_dir
+                # The worker lifecycle lock's refusals; any other ClaudeSwitchError text is not shown.
+                lock_codes = {"worker_lifecycle_busy", "worker_state_unavailable"}
                 if row_id == "remote_tasks_enabled":
                     if self._worker_policy.enabled:
                         action = "disable"
-                        ok, _result, diagnostic = disable_worker(root)
+                        try:
+                            ok, _result, diagnostic = disable_worker(root)
+                        except ClaudeSwitchError as exc:
+                            ok, diagnostic = False, str(exc) if str(exc) in lock_codes else "worker_control_failed"
                         if not ok:
                             diagnostic = diagnostic or "worker_disable_blocked"
                     else:
@@ -1134,7 +1139,10 @@ def run(switcher, codex=None) -> int:
                             diagnostic = str(exc) if str(exc) in _ENABLE_DIAGNOSTICS else "worker_control_failed"
                 elif row_id == "remote_tasks_paused":
                     action = "resume" if self._worker_policy.paused else "pause"
-                    result = request_pause(root, not self._worker_policy.paused)
+                    try:
+                        result = request_pause(root, not self._worker_policy.paused)
+                    except ClaudeSwitchError as exc:
+                        result = {"diagnostic_code": str(exc) if str(exc) in lock_codes else "worker_control_failed"}
                     if result.get("accepted") is not True:
                         diagnostic = result.get("diagnostic_code") or "pause_refused"
                 elif row_id == "remote_tasks_stop":
