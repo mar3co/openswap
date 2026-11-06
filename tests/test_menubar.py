@@ -2907,7 +2907,7 @@ def test_claude_login_copy_names_the_browser_and_the_retry():
 
 
 def test_claude_login_result_is_drained_before_auto_capture_and_canceled_on_quit():
-    text = Path(menubar.__file__).read_text()
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
     tick = text[text.index("def on_sync_tick") : text.index("def _consume_widget_command")]
     assert tick.index("_drain_claude_login_result()") < tick.index("_maybe_auto_capture_relogin()")
     quit_ = text[text.index("def on_quit") : text.index("def on_toggle_name")]
@@ -3523,7 +3523,7 @@ def test_every_settings_row_is_dispatched():
             continue  # local settings navigation, covered by panel tests
         if row["id"] == "claude_desktop_profiles":
             # Native menus need the clicked button as their popover anchor.
-            panel = Path(menubar.__file__).with_name("menubar_panel.py").read_text()
+            panel = Path(menubar.__file__).with_name("menubar_panel.py").read_text(encoding="utf-8")
             assert 'self._claude_desktop_profiles if row["id"] == "claude_desktop_profiles"' in panel
             continue
         assert f'"{row["id"]}"' in body, row["id"]
@@ -3748,7 +3748,7 @@ def test_refresh_requested_while_in_flight_runs_on_the_next_tick():
     app._refresh_pending = False
     app.refresh_async()
     assert app._refresh_pending is True
-    text = Path(menubar.__file__).read_text()
+    text = Path(menubar.__file__).read_text(encoding="utf-8")
     tick = text[text.index("def on_sync_tick") : text.index("def _consume_widget_command")]
     assert tick.index("_refresh_pending") < tick.index("_poll_login()")
 
