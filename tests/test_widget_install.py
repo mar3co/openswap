@@ -58,16 +58,16 @@ def test_widget_app_icons_use_the_opensoft_mark_at_every_declared_size():
         assert data.startswith(b"\x89PNG\r\n\x1a\n")
         assert struct.unpack(">II", data[16:24]) == (size, size)
 
-    source = (root / "assets" / "opensoft-app-icon.svg").read_text()
+    source = (root / "assets" / "opensoft-app-icon.svg").read_text(encoding="utf-8")
     assert 'aria-label="OpenSoft"' in source
     assert '<rect width="32" height="32" rx="6" fill="#0a0a0a"/>' in source
 
 
 def test_popover_packages_the_opensoft_symbol():
     package_dir = Path(__file__).resolve().parents[1] / "src" / "openswap"
-    svg = (package_dir / "assets" / "opensoft-symbol.svg").read_text()
+    svg = (package_dir / "assets" / "opensoft-symbol.svg").read_text(encoding="utf-8")
     png = package_dir / "assets" / "opensoft-symbol-64.png"
-    panel = (package_dir / "menubar_panel.py").read_text()
+    panel = (package_dir / "menubar_panel.py").read_text(encoding="utf-8")
 
     assert 'aria-label="OpenSoft"' in svg
     assert struct.unpack(">II", png.read_bytes()[16:24]) == (64, 64)
