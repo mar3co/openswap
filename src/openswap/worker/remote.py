@@ -44,8 +44,8 @@ WORKER_FEATURES = ("origin", "key_rotation", "attention")
 ROTATION_BACKOFF_SECONDS = 3600.0
 # How often the readiness report rescans folders of repos when nothing changed.
 FOLDER_RESCAN_SECONDS = 30.0
-# The session attention thread wakes this often to publish a question past its
-# fallback; it rescans running sessions and retries a failed report every
+# The session attention thread reads the session files this often (a "No" or
+# Esc at the Mac fires no hook); it retries a failed report every
 # HEARTBEAT_SECONDS, and reports a change at once.
 ATTENTION_WAKE_SECONDS = 0.5
 # Validation failures the service (or the local export check) reports for one
@@ -762,13 +762,13 @@ class RemoteClient:
             if changed:
                 store.changed.clear()
             try:
+                store.refresh()  # the session files: answers and exits that fire no hook
                 store.tick()
                 now = time.monotonic()
                 if now >= next_pass:
                     next_pass = now + HEARTBEAT_SECONDS
                     if not load_attention_settings(self.runtime.backup_root).notices:
                         store.clear()  # even with no service to tell
-                    store.prune()
                     changed = True
                 if changed or store.changed.is_set():
                     store.changed.clear()

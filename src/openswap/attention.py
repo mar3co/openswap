@@ -53,9 +53,18 @@ HOOK_TIMEOUT_SECONDS = 10
 # --- the entry point ---------------------------------------------------------
 
 
+CHANNEL_TAG = '<channel source="openswap"'
+# How Claude Code starts a turn with a background task's (a subagent's) result.
+TASK_TAG = "<task-notification>"
+SESSION_COMMANDS = frozenset({"/clear", "/exit", "/quit"})
+
+
 def main(argv: list[str]) -> int:
     """``openswap attention <event>``: never raises, never prints, exits 0."""
     import signal
+    import time
+
+    started = time.time()
 
     previous = None
     try:
@@ -71,6 +80,7 @@ def main(argv: list[str]) -> int:
         else:
             notice = None
         if notice is not None:
+            notice["at"] = started
             send_notice(notice)
     except BaseException:  # noqa: BLE001 - a hook must never fail loudly
         pass
@@ -117,6 +127,10 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
     tool_name = clean_text(data.get("tool_name"), DETAIL_CAPS["tool_name"])
     tool_input = data.get("tool_input")
     if event in ("PermissionRequest", "PostToolUse", "PostToolUseFailure") and tool_name:
+        agent = data.get("agent_id")
+        if isinstance(agent, str) and 0 < len(agent) <= 64 and all(
+                c.isascii() and (c.isalnum() or c in "_-") for c in agent):
+            notice["agent_id"] = agent
         notice["tool_name"] = tool_name
         notice["tool_key"] = tool_key(tool_input)
         if event == "PermissionRequest" and isinstance(tool_input, dict):
@@ -130,6 +144,15 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
                     notice["description"] = description
     elif event == "Notification":
         notice["notification_type"] = clean_text(data.get("notification_type"), 64)
+    elif event == "UserPromptSubmit":
+        # What kind of prompt only; the prompt itself never leaves the hook.
+        prompt = data.get("prompt") if isinstance(data.get("prompt"), str) else ""
+        if prompt.startswith(CHANNEL_TAG):
+            notice["prompt_kind"] = "channel"
+        elif prompt.startswith(TASK_TAG):
+            notice["prompt_kind"] = "task"
+        elif prompt.strip().split(" ", 1)[0] in SESSION_COMMANDS:
+            notice["prompt_kind"] = "end"
     elif event == "Stop":
         message = clean_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"], multiline=True)
         if message:
@@ -258,18 +281,22 @@ def is_our_notify(notify: object) -> bool:
 # --- Claude Code settings.json ----------------------------------------------
 
 
-def config_homes(backup_root: Path) -> list[Path]:
+def config_homes(backup_root: Path, problems: list | None = None) -> list[Path]:
     """Every Claude Code config home OpenSwap manages: ``~/.claude`` (and
     ``CLAUDE_CONFIG_DIR`` when set), each account session profile, and each
-    Claude Desktop profile's Code folder. Folders that do not exist are left out."""
+    Claude Desktop profile's Code folder. Folders that do not exist are left out.
+    A place that could not be listed is appended to ``problems``."""
     from openswap import paths
 
     homes = [paths.get_default_claude_config_home(), paths.get_claude_config_home()]
     sessions = Path(backup_root) / "sessions"
     try:
         homes += sorted(p for p in sessions.iterdir() if p.is_dir() and not p.is_symlink())
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        if problems is not None:
+            problems.append(f"{sessions}: {exc}")
     try:
         from openswap.claude_desktop import DesktopProfiles
 
@@ -280,7 +307,10 @@ def config_homes(backup_root: Path) -> list[Path]:
             if code is not None:
                 homes.append(code)
     except Exception as exc:  # noqa: BLE001 - an unreadable registry leaves its profiles out
-        logger.warning("Claude Desktop profiles left out of session notices: %s", exc)
+        # Read every few seconds by the worker: never a warning per read.
+        logger.debug("Claude Desktop profiles left out of session notices: %s", exc)
+        if problems is not None:
+            problems.append(f"Claude Desktop profiles: {exc}")
     out = []
     for home in homes:
         if home not in out and home.is_dir():

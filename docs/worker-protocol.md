@@ -1584,17 +1584,39 @@ failed removal left.
 A hook hands its event to the worker's socket and exits within a second,
 printing nothing; with no worker running the event is dropped. The worker
 publishes an item when Claude Code itself decides the owner seems away (its
-`permission_prompt` and `idle_prompt` notifications, about 6 and 60 seconds
-in), when a question is still unanswered after 6 seconds, and for every
-finished Codex turn. Answering at the Mac closes it: `PostToolUse` or
+`permission_prompt` notification, about 6 seconds into a permission or
+question dialog, and `idle_prompt`, about 60 seconds after a turn ends) and
+for every finished Codex turn. A `permission_prompt` publishes only the prompt
+waiting now, once: Claude Code sends it 6 seconds after that dialog showed,
+which is when the dialog's `PermissionRequest` ran, so it is matched to that
+call (several subagent prompts can wait at once, each with its own notice). A
+recorded call whose notice is overdue ended before it and is dropped unseen;
+a notice with no recorded call becomes a notice without detail.
+
+Answering at the Mac closes the item as `answered_on_mac`: `PostToolUse` or
 `PostToolUseFailure` of that very call (matched by a digest of its input),
-`Stop` for permissions and questions, `UserPromptSubmit` for everything,
-including an idle item. So does the session ending: `SessionEnd`, `/clear`,
-or its Claude Code process gone (the hook reports that process's ID; it is
-checked every 5 seconds). A deny or Esc at
-the terminal fires no hook, so such an item stays open until the next of
-those. Open items survive a worker restart (`worker/attention.json` under the
-backup root, owner-only).
+`Stop` for the main thread's permissions and questions (a background
+subagent's prompt can outlive the turn that started it), a typed prompt
+(`UserPromptSubmit`) for everything. A "No" or Esc fires no hook, so the worker also reads every
+managed config home's `sessions/{pid}.json` twice a second: a session that
+left `waiting` after a prompt was recorded answered it (an idle item closes
+only on a typed prompt: a channel or background turn also leaves `idle`).
+Those closes wait 1.5 seconds,
+so that a quit or `/clear` right after them closes the item as
+`session_ended` instead. The session ending (`SessionEnd`, `/clear`, its
+session file gone, or its Claude Code process gone; the hook reports that
+process's ID) closes everything as `session_ended`. A turn that OpenSwap's own
+channel starts (a prompt beginning `<channel source="openswap"`) closes the
+main thread's permission and question items, not a subagent's that still waits
+and not the idle item, which replies settle, and
+a turn that a background task's result starts (`<task-notification>`) closes
+nothing: a subagent's prompt may still be waiting.
+Hooks run asynchronously and can arrive out of order, so each one carries the
+time it ran, which orders it against the others and against the session
+files' `statusUpdatedAt`. An idle item shows the last message of the latest
+turn only, never one from an earlier turn. Open items survive a worker restart
+(`worker/attention.json` under the backup root, owner-only) and are checked
+against the session files and Claude Code processes when it starts.
 
 Always sent: the kind, the provider, a session label, the time and an opaque
 folder ID. With details on, also the folder's name (an approved Remote tasks

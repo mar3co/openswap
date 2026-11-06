@@ -23,7 +23,7 @@ from openswap.settings import (
 )
 from openswap.worker import ipc
 from openswap.worker.attention import (
-    AttentionStore, Item, NoticeError, QUESTION_FALLBACK_SECONDS, approved_folder_label,
+    SESSION_END_GRACE_SECONDS, AttentionStore, Item, NoticeError, SessionRecord, approved_folder_label, read_records,
     validate_notice,
 )
 from openswap.worker.protocol import MAX_BODY, ProtocolError, attention_report
@@ -46,7 +46,7 @@ def _no_real_session(monkeypatch):
 
 class Clock:
     def __init__(self):
-        self.now = 1_800_000_000.0
+        self.now = START
 
     def __call__(self):
         return self.now
@@ -74,8 +74,14 @@ def question():
          "options": [{"label": "Postgres", "description": "x"}, {"label": "SQLite", "description": "y"}]}]})
 
 
+START = 1_800_000_000.0  # the test clock's start
+
+
 def notification(kind, session=SESSION):
-    return hook("Notification", session=session, notification_type=kind, message="Claude needs you")
+    """As Claude Code sends it: a ``permission_prompt`` 6 s after its dialog
+    (hooks without ``at`` run at START)."""
+    notice = hook("Notification", session=session, notification_type=kind, message="Claude needs you")
+    return notice | {"at": START + 6} if kind == "permission_prompt" else notice
 
 
 @pytest.fixture
@@ -106,6 +112,10 @@ def test_hook_input_maps_to_its_notice_and_never_carries_raw_tool_input():
     assert hook("Notification", notification_type="idle_prompt")["notification_type"] == "idle_prompt"
     stop = hook("Stop", last_assistant_message="Done.\x1b[31m\nAll green " + "x" * 2000)
     assert stop["last_message"].startswith("Done. [31m\nAll green") and len(stop["last_message"]) == 1000
+    assert hook("UserPromptSubmit", prompt="<task-notification>\n…")["prompt_kind"] == "task"
+    assert hook("UserPromptSubmit", prompt="/clear")["prompt_kind"] == "end"
+    assert "prompt_kind" not in hook("UserPromptSubmit", prompt="fix the <task-notification> parser")
+    assert "fix the" not in json.dumps(hook("UserPromptSubmit", prompt="fix the bug"))
     assert question()["questions"] == [{"question": "Which database?", "header": "DB",
                                         "options": ["Postgres", "SQLite"]}]
     # Other tools send their name only.
@@ -183,7 +193,8 @@ def test_permission_publishes_only_on_permission_prompt(store):
 def test_two_waiting_permissions_are_two_items_with_their_own_ids(store):
     items, _ = store
     items.notice(permission(command="a"))
-    items.notice(permission(command="b"))
+    items.notice(notification("permission_prompt"))
+    items.notice(permission(command="b"))  # a subagent's prompt, queued behind the first
     items.notice(notification("permission_prompt"))
     first, second = published(items)
     assert first["id"] != second["id"]
@@ -203,13 +214,13 @@ def test_item_ids_are_never_reused(store):
         items.notice(hook("UserPromptSubmit"))
 
 
-def test_question_publishes_on_permission_prompt_or_after_the_fallback(store):
+def test_question_publishes_on_permission_prompt_only(store):
     items, clock = store
     items.notice(question())
+    clock.now += 60
     items.tick()
-    assert published(items) == []
-    clock.now += QUESTION_FALLBACK_SECONDS
-    items.tick()
+    assert published(items) == []  # no timer of its own
+    items.notice(notification("permission_prompt"))
     [item] = published(items)
     assert item["kind"] == "question" and item["detail"]["questions"][0]["options"] == ["Postgres", "SQLite"]
     items.notice(post(tool="AskUserQuestion", command="answered"))
@@ -235,6 +246,7 @@ def test_idle_publishes_on_idle_prompt_with_the_last_message(store):
 def test_each_close_signal_closes_the_right_items(store, signal, closed_kinds, reason):
     items, _ = store
     items.notice(permission())
+    items.notice(notification("permission_prompt"))
     items.notice(question())
     items.notice(notification("permission_prompt"))
     items.notice(notification("idle_prompt"))
@@ -259,6 +271,292 @@ def test_an_answer_before_publishing_reports_nothing(store):
     assert [i.get("detail") for i in body["items"]] == [None]
 
 
+# --- Required outcomes rows 1-7 (plan 025, phase 0 results) -----------------------
+
+
+def at(clock, seconds):
+    """A hook's own time, ``seconds`` after the test clock's start."""
+    return {"at": clock.now + seconds}
+
+
+def record(status, status_at, session=SESSION, waiting_for=""):
+    return {session: SessionRecord(session, os.getpid(), status, status_at, waiting_for)}
+
+
+def test_row1_a_call_that_ends_before_its_prompt_is_never_published(store):
+    items, clock = store
+    t = clock.now
+    # Auto mode decides call A; its PermissionRequest is the only trace.
+    items.notice(permission(command="a") | at(clock, 0))
+    items.observe(record("busy", t - 30), True)
+    # Call B is declined at the Mac faster than the watcher; its hook arrives late.
+    items.observe(record("idle", t + 3), True)
+    items.notice(permission(command="b") | at(clock, 2))
+    # A later prompt (call C, a new turn) must publish only C.
+    items.observe(record("waiting", t + 10, waiting_for="permission prompt"), True)
+    items.notice(permission(command="c") | at(clock, 9))
+    items.notice(notification("permission_prompt") | at(clock, 16))
+    assert len(published(items)) == 1
+    assert [i.tool_key for i in items._items] == [attention.tool_key({"command": "c", "description": "Run the tests"})]
+    assert closes(items) == []  # nothing of A or B was ever shown
+
+
+def first_is(items, command):
+    return [i.tool_key for i in items._items if i.published][:1] == [
+        attention.tool_key({"command": command, "description": "Run the tests"})]
+
+
+def test_a_late_notice_for_an_answered_call_leaves_the_next_call_alone(store):
+    items, clock = store
+    t = clock.now
+    items.notice(permission(command="a") | at(clock, 0))
+    items.observe(record("busy", t + 3), True)  # A answered at 3
+    items.notice(permission(command="b") | at(clock, 5.9))  # B's dialog shows
+    items.notice(notification("permission_prompt") | at(clock, 6))  # A's notice, late
+    assert published(items) == []
+    items.observe(record("waiting", t + 5.95, waiting_for="permission prompt"), True)
+    items.notice(notification("permission_prompt") | at(clock, 11.9))
+    assert first_is(items, "b")
+
+
+def test_parallel_subagent_prompts_each_publish_their_own_call(store):
+    """Measured live: both PermissionRequests run at once, each notice 6.0 s after its own."""
+    items, clock = store
+    t = clock.now
+    items.notice(permission(command="b", agent_id="a7c7645e861d1e073") | at(clock, 0))
+    # The subagents run in the background: the main turn ends while both prompts wait.
+    items.notice(hook("Stop", last_assistant_message="Launched both.") | at(clock, 0.2))
+    items.notice(permission(command="a", agent_id="aa66adb8aacae2617") | at(clock, 0.4))
+    items.observe(record("waiting", t, waiting_for="permission prompt"), True)
+    items.notice(notification("permission_prompt") | at(clock, 6.0))
+    assert first_is(items, "b")
+    [first] = published(items)
+    items.notice(notification("permission_prompt") | at(clock, 6.4))
+    assert len(published(items)) == 2
+    # Allowing B shows A's queued dialog, and Claude Code notifies for it again.
+    items.notice(notification("permission_prompt") | at(clock, 26))
+    assert len(published(items)) == 2
+    # B allowed: its result starts a turn; A still waits (the file stays waiting).
+    items.notice(post(command="b") | at(clock, 20))
+    items.notice(hook("UserPromptSubmit", prompt="<task-notification>\n<task-id>x</task-id>") | at(clock, 21))
+    items.notice(hook("Stop", last_assistant_message="B done.") | at(clock, 23))
+    items.observe(record("waiting", t, waiting_for="permission prompt"), True)
+    clock.now += 10
+    items.tick()
+    [left] = published(items)
+    assert left["id"] != first["id"]
+    assert [i.tool_key for i in items._items] == [attention.tool_key({"command": "a", "description": "Run the tests"})]
+
+
+def test_a_call_answered_before_its_notice_is_never_published_by_another(store):
+    items, clock = store
+    t = clock.now
+    items.notice(permission(command="declined fast") | at(clock, 0))  # a subagent's, No within 6 s
+    items.notice(permission(command="still waiting") | at(clock, 30))
+    items.observe(record("waiting", t, waiting_for="permission prompt"), True)
+    items.notice(notification("permission_prompt") | at(clock, 36))
+    [item] = published(items)
+    assert [i.tool_key for i in items._items] == [
+        attention.tool_key({"command": "still waiting", "description": "Run the tests"})]
+
+
+def test_an_unknown_session_status_is_never_read_as_an_answer(store):
+    items, clock = store
+    items.notice(permission() | at(clock, 0))
+    items.observe(record("", clock.now + 1), True)  # a record without status, or a new status
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    clock.now += 10
+    items.tick()
+    assert len(published(items)) == 1
+
+
+def test_another_processs_record_for_the_session_is_ignored(store):
+    items, clock = store
+    items.notice(permission() | at(clock, 0) | {"pid": os.getpid()})
+    stale = {SESSION: SessionRecord(SESSION, os.getppid(), "idle", clock.now + 1)}
+    items.observe(stale, True)
+    items.notice(notification("permission_prompt") | at(clock, 6) | {"pid": os.getpid()})
+    clock.now += 10
+    items.tick()
+    assert len(published(items)) == 1
+
+
+def test_row2_a_permission_prompt_publishes_only_the_prompt_waiting_now_once(store):
+    items, clock = store
+    t = clock.now
+    items.notice(permission(command="x") | at(clock, 0))
+    # The session left waiting (declined) and is busy on a new turn: nothing waits.
+    items.observe(record("busy", t + 2), True)
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    assert published(items) == [] and items._items == []
+    items.observe(record("waiting", t + 10, waiting_for="input needed"), True)
+    items.notice(notification("permission_prompt") | at(clock, 16))
+    items.notice(notification("permission_prompt") | at(clock, 16.2))  # the same notice again
+    [bare] = published(items)  # its PermissionRequest never arrived: one notice, kind from the record
+    assert bare["kind"] == "question" and "detail" not in bare
+
+
+@pytest.mark.parametrize("next_status", ["idle", "busy"])
+def test_row3_a_decline_at_the_mac_closes_the_item_as_answered_on_mac(store, next_status):
+    items, clock = store
+    t = clock.now
+    items.notice(permission() | at(clock, 0))
+    items.observe(record("waiting", t + 0.05, waiting_for="permission prompt"), True)
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    # No, Esc, or "No, and tell Claude…" with the next turn already running.
+    items.observe(record(next_status, t + 9), True)
+    assert len(published(items)) == 1  # inside the grace an exit could still follow
+    clock.now += SESSION_END_GRACE_SECONDS
+    items.tick()
+    assert published(items) == [] and [c["reason"] for c in closes(items)] == ["answered_on_mac"]
+
+
+def test_row4_one_prompt_ending_closes_only_its_own_item(store):
+    items, clock = store
+    t = clock.now
+    items.notice(permission(command="a") | at(clock, 0))
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    items.notice(permission(command="b") | at(clock, 7) | {"session_id": OTHER})
+    items.notice(notification("permission_prompt", session=OTHER) | at(clock, 13))
+    waiting = {**record("waiting", t + 0.1), **record("waiting", t + 7.1, session=OTHER)}
+    items.observe(waiting, True)
+    items.notice(post(command="b") | {"session_id": OTHER})
+    [left] = published(items)
+    assert left["session_id"] == items.session_id(next(i for i in items._items if i.session == SESSION))
+    clock.now += 10
+    items.tick()
+    assert len(published(items)) == 1  # still waiting: never closed
+
+
+def test_row5_after_a_restart_an_item_whose_session_moved_on_closes(tmp_path):
+    clock = Clock()
+    t = clock.now
+    first = AttentionStore(tmp_path, clock=clock)
+    first.notice(permission() | at(clock, 0))
+    first.notice(notification("permission_prompt") | at(clock, 6))
+    first.notice(notification("idle_prompt", session=OTHER) | at(clock, 6))
+    reads = [({**record("idle", t + 20), **record("busy", t + 30, session=OTHER)}, True)]
+    again = AttentionStore(tmp_path, clock=clock, records=lambda: reads[0])
+    clock.now += 60
+    again.refresh()
+    clock.now += SESSION_END_GRACE_SECONDS
+    again.tick()
+    # The prompt closed; the idle item waits for a typed prompt (a channel or
+    # background turn also leaves idle, so the file alone never closes it).
+    assert [i["kind"] for i in published(again)] == ["idle"]
+    assert [c["reason"] for c in closes(again)] == ["answered_on_mac"]
+
+
+@pytest.mark.parametrize("ending", ["exit", "clear", "hook"])
+def test_row6_an_exit_or_clear_is_session_ended_never_answered_on_mac(store, ending):
+    items, clock = store
+    t = clock.now
+    items.notice(permission() | at(clock, 0))
+    items.observe(record("waiting", t + 0.1), True)
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    # Esc first (the record leaves waiting), then the session goes away.
+    items.observe(record("idle", t + 8), True)
+    if ending == "exit":
+        items.observe({}, True)
+    elif ending == "clear":
+        items.notice(hook("UserPromptSubmit", prompt="/clear") | at(clock, 8.5))
+        items.observe(record("idle", t + 8.6, session="new-session-after-clear"), True)
+    else:
+        items.notice(hook("SessionEnd", reason="other") | at(clock, 8.5))
+    clock.now += 10
+    items.tick()
+    assert [c["reason"] for c in closes(items)] == ["session_ended"]
+
+
+def test_row6_an_unreadable_record_is_not_an_exit(store):
+    items, clock = store
+    items.notice(notification("idle_prompt"))
+    items.observe(record("idle", clock.now - 1), True)
+    items.observe({}, False)
+    assert len(published(items)) == 1
+
+
+def test_a_late_stop_of_the_previous_turn_leaves_the_new_prompt_open(store):
+    items, clock = store
+    items.notice(hook("UserPromptSubmit", prompt="next") | at(clock, 6))
+    items.notice(permission() | at(clock, 7))
+    items.notice(hook("Stop", last_assistant_message="Turn one done.") | at(clock, 5))
+    items.notice(notification("permission_prompt") | at(clock, 13))
+    [item] = published(items)
+    assert item["detail"]["tool_name"] == "Bash"
+
+
+def test_a_home_that_could_not_be_listed_hides_no_ended_session(tmp_path, monkeypatch):
+    from openswap.worker.runtime import _session_records
+
+    def homes(root, problems):
+        problems.append("sessions: permission denied")
+        return []
+
+    monkeypatch.setattr(attention, "config_homes", homes)
+    assert _session_records(tmp_path)() == ({}, False)
+
+
+def test_a_background_task_turn_refreshes_the_idle_items_reply(store):
+    items, clock = store
+    items.notice(hook("Stop", last_assistant_message="Launched both.") | at(clock, 1))
+    items.notice(notification("idle_prompt") | at(clock, 61))
+    [first] = published(items)
+    items.notice(hook("UserPromptSubmit", prompt="<task-notification>\n<task-id>x</task-id>") | at(clock, 90))
+    items.notice(hook("Stop", last_assistant_message="Result is 42.") | at(clock, 95))
+    items.notice(notification("idle_prompt") | at(clock, 155))
+    [again] = published(items)
+    assert again["id"] == first["id"] and again["detail"] == {"last_message": "Result is 42."}
+
+
+def test_a_channel_turn_leaves_a_waiting_subagent_prompt_open(store):
+    items, clock = store
+    items.notice(permission(agent_id="a1") | at(clock, 0))
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    items.notice(hook("UserPromptSubmit", prompt='<channel source="openswap">Continue</channel>') | at(clock, 9))
+    assert len(published(items)) == 1
+
+
+def test_row7_an_idle_item_after_an_interrupted_turn_has_no_older_message(store):
+    items, clock = store
+    items.notice(hook("UserPromptSubmit", prompt="first") | at(clock, 0))
+    items.notice(hook("Stop", last_assistant_message="Old reply.") | at(clock, 5))
+    items.notice(hook("UserPromptSubmit", prompt="second") | at(clock, 10))
+    # Esc interrupts the second turn: no Stop. A late Stop of the first turn changes nothing.
+    items.notice(hook("Stop", last_assistant_message="Late.") | at(clock, 4))
+    items.notice(notification("idle_prompt") | at(clock, 72))
+    [item] = published(items)
+    assert "detail" not in item
+
+
+def test_openswaps_own_channel_turn_does_not_close_the_idle_item(store):
+    items, clock = store
+    items.notice(permission() | at(clock, 0))
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    items.notice(notification("idle_prompt") | at(clock, 7))
+    items.notice(hook("UserPromptSubmit", prompt='<channel source="openswap">Continue</channel>') | at(clock, 9))
+    items.observe(record("busy", clock.now + 9.1), True)  # the channel's turn runs
+    clock.now += 10
+    items.tick()
+    assert [i["kind"] for i in published(items)] == ["idle"]
+    items.notice(hook("UserPromptSubmit", prompt='<channel source="slack">hi</channel>') | at(clock, 10))
+    assert published(items) == []
+
+
+def test_session_records_are_read_from_every_home(tmp_path):
+    home, other = tmp_path / "a", tmp_path / "b"
+    (home / "sessions").mkdir(parents=True)
+    (other / "sessions").mkdir(parents=True)
+    (home / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
+        "pid": os.getpid(), "sessionId": SESSION, "status": "waiting", "statusUpdatedAt": 1_800_000_000_500,
+        "waitingFor": "permission prompt"}))
+    (other / "sessions" / "999999.json").write_text(json.dumps({"pid": 999999, "sessionId": OTHER}))  # gone
+    assert read_records([home, other, tmp_path / "missing"]) == (
+        {SESSION: SessionRecord(SESSION, os.getpid(), "waiting", 1_800_000_000.5, "permission prompt")}, True)
+    (other / "sessions" / "1.json").write_text("{torn")
+    assert read_records([home, other])[1] is False
+
+
 def test_another_call_of_the_same_tool_finishing_leaves_the_prompt_open(store):
     """A subagent's or a parallel call's PostToolUse carries the session's ID too."""
     items, _ = store
@@ -279,7 +577,7 @@ def test_a_gone_claude_process_closes_its_items(store):
     items.notice(notification("idle_prompt") | {"pid": ended.pid, "entrypoint": "cli"})
     items.notice(notification("idle_prompt", session=OTHER) | {"pid": os.getpid(), "entrypoint": "claude-vscode"})
     items.notice(notification("idle_prompt", session="no-pid-known"))
-    items.prune()
+    items.observe({}, True)
     left = published(items)
     assert [i["session_label"] for i in left] == ["VS Code · 77aa", "Claude Code · nopi"]
     assert [c["reason"] for c in closes(items)] == ["session_ended"]
@@ -825,7 +1123,7 @@ def test_codex_notify_runs_the_previous_program_with_the_same_arguments(tmp_path
             break
         time.sleep(0.1)
     assert json.loads(out.read_text()) == ["turn-ended", payload]
-    assert sent == [{"provider": "codex", "event": "agent-turn-complete", "thread_id": "019a", "cwd": "/r",
+    assert [{k: v for k, v in n.items() if k != "at"} for n in sent] == [{"provider": "codex", "event": "agent-turn-complete", "thread_id": "019a", "cwd": "/r",
                      "last_message": "Done"}]
     validate_notice(sent[0])
 

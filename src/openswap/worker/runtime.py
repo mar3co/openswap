@@ -1780,7 +1780,29 @@ def _attention_store(backup_root: Path):
             logger.warning("Session notices: %s", problem)
     except Exception:
         logger.warning("Session notice hooks could not be checked", exc_info=True)
-    return AttentionStore(backup_root, enabled=lambda: load_attention_settings(backup_root).notices)
+    return AttentionStore(backup_root, enabled=lambda: load_attention_settings(backup_root).notices,
+                          records=_session_records(backup_root))
+
+
+def _session_records(backup_root: Path):
+    """Reads every managed config home's session files; the homes are looked up
+    again every few seconds (a new account or Desktop profile)."""
+    from openswap import attention as hooks
+    from openswap.worker.attention import read_records
+
+    state = {"homes": [], "complete": True, "at": float("-inf")}
+
+    def read():
+        now = time.monotonic()
+        if now - state["at"] >= 5.0:
+            problems: list = []
+            state["homes"] = hooks.config_homes(backup_root, problems)
+            state["complete"], state["at"] = not problems, now
+        records, complete = read_records(state["homes"])
+        # A home that could not be listed hides its sessions: none of them has ended.
+        return records, complete and state["complete"]
+
+    return read
 
 
 def run_worker(

@@ -6,15 +6,18 @@ over its private socket (``openswap attention``). This module turns them into
 optional ``attention`` report the worker sends to the control service.
 
 An item is recorded unpublished and published (reported) only once Claude
-Code itself decides the owner seems away: ``permission_prompt`` and
-``idle_prompt`` notifications, a question left unanswered for
-``QUESTION_FALLBACK_SECONDS``, or a finished Codex turn. Every item gets a
+Code itself decides the owner seems away (its ``permission_prompt`` and
+``idle_prompt`` notifications; ``permission_prompt`` fires for questions too),
+or for a finished Codex turn. Every item gets a
 fresh random ID that is never reused. Open items are kept in a private file
 under the backup root so they survive a worker restart.
 
-A Claude item also ends with its Claude Code process, whose PID the hook
-reports. That needs no ``sessions/{pid}.json``, which a child session started
-from another Claude Code session does not write.
+A "No" or Esc at the Mac fires no hook, so the worker also reads each
+session's ``sessions/{pid}.json`` (``status`` and ``statusUpdatedAt``) in every
+managed config home. Hooks are async and arrive out of order: each carries
+the time it ran, which orders it against the others and against the session
+files. A Claude item also ends with its Claude Code process, whose PID the
+hook reports, which covers a child session that writes no session file.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import secrets
 import tempfile
@@ -43,7 +47,20 @@ logger = logging.getLogger(__name__)
 STATE_FILE = Path("worker") / "attention.json"
 STATE_VERSION = 1
 QUESTION_TOOL = "AskUserQuestion"
-QUESTION_FALLBACK_SECONDS = 6.0
+# An answer seen in a session file closes its item this much later, so an exit
+# or /clear right after it (Esc, then quit) closes it as session_ended instead.
+SESSION_END_GRACE_SECONDS = 1.5
+# A hook's own time is used only within this of the worker's clock.
+MAX_HOOK_AGE_SECONDS = 3600
+# Claude Code sends ``permission_prompt`` this long after the dialog shows,
+# and the dialog's PermissionRequest runs as it shows (measured: 6.0 s, also
+# for each of several subagent prompts waiting at once). A notice is matched
+# to the recorded call whose PermissionRequest ran this long before it.
+PROMPT_NOTICE_SECONDS = 6.0
+PROMPT_MATCH_SECONDS = 2.0
+# Session statuses that mean no dialog is on screen; a missing or unknown
+# status is never read as an answer.
+NOT_WAITING = frozenset({"busy", "idle"})
 CODEX_ITEM_SECONDS = 24 * 3600
 # Closes kept for a report the service has not accepted yet (an offline Mac, or
 # a backend without the extension); past this the oldest go unreported.
@@ -122,9 +139,10 @@ def _optional_text(data: dict, name: str, limit: int, *, multiline: bool = False
     return value
 
 
-_CLAUDE_FIELDS = {"provider", "event", "session_id", "cwd", "pid", "entrypoint", "tool_name", "tool_key",
-                  "description", "questions", "notification_type", "last_message"}
-_CODEX_FIELDS = {"provider", "event", "thread_id", "cwd", "last_message"}
+_CLAUDE_FIELDS = {"provider", "event", "session_id", "cwd", "at", "pid", "entrypoint", "agent_id", "tool_name",
+                  "tool_key", "description", "questions", "notification_type", "last_message", "prompt_kind"}
+_CODEX_FIELDS = {"provider", "event", "thread_id", "cwd", "at", "last_message"}
+PROMPT_KINDS = frozenset({"channel", "task", "end"})
 
 
 def validate_notice(value: object) -> dict:
@@ -168,6 +186,13 @@ def validate_notice(value: object) -> dict:
         raise NoticeError("invalid_notice")
     if "entrypoint" in value and not is_entrypoint(value["entrypoint"]):
         raise NoticeError("invalid_notice")
+    if "at" in value and (type(value["at"]) not in (int, float) or not math.isfinite(value["at"])):
+        raise NoticeError("invalid_notice")
+    if "prompt_kind" in value and value["prompt_kind"] not in PROMPT_KINDS:
+        raise NoticeError("invalid_notice")
+    if "agent_id" in value and not (isinstance(value["agent_id"], str) and 0 < len(value["agent_id"]) <= 64
+                                    and all(c.isascii() and (c.isalnum() or c in "_-") for c in value["agent_id"])):
+        raise NoticeError("invalid_notice")
     return value
 
 
@@ -185,6 +210,7 @@ class Item:
     detail: dict = field(default_factory=dict)
     pid: int = 0  # the Claude Code process; 0 when the hook could not tell
     entrypoint: str = ""  # Claude Code's own name for its surface (cli, claude-vscode, ...)
+    agent: str = ""  # the subagent whose call it is; "" for the main thread
 
     @classmethod
     def from_dict(cls, data: object) -> Item:
@@ -196,9 +222,55 @@ class Item:
                 or not isinstance(item.cwd, str) or type(item.created_at) not in (int, float)
                 or type(item.published) is not bool or not isinstance(item.tool_name, str)
                 or not isinstance(item.tool_key, str) or not isinstance(item.detail, dict)
-                or type(item.pid) is not int or not isinstance(item.entrypoint, str)):
+                or type(item.pid) is not int or not isinstance(item.entrypoint, str)
+                or not isinstance(item.agent, str)):
             raise ValueError("invalid item")
         return item
+
+
+@dataclass(frozen=True)
+class SessionRecord:
+    """What a running session's ``sessions/{pid}.json`` says: its status
+    (``busy``, ``waiting``, ``idle``), when that status began (epoch seconds,
+    0 when the record does not say) and, while waiting, what for."""
+    session_id: str
+    pid: int
+    status: str
+    status_at: float = 0.0
+    waiting_for: str = ""
+
+
+def read_records(config_homes) -> tuple[dict[str, SessionRecord], bool]:
+    """The records of every running Claude Code session in ``config_homes``, by
+    session ID, and whether every record could be read."""
+    from openswap.process_detection import is_pid_alive
+
+    records, complete = {}, True
+    for home in config_homes:
+        try:
+            paths = list((Path(home) / "sessions").glob("*.json"))
+        except OSError:
+            complete = False
+            continue
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                pid, session = data["pid"], data["sessionId"]
+                if type(pid) is not int or not isinstance(session, str) or not session:
+                    raise ValueError("no pid or session")
+                if not is_pid_alive(pid):
+                    continue
+                at = data.get("statusUpdatedAt")
+                waiting = data.get("waitingFor")
+                records[session] = SessionRecord(
+                    session, pid, data.get("status") if isinstance(data.get("status"), str) else "",
+                    at / 1000 if type(at) in (int, float) and math.isfinite(at) else 0.0,
+                    waiting if isinstance(waiting, str) else "")
+            except FileNotFoundError:
+                continue  # the session ended between listing and reading
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError, RecursionError):
+                complete = False
+    return records, complete
 
 
 def _new_id() -> str:
@@ -216,7 +288,7 @@ class AttentionStore:
     can send it at once instead of on its next pass.
     """
 
-    def __init__(self, backup_root: Path, *, clock=time.time, enabled=None):
+    def __init__(self, backup_root: Path, *, clock=time.time, enabled=None, records=None):
         self.backup_root = Path(backup_root)
         self.path = self.backup_root / STATE_FILE
         self.clock = clock
@@ -227,7 +299,17 @@ class AttentionStore:
         self._lock = threading.Lock()
         self._items: list[Item] = []
         self._closed: list[dict] = []  # {"id", "reason"} not yet acknowledged by the service
-        self._last_message: dict[str, str] = {}  # Claude session ID -> start of the last reply
+        # By Claude session ID: (hook time, start of the last reply), when the
+        # owner last submitted a prompt, and when the session last left ``waiting``.
+        self._last_message: dict[str, tuple[float, str]] = {}
+        self._prompted: dict[str, float] = {}
+        self._left_waiting: dict[str, float] = {}
+        # The session files: ``records()`` reads them as (records, complete).
+        self._read_records = records
+        self._records: dict[str, SessionRecord] = {}
+        self._known: set[str] = set()  # sessions seen in a record, so a missing one has ended
+        self._due: dict[str, float] = {}  # item ID -> when its answer at the Mac closes it
+        self._refresh_lock = threading.Lock()
         self._secret = b""
         self._load()
 
@@ -285,6 +367,8 @@ class AttentionStore:
             return False
         gone = {id(item) for item in items}
         self._items = [item for item in self._items if id(item) not in gone]
+        for item in items:
+            self._due.pop(item.id, None)
         # The service only ever saw published items; an unpublished one just ends.
         self._closed.extend({"id": item.id, "reason": reason} for item in items if item.published)
         del self._closed[:-MAX_PENDING_CLOSES]
@@ -292,16 +376,28 @@ class AttentionStore:
 
     def _open(self, kind: str, provider: str, session: str, notice: dict, *, published: bool,
               tool_name: str = "", tool_key: str = "", detail: dict | None = None) -> None:
-        self._items.append(Item(_new_id(), kind, provider, session, notice["cwd"], self.clock(), published,
+        self._items.append(Item(_new_id(), kind, provider, session, notice["cwd"], self._at(notice), published,
                                 tool_name, tool_key, {k: v for k, v in (detail or {}).items() if v},
-                                notice.get("pid", 0), notice.get("entrypoint", "")))
+                                notice.get("pid", 0), notice.get("entrypoint", ""), notice.get("agent_id", "")))
+
+    def _at(self, notice: dict) -> float:
+        """When the hook ran (its own clock reading), else now. Hooks are async and
+        can arrive out of order; this is what orders them against each other and
+        against a session file's ``statusUpdatedAt``."""
+        now = self.clock()
+        at = notice.get("at")
+        return at if isinstance(at, (int, float)) and abs(at - now) <= MAX_HOOK_AGE_SECONDS else now
 
     def notice(self, notice: dict) -> None:
         """Apply one validated notice (see ``validate_notice``) to the items.
 
-        Dropped while notices are off."""
+        Dropped while notices are off. A ``permission_prompt`` is applied
+        against a fresh read of the session files, so only a prompt still
+        waiting is published."""
         if not self.enabled():
             return
+        if notice.get("event") == "Notification":
+            self.refresh()
         with self._lock:
             if self._apply(notice):
                 self._commit()
@@ -313,11 +409,16 @@ class AttentionStore:
             self._open("finished", "codex", thread, notice, published=True,
                        detail={"last_message": notice.get("last_message", "")})
             return True
-        event, session = notice["event"], notice["session_id"]
+        event, session, at = notice["event"], notice["session_id"], self._at(notice)
         mine = [i for i in self._items if i.provider == "claude" and i.session == session]
         prompts = [i for i in mine if i.kind in ("permission", "question")]
         tool_name = notice.get("tool_name", "")
+        record = self._records.get(session)
+        if record is not None and notice.get("pid") and record.pid != notice["pid"]:
+            record = None  # another process's record (a reused ID): it says nothing here
         if event == "PermissionRequest":
+            if at < self._left_waiting.get(session, 0.0):
+                return False  # its prompt was already answered (a decline faster than this hook)
             if tool_name == QUESTION_TOOL:
                 self._open("question", "claude", session, notice, published=False, tool_name=tool_name,
                            detail={"questions": notice.get("questions", [])})
@@ -329,34 +430,78 @@ class AttentionStore:
         if event == "Notification":
             kind = notice.get("notification_type")
             if kind == "permission_prompt":
-                waiting = [i for i in prompts if not i.published]
-                for item in waiting:
-                    item.published = True
-                if waiting:
+                recorded = [i for i in prompts if not i.published]
+                if record is not None and record.status in NOT_WAITING:
+                    # Nothing waits now: every call recorded before that ended without a prompt to show.
+                    return self._close([i for i in recorded if i.created_at <= record.status_at], "answered_on_mac")
+                shown_at = at - PROMPT_NOTICE_SECONDS
+                # A call whose own notice is overdue ended before it (answered fast).
+                ended = [i for i in recorded if i.created_at < shown_at - PROMPT_MATCH_SECONDS]
+                changed = self._close(ended, "answered_on_mac")
+                match = sorted((i for i in recorded if i not in ended
+                                and abs(i.created_at - shown_at) <= PROMPT_MATCH_SECONDS),
+                               key=lambda i: abs(i.created_at - shown_at))[:1]
+                if match:
+                    match[0].published = True
                     return True
-                if prompts:
-                    return False
-                # A prompt whose PermissionRequest never reached us: a notice without detail.
-                self._open("permission", "claude", session, notice, published=True)
+                if any(i.published for i in prompts):
+                    # This prompt's notice again: a queued subagent dialog gets a
+                    # second one when it finally shows. The owner already knows.
+                    return changed
+                # A prompt whose PermissionRequest never reached us (or a notice
+                # delay other than Claude Code's default): a notice without detail.
+                question = record is not None and record.waiting_for == "input needed"
+                # Dated when its dialog showed, like a recorded call.
+                self._open("question" if question else "permission", "claude", session,
+                           {**notice, "at": shown_at}, published=True)
                 return True
             if kind == "idle_prompt":
-                if any(i.kind == "idle" for i in mine):
+                if at < self._prompted.get(session, 0.0):
                     return False
-                self._open("idle", "claude", session, notice, published=True,
-                           detail={"last_message": self._last_message.get(session, "")})
+                said_at, said = self._last_message.get(session, (0.0, ""))
+                # A reply from before the latest prompt belongs to an older turn (an
+                # Esc-interrupted turn has no Stop of its own).
+                last = said if said_at > self._prompted.get(session, 0.0) else ""
+                idle = next((i for i in mine if i.kind == "idle"), None)
+                if idle is not None:
+                    # Still idle after a turn the owner did not start (a background
+                    # task's result, OpenSwap's channel): the same item, with that
+                    # turn's reply.
+                    if idle.detail.get("last_message", "") == last:
+                        return False
+                    idle.detail = {"last_message": last} if last else {}
+                    return True
+                self._open("idle", "claude", session, notice, published=True, detail={"last_message": last})
                 return True
             return False
         if event == "Stop":
-            if notice.get("last_message"):
+            if notice.get("last_message") and at > self._prompted.get(session, 0.0):
                 self._last_message.pop(session, None)
-                self._last_message[session] = notice["last_message"]
+                self._last_message[session] = (at, notice["last_message"])
                 for oldest in list(self._last_message)[:-MAX_LAST_MESSAGES]:
                     del self._last_message[oldest]
-            return self._close(prompts, "answered_on_mac")
+            # The main thread's turn ended: its own prompts were answered. A
+            # background subagent's prompt may still wait, and a late Stop of an
+            # earlier turn says nothing about this turn's prompts.
+            return self._close([i for i in prompts if not i.agent and i.created_at <= at], "answered_on_mac")
         if event == "UserPromptSubmit":
-            return self._close(mine, "answered_on_mac")
+            prompt = notice.get("prompt_kind")
+            if prompt == "end":
+                return False  # /clear or /exit: SessionEnd closes the items as session_ended
+            self._prompted[session] = max(at, self._prompted.get(session, 0.0))
+            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
+                del self._prompted[oldest]
+            if prompt == "task":
+                # A background task's result starting a turn: the owner did
+                # nothing, and a subagent's prompt may still be waiting.
+                return False
+            # OpenSwap's own channel turn answers no prompt of a subagent and not
+            # the idle item (S2 settles that); a main-thread prompt left open is stale.
+            answered = [i for i in prompts if not i.agent] if prompt == "channel" else mine
+            return self._close([i for i in answered if i.created_at <= at], "answered_on_mac")
         if event == "SessionEnd":
-            self._last_message.pop(session, None)
+            for table in (self._last_message, self._prompted, self._left_waiting):
+                table.pop(session, None)
             return self._close(mine, "session_ended")
         # PostToolUse / PostToolUseFailure: the prompt for that call was answered.
         if tool_name == QUESTION_TOOL:
@@ -369,34 +514,86 @@ class AttentionStore:
             match = [i for i in same_tool if i.tool_key == key][:1] if key else same_tool[:1]
         return self._close(match, "answered_on_mac")
 
-    def tick(self) -> None:
-        """Publish questions left unanswered past the fallback, and expire old Codex items."""
-        with self._lock:
-            now = self.clock()
-            changed = False
-            for item in self._items:
-                if (item.kind == "question" and not item.published
-                        and now - item.created_at >= QUESTION_FALLBACK_SECONDS):
-                    item.published = changed = True
-            expired = [i for i in self._items if i.provider == "codex" and now - i.created_at >= CODEX_ITEM_SECONDS]
-            changed = self._close(expired, "expired") or changed
-            if changed:
-                self._commit()
+    def refresh(self) -> None:
+        """Read the session files (outside the lock) and apply what they say."""
+        if self._read_records is None:
+            return
+        # One read at a time, so an older read is never applied after a newer one.
+        with self._refresh_lock:
+            try:
+                records, complete = self._read_records()
+            except Exception as exc:  # noqa: BLE001 - an unreadable folder must not stop notices
+                logger.debug("Session files unreadable: %s", exc)
+                return
+            self.observe(records, complete)
 
-    def prune(self) -> None:
-        """Close the Claude items whose Claude Code process has ended."""
+    def observe(self, records: dict[str, SessionRecord], complete: bool) -> None:
+        """Apply the running sessions' records (by session ID), as read from every
+        managed config home. ``complete`` is False when a record could not be
+        read: then no session counts as gone for want of its record.
+
+        - A prompt whose session has left ``waiting`` since the prompt was
+          recorded was answered at the Mac (Allow, No, Esc). It closes after
+          ``SESSION_END_GRACE_SECONDS``, unless the session ends meanwhile (an
+          exit or ``/clear`` is never an answer). An idle item is not closed
+          here: a turn the owner did not type (OpenSwap's channel, a
+          background task) also leaves ``idle``.
+        - A session whose record went away, or whose Claude Code process
+          ended, closes its items as ``session_ended``.
+        """
         from openswap.process_detection import is_pid_alive
 
         with self._lock:
-            gone = [i for i in self._items if i.provider == "claude" and i.pid and not is_pid_alive(i.pid)]
-            if self._close(gone, "session_ended"):
+            now = self.clock()
+            changed = False
+            open_sessions = {i.session for i in self._items if i.provider == "claude"}
+            # Only running sessions and those with items are kept: nothing grows with every session ever seen.
+            self._records = dict(records)
+            self._known = {s for s in self._known if s in open_sessions} | set(records)
+            self._left_waiting = {s: t for s, t in self._left_waiting.items() if s in records or s in open_sessions}
+            for session, record in records.items():
+                if record.status in NOT_WAITING and record.status_at:
+                    self._left_waiting[session] = max(record.status_at, self._left_waiting.get(session, 0.0))
+            ended = []
+            for item in [i for i in self._items if i.provider == "claude"]:
+                record = records.get(item.session)
+                if record is not None and item.pid and record.pid != item.pid:
+                    record = None  # another process's record (a reused ID): it says nothing here
+                if (item.pid and not is_pid_alive(item.pid)) or (
+                        record is None and complete and item.session in self._known):
+                    ended.append(item)
+                    continue
+                if (item.kind not in ("permission", "question") or record is None or not record.status_at
+                        or record.status_at <= item.created_at or record.status not in NOT_WAITING):
+                    continue
+                if not item.published:
+                    changed = self._close([item], "answered_on_mac") or changed
+                elif item.id not in self._due:
+                    self._due[item.id] = now + SESSION_END_GRACE_SECONDS
+            for session in {i.session for i in ended}:
+                for table in (self._records, self._last_message, self._prompted, self._left_waiting):
+                    table.pop(session, None)
+                self._known.discard(session)
+            changed = self._close(ended, "session_ended") or changed
+            if changed:
+                self._commit()
+
+    def tick(self) -> None:
+        """Close the answers whose grace has passed, and expire old Codex items."""
+        with self._lock:
+            now = self.clock()
+            due = [i for i in self._items if self._due.get(i.id, now + 1) <= now]
+            changed = self._close(due, "answered_on_mac")
+            expired = [i for i in self._items if i.provider == "codex" and now - i.created_at >= CODEX_ITEM_SECONDS]
+            changed = self._close(expired, "expired") or changed
+            if changed:
                 self._commit()
 
     def clear(self) -> None:
         """Notices were turned off: drop every item without reporting closes."""
         with self._lock:
             if self._items or self._closed or self._last_message:
-                self._items, self._closed, self._last_message = [], [], {}
+                self._items, self._closed, self._last_message, self._due = [], [], {}, {}
                 self._commit()
 
     # --- the report ----------------------------------------------------------
