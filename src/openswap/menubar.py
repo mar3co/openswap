@@ -1100,6 +1100,7 @@ def run(switcher, codex=None) -> int:
 
         def _worker_action_worker(self, generation, row_id, value):
             diagnostic = None
+            acted = False
             policy = None
             notice = None
             try:
@@ -1143,6 +1144,7 @@ def run(switcher, codex=None) -> int:
                     from openswap.worker.guided_setup import remove_folder
 
                     notice = remove_folder(root, value)
+                acted = True
                 policy = load_worker_settings(root)
                 snapshot = read_status(root)
             except Exception:
@@ -1153,7 +1155,7 @@ def run(switcher, codex=None) -> int:
                     "queue_depth": 0,
                     "lease_quarantined": True,
                 }
-                diagnostic = diagnostic or "worker_control_failed"
+                diagnostic = diagnostic or ("status_read_failed" if acted else "worker_control_failed")
                 try:
                     from openswap.settings import load_worker_settings
 
@@ -1235,6 +1237,7 @@ def run(switcher, codex=None) -> int:
                     self._worker_status_inflight = False
                 return
             self._worker_status_inflight = False
+            acting = self._worker_operation is not None
             self._worker_operation = None
             previous, cache = self._worker_status_cache, dict(snapshot)
             self._worker_status_cache = cache
@@ -1252,7 +1255,18 @@ def run(switcher, codex=None) -> int:
             if policy is not None:
                 self._worker_policy = policy
             cache.pop("operation", None)
-            cache["diagnostic_notice"] = diagnostic
+            from openswap.menubar_display import remote_control_state
+
+            # An action's result stays until the next action, or until a refresh shows the controls changed.
+            state = remote_control_state(cache, self._worker_policy)
+            if acting:
+                cache["diagnostic_notice"] = diagnostic
+            elif previous.get("diagnostic_notice") and previous.get("notice_state") == state:
+                cache["diagnostic_notice"] = previous["diagnostic_notice"]
+            else:
+                cache["diagnostic_notice"] = None
+            if cache["diagnostic_notice"]:
+                cache["notice_state"] = state
             self._reload_remote_settings()
 
         def _stop_codex_engine(self):

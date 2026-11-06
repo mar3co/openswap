@@ -359,7 +359,7 @@ def test_remote_tasks_settings_are_opt_in_redacted_and_stop_targets_job_id():
     assert by_id["remote_tasks_stop"]["value"] == "job-local-7"
     assert by_id["remote_tasks_stop"]["disabled"] is False
     assert by_id["remote_tasks_stop"]["detail"] == "stopping the task"
-    assert by_id["remote_tasks_status"]["value"] == "Paused"
+    assert by_id["remote_tasks_status"]["value"] == "Running · live tasks off · paused"
     assert "remote_tasks_status_details" not in by_id
     expanded = {row["id"]: row for row in menubar.settings_page_rows(
         menubar.MenuBarSettings(), strategy="best", threshold=90, worker_enabled=True, worker_paused=True,

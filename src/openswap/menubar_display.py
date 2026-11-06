@@ -308,27 +308,38 @@ def remote_status_line(snapshot: dict, *, enabled: bool, paused: bool,
     if process in ("stopped", "stale"):
         return "crit", "Not running"
     if process != "running":
-        return "muted", "Status unavailable"
+        return "warn", "Status unavailable"
+    suffix = " · paused" if paused else ""
     if connectivity == "revoked":
         return "crit", "Running · removed in OpenTag"
     expires = _remote_key_expiry(snapshot)
-    expired = connectivity == "expired" or (
-        expires is not None and expires <= (now or datetime.now(timezone.utc)))
-    if expired:
-        return "crit", "Running · key expired"
-    tone = "warn" if remote_reconnect_label(snapshot, now=now) is not None else "ok"
-    if paused:
-        return "warn", "Paused"
+    if connectivity == "expired" or (expires is not None and expires <= (now or datetime.now(timezone.utc))):
+        return "crit", "Running · key expired" + suffix
     if connectivity == "offline":
-        return "warn", "Running · offline"
-    if isinstance(snapshot.get("active_job"), dict):
-        origin = _remote_task_origin(snapshot["active_job"].get("origin")).strip()
-        return tone, " · ".join(["Running", remote_job_words(snapshot)] + ([origin] if origin else []))
+        return "warn", "Running · offline" + suffix
     provider = snapshot.get("provider")
     if not (isinstance(provider, dict) and provider.get("available") is True):
         code = provider.get("diagnostic_code") if isinstance(provider, dict) else None
-        return "warn", "Running · " + _PROVIDER_WORDS.get(code, "tasks can't run")
+        return "warn", "Running · " + _PROVIDER_WORDS.get(code, "tasks can't run") + suffix
+    active = snapshot.get("active_job")
+    job = []
+    if isinstance(active, dict):
+        origin = _remote_task_origin(active.get("origin")).strip()
+        job = [remote_job_words(snapshot)] + ([origin] if origin else [])
+    if paused:
+        return "warn", " · ".join(["Paused"] + job)
+    tone = "warn" if remote_reconnect_label(snapshot, now=now) is not None else "ok"
+    if job:
+        return tone, " · ".join(["Running"] + job)
     return tone, "Running · online · idle" if connectivity == "online" else "Running · idle"
+
+
+def remote_control_state(snapshot: dict, policy) -> tuple:
+    """What a worker control changes: a refresh that reads a different value clears its notice."""
+    active = snapshot.get("active_job")
+    return (getattr(policy, "enabled", None), getattr(policy, "paused", None),
+            getattr(policy, "pinned_account_ref", None), getattr(policy, "account_allowlist", None),
+            active.get("job_id") if isinstance(active, dict) else None)
 
 
 SETTINGS_PAGE = "settings"
@@ -680,9 +691,10 @@ def remote_folder_rows(worker_status: dict) -> list[dict]:
             "value": _bounded_text(workspace_id, 64),
             "disabled": busy,
         })
-    if unreadable or not folders:
-        rows.append(_remote_hint("remote_tasks_folders_note",
-                                 REMOTE_FOLDERS_UNREADABLE if unreadable else REMOTE_NO_FOLDERS))
+    if unreadable:
+        rows.append({**_remote_hint("remote_tasks_folders_note", REMOTE_FOLDERS_UNREADABLE), "tone": "warning"})
+    elif not folders:
+        rows.append(_remote_hint("remote_tasks_folders_note", REMOTE_NO_FOLDERS))
     rows.append({
         "kind": "button",
         "section": SETTINGS_SECTION_REMOTE,
@@ -694,7 +706,7 @@ def remote_folder_rows(worker_status: dict) -> list[dict]:
     })
     if locked:
         rows.append(_remote_hint("remote_tasks_folders_note", REMOTE_SETUP_CHANGING_FOLDERS))
-    notice = _bounded_text(worker_status.get("folder_notice"), 200)
+    notice = _bounded_text(worker_status.get("folder_notice"), 400)
     if notice:
         rows.append(_remote_hint("remote_tasks_folders_note", notice))
     return rows
@@ -710,9 +722,17 @@ def remote_status_rows(worker_status: dict, *, enabled: bool, paused: bool, pair
         {"kind": "status", "section": SETTINGS_SECTION_REMOTE, "id": "remote_tasks_status",
          "label": "Status", "value": line, "tone": tone},
     ]
+    notice = worker_status.get("diagnostic_notice")
+    if isinstance(notice, str) and notice:
+        from openswap.worker.guided_setup import control_message
+
+        rows.append(_remote_hint("remote_tasks_notice", f"{printer.MARK_WARN} {control_message(notice)}"))
     key_note = remote_key_copy(worker_status) if paired else ""
     if key_note and key_note != REMOTE_KEY_RENEWS_NOTE:
-        rows.append(_remote_hint("remote_tasks_key", key_note))
+        key = _remote_hint("remote_tasks_key", key_note)
+        if remote_reconnect_label(worker_status) is not None:
+            key["tone"] = "warning"
+        rows.append(key)
     rows += [
         {"kind": "button", "section": SETTINGS_SECTION_REMOTE, "id": "remote_tasks_stop",
          "label": "Active job", "detail": remote_job_words(worker_status), "title": "Stop",

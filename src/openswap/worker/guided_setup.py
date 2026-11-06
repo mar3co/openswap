@@ -310,6 +310,28 @@ def account_message(code: str, *, gui: bool = False) -> str:
     return _SETTINGS_ACCOUNT_MESSAGES.get(code, text) if gui else text
 
 
+# Settings → Remote's words for control results the CLI's tables don't cover.
+_SETTINGS_CONTROL_MESSAGES = {
+    "status_read_failed": "Couldn't read the worker status after the change.",
+    "job_identity_unknown": "The running task couldn't be identified.",
+}
+CONTROL_FAILED = "That change didn't go through."
+
+
+def control_message(code: str) -> str:
+    """Why a Settings → Remote control (switch, pause, stop, account) did not do what was asked."""
+    cli = _cli()
+    if code in _SETTINGS_CONTROL_MESSAGES:
+        return _SETTINGS_CONTROL_MESSAGES[code]
+    if code in cli._ACCOUNT_MESSAGES:
+        return account_message(code, gui=True)
+    if code in cli._STOP_MESSAGES:
+        return f"Couldn't stop the task: {cli._STOP_MESSAGES[code]}."
+    if code in cli._DISABLE_BLOCKED:
+        return f"Couldn't turn off the worker: {cli._DISABLE_BLOCKED[code][0]}."
+    return CONTROL_FAILED
+
+
 def confirm_account(root: Path, ui: Prompts) -> None:
     """Show the eligible accounts as a numbered menu; Enter keeps the pinned one."""
     cli = _cli()
@@ -525,7 +547,8 @@ def folder_menu(root: Path, workspaces, *, groups: bool = False) -> FolderMenu:
         detected = cli.detect_code_folders(root)
     except Exception:
         detected = []
-    code = {folder: _has_repos(folder) or (groups and bool(repo_groups(folder))) for folder in detected}
+    code = {folder: (_holds_repos(folder) or bool(repo_groups(folder))) if groups else _has_repos(folder)
+            for folder in detected}
     # Repos and folders of repos first: a session needs one to work in.
     detected.sort(key=lambda folder: not code[folder])
     reads = {}
@@ -561,6 +584,13 @@ def _has_repos(folder: Path) -> bool:
                    if not child.name.startswith("."))
     except OSError:
         return False
+
+
+def _holds_repos(folder: Path) -> bool:
+    """Whether ``folder`` is a git repo or holds one directly, by ``add_work_folder``'s rule."""
+    from openswap.worker import worktrees
+
+    return worktrees.is_repo(folder) or bool(worktrees.child_repos(folder))
 
 
 def repo_groups(folder: Path) -> list[Path]:
@@ -727,7 +757,7 @@ def folder_rows(root: Path, workspaces) -> list[FolderRow]:
 
 def _groups_saved(folder: Path, workspaces) -> bool:
     """Whether ``folder`` holds no repo itself and every subfolder of it that holds repos is a saved work folder."""
-    if _has_repos(folder):
+    if _holds_repos(folder):
         return False
     groups = repo_groups(folder)
     return bool(groups) and all(_cli().work_workspace(workspaces, group) is not None for group in groups)
@@ -753,7 +783,7 @@ def apply_folders(root: Path, ui, rows: list[FolderRow], answer) -> None:
     """Make the checked set the allowed folders and say each folder's result.
 
     ``answer`` holds the checked row indexes and the paths added with Add
-    folder…. Adds run before removes, so the last folder is never removed
+    Folder…. Adds run before removes, so the last folder is never removed
     first; a checked repo inside an unchecked folder (of repos, or one tasks
     only read) is added after that folder is removed, since until then the
     folder allows it already or blocks it.
@@ -767,6 +797,9 @@ def apply_folders(root: Path, ui, rows: list[FolderRow], answer) -> None:
         return any(pathid.inside(folder, source) for source in _folder_of(workspace))
 
     after = [folder for folder in adds if any(within(folder, w) for w in removes)]
+    # A folder of org folders whose only org is unchecked here adds nothing: the removal alone shows.
+    adds = [folder for folder in adds
+            if not (len(repo_groups(Path(folder))) == 1 and _groups_saved(Path(folder), removes))]
     _add_folders(root, ui, [folder for folder in adds if folder not in after])
     last = None  # the only saved folder, kept: its line waits on the adds inside it
     for workspace in removes:
@@ -861,7 +894,7 @@ def add_repo_groups(root: Path, folder) -> tuple[str, bool, bool] | None:
     groups = repo_groups(Path(folder))
     if not groups:
         return None
-    added, kept_builtin, refused = 0, False, []
+    added, saved, kept_builtin, refused = 0, 0, False, []
     for group in groups:
         try:
             result = cli.add_work_folder(root, group)
@@ -872,25 +905,39 @@ def add_repo_groups(root: Path, folder) -> tuple[str, bool, bool] | None:
             refused.append((group, _write_failure(exc)))
             continue
         added += result.added
+        saved += not result.added
         kept_builtin = kept_builtin or result.kept_builtin
-    text = repo_groups_message(Path(folder), added, refused)
+    text = repo_groups_message(Path(folder), added, saved, refused)
     if kept_builtin:
         text += f' "{cli.DEFAULT_RESEARCH_ID}" stays until its running task ends.'
     return text, bool(refused), len(refused) < len(groups)
 
 
-def repo_groups_message(folder: Path, added: int, refused: list[tuple[Path, str]]) -> str:
-    """What adding ``folder``'s repo-holding subfolders did: ``refused`` is ``(subfolder, reason)`` pairs."""
-    if not added:
-        if not refused:
-            return "Already allowed."
+REPO_GROUPS_NAMED = 3
+
+
+def repo_groups_message(folder: Path, added: int, saved: int, refused: list[tuple[Path, str]]) -> str:
+    """What adding ``folder``'s repo-holding subfolders did.
+
+    ``added`` and ``saved`` (already allowed) count subfolders; ``refused``
+    is ``(subfolder, reason)`` pairs, the first ``REPO_GROUPS_NAMED`` named.
+    """
+    shown = _display_path(folder)
+    if not refused:
+        return f"Added {added} folder{'s' if added != 1 else ''} from {shown}." if added else "Already allowed."
+    if not added and not saved and len(refused) == 1:
         group, reason = refused[0]
         return f"{_display_path(group)}: {_clause(reason)}."
-    text = f"Added {added} folder{'s' if added != 1 else ''} from {_display_path(folder)}"
-    if not refused:
-        return f"{text}."
-    reasons = ", ".join(f"{group.name}: {_clause(reason)}" for group, reason in refused)
-    return f"{text}; {len(refused)} not added: {reasons}."
+    if added:
+        head = f"Added {added} folder{'s' if added != 1 else ''} from {shown}"
+        head += f"; {saved} already allowed" if saved else ""
+    elif saved:
+        head = f"{saved} already allowed from {shown}"
+    else:
+        head = f"No folders added from {shown}"
+    names = ", ".join(f"{group.name} ({_clause(reason)})" for group, reason in refused[:REPO_GROUPS_NAMED])
+    more = len(refused) - REPO_GROUPS_NAMED
+    return f"{head}; {len(refused)} not added: {names}{f' and {more} more' if more > 0 else ''}."
 
 
 def _bad_choice(count: int) -> str:

@@ -1509,9 +1509,9 @@ def test_menu_setup_on_a_paired_mac_skips_pairing(root, enable_calls):
     _settle(app)
     worker, _account, folders, done = app._remote_setup_window.shown
     assert worker["title"] == "Start the worker"
-    # Nothing found: only Add folder….
+    # Nothing found: only Add Folder….
     assert [row["kind"] for row in folders["rows"]] == ["choices", "actions"]
-    assert folders["rows"][0]["items"] == [] and folders["rows"][1]["items"][0]["title"] == "Add folder…"
+    assert folders["rows"][0]["items"] == [] and folders["rows"][1]["items"][0]["title"] == "Add Folder…"
     assert done["title"] == "Almost done"
     assert "Turn on Local worker in Settings → Remote." in [row.get("text") for row in done["rows"]]
     assert enable_calls == [] and _builtin(root)
@@ -1654,7 +1654,7 @@ def test_a_claude_pin_with_a_passing_claude_check_reports_live(root, monkeypatch
 
 
 def test_menu_setup_adds_a_folder_from_the_native_chooser(root, enable_calls, tmp_path):
-    """Add folder… opens the native chooser and adds the folder as a checked row."""
+    """Add Folder… opens the native chooser and adds the folder as a checked row."""
     configure_worker_service(root, URL, "worker-1")
     notes = _repo(_code(tmp_path, "Notes"))
     dialogs = _Dialogs([(1, str(notes))])

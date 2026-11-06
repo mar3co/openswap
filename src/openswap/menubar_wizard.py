@@ -190,7 +190,7 @@ class SetupWizard:
         old_key, old_height, offset = old_state
         if scroll is not None and old_key == (page.get("title"), page.get("progress")):
             document = scroll.documentView().frame().size.height
-            # A taller list means Add folder… appended a row: show it; otherwise stay put.
+            # A taller list means Add Folder… appended a row: show it; otherwise stay put.
             limit = max(0.0, document - scroll.contentSize().height)
             scroll.contentView().scrollToPoint_((0, limit if document > old_height else min(offset, limit)))
             scroll.reflectScrolledClipView_(scroll.contentView())
