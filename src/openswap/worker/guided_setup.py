@@ -65,7 +65,7 @@ def _section(ui, title: str) -> None:
 class TerminalPrompts:
     """``input()``/``print`` prompts for the CLI; ``read_line`` is injectable for tests.
 
-    Only this front end styles anything (a bold step header when colours are
+    Only this front end styles anything (a bold step header when colors are
     on): the step text itself stays plain, because the menu bar shows the same
     lines in dialogs.
     """
@@ -77,7 +77,7 @@ class TerminalPrompts:
     _index: object = field(default=None, repr=False)
 
     def say(self, text: str) -> None:
-        # The one `Next:` line is bold on a colour terminal, like every other command's.
+        # The one `Next:` line is bold on a color terminal, like every other command's.
         if text.startswith("Next: "):
             text = printer.next_step(text.removeprefix("Next: "))
         self.write(text)
@@ -151,7 +151,7 @@ CLAUDE_EXECUTION_OFF_NOTE = (
 READY_NOTE = f"{printer.MARK_OK} Ready: Slack can send tasks to this Mac."
 # The setup window's line for each `Next:` above: the Settings → Remote control instead.
 SETTINGS_NEXT = {
-    START_WORKER_NEXT: "Turn on Enable local worker in Settings → Remote to start it.",
+    START_WORKER_NEXT: "Turn on Local worker in Settings → Remote to start it.",
     ACCOUNT_NEXT: "Pick one under Account in Settings → Remote.",
     FOLDER_NEXT: "Add one under Folders in Settings → Remote.",
 }
@@ -189,9 +189,9 @@ WORKER_OFFER = "Start the worker now?"
 WORKER_ONLINE = f"{printer.MARK_OK} Worker started. This Mac shows online in about 15 seconds."
 WORKER_STOPPED = f"{printer.MARK_BAD} The worker is on but not running."
 WORKER_PAUSED = ("The worker is running but paused, so it takes no new tasks. "
-                 "Turn off Pause admission in Settings → Remote to resume.")
+                 "Turn off Pause new tasks in Settings → Remote to resume.")
 WORKER_UNREADABLE = f"{printer.MARK_BAD} Couldn't read the worker's status."
-WORKER_RESTART = "turn Enable local worker off and on in Settings → Remote to restart it"
+WORKER_RESTART = "turn Local worker off and on in Settings → Remote to restart it"
 # The setup window's words for `enable` refusals whose message names a command.
 _SETTINGS_ENABLE_MESSAGES = {
     "worker_running_unmanaged": "Could not start the worker: another one started from Terminal is running.",
@@ -431,17 +431,25 @@ def suggested_folder_id(folder: Path, taken: set[str]) -> str:
     return _cli().suggested_folder_id(folder, taken)
 
 
-# The setup window's and Settings' words for workspace refusals whose message names a command.
+# The setup window's and Settings' words for workspace refusals: shorter, and never naming a command.
 _SETTINGS_WORKSPACE_MESSAGES = {
     "workspace_not_found": "That folder was already removed.",
     "folder_permissions": ("Only you may open a results folder. Remove other people's access in "
                            "Finder (Get Info), then try again."),
     "readonly_source_permissions": ("Other users can change that read-only folder. Remove their write "
                                     "access in Finder (Get Info)."),
-    "readable_permissions": ("Other users can change that folder. Remove their write access in Finder "
-                             "(Get Info), then try again."),
-    "work_not_a_repo": "That's not a git repo and holds none. Pick a repo or a folder of repos.",
-    "work_overlaps_readable": "That folder overlaps one tasks only read. Remove that one under Folders first.",
+    "readable_permissions": "Other users can change it. Remove their write access in Finder (Get Info).",
+    "readable_system": "That's a system folder.",
+    "readable_home": "That's your whole home folder. Pick one inside it.",
+    "readable_private": "That's app data or a hidden folder.",
+    "readable_exposes_credentials": "It holds OpenSwap, Codex or Claude sign-ins.",
+    "readable_results": "That's where results are saved.",
+    "readable_unavailable": "It doesn't exist or can't be opened.",
+    "readable_unsafe": "That's not a folder.",
+    "readable_not_owned": "That folder isn't yours.",
+    "work_not_a_repo": "No git repos in it.",
+    "work_no_repos": "It holds no git repos anymore.",
+    "work_overlaps_readable": "It overlaps a read-only folder. Remove that one under Folders first.",
     "mode_invalid": "A folder either gives each task its own copy or works in the folder itself.",
     "mode_not_work": "Only a folder tasks work in has a mode.",
 }
@@ -453,14 +461,45 @@ def workspace_message(code: str, *, gui: bool = False) -> str:
     return _SETTINGS_WORKSPACE_MESSAGES.get(code, text) if gui else text
 
 
-def folder_label(workspace) -> str:
-    """A saved folder as the window and Settings list it: its paths, then how tasks use it."""
+def _clause(message: str) -> str:
+    """A sentence as a clause after ``<folder>: ``: lowercase start, no final period."""
+    return message[:1].lower() + message[1:].rstrip(".")
+
+
+def _paths_and_use(workspace) -> tuple[str, str]:
+    """A saved folder's paths and how tasks use it ("" for a folder tasks work in a copy of)."""
     paths = ", ".join(_display_path(source) for source in _folder_of(workspace))
     if not paths:
-        return f"{_display_path(workspace.output_root)} (results only)"
+        return _display_path(workspace.output_root), "results only"
     if getattr(workspace, "work_root", None) is None:
-        return f"{paths} (read only)"
-    return f"{paths} (works in the folder itself)" if workspace.mode == "direct" else paths
+        return paths, "read only"
+    return paths, "works in the folder itself" if workspace.mode == "direct" else ""
+
+
+def folder_label(workspace) -> str:
+    """A saved folder as the window lists it: its paths, then how tasks use it."""
+    paths, use = _paths_and_use(workspace)
+    return f"{paths} ({use})" if use else paths
+
+
+_SHORT_USE = {"works in the folder itself": "in place"}
+
+
+def settings_folders(root: Path, workspaces) -> list[tuple[str, str, str, str]]:
+    """Settings → Remote's folder list: ``(ID, name, ~ paths, short use)`` per saved folder.
+
+    The name is the folder's label, else its first folder's name. Empty
+    while the registry is still only the untouched built-in ``research``
+    folder: the first add replaces it.
+    """
+    if _cli().is_builtin_default_registry(root, workspaces):
+        return []
+    out = []
+    for workspace in workspaces:
+        paths, use = _paths_and_use(workspace)
+        first = (_folder_of(workspace) or [workspace.output_root])[0]
+        out.append((workspace.workspace_id, workspace.label or Path(first).name, paths, _SHORT_USE.get(use, use)))
+    return out
 
 
 @dataclass(frozen=True)
@@ -474,22 +513,28 @@ class FolderMenu:
     notes: tuple[str, ...] = ()  # per folder: "recommended", "git repo", "added as <id>"
 
 
-def folder_menu(root: Path, workspaces) -> FolderMenu:
-    """Number the detected folders (a GitHub folder first, "recommended"); ✓ marks readable ones."""
+def folder_menu(root: Path, workspaces, *, groups: bool = False) -> FolderMenu:
+    """Number the detected folders (a GitHub folder first, "recommended"); ✓ marks readable ones.
+
+    ``groups`` (the setup window): a folder whose subfolders hold repos
+    (``repo_groups``) counts as a code folder too, and only a code folder is
+    recommended.
+    """
     cli = _cli()
     try:
         detected = cli.detect_code_folders(root)
     except Exception:
         detected = []
+    code = {folder: _has_repos(folder) or (groups and bool(repo_groups(folder))) for folder in detected}
     # Repos and folders of repos first: a session needs one to work in.
-    detected = [folder for folder in detected if _has_repos(folder)] + \
-        [folder for folder in detected if not _has_repos(folder)]
+    detected.sort(key=lambda folder: not code[folder])
     reads = {}
     for workspace in _readable(workspaces):
         for source in _folder_of(workspace):
             reads.setdefault(Path(source), workspace.workspace_id)
     folders = list(detected) + [source for source in reads if source not in detected]
-    recommended = 0 if detected and cli.is_github_folder(detected[0]) else None
+    recommended = (0 if detected and cli.is_github_folder(detected[0]) and (code[detected[0]] or not groups)
+                   else None)
     parents = set(detected)
     rows, all_notes = [], []
     for index, folder in enumerate(folders):
@@ -516,6 +561,29 @@ def _has_repos(folder: Path) -> bool:
                    if not child.name.startswith("."))
     except OSError:
         return False
+
+
+def repo_groups(folder: Path) -> list[Path]:
+    """The subfolders directly inside ``folder`` that hold git repos (``~/GitHub/<org>``), by name.
+
+    Hidden folders and symlinks are skipped, as ``worktrees.child_repos`` skips them.
+    """
+    from openswap.worker import worktrees
+
+    try:
+        children = sorted(Path(folder).iterdir(), key=lambda p: (p.name.lower(), p.name))
+    except OSError:
+        return []
+    out = []
+    for child in children[:worktrees._MAX_SCANNED_CHILDREN]:
+        try:
+            if child.name.startswith(".") or child.is_symlink() or not child.is_dir():
+                continue
+        except OSError:
+            continue
+        if worktrees.child_repos(child):
+            out.append(child)
+    return out
 
 
 def _names_a_path(text: str) -> bool:
@@ -642,17 +710,27 @@ class FolderRow:
 def folder_rows(root: Path, workspaces) -> list[FolderRow]:
     """Every saved folder (checked), then the found ones not saved yet (unchecked).
 
-    With nothing saved, the recommended folder (else the first found) starts checked.
+    With nothing saved, the recommended folder (else the first found) starts
+    checked. A found folder whose repo-holding subfolders are all saved
+    already is left out: their own rows show instead.
     """
     saved = _readable(workspaces)
     rows = [FolderRow(folder_label(w), "", True, workspace=w) for w in saved]
-    menu = folder_menu(root, workspaces)
+    menu = folder_menu(root, workspaces, groups=True)
     first = menu.recommended or 0
     for index, (folder, note) in enumerate(zip(menu.folders, menu.notes)):
-        if folder not in menu.readable:
+        if folder not in menu.readable and not _groups_saved(folder, workspaces):
             rows.append(FolderRow(_display_path(folder), note.strip("()"), not saved and index == first,
                                   folder=folder))
     return rows
+
+
+def _groups_saved(folder: Path, workspaces) -> bool:
+    """Whether ``folder`` holds no repo itself and every subfolder of it that holds repos is a saved work folder."""
+    if _has_repos(folder):
+        return False
+    groups = repo_groups(folder)
+    return bool(groups) and all(_cli().work_workspace(workspaces, group) is not None for group in groups)
 
 
 def _check_folders(root: Path, ui, workspaces) -> None:
@@ -736,23 +814,30 @@ def _remove(root: Path, workspace_id: str) -> tuple[str | None, str] | None:
 
 
 def remove_folder(root: Path, workspace_id: str) -> str | None:
-    """Remove a saved folder (Settings → Remote); the window's reason if refused."""
+    """Remove a saved folder (Settings → Remote); the window's reason, marked ⚠, if refused."""
     refused = _remove(root, workspace_id)
-    return None if refused is None else refused[1]
+    return None if refused is None else f"{printer.MARK_WARN} {refused[1]}"
 
 
 def add_folder(root: Path, folder) -> str | None:
     """Add a folder with `worker workspace add --work`'s function (Settings → Remote).
 
-    Returns what to tell the owner, or None when it was simply added.
+    A folder that is no repo and holds none, but whose subfolders hold
+    repos, adds each of those instead (``add_repo_groups``). Returns what to
+    tell the owner (a refusal marked ⚠), or None when it was simply added.
     """
     cli = _cli()
     try:
         result = cli.add_work_folder(root, folder)
     except cli.WorkspaceError as exc:
-        return workspace_message(exc.code, gui=True)
+        groups = add_repo_groups(root, folder) if exc.code == "work_not_a_repo" else None
+        if groups is not None:
+            text, refused, _ok = groups
+            return f"{printer.MARK_WARN} {text}" if refused else text
+        shown = _display_path(Path(folder))
+        return f"{printer.MARK_WARN} {shown}: {_clause(workspace_message(exc.code, gui=True))}."
     except Exception as exc:
-        return _write_failure(exc)
+        return f"{printer.MARK_WARN} {_write_failure(exc)}"
     if result.added:
         return f'"{cli.DEFAULT_RESEARCH_ID}" stays until its running task ends.' if result.kept_builtin else None
     added = result.workspace.work_root
@@ -760,6 +845,52 @@ def add_folder(root: Path, folder) -> str | None:
                    if getattr(w, "repos", False) and w.work_root is not None
                    and not pathid.same(w.work_root, added) and pathid.inside(added, w.work_root)), None)
     return f"Already allowed through {_display_path(parent.work_root)}." if parent else "Already allowed."
+
+
+def add_repo_groups(root: Path, folder) -> tuple[str, bool, bool] | None:
+    """Add each subfolder of ``folder`` that holds repos as a folder of repos, each on its own.
+
+    The setup window and Settings only, for a folder ``add_work_folder``
+    refused as holding no repos (``~/GitHub`` whose repos sit in org
+    folders). A refusal never undoes the subfolders added before it, and one
+    saved already is skipped. None when no subfolder holds repos; else the
+    line to show, whether any subfolder was refused, and whether any was not
+    (added, or saved already).
+    """
+    cli = _cli()
+    groups = repo_groups(Path(folder))
+    if not groups:
+        return None
+    added, kept_builtin, refused = 0, False, []
+    for group in groups:
+        try:
+            result = cli.add_work_folder(root, group)
+        except cli.WorkspaceError as exc:
+            refused.append((group, workspace_message(exc.code, gui=True)))
+            continue
+        except Exception as exc:
+            refused.append((group, _write_failure(exc)))
+            continue
+        added += result.added
+        kept_builtin = kept_builtin or result.kept_builtin
+    text = repo_groups_message(Path(folder), added, refused)
+    if kept_builtin:
+        text += f' "{cli.DEFAULT_RESEARCH_ID}" stays until its running task ends.'
+    return text, bool(refused), len(refused) < len(groups)
+
+
+def repo_groups_message(folder: Path, added: int, refused: list[tuple[Path, str]]) -> str:
+    """What adding ``folder``'s repo-holding subfolders did: ``refused`` is ``(subfolder, reason)`` pairs."""
+    if not added:
+        if not refused:
+            return "Already allowed."
+        group, reason = refused[0]
+        return f"{_display_path(group)}: {_clause(reason)}."
+    text = f"Added {added} folder{'s' if added != 1 else ''} from {_display_path(folder)}"
+    if not refused:
+        return f"{text}."
+    reasons = ", ".join(f"{group.name}: {_clause(reason)}" for group, reason in refused)
+    return f"{text}; {len(refused)} not added: {reasons}."
 
 
 def _bad_choice(count: int) -> str:
@@ -813,7 +944,12 @@ def _add_folders(root: Path, ui, folders, *, refused=None) -> bool:
         try:
             result = cli.add_work_folder(root, folder)
         except cli.WorkspaceError as exc:
-            if refused is None or not refused(folder, exc.code):
+            groups = add_repo_groups(root, folder) if _gui(ui) and exc.code == "work_not_a_repo" else None
+            if groups is not None:
+                text, partly_refused, ok = groups
+                ui.say(f"{printer.MARK_BAD if partly_refused else printer.MARK_OK} {text}")
+                any_ok = any_ok or ok
+            elif refused is None or not refused(folder, exc.code):
                 ui.say(f"{shown}: {workspace_message(exc.code, gui=_gui(ui))}")
             continue
         except Exception as exc:
@@ -893,7 +1029,7 @@ class Readiness:
         elif self.worker == "stopped" and gui:
             out.append(WORKER_RESTART)
         elif self.worker != "running":
-            out.append("turn on Enable local worker in Settings → Remote" if gui
+            out.append("turn on Local worker in Settings → Remote" if gui
                        else "`openswap worker enable` to start the worker")
         elif self.paired_url is not None and self.connection != "online":
             # Only an online worker can receive tasks from the service.
@@ -911,7 +1047,7 @@ class Readiness:
         # tasks are on (until then the summary names the check, without a pause first).
         # The window has no live check, so there a pause is always a step.
         if self.paused and (self.execution == "live" or gui):
-            out.append("turn off Pause admission in Settings → Remote to resume" if gui
+            out.append("turn off Pause new tasks in Settings → Remote to resume" if gui
                        else "`openswap worker pause --off` to resume")
         if self.account is None:
             out.append("pick an account under Account in Settings → Remote" if gui

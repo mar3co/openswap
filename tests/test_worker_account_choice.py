@@ -321,7 +321,7 @@ def test_menu_web_choice_row_marks_allowed_and_default(root):
     row = _web_choice_row(root)
     assert row["kind"] == "popup" and row["value"] == ""
     options = {option[0]: option for option in row["options"]}
-    assert options[""][1] == "2 accounts allowed for web choice"
+    assert options[""][1] == "2 accounts allowed"
     assert options[f"default:{ALICE}"] == (f"default:{ALICE}", "✓ Codex 1 · alice@example.com (work) — default",
                                            {"disabled": True})
     five = stable_account_identity("codex", "acct-s1")
@@ -346,7 +346,7 @@ def test_menu_web_choice_row_placeholder_and_removed_account(root):
     _write_codex_roster(root, {"1": {"email": "alice@example.com", "accountId": "acct-alice"}})
     row = _web_choice_row(root)
     assert (f"disallow:{BOB}", "✓ Bob — removed from roster") in row["options"]
-    assert row["options"][0] == ("", "1 account allowed for web choice")
+    assert row["options"][0] == ("", "1 account allowed")
 
 
 def _menu(root):

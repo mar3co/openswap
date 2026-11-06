@@ -871,11 +871,11 @@ def run(switcher, codex=None) -> int:
                     self._worker_result = (generation, snapshot, policy, None)
 
         def _with_folders(self, snapshot, policy):
-            """Attach the saved folders for Settings › Remote: ``(workspace ID, label)``, never more."""
+            """Attach the saved folders for Settings › Remote: ``(ID, name, ~ paths, short use)``, never more."""
             if policy is not None:
-                from openswap.worker.guided_setup import folder_label
+                from openswap.worker.guided_setup import settings_folders
 
-                snapshot["folders"] = [(w.workspace_id, folder_label(w)) for w in policy.workspaces]
+                snapshot["folders"] = settings_folders(self.switcher.backup_dir, policy.workspaces)
             return snapshot
 
         def _with_account_picker(self, snapshot):
@@ -966,7 +966,7 @@ def run(switcher, codex=None) -> int:
                                        message="Choose a git repo, or a folder of repos, for tasks to work in.")
 
         def _run_guided_setup(self):
-            """Set up Remote tasks…: the steps of `openswap worker pair`, in the setup window.
+            """Settings › Remote › Set Up…: the steps of `openswap worker pair`, in the setup window.
 
             Pair from the pasted pairing command (a dialog) when this Mac is not
             paired, then start the worker, confirm the account, choose the
@@ -992,7 +992,7 @@ def run(switcher, codex=None) -> int:
                 except guided_setup.SetupClosed:
                     pass
                 except Exception:
-                    ui.say("Setup stopped unexpectedly. Choose Set up Remote tasks… again to finish.")
+                    ui.say("Setup stopped unexpectedly. Choose Set Up… in Settings → Remote again to finish.")
                 finally:
                     try:
                         ui.flush()

@@ -1,6 +1,6 @@
 """The guided Remote tasks setup and the optional readiness report.
 
-``openswap worker pair``/``setup`` and the menu bar's "Set up Remote tasks…"
+``openswap worker pair``/``setup`` and the menu bar's "Set Up…"
 walk the owner through the same steps: start the worker, confirm the Codex
 account, choose the folders tasks may read (a GitHub folder is recommended;
 results go to ``~/OpenSwap Research/<id>``), then a summary. The worker then
@@ -1394,16 +1394,16 @@ def _remote_rows(**kwargs):
     )
 
 
-def test_menu_has_a_set_up_button_first_in_remote_tasks():
-    # On a paired Mac it leads; on an unpaired one it follows Connect (plan 022).
-    rows = _remote_rows(worker_paired=True)
+def test_menu_has_a_set_up_button_after_the_worker_switches():
+    # Remote tasks reads Local worker, Pause new tasks, Setup; an unpaired Mac leads with Connect.
+    rows = _remote_rows(worker_paired=True, worker_enabled=True)
     ids = [row["id"] for row in rows]
-    assert ids.index("group_remote_tasks") + 1 == ids.index("remote_tasks_setup")
+    assert ids[:4] == ["group_remote_tasks", "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_setup"]
     unpaired = [row["id"] for row in _remote_rows()]
-    assert unpaired[:4] == ["group_remote_tasks", "remote_tasks_connect", "remote_tasks_connect_other",
-                            "remote_tasks_setup"]
+    assert unpaired[:6] == ["group_remote_tasks", "remote_tasks_connect", "remote_tasks_connect_other",
+                            "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_setup"]
     row = rows[ids.index("remote_tasks_setup")]
-    assert row["kind"] == "button" and row["label"] == "Set up Remote tasks…" and row["disabled"] is False
+    assert (row["kind"], row["label"], row["title"], row["disabled"]) == ("button", "Setup", "Set Up…", False)
     busy = {r["id"]: r for r in _remote_rows(worker_status={"operation": "worker_account_update"})}
     assert busy["remote_tasks_setup"]["disabled"] is True
 
@@ -1513,7 +1513,7 @@ def test_menu_setup_on_a_paired_mac_skips_pairing(root, enable_calls):
     assert [row["kind"] for row in folders["rows"]] == ["choices", "actions"]
     assert folders["rows"][0]["items"] == [] and folders["rows"][1]["items"][0]["title"] == "Add folder…"
     assert done["title"] == "Almost done"
-    assert "Turn on Enable local worker in Settings → Remote." in [row.get("text") for row in done["rows"]]
+    assert "Turn on Local worker in Settings → Remote." in [row.get("text") for row in done["rows"]]
     assert enable_calls == [] and _builtin(root)
 
 

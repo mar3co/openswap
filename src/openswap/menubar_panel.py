@@ -36,6 +36,7 @@ from AppKit import (
     NSImageOnly,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
+    NSLineBreakByTruncatingMiddle,
     NSLineBreakByTruncatingTail,
     NSLineBreakByWordWrapping,
     NSMenu,
@@ -214,9 +215,11 @@ SETTINGS_BTN_H = 22.0
 SETTINGS_BTN_GAP_X = 6.0
 SETTINGS_BTN_GAP_Y = 4.0
 SETTINGS_ROW_GAP = 6.0
+# Extra room above a section header that follows other rows.
+SETTINGS_SECTION_GAP = 10.0
 SETTINGS_POPUP_H = 24.0
-# Room left for a short label ("Account") beside a full-width popup.
-SETTINGS_WIDE_POPUP_LABEL_W = 72.0
+# Room left for a short label ("Web choice") beside a full-width popup.
+SETTINGS_WIDE_POPUP_LABEL_W = 92.0
 SETTINGS_BACK_W = 64.0
 SETTINGS_BACK_H = 22.0
 SETTINGS_TABS_H = 40.0
@@ -1535,7 +1538,7 @@ class MenuBarPanel:
         if row_id in {"claude_desktop_update", "claude_desktop_cancel_update"}:
             self._desktop_profile_action("update" if row_id == "claude_desktop_update" else "cancel_update")
             return
-        if row_id in {"claude_desktop_help", "claude_desktop_archived", "chatgpt_help"}:
+        if row_id in {"claude_desktop_help", "claude_desktop_archived", "chatgpt_help", "remote_tasks_details"}:
             if row_id in self._settings_disclosures:
                 self._settings_disclosures.remove(row_id)
             else:
@@ -2457,6 +2460,9 @@ class MenuBarPanel:
                 lines.append(line)
             return lines
 
+        def _gap_above(row) -> bool:
+            return row.get("style") == "section" and row is not rows[0]
+
         def _row_height(row) -> float:
             kind = row.get("kind")
             if kind == "app_check":
@@ -2467,9 +2473,9 @@ class MenuBarPanel:
             if kind == "group":
                 if row.get("style") == "hint":
                     return 34.0 + 14.0 * max(0, int(row.get("lines") or 2) - 2)
-                return SETTINGS_GROUP_H
+                return SETTINGS_GROUP_H + (SETTINGS_SECTION_GAP if _gap_above(row) else 0.0)
             if kind == "status":
-                return 44.0
+                return SETTINGS_TOGGLE_H
             if kind == "toggle":
                 return SETTINGS_TOGGLE_H
             if kind == "popup":
@@ -2550,11 +2556,12 @@ class MenuBarPanel:
                 button.setEnabled_(not row.get("disabled"))
             elif kind == "group":
                 is_hint = row.get("style") == "hint"
+                gap = SETTINGS_SECTION_GAP if not is_hint and _gap_above(row) else 0.0
                 label = _label(
                     row.get("label") or "",
                     font_small if is_hint else font_group,
-                    pal["muted"] if is_hint else pal["fg"],
-                    NSMakeRect(PAD, y + (2 if is_hint else 4), inner_w, h - 4),
+                    (pal["warn"] if row.get("tone") == "warning" else pal["muted"]) if is_hint else pal["fg"],
+                    NSMakeRect(PAD, y + gap + (2 if is_hint else 4), inner_w, h - gap - 4),
                 )
                 if is_hint:
                     _wrap(label)
@@ -2611,35 +2618,37 @@ class MenuBarPanel:
                 )
                 popup.setEnabled_(not bool(row.get("disabled")))
             elif kind == "status":
-                content.addSubview_(
-                    _label(
-                        row.get("label") or "",
-                        font_small,
-                        pal["muted"],
-                        NSMakeRect(PAD, y, inner_w, 14),
-                    )
-                )
-                value_label = _label(
-                    row.get("value") or "Worker status unavailable",
-                    font_small,
-                    pal["muted"],
-                    NSMakeRect(PAD, y + 14, inner_w, h - 14),
-                )
-                _wrap(value_label)
+                dot = _label("●", font_small, pal.get(row.get("tone"), pal["muted"]), NSMakeRect(PAD, y + 7, 14, 16))
+                dot.setAccessibilityElement_(False)
+                content.addSubview_(dot)
+                value_label = _label(row.get("value") or "Worker status unavailable", font_body, pal["fg"],
+                                     NSMakeRect(PAD + 16, y + 5, inner_w - 16, 20))
+                value_label.setAccessibilityLabel_(f"{row.get('label') or 'Status'}: {value_label.stringValue()}")
                 content.addSubview_(value_label)
             elif kind == "button":
                 title = row.get("title") or "Action"
                 button_w = max(70.0, _button_width(title, font_small))
+                text_w = inner_w - button_w - 8
                 label = _label(
                     row.get("label") or "",
                     font_body,
                     pal["fg"],
-                    NSMakeRect(PAD, y + 5, inner_w - button_w - 8, 20),
+                    NSMakeRect(PAD, y + 5, text_w, 20),
                 )
                 if row.get("full_label"):
                     label.setToolTip_(row["full_label"])
                     label.setAccessibilityLabel_(row["full_label"])
                 content.addSubview_(label)
+                if row.get("detail"):
+                    name_w = min(_measure_text(row.get("label"), font_body) + 6, text_w * 0.5) if row.get("label") else 0
+                    label.setFrame_(NSMakeRect(PAD, y + 5, name_w, 20))
+                    detail = _label(row["detail"], font_small, pal["muted"],
+                                    NSMakeRect(PAD + name_w + 6, y + 7, text_w - name_w - 6, 16))
+                    detail.setLineBreakMode_(NSLineBreakByTruncatingMiddle)
+                    if row.get("full_label"):
+                        detail.setToolTip_(row["full_label"])
+                        detail.setAccessibilityElement_(False)
+                    content.addSubview_(detail)
                 button = self._add_button(
                     content,
                     title,

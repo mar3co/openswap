@@ -10,18 +10,20 @@ from __future__ import annotations
 import dataclasses
 import threading
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from openswap import menubar
+from openswap import menubar, menubar_display
 from openswap.settings import WorkerSettings, configure_worker_service, load_worker_settings, update_worker_settings
 from openswap.worker import cli, guided_setup, setup_window
 from openswap.worker.guided_setup import Readiness, SetupClosed
 from openswap.worker.setup_window import WindowPrompts, done_page, window_page
 from tests.menubar_harness import SetupWindow, extract_class, settle_setup, setup_app
 from tests.test_worker_accounts import ALICE, root  # noqa: F401 (fixture)
-from tests.test_worker_guided_setup import URL, _code, _repo, enable_calls, research_home  # noqa: F401 (fixtures)
+from tests.test_worker_guided_setup import URL, _builtin, _code, _repo, enable_calls, research_home  # noqa: F401 (fixtures)
 
 
 def _drive(root, answers, *, chosen=(), steps=guided_setup.run):
@@ -122,12 +124,12 @@ def test_the_folder_page_lists_rows_then_added_folders_and_add_folder(research_h
     (_state(connection="offline"), setup_window.ALMOST, ("connecting…", None),
      ["Wait a moment, then check Status in Settings → Remote."]),
     (_state(worker="off", account=None), setup_window.ALMOST, ("off", False),
-     ["Turn on Enable local worker in Settings → Remote.",
+     ["Turn on Local worker in Settings → Remote.",
       "Pick an account under Account in Settings → Remote."]),
     (_state(worker="stopped"), setup_window.ALMOST, ("on but not running", False),
-     ["Turn Enable local worker off and on in Settings → Remote to restart it."]),
+     ["Turn Local worker off and on in Settings → Remote to restart it."]),
     (_state(paused=True, execution="disabled"), setup_window.ALMOST, ("paused", False),
-     ["Turn off Pause admission in Settings → Remote to resume."]),
+     ["Turn off Pause new tasks in Settings → Remote to resume."]),
     (_state(execution="disabled"), setup_window.ALMOST, ("running", True), [setup_window.LIVE_OFF]),
 ])
 def test_the_done_page_checklist_names_settings_controls(state, title, worker, lines):
@@ -144,7 +146,7 @@ def test_the_done_page_names_refused_folders_and_the_claude_sign_in_note():
     assert page["rows"][0]["items"][2][2] is False
     lines = _notes(page)
     assert lines[0] == 'Remove "site" under Folders in Settings → Remote.'
-    assert lines[1].startswith('✗ "site" is blocked. Other users can change that folder')
+    assert lines[1].startswith('✗ "site" is blocked. Other users can change it.')
     assert lines[2] == setup_window.SIGN_IN_NOTE
     assert "`" not in " ".join(lines)
 
@@ -234,7 +236,7 @@ def test_a_refused_start_stays_on_the_worker_page_without_a_command(root, monkey
     assert line.endswith(guided_setup.SETTINGS_NEXT[guided_setup.START_WORKER_NEXT])
 
 
-RESTART = "Turn Enable local worker off and on in Settings → Remote to restart it."
+RESTART = "Turn Local worker off and on in Settings → Remote to restart it."
 
 
 def test_a_failed_restart_of_a_stopped_worker_points_to_the_switch(root, worker_on, monkeypatch):
@@ -635,39 +637,69 @@ def test_setup_chosen_while_a_settings_change_runs_says_so(root, row_id):
 # --- Settings › Remote › Folders ------------------------------------------------------------------
 
 
-def _remote(paired=True, **status):
+def _remote(paired=True, expanded=(), enabled=False, paused=False, **status):
     return menubar.settings_page_rows(menubar.MenuBarSettings(), strategy="best", threshold=90,
                                       section=menubar.SETTINGS_SECTION_REMOTE, worker_paired=paired,
-                                      worker_status=status)
+                                      worker_enabled=enabled, worker_paused=paused,
+                                      worker_status=status, expanded_sections=set(expanded))
 
 
-def test_settings_lists_each_folder_with_remove_then_add_folder():
-    rows = _remote(folders=[("github", "~/GitHub"), ("research", "~/OpenSwap Research/research (results only)")])
+GITHUB = ("github", "GitHub", "~/GitHub", "")
+GONE = "⚠ That folder was already removed."
+
+
+def _sections(rows):
+    return [row["label"] for row in rows if row.get("style") == "section"]
+
+
+def test_settings_remote_has_four_sections_with_short_labels():
+    rows = _remote(folders=[GITHUB])
+    assert _sections(rows) == ["Remote tasks", "Account", "Folders", "Status"]
+    labels = {row["id"]: (row["label"], row.get("title")) for row in rows}
+    assert labels["remote_tasks_enabled"][0] == "Local worker"
+    assert labels["remote_tasks_paused"][0] == "Pause new tasks"
+    assert labels["remote_tasks_setup"] == ("Setup", "Set Up…")
+    assert labels["remote_tasks_account"][0] == "Tasks use"
+    assert labels["remote_tasks_web_choice"][0] == "Web choice"
+
+
+def test_settings_remote_before_pairing_shows_connect_and_no_folders_section():
+    rows = _remote(paired=False, folders=[GITHUB])
+    assert _sections(rows) == ["Remote tasks", "Account", "Status"]
+    ids = [row["id"] for row in rows]
+    assert ids[1:3] == ["remote_tasks_connect", "remote_tasks_connect_other"]
+    assert not any(row_id.startswith("remote_tasks_folder") for row_id in ids)
+
+
+def test_settings_lists_each_folder_by_name_and_path_then_add_folder():
+    rows = _remote(folders=[GITHUB, ("notes", "Notes", "~/Notes", "read only")])
     ids = [row["id"] for row in rows]
     start = ids.index("remote_tasks_folders")
     assert ids[start:start + 4] == ["remote_tasks_folders", "remote_tasks_folder_remove",
                                     "remote_tasks_folder_remove", "remote_tasks_folder_add"]
-    assert ids.index("remote_tasks_folder_add") < ids.index("remote_tasks_status")
-    remove = rows[start + 1]
-    assert (remove["label"], remove["title"], remove["value"], remove["disabled"]) == (
-        "~/GitHub", "Remove", "github", False)
-    assert rows[start + 3]["title"] == "Add folder…"
+    assert ids.index("remote_tasks_folder_add") < ids.index("group_remote_status")
+    github, notes = rows[start + 1], rows[start + 2]
+    assert (github["label"], github["detail"], github["title"], github["value"], github["disabled"]) == (
+        "GitHub", "~/GitHub", "Remove", "github", False)
+    assert (notes["label"], notes["detail"], notes["full_label"]) == ("Notes", "~/Notes · read only",
+                                                                     "Notes · ~/Notes · read only")
+    assert rows[start + 3]["title"] == "Add Folder…" and rows[start + 3]["label"] == ""
 
 
 def test_settings_without_folders_says_tasks_need_one():
     rows = _remote(folders=[])
     (hint,) = [row for row in rows if row["id"] == "remote_tasks_folders_note"]
-    assert hint["label"] == menubar.REMOTE_NO_FOLDERS
+    assert hint["label"] == menubar.REMOTE_NO_FOLDERS and "tone" not in hint
     assert "remote_tasks_folder_add" in [row["id"] for row in rows]
 
 
 def test_settings_shows_no_folders_before_pairing_or_before_the_first_read():
-    for rows in (_remote(paired=False, folders=[("github", "~/GitHub")]), _remote()):
+    for rows in (_remote(paired=False, folders=[GITHUB]), _remote()):
         assert not any(row["id"].startswith("remote_tasks_folder") for row in rows)
 
 
 def test_settings_folders_wait_while_the_setup_window_changes_them():
-    rows = _remote(folders=[("github", "~/GitHub")], setup_changing_folders=True)
+    rows = _remote(folders=[GITHUB], setup_changing_folders=True)
     (hint,) = [row for row in rows if row["id"] == "remote_tasks_folders_note"]
     assert hint["label"] == menubar.REMOTE_SETUP_CHANGING_FOLDERS
     assert all(row["disabled"] for row in rows if row["id"] in ("remote_tasks_folder_remove",
@@ -675,28 +707,103 @@ def test_settings_folders_wait_while_the_setup_window_changes_them():
 
 
 def test_settings_says_when_the_folder_list_cannot_be_read():
-    rows = _remote(folders=None, folder_notice="That folder was already removed.")
+    rows = _remote(folders=None, folder_notice="⚠ That folder was already removed.")
     assert [row["label"] for row in rows if row["id"] == "remote_tasks_folders_note"] == [
-        menubar.REMOTE_FOLDERS_UNREADABLE, "That folder was already removed."]
+        menubar.REMOTE_FOLDERS_UNREADABLE, "⚠ That folder was already removed."]
     assert "remote_tasks_folder_remove" not in [row["id"] for row in rows]
     assert next(row for row in rows if row["id"] == "remote_tasks_folder_add")["disabled"] is False
 
 
-def test_a_long_folder_label_keeps_its_end_and_its_full_text():
-    full = "~/" + "/".join(["a-rather-long-folder-name"] * 4) + " (read only)"
-    (remove,) = [row for row in _remote(folders=[("site", full)]) if row["id"] == "remote_tasks_folder_remove"]
-    assert remove["full_label"] == full and len(remove["label"]) <= menubar.REMOTE_FOLDER_LABEL_CHARS
-    assert remove["label"].startswith("~/a-rather") and remove["label"].endswith("name (read only)")
-    assert "…" in remove["label"]
+def test_a_long_folder_path_keeps_its_end_its_use_and_its_full_text():
+    paths = "~/" + "/".join(["a-rather-long-folder-name"] * 4)
+    (remove,) = [row for row in _remote(folders=[("site", "Site", paths, "read only")])
+                 if row["id"] == "remote_tasks_folder_remove"]
+    assert remove["full_label"] == f"Site · {paths} · read only"
+    assert len(remove["label"]) + len(remove["detail"]) <= menubar.REMOTE_FOLDER_LABEL_CHARS
+    assert remove["detail"].startswith("~/a-rather") and remove["detail"].endswith("name · read only")
+    assert "…" in remove["detail"]
 
 
-def test_settings_shows_the_last_folder_message_and_disables_while_busy():
-    rows = _remote(folders=[("github", "~/GitHub")], folder_notice="That folder was already removed.",
+def test_a_folder_message_shows_once_under_the_list_and_a_refusal_is_a_warning():
+    rows = _remote(folders=[GITHUB], folder_notice="⚠ ~/Desktop: no git repos in it.",
                    operation="worker_folder_update")
+    ids = [row["id"] for row in rows]
     (hint,) = [row for row in rows if row["id"] == "remote_tasks_folders_note"]
-    assert hint["label"] == "That folder was already removed."
+    assert hint["label"] == "⚠ ~/Desktop: no git repos in it." and hint["tone"] == "warning"
+    assert ids.index("remote_tasks_folders_note") == ids.index("remote_tasks_folder_add") + 1
     assert all(row["disabled"] for row in rows if row["id"] in ("remote_tasks_folder_remove",
                                                                 "remote_tasks_folder_add"))
+    (plain,) = [row for row in _remote(folders=[GITHUB], folder_notice="Added 2 folders from ~/GitHub.")
+                if row["id"] == "remote_tasks_folders_note"]
+    assert "tone" not in plain
+
+
+# --- Settings › Remote › Status ---------------------------------------------------------------------
+
+SOON = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+PAST = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+RUNNING = {"process_state": "running", "provider": {"available": True}, "remote_connectivity": "online"}
+JOB = {"job_id": "job-1", "state": "waiting_for_approval", "origin": {"kind": "assistant", "label": "ChatGPT"}}
+
+
+@pytest.mark.parametrize("status, enabled, paused, expected", [
+    (RUNNING, True, False, ("ok", "Running · online · idle")),
+    ({**RUNNING, "remote_connectivity": None}, True, False, ("ok", "Running · idle")),
+    ({**RUNNING, "active_job": JOB}, True, False, ("ok", "Running · waiting for approval · from ChatGPT (assistant)")),
+    ({**RUNNING, "active_job": {"job_id": "job-1", "state": "running"}}, True, False, ("ok", "Running · task running")),
+    ({"process_state": "starting"}, True, False, ("muted", "Starting…")),
+    ({"process_state": "stopping"}, True, False, ("muted", "Stopping…")),
+    ({**RUNNING, "operation": "worker_folder_update"}, True, False, ("muted", "Applying a change…")),
+    ({**RUNNING, "operation": "worker_status_checking"}, True, False, ("muted", "Checking…")),
+    ({"process_state": "stopped"}, True, False, ("crit", "Not running")),
+    ({"process_state": "stale"}, True, False, ("crit", "Not running")),
+    ({"process_state": "unavailable"}, True, False, ("muted", "Status unavailable")),
+    (RUNNING, False, False, ("muted", "Off")),
+    (RUNNING, True, True, ("warn", "Paused")),
+    ({**RUNNING, "remote_connectivity": "offline"}, True, False, ("warn", "Running · offline")),
+    ({**RUNNING, "provider": {"available": False, "diagnostic_code": "live_adapter_disabled"}}, True, False,
+     ("warn", "Running · live tasks off")),
+    ({**RUNNING, "provider": {"available": False, "diagnostic_code": "provider_unavailable"}}, True, False,
+     ("warn", "Running · account unavailable")),
+    ({**RUNNING, "provider": None}, True, False, ("warn", "Running · tasks can't run")),
+    ({**RUNNING, "remote_connectivity": "revoked"}, True, True, ("crit", "Running · removed in OpenTag")),
+    ({**RUNNING, "remote_connectivity": "expired"}, True, True, ("crit", "Running · key expired")),
+    ({**RUNNING, "remote_key_expires_at": PAST, "remote_key_renews": True}, True, False,
+     ("crit", "Running · key expired")),
+    ({**RUNNING, "remote_key_expires_at": SOON, "remote_key_renews": False}, True, False,
+     ("warn", "Running · online · idle")),
+    ({**RUNNING, "remote_key_expires_at": SOON, "remote_key_renews": True}, True, False,
+     ("ok", "Running · online · idle")),
+])
+def test_the_status_line_names_the_actionable_state(status, enabled, paused, expected):
+    assert menubar.remote_status_line(status, enabled=enabled, paused=paused) == expected
+
+
+def test_status_details_hold_the_full_fields_and_routine_key_renewal():
+    status = {**RUNNING, "queue_depth": 2, "remote_key_expires_at": SOON, "remote_key_renews": True}
+    collapsed = {row["id"]: row for row in _remote(enabled=True, **status)}
+    assert collapsed["remote_tasks_status"]["value"] == "Running · online · idle"
+    assert collapsed["remote_tasks_details"]["value"] is False
+    assert "remote_tasks_status_details" not in collapsed and "remote_tasks_key" not in collapsed
+    rows = _remote(enabled=True, expanded={"remote_tasks_details"}, **status)
+    ids = [row["id"] for row in rows]
+    assert ids[-3:] == ["remote_tasks_details", "remote_tasks_status_details", "remote_tasks_key"]
+    assert rows[-2]["label"] == menubar_display._remote_tasks_status_copy(status, enabled=True, paused=False)
+    assert rows[-1]["label"] == menubar.REMOTE_KEY_RENEWS_NOTE
+
+
+def test_a_key_that_needs_reconnecting_stays_visible_under_the_status_line():
+    rows = _remote(enabled=True, **{**RUNNING, "remote_key_expires_at": SOON, "remote_key_renews": False})
+    ids = [row["id"] for row in rows]
+    assert ids.index("remote_tasks_key") == ids.index("remote_tasks_status") + 1
+    assert rows[ids.index("remote_tasks_key")]["label"].startswith("Key expires in")
+
+
+def test_active_job_reads_none_with_stop_disabled_until_a_job_runs():
+    idle = next(row for row in _remote(enabled=True, **RUNNING) if row["id"] == "remote_tasks_stop")
+    assert (idle["label"], idle["detail"], idle["title"], idle["disabled"]) == ("Active job", "none", "Stop", True)
+    busy = next(row for row in _remote(enabled=True, **RUNNING, active_job=JOB) if row["id"] == "remote_tasks_stop")
+    assert (busy["detail"], busy["value"], busy["disabled"]) == ("waiting for approval", "job-1", False)
 
 
 def _settings_app(root):
@@ -739,17 +846,17 @@ def test_settings_add_and_remove_use_the_cli_functions(root, research_home, sett
     made = _folders(root, research_home, "GitHub", "Notes", saved=("GitHub",))
     settings_app.picked = [str(made["Notes"])]
     status = _settings(settings_app, "remote_tasks_folder_add")
-    assert status["folders"] == [("github", "~/GitHub"), ("notes", "~/Notes")] and "folder_notice" not in status
+    assert status["folders"] == [GITHUB, ("notes", "Notes", "~/Notes", "")] and "folder_notice" not in status
     status = _settings(settings_app, "remote_tasks_folder_remove", "github")
-    assert status["folders"] == [("notes", "~/Notes")]
+    assert status["folders"] == [("notes", "Notes", "~/Notes", "")]
 
 
 def test_settings_add_of_an_unusable_folder_adds_nothing(root, research_home, settings_app):
     _folders(root, research_home, "GitHub", saved=("GitHub",))
     settings_app.picked = [str(research_home.parent / "Missing")]
     status = _settings(settings_app, "remote_tasks_folder_add")
-    assert status["folder_notice"] == guided_setup.workspace_message("readable_unavailable", gui=True)
-    assert status["folders"] == [("github", "~/GitHub")]
+    assert status["folder_notice"] == "⚠ ~/Missing: it doesn't exist or can't be opened."
+    assert status["folders"] == [GITHUB]
 
 
 def test_settings_add_of_a_folder_already_covered_says_through_which(root, research_home, settings_app):
@@ -759,27 +866,27 @@ def test_settings_add_of_a_folder_already_covered_says_through_which(root, resea
     settings_app.picked = [str(home / "Code" / "app")]
     status = _settings(settings_app, "remote_tasks_folder_add")
     assert status["folder_notice"] == "Already allowed through ~/Code."
-    assert [workspace_id for workspace_id, _label in status["folders"]] == ["code"]
+    assert [entry[0] for entry in status["folders"]] == ["code"]
 
 
 def test_settings_remove_of_a_folder_in_use_is_refused_and_it_stays(root, research_home, settings_app, monkeypatch):
     _folders(root, research_home, "GitHub", "Notes", saved=("GitHub", "Notes"))
     monkeypatch.setattr(cli, "_folder_in_use", lambda *_args: True)
     status = _settings(settings_app, "remote_tasks_folder_remove", "github")
-    assert status["folder_notice"] == cli._WORKSPACE_MESSAGES["workspace_in_use"]
-    assert [workspace_id for workspace_id, _label in status["folders"]] == ["github", "notes"]
+    assert status["folder_notice"] == f"⚠ {cli._WORKSPACE_MESSAGES['workspace_in_use']}"
+    assert [entry[0] for entry in status["folders"]] == ["github", "notes"]
 
 
 def test_settings_remove_of_a_folder_already_gone_refreshes_the_list(root, research_home, settings_app):
     _folders(root, research_home, "GitHub", "Notes", saved=("GitHub", "Notes"))
     cli.remove_worker_workspace(root, "notes")
     status = _settings(settings_app, "remote_tasks_folder_remove", "notes")
-    assert status["folder_notice"] == "That folder was already removed."
-    assert status["folders"] == [("github", "~/GitHub")]
+    assert status["folder_notice"] == GONE
+    assert status["folders"] == [GITHUB]
     # The message outlives the next status read, until the next folder change.
     settings_app._worker_result = (settings_app._worker_generation, {"process_state": "stopped"}, None, None)
     settings_app._drain_worker_result()
-    assert settings_app._worker_status_cache["folder_notice"] == "That folder was already removed."
+    assert settings_app._worker_status_cache["folder_notice"] == GONE
 
 
 def test_settings_cancelled_chooser_changes_nothing(root, settings_app):
@@ -810,7 +917,7 @@ def test_settings_folder_change_during_another_worker_change_says_try_again(root
     monkeypatch.setattr(cli, "add_work_folder", busy)
     monkeypatch.setattr(cli, "remove_worker_workspace", busy)
     settings_app.picked = [str(made["Notes"])]
-    assert _settings(settings_app, row_id, value)["folder_notice"] == cli.BUSY_MESSAGE
+    assert _settings(settings_app, row_id, value)["folder_notice"] == f"⚠ {cli.BUSY_MESSAGE}"
 
 
 def _poll(app, **snapshot):
@@ -824,10 +931,10 @@ def test_a_folder_message_goes_once_a_refresh_reads_another_folder_list(root, re
     _folders(root, research_home, "GitHub", "Notes", saved=("GitHub", "Notes"))
     cli.remove_worker_workspace(root, "notes")
     status = _settings(settings_app, "remote_tasks_folder_remove", "notes")
-    assert status["folder_notice"] == "That folder was already removed."
-    assert _poll(settings_app)["folder_notice"] == "That folder was already removed."
-    assert _poll(settings_app, folders=[("github", "~/GitHub")])["folder_notice"] == "That folder was already removed."
-    status = _poll(settings_app, folders=[("github", "~/GitHub"), ("code", "~/Code")])
+    assert status["folder_notice"] == GONE
+    assert _poll(settings_app)["folder_notice"] == GONE
+    assert _poll(settings_app, folders=[GITHUB])["folder_notice"] == GONE
+    status = _poll(settings_app, folders=[GITHUB, ("code", "Code", "~/Code", "")])
     assert "folder_notice" not in status
 
 
@@ -840,13 +947,184 @@ def test_a_folder_message_stays_through_an_unreadable_reread(root, research_home
 
     monkeypatch.setattr(openswap.settings, "load_worker_settings", unreadable)
     status = _settings(settings_app, "remote_tasks_folder_remove", "gone")
-    assert status["folders"] is None and status["folder_notice"] == "That folder was already removed."
-    status = _poll(settings_app, folders=[("github", "~/GitHub")])
-    assert status["folder_notice"] == "That folder was already removed."
+    assert status["folders"] is None and status["folder_notice"] == GONE
+    status = _poll(settings_app, folders=[GITHUB])
+    assert status["folder_notice"] == GONE
     assert "folder_notice" not in _poll(settings_app, folders=[])
 
 
 def test_a_status_read_without_the_settings_keeps_the_last_folders(root, research_home, settings_app):
     _folders(root, research_home, "GitHub", saved=("GitHub",))
     _settings(settings_app, "remote_tasks_folder_remove", "gone")
-    assert _poll(settings_app)["folders"] == [("github", "~/GitHub")]
+    assert _poll(settings_app)["folders"] == [GITHUB]
+
+
+# --- a folder of org folders (~/GitHub/<org>/<repo>): the window and Settings only -----------------
+
+
+def _orgs(research_home, *repos):
+    """``~/GitHub/<org>/<repo>`` for each ``"org/repo"``; returns ~/GitHub."""
+    home = research_home.parent
+    _repo(*(_code(home, f"GitHub/{repo}") for repo in repos))
+    return home / "GitHub"
+
+
+def _saved(root):
+    return [(w.workspace_id, w.work_root.name, w.repos) for w in load_worker_settings(root).workspaces]
+
+
+def test_settings_add_of_a_folder_of_org_folders_adds_each_org(root, research_home, settings_app):
+    github = _orgs(research_home, "opensoft/app", "opensoft/site", "veba/api")
+    (github / "empty").mkdir()
+    settings_app.picked = [str(github)]
+    status = _settings(settings_app, "remote_tasks_folder_add")
+    assert status["folder_notice"] == "Added 2 folders from ~/GitHub."
+    assert _saved(root) == [("opensoft", "opensoft", True), ("veba", "veba", True)]
+    assert status["folders"] == [("opensoft", "opensoft", "~/GitHub/opensoft", ""),
+                                 ("veba", "veba", "~/GitHub/veba", "")]
+
+
+def test_settings_add_of_org_folders_skips_saved_ones_and_says_when_all_are(root, research_home, settings_app):
+    github = _orgs(research_home, "opensoft/app", "veba/api")
+    cli.add_work_folder(root, github / "opensoft")
+    settings_app.picked = [str(github), str(github)]
+    assert _settings(settings_app, "remote_tasks_folder_add")["folder_notice"] == "Added 1 folder from ~/GitHub."
+    assert _settings(settings_app, "remote_tasks_folder_add")["folder_notice"] == "Already allowed."
+    assert [entry[0] for entry in _saved(root)] == ["opensoft", "veba"]
+
+
+def test_a_refused_org_keeps_the_ones_added_and_is_named(root, research_home, settings_app, monkeypatch):
+    github = _orgs(research_home, "acme/app", "opensoft/app", "veba/api")
+    add = cli.add_work_folder
+
+    def full(backup_root, folder, **kwargs):
+        if Path(folder).name in ("opensoft", "veba"):
+            raise cli.WorkspaceError("too_many_workspaces")
+        return add(backup_root, folder, **kwargs)
+
+    monkeypatch.setattr(cli, "add_work_folder", full)
+    settings_app.picked = [str(github)]
+    assert _settings(settings_app, "remote_tasks_folder_add")["folder_notice"] == (
+        "⚠ Added 1 folder from ~/GitHub; 2 not added: opensoft: at most 16 folders can be added, "
+        "veba: at most 16 folders can be added.")
+    assert [entry[0] for entry in _saved(root)] == ["acme"]
+
+
+def test_org_folders_all_refused_show_the_first_refusal(root, research_home, settings_app, monkeypatch):
+    github = _orgs(research_home, "opensoft/app", "veba/api")
+    add = cli.add_work_folder
+
+    def full(backup_root, folder, **kwargs):
+        if Path(folder) != github:
+            raise cli.WorkspaceError("too_many_workspaces")
+        return add(backup_root, folder, **kwargs)
+
+    monkeypatch.setattr(cli, "add_work_folder", full)
+    settings_app.picked = [str(github)]
+    assert _settings(settings_app, "remote_tasks_folder_add")["folder_notice"] == (
+        "⚠ ~/GitHub/opensoft: at most 16 folders can be added.")
+
+
+def test_a_folder_whose_subfolders_hold_no_repos_is_refused_as_before(root, research_home, settings_app):
+    desktop = _code(research_home.parent, "Desktop/notes")
+    settings_app.picked = [str(desktop.parent)]
+    status = _settings(settings_app, "remote_tasks_folder_add")
+    assert status["folder_notice"] == "⚠ ~/Desktop: no git repos in it."
+    assert _builtin(root)
+
+
+def test_a_read_only_org_folder_becomes_a_work_folder(root, research_home, settings_app):
+    github = _orgs(research_home, "opensoft/app", "veba/api")
+    cli.add_readable_folder(root, github / "opensoft")
+    settings_app.picked = [str(github)]
+    assert _settings(settings_app, "remote_tasks_folder_add")["folder_notice"] == "Added 2 folders from ~/GitHub."
+    assert _saved(root) == [("opensoft", "opensoft", True), ("veba", "veba", True)]
+
+
+def test_a_folder_holding_a_repo_itself_is_a_plain_folder_of_repos(root, research_home, settings_app):
+    github = _orgs(research_home, "opensoft/app", "stray")
+    settings_app.picked = [str(github)]
+    assert "folder_notice" not in _settings(settings_app, "remote_tasks_folder_add")
+    assert _saved(root) == [("github", "GitHub", True)]
+
+
+@pytest.mark.parametrize("added, refused, line", [
+    (3, [], "Added 3 folders from ~/GitHub."),
+    (1, [], "Added 1 folder from ~/GitHub."),
+    (0, [], "Already allowed."),
+    (2, [("veba", "At most 16 folders can be added.")],
+     "Added 2 folders from ~/GitHub; 1 not added: veba: at most 16 folders can be added."),
+    (0, [("veba", "That folder isn't yours."), ("acme", "No git repos in it.")],
+     "~/GitHub/veba: that folder isn't yours."),
+])
+def test_the_org_folders_line(research_home, added, refused, line):
+    github = research_home.parent / "GitHub"
+    assert guided_setup.repo_groups_message(github, added, [(github / name, why) for name, why in refused]) == line
+
+
+def test_the_window_recommends_and_checks_a_folder_of_org_folders(root, research_home):
+    _orgs(research_home, "opensoft/app")
+    _repo(_code(research_home.parent, "Code/lib"))
+    rows = guided_setup.folder_rows(root, load_worker_settings(root).workspaces)
+    assert [(row.label, row.note, row.checked) for row in rows] == [
+        ("~/GitHub", "recommended", True), ("~/Code", "", False), ("~/Code/lib", "git repo", False)]
+    # The terminal's numbered menu keeps its order: ~/GitHub holds no repo itself.
+    menu = guided_setup.folder_menu(root, load_worker_settings(root).workspaces)
+    assert [folder.name for folder in menu.folders] == ["Code", "lib", "GitHub"] and menu.recommended is None
+
+
+def test_the_window_never_recommends_a_folder_that_cannot_be_added(root, research_home):
+    _code(research_home.parent, "GitHub/opensoft")
+    (row,) = guided_setup.folder_rows(root, load_worker_settings(root).workspaces)
+    assert (row.label, row.note) == ("~/GitHub", "")
+    assert guided_setup.folder_menu(root, load_worker_settings(root).workspaces).recommended == 0
+
+
+def test_the_window_hides_a_folder_of_org_folders_once_every_org_is_saved(root, research_home):
+    github = _orgs(research_home, "opensoft/app", "veba/api")
+    cli.add_work_folder(root, github / "opensoft")
+    assert [row.label for row in guided_setup.folder_rows(root, load_worker_settings(root).workspaces)] == [
+        "~/GitHub/opensoft", "~/GitHub"]
+    cli.add_work_folder(root, github / "veba")
+    assert [row.label for row in guided_setup.folder_rows(root, load_worker_settings(root).workspaces)] == [
+        "~/GitHub/opensoft", "~/GitHub/veba"]
+
+
+def test_continue_with_a_folder_of_org_folders_adds_each_org(root, research_home, enable_calls):
+    _orgs(research_home, "opensoft/app", "veba/api")
+    window = _drive(root, ["skip", "skip", "continue", "continue", "done"])
+    assert _notes(window.shown[3]) == ["✓ Added 2 folders from ~/GitHub."]
+    assert [entry[0] for entry in _saved(root)] == ["opensoft", "veba"]
+
+
+def test_the_terminal_and_cli_still_refuse_a_folder_of_org_folders(root, research_home, capsys):
+    github = _orgs(research_home, "opensoft/app")
+    with pytest.raises(cli.WorkspaceError) as refused:
+        cli.add_work_folder(root, github)
+    assert refused.value.code == "work_not_a_repo"
+    assert cli.main(["workspace", "add", "--work", str(github)], backup_root=root) != 0
+    assert cli._WORKSPACE_MESSAGES["work_not_a_repo"] in capsys.readouterr().err
+    lines = []
+    guided_setup._add_folders(root, SimpleNamespace(say=lines.append), [github])
+    assert lines == [f"~/GitHub: {cli._WORKSPACE_MESSAGES['work_not_a_repo']}"] and _builtin(root)
+
+
+# --- the built-in research folder --------------------------------------------------------------------
+
+
+def test_settings_hide_the_untouched_built_in_folder(root):
+    assert guided_setup.settings_folders(root, load_worker_settings(root).workspaces) == []
+
+
+def test_settings_list_the_built_in_folder_kept_beside_a_real_one(root, research_home, monkeypatch):
+    monkeypatch.setattr(cli, "_workspace_in_use", lambda *_args: True)
+    cli.add_work_folder(root, _repo(_code(research_home.parent, "Site")))
+    (research, site) = guided_setup.settings_folders(root, load_worker_settings(root).workspaces)
+    assert research[:2] == ("research", "research") and research[3] == "results only"
+    assert site == ("site", "Site", "~/Site", "")
+
+
+def test_a_direct_folder_is_named_by_its_label_and_says_in_place(root, research_home):
+    cli.add_work_folder(root, _repo(_code(research_home.parent, "Site")), mode="direct", label="Web")
+    assert guided_setup.settings_folders(root, load_worker_settings(root).workspaces) == [
+        ("site", "Web", "~/Site", "in place")]

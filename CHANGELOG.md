@@ -15,12 +15,14 @@ opensoft.me/swap/changelog shows this file.
 
 ### New
 
-- Settings › Remote lists the folders remote tasks may work in, with Add folder… and Remove for each.
+- Settings › Remote lists the folders remote tasks may work in, with Add Folder… and Remove for each.
 
 ### Improved
 
 - The Claude Desktop update row now shows when Claude has downloaded an update that is ready to install, or that no update is downloaded yet.
-- Set up Remote tasks… and Connect to OpenTag… now finish in OpenSwap's setup window, one step per page with real controls: start the worker, pick the account, check the folders tasks may use (or add one), then a checklist of what's ready and which Settings control fixes the rest.
+- Settings › Remote is tidier: Remote tasks, Account, Folders and Status sections with short labels, each folder shown by name with its path, and the status in one plain line with the full fields under Details.
+- Adding a folder like ~/GitHub whose repos sit in organization folders now adds each of those folders, in Settings and in the setup window.
+- Set Up… and Connect to OpenTag… in Settings › Remote now finish in OpenSwap's setup window, one step per page with real controls: start the worker, pick the account, check the folders tasks may use (or add one), then a checklist of what's ready and which Settings control fixes the rest.
 
 ## 0.3.1 (2026-11-05)
 

@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from openswap import pace
+from openswap import pace, printer
 from openswap.exceptions import ClaudeSwitchError, CredentialReadError
 from openswap.kickoff import (
     KICKOFF_RETRY_BACKOFF_S,
@@ -267,6 +267,70 @@ def _remote_task_origin(origin) -> str:
     label = origin.get("label")
     label = "".join(c for c in label[:100] if c.isprintable()).strip() if isinstance(label, str) else ""
     return f" from {label} ({origin['kind']})" if label else f" from {origin['kind']}"
+
+
+# A job's state in plain words, for Settings › Remote's status line and Active job row.
+_JOB_WORDS = {
+    "queued": "task queued", "claimed": "task starting", "starting": "task starting",
+    "running": "task running", "waiting_for_approval": "waiting for approval",
+    "cancel_requested": "stopping the task", "succeeded": "task finished", "failed": "task failed",
+    "cancelled": "task stopped", "interrupted": "task interrupted", "expired": "task expired",
+}
+_PROVIDER_WORDS = {"live_adapter_disabled": "live tasks off", "provider_unavailable": "account unavailable"}
+
+
+def remote_job_words(snapshot: dict) -> str:
+    """The active job in plain words, or "none"."""
+    active = snapshot.get("active_job")
+    if not isinstance(active, dict):
+        return "none"
+    return _JOB_WORDS.get(active.get("state"), "a task")
+
+
+def remote_status_line(snapshot: dict, *, enabled: bool, paused: bool,
+                       now: datetime | None = None) -> tuple[str, str]:
+    """Settings › Remote's one status line: ``(tone, text)``, tone a palette key (ok, warn, crit, muted).
+
+    Actionable states win over routine ones; the full fields stay in
+    ``_remote_tasks_status_copy`` (behind Details).
+    """
+    operation = snapshot.get("operation")
+    process = snapshot.get("process_state")
+    connectivity = snapshot.get("remote_connectivity")
+    if operation == "worker_status_checking":
+        return "muted", "Checking…"
+    if operation is not None:
+        return "muted", "Applying a change…"
+    if not enabled:
+        return "muted", "Off"
+    if process in ("starting", "stopping"):
+        return "muted", f"{process.capitalize()}…"
+    if process in ("stopped", "stale"):
+        return "crit", "Not running"
+    if process != "running":
+        return "muted", "Status unavailable"
+    if connectivity == "revoked":
+        return "crit", "Running · removed in OpenTag"
+    expires = _remote_key_expiry(snapshot)
+    expired = connectivity == "expired" or (
+        expires is not None and expires <= (now or datetime.now(timezone.utc)))
+    if expired:
+        return "crit", "Running · key expired"
+    tone = "warn" if remote_reconnect_label(snapshot, now=now) is not None else "ok"
+    if paused:
+        return "warn", "Paused"
+    if connectivity == "offline":
+        return "warn", "Running · offline"
+    if isinstance(snapshot.get("active_job"), dict):
+        origin = _remote_task_origin(snapshot["active_job"].get("origin")).strip()
+        return tone, " · ".join(["Running", remote_job_words(snapshot)] + ([origin] if origin else []))
+    provider = snapshot.get("provider")
+    if not (isinstance(provider, dict) and provider.get("available") is True):
+        code = provider.get("diagnostic_code") if isinstance(provider, dict) else None
+        return "warn", "Running · " + _PROVIDER_WORDS.get(code, "tasks can't run")
+    return tone, "Running · online · idle" if connectivity == "online" else "Running · idle"
+
+
 SETTINGS_PAGE = "settings"
 TOKEN_PAGE = "token"
 SETUP_TOKEN_PREFIX = "sk-ant-oat"
@@ -299,9 +363,7 @@ CODEX_RELOGIN_CARD_NOTE = (
     "Action required · OAuth expired. Sign in again with Codex."
 )
 RESTORE_CARD_NOTE = "Click to restore the saved Claude login."
-REMOTE_TASKS_PAIRED_OFF_NOTE = (
-    "Paired, worker off · Turn on Enable local worker so this Mac can accept approved tasks."
-)
+REMOTE_TASKS_PAIRED_OFF_NOTE = "Paired, worker off. Turn on Local worker so this Mac can take tasks."
 REMOTE_KEY_RENEWS_NOTE = "Key renews automatically."
 
 
@@ -522,7 +584,7 @@ class MenuBarSettings:
 def remote_connect_rows(paired: bool, worker_status: dict) -> list[dict]:
     """Connect to OpenTag… on an unpaired Mac (with Use another server…), and
     Reconnect on a paired Mac whose key has expired. No rows otherwise; the
-    pasted command stays under Set up Remote tasks…."""
+    pasted command stays under Setup."""
     busy = worker_status.get("operation") is not None
     if not paired:
         return [
@@ -562,31 +624,40 @@ def remote_connect_rows(paired: bool, worker_status: dict) -> list[dict]:
 REMOTE_NO_FOLDERS = "No folders yet. Tasks need at least one."
 REMOTE_FOLDERS_UNREADABLE = "The folder list can't be read right now."
 REMOTE_SETUP_CHANGING_FOLDERS = "Setup is changing folders; finish or close that step first."
-# What fits beside Remove on one line of the Settings panel.
-REMOTE_FOLDER_LABEL_CHARS = 40
+# What fits beside Remove on one line of the Settings panel: the name, then the path.
+REMOTE_FOLDER_LABEL_CHARS = 44
+REMOTE_FOLDER_NAME_CHARS = 20
 
 
-def _folder_row_label(label: str) -> str:
-    """``label`` fit to one row: its paths shortened in the middle, its "(…)" suffix kept whole."""
-    if len(label) <= REMOTE_FOLDER_LABEL_CHARS:
-        return label
-    paths, sep, suffix = label.rpartition(" (")
-    if not (sep and label.endswith(")")):
-        paths, suffix = label, ""
-    else:
-        suffix = sep + suffix
-    room = max(REMOTE_FOLDER_LABEL_CHARS - len(suffix) - 1, 8)
+def _folder_detail(paths: str, use: str, room: int) -> str:
+    """A folder's ``~`` paths and short use, fit to ``room`` characters: the paths shortened in the middle."""
+    suffix = f" · {use}" if use else ""
+    if len(paths) + len(suffix) <= room:
+        return paths + suffix
+    room = max(room - len(suffix) - 1, 8)
     return f"{paths[:room - room // 2]}…{paths[-(room // 2):]}{suffix}"
 
 
-def remote_folder_rows(worker_status: dict) -> list[dict]:
-    """Settings › Remote › Folders on a paired Mac: each saved folder with Remove, then Add folder….
+def _section_row(row_id: str, label: str) -> dict:
+    return {"kind": "group", "style": "section", "section": SETTINGS_SECTION_REMOTE, "id": row_id, "label": label}
 
-    ``worker_status["folders"]`` is ``(workspace ID, label)`` pairs read off
-    the UI thread (no rows until the first read; None when a folder change's
-    reread failed); ``folder_notice`` is the last folder change's message and
-    ``setup_changing_folders`` holds the buttons while the setup window's
-    folder step may write.
+
+def _remote_hint(row_id: str, text: str) -> dict:
+    row = {"kind": "group", "style": "hint", "section": SETTINGS_SECTION_REMOTE,
+           "id": row_id, "label": text, "lines": _hint_lines(text)}
+    if text.startswith(printer.MARK_WARN):
+        row["tone"] = "warning"
+    return row
+
+
+def remote_folder_rows(worker_status: dict) -> list[dict]:
+    """Settings › Remote › Folders on a paired Mac: each saved folder with Remove, then Add Folder….
+
+    ``worker_status["folders"]`` is ``(ID, name, ~ paths, short use)``
+    entries read off the UI thread (no rows until the first read; None when
+    a folder change's reread failed); ``folder_notice`` is the last folder
+    change's message and ``setup_changing_folders`` holds the buttons while
+    the setup window's folder step may write.
     """
     if "folders" not in worker_status:
         return []
@@ -594,37 +665,66 @@ def remote_folder_rows(worker_status: dict) -> list[dict]:
     unreadable = not isinstance(folders, list)
     locked = worker_status.get("setup_changing_folders") is True
     busy = worker_status.get("operation") is not None or locked
-    rows = [{"kind": "group", "section": SETTINGS_SECTION_REMOTE, "id": "remote_tasks_folders", "label": "Folders"}]
-    for workspace_id, label in [] if unreadable else folders:
-        full = _bounded_text(label, 400)
+    rows = [_section_row("remote_tasks_folders", "Folders")]
+    for workspace_id, name, paths, use in [] if unreadable else folders:
+        name, paths, use = _bounded_text(name, 100), _bounded_text(paths, 400), _bounded_text(use, 40)
+        short = name if len(name) <= REMOTE_FOLDER_NAME_CHARS else f"{name[:REMOTE_FOLDER_NAME_CHARS - 1]}…"
         rows.append({
             "kind": "button",
             "section": SETTINGS_SECTION_REMOTE,
             "id": "remote_tasks_folder_remove",
-            "label": _folder_row_label(full),
-            "full_label": full,
+            "label": short,
+            "detail": _folder_detail(paths, use, REMOTE_FOLDER_LABEL_CHARS - len(short)),
+            "full_label": f"{name} · {paths}" + (f" · {use}" if use else ""),
             "title": "Remove",
             "value": _bounded_text(workspace_id, 64),
             "disabled": busy,
         })
-    hints = [REMOTE_FOLDERS_UNREADABLE] if unreadable else [] if folders else [REMOTE_NO_FOLDERS]
-    if locked:
-        hints.append(REMOTE_SETUP_CHANGING_FOLDERS)
-    notice = _bounded_text(worker_status.get("folder_notice"), 200)
-    if notice:
-        hints.append(notice)
-    for hint in hints:
-        rows.append({"kind": "group", "style": "hint", "section": SETTINGS_SECTION_REMOTE,
-                     "id": "remote_tasks_folders_note", "label": hint, "lines": _hint_lines(hint)})
+    if unreadable or not folders:
+        rows.append(_remote_hint("remote_tasks_folders_note",
+                                 REMOTE_FOLDERS_UNREADABLE if unreadable else REMOTE_NO_FOLDERS))
     rows.append({
         "kind": "button",
         "section": SETTINGS_SECTION_REMOTE,
         "id": "remote_tasks_folder_add",
-        "label": "A git repo or a folder of repos",
-        "title": "Add folder…",
+        "label": "",
+        "title": "Add Folder…",
         "value": None,
         "disabled": busy,
     })
+    if locked:
+        rows.append(_remote_hint("remote_tasks_folders_note", REMOTE_SETUP_CHANGING_FOLDERS))
+    notice = _bounded_text(worker_status.get("folder_notice"), 200)
+    if notice:
+        rows.append(_remote_hint("remote_tasks_folders_note", notice))
+    return rows
+
+
+def remote_status_rows(worker_status: dict, *, enabled: bool, paused: bool, paired: bool,
+                       expanded: bool) -> list[dict]:
+    """Settings › Remote › Status: the one-line status, a key warning, Active job, then Details."""
+    tone, line = remote_status_line(worker_status, enabled=enabled, paused=paused)
+    job_id = _worker_active_job_id(worker_status)
+    rows = [
+        _section_row("group_remote_status", "Status"),
+        {"kind": "status", "section": SETTINGS_SECTION_REMOTE, "id": "remote_tasks_status",
+         "label": "Status", "value": line, "tone": tone},
+    ]
+    key_note = remote_key_copy(worker_status) if paired else ""
+    if key_note and key_note != REMOTE_KEY_RENEWS_NOTE:
+        rows.append(_remote_hint("remote_tasks_key", key_note))
+    rows += [
+        {"kind": "button", "section": SETTINGS_SECTION_REMOTE, "id": "remote_tasks_stop",
+         "label": "Active job", "detail": remote_job_words(worker_status), "title": "Stop",
+         "value": job_id, "disabled": job_id is None},
+        {"kind": "disclosure", "section": SETTINGS_SECTION_REMOTE, "id": "remote_tasks_details",
+         "label": "Details", "value": expanded},
+    ]
+    if expanded:
+        rows.append(_remote_hint("remote_tasks_status_details",
+                                 _remote_tasks_status_copy(worker_status, enabled=enabled, paused=paused)))
+        if key_note == REMOTE_KEY_RENEWS_NOTE:
+            rows.append(_remote_hint("remote_tasks_key", key_note))
     return rows
 
 
@@ -775,93 +875,50 @@ def settings_page_rows(
         temporary=bool(isinstance(login_item, dict) and login_item.get("temporary")),
     ))
 
+    status = worker_status or {}
     remote = [
-        {
-            "kind": "group",
-            "style": "section",
-            "section": SETTINGS_SECTION_REMOTE,
-            "id": "group_remote_tasks",
-            "label": "Remote tasks",
-        },
-        {
-            # The guided steps of `openswap worker pair`/`setup`, in dialogs.
-            "kind": "button",
-            "section": SETTINGS_SECTION_REMOTE,
-            "id": "remote_tasks_setup",
-            "label": "Set up Remote tasks…",
-            "title": "Set Up",
-            "value": None,
-            "disabled": (worker_status or {}).get("operation") is not None,
-        },
+        _section_row("group_remote_tasks", "Remote tasks"),
         {
             "kind": "toggle",
             "section": SETTINGS_SECTION_REMOTE,
             "id": "remote_tasks_enabled",
-            "label": "Enable local worker",
+            "label": "Local worker",
             "value": bool(worker_enabled),
-        },
-        _remote_tasks_account_row((worker_status or {}).get("account_picker")),
-        _remote_tasks_web_choice_row((worker_status or {}).get("account_picker")),
-        {
-            "kind": "status",
-            "section": SETTINGS_SECTION_REMOTE,
-            "id": "remote_tasks_status",
-            "label": "Status",
-            "value": _remote_tasks_status_copy(
-                worker_status or {}, enabled=worker_enabled, paused=worker_paused,
-            ),
         },
         {
             "kind": "toggle",
             "section": SETTINGS_SECTION_REMOTE,
             "id": "remote_tasks_paused",
-            "label": "Pause admission",
+            "label": "Pause new tasks",
             "value": bool(worker_paused),
             "disabled": not worker_enabled,
         },
         {
+            # The guided steps of `openswap worker pair`/`setup`, in the setup window.
             "kind": "button",
             "section": SETTINGS_SECTION_REMOTE,
-            "id": "remote_tasks_stop",
-            "label": "Active job",
-            "title": "Stop",
-            "value": _worker_active_job_id(worker_status or {}),
-            "disabled": _worker_active_job_id(worker_status or {}) is None,
+            "id": "remote_tasks_setup",
+            "label": "Setup",
+            "title": "Set Up…",
+            "value": None,
+            "disabled": status.get("operation") is not None,
         },
+        _section_row("group_remote_account", "Account"),
+        _remote_tasks_account_row(status.get("account_picker")),
+        _remote_tasks_web_choice_row(status.get("account_picker")),
+        *(remote_folder_rows(status) if worker_paired else []),
+        *remote_status_rows(status, enabled=worker_enabled, paused=worker_paused, paired=worker_paired,
+                            expanded="remote_tasks_details" in (expanded_sections or ())),
     ]
-    if worker_paired:
-        folders_at = next(i for i, row in enumerate(remote) if row["id"] == "remote_tasks_status")
-        remote[folders_at:folders_at] = remote_folder_rows(worker_status or {})
-    remote[1:1] = remote_connect_rows(worker_paired, worker_status or {})
-    setup_note = _bounded_text((worker_status or {}).get("setup_note"), 120)
+    remote[1:1] = remote_connect_rows(worker_paired, status)
+    setup_note = _bounded_text(status.get("setup_note"), 120)
     if setup_note:
         # Why Set up or Connect did nothing just now.
-        remote.insert(1, {"kind": "group", "style": "hint", "section": SETTINGS_SECTION_REMOTE,
-                          "id": "remote_tasks_setup_note", "label": setup_note, "lines": _hint_lines(setup_note)})
-    if worker_paired and not worker_enabled and (
-        (worker_status or {}).get("operation") != "worker_enable_or_disable"
-    ):
+        remote.insert(1, _remote_hint("remote_tasks_setup_note", setup_note))
+    if worker_paired and not worker_enabled and status.get("operation") != "worker_enable_or_disable":
         # Pairing never starts the worker; say so right under its switch.
         hint_at = next(i for i, row in enumerate(remote) if row["id"] == "remote_tasks_enabled") + 1
-        remote.insert(hint_at, {
-            "kind": "group",
-            "style": "hint",
-            "section": SETTINGS_SECTION_REMOTE,
-            "id": "remote_tasks_paired_off",
-            "label": REMOTE_TASKS_PAIRED_OFF_NOTE,
-        })
-    key_note = remote_key_copy(worker_status or {}) if worker_paired else ""
-    if key_note:
-        # The device key's renewal, right under the status it belongs to.
-        key_at = next(i for i, row in enumerate(remote) if row["id"] == "remote_tasks_status") + 1
-        remote.insert(key_at, {
-            "kind": "group",
-            "style": "hint",
-            "section": SETTINGS_SECTION_REMOTE,
-            "id": "remote_tasks_key",
-            "label": key_note,
-            "lines": _hint_lines(key_note),
-        })
+        remote.insert(hint_at, _remote_hint("remote_tasks_paired_off", REMOTE_TASKS_PAIRED_OFF_NOTE))
 
     automation = [
         {
@@ -1348,7 +1405,7 @@ def _remote_tasks_account_row(picker) -> dict:
         "kind": "popup",
         "section": SETTINGS_SECTION_REMOTE,
         "id": "remote_tasks_account",
-        "label": "Account",
+        "label": "Tasks use",
         "wide": True,
     }
     if not isinstance(picker, dict):
@@ -1415,10 +1472,7 @@ def _remote_tasks_web_choice_row(picker) -> dict:
         if isinstance(entry.get("identity"), str) and entry["identity"].startswith(("codex:", "claude:"))
     }
     count = len(allowed)
-    summary = (
-        "No accounts allowed for web choice" if count == 0
-        else f"{count} account{'s' if count != 1 else ''} allowed for web choice"
-    )
+    summary = "No accounts allowed" if count == 0 else f"{count} account{'s' if count != 1 else ''} allowed"
     options: list[tuple] = [("", summary)]
     listed = set()
     entries = [("Codex", "codex:", e) for e in picker.get("codex") or []] + [

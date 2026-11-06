@@ -790,7 +790,7 @@ and prints each step's command. While a URL is configured and the worker is
 disabled or not running, human `worker status` adds "Next: paired with
 <origin> but the worker is off; run `openswap worker enable`" (`--json` is
 unchanged), and the menu bar's Remote tasks section shows "Paired, worker
-off" under **Enable local worker**.
+off" under **Local worker**.
 
 ### Choosing the folders sessions work in
 
