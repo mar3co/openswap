@@ -1154,6 +1154,32 @@ def test_codex_log_answers_are_read_by_thread_from_codex_log_database(tmp_path):
     assert answers == {THREAD: pytest.approx(START + 3.075)}
 
 
+@pytest.mark.parametrize("schema", ["create table logs (id integer primary key, ts integer)",
+                                    "create table other (x text)", None])
+def test_c2_an_unexpected_codex_log_is_no_signal(tmp_path, schema):
+    from openswap.worker.attention import read_codex_answers
+
+    home = tmp_path / "codex"
+    home.mkdir()
+    if schema is None:
+        (home / "logs_2.sqlite").write_bytes(b"not a database")
+    else:
+        db = sqlite3.connect(home / "logs_2.sqlite")
+        db.execute(schema)
+        db.commit()
+        db.close()
+    before = (home / "logs_2.sqlite").read_bytes()
+    clock = Clock()
+    items = AttentionStore(tmp_path / "root", clock=clock,
+                           codex_answers=lambda threads: read_codex_answers([home], threads))
+    items.notice(codex_permission())
+    wait(items, clock, 7)
+    assert len(published(items)) == 1 and closes(items) == []  # published normally, nothing guessed
+    assert (home / "logs_2.sqlite").read_bytes() == before  # read-only
+    items.notice(codex_stop() | {"at": START + 8})
+    assert [c["reason"] for c in closes(items)] == ["answered_on_mac"]
+
+
 def _transcript(tmp_path, reviewer, turn="t1"):
     path = tmp_path / "rollout.jsonl"
     lines = [{"type": "session_meta", "payload": {"thread_source": "user"}},
