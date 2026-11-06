@@ -1090,6 +1090,8 @@ def run(switcher, codex=None) -> int:
             self._worker_status_cache["operation"] = self._worker_operation
             self._worker_status_cache.pop("folder_notice", None)
             self._worker_status_cache.pop("folder_baseline", None)
+            self._worker_status_cache.pop("diagnostic_notice", None)
+            self._worker_status_cache.pop("notice_state", None)
             self._worker_generation += 1
             generation = self._worker_generation
             threading.Thread(
@@ -1261,7 +1263,9 @@ def run(switcher, codex=None) -> int:
             state = remote_control_state(cache, self._worker_policy)
             if acting:
                 cache["diagnostic_notice"] = diagnostic
-            elif previous.get("diagnostic_notice") and previous.get("notice_state") == state:
+            elif (previous.get("diagnostic_notice") and previous.get("notice_state") == state
+                  and not (previous["diagnostic_notice"] == "status_read_failed"
+                           and cache.get("process_state") != "unavailable")):
                 cache["diagnostic_notice"] = previous["diagnostic_notice"]
             else:
                 cache["diagnostic_notice"] = None

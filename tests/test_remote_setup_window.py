@@ -1094,6 +1094,11 @@ def test_a_long_org_folders_line_reaches_settings_whole(research_home):
     (hint,) = [row for row in _remote(folders=[GITHUB], folder_notice=f"⚠ {line}")
                if row["id"] == "remote_tasks_folders_note"]
     assert hint["label"] == f"⚠ {line}" and line.endswith("and 13 more.")
+    shared = guided_setup.workspace_message("folder_permissions", gui=True)
+    line = guided_setup.repo_groups_message(github, 0, 0, [(github / ("x" * 60 + str(n)), shared) for n in range(5)])
+    (hint,) = [row for row in _remote(folders=[GITHUB], folder_notice=f"⚠ {line}")
+               if row["id"] == "remote_tasks_folders_note"]
+    assert hint["label"] == f"⚠ {line}" and line.endswith("and 2 more.")
 
 
 def test_the_window_recommends_and_checks_a_folder_of_org_folders(root, research_home):
@@ -1215,6 +1220,38 @@ def test_a_status_read_failing_after_a_change_does_not_say_the_change_failed(roo
     assert _settings(settings_app, "remote_tasks_paused")["diagnostic_notice"] == "status_read_failed"
     monkeypatch.setattr(cli, "request_pause", lambda *_args: (_ for _ in ()).throw(OSError("pause")))
     assert _settings(settings_app, "remote_tasks_paused")["diagnostic_notice"] == "worker_control_failed"
+
+
+def test_a_status_read_notice_goes_once_the_status_reads_again(settings_app, monkeypatch):
+    monkeypatch.setattr(cli, "request_pause", lambda *_args: {"accepted": True})
+    monkeypatch.setattr(cli, "read_status", lambda _root: (_ for _ in ()).throw(OSError("status")))
+    _settings(settings_app, "remote_tasks_paused")
+    assert _poll(settings_app, process_state="unavailable")["diagnostic_notice"] == "status_read_failed"
+    assert _poll(settings_app, process_state="running")["diagnostic_notice"] is None
+
+
+def test_a_new_action_clears_the_last_notice_while_it_runs(settings_app, monkeypatch):
+    monkeypatch.setattr(cli, "request_pause", lambda *_args: {"accepted": False})
+    assert _settings(settings_app, "remote_tasks_paused")["diagnostic_notice"] == "pause_refused"
+    started = threading.Event()
+    release = threading.Event()
+
+    def waiting(*_args):
+        started.set()
+        release.wait(5)
+        return {"accepted": True}
+
+    monkeypatch.setattr(cli, "request_pause", waiting)
+    settings_app._on_setting("remote_tasks_paused", None)
+    assert started.wait(5)
+    assert "diagnostic_notice" not in settings_app._worker_status_cache
+    release.set()
+    deadline = time.monotonic() + 20
+    while settings_app._worker_operation is not None:
+        assert time.monotonic() < deadline
+        settings_app._drain_worker_result()
+        time.sleep(0.005)
+    assert settings_app._worker_status_cache["diagnostic_notice"] is None
 
 
 def test_the_window_treats_a_symlinked_repo_as_no_repo_of_the_folder(root, research_home, tmp_path):

@@ -706,7 +706,7 @@ def remote_folder_rows(worker_status: dict) -> list[dict]:
     })
     if locked:
         rows.append(_remote_hint("remote_tasks_folders_note", REMOTE_SETUP_CHANGING_FOLDERS))
-    notice = _bounded_text(worker_status.get("folder_notice"), 400)
+    notice = _bounded_text(worker_status.get("folder_notice"), 1500)
     if notice:
         rows.append(_remote_hint("remote_tasks_folders_note", notice))
     return rows
