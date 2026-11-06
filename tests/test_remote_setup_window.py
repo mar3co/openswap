@@ -1197,6 +1197,9 @@ def test_a_direct_folder_is_named_by_its_label_and_says_in_place(root, research_
     ("worker_stop_unconfirmed", "disable",
      "Couldn't turn off the worker: the worker hasn't stopped yet; try again in a moment."),
     ("worker_disable_blocked", "disable", "Couldn't turn off the worker."),
+    ("pause_unconfirmed", "pause", "New tasks are paused, but the worker didn't confirm it."),
+    ("pause_unconfirmed", "resume", "New tasks can start again, but the worker didn't confirm it."),
+    ("pause_not_saved", "pause", "Couldn't pause new tasks."),
     ("worker_state_unavailable", "disable", "Couldn't turn off the worker: the worker's state could not be read."),
     ("worker_state_unavailable", "resume", "Couldn't resume new tasks: the worker's state could not be read."),
     ("worker_state_unavailable", "pause", "Couldn't pause new tasks: the worker's state could not be read."),
@@ -1262,6 +1265,16 @@ def test_a_locked_pause_or_turn_off_says_why_and_reads_the_status(settings_app, 
     status = _settings(settings_app, "remote_tasks_paused" if action == "pause" else "remote_tasks_enabled")
     assert (status["diagnostic_notice"], status["notice_action"], status["process_state"]) == (
         notice, action, "stopped")
+
+
+@pytest.mark.parametrize("payload, notice", [
+    ({"accepted": False, "diagnostic_code": "request_timeout", "restored": False}, "pause_unconfirmed"),
+    ({"accepted": False, "diagnostic_code": "invalid_pause_value", "restored": True}, "invalid_pause_value"),
+])
+def test_a_pause_left_saved_after_a_failed_rollback_says_it_is_unconfirmed(settings_app, monkeypatch,
+                                                                                    payload, notice):
+    monkeypatch.setattr(cli, "request_pause", lambda *_args: payload)
+    assert _settings(settings_app, "remote_tasks_paused")["diagnostic_notice"] == notice
 
 
 def test_a_refused_stop_outlives_a_refresh_that_cannot_read_the_status(settings_app, monkeypatch):

@@ -123,7 +123,11 @@ def request_stop(backup_root: Path, job_id: str | None) -> dict:
 
 
 def request_pause(backup_root: Path, paused: bool) -> dict:
-    """Persist admission policy and request the worker's barrier update."""
+    """Persist admission policy and request the worker's barrier update.
+
+    A change the worker didn't take is rolled back. ``restored`` says
+    whether the rollback worked; ``paused`` is always the saved value.
+    """
     root = Path(backup_root)
     _migrate_legacy_before_worker_state_change(root)
     with lifecycle_lock(root):
@@ -137,27 +141,27 @@ def request_pause(backup_root: Path, paused: bool) -> dict:
             except _SETTINGS_WRITE_ERRORS:
                 return False
 
+        restored = None
         try:
             result = WorkerClient(socket_path(root)).set_paused(paused)
         except IpcError as exc:
-            if str(exc) != "worker_unavailable":
-                restore_previous()
+            if str(exc) == "worker_unavailable":
+                result = {"accepted": True, "diagnostic_code": "worker_not_running"}
+            elif restore_previous():
                 raise
-            result = {"accepted": True, "diagnostic_code": "worker_not_running"}
-        if result.get("accepted") is not True:
+            else:
+                result, restored = {"diagnostic_code": str(exc)}, False
+        accepted = result.get("accepted") is True
+        if not accepted and restored is None:
             restored = restore_previous()
-            if not restored:
-                return {
-                    "accepted": False,
-                    "paused": load_worker_settings(root).paused,
-                    "diagnostic_code": "settings_unavailable",
-                }
-        persisted = load_worker_settings(root)
-        return {
-            "accepted": result.get("accepted") is True,
-            "paused": persisted.paused,
-            "diagnostic_code": result.get("diagnostic_code"),
+        payload = {
+            "accepted": accepted,
+            "paused": load_worker_settings(root).paused,
+            "diagnostic_code": result.get("diagnostic_code") or (None if accepted else "pause_refused"),
         }
+        if not accepted:
+            payload["restored"] = restored
+        return payload
 
 
 def _managed_worker_loaded() -> bool:
@@ -1505,7 +1509,7 @@ def _disable_locked(backup_root: Path) -> tuple[bool, dict, str | None]:
         try:
             update_worker_settings(backup_root, enabled=was_enabled, paused=True)
         except _SETTINGS_WRITE_ERRORS:
-            return False, _safe_snapshot(backup_root), "settings_unavailable"
+            pass  # The unload is still what failed; the caller reads the saved state.
         return False, _safe_snapshot(backup_root), "worker_unload_failed"
     if not _wait_for_worker_exit(backup_root):
         # Opt-out stays committed. Re-enabling policy here could let the
@@ -2271,20 +2275,24 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
         paused = not args.off
         try:
             payload = request_pause(root, paused)
-        except (IpcError, ClaudeSwitchError):
-            print("Could not change whether the worker takes tasks.", file=sys.stderr)
+        except (IpcError, ClaudeSwitchError) as exc:
+            print(BUSY_MESSAGE if str(exc) == "worker_lifecycle_busy"
+                  else "Could not change whether the worker takes tasks.", file=sys.stderr)
             return 1
         except (OSError, RuntimeError, ValueError):
             print(SETTINGS_MESSAGE, file=sys.stderr)
             return 1
         if payload["accepted"] is not True:
-            # The worker refused and the previous setting was restored: say what still holds.
+            # The worker didn't take the change: say what is saved, and whether it was rolled back.
             if args.json:
                 _write(payload, as_json=True)
             else:
-                still = "paused" if payload.get("paused") else "taking tasks"
-                print(f"{printer.MARK_BAD} Not changed ({payload.get('diagnostic_code')}); the worker is still "
-                      f"{still}.", file=sys.stderr)
+                code = payload.get("diagnostic_code")
+                state = "paused" if payload.get("paused") else "taking tasks"
+                line = (f"Not confirmed ({code}): the setting is saved as {state}, but the worker didn't confirm "
+                        "it." if payload.get("restored") is False
+                        else f"Not changed ({code}); the worker is still {state}.")
+                print(f"{printer.MARK_BAD} {line}", file=sys.stderr)
             return 1
         _write(
             payload,
@@ -2326,7 +2334,7 @@ def main(argv: list[str] | None = None, *, backup_root: Path | None = None) -> i
                 reason, step = _DISABLE_BLOCKED.get(diagnostic, ("the worker could not be proven idle", None))
                 if diagnostic == "lease_state_unknown":
                     step = _lease_release_step(root)
-                where = "no new task starts" if state is None else f"Remote tasks stay {state}"
+                where = "no new task starts" if state is None else f"Remote tasks are {state}"
                 line = f"Not stopped: {reason} ({diagnostic}). {where}."
                 print(line if step is None else f"{line} {printer.next_step(step)}", file=sys.stderr)
             return 1
