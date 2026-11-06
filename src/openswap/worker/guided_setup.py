@@ -242,9 +242,7 @@ def offer_worker(root: Path, ui: Prompts) -> None:
         cli.enable_worker(root)
     except ClaudeSwitchError as exc:
         code = str(exc)
-        message = cli._enable_failure_message(exc)
-        if _gui(ui):
-            message = _SETTINGS_ENABLE_MESSAGES.get(code, message)
+        message = enable_message(code) if _gui(ui) else cli._enable_failure_message(exc)
         if code in cli._ENABLE_DIAGNOSTICS:
             message = f"{message.rstrip('.')} ({code})."
         # Restarting can't help while a worker from Terminal runs.
@@ -298,6 +296,7 @@ _SETTINGS_ACCOUNT_MESSAGES = {
     "account_ambiguous": "That matches several accounts. Pick another.",
     "account_not_allowlisted": "Tasks can't pick that account yet. Pick another.",
     "account_is_default": "That is the pinned account already.",
+    "account_not_eligible": "That account can't be used for tasks. Pick another.",
 }
 NO_ACCOUNT = "No account to pick. Next: `openswap codex add` or `openswap add`."
 NO_ACCOUNT_SETTINGS = "No account to pick. Add a Claude or Codex account in OpenSwap first."
@@ -310,26 +309,55 @@ def account_message(code: str, *, gui: bool = False) -> str:
     return _SETTINGS_ACCOUNT_MESSAGES.get(code, text) if gui else text
 
 
-# Settings → Remote's words for control results the CLI's tables don't cover.
-_SETTINGS_CONTROL_MESSAGES = {
-    "status_read_failed": "Couldn't read the worker status after the change.",
-    "job_identity_unknown": "The running task couldn't be identified.",
-}
+STATUS_READ_FAILED = "Couldn't read the worker status after the change."
 CONTROL_FAILED = "That change didn't go through."
+# What each Settings → Remote control failed to do; a known reason follows after a colon.
+_CONTROL_FAILED = {
+    "enable": "Couldn't turn on the worker",
+    "disable": "Couldn't turn off the worker",
+    "pause": "Couldn't pause new tasks",
+    "resume": "Couldn't resume new tasks",
+    "stop": "Couldn't stop the task",
+}
+# Reasons the CLI's tables don't have, or word for the terminal.
+_CONTROL_REASONS = {
+    ("disable", "worker_stop_unconfirmed"): "the worker hasn't stopped yet; try again in a moment",
+    ("stop", "job_identity_unknown"): "the running task could not be identified",
+    ("stop", "job_not_found"): "that task has already ended",
+    ("stop", "active_job_mismatch"): "a different task is running now",
+    ("pause", "settings_unavailable"): "the worker couldn't apply it",
+    ("resume", "settings_unavailable"): "the worker couldn't apply it",
+}
 
 
-def control_message(code: str) -> str:
-    """Why a Settings → Remote control (switch, pause, stop, account) did not do what was asked."""
+def control_message(code: str, action: str | None = None) -> str:
+    """Why a Settings → Remote control did not do what was asked.
+
+    ``action`` is the control used: enable, disable, pause, resume, stop or
+    account; the same code can mean different things for different controls.
+    """
     cli = _cli()
-    if code in _SETTINGS_CONTROL_MESSAGES:
-        return _SETTINGS_CONTROL_MESSAGES[code]
-    if code in cli._ACCOUNT_MESSAGES:
-        return account_message(code, gui=True)
-    if code in cli._STOP_MESSAGES:
-        return f"Couldn't stop the task: {cli._STOP_MESSAGES[code]}."
-    if code in cli._DISABLE_BLOCKED:
-        return f"Couldn't turn off the worker: {cli._DISABLE_BLOCKED[code][0]}."
-    return CONTROL_FAILED
+    if code == "status_read_failed":
+        return STATUS_READ_FAILED
+    if code == "worker_lifecycle_busy":
+        return cli.BUSY_MESSAGE
+    if action == "account":
+        return account_message(code, gui=True) if code in cli._ACCOUNT_MESSAGES else CONTROL_FAILED
+    if action == "enable" and code in cli._ENABLE_DIAGNOSTICS:
+        return enable_message(code)
+    if action not in _CONTROL_FAILED:
+        return CONTROL_FAILED
+    reason = _CONTROL_REASONS.get((action, code))
+    if reason is None and action == "disable" and code in cli._DISABLE_BLOCKED:
+        reason = cli._DISABLE_BLOCKED[code][0]
+    if reason is None and action == "stop":
+        reason = cli._STOP_MESSAGES.get(code)
+    return f"{_CONTROL_FAILED[action]}: {reason}." if reason else f"{_CONTROL_FAILED[action]}."
+
+
+def enable_message(code: str) -> str:
+    """Why the worker didn't start, in the setup window's and Settings' words."""
+    return _SETTINGS_ENABLE_MESSAGES.get(code) or _cli()._enable_failure_message(ClaudeSwitchError(code))
 
 
 def confirm_account(root: Path, ui: Prompts) -> None:
@@ -914,6 +942,12 @@ def add_repo_groups(root: Path, folder) -> tuple[str, bool, bool] | None:
 
 
 REPO_GROUPS_NAMED = 3
+# Each name, path and reason is cut to these lengths, so the line fits Settings' notice bound whole.
+_NAME_LIMIT, _PATH_LIMIT, _REASON_LIMIT = 60, 200, 200
+
+
+def _trim(text: str, limit: int) -> str:
+    return text if len(text) <= limit else f"{text[:limit - 1]}…"
 
 
 def repo_groups_message(folder: Path, added: int, saved: int, refused: list[tuple[Path, str]]) -> str:
@@ -922,12 +956,12 @@ def repo_groups_message(folder: Path, added: int, saved: int, refused: list[tupl
     ``added`` and ``saved`` (already allowed) count subfolders; ``refused``
     is ``(subfolder, reason)`` pairs, the first ``REPO_GROUPS_NAMED`` named.
     """
-    shown = _display_path(folder)
+    shown = _trim(_display_path(folder), _PATH_LIMIT)
     if not refused:
         return f"Added {added} folder{'s' if added != 1 else ''} from {shown}." if added else "Already allowed."
     if not added and not saved and len(refused) == 1:
         group, reason = refused[0]
-        return f"{_display_path(group)}: {_clause(reason)}."
+        return f"{_trim(_display_path(group), _PATH_LIMIT)}: {_trim(_clause(reason), _REASON_LIMIT)}."
     if added:
         head = f"Added {added} folder{'s' if added != 1 else ''} from {shown}"
         head += f"; {saved} already allowed" if saved else ""
@@ -935,9 +969,12 @@ def repo_groups_message(folder: Path, added: int, saved: int, refused: list[tupl
         head = f"{saved} already allowed from {shown}"
     else:
         head = f"No folders added from {shown}"
-    names = ", ".join(f"{group.name} ({_clause(reason)})" for group, reason in refused[:REPO_GROUPS_NAMED])
+    names = [f"{_trim(group.name, _NAME_LIMIT)}: {_trim(_clause(reason), _REASON_LIMIT)}."
+             for group, reason in refused[:REPO_GROUPS_NAMED]]
     more = len(refused) - REPO_GROUPS_NAMED
-    return f"{head}; {len(refused)} not added: {names}{f' and {more} more' if more > 0 else ''}."
+    if more > 0:
+        names.append(f"And {more} more.")
+    return f"{head}. {len(refused)} not added. {' '.join(names)}"
 
 
 def _bad_choice(count: int) -> str:

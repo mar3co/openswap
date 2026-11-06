@@ -1092,6 +1092,7 @@ def run(switcher, codex=None) -> int:
             self._worker_status_cache.pop("folder_baseline", None)
             self._worker_status_cache.pop("diagnostic_notice", None)
             self._worker_status_cache.pop("notice_state", None)
+            self._worker_status_cache.pop("notice_action", None)
             self._worker_generation += 1
             generation = self._worker_generation
             threading.Thread(
@@ -1102,12 +1103,15 @@ def run(switcher, codex=None) -> int:
 
         def _worker_action_worker(self, generation, row_id, value):
             diagnostic = None
+            action = None
             acted = False
             policy = None
             notice = None
             try:
+                from openswap.exceptions import ClaudeSwitchError
                 from openswap.settings import load_worker_settings
                 from openswap.worker.cli import (
+                    _ENABLE_DIAGNOSTICS,
                     disable_worker,
                     enable_worker,
                     request_pause,
@@ -1118,16 +1122,23 @@ def run(switcher, codex=None) -> int:
                 root = self.switcher.backup_dir
                 if row_id == "remote_tasks_enabled":
                     if self._worker_policy.enabled:
+                        action = "disable"
                         ok, _result, diagnostic = disable_worker(root)
                         if not ok:
                             diagnostic = diagnostic or "worker_disable_blocked"
                     else:
-                        enable_worker(root)
+                        action = "enable"
+                        try:
+                            enable_worker(root)
+                        except ClaudeSwitchError as exc:
+                            diagnostic = str(exc) if str(exc) in _ENABLE_DIAGNOSTICS else "worker_control_failed"
                 elif row_id == "remote_tasks_paused":
+                    action = "resume" if self._worker_policy.paused else "pause"
                     result = request_pause(root, not self._worker_policy.paused)
                     if result.get("accepted") is not True:
                         diagnostic = result.get("diagnostic_code") or "pause_refused"
                 elif row_id == "remote_tasks_stop":
+                    action = "stop"
                     if not isinstance(value, str) or not value:
                         diagnostic = "job_identity_unknown"
                     else:
@@ -1135,8 +1146,10 @@ def run(switcher, codex=None) -> int:
                         if result.get("accepted") is not True:
                             diagnostic = result.get("diagnostic_code") or "stop_refused"
                 elif row_id == "remote_tasks_account":
+                    action = "account"
                     diagnostic = self._pin_worker_account(root, value)
                 elif row_id == "remote_tasks_web_choice":
+                    action = "account"
                     diagnostic = self._toggle_web_choice(root, value)
                 elif row_id == "remote_tasks_folder_add":
                     from openswap.worker.guided_setup import add_folder
@@ -1170,6 +1183,8 @@ def run(switcher, codex=None) -> int:
                 snapshot.setdefault("folders", None)
             if notice is not None:
                 snapshot["folder_notice"] = notice
+            if diagnostic and action:
+                snapshot["notice_action"] = action
             with self._worker_result_lock:
                 if generation == self._worker_generation:
                     self._worker_result = (generation, snapshot, policy, diagnostic)
@@ -1257,20 +1272,22 @@ def run(switcher, codex=None) -> int:
             if policy is not None:
                 self._worker_policy = policy
             cache.pop("operation", None)
-            from openswap.menubar_display import remote_control_state
+            from openswap.menubar_display import kept_control_state, remote_control_state
 
             # An action's result stays until the next action, or until a refresh shows the controls changed.
             state = remote_control_state(cache, self._worker_policy)
+            notice, notice_state = None, None
             if acting:
-                cache["diagnostic_notice"] = diagnostic
-            elif (previous.get("diagnostic_notice") and previous.get("notice_state") == state
-                  and not (previous["diagnostic_notice"] == "status_read_failed"
-                           and cache.get("process_state") != "unavailable")):
-                cache["diagnostic_notice"] = previous["diagnostic_notice"]
-            else:
-                cache["diagnostic_notice"] = None
-            if cache["diagnostic_notice"]:
-                cache["notice_state"] = state
+                notice, notice_state = diagnostic, state
+            elif previous.get("diagnostic_notice"):
+                notice_state = kept_control_state(previous.get("notice_state"), state)
+                readable = cache.get("process_state") != "unavailable"
+                if notice_state is not None and not (previous["diagnostic_notice"] == "status_read_failed" and readable):
+                    notice = previous["diagnostic_notice"]
+                    cache["notice_action"] = previous.get("notice_action")
+            cache["diagnostic_notice"] = notice
+            if notice:
+                cache["notice_state"] = notice_state
             self._reload_remote_settings()
 
         def _stop_codex_engine(self):
