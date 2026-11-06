@@ -71,3 +71,15 @@ def test_details_expand_to_the_full_status_fields(panel):
     assert details.accessibilityValue() == "Collapsed"
     details.performClick_(None)
     assert any("provider available" in text for text in _labels(panel._controller.view()))
+
+
+def test_a_long_remote_page_scrolls_within_the_screen():
+    folders = [(f"org{n}", f"org{n}", f"~/GitHub/org{n}", "") for n in range(16)]
+    panel = make_panel(folders=folders)
+    try:
+        panel._available_panel_height = lambda: 460
+        panel.reload()
+        assert panel._settings_scroll is not None
+        assert panel._controller.view().frame().size.height <= 460
+    finally:
+        panel.close()

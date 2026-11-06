@@ -2489,9 +2489,7 @@ class MenuBarPanel:
         for row in rows:
             body_h += _row_height(row) + SETTINGS_ROW_GAP
         chrome_h = PAD + HEADER_H + SETTINGS_TABS_H + PAD
-        visible_body_h = body_h
-        if self._settings_section == SETTINGS_SECTION_DESKTOP:
-            visible_body_h = min(body_h, max(120, (self._available_panel_height() or 640) - chrome_h))
+        visible_body_h = min(body_h, max(120, (self._available_panel_height() or 640) - chrome_h))
         height = chrome_h + visible_body_h
         root = _RootView.alloc().initWithHover_(self._on_hover)
         root.setFrame_(NSMakeRect(0, 0, PANEL_WIDTH, height))
