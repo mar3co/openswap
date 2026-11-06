@@ -310,6 +310,11 @@ def account_message(code: str, *, gui: bool = False) -> str:
 
 
 STATUS_READ_FAILED = "Couldn't read the worker status after the change."
+# The change is saved (and admission follows the saved value), but the worker didn't confirm it.
+_PAUSE_UNCONFIRMED = {
+    "pause": "New tasks are paused, but the worker didn't confirm it.",
+    "resume": "New tasks can start again, but the worker didn't confirm it.",
+}
 CONTROL_FAILED = "That change didn't go through."
 # What each Settings → Remote control failed to do; a known reason follows after a colon.
 _CONTROL_FAILED = {
@@ -348,6 +353,8 @@ def control_message(code: str, action: str | None = None) -> str:
         return account_message(code, gui=True) if code in cli._ACCOUNT_MESSAGES else CONTROL_FAILED
     if action == "enable" and code in cli._ENABLE_DIAGNOSTICS:
         return enable_message(code)
+    if code == "pause_unconfirmed" and action in _PAUSE_UNCONFIRMED:
+        return _PAUSE_UNCONFIRMED[action]
     if action not in _CONTROL_FAILED:
         return CONTROL_FAILED
     reason = _CONTROL_REASONS.get((action, code))
