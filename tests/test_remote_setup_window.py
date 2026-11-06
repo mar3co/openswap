@@ -1197,6 +1197,9 @@ def test_a_direct_folder_is_named_by_its_label_and_says_in_place(root, research_
     ("worker_stop_unconfirmed", "disable",
      "Couldn't turn off the worker: the worker hasn't stopped yet; try again in a moment."),
     ("worker_disable_blocked", "disable", "Couldn't turn off the worker."),
+    ("worker_state_unavailable", "disable", "Couldn't turn off the worker: the worker's state could not be read."),
+    ("worker_state_unavailable", "resume", "Couldn't resume new tasks: the worker's state could not be read."),
+    ("worker_state_unavailable", "pause", "Couldn't pause new tasks: the worker's state could not be read."),
     ("job_still_active", "disable", "Couldn't turn off the worker: a task is still running."),
     ("job_not_found", "stop", "Couldn't stop the task: that task has already ended."),
     ("stop_refused", "stop", "Couldn't stop the task."),
@@ -1243,6 +1246,22 @@ def test_a_refused_start_reads_the_status_and_says_why(settings_app, monkeypatch
     status = _settings(settings_app, "remote_tasks_enabled")
     assert (status["diagnostic_notice"], status["notice_action"], status["process_state"]) == (
         "kickoff_in_progress", "enable", "stopped")
+
+
+@pytest.mark.parametrize("function, enabled, action", [
+    ("request_pause", False, "pause"), ("disable_worker", True, "disable")])
+@pytest.mark.parametrize("code, notice", [
+    ("worker_lifecycle_busy", "worker_lifecycle_busy"),
+    ("worker_state_unavailable", "worker_state_unavailable"),
+    ("/private/path detail", "worker_control_failed"),
+])
+def test_a_locked_pause_or_turn_off_says_why_and_reads_the_status(settings_app, monkeypatch, function, enabled,
+                                                                   action, code, notice):
+    monkeypatch.setattr(cli, function, lambda *_args: (_ for _ in ()).throw(ClaudeSwitchError(code)))
+    settings_app._worker_policy = WorkerSettings(enabled=enabled)
+    status = _settings(settings_app, "remote_tasks_paused" if action == "pause" else "remote_tasks_enabled")
+    assert (status["diagnostic_notice"], status["notice_action"], status["process_state"]) == (
+        notice, action, "stopped")
 
 
 def test_a_refused_stop_outlives_a_refresh_that_cannot_read_the_status(settings_app, monkeypatch):
