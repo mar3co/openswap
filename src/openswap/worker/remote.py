@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import http.client
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -29,6 +30,7 @@ from openswap.worker.protocol import (
 
 STATES = frozenset(state.value for state in JobState)
 # The protocol caps heartbeat cancel_job_ids; a longer list is a malformed response.
+logger = logging.getLogger(__name__)
 MAX_CANCEL_IDS = 100
 # Reserved by the protocol: v1 has no approval/resume operation, so it fails closed.
 APPROVAL = "waiting_for_approval"
@@ -373,11 +375,11 @@ class RemoteClient:
         # Fixed length whatever the remote ID's size (IDs may be 200 characters).
         return "remote:" + hashlib.sha256((self.journal.service + "\0" + claim.job_id).encode()).hexdigest()
 
-    def _worker_request(self, operation):
+    def _worker_request(self, operation, extra=None):
         """``heartbeat``/``poll``: a stale worker epoch means another registration
         superseded this one, so re-register on the next tick instead of reporting online."""
         try:
-            return self.transport.request(operation, {"worker_epoch": self.worker_epoch})
+            return self.transport.request(operation, {"worker_epoch": self.worker_epoch, **(extra or {})})
         except ProtocolError as exc:
             if exc.code == "stale_epoch":
                 with self._lock:
@@ -726,6 +728,7 @@ class RemoteClient:
                 store.clear()
             workspaces = load_worker_settings(self.runtime.backup_root).workspaces
             body, closed_ids = store.report(notices=switches.notices, details=switches.details,
+                                            replies=switches.replies,
                                             folder_label=lambda cwd: approved_folder_label(workspaces, cwd))
             fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
             if not closed_ids and self._attention_sent == (epoch, fingerprint):
@@ -764,6 +767,7 @@ class RemoteClient:
             try:
                 store.refresh()  # session files and Codex's log: answers and exits that fire no hook
                 store.tick()
+                store.apply_replies(self._server_now().timestamp())
                 now = time.monotonic()
                 if now >= next_pass:
                     next_pass = now + HEARTBEAT_SECONDS
@@ -820,12 +824,19 @@ class RemoteClient:
             return False
         if self.state in FINAL:
             return False  # only a new enrollment (re-pair) can restore access
+        store, acks = None, []
         try:
             if self.worker_epoch is None:
                 registered = self.transport.request("register", {})
                 self.worker_epoch = integer(registered["worker_epoch"], 1)
             sent = datetime.now(timezone.utc)
-            heartbeat = self._worker_request("heartbeat")
+            # Session attention replies ride on the heartbeat. Outcomes go out on
+            # any registration of a service that accepted "attention" (kept until
+            # a heartbeat carrying them succeeds); replies come in only for the
+            # registration that advertised it.
+            store = getattr(self.runtime, "attention", None)
+            acks = store.take_acks() if store is not None and self._attention_epoch is not None else []
+            heartbeat = self._worker_request("heartbeat", {"attention_acks": acks} if acks else None)
             seen = timestamp(heartbeat["last_seen_at"])
             cancel_ids = heartbeat["cancel_job_ids"]
             if (not isinstance(cancel_ids, list) or len(cancel_ids) > MAX_CANCEL_IDS
@@ -838,9 +849,18 @@ class RemoteClient:
                 self._skew = seen - sent
                 # Only queued here: runtime control calls never delay the next heartbeat.
                 self._cancels.update(cancel_ids)
+            if store is not None:
+                store.acks_sent(acks)
+                if self._attention_epoch is not None and self._attention_epoch == self.worker_epoch:
+                    # Only queued here too: the attention thread applies them.
+                    store.queue_replies(heartbeat.get("attention_replies"))
             self._connectivity()
             return self.state == "online"
         except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
+            if acks and isinstance(exc, ProtocolError) and exc.code == "invalid_request":
+                # A service that no longer takes them must not keep the Mac offline.
+                logger.warning("Session reply outcomes refused by the control service; dropping %d", len(acks))
+                store.acks_sent(acks)
             self._connectivity(exc)
             return False
 

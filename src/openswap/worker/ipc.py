@@ -154,11 +154,17 @@ def _dispatch_control(request: dict, command: object, control: WorkerControl) ->
     return None, "unsupported_request"
 
 
+# Connections that stay open and receive something back (plan 025 S2).
+LINKED_COMMANDS = frozenset({"channel", "question"})
+
+
 def _handle_connection(
     connection: socket.socket,
     control: WorkerControl,
     notices: AttentionStore | None = None,
     control_lock: threading.Lock | None = None,
+    stop_event: Event | None = None,
+    release=None,
 ) -> None:
     connection.settimeout(IO_TIMEOUT_SECONDS)
     try:
@@ -168,6 +174,13 @@ def _handle_connection(
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
             response = _encode_response(error="invalid_json")
         else:
+            command = request.get("command") if isinstance(request, dict) else None
+            if (notices is not None and isinstance(command, str) and command in LINKED_COMMANDS
+                    and request.get("version") == IPC_VERSION):
+                from openswap.worker import channel_link
+
+                channel_link.serve(notices, connection, request, stop_event or Event(), release or (lambda: None))
+                return
             try:
                 result, error = _dispatch(request, control, notices, control_lock)
                 response = _encode_response(result, error)
@@ -272,11 +285,20 @@ def serve(
         handlers: list[threading.Thread] = []
 
         def handle(connection: socket.socket) -> None:
+            # A channel or a waiting question hook, once accepted, gives its slot
+            # back: the attention store bounds how many of those stay open.
+            released = threading.Event()
+
+            def release() -> None:
+                if not released.is_set():
+                    released.set()
+                    slots.release()
+
             try:
                 with connection:
-                    _handle_connection(connection, control, notices, control_lock)
+                    _handle_connection(connection, control, notices, control_lock, stop_event, release)
             finally:
-                slots.release()
+                release()
 
         try:
             while not stop_event.is_set():

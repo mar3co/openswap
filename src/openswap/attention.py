@@ -48,19 +48,36 @@ HOOK_EVENTS = {
     "SessionEnd": "",
 }
 HOOK_TIMEOUT_SECONDS = 10
+# The synchronous question hook (installed only while replies are on) waits up to
+# this long for an answer from the phone or watch; the worker ends its wait sooner.
+QUESTION_EVENT = "question"
+QUESTION_TIMEOUT_SECONDS = 600
+CHANNEL_COMMAND = "channel"
 
 
 # --- the entry point ---------------------------------------------------------
 
 
 CHANNEL_TAG = '<channel source="openswap"'
+# A message from the phone or watch carries its reply's token back in this attribute.
+_REPLY_ATTRIBUTE = re.compile(r'<channel source="openswap" reply="([a-z0-9]{1,32})"')
 # How Claude Code starts a turn with a background task's (a subagent's) result.
 TASK_TAG = "<task-notification>"
 SESSION_COMMANDS = frozenset({"/clear", "/exit", "/quit"})
 
 
 def main(argv: list[str]) -> int:
-    """``openswap attention <event>``: never raises, never prints, exits 0."""
+    """``openswap attention <event>``: never raises, never prints, exits 0.
+
+    ``openswap attention channel`` is OpenSwap's channel (see ``openswap.channel``)
+    and ``openswap attention question`` the synchronous question hook, which
+    prints a decision when it has one."""
+    if argv == [CHANNEL_COMMAND]:
+        from openswap.channel import main as channel_main
+
+        return channel_main()
+    if argv == [QUESTION_EVENT]:
+        return question_main()
     import signal
     import time
 
@@ -96,11 +113,54 @@ def _read_stdin() -> bytes:
     return b"" if len(data) > MAX_STDIN_BYTES else data
 
 
+# Claude Code 2.1.311 previews a call for a channel as ``{ <field>, <field> }``,
+# each field ``JSON.stringify(key): JSON.stringify(value)``, with control and
+# some look-alike characters replaced, runs of whitespace collapsed, long
+# fields cut and credentials masked. Only a preview none of that changed can
+# prove which call it shows.
+PREVIEW_FIELD_LIMIT = 3500
+PREVIEW_TOTAL_LIMIT = 15000
+
+
+def channel_preview(tool_input: object) -> str | None:
+    """The ``input_preview`` Claude Code relays to a channel for this input, or
+    None when its preview would not show the input exactly (then no channel
+    request can be proven to be this call)."""
+    if not isinstance(tool_input, dict):
+        return None
+    fields = []
+    for key, value in tool_input.items():
+        try:
+            parts = [json.dumps(part, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                     for part in (key, value)]
+        except (TypeError, ValueError, RecursionError):
+            return None
+        for part in parts:
+            if (len(part) > PREVIEW_FIELD_LIMIT or "  " in part or "[REDACTED]" in part
+                    or not all(" " <= c <= "~" for c in part)):
+                return None
+        fields.append(f"{parts[0]}: {parts[1]}")
+    preview = "{ " + ", ".join(fields) + " }"
+    return preview if len(preview) <= PREVIEW_TOTAL_LIMIT else None
+
+
 def tool_key(tool_input: object) -> str:
     """A digest that matches a ``PermissionRequest`` to its ``PostToolUse``; the
     tool's input itself never leaves the hook."""
     encoded = json.dumps(tool_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
     return hashlib.sha256(encoded.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def question_key(tool_input: object) -> str:
+    """``tool_key`` for ``AskUserQuestion``: of its questions only, since the
+    answers join its input by ``PostToolUse``."""
+    return tool_key(tool_input.get("questions") if isinstance(tool_input, dict) else None)
+
+
+def _agent(data: dict) -> str:
+    agent = data.get("agent_id")
+    return agent if isinstance(agent, str) and 0 < len(agent) <= 64 and all(
+        c.isascii() and (c.isalnum() or c in "_-") for c in agent) else ""
 
 
 def _hook_notice(event: str, raw: bytes) -> dict | None:
@@ -127,15 +187,31 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
     tool_name = clean_text(data.get("tool_name"), DETAIL_CAPS["tool_name"])
     tool_input = data.get("tool_input")
     if event in ("PermissionRequest", "PostToolUse", "PostToolUseFailure") and tool_name:
-        agent = data.get("agent_id")
-        if isinstance(agent, str) and 0 < len(agent) <= 64 and all(
-                c.isascii() and (c.isalnum() or c in "_-") for c in agent):
+        agent = _agent(data)
+        if agent:
             notice["agent_id"] = agent
         notice["tool_name"] = tool_name
-        notice["tool_key"] = tool_key(tool_input)
+        notice["tool_key"] = question_key(tool_input) if tool_name == "AskUserQuestion" else tool_key(tool_input)
+        if event == "PermissionRequest" and tool_name != "AskUserQuestion":
+            from openswap.worker.attention import preview_key
+
+            preview = channel_preview(tool_input)
+            if preview is not None:
+                notice["preview_key"] = preview_key(preview)
+        if event != "PermissionRequest" and tool_name == "AskUserQuestion" and isinstance(tool_input, dict):
+            from openswap.worker.attention import answer_positions
+
+            response = data.get("tool_response") if isinstance(data.get("tool_response"), dict) else {}
+            answers = tool_input.get("answers", response.get("answers"))
+            positions = answer_positions(tool_input.get("questions"), answers)
+            if positions:
+                notice["answers"] = positions
         if event == "PermissionRequest" and isinstance(tool_input, dict):
             if tool_name == "AskUserQuestion":
-                notice["questions"] = clean_questions(tool_input.get("questions"))
+                raw, questions = tool_input.get("questions"), clean_questions(tool_input.get("questions"))
+                # Shown (and answerable) only whole: a question left out could not be answered.
+                if isinstance(raw, list) and len(questions) == len(raw):
+                    notice["questions"] = questions
             elif tool_name == "Bash":
                 # The model's own words for the command, never the raw command.
                 description = clean_text(tool_input.get("description"), DETAIL_CAPS["description"],
@@ -149,6 +225,9 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
         prompt = data.get("prompt") if isinstance(data.get("prompt"), str) else ""
         if prompt.startswith(CHANNEL_TAG):
             notice["prompt_kind"] = "channel"
+            token = _REPLY_ATTRIBUTE.match(prompt)
+            if token:
+                notice["reply"] = token.group(1)
         elif prompt.startswith(TASK_TAG):
             notice["prompt_kind"] = "task"
         elif prompt.strip().split(" ", 1)[0] in SESSION_COMMANDS:
@@ -262,6 +341,80 @@ def approvals_reviewer(transcript: object, turn_id: object) -> str | None:
     return latest
 
 
+def question_main(*, backup_root: Path | None = None) -> int:
+    """``openswap attention question``: the synchronous ``PermissionRequest`` hook
+    on ``AskUserQuestion``, installed only while replies are on.
+
+    In a session with OpenSwap's channel it waits for the owner's answer from
+    the phone or watch and gives it to Claude Code; it prints nothing (leaving
+    the dialog to the owner) when the session has no channel, the question
+    closes, the wait passes 10 minutes or the worker is gone. Never raises."""
+    try:
+        data = json.loads(_read_stdin())
+        if not isinstance(data, dict) or data.get("tool_name") != "AskUserQuestion":
+            return 0
+        session, tool_input = data.get("session_id"), data.get("tool_input")
+        if not isinstance(session, str) or not isinstance(tool_input, dict):
+            return 0
+        positions = _wait_for_answer(session, question_key(tool_input), _agent(data), backup_root)
+        answers = _answers(tool_input.get("questions"), positions)
+        if answers:
+            sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
+                "behavior": "allow", "updatedInput": {**tool_input, "answers": answers}}}}))
+            sys.stdout.flush()
+    except BaseException:  # noqa: BLE001 - a hook must never fail loudly
+        pass
+    return 0
+
+
+def _wait_for_answer(session: str, key: str, agent: str, backup_root: Path | None) -> object:
+    from openswap import paths
+    from openswap.worker.ipc import IPC_VERSION, socket_path
+
+    path = socket_path(backup_root or paths.get_backup_root())
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(QUESTION_TIMEOUT_SECONDS - 5)
+        try:
+            client.connect(str(path))
+            request = {"version": IPC_VERSION, "command": QUESTION_EVENT, "session_id": session, "tool_key": key}
+            if agent:
+                request["agent_id"] = agent
+            client.sendall(json.dumps(request).encode() + b"\n")
+            line = client.makefile("rb").readline(65536)
+        except OSError:
+            return None
+    try:
+        answer = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    return answer.get("answers") if isinstance(answer, dict) else None
+
+
+def _answers(questions: object, positions: object) -> dict:
+    """``AskUserQuestion``'s ``answers`` (question text to option label) for the
+    (question, option) positions the owner chose, in the questions as the report
+    showed them; {} unless every shown question gets one shown option."""
+    from openswap.worker.attention import question_entries
+
+    entries = question_entries(questions)
+    # Every question must have been shown: one the report left out would go unanswered.
+    if (not isinstance(questions, list) or len(entries) != len(questions) or not isinstance(positions, list)
+            or len(positions) != len(entries)):
+        return {}
+    answers = {}
+    for position in positions:
+        if not (isinstance(position, list) and len(position) == 2 and all(type(n) is int for n in position)):
+            return {}
+        question, option = position
+        if not 0 <= question < len(entries) or not 0 <= option < len(entries[question][2]):
+            return {}
+        _, raw_question, raw_labels = entries[question]
+        if not isinstance(raw_question, str) or not isinstance(raw_labels[option], str) or raw_question in answers:
+            return {}
+        answers[raw_question] = raw_labels[option]
+    return answers
+
+
 def send_notice(notice: dict, *, backup_root: Path | None = None) -> None:
     """Hand one notice to the worker's socket; any failure drops it."""
     from openswap import paths
@@ -300,6 +453,9 @@ def hook_command(event: str, executable: str) -> str:
     return f"{shlex.quote(executable)} attention {event}"
 
 
+OUR_HOOK_WORDS = frozenset({*HOOK_EVENTS, QUESTION_EVENT})
+
+
 def _is_openswap(word: str) -> bool:
     from openswap.statusline import _is_app_executable
 
@@ -314,7 +470,7 @@ def is_our_hook_command(command: object) -> bool:
         words = shlex.split(command)
     except ValueError:
         return False
-    return len(words) == 3 and words[1] == "attention" and words[2] in HOOK_EVENTS and _is_openswap(words[0])
+    return len(words) == 3 and words[1] == "attention" and words[2] in OUR_HOOK_WORDS and _is_openswap(words[0])
 
 
 # --- Claude Code settings.json ----------------------------------------------
@@ -373,10 +529,10 @@ def _without_ours(groups: list) -> list:
     return out
 
 
-def _with_hooks(settings: dict, executable: str | None) -> dict:
-    """``settings`` with OpenSwap's hooks for ``executable`` (None: removed).
-    Every other hook is kept as written. Raises ConfigError for a ``hooks``
-    value this would have to overwrite."""
+def _with_hooks(settings: dict, executable: str | None, *, question: bool = False) -> dict:
+    """``settings`` with OpenSwap's hooks for ``executable`` (None: removed), and
+    with ``question`` the synchronous question hook too. Every other hook is kept
+    as written. Raises ConfigError for a ``hooks`` value this would have to overwrite."""
     hooks = settings.get("hooks", {})
     if not isinstance(hooks, dict) or any(not isinstance(hooks.get(e, []), list) for e in HOOK_EVENTS):
         raise ConfigError("Claude Code's hooks setting is not in the expected form; refusing to rewrite it")
@@ -388,6 +544,11 @@ def _with_hooks(settings: dict, executable: str | None) -> dict:
                 "type": "command", "command": hook_command(event, executable),
                 "async": True, "timeout": HOOK_TIMEOUT_SECONDS,
             }]})
+            if question and event == "PermissionRequest":
+                groups.append({"matcher": "AskUserQuestion", "hooks": [{
+                    "type": "command", "command": hook_command(QUESTION_EVENT, executable),
+                    "timeout": QUESTION_TIMEOUT_SECONDS,
+                }]})
         if groups:
             hooks[event] = groups
         else:
@@ -409,11 +570,12 @@ def _has_ours(settings: dict) -> bool:
         for h in group["hooks"])
 
 
-def set_hooks(config_home: Path, executable: str | None) -> bool:
-    """Install OpenSwap's hooks for ``executable`` in one config home, or remove
-    them (None). Reads before writing: a settings file that cannot be read is
-    left alone (ConfigError). A file without OpenSwap's hooks is never
-    rewritten to remove them. Returns whether the file changed."""
+def set_hooks(config_home: Path, executable: str | None, *, question: bool = False) -> bool:
+    """Install OpenSwap's hooks for ``executable`` in one config home (with
+    ``question``, the question hook too), or remove them (None). Reads before
+    writing: a settings file that cannot be read is left alone (ConfigError). A
+    file without OpenSwap's hooks is never rewritten to remove them. Returns
+    whether the file changed."""
     from openswap.statusline import _read_json_for_write, _write_json
 
     path = Path(config_home) / "settings.json"
@@ -422,7 +584,7 @@ def set_hooks(config_home: Path, executable: str | None) -> bool:
     settings = _read_json_for_write(path)
     if executable is None and not _has_ours(settings):
         return False
-    updated = _with_hooks(settings, executable)
+    updated = _with_hooks(settings, executable, question=question)
     if updated == settings:
         return False
     _write_json(path, updated)
@@ -800,10 +962,11 @@ def codex_hooks_status(codex_home: Path, backup_root: Path) -> str | None:
 # --- turning it on and off -----------------------------------------------------
 
 
-def apply(backup_root: Path, enabled: bool) -> tuple[bool, list[str]]:
-    """Install (or remove) the hooks in every managed config home and in the
-    Codex home. Every place is tried; returns whether anything changed, and
-    what could not be changed, in words, for the owner."""
+def apply(backup_root: Path, enabled: bool, replies: bool = False) -> tuple[bool, list[str]]:
+    """Install (or remove) the hooks in every managed config home (the question
+    hook only while ``replies`` too) and in the Codex home. Every place is
+    tried; returns whether anything changed, and what could not be changed, in
+    words, for the owner."""
     from openswap.codex.auth import codex_home
 
     executable = program() if enabled else None
@@ -816,7 +979,7 @@ def apply(backup_root: Path, enabled: bool) -> tuple[bool, list[str]]:
         if is_profile and not os.path.lexists(home / "settings.json"):
             continue
         try:
-            changed = set_hooks(home, executable) or changed
+            changed = set_hooks(home, executable, question=enabled and replies) or changed
         except (ConfigError, OSError) as exc:
             problems.append(f"{home}: {exc}")
     try:
@@ -864,8 +1027,38 @@ def set_notices(backup_root: Path, enabled: bool) -> list[str]:
 
             raise ClaudeSwitchError(MOVE_TO_APPLICATIONS)
     with _switch_lock(backup_root):
-        write_attention_settings(backup_root, notices=enabled)
-        return apply(backup_root, enabled)[1]
+        switches = write_attention_settings(backup_root, notices=enabled)
+        return apply(backup_root, enabled, switches.replies)[1]
+
+
+def set_replies(backup_root: Path, enabled: bool) -> list[str]:
+    """Settings › Remote › "Allow replies from my phone and watch" (this Mac
+    only): the switch, then the question hook in every managed config home."""
+    from openswap.settings import load_attention_settings, write_attention_settings
+
+    from openswap import bundle
+
+    with _switch_lock(backup_root):
+        if load_attention_settings(backup_root).notices and bundle.runs_from_temporary_location():
+            # Rewriting the hooks would name a path that disappears. Turning
+            # replies off needs no hook change: the worker refuses them, and the
+            # question hook then exits at once until the next worker start.
+            if enabled:
+                _refuse_temporary_copy()
+            write_attention_settings(backup_root, replies=False)
+            return []
+        switches = write_attention_settings(backup_root, replies=enabled)
+        return apply(backup_root, switches.notices, switches.replies)[1]
+
+
+def _refuse_temporary_copy() -> None:
+    from openswap import bundle
+    from openswap.exceptions import ClaudeSwitchError
+
+    if bundle.runs_from_temporary_location():
+        from openswap.launch_agent import MOVE_TO_APPLICATIONS
+
+        raise ClaudeSwitchError(MOVE_TO_APPLICATIONS)
 
 
 def remove(backup_root: Path) -> bool:
@@ -885,4 +1078,77 @@ def reconcile(backup_root: Path) -> list[str]:
     from openswap.settings import load_attention_settings
 
     with _switch_lock(backup_root):
-        return apply(backup_root, load_attention_settings(backup_root, strict=True).notices)[1]
+        switches = load_attention_settings(backup_root, strict=True)
+        return apply(backup_root, switches.notices, switches.replies)[1]
+
+
+# --- openswap claude ------------------------------------------------------------
+
+CHANNEL_CONFIG = Path("worker") / "channel-mcp.json"
+CHANNEL_SERVER = "server:openswap"
+MANAGED_SETTINGS = Path("/Library/Application Support/ClaudeCode/managed-settings.json")
+CHANNELS_OFF = ("openswap claude: your organization has turned Claude Code channels off, so replies from your "
+                "phone and watch cannot reach this session (notices still work). An Owner can turn them on in "
+                "claude.ai › Organization settings › Claude Code › Channels.")
+
+
+def channel_config(backup_root: Path) -> Path:
+    """The ``--mcp-config`` file naming OpenSwap's channel, written for this
+    copy of OpenSwap. Nothing is installed into any config home: the channel
+    exists only in sessions ``openswap claude`` starts."""
+    from openswap.statusline import _write_json
+
+    path = Path(backup_root) / CHANNEL_CONFIG
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    wanted = {"mcpServers": {"openswap": {"command": program(), "args": ["attention", CHANNEL_COMMAND]}}}
+    try:
+        if json.loads(path.read_text(encoding="utf-8")) == wanted:
+            return path
+    except (OSError, ValueError):
+        pass
+    _write_json(path, wanted)
+    return path
+
+
+def channels_blocked() -> bool:
+    """Whether managed settings on this Mac turn channels off."""
+    try:
+        return json.loads(MANAGED_SETTINGS.read_text(encoding="utf-8")).get("channelsEnabled") is False
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def launch_claude(args: list[str], *, backup_root: Path | None = None, which=None, execv=os.execv) -> int:
+    """``openswap claude [args]``: Claude Code with OpenSwap's channel, so the
+    session can be answered from the phone and watch. While channels are a
+    research preview the channel is named on the development flag, and Claude
+    Code asks to confirm it at each start."""
+    import shutil
+
+    from openswap import bundle, paths
+
+    claude = (which or shutil.which)("claude")
+    if claude is None:
+        print("openswap claude: Claude Code (claude) is not on your PATH.", file=sys.stderr)
+        return 127
+    if bundle.runs_from_temporary_location():
+        from openswap.launch_agent import MOVE_TO_APPLICATIONS
+
+        print(f"openswap claude: {MOVE_TO_APPLICATIONS}", file=sys.stderr)
+        return 1
+    try:
+        config = channel_config(backup_root or paths.get_backup_root())
+    except (OSError, ConfigError) as exc:
+        print(f"openswap claude: could not write the channel's settings: {exc}", file=sys.stderr)
+        return 1
+    if channels_blocked():
+        print(CHANNELS_OFF, file=sys.stderr)
+    # One value each (the "=" form): both options take several values, and a
+    # prompt or subcommand after them would otherwise be read as another one.
+    try:
+        execv(claude, [claude, f"--mcp-config={config}",
+                       f"--dangerously-load-development-channels={CHANNEL_SERVER}", *args])
+    except OSError as exc:
+        print(f"openswap claude: could not start {claude}: {exc}", file=sys.stderr)
+        return 126
+    return 0

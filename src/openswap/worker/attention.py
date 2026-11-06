@@ -36,6 +36,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import sqlite3
 import tempfile
@@ -47,8 +48,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from openswap.worker.protocol import (
-    DETAIL_CAPS, MAX_ATTENTION_CLOSED, MAX_ATTENTION_ITEMS, MAX_BODY, MAX_FOLDER_LABEL, MAX_OPTION,
-    MAX_OPTIONS, MAX_QUESTION, MAX_QUESTION_HEADER, MAX_QUESTIONS, MAX_SESSION_LABEL,
+    ACK_OUTCOMES, DETAIL_CAPS, MAX_ATTENTION_ACKS, MAX_ATTENTION_CLOSED, MAX_ATTENTION_ITEMS, MAX_BODY,
+    MAX_FOLDER_LABEL, MAX_OPTION, MAX_OPTIONS, MAX_QUESTION, MAX_QUESTION_HEADER, MAX_QUESTIONS, MAX_SESSION_LABEL,
+    ProtocolError, attention_id, attention_reply, timestamp,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,25 @@ MAX_PID = 2**31 - 1
 # Session surfaces by Claude Code's ``entrypoint``.
 SURFACES = {"cli": "Terminal", "claude-vscode": "VS Code", "claude-desktop": "Claude Desktop"}
 
+# Replies (S2). A channel's permission request and its hook's PermissionRequest
+# arrive this close together (measured: the request 0.1 s first); an unpaired
+# request is dropped after REQUEST_SECONDS.
+PAIR_SECONDS = 5.0
+REQUEST_SECONDS = 10.0
+# A dialog that closes this soon after the watch's verdict reached it was closed
+# by that verdict; one that closed later (or earlier) was answered at the Mac.
+CONFIRM_SECONDS = 2.0
+# The question hook's own timeout is 600 s; its wait ends before that.
+QUESTION_WAIT_SECONDS = 590.0
+# A handled reply's outcome is acknowledged again until this long past its expiry
+# (the service takes a first acknowledgement until 10 minutes past it).
+HANDLED_KEEP_SECONDS = 660.0
+MAX_HANDLED = 500
+MAX_CHANNELS = 64
+MAX_WAITERS = 64
+MAX_REQUESTS = 50
+MAX_INCOMING = 100
+
 
 class NoticeError(ValueError):
     """A notice that is not a well-formed hook or Codex report."""
@@ -115,9 +136,10 @@ def clean_text(value: object, limit: int, *, multiline: bool = False) -> str:
     return cleaned.strip()[:limit].strip()
 
 
-def clean_questions(value: object) -> list[dict]:
-    """``AskUserQuestion``'s questions, cut to the report's caps: the question,
-    its header and its option labels only."""
+def question_entries(value: object) -> list[tuple[dict, str, list[str]]]:
+    """``AskUserQuestion``'s questions as the report shows them (the question,
+    its header and its option labels, cut to the report's caps), each with the
+    raw question text and raw option labels at the same positions."""
     if not isinstance(value, list):
         return []
     out = []
@@ -128,13 +150,36 @@ def clean_questions(value: object) -> list[dict]:
         if not question:
             continue
         options = entry.get("options") if isinstance(entry.get("options"), list) else []
-        labels = [clean_text(o.get("label") if isinstance(o, dict) else o, MAX_OPTION) for o in options]
-        cleaned = {"question": question, "options": [label for label in labels if label][:MAX_OPTIONS]}
+        raw = [o.get("label") if isinstance(o, dict) else o for o in options]
+        kept = [(clean_text(r, MAX_OPTION), r) for r in raw]
+        kept = [(label, r) for label, r in kept if label][:MAX_OPTIONS]
+        cleaned = {"question": question, "options": [label for label, _ in kept]}
         header = clean_text(entry.get("header"), MAX_QUESTION_HEADER)
         if header:
             cleaned["header"] = header
-        out.append(cleaned)
+        out.append((cleaned, entry.get("question"), [r for _, r in kept]))
     return out
+
+
+def clean_questions(value: object) -> list[dict]:
+    """``AskUserQuestion``'s questions, cut to the report's caps: the question,
+    its header and its option labels only."""
+    return [cleaned for cleaned, _, _ in question_entries(value)]
+
+
+def answer_positions(questions: object, answers: object) -> list[list[int]]:
+    """The (question, option) positions, in the report's questions, of the
+    answers ``AskUserQuestion`` received; [] when any answer is not one of the
+    shown options (typed text, or an option past the caps)."""
+    if not isinstance(answers, dict):
+        return []
+    positions = []
+    for index, (_, raw_question, raw_labels) in enumerate(question_entries(questions)):
+        answer = answers.get(raw_question) if isinstance(raw_question, str) else None
+        if answer not in raw_labels:
+            return []
+        positions.append([index, raw_labels.index(answer)])
+    return positions
 
 
 def _bounded_id(value: object) -> str:
@@ -161,10 +206,13 @@ def _optional_text(data: dict, name: str, limit: int, *, multiline: bool = False
 
 
 _CLAUDE_FIELDS = {"provider", "event", "session_id", "cwd", "at", "pid", "entrypoint", "agent_id", "tool_name",
-                  "tool_key", "description", "questions", "notification_type", "last_message", "prompt_kind"}
+                  "tool_key", "description", "questions", "notification_type", "last_message", "prompt_kind",
+                  "preview_key", "answers", "reply"}
 _CODEX_FIELDS = {"provider", "event", "session_id", "cwd", "at", "pid", "agent_id", "tool_name", "tool_key",
                  "description", "last_message"}
 PROMPT_KINDS = frozenset({"channel", "task", "end"})
+# The token a delivered message carries back in its channel turn's tag.
+REPLY_TOKEN = re.compile(r"[a-z0-9]{1,32}")
 
 
 def validate_notice(value: object) -> dict:
@@ -193,8 +241,16 @@ def validate_notice(value: object) -> dict:
     _optional_text(value, "description", DETAIL_CAPS["description"], multiline=True)
     _optional_text(value, "last_message", DETAIL_CAPS["last_message"], multiline=True)
     _optional_text(value, "notification_type", 64)
-    tool_key = value.get("tool_key", "")
-    if not isinstance(tool_key, str) or len(tool_key) > 64 or not all(c in "0123456789abcdef" for c in tool_key):
+    for name in ("tool_key", "preview_key"):
+        key = value.get(name, "")
+        if not isinstance(key, str) or len(key) > 64 or not all(c in "0123456789abcdef" for c in key):
+            raise NoticeError("invalid_notice")
+    answers = value.get("answers", [])
+    if not (isinstance(answers, list) and len(answers) <= MAX_QUESTIONS and all(
+            isinstance(a, list) and len(a) == 2 and type(a[0]) is int and type(a[1]) is int
+            and 0 <= a[0] < MAX_QUESTIONS and 0 <= a[1] < MAX_OPTIONS for a in answers)):
+        raise NoticeError("invalid_notice")
+    if "reply" in value and not (isinstance(value["reply"], str) and REPLY_TOKEN.fullmatch(value["reply"])):
         raise NoticeError("invalid_notice")
     if "questions" in value and clean_questions(value["questions"]) != value["questions"]:
         raise NoticeError("invalid_notice")
@@ -227,9 +283,12 @@ class Item:
     pid: int = 0  # the Claude Code or Codex process; 0 when the hook could not tell
     entrypoint: str = ""  # Claude Code's own name for its surface (cli, claude-vscode, ...)
     agent: str = ""  # the subagent whose call it is (Codex: its own thread ID); "" for the main thread
+    preview_key: str = ""  # digest of the call as a channel would preview it; "" when that is not exact
 
     @classmethod
     def from_dict(cls, data: object) -> Item:
+        if isinstance(data, dict):
+            data = {"preview_key": "", **data}  # saved before replies existed
         if not isinstance(data, dict) or set(data) != {f for f in cls.__dataclass_fields__}:
             raise ValueError("invalid item")
         item = cls(**data)
@@ -239,7 +298,7 @@ class Item:
                 or type(item.published) is not bool or not isinstance(item.tool_name, str)
                 or not isinstance(item.tool_key, str) or not isinstance(item.detail, dict)
                 or type(item.pid) is not int or not isinstance(item.entrypoint, str)
-                or not isinstance(item.agent, str)):
+                or not isinstance(item.agent, str) or not isinstance(item.preview_key, str)):
             raise ValueError("invalid item")
         return item
 
@@ -328,6 +387,95 @@ def read_codex_answers(codex_homes, threads: dict[str, float]) -> dict[str, floa
     return answers
 
 
+@dataclass
+class Channel:
+    """An OpenSwap channel's registration: the Claude Code process it serves (by
+    PID and start time) and the channel process itself, held for that Claude
+    Code process's life. ``link`` is its live connection, None while it is away."""
+    claude_pid: int
+    claude_started: str
+    pid: int
+    started: str
+    home: str  # the config home whose sessions/{claude_pid}.json names the session
+    link: object = None
+
+    def saved(self) -> list:
+        return [self.claude_started, self.pid, self.started, self.home]
+
+    @classmethod
+    def from_saved(cls, claude_pid: int, entry: object) -> Channel:
+        if (not isinstance(entry, list) or len(entry) != 4 or not isinstance(entry[0], str)
+                or type(entry[1]) is not int or not isinstance(entry[2], str) or not isinstance(entry[3], str)):
+            raise ValueError("invalid channel")
+        return cls(claude_pid, entry[0], entry[1], entry[2], entry[3])
+
+
+@dataclass
+class ChannelRequest:
+    """A permission prompt as a channel relays it: Claude Code's own words for the
+    call (``preview``), and the ``request_id`` a verdict must name."""
+    session: str
+    claude_pid: int
+    request_id: str
+    tool_name: str
+    description: str
+    preview: str
+    preview_key: str
+    at: float
+
+
+@dataclass
+class Waiter:
+    """A question hook waiting for the watch's answer."""
+    session: str
+    tool_key: str
+    agent: str
+    claude_pid: int
+    at: float
+    done: threading.Event = field(default_factory=threading.Event)
+    answers: list | None = None
+    item_id: str = ""  # the question item it waits for, once seen
+    reply_id: str = ""  # the reply whose answer it holds
+
+
+@dataclass
+class Sent:
+    """A reply delivered to a session, until its item closes."""
+    reply_id: str
+    action: str
+    at: float
+    answers: list | None = None
+    token: str = ""
+    exit_at: float | None = None  # when the session was first seen leaving ``waiting`` after it
+    # Other prompts waited in the session when it was sent: the session file
+    # cannot tell which of them closed, so the Mac never knows this one won.
+    shared: bool = False
+
+
+def _all_off():
+    from openswap.settings import AttentionSettings
+
+    return AttentionSettings(notices=False, details=False, replies=False)
+
+
+def preview_key(preview: str) -> str:
+    return hashlib.sha256(preview.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def read_session(home: str, pid: int) -> SessionRecord | None:
+    """``home``'s ``sessions/{pid}.json`` for the Claude Code process ``pid``, read now."""
+    try:
+        data = json.loads((Path(home) / "sessions" / f"{pid}.json").read_text(encoding="utf-8"))
+        session, at = data["sessionId"], data.get("statusUpdatedAt")
+        if data["pid"] != pid or not isinstance(session, str) or not session:
+            return None
+        return SessionRecord(session, pid, data.get("status") if isinstance(data.get("status"), str) else "",
+                             at / 1000 if type(at) in (int, float) and math.isfinite(at) else 0.0,
+                             data.get("waitingFor") if isinstance(data.get("waitingFor"), str) else "")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError, RecursionError):
+        return None
+
+
 def _new_id() -> str:
     return secrets.token_urlsafe(16)
 
@@ -343,7 +491,8 @@ class AttentionStore:
     can send it at once instead of on its next pass.
     """
 
-    def __init__(self, backup_root: Path, *, clock=time.time, enabled=None, records=None, codex_answers=None):
+    def __init__(self, backup_root: Path, *, clock=time.time, enabled=None, records=None, codex_answers=None,
+                 switches=None, homes=None):
         self.backup_root = Path(backup_root)
         self.path = self.backup_root / STATE_FILE
         self.clock = clock
@@ -368,6 +517,20 @@ class AttentionStore:
         self._due: dict[str, float] = {}  # item ID -> when its answer at the Mac closes it
         self._refresh_lock = threading.Lock()
         self._secret = b""
+        # Replies (S2). ``switches()`` returns the owner's AttentionSettings;
+        # ``homes()`` the managed config homes, where a channel's Claude Code
+        # process must have its session file.
+        self.switches = switches if switches is not None else _all_off
+        self.homes = homes if homes is not None else (lambda: [])
+        self._channels: dict[int, Channel] = {}  # by Claude Code PID; the first registration holds it
+        self._requests: list[ChannelRequest] = []  # channel permission requests not yet paired
+        self._attached: dict[str, ChannelRequest] = {}  # item ID -> the one request it answers
+        self._tainted: set[str] = set()  # items whose request could not be told apart: never actionable
+        self._waiters: list[Waiter] = []  # question hooks waiting for an answer
+        self._sent: dict[str, Sent] = {}  # item ID -> the reply delivered to it, until the item closes
+        self._handled: dict[str, list] = {}  # reply ID -> [outcome, keep until]
+        self._acks: dict[str, str] = {}  # reply ID -> outcome not yet acknowledged to the service
+        self._incoming: list = []  # replies the heartbeat queued, applied off its thread
         self._load()
 
     # --- persistence -------------------------------------------------------
@@ -383,19 +546,30 @@ class AttentionStore:
             if len(secret) != 32 or not isinstance(closed, list) or not all(
                     isinstance(c, dict) and set(c) == {"id", "reason"} for c in closed):
                 raise ValueError("invalid attention state")
+            saved, handled, acks = data.get("channels", {}), data.get("handled", {}), data.get("acks", {})
+            if not isinstance(saved, dict) or not isinstance(handled, dict) or not isinstance(acks, dict):
+                raise ValueError("invalid attention state")
+            channels = {int(pid): Channel.from_saved(int(pid), entry) for pid, entry in saved.items()}
+            if not all(isinstance(v, list) and len(v) == 2 and v[0] in ACK_OUTCOMES
+                       and type(v[1]) in (int, float) for v in handled.values()) or not all(
+                    v in ACK_OUTCOMES for v in acks.values()):
+                raise ValueError("invalid attention state")
         except FileNotFoundError:
             self._secret = secrets.token_bytes(32)
             return
-        except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError) as exc:
             # Starting empty only drops notices; it never reports anything as answered.
             logger.warning("Session attention state unreadable (%s); starting empty", exc)
             self._secret = secrets.token_bytes(32)
             return
         self._secret, self._items, self._closed = secret, items, closed
+        self._channels, self._handled, self._acks = channels, handled, acks
 
     def _save(self) -> None:
         data = {"version": STATE_VERSION, "secret": self._secret.hex(),
-                "items": [asdict(item) for item in self._items], "closed": self._closed}
+                "items": [asdict(item) for item in self._items], "closed": self._closed,
+                "channels": {str(pid): c.saved() for pid, c in self._channels.items()},
+                "handled": self._handled, "acks": self._acks}
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=".attention-", suffix=".tmp")
         try:
@@ -419,15 +593,25 @@ class AttentionStore:
 
     # --- lifecycle -----------------------------------------------------------
 
-    def _close(self, items: list[Item], reason: str) -> bool:
+    def _close(self, items: list[Item], reason: str, *, won: tuple = ()) -> bool:
+        """Close ``items`` for ``reason``; those in ``won`` were decided by the
+        watch's own reply, which is then ``applied``. Any other reply still in
+        flight for a closed item settles as not applied (it stays ``sent``)."""
         if not items:
             return False
         gone = {id(item) for item in items}
         self._items = [item for item in self._items if id(item) not in gone]
+        won_ids = {item.id for item in won}
         for item in items:
             self._due.pop(item.id, None)
+            self._attached.pop(item.id, None)
+            self._tainted.discard(item.id)
+            sent = self._sent.pop(item.id, None)
+            if sent is not None and item.id in won_ids:
+                self._record(sent.reply_id, "applied")
         # The service only ever saw published items; an unpublished one just ends.
-        self._closed.extend({"id": item.id, "reason": reason} for item in items if item.published)
+        self._closed.extend({"id": item.id, "reason": "answered_from_watch" if item.id in won_ids else reason}
+                            for item in items if item.published)
         del self._closed[:-MAX_PENDING_CLOSES]
         return True
 
@@ -435,7 +619,8 @@ class AttentionStore:
               tool_name: str = "", tool_key: str = "", detail: dict | None = None) -> None:
         self._items.append(Item(_new_id(), kind, provider, session, notice["cwd"], self._at(notice), published,
                                 tool_name, tool_key, {k: v for k, v in (detail or {}).items() if v},
-                                notice.get("pid", 0), notice.get("entrypoint", ""), notice.get("agent_id", "")))
+                                notice.get("pid", 0), notice.get("entrypoint", ""), notice.get("agent_id", ""),
+                                notice.get("preview_key", "") if kind == "permission" else ""))
 
     def _at(self, notice: dict) -> float:
         """When the hook ran (its own clock reading), else now. Hooks are async and
@@ -453,7 +638,9 @@ class AttentionStore:
         waiting is published."""
         if not self.enabled():
             return
-        if notice.get("event") == "Notification":
+        # A reply in flight is settled against what the session file says now.
+        if notice.get("event") == "Notification" or (notice.get("provider") == "claude" and any(
+                i.session == notice.get("session_id") for i in self._items if i.id in self._sent)):
             self.refresh()
         with self._lock:
             if self._apply(notice):
@@ -470,15 +657,18 @@ class AttentionStore:
         if record is not None and notice.get("pid") and record.pid != notice["pid"]:
             record = None  # another process's record (a reused ID): it says nothing here
         if event == "PermissionRequest":
+            # A subagent asking again has moved past a prompt the watch denied.
+            moved_on = self._agent_moved_on(prompts, notice.get("agent_id", ""), at, notice.get("tool_key", ""))
             if at < self._left_waiting.get(session, 0.0):
-                return False  # its prompt was already answered (a decline faster than this hook)
+                return moved_on  # its prompt was already answered (a decline faster than this hook)
             if tool_name == QUESTION_TOOL:
                 self._open("question", "claude", session, notice, published=False, tool_name=tool_name,
-                           detail={"questions": notice.get("questions", [])})
+                           tool_key=notice.get("tool_key", ""), detail={"questions": notice.get("questions", [])})
             else:
                 self._open("permission", "claude", session, notice, published=False, tool_name=tool_name,
                            tool_key=notice.get("tool_key", ""),
                            detail={"tool_name": tool_name, "description": notice.get("description", "")})
+                self._pair(session)
             return True
         if event == "Notification":
             kind = notice.get("notification_type")
@@ -536,7 +726,14 @@ class AttentionStore:
             # The main thread's turn ended: its own prompts were answered. A
             # background subagent's prompt may still wait, and a late Stop of an
             # earlier turn says nothing about this turn's prompts.
-            return self._close([i for i in prompts if not i.agent and i.created_at <= at], "answered_on_mac")
+            ended = [i for i in prompts if not i.agent and i.created_at <= at]
+            # A Stop follows a channel deny (a "No" at the Mac fires none); after
+            # an allow, the call's PostToolUse may still be on its way.
+            waiting = [i for i in ended if self._sent_action(i) == "allow"]
+            for item in waiting:
+                self._due.setdefault(item.id, self.clock() + SESSION_END_GRACE_SECONDS)
+            ended = [i for i in ended if i not in waiting]
+            return self._close(ended, "answered_on_mac", won=self._won(ended, at, "deny"))
         if event == "UserPromptSubmit":
             prompt = notice.get("prompt_kind")
             if prompt == "end":
@@ -548,24 +745,39 @@ class AttentionStore:
                 # A background task's result starting a turn: the owner did
                 # nothing, and a subagent's prompt may still be waiting.
                 return False
-            # OpenSwap's own channel turn answers no prompt of a subagent and not
-            # the idle item (S2 settles that); a main-thread prompt left open is stale.
-            answered = [i for i in prompts if not i.agent] if prompt == "channel" else mine
-            return self._close([i for i in answered if i.created_at <= at], "answered_on_mac")
+            if prompt == "channel":
+                # OpenSwap's own channel turn: the watch's message reached the idle
+                # item it was sent to. It answers no subagent's prompt; a main-thread
+                # prompt still open is stale.
+                delivered = [i for i in mine if i.kind == "idle" and notice.get("reply")
+                             and self._sent.get(i.id) is not None and self._sent[i.id].token == notice["reply"]]
+                stale = [i for i in prompts if not i.agent and i.created_at <= at]
+                changed = self._close(delivered, "answered_from_watch", won=delivered)
+                return self._close(stale, "answered_on_mac") or changed
+            return self._close([i for i in mine if i.created_at <= at], "answered_on_mac")
         if event == "SessionEnd":
             for table in (self._last_message, self._prompted, self._left_waiting):
                 table.pop(session, None)
             return self._close(mine, "session_ended")
         # PostToolUse / PostToolUseFailure: the prompt for that call was answered.
+        agent, key = notice.get("agent_id", ""), notice.get("tool_key", "")
         if tool_name == QUESTION_TOOL:
-            match = [i for i in prompts if i.kind == "question"][:1]
-        else:
-            same_tool = [i for i in prompts if i.kind == "permission" and i.tool_name == tool_name]
-            key = notice.get("tool_key", "")
-            # Another call of the same tool finishing (a subagent, a parallel
-            # call) says nothing about this prompt: only its own input matches.
-            match = [i for i in same_tool if i.tool_key == key][:1] if key else same_tool[:1]
-        return self._close(match, "answered_on_mac")
+            # Its own question only: another agent's is still open. Among one
+            # agent's, the questions decide (the answers join the input).
+            mine = [i for i in prompts if i.kind == "question" and i.agent == agent]
+            match = [i for i in mine if key and i.tool_key == key][:1]
+            if not match:
+                # Not provably this question: it closes, but no answer is claimed for it.
+                return self._close(mine if len(mine) == 1 else [], "answered_on_mac")
+            return self._close(match, "answered_on_mac", won=self._won(match, at, notice.get("answers") or None))
+        same_tool = [i for i in prompts if i.kind == "permission" and i.tool_name == tool_name and i.agent == agent]
+        # Another call of the same tool finishing (another agent, a parallel
+        # call) says nothing about this prompt: only its own input matches.
+        match = [i for i in same_tool if i.tool_key == key][:1] if key else same_tool[:1]
+        moved_on = self._agent_moved_on(prompts, agent, at, key)
+        # The call ran: an allow from the watch, if it decided the prompt (a
+        # failing call was still allowed).
+        return self._close(match, "answered_on_mac", won=self._won(match, at, "allow")) or moved_on
 
     def _apply_codex(self, notice: dict) -> bool:
         """One Codex hook. ``Stop``, ``UserPromptSubmit`` and ``Interrupt`` run
@@ -668,6 +880,12 @@ class AttentionStore:
             for session, record in records.items():
                 if record.status in NOT_WAITING and record.status_at:
                     self._left_waiting[session] = max(record.status_at, self._left_waiting.get(session, 0.0))
+            # A channel request whose session has stopped waiting since lost its prompt.
+            self._requests = [r for r in self._requests if r.at >= self._left_waiting.get(r.session, 0.0)]
+            for pid in [pid for pid in self._channels if not is_pid_alive(pid)]:
+                del self._channels[pid]  # that Claude Code process ended: its registration with it
+                changed = True
+            won = []
             ended = []
             for item in [i for i in self._items if i.provider == "claude"]:
                 record = records.get(item.session)
@@ -680,6 +898,14 @@ class AttentionStore:
                 if (item.kind not in ("permission", "question") or record is None or not record.status_at
                         or record.status_at <= item.created_at or record.status not in NOT_WAITING):
                     continue
+                sent = self._sent.get(item.id)
+                if sent is not None:
+                    if sent.exit_at is None:
+                        sent.exit_at = record.status_at
+                    # The dialog closed: approved (busy) or declined (idle).
+                    if self._won([item], record.status_at, "allow" if record.status == "busy" else "deny"):
+                        won.append(item)
+                        continue
                 if not item.published:
                     changed = self._close([item], "answered_on_mac") or changed
                 elif item.id not in self._due:
@@ -689,6 +915,7 @@ class AttentionStore:
                     table.pop(session, None)
                 self._known.discard(session)
             changed = self._close(ended, "session_ended") or changed
+            changed = self._close(won, "answered_from_watch", won=won) or changed
             if changed:
                 self._commit()
 
@@ -719,7 +946,422 @@ class AttentionStore:
         with self._lock:
             if self._items or self._closed or self._last_message:
                 self._items, self._closed, self._last_message, self._due = [], [], {}, {}
+                self._attached, self._sent, self._requests = {}, {}, []
+                self._tainted.clear()
                 self._commit()
+
+    # --- replies: channels, prompts and questions ------------------------------
+
+    def _sent_action(self, item: Item) -> str:
+        sent = self._sent.get(item.id)
+        return sent.action if sent is not None else ""
+
+    def _won(self, items: list[Item], at: float, effect) -> list[Item]:
+        """The items whose prompt the watch's reply decided: what happened
+        (``effect``: allow, deny or the answer's positions), seen at ``at``, is
+        what the watch sent, after it was sent, and the dialog closed within
+        ``CONFIRM_SECONDS`` of it when the session file shows when it closed."""
+        won = []
+        for item in items:
+            sent = self._sent.get(item.id)
+            if sent is None or sent.shared or at < sent.at:
+                continue
+            if sent.exit_at is not None and not sent.at <= sent.exit_at <= sent.at + CONFIRM_SECONDS:
+                continue
+            if (sent.answers if sent.action == "answer" else sent.action) == effect:
+                won.append(item)
+        return won
+
+    def _agent_moved_on(self, prompts: list[Item], agent: str, at: float, key: str) -> bool:
+        """A subagent's next call shows its earlier prompt is gone: one the watch
+        denied closes now (a subagent's prompt has no Stop of its own)."""
+        if not agent:
+            return False
+        gone = [i for i in prompts if i.agent == agent and i.tool_key != key and self._sent_action(i) == "deny"
+                and i.created_at < at]
+        return self._close(gone, "answered_on_mac", won=self._won(gone, at, "deny"))
+
+    def _pair(self, session: str) -> bool:
+        """Attach each channel request of ``session`` to the one recorded call it
+        previews. Only an exact, unambiguous pairing counts: the same tool, the
+        same input (the preview's digest), within PAIR_SECONDS, one request and
+        one call. Calls that share a preview with another open call or request
+        can never be told apart and stay notices; so does every other call."""
+        now = self.clock()
+        self._requests = [r for r in self._requests if now - r.at <= REQUEST_SECONDS]
+        open_calls = [i for i in self._items if i.session == session and i.kind == "permission"
+                      and i.preview_key and i.id not in self._due]
+        changed = False
+        for key in {(i.tool_name, i.preview_key) for i in open_calls}:
+            calls = [i for i in open_calls if (i.tool_name, i.preview_key) == key]
+            requests = [r for r in self._requests if r.session == session and (r.tool_name, r.preview_key) == key]
+            attached = [i for i in calls if i.id in self._attached]
+            if len(calls) > 1 or len(requests) + len(attached) > 1:
+                for item in calls:
+                    self._tainted.add(item.id)
+                    if item.id not in self._sent and self._attached.pop(item.id, None) is not None:
+                        changed = True
+                continue
+            item = calls[0]
+            if attached or not requests or item.id in self._tainted:
+                continue
+            request = requests[0]
+            if abs(item.created_at - request.at) > PAIR_SECONDS or (item.pid and item.pid != request.claude_pid):
+                continue
+            self._requests.remove(request)
+            self._attached[item.id] = request
+            # Shown as Claude Code relays it, so Allow names exactly what was shown.
+            item.detail = {k: v for k, v in (("tool_name", request.tool_name), ("description", request.description),
+                                             ("input_preview", request.preview)) if v}
+            changed = True
+        return changed
+
+    def channel_home(self, claude_pid: int) -> str | None:
+        """The managed config home whose session file lists ``claude_pid``, or None."""
+        for home in self.homes():
+            record = read_session(str(home), claude_pid)
+            if record is not None:
+                return str(home)
+        return None
+
+    def register_channel(self, channel, claude, link) -> bool:
+        """Register ``link`` as the OpenSwap channel of Claude Code process
+        ``claude`` (both ``peers.Process``). The caller checked that ``channel`` is
+        that process's direct child and that it was started with the channel
+        named. Only the first channel process of a Claude Code process's life is
+        ever accepted, and only while that process runs from a managed config home.
+        Any direct child of that process could take it first (one started before
+        the channel connected, say while the worker was down); such a child can
+        block replies to the session or read what is sent to it, never act on a
+        prompt it did not relay with the hook's own input."""
+        home = self.channel_home(claude.pid)
+        if home is None:
+            return False
+        with self._lock:
+            full = len(self._channels) >= MAX_CHANNELS and claude.pid not in self._channels
+            idle = [c for c in self._channels.values() if c.link is None] if full else []
+        if idle:
+            self._evict(idle)
+        with self._lock:
+            held = self._channels.get(claude.pid)
+            if held is not None and held.claude_started == claude.started:
+                if (held.pid, held.started) != (channel.pid, channel.started):
+                    return False  # another process holds this session's channel
+            elif len(self._channels) >= MAX_CHANNELS and held is None:
+                logger.warning("Session replies: %d channels are registered; refusing another", MAX_CHANNELS)
+                return False
+            else:
+                held = self._channels[claude.pid] = Channel(claude.pid, claude.started, channel.pid, channel.started,
+                                                            home)
+            old, held.link = held.link, link
+            self._commit()
+        if old is not None and old is not link:
+            old.close()
+        return True
+
+    def _evict(self, idle: list[Channel]) -> None:
+        """Drop registrations whose Claude Code process is gone, even where its PID
+        now names another process (after a restart of the Mac)."""
+        from openswap.worker import peers
+
+        from openswap.process_detection import is_pid_alive
+
+        gone = []
+        for held in idle:
+            proc = peers.process(held.claude_pid)
+            # Unreadable is not gone: a live process keeps its registration.
+            if (proc is None and not is_pid_alive(held.claude_pid)) or (
+                    proc is not None and proc.started != held.claude_started):
+                gone.append(held.claude_pid)
+        with self._lock:
+            for held in [h for h in idle if h.claude_pid in gone]:
+                if self._channels.get(held.claude_pid) is held and held.link is None:
+                    del self._channels[held.claude_pid]
+            if gone:
+                self._commit()
+
+    def unregister_channel(self, claude_pid: int, link) -> None:
+        """The channel's connection ended; its registration stays for the process's life."""
+        with self._lock:
+            held = self._channels.get(claude_pid)
+            if held is not None and held.link is link:
+                held.link = None
+                self.changed.set()
+
+    def channel_request(self, claude_pid: int, link, data: object) -> None:
+        """A permission prompt relayed by a registered channel."""
+        if not isinstance(data, dict) or not set(data) <= {"request_id", "tool_name", "description", "input_preview"}:
+            return
+        request_id, tool_name = data.get("request_id"), data.get("tool_name")
+        description, preview = data.get("description", ""), data.get("input_preview", "")
+        try:
+            attention_id(request_id)
+        except ProtocolError:
+            return
+        if (not isinstance(tool_name, str) or clean_text(tool_name, DETAIL_CAPS["tool_name"]) != tool_name
+                or not isinstance(description, str) or not isinstance(preview, str)
+                or len(preview) > DETAIL_CAPS["input_preview"]):
+            return
+        with self._lock:
+            held = self._channels.get(claude_pid)
+            home = held.home if held is not None and held.link is link else None
+        record = read_session(home, claude_pid) if home is not None else None
+        if record is None:
+            return
+        at = self.clock()
+        with self._lock:
+            self._requests.append(ChannelRequest(
+                record.session_id, claude_pid, request_id, tool_name,
+                clean_text(description, DETAIL_CAPS["description"], multiline=True),
+                clean_text(preview, DETAIL_CAPS["input_preview"], multiline=True), preview_key(preview), at))
+            del self._requests[:-MAX_REQUESTS]
+            if self._pair(record.session_id):
+                self._commit()
+
+    def _live_channel(self, item: Item) -> Channel | None:
+        """The connected channel of the item's session, by the latest session files."""
+        record = self._records.get(item.session)
+        held = self._channels.get(record.pid) if record is not None else None
+        if held is None or held.link is None or (item.pid and item.pid != held.claude_pid):
+            return None
+        return held
+
+    def question_waiter(self, claude, session: str, tool_key: str, agent: str = "") -> Waiter | None:
+        """A waiter for the question hook of ``session`` running under Claude Code
+        process ``claude`` (a ``peers.Process``), or None (the hook then lets the
+        dialog be): replies off, no connected channel registered for that process,
+        or that process's session file names another session."""
+        switches = self.switches()
+        if (not (switches.notices and switches.replies) or not isinstance(session, str)
+                or not isinstance(tool_key, str) or not isinstance(agent, str)):
+            return None
+        with self._lock:
+            held = self._channels.get(claude.pid)
+            if held is None or held.claude_started != claude.started or held.link is None:
+                return None
+            home = held.home
+        record = read_session(home, claude.pid)
+        if record is None or record.session_id != session:
+            return None
+        with self._lock:
+            if len(self._waiters) >= MAX_WAITERS:
+                return None
+            waiter = Waiter(session, tool_key, agent, claude.pid, self.clock())
+            self._waiters.append(waiter)
+            self.changed.set()
+        return waiter
+
+    def waiter_over(self, waiter: Waiter) -> bool:
+        """Whether a waiting question hook should stop: its question closed (or,
+        never seen, its session stopped waiting), its channel went away, or the
+        wait passed QUESTION_WAIT_SECONDS."""
+        with self._lock:
+            if waiter.done.is_set():
+                return True
+            if self.clock() - waiter.at >= QUESTION_WAIT_SECONDS:
+                return True
+            held = self._channels.get(waiter.claude_pid)
+            if held is None or held.link is None:
+                return True
+            item = self._waited(waiter)
+            if item is not None:
+                waiter.item_id = item.id
+                return False
+            return bool(waiter.item_id) or self._left_waiting.get(waiter.session, 0.0) > waiter.at
+
+    def _waited(self, waiter: Waiter) -> Item | None:
+        return next((i for i in self._items if self._waits_for(waiter, i)), None)
+
+    @staticmethod
+    def _waits_for(waiter: Waiter, item: Item) -> bool:
+        return (item.kind == "question" and item.session == waiter.session and item.tool_key == waiter.tool_key
+                and item.agent == waiter.agent)
+
+    def end_waiter(self, waiter: Waiter) -> None:
+        with self._lock:
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
+                self.changed.set()
+
+    # --- replies: the gate ------------------------------------------------------
+
+    def _actions(self, item: Item, switches) -> list[str]:
+        """The replies an item takes now. Only an item a registered channel can
+        answer takes any: a permission prompt paired with the channel's own
+        request (Allow only while details are on, since nothing else shows what
+        it would allow), a question whose hook is waiting, an idle session."""
+        if not (switches.notices and switches.replies) or item.provider != "claude" or not item.published:
+            return []
+        if self._live_channel(item) is None:
+            return []
+        if item.kind == "permission":
+            if item.id not in self._attached or item.id in self._tainted:
+                return []
+            return ["allow", "deny"] if switches.details else ["deny"]
+        if item.kind == "question":
+            return ["answer"] if item.detail.get("questions") and any(
+                self._waits_for(w, item) for w in self._waiters) else []
+        return ["message"] if item.kind == "idle" else []
+
+    def queue_replies(self, replies: object) -> None:
+        """From the heartbeat thread: keep the replies for the attention thread."""
+        if not isinstance(replies, list) or not replies:
+            return
+        with self._lock:
+            self._incoming.extend(replies[:MAX_INCOMING])
+            del self._incoming[:-MAX_INCOMING]
+        self.changed.set()
+
+    def _record(self, reply_id: str, outcome: str, until: float | None = None, *, queue: bool = True) -> None:
+        """A reply's outcome, kept for answering it again and (unless ``queue`` is
+        False) queued for the service."""
+        entry = self._handled.get(reply_id)
+        self._handled[reply_id] = [outcome, until if until is not None else entry[1] if entry else self.clock()]
+        if queue:
+            self._acks[reply_id] = outcome
+        for oldest in list(self._handled)[:-MAX_HANDLED]:
+            del self._handled[oldest]
+
+    def apply_replies(self, now: float | None = None) -> None:
+        """Apply the queued replies, each at most once. ``now`` is the service's
+        clock (replies expire by it)."""
+        with self._lock:
+            incoming, self._incoming = self._incoming, []
+        for raw in incoming:
+            try:
+                self._apply_reply(raw, self.clock() if now is None else now)
+            except Exception:  # noqa: BLE001 - one bad reply must not stop the others
+                logger.warning("Session reply could not be applied", exc_info=True)
+
+    def _apply_reply(self, raw: object, now: float) -> None:
+        try:
+            reply = attention_reply(raw)
+            expires = timestamp(reply["expires_at"]).timestamp()
+        except ProtocolError:
+            reply_id = raw.get("id") if isinstance(raw, dict) else None
+            try:
+                attention_id(reply_id)
+            except ProtocolError:
+                return
+            with self._lock:
+                if reply_id not in self._handled:
+                    self._record(reply_id, "refused", self.clock() + HANDLED_KEEP_SECONDS)
+                    self._commit()
+            return
+        reply_id, until = reply["id"], self.clock() + max(0.0, expires - now) + HANDLED_KEEP_SECONDS
+        switches = self.switches()
+        with self._lock:
+            handled = self._handled.get(reply_id)
+            if handled is not None:
+                self._acks[reply_id] = handled[0]  # its acknowledgement was lost: again, never applied twice
+                return
+            outcome, target = self._gate(reply, now, expires, switches)
+        if outcome is None:
+            outcome = self._deliver(reply, target, until)
+        if outcome is not None:
+            with self._lock:
+                self._record(reply_id, outcome, until)
+                self._commit()
+
+    def _gate(self, reply: dict, now: float, expires: float, switches):
+        """The outcome of a reply that cannot be delivered, or (None, item) for one
+        that can, judged now (under the lock)."""
+        if expires <= now:
+            return "expired", None
+        if not (switches.notices and switches.replies):
+            return "refused", None
+        item = next((i for i in self._items if i.id == reply["item_id"]), None)
+        if item is None:
+            return "item_closed", None
+        if item.id in self._due:
+            return "item_closed", None  # answered at the Mac; it closes after its grace
+        if reply["action"] not in self._actions(item, switches) or item.id in self._sent:
+            return "refused", None
+        if reply["action"] == "answer":
+            questions = item.detail.get("questions", [])
+            answers = reply["answers"]
+            if (len(answers) != len(questions) or any(a["question"] >= len(questions)
+                                                      or a["option"] >= len(questions[a["question"]]["options"])
+                                                      for a in answers)):
+                return "refused", None
+        return None, item
+
+    def _deliver(self, reply: dict, item: Item, until: float) -> str | None:
+        """Hand a reply to its session. The prompt must still be waiting in that
+        very session (read now from its session file); returns the outcome, or
+        None once ``sent`` was recorded here."""
+        with self._lock:
+            held = self._live_channel(item)
+            home, pid, link = (held.home, held.claude_pid, held.link) if held is not None else (None, 0, None)
+        record = read_session(home, pid) if home is not None else None
+        action = reply["action"]
+        with self._lock:
+            if item not in self._items or item.id in self._due or item.id in self._sent:
+                return "item_closed" if item not in self._items or item.id in self._due else "refused"
+            if link is None:
+                return "refused"  # the channel went away
+            if record is None or record.session_id != item.session:
+                return "item_closed"  # that session ended or was cleared
+            if action != "message" and (record.status != "waiting"
+                                        or self._left_waiting.get(item.session, 0.0) > item.created_at):
+                return "item_closed"  # the prompt was answered at the Mac
+            sent = Sent(reply["id"], action, self.clock(), shared=action != "message" and any(
+                i is not item and i.session == item.session and i.kind in ("permission", "question")
+                for i in self._items))
+            if action == "answer":
+                sent.answers = sorted([a["question"], a["option"]] for a in reply["answers"])
+                waiters = [w for w in self._waiters if self._waits_for(w, item)]
+                if not waiters:
+                    return "refused"
+                for waiter in waiters:
+                    waiter.answers, waiter.reply_id = sent.answers, reply["id"]
+                    waiter.done.set()
+                message = None
+            elif action == "message":
+                sent.token = secrets.token_hex(8)
+                message = {"message": {"content": reply["text"], "reply": sent.token}}
+            else:
+                request = self._attached.get(item.id)
+                if request is None:
+                    return "refused"
+                message = {"verdict": {"request_id": request.request_id, "behavior": action}}
+            # Recorded before the session can act on it, so the answer's own
+            # signal (PostToolUse, Stop, the channel turn) finds it, and so a
+            # restart never hands it over twice. The service hears "sent" only
+            # once it went out.
+            self._sent[item.id] = sent
+            self._record(reply["id"], "sent", until, queue=False)  # once a hook or the channel has it
+            self._commit()
+        if message is not None and not link.send(message):
+            with self._lock:
+                if self._sent.get(item.id) is sent:
+                    del self._sent[item.id]
+            return "refused"
+        if message is not None:
+            self.handed_over(reply["id"])
+        return None
+
+    def handed_over(self, reply_id: str) -> None:
+        """A reply reached its session (the channel or a waiting question hook took it)."""
+        with self._lock:
+            if self._handled.get(reply_id, [""])[0] == "sent" and reply_id not in self._acks:  # not applied meanwhile
+                self._acks[reply_id] = "sent"
+                self._commit()
+
+    def take_acks(self) -> list[dict]:
+        """Up to MAX_ATTENTION_ACKS outcomes for the next heartbeat."""
+        with self._lock:
+            return [{"id": rid, "outcome": outcome} for rid, outcome in list(self._acks.items())[:MAX_ATTENTION_ACKS]]
+
+    def acks_sent(self, acks: list[dict]) -> None:
+        """The service accepted a heartbeat carrying ``acks``."""
+        with self._lock:
+            for ack in acks:
+                if self._acks.get(ack["id"]) == ack["outcome"]:
+                    del self._acks[ack["id"]]
+            now = self.clock()
+            for reply_id in [r for r, (_, until) in self._handled.items() if until < now]:
+                del self._handled[reply_id]
 
     # --- the report ----------------------------------------------------------
 
@@ -737,15 +1379,19 @@ class AttentionStore:
         short = "".join(c for c in item.session if c.isalnum())[:4]
         return clean_text(f"{surface} · {short}" if short else surface, MAX_SESSION_LABEL)
 
-    def report(self, *, notices: bool, details: bool, folder_label) -> tuple[dict, list[str]]:
+    def report(self, *, notices: bool, details: bool, folder_label, replies: bool = False) -> tuple[dict, list[str]]:
         """The ``attention`` body (without ``worker_epoch``) and the close IDs it carries.
 
         ``folder_label(cwd)`` returns an approved Remote tasks folder's label,
         or None. Pass the close IDs to ``acknowledge`` once the service accepts.
         """
+        from openswap.settings import AttentionSettings
+
+        switches = AttentionSettings(notices=notices, details=details, replies=replies)
         with self._lock:
             published = sorted((i for i in self._items if i.published), key=lambda i: i.created_at)
             chosen = [replace(item, detail=dict(item.detail)) for item in published[-MAX_ATTENTION_ITEMS:]]
+            actions = {item.id: self._actions(item, switches) for item in chosen}
             closed = [dict(c) for c in self._closed[:MAX_ATTENTION_CLOSED]]
         # Labels may touch the file system (a stalled network folder): never under the lock.
         items = []
@@ -757,11 +1403,12 @@ class AttentionStore:
             entry = {"id": item.id, "kind": item.kind, "provider": item.provider,
                      "session_label": self._session_label(item), "session_id": self.session_id(item),
                      "folder_id": self.folder_id(item.cwd),
-                     "folder_label": label, "created_at": _stamp(item.created_at), "actions": []}
+                     "folder_label": label, "created_at": _stamp(item.created_at), "actions": actions[item.id]}
             if details and item.detail:
                 entry["detail"] = item.detail
             items.append(entry)
-        body = {"notices_enabled": notices, "replies_enabled": False, "items": items, "closed": closed}
+        body = {"notices_enabled": notices, "replies_enabled": notices and switches.replies, "items": items,
+                "closed": closed}
         # Escaped non-ASCII text can exceed the protocol's size limit: drop the
         # oldest items' detail until the request fits.
         for entry in items:

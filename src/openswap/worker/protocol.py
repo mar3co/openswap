@@ -464,3 +464,50 @@ def attention_report(value: object) -> dict:
     if len(set(ids)) != len(ids) or len(set(closed_ids)) != len(closed_ids) or set(ids) & set(closed_ids):
         raise ProtocolError("invalid_request")
     return data
+
+
+# Replies to attention items, carried by ``heartbeat``.
+MAX_ATTENTION_ACKS = 50
+MAX_ATTENTION_REPLIES = 20
+MAX_REPLY_TEXT = 1000
+REPLY_ACTIONS = frozenset({"allow", "deny", "answer", "message"})
+ACK_OUTCOMES = frozenset({"sent", "applied", "item_closed", "expired", "refused"})
+
+
+def attention_acks(value: object) -> list[dict]:
+    """A heartbeat's ``attention_acks``: 1-50 closed ``{id, outcome}`` objects."""
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_ATTENTION_ACKS:
+        raise ProtocolError("invalid_request")
+    for entry in value:
+        ack = fields(entry, {"id", "outcome"})
+        attention_id(ack["id"])
+        if not isinstance(ack["outcome"], str) or ack["outcome"] not in ACK_OUTCOMES:
+            raise ProtocolError("invalid_request")
+    return value
+
+
+def attention_reply(value: object) -> dict:
+    """One closed entry of a heartbeat response's ``attention_replies``:
+    ``answers`` exactly for ``answer``, ``text`` exactly for ``message``."""
+    data = fields(value, {"id", "item_id", "action", "expires_at"}, {"answers", "text"})
+    attention_id(data["id"])
+    attention_id(data["item_id"])
+    timestamp(data["expires_at"])
+    action = data["action"]
+    if not isinstance(action, str) or action not in REPLY_ACTIONS:
+        raise ProtocolError("invalid_request")
+    if ("answers" in data) != (action == "answer") or ("text" in data) != (action == "message"):
+        raise ProtocolError("invalid_request")
+    if action == "answer":
+        answers = data["answers"]
+        if not isinstance(answers, list) or not 1 <= len(answers) <= MAX_QUESTIONS:
+            raise ProtocolError("invalid_request")
+        for answer in answers:
+            entry = fields(answer, {"question", "option"})
+            if integer(entry["question"]) >= MAX_QUESTIONS or integer(entry["option"]) >= MAX_OPTIONS:
+                raise ProtocolError("invalid_request")
+        if len({a["question"] for a in answers}) != len(answers):
+            raise ProtocolError("invalid_request")
+    if action == "message":
+        _detail_text(data["text"], MAX_REPLY_TEXT)
+    return data

@@ -11,6 +11,7 @@ import logging
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import sys
 import threading
@@ -747,15 +748,20 @@ CODEX_HOOKS_STATUS = {
     "missing": "Codex: OpenSwap's hooks are missing from Codex's hooks.json; the worker puts them back when it starts.",
     "unknown": "Codex: OpenSwap can't read Codex's settings to tell whether its hooks are trusted.",
 }
+REMOTE_REPLIES_HOW = ("Only sessions started with {launcher} can be answered from your phone and watch; "
+                      "to make it your claude command, add alias claude={launcher_quoted} to your shell's "
+                      "startup file. Claude Code asks you to confirm the OpenSwap channel each time it starts, "
+                      "and Team and Enterprise organizations must turn channels on first.")
 
 
 def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
     """Settings › Remote › Sessions: the two session attention switches (shown on a
     paired Mac, and on an unpaired one while notices are on so they can be turned off).
 
-    ``worker_status["attention"]`` is ``{"notices": bool, "details": bool}``
+    ``worker_status["attention"]`` is ``{"notices": bool, "details": bool, "replies": bool}``
     as read from settings, plus ``codex``, Codex's state for OpenSwap's hooks
-    (None without Codex); no rows until it is known.
+    (None without Codex), and ``launcher``, the ``openswap claude`` command
+    line; no rows until it is known.
     """
     switches = worker_status.get("attention")
     if not isinstance(switches, dict):
@@ -767,12 +773,19 @@ def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
          "label": "Tell me when a session needs me", "value": notices},
         {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_details",
          "label": "Send details", "value": switches.get("details") is True, "disabled": not notices},
+        {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_replies",
+         "label": "Allow replies from my phone and watch", "value": switches.get("replies") is True,
+         "disabled": not notices},
     ]
     if notices and not enabled:
         rows.append(_remote_hint("remote_attention_note", REMOTE_ATTENTION_NEEDS_WORKER))
     codex = CODEX_HOOKS_STATUS.get(switches.get("codex"))
     if notices and codex:
         rows.append(_remote_hint("remote_attention_codex", codex))
+    launcher = switches.get("launcher")
+    if notices and switches.get("replies") is True and isinstance(launcher, str):
+        rows.append(_remote_hint("remote_attention_replies_note", REMOTE_REPLIES_HOW.format(
+            launcher=launcher, launcher_quoted=shlex.quote(launcher))))
     return rows
 
 

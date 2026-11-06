@@ -937,12 +937,16 @@ def run(switcher, codex=None) -> int:
         def _remote_status(self):
             """The worker snapshot Settings › Remote draws, with the setup window's folder
             lock and the session attention switches as saved now."""
+            import shlex
+
+            from openswap.attention import program
             from openswap.settings import load_attention_settings
 
             status = dict(self._worker_status_cache)
             switches = load_attention_settings(self.switcher.backup_dir)
             status["attention"] = {"notices": switches.notices, "details": switches.details,
-                                   "codex": self._codex_hooks_status() if switches.notices else None}
+                                   "codex": self._codex_hooks_status() if switches.notices else None,
+                                   "replies": switches.replies, "launcher": f"{shlex.quote(program())} claude"}
             if self._setup_changing_folders():
                 status["setup_changing_folders"] = True
             return status
@@ -2458,7 +2462,7 @@ def run(switcher, codex=None) -> int:
                 self.on_toggle_kickoff(None)
             elif row_id == "claude_status_line":
                 self._toggle_status_line()
-            elif row_id in ("remote_attention_notices", "remote_attention_details"):
+            elif row_id in ("remote_attention_notices", "remote_attention_details", "remote_attention_replies"):
                 self._toggle_attention(row_id)
             elif row_id == "kickoff_time":
                 self.on_kickoff_time(value)
@@ -2618,11 +2622,16 @@ def run(switcher, codex=None) -> int:
                 if row_id == "remote_attention_details":
                     write_attention_settings(root, details=not current.details)
                     return
-                from openswap.attention import set_notices
+                from openswap.attention import set_notices, set_replies
 
-                problems = set_notices(root, not current.notices)
+                if row_id == "remote_attention_replies":
+                    problems = set_replies(root, not current.replies)
+                else:
+                    problems = set_notices(root, not current.notices)
             except (ClaudeSwitchError, OSError, ValueError) as e:
-                self._show_error(f"Couldn't change session notices: {e}")
+                what = ("replies from your phone and watch" if row_id == "remote_attention_replies"
+                        else "session notices")
+                self._show_error(f"Couldn't change {what}: {e}")
                 return
             if problems:
                 more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""

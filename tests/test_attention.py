@@ -120,7 +120,7 @@ def test_hook_input_maps_to_its_notice_and_never_carries_raw_tool_input():
                                         "options": ["Postgres", "SQLite"]}]
     # Other tools send their name only.
     assert set(permission(tool="Write", command="x")) == {"provider", "event", "session_id", "cwd",
-                                                          "tool_name", "tool_key"}
+                                                          "tool_name", "tool_key", "preview_key"}
 
 
 @pytest.mark.parametrize("raw", [b"", b"{not json", b"[]", b'{"cwd": "/x"}', b'{"session_id": 7}'])
@@ -337,7 +337,7 @@ def test_parallel_subagent_prompts_each_publish_their_own_call(store):
     items.notice(notification("permission_prompt") | at(clock, 26))
     assert len(published(items)) == 2
     # B allowed: its result starts a turn; A still waits (the file stays waiting).
-    items.notice(post(command="b") | at(clock, 20))
+    items.notice(post(command="b", agent_id="a7c7645e861d1e073") | at(clock, 20))
     items.notice(hook("UserPromptSubmit", prompt="<task-notification>\n<task-id>x</task-id>") | at(clock, 21))
     items.notice(hook("Stop", last_assistant_message="B done.") | at(clock, 23))
     items.observe(record("waiting", t, waiting_for="permission prompt"), True)
@@ -1494,15 +1494,21 @@ def test_attention_switches_default_off_and_fail_closed(tmp_path):
     assert load_attention_settings(tmp_path) == AttentionSettings(notices=False, details=False)
 
 
-def test_settings_rows_show_the_two_switches_on_a_paired_mac():
+def test_settings_rows_show_the_switches_on_a_paired_mac():
     from openswap.menubar_display import remote_attention_rows
 
     assert remote_attention_rows({}, enabled=True) == []
     rows = remote_attention_rows({"attention": {"notices": False, "details": True}}, enabled=True)
     assert [(r["id"], r.get("value"), r.get("disabled")) for r in rows[1:]] == [
-        ("remote_attention_notices", False, None), ("remote_attention_details", True, True)]
+        ("remote_attention_notices", False, None), ("remote_attention_details", True, True),
+        ("remote_attention_replies", False, True)]
     rows = remote_attention_rows({"attention": {"notices": True, "details": True}}, enabled=False)
     assert rows[-1]["id"] == "remote_attention_note"
+    rows = remote_attention_rows({"attention": {"notices": True, "details": True, "replies": True,
+                                                "launcher": "/Apps/O S.app/Contents/MacOS/OpenSwap claude"}},
+                                 enabled=True)
+    assert rows[-1]["id"] == "remote_attention_replies_note"
+    assert "alias claude='/Apps/O S.app/Contents/MacOS/OpenSwap claude'" in rows[-1]["label"]
 
 
 @pytest.mark.parametrize(("paired", "notices", "shown"), [(True, False, True), (False, False, False),
@@ -1552,7 +1558,7 @@ def test_the_worker_reports_the_whole_set_and_each_close_once(reporting):
     assert "attention" in service.capabilities(worker)
     client.sync_attention()
     assert service.attention(worker) == {"notices_enabled": True, "replies_enabled": False, "items": [],
-                                         "closed": {}}
+                                         "closed": {}, "replies": []}
     items.notice(permission())
     items.notice(notification("permission_prompt"))
     client.sync_attention()
@@ -1574,7 +1580,7 @@ def test_turning_notices_off_reports_an_empty_set_and_drops_the_items(reporting)
     write_attention_settings(root, notices=False)
     client.sync_attention()
     assert service.attention(worker) == {"notices_enabled": False, "replies_enabled": False, "items": [],
-                                         "closed": {}}
+                                         "closed": {}, "replies": []}
     write_attention_settings(root, notices=True)
     client.sync_attention()
     assert service.attention(worker)["items"] == []

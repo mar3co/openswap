@@ -794,6 +794,8 @@ _ATTENTION_KEY = "attention"
 class AttentionSettings:
     notices: bool = False
     details: bool = True
+    # "Allow replies from my phone and watch": set on this Mac only, never from the web.
+    replies: bool = False
 
 
 def _attention_from_raw(raw: dict, *, strict: bool = False) -> AttentionSettings:
@@ -801,15 +803,16 @@ def _attention_from_raw(raw: dict, *, strict: bool = False) -> AttentionSettings
     value = section.get(_ATTENTION_KEY, {}) if isinstance(section, dict) else None
     if value == {}:
         return AttentionSettings()
-    if (not isinstance(value, dict) or not set(value) <= {"notices", "details"}
+    if (not isinstance(value, dict) or not set(value) <= {"notices", "details", "replies"}
             or not all(type(item) is bool for item in value.values())):
         if strict:
             raise ConfigError("settings.json worker.attention is invalid")
-        # Fail closed: an unreadable setting sends nothing.
+        # Fail closed: an unreadable setting sends nothing and accepts nothing.
         _logger.warning("settings.json worker.attention is invalid; session notices are off")
-        return AttentionSettings(notices=False, details=False)
+        return AttentionSettings(notices=False, details=False, replies=False)
     defaults = AttentionSettings()
-    return AttentionSettings(value.get("notices", defaults.notices), value.get("details", defaults.details))
+    return AttentionSettings(value.get("notices", defaults.notices), value.get("details", defaults.details),
+                             value.get("replies", defaults.replies))
 
 
 def load_attention_settings(backup_root: Path, *, strict: bool = False) -> AttentionSettings:
@@ -830,14 +833,14 @@ def load_attention_settings(backup_root: Path, *, strict: bool = False) -> Atten
         if strict:
             raise ConfigError(f"could not read {path}: {error}") from error
         _logger.warning("Could not read %s (%s); session notices are off", path, error)
-        return AttentionSettings(notices=False, details=False)
+        return AttentionSettings(notices=False, details=False, replies=False)
     return _attention_from_raw(raw, strict=strict)
 
 
 def write_attention_settings(backup_root: Path, *, notices: bool | None = None,
-                             details: bool | None = None) -> AttentionSettings:
-    """Change one or both attention switches, keeping every other setting."""
-    if any(value is not None and type(value) is not bool for value in (notices, details)):
+                             details: bool | None = None, replies: bool | None = None) -> AttentionSettings:
+    """Change attention switches, keeping every other setting."""
+    if any(value is not None and type(value) is not bool for value in (notices, details, replies)):
         raise ValueError("attention switches are booleans")
     path = settings_path(Path(backup_root))
     with _settings_write_lock(Path(backup_root)):
@@ -847,10 +850,16 @@ def write_attention_settings(backup_root: Path, *, notices: bool | None = None,
         if not isinstance(section, dict):
             section = {}
         current = _attention_from_raw(raw)
-        section[_ATTENTION_KEY] = {
+        updated = {
             "notices": current.notices if notices is None else notices,
             "details": current.details if details is None else details,
         }
+        replies = current.replies if replies is None else replies
+        previous = section.get(_ATTENTION_KEY)
+        if replies or (isinstance(previous, dict) and "replies" in previous):
+            # Written only once used: an older OpenSwap reads the section with it as invalid.
+            updated["replies"] = replies
+        section[_ATTENTION_KEY] = updated
         raw["worker"] = section
         atomic_write_json(path, raw)
         return _attention_from_raw(raw)
