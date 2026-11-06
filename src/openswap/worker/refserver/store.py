@@ -17,8 +17,8 @@ from openswap.worker.models import SafeEventKind
 from openswap.worker.protocol import (
     Artifact, DEVICE_TTL_SECONDS, FEATURES, HEARTBEAT_SECONDS, LEASE_SECONDS, MAX_ARTIFACTS,
     MISSED_HEARTBEATS, PREVIOUS_KEY_GRACE_SECONDS, ProtocolError, ROTATION_INTERVAL_SECONDS, Submission,
-    TERMINAL, advertised_accounts, capability_features, event_from_dict, execution_mode, fields, integer,
-    reported_folders, text, stamp as wire_stamp,
+    TERMINAL, advertised_accounts, attention_report, capability_features, event_from_dict, execution_mode,
+    fields, integer, reported_folders, text, stamp as wire_stamp,
 )
 
 # Jobs whose cancel flag a reconnecting worker must still enforce.
@@ -89,6 +89,11 @@ class ControlStore:
                     device TEXT PRIMARY KEY, folders TEXT NOT NULL, execution TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS capabilities (
                     device TEXT PRIMARY KEY, epoch INTEGER NOT NULL, features TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS attention (
+                    device TEXT PRIMARY KEY, notices INTEGER NOT NULL, replies INTEGER NOT NULL,
+                    items TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS attention_closed (
+                    device TEXT NOT NULL, id TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(device,id));
             ''')
             if "confirmed" not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
@@ -152,6 +157,24 @@ class ControlStore:
                              "WHERE c.device=? AND c.epoch=d.epoch", (worker_id,)).fetchone()
         return None if row is None else json.loads(row[0])
 
+    def attention(self, worker_id: str) -> dict | None:
+        """The worker's latest attention report (open items in sent order, the
+        switches, and the close reasons it reported for items it had listed),
+        or None when it has never reported (for the operator and tests)."""
+        with closing(self.connect()) as db:
+            row = db.execute("SELECT notices,replies,items FROM attention WHERE device=?", (worker_id,)).fetchone()
+            closed = db.execute("SELECT id,reason FROM attention_closed WHERE device=? ORDER BY rowid",
+                                (worker_id,)).fetchall()
+        if row is None:
+            return None
+        return {"notices_enabled": bool(row[0]), "replies_enabled": bool(row[1]), "items": json.loads(row[2]),
+                "closed": {r[0]: r[1] for r in closed}}
+
+    def attention_workers(self) -> list[str]:
+        """Workers with a current attention report, for the operator's listing."""
+        with closing(self.connect()) as db:
+            return [r[0] for r in db.execute("SELECT device FROM attention ORDER BY device")]
+
     @staticmethod
     def _advertised(db, device, feature) -> bool:
         """Whether the worker's current registration advertised ``feature`` (and it was accepted)."""
@@ -174,6 +197,8 @@ class ControlStore:
             db.execute("DELETE FROM account_choice_epochs WHERE device=?", (worker_id,))
             db.execute("DELETE FROM readiness WHERE device=?", (worker_id,))
             db.execute("DELETE FROM capabilities WHERE device=?", (worker_id,))
+            db.execute("DELETE FROM attention WHERE device=?", (worker_id,))
+            db.execute("DELETE FROM attention_closed WHERE device=?", (worker_id,))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state NOT IN "
                        "('queued','succeeded','failed','cancelled','interrupted','expired')", (worker_id,))
 
@@ -320,7 +345,8 @@ class ControlStore:
             db.execute("DELETE FROM account_choice_epochs WHERE device=?", (device["id"],))
             # ...and has not reported its folders or execution mode either.
             db.execute("DELETE FROM readiness WHERE device=?", (device["id"],))
-            # ...nor advertised any capability.
+            # ...nor advertised any capability. Its attention report stays: a restarted
+            # worker reports the same open items again, which are not new.
             db.execute("DELETE FROM capabilities WHERE device=?", (device["id"],))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state IN "
                        "('claimed','starting','running','cancel_requested')", (device["id"],))
@@ -389,6 +415,22 @@ class ControlStore:
             db.execute("INSERT OR REPLACE INTO capabilities VALUES (?,?,?)",
                        (device["id"], device["epoch"], json.dumps(accepted)))
             return {"features": accepted}
+        if op == "attention":
+            # Optional session attention extension: atomically replace the open items
+            # and record each close once, with its reason.
+            data = attention_report(value)
+            self._epoch(data, device)
+            if not self._advertised(db, device, "attention"):
+                raise ProtocolError("invalid_request")
+            row = db.execute("SELECT items FROM attention WHERE device=?", (device["id"],)).fetchone()
+            known = {item["id"] for item in json.loads(row[0])} if row is not None else set()
+            db.execute("INSERT OR REPLACE INTO attention VALUES (?,?,?,?)",
+                       (device["id"], int(data["notices_enabled"]), int(data["replies_enabled"]),
+                        json.dumps(data["items"])))
+            # A close for an item this service never listed is ignored.
+            db.executemany("INSERT OR IGNORE INTO attention_closed VALUES (?,?,?)",
+                           [(device["id"], c["id"], c["reason"]) for c in data["closed"] if c["id"] in known])
+            return {"item_count": len(data["items"])}
         if op == "rotate_key":
             # Optional key rotation extension: a new pending key, current once first used.
             data = fields(value, {"worker_epoch"})

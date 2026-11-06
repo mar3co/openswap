@@ -733,6 +733,32 @@ def remote_folder_rows(worker_status: dict) -> list[dict]:
     return rows
 
 
+REMOTE_ATTENTION_NEEDS_WORKER = "Notices are sent while the local worker is on."
+
+
+def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
+    """Settings › Remote › Sessions: the two session attention switches (shown on a
+    paired Mac, and on an unpaired one while notices are on so they can be turned off).
+
+    ``worker_status["attention"]`` is ``{"notices": bool, "details": bool}``
+    as read from settings; no rows until it is known.
+    """
+    switches = worker_status.get("attention")
+    if not isinstance(switches, dict):
+        return []
+    notices = switches.get("notices") is True
+    rows = [
+        _section_row("group_remote_attention", "Sessions"),
+        {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_notices",
+         "label": "Tell me when a session needs me", "value": notices},
+        {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_details",
+         "label": "Send details", "value": switches.get("details") is True, "disabled": not notices},
+    ]
+    if notices and not enabled:
+        rows.append(_remote_hint("remote_attention_note", REMOTE_ATTENTION_NEEDS_WORKER))
+    return rows
+
+
 def remote_status_rows(worker_status: dict, *, enabled: bool, paused: bool, paired: bool,
                        expanded: bool) -> list[dict]:
     """Settings › Remote › Status: the one-line status, a key warning, Active job, then Details."""
@@ -949,6 +975,9 @@ def settings_page_rows(
         _remote_tasks_account_row(status.get("account_picker")),
         _remote_tasks_web_choice_row(status.get("account_picker")),
         *(remote_folder_rows(status) if worker_paired else []),
+        # Also while unpaired with notices on, so they can still be turned off.
+        *(remote_attention_rows(status, enabled=worker_enabled)
+          if worker_paired or (status.get("attention") or {}).get("notices") else []),
         *remote_status_rows(status, enabled=worker_enabled, paused=worker_paused, paired=worker_paired,
                             expanded="remote_tasks_details" in (expanded_sections or ())),
     ]

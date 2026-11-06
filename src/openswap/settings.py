@@ -785,6 +785,77 @@ def write_refused_origins(backup_root: Path, kinds) -> tuple[str, ...]:
         return _refused_origins_from_raw(raw)
 
 
+# Session attention (plan 025), set on this Mac only: whether this Mac tells the
+# control service when a session needs the owner, and whether it sends details.
+_ATTENTION_KEY = "attention"
+
+
+@dataclass(frozen=True)
+class AttentionSettings:
+    notices: bool = False
+    details: bool = True
+
+
+def _attention_from_raw(raw: dict, *, strict: bool = False) -> AttentionSettings:
+    section = raw.get("worker", {})
+    value = section.get(_ATTENTION_KEY, {}) if isinstance(section, dict) else None
+    if value == {}:
+        return AttentionSettings()
+    if (not isinstance(value, dict) or not set(value) <= {"notices", "details"}
+            or not all(type(item) is bool for item in value.values())):
+        if strict:
+            raise ConfigError("settings.json worker.attention is invalid")
+        # Fail closed: an unreadable setting sends nothing.
+        _logger.warning("settings.json worker.attention is invalid; session notices are off")
+        return AttentionSettings(notices=False, details=False)
+    defaults = AttentionSettings()
+    return AttentionSettings(value.get("notices", defaults.notices), value.get("details", defaults.details))
+
+
+def load_attention_settings(backup_root: Path, *, strict: bool = False) -> AttentionSettings:
+    """Whether this Mac reports sessions that need the owner, and with details.
+
+    Off by default; set only on this Mac. Fails closed: a settings file that
+    cannot be read or parsed turns notices and details off. ``strict`` raises
+    ConfigError instead, for a caller that must not read "unreadable" as "off".
+    """
+    path = settings_path(Path(backup_root))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("not a JSON object")
+    except FileNotFoundError:
+        return AttentionSettings()
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        if strict:
+            raise ConfigError(f"could not read {path}: {error}") from error
+        _logger.warning("Could not read %s (%s); session notices are off", path, error)
+        return AttentionSettings(notices=False, details=False)
+    return _attention_from_raw(raw, strict=strict)
+
+
+def write_attention_settings(backup_root: Path, *, notices: bool | None = None,
+                             details: bool | None = None) -> AttentionSettings:
+    """Change one or both attention switches, keeping every other setting."""
+    if any(value is not None and type(value) is not bool for value in (notices, details)):
+        raise ValueError("attention switches are booleans")
+    path = settings_path(Path(backup_root))
+    with _settings_write_lock(Path(backup_root)):
+        raw = _read_raw_for_write(path)
+        raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+        section = raw.get("worker")
+        if not isinstance(section, dict):
+            section = {}
+        current = _attention_from_raw(raw)
+        section[_ATTENTION_KEY] = {
+            "notices": current.notices if notices is None else notices,
+            "details": current.details if details is None else details,
+        }
+        raw["worker"] = section
+        atomic_write_json(path, raw)
+        return _attention_from_raw(raw)
+
+
 def load_worker_settings(backup_root: Path) -> WorkerSettings:
     """Read default-off worker policy without creating directories or files."""
     return _worker_from_raw(_read_raw(settings_path(backup_root)), Path(backup_root))

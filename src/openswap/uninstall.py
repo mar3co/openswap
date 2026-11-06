@@ -145,6 +145,7 @@ def remove_integrations(
         ("setup wizard state", _reset_welcome),
         ("Remote tasks worker", lambda: _remove_worker(home, uid, force, removal)),
         ("Claude Code status line", _restore_status_line),
+        ("session notices", _remove_session_notices),
         ("widget", lambda: _remove_widget(home, uid)),
     )
     for name, step in steps:
@@ -414,6 +415,14 @@ def _remove_worker(home: Path, uid: int | None, force: bool, removal: Removal | 
         ) from e
     worker_agent.uninstall(home=home, uid=uid)
     return True
+
+
+def _remove_session_notices() -> bool:
+    """Take OpenSwap's session hooks out of every Claude Code config home and
+    put Codex's own ``notify`` program back."""
+    from openswap import attention
+
+    return attention.remove(paths.get_backup_root())
 
 
 def _restore_status_line() -> bool:

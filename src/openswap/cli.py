@@ -1669,6 +1669,12 @@ def main() -> None:
         from openswap.worker.cli import main as worker_main
 
         sys.exit(worker_main(sys.argv[2:]))
+    # Claude Code hooks and Codex's notify run this: no migration, theme or
+    # engine, and nothing printed.
+    if len(sys.argv) > 1 and sys.argv[1] == "attention":
+        from openswap.attention import main as attention_main
+
+        sys.exit(attention_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "claude-desktop":
         from openswap.claude_desktop import main as desktop_main
 

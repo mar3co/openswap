@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from dataclasses import replace
+import logging
 import os
 from pathlib import Path
 import re
@@ -55,6 +56,8 @@ from openswap.worker.models import (
     SafeEvent,
     ProviderRun,
 )
+
+logger = logging.getLogger(__name__)
 
 HEALTH_STALE_AFTER_SECONDS = 30.0
 _WORKER_JOB_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -1766,6 +1769,20 @@ def _mark_stopped_quietly(runtime) -> None:
         pass
 
 
+def _attention_store(backup_root: Path):
+    """Session attention for this worker: the items, and the hooks brought up to date."""
+    from openswap import attention as hooks
+    from openswap.settings import load_attention_settings
+    from openswap.worker.attention import AttentionStore
+
+    try:
+        for problem in hooks.reconcile(backup_root):
+            logger.warning("Session notices: %s", problem)
+    except Exception:
+        logger.warning("Session notice hooks could not be checked", exc_info=True)
+    return AttentionStore(backup_root, enabled=lambda: load_attention_settings(backup_root).notices)
+
+
 def run_worker(
     backup_root: Path,
     *,
@@ -1803,11 +1820,14 @@ def run_worker(
         if not managed and service_loaded is not None and service_loaded():
             return WORKER_REFUSED_MANAGED
         runtime = runtime_factory(backup_root)
+        attention = _attention_store(backup_root)
+        # The remote client reports it; set before the client is made.
+        runtime.attention = attention
         ready_event = threading.Event()
         server = threading.Thread(
             target=serve,
             args=(socket_path(backup_root), runtime, stop_event),
-            kwargs={"ready_event": ready_event},
+            kwargs={"ready_event": ready_event, "notices": attention},
             name="openswap-worker-ipc", daemon=False,
         )
         server.start()

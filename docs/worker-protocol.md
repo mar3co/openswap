@@ -498,8 +498,9 @@ unknown operation (404 `unsupported_version`).
 
 `features` holds 0–20 unique strings, each 1–64 characters of lowercase ASCII
 letters, digits, `_` and `-`. A backend ignores a feature it does not know;
-v1 defines `"origin"` and `"key_rotation"` (see
-[Optional key rotation](#optional-key-rotation-v1-extension)). The response's
+v1 defines `"origin"`, `"key_rotation"` (see
+[Optional key rotation](#optional-key-rotation-v1-extension)) and `"attention"`
+(see [Optional session attention](#optional-session-attention-v1-extension)). The response's
 `features` is the subset of the request the backend accepts. The request
 atomically replaces the worker's whole advertised set. It carries the current
 worker epoch like any other mutation and returns `stale_epoch` from a
@@ -641,6 +642,110 @@ wins, and nothing is written), then switches every later request to it. If
 the save fails, it keeps the old key, which still works because the new one is
 only pending. The registration, the worker ID and the saved status are kept;
 see [Local enrollment and status](#local-enrollment-and-status).
+
+## Optional session attention (v1 extension)
+
+Without this extension a session on the Mac that stops to ask the owner
+something just waits until the owner looks. With it, the Mac reports every
+Claude Code session that waits for a permission, asks a question or has gone
+idle, and every finished Codex turn, so the backend can tell the owner
+elsewhere. The report is informational: it authorizes nothing, and in this
+release no reply travels back.
+
+The extension is additive. A worker advertises it as the `"attention"` feature
+of `capabilities` (see
+[Optional submission origin](#optional-submission-origin-v1-extension)) whenever
+its build supports it, whatever the owner's switches say, and sends the
+operation only after a registration whose `capabilities` the backend
+acknowledged with that feature. A backend that does not implement it ignores
+the feature, and rejects the operation like any unknown operation (404
+`unsupported_version`).
+
+| Operation | Request fields | Success response |
+| --- | --- | --- |
+| `attention` | `worker_epoch`, `notices_enabled` (boolean), `replies_enabled` (boolean), `items` (array below), `closed` (array below) | `item_count` |
+
+The request atomically replaces the worker's whole set of open items, like
+`readiness`, and `item_count` is the number of `items` received. It carries
+the current worker epoch like any other mutation and returns `stale_epoch` from
+a superseded registration. A backend refuses it with 400 `invalid_request` when
+the current registration did not advertise `"attention"`. A new registration
+keeps the report: the worker sends the whole set again, and an item it still
+lists is the same item, not a new one (a backend that alerts the owner does so
+once per item ID). A revocation clears it.
+
+`notices_enabled` and `replies_enabled` are the owner's switches on the Mac
+(set only there, never from the backend). With notices off the worker sends
+`items: []`. Replies are not part of this release, so `replies_enabled` is
+always `false`. These three are promises of the reference worker; a backend
+need not refuse a request that breaks them.
+
+`items` holds 0–50 entries, the newest open items, each a closed object with
+exactly these fields, and optionally `session_id` and `detail`:
+
+- `id`: 1–64 characters of ASCII letters, digits, `_` and `-`; unique within
+  the request. Every occurrence of a session needing the owner gets a new
+  random ID, never reused.
+- `kind`: `permission` (a tool waits for approval), `question` (a session asks
+  a multiple-choice question), `idle` (a session finished its turn and waits)
+  or `finished` (a Codex turn ended).
+- `provider`: `claude` or `codex`.
+- `session_label`: 1–100 characters with no Unicode control characters,
+  naming the session without its content (for example `Terminal · 3f2a`).
+- `session_id` (optional; the reference worker always sends it): 1–64
+  characters of ASCII letters, digits, `_` and `-`; an opaque per-Mac
+  identifier of the session (an HMAC of the Claude session ID or Codex thread
+  ID under the same per-Mac key as `folder_id`), never the ID itself. Items of
+  one session share it, so a backend can group or collapse their alerts.
+- `folder_id`: 1–64 characters of ASCII letters, digits, `_` and `-`; an opaque
+  per-Mac identifier of the session's folder (the reference client sends an
+  HMAC of the path under a random per-Mac key), never a path.
+- `folder_label`: 1–100 characters with no Unicode control characters: an
+  approved Remote tasks folder's label, else the folder's own name when the
+  owner sends details, else `a session`.
+- `created_at`: when the item opened, RFC 3339.
+- `actions`: the reply kinds the item accepts, 0–8 unique strings of 1–64
+  lowercase ASCII letters, digits, `_` and `-`. This release always sends
+  `[]`: every item is a notice.
+- `detail` (optional, only while the owner sends details): a closed object
+  with at least one of `tool_name` (1–100 characters), `description` (1–1,000),
+  `input_preview` (1–4,000; reserved for the tool preview Claude Code relays
+  to a channel session, which this release never sends), `last_message`
+  (1–1,000, the start of the session's last message) and `questions` (1–4 closed objects, each with
+  `question` (1–1,000), an optional `header` (1–100) and `options`, 0–4
+  option labels of 1–100 characters). `tool_name`, `header` and option labels
+  contain no Unicode control characters; the other text may contain newline,
+  carriage return and tab, and no other control character. A tool's raw input
+  is never sent: for `Bash` the worker sends the model's own description of
+  the command.
+
+`closed` holds 0–50 closed objects with exactly `id` (the item ID's grammar,
+unique within the array) and `reason`, one for each item that closed since
+the last report the backend accepted, sent once:
+`answered_on_mac`, `answered_from_watch`, `session_ended`, `superseded` (a
+newer Codex turn) or `expired` (a Codex item 24 hours old). An ID never
+appears in both arrays of one request. A backend ignores a close for an item
+it never saw (an earlier report may have been lost). An item that leaves
+`items` without a close (notices turned off, or past the 50-item cap) ended
+without an answer to show.
+
+Text is counted in Unicode code points. Escaped non-ASCII text could take 50
+full items past the 1,500,000-byte body limit, so the worker leaves out the
+`detail` of the oldest items until the request fits.
+
+The worker sends the report after each registration whose `capabilities` the
+backend accepted with `"attention"`, at once whenever an item opens, is
+published or closes, and within 5 seconds of a switch changing (by local
+fingerprint, like `readiness`). It runs on a thread of its own, so it never delays heartbeats,
+claims or results. A 404 `unsupported_version` (or 404 `not_found`, from
+reference servers predating this extension) stops it until the next
+registration; other failures are retried every 5 seconds. A close is dropped
+on the Mac once a report carrying it was accepted, when notices are turned
+off, or, past 200 waiting while no report gets through, oldest first.
+
+The reference service implements `attention`, keeps the latest report per
+worker and the close reason of each item that was in the report before; `openswap worker
+refserver attention --database PATH [WORKER_ID]` prints them.
 
 ## Errors, persistence, and operating the reference service
 
@@ -1453,6 +1558,51 @@ After each registration the worker sends `capabilities` with `["origin"]`; the
 reference service implements it, keeps the accepted set per registration,
 accepts `origin` only from a worker that advertised it, and `submit-test` takes
 `--origin-kind KIND --origin-label LABEL` (both or neither).
+
+### Telling you when a session needs you
+
+Settings › Remote › Sessions has two switches, set on this Mac only: **Tell me
+when a session needs me** (off by default) and **Send details** (on by
+default). They need a paired Mac with the local worker on. The worker reports
+open items with the [session attention
+extension](#optional-session-attention-v1-extension).
+
+Turning notices on installs Claude Code hooks (`openswap attention <event>`,
+`async`) in the `settings.json` of every config home OpenSwap manages:
+`~/.claude`, each account session profile that has its own `settings.json`,
+and each Claude Desktop profile's Code folder. Only OpenSwap's own entries are
+added or removed; a settings file that cannot be read is left alone, as with
+the status line. Codex's `notify` is chained: it becomes `openswap attention
+codex-notify -- <the program that was there>`, which still runs that program
+with the same arguments. The worker repeats both at each start, so a config
+home added since gets the hooks and a `notify` another program rewrote is
+chained again, keeping the new program. Turning notices off, or uninstalling
+OpenSwap, removes the hooks and puts `notify` back only while it still names
+OpenSwap; with notices off, the worker also takes out at its start any hook a
+failed removal left.
+
+A hook hands its event to the worker's socket and exits within a second,
+printing nothing; with no worker running the event is dropped. The worker
+publishes an item when Claude Code itself decides the owner seems away (its
+`permission_prompt` and `idle_prompt` notifications, about 6 and 60 seconds
+in), when a question is still unanswered after 6 seconds, and for every
+finished Codex turn. Answering at the Mac closes it: `PostToolUse` or
+`PostToolUseFailure` of that very call (matched by a digest of its input),
+`Stop` for permissions and questions, `UserPromptSubmit` for everything,
+including an idle item. So does the session ending: `SessionEnd`, `/clear`,
+or its Claude Code process gone (the hook reports that process's ID; it is
+checked every 5 seconds). A deny or Esc at
+the terminal fires no hook, so such an item stays open until the next of
+those. Open items survive a worker restart (`worker/attention.json` under the
+backup root, owner-only).
+
+Always sent: the kind, the provider, a session label, the time and an opaque
+folder ID. With details on, also the folder's name (an approved Remote tasks
+folder's label is always sent), the tool name and, for `Bash`, the model's own
+description of the command (never the command itself), a question with its
+header and option labels, and the first 1,000 characters of the session's
+last message. Never sent: prompts the owner typed, transcripts, account data
+or a tool's raw input.
 
 `worker status --json` includes `remote_connectivity` and
 `remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.

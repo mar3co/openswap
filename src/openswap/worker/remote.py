@@ -38,12 +38,16 @@ APPROVAL = "waiting_for_approval"
 WIRE_DIAGNOSTICS = {"workspace_refused": "provider_unavailable", "origin_refused": "provider_unavailable"}
 # What this worker advertises with `capabilities` after each registration. The
 # set never changes at runtime in this release.
-WORKER_FEATURES = ("origin", "key_rotation")
+WORKER_FEATURES = ("origin", "key_rotation", "attention")
 # After a failed rotation (lost response, refused, Keychain failure) the next
 # attempt waits this long; the old key keeps working meanwhile.
 ROTATION_BACKOFF_SECONDS = 3600.0
 # How often the readiness report rescans folders of repos when nothing changed.
 FOLDER_RESCAN_SECONDS = 30.0
+# The session attention thread wakes this often to publish a question past its
+# fallback; it rescans running sessions and retries a failed report every
+# HEARTBEAT_SECONDS, and reports a change at once.
+ATTENTION_WAKE_SECONDS = 0.5
 # Validation failures the service (or the local export check) reports for one
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
@@ -353,6 +357,11 @@ class RemoteClient:
         self.key_store = None
         self._rotation_epoch = recorded[0] if recorded is not None and "key_rotation" in recorded[1] else None
         self._rotation_unsupported_epoch = None
+        # Optional session attention extension: sent only for a registration whose
+        # "attention" the service accepted, whenever the report changes.
+        self._attention_epoch = recorded[0] if recorded is not None and "attention" in recorded[1] else None
+        self._attention_sent = None
+        self._attention_unsupported_epoch = None
         self._rotation_retry_at = None  # time.monotonic() before which no rotation is asked for
         self.runtime.remote_launch_guard = self.launch_allowed
         self.runtime.remote_account_ref = self.requested_account_ref
@@ -501,6 +510,7 @@ class RemoteClient:
             self.journal.record_capabilities(epoch, accepted)
             self._origin_epoch = epoch if "origin" in accepted else None
             self._rotation_epoch = epoch if "key_rotation" in accepted else None
+            self._attention_epoch = epoch if "attention" in accepted else None
             self._capabilities_sent = epoch
         except Exception:
             return
@@ -693,6 +703,78 @@ class RemoteClient:
             self._readiness_sent = (epoch, fingerprint)
         except Exception:
             return
+
+    def sync_attention(self) -> None:
+        """Send ``attention`` whenever the open items, the closes to report or the
+        owner's switches changed, for a registration that advertised it.
+
+        Like ``sync_readiness``: never raises, a failure is retried on the next
+        pass, and a 404 stops it until the next registration. Closes are
+        dropped from the store only once the service accepted them.
+        """
+        try:
+            store = getattr(self.runtime, "attention", None)
+            epoch = self.worker_epoch
+            if (store is None or epoch is None or self.state != "online" or self._attention_epoch != epoch
+                    or self._attention_unsupported_epoch == epoch):
+                return
+            from openswap.settings import load_attention_settings
+            from openswap.worker.attention import approved_folder_label
+
+            switches = load_attention_settings(self.runtime.backup_root)
+            if not switches.notices:
+                store.clear()
+            workspaces = load_worker_settings(self.runtime.backup_root).workspaces
+            body, closed_ids = store.report(notices=switches.notices, details=switches.details,
+                                            folder_label=lambda cwd: approved_folder_label(workspaces, cwd))
+            fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+            if not closed_ids and self._attention_sent == (epoch, fingerprint):
+                return
+            try:
+                response = self.transport.request("attention", {"worker_epoch": epoch, **body})
+            except ProtocolError as exc:
+                if exc.status == 404 and exc.code in {"unsupported_version", "not_found"}:
+                    self._attention_unsupported_epoch = epoch
+                elif exc.code in {"revoked", "unauthorized", "device_expired"}:
+                    self._connectivity(exc)
+                return
+            try:
+                if integer(fields(response, {"item_count"})["item_count"]) != len(body["items"]):
+                    return  # malformed acknowledgement: resend on the next pass
+            except ProtocolError:
+                return
+            store.acknowledge(closed_ids)
+            # Without the closes the same open set needs no resend.
+            body["closed"] = []
+            self._attention_sent = (epoch, hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest())
+        except Exception:
+            return
+
+    def _attention_loop(self):
+        from openswap.settings import load_attention_settings
+
+        store = self.runtime.attention
+        next_pass = 0.0
+        while not self.stop_event.is_set():
+            # Cleared only once seen set: a notice landing after a timed-out
+            # wait wakes the next one at once.
+            changed = store.changed.wait(ATTENTION_WAKE_SECONDS)
+            if changed:
+                store.changed.clear()
+            try:
+                store.tick()
+                now = time.monotonic()
+                if now >= next_pass:
+                    next_pass = now + HEARTBEAT_SECONDS
+                    if not load_attention_settings(self.runtime.backup_root).notices:
+                        store.clear()  # even with no service to tell
+                    store.prune()
+                    changed = True
+                if changed or store.changed.is_set():
+                    store.changed.clear()
+                    self.sync_attention()
+            except Exception:
+                continue
 
     def accounts_offered(self) -> bool:
         """Whether the service acknowledged a non-empty account set for this registration."""
@@ -1159,6 +1241,10 @@ class RemoteClient:
         self.stop_event = stop_event
         helpers = [threading.Thread(target=self._sync_loop, name="openswap-worker-remote-sync", daemon=True),
                    threading.Thread(target=self._renew_loop, name="openswap-worker-remote-renew", daemon=True)]
+        if getattr(self.runtime, "attention", None) is not None:
+            # Its own thread, so a long synchronization pass never delays a notice.
+            helpers.append(threading.Thread(target=self._attention_loop, name="openswap-worker-remote-attention",
+                                            daemon=True))
         for helper in helpers:
             helper.start()
         try:

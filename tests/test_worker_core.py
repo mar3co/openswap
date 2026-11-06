@@ -1201,7 +1201,7 @@ def test_manual_worker_exits_when_policy_is_disabled(
         runtime_ready.set()
         return runtime
 
-    def fake_serve(_path, _control, stop_event, *, ready_event=None):
+    def fake_serve(_path, _control, stop_event, *, ready_event=None, notices=None):
         if ready_event is not None:
             ready_event.set()
         stop_event.wait(30)

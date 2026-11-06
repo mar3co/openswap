@@ -1,5 +1,6 @@
 """Operator-only reference service CLI. No secrets are read from remote callers."""
 import argparse
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -12,7 +13,7 @@ from openswap.worker.refserver import ControlStore, make_server
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="openswap worker refserver")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "pair-code", "revoke"):
+    for name in ("serve", "pair-code", "revoke", "attention"):
         command = commands.add_parser(name)
         command.add_argument("--database", type=Path, required=True, help="SQLite file in an owner-private directory")
         if name == "serve":
@@ -22,6 +23,8 @@ def main(argv=None):
                                  help="non-loopback HTTP must sit behind owner-controlled TLS termination on a private backend link")
         if name == "revoke":
             command.add_argument("worker_id")
+        if name == "attention":
+            command.add_argument("worker_id", nargs="?", help="one worker; every reporting worker by default")
         if name == "pair-code":
             command.add_argument("--renew", metavar="WORKER_ID",
                                  help="renewal code: pairing rotates this worker's key and keeps its ID and jobs")
@@ -31,6 +34,9 @@ def main(argv=None):
         store = ControlStore(args.database)
         if args.command == "pair-code":
             print(store.issue_code(args.renew))
+        elif args.command == "attention":
+            workers = [args.worker_id] if args.worker_id else store.attention_workers()
+            print(json.dumps({worker: store.attention(worker) for worker in workers}, indent=2))
         elif args.command == "revoke":
             store.revoke(args.worker_id)
             print("Device revoked.")

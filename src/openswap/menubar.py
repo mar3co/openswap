@@ -935,10 +935,16 @@ def run(switcher, codex=None) -> int:
             return ui is not None and ui.folders_locked
 
         def _remote_status(self):
-            """The worker snapshot Settings › Remote draws, with the setup window's folder lock."""
+            """The worker snapshot Settings › Remote draws, with the setup window's folder
+            lock and the session attention switches as saved now."""
+            from openswap.settings import load_attention_settings
+
+            status = dict(self._worker_status_cache)
+            switches = load_attention_settings(self.switcher.backup_dir)
+            status["attention"] = {"notices": switches.notices, "details": switches.details}
             if self._setup_changing_folders():
-                return {**self._worker_status_cache, "setup_changing_folders": True}
-            return self._worker_status_cache
+                status["setup_changing_folders"] = True
+            return status
 
         def _setup_prompts(self, title):
             """The setup's front end: pairing in dialogs, every later step in the setup window."""
@@ -2442,6 +2448,8 @@ def run(switcher, codex=None) -> int:
                 self.on_toggle_kickoff(None)
             elif row_id == "claude_status_line":
                 self._toggle_status_line()
+            elif row_id in ("remote_attention_notices", "remote_attention_details"):
+                self._toggle_attention(row_id)
             elif row_id == "kickoff_time":
                 self.on_kickoff_time(value)
                 # The popup already shows the pick; do not rebuild the page
@@ -2587,6 +2595,28 @@ def run(switcher, codex=None) -> int:
                 set_installed(paths.get_claude_config_home(), self.switcher.backup_dir, enable)
             except (ClaudeSwitchError, OSError) as e:
                 self._show_error(f"Couldn't change the Claude Code status line: {e}")
+
+        def _toggle_attention(self, row_id) -> None:
+            """Settings › Remote › Sessions: flip one switch as saved now. Turning
+            notices on or off also installs or removes the hooks; a config
+            home that could not be changed is named."""
+            from openswap.settings import load_attention_settings, write_attention_settings
+
+            root = self.switcher.backup_dir
+            try:
+                current = load_attention_settings(root)
+                if row_id == "remote_attention_details":
+                    write_attention_settings(root, details=not current.details)
+                    return
+                from openswap.attention import set_notices
+
+                problems = set_notices(root, not current.notices)
+            except (ClaudeSwitchError, OSError, ValueError) as e:
+                self._show_error(f"Couldn't change session notices: {e}")
+                return
+            if problems:
+                more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
+                self._show_error(f"Session notices could not be set up everywhere: {problems[0]}{more}")
 
         def _toggle_codex_auto(self) -> bool:
             """Flip Codex auto-switching (Settings row and the Codex tab's footer toggle)."""

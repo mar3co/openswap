@@ -16,6 +16,7 @@ opensoft.me/swap/changelog shows this file.
 ### New
 
 - Settings › Remote lists the folders remote tasks may work in, with Add Folder… and Remove for each.
+- Settings › Remote › Sessions can tell your control service when a Claude Code session waits for a permission, asks a question or sits idle, and when a Codex turn ends, with or without details. Off until you turn it on.
 
 ### Improved
 

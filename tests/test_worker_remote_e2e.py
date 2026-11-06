@@ -80,7 +80,7 @@ def test_loopback_pair_cli_submit_fake_run_events_and_artifact(tmp_path, keychai
             assert adapter.starts == 1
             # The worker advertised `origin` at registration, so a job may say where it came
             # from; the claim carries it unchanged and the local record keeps it.
-            assert store.capabilities(enrollment.worker_id) == ["origin", "key_rotation"]
+            assert store.capabilities(enrollment.worker_id) == ["origin", "key_rotation", "attention"]
             assert cli.main([*arguments, "--origin-kind", "assistant", "--origin-label", "ChatGPT"],
                             backup_root=root) == 0
             origin_job = json.loads(capsys.readouterr().out)["job_id"]
@@ -238,7 +238,7 @@ def test_loopback_key_rotation_survives_a_lost_response_then_promotes(tmp_path, 
             configured.tick()
             client = configured.client
             epoch = client.worker_epoch
-            assert client.state == "online" and store.capabilities(original.worker_id) == ["origin", "key_rotation"]
+            assert client.state == "online" and store.capabilities(original.worker_id) == ["origin", "key_rotation", "attention"]
             assert lost and json.loads(keychain[item])["device_key"] == original.device_key
             configured.tick()
             assert client.state == "online"  # the old key still works
