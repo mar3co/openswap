@@ -16,15 +16,20 @@ from contextlib import closing
 from openswap.worker.models import SafeEventKind
 from openswap.worker.protocol import (
     Artifact, DEVICE_TTL_SECONDS, FEATURES, HEARTBEAT_SECONDS, LEASE_SECONDS, MAX_ARTIFACTS,
-    MISSED_HEARTBEATS, PREVIOUS_KEY_GRACE_SECONDS, ProtocolError, ROTATION_INTERVAL_SECONDS, Submission,
-    TERMINAL, advertised_accounts, capability_features, event_from_dict, execution_mode, fields, integer,
-    reported_folders, text, stamp as wire_stamp,
+    MAX_ATTENTION_REPLIES, MISSED_HEARTBEATS, PREVIOUS_KEY_GRACE_SECONDS, ProtocolError, ROTATION_INTERVAL_SECONDS,
+    Submission, TERMINAL, advertised_accounts, attention_acks, attention_reply, attention_report,
+    capability_features, event_from_dict, execution_mode, fields, integer, reported_folders, text,
+    stamp as wire_stamp,
 )
 
 # Jobs whose cancel flag a reconnecting worker must still enforce.
 ENFORCE_CANCEL = ("claimed", "starting", "running", "cancel_requested", "interrupted")
 # Heartbeat lists at most this many: live jobs first, then the newest unconfirmed interruptions.
 MAX_CANCEL_IDS = 100
+# Attention replies expire this long after they are sent; a first acknowledgement
+# is still taken this long after that.
+REPLY_SECONDS = 600
+REPLY_ACK_GRACE_SECONDS = 600
 
 
 def stamp(seconds: float) -> str:
@@ -89,6 +94,16 @@ class ControlStore:
                     device TEXT PRIMARY KEY, folders TEXT NOT NULL, execution TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS capabilities (
                     device TEXT PRIMARY KEY, epoch INTEGER NOT NULL, features TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS attention (
+                    device TEXT PRIMARY KEY, notices INTEGER NOT NULL, replies INTEGER NOT NULL,
+                    items TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS attention_closed (
+                    device TEXT NOT NULL, id TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(device,id));
+                CREATE TABLE IF NOT EXISTS attention_known (
+                    device TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(device,id));
+                CREATE TABLE IF NOT EXISTS attention_replies (
+                    id TEXT PRIMARY KEY, device TEXT NOT NULL, item TEXT NOT NULL, payload TEXT NOT NULL,
+                    expiry REAL NOT NULL, outcome TEXT);
             ''')
             if "confirmed" not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
@@ -152,6 +167,57 @@ class ControlStore:
                              "WHERE c.device=? AND c.epoch=d.epoch", (worker_id,)).fetchone()
         return None if row is None else json.loads(row[0])
 
+    def attention(self, worker_id: str) -> dict | None:
+        """The worker's latest attention report (open items in sent order, the
+        switches, and the close reasons it reported for items it had listed),
+        or None when it has never reported (for the operator and tests)."""
+        with closing(self.connect()) as db:
+            row = db.execute("SELECT notices,replies,items FROM attention WHERE device=?", (worker_id,)).fetchone()
+            closed = db.execute("SELECT id,reason FROM attention_closed WHERE device=? ORDER BY rowid",
+                                (worker_id,)).fetchall()
+            replies = db.execute("SELECT id,item,payload,outcome FROM attention_replies WHERE device=? ORDER BY rowid",
+                                 (worker_id,)).fetchall()
+        if row is None:
+            return None
+        return {"notices_enabled": bool(row[0]), "replies_enabled": bool(row[1]), "items": json.loads(row[2]),
+                "closed": {r[0]: r[1] for r in closed},
+                "replies": [{**json.loads(r[2]), "outcome": r[3]} for r in replies]}
+
+    def attention_reply(self, worker_id: str, item_id: str, action: str, *, answers=None, text_value=None) -> str:
+        """Queue a reply to one of the worker's open items, as the owner's phone or
+        watch would (for the operator and tests). Refused (ProtocolError) unless
+        the worker's latest report lists the item open with that action and
+        replies on, and the item has no reply yet."""
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT replies,items FROM attention WHERE device=?", (worker_id,)).fetchone()
+            item = next((i for i in json.loads(row[1]) if i["id"] == item_id), None) if row is not None else None
+            if item is None:
+                raise ProtocolError("item_closed", 409)
+            if not row[0]:
+                raise ProtocolError("replies_off", 409)
+            if action not in item["actions"]:
+                raise ProtocolError("action_not_offered")
+            if db.execute("SELECT 1 FROM attention_replies WHERE device=? AND item=?",
+                          (worker_id, item_id)).fetchone() is not None:
+                raise ProtocolError("reply_exists", 409)
+            now = self.clock()
+            reply = {"id": secrets.token_urlsafe(12), "item_id": item_id, "action": action,
+                     "expires_at": stamp(now + REPLY_SECONDS)}
+            if action == "answer":
+                reply["answers"] = answers
+            if action == "message":
+                reply["text"] = text_value
+            attention_reply(reply)
+            db.execute("INSERT INTO attention_replies VALUES (?,?,?,?,?,NULL)",
+                       (reply["id"], worker_id, item_id, json.dumps(reply), now + REPLY_SECONDS))
+            return reply["id"]
+
+    def attention_workers(self) -> list[str]:
+        """Workers with a current attention report, for the operator's listing."""
+        with closing(self.connect()) as db:
+            return [r[0] for r in db.execute("SELECT device FROM attention ORDER BY device")]
+
     @staticmethod
     def _advertised(db, device, feature) -> bool:
         """Whether the worker's current registration advertised ``feature`` (and it was accepted)."""
@@ -174,6 +240,10 @@ class ControlStore:
             db.execute("DELETE FROM account_choice_epochs WHERE device=?", (worker_id,))
             db.execute("DELETE FROM readiness WHERE device=?", (worker_id,))
             db.execute("DELETE FROM capabilities WHERE device=?", (worker_id,))
+            db.execute("DELETE FROM attention WHERE device=?", (worker_id,))
+            db.execute("DELETE FROM attention_closed WHERE device=?", (worker_id,))
+            db.execute("DELETE FROM attention_known WHERE device=?", (worker_id,))
+            db.execute("DELETE FROM attention_replies WHERE device=?", (worker_id,))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state NOT IN "
                        "('queued','succeeded','failed','cancelled','interrupted','expired')", (worker_id,))
 
@@ -286,6 +356,34 @@ class ControlStore:
             db.close()
 
     @staticmethod
+    def _take_acks(db, device_id, acks, now):
+        """Record a heartbeat's acknowledgements, in order. Never refuses the
+        heartbeat: a malformed entry, one for an unknown or another worker's
+        reply, or one after the grace past its expiry is ignored. A reply's first
+        outcome is final, except that ``sent`` may become ``applied``; an ID may
+        appear more than once."""
+        for ack in acks if isinstance(acks, list) else []:
+            try:
+                attention_acks([ack])
+            except ProtocolError:
+                continue
+            row = db.execute("SELECT outcome,expiry FROM attention_replies WHERE id=? AND device=?",
+                             (ack["id"], device_id)).fetchone()
+            if row is None or now > row[1] + REPLY_ACK_GRACE_SECONDS:
+                continue
+            if row[0] is None or (row[0] == "sent" and ack["outcome"] == "applied"):
+                db.execute("UPDATE attention_replies SET outcome=? WHERE id=?", (ack["outcome"], ack["id"]))
+
+    @staticmethod
+    def _owed_replies(db, device_id, now):
+        """The replies still owed: unacknowledged, unexpired, their item still listed."""
+        report = db.execute("SELECT items FROM attention WHERE device=?", (device_id,)).fetchone()
+        open_items = {item["id"] for item in json.loads(report[0])} if report is not None else set()
+        rows = db.execute("SELECT item,payload FROM attention_replies WHERE device=? AND outcome IS NULL AND expiry>? "
+                          "ORDER BY rowid", (device_id, now)).fetchall()
+        return [json.loads(r[1]) for r in rows if r[0] in open_items][:MAX_ATTENTION_REPLIES]
+
+    @staticmethod
     def _epoch(data, device):
         if integer(data["worker_epoch"], 1) != device["epoch"]:
             raise ProtocolError("stale_epoch", 409)
@@ -320,21 +418,28 @@ class ControlStore:
             db.execute("DELETE FROM account_choice_epochs WHERE device=?", (device["id"],))
             # ...and has not reported its folders or execution mode either.
             db.execute("DELETE FROM readiness WHERE device=?", (device["id"],))
-            # ...nor advertised any capability.
+            # ...nor advertised any capability. Its attention report stays: a restarted
+            # worker reports the same open items again, which are not new.
             db.execute("DELETE FROM capabilities WHERE device=?", (device["id"],))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state IN "
                        "('claimed','starting','running','cancel_requested')", (device["id"],))
             return {"worker_id": device["id"], "worker_epoch": epoch,
                     "heartbeat_seconds": HEARTBEAT_SECONDS, "lease_seconds": LEASE_SECONDS}
         if op in {"heartbeat", "poll"}:
-            data = fields(value, {"worker_epoch"})
+            data = fields(value, {"worker_epoch"}, {"attention_acks"} if op == "heartbeat" else set())
             self._epoch(data, device)
             if op == "heartbeat":
                 db.execute("UPDATE devices SET seen=? WHERE id=?", (now, device["id"]))
                 cancelled = db.execute(
                     "SELECT id FROM jobs WHERE device=? AND cancel=1 AND confirmed=0 AND state IN (?,?,?,?,?) "
                     "ORDER BY state='interrupted', rowid DESC LIMIT ?", (device["id"], *ENFORCE_CANCEL, MAX_CANCEL_IDS))
-                return {"last_seen_at": stamp(now), "cancel_job_ids": [r[0] for r in cancelled]}
+                result = {"last_seen_at": stamp(now), "cancel_job_ids": [r[0] for r in cancelled]}
+                # Outcomes count from any registration of this worker; replies go
+                # only to one that advertised the extension.
+                self._take_acks(db, device["id"], data.get("attention_acks"), now)
+                if self._advertised(db, device, "attention"):
+                    result["attention_replies"] = self._owed_replies(db, device["id"], now)
+                return result
             if device["seen"] is None or device["seen"] <= now - HEARTBEAT_SECONDS * MISSED_HEARTBEATS:
                 raise ProtocolError("offline_worker", 409)
             active = db.execute("SELECT * FROM jobs WHERE device=? AND epoch>0 AND state NOT IN "
@@ -389,6 +494,27 @@ class ControlStore:
             db.execute("INSERT OR REPLACE INTO capabilities VALUES (?,?,?)",
                        (device["id"], device["epoch"], json.dumps(accepted)))
             return {"features": accepted}
+        if op == "attention":
+            # Optional session attention extension: atomically replace the open items
+            # and record each close once, with its reason.
+            data = attention_report(value)
+            self._epoch(data, device)
+            if not self._advertised(db, device, "attention"):
+                raise ProtocolError("invalid_request")
+            db.execute("INSERT OR REPLACE INTO attention VALUES (?,?,?,?)",
+                       (device["id"], int(data["notices_enabled"]), int(data["replies_enabled"]),
+                        json.dumps(data["items"])))
+            # A close is kept for any item this service listed since the worker
+            # paired (a close can arrive reports after the item left the list);
+            # one for an item it never listed is ignored.
+            db.executemany("INSERT OR IGNORE INTO attention_known VALUES (?,?)",
+                           [(device["id"], item["id"]) for item in data["items"]])
+            db.execute("DELETE FROM attention_known WHERE device=? AND rowid NOT IN (SELECT rowid FROM "
+                       "attention_known WHERE device=? ORDER BY rowid DESC LIMIT 5000)", (device["id"], device["id"]))
+            known = {r[0] for r in db.execute("SELECT id FROM attention_known WHERE device=?", (device["id"],))}
+            db.executemany("INSERT OR IGNORE INTO attention_closed VALUES (?,?,?)",
+                           [(device["id"], c["id"], c["reason"]) for c in data["closed"] if c["id"] in known])
+            return {"item_count": len(data["items"])}
         if op == "rotate_key":
             # Optional key rotation extension: a new pending key, current once first used.
             data = fields(value, {"worker_epoch"})

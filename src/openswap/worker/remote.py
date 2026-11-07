@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import http.client
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -19,6 +20,7 @@ from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, Requ
 from uuid import uuid4
 
 from openswap.settings import load_worker_settings
+from openswap.worker.attention import log_limited
 from openswap.worker.journal import AdmissionError, JournalError
 from openswap.worker.models import JobState, RemoteAuthorization, SafeEventKind
 from openswap.worker.protocol import (
@@ -29,6 +31,7 @@ from openswap.worker.protocol import (
 
 STATES = frozenset(state.value for state in JobState)
 # The protocol caps heartbeat cancel_job_ids; a longer list is a malformed response.
+logger = logging.getLogger(__name__)
 MAX_CANCEL_IDS = 100
 # Reserved by the protocol: v1 has no approval/resume operation, so it fails closed.
 APPROVAL = "waiting_for_approval"
@@ -38,12 +41,22 @@ APPROVAL = "waiting_for_approval"
 WIRE_DIAGNOSTICS = {"workspace_refused": "provider_unavailable", "origin_refused": "provider_unavailable"}
 # What this worker advertises with `capabilities` after each registration. The
 # set never changes at runtime in this release.
-WORKER_FEATURES = ("origin", "key_rotation")
+WORKER_FEATURES = ("origin", "key_rotation", "attention")
 # After a failed rotation (lost response, refused, Keychain failure) the next
 # attempt waits this long; the old key keeps working meanwhile.
 ROTATION_BACKOFF_SECONDS = 3600.0
 # How often the readiness report rescans folders of repos when nothing changed.
 FOLDER_RESCAN_SECONDS = 30.0
+# The session attention thread reads the session files this often (a "No" or
+# Esc at the Mac fires no hook); it retries a failed report every
+# HEARTBEAT_SECONDS, and reports a change at once.
+ATTENTION_WAKE_SECONDS = 0.5
+# A service that refuses session notices as forbidden is asked again this rarely.
+ATTENTION_FORBIDDEN_SECONDS = 900.0
+# Hooks go into config homes created since the worker started this often.
+ATTENTION_INSTALL_SECONDS = 30.0
+# A report the service refuses as too large shrinks, but never below this.
+ATTENTION_MIN_BUDGET = 8192
 # Validation failures the service (or the local export check) reports for one
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
@@ -148,7 +161,10 @@ class Transport:
                 result = self._read(response)
         except HTTPError as exc:
             with exc:
-                result = self._read(exc)
+                try:
+                    result = self._read(exc)
+                except ProtocolError:
+                    result = {}  # not the service's own answer (a proxy's page): its status still counts
             code = result.get("error", "service_unavailable")
             raise ProtocolError(code if code in SERVICE_ERRORS else "service_unavailable", exc.code) from None
         except (URLError, TimeoutError, OSError, http.client.HTTPException):
@@ -353,6 +369,13 @@ class RemoteClient:
         self.key_store = None
         self._rotation_epoch = recorded[0] if recorded is not None and "key_rotation" in recorded[1] else None
         self._rotation_unsupported_epoch = None
+        # Optional session attention extension: sent only for a registration whose
+        # "attention" the service accepted, whenever the report changes.
+        self._attention_epoch = recorded[0] if recorded is not None and "attention" in recorded[1] else None
+        self._attention_sent = None
+        self._attention_unsupported_epoch = None
+        # How reports are shaped after the service refused one (``_attention_refused``).
+        self._attention_shape = _ReportShape()
         self._rotation_retry_at = None  # time.monotonic() before which no rotation is asked for
         self.runtime.remote_launch_guard = self.launch_allowed
         self.runtime.remote_account_ref = self.requested_account_ref
@@ -364,11 +387,11 @@ class RemoteClient:
         # Fixed length whatever the remote ID's size (IDs may be 200 characters).
         return "remote:" + hashlib.sha256((self.journal.service + "\0" + claim.job_id).encode()).hexdigest()
 
-    def _worker_request(self, operation):
+    def _worker_request(self, operation, extra=None):
         """``heartbeat``/``poll``: a stale worker epoch means another registration
         superseded this one, so re-register on the next tick instead of reporting online."""
         try:
-            return self.transport.request(operation, {"worker_epoch": self.worker_epoch})
+            return self.transport.request(operation, {"worker_epoch": self.worker_epoch, **(extra or {})})
         except ProtocolError as exc:
             if exc.code == "stale_epoch":
                 with self._lock:
@@ -501,6 +524,7 @@ class RemoteClient:
             self.journal.record_capabilities(epoch, accepted)
             self._origin_epoch = epoch if "origin" in accepted else None
             self._rotation_epoch = epoch if "key_rotation" in accepted else None
+            self._attention_epoch = epoch if "attention" in accepted else None
             self._capabilities_sent = epoch
         except Exception:
             return
@@ -694,6 +718,130 @@ class RemoteClient:
         except Exception:
             return
 
+    def sync_attention(self) -> None:
+        """Send ``attention`` whenever the open items, the closes to report or the
+        owner's switches changed, for a registration that advertised it.
+
+        Like ``sync_readiness``: never raises, a failure is retried on the next
+        pass, and a 404 stops it until the next registration. Closes are
+        dropped from the store only once the service accepted them. A refused
+        report is reshaped (``_attention_refused``) so the closes always get
+        through. An unreadable settings file is not "off": the open items stay
+        and waiting closes still go, without details or replies.
+        """
+        try:
+            store = getattr(self.runtime, "attention", None)
+            epoch = self.worker_epoch
+            if (store is None or not store.ready or epoch is None or self.state != "online"
+                    or self._attention_epoch != epoch or self._attention_unsupported_epoch == epoch
+                    or time.monotonic() < self._attention_shape.retry_at):
+                return
+            from openswap.settings import load_attention_settings
+            from openswap.worker.attention import approved_folder_label
+
+            switches = load_attention_settings(self.runtime.backup_root)
+            store.note_problem("settings", None if switches.readable else
+                               "OpenSwap can't read its settings file, so session notices send nothing new.")
+            if switches.readable and not switches.notices:
+                store.clear()
+            notices = switches.notices or not switches.readable
+            workspaces = load_worker_settings(self.runtime.backup_root).workspaces
+            shape = self._attention_shape
+            shape.forget(store.open_ids())
+            body, closed_ids = store.report(
+                notices=notices, details=switches.details and switches.readable,
+                replies=switches.replies and switches.readable,
+                folder_label=lambda cwd: approved_folder_label(workspaces, cwd),
+                budget=shape.budget, plain=frozenset(shape.plain - {shape.trying}), bare=frozenset(shape.bare),
+                closes_only=shape.closes_only)
+            if not switches.readable and not body["items"] and not closed_ids:
+                return  # nothing to keep the service up to date with
+            fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+            if not closed_ids and self._attention_sent == (epoch, fingerprint):
+                shape.accepted()  # the very report the service took last: what it would say again
+                return
+            try:
+                response = self.transport.request("attention", {"worker_epoch": epoch, **body})
+            except ProtocolError as exc:
+                if exc.status == 404 and exc.code in {"unsupported_version", "not_found"}:
+                    self._attention_unsupported_epoch = epoch
+                elif exc.code in {"revoked", "unauthorized", "device_expired"}:
+                    self._connectivity(exc)
+                else:
+                    self._attention_refused(store, exc, body)
+                return
+            try:
+                if integer(fields(response, {"item_count"})["item_count"]) != len(body["items"]):
+                    return  # malformed acknowledgement: resend on the next pass
+            except ProtocolError:
+                return
+            store.acknowledge(closed_ids, body["items"])
+            shape.accepted()
+            store.note_problem("refused", None)
+            # Without the closes the same open set needs no resend.
+            body["closed"] = []
+            self._attention_sent = (epoch, hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest())
+        except Exception as exc:  # noqa: BLE001 - retried on the next pass
+            log_limited("attention_sync", "Session notices could not be reported: %s", exc)
+            return
+
+    def _attention_refused(self, store, exc: ProtocolError, body: dict) -> None:
+        """The service refused a report. 403: ask again only every
+        ``ATTENTION_FORBIDDEN_SECONDS`` and say why. 413: the next one is smaller.
+        400: the next one leaves out what may be the cause, an item's detail
+        first (then each is tried again alone), then its labels, and as a last
+        resort every item, so the closes get through. Anything else is retried
+        on the next pass."""
+        shape = self._attention_shape
+        log_limited(f"attention_{exc.status}_{exc.code}", "Control service refused the session notice report: "
+                    "%s %s", exc.status, exc.code)
+        if exc.status == 403:
+            shape.retry_at = time.monotonic() + ATTENTION_FORBIDDEN_SECONDS
+            store.note_problem("refused", "The control service refuses session notices from this Mac "
+                               f"({exc.code}); OpenSwap asks again every {int(ATTENTION_FORBIDDEN_SECONDS // 60)} "
+                               "minutes.")
+        elif exc.status == 413:
+            if shape.budget <= ATTENTION_MIN_BUDGET:
+                shape.only_closes()
+            sent = len(json.dumps(body, allow_nan=False).encode())
+            shape.budget = max(ATTENTION_MIN_BUDGET, min(shape.budget, sent) // 2)
+        elif exc.status == 400 and exc.code == "invalid_request":
+            shape.refused(body)  # the service's own refusal of the report, never a proxy's error page
+
+
+
+    def _attention_loop(self):
+        from openswap.settings import load_attention_settings
+
+        store = self.runtime.attention
+        next_pass = next_install = 0.0
+        while not self.stop_event.is_set():
+            # Cleared only once seen set: a notice landing after a timed-out
+            # wait wakes the next one at once.
+            changed = store.changed.wait(ATTENTION_WAKE_SECONDS)
+            if changed:
+                store.changed.clear()
+            try:
+                store.refresh()  # session files and Codex's log: answers and exits that fire no hook
+                store.tick()
+                store.apply_replies(self._server_now().timestamp())
+                now = time.monotonic()
+                if now >= next_pass:
+                    next_pass = now + HEARTBEAT_SECONDS
+                    switches = load_attention_settings(self.runtime.backup_root)
+                    if switches.readable and not switches.notices:
+                        store.clear()  # even with no service to tell
+                    changed = True
+                if now >= next_install:
+                    next_install = now + ATTENTION_INSTALL_SECONDS
+                    store.install()  # config homes and profiles added while the worker runs
+                if changed or store.changed.is_set():
+                    store.changed.clear()
+                    self.sync_attention()
+            except Exception as exc:  # noqa: BLE001 - the next pass tries again
+                log_limited("attention_loop", "Session notices pass failed: %s", exc)
+                continue
+
     def accounts_offered(self) -> bool:
         """Whether the service acknowledged a non-empty account set for this registration."""
         sent = self._accounts_sent
@@ -738,12 +886,29 @@ class RemoteClient:
             return False
         if self.state in FINAL:
             return False  # only a new enrollment (re-pair) can restore access
+        store, acks = None, []
         try:
             if self.worker_epoch is None:
                 registered = self.transport.request("register", {})
                 self.worker_epoch = integer(registered["worker_epoch"], 1)
             sent = datetime.now(timezone.utc)
-            heartbeat = self._worker_request("heartbeat")
+            # Session attention replies ride on the heartbeat. Outcomes go out on
+            # any registration of a service that accepted "attention" (kept until
+            # a heartbeat carrying them succeeds); replies come in only for the
+            # registration that advertised it.
+            store = getattr(self.runtime, "attention", None)
+            acks = store.take_acks() if store is not None and self._attention_epoch is not None else []
+            try:
+                heartbeat = self._worker_request("heartbeat", {"attention_acks": acks} if acks else None)
+            except ProtocolError as exc:
+                if not (acks and exc.code == "invalid_request"):
+                    raise
+                # Liveness and replies never wait on outcomes the service refuses:
+                # this heartbeat goes again without them, and only if that one is
+                # taken are they the cause (tried again apart: ``acks_refused``).
+                heartbeat = self._worker_request("heartbeat")
+                store.acks_refused(acks)
+                acks = []
             seen = timestamp(heartbeat["last_seen_at"])
             cancel_ids = heartbeat["cancel_job_ids"]
             if (not isinstance(cancel_ids, list) or len(cancel_ids) > MAX_CANCEL_IDS
@@ -756,6 +921,11 @@ class RemoteClient:
                 self._skew = seen - sent
                 # Only queued here: runtime control calls never delay the next heartbeat.
                 self._cancels.update(cancel_ids)
+            if store is not None:
+                store.acks_sent(acks)
+                if self._attention_epoch is not None and self._attention_epoch == self.worker_epoch:
+                    # Only queued here too: the attention thread applies them.
+                    store.queue_replies(heartbeat.get("attention_replies"))
             self._connectivity()
             return self.state == "online"
         except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
@@ -1159,6 +1329,10 @@ class RemoteClient:
         self.stop_event = stop_event
         helpers = [threading.Thread(target=self._sync_loop, name="openswap-worker-remote-sync", daemon=True),
                    threading.Thread(target=self._renew_loop, name="openswap-worker-remote-renew", daemon=True)]
+        if getattr(self.runtime, "attention", None) is not None:
+            # Its own thread, so a long synchronization pass never delays a notice.
+            helpers.append(threading.Thread(target=self._attention_loop, name="openswap-worker-remote-attention",
+                                            daemon=True))
         for helper in helpers:
             helper.start()
         try:
@@ -1193,3 +1367,67 @@ class RemoteClient:
                 # process lifetime; the next pass retries at the usual cadence.
                 self._connectivity(exc)
             self.stop_event.wait(HEARTBEAT_SECONDS)
+class _ReportShape:
+    """How the next ``attention`` report is cut after the service refused one."""
+
+    def __init__(self):
+        from openswap.worker.attention import REPORT_BUDGET
+
+        self.budget = REPORT_BUDGET
+        self.plain: set[str] = set()  # items sent without detail
+        self.bare: set[str] = set()  # items sent with generic labels too
+        self.suspects: list[str] = []  # items whose detail is tried again, one report at a time
+        self.trying = ""  # the suspect whose detail the current report carries
+        self.doubted = ""  # the suspect a refusal pointed at, until a report without its detail tells
+        self.closes_only = False
+        self.items_at = 0.0  # time.monotonic() when items are tried again after ``closes_only``
+        self.retry_at = 0.0  # time.monotonic() before which no report is sent
+
+    def forget(self, open_ids: set[str]) -> None:
+        self.plain &= open_ids
+        self.bare &= open_ids
+        self.suspects = [i for i in self.suspects if i in open_ids]
+        if self.trying not in open_ids:
+            self.trying = ""
+        if self.doubted not in open_ids:
+            self.doubted = ""
+        if not self.trying and not self.doubted and self.suspects:
+            self.trying = self.suspects.pop(0)
+        if self.closes_only and time.monotonic() >= self.items_at:
+            self.closes_only = False
+
+    def only_closes(self) -> None:
+        """Send only the closes for a while: the service refuses every item."""
+        self.closes_only = True
+        self.items_at = time.monotonic() + ATTENTION_FORBIDDEN_SECONDS
+
+    def refused(self, body: dict) -> None:
+        items = body.get("items", [])
+        if self.trying:
+            # This item's detail may be the difference: the next report, without
+            # it, tells (``accepted``), never this refusal alone.
+            self.doubted, self.trying = self.trying, ""
+            return
+        if self.doubted:
+            # Refused without its detail too: not its fault. Tried again later.
+            self.suspects.append(self.doubted)
+            self.doubted = ""
+        detailed = [e["id"] for e in items if "detail" in e]
+        if detailed:
+            self.plain.update(detailed)
+            self.suspects.extend(i for i in detailed if i not in self.suspects)
+        elif any(e["id"] not in self.bare for e in items):
+            self.bare.update(e["id"] for e in items)
+            logger.warning("Session notices sent with generic labels: the control service refused the report")
+        else:
+            self.only_closes()
+
+    def accepted(self) -> None:
+        if self.trying:
+            self.plain.discard(self.trying)
+            self.trying = ""
+        if self.doubted:
+            # Taken without it right after it was refused with it: its detail it was.
+            logger.warning("Session notice %s: its detail was refused by the control service; sent without it",
+                           self.doubted)
+            self.doubted = ""

@@ -330,7 +330,7 @@ def execution_mode(value: object) -> str:
 MAX_FEATURES = 20
 _FEATURE = re.compile(r"[a-z0-9_-]{1,64}")
 # The features this release defines. A backend answers with the subset it accepts.
-FEATURES = frozenset({"origin", "key_rotation"})
+FEATURES = frozenset({"origin", "key_rotation", "attention"})
 # Optional key rotation extension: a worker rotates once this little of its key's
 # life is left, and after a promotion the old key is still accepted this long.
 ROTATE_BEFORE_SECONDS = 7 * 86400
@@ -361,3 +361,153 @@ def submission_origin(value: object) -> Origin:
     if not isinstance(data["kind"], str) or data["kind"] not in ORIGIN_KINDS:
         raise ProtocolError("invalid_request")
     return Origin(data["kind"], owner_label(data["label"], MAX_ORIGIN_LABEL))
+
+
+# Optional session attention extension: what needs the owner in the Mac's sessions.
+MAX_ATTENTION_ITEMS = 50
+MAX_ATTENTION_CLOSED = 50
+MAX_ATTENTION_ACTIONS = 8
+ATTENTION_KINDS = frozenset({"permission", "question", "idle", "finished"})
+ATTENTION_PROVIDERS = frozenset({"claude", "codex"})
+CLOSE_REASONS = frozenset({"answered_on_mac", "answered_from_watch", "session_ended", "superseded", "expired"})
+# Character caps of each ``detail`` text field; a question's own caps are below.
+DETAIL_CAPS = {"tool_name": 100, "description": 1000, "input_preview": 4000, "last_message": 1000}
+MAX_QUESTIONS = 4
+MAX_QUESTION = 1000
+MAX_QUESTION_HEADER = 100
+MAX_OPTIONS = 4
+MAX_OPTION = 100
+MAX_SESSION_LABEL = 100
+_ATTENTION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def attention_id(value: object) -> str:
+    if not isinstance(value, str) or not _ATTENTION_ID.fullmatch(value):
+        raise ProtocolError("invalid_request")
+    return value
+
+
+def _detail_text(value: object, limit: int) -> str:
+    """1..limit characters; newline, CR and tab allowed, no other control character."""
+    result = text(value, limit, allow_multiline=True)
+    if any(unicodedata.category(c) == "Cc" and c not in "\n\r\t" for c in result):
+        raise ProtocolError("invalid_request")
+    return result
+
+
+def attention_detail(value: object) -> dict:
+    """A closed ``detail`` object: every field optional, at least one present."""
+    data = fields(value, set(), {*DETAIL_CAPS, "questions"})
+    if not data:
+        raise ProtocolError("invalid_request")
+    for name, limit in DETAIL_CAPS.items():
+        if name in data:
+            (owner_label if name == "tool_name" else _detail_text)(data[name], limit)
+    if "questions" in data:
+        questions = data["questions"]
+        if not isinstance(questions, list) or not 1 <= len(questions) <= MAX_QUESTIONS:
+            raise ProtocolError("invalid_request")
+        for question in questions:
+            entry = fields(question, {"question", "options"}, {"header"})
+            _detail_text(entry["question"], MAX_QUESTION)
+            if "header" in entry:
+                owner_label(entry["header"], MAX_QUESTION_HEADER)
+            options = entry["options"]
+            if not isinstance(options, list) or len(options) > MAX_OPTIONS:
+                raise ProtocolError("invalid_request")
+            for option in options:
+                owner_label(option, MAX_OPTION)
+    return data
+
+
+def attention_item(value: object) -> dict:
+    """One closed entry of the ``attention`` operation's ``items``."""
+    data = fields(value, {"id", "kind", "provider", "session_label", "folder_id", "folder_label",
+                          "created_at", "actions"}, {"session_id", "detail"})
+    attention_id(data["id"])
+    attention_id(data["folder_id"])
+    if "session_id" in data:
+        attention_id(data["session_id"])
+    if (not isinstance(data["kind"], str) or data["kind"] not in ATTENTION_KINDS
+            or not isinstance(data["provider"], str) or data["provider"] not in ATTENTION_PROVIDERS):
+        raise ProtocolError("invalid_request")
+    owner_label(data["session_label"], MAX_SESSION_LABEL)
+    owner_label(data["folder_label"], MAX_FOLDER_LABEL)
+    timestamp(data["created_at"])
+    actions = data["actions"]
+    if (not isinstance(actions, list) or len(actions) > MAX_ATTENTION_ACTIONS
+            or not all(isinstance(a, str) and _FEATURE.fullmatch(a) for a in actions)
+            or len(set(actions)) != len(actions)):
+        raise ProtocolError("invalid_request")
+    if "detail" in data:
+        attention_detail(data["detail"])
+    return data
+
+
+def attention_report(value: object) -> dict:
+    """Validate an ``attention`` request body (without its ``worker_epoch`` check)."""
+    data = fields(value, {"worker_epoch", "notices_enabled", "replies_enabled", "items", "closed"})
+    if type(data["notices_enabled"]) is not bool or type(data["replies_enabled"]) is not bool:
+        raise ProtocolError("invalid_request")
+    items, closed = data["items"], data["closed"]
+    if not isinstance(items, list) or len(items) > MAX_ATTENTION_ITEMS:
+        raise ProtocolError("invalid_request")
+    if not isinstance(closed, list) or len(closed) > MAX_ATTENTION_CLOSED:
+        raise ProtocolError("invalid_request")
+    ids = [attention_item(item)["id"] for item in items]
+    closed_ids = []
+    for entry in closed:
+        close = fields(entry, {"id", "reason"})
+        closed_ids.append(attention_id(close["id"]))
+        if not isinstance(close["reason"], str) or close["reason"] not in CLOSE_REASONS:
+            raise ProtocolError("invalid_request")
+    if len(set(ids)) != len(ids) or len(set(closed_ids)) != len(closed_ids) or set(ids) & set(closed_ids):
+        raise ProtocolError("invalid_request")
+    return data
+
+
+# Replies to attention items, carried by ``heartbeat``.
+MAX_ATTENTION_ACKS = 50
+MAX_ATTENTION_REPLIES = 20
+MAX_REPLY_TEXT = 1000
+REPLY_ACTIONS = frozenset({"allow", "deny", "answer", "message"})
+ACK_OUTCOMES = frozenset({"sent", "applied", "item_closed", "expired", "refused"})
+
+
+def attention_acks(value: object) -> list[dict]:
+    """A heartbeat's ``attention_acks``: 1-50 closed ``{id, outcome}`` objects."""
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_ATTENTION_ACKS:
+        raise ProtocolError("invalid_request")
+    for entry in value:
+        ack = fields(entry, {"id", "outcome"})
+        attention_id(ack["id"])
+        if not isinstance(ack["outcome"], str) or ack["outcome"] not in ACK_OUTCOMES:
+            raise ProtocolError("invalid_request")
+    return value
+
+
+def attention_reply(value: object) -> dict:
+    """One closed entry of a heartbeat response's ``attention_replies``:
+    ``answers`` exactly for ``answer``, ``text`` exactly for ``message``."""
+    data = fields(value, {"id", "item_id", "action", "expires_at"}, {"answers", "text"})
+    attention_id(data["id"])
+    attention_id(data["item_id"])
+    timestamp(data["expires_at"])
+    action = data["action"]
+    if not isinstance(action, str) or action not in REPLY_ACTIONS:
+        raise ProtocolError("invalid_request")
+    if ("answers" in data) != (action == "answer") or ("text" in data) != (action == "message"):
+        raise ProtocolError("invalid_request")
+    if action == "answer":
+        answers = data["answers"]
+        if not isinstance(answers, list) or not 1 <= len(answers) <= MAX_QUESTIONS:
+            raise ProtocolError("invalid_request")
+        for answer in answers:
+            entry = fields(answer, {"question", "option"})
+            if integer(entry["question"]) >= MAX_QUESTIONS or integer(entry["option"]) >= MAX_OPTIONS:
+                raise ProtocolError("invalid_request")
+        if len({a["question"] for a in answers}) != len(answers):
+            raise ProtocolError("invalid_request")
+    if action == "message":
+        _detail_text(data["text"], MAX_REPLY_TEXT)
+    return data

@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openswap import macos_keychain
+from openswap.attention import only_ours as only_openswap_hooks, profile_hooks
 from openswap.claude_locks import proper_lockfile
 from openswap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -911,6 +912,14 @@ class SessionManager:
         """
         if not session_dir.is_dir():
             return
+        try:
+            self._sync_shared_items(session_dir, share, share_history)
+        finally:
+            # Session notices: the profile's sessions keep OpenSwap's hooks
+            # whichever settings file they now read.
+            profile_hooks(session_dir, self.switcher.backup_dir)
+
+    def _sync_shared_items(self, session_dir: Path, share: bool, share_history: bool) -> None:
         self._sync_mcp_servers(session_dir, share)
         # History links are POSIX-only (also drops links left by a
         # POSIX→Windows profile move).
@@ -978,7 +987,8 @@ class SessionManager:
                     continue
                 # Platform moved POSIX → Windows: replace link with a copy.
                 dest.unlink()
-            elif dest.exists() and name not in managed:
+            elif dest.exists() and name not in managed and not (
+                    name == "settings.json" and only_openswap_hooks(dest)):
                 # Pre-existing user data in the profile — never touch it.
                 print(
                     dimmed(

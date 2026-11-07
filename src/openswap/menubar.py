@@ -23,7 +23,7 @@ from openswap.claude_login import (
     new_login_outcome,
     remove_legacy_login_command,
 )
-from openswap.exceptions import ClaudeSwitchError, CredentialMissingError, CredentialReadError
+from openswap.exceptions import ClaudeSwitchError, ConfigError, CredentialMissingError, CredentialReadError
 from openswap.menubar_display import *  # noqa: F403
 from openswap.codex.desktop_app import DesktopApp, DesktopCapability, capability_is_fresh
 from openswap.menubar_display import (  # noqa: F401  tests poke these
@@ -935,10 +935,37 @@ def run(switcher, codex=None) -> int:
             return ui is not None and ui.folders_locked
 
         def _remote_status(self):
-            """The worker snapshot Settings › Remote draws, with the setup window's folder lock."""
+            """The worker snapshot Settings › Remote draws, with the setup window's folder
+            lock and the session attention switches as saved now."""
+            import shlex
+
+            from openswap.attention import program
+            from openswap.settings import load_attention_settings
+
+            from openswap.attention import recorded_programs
+            from openswap.worker.attention import read_problems
+
+            root = self.switcher.backup_dir
+            status = dict(self._worker_status_cache)
+            switches = load_attention_settings(root)
+            status["attention"] = {"notices": switches.notices, "details": switches.details,
+                                   "codex": self._codex_hooks_status() if switches.notices else None,
+                                   "replies": switches.replies, "launcher": f"{shlex.quote(program())} claude",
+                                   "readable": switches.readable,
+                                   "missing": recorded_programs(root) if switches.notices else [],
+                                   "problems": read_problems(root)}
             if self._setup_changing_folders():
-                return {**self._worker_status_cache, "setup_changing_folders": True}
-            return self._worker_status_cache
+                status["setup_changing_folders"] = True
+            return status
+
+        def _codex_hooks_status(self):
+            from openswap.attention import codex_hooks_status
+            from openswap.codex.auth import codex_home
+
+            try:
+                return codex_hooks_status(codex_home(), self.switcher.backup_dir)
+            except OSError:
+                return "unknown"
 
         def _setup_prompts(self, title):
             """The setup's front end: pairing in dialogs, every later step in the setup window."""
@@ -2444,6 +2471,8 @@ def run(switcher, codex=None) -> int:
                 self.on_toggle_kickoff(None)
             elif row_id == "claude_status_line":
                 self._toggle_status_line()
+            elif row_id in ("remote_attention_notices", "remote_attention_details", "remote_attention_replies"):
+                self._toggle_attention(row_id)
             elif row_id == "kickoff_time":
                 self.on_kickoff_time(value)
                 # The popup already shows the pick; do not rebuild the page
@@ -2589,6 +2618,61 @@ def run(switcher, codex=None) -> int:
                 set_installed(paths.get_claude_config_home(), self.switcher.backup_dir, enable)
             except (ClaudeSwitchError, OSError) as e:
                 self._show_error(f"Couldn't change the Claude Code status line: {e}")
+
+        def _toggle_attention(self, row_id) -> None:
+            """Settings › Remote › Sessions: flip one switch as saved now. Turning
+            notices on or off also installs or removes the hooks; a config
+            home that could not be changed is named."""
+            from openswap.settings import load_attention_settings, write_attention_settings
+
+            root = self.switcher.backup_dir
+            try:
+                current = load_attention_settings(root)
+                if row_id == "remote_attention_details":
+                    write_attention_settings(root, details=not current.details)
+                    return
+                from openswap.attention import set_notices, set_replies
+
+                if row_id == "remote_attention_replies":
+                    problems = set_replies(root, not current.replies)
+                else:
+                    problems = set_notices(root, not current.notices)
+            except (ClaudeSwitchError, OSError, ValueError) as e:
+                what = ("replies from your phone and watch" if row_id == "remote_attention_replies"
+                        else "session notices")
+                self._show_error(f"Couldn't change {what}: {e}")
+                return
+            if problems:
+                more = f"\n(and {len(problems) - 5} more)" if len(problems) > 5 else ""
+                self._show_error("Session notices:\n" + "\n".join(problems[:5]) + more)
+            if row_id == "remote_attention_notices" and not current.notices:
+                self._ask_codex_hooks(root)
+                status = self._codex_hooks_status()
+                if status in ("review", "review_others"):
+                    from openswap.menubar_display import CODEX_HOOKS_STATUS
+
+                    self._alert(title="openswap", message=CODEX_HOOKS_STATUS[status].removeprefix("Codex: "))
+
+        def _ask_codex_hooks(self, root) -> None:
+            """Codex's hooks feature is off and turning it on would start other hooks
+            too: only with the owner's OK."""
+            from openswap.attention import codex_consent_needed, enable_codex_hooks
+
+            others = codex_consent_needed(root)
+            if not others:
+                return
+            listed = "\n".join(others[:8]) + (f"\n(and {len(others) - 8} more)" if len(others) > 8 else "")
+            if self._alert(title="Turn on Codex hooks?",
+                           message="Codex's hooks are turned off, so Codex sessions can't tell you when they need "
+                                   "you. Turning them on also starts these hooks of yours:\n" + listed,
+                           ok="Turn On", cancel="Not Now") != 1:
+                return
+            try:
+                problems = enable_codex_hooks(root)
+            except ConfigError as e:
+                problems = [str(e)]
+            if problems:
+                self._show_error("Session notices:\n" + "\n".join(problems))
 
         def _toggle_codex_auto(self) -> bool:
             """Flip Codex auto-switching (Settings row and the Codex tab's footer toggle)."""
