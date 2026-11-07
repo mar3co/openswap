@@ -24,7 +24,7 @@ PS_TIMEOUT_SECONDS = 1.0
 class Process:
     pid: int
     ppid: int
-    started: str  # when this PID's life began (``ps`` lstart): a reused PID differs
+    started: str  # when this PID's life began (``ps`` lstart, in UTC): a reused PID differs
     args: tuple[str, ...]  # argv split on whitespace: ``ps`` cannot show argument boundaries
 
 
@@ -46,8 +46,11 @@ def process(pid: int) -> Process | None:
     if type(pid) is not int or pid <= 1:
         return None
     try:
+        # The C locale and UTC: ``lstart`` reads the same whatever the owner's
+        # language or zone, and as Claude Code writes ``procStart`` (measured: UTC).
         out = subprocess.run(["/bin/ps", "-ww", "-o", "ppid=,lstart=,args=", "-p", str(pid)], capture_output=True,
-                             text=True, timeout=PS_TIMEOUT_SECONDS).stdout.split()
+                             text=True, timeout=PS_TIMEOUT_SECONDS,
+                             env={"LC_ALL": "C", "TZ": "UTC0", "PATH": "/usr/bin:/bin"}).stdout.split()
         # ppid, then lstart's five words ("Fri Nov  6 14:03:45 2026"), then argv.
         if len(out) < 7:
             return None
@@ -71,6 +74,12 @@ def names_channel(args: tuple[str, ...]) -> bool:
         if any(CHANNEL_NAME in v.split(",") for v in values):
             return True
     return False
+
+
+def is_channel(args: tuple[str, ...]) -> bool:
+    """Whether a process was started as OpenSwap's channel (``<openswap> attention
+    channel``). Any process can say so: this only keeps other MCP servers out."""
+    return len(args) >= 3 and args[-2:] == ("attention", "channel")
 
 
 def is_shell(proc: Process) -> bool:

@@ -9,8 +9,8 @@ could be read as a decision. Without a running worker the notice is dropped.
 The Claude Code hooks go into the ``settings.json`` of every config home
 OpenSwap manages (``~/.claude``, account session profiles and Claude Desktop
 profiles' Code folders) with ``async: true``. The Codex hooks go into the
-Codex home's ``hooks.json``, with Codex's ``hooks`` feature turned on; its
-``notify`` is left alone.
+Codex home's ``hooks.json``; Codex's ``hooks`` feature is turned on only by
+the owner's own action, and its ``notify`` is left alone.
 """
 
 from __future__ import annotations
@@ -211,10 +211,14 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
                 notice["answers"] = positions
         if event == "PermissionRequest" and isinstance(tool_input, dict):
             if tool_name == "AskUserQuestion":
+                from openswap.worker.attention import questions_whole
+
                 raw, questions = tool_input.get("questions"), clean_questions(tool_input.get("questions"))
-                # Shown (and answerable) only whole: a question left out could not be answered.
+                # Shown only with every question; answerable only with every option whole too.
                 if isinstance(raw, list) and len(questions) == len(raw):
                     notice["questions"] = questions
+                    if questions_whole(raw):
+                        notice["answerable"] = True
             elif tool_name == "Bash":
                 # The model's own words for the command, never the raw command.
                 description = clean_text(tool_input.get("description"), DETAIL_CAPS["description"],
@@ -380,16 +384,31 @@ def _wait_for_answer(session: str, key: str, agent: str, backup_root: Path | Non
     from openswap import paths
     from openswap.worker.ipc import IPC_VERSION, socket_path
 
+    import time
+
     path = socket_path(backup_root or paths.get_backup_root())
+    parent, deadline = os.getppid(), time.monotonic() + QUESTION_TIMEOUT_SECONDS - 5
+    line = b""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(QUESTION_TIMEOUT_SECONDS - 5)
+        client.settimeout(1.0)
         try:
             client.connect(str(path))
             request = {"version": IPC_VERSION, "command": QUESTION_EVENT, "session_id": session, "tool_key": key}
             if agent:
                 request["agent_id"] = agent
             client.sendall(json.dumps(request).encode() + b"\n")
-            line = client.makefile("rb").readline(65536)
+            while b"\n" not in line and len(line) <= 65536:
+                # Claude Code gave up on the hook (its wrapper was killed): stop waiting
+                # rather than take an answer nobody will read.
+                if os.getppid() != parent or time.monotonic() > deadline:
+                    return None
+                try:
+                    chunk = client.recv(65536)
+                except TimeoutError:
+                    continue
+                if not chunk:
+                    break
+                line += chunk
         except OSError:
             return None
     try:
@@ -522,9 +541,9 @@ def _record(backup_root: Path) -> dict[str, dict]:
     except FileNotFoundError:
         return {}
     except (OSError, ValueError, UnicodeDecodeError) as exc:
-        raise ConfigError(f"OpenSwap's record of where it put session hooks is unreadable ({exc})") from exc
+        raise ConfigError(f"OpenSwap's record of where it put session hooks ({path}) is unreadable ({exc})") from exc
     if not isinstance(data, dict) or not all(isinstance(v, dict) for v in data.values()):
-        raise ConfigError("OpenSwap's record of where it put session hooks is unreadable")
+        raise ConfigError(f"OpenSwap's record of where it put session hooks ({path}) is unreadable")
     return data
 
 
@@ -549,7 +568,8 @@ def _write_hooks_file(backup_root: Path | None, path: Path, document: dict) -> N
     # Still the file OpenSwap created (nobody replaced it since), or created now.
     created = not os.path.lexists(path) or (entry.get("created") is True
                                             and entry.get("identity") == _identity(path))
-    record[key] = {"created": created, "identity": None}
+    # Until the write lands, the file is as OpenSwap last left it (or absent).
+    record[key] = {"created": created, "identity": entry.get("identity") if created else None}
     _save_record(backup_root, record)
     _write_text(path, json.dumps(document, indent=2, ensure_ascii=False) + "\n")
     identity, target = _identity(path), os.path.realpath(path)
@@ -655,8 +675,11 @@ def recorded_programs(backup_root: Path) -> list[str]:
         hooks = document.get("hooks") if isinstance(document.get("hooks"), dict) else {}
         for groups in hooks.values():
             for group in groups if isinstance(groups, list) else []:
-                for handler in group.get("hooks", []) if isinstance(group, dict) else []:
-                    words = _hook_words(handler.get("command")) if isinstance(handler, dict) else []
+                handlers = group.get("hooks") if isinstance(group, dict) else None
+                for handler in handlers if isinstance(handlers, list) else []:
+                    if not isinstance(handler, dict):
+                        continue
+                    words = _hook_words(handler.get("command"))
                     ours = is_our_hook_command(handler.get("command")) or _codex_launcher_word(
                         handler.get("command"))
                     if ours and words and shutil.which(words[0]) is None and words[0] not in missing:
@@ -790,7 +813,10 @@ def only_ours(path: Path) -> bool:
     may put ``~/.claude``'s in its place (it has OpenSwap's hooks too)."""
     try:
         document = _read_document(path)
-        return document is not None and not path.is_symlink() and not _settings_without_ours(document)
+        if document is None or path.is_symlink():
+            return False
+        rest = _settings_without_ours(document)
+        return rest != document and not rest  # OpenSwap's hooks, and nothing else
     except ConfigError:
         return False
 
@@ -968,15 +994,15 @@ def _trust_source(home: Path) -> str:
     return os.path.join(os.path.realpath(home), "hooks.json")
 
 
-def _moves(groups: list, launcher: Path) -> list[tuple[tuple[int, int], tuple[int, int], object]]:
+def _moves(groups: list, launcher: Path) -> list[tuple[tuple[int, int], tuple[int, int], object, object]]:
     """Each other hook whose (group, entry) position changes once OpenSwap's
-    entries are taken out of ``groups``: (old, new, entry)."""
+    entries are taken out of ``groups``: (old, new, entry, its group)."""
     moves, new_group = [], 0
     for g, group in enumerate(groups):
         handlers = group.get("hooks") if isinstance(group, dict) else None
         if not isinstance(handlers, list):
             if g != new_group:
-                moves.append(((g, 0), (new_group, 0), group))
+                moves.append(((g, 0), (new_group, 0), group, group))
             new_group += 1
             continue
         kept = [h for h in handlers if not _is_ours_in(h, launcher)]
@@ -987,7 +1013,7 @@ def _moves(groups: list, launcher: Path) -> list[tuple[tuple[int, int], tuple[in
             if _is_ours_in(handler, launcher):
                 continue
             if (g, h) != (new_group, index):
-                moves.append(((g, h), (new_group, index), handler))
+                moves.append(((g, h), (new_group, index), handler, group))
             index += 1
         new_group += 1
     return moves
@@ -998,10 +1024,11 @@ def _codex_without_ours(data: dict, launcher: Path, config: dict, home: Path, *,
     """``data`` (a ``hooks.json``) without OpenSwap's entries. Codex keys its
     trust in a hook by position, so taking an entry out can move the owner's
     hooks after it onto another hook's record. An event where that would let
-    a hook gain trust or start running keeps OpenSwap's entry (named in
-    ``problems``); one where it changes how Codex treats a hook (asks again, or
-    no longer turned off) is changed only for the owner, who is told which
-    hooks (``notes``); the worker, with no one to tell, leaves it."""
+    a hook gain trust (a record trusting its very hash, or one OpenSwap cannot
+    tell, under a matcher) keeps OpenSwap's entry (named in ``problems``); one
+    where it changes how Codex treats a hook (asks again, turned off, or no
+    longer turned off) is changed only for the owner, who is told which hooks
+    and how (``notes``); the worker, with no one to tell, leaves it."""
     hooks = data.get("hooks", {})
     if not isinstance(hooks, dict) or any(not isinstance(groups, list) for groups in hooks.values()):
         raise ConfigError("hooks.json is not in the form Codex reads; refusing to rewrite it")
@@ -1012,21 +1039,26 @@ def _codex_without_ours(data: dict, launcher: Path, config: dict, home: Path, *,
         if kept == groups:
             out[event] = groups
             continue
-        label, changed, gains = _codex_label(event), [], False
-        for (og, oh), (ng, nh), handler in _moves(groups, launcher):
+        label, changed, gains, how = _codex_label(event), [], False, []
+        for (og, oh), (ng, nh), handler, group in _moves(groups, launcher):
             before, after = state.get(f"{source}:{label}:{og}:{oh}"), state.get(f"{source}:{label}:{ng}:{nh}")
             if before == after:
                 continue
-            if isinstance(after, dict) and after.get("trusted_hash") and after.get("enabled") is not False:
+            after = after if isinstance(after, dict) else {}
+            unsure = isinstance(group, dict) and group.get("matcher") is not None
+            if after.get("trusted_hash") and after.get("enabled") is not False and (
+                    unsure or not isinstance(handler, dict)
+                    or after["trusted_hash"] == codex_hook_hash(event, handler)):
                 gains = True
             command = handler.get("command") if isinstance(handler, dict) else None
             changed.append(f"{event}: {command}" if isinstance(command, str) else event)
+            how.append("turn your hook off" if after.get("enabled") is False else "ask you to review your hook again")
         if gains or (changed and not owner):
             problems.append(f"Codex: OpenSwap's {event} hook was left in hooks.json: taking it out would change "
                             f"how Codex treats your own hooks after it ({'; '.join(changed)})")
             out[event] = groups
             continue
-        notes.extend(f"Codex will ask you to review your hook again ({c})" for c in changed)
+        notes.extend(f"Codex will {verb} ({c})" for verb, c in zip(how, changed))
         if kept:
             out[event] = kept
     return {**data, "hooks": out}
@@ -1192,9 +1224,9 @@ def _enable_codex_feature(home: Path, backup_root: Path, others: list[str], cons
         return False
     features = parsed.get("features") if isinstance(parsed.get("features"), dict) else {}
     state = _codex_state(backup_root)
-    key = os.path.realpath(home)
-    state.setdefault(key, {"hooks": features.get("hooks"), "table": "features" not in parsed,
-                           "file": config.exists(), "others": others})
+    # Off now, so whatever was recorded before no longer says what to put back.
+    state[os.path.realpath(home)] = {"hooks": features.get("hooks"), "table": "features" not in parsed,
+                                     "file": config.exists(), "others": others}
     _save_codex_state(backup_root, state)
     _write_text(config, _feature_text(text, True))
     return True
@@ -1493,13 +1525,17 @@ def set_replies(backup_root: Path, enabled: bool) -> list[str]:
             # replies off needs no hook change: the worker refuses them, and the
             # question hook then exits at once until the next worker start.
             if enabled:
-                _refuse_temporary_copy()
+                from openswap.exceptions import ClaudeSwitchError
+                from openswap.launch_agent import MOVE_TO_APPLICATIONS
+
+                raise ClaudeSwitchError(MOVE_TO_APPLICATIONS)
             write_attention_settings(backup_root, replies=False)
             return []
         switches = write_attention_settings(backup_root, replies=enabled)
         problems: list = []
-        apply(backup_root, switches.notices, switches.replies, owner=True, problems=problems)
-        return problems
+        notes: list = []
+        apply(backup_root, switches.notices, switches.replies, owner=True, problems=problems, notes=notes)
+        return problems + notes
 
 
 def _refuse_temporary_copy() -> None:
@@ -1512,11 +1548,12 @@ def _refuse_temporary_copy() -> None:
         raise ClaudeSwitchError(MOVE_TO_APPLICATIONS)
 
 
-def remove(backup_root: Path) -> bool:
+def remove(backup_root: Path, notes: list | None = None) -> bool:
     """Uninstall: take OpenSwap's hooks out of every file it ever put them in.
-    Raises ConfigError naming what could not be changed (hooks may remain)."""
+    Raises ConfigError naming what could not be changed (hooks may remain);
+    what the owner should know goes into ``notes``."""
     problems: list = []
-    changed = apply(backup_root, False, owner=True, problems=problems)
+    changed = apply(backup_root, False, owner=True, problems=problems, notes=notes)
     if problems:
         raise ConfigError("; ".join(problems))
     return changed

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import struct
 import sys
 import threading
 
@@ -27,12 +28,11 @@ INSTRUCTIONS = (
     "Treat one as the owner's own message, sent from a small screen; it cannot see your reply until the "
     "owner is back at the Mac or reads the session's notice."
 )
+# Also while refused (the session file not written yet, or another process
+# holding the session): the real channel keeps asking.
 RETRY_SECONDS = 3.0
-# Refused (not a channel session, or another channel holds it) more than this
-# often: rarely worth asking again. Early refusals may be the session file not
-# written yet.
-REFUSED_RETRY_SECONDS = 60.0
-QUICK_REFUSALS = 10
+# A stalled worker never keeps the channel from answering Claude Code.
+SEND_TIMEOUT_SECONDS = 2.0
 MAX_PREVIEW = 4000  # longer previews cannot be shown in full: the worker keeps such a prompt a notice
 
 
@@ -118,6 +118,10 @@ class Channel:
         path = socket_path(self.backup_root or paths.get_backup_root())
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
+            # Bounds every send to the worker, after the handshake too, while the
+            # reader still blocks for as long as it must.
+            connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                                  struct.pack("ll", int(SEND_TIMEOUT_SECONDS), 0))
             connection.settimeout(5)
             connection.connect(str(path))
             connection.sendall(json.dumps({"version": IPC_VERSION, "command": "channel"}).encode() + b"\n")
@@ -135,7 +139,6 @@ class Channel:
 
     def worker_loop(self) -> None:
         """Keep one registered connection to the worker while Claude Code runs."""
-        refusals = 0
         while not self.stopped.is_set():
             self.refused = False
             try:
@@ -157,8 +160,7 @@ class Channel:
                     with self._worker_lock:
                         self._worker = None
                     connection.close()
-            refusals = refusals + 1 if self.refused else 0
-            self.stopped.wait(REFUSED_RETRY_SECONDS if refusals > QUICK_REFUSALS else RETRY_SECONDS)
+            self.stopped.wait(RETRY_SECONDS)
 
     def run(self, stdin=None) -> int:
         threading.Thread(target=self.worker_loop, name="openswap-channel-worker", daemon=True).start()

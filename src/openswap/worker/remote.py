@@ -161,7 +161,10 @@ class Transport:
                 result = self._read(response)
         except HTTPError as exc:
             with exc:
-                result = self._read(exc)
+                try:
+                    result = self._read(exc)
+                except ProtocolError:
+                    result = {}  # not the service's own answer (a proxy's page): its status still counts
             code = result.get("error", "service_unavailable")
             raise ProtocolError(code if code in SERVICE_ERRORS else "service_unavailable", exc.code) from None
         except (URLError, TimeoutError, OSError, http.client.HTTPException):
@@ -755,6 +758,7 @@ class RemoteClient:
                 return  # nothing to keep the service up to date with
             fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
             if not closed_ids and self._attention_sent == (epoch, fingerprint):
+                shape.accepted()  # the very report the service took last: what it would say again
                 return
             try:
                 response = self.transport.request("attention", {"worker_epoch": epoch, **body})
@@ -771,7 +775,7 @@ class RemoteClient:
                     return  # malformed acknowledgement: resend on the next pass
             except ProtocolError:
                 return
-            store.acknowledge(closed_ids)
+            store.acknowledge(closed_ids, body["items"])
             shape.accepted()
             store.note_problem("refused", None)
             # Without the closes the same open set needs no resend.
@@ -801,8 +805,8 @@ class RemoteClient:
                 shape.only_closes()
             sent = len(json.dumps(body, allow_nan=False).encode())
             shape.budget = max(ATTENTION_MIN_BUDGET, min(shape.budget, sent) // 2)
-        elif exc.status == 400:
-            shape.refused(body)
+        elif exc.status == 400 and exc.code == "invalid_request":
+            shape.refused(body)  # the service's own refusal of the report, never a proxy's error page
 
 
 
@@ -894,7 +898,17 @@ class RemoteClient:
             # registration that advertised it.
             store = getattr(self.runtime, "attention", None)
             acks = store.take_acks() if store is not None and self._attention_epoch is not None else []
-            heartbeat = self._worker_request("heartbeat", {"attention_acks": acks} if acks else None)
+            try:
+                heartbeat = self._worker_request("heartbeat", {"attention_acks": acks} if acks else None)
+            except ProtocolError as exc:
+                if not (acks and exc.code == "invalid_request"):
+                    raise
+                # Liveness and replies never wait on outcomes the service refuses:
+                # this heartbeat goes again without them, and only if that one is
+                # taken are they the cause (tried again apart: ``acks_refused``).
+                heartbeat = self._worker_request("heartbeat")
+                store.acks_refused(acks)
+                acks = []
             seen = timestamp(heartbeat["last_seen_at"])
             cancel_ids = heartbeat["cancel_job_ids"]
             if (not isinstance(cancel_ids, list) or len(cancel_ids) > MAX_CANCEL_IDS
@@ -915,10 +929,6 @@ class RemoteClient:
             self._connectivity()
             return self.state == "online"
         except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
-            if acks and isinstance(exc, ProtocolError) and exc.code == "invalid_request":
-                # A service that no longer takes them must not keep the Mac offline.
-                logger.warning("Session reply outcomes refused by the control service; dropping %d", len(acks))
-                store.acks_sent(acks)
             self._connectivity(exc)
             return False
 
@@ -1368,6 +1378,7 @@ class _ReportShape:
         self.bare: set[str] = set()  # items sent with generic labels too
         self.suspects: list[str] = []  # items whose detail is tried again, one report at a time
         self.trying = ""  # the suspect whose detail the current report carries
+        self.doubted = ""  # the suspect a refusal pointed at, until a report without its detail tells
         self.closes_only = False
         self.items_at = 0.0  # time.monotonic() when items are tried again after ``closes_only``
         self.retry_at = 0.0  # time.monotonic() before which no report is sent
@@ -1378,7 +1389,9 @@ class _ReportShape:
         self.suspects = [i for i in self.suspects if i in open_ids]
         if self.trying not in open_ids:
             self.trying = ""
-        if not self.trying and self.suspects:
+        if self.doubted not in open_ids:
+            self.doubted = ""
+        if not self.trying and not self.doubted and self.suspects:
             self.trying = self.suspects.pop(0)
         if self.closes_only and time.monotonic() >= self.items_at:
             self.closes_only = False
@@ -1391,11 +1404,14 @@ class _ReportShape:
     def refused(self, body: dict) -> None:
         items = body.get("items", [])
         if self.trying:
-            # This item's detail alone was the difference: it never goes again.
-            logger.warning("Session notice %s: its detail was refused by the control service; sent without it",
-                           self.trying)
-            self.trying = ""
+            # This item's detail may be the difference: the next report, without
+            # it, tells (``accepted``), never this refusal alone.
+            self.doubted, self.trying = self.trying, ""
             return
+        if self.doubted:
+            # Refused without its detail too: not its fault. Tried again later.
+            self.suspects.append(self.doubted)
+            self.doubted = ""
         detailed = [e["id"] for e in items if "detail" in e]
         if detailed:
             self.plain.update(detailed)
@@ -1410,3 +1426,8 @@ class _ReportShape:
         if self.trying:
             self.plain.discard(self.trying)
             self.trying = ""
+        if self.doubted:
+            # Taken without it right after it was refused with it: its detail it was.
+            logger.warning("Session notice %s: its detail was refused by the control service; sent without it",
+                           self.doubted)
+            self.doubted = ""

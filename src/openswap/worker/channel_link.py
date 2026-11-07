@@ -82,7 +82,7 @@ def _serve_channel(store, connection, stop_event, release) -> None:
     link = Link(connection)
     # Held until the handshake is out: a verdict sent meanwhile would come first.
     with link._send_lock:
-        accepted = (claude is not None and peers.names_channel(claude.args)
+        accepted = (claude is not None and peers.names_channel(claude.args) and peers.is_channel(channel.args)
                     and store.register_channel(channel, claude, link))
         answered = _reply(connection, {"version": 1, "ok": True, "result": {}} if accepted
                           else {"version": 1, "ok": False, "error": "channel_refused"})
@@ -120,13 +120,17 @@ def _serve_channel(store, connection, stop_event, release) -> None:
 
 
 def _serve_question(store, connection, request, stop_event, release) -> None:
-    claude = peers.hook_claude(peers.peer_pid(connection))
+    pid = peers.peer_pid(connection)
+    hook = peers.process(pid)
+    # The session's own synchronous hook: OpenSwap's question command, under Claude Code.
+    claude = peers.hook_claude(pid) if hook is not None and hook.args[-2:] == ("attention", "question") else None
     waiter = store.question_waiter(claude, request["session_id"], request["tool_key"],
                                    request.get("agent_id", "")) if claude else None
     if waiter is None:
         _reply(connection, {"answers": None})
         return
     release()
+    handed = False
     try:
         while not stop_event.is_set() and not store.waiter_over(waiter):
             if waiter.done.wait(POLL_SECONDS):
@@ -136,8 +140,9 @@ def _serve_question(store, connection, request, stop_event, release) -> None:
                 return  # the hook is gone (Claude Code moved on)
         answers = waiter.answers if waiter.done.is_set() else None
         if _reply(connection, {"answers": answers}) and answers is not None:
+            handed = True
             store.handed_over(waiter.reply_id)
     except OSError:
         return
     finally:
-        store.end_waiter(waiter)
+        store.end_waiter(waiter, handed=handed)

@@ -510,16 +510,19 @@ def test_a_home_that_could_not_be_listed_hides_no_ended_session(tmp_path, monkey
     assert _session_records(tmp_path)() == ([], False)
 
 
-def test_a_background_task_turn_refreshes_the_idle_items_reply(store):
+def test_q3_a_background_task_turn_opens_a_new_idle_item(store):
+    """Plan 025 S2 review Q3: a turn that ends while the session stays idle gets a new item."""
     items, clock = store
     items.notice(hook("Stop", last_assistant_message="Launched both.") | at(clock, 1))
     items.notice(notification("idle_prompt") | at(clock, 61))
     [first] = published(items)
     items.notice(hook("UserPromptSubmit", prompt="<task-notification>\n<task-id>x</task-id>") | at(clock, 90))
     items.notice(hook("Stop", last_assistant_message="Result is 42.") | at(clock, 95))
-    items.notice(notification("idle_prompt") | at(clock, 155))
     [again] = published(items)
-    assert again["id"] == first["id"] and again["detail"] == {"last_message": "Result is 42."}
+    assert again["id"] != first["id"] and again["detail"] == {"last_message": "Result is 42."}
+    assert closes(items) == [{"id": first["id"], "reason": "superseded"}]
+    items.notice(notification("idle_prompt") | at(clock, 155))  # that turn's own notice: the same item
+    assert published(items) == [again]
 
 
 def test_a_channel_turn_leaves_a_waiting_subagent_prompt_open(store):
@@ -1895,11 +1898,24 @@ def test_h4_the_owner_is_told_which_codex_hooks_codex_asks_about_again(codex_hom
 
 def test_h4_no_removal_lets_a_codex_hook_gain_trust(codex_home):
     home, root = codex_home
-    # The record at the position it would move to trusts something: never moved onto it.
-    theirs = _shifted(home, root, 'trusted_hash = "sha256:something-else"')
+    hooked = {"type": "command", "command": "~/bin/log", "timeout": 10, "async": False}
+    # The record at the position it would move to trusts this very hook: never moved onto it.
+    theirs = _shifted(home, root, f'trusted_hash = "{attention.codex_hook_hash("Stop", hooked)}"\nenabled = true')
     problems = attention.set_notices(root, False)
     assert any("left in hooks.json" in p for p in problems)
     assert json.loads((home / "hooks.json").read_text())["hooks"]["Stop"][1] == {"hooks": [theirs]}
+
+
+@pytest.mark.parametrize(("record_after", "note"), [
+    ('trusted_hash = "sha256:openswaps-own"', "ask you to review your hook again"),  # OpenSwap's trusted record
+    ("enabled = false", "turn your hook off"),  # OpenSwap's hook turned off in /hooks
+])
+def test_h4_the_owner_is_told_how_codex_treats_a_moved_hook(codex_home, record_after, note):
+    home, root = codex_home
+    theirs = _shifted(home, root, record_after)
+    notes = attention.set_notices(root, False)
+    assert notes == [f"Codex will {note} (Stop: ~/bin/log)"]
+    assert json.loads((home / "hooks.json").read_text())["hooks"]["Stop"] == [{"hooks": [theirs]}]
 
 
 def test_h5_only_the_owners_ok_turns_codex_hooks_on_when_other_hooks_would_start(codex_home):
@@ -2087,7 +2103,7 @@ def test_w1_one_items_refused_detail_is_repaired_and_the_rest_and_closes_go(repo
         client.sync_attention()
     report = service.attention(worker)
     assert len(report["items"]) == 1 and "detail" not in report["items"][0]  # repaired, not dropped
-    assert list(report["closed"].values()) == ["answered_on_mac"]
+    assert sorted(report["closed"].values()) == ["answered_on_mac", "superseded"]
     assert len(refusing.sent) < 6
 
 
@@ -2334,3 +2350,179 @@ def test_minor_status_pause_and_stop_keep_their_slots(served):
     finally:
         for c in held:
             c.close()
+
+
+def test_w2_a_process_start_in_another_locale_is_not_compared(tmp_path):
+    home = tmp_path / "h"
+    (home / "sessions").mkdir(parents=True)
+    for started, kept in (("Fri Nov  6 17:31:25 2026", "Fri Nov 6 17:31:25 2026"), ("ven  6 nov 17:31:25 2026", "")):
+        (home / "sessions" / f"{os.getpid()}.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": SESSION, "status": "idle", "procStart": started}))
+        [found], _ = read_records([home])
+        assert found.proc_start == kept
+
+
+# --- review of the fix round (Opus seats) ----------------------------------------
+
+
+def test_review_a_proxys_error_page_never_reshapes_the_report(reporting, monkeypatch):
+    from openswap.worker import remote
+
+    client, items, _, _, _, _ = reporting
+    items.notice(notification("idle_prompt"))
+    client._attention_refused(items, ProtocolError("service_unavailable", 400), {"items": [{"id": "x", "detail": {}}]})
+    assert client._attention_shape.plain == set() and not client._attention_shape.closes_only
+
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    page = HTTPError("https://x", 502, "Bad Gateway", {}, BytesIO(b"<html>Bad Gateway</html>"))
+    transport = remote.Transport("https://control.example")
+    monkeypatch.setattr(transport.opener, "open", lambda *a, **k: (_ for _ in ()).throw(page))
+    with pytest.raises(ProtocolError) as raised:
+        transport.request("attention", {})
+    assert (raised.value.status, raised.value.code) == (502, "service_unavailable")  # not a 400 refusal
+
+
+def test_review_a_refusal_while_one_item_is_tried_blames_it_only_if_it_was_its_detail(reporting):
+    client, items, service, worker, transport, _ = reporting
+    items.notice(hook("Stop", session=OTHER, last_assistant_message="fine") | {"at": START - 1})
+    items.notice(notification("idle_prompt", session=OTHER))
+    items.notice(hook("Stop", last_assistant_message="also fine") | {"at": START - 1})
+    items.notice(notification("idle_prompt"))
+    # The service refuses labels it cannot take, never any detail.
+    refusing = client.transport = _Refusing(transport, 400, "invalid_request", lambda data: any(
+        e["session_label"] != "Session" for e in data["items"]))
+    for _ in range(12):
+        client.sync_attention()
+    refusing.status = None
+    client._attention_shape.retry_at = 0.0
+    client.sync_attention()
+    report = service.attention(worker)
+    assert all("detail" in e for e in report["items"])  # no item lost its detail over a label refusal
+
+
+def test_review_an_unreadable_state_file_says_so_in_settings(tmp_path, monkeypatch):
+    from openswap.worker import attention as worker_attention
+
+    AttentionStore(tmp_path, clock=Clock()).notice(notification("idle_prompt"))
+    real_read = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("root-owned"))
+                        if self.name == "attention.json" else real_read(self, *a, **k))
+    store = AttentionStore(tmp_path, clock=Clock())
+    assert not store.ready and "can't read its record" in worker_attention.read_problems(tmp_path)[0]
+    assert not store.register_channel(None, None, None)  # nothing taken that a later load would overwrite
+
+
+def test_review_recorded_programs_survives_an_owners_odd_hook_entries(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    root = tmp_path / "backup"
+    home = tmp_path / "h"
+    home.mkdir()
+    gone = str(tmp_path / "Gone.app" / "openswap")
+    attention.set_hooks(home, gone, backup_root=root)
+    data = _settings(home)
+    data["hooks"]["Odd"] = [{"hooks": ["echo hi"]}, {"hooks": None}, "x"]
+    (home / "settings.json").write_text(json.dumps(data))
+    assert attention.recorded_programs(root) == [gone]
+
+
+def test_review_an_empty_profile_settings_file_is_the_owners(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text("{}")
+    assert not attention.only_ours(path)
+
+
+def test_review_a_failed_write_keeps_a_file_openswap_created_deletable(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    root = tmp_path / "backup"
+    home = tmp_path / "h"
+    home.mkdir()
+    attention.set_hooks(home, EXE, backup_root=root)
+    real = attention._write_text
+
+    def full(path, text, **kwargs):
+        if path.name == "settings.json":
+            raise OSError(28, "No space left on device")
+        return real(path, text, **kwargs)
+
+    monkeypatch.setattr(attention, "_write_text", full)
+    with pytest.raises(OSError):
+        attention.set_hooks(home, "/elsewhere/openswap", backup_root=root)
+    monkeypatch.setattr(attention, "_write_text", real)
+    attention.remove(root)
+    assert not (home / "settings.json").exists()
+
+
+def test_review_turning_codex_hooks_on_again_records_what_the_owner_set_since(codex_home):
+    home, root = codex_home
+    (home / "config.toml").write_text("[features]\nhooks = false\n")
+    (home / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command",
+                                                                                  "command": "~/bin/a"}]}]}}))
+    write_attention_settings(root, notices=True)
+    attention.enable_codex_hooks(root)
+    attention.set_notices(root, False)  # put back: hooks = false
+    (home / "config.toml").write_text("")  # the owner removes the line (Codex's default: on)...
+    attention._save_codex_state(root, {os.path.realpath(home): {"hooks": True, "others": []}})  # a stale record
+    (home / "config.toml").write_text("[features]\nhooks = false\n")  # ...then sets it off again
+    attention.set_notices(root, True)
+    attention.enable_codex_hooks(root)
+    attention.set_notices(root, False)
+    assert (home / "config.toml").read_text() == "[features]\nhooks = false\n"
+
+
+def test_review_uninstall_tells_the_owner_which_codex_hooks_codex_asks_about(codex_home):
+    home, root = codex_home
+    _shifted(home, root, 'trusted_hash = "sha256:openswaps-own"')
+    notes: list = []
+    attention.remove(root, notes=notes)
+    assert notes == ["Codex will ask you to review your hook again (Stop: ~/bin/log)"]
+
+
+def test_review_the_question_hook_stops_waiting_once_claude_code_gave_up(tmp_path, monkeypatch):
+    root = tmp_path / "w"
+    path = ipc.socket_path(root)
+    path.parent.mkdir(parents=True, mode=0o700)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen(1)
+    parents = iter([4242] + [1] * 100)  # its wrapper was killed: reparented
+    monkeypatch.setattr(attention.os, "getppid", lambda: next(parents))
+    started = time.monotonic()
+    try:
+        assert attention._wait_for_answer(SESSION, "f" * 32, "", root) is None
+    finally:
+        server.close()
+    assert time.monotonic() - started < 3
+
+
+def test_review_codex_answers_already_applied_stay_applied_across_a_restart(tmp_path):
+    answers = Answers()
+    clock = Clock()
+    first = AttentionStore(tmp_path, clock=clock, codex_answers=answers)
+    first.notice(codex_permission(command="a") | {"at": START})
+    first.notice(codex_permission(command="b") | {"at": START + 0.1})
+    wait(first, clock, 7)
+    answers.at[THREAD] = START + 8
+    wait(first, clock, 0.5)
+    again = AttentionStore(tmp_path, clock=clock, codex_answers=answers)
+    wait(again, clock, 0.5)
+    assert len(published(again)) == 1  # the same log row never closes the other approval
+
+
+def test_review_an_item_without_detail_never_stalls_the_items_tried_after_a_refusal(reporting):
+    client, items, service, worker, transport, _ = reporting
+    items.notice(notification("idle_prompt", session=OTHER))  # no last message: never any detail
+    items.notice(notification("idle_prompt", session="third"))
+    items.notice(hook("Stop", last_assistant_message="poison") | {"at": START - 1})
+    items.notice(notification("idle_prompt"))
+    refusing = client.transport = _Refusing(transport, 400, "invalid_request", lambda data: any(
+        e.get("detail", {}).get("last_message") == "poison" for e in data["items"]))
+    for _ in range(4):
+        client.sync_attention()
+    items.notice(hook("Stop", session="fourth", last_assistant_message="fine") | {"at": START - 1})
+    items.notice(notification("idle_prompt", session="fourth"))
+    for _ in range(6):
+        client.sync_attention()
+    shown = {e["detail"]["last_message"] for e in service.attention(worker)["items"] if "detail" in e}
+    assert shown == {"fine"} and refusing.sent  # the new item's detail went; only the refused one is kept out

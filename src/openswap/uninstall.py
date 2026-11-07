@@ -145,7 +145,7 @@ def remove_integrations(
         ("setup wizard state", _reset_welcome),
         ("Remote tasks worker", lambda: _remove_worker(home, uid, force, removal)),
         ("Claude Code status line", _restore_status_line),
-        ("session notices", _remove_session_notices),
+        ("session notices", lambda: _remove_session_notices(removal)),
         ("widget", lambda: _remove_widget(home, uid)),
     )
     for name, step in steps:
@@ -417,12 +417,12 @@ def _remove_worker(home: Path, uid: int | None, force: bool, removal: Removal | 
     return True
 
 
-def _remove_session_notices() -> bool:
+def _remove_session_notices(removal: Removal) -> bool:
     """Take OpenSwap's session hooks out of every file it put them in, and put
     Codex's ``hooks`` feature back as it was."""
     from openswap import attention
 
-    return attention.remove(paths.get_backup_root())
+    return attention.remove(paths.get_backup_root(), notes=removal.warnings)
 
 
 def _restore_status_line() -> bool:

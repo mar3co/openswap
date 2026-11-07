@@ -182,7 +182,7 @@ def _handle_connection(
             response = _encode_response(error="invalid_json")
         else:
             command = request.get("command") if isinstance(request, dict) else None
-            if control_only and command not in CONTROL_COMMANDS:
+            if control_only and not (isinstance(command, str) and command in CONTROL_COMMANDS):
                 response = _encode_response(error="busy")
             elif (notices is not None and isinstance(command, str) and command in LINKED_COMMANDS
                     and request.get("version") == IPC_VERSION):

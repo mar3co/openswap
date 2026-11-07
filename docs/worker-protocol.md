@@ -725,7 +725,7 @@ exactly these fields, and optionally `session_id` and `detail`:
 unique within the array) and `reason`, one for each item that closed since
 the last report the backend accepted, sent once:
 `answered_on_mac`, `answered_from_watch`, `session_ended`, `superseded` (a
-newer Codex turn) or `expired` (a Codex item 24 hours old). An ID never
+newer Codex turn, or a newer turn of an idle Claude Code session) or `expired` (a Codex item 24 hours old). An ID never
 appears in both arrays of one request. A backend ignores a close for an item
 it never saw (an earlier report may have been lost). An item that leaves
 `items` without a close (notices turned off, or past the 50-item cap) ended
@@ -803,7 +803,10 @@ acknowledgement of a reply fixes its outcome, except `sent` → `applied`;
 later ones are ignored.
 
 The heartbeat thread only queues replies; another thread applies them, so a
-reply never delays liveness. An item answered from the other device closes as
+reply never delays liveness. A heartbeat refused with `invalid_request` for
+the outcomes it carries is sent again at once without them; those outcomes
+are tried again one per heartbeat after a minute, and one refused alone is
+given up (logged). An item answered from the other device closes as
 `answered_from_watch` only when the Mac knows that reply decided it.
 
 The reference service implements `attention`, keeps the latest report per
@@ -1769,15 +1772,31 @@ The channel is a stdio MCP server with no SDK: it never offers
 `server/discover` and answers `initialize` with MCP revision 2025-11-25, with
 the channel and permission-relay capabilities. It registers on a long-lived
 connection to the worker's socket. The worker accepts it only when the
-connecting process is a direct child of a Claude Code process started with the
-channel named (`--dangerously-load-development-channels` or `--channels`) whose
-`sessions/{pid}.json` is in a managed config home, and only the first channel
-process of that Claude Code process's life (by PID and start time, kept across
-worker restarts). The session is read from that file at each use, so `/clear`
-moves it. Permission prompts the channel relays, verdicts and messages travel
-only on that connection.
+connecting process, started as `<openswap> attention channel`, is a direct
+child of a Claude Code process started with the channel named
+(`--dangerously-load-development-channels` or `--channels`) whose
+`sessions/{pid}.json` is in a managed config home. The first such channel of
+that Claude Code process holds it (by PID and start time, kept across worker
+restarts). Another process asking for it while the holder runs (another MCP
+server, a command the session ran, whatever its command line says) cannot be
+told from the real one, so that Claude Code process gets no replies for the
+rest of its life, and Settings says why. A new channel takes over only once
+the holder's process is gone: `/mcp` → Reconnect starts a new channel process,
+and Claude Code 2.1.311 relays the next prompt to it and obeys its verdict
+(measured). A refused channel asks again every 3 seconds. The session is read
+from that file at each use, so `/clear` moves it. Permission prompts the
+channel relays, verdicts and messages travel only on that connection; a
+verdict goes only to the channel that relayed its prompt, while its process
+still holds the session.
 
-What each item takes, while replies are on:
+What each item takes, while replies are on, and only while nothing but the
+item's own Claude Code process has been seen for its session since it opened
+(a hook of another process or of an unknown one, another process's session
+file: `claude --resume` in a second terminal, a headless run), checked again
+at delivery. The Mac takes a reply only for an action the last report the
+backend accepted offered for that item, and an item is never offered `allow`
+or `answer` in a report that leaves out the detail showing its call or its
+questions (details off, or the detail cut for size):
 
 - A permission prompt takes `deny`, and `allow` while details are on (the
   phone then shows the call as Claude Code previews it to the channel). It
@@ -1787,7 +1806,12 @@ What each item takes, while replies are on:
   normalize), within 5 seconds, and no other waiting prompt or request with
   the same preview. Anything else stays a notice, so Allow never approves a
   call other than the one shown.
-- A question takes `answer` while its synchronous hook waits. That hook
+- A question takes `answer` while exactly one synchronous hook waits for that
+  very question (the one Claude Code ran with it), and only when every
+  question and option is sent whole (none past the caps, cut or cleaned to
+  nothing) while details are on. Any command a session runs can connect as a
+  question hook; it gains nothing (a second one only keeps the question from
+  taking an answer), and at most 4 wait per Claude Code process. That hook
   (`openswap attention question`, a `PermissionRequest` hook on
   `AskUserQuestion` with a 600-second timeout) is installed in every managed
   config home only while replies are on. It is served only in a session whose
@@ -1797,10 +1821,22 @@ What each item takes, while replies are on:
   question closes, the wait passes about 10 minutes or the worker is gone.
 - An idle session takes `message`, which arrives as a channel event the
   channel's instructions describe as the owner's message from the paired
-  device.
+  device. It is handed over only while the session file says `idle` with no
+  turn since the item opened: otherwise `refused` (the owner typed, a turn
+  runs or a dialog waits). A turn that ends while the session stays idle (a
+  background task's result) closes the item as `superseded` and opens a new
+  one, which takes messages; a reply to the old one gets `item_closed`.
 
 Before handing a verdict or an answer over, the worker reads the session file:
-a prompt that is no longer waiting was answered at the Mac (`item_closed`). A
+a prompt that is no longer waiting was answered at the Mac (`item_closed`).
+It saves the record that the reply was handled first, and refuses the reply
+when that save fails; a reply arriving after the saved state had to be set
+aside at start is refused too. `sent` is reported only once the channel or
+the question hook took the reply; one that never got there (the hook left,
+the send failed) settles as `refused` (`item_closed` if the item closed) and
+the item takes a reply again. A reply a worker restart left between the two
+is never reported `refused` or `item_closed` (it may have landed), and its
+item takes no other reply until it closes. A
 reply counts as `applied` only on the session's own signal for it: the
 dialog closing within 2 seconds of the verdict as an approval or a decline, the
 call's `PostToolUse` or `PostToolUseFailure` after an allow, the `Stop` that

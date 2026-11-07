@@ -23,7 +23,7 @@ from openswap.claude_login import (
     new_login_outcome,
     remove_legacy_login_command,
 )
-from openswap.exceptions import ClaudeSwitchError, CredentialMissingError, CredentialReadError
+from openswap.exceptions import ClaudeSwitchError, ConfigError, CredentialMissingError, CredentialReadError
 from openswap.menubar_display import *  # noqa: F403
 from openswap.codex.desktop_app import DesktopApp, DesktopCapability, capability_is_fresh
 from openswap.menubar_display import (  # noqa: F401  tests poke these
@@ -2665,7 +2665,10 @@ def run(switcher, codex=None) -> int:
                                    "you. Turning them on also starts these hooks of yours:\n" + listed,
                            ok="Turn On", cancel="Not Now") != 1:
                 return
-            problems = enable_codex_hooks(root)
+            try:
+                problems = enable_codex_hooks(root)
+            except ConfigError as e:
+                problems = [str(e)]
             if problems:
                 self._show_error("Session notices:\n" + "\n".join(problems))
 

@@ -97,9 +97,9 @@ class Env:
         self.status("busy", self.clock.now - 10)
         assert self.store.register_channel(CHANNEL, CLAUDE, self.link)
 
-    def relay(self, tool_input, tool="Bash", request_id="abcde"):
+    def relay(self, tool_input, tool="Bash", request_id="abcde", link=None):
         """The channel relays Claude Code's permission request for ``tool_input``."""
-        self.store.channel_request(PID, self.link, {
+        self.store.channel_request(PID, link or self.link, {
             "request_id": request_id, "tool_name": tool, "description": "Run the tests",
             "input_preview": attention.channel_preview(tool_input)})
 
@@ -116,8 +116,17 @@ class Env:
         self.clock.now = t + 7
         return next(i for i in self.store._items if i.created_at == t + 0.1)
 
+    def waiter(self, key=None):
+        """The question's synchronous hook, connected when its PermissionRequest ran."""
+        now, self.clock.now = self.clock.now, self.asked
+        try:
+            return self.store.question_waiter(CLAUDE, SESSION, key or attention.question_key({"questions": QUESTIONS}))
+        finally:
+            self.clock.now = now
+
     def question(self):
         t = self.clock.now
+        self.asked = t + 0.1
         self.store.notice(hook("PermissionRequest", tool_name="AskUserQuestion", tool_input={"questions": QUESTIONS})
                           | {"at": t + 0.1})
         self.status("waiting", t + 0.05)
@@ -138,7 +147,13 @@ class Env:
     def actions(self, item):
         return next(i["actions"] for i in self.report()["items"] if i["id"] == item.id)
 
-    def reply(self, item_id, action, reply_id="r1", expires=600, **extra):
+    def accepted(self):
+        """The service accepts the report as it stands now (what it may take replies for)."""
+        self.store.acknowledge([], self.report()["items"])
+
+    def reply(self, item_id, action, reply_id="r1", expires=600, offered=True, **extra):
+        if offered:
+            self.accepted()
         self.store.queue_replies([{"id": reply_id, "item_id": item_id, "action": action,
                                    "expires_at": stamp(self.clock.now + expires), **extra}])
         self.store.apply_replies(self.clock.now)
@@ -168,7 +183,9 @@ def env(tmp_path):
 
 
 def test_the_preview_is_rendered_exactly_as_claude_code_relays_it():
-    """Shapes copied from Claude Code 2.1.311's real permission_request messages (phase 0)."""
+    """The flat shapes are copied from Claude Code 2.1.311's real permission_request
+    messages (phase 0); no built-in tool relays a nested input, so the last one
+    follows the rendering rule only."""
     assert attention.channel_preview({"command": "touch /tmp/r1/ran-22", "description": "Touch marker file 22"}) \
         == '{ "command": "touch /tmp/r1/ran-22", "description": "Touch marker file 22" }'
     assert attention.channel_preview({"file_path": "/tmp/w.txt", "content": "token=x hunter2\n"}) \
@@ -447,7 +464,7 @@ def test_row18_openswaps_channel_turn_closes_a_stale_prompt_as_answered_on_the_m
 def test_a_question_takes_answers_only_while_its_hook_waits_and_applies_the_match(env):
     item = env.question()
     assert env.actions(item) == []  # no hook waiting: nothing to hand an answer to
-    waiter = env.store.question_waiter(CLAUDE, SESSION, attention.question_key({"questions": QUESTIONS}))
+    waiter = env.waiter()
     assert env.actions(item) == ["answer"]
     env.reply(item.id, "answer", answers=[{"question": 0, "option": 1}])
     assert waiter.done.is_set() and waiter.answers == [[0, 1]]
@@ -462,7 +479,7 @@ def test_a_question_takes_answers_only_while_its_hook_waits_and_applies_the_matc
 
 def test_a_question_answered_otherwise_at_the_mac_is_not_applied(env):
     item = env.question()
-    waiter = env.store.question_waiter(CLAUDE, SESSION, attention.question_key({"questions": QUESTIONS}))
+    waiter = env.waiter()
     env.reply(item.id, "answer", answers=[{"question": 0, "option": 1}])
     env.store.handed_over(waiter.reply_id)
     answered = {"questions": QUESTIONS, "answers": {"Which database?": "Postgres"}}
@@ -474,7 +491,7 @@ def test_a_question_answered_otherwise_at_the_mac_is_not_applied(env):
                                      [{"question": 0, "option": 0}, {"question": 1, "option": 0}]])
 def test_an_answer_that_does_not_fit_the_question_is_refused(env, answers):
     item = env.question()
-    waiter = env.store.question_waiter(CLAUDE, SESSION, attention.question_key({"questions": QUESTIONS}))
+    waiter = env.waiter()
     try:
         attention_reply({"id": "r1", "item_id": item.id, "action": "answer", "answers": answers,
                          "expires_at": stamp(env.clock.now + 600)})
@@ -628,6 +645,7 @@ def test_the_gate_drops_what_it_cannot_deliver(env, change, outcome):
 
 
 def test_a_malformed_reply_with_an_id_is_refused_and_without_one_ignored(env):
+    env.accepted()
     env.store.queue_replies([{"id": "r1", "item_id": "x", "action": "message", "expires_at": stamp(START)},
                              {"item_id": "x"}, "junk"])
     env.store.apply_replies(env.clock.now)
@@ -646,16 +664,47 @@ def test_acks_go_until_the_service_takes_them_and_applied_replaces_sent(env):
 # --- channel registration -----------------------------------------------------------------
 
 
-def test_only_the_first_channel_of_a_claude_code_process_is_registered(env, tmp_path):
+def _running(monkeypatch, *processes):
+    """``peers.process`` sees these (fake) processes running."""
+    real = peers.process
+    monkeypatch.setattr(peers, "process", lambda pid: next((p for p in processes if p.pid == pid), None)
+                        or real(pid))
+
+
+def test_q7_a_second_candidate_while_the_channel_runs_turns_replies_off(env, tmp_path, monkeypatch):
+    from openswap.worker.attention import read_problems
+
+    _running(monkeypatch, CHANNEL)
+    # Its own channel reconnecting (the worker restarted, or the socket dropped) is fine.
+    assert env.store.register_channel(CHANNEL, CLAUDE, env.link)
+    item = env.prompt()
+    assert env.actions(item) == ["allow", "deny"]
+    # Another process (another MCP server, a command faking the command line) cannot be told
+    # from the real one: no replies for that Claude Code process's life, and status says why.
     impostor = Process(PID + 200000, PID, "Fri Nov  6 14:05:00 2026", ("openswap", "attention", "channel"))
     assert not env.store.register_channel(impostor, CLAUDE, FakeLink())
-    # Its own channel reconnecting (the worker restarted, or the socket dropped) is fine.
-    assert env.store.register_channel(CHANNEL, CLAUDE, FakeLink())
-    # ...and the hold survives a worker restart.
+    assert env.actions(item) == []
+    assert not env.store.register_channel(CHANNEL, CLAUDE, FakeLink())  # never trusted again
     restarted = AttentionStore(tmp_path / "root", clock=env.clock, switches=lambda: env.switches,
                                homes=lambda: [env.home])
-    assert not restarted.register_channel(impostor, CLAUDE, FakeLink())
-    assert restarted.register_channel(CHANNEL, CLAUDE, FakeLink())
+    assert not restarted.register_channel(CHANNEL, CLAUDE, FakeLink())  # not across a restart either
+    assert "another process tried to act as OpenSwap's channel" in read_problems(tmp_path / "root")[0]
+
+
+def test_q8_a_reconnected_channel_takes_over_once_the_holder_is_gone(env, monkeypatch):
+    item = env.prompt()
+    assert env.actions(item) == ["allow", "deny"]
+    _running(monkeypatch)  # the first channel process ended (/mcp → Reconnect)
+    env.store.unregister_channel(PID, env.link)
+    again = Process(PID + 300000, PID, "Fri Nov  6 14:06:00 2026", CHANNEL.args)
+    link = FakeLink()
+    assert env.store.register_channel(again, CLAUDE, link)
+    env.reply(item.id, "deny")
+    assert link.sent == [] and env.outcomes() == {"r1": "refused"}  # the request was relayed by the old one
+    env.relay(bash("npm run build"), request_id="fghij", link=link)
+    later = env.prompt("npm run build", relay=False)
+    env.reply(later.id, "allow", reply_id="r2")
+    assert link.sent == [{"verdict": {"request_id": "fghij", "behavior": "allow"}}]
 
 
 def test_a_reused_pid_starts_a_new_registration(env):
@@ -974,7 +1023,7 @@ def test_the_worker_sends_its_outcomes_before_capabilities_are_resent(env, onlin
     assert service.attention(worker)["replies"][0]["outcome"] == "sent"
 
 
-def test_outcomes_never_keep_a_mac_offline_on_a_service_without_the_extension(env, online):
+def test_q6_outcomes_never_keep_a_mac_offline_and_only_refused_ones_are_given_up(env, online):
     client, service, worker, transport = online
     env.store._acks["r9"] = "sent"
     client._attention_epoch = None  # this service never accepted "attention"
@@ -991,8 +1040,15 @@ def test_outcomes_never_keep_a_mac_offline_on_a_service_without_the_extension(en
 
     client.transport = Refusing()
     client._attention_epoch = client.worker_epoch
-    assert client.heartbeat_tick() is False  # refused once: the outcomes are dropped
-    assert env.store.take_acks() == [] and client.heartbeat_tick() is True
+    env.store._acks["r8"] = "applied"
+    assert client.heartbeat_tick() is True  # liveness never waits on refused outcomes
+    assert env.store.take_acks() == []  # the refused batch waits; not on every heartbeat
+    env.store._ack_retry_at = 0.0
+    assert len(env.store.take_acks()) == 1  # then one at a time
+    assert client.heartbeat_tick() is True  # refused alone: given up (logged)
+    env.store._ack_retry_at = 0.0
+    assert len(env.store.take_acks()) == 1 and client.heartbeat_tick() is True
+    assert env.store.take_acks() == [] and env.store._acks == {}
 
 
 @pytest.mark.parametrize("reply", [
@@ -1156,10 +1212,306 @@ def test_a_question_that_cannot_be_shown_whole_takes_no_answer(env):
 
 def test_a_question_closed_by_another_questions_answer_claims_nothing(env):
     item = env.question()
-    waiter = env.store.question_waiter(CLAUDE, SESSION, attention.question_key({"questions": QUESTIONS}))
+    waiter = env.waiter()
     env.reply(item.id, "answer", answers=[{"question": 0, "option": 1}])
     env.store.handed_over(waiter.reply_id)
     other = [{"question": "Which cache?", "options": [{"label": "Postgres"}, {"label": "SQLite"}]}]
     env.store.notice(hook("PostToolUse", tool_name="AskUserQuestion", tool_input={
         "questions": other, "answers": {"Which cache?": "SQLite"}}) | env.at(0.2))
     assert env.closes() == {item.id: "answered_on_mac"} and env.outcomes() == {"r1": "sent"}
+
+
+# --- S2 review round (plan 025, 025-review-s2.md) ------------------------------------
+
+
+def test_q1_an_item_whose_detail_does_not_fit_offers_no_allow(env):
+    env.prompt("npm test")
+    full = len(json.dumps(env.report()).encode())
+    body = env.store.report(notices=True, details=True, replies=True, folder_label=lambda cwd: None,
+                            budget=full - 1)[0]
+    [shown] = body["items"]
+    assert "detail" not in shown and shown["actions"] == ["deny"]  # Allow never without the call it allows
+
+
+def test_q1_a_reply_needs_the_action_the_last_accepted_report_offered(env):
+    item = env.prompt("npm test")
+    env.switches = AttentionSettings(notices=True, details=False, replies=True)
+    env.accepted()  # the service last took the report without details: Deny only
+    env.switches = AttentionSettings(notices=True, details=True, replies=True)
+    env.reply(item.id, "allow", offered=False)
+    assert env.link.sent == [] and env.outcomes() == {"r1": "refused"}
+    env.reply(item.id, "allow", reply_id="r2")  # offered by the report accepted now
+    assert env.link.sent == [{"verdict": {"request_id": "abcde", "behavior": "allow"}}]
+
+
+@pytest.mark.parametrize("questions", [
+    [{"question": "Pick", "options": [{"label": str(n)} for n in range(5)]}],  # past MAX_OPTIONS
+    [{"question": "Pick", "options": [{"label": "A"}, {"label": " \x07 "}]}],  # a label that cleans to nothing
+    [{"question": "Pick", "options": [{"label": "A"}, {"label": "B" * 101}]}],  # cut
+    [{"question": "Q" * 1001, "options": [{"label": "A"}, {"label": "B"}]}],  # cut
+])
+def test_q2_a_question_not_sent_whole_takes_no_answer(env, questions):
+    t = env.clock.now
+    env.asked = t + 0.1
+    env.store.notice(hook("PermissionRequest", tool_name="AskUserQuestion", tool_input={"questions": questions})
+                     | {"at": t + 0.1})
+    env.status("waiting", t + 0.05)
+    env.store.notice(hook("Notification", notification_type="permission_prompt") | {"at": t + 6.1})
+    env.waiter(attention.question_key({"questions": questions}))
+    [item] = env.store._items
+    assert env.actions(item) == []
+
+
+def test_q2_no_answer_while_details_are_off(env):
+    item = env.question()
+    env.waiter()
+    assert env.actions(item) == ["answer"]
+    env.switches = AttentionSettings(notices=True, details=False, replies=True)
+    assert env.actions(item) == []
+
+
+@pytest.mark.parametrize(("status", "outcome"), [("busy", "refused"), ("waiting", "refused")])
+def test_q3_a_message_is_never_typed_into_a_session_that_is_not_idle(env, status, outcome):
+    item = env.idle()
+    env.accepted()
+    env.status(status, env.clock.now)  # the owner typed, a background turn runs, or a dialog waits
+    env.reply(item.id, "message", text="Run the tests", offered=False)
+    assert env.link.sent == [] and env.outcomes() == {"r1": outcome}
+
+
+def test_q3_a_message_for_an_item_a_later_turn_replaced_is_closed_and_the_new_one_takes_it(env):
+    item = env.idle()
+    env.accepted()
+    env.store.notice(hook("UserPromptSubmit", prompt="<task-notification>x") | env.at(1))
+    env.status("idle", env.clock.now + 5)
+    env.store.notice(hook("Stop", last_assistant_message="Result is 42.") | env.at(5))
+    env.reply(item.id, "message", text="Thanks", offered=False)
+    assert env.link.sent == [] and env.outcomes() == {"r1": "item_closed"}
+    env.clock.now += 6
+    newer = next(i for i in env.store._items if i.kind == "idle")
+    assert newer.id != item.id
+    env.reply(newer.id, "message", reply_id="r2", text="Thanks")
+    assert env.link.sent[0]["message"]["content"] == "Thanks"
+
+
+def test_q4_an_answer_the_hook_never_took_settles_and_the_item_takes_a_reply_again(env):
+    item = env.question()
+    waiter = env.waiter()
+    env.reply(item.id, "answer", answers=[{"question": 0, "option": 1}])
+    assert waiter.done.is_set()
+    env.store.end_waiter(waiter)  # the hook left before it took the answer
+    assert env.outcomes() == {"r1": "refused"}
+    waiter = env.waiter()
+    assert env.actions(item) == ["answer"]  # still open: it takes a reply again
+
+
+def test_q4_a_reply_whose_hand_over_a_restart_left_unknown_is_never_reported_or_repeated(env, tmp_path):
+    item = env.prompt()
+    env.link.send = lambda message: (_ for _ in ()).throw(SystemExit)  # the worker dies mid-hand-over
+    with pytest.raises(SystemExit):
+        env.reply(item.id, "allow")
+    restarted = AttentionStore(tmp_path / "root", clock=env.clock, switches=lambda: env.switches,
+                               homes=lambda: [env.home])
+    restarted.register_channel(CHANNEL, CLAUDE, env.link)
+    env.store = restarted
+    env.status("waiting", env.clock.now - 6)
+    assert env.actions(item) == []  # takes no further reply until it closes
+    env.reply(item.id, "allow")  # the same reply again: no outcome at all
+    env.reply(item.id, "deny", reply_id="r2")
+    assert env.outcomes() == {"r2": "refused"}
+    env.store.notice(hook("PostToolUse", tool_name="Bash", tool_input=bash("npm test")) | env.at(0.1))
+    assert env.outcomes() == {}  # never "refused" nor "item_closed" for r1
+
+
+def test_q5_a_reply_whose_record_cannot_be_saved_is_refused_not_delivered(env, monkeypatch):
+    item = env.prompt()
+
+    def full(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(env.store, "_save", full)
+    env.reply(item.id, "allow")
+    assert env.link.sent == [] and env.outcomes() == {"r1": "refused"}
+
+
+def test_q5_replies_from_before_a_set_aside_state_are_refused(env, tmp_path):
+    item = env.prompt()
+    env.accepted()
+    (tmp_path / "root" / "worker" / "attention.json").write_text("{torn")
+    restarted = AttentionStore(tmp_path / "root", clock=env.clock, switches=lambda: env.switches,
+                               homes=lambda: [env.home])
+    env.store = restarted
+    env.reply(item.id, "allow", offered=False)
+    assert env.outcomes() == {}  # kept until this start's first report was accepted
+    env.accepted()
+    env.store.apply_replies(env.clock.now)
+    assert env.outcomes() == {"r1": "refused"}  # its item is unknown, and it may predate this start
+    env.clock.now += 1300
+    env.reply(item.id, "allow", reply_id="r2")
+    assert env.outcomes() == {"r2": "item_closed"}  # past any reply's life: an ordinary closed item
+
+
+def test_q9_another_process_seen_for_the_session_takes_every_reply_away(env):
+    item = env.prompt()
+    env.accepted()
+    assert env.actions(item) == ["allow", "deny"]
+    other = os.getppid()  # a headless --resume, a second terminal: another process for the session
+    env.store.notice(hook("UserPromptSubmit", prompt="<task-notification>") | {"pid": other} | env.at(1))
+    assert env.actions(item) == []
+    env.reply(item.id, "allow", offered=False)  # offered before: still refused at delivery
+    assert env.link.sent == [] and env.outcomes() == {"r1": "refused"}
+
+
+def test_q9_an_unknown_process_counts_as_another(env):
+    item = env.prompt()
+    env.store.notice(hook("UserPromptSubmit", prompt="<task-notification>") | {"pid": 0} | env.at(1))
+    assert env.actions(item) == []
+
+
+def test_q11_two_waiters_for_one_question_take_no_answer(env):
+    item = env.question()
+    first, second = env.waiter(), env.waiter()
+    assert env.actions(item) == []
+    env.store.end_waiter(second)
+    assert env.actions(item) == ["answer"]
+    env.reply(item.id, "answer", answers=[{"question": 0, "option": 1}])
+    assert first.done.is_set()
+
+
+def test_q11_a_waiter_from_another_occurrence_or_past_the_cap_is_not_used(env):
+    item = env.question()
+    env.clock.now, now = env.asked + 30, env.clock.now  # connected long after this question was asked
+    late = env.store.question_waiter(CLAUDE, SESSION, attention.question_key({"questions": QUESTIONS}))
+    env.clock.now = now
+    assert late is not None and env.actions(item) == []
+    for _ in range(3):
+        assert env.store.question_waiter(CLAUDE, SESSION, "f" * 32) is not None
+    assert env.store.question_waiter(CLAUDE, SESSION, "f" * 32) is None  # four per Claude Code process
+
+
+def test_q11_only_openswaps_question_command_is_served(env, monkeypatch):
+    stranger = Process(PID + 7, PID, "Fri Nov  6 14:00:02 2026", ("python3", "fake.py"))
+    monkeypatch.setattr(peers, "peer_pid", lambda _c: stranger.pid)
+    _running(monkeypatch, stranger)
+    a, b = socket.socketpair()
+    with a, b:
+        channel_link._serve_question(env.store, a, {"session_id": SESSION, "tool_key": "f" * 32},
+                                     threading.Event(), lambda: None)
+        assert json.loads(b.recv(4096)) == {"answers": None} and env.store._waiters == []
+
+
+def test_minor_a_malformed_reply_is_answered_again_when_it_comes_back(env):
+    bad = {"id": "r7", "item_id": "i", "action": "allow", "expires_at": "not a time"}
+    env.accepted()
+    env.store.queue_replies([bad])
+    env.store.apply_replies(env.clock.now)
+    assert env.outcomes() == {"r7": "refused"}
+    env.store.queue_replies([bad])
+    env.store.apply_replies(env.clock.now)
+    assert env.outcomes() == {"r7": "refused"}
+
+
+def test_minor_the_heartbeat_never_waits_on_the_store_lock(env):
+    env.store._acks["r9"] = "sent"
+    with env.store._lock:  # held across a slow disk write, say
+        done = []
+        thread = threading.Thread(target=lambda: done.append(env.store.take_acks()))
+        thread.start()
+        thread.join(timeout=2)
+        assert done == [[{"id": "r9", "outcome": "sent"}]]
+
+
+def test_minor_a_refused_channel_keeps_asking_every_few_seconds(monkeypatch):
+    waits = []
+    client = channel.Channel(stdout=io.StringIO())
+    monkeypatch.setattr(client, "_connect", lambda: (None, None))
+    monkeypatch.setattr(client.stopped, "wait", lambda seconds: (waits.append(seconds), len(waits) >= 20)[1]
+                        and client.stopped.set())
+    client.worker_loop()
+    assert set(waits) == {channel.RETRY_SECONDS} and channel.RETRY_SECONDS <= 5
+
+
+def test_minor_ps_reads_start_times_in_the_c_locale_and_utc(monkeypatch):
+    import subprocess
+
+    seen = {}
+    monkeypatch.setattr(peers.subprocess, "run", lambda *a, **k: (seen.update(k), subprocess.CompletedProcess(
+        [], 0, "1 Fri Nov  6 14:00:00 2026 claude\n", ""))[1])
+    assert peers.process(4242).started == "Fri Nov 6 14:00:00 2026"
+    # As Claude Code writes procStart (`LC_ALL=C TZ=UTC ps -o lstart=`, read from 2.1.311).
+    assert (seen["env"]["LC_ALL"], seen["env"]["TZ"]) == ("C", "UTC0")
+
+
+def test_q10_a_verdict_whose_pairing_went_before_delivery_is_refused(env):
+    item = env.prompt()
+    env.store._attached.pop(item.id)  # after the gate passed it: a second identical call came in, say
+    outcome = env.store._deliver({"id": "r1", "item_id": item.id, "action": "allow"}, item, env.clock.now + 600)
+    assert outcome == "refused" and env.link.sent == []
+
+
+def test_review_refused_outcomes_are_blamed_only_once_the_heartbeat_without_them_went(env, online):
+    client, service, worker, transport = online
+
+    class Down:
+        key = transport.key
+
+        def request(self, operation, data):
+            raise ProtocolError("invalid_request")  # every heartbeat, for some other reason
+
+    env.store._acks["r9"] = "sent"
+    client._attention_epoch = client.worker_epoch
+    client.transport = Down()
+    assert client.heartbeat_tick() is False
+    assert env.store._suspects == [] and env.store.take_acks() == [{"id": "r9", "outcome": "sent"}]
+
+
+def test_review_a_handled_reply_whose_outcome_is_still_owed_is_kept(env):
+    item = env.prompt()
+    env.reply(item.id, "allow")
+    env.clock.now += 10_000  # long past its expiry, its "sent" never taken (an outage)
+    env.store.apply_replies(env.clock.now)
+    assert "r1" in env.store._handled and env.store.take_acks() == [{"id": "r1", "outcome": "sent"}]
+
+
+def test_review_a_reply_in_flight_for_an_item_gone_at_restart_is_not_held_for_ever(env, tmp_path):
+    item = env.prompt()
+    env.store._inflight["r1"] = "gone-item"
+    env.store._inflight["r2"] = item.id
+    env.store._handled["r1"] = ["sent", env.clock.now + 600]
+    env.store._commit()
+    restarted = AttentionStore(tmp_path / "root", clock=env.clock, switches=lambda: env.switches,
+                               homes=lambda: [env.home])
+    assert restarted._inflight == {"r2": item.id} and restarted._unknown == {item.id}
+    restarted.clear()  # notices off: the unknown one stays "sent" for good
+    assert restarted._inflight == {} and restarted._unknown == set()
+
+
+def test_review_a_blocked_sessions_status_clears_once_its_claude_code_ended(env, tmp_path, monkeypatch):
+    from openswap.worker.attention import read_problems
+
+    _running(monkeypatch, CHANNEL)
+    impostor = Process(PID + 200000, PID, "Fri Nov  6 14:05:00 2026", CHANNEL.args)
+    assert not env.store.register_channel(impostor, CLAUDE, FakeLink())
+    assert read_problems(tmp_path / "root")
+    env.store._channels[PID].claude_pid = 999_999_999  # stand-in: that process ended
+    env.store._channels = {999_999_999: env.store._channels[PID]}
+    env.store.observe([], True)
+    assert read_problems(tmp_path / "root") == []
+
+
+def test_review_a_takeover_never_follows_another_candidates_in_the_same_moment(env, monkeypatch):
+    first = Process(PID + 300000, PID, "Fri Nov  6 14:06:00 2026", CHANNEL.args)
+    second = Process(PID + 400000, PID, "Fri Nov  6 14:06:00 2026", CHANNEL.args)
+    real = peers.process
+
+    def race(pid):
+        if pid == CHANNEL.pid and not race.done:  # while the second checks the old holder...
+            race.done = True
+            assert env.store.register_channel(first, CLAUDE, FakeLink())  # ...the first takes over
+        return None if pid == CHANNEL.pid else real(pid)
+
+    race.done = False
+    monkeypatch.setattr(peers, "process", race)
+    env.store.unregister_channel(PID, env.link)
+    assert not env.store.register_channel(second, CLAUDE, FakeLink())
+    assert env.store._channels[PID].contested
