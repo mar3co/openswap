@@ -1785,7 +1785,8 @@ def _attention_store(backup_root: Path):
                           records=_session_records(backup_root),
                           codex_answers=lambda threads: read_codex_answers([codex_home()], threads),
                           switches=lambda: load_attention_settings(backup_root),
-                          homes=lambda: hooks.config_homes(backup_root))
+                          homes=lambda: hooks.config_homes(backup_root),
+                          install=lambda: hooks.reconcile(backup_root, installs_only=True))
 
 
 def _session_records(backup_root: Path):

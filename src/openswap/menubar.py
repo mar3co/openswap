@@ -942,11 +942,18 @@ def run(switcher, codex=None) -> int:
             from openswap.attention import program
             from openswap.settings import load_attention_settings
 
+            from openswap.attention import recorded_programs
+            from openswap.worker.attention import read_problems
+
+            root = self.switcher.backup_dir
             status = dict(self._worker_status_cache)
-            switches = load_attention_settings(self.switcher.backup_dir)
+            switches = load_attention_settings(root)
             status["attention"] = {"notices": switches.notices, "details": switches.details,
                                    "codex": self._codex_hooks_status() if switches.notices else None,
-                                   "replies": switches.replies, "launcher": f"{shlex.quote(program())} claude"}
+                                   "replies": switches.replies, "launcher": f"{shlex.quote(program())} claude",
+                                   "readable": switches.readable,
+                                   "missing": recorded_programs(root) if switches.notices else [],
+                                   "problems": read_problems(root)}
             if self._setup_changing_folders():
                 status["setup_changing_folders"] = True
             return status
@@ -2634,12 +2641,33 @@ def run(switcher, codex=None) -> int:
                 self._show_error(f"Couldn't change {what}: {e}")
                 return
             if problems:
-                more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
-                self._show_error(f"Session notices could not be set up everywhere: {problems[0]}{more}")
-            elif not current.notices and self._codex_hooks_status() == "review":
-                from openswap.menubar_display import CODEX_REVIEW
+                more = f"\n(and {len(problems) - 5} more)" if len(problems) > 5 else ""
+                self._show_error("Session notices:\n" + "\n".join(problems[:5]) + more)
+            if row_id == "remote_attention_notices" and not current.notices:
+                self._ask_codex_hooks(root)
+                status = self._codex_hooks_status()
+                if status in ("review", "review_others"):
+                    from openswap.menubar_display import CODEX_HOOKS_STATUS
 
-                self._alert(title="openswap", message=CODEX_REVIEW)
+                    self._alert(title="openswap", message=CODEX_HOOKS_STATUS[status].removeprefix("Codex: "))
+
+        def _ask_codex_hooks(self, root) -> None:
+            """Codex's hooks feature is off and turning it on would start other hooks
+            too: only with the owner's OK."""
+            from openswap.attention import codex_consent_needed, enable_codex_hooks
+
+            others = codex_consent_needed(root)
+            if not others:
+                return
+            listed = "\n".join(others[:8]) + (f"\n(and {len(others) - 8} more)" if len(others) > 8 else "")
+            if self._alert(title="Turn on Codex hooks?",
+                           message="Codex's hooks are turned off, so Codex sessions can't tell you when they need "
+                                   "you. Turning them on also starts these hooks of yours:\n" + listed,
+                           ok="Turn On", cancel="Not Now") != 1:
+                return
+            problems = enable_codex_hooks(root)
+            if problems:
+                self._show_error("Session notices:\n" + "\n".join(problems))
 
         def _toggle_codex_auto(self) -> bool:
             """Flip Codex auto-switching (Settings row and the Codex tab's footer toggle)."""

@@ -418,8 +418,8 @@ def _remove_worker(home: Path, uid: int | None, force: bool, removal: Removal | 
 
 
 def _remove_session_notices() -> bool:
-    """Take OpenSwap's session hooks out of every Claude Code config home and
-    put Codex's own ``notify`` program back."""
+    """Take OpenSwap's session hooks out of every file it put them in, and put
+    Codex's ``hooks`` feature back as it was."""
     from openswap import attention
 
     return attention.remove(paths.get_backup_root())

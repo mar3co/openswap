@@ -14,6 +14,8 @@ from pathlib import Path
 from threading import Event
 from typing import TYPE_CHECKING, Protocol
 
+from openswap.worker.attention import log_limited
+
 if TYPE_CHECKING:
     from openswap.worker.attention import AttentionStore
     from openswap.worker.models import ControlResult, WorkerSnapshot
@@ -27,6 +29,10 @@ IO_TIMEOUT_SECONDS = 2.0
 # Connections are served concurrently, so a slow or idle client cannot stall
 # status, pause or stop; past this many at once, a new one is closed unread.
 MAX_CONNECTIONS = 32
+# Of those, kept for status, pause and stop: notices, channels and question
+# hooks never take the last of them.
+CONTROL_RESERVED = 2
+CONTROL_COMMANDS = frozenset({"status", "stop", "pause"})
 _JOB_ID_LIMIT = 128
 
 
@@ -165,6 +171,7 @@ def _handle_connection(
     control_lock: threading.Lock | None = None,
     stop_event: Event | None = None,
     release=None,
+    control_only: bool = False,
 ) -> None:
     connection.settimeout(IO_TIMEOUT_SECONDS)
     try:
@@ -175,19 +182,22 @@ def _handle_connection(
             response = _encode_response(error="invalid_json")
         else:
             command = request.get("command") if isinstance(request, dict) else None
-            if (notices is not None and isinstance(command, str) and command in LINKED_COMMANDS
+            if control_only and command not in CONTROL_COMMANDS:
+                response = _encode_response(error="busy")
+            elif (notices is not None and isinstance(command, str) and command in LINKED_COMMANDS
                     and request.get("version") == IPC_VERSION):
                 from openswap.worker import channel_link
 
                 channel_link.serve(notices, connection, request, stop_event or Event(), release or (lambda: None))
                 return
-            try:
-                result, error = _dispatch(request, control, notices, control_lock)
-                response = _encode_response(result, error)
-            except Exception:
-                # Do not send callback exception strings or runtime details to
-                # an arbitrary local client.
-                response = _encode_response(error="control_failed")
+            else:
+                try:
+                    result, error = _dispatch(request, control, notices, control_lock)
+                    response = _encode_response(result, error)
+                except Exception:
+                    # Do not send callback exception strings or runtime details to
+                    # an arbitrary local client.
+                    response = _encode_response(error="control_failed")
     except IpcError as exc:
         response = _encode_response(error=str(exc))
     except (OSError, TimeoutError):
@@ -280,11 +290,12 @@ def serve(
         if ready_event is not None:
             ready_event.set()
         server.settimeout(0.2)
-        slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        slots = threading.BoundedSemaphore(MAX_CONNECTIONS - CONTROL_RESERVED)
+        reserve = threading.BoundedSemaphore(CONTROL_RESERVED)
         control_lock = threading.Lock()
         handlers: list[threading.Thread] = []
 
-        def handle(connection: socket.socket) -> None:
+        def handle(connection: socket.socket, pool: threading.BoundedSemaphore) -> None:
             # A channel or a waiting question hook, once accepted, gives its slot
             # back: the attention store bounds how many of those stay open.
             released = threading.Event()
@@ -292,11 +303,12 @@ def serve(
             def release() -> None:
                 if not released.is_set():
                     released.set()
-                    slots.release()
+                    pool.release()
 
             try:
                 with connection:
-                    _handle_connection(connection, control, notices, control_lock, stop_event, release)
+                    _handle_connection(connection, control, notices, control_lock, stop_event, release,
+                                       control_only=pool is reserve)
             finally:
                 release()
 
@@ -306,16 +318,23 @@ def serve(
                     connection, _ = server.accept()
                 except socket.timeout:
                     continue
-                if not slots.acquire(blocking=False):
+                except OSError as exc:  # out of descriptors, say: the server keeps serving
+                    log_limited("ipc_accept", "Worker socket could not accept a connection: %s", exc)
+                    stop_event.wait(0.05)
+                    continue
+                pool = slots if slots.acquire(blocking=False) else reserve if reserve.acquire(blocking=False) else None
+                if pool is None:
+                    log_limited("ipc_full", "Worker socket busy: %d connections open; one was refused",
+                                MAX_CONNECTIONS)
                     connection.close()
                     continue
                 handlers = [thread for thread in handlers if thread.is_alive()]
-                thread = threading.Thread(target=handle, args=(connection,),
+                thread = threading.Thread(target=handle, args=(connection, pool),
                                           name="openswap-worker-ipc-connection", daemon=True)
                 try:
                     thread.start()
                 except RuntimeError:
-                    slots.release()
+                    pool.release()
                     connection.close()
                     continue
                 handlers.append(thread)

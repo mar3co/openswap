@@ -99,6 +99,8 @@ class ControlStore:
                     items TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS attention_closed (
                     device TEXT NOT NULL, id TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(device,id));
+                CREATE TABLE IF NOT EXISTS attention_known (
+                    device TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(device,id));
                 CREATE TABLE IF NOT EXISTS attention_replies (
                     id TEXT PRIMARY KEY, device TEXT NOT NULL, item TEXT NOT NULL, payload TEXT NOT NULL,
                     expiry REAL NOT NULL, outcome TEXT);
@@ -240,6 +242,7 @@ class ControlStore:
             db.execute("DELETE FROM capabilities WHERE device=?", (worker_id,))
             db.execute("DELETE FROM attention WHERE device=?", (worker_id,))
             db.execute("DELETE FROM attention_closed WHERE device=?", (worker_id,))
+            db.execute("DELETE FROM attention_known WHERE device=?", (worker_id,))
             db.execute("DELETE FROM attention_replies WHERE device=?", (worker_id,))
             db.execute("UPDATE jobs SET state='interrupted' WHERE device=? AND state NOT IN "
                        "('queued','succeeded','failed','cancelled','interrupted','expired')", (worker_id,))
@@ -498,12 +501,17 @@ class ControlStore:
             self._epoch(data, device)
             if not self._advertised(db, device, "attention"):
                 raise ProtocolError("invalid_request")
-            row = db.execute("SELECT items FROM attention WHERE device=?", (device["id"],)).fetchone()
-            known = {item["id"] for item in json.loads(row[0])} if row is not None else set()
             db.execute("INSERT OR REPLACE INTO attention VALUES (?,?,?,?)",
                        (device["id"], int(data["notices_enabled"]), int(data["replies_enabled"]),
                         json.dumps(data["items"])))
-            # A close for an item this service never listed is ignored.
+            # A close is kept for any item this service listed since the worker
+            # paired (a close can arrive reports after the item left the list);
+            # one for an item it never listed is ignored.
+            db.executemany("INSERT OR IGNORE INTO attention_known VALUES (?,?)",
+                           [(device["id"], item["id"]) for item in data["items"]])
+            db.execute("DELETE FROM attention_known WHERE device=? AND rowid NOT IN (SELECT rowid FROM "
+                       "attention_known WHERE device=? ORDER BY rowid DESC LIMIT 5000)", (device["id"], device["id"]))
+            known = {r[0] for r in db.execute("SELECT id FROM attention_known WHERE device=?", (device["id"],))}
             db.executemany("INSERT OR IGNORE INTO attention_closed VALUES (?,?,?)",
                            [(device["id"], c["id"], c["reason"]) for c in data["closed"] if c["id"] in known])
             return {"item_count": len(data["items"])}

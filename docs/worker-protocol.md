@@ -741,9 +741,19 @@ published or closes, and within 5 seconds of a switch changing (by local
 fingerprint, like `readiness`). It runs on a thread of its own, so it never delays heartbeats,
 claims or results. A 404 `unsupported_version` (or 404 `not_found`, from
 reference servers predating this extension) stops it until the next
-registration; other failures are retried every 5 seconds. A close is dropped
-on the Mac once a report carrying it was accepted, when notices are turned
-off, or, past 200 waiting while no report gets through, oldest first.
+registration; other failures are retried every 5 seconds, and logged at
+most every 10 minutes per error. A 403 (`forbidden`) is asked again only
+every 15 minutes, and the worker's status says why. A 413 halves the next
+report's size (oldest details, then oldest items, left out). A 400 is taken
+as one item's fault: the next report leaves out the items' detail, then adds
+each back one report at a time and keeps out for good the one refused again;
+failing that, generic labels; failing that, the report carries only closes.
+Closes always get through: at most 50 a report, the next report follows at
+once while more wait. A close is dropped on the Mac once a report carrying it
+was accepted, when notices are turned off, or, past 200 waiting while no
+report gets through, oldest first; its item still leaves `items`. An
+unreadable settings file is not "off": the worker keeps its open items and
+sends waiting closes, with no detail and no actions, and its status says so.
 
 ### Replies
 
@@ -797,7 +807,8 @@ reply never delays liveness. An item answered from the other device closes as
 `answered_from_watch` only when the Mac knows that reply decided it.
 
 The reference service implements `attention`, keeps the latest report per
-worker and the close reason of each item that was in the report before;
+worker and the close reason of each item any report listed since the worker
+paired;
 `openswap worker refserver attention --database PATH [WORKER_ID]` prints them
 with each reply and its outcome. `openswap worker refserver attention-reply
 --database PATH WORKER_ID ITEM_ID ACTION [--answer QUESTION:OPTION ...]
@@ -1627,24 +1638,42 @@ extension](#optional-session-attention-v1-extension).
 
 Turning notices on installs Claude Code hooks (`openswap attention <event>`,
 `async`) in the `settings.json` of every config home OpenSwap manages:
-`~/.claude`, each account session profile that has its own `settings.json`,
-and each Claude Desktop profile's Code folder. Only OpenSwap's own entries are
-added or removed; a settings file that cannot be read is left alone, as with
-the status line. For Codex, it adds OpenSwap's hooks (`PermissionRequest`,
-`PostToolUse`, `Stop`, `UserPromptSubmit`, `Interrupt`, `SessionEnd`) to the
-Codex home's `hooks.json` and sets `[features] hooks = true` in its
-`config.toml`; Codex's `notify` is left alone. Each Codex entry runs
+`~/.claude`, each account session profile (in a `settings.json` of its own
+when it does not share `~/.claude`'s, which sharing may later replace), and
+each Claude Desktop profile's Code folder. Every entry runs through
+`/bin/sh -c`, so a program that is gone or cannot run the hook (an older
+build) exits 0 and prints nothing: no Claude Code or Codex event fails or is
+blocked over it. Only OpenSwap's own entries are added or removed; a settings
+file that cannot be read is left alone, as with the status line. OpenSwap
+records every file it writes hooks into (`worker/attention-hooks.json`), and
+removal goes through exactly those files, found or not, and no other: it
+writes through a link, deletes a file only when OpenSwap created it at its
+latest install and nothing else is in it, and names a file it could not
+change (uninstall then does not report the step done). For Codex, it adds
+OpenSwap's hooks (`PermissionRequest`, `PostToolUse`, `Stop`,
+`UserPromptSubmit`, `Interrupt`, `SessionEnd`) to the Codex home's
+`hooks.json`; Codex's `notify` is left alone. Codex runs hooks unless its
+`hooks` feature is off (`features.hooks`, else the legacy
+`features.codex_hooks`; on by default in Codex 0.166). When it is off, only
+the owner's own turning on of notices sets `[features] hooks = true`, and,
+while other hooks in `hooks.json` would start running with it, only after the
+owner agrees to that; the worker never turns it on. Each Codex entry runs
 `<backup root>/bin/codex-hook <event>`, a script that starts the current
 OpenSwap: the entries never change when the app is updated or moved or a DEV
 build runs, so Codex asks to trust them once. Codex records trust by an
-entry's position, so an existing entry keeps its place and other hooks are
-never moved; a new entry goes last. OpenSwap never writes `/etc/codex` or other
-managed Codex files. The worker repeats all of this at each start, so a
-config home added since gets the hooks and the script follows the app.
-Turning notices off, or uninstalling OpenSwap, removes the hooks and puts
-`features.hooks` back as it was (unset, `true` or `false`) unless `hooks.json`
-still holds other hooks, which keeps it on; with notices off, the worker also
-takes out at its start any hook a failed removal left.
+entry's position (under the Codex home's resolved path), so an existing entry
+keeps its place and other hooks are never moved; a new entry goes last.
+OpenSwap never writes `/etc/codex` or other managed Codex files. The worker
+repeats the install at each start and every 30 seconds, so a config home
+added since gets the hooks and the script follows the app. Turning notices
+off, or uninstalling OpenSwap, removes the hooks and puts `features.hooks`
+back as it was before OpenSwap turned it on (unset, `true` or `false`) unless
+the owner changed it since or hooks other than those there then were added,
+which keeps it on. Taking an entry out of `hooks.json` can move the owner's
+hooks after it onto other trust records: OpenSwap never does that where a
+hook would gain trust, and otherwise only for the owner, naming the hooks
+Codex will ask about again; with notices off, the worker takes out at its
+start any hook a failed removal left, except such an entry.
 
 Codex shows "Hooks need review" at its next start after the hooks are added
 or changed; until the owner chooses "Trust all and continue" (or trusts them
@@ -1652,8 +1681,10 @@ in `/hooks`), they do not run. Settings › Remote › Sessions shows Codex's
 actual state, read from Codex's own files: trusted, waiting for that review,
 turned off in Codex (`/hooks` or `features.hooks = false`), blocked by managed
 configuration (`allow_managed_hooks_only`, or hooks turned off in
-`/etc/codex` or a managed profile), or missing. Turning notices on says so
-when the review is still to come.
+`/etc/codex` or a managed profile), or missing; it never advises trusting
+all while other hooks there also wait for review. It also names hook entries
+whose program is gone. Turning notices on says so when the review is still
+to come.
 
 A hook hands its event to the worker's socket and exits within a second,
 printing nothing; with no worker running the event is dropped. The worker
@@ -1669,11 +1700,21 @@ a notice with no recorded call becomes a notice without detail.
 Answering at the Mac closes the item as `answered_on_mac`: `PostToolUse` or
 `PostToolUseFailure` of that very call (matched by a digest of its input),
 `Stop` for the main thread's permissions and questions (a background
-subagent's prompt can outlive the turn that started it), a typed prompt
-(`UserPromptSubmit`) for everything. A "No" or Esc fires no hook, so the worker also reads every
+subagent's prompt can outlive the turn that started it), `SubagentStop` for
+that subagent's (a "No" or Esc on its prompt ends it), a typed prompt
+(`UserPromptSubmit`) for everything. One session can run in two Claude Code
+processes (`claude --resume` elsewhere): each process's hooks and session
+file speak only for its own items, a process is the same one only while its
+start time matches (a reused PID is not), and an item whose process is unknown
+closes only when every running copy of the session agrees. A "No" or Esc fires no hook, so the worker also reads every
 managed config home's `sessions/{pid}.json` twice a second: a session that
 left `waiting` after a prompt was recorded answered it (an idle item closes
-only on a typed prompt: a channel or background turn also leaves `idle`).
+only on a typed prompt: a channel or background turn also leaves `idle`). With
+several prompts open in a session, a status that is `waiting` again when the
+grace ends closes none of them (queued dialogs: the one answered cannot be
+told from the one now shown); each closes on its own signal. A
+`permission_prompt` that finds the session not waiting publishes nothing only
+when that status was set after the dialog showed.
 Those closes wait 1.5 seconds,
 so that a quit or `/clear` right after them closes the item as
 `session_ended` instead. The session ending (`SessionEnd`, `/clear`, its
@@ -1695,7 +1736,8 @@ thread's `approvals_reviewer` (read from its session record's `turn_context`)
 is not `user`. A Codex approval closes as `answered_on_mac` on that call's
 `PostToolUse`, on `Stop`, `UserPromptSubmit` or `Interrupt` (Esc or "No") on
 the same thread, or when Codex's own log database (`logs_*.sqlite` in the
-Codex home) records an answer on that thread since the approval was asked;
+Codex home) records an answer on that thread since the approval was asked
+(each logged answer closes one approval, the oldest asked before it, once);
 a finished turn closes on the thread's next `UserPromptSubmit`. A subagent's
 approval belongs to its own thread. Codex items close as `session_ended` with
 `SessionEnd` or when the Codex process that ran their hooks exits (Codex's

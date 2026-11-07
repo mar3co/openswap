@@ -735,17 +735,24 @@ def remote_folder_rows(worker_status: dict) -> list[dict]:
 
 
 REMOTE_ATTENTION_NEEDS_WORKER = "Notices are sent while the local worker is on."
+REMOTE_ATTENTION_UNREADABLE = ("OpenSwap can't read its settings file, so these switches show as off and sessions "
+                               "send nothing new until it can.")
+REMOTE_ATTENTION_MISSING = ("Some session hooks run {program}, which is gone{more}; sessions skip them quietly. "
+                            "Turn notices off and on to point them at this copy of OpenSwap.")
 CODEX_REVIEW = ("Codex shows “Hooks need review” the next time it starts. Choose “Trust all and "
                 "continue” so Codex sessions can tell you when they need you.")
 # Codex's state for OpenSwap's hooks (``attention.codex_hooks_status``), in words.
 CODEX_HOOKS_STATUS = {
     "trusted": "Codex: OpenSwap's hooks are trusted.",
     "review": "Codex: " + CODEX_REVIEW,
+    "review_others": ("Codex: Codex shows “Hooks need review” the next time it starts, for other hooks too. "
+                      "Trust OpenSwap's (codex-hook) and only the hooks you recognize; don't choose “Trust all and "
+                      "continue” unless you know them all."),
     "disabled": "Codex: OpenSwap's hooks are turned off in Codex (/hooks), so Codex sessions can't tell you "
                 "when they need you.",
     "off": "Codex: hooks are turned off in Codex's settings, so Codex sessions can't tell you when they need you.",
     "blocked": "Codex: your organization's Codex settings don't allow OpenSwap's hooks.",
-    "missing": "Codex: OpenSwap's hooks are missing from Codex's hooks.json; the worker puts them back when it starts.",
+    "missing": "Codex: OpenSwap's hooks are missing from Codex's hooks.json; the worker puts them back.",
     "unknown": "Codex: OpenSwap can't read Codex's settings to tell whether its hooks are trusted.",
 }
 REMOTE_REPLIES_HOW = ("Only sessions started with {launcher} can be answered from your phone and watch; "
@@ -779,6 +786,14 @@ def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
     ]
     if notices and not enabled:
         rows.append(_remote_hint("remote_attention_note", REMOTE_ATTENTION_NEEDS_WORKER))
+    if switches.get("readable") is False:
+        rows.append(_remote_hint("remote_attention_unreadable", REMOTE_ATTENTION_UNREADABLE))
+    missing = switches.get("missing") or []
+    if notices and missing:
+        rows.append(_remote_hint("remote_attention_missing", REMOTE_ATTENTION_MISSING.format(
+            program=missing[0], more=f" (and {len(missing) - 1} more)" if len(missing) > 1 else "")))
+    for n, problem in enumerate(switches.get("problems") or []):
+        rows.append(_remote_hint(f"remote_attention_problem_{n}", problem))
     codex = CODEX_HOOKS_STATUS.get(switches.get("codex"))
     if notices and codex:
         rows.append(_remote_hint("remote_attention_codex", codex))

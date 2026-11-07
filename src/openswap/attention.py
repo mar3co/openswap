@@ -45,6 +45,7 @@ HOOK_EVENTS = {
     "UserPromptSubmit": "",
     "PostToolUse": "",
     "PostToolUseFailure": "",
+    "SubagentStop": "",
     "SessionEnd": "",
 }
 HOOK_TIMEOUT_SECONDS = 10
@@ -186,6 +187,8 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
         notice["entrypoint"] = entrypoint
     tool_name = clean_text(data.get("tool_name"), DETAIL_CAPS["tool_name"])
     tool_input = data.get("tool_input")
+    if event == "SubagentStop" and _agent(data):
+        notice["agent_id"] = _agent(data)
     if event in ("PermissionRequest", "PostToolUse", "PostToolUseFailure") and tool_name:
         agent = _agent(data)
         if agent:
@@ -243,23 +246,29 @@ _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh",
 
 
 def claude_pid() -> int:
-    """The Claude Code process running this hook: the parent, or the
-    grandparent when Claude Code ran the hook through a shell.
+    """The Claude Code process running this hook: the first ancestor that is
+    not a shell (the hook's own wrapper, and the shell Claude Code may run
+    hooks through, sit in between).
 
     0 when it cannot be told: a shell's PID taken for Claude Code's would end
     the session's items as soon as the hook exits."""
-    parent = os.getppid()
     if os.environ.get("CLAUDE_CODE_SHELL_PREFIX"):
         return 0  # a wrapper of the owner's own may sit between the hook and Claude Code
+    pid = os.getppid()
     try:
-        out = subprocess.run(["/bin/ps", "-o", "ppid=,comm=", "-p", str(parent)], capture_output=True,
-                             text=True, timeout=0.3).stdout.split(None, 1)
-        if len(out) != 2:
-            return 0
-        pid = int(out[0]) if Path(out[1].strip()).name.lstrip("-") in _SHELLS else parent
+        for _ in range(3):
+            out = subprocess.run(["/bin/ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True,
+                                 timeout=0.3, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"}).stdout.split(None, 1)
+            if len(out) != 2:
+                return 0
+            if Path(out[1].strip()).name.lstrip("-") not in _SHELLS:
+                return pid if pid > 1 else 0
+            pid = int(out[0])
+            if pid <= 1:
+                return 0
     except (OSError, ValueError, subprocess.SubprocessError):
         return 0
-    return pid if pid > 1 else 0
+    return 0
 
 
 def _codex_notice(event: str, raw: bytes) -> dict | None:
@@ -449,11 +458,30 @@ def program() -> str:
     return words[0] if len(words) == 2 else "openswap"
 
 
+# Every hook entry runs through this: a program that is missing, or present but
+# unable to run the hook (an older build, an import failure), exits 0 and prints
+# nothing, so no Claude Code or Codex event ever fails or is blocked over it.
+HOOK_SHELL = "/bin/sh"
+HOOK_SCRIPT = 'command -v "$0" >/dev/null 2>&1 || exit 0; "$0" "$@" 2>/dev/null || exit 0'
+
+
+def _wrapped(*words: str) -> str:
+    return " ".join([HOOK_SHELL, "-c", shlex.quote(HOOK_SCRIPT), *(shlex.quote(w) for w in words)])
+
+
 def hook_command(event: str, executable: str) -> str:
-    return f"{shlex.quote(executable)} attention {event}"
+    return _wrapped(executable, "attention", event)
 
 
-OUR_HOOK_WORDS = frozenset({*HOOK_EVENTS, QUESTION_EVENT})
+def _hook_words(command: object) -> list[str]:
+    """The command a hook entry runs, without the wrapper (if any)."""
+    if not isinstance(command, str):
+        return []
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return []
+    return words[3:] if len(words) >= 4 and words[:2] == [HOOK_SHELL, "-c"] else words
 
 
 def _is_openswap(word: str) -> bool:
@@ -463,14 +491,177 @@ def _is_openswap(word: str) -> bool:
 
 
 def is_our_hook_command(command: object) -> bool:
-    """Whether ``command`` is ``<openswap> attention <event>`` for any openswap."""
-    if not isinstance(command, str):
-        return False
+    """Whether ``command`` runs ``<openswap> attention …`` for any openswap and
+    any event (a newer build's included), wrapped or not."""
+    words = _hook_words(command)
+    return len(words) >= 3 and words[1] == "attention" and _is_openswap(words[0])
+
+
+# --- where OpenSwap put hooks ------------------------------------------------------
+
+# Every file OpenSwap ever wrote hooks into, by the path it wrote: removal covers
+# these whether or not their home is still found, and no other file.
+HOOKS_RECORD = Path("worker") / "attention-hooks.json"
+
+
+def _identity(path: Path) -> list[int] | None:
     try:
-        words = shlex.split(command)
-    except ValueError:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return [info.st_dev, info.st_ino]
+
+
+def _record(backup_root: Path) -> dict[str, dict]:
+    """``{path: {"created": bool, "identity": [dev, inode]}}``: whether OpenSwap
+    created the file at its latest install, and the file as OpenSwap last
+    wrote it. Raises ConfigError when it cannot be read."""
+    path = Path(backup_root) / HOOKS_RECORD
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"OpenSwap's record of where it put session hooks is unreadable ({exc})") from exc
+    if not isinstance(data, dict) or not all(isinstance(v, dict) for v in data.values()):
+        raise ConfigError("OpenSwap's record of where it put session hooks is unreadable")
+    return data
+
+
+def _save_record(backup_root: Path, record: dict) -> None:
+    path = Path(backup_root) / HOOKS_RECORD
+    if not record:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _write_text(path, json.dumps(record, indent=1, sort_keys=True) + "\n")
+
+
+def _write_hooks_file(backup_root: Path | None, path: Path, document: dict) -> None:
+    """Write ``document`` to ``path`` (through a link), recorded before the write
+    so a removal finds it whatever happens next."""
+    if backup_root is None:
+        _write_text(path, json.dumps(document, indent=2, ensure_ascii=False) + "\n")
+        return
+    record = _record(backup_root)
+    key = str(path)
+    entry = record.get(key, {})
+    # Still the file OpenSwap created (nobody replaced it since), or created now.
+    created = not os.path.lexists(path) or (entry.get("created") is True
+                                            and entry.get("identity") == _identity(path))
+    record[key] = {"created": created, "identity": None}
+    _save_record(backup_root, record)
+    _write_text(path, json.dumps(document, indent=2, ensure_ascii=False) + "\n")
+    identity, target = _identity(path), os.path.realpath(path)
+    for other, entry in record.items():  # the same file reached through a link: OpenSwap's own write
+        if other == key or os.path.realpath(other) == target:
+            entry["identity"] = identity
+    _save_record(backup_root, record)
+
+
+def _read_document(path: Path) -> dict | None:
+    """A hooks file's JSON object; None when it does not exist. ConfigError when
+    it cannot be read or is not an object."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"could not read {path}: {exc}; refusing to overwrite it unread") from exc
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        raise ConfigError(f"{path} does not parse ({exc}); refusing to rewrite it") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path} is not a JSON object; refusing to rewrite it")
+    return data
+
+
+def _strip_file(path: Path, strip, entry: dict | None) -> bool:
+    """Take OpenSwap's hooks out of one file with ``strip(document)``. The file
+    goes only when OpenSwap created it at its latest install, nobody replaced it
+    since, it is not a link and nothing else is left in it; otherwise what is
+    left is written through any link. Returns whether it changed; raises
+    ConfigError when it cannot be read or rewritten as it is."""
+    document = _read_document(path)
+    if document is None:
         return False
-    return len(words) == 3 and words[1] == "attention" and words[2] in OUR_HOOK_WORDS and _is_openswap(words[0])
+    updated = strip(document)
+    if updated == document:
+        return False
+    if (not updated or updated == {"hooks": {}}) and entry is not None and entry.get("created") is True \
+            and entry.get("identity") == _identity(path) and not path.is_symlink():
+        path.unlink()
+    else:
+        _write_text(path, json.dumps(updated, indent=2, ensure_ascii=False) + "\n")
+    return True
+
+
+def _remove_recorded(backup_root: Path, strip_for, problems: list) -> bool:
+    """Take OpenSwap's hooks out of every file it recorded. ``strip_for(path)``
+    returns the function that strips one file, or None to leave it for now. A
+    file leaves the record once none of OpenSwap's hooks are left in it; one
+    that cannot be changed is named in ``problems``."""
+    try:
+        record = _record(backup_root)
+    except ConfigError as exc:
+        problems.append(str(exc))
+        return False
+    changed = False
+    for key, entry in sorted(record.items()):
+        path = Path(key)
+        strip = strip_for(path)
+        if strip is None:
+            continue
+        try:
+            changed = _strip_file(path, strip, entry) or changed
+            if path.exists() and _has_ours_in(path):
+                continue  # left in place on purpose; ``strip`` said why
+        except (ConfigError, OSError) as exc:
+            problems.append(f"{path}: {exc}")
+            continue
+        del record[key]
+    try:
+        _save_record(backup_root, record)
+    except OSError as exc:
+        problems.append(f"could not update OpenSwap's record of its session hooks: {exc}")
+    return changed
+
+
+def _has_ours_in(path: Path) -> bool:
+    document = _read_document(path) or {}
+    hooks = document.get("hooks")
+    return isinstance(hooks, dict) and any(
+        is_our_hook_command(h.get("command")) or _codex_launcher_word(h.get("command"))
+        for groups in hooks.values() if isinstance(groups, list)
+        for group in groups if isinstance(group, dict) and isinstance(group.get("hooks"), list)
+        for h in group["hooks"] if isinstance(h, dict))
+
+
+def recorded_programs(backup_root: Path) -> list[str]:
+    """The programs OpenSwap's recorded hooks run that no longer exist, for Settings."""
+    import shutil
+
+    missing = []
+    try:
+        record = _record(backup_root)
+    except ConfigError:
+        return []
+    for key in record:
+        try:
+            document = _read_document(Path(key)) or {}
+        except ConfigError:
+            continue
+        hooks = document.get("hooks") if isinstance(document.get("hooks"), dict) else {}
+        for groups in hooks.values():
+            for group in groups if isinstance(groups, list) else []:
+                for handler in group.get("hooks", []) if isinstance(group, dict) else []:
+                    words = _hook_words(handler.get("command")) if isinstance(handler, dict) else []
+                    ours = is_our_hook_command(handler.get("command")) or _codex_launcher_word(
+                        handler.get("command"))
+                    if ours and words and shutil.which(words[0]) is None and words[0] not in missing:
+                        missing.append(words[0])
+    return missing
 
 
 # --- Claude Code settings.json ----------------------------------------------
@@ -529,66 +720,100 @@ def _without_ours(groups: list) -> list:
     return out
 
 
-def _with_hooks(settings: dict, executable: str | None, *, question: bool = False) -> dict:
-    """``settings`` with OpenSwap's hooks for ``executable`` (None: removed), and
-    with ``question`` the synchronous question hook too. Every other hook is kept
+def _settings_without_ours(settings: dict) -> dict:
+    """``settings`` with OpenSwap's hooks taken out of every event, a newer
+    build's events too. Raises ConfigError for a ``hooks`` value that is not
+    an object."""
+    hooks = settings.get("hooks")
+    if hooks is None:
+        return settings
+    if not isinstance(hooks, dict):
+        raise ConfigError("Claude Code's hooks setting is not in the expected form; refusing to rewrite it")
+    out = {}
+    for event, groups in hooks.items():
+        kept = _without_ours(groups) if isinstance(groups, list) else groups
+        if kept or not groups:
+            out[event] = kept
+    if out == hooks:
+        return settings
+    result = dict(settings)
+    if out:
+        result["hooks"] = out
+    else:
+        result.pop("hooks")
+    return result
+
+
+def _with_hooks(settings: dict, executable: str, *, question: bool = False) -> dict:
+    """``settings`` with OpenSwap's hooks for ``executable``, and with
+    ``question`` the synchronous question hook too. Every other hook is kept
     as written. Raises ConfigError for a ``hooks`` value this would have to overwrite."""
     hooks = settings.get("hooks", {})
     if not isinstance(hooks, dict) or any(not isinstance(hooks.get(e, []), list) for e in HOOK_EVENTS):
         raise ConfigError("Claude Code's hooks setting is not in the expected form; refusing to rewrite it")
-    hooks = dict(hooks)
+    hooks = dict(_settings_without_ours(settings).get("hooks", {}))
     for event, matcher in HOOK_EVENTS.items():
-        groups = _without_ours(hooks.get(event, []))
-        if executable is not None:
-            groups.append({"matcher": matcher, "hooks": [{
-                "type": "command", "command": hook_command(event, executable),
-                "async": True, "timeout": HOOK_TIMEOUT_SECONDS,
+        groups = list(hooks.get(event, []))
+        groups.append({"matcher": matcher, "hooks": [{
+            "type": "command", "command": hook_command(event, executable),
+            "async": True, "timeout": HOOK_TIMEOUT_SECONDS,
+        }]})
+        if question and event == "PermissionRequest":
+            groups.append({"matcher": "AskUserQuestion", "hooks": [{
+                "type": "command", "command": hook_command(QUESTION_EVENT, executable),
+                "timeout": QUESTION_TIMEOUT_SECONDS,
             }]})
-            if question and event == "PermissionRequest":
-                groups.append({"matcher": "AskUserQuestion", "hooks": [{
-                    "type": "command", "command": hook_command(QUESTION_EVENT, executable),
-                    "timeout": QUESTION_TIMEOUT_SECONDS,
-                }]})
-        if groups:
-            hooks[event] = groups
-        else:
-            hooks.pop(event, None)
-    result = dict(settings)
-    if hooks:
-        result["hooks"] = hooks
-    else:
-        result.pop("hooks", None)
-    return result
+        hooks[event] = groups
+    return {**settings, "hooks": hooks}
 
 
-def _has_ours(settings: dict) -> bool:
-    hooks = settings.get("hooks")
-    return isinstance(hooks, dict) and any(
-        isinstance(h, dict) and is_our_hook_command(h.get("command"))
-        for groups in hooks.values() if isinstance(groups, list)
-        for group in groups if isinstance(group, dict) and isinstance(group.get("hooks"), list)
-        for h in group["hooks"])
-
-
-def set_hooks(config_home: Path, executable: str | None, *, question: bool = False) -> bool:
+def set_hooks(config_home: Path, executable: str | None, *, question: bool = False,
+              backup_root: Path | None = None) -> bool:
     """Install OpenSwap's hooks for ``executable`` in one config home (with
-    ``question``, the question hook too), or remove them (None). Reads before
-    writing: a settings file that cannot be read is left alone (ConfigError). A
-    file without OpenSwap's hooks is never rewritten to remove them. Returns
-    whether the file changed."""
-    from openswap.statusline import _read_json_for_write, _write_json
-
+    ``question``, the question hook too), recorded under ``backup_root``; or,
+    with None, take them out of it (never deleting the file). Reads before
+    writing: a settings file that cannot be read is left alone (ConfigError).
+    Returns whether the file changed."""
     path = Path(config_home) / "settings.json"
-    if executable is None and not os.path.lexists(path):
-        return False
-    settings = _read_json_for_write(path)
-    if executable is None and not _has_ours(settings):
-        return False
+    if executable is None:
+        return _strip_file(path, _settings_without_ours, None)
+    settings = _read_document(path) or {}
     updated = _with_hooks(settings, executable, question=question)
-    if updated == settings:
+    if updated == settings and (backup_root is None or str(path) in _record(backup_root)):
         return False
-    _write_json(path, updated)
+    _write_hooks_file(backup_root, path, updated)
     return True
+
+
+def only_ours(path: Path) -> bool:
+    """Whether a settings file holds nothing but OpenSwap's hooks, so sharing
+    may put ``~/.claude``'s in its place (it has OpenSwap's hooks too)."""
+    try:
+        document = _read_document(path)
+        return document is not None and not path.is_symlink() and not _settings_without_ours(document)
+    except ConfigError:
+        return False
+
+
+def profile_hooks(session_dir: Path, backup_root: Path) -> None:
+    """After an account profile's sharing changed: while notices are on, its
+    sessions get OpenSwap's hooks (through ``~/.claude``'s settings when shared,
+    else in a settings file of its own). Never raises; the worker's next pass
+    catches up on anything left."""
+    if os.name != "posix":
+        return
+    try:
+        from openswap.settings import load_attention_settings
+
+        root = Path(backup_root)
+        if not load_attention_settings(root).notices:
+            return
+        with _switch_lock(root, timeout=1):
+            switches = load_attention_settings(root, strict=True)
+            if switches.notices:
+                set_hooks(session_dir, program(), question=switches.replies, backup_root=root)
+    except Exception as exc:  # noqa: BLE001 - never in the way of starting a session
+        logger.debug("Session hooks for %s left to the worker: %s", session_dir, exc)
 
 
 # --- Codex hooks.json ----------------------------------------------------------
@@ -601,7 +826,8 @@ CODEX_HOOK_EVENTS = {
     "UserPromptSubmit": (10, True), "Interrupt": (3, True), "SessionEnd": (3, False),
 }
 CODEX_LAUNCHER = Path("bin") / "codex-hook"
-# Per Codex home: what ``features.hooks`` was before OpenSwap turned it on.
+# Per Codex home: what ``features.hooks`` was before OpenSwap turned it on, and
+# the other hooks there were then.
 CODEX_STATE_FILE = Path("worker") / "attention-codex.json"
 # Codex's own managed configuration: never written; read for whether it blocks hooks.
 CODEX_MANAGED_FILES = (Path("/etc/codex/requirements.toml"), Path("/etc/codex/managed_config.toml"))
@@ -619,17 +845,31 @@ def codex_launcher(backup_root: Path) -> Path:
 
 def codex_hook_entry(event: str, launcher: Path) -> dict:
     timeout, run_async = CODEX_HOOK_EVENTS[event]
-    return {"type": "command", "command": f"{shlex.quote(str(launcher))} {event}",
-            "timeout": timeout, "async": run_async}
+    return {"type": "command", "command": _wrapped(str(launcher), event), "timeout": timeout, "async": run_async}
+
+
+def _codex_label(event: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
 
 
 def codex_hook_hash(event: str, entry: dict) -> str:
     """The hash Codex records as ``trusted_hash`` once the owner trusts ``entry``
-    (no matcher), as Codex 0.166 computes it."""
-    label = re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
-    identity = json.dumps({"event_name": label, "hooks": [entry]}, sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=False)
+    (no matcher), as Codex 0.166 computes it (``async`` defaults to false)."""
+    identity = json.dumps({"event_name": _codex_label(event), "hooks": [{"async": False, **entry}]},
+                          sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def codex_hooks_on(config: dict) -> bool:
+    """Whether Codex runs hooks under ``config`` (a parsed config.toml):
+    ``features.hooks``, else the legacy ``features.codex_hooks``, else Codex's
+    default, which is on (measured: Codex 0.166, where ``hooks`` wins over
+    ``codex_hooks`` whatever their order)."""
+    features = config.get("features") if isinstance(config.get("features"), dict) else {}
+    for key in ("hooks", "codex_hooks"):
+        if isinstance(features.get(key), bool):
+            return features[key]
+    return True
 
 
 def _write_launcher(backup_root: Path, executable: str) -> None:
@@ -643,8 +883,7 @@ def _write_launcher(backup_root: Path, executable: str) -> None:
             return
     except (OSError, UnicodeDecodeError):
         pass
-    _write_text(path, text)
-    os.chmod(path, 0o755)
+    _write_text(path, text, mode=0o755)
 
 
 def _refuse_managed(codex_home: Path) -> None:
@@ -654,30 +893,24 @@ def _refuse_managed(codex_home: Path) -> None:
 
 
 def _read_hooks_file(path: Path) -> dict:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
-    except (OSError, UnicodeDecodeError) as exc:
-        raise ConfigError(f"could not read {path}: {exc}; refusing to overwrite it unread") from exc
-    try:
-        data = json.loads(text)
-    except (ValueError, RecursionError) as exc:
-        raise ConfigError(f"{path} does not parse ({exc}); refusing to rewrite it") from exc
-    hooks = data.get("hooks", {}) if isinstance(data, dict) else None
+    data = _read_document(path) or {}
+    hooks = data.get("hooks", {})
     if not isinstance(hooks, dict) or any(not isinstance(groups, list) for groups in hooks.values()):
         raise ConfigError(f"{path} is not in the form Codex reads; refusing to rewrite it")
     return data
 
 
+def _codex_launcher_word(command: object) -> bool:
+    words = _hook_words(command)
+    return len(words) >= 2 and words[0].endswith("/" + str(CODEX_LAUNCHER))
+
+
 def _is_ours_in(handler: object, launcher: Path) -> bool:
-    if not isinstance(handler, dict) or not isinstance(handler.get("command"), str):
+    """Whether a Codex hook entry runs OpenSwap's launcher, for any event."""
+    if not isinstance(handler, dict):
         return False
-    try:
-        words = shlex.split(handler["command"])
-    except ValueError:
-        return False
-    return len(words) == 2 and words[0] == str(launcher) and words[1] in CODEX_HOOK_EVENTS
+    words = _hook_words(handler.get("command"))
+    return len(words) >= 2 and words[0] == str(launcher)
 
 
 def _codex_groups(groups: list, event: str, launcher: Path | None, ours_at: Path) -> list:
@@ -704,11 +937,107 @@ def _codex_groups(groups: list, event: str, launcher: Path | None, ours_at: Path
     return out
 
 
+def _codex_others(data: dict, launcher: Path) -> list[str]:
+    """Every hook in a ``hooks.json`` that is not OpenSwap's, as comparable strings."""
+    out = []
+    for event, groups in data.get("hooks", {}).items():
+        for group in groups if isinstance(groups, list) else []:
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            matcher = group.get("matcher") if isinstance(group, dict) else None
+            for handler in handlers if isinstance(handlers, list) else [group]:
+                if not _is_ours_in(handler, launcher):
+                    out.append(json.dumps([event, matcher, handler], sort_keys=True, ensure_ascii=False))
+    return sorted(out)
+
+
+def _describe(other: str) -> str:
+    event, _, handler = json.loads(other)
+    command = handler.get("command") if isinstance(handler, dict) else None
+    return f"{event}: {command}" if isinstance(command, str) else event
+
+
+def _trust_state(config: dict) -> dict:
+    hooks = config.get("hooks") if isinstance(config.get("hooks"), dict) else {}
+    state = hooks.get("state")
+    return state if isinstance(state, dict) else {}
+
+
+def _trust_source(home: Path) -> str:
+    """The path Codex names ``hooks.json`` by in its trust records: the Codex
+    home resolved, the file itself not (measured: Codex 0.166 ``hooks/list``)."""
+    return os.path.join(os.path.realpath(home), "hooks.json")
+
+
+def _moves(groups: list, launcher: Path) -> list[tuple[tuple[int, int], tuple[int, int], object]]:
+    """Each other hook whose (group, entry) position changes once OpenSwap's
+    entries are taken out of ``groups``: (old, new, entry)."""
+    moves, new_group = [], 0
+    for g, group in enumerate(groups):
+        handlers = group.get("hooks") if isinstance(group, dict) else None
+        if not isinstance(handlers, list):
+            if g != new_group:
+                moves.append(((g, 0), (new_group, 0), group))
+            new_group += 1
+            continue
+        kept = [h for h in handlers if not _is_ours_in(h, launcher)]
+        if not kept:
+            continue
+        index = 0
+        for h, handler in enumerate(handlers):
+            if _is_ours_in(handler, launcher):
+                continue
+            if (g, h) != (new_group, index):
+                moves.append(((g, h), (new_group, index), handler))
+            index += 1
+        new_group += 1
+    return moves
+
+
+def _codex_without_ours(data: dict, launcher: Path, config: dict, home: Path, *, owner: bool,
+                        notes: list, problems: list) -> dict:
+    """``data`` (a ``hooks.json``) without OpenSwap's entries. Codex keys its
+    trust in a hook by position, so taking an entry out can move the owner's
+    hooks after it onto another hook's record. An event where that would let
+    a hook gain trust or start running keeps OpenSwap's entry (named in
+    ``problems``); one where it changes how Codex treats a hook (asks again, or
+    no longer turned off) is changed only for the owner, who is told which
+    hooks (``notes``); the worker, with no one to tell, leaves it."""
+    hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict) or any(not isinstance(groups, list) for groups in hooks.values()):
+        raise ConfigError("hooks.json is not in the form Codex reads; refusing to rewrite it")
+    state, source = _trust_state(config), _trust_source(home)
+    out = {}
+    for event, groups in hooks.items():
+        kept = _codex_groups(groups, event, None, launcher)
+        if kept == groups:
+            out[event] = groups
+            continue
+        label, changed, gains = _codex_label(event), [], False
+        for (og, oh), (ng, nh), handler in _moves(groups, launcher):
+            before, after = state.get(f"{source}:{label}:{og}:{oh}"), state.get(f"{source}:{label}:{ng}:{nh}")
+            if before == after:
+                continue
+            if isinstance(after, dict) and after.get("trusted_hash") and after.get("enabled") is not False:
+                gains = True
+            command = handler.get("command") if isinstance(handler, dict) else None
+            changed.append(f"{event}: {command}" if isinstance(command, str) else event)
+        if gains or (changed and not owner):
+            problems.append(f"Codex: OpenSwap's {event} hook was left in hooks.json: taking it out would change "
+                            f"how Codex treats your own hooks after it ({'; '.join(changed)})")
+            out[event] = groups
+            continue
+        notes.extend(f"Codex will ask you to review your hook again ({c})" for c in changed)
+        if kept:
+            out[event] = kept
+    return {**data, "hooks": out}
+
+
 def _feature_text(text: str, value: bool | None, *, drop_table: bool = False) -> str:
     """``text`` (a config.toml) with ``[features] hooks`` set to ``value`` (None:
     removed, and with ``drop_table`` the ``[features]`` table too once nothing
-    else is in it), every other line kept as written. Raises ConfigError unless
-    the result parses to the same document with only that changed."""
+    else is in it), every other line kept as written (a comment after the
+    ``hooks`` line's value too). Raises ConfigError unless the result parses to
+    the same document with only that changed."""
     import copy
 
     try:
@@ -726,7 +1055,7 @@ def _feature_text(text: str, value: bool | None, *, drop_table: bool = False) ->
     else:
         features["hooks"] = value
     without_table = {k: v for k, v in expected.items() if k != "features"}
-    line = None if value is None else f"hooks = {'true' if value else 'false'}\n"
+    line = None if value is None else f"hooks = {'true' if value else 'false'}"
     lines = text.splitlines(keepends=True)
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"
@@ -735,7 +1064,7 @@ def _feature_text(text: str, value: bool | None, *, drop_table: bool = False) ->
     candidates = []  # (text, what it must parse to)
     if header is None:
         if line is not None:
-            candidates.append((lines + ["\n" if lines else "", "[features]\n", line], expected))
+            candidates.append((lines + ["\n" if lines else "", "[features]\n", line + "\n"], expected))
     else:
         table_end = next((n for n in range(header + 1, len(lines)) if lines[n].lstrip().startswith("[")),
                          len(lines))
@@ -745,9 +1074,13 @@ def _feature_text(text: str, value: bool | None, *, drop_table: bool = False) ->
                 # The table as OpenSwap added it: a blank line, the header, the key.
                 first = header - 1 if header and not lines[header - 1].strip() else header
                 candidates.append((lines[:first] + lines[header + 1:n] + lines[n + 1:], without_table))
-            candidates.append((lines[:n] + ([line] if line else []) + lines[n + 1:], expected))
+            comment = re.search(r"\s#[^\"']*$", lines[n].rstrip("\n"))
+            replaced = [line + (comment.group(0) if comment else "") + "\n"] if line else []
+            candidates.append((lines[:n] + replaced + lines[n + 1:], expected))
+            if comment:
+                candidates.append((lines[:n] + ([line + "\n"] if line else []) + lines[n + 1:], expected))
         if not found and line is not None:
-            candidates.append((lines[:header + 1] + [line] + lines[header + 1:], expected))
+            candidates.append((lines[:header + 1] + [line + "\n"] + lines[header + 1:], expected))
     for candidate, wanted in candidates:
         rewritten = "".join(candidate)
         try:
@@ -768,15 +1101,29 @@ def _codex_config(codex_home: Path) -> tuple[Path, str]:
         raise ConfigError(f"could not read {path}: {exc}; refusing to overwrite it unread") from exc
 
 
-def _write_text(path: Path, text: str) -> None:
-    """Atomic write through a symlink, like the status line's settings writes."""
+def _parse_config(text: str) -> dict:
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"Codex's config.toml does not parse ({exc}); refusing to rewrite it") from exc
+
+
+def _write_text(path: Path, text: str, *, mode: int | None = None) -> None:
+    """Atomic, durable write through a symlink, like the status line's settings
+    writes, keeping the file's permissions (``mode`` for a new file, else 0600)."""
     from openswap.fsutil import replace_with_retry
 
     target = Path(os.path.realpath(path)) if path.is_symlink() else path
     target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        keep = os.stat(target).st_mode & 0o7777
+    except FileNotFoundError:
+        keep = 0o600 if mode is None else mode
     fd, tmp = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
     try:
         os.write(fd, text.encode("utf-8"))
+        os.fchmod(fd, keep if mode is None else mode)
+        os.fsync(fd)
         os.close(fd)
         fd = -1
         replace_with_retry(tmp, str(target))
@@ -805,20 +1152,19 @@ def _codex_state(backup_root: Path) -> dict:
 def _save_codex_state(backup_root: Path, state: dict) -> None:
     path = Path(backup_root) / CODEX_STATE_FILE
     if not state:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        path.unlink(missing_ok=True)
         return
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _write_text(path, json.dumps(state, indent=1) + "\n")
 
 
-def set_codex_hooks(codex_home: Path, backup_root: Path, enabled: bool) -> bool:
-    """Install OpenSwap's hooks in one Codex home's ``hooks.json`` and turn on
-    Codex's ``hooks`` feature, or take them out and put the feature back as
-    it was (left on while ``hooks.json`` still holds other hooks). Codex not
-    installed (no home): nothing to do. Returns whether anything changed."""
+def install_codex_hooks(codex_home: Path, backup_root: Path, *, owner: bool = False,
+                        consent: bool = False) -> bool:
+    """Install OpenSwap's hooks in one Codex home's ``hooks.json``. Codex's
+    ``hooks`` feature is turned on only by the owner's own action (``owner``),
+    and, while other hooks there would start running with it, only with the
+    owner's OK (``consent``; see ``codex_consent_needed``). Codex not installed
+    (no home): nothing to do. Returns whether anything changed."""
     home = Path(codex_home)
     _refuse_managed(home)
     if not home.is_dir():
@@ -828,51 +1174,119 @@ def set_codex_hooks(codex_home: Path, backup_root: Path, enabled: bool) -> bool:
     data = _read_hooks_file(path)
     hooks = dict(data.get("hooks", {}))
     for event in CODEX_HOOK_EVENTS:
-        groups = _codex_groups(hooks.get(event, []), event, launcher if enabled else None, launcher)
-        if groups:
-            hooks[event] = groups
-        else:
-            hooks.pop(event, None)
-    updated = {**data, "hooks": hooks}
+        hooks[event] = _codex_groups(hooks.get(event, []), event, launcher, launcher)
+    updated = {**data, "hooks": {e: g for e, g in hooks.items() if g}}
     changed = False
-    if updated != data and not (not enabled and not data):
-        if not hooks and set(updated) == {"hooks"}:
-            path.unlink()
-        else:
-            _write_text(path, json.dumps(updated, indent=2, ensure_ascii=False) + "\n")
+    if updated != data or str(path) not in _record(backup_root):
+        _write_hooks_file(backup_root, path, updated)
         changed = True
-    others = any(not _is_ours_in(h, launcher) for groups in hooks.values() for g in groups
-                 if isinstance(g, dict) and isinstance(g.get("hooks"), list) for h in g["hooks"])
-    return _set_codex_feature(home, backup_root, enabled, keep_on=others) or changed
+    if owner:
+        changed = _enable_codex_feature(home, backup_root, _codex_others(updated, launcher), consent) or changed
+    return changed
 
 
-def _set_codex_feature(home: Path, backup_root: Path, enabled: bool, *, keep_on: bool) -> bool:
+def _enable_codex_feature(home: Path, backup_root: Path, others: list[str], consent: bool) -> bool:
     config, text = _codex_config(home)
-    try:
-        features = tomllib.loads(text).get("features", {})
-    except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"Codex's config.toml does not parse ({exc}); refusing to rewrite it") from exc
-    current = features.get("hooks", _MISSING) if isinstance(features, dict) else _MISSING
+    parsed = _parse_config(text)
+    if codex_hooks_on(parsed) or (others and not consent):
+        return False
+    features = parsed.get("features") if isinstance(parsed.get("features"), dict) else {}
     state = _codex_state(backup_root)
     key = os.path.realpath(home)
-    if enabled:
-        if current is True:
-            return False
-        state.setdefault(key, {"hooks": None if current is _MISSING else current,
-                               "table": "features" not in tomllib.loads(text)})
-        _save_codex_state(backup_root, state)
-        _write_text(config, _feature_text(text, True))
-        return True
-    record = state.pop(key, None)
-    if record is None:
-        return False
-    before = record.get("hooks") if isinstance(record, dict) else True
-    # Turned off by the owner since, or still needed by other hooks: left as it is.
-    restore = current is True and not keep_on and before in (None, False)
-    if restore:
-        _write_text(config, _feature_text(text, before, drop_table=record.get("table") is True))
+    state.setdefault(key, {"hooks": features.get("hooks"), "table": "features" not in parsed,
+                           "file": config.exists(), "others": others})
     _save_codex_state(backup_root, state)
-    return restore
+    _write_text(config, _feature_text(text, True))
+    return True
+
+
+def _restore_codex_feature(backup_root: Path, problems: list) -> bool:
+    """In every Codex home where OpenSwap turned Codex's ``hooks`` feature on,
+    put it back as it was then, unless the owner changed it since or hooks
+    other than those there then were added (it stays on, and the record stays
+    for a later removal)."""
+    try:
+        homes = list(_codex_state(backup_root))
+    except ConfigError as exc:
+        problems.append(f"Codex: {exc}")
+        return False
+    changed = False
+    for key in homes:
+        changed = _restore_one_codex_feature(Path(key), backup_root, problems) or changed
+    return changed
+
+
+def _restore_one_codex_feature(home: Path, backup_root: Path, problems: list) -> bool:
+    try:
+        state = _codex_state(backup_root)
+        key = str(home)
+        saved = state.get(key)
+        if saved is None:
+            return False
+        if not home.is_dir():
+            del state[key]  # that Codex home is gone, and its setting with it
+            _save_codex_state(backup_root, state)
+            return False
+        config, text = _codex_config(home)
+        parsed = _parse_config(text)
+        features = parsed.get("features") if isinstance(parsed.get("features"), dict) else {}
+        if not isinstance(saved, dict) or features.get("hooks") is not True:
+            del state[key]  # changed by the owner since: theirs now
+            _save_codex_state(backup_root, state)
+            return False
+        try:
+            others = _codex_others(_read_hooks_file(home / "hooks.json"), codex_launcher(backup_root))
+        except ConfigError as exc:
+            logger.info("Codex's hooks feature left on: %s", exc)
+            return False  # cannot tell whether other hooks were added
+        if not set(others) <= set(saved.get("others") or []):
+            return False
+        before = saved.get("hooks")
+        rewritten = _feature_text(text, before if isinstance(before, bool) else None,
+                                  drop_table=saved.get("table") is True)
+        if not rewritten.strip() and saved.get("file") is False:
+            config.unlink()
+        else:
+            _write_text(config, rewritten)
+        del state[key]
+        _save_codex_state(backup_root, state)
+        return True
+    except (ConfigError, OSError) as exc:
+        problems.append(f"Codex: {exc}")
+        return False
+
+
+def codex_consent_needed(backup_root: Path) -> list[str]:
+    """The owner's other Codex hooks that would start running if OpenSwap
+    turned on Codex's ``hooks`` feature now; [] when nothing needs asking."""
+    from openswap.codex.auth import codex_home
+
+    home = Path(codex_home())
+    try:
+        if not home.is_dir():
+            return []
+        if codex_hooks_on(_parse_config(_codex_config(home)[1])):
+            return []
+        return [_describe(o) for o in _codex_others(_read_hooks_file(home / "hooks.json"),
+                                                     codex_launcher(backup_root))]
+    except (ConfigError, OSError):
+        return []
+
+
+def enable_codex_hooks(backup_root: Path) -> list[str]:
+    """The owner agreed: turn on Codex's ``hooks`` feature (while notices are
+    on), knowing their other hooks start running too."""
+    from openswap.codex.auth import codex_home
+    from openswap.settings import load_attention_settings
+
+    with _switch_lock(backup_root):
+        if not load_attention_settings(backup_root, strict=True).notices:
+            return []
+        try:
+            install_codex_hooks(codex_home(), backup_root, owner=True, consent=True)
+        except (ConfigError, OSError) as exc:
+            return [f"Codex: {exc}"]
+    return []
 
 
 def _managed_blocks_hooks() -> bool | None:
@@ -908,8 +1322,7 @@ def _managed_blocks_hooks() -> bool | None:
             data = tomllib.loads(text)
         except tomllib.TOMLDecodeError:
             return None
-        features = data.get("features") if isinstance(data.get("features"), dict) else {}
-        if data.get("allow_managed_hooks_only") is True or features.get("hooks") is False:
+        if data.get("allow_managed_hooks_only") is True or not codex_hooks_on(data):
             return True
     return False
 
@@ -917,9 +1330,12 @@ def _managed_blocks_hooks() -> bool | None:
 def codex_hooks_status(codex_home: Path, backup_root: Path) -> str | None:
     """Codex's actual state for OpenSwap's hooks in one Codex home, from Codex's
     own files: ``trusted``, ``review`` (Codex shows "Hooks need review" at its
-    next start), ``disabled`` (turned off in Codex's ``/hooks``), ``off``
-    (Codex's hooks feature is off), ``blocked`` (managed configuration),
-    ``missing`` (not in ``hooks.json``) or ``unknown``. None without Codex."""
+    next start), ``review_others`` (the same, with other hooks there also
+    waiting for review), ``disabled`` (turned off in Codex's ``/hooks``),
+    ``off`` (Codex's hooks feature is off, the legacy ``codex_hooks`` key
+    included), ``blocked`` (managed configuration), ``missing`` (not in
+    ``hooks.json``, or the launcher it runs is gone) or ``unknown``. None
+    without Codex."""
     home = Path(codex_home)
     if not home.is_dir():
         return None
@@ -934,74 +1350,109 @@ def codex_hooks_status(codex_home: Path, backup_root: Path) -> str | None:
         data = _read_hooks_file(home / "hooks.json")
     except (ConfigError, tomllib.TOMLDecodeError):
         return "unknown"
-    features = config.get("features") if isinstance(config.get("features"), dict) else {}
-    if features.get("hooks", features.get("codex_hooks")) is False:
+    if not codex_hooks_on(config):
         return "off"
     launcher = codex_launcher(backup_root)
-    hooks_state = config.get("hooks", {}).get("state") if isinstance(config.get("hooks"), dict) else None
-    hooks_state = hooks_state if isinstance(hooks_state, dict) else {}
-    sources = {str(home / "hooks.json"), os.path.join(os.path.realpath(home), "hooks.json")}
-    statuses = set()
+    if not os.access(launcher, os.X_OK):
+        return "missing"
+    hooks_state, source = _trust_state(config), _trust_source(home)
+    statuses, others_untrusted = set(), False
+    for event, groups in data.get("hooks", {}).items():
+        for g, group in enumerate(groups):
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            for h, handler in enumerate(handlers if isinstance(handlers, list) else []):
+                if _is_ours_in(handler, launcher) or not isinstance(handler, dict):
+                    continue
+                state = hooks_state.get(f"{source}:{_codex_label(event)}:{g}:{h}")
+                state = state if isinstance(state, dict) else {}
+                if state.get("enabled") is not False and (
+                        isinstance(group, dict) and group.get("matcher") is not None
+                        or state.get("trusted_hash") != codex_hook_hash(event, handler)):
+                    others_untrusted = True  # or OpenSwap cannot tell: never advise trusting all
     for event in CODEX_HOOK_EVENTS:
         entry = codex_hook_entry(event, launcher)
-        label = re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
         place = next(((g, h) for g, group in enumerate(data.get("hooks", {}).get(event, []))
                       if isinstance(group, dict) and isinstance(group.get("hooks"), list)
                       for h, handler in enumerate(group["hooks"]) if handler == entry), None)
         if place is None:
             return "missing"
-        state = next((hooks_state[k] for k in (f"{s}:{label}:{place[0]}:{place[1]}" for s in sources)
-                      if isinstance(hooks_state.get(k), dict)), {})
+        state = hooks_state.get(f"{source}:{_codex_label(event)}:{place[0]}:{place[1]}")
+        state = state if isinstance(state, dict) else {}
         if state.get("enabled") is False:
             statuses.add("disabled")
         elif state.get("trusted_hash") != codex_hook_hash(event, entry):
             statuses.add("review")
-    return "disabled" if "disabled" in statuses else "review" if statuses else "trusted"
+    if "disabled" in statuses:
+        return "disabled"
+    if statuses:
+        return "review_others" if others_untrusted else "review"
+    return "trusted"
 
 
 # --- turning it on and off -----------------------------------------------------
 
 
-def apply(backup_root: Path, enabled: bool, replies: bool = False) -> tuple[bool, list[str]]:
-    """Install (or remove) the hooks in every managed config home (the question
-    hook only while ``replies`` too) and in the Codex home. Every place is
-    tried; returns whether anything changed, and what could not be changed, in
-    words, for the owner."""
+def apply(backup_root: Path, enabled: bool, replies: bool = False, *, owner: bool = False,
+          problems: list | None = None, notes: list | None = None) -> bool:
+    """Install the hooks in every managed config home (the question hook only
+    while ``replies`` too) and in the Codex home, or take them out of every
+    file OpenSwap ever put them in. Every place is tried; returns whether
+    anything changed. What could not be changed goes into ``problems``, and
+    what the owner should know into ``notes``, in words. ``owner`` is True for
+    the owner's own action: only then is Codex's hooks feature turned on, or a
+    Codex removal that changes how Codex treats other hooks made."""
     from openswap.codex.auth import codex_home
 
-    executable = program() if enabled else None
+    problems = [] if problems is None else problems
+    notes = [] if notes is None else notes
     changed = False
-    problems = []
-    for home in config_homes(backup_root):
-        is_profile = Path(backup_root) / "sessions" in home.parents
-        # An account profile without its own settings.json shares ~/.claude's
-        # once sharing is on; creating one would block that link.
-        if is_profile and not os.path.lexists(home / "settings.json"):
-            continue
+    if enabled:
+        executable = program()
+        homes_problems: list = []
+        for home in config_homes(backup_root, homes_problems):
+            try:
+                changed = set_hooks(home, executable, question=replies, backup_root=backup_root) or changed
+            except (ConfigError, OSError) as exc:
+                problems.append(f"{home}: {exc}")
+        problems.extend(homes_problems)
         try:
-            changed = set_hooks(home, executable, question=enabled and replies) or changed
-        except (ConfigError, OSError) as exc:
-            problems.append(f"{home}: {exc}")
-    try:
-        if enabled:
             _write_launcher(backup_root, executable)
-        changed = set_codex_hooks(codex_home(), backup_root, enabled) or changed
-        if not enabled:
-            codex_launcher(backup_root).unlink(missing_ok=True)
-    except (ConfigError, OSError) as exc:
-        problems.append(f"Codex: {exc}")
-    return changed, problems
+            changed = install_codex_hooks(codex_home(), backup_root, owner=owner) or changed
+        except (ConfigError, OSError) as exc:
+            problems.append(f"Codex: {exc}")
+        return changed
+    launcher = codex_launcher(backup_root)
+
+    def strip_for(path: Path):
+        if path.name != "hooks.json":
+            return _settings_without_ours
+        try:
+            config = _parse_config(_codex_config(path.parent)[1])
+        except (ConfigError, OSError) as exc:
+            problems.append(f"Codex: {exc}")
+            return None
+        return lambda data: _codex_without_ours(data, launcher, config, path.parent, owner=owner,
+                                                notes=notes, problems=problems)
+
+    changed = _remove_recorded(backup_root, strip_for, problems)
+    changed = _restore_codex_feature(backup_root, problems) or changed
+    try:
+        if not any(Path(p).name == "hooks.json" for p in _record(backup_root)):
+            launcher.unlink(missing_ok=True)  # nothing left that runs it
+    except (ConfigError, OSError):
+        pass
+    return changed
 
 
 @contextmanager
-def _switch_lock(backup_root: Path):
+def _switch_lock(backup_root: Path, *, timeout: float = 10):
     """Held while the notices switch is read or written together with the hooks
     it implies, so a worker starting while the owner flips it cannot undo the flip."""
     from openswap.locking import FileLock
 
     path = Path(backup_root) / "worker" / "attention.lock"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock = FileLock(path, timeout=10)
+    lock = FileLock(path, timeout=timeout)
     if not lock.acquire():
         raise ConfigError("another change to session notices is still running; try again")
     try:
@@ -1011,7 +1462,9 @@ def _switch_lock(backup_root: Path):
 
 
 def set_notices(backup_root: Path, enabled: bool) -> list[str]:
-    """Settings › Remote › "Tell me when a session needs me": the switch, then the hooks.
+    """Settings › Remote › "Tell me when a session needs me": the switch, then
+    the hooks. Returns what the owner should hear: what could not be changed,
+    and which of their own Codex hooks Codex will ask about again.
 
     Turning it on from a translocated or mounted copy of the app raises
     ClaudeSwitchError (the hooks would name a path that disappears).
@@ -1019,24 +1472,20 @@ def set_notices(backup_root: Path, enabled: bool) -> list[str]:
     from openswap.settings import write_attention_settings
 
     if enabled:
-        from openswap import bundle
-        from openswap.exceptions import ClaudeSwitchError
-
-        if bundle.runs_from_temporary_location():
-            from openswap.launch_agent import MOVE_TO_APPLICATIONS
-
-            raise ClaudeSwitchError(MOVE_TO_APPLICATIONS)
+        _refuse_temporary_copy()
     with _switch_lock(backup_root):
         switches = write_attention_settings(backup_root, notices=enabled)
-        return apply(backup_root, enabled, switches.replies)[1]
+        problems: list = []
+        notes: list = []
+        apply(backup_root, enabled, switches.replies, owner=True, problems=problems, notes=notes)
+        return problems + notes
 
 
 def set_replies(backup_root: Path, enabled: bool) -> list[str]:
     """Settings › Remote › "Allow replies from my phone and watch" (this Mac
     only): the switch, then the question hook in every managed config home."""
-    from openswap.settings import load_attention_settings, write_attention_settings
-
     from openswap import bundle
+    from openswap.settings import load_attention_settings, write_attention_settings
 
     with _switch_lock(backup_root):
         if load_attention_settings(backup_root).notices and bundle.runs_from_temporary_location():
@@ -1048,7 +1497,9 @@ def set_replies(backup_root: Path, enabled: bool) -> list[str]:
             write_attention_settings(backup_root, replies=False)
             return []
         switches = write_attention_settings(backup_root, replies=enabled)
-        return apply(backup_root, switches.notices, switches.replies)[1]
+        problems: list = []
+        apply(backup_root, switches.notices, switches.replies, owner=True, problems=problems)
+        return problems
 
 
 def _refuse_temporary_copy() -> None:
@@ -1062,24 +1513,30 @@ def _refuse_temporary_copy() -> None:
 
 
 def remove(backup_root: Path) -> bool:
-    """Uninstall: take OpenSwap's hooks out of every managed config home and the
-    Codex home. Raises ConfigError naming what could not be changed."""
-    changed, problems = apply(backup_root, False)
+    """Uninstall: take OpenSwap's hooks out of every file it ever put them in.
+    Raises ConfigError naming what could not be changed (hooks may remain)."""
+    problems: list = []
+    changed = apply(backup_root, False, owner=True, problems=problems)
     if problems:
         raise ConfigError("; ".join(problems))
     return changed
 
 
-def reconcile(backup_root: Path) -> list[str]:
-    """At worker start: while notices are on, install the hooks in config homes
+def reconcile(backup_root: Path, *, installs_only: bool = False) -> list[str]:
+    """For the worker: while notices are on, install the hooks in config homes
     created since and repoint the Codex launcher at this app; while they are
-    off, take out hooks a failed or interrupted removal left. An
-    unreadable switch changes nothing (ConfigError): it is not an "off"."""
+    off (unless ``installs_only``), take out hooks a failed or interrupted
+    removal left. Never turns Codex's hooks feature on. An unreadable switch
+    changes nothing (ConfigError): it is not an "off"."""
     from openswap.settings import load_attention_settings
 
     with _switch_lock(backup_root):
         switches = load_attention_settings(backup_root, strict=True)
-        return apply(backup_root, switches.notices, switches.replies)[1]
+        if installs_only and not switches.notices:
+            return []
+        problems: list = []
+        apply(backup_root, switches.notices, switches.replies, problems=problems)
+        return problems
 
 
 # --- openswap claude ------------------------------------------------------------

@@ -164,10 +164,15 @@ def test_hook_stops_at_its_deadline_whatever_happens(tmp_path):
     listener.listen(1)  # accepted by the kernel, never read
     env = {**os.environ, "HOME": str(home)}
     started = time.monotonic()
-    result = subprocess.run([sys.executable, "-c", "import sys; from openswap.attention import main; "
-                             "sys.exit(main(['Stop']))"],
-                            input=json.dumps({"session_id": SESSION, "cwd": "/x"}).encode(),
-                            capture_output=True, env=env, timeout=10)
+    hook_process = subprocess.Popen([sys.executable, "-c", "import sys; from openswap.attention import main; "
+                                     "sys.exit(main(['Stop']))"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, env=env)
+    # Its input never ends: only the deadline can end the hook.
+    hook_process.stdin.write(json.dumps({"session_id": SESSION, "cwd": "/x"}).encode())
+    hook_process.stdin.flush()
+    out, err = hook_process.stdout.read(), hook_process.stderr.read()  # until the hook exits
+    result = subprocess.CompletedProcess([], hook_process.wait(timeout=10), out, err)
+    hook_process.stdin.close()
     listener.close()
     path.unlink()
     if path.parent.parent == Path("/tmp"):
@@ -279,8 +284,8 @@ def at(clock, seconds):
     return {"at": clock.now + seconds}
 
 
-def record(status, status_at, session=SESSION, waiting_for=""):
-    return {session: SessionRecord(session, os.getpid(), status, status_at, waiting_for)}
+def record(status, status_at, session=SESSION, waiting_for="", pid=None):
+    return [SessionRecord(session, os.getpid() if pid is None else pid, status, status_at, waiting_for)]
 
 
 def test_row1_a_call_that_ends_before_its_prompt_is_never_published(store):
@@ -370,15 +375,23 @@ def test_an_unknown_session_status_is_never_read_as_an_answer(store):
     assert len(published(items)) == 1
 
 
-def test_another_processs_record_for_the_session_is_ignored(store):
+@pytest.mark.parametrize("other", ["idle", "busy", "gone"])
+def test_another_processs_record_for_the_session_is_ignored(store, other):
+    """W10: the same session in a second process (``claude --resume`` elsewhere)."""
     items, clock = store
+    mine = SessionRecord(SESSION, os.getpid(), "waiting", clock.now - 1, "permission prompt")
+    items.observe([mine], True)
     items.notice(permission() | at(clock, 0) | {"pid": os.getpid()})
-    stale = {SESSION: SessionRecord(SESSION, os.getppid(), "idle", clock.now + 1)}
-    items.observe(stale, True)
     items.notice(notification("permission_prompt") | at(clock, 6) | {"pid": os.getpid()})
+    [shown] = published(items)
+    theirs = SessionRecord(SESSION, os.getppid(), other if other != "gone" else "idle", clock.now + 8)
+    items.observe([mine, theirs], True)  # the other process left waiting after the item opened
+    if other == "gone":
+        items.observe([mine], True)  # and then ended
     clock.now += 10
     items.tick()
-    assert len(published(items)) == 1
+    assert published(items) == [shown] and shown["detail"]["description"] == "Run the tests"
+    assert closes(items) == []
 
 
 def test_row2_a_permission_prompt_publishes_only_the_prompt_waiting_now_once(store):
@@ -418,7 +431,7 @@ def test_row4_one_prompt_ending_closes_only_its_own_item(store):
     items.notice(notification("permission_prompt") | at(clock, 6))
     items.notice(permission(command="b") | at(clock, 7) | {"session_id": OTHER})
     items.notice(notification("permission_prompt", session=OTHER) | at(clock, 13))
-    waiting = {**record("waiting", t + 0.1), **record("waiting", t + 7.1, session=OTHER)}
+    waiting = record("waiting", t + 0.1) + record("waiting", t + 7.1, session=OTHER)
     items.observe(waiting, True)
     items.notice(post(command="b") | {"session_id": OTHER})
     [left] = published(items)
@@ -435,7 +448,7 @@ def test_row5_after_a_restart_an_item_whose_session_moved_on_closes(tmp_path):
     first.notice(permission() | at(clock, 0))
     first.notice(notification("permission_prompt") | at(clock, 6))
     first.notice(notification("idle_prompt", session=OTHER) | at(clock, 6))
-    reads = [({**record("idle", t + 20), **record("busy", t + 30, session=OTHER)}, True)]
+    reads = [(record("idle", t + 20) + record("busy", t + 30, session=OTHER), True)]
     again = AttentionStore(tmp_path, clock=clock, records=lambda: reads[0])
     clock.now += 60
     again.refresh()
@@ -494,7 +507,7 @@ def test_a_home_that_could_not_be_listed_hides_no_ended_session(tmp_path, monkey
         return []
 
     monkeypatch.setattr(attention, "config_homes", homes)
-    assert _session_records(tmp_path)() == ({}, False)
+    assert _session_records(tmp_path)() == ([], False)
 
 
 def test_a_background_task_turn_refreshes_the_idle_items_reply(store):
@@ -552,7 +565,7 @@ def test_session_records_are_read_from_every_home(tmp_path):
         "waitingFor": "permission prompt"}))
     (other / "sessions" / "999999.json").write_text(json.dumps({"pid": 999999, "sessionId": OTHER}))  # gone
     assert read_records([home, other, tmp_path / "missing"]) == (
-        {SESSION: SessionRecord(SESSION, os.getpid(), "waiting", 1_800_000_000.5, "permission prompt")}, True)
+        [SessionRecord(SESSION, os.getpid(), "waiting", 1_800_000_000.5, "permission prompt")], True)
     (other / "sessions" / "1.json").write_text("{torn")
     assert read_records([home, other])[1] is False
 
@@ -577,9 +590,9 @@ def test_a_gone_claude_process_closes_its_items(store):
     items.notice(notification("idle_prompt") | {"pid": ended.pid, "entrypoint": "cli"})
     items.notice(notification("idle_prompt", session=OTHER) | {"pid": os.getpid(), "entrypoint": "claude-vscode"})
     items.notice(notification("idle_prompt", session="no-pid-known"))
-    items.observe({}, True)
+    items.observe([], True)
     left = published(items)
-    assert [i["session_label"] for i in left] == ["VS Code · 77aa", "Claude Code · nopi"]
+    assert [i["session_label"].split(" · ")[0] for i in left] == ["VS Code", "Claude Code"]
     assert [c["reason"] for c in closes(items)] == ["session_ended"]
 
 
@@ -593,25 +606,32 @@ def test_the_hook_reports_its_claude_code_process_and_surface(monkeypatch):
 
 
 @pytest.mark.parametrize(("ps_out", "expected"), [
-    ("  4242 /bin/zsh\n", 4242),      # through a shell: its parent
-    ("     1 /bin/sh\n", 0),          # Claude Code already gone
-    ("  4242 claude\n", "parent"),    # run directly
-    ("", 0),                          # ps could not tell
-    (TimeoutError, 0),
+    (["  4242 /bin/sh\n", "  4243 /bin/zsh\n", "  1 claude\n"], 4243),  # its wrapper, then Claude Code's shell
+    (["  4242 claude\n"], "parent"),  # run directly
+    (["     1 /bin/sh\n"], 0),         # Claude Code already gone
+    (["  4242 sh\n"] * 3, 0),          # shells all the way: cannot tell
+    ([""], 0),                         # ps could not tell
+    ([TimeoutError], 0),
 ])
 def test_claude_pid_is_unknown_rather_than_a_shell(monkeypatch, ps_out, expected):
     import subprocess
 
     monkeypatch.setattr(attention, "claude_pid", REAL_CLAUDE_PID)
 
-    def ps(*_args, **_kwargs):
-        if ps_out is TimeoutError:
-            raise subprocess.TimeoutExpired("ps", 0.3)
-        return subprocess.CompletedProcess([], 0, ps_out, "")
+    def run(outputs):
+        outputs = iter(outputs)
 
-    monkeypatch.setattr(attention.subprocess, "run", ps)
+        def ps(*_args, **_kwargs):
+            out = next(outputs)
+            if out is TimeoutError:
+                raise subprocess.TimeoutExpired("ps", 0.3)
+            return subprocess.CompletedProcess([], 0, out, "")
+        return ps
+
+    monkeypatch.setattr(attention.subprocess, "run", run(ps_out))
     monkeypatch.delenv("CLAUDE_CODE_SHELL_PREFIX", raising=False)
     assert attention.claude_pid() == (os.getppid() if expected == "parent" else expected)
+    monkeypatch.setattr(attention.subprocess, "run", run(ps_out))
     monkeypatch.setenv("CLAUDE_CODE_SHELL_PREFIX", "/usr/local/bin/my-wrapper")
     assert attention.claude_pid() == 0
 
@@ -620,9 +640,9 @@ def test_claude_pid_skips_the_shell_claude_code_ran_the_hook_through(monkeypatch
     import subprocess
 
     monkeypatch.setattr(attention, "claude_pid", REAL_CLAUDE_PID)
-    out = subprocess.run(["/bin/sh", "-c", f"{sys.executable} -c 'from openswap.attention import claude_pid; "
-                          "print(claude_pid())'; true"], capture_output=True, text=True)
-    assert int(out.stdout) == os.getpid()
+    out = subprocess.run(["/bin/sh", "-c", f"/bin/sh -c \"{sys.executable} -c 'from openswap.attention import "
+                          "claude_pid; print(claude_pid())'; true\"; true"], capture_output=True, text=True)
+    assert int(out.stdout) == os.getpid()  # through the hook's wrapper and the shell Claude Code ran it in
 
 
 def test_open_items_survive_a_restart_and_a_lost_file_reports_no_closes(tmp_path):
@@ -907,9 +927,9 @@ def test_install_adds_only_openswap_hooks_and_removal_leaves_the_rest(tmp_path):
     assert data["model"] == "opus" and data["hooks"]["PreToolUse"] == [theirs]
     assert data["hooks"]["PostToolUse"][0] == theirs
     ours = data["hooks"]["PostToolUse"][1]["hooks"][0]
-    assert ours == {"type": "command", "command": f"{EXE} attention PostToolUse", "async": True, "timeout": 10}
+    assert ours == {"type": "command", "command": attention.hook_command("PostToolUse", EXE), "async": True, "timeout": 10}
     assert data["hooks"]["Notification"][0]["matcher"] == "permission_prompt|idle_prompt"
-    assert _ours(home) == {e: f"{EXE} attention {e}" for e in attention.HOOK_EVENTS}
+    assert _ours(home) == {e: attention.hook_command(e, EXE) for e in attention.HOOK_EVENTS}
     assert attention.set_hooks(home, EXE) is False  # already there
     assert attention.set_hooks(home, "/other/openswap") is True  # repointed, not doubled
     assert len(_settings(home)["hooks"]["Stop"]) == 1
@@ -964,9 +984,9 @@ def test_worker_start_takes_out_hooks_left_after_notices_went_off(tmp_path, monk
     root = tmp_path / "backup"
     claude = Path.home() / ".claude"
     claude.mkdir(exist_ok=True)
-    attention.set_hooks(claude, EXE)  # a removal that never finished
+    attention.set_hooks(claude, EXE, backup_root=root)  # a removal that never finished
     assert attention.reconcile(root) == []
-    assert _ours(claude) == {}
+    assert not (claude / "settings.json").exists()  # OpenSwap created it for its hooks alone
 
 
 def test_worker_start_leaves_the_hooks_when_the_switch_cannot_be_read(tmp_path, monkeypatch):
@@ -985,9 +1005,13 @@ def test_worker_start_leaves_the_hooks_when_the_switch_cannot_be_read(tmp_path, 
 def test_is_our_hook_command():
     assert attention.is_our_hook_command("openswap attention Stop")
     assert attention.is_our_hook_command(f"'{EXE}' attention Notification")
-    assert not attention.is_our_hook_command("openswap attention rm -rf")
+    assert attention.is_our_hook_command(attention.hook_command("Stop", EXE))
+    # A newer build's event is OpenSwap's too (a downgrade must still take it out).
+    assert attention.is_our_hook_command("openswap attention SomeLaterEvent")
+    assert attention.is_our_hook_command(attention.hook_command("SomeLaterEvent", EXE))
     assert not attention.is_our_hook_command("~/bin/notify attention Stop")
     assert not attention.is_our_hook_command("openswap statusline")
+    assert not attention.is_our_hook_command("/bin/sh -c 'x' ~/bin/notify attention Stop")
 
 
 def test_config_homes_and_apply_cover_every_managed_home(tmp_path, monkeypatch):
@@ -1007,13 +1031,16 @@ def test_config_homes_and_apply_cover_every_managed_home(tmp_path, monkeypatch):
     profile = store.add("Work")
     code = store.directories(profile, create=True)[1]
     assert attention.config_homes(root) == [claude, shared, alone, code]
-    changed, problems = attention.apply(root, True)
-    assert changed and problems == []
-    assert _ours(claude) == _ours(code) == {e: f"{EXE} attention {e}" for e in attention.HOOK_EVENTS}
-    # A profile without its own settings.json would lose ~/.claude's once sharing is on.
-    assert not (alone / "settings.json").exists()
+    problems: list = []
+    assert attention.apply(root, True, problems=problems) and problems == []
+    assert _ours(claude) == _ours(code) == _ours(alone) == {
+        e: attention.hook_command(e, EXE) for e in attention.HOOK_EVENTS}
+    # H8: a profile that does not share ~/.claude's settings gets a file of its
+    # own, holding only OpenSwap's hooks, which sharing may replace later.
+    assert attention.only_ours(alone / "settings.json") and not attention.only_ours(shared / "settings.json")
     assert attention.remove(root) is True
-    assert "hooks" not in _settings(claude) and "hooks" not in _settings(code)
+    # OpenSwap created each for its hooks alone: nothing else is in them.
+    assert not any((home / "settings.json").exists() for home in (claude, code, alone))
 
 
 def test_set_notices_saves_the_switch_and_reports_what_failed(tmp_path, monkeypatch):
@@ -1057,15 +1084,26 @@ def codex_stop(message="Codex mock reply 7", thread=THREAD):
 
 
 class Answers:
-    """Codex's log as ``read_codex_answers`` reads it: thread -> when a person answered."""
+    """Codex's log as ``read_codex_answers`` reads it: thread -> each answer a
+    person gave, (row, time). ``at[thread] = t`` logs one more answer."""
 
     def __init__(self):
-        self.at, self.fail = {}, False
+        self.rows, self.fail = {}, False
+        self.at = _Log(self.rows)
 
     def __call__(self, threads):
         if self.fail:
             raise sqlite3.OperationalError("no such table: logs")
-        return {t: at for t, at in self.at.items() if t in threads}
+        return {t: list(rows) for t, rows in self.rows.items() if t in threads}
+
+
+class _Log:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __setitem__(self, thread, at):
+        rows = self.rows.setdefault(thread, [])
+        rows.append((f"logs_2.sqlite:{sum(map(len, self.rows.values()))}", at))
 
 
 @pytest.fixture
@@ -1087,7 +1125,8 @@ def test_c1_an_approval_still_open_after_six_seconds_is_published(codex_store):
     assert published(items) == []
     wait(items, clock, 0.1)
     [item] = published(items)
-    assert (item["kind"], item["provider"], item["session_label"]) == ("permission", "codex", "Codex · 01a1")
+    assert (item["kind"], item["provider"], item["session_label"]) == (
+        "permission", "codex", f"Codex · {items.session_id(items._items[0])[:4]}")
     assert item["detail"] == {"tool_name": "Bash", "description": "Create a marker file?"}
 
 
@@ -1151,7 +1190,7 @@ def test_codex_log_answers_are_read_by_thread_from_codex_log_database(tmp_path):
     db.commit()
     db.close()
     answers = read_codex_answers([home, tmp_path / "no-codex"], {THREAD: START, OTHER: START})
-    assert answers == {THREAD: pytest.approx(START + 3.075)}
+    assert answers == {THREAD: [(f"{home / 'logs_2.sqlite'}:1", pytest.approx(START + 3.075))]}
 
 
 @pytest.mark.parametrize("schema", ["create table logs (id integer primary key, ts integer)",
@@ -1360,7 +1399,7 @@ def test_c10_settings_shows_codex_trust_state_from_codex_files(codex_home, tmp_p
     text = (home / "config.toml").read_text()
     (home / "config.toml").write_text(text.replace('"\n', '"\nenabled = false\n', 1))
     assert attention.codex_hooks_status(home, root) == "disabled"
-    (home / "config.toml").write_text(text.replace("hooks = true", "hooks = false"))
+    (home / "config.toml").write_text("[features]\nhooks = false\n" + text)
     assert attention.codex_hooks_status(home, root) == "off"
     (tmp_path / "etc").mkdir()
     (tmp_path / "etc" / "requirements.toml").write_text("allow_managed_hooks_only = true\n")
@@ -1375,7 +1414,8 @@ def test_c10_settings_rows_say_what_codex_will_do():
 
     rows = remote_attention_rows({"attention": {"notices": True, "details": True, "codex": "review"}}, enabled=True)
     assert rows[-1]["id"] == "remote_attention_codex" and "Hooks need review" in rows[-1]["label"]
-    assert set(CODEX_HOOKS_STATUS) == {"trusted", "review", "disabled", "off", "blocked", "missing", "unknown"}
+    assert set(CODEX_HOOKS_STATUS) == {"trusted", "review", "review_others", "disabled", "off", "blocked", "missing",
+                                       "unknown"}
     rows = remote_attention_rows({"attention": {"notices": False, "details": True, "codex": "review"}}, enabled=True)
     assert all(r["id"] != "remote_attention_codex" for r in rows)
 
@@ -1427,22 +1467,27 @@ def test_c12_installing_keeps_every_trusted_user_hook_in_its_place(codex_home):
 
 
 @pytest.mark.parametrize("before", ["", "[features]\nhooks = true\n", "[features]\nhooks = false\nplugins = true\n",
-                                    "model = \"o3\"\n\n[features]\nmemories = true\n"])
+                                    "model = \"o3\"\n\n[features]\nmemories = true\n",
+                                    "[features]\ncodex_hooks = false\n", "[features]\nhooks = false # mine\n"])
 def test_c13_removal_puts_the_hooks_feature_back_exactly(codex_home, before):
     home, root = codex_home
-    (home / "config.toml").write_text(before)
-    attention.apply(root, True)
-    assert tomllib.loads((home / "config.toml").read_text())["features"]["hooks"] is True
+    if before:
+        (home / "config.toml").write_text(before)
+    attention.apply(root, True, owner=True)
+    assert attention.codex_hooks_on(tomllib.loads((home / "config.toml").read_text() if before else ""))
     attention.remove(root)
-    assert (home / "config.toml").read_text() == before
+    assert ((home / "config.toml").read_text() if before else not (home / "config.toml").exists()) in (before, True)
     assert not (home / "hooks.json").exists() and not attention.codex_launcher(root).exists()
 
 
-def test_c13_the_feature_stays_on_while_other_hooks_remain(codex_home):
+def test_c13_the_feature_stays_on_while_hooks_added_since_remain(codex_home):
     home, root = codex_home
+    (home / "config.toml").write_text("[features]\nhooks = false\n")
+    attention.apply(root, True, owner=True)
     theirs = {"hooks": [{"type": "command", "command": "~/bin/log"}]}
-    (home / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [theirs]}}))
-    attention.apply(root, True)
+    data = json.loads((home / "hooks.json").read_text())
+    data["hooks"]["Stop"].append(theirs)  # the owner adds a hook of their own since
+    (home / "hooks.json").write_text(json.dumps(data))
     attention.remove(root)
     assert json.loads((home / "hooks.json").read_text()) == {"hooks": {"Stop": [theirs]}}
     assert tomllib.loads((home / "config.toml").read_text())["features"]["hooks"] is True
@@ -1463,19 +1508,22 @@ def test_c13_turning_notices_back_on_shows_whether_codex_asks_again(codex_home):
 def test_c14_managed_codex_files_are_never_written(codex_home, tmp_path):
     home, root = codex_home
     with pytest.raises(ConfigError):
-        attention.set_codex_hooks(Path("/etc/codex"), root, True)
+        attention.install_codex_hooks(Path("/etc/codex"), root, owner=True)
+    (home / "config.toml").write_text("[features]\nhooks = false\n")
     before = {p for p in tmp_path.rglob("*")}
-    attention.apply(root, True)
+    attention.apply(root, True, owner=True)
     written = {p for p in tmp_path.rglob("*")} - before
     assert {p for p in written if p.is_file()} <= {home / "hooks.json", home / "config.toml",
-                                                   attention.codex_launcher(root), root / attention.CODEX_STATE_FILE}
+                                                   attention.codex_launcher(root), root / attention.CODEX_STATE_FILE,
+                                                   root / attention.HOOKS_RECORD}
 
 
-@pytest.mark.parametrize("text", ['features = "x"\n', "[features\n", 'features.hooks = false\n'])
+@pytest.mark.parametrize("text", ["[features\n", 'features.hooks = false\n'])
 def test_a_config_this_cannot_rewrite_is_left_alone(codex_home, text):
     home, root = codex_home
     (home / "config.toml").write_text(text)
-    _, problems = attention.apply(root, True)
+    problems: list = []
+    attention.apply(root, True, owner=True, problems=problems)
     assert len(problems) == 1 and problems[0].startswith("Codex:")
     assert (home / "config.toml").read_text() == text
 
@@ -1491,7 +1539,7 @@ def test_attention_switches_default_off_and_fail_closed(tmp_path):
     raw = json.loads((tmp_path / "settings.json").read_text())
     raw["worker"]["attention"] = {"notices": "yes"}
     (tmp_path / "settings.json").write_text(json.dumps(raw))
-    assert load_attention_settings(tmp_path) == AttentionSettings(notices=False, details=False)
+    assert load_attention_settings(tmp_path) == AttentionSettings(notices=False, details=False, readable=False)
 
 
 def test_settings_rows_show_the_switches_on_a_paired_mac():
@@ -1694,3 +1742,595 @@ def test_the_attention_loop_reports_a_notice_within_a_second(reporting, monkeypa
     finally:
         client.stop_event.set()
         thread.join(timeout=3)
+
+
+# --- S1 review round (plan 025, 025-review-s1.md) ------------------------------------
+
+
+def _recorded(root):
+    return json.loads((root / attention.HOOKS_RECORD).read_text())
+
+
+def test_h1_removal_covers_every_recorded_file_found_or_not(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    monkeypatch.setattr(attention, "program", lambda: EXE)
+    root = tmp_path / "backup"
+    gone_home = tmp_path / "dropped-profile"  # a home no longer discovered (registry unreadable, profile dropped)
+    gone_home.mkdir()
+    (gone_home / "settings.json").write_text('{"model": "opus"}')
+    attention.set_hooks(gone_home, EXE, backup_root=root)
+    unreadable = tmp_path / "unreadable"
+    unreadable.mkdir()
+    attention.set_hooks(unreadable, EXE, backup_root=root)
+    monkeypatch.setattr(attention, "config_homes", lambda *_a, **_k: [])
+    (unreadable / "settings.json").chmod(0)
+    with pytest.raises(ConfigError, match="unreadable"):  # named; uninstall does not report the step done
+        attention.remove(root)
+    assert _settings(gone_home) == {"model": "opus"}
+    assert list(_recorded(root)) == [str(unreadable / "settings.json")]  # kept for the next try
+    (unreadable / "settings.json").chmod(0o600)
+    assert attention.remove(root) is True
+    assert not (root / attention.HOOKS_RECORD).exists()
+
+
+def test_h1_an_unreadable_record_is_named_never_read_as_nothing_to_do(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    root = tmp_path / "backup"
+    (root / "worker").mkdir(parents=True)
+    (root / attention.HOOKS_RECORD).write_text("{torn")
+    with pytest.raises(ConfigError, match="record"):
+        attention.remove(root)
+
+
+def test_h2_removal_never_touches_a_file_openswap_never_wrote(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    (tmp_path / "codex").mkdir()
+    root = tmp_path / "backup"
+    claude = Path.home() / ".claude"
+    claude.mkdir(exist_ok=True)
+    torn = '{"hooks": {"Stop": [{"hooks": [{"command": "openswap attention Stop"}]}]'  # torn, not ours to judge
+    (claude / "settings.json").write_text(torn)
+    (tmp_path / "codex" / "hooks.json").write_text("[not codex's form]")
+    assert attention.remove(root) is False
+    assert (claude / "settings.json").read_text() == torn
+    assert (tmp_path / "codex" / "hooks.json").read_text() == "[not codex's form]"
+
+
+def test_h2_a_downgrade_takes_out_a_newer_builds_hooks_too(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    root = tmp_path / "backup"
+    home = tmp_path / "h"
+    home.mkdir()
+    attention.set_hooks(home, EXE, backup_root=root)
+    data = _settings(home)
+    data["hooks"]["SomeLaterEvent"] = [{"hooks": [{"type": "command",
+                                                   "command": attention.hook_command("SomeLaterEvent", EXE)}]}]
+    data["model"] = "opus"
+    (home / "settings.json").write_text(json.dumps(data))
+    attention.remove(root)
+    assert _settings(home) == {"model": "opus"}
+
+
+def test_h2_the_codex_feature_is_put_back_with_none_of_openswaps_entries_left(codex_home):
+    home, root = codex_home
+    (home / "config.toml").write_text("[features]\nhooks = false\n")
+    attention.apply(root, True, owner=True)
+    (home / "hooks.json").unlink()  # the owner deleted hooks.json; OpenSwap's record of the feature remains
+    attention.remove(root)
+    assert (home / "config.toml").read_text() == "[features]\nhooks = false\n"
+
+
+def test_h3_removal_writes_through_a_linked_hooks_file_and_never_unlinks_it(codex_home, tmp_path):
+    home, root = codex_home
+    real = tmp_path / "dotfiles" / "hooks.json"
+    real.parent.mkdir()
+    real.write_text("{}")
+    (home / "hooks.json").symlink_to(real)
+    attention.apply(root, True)
+    assert "Stop" in json.loads(real.read_text())["hooks"]
+    attention.remove(root)
+    assert (home / "hooks.json").is_symlink() and json.loads(real.read_text()) == {"hooks": {}}
+
+
+def test_h3_a_file_the_owner_replaced_since_is_never_deleted(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    root = tmp_path / "backup"
+    home = tmp_path / "h"
+    home.mkdir()
+    attention.set_hooks(home, EXE, backup_root=root)  # created by OpenSwap
+    text = (home / "settings.json").read_text()
+    (home / "settings.json").unlink()
+    (home / "settings.json").write_text(text)  # the owner's own file now, with the same content
+    attention.remove(root)
+    assert (home / "settings.json").exists() and _settings(home) == {}
+
+
+def test_h3_settings_reads_trust_under_the_resolved_codex_home(codex_home, tmp_path, monkeypatch):
+    home, root = codex_home
+    linked = tmp_path / "codex-link"
+    linked.symlink_to(home)
+    monkeypatch.setenv("CODEX_HOME", str(linked))
+    attention.apply(root, True)
+    _trust(home, root)  # Codex keys trust by the resolved home (measured: hooks/list)
+    assert attention.codex_hooks_status(linked, root) == "trusted"
+    text = (home / "config.toml").read_text()
+    (home / "config.toml").write_text(text.replace(str(home), str(linked)))  # an unresolved key is not Codex's
+    assert attention.codex_hooks_status(linked, root) == "review"
+
+
+def _shifted(home, root, state_after):
+    """hooks.json with OpenSwap's Stop entry, then the owner's own Stop hook
+    after it, which taking OpenSwap's out moves from group 1 to group 0."""
+    attention.apply(root, True)
+    data = json.loads((home / "hooks.json").read_text())
+    theirs = {"type": "command", "command": "~/bin/log", "timeout": 10, "async": False}
+    data["hooks"]["Stop"].append({"hooks": [theirs]})
+    (home / "hooks.json").write_text(json.dumps(data))
+    source = os.path.join(os.path.realpath(home), "hooks.json")
+    trusted = attention.codex_hook_hash("Stop", theirs)
+    lines = [f'[hooks.state."{source}:stop:1:0"]\ntrusted_hash = "{trusted}"\n']
+    if state_after:
+        lines.append(f'[hooks.state."{source}:stop:0:0"]\n{state_after}\n')
+    (home / "config.toml").write_text("\n".join(lines))
+    return theirs
+
+
+def test_h4_the_worker_never_moves_the_owners_codex_hooks(codex_home):
+    home, root = codex_home
+    theirs = _shifted(home, root, "")
+    write_attention_settings(root, notices=False)
+    problems = attention.reconcile(root)
+    assert any("left in hooks.json" in p for p in problems)
+    assert json.loads((home / "hooks.json").read_text())["hooks"]["Stop"][1] == {"hooks": [theirs]}
+    assert attention.codex_launcher(root).exists()  # an entry left in place still has something to run
+
+
+def test_h4_the_owner_is_told_which_codex_hooks_codex_asks_about_again(codex_home):
+    home, root = codex_home
+    theirs = _shifted(home, root, "")
+    notes = attention.set_notices(root, False)
+    assert notes == ["Codex will ask you to review your hook again (Stop: ~/bin/log)"]
+    assert json.loads((home / "hooks.json").read_text())["hooks"]["Stop"] == [{"hooks": [theirs]}]
+
+
+def test_h4_no_removal_lets_a_codex_hook_gain_trust(codex_home):
+    home, root = codex_home
+    # The record at the position it would move to trusts something: never moved onto it.
+    theirs = _shifted(home, root, 'trusted_hash = "sha256:something-else"')
+    problems = attention.set_notices(root, False)
+    assert any("left in hooks.json" in p for p in problems)
+    assert json.loads((home / "hooks.json").read_text())["hooks"]["Stop"][1] == {"hooks": [theirs]}
+
+
+def test_h5_only_the_owners_ok_turns_codex_hooks_on_when_other_hooks_would_start(codex_home):
+    home, root = codex_home
+    (home / "config.toml").write_text("[features]\nhooks = false\n")
+    theirs = {"hooks": [{"type": "command", "command": "~/bin/audit"}]}
+    (home / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [theirs]}}))
+    attention.set_notices(root, True)
+    assert not attention.codex_hooks_on(tomllib.loads((home / "config.toml").read_text()))
+    assert attention.codex_consent_needed(root) == ["Stop: ~/bin/audit"]
+    assert attention.enable_codex_hooks(root) == []
+    assert attention.codex_hooks_on(tomllib.loads((home / "config.toml").read_text()))
+    assert attention.codex_consent_needed(root) == []
+    attention.set_notices(root, False)  # only OpenSwap's added since: put back
+    assert (home / "config.toml").read_text() == "[features]\nhooks = false\n"
+
+
+def test_h5_the_worker_never_turns_codex_hooks_on(codex_home):
+    home, root = codex_home
+    (home / "config.toml").write_text("[features]\nhooks = false\n")
+    write_attention_settings(root, notices=True)
+    assert attention.reconcile(root) == []
+    assert (home / "config.toml").read_text() == "[features]\nhooks = false\n"
+    assert (home / "hooks.json").exists()  # the entries go in; the feature is the owner's to turn on
+
+
+def test_h5_settings_never_advises_trusting_all_while_other_hooks_wait(codex_home):
+    from openswap.menubar_display import CODEX_HOOKS_STATUS
+
+    home, root = codex_home
+    theirs = {"hooks": [{"type": "command", "command": "~/bin/audit"}]}
+    (home / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [theirs]}}))
+    attention.apply(root, True)
+    assert attention.codex_hooks_status(home, root) == "review_others"
+    assert "don't choose" in CODEX_HOOKS_STATUS["review_others"]
+
+
+@pytest.mark.parametrize(("config", "on"), [
+    ({}, True), ({"features": {"hooks": False}}, False), ({"features": {"codex_hooks": False}}, False),
+    ({"features": {"codex_hooks": False, "hooks": True}}, True), ({"features": {"codex_hooks": True, "hooks": False}},
+                                                                   False)])
+def test_h6_codex_hooks_follow_hooks_then_the_legacy_key_then_codexs_default(config, on):
+    assert attention.codex_hooks_on(config) is on  # measured: Codex 0.166 `codex features list`
+
+
+def test_h6_settings_shows_the_legacy_key_turning_hooks_off(codex_home):
+    home, root = codex_home
+    attention.apply(root, True)
+    _trust(home, root)
+    text = (home / "config.toml").read_text()
+    (home / "config.toml").write_text("[features]\ncodex_hooks = false\n" + text)
+    assert attention.codex_hooks_status(home, root) == "off"
+
+
+def test_h7_a_hook_whose_program_is_missing_or_fails_exits_quietly(tmp_path):
+    import subprocess
+
+    failing = tmp_path / "old-openswap"
+    failing.write_text("#!/bin/sh\necho 'usage: openswap ...' >&2\nexit 2\n")
+    failing.chmod(0o755)
+    for program in (str(tmp_path / "gone" / "openswap"), str(failing), "openswap-not-on-path"):
+        for event in ("PermissionRequest", "question"):
+            ran = subprocess.run(["/bin/sh", "-c", attention.hook_command(event, program)], input="{}",
+                                 capture_output=True, text=True)
+            assert (ran.returncode, ran.stdout, ran.stderr) == (0, "", "")
+
+
+def test_h7_settings_names_hooks_that_point_at_a_missing_program(tmp_path, monkeypatch):
+    from openswap.menubar_display import remote_attention_rows
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    root = tmp_path / "backup"
+    home = tmp_path / "h"
+    home.mkdir()
+    attention.set_hooks(home, "/Applications/Gone.app/Contents/MacOS/OpenSwap", backup_root=root)
+    assert attention.recorded_programs(root) == ["/Applications/Gone.app/Contents/MacOS/OpenSwap"]
+    rows = remote_attention_rows({"attention": {"notices": True, "details": True,
+                                                "missing": attention.recorded_programs(root)}}, enabled=True)
+    assert any(r["id"] == "remote_attention_missing" for r in rows)
+
+
+def test_h8_a_profile_added_while_the_worker_runs_gets_hooks_and_none_after_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    monkeypatch.setattr(attention, "program", lambda: EXE)
+    root = tmp_path / "backup"
+    write_attention_settings(root, notices=True)
+    profile = root / "sessions" / "4-c_x.com"
+    profile.mkdir(parents=True)
+    assert attention.reconcile(root, installs_only=True) == []  # the worker's pass every 30 s
+    assert attention.only_ours(profile / "settings.json")
+    write_attention_settings(root, notices=False)
+    late = root / "sessions" / "5-d_x.com"
+    late.mkdir()
+    assert attention.reconcile(root, installs_only=True) == []
+    assert not (late / "settings.json").exists()  # no home gets hooks after the switch went off
+
+
+def test_h8_sharing_replaces_a_file_of_only_openswaps_hooks_and_unsharing_keeps_them(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from openswap.models import Platform
+    from openswap.session import SessionManager
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    monkeypatch.setattr(attention, "program", lambda: EXE)
+    root = tmp_path / "backup"
+    write_attention_settings(root, notices=True)
+    claude = Path.home() / ".claude"
+    claude.mkdir(exist_ok=True)
+    attention.set_hooks(claude, EXE, backup_root=root)
+    profile = root / "sessions" / "2-a_x.com"
+    profile.mkdir(parents=True)
+    attention.set_hooks(profile, EXE, backup_root=root)
+    manager = SessionManager.__new__(SessionManager)
+    manager.switcher = SimpleNamespace(platform=Platform.MACOS, backup_dir=root)
+    manager._logger = SimpleNamespace(warning=lambda *_: None)
+    monkeypatch.setattr(SessionManager, "_sync_mcp_servers", lambda *_a: None)
+    manager._sync_sharing(profile, True)
+    assert (profile / "settings.json").is_symlink() and _ours(profile) == _ours(claude) != {}
+    manager._sync_sharing(profile, False)
+    assert not (profile / "settings.json").is_symlink() and _ours(profile) == _ours(claude)
+
+
+class _Refusing:
+    """A control service that refuses ``attention`` reports ``when(data)`` says
+    (every one by default) with ``status`` and ``code``."""
+
+    def __init__(self, transport, status, code, when=None):
+        self.transport, self.status, self.code, self.sent = transport, status, code, []
+        self.when = when or (lambda data: True)
+
+    def request(self, operation, data):
+        if operation == "attention":
+            self.sent.append(data)
+            if self.status is not None and self.when(data):
+                raise ProtocolError(self.code, self.status)
+        return self.transport.request(operation, data)
+
+
+def test_w1_a_forbidden_report_waits_long_says_why_and_resumes(reporting, monkeypatch):
+    from openswap.worker import remote
+    from openswap.worker.attention import read_problems
+
+    client, items, service, worker, transport, root = reporting
+    refusing = client.transport = _Refusing(transport, 403, "forbidden")
+    items.notice(notification("idle_prompt"))
+    client.sync_attention()
+    client.sync_attention()  # within the backoff: not asked again
+    assert len(refusing.sent) == 1
+    assert "refuses session notices" in read_problems(root)[0]
+    refusing.status = None
+    client._attention_shape.retry_at = 0.0  # the 15 minutes have passed
+    client.sync_attention()
+    assert len(service.attention(worker)["items"]) == 1 and read_problems(root) == []
+    assert remote.ATTENTION_FORBIDDEN_SECONDS >= 600
+
+
+def test_w1_a_report_refused_as_too_large_shrinks(reporting):
+    client, items, service, worker, transport, _ = reporting
+    refusing = client.transport = _Refusing(transport, 413, "body_too_large")
+    for n in range(20):
+        items.notice(hook("Stop", session=f"s{n}", last_assistant_message="é" * 900) | {"at": START - 1})
+        items.notice(notification("idle_prompt", session=f"s{n}"))
+    client.sync_attention()
+    first = len(json.dumps(refusing.sent[-1]))
+    refusing.when = lambda data: len(json.dumps(data)) > first // 4
+    for _ in range(4):
+        client.sync_attention()
+    report = service.attention(worker)
+    assert report is not None and len(report["items"]) == 20  # details went; every item still did
+
+
+def test_w1_one_items_refused_detail_is_repaired_and_the_rest_and_closes_go(reporting):
+    client, items, service, worker, transport, _ = reporting
+    items.notice(hook("Stop", session=OTHER, last_assistant_message="fine") | {"at": START - 1})
+    items.notice(notification("idle_prompt", session=OTHER))
+    items.notice(notification("idle_prompt"))
+    client.sync_attention()
+    items.notice(hook("Stop", last_assistant_message="poison") | {"at": START + 1})
+    items.notice(notification("idle_prompt") | {"at": START + 2})  # the same idle item, with that reply
+    items.notice(hook("UserPromptSubmit", session=OTHER, prompt="typed") | {"at": START + 3})  # a close waits
+    refusing = client.transport = _Refusing(transport, 400, "invalid_request", lambda data: any(
+        e.get("detail", {}).get("last_message") == "poison" for e in data["items"]))
+    for _ in range(6):
+        client.sync_attention()
+    report = service.attention(worker)
+    assert len(report["items"]) == 1 and "detail" not in report["items"][0]  # repaired, not dropped
+    assert list(report["closed"].values()) == ["answered_on_mac"]
+    assert len(refusing.sent) < 6
+
+
+def test_w1_closes_get_through_a_service_that_refuses_every_item(reporting):
+    client, items, service, worker, transport, _ = reporting
+    items.notice(notification("idle_prompt"))
+    client.sync_attention()
+    [shown] = service.attention(worker)["items"]
+    items.notice(hook("UserPromptSubmit", prompt="typed") | {"at": START + 1})
+    items.notice(notification("idle_prompt", session=OTHER) | {"at": START + 2})
+    client.transport = _Refusing(transport, 400, "invalid_request", lambda data: bool(data["items"]))
+    for _ in range(4):
+        client.sync_attention()
+    assert service.attention(worker)["closed"] == {shown["id"]: "answered_on_mac"}
+
+
+def test_w2_one_session_in_two_processes_keeps_each_ones_items(store):
+    items, clock = store
+    a, b = os.getpid(), os.getppid()
+    items.observe([SessionRecord(SESSION, a, "idle", clock.now - 5), SessionRecord(SESSION, b, "idle", clock.now - 5)],
+                  True)
+    items.notice(notification("idle_prompt") | {"pid": a})
+    items.notice(hook("UserPromptSubmit", prompt="typed in the other terminal") | {"pid": b, "at": clock.now + 1})
+    assert len(published(items)) == 1  # b's prompt never answers a's item
+    items.notice(hook("UserPromptSubmit", prompt="typed") | {"pid": 0, "at": clock.now + 2})
+    assert len(published(items)) == 1  # an unknown process speaks for neither while both run
+
+
+def test_w2_an_item_of_no_known_process_closes_only_when_every_copy_agrees(store):
+    items, clock = store
+    a, b = os.getpid(), os.getppid()
+    both = [SessionRecord(SESSION, a, "waiting", clock.now - 1), SessionRecord(SESSION, b, "waiting", clock.now - 1)]
+    items.observe(both, True)
+    items.notice(permission() | at(clock, 0))
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    items.observe([SessionRecord(SESSION, a, "busy", clock.now + 8), both[1]], True)
+    clock.now += 10
+    items.tick()
+    assert len(published(items)) == 1
+    items.observe([SessionRecord(SESSION, a, "busy", clock.now), SessionRecord(SESSION, b, "idle", clock.now)], True)
+    clock.now += 10
+    items.tick()
+    assert published(items) == []
+
+
+def test_w2_a_reused_pid_is_not_the_items_process(store, monkeypatch):
+    items, clock = store
+    items._starts[os.getpid()] = "Thu Nov  5 09:00:00 2026"  # what the process that ran the hook began at
+    items.notice(notification("idle_prompt") | {"pid": os.getpid()})
+    assert len(published(items)) == 1
+    items._starts[os.getpid()] = "Fri Nov  6 10:00:00 2026"  # the PID now runs another process
+    items.observe([], True)
+    assert published(items) == [] and [c["reason"] for c in closes(items)] == ["session_ended"]
+    stale = SessionRecord(OTHER, os.getpid(), "waiting", clock.now, proc_start="Thu Nov  5 09:00:00 2026")
+    items.observe([stale], True)
+    assert items._records == {}  # a session file whose PID now runs another process says nothing
+
+
+@pytest.mark.parametrize(("status_at", "shown"), [(-30, True), (8, False)])
+def test_w3_a_status_counts_as_the_answer_only_when_set_after_the_call(store, status_at, shown):
+    items, clock = store
+    t = clock.now
+    items.notice(permission() | at(clock, 0))
+    items.observe(record("idle", t + status_at), True)  # before the dialog (a lagging watcher), or after it
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    assert len(published(items)) == (1 if shown else 0)
+
+
+def test_w4_a_subagent_prompt_closes_when_that_subagent_ends(store):
+    items, clock = store
+    sub = "a101aadecfe40f562"
+    items.observe(record("waiting", clock.now - 1, waiting_for="permission prompt"), True)
+    items.notice(permission(agent_id=sub) | at(clock, 0))
+    items.notice(permission(command="b", agent_id="a77bdeec2513e90cd") | at(clock, 0.01))
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    items.notice(hook("Stop") | at(clock, 0.1))  # the main thread's turn: says nothing about them
+    items.notice(hook("SubagentStop", agent_id="aba2869f8fa98be6f") | at(clock, 0.2))  # a helper agent
+    assert len(published(items)) == 1
+    items.notice(hook("SubagentStop", agent_id=sub) | at(clock, 20))  # "No" on its prompt ended it
+    assert published(items) == [] and [c["reason"] for c in closes(items)] == ["answered_on_mac"]
+
+
+def test_w4_a_brief_busy_between_queued_dialogs_closes_none_while_one_waits(store):
+    items, clock = store
+    t = clock.now
+    items.notice(permission(command="a", agent_id="sub1") | at(clock, 0))
+    items.notice(permission(command="b", agent_id="sub2") | at(clock, 0.1))
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    items.notice(notification("permission_prompt") | at(clock, 6.1))
+    items.observe(record("busy", t + 20), True)
+    items.observe(record("waiting", t + 20.5, waiting_for="permission prompt"), True)  # the queued one shows
+    clock.now += 25
+    items.tick()
+    assert len(published(items)) == 2
+    items.observe(record("idle", t + 40), True)  # nothing waits when the grace ends: both are gone
+    clock.now += 25
+    items.tick()
+    assert published(items) == []
+
+
+def test_w5_each_logged_codex_answer_closes_one_approval_once(codex_store):
+    items, clock, answers = codex_store
+    items.notice(codex_permission(command="a") | {"at": START})
+    items.notice(codex_permission(command="b") | {"at": START + 0.1})
+    wait(items, clock, 7)
+    assert len(published(items)) == 2
+    answers.at[THREAD] = START + 8  # one answer
+    wait(items, clock, 0.5)
+    wait(items, clock, 0.5)  # read again: the same row never closes the other
+    assert len(published(items)) == 1
+    answers.at[THREAD] = START + 9
+    wait(items, clock, 0.5)
+    assert published(items) == []
+
+
+def test_w6_closes_past_one_report_all_reach_the_service_with_their_reasons(reporting):
+    client, items, service, worker, _, _ = reporting
+    for n in range(60):
+        items.notice(notification("idle_prompt", session=f"s{n}"))
+    client.sync_attention()
+    shown = [i["id"] for i in service.attention(worker)["items"]]
+    assert len(shown) == 50
+    for n in range(60):
+        items.notice(hook("SessionEnd", session=f"s{n}"))
+    assert items.changed.is_set()
+    for _ in range(3):
+        client.sync_attention()
+    assert service.attention(worker)["items"] == []
+    assert set(service.attention(worker)["closed"]) == set(shown)  # kept though they left the list a report earlier
+
+
+def test_w7_an_unknown_switch_is_ignored_and_an_unreadable_file_wipes_nothing(reporting):
+    client, items, service, worker, _, root = reporting
+    raw = json.loads((root / "settings.json").read_text())
+    raw["worker"]["attention"]["later_switch"] = True  # written by a newer build
+    (root / "settings.json").write_text(json.dumps(raw))
+    assert load_attention_settings(root).notices is True
+    write_attention_settings(root, details=False)
+    assert json.loads((root / "settings.json").read_text())["worker"]["attention"]["later_switch"] is True
+    items.notice(notification("idle_prompt"))
+    items.notice(notification("idle_prompt", session=OTHER))
+    client.sync_attention()
+    (root / "settings.json").write_text("{torn")
+    items.notice(hook("SessionEnd", session=OTHER))
+    client.sync_attention()
+    assert len(items._items) == 1  # never wiped for that reason
+    report = service.attention(worker)
+    assert len(report["items"]) == 1 and report["items"][0]["actions"] == [] and "detail" not in report["items"][0]
+    assert list(report["closed"].values()) == ["session_ended"]  # the waiting close still went
+    from openswap.worker.attention import read_problems
+
+    assert "can't read its settings" in read_problems(root)[0]
+
+
+def test_w8_state_is_synced_and_only_a_file_that_parses_wrong_is_set_aside(tmp_path, monkeypatch):
+    from openswap.worker import attention as worker_attention
+
+    first = AttentionStore(tmp_path, clock=Clock())
+    first.notice(notification("idle_prompt"))
+    saved = (tmp_path / worker_attention.STATE_FILE).read_text()
+    real_read = Path.read_text
+
+    def flaky(self, *args, **kwargs):
+        if self.name == "attention.json":
+            raise PermissionError("passing")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    again = AttentionStore(tmp_path, clock=Clock())
+    again.notice(notification("idle_prompt", session=OTHER))  # not taken while the file cannot be read
+    assert not again.ready and (tmp_path / worker_attention.STATE_FILE).read_text.__self__  # file untouched
+    monkeypatch.setattr(Path, "read_text", real_read)
+    assert (tmp_path / worker_attention.STATE_FILE).read_text() == saved
+    again.refresh()
+    assert again.ready and len(published(again)) == 1 and again._secret == first._secret
+    (tmp_path / worker_attention.STATE_FILE).write_text("{torn")
+    fresh = AttentionStore(tmp_path, clock=Clock())
+    assert fresh.ready and list(tmp_path.glob("worker/attention.json.unreadable-*"))
+
+
+def test_w8_the_state_file_is_synced_before_it_replaces_the_old_one(tmp_path, monkeypatch):
+    synced = []
+    real = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real(fd)))
+    AttentionStore(tmp_path, clock=Clock()).notice(notification("idle_prompt"))
+    assert synced
+
+
+def test_w9_text_with_a_lone_surrogate_is_replaced_never_dropped(store, tmp_path):
+    items, _ = store
+    raw = ('{"session_id": "%s", "cwd": "/Users/o/\\ud800app", "hook_event_name": "Stop", '
+           '"last_assistant_message": "done \\udc00 here"}' % SESSION).encode()
+    items.notice(validate_notice(attention._hook_notice("Stop", raw)))
+    items.notice(validate_notice({**notification("idle_prompt"), "cwd": "/Users/o/\ud800app"}))
+    [item] = published(items)
+    assert item["detail"]["last_message"] == "done � here"
+    json.dumps(item).encode("utf-8")
+    items._items[0].detail = {"last_message": "saved \udc00 by an older build"}
+    [item] = published(items)
+    assert item["detail"]["last_message"] == "saved � by an older build"
+
+
+def test_minor_the_session_label_never_shows_the_session_id(store):
+    items, _ = store
+    items.notice(notification("idle_prompt"))
+    [item] = published(items)
+    assert SESSION[:4] not in item["session_label"] and item["session_label"].endswith(item["session_id"][:4])
+
+
+def test_minor_nothing_is_read_while_notices_are_off_and_nothing_is_open(tmp_path):
+    reads = []
+    items = AttentionStore(tmp_path, clock=Clock(), enabled=lambda: False,
+                           records=lambda: (reads.append(1), ([], True))[1])
+    items.refresh()
+    assert reads == []
+
+
+def test_minor_a_rewrite_keeps_the_files_mode_and_a_trailing_comment(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text("[features]\nhooks = false # mine\n")
+    path.chmod(0o640)
+    attention._write_text(path, attention._feature_text(path.read_text(), True))
+    assert path.read_text() == "[features]\nhooks = true # mine\n" and path.stat().st_mode & 0o777 == 0o640
+
+
+def test_minor_status_pause_and_stop_keep_their_slots(served):
+    from openswap.worker.client import WorkerClient
+
+    _, path, _, control = served
+    held = []
+    try:
+        for _ in range(ipc.MAX_CONNECTIONS - ipc.CONTROL_RESERVED):
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.connect(str(path))
+            held.append(c)
+        time.sleep(0.3)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.connect(str(path))
+            c.sendall(json.dumps({"version": 1, "command": "notice", "notice": notification("idle_prompt")}).encode()
+                      + b"\n")
+            assert json.loads(c.recv(4096))["error"] == "busy"  # a reserved slot serves only control calls
+        WorkerClient(path).status()
+        assert control.calls == ["status"]
+    finally:
+        for c in held:
+            c.close()

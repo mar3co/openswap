@@ -796,6 +796,12 @@ class AttentionSettings:
     details: bool = True
     # "Allow replies from my phone and watch": set on this Mac only, never from the web.
     replies: bool = False
+    # False when the settings could not be read: every switch then reads off,
+    # which must not be taken for the owner turning notices off.
+    readable: bool = True
+
+
+_ATTENTION_SWITCHES = ("notices", "details", "replies")
 
 
 def _attention_from_raw(raw: dict, *, strict: bool = False) -> AttentionSettings:
@@ -803,13 +809,13 @@ def _attention_from_raw(raw: dict, *, strict: bool = False) -> AttentionSettings
     value = section.get(_ATTENTION_KEY, {}) if isinstance(section, dict) else None
     if value == {}:
         return AttentionSettings()
-    if (not isinstance(value, dict) or not set(value) <= {"notices", "details", "replies"}
-            or not all(type(item) is bool for item in value.values())):
+    # A key a newer build wrote is ignored; a known one of the wrong type is not.
+    if not isinstance(value, dict) or not all(type(value.get(k, False)) is bool for k in _ATTENTION_SWITCHES):
         if strict:
             raise ConfigError("settings.json worker.attention is invalid")
         # Fail closed: an unreadable setting sends nothing and accepts nothing.
         _logger.warning("settings.json worker.attention is invalid; session notices are off")
-        return AttentionSettings(notices=False, details=False, replies=False)
+        return AttentionSettings(notices=False, details=False, replies=False, readable=False)
     defaults = AttentionSettings()
     return AttentionSettings(value.get("notices", defaults.notices), value.get("details", defaults.details),
                              value.get("replies", defaults.replies))
@@ -833,7 +839,7 @@ def load_attention_settings(backup_root: Path, *, strict: bool = False) -> Atten
         if strict:
             raise ConfigError(f"could not read {path}: {error}") from error
         _logger.warning("Could not read %s (%s); session notices are off", path, error)
-        return AttentionSettings(notices=False, details=False, replies=False)
+        return AttentionSettings(notices=False, details=False, replies=False, readable=False)
     return _attention_from_raw(raw, strict=strict)
 
 
@@ -850,12 +856,13 @@ def write_attention_settings(backup_root: Path, *, notices: bool | None = None,
         if not isinstance(section, dict):
             section = {}
         current = _attention_from_raw(raw)
-        updated = {
-            "notices": current.notices if notices is None else notices,
-            "details": current.details if details is None else details,
-        }
-        replies = current.replies if replies is None else replies
         previous = section.get(_ATTENTION_KEY)
+        # Keys a newer build wrote stay as they are.
+        updated = {k: v for k, v in previous.items() if k not in _ATTENTION_SWITCHES} if isinstance(
+            previous, dict) and current.readable else {}
+        updated["notices"] = current.notices if notices is None else notices
+        updated["details"] = current.details if details is None else details
+        replies = current.replies if replies is None else replies
         if replies or (isinstance(previous, dict) and "replies" in previous):
             # Written only once used: an older OpenSwap reads the section with it as invalid.
             updated["replies"] = replies

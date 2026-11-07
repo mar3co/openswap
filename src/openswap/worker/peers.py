@@ -78,10 +78,13 @@ def is_shell(proc: Process) -> bool:
 
 
 def hook_claude(pid: int) -> Process | None:
-    """The Claude Code process a hook process runs under: its parent, or its
-    grandparent when Claude Code ran the hook through a shell. None when unknown."""
+    """The Claude Code process a hook process runs under: its first ancestor
+    that is not a shell (the hook's own wrapper, and a shell Claude Code ran
+    it through, sit in between). None when unknown."""
     hook = process(pid)
-    parent = process(hook.ppid) if hook is not None else None
-    if parent is None:
-        return None
-    return process(parent.ppid) if is_shell(parent) else parent
+    ancestor = process(hook.ppid) if hook is not None else None
+    for _ in range(3):
+        if ancestor is None or not is_shell(ancestor):
+            return ancestor
+        ancestor = process(ancestor.ppid)
+    return None

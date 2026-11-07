@@ -858,7 +858,8 @@ def test_the_question_hook_is_installed_only_with_replies_and_removed_alone(tmp_
     groups = json.loads((home / "settings.json").read_text())["hooks"]["PermissionRequest"]
     question = [g for g in groups if g["matcher"] == "AskUserQuestion"]
     assert question == [{"matcher": "AskUserQuestion", "hooks": [{
-        "type": "command", "command": "/usr/local/bin/openswap attention question", "timeout": 600}]}]
+        "type": "command", "command": attention.hook_command("question", "/usr/local/bin/openswap"),
+        "timeout": 600}]}]
     attention.set_hooks(home, "/usr/local/bin/openswap", question=False)
     groups = json.loads((home / "settings.json").read_text())["hooks"]["PermissionRequest"]
     assert [g["matcher"] for g in groups] == ["Bash", ""]
